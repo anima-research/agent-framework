@@ -31,9 +31,17 @@ function createMockResponse(
   content: ContentBlock[],
   stopReason: NormalizedResponse['stopReason'] = 'end_turn'
 ): NormalizedResponse {
+  const rawText = content
+    .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+    .map((b) => b.text)
+    .join('');
+
   return {
     content,
     stopReason,
+    rawAssistantText: rawText,
+    toolCalls: [],
+    toolResults: [],
     usage: { inputTokens: 10, outputTokens: 5 },
     details: {
       stop: { reason: stopReason, wasTruncated: false },

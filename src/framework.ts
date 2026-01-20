@@ -17,6 +17,7 @@ import type {
   InferenceLogSummary,
   QueueEvent,
   EventResponse,
+  ModuleEventResponse,
   ToolCall,
   ToolResult,
   AgentConfig,
@@ -471,19 +472,19 @@ export class AgentFramework {
   }
 
   private async handleEvent(event: QueueEvent): Promise<void> {
-    // Dispatch to all modules
-    const responses: EventResponse[] = [];
+    // Dispatch to all modules, tracking responses with module names
+    const responses: ModuleEventResponse[] = [];
     for (const module of this.moduleRegistry.getAllModules()) {
       try {
         const response = await module.onEvent(event);
-        responses.push(response);
+        responses.push({ moduleName: module.name, response });
       } catch (error) {
         console.error(`Module ${module.name} error handling event:`, error);
       }
     }
 
     // Apply responses
-    for (const response of responses) {
+    for (const { response } of responses) {
       await this.applyEventResponse(response, event);
     }
 
@@ -505,6 +506,9 @@ export class AgentFramework {
         }
       }
     }
+
+    // Emit for observability
+    this.emit({ type: 'event:handled', event, responses });
   }
 
   private async applyEventResponse(response: EventResponse, event: QueueEvent): Promise<void> {

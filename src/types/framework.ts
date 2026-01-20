@@ -1,8 +1,16 @@
 import type { JsStore } from 'chronicle';
 import type { Membrane } from 'membrane';
-import type { Module } from './module.js';
+import type { Module, EventResponse } from './module.js';
 import type { AgentConfig, InferenceRequest } from './agent.js';
 import type { QueueEvent } from './events.js';
+
+/**
+ * A module's response to an event, tagged with the module name.
+ */
+export interface ModuleEventResponse {
+  moduleName: string;
+  response: EventResponse;
+}
 
 /**
  * Configuration for the agent framework.
@@ -101,7 +109,8 @@ export type FrameworkEvent =
   | { type: 'tool:error'; moduleName: string; toolName: string; callId: string; error: Error }
   | { type: 'module:start'; moduleName: string }
   | { type: 'module:stop'; moduleName: string }
-  | { type: 'queue:event'; event: QueueEvent };
+  | { type: 'queue:event'; event: QueueEvent }
+  | { type: 'event:handled'; event: QueueEvent; responses: ModuleEventResponse[] };
 
 /**
  * Listener for framework events.

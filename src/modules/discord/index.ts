@@ -35,6 +35,7 @@ import type {
 } from './types.js';
 
 export * from './types.js';
+export { DiscordJsClient, type DiscordJsClientConfig } from './discord-js-client.js';
 
 const DEFAULT_CONFIG: Partial<DiscordModuleConfig> = {
   handleDMs: true,
