@@ -86,6 +86,8 @@ export class AgentFramework {
   private eventListeners: FrameworkEventListener[] = [];
   private syncIntervalMs: number;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
+  private eventLoggingPersist: boolean;
+  private eventLoggingBroadcast: boolean;
 
   private constructor(
     store: JsStore,
@@ -93,7 +95,9 @@ export class AgentFramework {
     membrane: Membrane,
     inferencePolicy: InferencePolicy,
     errorPolicy: ErrorPolicy,
-    syncIntervalMs: number
+    syncIntervalMs: number,
+    eventLoggingPersist: boolean,
+    eventLoggingBroadcast: boolean
   ) {
     this.store = store;
     this.ownsStore = ownsStore;
@@ -101,6 +105,8 @@ export class AgentFramework {
     this.inferencePolicy = inferencePolicy;
     this.errorPolicy = errorPolicy;
     this.syncIntervalMs = syncIntervalMs;
+    this.eventLoggingPersist = eventLoggingPersist;
+    this.eventLoggingBroadcast = eventLoggingBroadcast;
     this.queue = new EventQueueImpl();
 
     // Initialize module registry with callbacks
@@ -148,13 +154,33 @@ export class AgentFramework {
       // Already registered
     }
 
+    // Event logging config (default: disabled)
+    const eventLoggingPersist = config.eventLogging?.persist ?? false;
+    const eventLoggingBroadcast = config.eventLogging?.broadcast ?? false;
+
+    // Register event log state only if persistence is enabled
+    if (eventLoggingPersist) {
+      try {
+        store.registerState({
+          id: EVENT_LOG_ID,
+          strategy: 'append_log',
+          deltaSnapshotEvery: 100,
+          fullSnapshotEvery: 20,
+        });
+      } catch {
+        // Already registered
+      }
+    }
+
     const framework = new AgentFramework(
       store,
       ownsStore,
       config.membrane,
       config.inferencePolicy ?? new DefaultInferencePolicy(),
       config.errorPolicy ?? new DefaultErrorPolicy(),
-      config.syncIntervalMs ?? DEFAULT_SYNC_INTERVAL_MS
+      config.syncIntervalMs ?? DEFAULT_SYNC_INTERVAL_MS,
+      eventLoggingPersist,
+      eventLoggingBroadcast
     );
 
     // Create agents
@@ -277,6 +303,16 @@ export class AgentFramework {
    */
   getAllAgents(): Agent[] {
     return Array.from(this.agents.values());
+  }
+
+  /**
+   * Check if event logging is enabled.
+   */
+  isEventLoggingEnabled(): { persist: boolean; broadcast: boolean } {
+    return {
+      persist: this.eventLoggingPersist,
+      broadcast: this.eventLoggingBroadcast,
+    };
   }
 
   /**
@@ -643,9 +679,15 @@ export class AgentFramework {
       }
     }
 
-    // Emit for observability and log to Chronicle
-    this.emit({ type: 'event:handled', event, responses });
-    this.logEvent(event, responses);
+    // Emit for observability (if enabled)
+    if (this.eventLoggingBroadcast) {
+      this.emit({ type: 'event:handled', event, responses });
+    }
+
+    // Log to Chronicle (if enabled)
+    if (this.eventLoggingPersist) {
+      this.logEvent(event, responses);
+    }
   }
 
   private async applyEventResponse(response: EventResponse, event: QueueEvent): Promise<void> {

@@ -32,6 +32,9 @@ import type {
   InferenceTailParams,
   InferenceInspectParams,
   InferenceSearchParams,
+  EventsTailParams,
+  EventsInspectParams,
+  EventsSearchParams,
   AgentInfo,
   ModuleInfo,
   BranchInfo,
@@ -317,6 +320,14 @@ export class ApiServer {
         // Don't broadcast raw queue events
         break;
 
+      case 'event:handled':
+        this.broadcast('event:handled', {
+          timestamp: Date.now(),
+          event: event.event,
+          responses: event.responses,
+        });
+        break;
+
       case 'module:start':
         this.broadcast('module:started', { moduleName: event.moduleName });
         break;
@@ -386,6 +397,14 @@ export class ApiServer {
         return this.cmdInferenceInspect(params as unknown as InferenceInspectParams);
       case 'inference.search':
         return this.cmdInferenceSearch(params as unknown as InferenceSearchParams);
+
+      // Event logs
+      case 'events.tail':
+        return this.cmdEventsTail(params as unknown as EventsTailParams);
+      case 'events.inspect':
+        return this.cmdEventsInspect(params as unknown as EventsInspectParams);
+      case 'events.search':
+        return this.cmdEventsSearch(params as unknown as EventsSearchParams);
 
       default:
         throw new Error(`Unknown command: ${command}`);
@@ -699,6 +718,44 @@ export class ApiServer {
       offset: params?.offset,
       pattern: params?.pattern,
       errorsOnly: params?.errorsOnly,
+    });
+
+    return result;
+  }
+
+  // ==========================================================================
+  // Event Log Commands
+  // ==========================================================================
+
+  private async cmdEventsTail(params?: EventsTailParams): Promise<{ entries: unknown[] }> {
+    const entries = this.framework.tailEventLogs(
+      params?.count ?? 10,
+      params?.eventType
+    );
+
+    return { entries };
+  }
+
+  private async cmdEventsInspect(params: EventsInspectParams): Promise<{ entry: unknown }> {
+    if (params.sequence === undefined || params.sequence === null) {
+      throw new Error('sequence is required');
+    }
+
+    const entry = this.framework.getEventLog(params.sequence);
+    if (!entry) {
+      throw new Error(`Event log not found: ${params.sequence}`);
+    }
+
+    return { entry };
+  }
+
+  private async cmdEventsSearch(params?: EventsSearchParams): Promise<unknown> {
+    const result = this.framework.queryEventLogs({
+      eventType: params?.eventType,
+      moduleName: params?.moduleName,
+      limit: params?.limit,
+      offset: params?.offset,
+      pattern: params?.pattern,
     });
 
     return result;
