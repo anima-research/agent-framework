@@ -7,10 +7,6 @@ const eventsStore = useEventsStore();
 
 const events = computed(() => eventsStore.filteredEvents);
 const loading = computed(() => eventsStore.loading);
-
-function formatTime(timestamp: number): string {
-  return new Date(timestamp).toLocaleTimeString();
-}
 </script>
 
 <template>

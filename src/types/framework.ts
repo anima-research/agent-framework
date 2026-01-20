@@ -13,6 +13,16 @@ export interface ModuleEventResponse {
 }
 
 /**
+ * Configuration for event logging.
+ */
+export interface EventLoggingConfig {
+  /** Persist event logs to Chronicle (default: false) */
+  persist?: boolean;
+  /** Broadcast event:handled via WebSocket/emit (default: false) */
+  broadcast?: boolean;
+}
+
+/**
  * Configuration for the agent framework.
  */
 export interface FrameworkConfig {
@@ -39,6 +49,9 @@ export interface FrameworkConfig {
 
   /** Interval for periodic store sync in milliseconds (default: 1000ms, 0 to disable) */
   syncIntervalMs?: number;
+
+  /** Event logging configuration (default: disabled) */
+  eventLogging?: EventLoggingConfig;
 }
 
 /**

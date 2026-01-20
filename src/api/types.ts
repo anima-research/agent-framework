@@ -83,7 +83,11 @@ export type ApiCommand =
   // Inference logs
   | 'inference.tail'
   | 'inference.inspect'
-  | 'inference.search';
+  | 'inference.search'
+  // Event logs
+  | 'events.tail'
+  | 'events.inspect'
+  | 'events.search';
 
 // ============================================================================
 // Command Parameters
@@ -193,6 +197,33 @@ export interface InferenceSearchParams {
   errorsOnly?: boolean;
 }
 
+// --- Event Log Parameters ---
+
+export interface EventsTailParams {
+  /** Number of recent entries to return (default: 10) */
+  count?: number;
+  /** Filter by event type */
+  eventType?: string;
+}
+
+export interface EventsInspectParams {
+  /** Sequence number of the log entry to inspect */
+  sequence: number;
+}
+
+export interface EventsSearchParams {
+  /** Filter by event type */
+  eventType?: string;
+  /** Filter by module name */
+  moduleName?: string;
+  /** Maximum number of results (default: 20) */
+  limit?: number;
+  /** Skip first N results for pagination (default: 0) */
+  offset?: number;
+  /** Regex pattern to match against log content */
+  pattern?: string;
+}
+
 // --- Subscription Parameters ---
 
 export interface StoreSubscribeParams {
@@ -295,6 +326,7 @@ export type ApiEventType =
   | 'tool:start'
   | 'tool:complete'
   | 'tool:error'
+  | 'event:handled'
   | 'speech'
   | 'message:added'
   | 'message:edited'
