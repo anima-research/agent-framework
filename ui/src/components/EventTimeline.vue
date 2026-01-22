@@ -12,7 +12,7 @@ const loading = computed(() => eventsStore.loading);
 <template>
   <div class="event-timeline">
     <div class="timeline-header">
-      <h2>Event Timeline</h2>
+      <h2>Activity Stream</h2>
       <span class="event-count">{{ events.length }} events</span>
     </div>
 
