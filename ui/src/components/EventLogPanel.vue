@@ -24,7 +24,7 @@ function setModuleFilter(name: string | null) {
 <template>
   <div class="event-log-panel">
     <div class="panel-header">
-      <h2>Event Log</h2>
+      <h2>Process Log</h2>
       <span class="log-count">{{ logs.length }} events</span>
     </div>
 
@@ -52,10 +52,10 @@ function setModuleFilter(name: string | null) {
       </select>
     </div>
 
-    <div v-if="loading" class="loading">Loading event logs...</div>
+    <div v-if="loading" class="loading">Loading process logs...</div>
 
     <div v-else-if="logs.length === 0" class="empty">
-      No event logs to display.
+      No process logs to display.
     </div>
 
     <div v-else class="logs-list">
