@@ -683,10 +683,8 @@ export class AgentFramework {
 
     const durationMs = Date.now() - startTime;
 
-    // Emit trace for observability (if enabled)
-    if (this.processLoggingBroadcast) {
-      this.emitTrace({ type: 'process:completed', processEvent: event, responses, durationMs });
-    }
+    // Always emit trace for observability (UI needs this)
+    this.emitTrace({ type: 'process:completed', processEvent: event, responses, durationMs });
 
     // Log to Chronicle (if enabled)
     if (this.processLoggingPersist) {

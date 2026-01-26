@@ -95,10 +95,12 @@ export const useEventLogsStore = defineStore('eventLogs', () => {
       const responses = Array.isArray(entry.entry.responses)
         ? entry.entry.responses
         : [];
+      // Support both old format (event) and new format (processEvent)
+      const eventData = (entry.entry as any).processEvent ?? entry.entry.event;
       const log: LiveEventLog = {
         id: `hist-${entry.sequence}`,
         timestamp: entry.entry.timestamp,
-        event: entry.entry.event,
+        event: eventData,
         responses,
       };
       // Add if not already present

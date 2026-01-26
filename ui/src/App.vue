@@ -82,22 +82,28 @@ function handleEvent(data: { event: string; data: unknown }) {
   eventsStore.addEvent(persistedEvent);
 
   // Update agent status if relevant
-  if (data.event === 'inference:start') {
+  if (data.event === 'inference:started') {
     const { agentName } = data.data as { agentName: string };
     agentsStore.updateAgentStatus(agentName, 'inferring');
-  } else if (data.event === 'inference:complete' || data.event === 'inference:error') {
+  } else if (data.event === 'inference:completed' || data.event === 'inference:failed') {
     const { agentName } = data.data as { agentName: string };
     agentsStore.updateAgentStatus(agentName, 'idle');
   }
 
-  // Handle event:handled for event log panel
-  if (data.event === 'event:handled') {
+  // Handle process:completed for process log panel
+  if (data.event === 'process:completed') {
     const eventData = data.data as {
       timestamp: number;
-      event: { type: string; [key: string]: unknown };
+      processEvent: { type: string; [key: string]: unknown };
       responses: ModuleEventResponse[];
+      durationMs: number;
     };
-    eventLogsStore.addLogFromEvent(eventData);
+    // Convert to the format the store expects
+    eventLogsStore.addLogFromEvent({
+      timestamp: eventData.timestamp,
+      event: eventData.processEvent,
+      responses: eventData.responses,
+    });
   }
 }
 
