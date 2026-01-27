@@ -650,7 +650,8 @@ export class AgentFramework {
     const responses: ModuleProcessResponse[] = [];
     for (const module of this.moduleRegistry.getAllModules()) {
       try {
-        const response = await module.onProcess(event);
+        const processState = this.moduleRegistry.createProcessState(module.name);
+        const response = await module.onProcess(event, processState);
         responses.push({ moduleName: module.name, response });
       } catch (error) {
         console.error(`Module ${module.name} error handling process event:`, error);
@@ -658,8 +659,8 @@ export class AgentFramework {
     }
 
     // Apply responses
-    for (const { response } of responses) {
-      await this.applyProcessResponse(response, event);
+    for (const { moduleName, response } of responses) {
+      await this.applyProcessResponse(response, event, moduleName);
     }
 
     // Handle tool results specially
@@ -692,7 +693,11 @@ export class AgentFramework {
     }
   }
 
-  private async applyProcessResponse(response: EventResponse, event: ProcessEvent): Promise<void> {
+  private async applyProcessResponse(
+    response: EventResponse,
+    event: ProcessEvent,
+    moduleName: string
+  ): Promise<void> {
     // Add messages
     if (response.addMessages) {
       for (const msg of response.addMessages) {
@@ -713,6 +718,11 @@ export class AgentFramework {
       for (const id of response.removeMessages) {
         this.removeMessage(id);
       }
+    }
+
+    // Apply module state update atomically with message operations
+    if (response.stateUpdate !== undefined) {
+      this.moduleRegistry.setModuleState(moduleName, response.stateUpdate);
     }
 
     // Queue inference requests

@@ -4,6 +4,7 @@ import type { MessageId, MessageMetadata } from '@connectome/context-manager';
 import type {
   Module,
   ModuleContext,
+  ProcessState,
   ProcessQueue,
   ToolDefinition,
   ToolCall,
@@ -129,6 +130,39 @@ export class ModuleRegistry {
    */
   getAllModules(): Module[] {
     return Array.from(this.modules.values());
+  }
+
+  /**
+   * Set state for a module by name.
+   * Used by the framework to apply stateUpdate from EventResponse atomically.
+   */
+  setModuleState(moduleName: string, state: unknown): void {
+    const ctx = this.moduleContexts.get(moduleName);
+    if (ctx) {
+      ctx.setState(state);
+    }
+  }
+
+  /**
+   * Get state for a module by name.
+   */
+  getModuleState<T>(moduleName: string): T | null {
+    const ctx = this.moduleContexts.get(moduleName);
+    if (ctx) {
+      return ctx.getState<T>();
+    }
+    return null;
+  }
+
+  /**
+   * Create a ProcessState for a module to use during event processing.
+   */
+  createProcessState(moduleName: string): ProcessState {
+    const ctx = this.moduleContexts.get(moduleName);
+    if (!ctx) {
+      throw new Error(`Module ${moduleName} not found`);
+    }
+    return new ProcessStateImpl(moduleName, ctx, this);
   }
 
   /**
@@ -398,5 +432,44 @@ class ModuleContextImpl implements ModuleContext {
       ...currentState,
       externalIdMap: Object.fromEntries(this.externalIdMap),
     });
+  }
+}
+
+/**
+ * Implementation of ProcessState - read-only state access during event processing.
+ */
+class ProcessStateImpl implements ProcessState {
+  private moduleName: string;
+  private ctx: ModuleContextImpl;
+  private registry: ModuleRegistry;
+
+  constructor(moduleName: string, ctx: ModuleContextImpl, registry: ModuleRegistry) {
+    this.moduleName = moduleName;
+    this.ctx = ctx;
+    this.registry = registry;
+  }
+
+  getState<T>(): T | null {
+    return this.ctx.getState<T>();
+  }
+
+  getModuleState<T>(name: string): T | null {
+    return this.registry.getModuleState<T>(name);
+  }
+
+  findMessageByExternalId(source: string, externalId: string): MessageId | null {
+    return this.ctx.findMessageByExternalId(source, externalId);
+  }
+
+  getAgents(): AgentInfo[] {
+    return this.ctx.getAgents();
+  }
+
+  getActiveTools(): ToolDefinition[] {
+    return this.ctx.getActiveTools();
+  }
+
+  get queue(): ProcessQueue {
+    return this.ctx.queue;
   }
 }

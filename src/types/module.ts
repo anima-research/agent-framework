@@ -36,8 +36,11 @@ export interface Module {
   /**
    * Handle a process event from the queue.
    * Return response indicating what actions to take.
+   *
+   * @param event - The event to process
+   * @param state - Read-only state snapshot for accessing module state and lookups
    */
-  onProcess(event: ProcessEvent): Promise<EventResponse>;
+  onProcess(event: ProcessEvent, state: ProcessState): Promise<EventResponse>;
 
   /**
    * Handle agent speech (if registered as speech handler).
@@ -131,6 +134,42 @@ export interface ModuleContext {
 }
 
 /**
+ * Read-only state snapshot provided to modules during event processing.
+ * State writes happen via EventResponse, not through this interface.
+ */
+export interface ProcessState {
+  /**
+   * Get this module's state.
+   */
+  getState<T>(): T | null;
+
+  /**
+   * Get another module's state by name.
+   */
+  getModuleState<T>(name: string): T | null;
+
+  /**
+   * Find a message by external ID.
+   */
+  findMessageByExternalId(source: string, externalId: string): MessageId | null;
+
+  /**
+   * Get info about all agents.
+   */
+  getAgents(): AgentInfo[];
+
+  /**
+   * Get all currently available tools.
+   */
+  getActiveTools(): ToolDefinition[];
+
+  /**
+   * Queue for emitting follow-up events.
+   */
+  readonly queue: ProcessQueue;
+}
+
+/**
  * Reference to an external system's ID.
  */
 export interface ExternalIdRef {
@@ -193,6 +232,13 @@ export interface EventResponse {
    * Signal that this module's tools have changed.
    */
   toolsChanged?: boolean;
+
+  /**
+   * Module state update. Applied atomically with message operations.
+   * The framework will call setState() with this value after applying
+   * message changes, ensuring consistent state.
+   */
+  stateUpdate?: unknown;
 }
 
 /**

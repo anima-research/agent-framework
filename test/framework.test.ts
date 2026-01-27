@@ -11,6 +11,7 @@ import type { NormalizedRequest, NormalizedResponse, ContentBlock } from 'membra
 import type {
   Module,
   ModuleContext,
+  ProcessState,
   ProcessEvent,
   EventResponse,
   ToolDefinition,
@@ -121,7 +122,7 @@ class TestModule implements Module {
     return { success: false, error: 'Unknown tool', isError: true };
   }
 
-  async onProcess(event: ProcessEvent): Promise<EventResponse> {
+  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     this.events.push(event);
 
     // Handle external message by requesting inference
@@ -362,10 +363,10 @@ describe('AgentFramework', () => {
 
     await framework.runUntilIdle();
 
-    assert.ok(events.includes('queue:event'));
-    assert.ok(events.includes('inference:start'));
-    assert.ok(events.includes('inference:complete'));
-    assert.ok(events.includes('message:added'));
+    assert.ok(events.includes('process:received'), 'Should emit process:received');
+    assert.ok(events.includes('inference:started'), 'Should emit inference:started');
+    assert.ok(events.includes('inference:completed'), 'Should emit inference:completed');
+    assert.ok(events.includes('message:added'), 'Should emit message:added');
 
     await framework.stop();
     rmSync(tempDir, { recursive: true });
