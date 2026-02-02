@@ -115,6 +115,16 @@ export interface SendInput {
     name: string;
   };
 
+  /** File attachments to send with the message */
+  files?: Array<{
+    /** Filename to display (required if using content, optional if using path) */
+    name?: string;
+    /** File content as text (use this OR path, not both) */
+    content?: string;
+    /** Path to file in files workspace (use this OR content, not both) */
+    path?: string;
+  }>;
+
   /** Message ID to reply to (optional) */
   replyTo?: string;
 }
@@ -407,6 +417,7 @@ export interface DiscordClientInterface {
     options?: {
       replyTo?: string;
       createThread?: { name: string };
+      files?: Array<{ name: string; content: string | Buffer }>;
     }
   ): Promise<{ messageId: string }>;
 

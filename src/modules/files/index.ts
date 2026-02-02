@@ -485,6 +485,18 @@ export class FilesModule implements Module {
     const index = this.getIndex();
     const allPaths = Object.keys(index.files);
 
+    // Check if workspace is empty
+    if (allPaths.length === 0) {
+      return {
+        success: true,
+        data: {
+          files: [],
+          count: 0,
+          note: 'Virtual workspace is empty. Use files:sync to import files from the filesystem, or files:write to create new files.',
+        },
+      };
+    }
+
     // Simple glob matching (supports * and **)
     const pattern = input.pattern;
     const basePath = input.path ?? '';
@@ -495,6 +507,18 @@ export class FilesModule implements Module {
       return regex.test(relativePath);
     });
 
+    // Provide helpful note if no matches
+    if (matches.length === 0) {
+      return {
+        success: true,
+        data: {
+          files: [],
+          count: 0,
+          note: `No files match pattern "${pattern}". Workspace contains ${allPaths.length} file(s). Try files:glob with pattern "*" to list all files.`,
+        },
+      };
+    }
+
     return {
       success: true,
       data: { files: matches, count: matches.length },
@@ -503,19 +527,54 @@ export class FilesModule implements Module {
 
   private async handleGrep(input: GrepInput): Promise<ToolResult> {
     const index = this.getIndex();
-    let filesToSearch = Object.keys(index.files);
+    const allPaths = Object.keys(index.files);
+    let filesToSearch = allPaths;
+
+    // Check if workspace is empty
+    if (allPaths.length === 0) {
+      return {
+        success: true,
+        data: {
+          results: [],
+          totalMatches: 0,
+          note: 'Virtual workspace is empty. Use files:sync to import files from the filesystem, or files:write to create new files.',
+        },
+      };
+    }
 
     // Filter by path
     if (input.path) {
       filesToSearch = filesToSearch.filter(
         (p) => p === input.path || p.startsWith(input.path + '/')
       );
+      
+      if (filesToSearch.length === 0) {
+        return {
+          success: true,
+          data: {
+            results: [],
+            totalMatches: 0,
+            note: `No files found at path "${input.path}". Use files:glob with pattern "*" to see all files in workspace.`,
+          },
+        };
+      }
     }
 
     // Filter by glob
     if (input.glob) {
-      const regex = this.globToRegex(input.glob);
-      filesToSearch = filesToSearch.filter((p) => regex.test(p));
+      const globRegex = this.globToRegex(input.glob);
+      filesToSearch = filesToSearch.filter((p) => globRegex.test(p));
+      
+      if (filesToSearch.length === 0) {
+        return {
+          success: true,
+          data: {
+            results: [],
+            totalMatches: 0,
+            note: `No files match glob "${input.glob}". Workspace contains ${allPaths.length} file(s).`,
+          },
+        };
+      }
     }
 
     const regex = new RegExp(input.pattern, 'g');
@@ -561,9 +620,24 @@ export class FilesModule implements Module {
       }
     }
 
+    const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
+    
+    // Provide helpful note if no matches found
+    if (totalMatches === 0) {
+      return {
+        success: true,
+        data: {
+          results: [],
+          totalMatches: 0,
+          filesSearched: filesToSearch.length,
+          note: `Pattern "${input.pattern}" not found in ${filesToSearch.length} file(s) searched.`,
+        },
+      };
+    }
+
     return {
       success: true,
-      data: { results, totalMatches: results.reduce((sum, r) => sum + r.matches.length, 0) },
+      data: { results, totalMatches, filesSearched: filesToSearch.length },
     };
   }
 
@@ -676,13 +750,19 @@ export class FilesModule implements Module {
     index.nextStateId++;
     this.setIndex(index);
 
-    // Register content state
-    this.store.registerState({
-      id: stateId,
-      strategy: 'append_log',
-      deltaSnapshotEvery: this.config.deltaSnapshotEvery,
-      fullSnapshotEvery: this.config.fullSnapshotEvery,
-    });
+    // Check if state already exists (can happen after unclean shutdown)
+    const existingStates = this.store.listStates();
+    const stateExists = existingStates.some((s: { id: string }) => s.id === stateId);
+
+    if (!stateExists) {
+      // Register content state
+      this.store.registerState({
+        id: stateId,
+        strategy: 'append_log',
+        deltaSnapshotEvery: this.config.deltaSnapshotEvery,
+        fullSnapshotEvery: this.config.fullSnapshotEvery,
+      });
+    }
 
     // Initialize with content
     this.appendToContentLog(stateId, { type: 'init', content: initialContent });

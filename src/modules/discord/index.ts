@@ -151,7 +151,7 @@ export class DiscordModule implements Module {
     return [
       {
         name: 'send',
-        description: 'Send a message to a specific Discord channel',
+        description: 'Send a message to a specific Discord channel, optionally with file attachments',
         inputSchema: {
           type: 'object',
           properties: {
@@ -163,6 +163,18 @@ export class DiscordModule implements Module {
               description: 'Create a thread with this message',
               properties: {
                 name: { type: 'string', description: 'Thread name' },
+              },
+            },
+            files: {
+              type: 'array',
+              description: 'File attachments to include. Provide either content directly OR path to read from files workspace.',
+              items: {
+                type: 'object',
+                properties: {
+                  name: { type: 'string', description: 'Filename for the attachment (e.g., "code.py"). If using path, defaults to the filename from path.' },
+                  content: { type: 'string', description: 'File content as text (use this OR path, not both)' },
+                  path: { type: 'string', description: 'Path to file in files workspace to attach (use this OR content, not both)' },
+                },
               },
             },
           },
@@ -884,12 +896,79 @@ export class DiscordModule implements Module {
       return { success: false, error: 'Rate limited', isError: true };
     }
 
+    // Process files - resolve paths from FilesModule if needed
+    const processedFiles = await this.processFileAttachments(input.files);
+    if (processedFiles.error) {
+      return { success: false, error: processedFiles.error, isError: true };
+    }
+
     const result = await this.client.sendMessage(input.channelId, input.content, {
       replyTo: input.replyTo,
       createThread: input.createThread,
+      files: processedFiles.files,
     });
 
-    return { success: true, data: { messageId: result.messageId } };
+    return { success: true, data: { messageId: result.messageId, filesAttached: processedFiles.files?.length ?? 0 } };
+  }
+
+  /**
+   * Process file attachments - resolve paths from FilesModule workspace or use inline content.
+   */
+  private async processFileAttachments(
+    files?: Array<{ name?: string; content?: string; path?: string }>
+  ): Promise<{ files?: Array<{ name: string; content: string }>; error?: string }> {
+    if (!files || files.length === 0) {
+      return { files: undefined };
+    }
+
+    const processed: Array<{ name: string; content: string }> = [];
+
+    for (const file of files) {
+      // Validate: need either content or path
+      if (!file.content && !file.path) {
+        return { error: `File attachment missing both 'content' and 'path'. Provide one or the other.` };
+      }
+
+      let content: string;
+      let name: string;
+
+      if (file.path) {
+        // Try to read from FilesModule workspace
+        const fileContent = this.readFileFromWorkspace(file.path);
+        if (fileContent === null) {
+          return { error: `File not found in workspace: ${file.path}. Use files:read to check if file exists.` };
+        }
+        content = fileContent;
+        // Extract filename from path if name not provided
+        name = file.name ?? file.path.split('/').pop() ?? 'attachment';
+      } else {
+        // Use inline content
+        if (!file.name) {
+          return { error: `File attachment with inline content must have a 'name' field.` };
+        }
+        content = file.content!;
+        name = file.name;
+      }
+
+      processed.push({ name, content });
+    }
+
+    return { files: processed };
+  }
+
+  /**
+   * Try to read file from FilesModule workspace.
+   * Returns null if file not found or FilesModule not available.
+   */
+  private readFileFromWorkspace(path: string): string | null {
+    if (!this.ctx) return null;
+    
+    // Try to get FilesModule from the framework
+    const filesModule = this.ctx.getModule('files');
+    if (filesModule && 'readFile' in filesModule) {
+      return (filesModule as { readFile: (path: string) => string | null }).readFile(path);
+    }
+    return null;
   }
 
   private async handleDM(input: SendDMInput): Promise<ToolResult> {

@@ -96,14 +96,17 @@ export class DiscordJsClient implements DiscordClientInterface {
       return false;
     }
 
-    // Filter by guild
-    if (this.guildIds && this.guildIds.length > 0) {
-      if (!message.guildId || !this.guildIds.includes(message.guildId)) {
+    // DMs have no guildId - always allow them through (separate from guild filtering)
+    const isDM = !message.guildId;
+
+    // Filter by guild (only applies to guild messages, not DMs)
+    if (!isDM && this.guildIds && this.guildIds.length > 0) {
+      if (!this.guildIds.includes(message.guildId!)) {
         return false;
       }
     }
 
-    // Filter by channel
+    // Filter by channel (applies to both guild channels and DM channels)
     if (this.channelIds && this.channelIds.length > 0) {
       if (!this.channelIds.includes(message.channelId)) {
         return false;
@@ -159,7 +162,11 @@ export class DiscordJsClient implements DiscordClientInterface {
   async sendMessage(
     channelId: string,
     content: string,
-    options?: { replyTo?: string; createThread?: { name: string } }
+    options?: {
+      replyTo?: string;
+      createThread?: { name: string };
+      files?: Array<{ name: string; content: string | Buffer }>;
+    }
   ): Promise<{ messageId: string }> {
     const channel = await this.client.channels.fetch(channelId);
     if (!channel || !('send' in channel)) {
@@ -167,9 +174,17 @@ export class DiscordJsClient implements DiscordClientInterface {
     }
 
     const textChannel = channel as TextChannel | DMChannel;
+
+    // Build files array for Discord.js
+    const files = options?.files?.map((f) => ({
+      name: f.name,
+      attachment: typeof f.content === 'string' ? Buffer.from(f.content, 'utf-8') : f.content,
+    }));
+
     const message = await textChannel.send({
       content,
       reply: options?.replyTo ? { messageReference: options.replyTo } : undefined,
+      files,
     });
 
     if (options?.createThread && 'threads' in textChannel) {
