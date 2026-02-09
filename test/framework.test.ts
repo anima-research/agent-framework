@@ -37,11 +37,15 @@ function createMockResponse(
     .map((b) => b.text)
     .join('');
 
+  const toolCalls = content
+    .filter((b): b is ContentBlock & { type: 'tool_use'; id: string; name: string; input: Record<string, unknown> } => b.type === 'tool_use')
+    .map((b) => ({ id: b.id, name: b.name, input: b.input }));
+
   return {
     content,
     stopReason,
     rawAssistantText: rawText,
-    toolCalls: [],
+    toolCalls,
     toolResults: [],
     usage: { inputTokens: 10, outputTokens: 5 },
     details: {
