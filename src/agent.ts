@@ -1,4 +1,4 @@
-import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock } from 'membrane';
+import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from 'membrane';
 import type { ContextManager, TokenBudget } from '@connectome/context-manager';
 import type {
   AgentConfig,
@@ -181,8 +181,88 @@ export class Agent {
 
     // If all tools done, transition to ready
     if (this._state.pending.size === 0) {
-      this._state = { status: 'ready', toolResults: this._state.completed };
+      this._state = { status: 'ready', toolResults: this._state.completed, stream: this._state.stream };
     }
+  }
+
+  /**
+   * Start a yielding stream for inference.
+   * Returns the stream — the caller (framework) iterates it.
+   */
+  async startStream(
+    availableTools: ToolDefinition[],
+    budget?: TokenBudget
+  ): Promise<YieldingStream> {
+    if (this._state.status !== 'idle') {
+      throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
+    }
+
+    const tools = availableTools.filter((t) => this.canUseTool(t.name));
+    const messages = await this.contextManager.compile(budget);
+
+    const request: NormalizedRequest = {
+      messages,
+      system: this.systemPrompt,
+      config: {
+        model: this.model,
+        maxTokens: this.maxTokens,
+        temperature: this.temperature,
+      },
+      tools: tools.length > 0 ? tools : undefined,
+    };
+
+    const stream = this.membrane.streamYielding(request, {
+      emitTokens: true,
+      emitBlocks: false,
+      emitUsage: true,
+    });
+
+    this._state = { status: 'streaming', stream };
+    return stream;
+  }
+
+  /**
+   * Transition to waiting_for_tools when stream yields tool calls.
+   * Called by framework's driveStream.
+   */
+  enterWaitingForTools(calls: ToolCall[], stream: YieldingStream): void {
+    const pending = new Map<ToolCallId, PendingToolCall>();
+    for (const call of calls) {
+      pending.set(call.id, {
+        id: call.id,
+        name: call.name,
+        input: call.input,
+        startedAt: Date.now(),
+      });
+    }
+    this._state = { status: 'waiting_for_tools', pending, completed: [], stream };
+  }
+
+  /**
+   * Add an assistant response to context.
+   * Called by framework when stream completes.
+   */
+  addAssistantResponse(content: ContentBlock[]): void {
+    this.contextManager.addMessage(this.name, content);
+  }
+
+  /**
+   * Transition back to streaming state after tool results are provided.
+   */
+  setStreaming(stream: YieldingStream): void {
+    this._state = { status: 'streaming', stream };
+  }
+
+  /**
+   * Cancel any active stream and reset to idle.
+   */
+  cancelStream(): void {
+    if (this._state.status === 'streaming') {
+      this._state.stream.cancel();
+    } else if (this._state.status === 'waiting_for_tools' && this._state.stream) {
+      this._state.stream.cancel();
+    }
+    this._state = { status: 'idle' };
   }
 
   /**

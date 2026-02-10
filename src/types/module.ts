@@ -216,7 +216,7 @@ export interface AgentInfo {
 /**
  * Agent execution status.
  */
-export type AgentStatus = 'idle' | 'inferring' | 'waiting_for_tools' | 'ready';
+export type AgentStatus = 'idle' | 'inferring' | 'streaming' | 'waiting_for_tools' | 'ready';
 
 /**
  * Response from a module's event handler.
