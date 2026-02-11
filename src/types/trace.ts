@@ -50,6 +50,22 @@ export type TraceEvent =
       stack?: string;
     })
 
+  // Streaming inference lifecycle
+  | (TraceEventBase & {
+      type: 'inference:tokens';
+      agentName: string;
+      content: string;
+    })
+  | (TraceEventBase & {
+      type: 'inference:tool_calls_yielded';
+      agentName: string;
+      calls: Array<{ id: string; name: string }>;
+    })
+  | (TraceEventBase & {
+      type: 'inference:stream_resumed';
+      agentName: string;
+    })
+
   // Tool lifecycle
   | (TraceEventBase & {
       type: 'tool:started';

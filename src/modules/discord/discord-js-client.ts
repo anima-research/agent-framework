@@ -9,8 +9,19 @@ import {
   TextChannel,
   DMChannel,
   type Message,
+  type Attachment,
+  type User,
+  type Guild,
+  type GuildBasedChannel,
 } from 'discord.js';
-import type { DiscordClientInterface, DiscordMessageData, DiscordAttachment } from './types.js';
+import type {
+  DiscordClientInterface,
+  DiscordMessageData,
+  DiscordAttachment,
+  DiscordGuild,
+  DiscordChannel,
+  HistoryMessage,
+} from './types.js';
 
 export interface DiscordJsClientConfig {
   token: string;
@@ -27,6 +38,7 @@ export class DiscordJsClient implements DiscordClientInterface {
   private messageHandler?: (message: DiscordMessageData) => void;
   private editHandler?: (messageId: string, newContent: string) => void;
   private deleteHandler?: (messageId: string) => void;
+  private readyHandler?: () => void;
 
   constructor(config: DiscordJsClientConfig) {
     this.token = config.token;
@@ -48,7 +60,7 @@ export class DiscordJsClient implements DiscordClientInterface {
   }
 
   private setupEventHandlers(): void {
-    this.client.on('messageCreate', (message) => {
+    this.client.on('messageCreate', (message: Message) => {
       if (!this.shouldHandleMessage(message)) return;
       if (this.messageHandler) {
         this.messageHandler(this.convertMessage(message));
@@ -68,9 +80,12 @@ export class DiscordJsClient implements DiscordClientInterface {
 
     this.client.on('ready', () => {
       console.log(`[Discord] Logged in as ${this.client.user?.tag}`);
+      if (this.readyHandler) {
+        this.readyHandler();
+      }
     });
 
-    this.client.on('error', (error) => {
+    this.client.on('error', (error: Error) => {
       console.error('[Discord] Client error:', error);
     });
   }
@@ -99,7 +114,7 @@ export class DiscordJsClient implements DiscordClientInterface {
   }
 
   private convertMessage(message: Message): DiscordMessageData {
-    const attachments: DiscordAttachment[] = message.attachments.map((a) => ({
+    const attachments: DiscordAttachment[] = message.attachments.map((a: Attachment) => ({
       id: a.id,
       filename: a.name ?? 'unknown',
       url: a.url,
@@ -107,15 +122,23 @@ export class DiscordJsClient implements DiscordClientInterface {
       size: a.size,
     }));
 
+    // Extract mentioned user IDs
+    const mentionedUserIds = message.mentions.users.map((u: User) => u.id);
+
     return {
       id: message.id,
       content: message.content,
       authorId: message.author.id,
       authorName: message.author.username,
+      isBot: message.author.bot,
       channelId: message.channelId,
       guildId: message.guildId ?? null,
       isReply: message.reference !== null,
       replyToId: message.reference?.messageId ?? undefined,
+      // Note: replyToAuthorId requires fetching the referenced message
+      // We'll leave it undefined for now - can be enhanced later if needed
+      replyToAuthorId: undefined,
+      mentionedUserIds,
       attachments,
       timestamp: message.createdAt,
     };
@@ -217,5 +240,105 @@ export class DiscordJsClient implements DiscordClientInterface {
 
   onMessageDelete(handler: (messageId: string) => void): void {
     this.deleteHandler = handler;
+  }
+
+  onReady(handler: () => void): void {
+    this.readyHandler = handler;
+  }
+
+  getBotUserId(): string | null {
+    return this.client.user?.id ?? null;
+  }
+
+  async sendTyping(channelId: string): Promise<void> {
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel || !('sendTyping' in channel)) {
+      throw new Error(`Channel ${channelId} not found or not a text channel`);
+    }
+    await (channel as TextChannel).sendTyping();
+  }
+
+  async listGuilds(): Promise<DiscordGuild[]> {
+    const guilds = this.client.guilds.cache;
+    return guilds.map((g: Guild) => ({
+      id: g.id,
+      name: g.name,
+      iconUrl: g.iconURL() ?? undefined,
+      memberCount: g.memberCount,
+    }));
+  }
+
+  async listChannels(guildId: string): Promise<DiscordChannel[]> {
+    const guild = await this.client.guilds.fetch(guildId);
+    if (!guild) {
+      throw new Error(`Guild ${guildId} not found`);
+    }
+
+    // guild.channels might be undefined if the guild was fetched without full data
+    if (!guild.channels) {
+      throw new Error(`Guild ${guildId} channels not available - may need to re-fetch with force`);
+    }
+
+    const channels = await guild.channels.fetch();
+    const result: DiscordChannel[] = [];
+    
+    channels.forEach((c: GuildBasedChannel | null) => {
+      if (c) {
+        result.push({
+          id: c.id,
+          name: c.name,
+          type: this.mapChannelType(c.type),
+          parentId: c.parentId ?? undefined,
+          position: 'position' in c ? (c as { position?: number }).position : undefined,
+        });
+      }
+    });
+    
+    return result;
+  }
+
+  private mapChannelType(type: number | undefined): DiscordChannel['type'] {
+    if (type === undefined) return 'unknown';
+    // Discord.js channel types: 0=text, 2=voice, 4=category, 11=thread, 15=forum
+    switch (type) {
+      case 0: return 'text';
+      case 2: return 'voice';
+      case 4: return 'category';
+      case 11:
+      case 12: return 'thread';
+      case 15: return 'forum';
+      default: return 'unknown';
+    }
+  }
+
+  async fetchHistory(
+    channelId: string,
+    options?: { limit?: number; before?: string }
+  ): Promise<HistoryMessage[]> {
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel || !('messages' in channel)) {
+      throw new Error(`Channel ${channelId} not found or not a text channel`);
+    }
+
+    const textChannel = channel as TextChannel;
+    const messages = await textChannel.messages.fetch({
+      limit: options?.limit ?? 50,
+      before: options?.before,
+    });
+
+    return messages.map((m: Message) => ({
+      id: m.id,
+      authorId: m.author.id,
+      authorName: m.author.username,
+      isBot: m.author.bot,
+      content: m.content,
+      timestamp: m.createdAt,
+      replyTo: m.reference
+        ? {
+            messageId: m.reference.messageId ?? '',
+            authorId: '', // Would need additional fetch to get this
+          }
+        : undefined,
+    }));
   }
 }

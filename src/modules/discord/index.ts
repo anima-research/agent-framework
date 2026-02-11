@@ -36,6 +36,9 @@ import type {
   DeleteMessageInput,
   CreateThreadInput,
   SetReplyContextInput,
+  ListGuildsInput,
+  ListChannelsInput,
+  FetchHistoryInput,
 } from './types.js';
 
 // Re-export event types for consumers who want to handle them
@@ -48,7 +51,25 @@ const DEFAULT_CONFIG: Partial<DiscordModuleConfig> = {
   handleDMs: true,
   ignoreBots: true,
   rateLimitPerMinute: 30,
+  triggerOn: 'mention_or_reply',
+  autoTyping: true,
+  historyScrollback: 50,
 };
+
+// Image MIME types that Claude can process
+const SUPPORTED_IMAGE_TYPES = [
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+];
+
+// Text file extensions for inline reading
+const TEXT_FILE_EXTENSIONS = [
+  '.txt', '.md', '.json', '.yaml', '.yml', '.toml',
+  '.js', '.ts', '.jsx', '.tsx', '.py', '.rb', '.go', '.rs',
+  '.html', '.css', '.xml', '.csv', '.log', '.sh', '.bash',
+];
 
 const CONVERSATION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
@@ -65,6 +86,7 @@ export class DiscordModule implements Module {
     connectedGuilds: [],
     conversations: {},
     rateLimits: {},
+    lastReadMessageId: {},
   };
 
   // Track current reply context per agent
@@ -94,9 +116,24 @@ export class DiscordModule implements Module {
     this.client.onMessageEdit((id, content) => this.handleDiscordMessageEdit(id, content));
     this.client.onMessageDelete((id) => this.handleDiscordMessageDelete(id));
 
+    // Set up ready handler for history sync on (re)connect
+    if (this.client.onReady) {
+      this.client.onReady(() => this.handleReady());
+    }
+
     // Connect to Discord
     if (!ctx.isRestart || !this.client.isConnected()) {
       await this.client.connect();
+    } else {
+      // Already connected (restart) - sync history now
+      await this.syncAllChannelHistory();
+    }
+
+    // Get bot user ID after connect
+    const botUserId = this.client.getBotUserId();
+    if (botUserId) {
+      this.state.botUserId = botUserId;
+      ctx.setState(this.state);
     }
   }
 
@@ -246,6 +283,39 @@ export class DiscordModule implements Module {
           properties: {},
         },
       },
+      // ========== Discovery & Utility Tools ==========
+      {
+        name: 'list_guilds',
+        description: 'List all Discord servers (guilds) the bot is in',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+        },
+      },
+      {
+        name: 'list_channels',
+        description: 'List all channels in a Discord server',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            guildId: { type: 'string', description: 'Guild/Server ID' },
+          },
+          required: ['guildId'],
+        },
+      },
+      {
+        name: 'fetch_history',
+        description: 'Fetch recent message history from a channel',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            channelId: { type: 'string', description: 'Channel ID' },
+            limit: { type: 'number', description: 'Number of messages to fetch (default: 50, max: 100)' },
+            before: { type: 'string', description: 'Fetch messages before this message ID' },
+          },
+          required: ['channelId'],
+        },
+      },
     ];
   }
 
@@ -272,6 +342,12 @@ export class DiscordModule implements Module {
           return await this.handleActivate(call.input as { additive?: boolean });
         case 'deactivate':
           return await this.handleDeactivate();
+        case 'list_guilds':
+          return await this.handleListGuilds();
+        case 'list_channels':
+          return await this.handleListChannels(call.input as ListChannelsInput);
+        case 'fetch_history':
+          return await this.handleFetchHistory(call.input as FetchHistoryInput);
         default:
           return { success: false, error: `Unknown tool: ${call.name}`, isError: true };
       }
@@ -292,6 +368,7 @@ export class DiscordModule implements Module {
         connectedGuilds: [],
         conversations: {},
         rateLimits: {},
+        lastReadMessageId: {},
       };
 
       // Build conversation state update
@@ -314,25 +391,41 @@ export class DiscordModule implements Module {
           ...currentState.conversations,
           [convKey]: conversation,
         },
+        lastReadMessageId: {
+          ...currentState.lastReadMessageId,
+          [msg.channelId]: msg.discordMessageId,
+        },
       };
 
       // Update local state reference for tool handlers
       this.state = newState;
+
+      // Auto-send typing indicator if configured
+      if (this.config.autoTyping) {
+        // Fire and forget - don't await
+        this.client.sendTyping(msg.channelId).catch((err) => {
+          console.warn('Discord: Failed to send typing indicator:', err);
+        });
+      }
+
+      // Build content blocks from message and attachments
+      const contentBlocks = msg.contentBlocks ?? [{ type: 'text' as const, text: msg.content }];
 
       // Return declarative response - framework applies all writes atomically
       return {
         addMessages: [
           {
             participant: msg.authorName,
-            content: [{ type: 'text', text: msg.content }],
+            content: contentBlocks,
             metadata: {
               external: { source: 'discord', id: msg.discordMessageId },
+              channelId: msg.channelId,
               timestamp: msg.timestamp,
             },
           },
         ],
         stateUpdate: newState,
-        requestInference: true,
+        requestInference: msg.shouldTriggerInference ?? true,
       };
     }
 
@@ -411,11 +504,205 @@ export class DiscordModule implements Module {
   // Discord Event Handlers
   // ==========================================================================
 
-  private handleDiscordMessage(message: DiscordMessageData): void {
+  /**
+   * Handle Discord ready event - sync history for all tracked channels.
+   */
+  private async handleReady(): Promise<void> {
+    console.log('[Discord] Ready - syncing history for tracked channels');
+    
+    // Get bot user ID
+    const botUserId = this.client.getBotUserId();
+    if (botUserId) {
+      this.state.botUserId = botUserId;
+    }
+
+    await this.syncAllChannelHistory();
+  }
+
+  /**
+   * Sync history for all channels we have conversations in.
+   */
+  private async syncAllChannelHistory(): Promise<void> {
     if (!this.ctx) return;
 
-    // Ignore bots if configured
-    if (this.config.ignoreBots && message.authorId === 'bot') {
+    // Get unique channel IDs from conversations
+    const channelIds = new Set<string>();
+    for (const conv of Object.values(this.state.conversations)) {
+      channelIds.add(conv.channelId);
+    }
+
+    if (channelIds.size === 0) {
+      console.log('[Discord] No channels to sync');
+      return;
+    }
+
+    console.log(`[Discord] Syncing history for ${channelIds.size} channel(s)`);
+
+    const syncResults: Array<{
+      channelId: string;
+      newMessages: number;
+      editedMessages: number;
+      deletedMessages: number;
+    }> = [];
+
+    for (const channelId of channelIds) {
+      try {
+        const result = await this.syncChannelHistory(channelId);
+        if (result.newMessages > 0 || result.editedMessages > 0 || result.deletedMessages > 0) {
+          syncResults.push({ channelId, ...result });
+        }
+      } catch (error) {
+        console.error(`[Discord] Failed to sync channel ${channelId}:`, error);
+      }
+    }
+
+    // Emit sync complete event if there were any changes
+    if (syncResults.length > 0 && this.ctx) {
+      const totalNew = syncResults.reduce((sum, r) => sum + r.newMessages, 0);
+      const totalEdited = syncResults.reduce((sum, r) => sum + r.editedMessages, 0);
+      const totalDeleted = syncResults.reduce((sum, r) => sum + r.deletedMessages, 0);
+
+      console.log(`[Discord] History sync complete: ${totalNew} new, ${totalEdited} edited, ${totalDeleted} deleted`);
+
+      // Push a notification event (doesn't trigger inference, just informs)
+      this.ctx.queue.push({
+        type: 'module-event',
+        source: 'discord',
+        eventType: 'history-sync-complete',
+        payload: {
+          channels: syncResults.length,
+          newMessages: totalNew,
+          editedMessages: totalEdited,
+          deletedMessages: totalDeleted,
+        },
+      });
+    }
+
+    this.ctx?.setState(this.state);
+  }
+
+  /**
+   * Sync history for a specific channel - compare with Context Manager and update.
+   * Uses queryMessages() to enumerate stored messages for proper edit/delete detection.
+   */
+  private async syncChannelHistory(channelId: string): Promise<{
+    newMessages: number;
+    editedMessages: number;
+    deletedMessages: number;
+  }> {
+    if (!this.ctx) {
+      return { newMessages: 0, editedMessages: 0, deletedMessages: 0 };
+    }
+
+    const scrollback = this.config.historyScrollback ?? 50;
+    
+    // Fetch recent history from Discord
+    const discordMessages = await this.client.fetchHistory(channelId, { limit: scrollback });
+    
+    // Build a map of Discord message ID -> content for comparison
+    const discordMessageMap = new Map<string, { content: string; authorName: string; timestamp: Date }>();
+    for (const msg of discordMessages) {
+      discordMessageMap.set(msg.id, {
+        content: msg.content,
+        authorName: msg.authorName,
+        timestamp: msg.timestamp,
+      });
+    }
+
+    // Query Context Manager for all Discord messages from this channel
+    const { messages: storedMessages } = this.ctx.queryMessages({
+      source: 'discord',
+      metadata: { channelId },
+    });
+
+    // Build a map of stored message external IDs -> internal data
+    const storedMessageMap = new Map<string, { internalId: string; content: string }>();
+    for (const msg of storedMessages) {
+      const external = msg.metadata?.external as { id?: string } | undefined;
+      if (external?.id) {
+        // Extract text content for comparison
+        const textContent = msg.content
+          .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+          .map((block) => block.text)
+          .join('\n');
+        storedMessageMap.set(external.id, {
+          internalId: msg.id,
+          content: textContent,
+        });
+      }
+    }
+
+    let newMessages = 0;
+    let editedMessages = 0;
+    let deletedMessages = 0;
+
+    // Process Discord messages - check for new/edited
+    for (const discordMsg of discordMessages) {
+      const stored = storedMessageMap.get(discordMsg.id);
+      
+      if (!stored) {
+        // New message we haven't seen
+        // For bot's own messages (from previous sessions), use the agent name
+        // This ensures continuity of conversation history
+        const isBotMessage = discordMsg.authorId === this.state.botUserId;
+        const agentName = this.ctx.getAgents()[0]?.name;
+        const participantName = isBotMessage 
+          ? (agentName ?? discordMsg.authorName)
+          : discordMsg.authorName;
+        
+        this.ctx.addMessage(
+          participantName,
+          [{ type: 'text', text: discordMsg.content }],
+          {
+            external: { source: 'discord', id: discordMsg.id },
+            channelId,
+            timestamp: discordMsg.timestamp.getTime(),
+            isOwnMessage: isBotMessage, // Mark as our own for reference
+          }
+        );
+        newMessages++;
+      } else {
+        // We have this message - check if content changed (offline edit detection)
+        if (stored.content !== discordMsg.content) {
+          this.ctx.editMessage(stored.internalId, [
+            { type: 'text', text: discordMsg.content },
+          ]);
+          editedMessages++;
+        }
+      }
+    }
+
+    // Check for deletes - messages we have that Discord doesn't
+    // Only consider messages within the scrollback window (recent ones)
+    for (const [externalId, stored] of storedMessageMap) {
+      if (!discordMessageMap.has(externalId)) {
+        // Message exists in our store but not in Discord - it was deleted
+        // Note: This only catches deletes within the scrollback window
+        this.ctx.removeMessage(stored.internalId);
+        deletedMessages++;
+      }
+    }
+
+    // Update last read
+    if (discordMessages.length > 0) {
+      // Messages are typically newest first
+      const newestId = discordMessages[0].id;
+      this.state.lastReadMessageId[channelId] = newestId;
+    }
+
+    return { newMessages, editedMessages, deletedMessages };
+  }
+
+  private async handleDiscordMessage(message: DiscordMessageData): Promise<void> {
+    if (!this.ctx) return;
+
+    // ALWAYS ignore our own messages to prevent feedback loops
+    if (this.state.botUserId && message.authorId === this.state.botUserId) {
+      return;
+    }
+
+    // Optionally ignore other bots
+    if (this.config.ignoreBots && message.isBot) {
       return;
     }
 
@@ -434,9 +721,16 @@ export class DiscordModule implements Module {
     }
 
     // Check if we should handle DMs
-    if (!message.guildId && !this.config.handleDMs) {
+    const isDM = !message.guildId;
+    if (isDM && !this.config.handleDMs) {
       return;
     }
+
+    // Determine if this message should trigger inference
+    const shouldTrigger = this.shouldTriggerInference(message, isDM);
+
+    // Convert message content including attachments
+    const contentBlocks = await this.convertMessageToContent(message);
 
     // Only queue the event - all state writes happen in onProcess()
     this.ctx.queue.push({
@@ -447,9 +741,117 @@ export class DiscordModule implements Module {
       authorId: message.authorId,
       authorName: message.authorName,
       content: message.content,
-      timestamp: message.timestamp,
+      contentBlocks,
+      timestamp: message.timestamp.getTime(),
       attachments: message.attachments,
-    });
+      shouldTriggerInference: shouldTrigger,
+    } as DiscordMessageEvent);
+  }
+
+  /**
+   * Convert Discord message to ContentBlock array.
+   * Includes text content and any supported attachments (images, text files).
+   */
+  private async convertMessageToContent(message: DiscordMessageData): Promise<ContentBlock[]> {
+    const blocks: ContentBlock[] = [];
+
+    // Add text content if present
+    if (message.content.trim()) {
+      blocks.push({ type: 'text', text: message.content });
+    }
+
+    // Process attachments
+    for (const attachment of message.attachments) {
+      const contentType = attachment.contentType?.toLowerCase() ?? '';
+      const filename = attachment.filename.toLowerCase();
+
+      // Check for supported image types
+      if (SUPPORTED_IMAGE_TYPES.some(type => contentType.startsWith(type))) {
+        blocks.push({
+          type: 'image',
+          source: {
+            type: 'url',
+            url: attachment.url,
+          },
+        } as ContentBlock);
+        continue;
+      }
+
+      // Check for text files - fetch and include content
+      const isTextFile = TEXT_FILE_EXTENSIONS.some(ext => filename.endsWith(ext));
+      if (isTextFile && attachment.size && attachment.size < 100_000) { // < 100KB
+        try {
+          const response = await fetch(attachment.url);
+          if (response.ok) {
+            const textContent = await response.text();
+            blocks.push({
+              type: 'text',
+              text: `\n--- File: ${attachment.filename} ---\n${textContent}\n--- End of ${attachment.filename} ---\n`,
+            });
+          }
+        } catch (error) {
+          // If fetch fails, just note the attachment
+          blocks.push({
+            type: 'text',
+            text: `[Attachment: ${attachment.filename} (failed to fetch)]`,
+          });
+        }
+        continue;
+      }
+
+      // For unsupported attachments, add a note
+      blocks.push({
+        type: 'text',
+        text: `[Attachment: ${attachment.filename} (${contentType || 'unknown type'})]`,
+      });
+    }
+
+    // Ensure we have at least empty text if nothing else
+    if (blocks.length === 0) {
+      blocks.push({ type: 'text', text: '[Empty message]' });
+    }
+
+    return blocks;
+  }
+
+  /**
+   * Determine if a message should trigger agent inference based on config.
+   */
+  private shouldTriggerInference(message: DiscordMessageData, isDM: boolean): boolean {
+    const triggerMode = this.config.triggerOn ?? 'mention_or_reply';
+    const botUserId = this.state.botUserId;
+
+    // Check if bot is mentioned
+    const isMentioned = botUserId
+      ? message.mentionedUserIds.includes(botUserId)
+      : false;
+
+    // Check if this is a reply to bot's message
+    const isReplyToBot = botUserId
+      ? message.replyToAuthorId === botUserId
+      : false;
+
+    switch (triggerMode) {
+      case 'all':
+        // Always trigger (use with caution!)
+        return true;
+
+      case 'mention':
+        // Only trigger on direct @mention
+        return isMentioned;
+
+      case 'mention_or_reply':
+        // Trigger on @mention OR when replying to bot
+        return isMentioned || isReplyToBot;
+
+      case 'dm_or_mention':
+        // DMs always trigger, channels require mention
+        return isDM || isMentioned;
+
+      default:
+        // Fallback: mention_or_reply behavior
+        return isMentioned || isReplyToBot;
+    }
   }
 
   private handleDiscordMessageEdit(messageId: string, newContent: string): void {
@@ -590,6 +992,68 @@ export class DiscordModule implements Module {
 
     this.ctx.unregisterSpeechHandler();
     return { success: true, data: { message: 'Discord is no longer handling speech' } };
+  }
+
+  private async handleListGuilds(): Promise<ToolResult> {
+    const guilds = await this.client.listGuilds();
+    return {
+      success: true,
+      data: {
+        guilds: guilds.map((g) => ({
+          id: g.id,
+          name: g.name,
+          memberCount: g.memberCount,
+        })),
+      },
+    };
+  }
+
+  private async handleListChannels(input: ListChannelsInput): Promise<ToolResult> {
+    const channels = await this.client.listChannels(input.guildId);
+    return {
+      success: true,
+      data: {
+        guildId: input.guildId,
+        channels: channels.map((c) => ({
+          id: c.id,
+          name: c.name,
+          type: c.type,
+          parentId: c.parentId,
+        })),
+      },
+    };
+  }
+
+  private async handleFetchHistory(input: FetchHistoryInput): Promise<ToolResult> {
+    const limit = Math.min(input.limit ?? 50, 100); // Cap at 100
+    const messages = await this.client.fetchHistory(input.channelId, {
+      limit,
+      before: input.before,
+    });
+
+    // Update last read if we got messages
+    if (messages.length > 0) {
+      const latestId = messages[0].id; // Assuming sorted newest first
+      this.state.lastReadMessageId[input.channelId] = latestId;
+      this.ctx?.setState(this.state);
+    }
+
+    return {
+      success: true,
+      data: {
+        channelId: input.channelId,
+        messageCount: messages.length,
+        messages: messages.map((m) => ({
+          id: m.id,
+          author: m.authorName,
+          authorId: m.authorId,
+          isBot: m.isBot,
+          content: m.content,
+          timestamp: m.timestamp.toISOString(),
+          replyTo: m.replyTo,
+        })),
+      },
+    };
   }
 
   // ==========================================================================

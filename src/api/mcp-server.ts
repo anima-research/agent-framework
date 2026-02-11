@@ -185,8 +185,17 @@ export class McpServer {
 
   private handleInput(line: string): void {
     try {
-      const request = JSON.parse(line) as JsonRpcRequest;
-      this.handleRequest(request);
+      const message = JSON.parse(line);
+      
+      // Check if this is a notification (no id) or a request (has id)
+      if (!('id' in message) || message.id === undefined) {
+        // This is a notification - handle silently without response
+        // Common notifications: notifications/initialized, notifications/cancelled
+        return;
+      }
+      
+      // This is a request - process and respond
+      this.handleRequest(message as JsonRpcRequest);
     } catch {
       this.sendError(null, -32700, 'Parse error');
     }

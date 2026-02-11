@@ -1,4 +1,4 @@
-import type { ContentBlock } from 'membrane';
+import type { ContentBlock, YieldingStream } from 'membrane';
 import type { ContextStrategy } from '@connectome/context-manager';
 import type { ToolCallId, ToolResult, ToolCall } from './events.js';
 
@@ -67,8 +67,9 @@ export interface InferenceResult {
 export type AgentState =
   | { status: 'idle' }
   | { status: 'inferring'; promise: Promise<InferenceResult> }
-  | { status: 'waiting_for_tools'; pending: Map<ToolCallId, PendingToolCall> }
-  | { status: 'ready'; toolResults: CompletedToolCall[] };
+  | { status: 'streaming'; stream: YieldingStream }
+  | { status: 'waiting_for_tools'; pending: Map<ToolCallId, PendingToolCall>; completed: CompletedToolCall[]; stream?: YieldingStream }
+  | { status: 'ready'; toolResults: CompletedToolCall[]; stream?: YieldingStream };
 
 /**
  * A tool call that's in progress.

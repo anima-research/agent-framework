@@ -2,6 +2,8 @@
  * Types for the Discord module
  */
 
+import type { ContentBlock } from 'membrane';
+
 // ============================================================================
 // Module Configuration
 // ============================================================================
@@ -27,6 +29,25 @@ export interface DiscordModuleConfig {
 
   /** Rate limit: max messages per minute per channel (default: 30) */
   rateLimitPerMinute?: number;
+
+  /**
+   * When to trigger agent inference (default: 'mention')
+   * - 'all': Every message triggers inference (use with caution!)
+   * - 'mention': Only when bot is @mentioned
+   * - 'mention_or_reply': When mentioned OR when replying to bot's message
+   * - 'dm_or_mention': DMs always trigger, channels require mention
+   */
+  triggerOn?: 'all' | 'mention' | 'mention_or_reply' | 'dm_or_mention';
+
+  /** 
+   * Auto-send typing indicator when agent is activated (default: true)
+   */
+  autoTyping?: boolean;
+
+  /**
+   * Number of messages to fetch on history sync (default: 50)
+   */
+  historyScrollback?: number;
 }
 
 // ============================================================================
@@ -42,6 +63,12 @@ export interface DiscordModuleState {
 
   /** Rate limit tracking */
   rateLimits: Record<string, RateLimitInfo>;
+
+  /** Bot user ID (set after connect) */
+  botUserId?: string;
+
+  /** Last read message ID per channel (for history sync) */
+  lastReadMessageId: Record<string, string>;
 }
 
 export interface ConversationContext {
@@ -163,6 +190,87 @@ export interface SetReplyContextInput {
   replyToMessageId?: string;
 }
 
+export interface ListGuildsInput {
+  // No parameters needed
+}
+
+export interface ListChannelsInput {
+  /** Guild ID to list channels for */
+  guildId: string;
+}
+
+export interface FetchHistoryInput {
+  /** Channel ID to fetch history from */
+  channelId: string;
+
+  /** Number of messages to fetch (default: 50) */
+  limit?: number;
+
+  /** Fetch messages before this message ID */
+  before?: string;
+}
+
+// ============================================================================
+// Discord Data Types (returned by tools)
+// ============================================================================
+
+export interface DiscordGuild {
+  /** Guild ID */
+  id: string;
+
+  /** Guild name */
+  name: string;
+
+  /** Guild icon URL (optional) */
+  iconUrl?: string;
+
+  /** Number of members */
+  memberCount?: number;
+}
+
+export interface DiscordChannel {
+  /** Channel ID */
+  id: string;
+
+  /** Channel name */
+  name: string;
+
+  /** Channel type */
+  type: 'text' | 'voice' | 'category' | 'thread' | 'forum' | 'unknown';
+
+  /** Parent category ID (if applicable) */
+  parentId?: string;
+
+  /** Position in channel list */
+  position?: number;
+}
+
+export interface HistoryMessage {
+  /** Message ID */
+  id: string;
+
+  /** Author user ID */
+  authorId: string;
+
+  /** Author username */
+  authorName: string;
+
+  /** Whether author is a bot */
+  isBot: boolean;
+
+  /** Message content */
+  content: string;
+
+  /** Timestamp */
+  timestamp: Date;
+
+  /** Reply info (if this is a reply) */
+  replyTo?: {
+    messageId: string;
+    authorId: string;
+  };
+}
+
 // ============================================================================
 // Discord Events (internal)
 // ============================================================================
@@ -183,6 +291,9 @@ export interface DiscordMessageData {
   /** Author username */
   authorName: string;
 
+  /** Whether the author is a bot */
+  isBot: boolean;
+
   /** Message content */
   content: string;
 
@@ -191,6 +302,12 @@ export interface DiscordMessageData {
 
   /** ID of message being replied to */
   replyToId?: string;
+
+  /** Author ID of the message being replied to */
+  replyToAuthorId?: string;
+
+  /** User IDs mentioned in this message */
+  mentionedUserIds: string[];
 
   /** Attachments */
   attachments: DiscordAttachment[];
@@ -232,8 +349,12 @@ export interface DiscordMessageEvent {
   authorId: string;
   authorName: string;
   content: string;
-  timestamp: Date;
+  /** Pre-converted content blocks (includes attachments) */
+  contentBlocks?: ContentBlock[];
+  timestamp: number;
   attachments: DiscordAttachment[];
+  /** Whether this message should trigger agent inference */
+  shouldTriggerInference?: boolean;
   [key: string]: unknown; // Required for CustomEvent compatibility
 }
 
@@ -276,6 +397,9 @@ export interface DiscordClientInterface {
   /** Disconnect from Discord */
   disconnect(): Promise<void>;
 
+  /** Get the bot's user ID (available after connect) */
+  getBotUserId(): string | null;
+
   /** Send a message to a channel */
   sendMessage(
     channelId: string,
@@ -306,6 +430,21 @@ export interface DiscordClientInterface {
     autoArchiveDuration?: number
   ): Promise<{ threadId: string }>;
 
+  /** Send typing indicator to a channel */
+  sendTyping(channelId: string): Promise<void>;
+
+  /** List guilds the bot is in */
+  listGuilds(): Promise<DiscordGuild[]>;
+
+  /** List channels in a guild */
+  listChannels(guildId: string): Promise<DiscordChannel[]>;
+
+  /** Fetch message history from a channel */
+  fetchHistory(
+    channelId: string,
+    options?: { limit?: number; before?: string }
+  ): Promise<HistoryMessage[]>;
+
   /** Register message handler */
   onMessage(handler: (message: DiscordMessageData) => void): void;
 
@@ -314,6 +453,9 @@ export interface DiscordClientInterface {
 
   /** Register message delete handler */
   onMessageDelete(handler: (messageId: string) => void): void;
+
+  /** Register ready handler (called when connected and ready) */
+  onReady?(handler: () => void): void;
 
   /** Check if connected */
   isConnected(): boolean;

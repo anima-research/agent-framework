@@ -1,7 +1,13 @@
 import { JsStore } from 'chronicle';
-import type { Membrane, ContentBlock } from 'membrane';
+import type { Membrane, ContentBlock, YieldingStream, ToolResult as MembraneToolResult } from 'membrane';
 import { ContextManager, PassthroughStrategy } from '@connectome/context-manager';
-import type { MessageId, MessageMetadata } from '@connectome/context-manager';
+import type {
+  MessageId,
+  MessageMetadata,
+  MessageQuery,
+  MessageQueryResult,
+  StoredMessage,
+} from '@connectome/context-manager';
 import type {
   FrameworkConfig,
   InferencePolicy,
@@ -88,6 +94,7 @@ export class AgentFramework {
   private syncTimer: ReturnType<typeof setInterval> | null = null;
   private processLoggingPersist: boolean;
   private processLoggingBroadcast: boolean;
+  private activeStreams: Map<string, Promise<void>> = new Map();
 
   private constructor(
     store: JsStore,
@@ -115,6 +122,9 @@ export class AgentFramework {
       addMessage: (p, c, m) => this.addMessage(p, c, m),
       editMessage: (id, c) => this.editMessage(id, c),
       removeMessage: (id) => this.removeMessage(id),
+      getMessage: (id) => this.getMessage(id),
+      queryMessages: (filter) => this.queryMessages(filter),
+      pushEvent: (event) => this.pushEvent(event),
     });
   }
 
@@ -225,6 +235,19 @@ export class AgentFramework {
   async stop(): Promise<void> {
     this.running = false;
     this.queue.close();
+
+    // Cancel all active streams
+    for (const agent of this.agents.values()) {
+      if (agent.state.status === 'streaming' ||
+          (agent.state.status === 'waiting_for_tools' && agent.state.stream)) {
+        agent.cancelStream();
+      }
+    }
+
+    // Wait for all stream iteration handles to settle
+    if (this.activeStreams.size > 0) {
+      await Promise.allSettled(this.activeStreams.values());
+    }
 
     // Stop sync timer
     if (this.syncTimer) {
@@ -609,6 +632,7 @@ export class AgentFramework {
   async runUntilIdle(): Promise<void> {
     while (
       !this.queue.isEmpty ||
+      this.activeStreams.size > 0 ||
       Array.from(this.agents.values()).some((a) => a.state.status !== 'idle')
     ) {
       await this.processNextEvent();
@@ -651,9 +675,13 @@ export class AgentFramework {
     // Check for inference requests
     await this.processInferenceRequests();
 
-    // Small delay if nothing to do
+    // Yield to the event loop between iterations.
+    // Full 10ms sleep when truly idle; minimal yield when streams are active
+    // (needed to let stream microtasks and tool-call callbacks execute).
     if (!event && this.pendingRequests.length === 0) {
       await new Promise((resolve) => setTimeout(resolve, 10));
+    } else if (this.activeStreams.size > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
     }
   }
 
@@ -685,13 +713,25 @@ export class AgentFramework {
 
         // Check if agent is now ready (state may have changed after provideToolResult)
         // Cast to AgentState to bypass TypeScript's control flow narrowing
-        if ((agent.state as AgentState).status === 'ready') {
-          this.pendingRequests.push({
-            agentName: agent.name,
-            reason: 'tool_results_ready',
-            source: 'framework',
-            timestamp: Date.now(),
-          });
+        const currentState = agent.state as AgentState;
+        if (currentState.status === 'ready') {
+          if (currentState.stream) {
+            // Streaming path: convert results and resume the stream
+            const membraneResults = currentState.toolResults.map(tc =>
+              this.toMembraneToolResult(tc.id, tc.result)
+            );
+            currentState.stream.provideToolResults(membraneResults);
+            agent.setStreaming(currentState.stream);
+            this.emitTrace({ type: 'inference:stream_resumed', agentName: agent.name });
+          } else {
+            // Non-streaming fallback: schedule re-inference
+            this.pendingRequests.push({
+              agentName: agent.name,
+              reason: 'tool_results_ready',
+              source: 'framework',
+              timestamp: Date.now(),
+            });
+          }
         }
       }
     }
@@ -784,8 +824,8 @@ export class AgentFramework {
       const agent = this.agents.get(agentName);
       if (!agent) continue;
 
-      // Skip if agent is busy
-      if (agent.state.status === 'inferring' || agent.state.status === 'waiting_for_tools') {
+      // Skip if agent is busy (inferring, streaming, or waiting for tools)
+      if (agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
         // Re-queue requests
         this.pendingRequests.push(...requests);
         continue;
@@ -796,93 +836,197 @@ export class AgentFramework {
         continue;
       }
 
-      // Run inference with the first request as trigger context
+      // Start streaming inference (non-blocking — driveStream runs in background)
       const trigger = requests[0];
-      await this.runAgentInference(agent, 0, trigger);
+      await this.startAgentStream(agent, trigger);
     }
   }
 
-  private async runAgentInference(agent: Agent, attempt = 0, trigger?: InferenceRequest): Promise<void> {
+  private async startAgentStream(agent: Agent, trigger?: InferenceRequest, attempt = 0): Promise<void> {
     this.emitTrace({ type: 'inference:started', agentName: agent.name });
-    const startTime = Date.now();
-    const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
 
     try {
       const tools = this.moduleRegistry.getAllTools().filter((t) => agent.canUseTool(t.name));
-      const result = await agent.runInference(tools);
+      const stream = await agent.startStream(tools);
 
-      const durationMs = Date.now() - startTime;
-      const tokenUsage = result.usage
-        ? { input: result.usage.inputTokens, output: result.usage.outputTokens }
-        : undefined;
-      this.emitTrace({ type: 'inference:completed', agentName: agent.name, durationMs, tokenUsage });
-
-      // Log successful inference
-      this.logInference({
-        timestamp: startTime,
-        agentName: agent.name,
-        requestId,
-        success: true,
-        request: result.raw?.request ?? { note: 'request not captured' },
-        response: result.raw?.response ?? { note: 'response not captured' },
-        durationMs,
-        tokenUsage: result.usage
-          ? { input: result.usage.inputTokens, output: result.usage.outputTokens }
-          : undefined,
-        stopReason: result.stopReason,
-      });
-
-      // Dispatch speech to handlers
-      if (result.speechContent.length > 0) {
-        const speechContext = {
-          turnComplete: result.toolCalls.length === 0,
-          trigger: trigger ?? {
-            reason: 'unknown',
-            source: 'unknown',
-            timestamp: Date.now(),
-          },
-        };
-        await this.moduleRegistry.dispatchSpeech(
-          agent.name,
-          result.speechContent,
-          speechContext
-        );
-      }
-
-      // Dispatch tool calls
-      for (const call of result.toolCalls) {
-        this.dispatchToolCall(agent.name, call);
-      }
+      const handle = this.driveStream(agent, stream, trigger, attempt);
+      this.activeStreams.set(agent.name, handle);
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
-      const durationMs = Date.now() - startTime;
       this.emitTrace({
         type: 'inference:failed',
         agentName: agent.name,
         error: err.message,
         stack: err.stack,
       });
+      agent.reset();
 
-      // Log failed inference
-      this.logInference({
-        timestamp: startTime,
-        agentName: agent.name,
-        requestId,
-        success: false,
-        error: err.message,
-        request: { note: 'request may have failed before capture' },
-        durationMs,
-      });
-
-      // Handle error with policy
       const action = this.errorPolicy.onInferenceError(err, agent.name, attempt);
       if (action.retry) {
         await new Promise((resolve) => setTimeout(resolve, action.delayMs));
-        await this.runAgentInference(agent, attempt + 1, trigger);
+        await this.startAgentStream(agent, trigger, attempt + 1);
       } else if (action.emit) {
         this.pushEvent(action.emit);
       }
     }
+  }
+
+  private async driveStream(
+    agent: Agent,
+    stream: YieldingStream,
+    trigger?: InferenceRequest,
+    attempt = 0
+  ): Promise<void> {
+    const startTime = Date.now();
+    const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
+
+    try {
+      for await (const event of stream) {
+        switch (event.type) {
+          case 'tokens':
+            this.emitTrace({
+              type: 'inference:tokens',
+              agentName: agent.name,
+              content: event.content,
+            });
+            break;
+
+          case 'tool-calls':
+            this.emitTrace({
+              type: 'inference:tool_calls_yielded',
+              agentName: agent.name,
+              calls: event.calls.map((c) => ({ id: c.id, name: c.name })),
+            });
+            agent.enterWaitingForTools(event.calls, stream);
+            // Dispatch each tool call (async, results come back via ToolResultEvent)
+            for (const call of event.calls) {
+              this.dispatchToolCall(agent.name, call);
+            }
+            // Stream's async iterator blocks on next() until provideToolResults() is called
+            break;
+
+          case 'complete': {
+            const durationMs = Date.now() - startTime;
+            const response = event.response;
+
+            // Add assistant response to context
+            agent.addAssistantResponse(response.content);
+
+            // Extract speech content
+            const speechContent = response.content.filter(
+              (block: ContentBlock): block is ContentBlock & { type: 'text' } =>
+                block.type === 'text'
+            );
+
+            const tokenUsage = response.usage
+              ? { input: response.usage.inputTokens, output: response.usage.outputTokens }
+              : undefined;
+            this.emitTrace({
+              type: 'inference:completed',
+              agentName: agent.name,
+              durationMs,
+              tokenUsage,
+            });
+
+            // Log inference
+            this.logInference({
+              timestamp: startTime,
+              agentName: agent.name,
+              requestId,
+              success: true,
+              request: { note: 'streaming request' },
+              response: response.raw ?? { note: 'streaming response' },
+              durationMs,
+              tokenUsage,
+              stopReason: response.stopReason,
+            });
+
+            // Dispatch speech
+            if (speechContent.length > 0) {
+              const speechContext = {
+                turnComplete: true,
+                trigger: trigger ?? {
+                  reason: 'unknown',
+                  source: 'unknown',
+                  timestamp: Date.now(),
+                },
+              };
+              await this.moduleRegistry.dispatchSpeech(
+                agent.name,
+                speechContent,
+                speechContext
+              );
+            }
+
+            // Done — reset to idle
+            agent.reset();
+            break;
+          }
+
+          case 'error': {
+            const err = event.error;
+            const durationMs = Date.now() - startTime;
+            this.emitTrace({
+              type: 'inference:failed',
+              agentName: agent.name,
+              error: err.message,
+              stack: err.stack,
+            });
+
+            this.logInference({
+              timestamp: startTime,
+              agentName: agent.name,
+              requestId,
+              success: false,
+              error: err.message,
+              request: { note: 'streaming request failed' },
+              durationMs,
+            });
+
+            agent.reset();
+
+            const action = this.errorPolicy.onInferenceError(err, agent.name, attempt);
+            if (action.retry) {
+              await new Promise((resolve) => setTimeout(resolve, action.delayMs));
+              await this.startAgentStream(agent, trigger, attempt + 1);
+            } else if (action.emit) {
+              this.pushEvent(action.emit);
+            }
+            break;
+          }
+
+          case 'aborted':
+            agent.reset();
+            break;
+
+          case 'usage':
+            // Token count updates — could emit trace for UI
+            break;
+        }
+      }
+    } catch (error) {
+      // Stream itself threw (unexpected)
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.emitTrace({
+        type: 'inference:failed',
+        agentName: agent.name,
+        error: err.message,
+        stack: err.stack,
+      });
+      agent.reset();
+    } finally {
+      this.activeStreams.delete(agent.name);
+    }
+  }
+
+  private toMembraneToolResult(callId: string, afResult: ToolResult): MembraneToolResult {
+    return {
+      toolUseId: callId,
+      content: afResult.isError
+        ? (afResult.error ?? 'Unknown error')
+        : JSON.stringify(afResult.data),
+      isError: afResult.isError,
+    };
   }
 
   private logInference(entry: InferenceLogEntry): void {
@@ -1027,6 +1171,22 @@ export class AgentFramework {
       throw new Error('No agents configured');
     }
     agent.getContextManager().removeMessage(id);
+  }
+
+  private getMessage(id: MessageId): StoredMessage | null {
+    const agent = this.agents.values().next().value;
+    if (!agent) {
+      return null;
+    }
+    return agent.getContextManager().getMessage(id);
+  }
+
+  private queryMessages(filter: MessageQuery): MessageQueryResult {
+    const agent = this.agents.values().next().value;
+    if (!agent) {
+      return { messages: [], totalCount: 0 };
+    }
+    return agent.getContextManager().queryMessages(filter);
   }
 
   private createFrameworkState(): FrameworkState {

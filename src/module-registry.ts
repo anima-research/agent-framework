@@ -1,6 +1,12 @@
 import type { JsStore } from 'chronicle';
 import type { ContentBlock } from 'membrane';
-import type { MessageId, MessageMetadata } from '@connectome/context-manager';
+import type {
+  MessageId,
+  MessageMetadata,
+  MessageQuery,
+  MessageQueryResult,
+  StoredMessage,
+} from '@connectome/context-manager';
 import type {
   Module,
   ModuleContext,
@@ -13,6 +19,7 @@ import type {
   ExternalIdRef,
   SpeechContext,
   SpeechHandlerOptions,
+  ProcessEvent,
 } from './types/index.js';
 import type { Agent } from './agent.js';
 
@@ -41,6 +48,10 @@ export class ModuleRegistry {
   private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
+  private getMessageFn: (id: MessageId) => StoredMessage | null;
+  private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
+
+  private pushEventFn: (event: ProcessEvent) => void;
 
   constructor(
     store: JsStore,
@@ -50,6 +61,9 @@ export class ModuleRegistry {
       addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
       editMessage: (id: MessageId, content: ContentBlock[]) => void;
       removeMessage: (id: MessageId) => void;
+      getMessage: (id: MessageId) => StoredMessage | null;
+      queryMessages: (filter: MessageQuery) => MessageQueryResult;
+      pushEvent: (event: ProcessEvent) => void;
     }
   ) {
     this.store = store;
@@ -58,6 +72,9 @@ export class ModuleRegistry {
     this.addMessageFn = options.addMessage;
     this.editMessageFn = options.editMessage;
     this.removeMessageFn = options.removeMessage;
+    this.getMessageFn = options.getMessage;
+    this.queryMessagesFn = options.queryMessages;
+    this.pushEventFn = options.pushEvent;
   }
 
   /**
@@ -94,7 +111,10 @@ export class ModuleRegistry {
       this.getAgents,
       this.addMessageFn,
       this.editMessageFn,
-      this.removeMessageFn
+      this.removeMessageFn,
+      this.getMessageFn,
+      this.queryMessagesFn,
+      this.pushEventFn
     );
 
     this.modules.set(module.name, module);
@@ -316,6 +336,9 @@ class ModuleContextImpl implements ModuleContext {
   private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
+  private getMessageFn: (id: MessageId) => StoredMessage | null;
+  private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
+  private pushEventFn: (event: ProcessEvent) => void;
 
   // External ID mapping stored in module state
   private externalIdMap: Map<string, MessageId> = new Map();
@@ -330,7 +353,10 @@ class ModuleContextImpl implements ModuleContext {
     getAgents: () => Agent[],
     addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId,
     editMessage: (id: MessageId, content: ContentBlock[]) => void,
-    removeMessage: (id: MessageId) => void
+    removeMessage: (id: MessageId) => void,
+    getMessage: (id: MessageId) => StoredMessage | null,
+    queryMessages: (filter: MessageQuery) => MessageQueryResult,
+    pushEvent: (event: ProcessEvent) => void
   ) {
     this.moduleName = moduleName;
     this.store = store;
@@ -342,6 +368,9 @@ class ModuleContextImpl implements ModuleContext {
     this.addMessageFn = addMessage;
     this.editMessageFn = editMessage;
     this.removeMessageFn = removeMessage;
+    this.getMessageFn = getMessage;
+    this.queryMessagesFn = queryMessages;
+    this.pushEventFn = pushEvent;
 
     // Load external ID map from state if exists
     const state = this.getState<{ externalIdMap?: Record<string, string> }>();
@@ -407,6 +436,14 @@ class ModuleContextImpl implements ModuleContext {
     return this.externalIdMap.get(key) ?? null;
   }
 
+  getMessage(id: MessageId): StoredMessage | null {
+    return this.getMessageFn(id);
+  }
+
+  queryMessages(filter: MessageQuery): MessageQueryResult {
+    return this.queryMessagesFn(filter);
+  }
+
   getAgents(): AgentInfo[] {
     return this.getAgentsFn().map((a) => a.info);
   }
@@ -424,6 +461,10 @@ class ModuleContextImpl implements ModuleContext {
 
   unregisterSpeechHandler(): void {
     this.registry.unregisterSpeechHandler(this.moduleName);
+  }
+
+  pushEvent(event: ProcessEvent): void {
+    this.pushEventFn(event);
   }
 
   private persistExternalIdMap(): void {
@@ -471,5 +512,9 @@ class ProcessStateImpl implements ProcessState {
 
   get queue(): ProcessQueue {
     return this.ctx.queue;
+  }
+
+  pushEvent(event: ProcessEvent): void {
+    this.ctx.pushEvent(event);
   }
 }

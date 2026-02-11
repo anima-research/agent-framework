@@ -1,5 +1,11 @@
 import type { ContentBlock } from 'membrane';
-import type { MessageId, MessageMetadata } from '@connectome/context-manager';
+import type {
+  MessageId,
+  MessageMetadata,
+  MessageQuery,
+  MessageQueryResult,
+  StoredMessage,
+} from '@connectome/context-manager';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from './events.js';
 
 /**
@@ -70,8 +76,15 @@ export interface ModuleContext {
 
   /**
    * Process queue for pushing events from external listeners.
+   * @deprecated Use pushEvent() instead — it also emits process:received traces.
    */
   readonly queue: ProcessQueue;
+
+  /**
+   * Push a process event to the queue and emit a process:received trace.
+   * Preferred over direct queue.push() for proper observability.
+   */
+  pushEvent(event: ProcessEvent): void;
 
   /**
    * Get another module by name.
@@ -101,6 +114,17 @@ export interface ModuleContext {
    * Find a message by external ID.
    */
   findMessageByExternalId(source: string, externalId: string): MessageId | null;
+
+  /**
+   * Get a message by ID.
+   */
+  getMessage(id: MessageId): StoredMessage | null;
+
+  /**
+   * Query messages by filter criteria.
+   * Useful for finding messages from external sources, by participant, etc.
+   */
+  queryMessages(filter: MessageQuery): MessageQueryResult;
 
   /**
    * Get info about all agents.
@@ -165,8 +189,15 @@ export interface ProcessState {
 
   /**
    * Queue for emitting follow-up events.
+   * @deprecated Use pushEvent() instead — it also emits process:received traces.
    */
   readonly queue: ProcessQueue;
+
+  /**
+   * Push a process event to the queue and emit a process:received trace.
+   * Preferred over direct queue.push() for proper observability.
+   */
+  pushEvent(event: ProcessEvent): void;
 }
 
 /**
@@ -199,7 +230,7 @@ export interface AgentInfo {
 /**
  * Agent execution status.
  */
-export type AgentStatus = 'idle' | 'inferring' | 'waiting_for_tools' | 'ready';
+export type AgentStatus = 'idle' | 'inferring' | 'streaming' | 'waiting_for_tools' | 'ready';
 
 /**
  * Response from a module's event handler.
