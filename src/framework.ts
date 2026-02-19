@@ -39,6 +39,30 @@ import type {
 import { ProcessQueueImpl } from './queue.js';
 import { Agent } from './agent.js';
 import { ModuleRegistry } from './module-registry.js';
+import { McplServerRegistry } from './mcpl/server-registry.js';
+import { FeatureSetManager } from './mcpl/feature-set-manager.js';
+import { ScopeManager } from './mcpl/scope-manager.js';
+import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
+import { PushHandler } from './mcpl/push-handler.js';
+import { InferenceRouter } from './mcpl/inference-router.js';
+import { ChannelRegistry } from './mcpl/channel-registry.js';
+import { CheckpointManager } from './mcpl/checkpoint-manager.js';
+import type { McplServerConnection } from './mcpl/server-connection.js';
+import type {
+  McplServerConfig,
+  McplHostCapabilities,
+  FeatureSetsChangedParams,
+  ScopeElevateParams,
+  ScopeElevateResult,
+  BeforeInferenceParams,
+  AfterInferenceParams,
+  PushEventParams,
+  McplInferenceRequestParams,
+  ChannelsRegisterParams,
+  ChannelsChangedParams,
+  ChannelsIncomingParams,
+} from './mcpl/types.js';
+import type { ContextInjection } from '@connectome/context-manager';
 
 const FRAMEWORK_STATE_ID = 'framework/state';
 const INFERENCE_LOG_ID = 'framework/inference-log';
@@ -95,6 +119,17 @@ export class AgentFramework {
   private processLoggingPersist: boolean;
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
+
+  // MCPL subsystems (null when no mcplServers configured)
+  private mcplServerRegistry: McplServerRegistry | null = null;
+  private featureSetManager: FeatureSetManager | null = null;
+  private scopeManager: ScopeManager | null = null;
+  private hookOrchestrator: HookOrchestrator | null = null;
+  private pushHandler: PushHandler | null = null;
+  private inferenceRouter: InferenceRouter | null = null;
+  private channelRegistry: ChannelRegistry | null = null;
+  private checkpointManager: CheckpointManager | null = null;
+  private mcplTools: import('./types/index.js').ToolDefinition[] = [];
 
   private constructor(
     store: JsStore,
@@ -203,6 +238,11 @@ export class AgentFramework {
       await framework.addModule(module);
     }
 
+    // Initialize MCPL subsystems if configured
+    if (config.mcplServers && config.mcplServers.length > 0) {
+      await framework.initializeMcpl(config.mcplServers, config.inferenceRouting);
+    }
+
     return framework;
   }
 
@@ -259,7 +299,15 @@ export class AgentFramework {
       await this.loopPromise;
     }
 
-    await this.moduleRegistry.stopAll();
+    // Stop typing indicators
+    this.channelRegistry?.stopAll();
+
+    // Stop modules and MCPL servers in parallel
+    const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll()];
+    if (this.mcplServerRegistry) {
+      shutdownPromises.push(this.mcplServerRegistry.closeAll());
+    }
+    await Promise.all(shutdownPromises);
 
     // Final sync before closing
     try {
@@ -336,10 +384,15 @@ export class AgentFramework {
   }
 
   /**
-   * Get all available tools from all modules.
+   * Get all available tools from all modules and MCPL servers.
    */
   getAllTools(): import('./types/index.js').ToolDefinition[] {
-    return this.moduleRegistry.getAllTools();
+    const moduleTools = this.moduleRegistry.getAllTools();
+    const channelTools = this.channelRegistry?.getChannelTools() ?? [];
+    if (this.mcplTools.length === 0 && channelTools.length === 0) {
+      return moduleTools;
+    }
+    return [...moduleTools, ...this.mcplTools, ...channelTools];
   }
 
   /**
@@ -715,7 +768,23 @@ export class AgentFramework {
         // Cast to AgentState to bypass TypeScript's control flow narrowing
         const currentState = agent.state as AgentState;
         if (currentState.status === 'ready') {
-          if (currentState.stream) {
+          // Check if any tool result requested endTurn
+          const shouldEndTurn = currentState.toolResults.some(tc => tc.result.endTurn);
+
+          if (shouldEndTurn) {
+            // endTurn: save tool_use + tool_result to context, cancel stream, reset to idle.
+            // The LLM expects this call to block — agent sleeps until next event.
+            if (currentState.stream) {
+              // Provide results so they get saved to context, then cancel
+              const membraneResults = currentState.toolResults.map(tc =>
+                this.toMembraneToolResult(tc.id, tc.result)
+              );
+              currentState.stream.provideToolResults(membraneResults);
+              agent.cancelStream();
+            }
+            agent.reset();
+            this.emitTrace({ type: 'inference:completed', agentName: agent.name, durationMs: 0 });
+          } else if (currentState.stream) {
             // Streaming path: convert results and resume the stream
             const membraneResults = currentState.toolResults.map(tc =>
               this.toMembraneToolResult(tc.id, tc.result)
@@ -846,8 +915,36 @@ export class AgentFramework {
     this.emitTrace({ type: 'inference:started', agentName: agent.name });
 
     try {
-      const tools = this.moduleRegistry.getAllTools().filter((t) => agent.canUseTool(t.name));
-      const stream = await agent.startStream(tools);
+      const tools = this.getAllTools().filter((t) => agent.canUseTool(t.name));
+
+      // Gather context from modules (pull-based) and MCPL hooks (push-based)
+      // Both produce ContextInjection[] that get merged before inference.
+      let injections: ContextInjection[] | undefined;
+
+      // Module gatherContext (fail-open, 5s timeout per module)
+      try {
+        const moduleInjections = await this.moduleRegistry.gatherContext(agent.name);
+        if (moduleInjections.length > 0) {
+          injections = moduleInjections;
+        }
+      } catch (error) {
+        console.error('Module gatherContext error:', error);
+      }
+
+      // MCPL beforeInference hooks (fail-open)
+      if (this.hookOrchestrator) {
+        try {
+          const hookParams = this.buildBeforeInferenceParams(agent, trigger);
+          const hookInjections = await this.hookOrchestrator.beforeInference(hookParams);
+          if (hookInjections.length > 0) {
+            injections = injections ? [...injections, ...hookInjections] : hookInjections;
+          }
+        } catch (error) {
+          console.error('beforeInference hook error:', error);
+        }
+      }
+
+      const stream = await agent.startStreamWithInjections(tools, injections);
 
       const handle = this.driveStream(agent, stream, trigger, attempt);
       this.activeStreams.set(agent.name, handle);
@@ -911,6 +1008,39 @@ export class AgentFramework {
 
             // Add assistant response to context
             agent.addAssistantResponse(response.content);
+
+            // Run afterInference hooks (no-op if no MCPL servers)
+            if (this.hookOrchestrator) {
+              try {
+                const speechText = response.content
+                  .filter((block: ContentBlock): block is ContentBlock & { type: 'text' } => block.type === 'text')
+                  .map((b) => b.text)
+                  .join('\n');
+
+                const afterParams: AfterInferenceParams = {
+                  inferenceId: requestId,
+                  conversationId: agent.name,
+                  turnIndex: 0,
+                  userMessage: null,
+                  assistantMessage: speechText,
+                  model: {
+                    id: agent.model,
+                    vendor: 'unknown',
+                    contextWindow: 200000,
+                    capabilities: ['tools'],
+                  },
+                  usage: {
+                    inputTokens: response.usage?.inputTokens ?? 0,
+                    outputTokens: response.usage?.outputTokens ?? 0,
+                  },
+                };
+
+                await this.hookOrchestrator.afterInference(afterParams);
+              } catch (error) {
+                // Fail-open: continue with speech dispatch
+                console.error('afterInference hook error:', error);
+              }
+            }
 
             // Extract speech content
             const speechContent = response.content.filter(
@@ -1084,6 +1214,18 @@ export class AgentFramework {
   }
 
   private dispatchToolCall(agentName: string, call: ToolCall): void {
+    // Route MCPL tool calls to the appropriate server
+    if (call.name.startsWith('mcpl:') && this.mcplServerRegistry) {
+      this.dispatchMcplToolCall(agentName, call);
+      return;
+    }
+
+    // Route synthesized channel tools
+    if (call.name.startsWith('channel_') && this.channelRegistry) {
+      this.dispatchChannelToolCall(agentName, call);
+      return;
+    }
+
     const colonIndex = call.name.indexOf(':');
     const moduleName = colonIndex >= 0 ? call.name.substring(0, colonIndex) : 'unknown';
 
@@ -1218,5 +1360,386 @@ export class AgentFramework {
         console.error('Trace listener error:', error);
       }
     }
+  }
+
+  // ==========================================================================
+  // MCPL subsystem wiring
+  // ==========================================================================
+
+  /**
+   * Initialize all MCPL subsystems and connect configured servers.
+   * Fail-open: individual server connection failures don't prevent framework startup.
+   */
+  private async initializeMcpl(
+    serverConfigs: McplServerConfig[],
+    inferenceRouting?: import('./mcpl/types.js').InferenceRoutingPolicy,
+  ): Promise<void> {
+    this.mcplServerRegistry = new McplServerRegistry();
+    this.featureSetManager = new FeatureSetManager();
+    this.scopeManager = new ScopeManager();
+    this.hookOrchestrator = new HookOrchestrator(this.mcplServerRegistry, this.featureSetManager);
+
+    // Push events handler (Step 6)
+    this.pushHandler = new PushHandler(
+      this.featureSetManager,
+      (event) => this.pushEvent(event as unknown as ProcessEvent),
+      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+    );
+
+    // Server-initiated inference router (Step 6)
+    this.inferenceRouter = new InferenceRouter(
+      this.membrane,
+      this.hookOrchestrator,
+      this.featureSetManager,
+      inferenceRouting ?? null,
+      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      (serverId, params) => {
+        const server = this.mcplServerRegistry!.getServer(serverId);
+        server?.sendInferenceChunk(params);
+      },
+    );
+
+    // Checkpoint manager (Step 8)
+    this.checkpointManager = new CheckpointManager(
+      this.store,
+      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+    );
+
+    // Channel registry (Step 7)
+    this.channelRegistry = new ChannelRegistry(
+      this.mcplServerRegistry,
+      this.featureSetManager,
+      (event) => this.pushEvent(event),
+      (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
+      {
+        sendTypingFn: (serverId, channelId) => {
+          const server = this.mcplServerRegistry!.getServer(serverId);
+          if (server) {
+            server.sendChannelsTyping(channelId);
+          }
+        },
+      },
+    );
+
+    // Host capabilities advertised during the MCP handshake
+    const hostCapabilities: McplHostCapabilities = {
+      version: '0.4',
+      pushEvents: true,
+      contextHooks: {
+        beforeInference: true,
+        afterInference: { blocking: true },
+      },
+      featureSets: true,
+    };
+
+    for (const config of serverConfigs) {
+      try {
+        const connection = await this.mcplServerRegistry.addServer(config, hostCapabilities);
+
+        // Initialize feature sets if server advertises MCPL capabilities
+        if (connection.capabilities) {
+          const updateParams = this.featureSetManager.initializeServer(
+            config.id,
+            connection.capabilities,
+            {
+              enabledFeatureSets: config.enabledFeatureSets,
+              disabledFeatureSets: config.disabledFeatureSets,
+            },
+          );
+
+          // Inform server which feature sets are enabled/disabled
+          if (updateParams.enabled?.length || updateParams.disabled?.length) {
+            connection.sendFeatureSetsUpdate(updateParams);
+          }
+
+          // Configure scope whitelist/blacklist patterns
+          if (config.scopes) {
+            this.scopeManager.configureAll(config.scopes);
+          }
+
+          // Register stateful feature sets with checkpoint manager (Step 8)
+          if (this.checkpointManager) {
+            const declared = this.featureSetManager.getDeclaredFeatureSets(config.id);
+            if (declared) {
+              for (const [fsName, fsDecl] of Object.entries(declared)) {
+                if (fsDecl.rollback || fsDecl.hostState) {
+                  this.checkpointManager.registerFeatureSet(config.id, fsName, {
+                    hostState: fsDecl.hostState ?? false,
+                    rollback: fsDecl.rollback ?? false,
+                  });
+                }
+              }
+            }
+          }
+        }
+
+        // Wire event listeners for this connection
+        this.wireMcplEvents(connection);
+
+        this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+      } catch (error) {
+        // Fail-open: log and continue with remaining servers
+        const err = error instanceof Error ? error : new Error(String(error));
+        console.error(`Failed to connect MCPL server "${config.id}":`, err.message);
+      }
+    }
+
+    // Discover tools from all connected servers
+    await this.refreshMcplTools();
+  }
+
+  /**
+   * Wire event listeners on an MCPL server connection.
+   * Push events and inference requests are deferred to Steps 6/7.
+   */
+  private wireMcplEvents(connection: McplServerConnection): void {
+    // Handle dynamic feature set changes from server
+    connection.on('feature-sets-changed', (params: FeatureSetsChangedParams) => {
+      this.featureSetManager?.handleFeatureSetsChanged(connection.id, params);
+    });
+
+    // Handle scope elevation requests
+    connection.on('scope-elevate', async (
+      params: ScopeElevateParams,
+      responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
+    ) => {
+      if (this.scopeManager && responder) {
+        try {
+          const result: ScopeElevateResult = await this.scopeManager.handleElevation(params);
+          responder.respond(result);
+        } catch (error) {
+          const err = error instanceof Error ? error : new Error(String(error));
+          responder.respondError(-32603, err.message);
+        }
+      }
+    });
+
+    // Handle push events (Step 6)
+    connection.on('push-event', (
+      params: PushEventParams,
+      responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
+    ) => {
+      this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+    });
+
+    // Handle server-initiated inference requests (Step 6)
+    connection.on('inference-request', async (
+      params: McplInferenceRequestParams,
+      responder?: { id: string | number; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
+    ) => {
+      if (this.inferenceRouter && responder) {
+        await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
+          respond: responder.respond,
+          respondError: responder.respondError,
+          requestId: responder.id,
+        });
+      }
+    });
+
+    // Handle channel registration (Step 7)
+    connection.on('channels-register', async (
+      params: ChannelsRegisterParams,
+      responder?: { respond: (result: unknown) => void },
+    ) => {
+      await this.channelRegistry?.handleRegister(connection.id, params, responder as never);
+    });
+
+    // Handle channel changes (Step 7)
+    connection.on('channels-changed', async (params: ChannelsChangedParams) => {
+      await this.channelRegistry?.handleChanged(connection.id, params);
+    });
+
+    // Handle incoming channel messages (Step 7)
+    connection.on('channels-incoming', (
+      params: ChannelsIncomingParams,
+      responder?: { respond: (result: unknown) => void },
+    ) => {
+      this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
+    });
+
+    // Cleanup on disconnect
+    connection.on('close', () => {
+      this.featureSetManager?.removeServer(connection.id);
+      this.checkpointManager?.removeServer(connection.id);
+      this.emitTrace({ type: 'module:removed', moduleName: `mcpl:${connection.id}` });
+    });
+  }
+
+  /**
+   * Discover tools from all connected MCPL servers and cache them.
+   * Tools are namespaced as `mcpl:{serverId}:{toolName}`.
+   */
+  private async refreshMcplTools(): Promise<void> {
+    if (!this.mcplServerRegistry) return;
+
+    const tools: import('./types/index.js').ToolDefinition[] = [];
+
+    for (const server of this.mcplServerRegistry.getAllServers()) {
+      try {
+        const result = await server.sendToolsList();
+        for (const tool of result.tools) {
+          // MCP tool schemas are generic JSON Schema; cast to membrane's ToolDefinition format
+          const schema = tool.inputSchema as import('./types/index.js').ToolDefinition['inputSchema'];
+          tools.push({
+            name: `mcpl:${server.id}:${tool.name}`,
+            description: tool.description ?? '',
+            inputSchema: schema,
+          });
+        }
+      } catch {
+        // Server may not support tools/list — skip silently
+      }
+    }
+
+    this.mcplTools = tools;
+  }
+
+  /**
+   * Dispatch a tool call to an MCPL server.
+   * Parses `mcpl:{serverId}:{toolName}` and routes accordingly.
+   */
+  private dispatchMcplToolCall(agentName: string, call: ToolCall): void {
+    // Parse mcpl:{serverId}:{toolName}
+    const parts = call.name.split(':');
+    if (parts.length < 3) {
+      this.pushEvent({
+        type: 'tool-result',
+        callId: call.id,
+        agentName,
+        moduleName: 'mcpl',
+        result: { success: false, error: `Invalid MCPL tool name: ${call.name}`, isError: true },
+      });
+      return;
+    }
+
+    const serverId = parts[1];
+    const toolName = parts.slice(2).join(':'); // Handle tool names that contain colons
+    const server = this.mcplServerRegistry!.getServer(serverId);
+
+    if (!server) {
+      this.pushEvent({
+        type: 'tool-result',
+        callId: call.id,
+        agentName,
+        moduleName: `mcpl:${serverId}`,
+        result: { success: false, error: `MCPL server not found: ${serverId}`, isError: true },
+      });
+      return;
+    }
+
+    this.emitTrace({ type: 'tool:started', module: `mcpl:${serverId}`, tool: toolName, callId: call.id });
+    const startTime = Date.now();
+    const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
+
+    // Build state params for stateful tools (Step 8)
+    let stateParams: { state?: unknown; checkpoint?: string } | undefined;
+    if (this.checkpointManager) {
+      const fs = this.checkpointManager.getStatefulFeatureSet(serverId);
+      if (fs) {
+        if (this.checkpointManager.isHostManaged(serverId, fs)) {
+          stateParams = { state: this.checkpointManager.getCurrentState(serverId, fs) };
+        } else {
+          const cp = this.checkpointManager.getCurrentCheckpoint(serverId, fs);
+          if (cp) stateParams = { checkpoint: cp };
+        }
+      }
+    }
+
+    server.sendToolsCall(toolName, args, stateParams)
+      .then((result) => {
+        const durationMs = Date.now() - startTime;
+        this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, durationMs });
+
+        // Record checkpoint from stateful tool response (Step 8)
+        if (result.state && this.checkpointManager) {
+          const fs = this.checkpointManager.getStatefulFeatureSet(serverId);
+          if (fs) {
+            this.checkpointManager.recordCheckpoint(serverId, fs, result.state);
+          }
+        }
+
+        // Convert MCP tool result to framework ToolResult
+        const textContent = result.content
+          ?.filter((c) => c.type === 'text' && c.text)
+          .map((c) => c.text!)
+          .join('\n');
+
+        this.pushEvent({
+          type: 'tool-result',
+          callId: call.id,
+          agentName,
+          moduleName: `mcpl:${serverId}`,
+          result: {
+            success: !result.isError,
+            data: result.isError ? undefined : textContent || undefined,
+            error: result.isError ? (textContent || 'Tool call failed') : undefined,
+            isError: result.isError ?? false,
+          },
+        });
+      })
+      .catch((error) => {
+        const err = error instanceof Error ? error : new Error(String(error));
+        this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: err.message, stack: err.stack });
+
+        this.pushEvent({
+          type: 'tool-result',
+          callId: call.id,
+          agentName,
+          moduleName: `mcpl:${serverId}`,
+          result: { success: false, error: err.message, isError: true },
+        });
+      });
+  }
+
+  /**
+   * Build BeforeInferenceParams from agent state and trigger context.
+   */
+  /**
+   * Dispatch a synthesized channel tool call.
+   */
+  private dispatchChannelToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id });
+    const startTime = Date.now();
+
+    this.channelRegistry!.handleChannelToolCall(call.name, call.input)
+      .then((result) => {
+        const durationMs = Date.now() - startTime;
+        this.emitTrace({ type: 'tool:completed', module: 'channels', tool: call.name, callId: call.id, durationMs });
+        this.pushEvent({
+          type: 'tool-result',
+          callId: call.id,
+          agentName,
+          moduleName: 'channels',
+          result,
+        });
+      })
+      .catch((error) => {
+        const err = error instanceof Error ? error : new Error(String(error));
+        this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error: err.message });
+        this.pushEvent({
+          type: 'tool-result',
+          callId: call.id,
+          agentName,
+          moduleName: 'channels',
+          result: { success: false, error: err.message, isError: true },
+        });
+      });
+  }
+
+  private buildBeforeInferenceParams(agent: Agent, trigger?: InferenceRequest): BeforeInferenceParams {
+    const inferenceId = `${agent.name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    return {
+      inferenceId,
+      conversationId: agent.name, // Simplified; proper conversation tracking TODO
+      turnIndex: 0, // Simplified; needs per-conversation counter TODO
+      userMessage: null, // Could extract from trigger context
+      model: {
+        id: agent.model,
+        vendor: 'unknown',
+        contextWindow: 200000,
+        capabilities: ['tools'],
+      },
+      channels: this.channelRegistry?.buildChannelContext(),
+    };
   }
 }

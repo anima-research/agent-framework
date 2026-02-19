@@ -3,6 +3,7 @@ import type { Membrane } from 'membrane';
 import type { Module, EventResponse } from './module.js';
 import type { AgentConfig, InferenceRequest } from './agent.js';
 import type { ProcessEvent } from './events.js';
+import type { McplServerConfig, InferenceRoutingPolicy } from '../mcpl/types.js';
 
 // Re-export trace types
 export type { TraceEvent, TraceEventListener } from './trace.js';
@@ -55,6 +56,12 @@ export interface FrameworkConfig {
 
   /** Process logging configuration (default: disabled) */
   processLogging?: ProcessLoggingConfig;
+
+  /** MCPL server configurations. If omitted or empty, no MCPL subsystems are created. */
+  mcplServers?: McplServerConfig[];
+
+  /** Inference routing policy for server-initiated inference (optional). */
+  inferenceRouting?: InferenceRoutingPolicy;
 }
 
 /**

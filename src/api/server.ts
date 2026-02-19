@@ -380,7 +380,7 @@ export class ApiServer {
     }
 
     const contextManager = agent.getContextManager();
-    const messages = await contextManager.compile();
+    const { messages } = await contextManager.compile();
 
     const limit = params?.limit ?? 50;
     const offset = params?.offset ?? 0;
@@ -510,7 +510,7 @@ export class ApiServer {
     }
 
     const contextManager = agent.getContextManager();
-    const messages = await contextManager.compile(
+    const { messages } = await contextManager.compile(
       params.maxTokens
         ? { maxTokens: params.maxTokens, reserveForResponse: 4096 }
         : undefined

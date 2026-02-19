@@ -29,6 +29,8 @@ export type ProcessEvent =
   | ModuleEvent
   | ApiMessageEvent
   | ApiInferenceRequestEvent
+  | McplPushEvent
+  | McplChannelIncomingEvent
   | CustomEvent;
 
 /**
@@ -168,6 +170,13 @@ export interface ToolResult {
   error?: string;
   /** Whether this was an error (for LLM) */
   isError?: boolean;
+  /**
+   * When true, the framework saves tool_use + tool_result messages to context,
+   * cancels the active stream, and resets the agent to idle.
+   * This is a "sleep until next event" primitive — the LLM expects the call to block.
+   * Adapted from Anarchid/agent-framework@mcpl-module-proto.
+   */
+  endTurn?: boolean;
 }
 
 /**
@@ -180,5 +189,44 @@ export interface ToolCall {
   name: string;
   /** Tool input */
   input: unknown;
+}
+
+// ============================================================================
+// MCPL Events (Steps 6-7)
+// ============================================================================
+
+/**
+ * Push event from an MCPL server (Section 9).
+ * Converted from wire-format McplContentBlock to membrane ContentBlock.
+ */
+export interface McplPushEvent {
+  type: 'mcpl:push-event';
+  serverId: string;
+  featureSet: string;
+  eventId: string;
+  content: ContentBlock[];
+  origin?: Record<string, unknown>;
+  timestamp: string;
+  inferenceId: string;
+  triggerInference?: boolean;
+  targetAgents?: string[];
+}
+
+/**
+ * Incoming channel message from an MCPL server (Section 14).
+ * Converted from wire-format McplContentBlock to membrane ContentBlock.
+ */
+export interface McplChannelIncomingEvent {
+  type: 'mcpl:channel-incoming';
+  serverId: string;
+  channelId: string;
+  messageId: string;
+  threadId?: string;
+  author: { id: string; name: string };
+  content: ContentBlock[];
+  timestamp: string;
+  metadata?: Record<string, unknown>;
+  triggerInference?: boolean;
+  targetAgents?: string[];
 }
 

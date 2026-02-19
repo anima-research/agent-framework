@@ -5,6 +5,7 @@ import type {
   MessageQuery,
   MessageQueryResult,
   StoredMessage,
+  ContextInjection,
 } from '@connectome/context-manager';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from './events.js';
 
@@ -57,6 +58,15 @@ export interface Module {
     content: ContentBlock[],
     context: SpeechContext
   ): Promise<void>;
+
+  /**
+   * Gather context injections before agent inference.
+   * Called before each inference to collect data (e.g., HUD overlays, game state)
+   * that should be injected into the compiled context.
+   * Complementary to MCPL push-based hooks — modules pull via gatherContext.
+   * Adapted from Anarchid/agent-framework@mcpl-module-proto.
+   */
+  gatherContext?(agentName: string): Promise<ContextInjection[]>;
 }
 
 /**

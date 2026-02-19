@@ -6,6 +6,7 @@ import type {
   MessageQuery,
   MessageQueryResult,
   StoredMessage,
+  ContextInjection,
 } from '@connectome/context-manager';
 import type {
   Module,
@@ -286,6 +287,31 @@ export class ModuleRegistry {
     this.speechHandlers = this.speechHandlers.filter(
       (h) => h.moduleName !== moduleName
     );
+  }
+
+  /**
+   * Gather context injections from all modules before inference.
+   * Calls each module's gatherContext() in parallel with a per-module timeout.
+   * Fail-open: timed-out or erroring modules are skipped silently.
+   * Adapted from Anarchid/agent-framework@mcpl-module-proto.
+   */
+  async gatherContext(agentName: string, timeoutMs = 5000): Promise<ContextInjection[]> {
+    const injections: ContextInjection[] = [];
+    const promises: Promise<void>[] = [];
+
+    for (const module of this.modules.values()) {
+      if (!module.gatherContext) continue;
+
+      const promise = Promise.race([
+        module.gatherContext(agentName).then(r => injections.push(...r)),
+        new Promise<void>((_, rej) => setTimeout(() => rej(new Error('timeout')), timeoutMs)),
+      ]).catch(err => console.error(`[${module.name}] gatherContext:`, err));
+
+      promises.push(promise as Promise<void>);
+    }
+
+    await Promise.all(promises);
+    return injections;
   }
 
   /**
