@@ -460,10 +460,15 @@ export class AgentFramework {
     contextManager: ContextManager;
     cleanup: () => void;
   }> {
-    const namespace = `ephemeral/${config.name}`;
+    // Ephemeral agents get their own isolated store so their messages
+    // don't leak into the parent's shared message store.
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const tempPath = mkdtempSync(join(tmpdir(), `af-ephemeral-${config.name}-`));
+
     const contextManager = await ContextManager.open({
-      store: this.store,
-      namespace,
+      path: join(tempPath, 'store'),
       strategy: config.strategy ?? new PassthroughStrategy(),
       membrane: this.membrane,
     });
@@ -471,8 +476,12 @@ export class AgentFramework {
     const agent = new Agent(config, contextManager, this.membrane);
 
     const cleanup = () => {
-      // Context manager cleanup is minimal — it doesn't own the store
-      // The namespace data remains in Chronicle (harmless, can be GC'd later)
+      try {
+        contextManager.close();
+        rmSync(tempPath, { recursive: true, force: true });
+      } catch {
+        // Best-effort cleanup
+      }
     };
 
     return { agent, contextManager, cleanup };
