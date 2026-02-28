@@ -49,6 +49,11 @@ export type TraceEvent =
       error: string;
       stack?: string;
     })
+  | (TraceEventBase & {
+      type: 'inference:exhausted';
+      agentName: string;
+      error: string;
+    })
 
   // Streaming inference lifecycle
   | (TraceEventBase & {

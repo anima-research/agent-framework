@@ -549,7 +549,11 @@ export class AgentFramework {
             resolve({ speech, toolCallsCount });
             break;
           }
-          case 'inference:failed': {
+          case 'inference:exhausted': {
+            // Retries exhausted — reject only after the error policy gives up.
+            // Earlier inference:failed events are left alone so the framework
+            // retry path in driveStream/startAgentStream can restart the stream
+            // while this listener stays alive.
             const error = (event as { error?: string }).error ?? 'Unknown error';
             cleanup();
             reject(new Error(error));
@@ -1225,8 +1229,15 @@ export class AgentFramework {
       if (action.retry) {
         await new Promise((resolve) => setTimeout(resolve, action.delayMs));
         await this.startAgentStream(agent, trigger, attempt + 1);
-      } else if (action.emit) {
-        this.pushEvent(action.emit);
+      } else {
+        this.emitTrace({
+          type: 'inference:exhausted',
+          agentName: agent.name,
+          error: err.message,
+        });
+        if (action.emit) {
+          this.pushEvent(action.emit);
+        }
       }
     }
   }
@@ -1418,15 +1429,29 @@ export class AgentFramework {
             if (action.retry) {
               await new Promise((resolve) => setTimeout(resolve, action.delayMs));
               await this.startAgentStream(agent, trigger, attempt + 1);
-            } else if (action.emit) {
-              this.pushEvent(action.emit);
+            } else {
+              this.emitTrace({
+                type: 'inference:exhausted',
+                agentName: agent.name,
+                error: err.message,
+              });
+              if (action.emit) {
+                this.pushEvent(action.emit);
+              }
             }
             break;
           }
 
-          case 'aborted':
+          case 'aborted': {
+            const reason = event.reason ?? 'unknown';
             agent.reset();
+            this.emitTrace({
+              type: 'inference:exhausted',
+              agentName: agent.name,
+              error: `Stream aborted: ${reason}`,
+            });
             break;
+          }
 
           case 'usage':
             // Token count updates — could emit trace for UI
@@ -1434,13 +1459,19 @@ export class AgentFramework {
         }
       }
     } catch (error) {
-      // Stream itself threw (unexpected)
+      // Stream itself threw (unexpected) — no retry path here, so also emit
+      // inference:exhausted so ephemeral agent promises can settle.
       const err = error instanceof Error ? error : new Error(String(error));
       this.emitTrace({
         type: 'inference:failed',
         agentName: agent.name,
         error: err.message,
         stack: err.stack,
+      });
+      this.emitTrace({
+        type: 'inference:exhausted',
+        agentName: agent.name,
+        error: err.message,
       });
       agent.reset();
     } finally {
