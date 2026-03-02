@@ -470,6 +470,7 @@ export class AgentFramework {
       isolate: true,
       strategy: config.strategy ?? new PassthroughStrategy(),
       membrane: this.membrane,
+      debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
@@ -861,6 +862,7 @@ export class AgentFramework {
       namespace: `agents/${config.name}`,
       strategy: config.strategy ?? new PassthroughStrategy(),
       membrane: this.membrane,
+      debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
@@ -1454,7 +1456,14 @@ export class AgentFramework {
           }
 
           case 'usage':
-            // Token count updates — could emit trace for UI
+            this.emitTrace({
+              type: 'inference:usage',
+              agentName: agent.name,
+              tokenUsage: {
+                input: event.usage.inputTokens,
+                output: event.usage.outputTokens,
+              },
+            });
             break;
         }
       }

@@ -67,6 +67,11 @@ export type TraceEvent =
       calls: Array<{ id: string; name: string; input?: unknown }>;
     })
   | (TraceEventBase & {
+      type: 'inference:usage';
+      agentName: string;
+      tokenUsage: { input: number; output: number };
+    })
+  | (TraceEventBase & {
       type: 'inference:stream_resumed';
       agentName: string;
     })
