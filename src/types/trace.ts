@@ -76,6 +76,13 @@ export type TraceEvent =
       agentName: string;
     })
   | (TraceEventBase & {
+      type: 'inference:stream_restarted';
+      agentName: string;
+      reason: string;
+      inputTokens: number;
+      budget: number;
+    })
+  | (TraceEventBase & {
       type: 'inference:turn_ended';
       agentName: string;
     })

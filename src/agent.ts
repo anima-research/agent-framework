@@ -31,6 +31,9 @@ export class Agent {
   readonly temperature: number;
 
   private _state: AgentState = { status: 'idle' };
+  private _streamId = 0;
+  lastStreamInputTokens = 0;
+  readonly maxStreamTokens: number;
   private contextManager: ContextManager;
   private membrane: Membrane;
 
@@ -46,6 +49,7 @@ export class Agent {
     this.triggerSources = config.triggerSources ?? 'all';
     this.maxTokens = config.maxTokens ?? 4096;
     this.temperature = config.temperature ?? 1;
+    this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
     this.contextManager = contextManager;
     this.membrane = membrane;
   }
@@ -55,6 +59,14 @@ export class Agent {
    */
   get state(): AgentState {
     return this._state;
+  }
+
+  /**
+   * Monotonically increasing stream generation counter.
+   * Used to guard stale driveStream handlers after a budget restart.
+   */
+  get streamId(): number {
+    return this._streamId;
   }
 
   /**
@@ -255,6 +267,9 @@ export class Agent {
     if (this._state.status !== 'idle') {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
     }
+
+    this._streamId++;
+    this.lastStreamInputTokens = 0;
 
     const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
 

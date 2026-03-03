@@ -986,6 +986,11 @@ export class AgentFramework {
           // Check if any tool result requested endTurn
           const shouldEndTurn = currentState.toolResults.some(tc => tc.result.endTurn);
 
+          // Check if accumulated input tokens exceed the agent's budget
+          const overBudget = currentState.stream
+            && agent.lastStreamInputTokens > 0
+            && agent.lastStreamInputTokens > agent.maxStreamTokens;
+
           if (shouldEndTurn) {
             // endTurn: messages already stored above, cancel stream, reset to idle.
             if (currentState.stream) {
@@ -993,6 +998,22 @@ export class AgentFramework {
             }
             agent.reset();
             this.emitTrace({ type: 'inference:turn_ended', agentName: agent.name });
+          } else if (overBudget) {
+            // Context budget exceeded: break the stream, let compile() compress
+            agent.cancelStream();
+            this.emitTrace({
+              type: 'inference:stream_restarted',
+              agentName: agent.name,
+              reason: 'context_budget',
+              inputTokens: agent.lastStreamInputTokens,
+              budget: agent.maxStreamTokens,
+            });
+            this.pendingRequests.push({
+              agentName: agent.name,
+              reason: 'context_budget_restart',
+              source: 'framework',
+              timestamp: Date.now(),
+            });
           } else if (currentState.stream) {
             // Streaming path: convert results and resume the stream
             const membraneResults = currentState.toolResults.map(tc =>
@@ -1266,6 +1287,7 @@ export class AgentFramework {
   ): Promise<void> {
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
+    const myStreamId = agent.streamId;
     let hadToolCalls = false;
 
     try {
@@ -1438,6 +1460,9 @@ export class AgentFramework {
               durationMs,
             });
 
+            // Only reset + retry if this is still the active stream
+            if (agent.streamId !== myStreamId) break;
+
             agent.reset();
 
             const action = this.errorPolicy.onInferenceError(err, agent.name, attempt);
@@ -1459,16 +1484,21 @@ export class AgentFramework {
 
           case 'aborted': {
             const reason = event.reason ?? 'unknown';
-            agent.reset();
-            this.emitTrace({
-              type: 'inference:exhausted',
-              agentName: agent.name,
-              error: `Stream aborted: ${reason}`,
-            });
+            // Only reset if this is still the active stream (a budget restart
+            // may have already started a new stream, bumping streamId)
+            if (agent.streamId === myStreamId) {
+              agent.reset();
+              this.emitTrace({
+                type: 'inference:exhausted',
+                agentName: agent.name,
+                error: `Stream aborted: ${reason}`,
+              });
+            }
             break;
           }
 
           case 'usage':
+            agent.lastStreamInputTokens = event.usage.inputTokens;
             this.emitTrace({
               type: 'inference:usage',
               agentName: agent.name,

@@ -37,6 +37,10 @@ export interface AgentConfig {
 
   /** Temperature for inference */
   temperature?: number;
+
+  /** Max input tokens before framework breaks a yielding stream and
+   *  restarts with recompiled (compressed) context. Default: 150000. */
+  maxStreamTokens?: number;
 }
 
 /**
