@@ -140,7 +140,7 @@ export class Agent {
     budget?: TokenBudget,
     options: InferenceOptions = {}
   ): Promise<InferenceResult> {
-    return this.runInferenceWithInjections(availableTools, undefined, budget);
+    return this.runInferenceWithInjections(availableTools, undefined, budget, options);
   }
 
   /**
@@ -464,7 +464,7 @@ export class Agent {
           name: block.name,
           input: block.input,
         });
-      } else if (block.type === 'text' || block.type === 'thinking') {
+      } else if (block.type === 'text') {
         speechContent.push(block);
       }
     }
