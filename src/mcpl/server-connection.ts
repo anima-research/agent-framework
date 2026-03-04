@@ -134,19 +134,13 @@ export class McplServerConnection extends EventEmitter {
 
     // Fail fast if the process exits before the handshake completes
     const earlyExitPromise = new Promise<never>((_resolve, reject) => {
-      child.on('error', (err) => reject(new Error(`Failed to spawn MCPL server "${config.id}": ${err.message}`)));
-      child.on('exit', (code) => reject(new Error(`MCPL server "${config.id}" exited before handshake (code ${code})`)));
-    });
-
-    // Log stderr but do not crash
-    if (child.stderr) {
-      const stderrRl = createInterface({ input: child.stderr });
-      stderrRl.on('line', (line) => {
-        // Stderr is emitted as a warning — callers can listen for 'error' if desired
-        // but we intentionally do not crash here.
-        process.stderr.write(`[mcpl:${config.id}:stderr] ${line}\n`);
+      child.on('error', (err) => {
+        reject(new Error(`Failed to spawn MCPL server "${config.id}": ${err.message}`));
       });
-    }
+      child.on('exit', (code) => {
+        reject(new Error(`MCPL server "${config.id}" exited before handshake (code ${code})`));
+      });
+    });
 
     // Set up readline for newline-delimited JSON on stdout
     const rl = createInterface({ input: child.stdout! });
@@ -191,14 +185,16 @@ export class McplServerConnection extends EventEmitter {
               }
             }
           } catch {
-            // Ignore non-JSON lines during handshake
+            // Ignore non-JSON lines (e.g. logback output from Java servers)
           }
         };
         rl.on('line', onLine);
       }),
       earlyExitPromise,
       new Promise<never>((_resolve, reject) =>
-        setTimeout(() => reject(new Error(`MCPL server "${config.id}" initialize handshake timed out`)), INITIALIZE_TIMEOUT_MS),
+        setTimeout(() => {
+          reject(new Error(`MCPL server "${config.id}" initialize handshake timed out`));
+        }, INITIALIZE_TIMEOUT_MS),
       ),
     ]);
 
