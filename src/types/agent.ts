@@ -63,6 +63,18 @@ export interface InferenceResult {
   };
   /** Stop reason */
   stopReason?: string;
+  /** Whether inference was aborted */
+  aborted?: boolean;
+  /** Reason for abort, if available */
+  abortReason?: string;
+}
+
+/**
+ * Options for running inference.
+ */
+export interface InferenceOptions {
+  /** Abort signal for cancellation */
+  signal?: AbortSignal;
 }
 
 /**
@@ -70,7 +82,7 @@ export interface InferenceResult {
  */
 export type AgentState =
   | { status: 'idle' }
-  | { status: 'inferring'; promise: Promise<InferenceResult> }
+  | { status: 'inferring'; promise: Promise<InferenceResult>; abortController: AbortController }
   | { status: 'streaming'; stream: YieldingStream }
   | { status: 'waiting_for_tools'; pending: Map<ToolCallId, PendingToolCall>; completed: CompletedToolCall[]; stream?: YieldingStream }
   | { status: 'ready'; toolResults: CompletedToolCall[]; stream?: YieldingStream };

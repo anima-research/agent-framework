@@ -19,6 +19,7 @@ import type {
   MessageSendParams,
   MessageListParams,
   InferenceRequestParams,
+  InferenceAbortParams,
   BranchCreateParams,
   BranchSwitchParams,
   BranchDeleteParams,
@@ -293,6 +294,8 @@ export class ApiServer {
         return this.cmdMessageList(params as unknown as MessageListParams);
       case 'inference.request':
         return this.cmdInferenceRequest(params as unknown as InferenceRequestParams);
+      case 'inference.abort':
+        return this.cmdInferenceAbort(params as unknown as InferenceAbortParams);
 
       // Branching
       case 'branch.list':
@@ -399,6 +402,15 @@ export class ApiServer {
     } as ProcessEvent);
 
     return { queued: true };
+  }
+
+  private async cmdInferenceAbort(params?: InferenceAbortParams): Promise<{ aborted: boolean }> {
+    if (!params?.agentName) {
+      throw new Error('agentName is required');
+    }
+
+    const aborted = this.framework.abortInference(params.agentName, params.reason);
+    return { aborted };
   }
 
   // ==========================================================================

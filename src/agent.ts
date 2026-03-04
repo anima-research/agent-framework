@@ -1,4 +1,5 @@
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from 'membrane';
+import { isAbortedResponse } from 'membrane';
 
 export interface StartStreamResult {
   stream: YieldingStream;
@@ -16,6 +17,7 @@ import type {
   ToolDefinition,
   AgentInfo,
   InferenceResult,
+  InferenceOptions,
 } from './types/index.js';
 
 /**
@@ -135,7 +137,8 @@ export class Agent {
    */
   async runInference(
     availableTools: ToolDefinition[],
-    budget?: TokenBudget
+    budget?: TokenBudget,
+    options: InferenceOptions = {}
   ): Promise<InferenceResult> {
     return this.runInferenceWithInjections(availableTools, undefined, budget);
   }
@@ -147,7 +150,8 @@ export class Agent {
   async runInferenceWithInjections(
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
-    budget?: TokenBudget
+    budget?: TokenBudget,
+    options?: InferenceOptions
   ): Promise<InferenceResult> {
     if (this._state.status === 'inferring') {
       throw new Error(`Agent ${this.name} is already inferring`);
@@ -181,12 +185,26 @@ export class Agent {
       assistantParticipant: this.name,
     };
 
+    const abortController = new AbortController();
+    if (options?.signal) {
+      if (options.signal.aborted) {
+        abortController.abort();
+      } else {
+        options.signal.addEventListener('abort', () => abortController.abort(), { once: true });
+      }
+    }
+
     // Set state to inferring
-    const inferencePromise = this.doInference(request);
-    this._state = { status: 'inferring', promise: inferencePromise };
+    const inferencePromise = this.doInference(request, abortController.signal);
+    this._state = { status: 'inferring', promise: inferencePromise, abortController };
 
     try {
       const result = await inferencePromise;
+
+      if (result.aborted) {
+        this._state = { status: 'idle' };
+        return result;
+      }
 
       if (result.toolCalls.length > 0) {
         // Waiting for tool results
@@ -390,21 +408,37 @@ export class Agent {
     return this.systemPrompt + '\n' + injectedText.join('\n');
   }
 
-  private async doInference(request: NormalizedRequest): Promise<InferenceResult> {
-    const response = await this.membrane.complete(request);
+  abortInference(reason?: string): boolean {
+    if (this._state.status !== 'inferring') {
+      return false;
+    }
 
-    // Membrane normalizes both native and XML modes to the same block structure.
-    // We receive clean content blocks: text (no XML), tool_use, thinking, etc.
-    const toolCalls = response.toolCalls;
+    this._state.abortController.abort(reason);
+    return true;
+  }
 
-    // Extract speech content - text blocks that should be shown to users.
-    // Thinking blocks are internal reasoning, not speech.
-    // Tool_use blocks are handled separately via toolCalls.
-    const speechContent = response.content.filter(
-      (block): block is ContentBlock & { type: 'text' } => block.type === 'text'
-    );
+  private async doInference(
+    request: NormalizedRequest,
+    signal?: AbortSignal
+  ): Promise<InferenceResult> {
+    const response = await this.membrane.stream(request, { signal });
 
-    // Add assistant response to context (store full response including tool calls)
+    if (isAbortedResponse(response)) {
+      const partialContent = response.partialContent ?? [];
+      const { toolCalls, speechContent } = this.extractToolCallsAndSpeech(partialContent);
+      return {
+        toolCalls,
+        speechContent,
+        usage: response.partialUsage,
+        stopReason: 'abort',
+        aborted: true,
+        abortReason: response.reason,
+      };
+    }
+
+    const { toolCalls, speechContent } = this.extractToolCallsAndSpeech(response.content);
+
+    // Add assistant response to context
     this.contextManager.addMessage(this.name, response.content);
 
     return {
@@ -414,6 +448,28 @@ export class Agent {
       usage: response.usage,
       stopReason: response.stopReason,
     };
+  }
+
+  private extractToolCallsAndSpeech(content: ContentBlock[]): {
+    toolCalls: ToolCall[];
+    speechContent: ContentBlock[];
+  } {
+    const toolCalls: ToolCall[] = [];
+    const speechContent: ContentBlock[] = [];
+
+    for (const block of content) {
+      if (block.type === 'tool_use') {
+        toolCalls.push({
+          id: block.id,
+          name: block.name,
+          input: block.input,
+        });
+      } else if (block.type === 'text' || block.type === 'thinking') {
+        speechContent.push(block);
+      }
+    }
+
+    return { toolCalls, speechContent };
   }
 
   private buildToolResultMessages(results: CompletedToolCall[]): NormalizedMessage[] {

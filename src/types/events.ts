@@ -21,6 +21,7 @@ export type ToolDefinition = MembraneToolDefinition;
  */
 export type ProcessEvent =
   | ExternalMessageEvent
+  | ToolCallEvent
   | ToolResultEvent
   | TimerFiredEvent
   | InferenceRequestEvent
@@ -93,6 +94,23 @@ export interface ToolResultEvent {
   moduleName: string;
   /** Result of the tool call */
   result: ToolResult;
+}
+
+/**
+ * Tool call scheduled for execution.
+ */
+export interface ToolCallEvent {
+  type: 'tool-call';
+  /** ID of the tool call */
+  callId: ToolCallId;
+  /** Agent that made the call */
+  agentName: string;
+  /** Module that will handle the call */
+  moduleName: string;
+  /** Un-prefixed tool name */
+  toolName: string;
+  /** Full tool call payload */
+  call: ToolCall;
 }
 
 /**

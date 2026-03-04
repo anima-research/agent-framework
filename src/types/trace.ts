@@ -44,6 +44,12 @@ export type TraceEvent =
       tokenUsage?: { input: number; output: number; cacheCreation?: number; cacheRead?: number };
     })
   | (TraceEventBase & {
+      type: 'inference:aborted';
+      agentName: string;
+      durationMs: number;
+      reason?: string;
+    })
+  | (TraceEventBase & {
       type: 'inference:failed';
       agentName: string;
       error: string;

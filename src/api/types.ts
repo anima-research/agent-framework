@@ -63,6 +63,7 @@ export type ApiCommand =
   | 'message.send'
   | 'message.list'
   | 'inference.request'
+  | 'inference.abort'
   // Branching
   | 'branch.list'
   | 'branch.create'
@@ -116,6 +117,13 @@ export interface InferenceRequestParams {
   /** Agent to run inference for (or all if not specified) */
   agentName?: string;
   /** Reason for the request */
+  reason?: string;
+}
+
+export interface InferenceAbortParams {
+  /** Agent to abort inference for */
+  agentName: string;
+  /** Optional reason for abort */
   reason?: string;
 }
 
@@ -352,6 +360,7 @@ export type ApiEventType =
   | 'process:completed'
   | 'inference:started'
   | 'inference:completed'
+  | 'inference:aborted'
   | 'inference:failed'
   | 'tool:started'
   | 'tool:completed'
@@ -383,6 +392,12 @@ export interface InferenceStartEvent {
 export interface InferenceCompleteEvent {
   agentName: string;
   durationMs: number;
+}
+
+export interface InferenceAbortedEvent {
+  agentName: string;
+  durationMs: number;
+  reason?: string;
 }
 
 export interface InferenceErrorEvent {
