@@ -335,7 +335,7 @@ export class ChannelRegistry {
           .join('\n');
         triggerInference = this.shouldTriggerInference(
           textContent,
-          message.metadata ?? {},
+          { ...message.metadata, eventType: 'channel:incoming' },
         );
       }
 
