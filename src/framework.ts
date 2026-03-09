@@ -67,6 +67,23 @@ import type { ContextInjection } from '@connectome/context-manager';
 const FRAMEWORK_STATE_ID = 'framework/state';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
+const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints';
+
+/** Maximum number of turn checkpoints to keep per agent. */
+const MAX_TURN_CHECKPOINTS = 20;
+
+interface TurnCheckpoint {
+  agentName: string;
+  turnIndex: number;
+  sequenceBefore: number;
+  branchName: string;
+  timestamp: number;
+}
+
+interface RedoEntry {
+  branchName: string;
+  checkpoint: TurnCheckpoint;
+}
 
 /**
  * Default inference policy - infer if any request exists for the agent.
@@ -120,6 +137,10 @@ export class AgentFramework {
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
+
+  // Undo/redo state
+  private turnCounters: Map<string, number> = new Map(); // agentName → next turnIndex
+  private redoStacks: Map<string, RedoEntry[]> = new Map(); // agentName → redo entries
 
   // MCPL subsystems (null when no mcplServers configured)
   private mcplServerRegistry: McplServerRegistry | null = null;
@@ -202,6 +223,12 @@ export class AgentFramework {
         deltaSnapshotEvery: 100,
         fullSnapshotEvery: 20,
       });
+    } catch {
+      // Already registered
+    }
+
+    try {
+      store.registerState({ id: TURN_CHECKPOINTS_ID, strategy: 'snapshot' });
     } catch {
       // Already registered
     }
@@ -863,6 +890,180 @@ export class AgentFramework {
     return result.entries;
   }
 
+  // ==========================================================================
+  // Undo / Redo
+  // ==========================================================================
+
+  /**
+   * Undo the last inference turn for an agent.
+   *
+   * Creates a new branch at the Chronicle sequence recorded before that turn
+   * and switches to it, atomically rolling back all state (messages, context
+   * log, inference log, MCPL checkpoints).
+   *
+   * The undone branch is saved so `redo()` can restore it.
+   * Returns the checkpoint that was undone, or null if nothing to undo.
+   */
+  undoLastTurn(agentName: string): {
+    undone: boolean;
+    turnIndex?: number;
+    fromBranch?: string;
+    toBranch?: string;
+  } {
+    const agent = this.agents.get(agentName);
+    if (!agent) {
+      throw new Error(`Unknown agent: ${agentName}`);
+    }
+    if (agent.state.status !== 'idle') {
+      throw new Error(`Cannot undo while agent is ${agent.state.status}`);
+    }
+
+    const checkpoints = this.getTurnCheckpoints(agentName);
+    if (checkpoints.length === 0) {
+      return { undone: false };
+    }
+
+    const checkpoint = checkpoints.pop()!;
+    this.saveTurnCheckpoints(agentName, checkpoints);
+
+    const currentBranch = this.store.currentBranch();
+    const undoBranchName = `undo/${agentName}/${checkpoint.turnIndex}-${Date.now()}`;
+
+    this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
+    this.store.switchBranch(undoBranchName);
+
+    // Push onto redo stack
+    let redoStack = this.redoStacks.get(agentName);
+    if (!redoStack) {
+      redoStack = [];
+      this.redoStacks.set(agentName, redoStack);
+    }
+    redoStack.push({ branchName: currentBranch.name, checkpoint });
+
+    this.emitTrace({
+      type: 'undo:completed',
+      agentName,
+      turnIndex: checkpoint.turnIndex,
+      fromBranch: currentBranch.name,
+      toBranch: undoBranchName,
+    });
+
+    return {
+      undone: true,
+      turnIndex: checkpoint.turnIndex,
+      fromBranch: currentBranch.name,
+      toBranch: undoBranchName,
+    };
+  }
+
+  /**
+   * Redo a previously undone turn for an agent.
+   *
+   * Switches back to the branch that was active before the last undo.
+   * Returns false if there's nothing to redo.
+   */
+  redo(agentName: string): {
+    redone: boolean;
+    fromBranch?: string;
+    toBranch?: string;
+  } {
+    const agent = this.agents.get(agentName);
+    if (!agent) {
+      throw new Error(`Unknown agent: ${agentName}`);
+    }
+    if (agent.state.status !== 'idle') {
+      throw new Error(`Cannot redo while agent is ${agent.state.status}`);
+    }
+
+    const redoStack = this.redoStacks.get(agentName);
+    if (!redoStack || redoStack.length === 0) {
+      return { redone: false };
+    }
+
+    const { branchName, checkpoint } = redoStack.pop()!;
+    const currentBranch = this.store.currentBranch();
+
+    this.store.switchBranch(branchName);
+
+    // Restore the checkpoint
+    const checkpoints = this.getTurnCheckpoints(agentName);
+    checkpoints.push(checkpoint);
+    this.saveTurnCheckpoints(agentName, checkpoints);
+
+    this.emitTrace({
+      type: 'redo:completed',
+      agentName,
+      fromBranch: currentBranch.name,
+      toBranch: branchName,
+    });
+
+    return {
+      redone: true,
+      fromBranch: currentBranch.name,
+      toBranch: branchName,
+    };
+  }
+
+  /**
+   * Check if undo/redo is available for an agent.
+   */
+  getUndoRedoState(agentName: string): {
+    canUndo: boolean;
+    canRedo: boolean;
+    undoDepth: number;
+    redoDepth: number;
+  } {
+    const checkpoints = this.getTurnCheckpoints(agentName);
+    const redoStack = this.redoStacks.get(agentName);
+    return {
+      canUndo: checkpoints.length > 0,
+      canRedo: (redoStack?.length ?? 0) > 0,
+      undoDepth: checkpoints.length,
+      redoDepth: redoStack?.length ?? 0,
+    };
+  }
+
+  // ==========================================================================
+  // Turn checkpoint internals
+  // ==========================================================================
+
+  private recordTurnCheckpoint(agentName: string): void {
+    const turnIndex = this.turnCounters.get(agentName) ?? 0;
+    this.turnCounters.set(agentName, turnIndex + 1);
+
+    const checkpoint: TurnCheckpoint = {
+      agentName,
+      turnIndex,
+      sequenceBefore: this.store.currentSequence(),
+      branchName: this.store.currentBranch().name,
+      timestamp: Date.now(),
+    };
+
+    const checkpoints = this.getTurnCheckpoints(agentName);
+    checkpoints.push(checkpoint);
+
+    // Trim to max depth
+    if (checkpoints.length > MAX_TURN_CHECKPOINTS) {
+      checkpoints.splice(0, checkpoints.length - MAX_TURN_CHECKPOINTS);
+    }
+
+    this.saveTurnCheckpoints(agentName, checkpoints);
+  }
+
+  private getTurnCheckpoints(agentName: string): TurnCheckpoint[] {
+    const data = this.store.getStateJson(TURN_CHECKPOINTS_ID);
+    if (!data || typeof data !== 'object') return [];
+    const allCheckpoints = data as Record<string, TurnCheckpoint[]>;
+    return Array.isArray(allCheckpoints[agentName]) ? [...allCheckpoints[agentName]] : [];
+  }
+
+  private saveTurnCheckpoints(agentName: string, checkpoints: TurnCheckpoint[]): void {
+    const data = this.store.getStateJson(TURN_CHECKPOINTS_ID);
+    const allCheckpoints = (data && typeof data === 'object' ? data : {}) as Record<string, TurnCheckpoint[]>;
+    allCheckpoints[agentName] = checkpoints;
+    this.store.setStateJson(TURN_CHECKPOINTS_ID, allCheckpoints);
+  }
+
   /**
    * Run until the queue is empty and all agents are idle.
    * Useful for testing.
@@ -1260,6 +1461,12 @@ export class AgentFramework {
   }
 
   private async startAgentStream(agent: Agent, trigger?: InferenceRequest, attempt = 0): Promise<void> {
+    // Record turn checkpoint before inference (only on first attempt, not retries)
+    if (attempt === 0) {
+      this.recordTurnCheckpoint(agent.name);
+      this.redoStacks.delete(agent.name); // new work invalidates redo
+    }
+
     this.emitTrace({ type: 'inference:started', agentName: agent.name });
 
     try {

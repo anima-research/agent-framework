@@ -136,6 +136,21 @@ export type TraceEvent =
       type: 'message:added';
       messageId: string;
       source: string;
+    })
+
+  // Undo/redo lifecycle
+  | (TraceEventBase & {
+      type: 'undo:completed';
+      agentName: string;
+      turnIndex: number;
+      fromBranch: string;
+      toBranch: string;
+    })
+  | (TraceEventBase & {
+      type: 'redo:completed';
+      agentName: string;
+      fromBranch: string;
+      toBranch: string;
     });
 
 /**
