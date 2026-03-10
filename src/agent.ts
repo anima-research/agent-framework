@@ -33,6 +33,7 @@ export class Agent {
   readonly temperature: number;
 
   private _state: AgentState = { status: 'idle' };
+  private _inferenceStartedAt = 0;
   private _streamId = 0;
   lastStreamInputTokens = 0;
   maxStreamTokens: number;
@@ -195,6 +196,7 @@ export class Agent {
     }
 
     // Set state to inferring
+    this._inferenceStartedAt = Date.now();
     const inferencePromise = this.doInference(request, abortController.signal);
     this._state = { status: 'inferring', promise: inferencePromise, abortController };
 
@@ -287,6 +289,7 @@ export class Agent {
     }
 
     this._streamId++;
+    this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
 
     const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
@@ -408,16 +411,18 @@ export class Agent {
     return this.systemPrompt + '\n' + injectedText.join('\n');
   }
 
-  abortInference(reason?: string): boolean {
+  abortInference(reason?: string): { aborted: true; durationMs: number } | false {
     if (this._state.status === 'inferring') {
+      const durationMs = Date.now() - this._inferenceStartedAt;
       this._state.abortController.abort(reason);
-      return true;
+      return { aborted: true, durationMs };
     }
 
     if (this._state.status === 'streaming' ||
         (this._state.status === 'waiting_for_tools' && this._state.stream)) {
+      const durationMs = Date.now() - this._inferenceStartedAt;
       this.cancelStream();
-      return true;
+      return { aborted: true, durationMs };
     }
 
     return false;
