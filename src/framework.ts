@@ -438,11 +438,11 @@ export class AgentFramework {
     if (!agent) {
       return false;
     }
-    const aborted = agent.abortInference(reason);
-    if (aborted) {
-      this.emitTrace({ type: 'inference:aborted', agentName, reason });
+    const result = agent.abortInference(reason);
+    if (result) {
+      this.emitTrace({ type: 'inference:aborted', agentName, reason, durationMs: result.durationMs });
     }
-    return aborted;
+    return !!result;
   }
 
   /**
@@ -1978,15 +1978,15 @@ export class AgentFramework {
     this.emitTrace({
       type: 'tool:started',
       module: moduleName,
-      tool: enrichedCall.name,
-      callId: enrichedCall.id,
-      input: enrichedCall.input,
+      tool: call.name,
+      callId: call.id,
+      input: call.input,
     });
 
     const startTime = Date.now();
 
     this.moduleRegistry
-      .handleToolCall(enrichedCall)
+      .handleToolCall(call)
       .then((result) => {
         const durationMs = Date.now() - startTime;
         this.emitTrace({
