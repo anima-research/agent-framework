@@ -62,12 +62,19 @@ interface PendingRequest {
  *
  * Events emitted:
  * - `'push-event'`        — Server sent `push/event`
+ * - `'state-update'`      — Server sent `state/update`
+ * - `'state-get'`         — Server sent `state/get`
  * - `'inference-request'`  — Server sent `inference/request`
  * - `'scope-elevate'`      — Server sent `scope/elevate`
  * - `'channels-register'`  — Server sent `channels/register`
  * - `'channels-changed'`   — Server sent `channels/changed`
  * - `'channels-incoming'`  — Server sent `channels/incoming`
  * - `'feature-sets-changed'` — Server sent `featureSets/changed`
+ * - `'branches-list'`     — Server sent `branches/list`
+ * - `'branches-current'`  — Server sent `branches/current`
+ * - `'branches-create'`   — Server sent `branches/create`
+ * - `'branches-switch'`   — Server sent `branches/switch`
+ * - `'branches-delete'`   — Server sent `branches/delete`
  * - `'error'`              — Connection-level error
  * - `'close'`              — Connection closed
  */
@@ -400,6 +407,11 @@ export class McplServerConnection extends EventEmitter {
     this.sendNotification(McplMethod.ChannelsTyping, { channelId });
   }
 
+  /** Send `branches/changed` notification. */
+  sendBranchesChanged(params: import('./types.js').BranchesChangedParams): void {
+    this.sendNotification(McplMethod.BranchesChanged, params as unknown as Record<string, unknown>);
+  }
+
   // ==========================================================================
   // Standard MCP methods
   // ==========================================================================
@@ -564,12 +576,19 @@ export class McplServerConnection extends EventEmitter {
    */
   private static readonly METHOD_TO_EVENT: Record<string, string> = {
     [McplMethod.PushEvent]: 'push-event',
+    [McplMethod.StateUpdate]: 'state-update',
+    [McplMethod.StateGet]: 'state-get',
     [McplMethod.InferenceRequest]: 'inference-request',
     [McplMethod.ScopeElevate]: 'scope-elevate',
     [McplMethod.ChannelsRegister]: 'channels-register',
     [McplMethod.ChannelsChanged]: 'channels-changed',
     [McplMethod.ChannelsIncoming]: 'channels-incoming',
     [McplMethod.FeatureSetsChanged]: 'feature-sets-changed',
+    [McplMethod.BranchesList]: 'branches-list',
+    [McplMethod.BranchesCurrent]: 'branches-current',
+    [McplMethod.BranchesCreate]: 'branches-create',
+    [McplMethod.BranchesSwitch]: 'branches-switch',
+    [McplMethod.BranchesDelete]: 'branches-delete',
     'notifications/tools/list_changed': 'tools-list-changed',
   };
 
