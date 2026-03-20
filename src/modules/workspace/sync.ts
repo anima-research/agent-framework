@@ -1,0 +1,278 @@
+/**
+ * Sync logic between filesystem and Chronicle tree state.
+ *
+ * Two directions:
+ * - syncFromFs: filesystem → Chronicle (user changes)
+ * - materializeToFs: Chronicle → filesystem (agent changes)
+ */
+
+import { createHash } from 'node:crypto';
+import { readFile, writeFile, mkdir, readdir, stat, access } from 'node:fs/promises';
+import { join, dirname, relative } from 'node:path';
+import type { JsStore, JsTreeEntry } from 'chronicle';
+import type { MountState } from './types.js';
+
+const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+
+/**
+ * Hash file content to a hex string (SHA-256, first 16 chars).
+ */
+export function hashContent(content: string | Buffer): string {
+  const hash = createHash('sha256');
+  hash.update(content);
+  return hash.digest('hex').slice(0, 16);
+}
+
+/**
+ * Check if content appears to be binary.
+ */
+function isBinary(buffer: Buffer): boolean {
+  // Check for null bytes in first 8KB
+  const check = buffer.subarray(0, 8192);
+  for (let i = 0; i < check.length; i++) {
+    if (check[i] === 0) return true;
+  }
+  return false;
+}
+
+export interface SyncResult {
+  /** Paths that were synced */
+  synced: string[];
+  /** Paths that conflicted (both agent and user modified) */
+  conflicts: string[];
+  /** Paths that were skipped (binary, too large, etc.) */
+  skipped: string[];
+}
+
+/**
+ * Sync filesystem changes into Chronicle tree state.
+ *
+ * @param store Chronicle store
+ * @param mount Mount state
+ * @param paths Specific paths to sync (relative to mount). If empty, walks the directory.
+ * @returns Sync result with synced/conflicted/skipped paths
+ */
+export async function syncFromFs(
+  store: JsStore,
+  mount: MountState,
+  paths?: string[],
+): Promise<SyncResult> {
+  const result: SyncResult = { synced: [], conflicts: [], skipped: [] };
+  const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
+
+  const filesToSync = paths ?? await walkDirectory(mount.config.path, mount.config.ignore ?? []);
+
+  for (const relativePath of filesToSync) {
+    const absolutePath = join(mount.config.path, relativePath);
+
+    try {
+      await access(absolutePath);
+    } catch {
+      // File was deleted on disk — remove from tree
+      const existing = store.treeGet(mount.treeStateId, relativePath);
+      if (existing) {
+        store.treeRemove(mount.treeStateId, relativePath);
+        result.synced.push(relativePath);
+      }
+      continue;
+    }
+
+    try {
+      const fileStat = await stat(absolutePath);
+      if (!fileStat.isFile()) continue;
+      if (fileStat.size > maxSize) {
+        result.skipped.push(relativePath);
+        continue;
+      }
+
+      const buffer = await readFile(absolutePath);
+      if (isBinary(buffer)) {
+        result.skipped.push(relativePath);
+        continue;
+      }
+
+      const content = buffer.toString('utf-8');
+      const hash = hashContent(content);
+
+      // Check current tree state
+      const existing = store.treeGet(mount.treeStateId, relativePath);
+
+      if (existing && existing.blobHash === hash) {
+        // No change
+        continue;
+      }
+
+      // Store blob and update tree
+      const blobHash = store.storeBlob(Buffer.from(content, 'utf-8'), 'text/plain');
+      const entry: JsTreeEntry = {
+        blobHash,
+        size: buffer.length,
+        mode: 0o644,
+      };
+
+      // Check if agent also modified this path since last materialization
+      if (existing && existing.blobHash !== hash) {
+        // Both changed — check if agent changed it too by comparing against
+        // what was last materialized. If existing differs from what we materialized,
+        // agent changed it, so it's a conflict.
+        // For now, filesystem always wins — mark as conflict for notification.
+        result.conflicts.push(relativePath);
+      }
+
+      store.treeSet(mount.treeStateId, relativePath, entry);
+      result.synced.push(relativePath);
+    } catch {
+      result.skipped.push(relativePath);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Materialize Chronicle tree state to filesystem.
+ *
+ * @param store Chronicle store
+ * @param mount Mount state
+ * @param paths Specific paths to materialize. If undefined, materializes all changed since last.
+ * @returns List of paths that were written
+ */
+export async function materializeToFs(
+  store: JsStore,
+  mount: MountState,
+  paths?: string[],
+): Promise<string[]> {
+  if (mount.config.mode === 'read-only') {
+    return [];
+  }
+
+  const written: string[] = [];
+
+  // Get changed files since last materialization
+  const currentSeq = store.currentSequence();
+  let filesToMaterialize: Array<{ path: string; blobHash: string }>;
+
+  if (paths) {
+    // Materialize specific paths
+    filesToMaterialize = [];
+    for (const p of paths) {
+      const entry = store.treeGet(mount.treeStateId, p);
+      if (entry) {
+        filesToMaterialize.push({ path: p, blobHash: entry.blobHash });
+      }
+    }
+  } else if (mount.lastMaterializedSeq > 0) {
+    // Diff since last materialization
+    const changes = store.treeDiff(
+      mount.treeStateId,
+      mount.lastMaterializedSeq,
+      currentSeq,
+    );
+    filesToMaterialize = changes
+      .filter(c => c.changeType === 'added' || c.changeType === 'modified')
+      .map(c => ({
+        path: c.path,
+        blobHash: (c.entry ?? c.newEntry)!.blobHash,
+      }));
+
+    // Handle removals
+    for (const change of changes) {
+      if (change.changeType === 'removed') {
+        // Don't delete from filesystem — just skip.
+        // Agent removing from tree doesn't mean delete user's file.
+      }
+    }
+  } else {
+    // First materialization — materialize everything
+    const entries = store.treeList(mount.treeStateId);
+    filesToMaterialize = entries.map(e => ({
+      path: e.path,
+      blobHash: e.blobHash,
+    }));
+  }
+
+  for (const { path: relativePath, blobHash } of filesToMaterialize) {
+    const absolutePath = join(mount.config.path, relativePath);
+    const blob = store.getBlob(blobHash);
+    if (!blob) continue;
+
+    // Create parent directories
+    await mkdir(dirname(absolutePath), { recursive: true });
+
+    // Write file
+    await writeFile(absolutePath, blob);
+    written.push(relativePath);
+  }
+
+  mount.lastMaterializedSeq = currentSeq;
+
+  return written;
+}
+
+/**
+ * Walk a directory recursively, respecting ignore patterns.
+ */
+async function walkDirectory(
+  basePath: string,
+  ignorePatterns: string[],
+): Promise<string[]> {
+  const results: string[] = [];
+  const maxFiles = 5000; // Safety limit
+
+  async function walk(dir: string) {
+    if (results.length >= maxFiles) return;
+
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (results.length >= maxFiles) break;
+
+      const fullPath = join(dir, entry.name);
+      const relativePath = relative(basePath, fullPath);
+
+      // Check ignore patterns (simple glob matching)
+      if (shouldIgnore(relativePath, entry.name, ignorePatterns)) continue;
+
+      if (entry.isFile()) {
+        results.push(relativePath);
+      } else if (entry.isDirectory()) {
+        await walk(fullPath);
+      }
+    }
+  }
+
+  await walk(basePath);
+  return results;
+}
+
+/**
+ * Simple ignore pattern matching.
+ */
+function shouldIgnore(
+  relativePath: string,
+  name: string,
+  patterns: string[],
+): boolean {
+  for (const pattern of patterns) {
+    // Exact name match (e.g., ".git", "node_modules")
+    if (pattern === name) return true;
+
+    // Simple ** glob: "node_modules/**" matches anything under node_modules
+    if (pattern.endsWith('/**')) {
+      const prefix = pattern.slice(0, -3);
+      if (relativePath.startsWith(prefix + '/') || relativePath === prefix) return true;
+    }
+
+    // Extension glob: "*.pyc" matches any .pyc file
+    if (pattern.startsWith('*.')) {
+      const ext = pattern.slice(1);
+      if (name.endsWith(ext)) return true;
+    }
+  }
+  return false;
+}

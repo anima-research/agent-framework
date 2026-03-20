@@ -110,7 +110,7 @@ return {
 **Built-in modules:**
 - **DiscordModule** - Discord bot integration (messages, reactions, threads, typing indicators)
 - **ApiModule** - WebSocket API event processing
-- **FilesModule** - File editing with Chronicle branch support
+- **WorkspaceModule** - Mountable filesystem abstraction with Chronicle tree state, filesystem watching, and materialization
 
 ### Event Processing
 
