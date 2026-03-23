@@ -7,7 +7,7 @@
 
 import { createHash } from 'node:crypto';
 import { readFile, stat, access } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { JsStore } from 'chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
@@ -90,6 +90,7 @@ export class WorkspaceModule implements Module {
         suppressedPaths: new Set(),
         initialSyncDone: false,
         lastMaterializedBranchId: null,
+        materializedHashes: new Map(),
       };
       this.mounts.set(mount.name, mountState);
     }
@@ -128,7 +129,7 @@ export class WorkspaceModule implements Module {
         type: 'workspace:mounted',
         mount: name,
         path: mount.config.path,
-      } as unknown as ProcessEvent);
+      } as ProcessEvent);
     }
   }
 
@@ -148,7 +149,7 @@ export class WorkspaceModule implements Module {
 
     // Stop watchers
     for (const watcher of this.watchers.values()) {
-      watcher.stop();
+      await watcher.stop();
     }
     this.watchers.clear();
     this.ctx = null;
@@ -329,6 +330,14 @@ export class WorkspaceModule implements Module {
     if (!mount) {
       throw new Error(`Unknown mount: "${mountName}". Available: ${[...this.mounts.keys()].join(', ')}`);
     }
+
+    // Path traversal guard (CWE-22): ensure resolved path stays within mount
+    const resolved = resolve(mount.config.path, relativePath);
+    const mountRoot = mount.config.path.endsWith('/') ? mount.config.path : mount.config.path + '/';
+    if (resolved !== mount.config.path && !resolved.startsWith(mountRoot)) {
+      throw new Error(`Path traversal detected: "${path}" resolves outside mount "${mountName}"`);
+    }
+
     return { mount, relativePath };
   }
 
@@ -748,16 +757,20 @@ export class WorkspaceModule implements Module {
 
     const allWritten: Array<{ mount: string; path: string }> = [];
 
-    const mountsToMaterialize = input.mount
-      ? [{ name: input.mount, mount: this.mounts.get(input.mount)! }]
-      : [...this.mounts.entries()]
-          .filter(([, m]) => m.config.mode === 'read-write')
-          .map(([name, mount]) => ({ name, mount }));
-
-    for (const { name, mount } of mountsToMaterialize) {
-      if (!mount) {
+    let mountsToMaterialize: Array<{ name: string; mount: MountState }>;
+    if (input.mount) {
+      const m = this.mounts.get(input.mount);
+      if (!m) {
         return { success: false, error: `Unknown mount: ${input.mount}`, isError: true };
       }
+      mountsToMaterialize = [{ name: input.mount, mount: m }];
+    } else {
+      mountsToMaterialize = [...this.mounts.entries()]
+        .filter(([, m]) => m.config.mode === 'read-write')
+        .map(([name, mount]) => ({ name, mount }));
+    }
+
+    for (const { name, mount } of mountsToMaterialize) {
 
       const paths = input.path
         ? [this.parsePath(`${name}/${input.path}`).relativePath]
@@ -791,14 +804,18 @@ export class WorkspaceModule implements Module {
     const store = this.getStore();
     const allResults: Array<{ mount: string; synced: string[]; conflicts: string[] }> = [];
 
-    const mountsToSync = input.mount
-      ? [{ name: input.mount, mount: this.mounts.get(input.mount)! }]
-      : [...this.mounts.entries()].map(([name, mount]) => ({ name, mount }));
-
-    for (const { name, mount } of mountsToSync) {
-      if (!mount) {
+    let mountsToSync: Array<{ name: string; mount: MountState }>;
+    if (input.mount) {
+      const m = this.mounts.get(input.mount);
+      if (!m) {
         return { success: false, error: `Unknown mount: ${input.mount}`, isError: true };
       }
+      mountsToSync = [{ name: input.mount, mount: m }];
+    } else {
+      mountsToSync = [...this.mounts.entries()].map(([name, mount]) => ({ name, mount }));
+    }
+
+    for (const { name, mount } of mountsToSync) {
 
       const paths = input.path
         ? [this.parsePath(`${name}/${input.path}`).relativePath]
@@ -820,7 +837,7 @@ export class WorkspaceModule implements Module {
               ? result.conflicts.map(p => `${name}/${p}`)
               : undefined,
           };
-          this.ctx.pushEvent(event as unknown as ProcessEvent);
+          this.ctx.pushEvent(event as ProcessEvent);
         }
       }
     }
@@ -896,11 +913,37 @@ export class WorkspaceModule implements Module {
  * Convert a glob pattern to a RegExp.
  */
 function globToRegex(pattern: string): RegExp {
-  let regex = pattern
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape special regex chars
+  // Split pattern into segments, handling {a,b,c} alternation
+  let regex = '';
+  let i = 0;
+  while (i < pattern.length) {
+    if (pattern[i] === '{') {
+      const closeIdx = pattern.indexOf('}', i);
+      if (closeIdx > i) {
+        const alternatives = pattern.slice(i + 1, closeIdx).split(',');
+        regex += '(?:' + alternatives.map(a => globPartToRegex(a)).join('|') + ')';
+        i = closeIdx + 1;
+        continue;
+      }
+    }
+    // Accumulate non-brace characters, convert as a chunk
+    let chunk = '';
+    while (i < pattern.length && pattern[i] !== '{') {
+      chunk += pattern[i];
+      i++;
+    }
+    if (chunk) {
+      regex += globPartToRegex(chunk);
+    }
+  }
+  return new RegExp(`^${regex}$`);
+}
+
+function globPartToRegex(part: string): string {
+  return part
+    .replace(/[.+^$()|[\]\\]/g, '\\$&')
     .replace(/\*\*/g, '__DOUBLESTAR__')
     .replace(/\*/g, '[^/]*')
     .replace(/__DOUBLESTAR__/g, '.*')
     .replace(/\?/g, '[^/]');
-  return new RegExp(`^${regex}$`);
 }

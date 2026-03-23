@@ -71,7 +71,7 @@ export class MountWatcher {
   /**
    * Stop watching.
    */
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
@@ -84,7 +84,7 @@ export class MountWatcher {
     this.pendingChanges.clear();
 
     if (this.watcher) {
-      this.watcher.close();
+      await this.watcher.close();
       this.watcher = null;
     }
   }

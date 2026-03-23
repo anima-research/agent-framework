@@ -67,6 +67,8 @@ export interface MountState {
   initialSyncDone: boolean;
   /** Branch ID that was active when this mount last materialized */
   lastMaterializedBranchId: string | null;
+  /** Per-file hash at time of last materialization — baseline for conflict detection */
+  materializedHashes: Map<string, string>;
 }
 
 /**
@@ -173,17 +175,20 @@ export interface WorkspaceChangedEvent {
   paths: string[];
   mount: string;
   conflicts?: string[];
+  [key: string]: unknown;
 }
 
 export interface WorkspaceMountedEvent {
   type: 'workspace:mounted';
   mount: string;
   path: string;
+  [key: string]: unknown;
 }
 
 export interface WorkspaceUnmountedEvent {
   type: 'workspace:unmounted';
   mount: string;
+  [key: string]: unknown;
 }
 
 export type WorkspaceEvent =

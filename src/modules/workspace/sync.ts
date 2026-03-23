@@ -15,12 +15,13 @@ import type { MountState } from './types.js';
 const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
 
 /**
- * Hash file content to a hex string (SHA-256, first 16 chars).
+ * Hash file content to a full SHA-256 hex string.
+ * Must match Chronicle's storeBlob() hash format (64-char hex).
  */
 export function hashContent(content: string | Buffer): string {
   const hash = createHash('sha256');
   hash.update(content);
-  return hash.digest('hex').slice(0, 16);
+  return hash.digest('hex');
 }
 
 /**
@@ -110,13 +111,16 @@ export async function syncFromFs(
         mode: 0o644,
       };
 
-      // Check if agent also modified this path since last materialization
-      if (existing && existing.blobHash !== hash) {
-        // Both changed — check if agent changed it too by comparing against
-        // what was last materialized. If existing differs from what we materialized,
-        // agent changed it, so it's a conflict.
-        // For now, filesystem always wins — mark as conflict for notification.
-        result.conflicts.push(relativePath);
+      // Conflict detection: if the file existed in the tree AND the agent has
+      // modified it since last materialization, this is a genuine conflict
+      // (both agent and user changed the same file).
+      if (existing) {
+        const baselineHash = mount.materializedHashes.get(relativePath);
+        if (baselineHash && existing.blobHash !== baselineHash) {
+          // Agent changed the tree entry since we last materialized — conflict.
+          // Filesystem still wins, but flag it.
+          result.conflicts.push(relativePath);
+        }
       }
 
       store.treeSet(mount.treeStateId, relativePath, entry);
@@ -202,6 +206,9 @@ export async function materializeToFs(
     // Write file
     await writeFile(absolutePath, blob);
     written.push(relativePath);
+
+    // Record blob hash at materialization time for conflict detection
+    mount.materializedHashes.set(relativePath, blobHash);
   }
 
   mount.lastMaterializedSeq = currentSeq;
