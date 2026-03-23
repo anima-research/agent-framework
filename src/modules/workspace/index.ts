@@ -5,7 +5,6 @@
  * auto-sync between real filesystem and Chronicle, and manual materialization.
  */
 
-import { createHash } from 'node:crypto';
 import { readFile, stat, access } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import type { JsStore } from 'chronicle';
@@ -29,7 +28,7 @@ import type {
   WorkspaceChangedEvent,
 } from './types.js';
 import { MountWatcher } from './watcher.js';
-import { syncFromFs, materializeToFs, hashContent } from './sync.js';
+import { syncFromFs, materializeToFs, hashContent, DEFAULT_MAX_FILE_SIZE, type ConflictInfo } from './sync.js';
 
 export type {
   WorkspaceConfig,
@@ -47,8 +46,6 @@ export type {
   MaterializeInput,
   SyncInput,
 } from './types.js';
-
-const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024;
 
 export class WorkspaceModule implements Module {
   readonly name = 'workspace';
@@ -443,9 +440,6 @@ export class WorkspaceModule implements Module {
       mode: 0o644,
     });
 
-    // On-agent-action sync: check filesystem after our action
-    await this.onAgentActionSync(mount);
-
     return {
       success: true,
       data: {
@@ -503,8 +497,6 @@ export class WorkspaceModule implements Module {
       mode: entry.mode,
     });
 
-    await this.onAgentActionSync(mount);
-
     return {
       success: true,
       data: {
@@ -527,8 +519,6 @@ export class WorkspaceModule implements Module {
     }
 
     store.treeRemove(mount.treeStateId, relativePath);
-
-    await this.onAgentActionSync(mount);
 
     return { success: true, data: { path: input.path, deleted: true } };
   }
@@ -802,7 +792,7 @@ export class WorkspaceModule implements Module {
 
   private async handleSync(input: SyncInput): Promise<ToolResult> {
     const store = this.getStore();
-    const allResults: Array<{ mount: string; synced: string[]; conflicts: string[] }> = [];
+    const allResults: Array<{ mount: string; synced: string[]; conflicts: ConflictInfo[] }> = [];
 
     let mountsToSync: Array<{ name: string; mount: MountState }>;
     if (input.mount) {
@@ -834,7 +824,7 @@ export class WorkspaceModule implements Module {
             paths: result.synced.map(p => `${name}/${p}`),
             mount: name,
             conflicts: result.conflicts.length > 0
-              ? result.conflicts.map(p => `${name}/${p}`)
+              ? result.conflicts.map(c => `${name}/${c.path}`)
               : undefined,
           };
           this.ctx.pushEvent(event as ProcessEvent);
@@ -872,37 +862,13 @@ export class WorkspaceModule implements Module {
         paths: result.synced.map(p => `${mountName}/${p}`),
         mount: mountName,
         conflicts: result.conflicts.length > 0
-          ? result.conflicts.map(p => `${mountName}/${p}`)
+          ? result.conflicts.map(c => `${mountName}/${c.path}`)
           : undefined,
       };
-      this.ctx.pushEvent(event as unknown as ProcessEvent);
+      this.ctx.pushEvent(event as ProcessEvent);
     }
   }
 
-  /**
-   * For 'on-agent-action' mode: sync filesystem after each agent tool call.
-   */
-  private async onAgentActionSync(mount: MountState): Promise<void> {
-    const watchMode = mount.config.watch ?? 'always';
-    if (watchMode !== 'on-agent-action') return;
-
-    const store = this.store;
-    if (!store) return;
-
-    const result = await syncFromFs(store, mount);
-
-    if ((result.synced.length > 0 || result.conflicts.length > 0) && this.ctx) {
-      const event: WorkspaceChangedEvent = {
-        type: 'workspace:changed',
-        paths: result.synced.map(p => `${mount.config.name}/${p}`),
-        mount: mount.config.name,
-        conflicts: result.conflicts.length > 0
-          ? result.conflicts.map(p => `${mount.config.name}/${p}`)
-          : undefined,
-      };
-      this.ctx.pushEvent(event as unknown as ProcessEvent);
-    }
-  }
 }
 
 // ==========================================================================

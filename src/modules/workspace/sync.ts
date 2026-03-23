@@ -8,11 +8,24 @@
 
 import { createHash } from 'node:crypto';
 import { readFile, writeFile, mkdir, readdir, stat, access } from 'node:fs/promises';
-import { join, dirname, relative } from 'node:path';
+import { join, dirname, relative, resolve } from 'node:path';
 import type { JsStore, JsTreeEntry } from 'chronicle';
 import type { MountState } from './types.js';
 
-const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+export const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+
+/**
+ * Resolve a relative path within a mount and verify it doesn't escape.
+ * Returns the absolute path, or null if the path is outside the mount.
+ */
+function safePath(mountPath: string, relativePath: string): string | null {
+  const resolved = resolve(mountPath, relativePath);
+  const root = mountPath.endsWith('/') ? mountPath : mountPath + '/';
+  if (resolved !== mountPath && !resolved.startsWith(root)) {
+    return null;
+  }
+  return resolved;
+}
 
 /**
  * Hash file content to a full SHA-256 hex string.
@@ -36,11 +49,18 @@ function isBinary(buffer: Buffer): boolean {
   return false;
 }
 
+export interface ConflictInfo {
+  /** Relative path of the conflicted file */
+  path: string;
+  /** Blob hash of the agent's version (retrievable via store.getBlob()) */
+  agentBlobHash: string;
+}
+
 export interface SyncResult {
   /** Paths that were synced */
   synced: string[];
-  /** Paths that conflicted (both agent and user modified) */
-  conflicts: string[];
+  /** Paths that conflicted (both agent and user modified) — filesystem wins */
+  conflicts: ConflictInfo[];
   /** Paths that were skipped (binary, too large, etc.) */
   skipped: string[];
 }
@@ -64,7 +84,11 @@ export async function syncFromFs(
   const filesToSync = paths ?? await walkDirectory(mount.config.path, mount.config.ignore ?? []);
 
   for (const relativePath of filesToSync) {
-    const absolutePath = join(mount.config.path, relativePath);
+    const absolutePath = safePath(mount.config.path, relativePath);
+    if (!absolutePath) {
+      result.skipped.push(relativePath);
+      continue;
+    }
 
     try {
       await access(absolutePath);
@@ -118,8 +142,11 @@ export async function syncFromFs(
         const baselineHash = mount.materializedHashes.get(relativePath);
         if (baselineHash && existing.blobHash !== baselineHash) {
           // Agent changed the tree entry since we last materialized — conflict.
-          // Filesystem still wins, but flag it.
-          result.conflicts.push(relativePath);
+          // Filesystem still wins, but agent's version is recoverable via agentBlobHash.
+          result.conflicts.push({
+            path: relativePath,
+            agentBlobHash: existing.blobHash,
+          });
         }
       }
 
@@ -196,7 +223,9 @@ export async function materializeToFs(
   }
 
   for (const { path: relativePath, blobHash } of filesToMaterialize) {
-    const absolutePath = join(mount.config.path, relativePath);
+    const absolutePath = safePath(mount.config.path, relativePath);
+    if (!absolutePath) continue; // Path traversal — skip silently
+
     const blob = store.getBlob(blobHash);
     if (!blob) continue;
 

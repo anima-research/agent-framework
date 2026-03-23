@@ -25,7 +25,12 @@ export interface MountConfig {
   watch?: 'always' | 'on-agent-action' | 'never';
   /** Debounce window in ms for watch: 'always' mode (default: 300) */
   watchDebounceMs?: number;
-  /** Glob patterns to ignore (e.g., [".git", "node_modules/**"]) */
+  /**
+   * Simple ignore patterns (NOT full gitignore syntax). Supported forms:
+   * - Exact name match: ".git", "node_modules"
+   * - Directory glob: "node_modules/**" (anything under node_modules)
+   * - Extension glob: "*.pyc" (any file ending in .pyc)
+   */
   ignore?: string[];
   /** Whether to follow symlinks (default: false) */
   followSymlinks?: boolean;
