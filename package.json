@@ -38,6 +38,7 @@
   "license": "MIT",
   "dependencies": {
     "@connectome/context-manager": "file:../context-manager",
+    "chokidar": "^4.0.3",
     "chronicle": "file:../chronicle",
     "discord.js": "^14.25.1",
     "membrane": "file:../membrane",
