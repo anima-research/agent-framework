@@ -5,20 +5,23 @@
 export { ApiModule } from './api/index.js';
 export type { ApiEvent } from './api/index.js';
 
-export { FilesModule } from './files/index.js';
+export { WorkspaceModule } from './workspace/index.js';
 export type {
-  FilesModuleConfig,
-  WorkspaceIndex,
-  FileEntry,
-  ContentLogEntry,
+  WorkspaceConfig,
+  MountConfig,
+  MountState,
+  WorkspaceModuleState,
   ReadInput,
   WriteInput,
   EditInput,
+  DeleteInput,
+  LsInput,
   GlobInput,
   GrepInput,
+  StatusInput,
   MaterializeInput,
   SyncInput,
-} from './files/index.js';
+} from './workspace/index.js';
 
 export { DiscordModule, DiscordJsClient } from './discord/index.js';
 export type { DiscordJsClientConfig } from './discord/index.js';

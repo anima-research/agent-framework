@@ -411,7 +411,7 @@ describe('AgentFramework', () => {
       {
         type: 'tool_use',
         id: 'call_1',
-        name: 'test:echo',
+        name: 'test--echo',
         input: { message: 'test message' },
       },
     ], 'tool_use'));
@@ -512,7 +512,7 @@ describe('AgentFramework', () => {
           name: 'assistant',
           model: 'test-model',
           systemPrompt: 'Test',
-          allowedTools: ['nonexistent:tool'], // Won't match test:echo
+          allowedTools: ['nonexistent--tool'], // Won't match test--echo
         },
       ],
       modules: [testModule],
@@ -641,13 +641,13 @@ describe('Streaming lifecycle', () => {
     // Round 1: tool call
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'First echo.' },
-      { type: 'tool_use', id: 'call_1', name: 'test:echo', input: { message: 'round1' } },
+      { type: 'tool_use', id: 'call_1', name: 'test--echo', input: { message: 'round1' } },
     ], 'tool_use'));
 
     // Round 2: another tool call
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Second echo.' },
-      { type: 'tool_use', id: 'call_2', name: 'test:echo', input: { message: 'round2' } },
+      { type: 'tool_use', id: 'call_2', name: 'test--echo', input: { message: 'round2' } },
     ], 'tool_use'));
 
     // Round 3: final response
@@ -691,7 +691,7 @@ describe('Streaming lifecycle', () => {
 
     // Response with a tool call but no follow-up (stream will wait forever)
     membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'call_hang', name: 'test:echo', input: { message: 'hang' } },
+      { type: 'tool_use', id: 'call_hang', name: 'test--echo', input: { message: 'hang' } },
     ], 'tool_use'));
 
     const framework = await AgentFramework.create({
@@ -728,7 +728,7 @@ describe('Streaming lifecycle', () => {
     const events: string[] = [];
 
     membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'call_t', name: 'test:echo', input: { message: 'trace' } },
+      { type: 'tool_use', id: 'call_t', name: 'test--echo', input: { message: 'trace' } },
     ], 'tool_use'));
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Done' },
@@ -764,7 +764,7 @@ describe('Streaming lifecycle', () => {
     const testModule = new TestModule();
 
     membrane.pushResponse(createMockResponse([
-      { type: 'tool_use', id: 'call_conv', name: 'test:echo', input: { message: 'convert' } },
+      { type: 'tool_use', id: 'call_conv', name: 'test--echo', input: { message: 'convert' } },
     ], 'tool_use'));
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Converted' },
