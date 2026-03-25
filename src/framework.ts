@@ -1683,86 +1683,16 @@ export class AgentFramework {
             }
             this.pendingAssistantBlocks.set(agent.name, assistantBlocks);
 
-            // Detect incomplete tool calls (empty input from max_tokens truncation).
-            // These happen when the LLM hits max_tokens mid-tool-call, yielding a
-            // tool_use with {} input.  The stream won't block for tool results in
-            // this case — it immediately yields 'complete' with stop_reason='max_tokens'.
-            // If we dispatch these, the tool-result comes back after the agent has
-            // already been reset by the 'complete' handler, causing orphaned tool_use.
-            const completeCalls: ToolCall[] = [];
-            const incompleteCalls: ToolCall[] = [];
-            for (const call of event.calls) {
-              const input = call.input as Record<string, unknown> | undefined;
-              if (!input || Object.keys(input).length === 0) {
-                incompleteCalls.push(call);
-              } else {
-                completeCalls.push(call);
-              }
-            }
+            // Note: max_tokens truncation cannot produce tool-calls events here.
+            // The membrane only yields 'tool-calls' when stop_reason is 'tool_use'
+            // (native API) or the closing </function_calls> tag is found (text parser).
+            // Truncated responses yield 'complete' with stop_reason 'max_tokens' directly.
+            // So all calls here have valid input — {} is legitimate for parameterless tools.
 
             agent.enterWaitingForTools(event.calls, stream);
 
-            // For incomplete tool calls, immediately provide synthetic error results
-            // so the agent transitions correctly without waiting for async dispatch.
-            for (const call of incompleteCalls) {
-              console.warn(
-                `[framework] Tool call '${call.name}' (${call.id}) has empty input — ` +
-                `likely max_tokens truncation. Injecting synthetic error result.`
-              );
-              this.emitTrace({
-                type: 'tool:failed',
-                module: call.name.split('--')[0] ?? 'unknown',
-                tool: call.name,
-                callId: call.id,
-                error: 'Tool call had empty input (likely truncated by max_tokens). Retry with shorter output or split into smaller steps.',
-              });
-              agent.provideToolResult(call.id, {
-                success: false,
-                error: 'Tool call had empty input (likely truncated by max_tokens). ' +
-                  'Your output was too long and got cut off before the tool input could be generated. ' +
-                  'Please retry with shorter output, or break the task into smaller steps.',
-                isError: true,
-              });
-            }
-
-            // Dispatch complete tool calls normally (async, results come back via ToolResultEvent)
-            for (const call of completeCalls) {
+            for (const call of event.calls) {
               this.dispatchToolCall(agent.name, call);
-            }
-
-            // If ALL calls were incomplete, agent may have transitioned to 'ready'
-            // already.  Flush pending blocks and store tool results now.
-            const postState = agent.state as AgentState;
-            if (postState.status === 'ready') {
-              // Flush pending assistant blocks
-              const pending = this.pendingAssistantBlocks.get(agent.name);
-              if (pending) {
-                agent.addAssistantResponse(pending);
-                this.pendingAssistantBlocks.delete(agent.name);
-              }
-              // Store synthetic tool results as user message
-              const maxChars = this.getMaxToolResultChars(agent);
-              const toolResultContent: ContentBlock[] = postState.toolResults.map(tc => {
-                const content = tc.result.isError
-                  ? (tc.result.error ?? 'Unknown error')
-                  : JSON.stringify(tc.result.data);
-                return {
-                  type: 'tool_result' as const,
-                  toolUseId: tc.id,
-                  content,
-                  isError: tc.result.isError,
-                };
-              });
-              agent.getContextManager().addMessage('user', toolResultContent);
-
-              // Resume stream so it can continue to the 'complete' event
-              if (postState.stream) {
-                const membraneResults = postState.toolResults.map(tc =>
-                  this.toMembraneToolResult(tc.id, tc.result, maxChars)
-                );
-                postState.stream.provideToolResults(membraneResults);
-                agent.setStreaming(postState.stream);
-              }
             }
             // Stream's async iterator blocks on next() until provideToolResults() is called
             break;
