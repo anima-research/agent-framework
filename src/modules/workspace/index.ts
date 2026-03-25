@@ -561,8 +561,9 @@ export class WorkspaceModule implements Module {
 
     const { mount, relativePath } = this.parsePath(input.path);
 
-    // Ensure initial sync if needed
-    if (!mount.initialSyncDone && mount.config.watch !== 'never') {
+    // Ensure initial sync — always sync on first access regardless of watch mode,
+    // so that ls/glob/grep see filesystem contents even for unwatched mounts
+    if (!mount.initialSyncDone) {
       await syncFromFs(store, mount);
       mount.initialSyncDone = true;
     }
@@ -623,7 +624,7 @@ export class WorkspaceModule implements Module {
       : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
 
     for (const { mount, relativePath } of mountsToSearch) {
-      if (!mount.initialSyncDone && mount.config.watch !== 'never') {
+      if (!mount.initialSyncDone) {
         await syncFromFs(store, mount);
         mount.initialSyncDone = true;
       }
@@ -669,7 +670,7 @@ export class WorkspaceModule implements Module {
     const results: Array<{ file: string; matches: Array<{ line: number; text: string; context?: string[] }> }> = [];
 
     for (const { mount, relativePath } of mountsToSearch) {
-      if (!mount.initialSyncDone && mount.config.watch !== 'never') {
+      if (!mount.initialSyncDone) {
         await syncFromFs(store, mount);
         mount.initialSyncDone = true;
       }
@@ -785,9 +786,11 @@ export class WorkspaceModule implements Module {
 
     for (const { name, mount } of mountsToMaterialize) {
 
-      const paths = input.path
-        ? [this.parsePath(input.path).relativePath]
-        : undefined;
+      let paths: string[] | undefined;
+      if (input.path) {
+        const { relativePath } = this.parsePath(input.path);
+        paths = relativePath ? [relativePath] : undefined;
+      }
 
       // Suppress watcher for paths we're about to write
       const watcher = this.watchers.get(name);
@@ -855,9 +858,12 @@ export class WorkspaceModule implements Module {
 
     for (const { name, mount } of mountsToSync) {
 
-      const paths = input.path
-        ? [this.parsePath(input.path).relativePath]
-        : undefined;
+      let paths: string[] | undefined;
+      if (input.path) {
+        const { relativePath } = this.parsePath(input.path);
+        // Empty relativePath means mount root — sync entire mount, not a single path
+        paths = relativePath ? [relativePath] : undefined;
+      }
 
       const result = await syncFromFs(store, mount, paths);
       mount.initialSyncDone = true;
