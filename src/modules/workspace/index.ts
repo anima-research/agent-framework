@@ -6,7 +6,7 @@
  */
 
 import { readFile, stat, access } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { join, resolve, relative } from 'node:path';
 import type { JsStore } from 'chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
@@ -57,6 +57,29 @@ export class WorkspaceModule implements Module {
   private watchers = new Map<string, MountWatcher>();
 
   constructor(config: WorkspaceConfig) {
+    // Detect overlapping mount paths: if mount A contains mount B,
+    // auto-add an ignore rule on A for B's path to prevent syncing
+    // the sub-mount's directory through the super-mount.
+    for (const outer of config.mounts) {
+      for (const inner of config.mounts) {
+        if (outer === inner) continue;
+        const outerPath = resolve(outer.path);
+        const innerPath = resolve(inner.path);
+        const rel = relative(outerPath, innerPath);
+        if (rel && !rel.startsWith('..') && !rel.startsWith('/')) {
+          // inner is nested under outer — add ignore rule
+          outer.ignore = outer.ignore ?? [];
+          const pattern = rel + '/**';
+          if (!outer.ignore.includes(pattern) && !outer.ignore.includes(rel)) {
+            outer.ignore.push(rel);
+            console.warn(
+              `[workspace] Mount "${outer.name}" contains mount "${inner.name}" ` +
+              `(${rel}/) — auto-ignoring to prevent overlap`,
+            );
+          }
+        }
+      }
+    }
     this.config = config;
   }
 
