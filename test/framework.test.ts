@@ -7,7 +7,7 @@ import assert from 'node:assert';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import type { NormalizedRequest, NormalizedResponse, ContentBlock, YieldingStream, StreamEvent } from 'membrane';
+import type { NormalizedRequest, NormalizedResponse, ContentBlock, YieldingStream, StreamEvent } from '@animalabs/membrane';
 import type {
   Module,
   ModuleContext,
