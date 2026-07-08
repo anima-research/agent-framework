@@ -4,11 +4,18 @@ import { existsSync, mkdtempSync, mkdirSync, writeFileSync, unlinkSync, rmSync }
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { MountWatcher, type FsChange } from '../src/modules/workspace/watcher.js';
+import { MountWatcher, type FsChange, type WatcherLifecycle } from '../src/modules/workspace/watcher.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
+
+// Keep file-event delivery deterministic in sandboxed macOS runners where
+// chokidar's fs.watch backend can emit EMFILE on ordinary writes. The root
+// replacement detector under test still uses MountWatcher's watchRootPollMs.
+process.env.CHOKIDAR_USEPOLLING = 'true';
+process.env.CHOKIDAR_INTERVAL = '25';
 
 // Short debounce keeps each test under ~200ms.
 const DEBOUNCE_MS = 50;
+const WATCH_ROOT_POLL_MS = 50;
 // Chokidar's awaitWriteFinish (stabilityThreshold:100) + our debounce means
 // each emission takes ~150ms to land; wait at least 300ms.
 const SETTLE_MS = 350;
@@ -30,20 +37,30 @@ function makeConfig(): MountConfig {
     mode: 'read-write',
     watch: 'always',
     watchDebounceMs: DEBOUNCE_MS,
+    watchRootPollMs: WATCH_ROOT_POLL_MS,
   };
 }
 
-function collect(): { watcher: MountWatcher; batches: FsChange[][] } {
+function collect(lifecycle?: WatcherLifecycle): { watcher: MountWatcher; batches: FsChange[][] } {
   const batches: FsChange[][] = [];
   const watcher = new MountWatcher(makeConfig(), (changes) => {
     batches.push(changes);
-  });
+  }, lifecycle);
   watcher.start();
   return { watcher, batches };
 }
 
 async function wait(ms: number) {
   await new Promise(r => setTimeout(r, ms));
+}
+
+async function waitFor(predicate: () => boolean, message: string, timeoutMs = 800) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (predicate()) return;
+    await wait(25);
+  }
+  assert.fail(message);
 }
 
 describe('MountWatcher mergeOp', () => {
@@ -147,5 +164,96 @@ describe('MountWatcher lifecycle', () => {
     await wait(50);
     assert.ok(!existsSync(roPath), 'read-only mount must not mkdir -p behind the user\'s back');
     await watcher.stop();
+  });
+
+  it('re-attaches after the root is removed and recreated', async () => {
+    let readyCount = 0;
+    let reattachCount = 0;
+    const { watcher, batches } = collect({
+      onReady: () => { readyCount++; },
+      onReattach: () => { reattachCount++; },
+    });
+
+    try {
+      await waitFor(() => readyCount > 0, 'expected initial watcher ready');
+
+      rmSync(tmp, { recursive: true, force: true });
+      mkdirSync(tmp, { recursive: true });
+
+      await waitFor(() => reattachCount > 0, 'expected watcher to reattach');
+      await waitFor(() => readyCount > 1, 'expected reattached watcher ready');
+
+      writeFileSync(join(tmp, 'after-recreate.md'), 'hello');
+      await wait(SETTLE_MS);
+
+      const created = batches.flat().find(c => c.path === 'after-recreate.md');
+      assert.ok(created, `expected created event after reattach, got ${JSON.stringify(batches.flat())}`);
+      assert.strictEqual(created.op, 'created');
+    } finally {
+      await watcher.stop();
+    }
+  });
+
+  it('fires onReattach exactly once for one remove and recreate cycle', async () => {
+    let readyCount = 0;
+    let reattachCount = 0;
+    const { watcher } = collect({
+      onReady: () => { readyCount++; },
+      onReattach: () => { reattachCount++; },
+    });
+
+    try {
+      await waitFor(() => readyCount > 0, 'expected initial watcher ready');
+
+      rmSync(tmp, { recursive: true, force: true });
+      mkdirSync(tmp, { recursive: true });
+
+      await waitFor(() => readyCount > 1, 'expected reattached watcher ready');
+      await wait(WATCH_ROOT_POLL_MS * 4);
+
+      assert.strictEqual(reattachCount, 1);
+    } finally {
+      await watcher.stop();
+    }
+  });
+
+  it('does not re-attach for normal create and modify traffic', async () => {
+    let ready = false;
+    let reattachCount = 0;
+    const { watcher, batches } = collect({
+      onReady: () => { ready = true; },
+      onReattach: () => { reattachCount++; },
+    });
+
+    try {
+      await waitFor(() => ready, 'expected initial watcher ready');
+
+      const file = join(tmp, 'normal.md');
+      writeFileSync(file, 'v1');
+      await wait(SETTLE_MS);
+      writeFileSync(file, 'v2');
+      await wait(SETTLE_MS + WATCH_ROOT_POLL_MS * 4);
+
+      assert.strictEqual(reattachCount, 0);
+      const flat = batches.flat();
+      assert.ok(flat.some(c => c.path === 'normal.md'), `expected normal file event, got ${JSON.stringify(flat)}`);
+    } finally {
+      await watcher.stop();
+    }
+  });
+
+  it('stops cleanly during a detached root window', async () => {
+    let ready = false;
+    const { watcher } = collect({
+      onReady: () => { ready = true; },
+    });
+
+    try {
+      await waitFor(() => ready, 'expected initial watcher ready');
+      rmSync(tmp, { recursive: true, force: true });
+      await wait(WATCH_ROOT_POLL_MS * 2);
+    } finally {
+      await watcher.stop();
+    }
   });
 });
