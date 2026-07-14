@@ -48,6 +48,26 @@ class QueuedStrategy implements ContextStrategy {
   }
 }
 
+class FailingStrategy implements ContextStrategy {
+  readonly name = 'failing-maintenance-test';
+
+  checkReadiness(): ReadinessState {
+    return { ready: false, description: 'compression blocked' };
+  }
+
+  async tick(_ctx: StrategyContext): Promise<void> {
+    throw new Error('provider rejected maintenance request');
+  }
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
 class ToolModule implements Module {
   readonly name = 'maintenance-tools';
 
@@ -141,6 +161,57 @@ describe('queued context maintenance timer', () => {
       framework.start();
       await new Promise(resolve => setTimeout(resolve, 40));
       assert.equal(strategy.ticks, 0);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('routes a maintenance failure through the ops-alert pipeline', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-alert-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{
+        name: 'agent',
+        model: 'test-model',
+        systemPrompt: 'test',
+        strategy: new FailingStrategy(),
+      }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    const alerts: Array<{
+      kind: string;
+      agentName: string;
+      message: string;
+      data?: Record<string, unknown>;
+    }> = [];
+    (framework as any).opsAlert = (
+      kind: string,
+      agentName: string,
+      message: string,
+      opts?: { data?: Record<string, unknown> },
+    ) => alerts.push({ kind, agentName, message, data: opts?.data });
+
+    try {
+      framework.start();
+      await waitFor(() => alerts.length > 0);
+      assert.deepEqual(alerts[0], {
+        kind: 'context-maintenance-failed',
+        agentName: 'agent',
+        message: 'provider rejected maintenance request',
+        data: {
+          scope: 'agent',
+          pending: 'compression blocked',
+        },
+      });
+      await waitFor(() => framework.getContextMaintenanceSnapshot().history.length > 0);
+      assert.equal(
+        framework.getContextMaintenanceSnapshot().history[0].agents[0].error,
+        'provider rejected maintenance request',
+      );
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });

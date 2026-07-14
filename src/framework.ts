@@ -732,9 +732,16 @@ export class AgentFramework {
   private startQueuedMaintenance(): void {
     if (this.maintenancePass || !this.running) return;
     const pass = this.runQueuedMaintenance().catch((error) => {
+      const reason = error instanceof Error ? error.message : String(error);
       console.error(
         '[context-maintenance] pass failed:',
-        error instanceof Error ? error.message : error,
+        reason,
+      );
+      this.opsAlert(
+        'context-maintenance-failed',
+        'framework',
+        reason,
+        { data: { scope: 'pass' } },
       );
     });
     this.maintenancePass = pass;
@@ -789,6 +796,18 @@ export class AgentFramework {
         } catch (error) {
           record.error = error instanceof Error ? error.message : String(error);
           console.error(`[context-maintenance] agent=${agent.name} failed:`, record.error);
+          this.opsAlert(
+            'context-maintenance-failed',
+            agent.name,
+            record.error,
+            {
+              data: {
+                scope: 'agent',
+                ...(record.pendingBefore ? { pending: record.pendingBefore } : {}),
+                ...(record.progressBefore ? { progress: record.progressBefore } : {}),
+              },
+            },
+          );
         } finally {
           const pending = cm.getPendingWork()?.description;
           record.finishedAt = Date.now();
