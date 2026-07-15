@@ -25,7 +25,7 @@ export interface MountConfig {
   watch?: 'always' | 'on-agent-action' | 'never';
   /** Debounce window in ms for watch: 'always' mode (default: 300) */
   watchDebounceMs?: number;
-  /** Poll interval in ms for detecting watched root inode replacement (default: 2000) */
+  /** Poll interval in ms for checking watched root identity changes (default: 2000) */
   watchRootPollMs?: number;
   /**
    * Simple ignore patterns (NOT full gitignore syntax). Supported forms:

@@ -186,7 +186,6 @@ export class WorkspaceModule implements Module {
               } as ProcessEvent);
             },
             onReattach: () => {
-              mount.watcherReadyAt = Date.now();
               mount.watcherError = null;
               void this.initialScan(name);
               this.ctx?.pushEvent({
