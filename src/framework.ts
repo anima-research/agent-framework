@@ -322,7 +322,7 @@ export class AgentFramework {
   private maintenanceRunId = 0;
   private currentMaintenanceRun: ContextMaintenanceRun | null = null;
   private maintenanceHistory: ContextMaintenanceRun[] = [];
-  /** Last time we console-warned about stale (busy-requeued) inference requests, per agent. */
+  /** Last time we reported stale (busy-requeued) inference requests, per agent. */
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
   private lastInferenceAt = new Map<string, { startedAt?: number; endedAt?: number; failedAt?: number; lastError?: string }>();
@@ -2852,12 +2852,21 @@ export class AgentFramework {
     // Check for inference requests
     await this.processInferenceRequests();
 
-    // Yield to the event loop between iterations.
-    // Full 10ms sleep when truly idle; minimal yield when streams are active
-    // (needed to let stream microtasks and tool-call callbacks execute).
-    if (!event && this.pendingRequests.length === 0) {
+    // Yield to the event loop between iterations. A pending inference request
+    // is not necessarily runnable: while its agent is streaming or waiting for
+    // tools, processInferenceRequests() deliberately requeues it. Treating that
+    // requeued request as "work made progress" creates a microtask-only polling
+    // loop. If activeStreams bookkeeping is absent/stale at the same time, the
+    // old code had no await at all and starved the tool-result and HTTP I/O that
+    // could make the agent runnable again (the Sol outage, 2026-07-15).
+    //
+    // No queue event means no foreground progress, so always take the normal
+    // polling backoff. After an event, retain the low-latency macrotask yield
+    // while background work remains. Both paths give Bun/Node a real event-loop
+    // turn; neither can recurse forever through already-resolved promises.
+    if (!event) {
       await new Promise((resolve) => setTimeout(resolve, 10));
-    } else if (this.activeStreams.size > 0) {
+    } else if (this.pendingRequests.length > 0 || this.activeStreams.size > 0) {
       await new Promise((resolve) => setTimeout(resolve, 0));
     }
   }
@@ -3654,7 +3663,15 @@ export class AgentFramework {
       if (agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
         // Re-queue requests, but warn if they've been pending too long
         const oldest = Math.min(...requests.map(r => r.timestamp));
-        if (now - oldest > STALE_REQUEST_MS) {
+        if (
+          now - oldest > STALE_REQUEST_MS &&
+          (this.staleWarnAt.get(agentName) ?? 0) < now - 60_000
+        ) {
+          // Trace and stderr share the throttle. The old code throttled only
+          // stderr, so a long-running tool call generated one trace per poll
+          // (up to 100/sec after the scheduler backoff), adding avoidable work
+          // precisely while the agent was already under pressure.
+          this.staleWarnAt.set(agentName, now);
           this.emitTrace({
             type: 'inference:request_stale',
             agentName,
@@ -3662,14 +3679,10 @@ export class AgentFramework {
             requestCount: requests.length,
             oldestRequestAge: now - oldest,
           });
-          // Loud (but throttled) note that requests are waiting on a busy agent.
-          if ((this.staleWarnAt.get(agentName) ?? 0) < now - 60_000) {
-            this.staleWarnAt.set(agentName, now);
-            console.error(
-              `[inference-stale] agent=${agentName} busy (${agent.state.status}) — ` +
-              `${requests.length} request(s) waiting ${Math.round((now - oldest) / 1000)}s`,
-            );
-          }
+          console.error(
+            `[inference-stale] agent=${agentName} busy (${agent.state.status}) — ` +
+            `${requests.length} request(s) waiting ${Math.round((now - oldest) / 1000)}s`,
+          );
         }
         this.pendingRequests.push(...requests);
         continue;
