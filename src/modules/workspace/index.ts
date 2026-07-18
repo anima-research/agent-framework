@@ -1028,6 +1028,30 @@ export class WorkspaceModule implements Module {
   }
 
   /**
+   * Read a file's raw bytes from a mount (through the Chronicle tree, synced
+   * first like the `read` tool). Public API for the framework's synthesized
+   * `read_image` tool and other peer callers that need binary content.
+   */
+  async readBinary(
+    mountPrefixedPath: string,
+  ): Promise<{ data: Buffer } | { error: string }> {
+    let mount: MountState;
+    let relativePath: string;
+    try {
+      ({ mount, relativePath } = this.parsePath(mountPrefixedPath));
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+    const store = this.getStore();
+    await this.ensureSynced(mount, relativePath);
+    const entry = store.treeGet(mount.treeStateId, relativePath);
+    if (!entry) return { error: `File not found: ${mountPrefixedPath}` };
+    const blob = store.getBlob(entry.blobHash);
+    if (!blob) return { error: `Blob not found for: ${mountPrefixedPath}` };
+    return { data: blob };
+  }
+
+  /**
    * Parse a mount-prefixed path into (mountName, relativePath).
    */
   private parsePath(path: string): { mount: MountState; relativePath: string } {

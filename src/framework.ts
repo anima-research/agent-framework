@@ -66,6 +66,29 @@ import type { WorkspaceModule } from './modules/workspace/index.js';
 import { toolResultDataToHistoryString } from './tool-result-history.js';
 import { splitProseSegments } from './prose-segments.js';
 
+/** Detect a supported image media type from magic bytes (the model API
+ *  rejects mislabeled media types, so trust bytes over extensions).
+ *  Returns undefined for non-image content. */
+function sniffImageMediaType(data: Buffer): string | undefined {
+  if (data.length >= 4 && data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) {
+    return 'image/png';
+  }
+  if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (data.length >= 3 && data[0] === 0x47 && data[1] === 0x49 && data[2] === 0x46) {
+    return 'image/gif';
+  }
+  if (
+    data.length >= 12 &&
+    data[0] === 0x52 && data[1] === 0x49 && data[2] === 0x46 && data[3] === 0x46 &&
+    data[8] === 0x57 && data[9] === 0x45 && data[10] === 0x42 && data[11] === 0x50
+  ) {
+    return 'image/webp';
+  }
+  return undefined;
+}
+
 /**
  * Tools whose presence suppresses auto-routing of the surrounding prose,
  * for two distinct reasons:
@@ -1134,7 +1157,9 @@ export class AgentFramework {
       ...channelTools,
       ...gateTools,
       this.buildAgentSettingsTool(),
-      ...(this.getWorkspaceModule() ? [AgentFramework.SAVE_IMAGE_TOOL] : []),
+      ...(this.getWorkspaceModule()
+        ? [AgentFramework.SAVE_IMAGE_TOOL, AgentFramework.READ_IMAGE_TOOL]
+        : []),
     ];
   }
 
@@ -1909,6 +1934,29 @@ export class AgentFramework {
         count: {
           type: 'number',
           description: 'How many images to save, starting at `index` and going further back. Default 1.',
+        },
+      },
+      required: ['path'],
+    },
+  };
+
+  /** Synthesized read_image tool — present when a workspace module is
+   *  registered. Returns the image as a native image block in the tool
+   *  result, so the agent SEES it in the live turn (history keeps a compact
+   *  placeholder via the standard tool-result serializer). */
+  private static readonly READ_IMAGE_TOOL: import('./types/index.js').ToolDefinition = {
+    name: 'read_image',
+    description:
+      'View an image file from a workspace mount. The image is returned into ' +
+      'your context so you can actually see it (e.g. after save_recent_image, ' +
+      'or for images placed in the workspace by other means). Path is ' +
+      'mount-prefixed, e.g. "project/photos/cat.png". Supports png/jpeg/gif/webp.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Mount-prefixed image path, e.g. "project/photos/name.png".',
         },
       },
       required: ['path'],
@@ -5111,6 +5159,11 @@ export class AgentFramework {
       return;
     }
 
+    if (enrichedCall.name === 'read_image') {
+      this.dispatchReadImageToolCall(agentName, enrichedCall);
+      return;
+    }
+
     // Route gate_status tool
     if (enrichedCall.name === 'gate_status' && this.eventGate) {
       this.dispatchGateToolCall(agentName, enrichedCall);
@@ -7094,6 +7147,75 @@ export class AgentFramework {
       },
       endTurn: true,
     });
+  }
+
+  /**
+   * Handle the synthesized `read_image` tool: read image bytes from a
+   * workspace mount and return them as a native MCP-shaped content array
+   * (`[{type:'text'…},{type:'image', data, mimeType}]`). The live-turn
+   * converter (tryNativeToolResultContent → membrane tool_result image
+   * blocks) delivers the actual image to the model; history storage keeps
+   * the standard compact `[image: …]` placeholder.
+   */
+  private dispatchReadImageToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
+    const finish = (result: ToolResult): void => {
+      this.emitTrace({
+        type: result.isError ? 'tool:failed' : 'tool:completed',
+        module: 'workspace',
+        tool: call.name,
+        callId: call.id,
+        durationMs: 0,
+        ...(result.isError ? { error: result.error } : {}),
+      });
+      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'workspace', result });
+    };
+    void (async (): Promise<void> => {
+      try {
+        const workspace = this.getWorkspaceModule();
+        if (!workspace || typeof workspace.readBinary !== 'function') {
+          throw new Error('read_image requires a workspace module');
+        }
+        const input = (call.input ?? {}) as { path?: unknown };
+        if (typeof input.path !== 'string' || input.path.length === 0) {
+          throw new Error('read_image: `path` (mount-prefixed) is required');
+        }
+        const read = await workspace.readBinary(input.path);
+        if ('error' in read) throw new Error(read.error);
+        const mediaType = sniffImageMediaType(read.data);
+        if (!mediaType) {
+          throw new Error(
+            `read_image: "${input.path}" does not look like a supported image ` +
+            '(png/jpeg/gif/webp — checked by magic bytes, not extension)',
+          );
+        }
+        // Anthropic rejects images >5MB (and >8000px); guard the hard byte
+        // limit here — resizing is out of scope without an image library.
+        const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+        if (read.data.byteLength > MAX_IMAGE_BYTES) {
+          throw new Error(
+            `read_image: "${input.path}" is ${read.data.byteLength} bytes — ` +
+            `over the ${MAX_IMAGE_BYTES}-byte model limit`,
+          );
+        }
+        finish({
+          success: true,
+          data: [
+            {
+              type: 'text',
+              text: `${input.path} (${mediaType}, ${Math.ceil(read.data.byteLength / 1024)} KB):`,
+            },
+            { type: 'image', data: read.data.toString('base64'), mimeType: mediaType },
+          ],
+        });
+      } catch (error) {
+        finish({
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+          isError: true,
+        });
+      }
+    })();
   }
 
   /**
