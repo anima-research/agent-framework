@@ -175,9 +175,13 @@ describe('Trunk channel routing (item-3 redux)', () => {
       .join('\n') ?? '';
     assert.match(text, /Channel invitation/);
     assert.match(text, /channel_open/);
-    assert.match(text, /backscroll \(0-80\)/);
+    // 2026-07-21 rewrite: names resolved, numbered options, backscroll hint
+    // phrased as "a number up to N", explicit permission to do nothing.
+    assert.match(text, /#portables/);
+    assert.match(text, /backscroll \(a number up to 80\)/);
     assert.match(text, /channel_decline/);
     assert.match(text, /optionally set acknowledge/);
+    assert.match(text, /Doing nothing is also fine\./);
     await framework.stop();
   });
 
