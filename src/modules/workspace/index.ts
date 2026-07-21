@@ -1662,8 +1662,20 @@ export class WorkspaceModule implements Module {
         mount.initialSyncDone = true;
       }
 
-      const prefix = relativePath ? relativePath + '/' : undefined;
-      const entries = store.treeList(mount.treeStateId, prefix);
+      // If `path` points at a single FILE, grep just that file. Otherwise treat
+      // `path` as a directory prefix (the original behaviour). Previously a file
+      // path produced an empty prefix like "notes.md/" and matched nothing, so
+      // grepping a specific file silently returned zero results.
+      let entries: Array<{ path: string; blobHash: string }>;
+      const fileNode = relativePath
+        ? (store.treeGet(mount.treeStateId, relativePath) as { blobHash?: string } | null)
+        : null;
+      if (fileNode && fileNode.blobHash) {
+        entries = [{ path: relativePath, blobHash: fileNode.blobHash }];
+      } else {
+        const prefix = relativePath ? relativePath + '/' : undefined;
+        entries = store.treeList(mount.treeStateId, prefix);
+      }
 
       for (const entry of entries) {
         if (fileGlob && !fileGlob.test(entry.path)) continue;
