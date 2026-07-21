@@ -651,6 +651,15 @@ export class WorkspaceModule implements Module {
                 error: err.message,
               } as ProcessEvent);
             },
+            onReattach: () => {
+              mount.watcherError = null;
+              void this.initialScan(name);
+              this.ctx?.pushEvent({
+                type: 'workspace:watcher-reattached',
+                mount: name,
+                path: mount.config.path,
+              } as ProcessEvent);
+            },
           },
         );
         watcher.start();

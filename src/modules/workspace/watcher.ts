@@ -6,7 +6,8 @@
  */
 
 import { watch, type FSWatcher } from 'chokidar';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
+import { basename } from 'node:path';
 import { type MountConfig } from './types.js';
 
 export type FsOp = 'created' | 'modified' | 'deleted';
@@ -30,6 +31,14 @@ export interface WatcherLifecycle {
   onReady?: () => void;
   /** Fires on any chokidar-reported error (ENOENT, EACCES, platform faults). */
   onError?: (err: Error) => void;
+  /** Fires after the watcher re-attaches to a replaced root inode. */
+  onReattach?: () => void;
+}
+
+interface RootIdentity {
+  dev: number;
+  ino: number;
+  birthtimeMs: number;
 }
 
 /**
@@ -42,8 +51,13 @@ export class MountWatcher {
   // create -> modify collapses to 'created' (single batch); delete always wins.
   private pendingChanges = new Map<string, FsOp>();
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private rootPollTimer: ReturnType<typeof setInterval> | null = null;
   private suppressedPaths = new Set<string>();
   private suppressionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private rootIdentity: RootIdentity | null = null;
+  private detached = false;
+  private attaching = false;
+  private stopped = true;
   private readonly debounceMs: number;
   private readonly config: MountConfig;
   private readonly onChangeCallback: (changes: FsChange[]) => void;
@@ -64,8 +78,14 @@ export class MountWatcher {
    * Start watching the filesystem.
    */
   start(): void {
-    if (this.watcher) return;
+    if (this.watcher || this.rootPollTimer) return;
 
+    this.stopped = false;
+    this.attach();
+    this.startRootPolling();
+  }
+
+  private attach(): void {
     // Read-write mounts: ensure the path exists before chokidar attaches.
     // chokidar 4's fs.watch-based backend silently fails to fire events when
     // the watched path OR any of its parent directories don't exist at
@@ -110,21 +130,39 @@ export class MountWatcher {
     this.watcher.on('add', handleEvent('created'));
     this.watcher.on('change', handleEvent('modified'));
     this.watcher.on('unlink', handleEvent('deleted'));
+    this.watcher.on('unlinkDir', (dirPath) => {
+      if (this.isRootPath(dirPath)) {
+        this.detached = true;
+      }
+    });
 
     if (this.lifecycle.onReady) {
       this.watcher.once('ready', this.lifecycle.onReady);
     }
-    if (this.lifecycle.onError) {
-      this.watcher.on('error', (err) => {
-        this.lifecycle.onError?.(err instanceof Error ? err : new Error(String(err)));
-      });
-    }
+    this.watcher.on('error', (err) => {
+      this.reportError(err);
+    });
+    this.watcher.on('raw', (event: string, rawPath: string, _details: unknown) => {
+      if (event !== 'rename') return;
+      // A rename on the watched root's path/basename is the one signal that
+      // survives inode reuse on Linux, where unlinkDir/error never fire.
+      if (this.isRootPath(rawPath) || basename(rawPath) === basename(this.config.path)) {
+        void this.checkRootLiveness({ force: true });
+      }
+    });
+
+    this.captureRootIdentity();
   }
 
   /**
    * Stop watching.
    */
   async stop(): Promise<void> {
+    this.stopped = true;
+    if (this.rootPollTimer) {
+      clearInterval(this.rootPollTimer);
+      this.rootPollTimer = null;
+    }
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
@@ -140,6 +178,9 @@ export class MountWatcher {
       await this.watcher.close();
       this.watcher = null;
     }
+    this.rootIdentity = null;
+    this.detached = false;
+    this.attaching = false;
   }
 
   /**
@@ -219,6 +260,108 @@ export class MountWatcher {
     }, this.debounceMs);
   }
 
+  private startRootPolling(): void {
+    const pollMs = this.config.watchRootPollMs ?? 2000;
+    this.rootPollTimer = setInterval(() => {
+      void this.checkRootLiveness();
+    }, pollMs);
+    this.rootPollTimer.unref();
+  }
+
+  private async checkRootLiveness(opts: { force?: boolean } = {}): Promise<void> {
+    if (this.stopped || this.attaching) return;
+
+    let current: RootIdentity;
+    try {
+      current = this.readRootIdentity();
+    } catch (err) {
+      if (this.isErrno(err, 'ENOENT')) {
+        this.detached = true;
+        if (this.config.mode === 'read-write') {
+          await this.reattach();
+        }
+        return;
+      }
+      this.reportError(err);
+      if (opts.force) {
+        this.detached = true;
+        await this.reattach();
+      }
+      return;
+    }
+
+    if (!this.rootIdentity && !this.detached) {
+      await this.reattach();
+      return;
+    }
+
+    if (!opts.force && !this.detached && this.rootIdentity
+      && this.sameIdentity(current, this.rootIdentity)) {
+      return;
+    }
+
+    await this.reattach();
+  }
+
+  private async reattach(): Promise<void> {
+    if (this.attaching || this.stopped) return;
+
+    this.attaching = true;
+    try {
+      const oldWatcher = this.watcher;
+      this.watcher = null;
+      if (oldWatcher) {
+        await oldWatcher.close();
+      }
+      if (this.stopped) return;
+
+      this.attach();
+      if (!this.detached && this.rootIdentity) {
+        this.lifecycle.onReattach?.();
+      }
+    } catch (err) {
+      this.reportError(err);
+    } finally {
+      this.attaching = false;
+    }
+  }
+
+  private captureRootIdentity(): void {
+    try {
+      this.rootIdentity = this.readRootIdentity();
+      this.detached = false;
+    } catch (err) {
+      if (this.isErrno(err, 'ENOENT')) {
+        this.rootIdentity = null;
+        this.detached = true;
+        return;
+      }
+      this.rootIdentity = null;
+      this.detached = false;
+      this.reportError(err);
+    }
+  }
+
+  private readRootIdentity(): RootIdentity {
+    const stat = statSync(this.config.path);
+    return { dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs };
+  }
+
+  private sameIdentity(a: RootIdentity, b: RootIdentity): boolean {
+    // birthtimeMs is only a secondary tripwire: sub-millisecond replacements
+    // can reuse both the inode and timestamp, so raw rename remains essential.
+    return a.dev === b.dev && a.ino === b.ino && a.birthtimeMs === b.birthtimeMs;
+  }
+
+  private isErrno(err: unknown, code: string): boolean {
+    return typeof err === 'object' && err !== null && 'code' in err
+      && (err as NodeJS.ErrnoException).code === code;
+  }
+
+  private reportError(err: unknown): void {
+    this.lifecycle.onError?.(err instanceof Error ? err : new Error(String(err)));
+  }
+
   private toRelative(absolutePath: string): string | null {
     const base = this.config.path.endsWith('/')
       ? this.config.path
@@ -227,5 +370,15 @@ export class MountWatcher {
       return absolutePath.slice(base.length);
     }
     return null;
+  }
+
+  private isRootPath(absolutePath: string): boolean {
+    const root = this.config.path.endsWith('/')
+      ? this.config.path.slice(0, -1)
+      : this.config.path;
+    const candidate = absolutePath.endsWith('/')
+      ? absolutePath.slice(0, -1)
+      : absolutePath;
+    return candidate === root;
   }
 }
