@@ -3822,18 +3822,30 @@ export class AgentFramework {
         ? event.origin.messageId
         : event.eventId;
       const maxBackscroll = descriptor?.capabilities?.history?.maxMessages ?? 0;
+      // Resolve human-readable names from the event origin wherever the
+      // surface provided them — a mind reading this should see WHO addressed
+      // it WHERE, not a wall of snowflake ids. Raw ids remain only inside the
+      // tool-argument instructions, where they are the literal values to pass.
+      const origin = (event.origin ?? {}) as Record<string, unknown>;
+      const authorName = typeof origin.authorName === 'string' && origin.authorName ? origin.authorName : 'Someone';
+      const channelLabel = triggerChannel.label ? `#${triggerChannel.label}` : `"${triggerChannel.channelId}"`;
+      const place = typeof origin.guildName === 'string' && origin.guildName
+        ? `${channelLabel} in "${origin.guildName}"`
+        : channelLabel;
       content.push({
         type: 'text',
         text:
-          `\n[Channel invitation] You were addressed in closed channel ` +
-          `"${triggerChannel.label ?? triggerChannel.channelId}" (${triggerChannel.channelId}, server ${event.serverId}). ` +
-          `You received this one message without subscribing. ` +
+          `\n[Channel invitation] ${authorName} addressed you in ${place} — ` +
+          `a channel you haven't joined. You're seeing this one message; you won't receive more from it unless you join. ` +
+          `Your options:\n` +
+          `1. Reply without joining — simply write your reply as normal text this turn; it will be delivered to ${channelLabel}.\n` +
+          `2. Join the channel — call channel_open with channelId "${triggerChannel.channelId}" and serverId "${event.serverId}"` +
           (maxBackscroll > 0
-            ? `To subscribe, call channel_open with channelId, serverId "${event.serverId}", backscroll (0-${maxBackscroll}), and beforeMessageId "${messageId}". `
-            : `To subscribe, call channel_open with this channelId and serverId "${event.serverId}". `) +
-          `You may reply once without subscribing. To remain closed, call channel_decline ` +
-          `with channelId, serverId "${event.serverId}", and messageId "${messageId}"; ` +
-          `optionally set acknowledge to a surface value such as 👀.`,
+            ? `; to also read recent history, add backscroll (a number up to ${maxBackscroll}) and beforeMessageId "${messageId}".\n`
+            : `.\n`) +
+          `3. Stay out — call channel_decline with channelId "${triggerChannel.channelId}", serverId "${event.serverId}", ` +
+          `and messageId "${messageId}" (optionally set acknowledge to an emoji like 👀 so ${authorName} isn't left hanging).\n` +
+          `Doing nothing is also fine.`,
       });
       metadata.channelInvitation = true;
       metadata.channelOpen = false;
@@ -6987,6 +6999,19 @@ export class AgentFramework {
       .then((result) => {
         const durationMs = Date.now() - startTime;
         this.emitTrace({ type: 'tool:completed', module: 'channels', tool: call.name, callId: call.id, durationMs });
+        // A successful channel_open plants the agent's feet in the opened
+        // channel: pin it as this turn's reply locus so plain-text speech
+        // written right after opening routes THERE. Found live 2026-07-21
+        // (Aria bring-up): open → plain-text reply → "no locus (no
+        // home/active channel, defaultPublishChannel null)" on a turn with
+        // no channel trigger (post-restart continuation). Next turn start
+        // re-resolves the locus as usual (startAgentStream set/delete).
+        if (call.name === 'channel_open' && result?.success) {
+          const opened =
+            (result.data as { channelId?: string } | undefined)?.channelId
+            ?? (call.input as { channelId?: string } | undefined)?.channelId;
+          if (opened) this.activeTriggerChannels.set(agentName, opened);
+        }
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
