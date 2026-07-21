@@ -1,6 +1,6 @@
 {
   "name": "@animalabs/agent-framework",
-  "version": "0.6.9",
+  "version": "0.6.10",
   "description": "Multi-agent framework with pluggable modules, persistent state, and concurrent tool execution",
   "repository": {
     "type": "git",
