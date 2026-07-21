@@ -239,4 +239,12 @@ export interface InferenceRequest {
    * which correctly fall back to the global default channel.
    */
   channelId?: string;
+  /**
+   * True when the triggering message explicitly addressed the agent (mention,
+   * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake
+   * batch spans several channels, an addressed channel outranks ambient
+   * chatter for the turn's frozen speech locus: overheard conversation must
+   * not capture the agent's voice just by being newest.
+   */
+  addressed?: boolean;
 }

@@ -101,6 +101,10 @@ interface McplChannelIncomingEvent {
   content: ContentBlock[];
   timestamp: string;
   metadata?: Record<string, unknown>;
+  /** MCPL RFC-001 event tags (`chat:addressed`, `chat:ambient`, …) — carried
+   *  through so the host can rank addressed messages over ambient chatter
+   *  when picking a turn's frozen speech locus. */
+  tags?: string[];
   triggerInference?: boolean;
   targetAgents?: string[];
 }
@@ -595,6 +599,7 @@ export class ChannelRegistry {
         content: convertedContent,
         timestamp: message.timestamp,
         metadata: message.metadata,
+        ...(message.tags ? { tags: message.tags } : {}),
         triggerInference,
       };
 
@@ -1463,10 +1468,12 @@ export class ChannelRegistry {
     conversationId: string,
     text: string,
     /** Pin the outbound locus, skipping resolution. Callers delivering MULTIPLE
-     *  segments of ONE turn snapshot resolveLocus() once and pass it here, so a
-     *  new turn starting mid-dispatch (segments run after the agent is idle,
-     *  PR #32) can't overwrite the per-agent triggering channel between segments
-     *  and split one reply across channels. */
+     *  segments of ONE turn snapshot the frozen turn locus once and pass it
+     *  here, so a new turn starting mid-dispatch (segments run after the agent
+     *  is idle, PR #32) can't overwrite the per-agent triggering channel
+     *  between segments and split one reply across channels. Explicit `null`
+     *  means "pinned to no locus" (fail rather than re-resolve); omit the
+     *  parameter entirely for live resolution. */
     overrideChannelId?: string | null,
   ): Promise<{ delivered: boolean; channelId: string } | null> {
     // Surface a routing failure: emit a trace AND notify the host (which drops
@@ -1497,7 +1504,15 @@ export class ChannelRegistry {
     // Using the global for a fork or a concurrent trunk turn is the item-3 bug:
     // it tracks the most-recent inbound across ALL channels, so a reply lands
     // wherever a message last happened to arrive rather than where it belongs.
-    const channelId = overrideChannelId ?? this.resolveLocus(conversationId);
+    //
+    // An EXPLICIT null override means "this turn is pinned to no locus" (the
+    // turn-frozen pin resolved to nothing at turn start): do NOT re-resolve —
+    // the global default may have moved mid-turn, and the agent was told its
+    // prose stays in the archive. Only an ABSENT override resolves live.
+    const channelId =
+      overrideChannelId !== undefined
+        ? overrideChannelId
+        : this.resolveLocus(conversationId);
     if (!channelId) {
       // Reached only when the agent has no home, no active triggering channel,
       // AND no global inbound was ever seen.

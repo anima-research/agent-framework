@@ -48,6 +48,9 @@ class RobotModule implements Module {
   interjection: string | null = null;
   /** Optional routing locus attached to the interjected message. */
   interjectionChannelId: string | null = null;
+  /** Full metadata override for the interjected message (wins over
+   *  interjectionChannelId when set) — e.g. reaction tags. */
+  interjectionMetadata: Record<string, unknown> | null = null;
   /** Delay tool completion so live routing deterministically precedes it. */
   toolDelayMs = 0;
 
@@ -80,9 +83,10 @@ class RobotModule implements Module {
         type: 'external-message',
         source: 'test',
         content: text,
-        metadata: this.interjectionChannelId
-          ? { channelId: this.interjectionChannelId }
-          : {},
+        metadata: this.interjectionMetadata
+          ?? (this.interjectionChannelId
+            ? { channelId: this.interjectionChannelId }
+            : {}),
       } as unknown as ProcessEvent);
       // Give the run loop a beat to process the queued message while this
       // tool round is still pending (pendingAssistantBlocks non-empty), so
@@ -287,10 +291,14 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it('new injected channel input resets send suppression and moves the reply locus', async () => {
-    // Exact shape of the Fable incident: while handling one channel, the agent
-    // explicitly sends that response; a message from another channel arrives
-    // during the send, and the terminal prose answers the new message.
+  it('new injected channel input resets send suppression but the turn locus stays frozen', async () => {
+    // While handling one channel, the agent explicitly sends that response; a
+    // message from another channel arrives during the send, and the terminal
+    // prose answers the new message. The suppression is cleared (the prose IS
+    // delivered) — but it lands in the TURN's frozen locus, not the injected
+    // message's channel: ambient input must never capture the agent's voice
+    // mid-turn (2026-07-21 Cairn lounge misroute). A cross-channel reply
+    // needs an explicit send.
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'reply to room4' } },
     ] as ContentBlock[], 'tool_use'));
@@ -307,8 +315,77 @@ describe('present while acting', () => {
     await framework.runUntilIdle();
 
     assert.deepEqual(routed, [
-      { text: 'Yes, I want to try the VR space.', locus: 'discord:guild:fable' },
+      { text: 'Yes, I want to try the VR space.', locus: 'chan-live-1' },
     ]);
+
+    await framework.stop();
+  });
+
+  it('reactions and system markers injected mid-turn do not clear send suppression', async () => {
+    // A reaction (`chat:reaction` tag) or a `system: true` marker is not
+    // conversational input: prose following an explicit send stays suppressed,
+    // so a stray reaction can't make the agent double-post a "sent it"
+    // postscript — and (with the frozen locus) can't move routing either.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'reply to room4' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Sent it.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.interjection = '[reaction] @someone reacted 👍';
+    module.interjectionChannelId = null;
+    module.interjectionMetadata = { channelId: '999888777', tags: ['chat:reaction'] };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [], 'post-send prose stayed suppressed after a reaction');
+
+    await framework.stop();
+  });
+
+  it('announces the outbound locus in the window only when it changes', async () => {
+    // Turn 1 (locus chan-live-1, e2e): one durable [routing] notice — the
+    // boot baseline. Then the announce-on-change logic directly (MockMembrane
+    // supports one turn per test): same locus → silence (steady state must
+    // not chatter — KV); new locus → exactly one more notice.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'one' }] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+
+    const notices: string[] = [];
+    framework.onTrace((event) => {
+      const e = event as { type: string; source?: string };
+      if (e.type === 'message:added' && e.source === 'routing-notice') {
+        notices.push(e.source!);
+      }
+    });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.equal(notices.length, 1, 'first turn announced the boot-baseline locus');
+
+    const announce = (
+      framework as unknown as {
+        announceLocusIfChanged(agentName: string, locus: string | null): void;
+      }
+    ).announceLocusIfChanged.bind(framework);
+
+    announce('assistant', 'chan-live-1');
+    assert.equal(notices.length, 1, 'unchanged locus announced nothing');
+
+    announce('assistant', 'chan-B');
+    assert.equal(notices.length, 2, 'changed locus announced exactly once');
+
+    announce('assistant', 'chan-B');
+    assert.equal(notices.length, 2, 'steady state on the new locus stays silent');
+
+    announce('assistant', null);
+    assert.equal(notices.length, 3, 'losing the locus is announced too');
 
     await framework.stop();
   });

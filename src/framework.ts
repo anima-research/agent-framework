@@ -109,6 +109,42 @@ function sniffImageMediaType(data: Buffer): string | undefined {
 const SILENCING_TOOLS = new Set([
   'skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
 ]);
+
+/**
+ * True when an injected message is real conversational input — something the
+ * agent might actually be replying to — rather than ambient machinery.
+ * System markers (`system: true` — send-failed notices, routing notices) and
+ * reactions (`chat:reaction` tag, MCPL RFC-001) don't count: they must not
+ * clear explicit-send suppression, and they never influence routing.
+ */
+const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
+  if (!metadata) return true;
+  const m = metadata as Record<string, unknown>;
+  if (m.system === true) return false;
+  if (Array.isArray(m.tags) && m.tags.includes('chat:reaction')) return false;
+  return true;
+};
+
+/**
+ * True when an incoming channel message explicitly addressed the agent.
+ * Primary signal is the MCPL RFC-001 `chat:addressed` tag (mention / reply /
+ * DM, as classified by the server); the metadata booleans are the fallback
+ * for servers that predate tags. Addressed messages outrank ambient chatter
+ * when picking a turn's frozen speech locus.
+ */
+const isAddressedMessage = (
+  tags?: string[],
+  metadata?: Record<string, unknown>,
+): boolean => {
+  if (Array.isArray(tags) && tags.includes('chat:addressed')) return true;
+  if (!metadata) return false;
+  return (
+    metadata.isExplicitMention === true ||
+    metadata.isReplyToBot === true ||
+    metadata.isMention === true ||
+    metadata.isDM === true
+  );
+};
 /** Strip the `server--` MCPL prefix from a tool name. */
 const bareToolName = (n: string): string => n.split('--').pop()!;
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
@@ -391,20 +427,25 @@ export class AgentFramework {
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
 
-  /** Per-agent output locus pinned for the CURRENT logical turn (see
-   *  resolveTurnLocus in driveStream). Lives here — not in driveStream
-   *  locals — so the pin survives a context-budget stream restart, which
-   *  continues the same logical turn in a fresh driveStream. A mid-turn
-   *  injected channel message replaces the pin for the next conversational
-   *  round; otherwise it remains stable. Cleared at the start of every
-   *  non-restart turn. */
+  /** Per-agent output locus FROZEN for the CURRENT logical turn. Resolved
+   *  eagerly in startAgentStream (home → addressed trigger → global default)
+   *  and never moved until the next turn: mid-turn injected messages — ambient
+   *  chatter, reactions, system markers — must not hijack where the agent's
+   *  plain prose lands (2026-07-21 Cairn lounge misroute). Lives here — not in
+   *  driveStream locals — so the pin survives a context-budget stream restart,
+   *  which continues the same logical turn in a fresh driveStream. Cleared or
+   *  re-set at the start of every non-restart turn. */
   private turnLocusPins: Map<string, string> = new Map();
-  /** A tool boundary injected fresh external input into the live stream.
-   *  Presence (including a null value) tells driveStream to clear sticky
-   *  explicit-send suppression before handling the next model round. A
-   *  string also moves that round's reply locus to the newest injected
-   *  channel. */
-  private midTurnRoutingResets: Map<string, string | null> = new Map();
+  /** A tool boundary injected fresh CONVERSATIONAL input (a real message —
+   *  not a reaction or a system marker) into the live stream. Tells
+   *  driveStream to clear sticky explicit-send suppression before handling
+   *  the next model round. Never affects routing: the turn locus is frozen. */
+  private midTurnInputSignals: Set<string> = new Set();
+  /** Last outbound locus announced to each agent as a durable `[routing]`
+   *  window message. Announce-on-change only: steady state emits nothing
+   *  (KV-safe, no per-turn chatter). In-memory — after a process restart the
+   *  first turn's locus is announced once to re-establish the baseline. */
+  private lastAnnouncedLocus: Map<string, string | null> = new Map();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
   /** Streams the FRAMEWORK cancelled for non-terminal reasons, keyed
    *  `${agentName}:${streamId}`: an endTurn tool result or a context-budget
@@ -3257,23 +3298,17 @@ export class AgentFramework {
             }
           }
 
-          // A newly injected message begins a new conversational round inside
-          // the same provider inference. Remember that boundary for
-          // driveStream: an explicit send in the preceding round must not
-          // silence the reply, and the newest channel-bearing injection is
-          // now the reply locus. Map presence matters even without a channel
-          // (CLI/module input): it still clears the prior send suppression.
-          if (midTurnInjections.length > 0) {
-            const injectedChannelId = midTurnInjections.reduce<string | null>(
-              (latest, injection) => {
-                const candidate = injection.metadata?.channelId;
-                return typeof candidate === 'string' && candidate.length > 0
-                  ? candidate
-                  : latest;
-              },
-              null,
-            );
-            this.midTurnRoutingResets.set(agent.name, injectedChannelId);
+          // A newly injected CONVERSATIONAL message begins a new
+          // conversational round inside the same provider inference. Remember
+          // that boundary for driveStream: an explicit send in the preceding
+          // round must not silence the reply. Routing is deliberately NOT
+          // affected — the turn locus is frozen at turn start, so ambient
+          // chatter, reactions, and system markers injected mid-turn can no
+          // longer hijack where the agent's prose lands. Non-conversational
+          // injections (reactions, `system: true` markers) don't even clear
+          // the send suppression: nothing new was said to the agent.
+          if (midTurnInjections.some((inj) => isConversationalInjection(inj.metadata))) {
+            this.midTurnInputSignals.add(agent.name);
           }
 
           // Check if any tool result requested endTurn
@@ -3493,6 +3528,7 @@ export class AgentFramework {
     content: ContentBlock[];
     timestamp: string;
     metadata?: Record<string, unknown>;
+    tags?: string[];
     triggerInference?: boolean;
   }): Promise<void> {
     const metadata: Record<string, unknown> = {
@@ -3504,6 +3540,7 @@ export class AgentFramework {
       serverId: event.serverId,
     };
     if (event.threadId) metadata.threadId = event.threadId;
+    if (event.tags) metadata.tags = event.tags;
 
     // Per-channel conversation routing: messages go to the channel's fork
     // agent (spawned from the template on first qualifying message), never
@@ -3517,6 +3554,7 @@ export class AgentFramework {
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
     if (event.triggerInference) {
+      const addressed = isAddressedMessage(event.tags, event.metadata);
       for (const agentName of this.agents.keys()) {
         this.pendingRequests.push({
           agentName,
@@ -3526,6 +3564,9 @@ export class AgentFramework {
           // Route this turn's auto-published speech back to THIS channel, not
           // the global most-recent-inbound locus (item-3 redux, trunk agents).
           channelId: event.channelId,
+          // Addressed messages outrank ambient chatter when a batched wake
+          // picks the turn's frozen speech locus.
+          addressed,
         });
       }
     }
@@ -3545,6 +3586,7 @@ export class AgentFramework {
       author: { id: string; name: string };
       content: ContentBlock[];
       metadata?: Record<string, unknown>;
+      tags?: string[];
       triggerInference?: boolean;
     },
     messageMetadata: Record<string, unknown>,
@@ -3623,6 +3665,7 @@ export class AgentFramework {
         // A fork's home channel wins in routeSpeech regardless, but carry the
         // triggering channel too so the trunk/active path stays consistent.
         channelId: event.channelId,
+        addressed: isAddressedMessage(event.tags, event.metadata),
       });
     }
   }
@@ -3809,7 +3852,17 @@ export class AgentFramework {
       featureSet: event.featureSet,
       eventId: event.eventId,
       triggered: event.triggerInference ?? false,
+      ...(event.tags ? { tags: event.tags } : {}),
     };
+    // `origin.channelId` is the server-internal raw id (a bare Discord
+    // snowflake) — unroutable as a locus and unresolvable by the agent. Store
+    // the composite MCPL id instead wherever we can derive it, so anything
+    // downstream that reads `metadata.channelId` (routing, provenance, the
+    // agent itself) sees the qualified form. The raw value stays available on
+    // servers that also send `rawChannelId`-style origin fields.
+    if (triggerChannel) {
+      metadata.channelId = triggerChannel.channelId;
+    }
 
     const content = [...event.content];
     const addressedWhileClosed = triggerChannel &&
@@ -3992,17 +4045,82 @@ export class AgentFramework {
       const trigger = requests[0];
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
-      // (messages arrived in >1 channel while the agent was busy/idle) — reply
-      // in the MOST-RECENT one: it matches the legacy last-inbound semantics and
-      // is the message the agent is most likely answering. The common case is
-      // 1 message → 1 channel (unambiguous). Non-channel wakes carry no
-      // channelId, leaving the field undefined → global fallback. `reduce`
-      // keeps the last defined channelId across the (FIFO-ordered) batch.
-      const triggerChannel = requests.reduce<string | undefined>(
-        (acc, r) => r.channelId ?? acc,
-        undefined,
+      // (messages arrived in >1 channel while the agent was busy/idle):
+      //   1. the most recent ADDRESSED channel wins (mention / reply / DM —
+      //      someone explicitly spoke TO the agent);
+      //   2. else the most recent channel-bearing request (ambient message in
+      //      an open channel — legacy last-inbound semantics).
+      // Ambient chatter must not outrank an addressed message just by being
+      // newest (2026-07-21 Cairn lounge misroute, turn-start variant).
+      // Non-channel wakes (heartbeats, module events, reactions — which never
+      // carry channelId) leave both undefined → global fallback.
+      let ambientChannel: string | undefined;
+      let addressedChannel: string | undefined;
+      for (const r of requests) {
+        if (!r.channelId) continue;
+        ambientChannel = r.channelId;
+        if (r.addressed) addressedChannel = r.channelId;
+      }
+      const triggerChannel = addressedChannel ?? ambientChannel;
+      const triggerAddressed = addressedChannel !== undefined;
+      await this.startAgentStream(agent, {
+        ...trigger,
+        channelId: triggerChannel,
+        addressed: triggerAddressed,
+      });
+    }
+  }
+
+  /**
+   * Announce-on-change locus notice (turn-frozen routing). Appends a durable
+   * `[routing]` window message when the turn's effective outbound locus
+   * differs from the last one announced — the agent must never have to guess
+   * where its plain prose lands. Durable append (never retracted) keeps the
+   * KV prefix stable; change-only keeps it out of steady-state turns. The
+   * first resolution after boot announces only a non-null locus ("prose has
+   * no destination" is the unremarkable boot default). Never triggers
+   * inference; never locus-eligible itself (system + no channel metadata).
+   */
+  private announceLocusIfChanged(agentName: string, locus: string | null): void {
+    const hasBaseline = this.lastAnnouncedLocus.has(agentName);
+    const prev = this.lastAnnouncedLocus.get(agentName) ?? null;
+    if (hasBaseline ? prev === locus : locus === null) {
+      if (!hasBaseline) this.lastAnnouncedLocus.set(agentName, locus);
+      return;
+    }
+    this.lastAnnouncedLocus.set(agentName, locus);
+
+    const agent = this.agents.get(agentName);
+    if (!agent) return;
+
+    let text: string;
+    if (locus === null) {
+      text =
+        '[routing] Your plain speech currently has no channel — it stays in ' +
+        'your archive. Use an explicit send tool to reach a channel.';
+    } else {
+      const label = this.channelRegistry?.getDescriptor(locus)?.label;
+      const shown =
+        label && label !== locus
+          ? `${label.startsWith('#') ? label : `#${label}`} (${locus})`
+          : locus;
+      text =
+        `[routing] Your plain speech now lands in ${shown}. ` +
+        'Other channels need an explicit send tool.';
+    }
+
+    try {
+      const id = agent.getContextManager().addMessage(
+        'user',
+        [{ type: 'text', text }],
+        { system: true, kind: 'routing-notice' },
       );
-      await this.startAgentStream(agent, { ...trigger, channelId: triggerChannel });
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
+      console.error(
+        `[routing] ${agentName}: locus ${prev ?? '(none)'} -> ${locus ?? '(none)'} (announced in window)`,
+      );
+    } catch (err) {
+      console.error('announceLocusIfChanged: failed to record routing notice:', err);
     }
   }
 
@@ -4023,6 +4141,26 @@ export class AgentFramework {
       this.activeTriggerChannels.set(agent.name, trigger.channelId);
     } else {
       this.activeTriggerChannels.delete(agent.name);
+    }
+
+    // FREEZE this turn's outbound locus now (turn-frozen routing). Resolved
+    // once — home channel for forks, else the triggering channel, else the
+    // global default — and never moved for the rest of the turn: mid-turn
+    // injections must not redirect the agent's plain prose (ambient chatter /
+    // reactions hijacked it before, 2026-07-21). A context-budget restart
+    // continues the same logical turn, so it keeps the existing pin. The
+    // eager snapshot also protects heartbeat turns from a moving
+    // defaultPublishChannel mid-turn. If the effective locus differs from the
+    // last one announced, drop a durable `[routing]` notice into the window
+    // BEFORE this turn compiles, so the agent always knows where its voice
+    // goes (announce-on-change only — no per-turn chatter, append-only for
+    // KV stability).
+    if (trigger?.reason !== 'context_budget_restart') {
+      const locus = this.channelRegistry?.resolveLocus(agent.name) ?? null;
+      if (locus !== null) this.turnLocusPins.set(agent.name, locus);
+      else this.turnLocusPins.delete(agent.name);
+      this.midTurnInputSignals.delete(agent.name);
+      if (attempt === 0) this.announceLocusIfChanged(agent.name, locus);
     }
 
     this.touchEphemeralRun(agent.name, true);
@@ -4138,24 +4276,15 @@ export class AgentFramework {
     let hadToolCalls = false;
 
     // ---- Present-while-acting turn state ---------------------------------
-    // Output locus for the current CONVERSATIONAL ROUND: resolved lazily and
-    // kept stable across tool-only rounds. A channel message injected at a
-    // tool boundary replaces the pin before the next model round, because a
-    // single provider inference can now contain several conversations. The
-    // pin lives in `turnLocusPins` so it survives a context-budget restart. A
-    // null resolution is not pinned.
-    if (trigger?.reason !== 'context_budget_restart') {
-      this.turnLocusPins.delete(agent.name);
-      this.midTurnRoutingResets.delete(agent.name);
-    }
-    const resolveTurnLocus = (): string | null => {
-      let locus = this.turnLocusPins.get(agent.name) ?? null;
-      if (locus === null && this.channelRegistry) {
-        locus = this.channelRegistry.resolveLocus(agent.name);
-        if (locus !== null) this.turnLocusPins.set(agent.name, locus);
-      }
-      return locus;
-    };
+    // Output locus for the WHOLE logical turn: frozen in startAgentStream
+    // (home → addressed trigger → global default) before this stream began,
+    // and never moved until the next turn. Mid-turn injections do not touch
+    // it — an ambient message or a reaction arriving at a tool boundary must
+    // not redirect the agent's task narration (2026-07-21 Cairn misroute).
+    // The pin lives in `turnLocusPins` so a context-budget restart (same
+    // logical turn, fresh driveStream) keeps it.
+    const resolveTurnLocus = (): string | null =>
+      this.turnLocusPins.get(agent.name) ?? null;
 
     // Ordered delivery chain for live-routed prose. Links are enqueued
     // WITHOUT awaiting in the stream-event loop — an awaited network post
@@ -4188,32 +4317,23 @@ export class AgentFramework {
     // delivered exactly once, at turn end.
     let liveProseRouting = false;
 
-    // Typing indicator: show "<agent> is typing…" in the channel she's
-    // responding to, for the whole duration of this turn. Started here (paired
-    // with the finally below, so it can never leak) and refreshed on a 7s
-    // interval by the ChannelRegistry until stopped on any exit path.
-    let typingChannel = this.channelRegistry
-      ? trigger?.channelId ?? this.channelRegistry.getDefaultPublishChannel()
-      : null;
+    // Typing indicator: show "<agent> is typing…" in the channel her plain
+    // prose will actually land in — the turn-frozen locus — for the whole
+    // duration of this turn. Started here (paired with the finally below, so
+    // it can never leak) and refreshed on a 7s interval by the
+    // ChannelRegistry until stopped on any exit path. Never moves mid-turn:
+    // it mirrors the frozen routing pin, not the newest inbound message.
+    const typingChannel = resolveTurnLocus();
     if (typingChannel) this.channelRegistry!.startTyping(typingChannel);
 
     const adoptInjectedRound = (): void => {
-      if (!this.midTurnRoutingResets.has(agent.name)) return;
-      const nextLocus = this.midTurnRoutingResets.get(agent.name) ?? null;
-      this.midTurnRoutingResets.delete(agent.name);
+      if (!this.midTurnInputSignals.has(agent.name)) return;
+      this.midTurnInputSignals.delete(agent.name);
 
-      // A new human/agent message, not merely a tool result, means any earlier
-      // explicit delivery has completed its conversational job.
+      // A new conversational message, not merely a tool result, means any
+      // earlier explicit delivery has completed its conversational job.
+      // Routing is NOT touched: the turn locus stays frozen.
       turnSilenced = false;
-
-      if (nextLocus) {
-        this.turnLocusPins.set(agent.name, nextLocus);
-        if (typingChannel !== nextLocus) {
-          if (typingChannel) this.channelRegistry?.stopTyping(typingChannel);
-          typingChannel = nextLocus;
-          this.channelRegistry?.startTyping(nextLocus);
-        }
-      }
     };
 
     try {
@@ -5853,11 +5973,24 @@ export class AgentFramework {
         // yes, wake no).
         onRouteFailure: ({ channelId, reason, textLen }) => {
           try {
+            // Render a human-readable channel name when we can — a bare
+            // snowflake in the marker is unresolvable for the agent (the
+            // 2026-07-21 incident read as "a stale artifact", not a live
+            // failure). The marker is `system: true`, so it is never
+            // conversational and never influences routing.
+            const label = channelId
+              ? this.channelRegistry?.getDescriptor(channelId)?.label
+              : undefined;
+            const where = channelId
+              ? label && label !== channelId
+                ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
+                : channelId
+              : 'the channel';
             this.addMessage(
               'user',
               [{
                 type: 'text',
-                text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${channelId ?? 'the channel'} (${reason}). It was saved to your archive but the human did not receive it.`,
+                text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
               }],
               { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason },
             );
