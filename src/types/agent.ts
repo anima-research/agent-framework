@@ -68,6 +68,23 @@ export interface AgentConfig {
    */
   cacheTtl?: '5m' | '1h';
 
+  /**
+   * Whether to emit prompt-cache markers (cache_control) on requests.
+   * Default true (Anthropic API). Set false for transports that reject
+   * cache_control — e.g. Bedrock legacy Claude models, which fail with
+   * "your request did not allow prompt caching".
+   */
+  promptCaching?: boolean;
+
+  /**
+   * Prefill-formatter support: a synthetic user message appended after the
+   * conversation (e.g. chapterx's `<cmd>cat untitled.txt</cmd>` CLI-sim
+   * scaffold). Forwarded verbatim to membrane's prefill formatters; ignored
+   * by native formatting. Part of reproducing a prefill-era bot's exact
+   * prompting structure when migrating it into a resident.
+   */
+  prefillUserMessage?: string;
+
   /** Provider-specific request parameters (for example Responses reasoning
    * and server-side compaction settings). */
   providerParams?: Record<string, unknown>;

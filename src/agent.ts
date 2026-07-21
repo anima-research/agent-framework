@@ -64,6 +64,10 @@ export class Agent {
   readonly refusalHandling: AgentConfig['refusalHandling'];
   /** Prompt-cache TTL forwarded to the provider (see AgentConfig.cacheTtl). */
   readonly cacheTtl: NonNullable<AgentConfig['cacheTtl']>;
+  /** Emit prompt-cache markers on requests (see AgentConfig.promptCaching). */
+  readonly promptCaching: boolean;
+  /** Prefill scaffold user message (see AgentConfig.prefillUserMessage). */
+  readonly prefillUserMessage?: string;
   /** Provider-specific request parameters forwarded unchanged by Membrane. */
   readonly providerParams?: Record<string, unknown>;
   readonly sameRoundThinkTextPolicy: AgentConfig['sameRoundThinkTextPolicy'];
@@ -101,6 +105,8 @@ export class Agent {
     this.thinking = config.thinking;
     this.refusalHandling = config.refusalHandling;
     this.cacheTtl = config.cacheTtl ?? '1h';
+    this.promptCaching = config.promptCaching ?? true;
+    this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
@@ -638,8 +644,9 @@ export class Agent {
         ...(this.thinking !== undefined && { thinking: this.thinking }),
       },
       tools: availableTools.length > 0 ? availableTools : undefined,
-      promptCaching: true,
+      promptCaching: this.promptCaching,
       cacheTtl: this.cacheTtl,
+      ...(this.prefillUserMessage && { prefillUserMessage: this.prefillUserMessage }),
       ...(this.providerParams && { providerParams: this.providerParams }),
       assistantParticipant: this.name,
     };
