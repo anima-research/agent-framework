@@ -4252,7 +4252,13 @@ export class AgentFramework {
     }
 
     this.touchEphemeralRun(agent.name, true);
-    this.emitTrace({ type: 'inference:started', agentName: agent.name });
+    this.emitTrace({
+      type: 'inference:started',
+      agentName: agent.name,
+      // The turn-frozen locus was pinned just above (kept across a
+      // context-budget restart, which skips the re-pin but re-emits this).
+      channelId: this.turnLocusPins.get(agent.name),
+    });
     this.eventGate?.onInferenceStarted(agent.name);
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
 
@@ -4435,6 +4441,10 @@ export class AgentFramework {
               content: event.content,
               blockType: event.meta.type,
               blockIndex: event.meta.blockIndex,
+              // Turn-frozen locus (same value as the typing indicator above):
+              // lets trace consumers tag every chunk with the channel this
+              // turn's prose is bound for, without re-deriving routing.
+              channelId: typingChannel ?? undefined,
             });
             break;
 
@@ -4446,6 +4456,7 @@ export class AgentFramework {
               phase,
               blockType: block.type,
               blockIndex: index,
+              channelId: typingChannel ?? undefined,
             });
             break;
           }

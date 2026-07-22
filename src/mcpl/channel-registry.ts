@@ -1621,7 +1621,7 @@ export class ChannelRegistry {
      *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
      *  "this turn is pinned to no locus": fail loudly rather than guess. */
     locusChannelId: string | null,
-  ): Promise<{ delivered: boolean; channelId: string } | null> {
+  ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
     // Surface a routing failure: emit a trace AND notify the host (which drops
     // a `[discord-send-failed]` marker into chronicle) so the agent learns her
     // reply never reached the human, instead of it vanishing silently.
@@ -1629,6 +1629,7 @@ export class ChannelRegistry {
       console.error(`[routeSpeech] ${conversationId}: ${reason} — speech NOT routed (${text.length} chars stay in chronicle)`);
       this.emitTraceFn({
         type: 'mcpl:speech-route-failed',
+        conversationId,
         channelId: channelId ?? '',
         reason,
         textLen: text.length,
@@ -1700,6 +1701,11 @@ export class ChannelRegistry {
     };
     const result = await server.sendChannelsPublish(publishParams);
     const delivered = (result as { delivered?: boolean } | undefined)?.delivered ?? true;
+    // Surface the posted message's id (ChannelsPublishResult.messageId) so
+    // trace consumers can act on the just-posted message — e.g. a TTS-relay
+    // tap editing it down to the words actually voiced on interruption.
+    // Previously this was silently dropped here.
+    const messageId = (result as { messageId?: string } | undefined)?.messageId;
 
     // The server accepted the publish RPC but reported the message was not
     // actually delivered (e.g. missing Send Messages permission). Previously
@@ -1711,13 +1717,16 @@ export class ChannelRegistry {
     console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${channelId} (server=${entry.serverId}, delivered=${delivered})`);
     this.emitTraceFn({
       type: 'mcpl:speech-routed',
+      conversationId,
       serverId: entry.serverId,
       channelId,
       delivered,
       textLen: text.length,
+      text,
+      ...(messageId !== undefined ? { messageId } : {}),
     });
 
-    return { delivered, channelId };
+    return { delivered, channelId, ...(messageId !== undefined ? { messageId } : {}) };
   }
 
   private async handleToolPublish(input: { channelId?: string; content?: string; text?: string }): Promise<ToolResult> {

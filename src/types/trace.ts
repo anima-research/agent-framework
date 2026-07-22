@@ -37,7 +37,18 @@ export type TraceEvent =
     })
 
   // Inference lifecycle
-  | (TraceEventBase & { type: 'inference:started'; agentName: string })
+  | (TraceEventBase & {
+      type: 'inference:started';
+      agentName: string;
+      /**
+       * The turn-frozen outbound locus (see turnLocusPins) — the channel this
+       * turn's plain prose will be routed to. Omitted for turns with no locus
+       * (heartbeats with no default channel). Observability only, like every
+       * trace field; lets external taps (e.g. a TTS relay) tag the whole
+       * activation with its channel without re-deriving routing.
+       */
+      channelId?: string;
+    })
   | (TraceEventBase & {
       type: 'inference:completed';
       agentName: string;
@@ -82,6 +93,8 @@ export type TraceEvent =
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       /** 0-indexed block position in the current assistant turn. */
       blockIndex: number;
+      /** Turn-frozen outbound locus for this turn (see inference:started). */
+      channelId?: string;
     })
   | (TraceEventBase & {
       /**
@@ -95,6 +108,8 @@ export type TraceEvent =
       phase: 'block_start' | 'block_complete';
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       blockIndex: number;
+      /** Turn-frozen outbound locus for this turn (see inference:started). */
+      channelId?: string;
     })
   | (TraceEventBase & {
       type: 'inference:tool_calls_yielded';
@@ -279,6 +294,37 @@ export type TraceEvent =
       type: 'mcpl:conversation-disposed';
       agentName: string;
       channelId?: string;
+    })
+
+  // Host-owned speech routing (ChannelRegistry.routeSpeech). One trace per
+  // delivered prose segment. `text` is the segment verbatim — the same content
+  // already on the bus chunk-by-chunk via inference:tokens, and mcpl:* traces
+  // are 'ops'-scoped on the webui wire — and `messageId` is the surface's id
+  // for the posted message (when the MCPL server reports one). Together they
+  // give external taps the (channelId, messageId, text) tuple needed to edit
+  // a just-posted message, e.g. a TTS interruption truncating a reply to the
+  // words actually voiced.
+  | (TraceEventBase & {
+      type: 'mcpl:speech-routed';
+      /** Agent / conversation whose speech was routed. */
+      conversationId: string;
+      serverId: string;
+      channelId: string;
+      delivered: boolean;
+      textLen: number;
+      /** The routed prose segment, verbatim. */
+      text: string;
+      /** Surface message id (e.g. Discord message id), when reported. */
+      messageId?: string;
+    })
+  | (TraceEventBase & {
+      type: 'mcpl:speech-route-failed';
+      /** Agent / conversation whose speech failed to route. */
+      conversationId: string;
+      /** Empty string when the failure was "no locus at all". */
+      channelId: string;
+      reason: string;
+      textLen: number;
     })
 
   // MCPL server connection lifecycle (spawn / handshake / reconnect health).
