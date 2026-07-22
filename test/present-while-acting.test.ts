@@ -347,6 +347,30 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it('text-only turns route to the turn-frozen locus, not a live re-resolution', async () => {
+    // The text-only dispatch runs after the agent is idle; a live resolution
+    // there can read the NEXT turn's trigger state or a post-restart cleared
+    // one (2026-07-22 Sol DM misroute). The stub increments its locus per
+    // resolveLocus() call: the turn-start freeze consumes chan-live-1, so a
+    // live re-resolution at dispatch would return chan-live-2. The frozen
+    // path must deliver to chan-live-1.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'A quiet reply with no tools.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'A quiet reply with no tools.', locus: 'chan-live-1' },
+    ]);
+
+    await framework.stop();
+  });
+
   it('announces the outbound locus in the window only when it changes', async () => {
     // Turn 1 (locus chan-live-1, e2e): one durable [routing] notice — the
     // boot baseline. Then the announce-on-change logic directly (MockMembrane

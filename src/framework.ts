@@ -3920,6 +3920,10 @@ export class AgentFramework {
           source: event.serverId,
           timestamp: Date.now(),
           channelId: triggerChannel?.channelId,
+          // DMs and addressed-while-closed messages arrive as push events;
+          // they must outrank ambient chatter in a batched wake's locus
+          // selection just like their channels/incoming counterparts.
+          addressed: isAddressedMessage(event.tags, event.origin),
         });
       }
     }
@@ -4137,10 +4141,19 @@ export class AgentFramework {
     // instead falls back to the global default. A given agent runs one turn at a
     // time, so a set here is only read during THIS turn's routeSpeech /
     // buildChannelContext; retries re-run with the same trigger, re-setting it.
-    if (trigger?.channelId) {
-      this.activeTriggerChannels.set(agent.name, trigger.channelId);
-    } else {
-      this.activeTriggerChannels.delete(agent.name);
+    // A context-budget restart continues the SAME logical turn in a fresh
+    // stream — its trigger carries no channelId, and deleting the trigger
+    // channel here mid-logical-turn is exactly the hole that sent Sol's DM
+    // reply to a stale guild channel (2026-07-22): any live locus resolution
+    // after the restart fell through to the hours-old defaultPublishChannel.
+    // Keep the turn's trigger channel across restarts; only real new turns
+    // reset it.
+    if (trigger?.reason !== 'context_budget_restart') {
+      if (trigger?.channelId) {
+        this.activeTriggerChannels.set(agent.name, trigger.channelId);
+      } else {
+        this.activeTriggerChannels.delete(agent.name);
+      }
     }
 
     // FREEZE this turn's outbound locus now (turn-frozen routing). Resolved
@@ -4755,8 +4768,18 @@ export class AgentFramework {
                 .join('\n')
                 .trim();
               if (speechText) {
+                // Route to the TURN-FROZEN locus, like every other speech
+                // path. This dispatch runs AFTER the agent is idle, so a live
+                // resolution here can read the NEXT turn's trigger state (or
+                // a post-restart cleared one) and land the reply in a stale
+                // channel — the 2026-07-22 Sol DM-to-guild misroute. The
+                // frozen pin is immune to both races.
+                const locus = resolveTurnLocus();
+                console.error(
+                  `[routing] ${agent.name}: text-only turn -> routing speech -> ${locus ?? '(none)'}`,
+                );
                 try {
-                  await this.channelRegistry.routeSpeech(agent.name, speechText);
+                  await this.channelRegistry.routeSpeech(agent.name, speechText, locus);
                 } catch (err) {
                   console.error('speech routing failed:', err);
                 }
