@@ -4158,6 +4158,51 @@ export class AgentFramework {
     }
   }
 
+  /**
+   * Durable window notice for a channel the agent did not ask to open —
+   * subscription-policy admission, or an open forced by the agent's own
+   * delivery into a closed channel. The agent must always learn that new
+   * traffic will start flowing, and that `channel_close` opts out (their
+   * decision outranks policy). System message: never triggers inference,
+   * never conversational, never locus-eligible.
+   */
+  private recordChannelAutoOpenNotice(
+    agentName: string | undefined,
+    channels: Array<{ channelId: string; label?: string }>,
+    cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply',
+  ): void {
+    if (channels.length === 0) return;
+    const shown = channels
+      .map((c) => (c.label && c.label !== c.channelId ? `${c.label} (${c.channelId})` : c.channelId))
+      .join(', ');
+    const plural = channels.length > 1;
+    const causeText =
+      cause === 'subscription-policy'
+        ? 'your subscription policy just admitted ' + (plural ? 'them' : 'it')
+        : 'your own message into the closed channel engaged it';
+    const text =
+      `[channels] Now open: ${shown} — ${causeText}. Ongoing traffic from ` +
+      (plural ? 'these channels' : 'this channel') +
+      ` will reach you. If you don't want ${plural ? 'one of them' : 'it'}, use channel_close — ` +
+      'your choice sticks; neither policy nor a later send will silently reopen it.';
+    try {
+      const agent = agentName ? this.agents.get(agentName) : undefined;
+      if (agent) {
+        const id = agent.getContextManager().addMessage(
+          'user',
+          [{ type: 'text', text }],
+          { system: true, kind: 'channel-notice' },
+        );
+        this.emitTrace({ type: 'message:added', messageId: id, source: 'channel-notice' });
+      } else {
+        this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'channel-notice' });
+      }
+      console.error(`[channel] auto-open notice (${cause}) -> ${agentName ?? 'primary'}: ${shown}`);
+    } catch (err) {
+      console.error('recordChannelAutoOpenNotice failed:', err);
+    }
+  }
+
   private async startAgentStream(agent: Agent, trigger?: InferenceRequest, attempt = 0): Promise<void> {
     // Record turn checkpoint before inference (only on first attempt, not retries)
     if (attempt === 0) {
@@ -6051,6 +6096,13 @@ export class AgentFramework {
             console.error('onRouteFailure: failed to record send-failure marker:', err);
           }
         },
+        // A channel opened without the agent asking (policy admission or an
+        // open forced by delivery) must be announced in the window, with the
+        // opt-out named. Routed here so registry-driven opens and framework-
+        // driven opens produce the same durable notice.
+        onChannelAutoOpened: ({ conversationId, source, channels }) => {
+          this.recordChannelAutoOpenNotice(conversationId, channels, source);
+        },
       },
     );
 
@@ -7108,10 +7160,15 @@ export class AgentFramework {
           if (target) {
             this.channelRegistry
               .openIfClosedForSend(target, serverId)
-              .then((status) => {
+              .then(({ status, channelId, label }) => {
                 if (status === 'opened') {
                   console.error(
                     `[channel] ${agentName}: explicit ${toolName} into closed channel ${target} — opened (send implies engagement)`,
+                  );
+                  this.recordChannelAutoOpenNotice(
+                    agentName,
+                    [{ channelId: channelId ?? target, label }],
+                    'opened-by-reply',
                   );
                 } else if (status === 'open-failed') {
                   console.error(

@@ -291,6 +291,22 @@ interface ChannelRegistryOptions {
     textLen: number;
   }) => void;
   /**
+   * Called when channels were opened WITHOUT the agent asking (subscription
+   * policy admitting a newly discovered channel, or delivery into a closed
+   * locus). The host wires this to drop a durable notice into the agent's
+   * window — the agent must always learn that new traffic will start
+   * flowing, and that `channel_close` opts out (their decision outranks
+   * policy). Fires ONCE per channel ever: the desired-state decision is
+   * durable, so reboots do not re-announce. Must not trigger inference.
+   */
+  onChannelAutoOpened?: (info: {
+    /** Agent whose action caused the open (delivery); absent for policy opens. */
+    conversationId?: string;
+    serverId: string;
+    source: 'subscription-policy' | 'opened-by-delivery';
+    channels: Array<{ channelId: string; label?: string }>;
+  }) => void;
+  /**
    * Resolve a conversation fork's HOME channel from its agent name. Conversation
    * forks are spawned bound to a single channel (the framework tracks this in
    * `conversationAgentHomes` / `ConversationRouter.channelForAgent`); their
@@ -338,6 +354,12 @@ export class ChannelRegistry {
     channelId: string | null;
     reason: string;
     textLen: number;
+  }) => void;
+  private onChannelAutoOpened?: (info: {
+    conversationId?: string;
+    serverId: string;
+    source: 'subscription-policy' | 'opened-by-delivery';
+    channels: Array<{ channelId: string; label?: string }>;
   }) => void;
   private homeChannelResolver?: (agentName: string) => string | undefined;
   private activeChannelResolver?: (agentName: string) => string | undefined;
@@ -390,6 +412,7 @@ export class ChannelRegistry {
     this.sendTypingFn = options?.sendTypingFn;
     this.shouldTriggerInference = options?.shouldTriggerInference;
     this.onRouteFailure = options?.onRouteFailure;
+    this.onChannelAutoOpened = options?.onChannelAutoOpened;
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
     this.store = options?.store;
@@ -1059,8 +1082,15 @@ export class ChannelRegistry {
     return false;
   }
 
-  private ensureInitialDesiredState(serverId: string, channel: ChannelDescriptor): void {
-    const wantsOpen = channel.initiallyOpen === true || this.policyWantsOpen(serverId, channel);
+  /**
+   * Returns true when this call made a FRESH subscription-policy decision to
+   * open the channel — the caller announces those to the agent (once per
+   * channel ever: the decision persists in chronicle, so reboots see an
+   * existing non-default source and never re-fire).
+   */
+  private ensureInitialDesiredState(serverId: string, channel: ChannelDescriptor): boolean {
+    const byPolicy = this.policyWantsOpen(serverId, channel);
+    const wantsOpen = channel.initiallyOpen === true || byPolicy;
     const existing = this.desiredStates.get(this.lifecycleKey(serverId, channel.id));
     if (existing) {
       // A server upgrading its descriptor to initiallyOpen — or a channel
@@ -1074,8 +1104,9 @@ export class ChannelRegistry {
           'open',
           channel.initiallyOpen === true ? 'server-bootstrap' : 'subscription-policy',
         );
+        return channel.initiallyOpen !== true && byPolicy;
       }
-      return;
+      return false;
     }
     this.setDesiredState(
       serverId,
@@ -1087,6 +1118,7 @@ export class ChannelRegistry {
           ? 'subscription-policy'
           : 'default-closed',
     );
+    return channel.initiallyOpen !== true && byPolicy;
   }
 
   private async reconcileChannels(
@@ -1096,8 +1128,15 @@ export class ChannelRegistry {
     const server = this.serverRegistry.getServer(serverId);
     if (!server) return;
 
+    // Channels the subscription policy freshly admitted in THIS pass —
+    // announced to the agent as one batched notice after the loop, so a
+    // first boot on a new policy doesn't produce one notice per channel.
+    const policyOpened: Array<{ channelId: string; label?: string }> = [];
+
     for (const channel of channels) {
-      this.ensureInitialDesiredState(serverId, channel);
+      if (this.ensureInitialDesiredState(serverId, channel)) {
+        policyOpened.push({ channelId: channel.id, label: channel.label });
+      }
       const key = `${serverId}:${channel.id}`;
       const desired = this.getDesiredState(serverId, channel.id);
       const entry = this.channels.get(key);
@@ -1133,6 +1172,21 @@ export class ChannelRegistry {
           desired,
           error: (err as Error).message,
         });
+      }
+    }
+
+    // Announce policy admissions to the agent — nothing may start flowing
+    // traffic into their window without them being told, and told how to
+    // opt out (channel_close; their decision outranks policy).
+    if (policyOpened.length > 0) {
+      try {
+        this.onChannelAutoOpened?.({
+          serverId,
+          source: 'subscription-policy',
+          channels: policyOpened,
+        });
+      } catch (err) {
+        console.error('onChannelAutoOpened (policy) failed:', err);
       }
     }
   }
@@ -1284,7 +1338,11 @@ export class ChannelRegistry {
   async openIfClosedForSend(
     rawChannelId: string,
     serverId?: string,
-  ): Promise<'opened' | 'already-open' | 'unknown-channel' | 'ambiguous' | 'open-failed'> {
+  ): Promise<{
+    status: 'opened' | 'already-open' | 'unknown-channel' | 'ambiguous' | 'open-failed';
+    channelId?: string;
+    label?: string;
+  }> {
     let matches = [...this.channels.values()].filter(
       (e) => e.descriptor.id === rawChannelId && (!serverId || e.serverId === serverId),
     );
@@ -1295,11 +1353,12 @@ export class ChannelRegistry {
           (!serverId || e.serverId === serverId),
       );
     }
-    if (matches.length === 0) return 'unknown-channel';
-    if (matches.length > 1) return 'ambiguous';
+    if (matches.length === 0) return { status: 'unknown-channel' };
+    if (matches.length > 1) return { status: 'ambiguous' };
     const entry = matches[0]!;
+    const resolved = { channelId: entry.descriptor.id, label: entry.descriptor.label };
     if (entry.open && this.getDesiredState(entry.serverId, entry.descriptor.id) === 'open') {
-      return 'already-open';
+      return { status: 'already-open', ...resolved };
     }
     try {
       await this.openChannelNow(entry, 'opened-by-reply');
@@ -1308,7 +1367,7 @@ export class ChannelRegistry {
         serverId: entry.serverId,
         channelId: entry.descriptor.id,
       });
-      return 'opened';
+      return { status: 'opened', ...resolved };
     } catch (err) {
       this.emitTraceFn({
         type: 'mcpl:channel-open-failed',
@@ -1316,7 +1375,7 @@ export class ChannelRegistry {
         channelId: entry.descriptor.id,
         error: (err as Error).message,
       });
-      return 'open-failed';
+      return { status: 'open-failed', ...resolved };
     }
   }
 
@@ -1614,6 +1673,16 @@ export class ChannelRegistry {
           serverId: entry.serverId,
           channelId,
         });
+        try {
+          this.onChannelAutoOpened?.({
+            conversationId,
+            serverId: entry.serverId,
+            source: 'opened-by-delivery',
+            channels: [{ channelId, label: entry.descriptor.label }],
+          });
+        } catch (err) {
+          console.error('onChannelAutoOpened (delivery) failed:', err);
+        }
       } catch (err) {
         return fail(channelId, `locus channel is closed and open failed: ${(err as Error).message}`);
       }

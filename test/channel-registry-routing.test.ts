@@ -14,6 +14,12 @@ function makeRegistry(
   publishResult: { delivered?: boolean } | undefined,
   homeChannelResolver?: (agentName: string) => string | undefined,
   activeChannelResolver?: (agentName: string) => string | undefined,
+  onChannelAutoOpened?: (info: {
+    conversationId?: string;
+    serverId: string;
+    source: 'subscription-policy' | 'opened-by-delivery';
+    channels: Array<{ channelId: string; label?: string }>;
+  }) => void,
 ) {
   const failures: RouteFailure[] = [];
   const traces: Array<{ type: string; [k: string]: unknown }> = [];
@@ -51,6 +57,7 @@ function makeRegistry(
       onRouteFailure: (info) => { failures.push(info); },
       homeChannelResolver,
       activeChannelResolver,
+      onChannelAutoOpened,
     },
   );
 
@@ -394,9 +401,47 @@ test('openIfClosedForSend resolves raw server-internal ids and opens the channel
   } as never);
   assert.equal(lookup('discord:dm:444555')!.open, false, 'DM registers closed');
 
-  const status = await registry.openIfClosedForSend('444555', 'discord');
+  const { status } = await registry.openIfClosedForSend('444555', 'discord');
 
   assert.equal(status, 'opened');
   assert.equal(lookup('discord:dm:444555')!.open, true);
   assert.ok(openCalls.some(c => c.channelId === 'discord:dm:444555'));
+});
+
+test('policy admissions are announced to the agent exactly once, as one batch', async () => {
+  const autoOpened: Array<{ conversationId?: string; source: string; channels: Array<{ channelId: string }> }> = [];
+  const { registry } = makeRegistry({ delivered: true }, undefined, undefined, (info) => autoOpened.push(info));
+  registry.setSubscriptionPolicy('discord', ['chan-1', 'chan-2']);
+
+  const added = {
+    added: [
+      { id: 'chan-1', type: 'discord', label: '#one', direction: 'bidirectional' },
+      { id: 'chan-2', type: 'discord', label: '#two', direction: 'bidirectional' },
+      { id: 'chan-3', type: 'discord', label: '#three', direction: 'bidirectional' },
+    ],
+  } as never;
+  await registry.handleChanged('discord', added);
+
+  assert.equal(autoOpened.length, 1, 'one batched notice per reconcile pass');
+  assert.equal(autoOpened[0]!.source, 'subscription-policy');
+  assert.deepEqual(autoOpened[0]!.channels.map(c => c.channelId).sort(), ['chan-1', 'chan-2']);
+
+  // Same channels registering again (reboot / re-register): no re-announcement.
+  await registry.handleChanged('discord', added);
+  assert.equal(autoOpened.length, 1, 'a durable decision is never re-announced');
+});
+
+test('opened-by-delivery is announced to the delivering agent', async () => {
+  const autoOpened: Array<{ conversationId?: string; source: string; channels: Array<{ channelId: string }> }> = [];
+  const { registry, lookup } = makeRegistry({ delivered: true }, undefined, undefined, (info) => autoOpened.push(info));
+
+  registry.handleIncoming('discord', incoming('dm-alice', 'hello?'));
+  lookup('dm-alice')!.open = false;
+
+  await registry.routeSpeech('sol', 'reply', 'dm-alice');
+
+  assert.equal(autoOpened.length, 1);
+  assert.equal(autoOpened[0]!.source, 'opened-by-delivery');
+  assert.equal(autoOpened[0]!.conversationId, 'sol');
+  assert.deepEqual(autoOpened[0]!.channels.map(c => c.channelId), ['dm-alice']);
 });
