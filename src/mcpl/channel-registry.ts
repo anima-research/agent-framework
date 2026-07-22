@@ -1042,22 +1042,50 @@ export class ChannelRegistry {
     });
   }
 
+  /**
+   * True when the server's recipe subscription policy wants this channel
+   * open. This is an ONGOING admission policy (subscribed ⇒ open, no matter
+   * when the channel is discovered) — not just a bootstrap seed. Allow-list
+   * entries may be composite MCPL ids or raw server-internal ids.
+   */
+  private policyWantsOpen(serverId: string, channel: ChannelDescriptor): boolean {
+    const policy = this.legacyPolicies.get(serverId) ?? 'manual';
+    if (policy === 'auto') return true;
+    if (Array.isArray(policy)) {
+      if (policy.includes(channel.id)) return true;
+      const raw = (channel.address as { channelId?: string } | undefined)?.channelId;
+      return typeof raw === 'string' && raw.length > 0 && policy.includes(raw);
+    }
+    return false;
+  }
+
   private ensureInitialDesiredState(serverId: string, channel: ChannelDescriptor): void {
+    const wantsOpen = channel.initiallyOpen === true || this.policyWantsOpen(serverId, channel);
     const existing = this.desiredStates.get(this.lifecycleKey(serverId, channel.id));
     if (existing) {
-      // A server upgrading its descriptor to initiallyOpen may lift a pure
-      // default — 'default-closed' means nobody ever decided. Real decisions
+      // A server upgrading its descriptor to initiallyOpen — or a channel
+      // matching the subscription policy — may lift a pure default:
+      // 'default-closed' means nobody ever decided. Real decisions
       // (agent-tool, invitation-declined, legacy migration, …) always stick.
-      if (channel.initiallyOpen === true && existing.state === 'closed' && existing.source === 'default-closed') {
-        this.setDesiredState(serverId, channel.id, 'open', 'server-bootstrap');
+      if (wantsOpen && existing.state === 'closed' && existing.source === 'default-closed') {
+        this.setDesiredState(
+          serverId,
+          channel.id,
+          'open',
+          channel.initiallyOpen === true ? 'server-bootstrap' : 'subscription-policy',
+        );
       }
       return;
     }
     this.setDesiredState(
       serverId,
       channel.id,
-      channel.initiallyOpen === true ? 'open' : 'closed',
-      channel.initiallyOpen === true ? 'server-bootstrap' : 'default-closed',
+      wantsOpen ? 'open' : 'closed',
+      channel.initiallyOpen === true
+        ? 'server-bootstrap'
+        : wantsOpen
+          ? 'subscription-policy'
+          : 'default-closed',
     );
   }
 
@@ -1216,6 +1244,82 @@ export class ChannelRegistry {
     };
   }
 
+  /**
+   * The single open executor: record durable desired-open intent, tell the
+   * server to subscribe, mark the live entry open. Every path that opens a
+   * channel — the agent's channel_open tool, delivery into a closed locus,
+   * an explicit send into a closed channel — funnels here, so lifecycle
+   * events, desired state, and live state can never diverge by path.
+   * Desired state is recorded BEFORE the server round-trip: intent sticks
+   * even if the subscribe fails, and reconciliation retries later.
+   */
+  private async openChannelNow(
+    entry: ChannelEntry,
+    source: string,
+    history?: ChannelHistoryRequest,
+  ): Promise<ChannelsOpenResult> {
+    this.setDesiredState(entry.serverId, entry.descriptor.id, 'open', source);
+    const server = this.serverRegistry.getServer(entry.serverId);
+    if (!server) {
+      throw new Error(`Server not found: ${entry.serverId}`);
+    }
+    const result: ChannelsOpenResult = await server.sendChannelsOpen({
+      channelId: entry.descriptor.id,
+      type: entry.descriptor.type,
+      address: entry.descriptor.address,
+      ...(history ? { history } : {}),
+    });
+    entry.open = true;
+    return result;
+  }
+
+  /**
+   * Open a channel because something was DELIVERED into it (explicit send
+   * tool or routed speech). Sending into a closed channel is not a thing:
+   * engaging a channel opens it, so typing indicators, reaction machinery,
+   * and inbound forwarding all come alive with the first outbound message.
+   * Accepts composite MCPL ids or raw server-internal ids (explicit send
+   * tools receive whatever the agent typed).
+   */
+  async openIfClosedForSend(
+    rawChannelId: string,
+    serverId?: string,
+  ): Promise<'opened' | 'already-open' | 'unknown-channel' | 'ambiguous' | 'open-failed'> {
+    let matches = [...this.channels.values()].filter(
+      (e) => e.descriptor.id === rawChannelId && (!serverId || e.serverId === serverId),
+    );
+    if (matches.length === 0) {
+      matches = [...this.channels.values()].filter(
+        (e) =>
+          (e.descriptor.address as { channelId?: string } | undefined)?.channelId === rawChannelId &&
+          (!serverId || e.serverId === serverId),
+      );
+    }
+    if (matches.length === 0) return 'unknown-channel';
+    if (matches.length > 1) return 'ambiguous';
+    const entry = matches[0]!;
+    if (entry.open && this.getDesiredState(entry.serverId, entry.descriptor.id) === 'open') {
+      return 'already-open';
+    }
+    try {
+      await this.openChannelNow(entry, 'opened-by-reply');
+      this.emitTraceFn({
+        type: 'mcpl:channel-opened-by-send',
+        serverId: entry.serverId,
+        channelId: entry.descriptor.id,
+      });
+      return 'opened';
+    } catch (err) {
+      this.emitTraceFn({
+        type: 'mcpl:channel-open-failed',
+        serverId: entry.serverId,
+        channelId: entry.descriptor.id,
+        error: (err as Error).message,
+      });
+      return 'open-failed';
+    }
+  }
+
   private async handleToolOpen(input: {
     channelId: string;
     serverId?: string;
@@ -1240,17 +1344,6 @@ export class ChannelRegistry {
       };
     }
 
-    this.setDesiredState(entry.serverId, input.channelId, 'open', 'agent-tool');
-
-    const server = this.serverRegistry.getServer(entry.serverId);
-    if (!server) {
-      return {
-        success: false,
-        error: `Server not found: ${entry.serverId}`,
-        isError: true,
-      };
-    }
-
     try {
       const history: ChannelHistoryRequest | undefined = input.backscroll
         ? {
@@ -1258,13 +1351,7 @@ export class ChannelRegistry {
             ...(input.beforeMessageId ? { beforeMessageId: input.beforeMessageId } : {}),
           }
         : undefined;
-      const result: ChannelsOpenResult = await server.sendChannelsOpen({
-        channelId: entry.descriptor.id,
-        type: entry.descriptor.type,
-        address: entry.descriptor.address,
-        ...(history ? { history } : {}),
-      });
-      entry.open = true;
+      const result = await this.openChannelNow(entry, 'agent-tool', history);
       return {
         success: true,
         data: {
@@ -1467,14 +1554,14 @@ export class ChannelRegistry {
   async routeSpeech(
     conversationId: string,
     text: string,
-    /** Pin the outbound locus, skipping resolution. Callers delivering MULTIPLE
-     *  segments of ONE turn snapshot the frozen turn locus once and pass it
-     *  here, so a new turn starting mid-dispatch (segments run after the agent
-     *  is idle, PR #32) can't overwrite the per-agent triggering channel
-     *  between segments and split one reply across channels. Explicit `null`
-     *  means "pinned to no locus" (fail rather than re-resolve); omit the
-     *  parameter entirely for live resolution. */
-    overrideChannelId?: string | null,
+    /** The turn's FROZEN locus, snapshotted once by the caller (resolveLocus
+     *  at turn start) and passed to every segment of the turn. Mandatory:
+     *  there is deliberately no live-resolution fallback here — a late
+     *  dispatch resolving live can read the NEXT turn's trigger state or a
+     *  stale global default and land the reply in the wrong channel (item-3,
+     *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
+     *  "this turn is pinned to no locus": fail loudly rather than guess. */
+    locusChannelId: string | null,
   ): Promise<{ delivered: boolean; channelId: string } | null> {
     // Surface a routing failure: emit a trace AND notify the host (which drops
     // a `[discord-send-failed]` marker into chronicle) so the agent learns her
@@ -1491,37 +1578,45 @@ export class ChannelRegistry {
       return null;
     };
 
-    // Resolve the outbound locus, in precedence order:
-    //   1. fork HOME channel — a conversation fork always replies in the channel
-    //      it was spawned to serve (item 3, forks).
-    //   2. this turn's TRIGGERING channel — a single trunk agent (connectome-
-    //      host's only mode) replies in the channel whose message woke THIS
-    //      inference, so a concurrent inbound elsewhere can't hijack the reply
-    //      (item-3 redux, trunk agents). Also carries DM channels, which arrive
-    //      as push/events and never touch `defaultPublishChannel`.
-    //   3. the process-global `defaultPublishChannel` — last resort for turns
-    //      with no triggering channel (heartbeats, timers).
-    // Using the global for a fork or a concurrent trunk turn is the item-3 bug:
-    // it tracks the most-recent inbound across ALL channels, so a reply lands
-    // wherever a message last happened to arrive rather than where it belongs.
-    //
-    // An EXPLICIT null override means "this turn is pinned to no locus" (the
-    // turn-frozen pin resolved to nothing at turn start): do NOT re-resolve —
-    // the global default may have moved mid-turn, and the agent was told its
-    // prose stays in the archive. Only an ABSENT override resolves live.
-    const channelId =
-      overrideChannelId !== undefined
-        ? overrideChannelId
-        : this.resolveLocus(conversationId);
+    // Runtime backstop for JS callers the compiler can't see: an omitted
+    // locus is a routing bug at the call site, never something to paper over
+    // with a live re-resolution.
+    if (locusChannelId === undefined) {
+      return fail(null, 'caller passed no locus (routing bug: every speech path must snapshot the turn locus)');
+    }
+    const channelId = locusChannelId;
     if (!channelId) {
-      // Reached only when the agent has no home, no active triggering channel,
-      // AND no global inbound was ever seen.
-      return fail(null, 'no locus (no home/active channel, defaultPublishChannel null)');
+      // The turn froze with no locus (no home, no triggering channel, no
+      // global inbound ever seen) — the agent was told its prose stays in
+      // the archive; honor that.
+      return fail(null, 'turn has no locus (no home/trigger channel; nothing to deliver into)');
     }
 
     const entry = this.findChannelEntry(channelId);
     if (!entry) {
       return fail(channelId, `no registered channel for locus "${channelId}"`);
+    }
+
+    // INVARIANT: it is not possible to send into a closed channel. Speech
+    // routed into a closed-but-registered locus (the canonical case: a DM
+    // that woke the agent — DMs register closed) OPENS the channel first,
+    // so typing indicators, reaction machinery, and inbound forwarding come
+    // alive with the reply. If the open fails, the speech does NOT go out:
+    // a half-alive delivery is worse than a loud marker.
+    if (!entry.open) {
+      try {
+        await this.openChannelNow(entry, 'opened-by-delivery');
+        console.error(
+          `[routeSpeech] ${conversationId}: locus ${channelId} was closed — opened by delivery (speech implies engagement)`,
+        );
+        this.emitTraceFn({
+          type: 'mcpl:channel-opened-by-send',
+          serverId: entry.serverId,
+          channelId,
+        });
+      } catch (err) {
+        return fail(channelId, `locus channel is closed and open failed: ${(err as Error).message}`);
+      }
     }
 
     const server = this.serverRegistry.getServer(entry.serverId);

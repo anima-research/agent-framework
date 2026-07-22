@@ -126,6 +126,36 @@ const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
 };
 
 /**
+ * Explicit delivery tools whose successful use into a closed channel OPENS
+ * it (send implies engagement — see openIfClosedForSend). Bare tool names,
+ * matched after stripping the MCPL server prefix.
+ */
+const SEND_ENGAGEMENT_TOOLS = new Set([
+  'send_message', 'reply_message', 'send_dm', 'send_file', 'send_files',
+]);
+
+/**
+ * Best-effort extraction of the delivered channel id from an MCPL send-tool
+ * result (the discord-mcpl send tools return JSON like
+ * `{"messageId":"…","channelId":"…"}` as a text block). Returns undefined on
+ * any shape mismatch — the caller falls back to the tool's input args.
+ */
+function extractChannelIdFromToolResult(
+  content: Array<{ type: string; text?: string }> | undefined,
+): string | undefined {
+  const text = content?.find((c) => c.type === 'text' && c.text)?.text;
+  if (!text) return undefined;
+  try {
+    const parsed = JSON.parse(text) as { channelId?: unknown };
+    return typeof parsed.channelId === 'string' && parsed.channelId.length > 0
+      ? parsed.channelId
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * True when an incoming channel message explicitly addressed the agent.
  * Primary signal is the MCPL RFC-001 `chat:addressed` tag (mention / reply /
  * DM, as classified by the server); the metadata booleans are the fallback
@@ -7060,6 +7090,39 @@ export class AgentFramework {
           }
         }
 
+        // INVARIANT: engaging a channel opens it. A successful explicit send
+        // into a channel the registry knows as closed drives the same open
+        // flow as channel_open (durable desired state, server subscribe), so
+        // there is no such thing as posting into a channel that stays
+        // half-alive (no typing, no reactions, no inbound forwarding).
+        // Fire-and-forget: the send already succeeded; the open must not
+        // delay or fail the tool result.
+        if (
+          this.channelRegistry &&
+          SEND_ENGAGEMENT_TOOLS.has(toolName) &&
+          result.isError !== true
+        ) {
+          const target =
+            extractChannelIdFromToolResult(result.content) ??
+            (typeof args.channelId === 'string' ? (args.channelId as string) : undefined);
+          if (target) {
+            this.channelRegistry
+              .openIfClosedForSend(target, serverId)
+              .then((status) => {
+                if (status === 'opened') {
+                  console.error(
+                    `[channel] ${agentName}: explicit ${toolName} into closed channel ${target} — opened (send implies engagement)`,
+                  );
+                } else if (status === 'open-failed') {
+                  console.error(
+                    `[channel] ${agentName}: ${toolName} delivered to ${target} but the open-on-send failed — channel remains half-alive, will reconcile`,
+                  );
+                }
+              })
+              .catch((err) => console.error('[channel] open-on-send error:', err));
+          }
+        }
+
         // Convert MCP tool result to framework ToolResult.
         // When the result contains non-text blocks (e.g. images from an MCP
         // tool like zulip-mcp's fetch_attachment), pass the full content array
@@ -7308,10 +7371,13 @@ export class AgentFramework {
       : seconds >= 60 ? `${Math.round(seconds / 60)}m`
       : `${Math.round(seconds)}s`;
 
-    // Announce in the sticky channel (best-effort; never blocks the result).
+    // Announce in the TURN's frozen locus (best-effort; never blocks the
+    // result). The sleep tool runs mid-turn, so the pin is live — same
+    // authority as every other speech path, no live re-resolution.
     if (announce && this.channelRegistry) {
       const text = input.message ?? `💤 Going quiet for ${human}. I'll still see messages, but won't respond until I wake.`;
-      this.channelRegistry.routeSpeech(agentName, text).catch((err) => {
+      const locus = this.turnLocusPins.get(agentName) ?? null;
+      this.channelRegistry.routeSpeech(agentName, text, locus).catch((err) => {
         console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
       });
     }
