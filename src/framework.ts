@@ -4666,13 +4666,20 @@ export class AgentFramework {
     // delivered exactly once, at turn end.
     let liveProseRouting = false;
 
-    // Typing indicator: show "<agent> is typing…" in the channel her plain
-    // prose will actually land in — the turn-frozen locus — for the whole
-    // duration of this turn. Started here (paired with the finally below, so
-    // it can never leak) and refreshed on a 7s interval by the
-    // ChannelRegistry until stopped on any exit path. Never moves mid-turn:
-    // it mirrors the frozen routing pin, not the newest inbound message.
-    const typingChannel = resolveTurnLocus();
+    // Typing indicator: show "<agent> is typing…" for the whole duration of
+    // this turn. Started here (paired with the finally below, so it can never
+    // leak) and refreshed on a 7s interval by the ChannelRegistry until
+    // stopped on any exit path. Never moves mid-turn.
+    //   - locus mode: the frozen routing pin (where bare prose will land).
+    //   - explicit mode: there is no locus — indicate on the TRIGGER channel
+    //     (where the wake came from). Typing is presence, not delivery, so
+    //     this doesn't violate never-guess: it says "attending to what you
+    //     sent here", which is true regardless of where the reply goes.
+    //     Heartbeat/no-trigger explicit turns show no indicator.
+    const typingChannel =
+      agent.proseRouting === 'explicit'
+        ? trigger?.channelId ?? null
+        : resolveTurnLocus();
     if (typingChannel) this.channelRegistry!.startTyping(typingChannel);
 
     const adoptInjectedRound = (): void => {
