@@ -8,6 +8,9 @@ export type { ApiEvent } from './api/index.js';
 export { HealthModule } from './health/index.js';
 export type { HealthModuleConfig } from './health/index.js';
 
+export { RelayClientModule } from './voice-relay/index.js';
+export type { RelayClientModuleConfig, TraceBridge } from './voice-relay/index.js';
+
 export { WorkspaceModule } from './workspace/index.js';
 export type {
   WorkspaceConfig,
