@@ -12,7 +12,6 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { WebSocket } from 'ws';
-import { hashToken } from '../../src/modules/voice-relay/tokens.js';
 
 // ── Wire-level socket with transcript recording ────────────────────────────
 
@@ -111,8 +110,8 @@ export class VoiceClientSim {
 
   /**
    * Subscribe and collect the reply burst: `subscribed`, then any of
-   * `members`/`config` in server order, until `config` arrives (both servers
-   * end the burst with config).
+   * `members`/`config` in server order, until `config` arrives (the relay
+   * ends the burst with config).
    */
   async subscribe(channels: string[]): Promise<Record<string, unknown>[]> {
     this.sock.send({ type: 'subscribe', channels });
@@ -145,12 +144,10 @@ export const TOKENS = {
   client: 'client-secret',
 };
 
-/** The user account the voice-relay tests authenticate as. */
-export const FIXTURE_USER = { username: 'plainuser', token: 'plain-token' };
-
 /**
- * Write the canonical fixture config (identical for module and reference so
- * config payloads diff clean). Returns the file path.
+ * Write the reference relay's fixture config. Returns the file path.
+ * (Client auth uses the BOT_TOKENS/TTS_CLIENT_TOKENS env pools, not this
+ * file; the config only feeds the relay's voice routing.)
  */
 export function writeRelayConfig(dir: string): string {
   const path = join(dir, 'config.json');
@@ -165,9 +162,6 @@ export function writeRelayConfig(dir: string): string {
         },
         mentionMode: 'default',
         defaultBot: 'Opus45',
-        users: {
-          [FIXTURE_USER.username]: { token: hashToken(FIXTURE_USER.token), tokenHashed: true },
-        },
       },
     }),
   );
@@ -220,8 +214,8 @@ export async function spawnReferenceRelay(configFile: string): Promise<Reference
           TTS_CLIENT_TOKENS: TOKENS.client,
           CONFIG_FILE: configFile,
           LOG_LEVEL: 'error',
-          // No DISCORD_BOT_TOKEN: reference runs gateway/webhook-less, the
-          // degraded mode the module mirrors when facade-less.
+          // No DISCORD_BOT_TOKEN: the relay runs gateway/webhook-less —
+          // pure streaming fan-out, all these tests need.
           DISCORD_BOT_TOKEN: '',
         },
         stdio: ['ignore', 'pipe', 'pipe'],

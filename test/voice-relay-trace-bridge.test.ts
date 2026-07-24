@@ -13,7 +13,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { InferenceTraceBridge } from '../src/modules/voice-relay/index.js';
-import type { RelayToVoiceClientMessage, RelayLogger } from '../src/modules/voice-relay/types.js';
+import type { BotStreamMessage, RelayLogger } from '../src/modules/voice-relay/types.js';
 import type { TraceEvent } from '../src/types/trace.js';
 import type { ModuleContext } from '../src/types/module.js';
 
@@ -24,8 +24,11 @@ const silentLogger: RelayLogger = {
   error: () => {},
 };
 
-function makeBridge(identity?: { userId?: string; username?: string }) {
-  const sent: Array<{ channelId: string; msg: RelayToVoiceClientMessage }> = [];
+function makeBridge(
+  identity?: { userId?: string; username?: string },
+  agentFilter?: (agentName: string) => boolean,
+) {
+  const sent: Array<{ msg: BotStreamMessage }> = [];
   let listener: ((e: TraceEvent) => void) | null = null;
   const ctx = {
     onTrace: (l: (e: TraceEvent) => void) => {
@@ -37,9 +40,10 @@ function makeBridge(identity?: { userId?: string; username?: string }) {
   } as unknown as ModuleContext;
 
   const bridge = new InferenceTraceBridge(
-    (channelId, msg) => sent.push({ channelId, msg }),
+    (msg) => sent.push({ msg }),
     () => identity,
     silentLogger,
+    agentFilter,
   );
   bridge.start(ctx);
   const emit = (e: Partial<TraceEvent> & { type: string }) =>
@@ -53,7 +57,6 @@ test('bridge: started → activation_start with resolved identity', () => {
 
   assert.equal(sent.length, 1);
   assert.deepEqual(sent[0], {
-    channelId: 'chan-1',
     msg: {
       type: 'activation_start',
       botId: 'opus45',
@@ -63,6 +66,16 @@ test('bridge: started → activation_start with resolved identity', () => {
       timestamp: 1710900000000,
     },
   });
+});
+
+test('bridge: agent filter drops other agents\' traces entirely', () => {
+  const { sent, emit } = makeBridge(undefined, (name) => name === 'mine');
+  emit({ type: 'inference:started', agentName: 'mine', channelId: 'c' } as never);
+  emit({ type: 'inference:started', agentName: 'other', channelId: 'c' } as never);
+  emit({ type: 'inference:tokens', agentName: 'other', channelId: 'c', content: 'x', blockType: 'text', blockIndex: 0 } as never);
+
+  assert.equal(sent.length, 1, 'only the filtered-in agent is translated');
+  assert.equal((sent[0].msg as { botId: string }).botId, 'mine');
 });
 
 test('bridge: tokens → chunk with visible derived from blockType', () => {
@@ -123,6 +136,21 @@ test('bridge: terminal traces map to activation_end reasons; accumulator clears'
     const complete = sent.at(-1)!.msg as { content: string };
     assert.equal(complete.content, 'fresh', `accumulator reset after ${type}`);
   }
+});
+
+test('bridge: stream_restarted closes the abandoned activation with abort', () => {
+  const { sent, emit } = makeBridge();
+  emit({ type: 'inference:tokens', agentName: 'a', channelId: 'c', content: 'x', blockType: 'text', blockIndex: 0 } as never);
+  emit({ type: 'inference:stream_restarted', agentName: 'a', channelId: 'c', reason: 'context_budget_restart', inputTokens: 1, budget: 1 } as never);
+
+  const end = sent.at(-1)!.msg as { type: string; reason: string };
+  assert.equal(end.type, 'activation_end', 'restart pairs the dangling activation_start');
+  assert.equal(end.reason, 'abort', 'the partial utterance was cut off, not finished');
+
+  // A channel-less restart has nothing to close on the wire.
+  const before = sent.length;
+  emit({ type: 'inference:stream_restarted', agentName: 'a', reason: 'r', inputTokens: 1, budget: 1 } as never);
+  assert.equal(sent.length, before);
 });
 
 test('bridge: traces without channelId are dropped; unrelated traces ignored', () => {

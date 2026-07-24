@@ -673,7 +673,12 @@ export class Agent {
 
     const stream = this.membrane.streamYielding(request, {
       emitTokens: true,
-      emitBlocks: false,
+      // Block boundaries MUST be emitted: driveStream translates them into
+      // inference:content_block traces, and voice clients key their
+      // utterance state machines on the resulting block_start /
+      // block_complete wire messages (melodeus can neither track nor
+      // interrupt an utterance without them).
+      emitBlocks: true,
       emitUsage: true,
     });
 

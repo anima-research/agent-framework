@@ -3,7 +3,12 @@
  *
  * Ported from melodeus-tts-relay/src/types.ts — wire shapes must stay
  * byte-compatible with the standalone relay so existing voice clients
- * (melodeus, the iOS app) and legacy ChapterX bots work unchanged.
+ * (melodeus, the iOS app) and legacy ChapterX bots (the Discord bot stack
+ * the relay was originally built to serve) work unchanged. Mirrors
+ * melodeus-tts-relay commit ec8f0f1 (2026-07-21); nothing on the wire
+ * carries a version, so on any divergence that repo's types.ts is
+ * canonical. "v2" is the relay repo's name for its current protocol —
+ * there is no negotiation and no v1 on the wire.
  *
  * Kept as the complete v2 protocol even though RelayClientModule uses only
  * the bot-side subset (the streamed relay messages + interruption +
@@ -601,6 +606,12 @@ export type BotToRelayMessage =
   | ActivationStartMessage
   | ActivationEndMessage;
 
+/** What a connected bot streams after authenticating — everything a bot may
+ *  put on the wire except the auth handshake itself. The outbound type of
+ *  RelayClientModule/InferenceTraceBridge, so the compiler rejects any
+ *  message a /bot client must never send. */
+export type BotStreamMessage = Exclude<BotToRelayMessage, BotAuthMessage>;
+
 export type VoiceClientToRelayMessage =
   | VoiceClientAuthMessage
   | SubscribeMessage
@@ -659,7 +670,9 @@ export type RelayToVoiceClientMessage =
 // Logging
 // ============================================================================
 
-/** Minimal logger surface so tests can silence output. Console-backed by default. */
+/** Minimal logger surface so hosts can capture or silence output.
+ *  Console-backed by default for info and above; debug is dropped unless a
+ *  logger is injected. */
 export interface RelayLogger {
   debug(msg: string, data?: unknown): void;
   info(msg: string, data?: unknown): void;

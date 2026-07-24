@@ -43,9 +43,13 @@ export type TraceEvent =
       /**
        * Channel identity of this turn (the locus its speech routes to):
        * the turn's pinned locus, else the triggering channel. Absent for
-       * channel-less turns (heartbeats, timers). Carried on the whole
-       * inference:* family so channel-scoped consumers (voice/streaming)
-       * can key per-channel streams without reaching into framework state.
+       * channel-less turns (heartbeats, timers). Carried on the turn-scoped
+       * traces — started, tokens, content_block, tool_calls_yielded,
+       * completed, turn_ended, aborted, failed — so channel-scoped consumers
+       * (voice/streaming) can key per-channel streams without reaching into
+       * framework state. Also on stream_restarted (so the abandoned
+       * activation can be closed). NOT carried on exhausted, usage,
+       * stream_resumed, or the request_* traces.
        */
       channelId?: string;
     })
@@ -132,6 +136,9 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'inference:stream_restarted';
       agentName: string;
+      /** Present so channel-scoped consumers can close the abandoned
+       *  activation before the replacement stream starts a fresh one. */
+      channelId?: string;
       reason: string;
       inputTokens: number;
       budget: number;

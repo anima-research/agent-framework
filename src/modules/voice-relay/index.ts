@@ -8,7 +8,13 @@
 export { RelayClientModule } from './relay-client-module.js';
 export type { RelayClientModuleConfig } from './relay-client-module.js';
 
-export { InferenceTraceBridge, NoopTraceBridge } from './trace-bridge.js';
+export { InferenceTraceBridge } from './trace-bridge.js';
 export type { TraceBridge, ChannelBroadcastFn, AgentIdentityResolver } from './trace-bridge.js';
 
-export type { RelayLogger, RelayToVoiceClientMessage, BlockType, ActivationEndReason } from './types.js';
+export type {
+  RelayLogger,
+  BotStreamMessage,
+  RelayToVoiceClientMessage,
+  BlockType,
+  ActivationEndReason,
+} from './types.js';

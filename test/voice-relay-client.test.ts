@@ -27,8 +27,8 @@ import { AgentFramework } from '../src/framework.js';
 import { RelayClientModule } from '../src/modules/voice-relay/index.js';
 import type { RelayLogger } from '../src/modules/voice-relay/types.js';
 import type { TraceEvent } from '../src/types/trace.js';
-import type { ModuleContext, Module } from '../src/types/module.js';
-import type { ProcessEvent } from '../src/types/events.js';
+import type { ModuleContext, Module, ProcessState, EventResponse } from '../src/types/module.js';
+import type { ProcessEvent, ToolCall, ToolResult, ToolDefinition } from '../src/types/events.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 import {
@@ -147,7 +147,7 @@ function startedTrace(agentName: string, channelId?: string): TraceEvent {
 // Unit: mock server
 // ---------------------------------------------------------------------------
 
-test('relay client auths and forwards messages under its own bot identity', async () => {
+test('relay client auths and forwards messages under its own bot identity', async (t) => {
   const server = await startMockBotServer();
   const { ctx, emit } = stubCtx();
   const module = new RelayClientModule({
@@ -158,6 +158,10 @@ test('relay client auths and forwards messages under its own bot identity', asyn
     logger: silentLogger,
   });
   await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
   await waitFor(() => module.isConnected, 3000, 'auth');
 
   emit(startedTrace('assistant', 'chan-1'));
@@ -219,11 +223,9 @@ test('relay client auths and forwards messages under its own bot identity', asyn
   const end = server.received.find((m) => m.type === 'activation_end');
   assert.equal(end?.reason, 'complete');
 
-  await module.stop();
-  await server.close();
 });
 
-test('relay client ignores heartbeats and drops relay traffic while down', async () => {
+test('relay client ignores heartbeats and drops relay traffic while down', async (t) => {
   const server = await startMockBotServer();
   const { ctx, emit } = stubCtx();
   const module = new RelayClientModule({
@@ -234,6 +236,10 @@ test('relay client ignores heartbeats and drops relay traffic while down', async
     logger: silentLogger,
   });
   await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
   await waitFor(() => module.isConnected, 3000, 'auth');
 
   server.authedSockets[0].send(JSON.stringify({ type: 'heartbeat', timestamp: Date.now() }));
@@ -247,11 +253,9 @@ test('relay client ignores heartbeats and drops relay traffic while down', async
   await new Promise((r) => setTimeout(r, 100));
   assert.equal(server.received.length, 0);
 
-  await module.stop();
-  await server.close();
 });
 
-test('relay client reconnects with backoff and re-authenticates', async () => {
+test('relay client reconnects with backoff and re-authenticates', async (t) => {
   const server = await startMockBotServer();
   const { ctx } = stubCtx();
   const module = new RelayClientModule({
@@ -263,17 +267,19 @@ test('relay client reconnects with backoff and re-authenticates', async () => {
     logger: silentLogger,
   });
   await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
   await waitFor(() => module.isConnected, 3000, 'first auth');
   assert.equal(server.connections, 1);
 
   server.authedSockets[0].terminate();
   await waitFor(() => server.connections >= 2 && module.isConnected, 3000, 'reconnect + re-auth');
 
-  await module.stop();
-  await server.close();
 });
 
-test('relay client keeps retrying after auth rejection', async () => {
+test('relay client keeps retrying after auth rejection', async (t) => {
   const server = await startMockBotServer();
   server.rejectAuth = true;
   const { ctx } = stubCtx();
@@ -286,17 +292,19 @@ test('relay client keeps retrying after auth rejection', async () => {
     logger: silentLogger,
   });
   await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
   await waitFor(() => server.connections >= 3, 3000, 'repeated attempts');
   assert.equal(module.isConnected, false);
 
   server.rejectAuth = false;
   await waitFor(() => module.isConnected, 3000, 'recovers once auth allowed');
 
-  await module.stop();
-  await server.close();
 });
 
-test('interruption from the relay maps to abortInference with keepText', async () => {
+test('interruption from the relay maps to abortInference with keepText', async (t) => {
   const server = await startMockBotServer();
   const { ctx, emit } = stubCtx();
   const { framework, aborts } = fakeFramework();
@@ -308,9 +316,23 @@ test('interruption from the relay maps to abortInference with keepText', async (
   });
   module.bind(framework);
   await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
   await waitFor(() => module.isConnected, 3000, 'auth');
 
   emit(startedTrace('assistant', 'chan-9'));
+  emit({
+    type: 'inference:tokens',
+    agentName: 'assistant',
+    channelId: 'chan-9',
+    content: 'Hey! Yes, I can hear you loud and clear',
+    blockType: 'text',
+    blockIndex: 0,
+    timestamp: T0,
+  } as TraceEvent);
+  await waitFor(() => server.received.length >= 2, 3000, 'turn streamed');
   server.authedSockets[0].send(
     JSON.stringify({
       type: 'interruption',
@@ -336,17 +358,19 @@ test('interruption from the relay maps to abortInference with keepText', async (
   await new Promise((r) => setTimeout(r, 150));
   assert.equal(aborts.length, 1);
 
-  await module.stop();
-  await server.close();
 });
 
-test('interruption naming an unknown channel is dropped even with a single candidate', async () => {
+test('interruption naming an unknown channel is dropped even with a single candidate', async (t) => {
   const server = await startMockBotServer();
   const { ctx, emit } = stubCtx();
   const { framework, aborts } = fakeFramework();
   const module = new RelayClientModule({ url: server.url, botId: 'opus45', token: 'tok', logger: silentLogger });
   module.bind(framework);
   await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
   await waitFor(() => module.isConnected, 3000, 'auth');
 
   // One tracked agent — but the interruption names a channel we never
@@ -358,17 +382,19 @@ test('interruption naming an unknown channel is dropped even with a single candi
   await new Promise((r) => setTimeout(r, 150));
   assert.equal(aborts.length, 0, 'unknown channel never falls back to the single candidate');
 
-  await module.stop();
-  await server.close();
 });
 
-test('interruption without a channel falls back to the single tracked agent', async () => {
+test('interruption without a channel falls back to the single tracked agent', async (t) => {
   const server = await startMockBotServer();
   const { ctx, emit } = stubCtx();
   const { framework, aborts } = fakeFramework();
   const module = new RelayClientModule({ url: server.url, botId: 'opus45', token: 'tok', logger: silentLogger });
   module.bind(framework);
   await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
   await waitFor(() => module.isConnected, 3000, 'auth');
 
   emit(startedTrace('assistant', 'chan-a'));
@@ -379,17 +405,19 @@ test('interruption without a channel falls back to the single tracked agent', as
   assert.equal(aborts[0].agentName, 'assistant');
   assert.equal(aborts[0].keepText, undefined, 'empty spokenText carries no keepText');
 
-  await module.stop();
-  await server.close();
 });
 
-test('stale interruption (spokenText from a previous utterance) is dropped', async () => {
+test('stale interruption (spokenText from a previous utterance) is dropped', async (t) => {
   const server = await startMockBotServer();
   const { ctx, emit } = stubCtx();
   const { framework, aborts } = fakeFramework();
   const module = new RelayClientModule({ url: server.url, botId: 'opus45', token: 'tok', logger: silentLogger });
   module.bind(framework);
   await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
   await waitFor(() => module.isConnected, 3000, 'auth');
 
   const chunk = (content: string, blockIndex: number, blockType = 'text'): TraceEvent =>
@@ -409,10 +437,14 @@ test('stale interruption (spokenText from a previous utterance) is dropped', asy
   await waitFor(() => aborts.length === 1, 3000, 'matching report aborts');
   assert.equal(aborts[0].keepText, 'Hello there gen');
 
-  // Utterance 2 starts; the old report races in again — stale, dropped.
+  // Utterance 2 = a NEW activation; the old report races in again — stale,
+  // dropped. (A new block within the SAME activation is not a new utterance:
+  // whole-activation clients legitimately report earlier blocks' text — see
+  // the iOS-style test below.)
+  emit(startedTrace('assistant', 'chan-7'));
   emit(blockStart(1));
   emit(chunk('Fresh words now', 1));
-  await waitFor(() => server.received.length >= 6, 3000, 'utterance 2 streamed');
+  await waitFor(() => server.received.length >= 7, 3000, 'utterance 2 streamed');
   server.authedSockets[0].send(
     JSON.stringify({ type: 'interruption', channelId: 'chan-7', spokenText: 'Hello there gen', reason: 'user_speech', timestamp: T0 }),
   );
@@ -426,17 +458,19 @@ test('stale interruption (spokenText from a previous utterance) is dropped', asy
   await waitFor(() => aborts.length === 2, 3000, 'current-utterance report aborts');
   assert.equal(aborts[1].keepText, 'Fresh words');
 
-  await module.stop();
-  await server.close();
 });
 
-test('channel tracking is bounded; evicted channels no longer address interruptions', async () => {
+test('channel tracking is bounded; evicted channels no longer address interruptions', async (t) => {
   const server = await startMockBotServer();
   const { ctx, emit } = stubCtx();
   const { framework, aborts } = fakeFramework();
   const module = new RelayClientModule({ url: server.url, botId: 'opus45', token: 'tok', logger: silentLogger });
   module.bind(framework);
   await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
   await waitFor(() => module.isConnected, 3000, 'auth');
 
   for (let i = 0; i < 300; i++) emit(startedTrace(`agent-${i % 3}`, `chan-${i}`));
@@ -454,11 +488,9 @@ test('channel tracking is bounded; evicted channels no longer address interrupti
   await waitFor(() => aborts.length === 1, 3000, 'tracked channel aborts');
   assert.equal(aborts[0].agentName, 'agent-2');
 
-  await module.stop();
-  await server.close();
 });
 
-test('relay client does not reconnect after the relay replaces its connection', async () => {
+test('relay client does not reconnect after the relay replaces its connection', async (t) => {
   const server = await startMockBotServer();
   const { ctx } = stubCtx();
   const module = new RelayClientModule({
@@ -469,6 +501,10 @@ test('relay client does not reconnect after the relay replaces its connection', 
     logger: silentLogger,
   });
   await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
   await waitFor(() => module.isConnected, 3000, 'auth');
 
   server.authedSockets[0].close(1000, 'Replaced by new connection');
@@ -476,11 +512,9 @@ test('relay client does not reconnect after the relay replaces its connection', 
   await new Promise((r) => setTimeout(r, 200));
   assert.equal(server.connections, 1, 'no reconnect after being replaced');
 
-  await module.stop();
-  await server.close();
 });
 
-test('backoff resets only after the connection stays authenticated', async () => {
+test('backoff resets only after the connection stays authenticated', async (t) => {
   const server = await startMockBotServer();
   const { ctx } = stubCtx();
   const module = new RelayClientModule({
@@ -489,10 +523,16 @@ test('backoff resets only after the connection stays authenticated', async () =>
     token: 'tok',
     reconnectInitialMs: 30,
     reconnectMaxMs: 500,
-    backoffResetAfterMs: 120,
+    // Wide enough that a CPU-starved runner cannot let the stability timer
+    // fire between the second re-auth and the growth assertion below.
+    backoffResetAfterMs: 800,
     logger: silentLogger,
   });
   await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
   await waitFor(() => module.isConnected, 3000, 'first auth');
   assert.equal(module.currentReconnectDelayMs, 30);
 
@@ -507,8 +547,458 @@ test('backoff resets only after the connection stays authenticated', async () =>
   // Stay connected past the stability window: backoff returns to the floor.
   await waitFor(() => module.currentReconnectDelayMs === 30, 3000, 'stability reset');
 
-  await module.stop();
-  await server.close();
+});
+
+test('watchdog: a silent link is presumed dead and re-dialed', async (t) => {
+  const server = await startMockBotServer();
+  const { ctx } = stubCtx();
+  const module = new RelayClientModule({
+    url: server.url,
+    botId: 'opus45',
+    token: 'tok',
+    reconnectInitialMs: 30,
+    heartbeatTimeoutMs: 400,
+    logger: silentLogger,
+  });
+  await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
+  await waitFor(() => module.isConnected, 3000, 'auth');
+  assert.equal(server.connections, 1);
+
+  // The mock server never heartbeats (the real relay does, every ~2s), so
+  // the watchdog must tear the link down and the client must re-dial.
+  await waitFor(() => server.connections >= 2, 5000, 'watchdog re-dial');
+});
+
+test('watchdog: heartbeats keep the link alive', async (t) => {
+  const server = await startMockBotServer();
+  const { ctx } = stubCtx();
+  const module = new RelayClientModule({
+    url: server.url,
+    botId: 'opus45',
+    token: 'tok',
+    heartbeatTimeoutMs: 400,
+    logger: silentLogger,
+  });
+  await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
+  await waitFor(() => module.isConnected, 3000, 'auth');
+
+  const hb = setInterval(() => {
+    for (const ws of server.authedSockets) {
+      try {
+        ws.send(JSON.stringify({ type: 'heartbeat', timestamp: Date.now() }));
+      } catch {
+        // socket may be mid-teardown; the assertion below still judges
+      }
+    }
+  }, 100);
+  t.after(() => clearInterval(hb));
+
+  await new Promise((r) => setTimeout(r, 900));
+  assert.equal(server.connections, 1, 'no re-dial while heartbeats flow');
+  assert.equal(module.isConnected, true);
+});
+
+test('malformed frames (null, primitives, bad JSON) do not crash the client', async (t) => {
+  const server = await startMockBotServer();
+  const { ctx } = stubCtx();
+  const module = new RelayClientModule({ url: server.url, botId: 'opus45', token: 'tok', logger: silentLogger });
+  await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
+  await waitFor(() => module.isConnected, 3000, 'auth');
+
+  for (const frame of ['null', '123', '"x"', '[1,2]', 'not json at all']) {
+    server.authedSockets[0].send(frame);
+  }
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(module.isConnected, true, 'client survives hostile frames');
+});
+
+test('unverifiable spokenText aborts the turn but never dictates keepText', async (t) => {
+  const server = await startMockBotServer();
+  const { ctx, emit } = stubCtx();
+  const { framework, aborts } = fakeFramework();
+  const module = new RelayClientModule({ url: server.url, botId: 'opus45', token: 'tok', logger: silentLogger });
+  module.bind(framework);
+  await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
+  // The turn starts BEFORE the socket authenticates: the tracker (a trace
+  // listener) records the channel, but the activation_start is dropped at
+  // the socket check, so no accumulator entry exists — the report below is
+  // genuinely unverifiable. It may stop the turn but its text must not be
+  // committed as words the agent said.
+  emit(startedTrace('assistant', 'chan-2'));
+  await waitFor(() => module.isConnected, 3000, 'auth');
+
+  server.authedSockets[0].send(
+    JSON.stringify({ type: 'interruption', channelId: 'chan-2', spokenText: 'words we never streamed', reason: 'user_speech', timestamp: T0 }),
+  );
+  await waitFor(() => aborts.length === 1, 3000, 'abort goes through');
+  assert.equal(aborts[0].agentName, 'assistant');
+  assert.equal(aborts[0].keepText, undefined, 'unverifiable text is not kept');
+});
+
+test('a non-empty report while the current utterance has voiced nothing is dropped as stale', async (t) => {
+  const server = await startMockBotServer();
+  const { ctx, emit } = stubCtx();
+  const { framework, aborts } = fakeFramework();
+  const module = new RelayClientModule({ url: server.url, botId: 'opus45', token: 'tok', logger: silentLogger });
+  module.bind(framework);
+  await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
+  await waitFor(() => module.isConnected, 3000, 'auth');
+
+  // Turn N streamed and finished; its late report arrives only after turn
+  // N+1's activation_start has been SENT (accumulator present but empty —
+  // N+1 is still thinking). Real clients never report non-empty spokenText
+  // for an utterance that voiced nothing, so this can only describe turn N
+  // and must not cut off N+1.
+  const ev = (e: Record<string, unknown>): TraceEvent =>
+    ({ agentName: 'assistant', channelId: 'chan-3', timestamp: T0, ...e } as unknown as TraceEvent);
+  emit(startedTrace('assistant', 'chan-3'));
+  emit(ev({ type: 'inference:tokens', content: 'Turn one words', blockType: 'text', blockIndex: 0 }));
+  emit(ev({ type: 'inference:completed', durationMs: 5 }));
+  emit(startedTrace('assistant', 'chan-3')); // N+1: activation_start sent, no text yet
+  await waitFor(() => server.received.filter((m) => m.type === 'activation_start').length >= 2, 3000, 'both activations sent');
+
+  server.authedSockets[0].send(
+    JSON.stringify({ type: 'interruption', channelId: 'chan-3', spokenText: 'Turn one words', reason: 'user_speech', timestamp: T0 }),
+  );
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(aborts.length, 0, 'the stale report must not abort the fresh turn');
+
+  // Once N+1 voices text, a matching report lands normally.
+  emit(ev({ type: 'inference:tokens', content: 'Turn two words', blockType: 'text', blockIndex: 0 }));
+  await waitFor(() => server.received.filter((m) => m.type === 'chunk').length >= 2, 3000, 'turn two streamed');
+  server.authedSockets[0].send(
+    JSON.stringify({ type: 'interruption', channelId: 'chan-3', spokenText: 'Turn two', reason: 'user_speech', timestamp: T0 }),
+  );
+  await waitFor(() => aborts.length === 1, 3000, 'the live turn is interruptible');
+  assert.equal(aborts[0].keepText, 'Turn two');
+});
+
+test("narrator-markup asterisks are ignored when matching a client's report", async (t) => {
+  const server = await startMockBotServer();
+  const { ctx, emit } = stubCtx();
+  const { framework, aborts } = fakeFramework();
+  const module = new RelayClientModule({ url: server.url, botId: 'opus45', token: 'tok', logger: silentLogger });
+  module.bind(framework);
+  await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
+  await waitFor(() => module.isConnected, 3000, 'auth');
+
+  emit(startedTrace('assistant', 'chan-4'));
+  emit({
+    type: 'inference:tokens',
+    agentName: 'assistant',
+    channelId: 'chan-4',
+    content: '*looks up* Hello there, how are you',
+    blockType: 'text',
+    blockIndex: 0,
+    timestamp: T0,
+  } as TraceEvent);
+  await waitFor(() => server.received.some((m) => m.type === 'chunk'), 3000, 'turn streamed');
+
+  // The iOS client voices `*action*` spans via its narrator voice and
+  // reports them WITHOUT the asterisks (segments trimmed and concatenated),
+  // so the report for the text above arrives as "looks upHello there".
+  server.authedSockets[0].send(
+    JSON.stringify({ type: 'interruption', channelId: 'chan-4', spokenText: 'looks upHello there', reason: 'user_speech', timestamp: T0 }),
+  );
+  await waitFor(() => aborts.length === 1, 3000, 'narrated turn is interruptible');
+  assert.equal(aborts[0].keepText, 'looks upHello there');
+});
+
+test('the fatal replaced-connection stop also tears down the trace subscriptions', async (t) => {
+  const server = await startMockBotServer();
+  const { ctx, emit } = stubCtx();
+  const module = new RelayClientModule({
+    url: server.url,
+    botId: 'opus45',
+    token: 'tok',
+    reconnectInitialMs: 20,
+    logger: silentLogger,
+  });
+  await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
+  await waitFor(() => module.isConnected, 3000, 'auth');
+  emit(startedTrace('assistant', 'chan-1'));
+  assert.equal(module.trackedChannelCount, 1);
+
+  server.authedSockets[0].close(1000, 'Replaced by new connection');
+  await waitFor(() => !module.isConnected, 3000, 'replacement noticed');
+
+  // A permanently-down module must not keep tracking or translating: the
+  // maps are cleared and later traces are ignored entirely.
+  assert.equal(module.trackedChannelCount, 0, 'tracking cleared on the fatal stop');
+  const before = server.received.length;
+  emit(startedTrace('assistant', 'chan-2'));
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(module.trackedChannelCount, 0, 'tracker unsubscribed');
+  assert.equal(server.received.length, before);
+});
+
+test('whole-activation report spanning blocks is accepted (iOS-style client)', async (t) => {
+  const server = await startMockBotServer();
+  const { ctx, emit } = stubCtx();
+  const { framework, aborts } = fakeFramework();
+  const module = new RelayClientModule({ url: server.url, botId: 'opus45', token: 'tok', logger: silentLogger });
+  module.bind(framework);
+  await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
+  await waitFor(() => module.isConnected, 3000, 'auth');
+
+  const ev = (e: Record<string, unknown>): TraceEvent =>
+    ({ agentName: 'assistant', channelId: 'chan-5', timestamp: T0, ...e } as unknown as TraceEvent);
+  emit(startedTrace('assistant', 'chan-5'));
+  emit(ev({ type: 'inference:content_block', phase: 'block_start', blockType: 'text', blockIndex: 0 }));
+  emit(ev({ type: 'inference:tokens', content: 'First sentence. ', blockType: 'text', blockIndex: 0 }));
+  emit(ev({ type: 'inference:content_block', phase: 'block_start', blockType: 'text', blockIndex: 1 }));
+  emit(ev({ type: 'inference:tokens', content: 'Second thought', blockType: 'text', blockIndex: 1 }));
+  await waitFor(() => server.received.length >= 5, 3000, 'both blocks streamed');
+
+  // The iOS client accumulates spokenText across the WHOLE activation, so a
+  // legitimate mid-turn report starts with block 0's text even though the
+  // stream is already in block 1. It must abort, and keep what was heard.
+  server.authedSockets[0].send(
+    JSON.stringify({ type: 'interruption', channelId: 'chan-5', spokenText: 'First sentence. Sec', reason: 'user_speech', timestamp: T0 }),
+  );
+  await waitFor(() => aborts.length === 1, 3000, 'whole-activation report accepted');
+  assert.equal(aborts[0].keepText, 'First sentence. Sec');
+});
+
+test('a late report for a channel the agent has left cannot abort its new turn', async (t) => {
+  const server = await startMockBotServer();
+  const { ctx, emit } = stubCtx();
+  const { framework, aborts } = fakeFramework();
+  const module = new RelayClientModule({ url: server.url, botId: 'opus45', token: 'tok', logger: silentLogger });
+  module.bind(framework);
+  await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
+  await waitFor(() => module.isConnected, 3000, 'auth');
+
+  const ev = (channelId: string, e: Record<string, unknown>): TraceEvent =>
+    ({ agentName: 'assistant', channelId, timestamp: T0, ...e } as unknown as TraceEvent);
+
+  // Turn 1 on chan-a streams and completes.
+  emit(startedTrace('assistant', 'chan-a'));
+  emit(ev('chan-a', { type: 'inference:tokens', content: 'Old turn words', blockType: 'text', blockIndex: 0 }));
+  emit(ev('chan-a', { type: 'inference:completed', durationMs: 5 }));
+  // Turn 2 on chan-b is now streaming.
+  emit(startedTrace('assistant', 'chan-b'));
+  emit(ev('chan-b', { type: 'inference:tokens', content: 'New turn words', blockType: 'text', blockIndex: 0 }));
+  // Wire: activation_start, chunk, activation_end (turn 1) + activation_start, chunk (turn 2).
+  await waitFor(() => server.received.length >= 5, 3000, 'both turns streamed');
+
+  // A late chan-a report (voice audio outlives the turn) still matches
+  // chan-a's retained accumulator — but the agent is mid-turn on chan-b now,
+  // so aborting would kill the wrong turn. Must be dropped.
+  server.authedSockets[0].send(
+    JSON.stringify({ type: 'interruption', channelId: 'chan-a', spokenText: 'Old turn', reason: 'user_speech', timestamp: T0 }),
+  );
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(aborts.length, 0, 'late report for the finished turn is dropped');
+
+  // A report for the channel the agent is ACTUALLY on still works.
+  server.authedSockets[0].send(
+    JSON.stringify({ type: 'interruption', channelId: 'chan-b', spokenText: 'New turn', reason: 'user_speech', timestamp: T0 }),
+  );
+  await waitFor(() => aborts.length === 1, 3000, 'active-channel report aborts');
+  assert.equal(aborts[0].keepText, 'New turn');
+});
+
+test('agents filter scopes streaming and interruption addressing', async (t) => {
+  const server = await startMockBotServer();
+  const { ctx, emit } = stubCtx();
+  const { framework, aborts } = fakeFramework();
+  const module = new RelayClientModule({
+    url: server.url,
+    botId: 'opus45',
+    token: 'tok',
+    agents: ['mine'],
+    logger: silentLogger,
+  });
+  module.bind(framework);
+  await module.start(ctx);
+  t.after(async () => {
+    await module.stop();
+    await server.close();
+  });
+  await waitFor(() => module.isConnected, 3000, 'auth');
+
+  const ev = (agentName: string, channelId: string, e: Record<string, unknown>): TraceEvent =>
+    ({ agentName, channelId, timestamp: T0, ...e } as unknown as TraceEvent);
+  emit(startedTrace('mine', 'chan-m'));
+  emit(ev('mine', 'chan-m', { type: 'inference:tokens', content: 'Mine speaking', blockType: 'text', blockIndex: 0 }));
+  emit(startedTrace('other', 'chan-o'));
+  emit(ev('other', 'chan-o', { type: 'inference:tokens', content: 'Other speaking', blockType: 'text', blockIndex: 0 }));
+  await waitFor(() => server.received.length >= 2, 3000, "the filtered-in agent's turn streamed");
+  await new Promise((r) => setTimeout(r, 100));
+
+  assert.ok(
+    server.received.every((m) => m.channelId === 'chan-m'),
+    `only the listed agent streams (got ${JSON.stringify(server.received.map((m) => m.channelId))})`,
+  );
+
+  // The unlisted agent's channel was never tracked → its interruption drops.
+  server.authedSockets[0].send(
+    JSON.stringify({ type: 'interruption', channelId: 'chan-o', spokenText: '', reason: 'manual', timestamp: T0 }),
+  );
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(aborts.length, 0);
+
+  server.authedSockets[0].send(
+    JSON.stringify({ type: 'interruption', channelId: 'chan-m', spokenText: 'Mine speak', reason: 'user_speech', timestamp: T0 }),
+  );
+  await waitFor(() => aborts.length === 1, 3000, "the listed agent's interruption lands");
+  assert.equal(aborts[0].agentName, 'mine');
+});
+
+// ---------------------------------------------------------------------------
+// Closed loop on CI: real framework + mock /bot server (no relay checkout)
+// ---------------------------------------------------------------------------
+
+/** One-shot tool that blocks until released, pinning the turn mid-flight. */
+class HoldToolModule implements Module {
+  readonly name = 'hold';
+  toolStarted: Promise<void>;
+  private signalStart!: () => void;
+  private release!: (r: ToolResult) => void;
+  private held: Promise<ToolResult>;
+
+  constructor() {
+    this.toolStarted = new Promise((r) => (this.signalStart = r));
+    this.held = new Promise((r) => (this.release = r));
+  }
+
+  releaseTool(): void {
+    this.release({ success: true, data: { ok: true } });
+  }
+
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return [
+      { name: 'hold', description: 'Blocks until released', inputSchema: { type: 'object', properties: {} } },
+    ];
+  }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
+    this.signalStart();
+    return this.held;
+  }
+  async onProcess(_e: ProcessEvent, _s: ProcessState): Promise<EventResponse> {
+    return {};
+  }
+}
+
+test('closed loop: a relay interruption aborts the live turn; the wire sees activation_end(abort) and context keeps the prefix', async (t) => {
+  const server = await startMockBotServer();
+  const tempDir = mkdtempSync(join(tmpdir(), 'relay-loop-'));
+  const membrane = new MockMembrane();
+  membrane.pushResponse(
+    createMockResponse(
+      [
+        { type: 'text', text: 'The weather is sunny today' },
+        { type: 'tool_use', id: 'c1', name: 'hold--hold', input: {} },
+      ] as ContentBlock[],
+      'tool_use',
+    ),
+  );
+  const hold = new HoldToolModule();
+  const clientModule = new RelayClientModule({
+    url: server.url,
+    botId: 'opus45',
+    token: 'tok',
+    logger: silentLogger,
+  });
+  const framework = await AgentFramework.create({
+    storePath: join(tempDir, 'loop.chronicle'),
+    membrane: membrane.asMembrane(),
+    agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Test.' }],
+    modules: [hold as unknown as Module, clientModule as unknown as Module],
+  });
+  clientModule.bind(framework);
+  t.after(async () => {
+    await framework.stop();
+    await server.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+  await waitFor(() => clientModule.isConnected, 5000, 'module authed against mock relay');
+
+  framework.pushEvent({
+    type: 'mcpl:channel-incoming',
+    serverId: 'test-server',
+    channelId: 'chan-loop',
+    messageId: 'm-loop-1',
+    author: { id: 'u1', name: 'Nick' },
+    content: [{ type: 'text', text: 'what is the weather' }],
+    timestamp: new Date().toISOString(),
+    triggerInference: true,
+  } as unknown as ProcessEvent);
+  const idle = framework.runUntilIdle();
+  await hold.toolStarted;
+  await waitFor(() => server.received.some((m) => m.type === 'chunk'), 5000, 'turn streamed to the relay');
+
+  server.authedSockets[0].send(
+    JSON.stringify({
+      type: 'interruption',
+      channelId: 'chan-loop',
+      spokenText: 'The weather',
+      reason: 'user_speech',
+      timestamp: Date.now(),
+    }),
+  );
+  await waitFor(
+    () => server.received.some((m) => m.type === 'activation_end' && m.reason === 'abort'),
+    5000,
+    'abort reaches the wire as activation_end',
+  );
+  hold.releaseTool();
+  await idle;
+
+  const cm = framework.getAgent('assistant')!.getContextManager() as unknown as {
+    queryMessages: (q: { participant?: string }) => {
+      messages: Array<{ content: Array<{ type: string; text?: string }> }>;
+    };
+  };
+  const texts = cm
+    .queryMessages({ participant: 'assistant' })
+    .messages.flatMap((m) => m.content)
+    .filter((b) => b.type === 'text')
+    .map((b) => b.text ?? '');
+  assert.ok(texts.includes('The weather'), `context keeps the spoken prefix (got ${JSON.stringify(texts)})`);
+  assert.ok(
+    !texts.includes('The weather is sunny today'),
+    'the full unspoken sentence is not committed',
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -518,9 +1008,18 @@ test('backoff resets only after the connection stays authenticated', async () =>
 test(
   'e2e: a voice client hears a framework agent through the real relay, and interrupts it',
   { skip: referenceRelayAvailable() === null ? 'reference relay repo unavailable' : false },
-  async () => {
+  async (t) => {
     const tempDir = mkdtempSync(join(tmpdir(), 'relay-client-e2e-'));
-    const relay = await spawnReferenceRelay(writeRelayConfig(tempDir));
+    // Cleanup via t.after so a failure at ANY point — including framework
+    // creation — cannot orphan the spawned relay child or the temp dir.
+    let relay: Awaited<ReturnType<typeof spawnReferenceRelay>> | null = null;
+    let frameworkRef: AgentFramework | null = null;
+    t.after(async () => {
+      await frameworkRef?.stop();
+      await relay?.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    });
+    relay = await spawnReferenceRelay(writeRelayConfig(tempDir));
     const membrane = new MockMembrane();
     const clientModule = new RelayClientModule({
       url: relay.url,
@@ -537,6 +1036,7 @@ test(
       agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Test.' }],
       modules: [clientModule as unknown as Module],
     });
+    frameworkRef = framework;
     clientModule.bind(framework);
 
     // Spy on abortInference to observe the interruption round-trip without
@@ -549,9 +1049,9 @@ test(
       return realAbort(agentName, opts as never);
     }) as typeof framework.abortInference;
 
-    try {
-      await waitFor(() => clientModule.isConnected, 10_000, 'module authed against real relay');
+    await waitFor(() => clientModule.isConnected, 10_000, 'module authed against real relay');
 
+    {
       const sim = new VoiceClientSim(relay.url);
       await sim.connect();
       const authReply = await sim.auth({ clientId: 'e2e-voice', token: TOKENS.client });
@@ -608,10 +1108,6 @@ test(
       assert.equal(aborts[0].keepText, 'Hello from');
 
       sim.close();
-    } finally {
-      await framework.stop();
-      await relay.stop();
-      rmSync(tempDir, { recursive: true, force: true });
     }
   },
 );
