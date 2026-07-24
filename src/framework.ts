@@ -164,17 +164,52 @@ function extractChannelIdFromToolResult(
  */
 const isAddressedMessage = (
   tags?: string[],
-  metadata?: Record<string, unknown>,
-): boolean => {
-  if (Array.isArray(tags) && tags.includes('chat:addressed')) return true;
-  if (!metadata) return false;
+  _metadata?: Record<string, unknown>,
+): boolean => Array.isArray(tags) && tags.includes('chat:addressed');
+
+/**
+ * Parse a prose segment's routing prefix (explicit prose routing —
+ * docs/explicit-prose-routing.md). The FIRST line may be:
+ *   `>>target [!] [body…]`   — target = channel spec or `private`
+ * The ` !` continuation modifier must immediately follow the target,
+ * whitespace-separated. Body may start on the same line or the next.
+ */
+function parseProsePrefix(text: string): {
+  kind: 'target' | 'private' | 'none';
+  target?: string;
+  continueTurn: boolean;
+  body: string;
+} {
+  const m = /^>>(\S+)([ \t]+!)?[ \t]*\n?/.exec(text);
+  if (!m) return { kind: 'none', continueTurn: false, body: text };
+  const target = m[1]!;
+  const continueTurn = m[2] !== undefined;
+  const body = text.slice(m[0].length);
+  if (target === 'private' || target === 'note') {
+    return { kind: 'private', continueTurn, body };
+  }
+  return { kind: 'target', target, continueTurn, body };
+}
+
+/** One-time primer appended when an agent's proseRouting mode changes. */
+function proseModePrimer(mode: 'explicit' | 'locus'): string {
+  if (mode === 'locus') {
+    return '[prose-routing] Mode change: your plain text auto-routes to the ' +
+      'conversational locus again. `>>` destination prefixes are no longer needed.';
+  }
   return (
-    metadata.isExplicitMention === true ||
-    metadata.isReplyToBot === true ||
-    metadata.isMention === true ||
-    metadata.isDM === true
+    '[prose-routing] NEW OUTPUT MODE — plain text no longer auto-routes to a channel.\n' +
+    'Start your text with a destination line to send it:\n' +
+    '  >>#channel-name …    or    >>@person …  (DM)    or    >>discord:guild:id …\n' +
+    '  The first destination in a turn sticks for the rest of that turn.\n' +
+    '  Add " !" right after the destination (e.g. ">>#ops !") to be woken again\n' +
+    '  immediately when this turn ends, instead of pausing until the next event.\n' +
+    '  >>private — keep the text as a private note (stored in context, sent nowhere).\n' +
+    'Unprefixed text is NOT sent: it is held on your clipboard and you will be asked\n' +
+    'to resend it — reply e.g. ">>#channel {{unsent}}" to send it verbatim without\n' +
+    'retyping. Explicit send tools (send_message, send_dm, …) work unchanged.'
   );
-};
+}
 /** Strip the `server--` MCPL prefix from a tool name. */
 const bareToolName = (n: string): string => n.split('--').pop()!;
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
@@ -476,6 +511,19 @@ export class AgentFramework {
    *  (KV-safe, no per-turn chatter). In-memory — after a process restart the
    *  first turn's locus is announced once to re-establish the baseline. */
   private lastAnnouncedLocus: Map<string, string | null> = new Map();
+
+  // ---- Explicit prose routing (docs/explicit-prose-routing.md) ----------
+  /** Latest bounced (undelivered) prose per agent — the `{{unsent}}` source. */
+  private proseClipboards: Map<string, string> = new Map();
+  /** Sticky per-TURN delivery target set by the turn's first `>>` prefix.
+   *  Cleared at every non-restart turn start; survives context restarts. */
+  private proseTargetPins: Map<string, string> = new Map();
+  /** Agents whose current turn requested `!` continuation — re-woken when the
+   *  turn completes instead of pausing until the next external event. */
+  private proseContinuations: Set<string> = new Set();
+  /** Consecutive bounce-wakes per agent; capped so an agent that keeps
+   *  emitting unprefixed prose can't wake-loop (notices still append). */
+  private proseBounceStreaks: Map<string, number> = new Map();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
   /** Streams the FRAMEWORK cancelled for non-terminal reasons, keyed
    *  `${agentName}:${streamId}`: an endTurn tool result or a context-budget
@@ -4203,6 +4251,150 @@ export class AgentFramework {
     }
   }
 
+  /**
+   * Explicit-prose-routing delivery gateway (docs/explicit-prose-routing.md).
+   * Every prose segment of an `explicit`-mode agent flows through here:
+   * parse the `>>` prefix, resolve the target, deliver — or bounce to the
+   * clipboard with a resend notice. Misdelivery is structurally impossible:
+   * nothing is ever sent to a destination the model did not name (directly
+   * or via the turn's sticky target).
+   */
+  private async deliverProse(agent: Agent, rawText: string): Promise<void> {
+    const name = agent.name;
+    const parsed = parseProsePrefix(rawText);
+    if (parsed.continueTurn) this.proseContinuations.add(name);
+
+    if (parsed.kind === 'private') {
+      // The text already lives in the assistant message (window/chronicle);
+      // "delivery" is deliberately a no-op. Consumes the clipboard if the
+      // note embedded it.
+      if (parsed.body.includes('{{unsent}}')) this.proseClipboards.delete(name);
+      console.error(`[prose] ${name}: >>private — ${parsed.body.length} chars kept as note (not sent)`);
+      return;
+    }
+
+    let targetChannel: string;
+    let body: string;
+    if (parsed.kind === 'target') {
+      const res = this.channelRegistry!.resolveProseTarget(parsed.target!);
+      if ('error' in res) {
+        this.bounceProse(agent, parsed.body, res.error, res.candidates);
+        return;
+      }
+      targetChannel = res.channelId;
+      // Sticky within the turn: later unprefixed segments follow this target.
+      this.proseTargetPins.set(name, targetChannel);
+      body = parsed.body;
+    } else {
+      const sticky = this.proseTargetPins.get(name);
+      if (!sticky) {
+        this.bounceProse(agent, rawText, 'no destination prefix and no destination set yet this turn');
+        return;
+      }
+      targetChannel = sticky;
+      body = rawText;
+    }
+
+    const usedClipboard = body.includes('{{unsent}}');
+    if (usedClipboard) {
+      body = body.replaceAll('{{unsent}}', this.proseClipboards.get(name) ?? '');
+    }
+    if (!body.trim()) {
+      console.error(`[prose] ${name}: empty body after prefix/substitution — nothing to send`);
+      return;
+    }
+
+    try {
+      const result = await this.channelRegistry!.routeSpeech(name, body, targetChannel);
+      if (result?.delivered) {
+        this.proseBounceStreaks.delete(name);
+        if (usedClipboard) this.proseClipboards.delete(name);
+      }
+    } catch (err) {
+      console.error(`[prose] ${name}: delivery to ${targetChannel} failed:`, err);
+    }
+  }
+
+  /** Cap on consecutive bounce-triggered wakes (notices still append after). */
+  private static readonly PROSE_BOUNCE_WAKE_CAP = 2;
+
+  private bounceProse(agent: Agent, text: string, reason: string, candidates?: string[]): void {
+    const name = agent.name;
+    this.proseClipboards.set(name, text);
+    const streak = (this.proseBounceStreaks.get(name) ?? 0) + 1;
+    this.proseBounceStreaks.set(name, streak);
+    const cand = candidates?.length ? ` Known channels it could mean: ${candidates.join(', ')}.` : '';
+    const notice =
+      `[prose-routing] Your text (${text.length} chars) was NOT sent — ${reason}.${cand} ` +
+      'It is saved on your clipboard; nothing is lost. To send it verbatim without retyping, ' +
+      'reply with a destination plus the token, e.g. ">>#channel {{unsent}}" or ">>@person {{unsent}}" ' +
+      '(or ">>private {{unsent}}" to keep it as a note).';
+    try {
+      const id = agent.getContextManager().addMessage(
+        'user',
+        [{ type: 'text', text: notice }],
+        { system: true, kind: 'prose-bounce' },
+      );
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-bounce' });
+    } catch (err) {
+      console.error('bounceProse: failed to record bounce notice:', err);
+    }
+    const capped = streak > AgentFramework.PROSE_BOUNCE_WAKE_CAP;
+    console.error(
+      `[prose] ${name}: BOUNCED ${text.length} chars — ${reason}` +
+      (capped ? ' (bounce-wake cap reached; notice appended without wake)' : ''),
+    );
+    if (!capped) {
+      // Wake so the resend can happen immediately — an unsent DM reply must
+      // not sit invisible until the next unrelated event.
+      this.pendingRequests.push({
+        agentName: name,
+        reason: 'prose-bounce',
+        source: 'framework',
+        timestamp: Date.now(),
+      });
+    }
+  }
+
+  /**
+   * One-time mode primer (docs/explicit-prose-routing.md): when an agent's
+   * configured proseRouting differs from the last mode we primed them for,
+   * append the teaching notice and persist the new mode. A brand-new agent
+   * in default locus mode is recorded silently — no primer for the status quo.
+   */
+  private maybePrimeProseMode(agent: Agent): void {
+    const mode = agent.proseRouting;
+    try {
+      const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+      const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      const primed = { ...((state.proseRoutingPrimed as Record<string, string> | undefined) ?? {}) };
+      const stored = primed[agent.name];
+      if (stored === mode) return;
+      // Absence means "always default (locus)": a locus-mode agent that was
+      // never explicit needs no entry and no primer — and skipping the write
+      // keeps framework/state from growing a record per agent (scaling gate).
+      if (mode === 'locus' && stored === undefined) return;
+      if (mode === 'locus') delete primed[agent.name];
+      else primed[agent.name] = mode;
+      state.proseRoutingPrimed = primed;
+      this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+    } catch (err) {
+      console.error('maybePrimeProseMode: state read/write failed:', err);
+      return;
+    }
+    try {
+      const id = agent.getContextManager().addMessage(
+        'user',
+        [{ type: 'text', text: proseModePrimer(mode) }],
+        { system: true, kind: 'prose-routing-primer' },
+      );
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-routing-primer' });
+      console.error(`[prose] ${agent.name}: mode primer appended (${mode})`);
+    } catch (err) {
+      console.error('maybePrimeProseMode: failed to append primer:', err);
+    }
+  }
+
   private async startAgentStream(agent: Agent, trigger?: InferenceRequest, attempt = 0): Promise<void> {
     // Record turn checkpoint before inference (only on first attempt, not retries)
     if (attempt === 0) {
@@ -4244,11 +4436,22 @@ export class AgentFramework {
     // goes (announce-on-change only — no per-turn chatter, append-only for
     // KV stability).
     if (trigger?.reason !== 'context_budget_restart') {
-      const locus = this.channelRegistry?.resolveLocus(agent.name) ?? null;
-      if (locus !== null) this.turnLocusPins.set(agent.name, locus);
-      else this.turnLocusPins.delete(agent.name);
-      this.midTurnInputSignals.delete(agent.name);
-      if (attempt === 0) this.announceLocusIfChanged(agent.name, locus);
+      if (attempt === 0) this.maybePrimeProseMode(agent);
+      if (agent.proseRouting === 'explicit') {
+        // Explicit prose routing: there is no locus. The model names every
+        // destination in-band (`>>` prefixes); the only turn state is the
+        // sticky target, reset for each fresh turn. No freeze, no announce.
+        this.proseTargetPins.delete(agent.name);
+        this.proseContinuations.delete(agent.name);
+        this.midTurnInputSignals.delete(agent.name);
+        this.turnLocusPins.delete(agent.name);
+      } else {
+        const locus = this.channelRegistry?.resolveLocus(agent.name) ?? null;
+        if (locus !== null) this.turnLocusPins.set(agent.name, locus);
+        else this.turnLocusPins.delete(agent.name);
+        this.midTurnInputSignals.delete(agent.name);
+        if (attempt === 0) this.announceLocusIfChanged(agent.name, locus);
+      }
     }
 
     this.touchEphemeralRun(agent.name, true);
@@ -4530,7 +4733,21 @@ export class AgentFramework {
                 liveProseRouting = true;
                 const roundSegments = splitProseSegments(assistantBlocks);
                 if (roundSegments.length > 0) {
-                  if (turnSilenced) {
+                  if (agent.proseRouting === 'explicit') {
+                    // Explicit mode: every segment through the prose gateway.
+                    // Silencing does not apply — unprefixed prose bounces and
+                    // prefixed prose is deliberate; think-privacy still holds.
+                    if (!hasSameRoundPrivateThink) {
+                      console.error(
+                        `[prose] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway`,
+                      );
+                      for (const seg of roundSegments) {
+                        turnSpeechChain = turnSpeechChain
+                          .then(() => this.deliverProse(agent, seg))
+                          .catch((err) => console.error('mid-turn prose delivery failed:', err));
+                      }
+                    }
+                  } else if (turnSilenced) {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (turn silenced)`,
                     );
@@ -4854,20 +5071,29 @@ export class AgentFramework {
                 .join('\n')
                 .trim();
               if (speechText) {
-                // Route to the TURN-FROZEN locus, like every other speech
-                // path. This dispatch runs AFTER the agent is idle, so a live
-                // resolution here can read the NEXT turn's trigger state (or
-                // a post-restart cleared one) and land the reply in a stale
-                // channel — the 2026-07-22 Sol DM-to-guild misroute. The
-                // frozen pin is immune to both races.
-                const locus = resolveTurnLocus();
-                console.error(
-                  `[routing] ${agent.name}: text-only turn -> routing speech -> ${locus ?? '(none)'}`,
-                );
-                try {
-                  await this.channelRegistry.routeSpeech(agent.name, speechText, locus);
-                } catch (err) {
-                  console.error('speech routing failed:', err);
+                if (agent.proseRouting === 'explicit') {
+                  console.error(`[prose] ${agent.name}: text-only turn -> prose gateway`);
+                  try {
+                    await this.deliverProse(agent, speechText);
+                  } catch (err) {
+                    console.error('text-only prose delivery failed:', err);
+                  }
+                } else {
+                  // Route to the TURN-FROZEN locus, like every other speech
+                  // path. This dispatch runs AFTER the agent is idle, so a live
+                  // resolution here can read the NEXT turn's trigger state (or
+                  // a post-restart cleared one) and land the reply in a stale
+                  // channel — the 2026-07-22 Sol DM-to-guild misroute. The
+                  // frozen pin is immune to both races.
+                  const locus = resolveTurnLocus();
+                  console.error(
+                    `[routing] ${agent.name}: text-only turn -> routing speech -> ${locus ?? '(none)'}`,
+                  );
+                  try {
+                    await this.channelRegistry.routeSpeech(agent.name, speechText, locus);
+                  } catch (err) {
+                    console.error('speech routing failed:', err);
+                  }
                 }
               }
             } else if (this.channelRegistry && hadToolCalls && allText.length > 0) {
@@ -4900,7 +5126,20 @@ export class AgentFramework {
               // the chain may still be flushing earlier rounds' posts.
               await turnSpeechChain;
 
-              if (silenced || segments.length === 0) {
+              if (agent.proseRouting === 'explicit') {
+                if (segments.length > 0) {
+                  console.error(
+                    `[prose] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> ${segments.length} trailing segment(s) via prose gateway`,
+                  );
+                  for (const seg of segments) {
+                    try {
+                      await this.deliverProse(agent, seg);
+                    } catch (err) {
+                      console.error('trailing prose delivery failed:', err);
+                    }
+                  }
+                }
+              } else if (silenced || segments.length === 0) {
                 console.error(
                   `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> trailing prose NOT routed ` +
                   `(${silenced ? 'silencing tool / explicit send' : 'no trailing prose'})`,
@@ -4930,6 +5169,21 @@ export class AgentFramework {
             // NOTE: agent.reset() + onInferenceEnded() already ran above,
             // BEFORE dispatchSpeech. Locus routing is speech dispatch and
             // doesn't depend on the status field, so it correctly runs after.
+
+            // Explicit-prose `!` continuation: a prose segment this turn asked
+            // to keep going (`>>#x !` / `>>private !`) — start another turn
+            // now instead of pausing until the next external event. This gives
+            // prose the same continuation ability tool rounds have (wanted for
+            // robotics-style loops where an end-of-turn pause is harmful).
+            if (this.proseContinuations.delete(agent.name)) {
+              console.error(`[prose] ${agent.name}: '!' continuation — requesting immediate next turn`);
+              this.pendingRequests.push({
+                agentName: agent.name,
+                reason: 'prose-continuation',
+                source: 'framework',
+                timestamp: Date.now(),
+              });
+            }
 
             break;
           }
@@ -7444,10 +7698,24 @@ export class AgentFramework {
     // authority as every other speech path, no live re-resolution.
     if (announce && this.channelRegistry) {
       const text = input.message ?? `💤 Going quiet for ${human}. I'll still see messages, but won't respond until I wake.`;
-      const locus = this.turnLocusPins.get(agentName) ?? null;
-      this.channelRegistry.routeSpeech(agentName, text, locus).catch((err) => {
-        console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
-      });
+      const agent = this.agents.get(agentName);
+      if (agent?.proseRouting === 'explicit') {
+        // Explicit mode: announce to the turn's sticky prose target if the
+        // model has set one; otherwise stay quiet — never guess a channel.
+        const target = this.proseTargetPins.get(agentName);
+        if (target) {
+          this.channelRegistry.routeSpeech(agentName, text, target).catch((err) => {
+            console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
+          });
+        } else {
+          console.error(`[sleep] ${agentName}: no prose target this turn — sleep announcement not posted (explicit mode never guesses)`);
+        }
+      } else {
+        const locus = this.turnLocusPins.get(agentName) ?? null;
+        this.channelRegistry.routeSpeech(agentName, text, locus).catch((err) => {
+          console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
+        });
+      }
     }
 
     console.error(`[sleep] agent=${agentName} seconds=${seconds} announce=${announce} until=${new Date(until).toISOString()}`);

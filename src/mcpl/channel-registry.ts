@@ -1328,6 +1328,83 @@ export class ChannelRegistry {
   }
 
   /**
+   * Resolve a `>>` prose-routing target (explicit prose routing —
+   * docs/explicit-prose-routing.md) to a registered channel.
+   *
+   * Accepted spellings, tried in order:
+   *   1. exact descriptor id (`discord:guild:123`, always unambiguous)
+   *   2. exact raw server-internal id (`address.channelId`)
+   *   3. `#label` / bare label — case-insensitive match on descriptor label
+   *      with any leading '#' stripped from both sides
+   *   4. `@name` — DM descriptor labels (`DM: name`), case-insensitive
+   *
+   * Ambiguity is an error carrying candidates — never a guess: this is the
+   * mechanism that makes prose misdelivery structurally impossible.
+   */
+  resolveProseTarget(
+    spec: string,
+  ): { channelId: string; label?: string } | { error: string; candidates?: string[] } {
+    const entries = [...this.channels.values()];
+    const trimmed = spec.trim();
+    if (!trimmed) return { error: 'empty target' };
+
+    const exact = entries.filter((e) => e.descriptor.id === trimmed);
+    if (exact.length === 1) {
+      return { channelId: exact[0]!.descriptor.id, label: exact[0]!.descriptor.label };
+    }
+    if (exact.length > 1) {
+      return {
+        error: `channel id "${trimmed}" is ambiguous across servers`,
+        candidates: exact.map((e) => `${e.serverId}:${e.descriptor.id}`),
+      };
+    }
+
+    const raw = entries.filter(
+      (e) => (e.descriptor.address as { channelId?: string } | undefined)?.channelId === trimmed,
+    );
+    if (raw.length === 1) {
+      return { channelId: raw[0]!.descriptor.id, label: raw[0]!.descriptor.label };
+    }
+    if (raw.length > 1) {
+      return {
+        error: `raw id "${trimmed}" is ambiguous`,
+        candidates: raw.map((e) => e.descriptor.id),
+      };
+    }
+
+    const norm = (s: string) => s.replace(/^#/, '').toLowerCase();
+    if (trimmed.startsWith('@')) {
+      const name = trimmed.slice(1).toLowerCase();
+      const dms = entries.filter((e) => {
+        const label = e.descriptor.label ?? '';
+        return label.toLowerCase() === `dm: ${name}` ||
+          ((e.descriptor.metadata as { channelType?: string } | undefined)?.channelType === 'dm' &&
+            label.toLowerCase().includes(name));
+      });
+      if (dms.length === 1) {
+        return { channelId: dms[0]!.descriptor.id, label: dms[0]!.descriptor.label };
+      }
+      return dms.length === 0
+        ? { error: `no DM found for "${trimmed}"` }
+        : { error: `"${trimmed}" matches several DMs`, candidates: dms.map((e) => e.descriptor.label ?? e.descriptor.id) };
+    }
+
+    const byLabel = entries.filter(
+      (e) => norm(e.descriptor.label ?? '') === norm(trimmed),
+    );
+    if (byLabel.length === 1) {
+      return { channelId: byLabel[0]!.descriptor.id, label: byLabel[0]!.descriptor.label };
+    }
+    if (byLabel.length > 1) {
+      return {
+        error: `label "${trimmed}" matches several channels`,
+        candidates: byLabel.map((e) => e.descriptor.id),
+      };
+    }
+    return { error: `no channel matches "${trimmed}"` };
+  }
+
+  /**
    * Open a channel because something was DELIVERED into it (explicit send
    * tool or routed speech). Sending into a closed channel is not a thing:
    * engaging a channel opens it, so typing indicators, reaction machinery,

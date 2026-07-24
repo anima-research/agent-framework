@@ -62,6 +62,8 @@ export class Agent {
   readonly thinking: AgentConfig['thinking'];
   /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
   readonly refusalHandling: AgentConfig['refusalHandling'];
+  /** Prose delivery mode (see AgentConfig.proseRouting). Default 'locus'. */
+  readonly proseRouting: 'locus' | 'explicit';
   /** Prompt-cache TTL forwarded to the provider (see AgentConfig.cacheTtl). */
   readonly cacheTtl: NonNullable<AgentConfig['cacheTtl']>;
   /** Emit prompt-cache markers on requests (see AgentConfig.promptCaching). */
@@ -104,6 +106,7 @@ export class Agent {
     this.temperature = config.temperature;
     this.thinking = config.thinking;
     this.refusalHandling = config.refusalHandling;
+    this.proseRouting = config.proseRouting ?? 'locus';
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching ?? true;
     this.prefillUserMessage = config.prefillUserMessage;

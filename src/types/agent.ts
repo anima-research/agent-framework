@@ -133,6 +133,16 @@ export interface AgentConfig {
      */
     announceHumanTurns?: boolean;
   };
+
+  /**
+   * How the agent's PLAIN PROSE (non-tool output) reaches channels.
+   * - 'locus' (default): host-inferred — the turn-frozen locus machinery.
+   * - 'explicit': the model prefixes prose with a destination
+   *   (`>>#channel` / `>>@person` / `>>private`); unprefixed prose is never
+   *   delivered — it bounces to a clipboard for a cheap prefixed resend.
+   *   See docs/explicit-prose-routing.md.
+   */
+  proseRouting?: 'locus' | 'explicit';
 }
 
 /** The intentionally small set of agent settings that may change in-process. */
