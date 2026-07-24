@@ -4234,17 +4234,12 @@ export class AgentFramework {
       ` will reach you. If you don't want ${plural ? 'one of them' : 'it'}, use channel_close — ` +
       'your choice sticks; neither policy nor a later send will silently reopen it.';
     try {
-      const agent = agentName ? this.agents.get(agentName) : undefined;
-      if (agent) {
-        const id = agent.getContextManager().addMessage(
-          'user',
-          [{ type: 'text', text }],
-          { system: true, kind: 'channel-notice' },
-        );
-        this.emitTrace({ type: 'message:added', messageId: id, source: 'channel-notice' });
-      } else {
-        this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'channel-notice' });
-      }
+      // Through framework.addMessage for mid-turn safety (deferral +
+      // hear-while-acting injection) — a delivery-forced open happens inside
+      // a live turn, and a direct context-manager append there would store
+      // the notice out of order. Targets the primary agent; connectome-host
+      // runs trunk-only, so this is the delivering agent in practice.
+      this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'channel-notice' });
       console.error(`[channel] auto-open notice (${cause}) -> ${agentName ?? 'primary'}: ${shown}`);
     } catch (err) {
       console.error('recordChannelAutoOpenNotice failed:', err);
@@ -4330,12 +4325,20 @@ export class AgentFramework {
       'reply with a destination plus the token, e.g. ">>#channel {{unsent}}" or ">>@person {{unsent}}" ' +
       '(or ">>private {{unsent}}" to keep it as a note).';
     try {
-      const id = agent.getContextManager().addMessage(
+      // Through framework.addMessage, NOT the context manager directly: while
+      // the turn is still streaming this defers the notice to the next tool
+      // boundary, where it is BOTH stored in order and injected into the live
+      // stream (hear-while-acting) — the model sees the error and can correct
+      // the prefix within the same turn. A direct append here would land the
+      // notice before the turn's assistant blocks (cache bust, invisible
+      // until the next compile).
+      const id = this.addMessage(
         'user',
         [{ type: 'text', text: notice }],
         { system: true, kind: 'prose-bounce' },
       );
-      this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-bounce' });
+      if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-bounce' });
+      else this.emitTrace({ type: 'message:added', messageId: 'deferred', source: 'prose-bounce' });
     } catch (err) {
       console.error('bounceProse: failed to record bounce notice:', err);
     }
