@@ -117,7 +117,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       guildId: null,
       isDM: true,
     });
-    assert.deepEqual(got, { channelId: 'discord:dm:42', label: undefined });
+    assert.deepEqual(got, { channelId: 'discord:dm:42' });
     await framework.stop();
   });
 
@@ -128,7 +128,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
       channelId: 'C7',
       guildId: 'G1',
     });
-    assert.deepEqual(got, { channelId: 'discord:G1:C7', label: undefined });
+    assert.deepEqual(got, { channelId: 'discord:G1:C7' });
     await framework.stop();
   });
 

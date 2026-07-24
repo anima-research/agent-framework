@@ -3946,6 +3946,7 @@ export class AgentFramework {
         event.serverId,
         triggerChannel.channelId,
         triggerChannel.label,
+        triggerChannel.metadata,
       );
     }
 
@@ -4050,13 +4051,29 @@ export class AgentFramework {
    */
   private derivePushEventChannel(
     origin: Record<string, unknown> | undefined,
-  ): { channelId: string; label?: string } | undefined {
+  ): { channelId: string; label?: string; metadata?: Record<string, unknown> } | undefined {
     if (!origin) return undefined;
-    const label = typeof origin.channelName === 'string' ? origin.channelName : undefined;
+    let label = typeof origin.channelName === 'string' && origin.channelName ? origin.channelName : undefined;
+    let metadata: Record<string, unknown> | undefined;
+
+    // A DM has no channelName — label it by the PERSON and carry their
+    // identity, so DM registrations are people-first (`DM: antra`, matchable
+    // by `>>@name` / `<@id>` mention tokens) instead of bare snowflakes.
+    const isDM = origin.isDM === true || origin.guildId === null;
+    if (isDM && typeof origin.authorName === 'string' && origin.authorName) {
+      label = label ?? `DM: ${origin.authorName}`;
+      metadata = {
+        channelType: 'dm',
+        recipientName: origin.authorName,
+        ...(typeof origin.authorId === 'string' && origin.authorId
+          ? { recipientId: origin.authorId }
+          : {}),
+      };
+    }
 
     const explicit = origin.mcplChannelId;
     if (typeof explicit === 'string' && explicit) {
-      return { channelId: explicit, label };
+      return { channelId: explicit, ...(label ? { label } : {}), ...(metadata ? { metadata } : {}) };
     }
 
     // Discord fallback: reconstruct the composite from origin parts. `guildId`
@@ -4064,7 +4081,11 @@ export class AgentFramework {
     if (origin.source === 'discord' && typeof origin.channelId === 'string' && origin.channelId) {
       const guild =
         typeof origin.guildId === 'string' && origin.guildId ? origin.guildId : 'dm';
-      return { channelId: `discord:${guild}:${origin.channelId}`, label };
+      return {
+        channelId: `discord:${guild}:${origin.channelId}`,
+        ...(label ? { label } : {}),
+        ...(metadata ? { metadata } : {}),
+      };
     }
 
     return undefined;

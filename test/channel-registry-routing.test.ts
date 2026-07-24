@@ -469,3 +469,29 @@ test('resolveProseTarget matches the name segment of suffixed labels (#fable vs 
   const miss = registry.resolveProseTarget('#fabl');
   assert.ok('error' in miss && (miss.candidates?.length ?? 0) >= 1, 'near-candidates on no-match');
 });
+
+test('DM prose targets resolve people-first: @name, prefix-lenient names, and <@id> mention tokens', async () => {
+  const { registry } = makeRegistry({ delivered: true });
+  await registry.handleChanged('discord', {
+    added: [
+      { id: 'discord:dm:555', type: 'discord', label: 'DM: antra', direction: 'bidirectional',
+        metadata: { channelType: 'dm', recipientName: 'antra', recipientId: '134390790938951680' } },
+      { id: 'discord:dm:556', type: 'discord', label: 'DM: laria', direction: 'bidirectional',
+        metadata: { channelType: 'dm', recipientName: 'laria', recipientId: '628555451356676097' } },
+    ],
+  } as never);
+
+  const exact = registry.resolveProseTarget('@antra');
+  assert.ok('channelId' in exact && exact.channelId === 'discord:dm:555', 'exact recipient name');
+
+  const lenient = registry.resolveProseTarget('@antra_tessera');
+  assert.ok('channelId' in lenient && lenient.channelId === 'discord:dm:555',
+    'handle resolves against display-name prefix');
+
+  const token = registry.resolveProseTarget('<@134390790938951680>');
+  assert.ok('channelId' in token && token.channelId === 'discord:dm:555', 'mention token by recipientId');
+
+  const missing = registry.resolveProseTarget('@nobody');
+  assert.ok('error' in missing && /send_dm/.test(missing.error), 'no-match points at send_dm');
+  assert.ok('error' in missing && (missing.candidates?.length ?? 0) === 2, 'lists known DMs by name');
+});

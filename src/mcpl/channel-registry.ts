@@ -664,9 +664,26 @@ export class ChannelRegistry {
    * channels/register or channels/changed overwrites this descriptor with the
    * richer one.
    */
-  ensureChannelRegistered(serverId: string, channelId: string, label?: string): void {
+  ensureChannelRegistered(
+    serverId: string,
+    channelId: string,
+    label?: string,
+    extraMetadata?: Record<string, unknown>,
+  ): void {
     const existing = this.findChannelEntry(channelId);
     if (existing) {
+      // Backfill identity onto a bare lazy registration: a DM that first
+      // arrived with no label/recipient info gets a usable name the next
+      // time a message reveals it (labels must show people, not ids).
+      if (
+        (existing.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered &&
+        label && existing.descriptor.label === channelId
+      ) {
+        existing.descriptor.label = label;
+        if (extraMetadata) {
+          existing.descriptor.metadata = { ...existing.descriptor.metadata, ...extraMetadata };
+        }
+      }
       return;
     }
 
@@ -678,7 +695,7 @@ export class ChannelRegistry {
         type: serverId,
         label: label ?? channelId,
         direction: 'bidirectional',
-        metadata: { lazyRegistered: true },
+        metadata: { lazyRegistered: true, ...(extraMetadata ?? {}) },
       },
       open: false,
     });
@@ -1373,20 +1390,61 @@ export class ChannelRegistry {
     }
 
     const norm = (s: string) => s.replace(/^#/, '').toLowerCase();
-    if (trimmed.startsWith('@')) {
-      const name = trimmed.slice(1).toLowerCase();
-      const dms = entries.filter((e) => {
-        const label = e.descriptor.label ?? '';
-        return label.toLowerCase() === `dm: ${name}` ||
-          ((e.descriptor.metadata as { channelType?: string } | undefined)?.channelType === 'dm' &&
-            label.toLowerCase().includes(name));
-      });
-      if (dms.length === 1) {
-        return { channelId: dms[0]!.descriptor.id, label: dms[0]!.descriptor.label };
+
+    // DM addressing is PEOPLE-first: usernames and mention tokens, never
+    // ids-only (2026-07-24, antra + Fable's live-canary bug report). A DM
+    // entry is matched by, in order: recipientId (from a `<@id>` mention
+    // token), exact recipient/label name, then prefix-lenient name (handles
+    // "@antra_tessera" vs a display name "antra" and vice versa).
+    const mention = /^<@!?(\d+)>$/.exec(trimmed);
+    if (trimmed.startsWith('@') || mention) {
+      const dmMeta = (e: ChannelEntry) =>
+        e.descriptor.metadata as { channelType?: string; recipientId?: string; recipientName?: string } | undefined;
+      const dmName = (e: ChannelEntry) => {
+        const meta = dmMeta(e);
+        if (meta?.recipientName) return meta.recipientName.toLowerCase();
+        const label = (e.descriptor.label ?? '').toLowerCase();
+        return label.startsWith('dm: ') ? label.slice(4) : label;
+      };
+      const isDmEntry = (e: ChannelEntry) =>
+        dmMeta(e)?.channelType === 'dm' ||
+        (e.descriptor.label ?? '').toLowerCase().startsWith('dm: ') ||
+        e.descriptor.id.includes(':dm:');
+      const dms = entries.filter(isDmEntry);
+
+      if (mention) {
+        const id = mention[1]!;
+        const byId = dms.filter((e) => dmMeta(e)?.recipientId === id);
+        if (byId.length === 1) {
+          return { channelId: byId[0]!.descriptor.id, label: byId[0]!.descriptor.label };
+        }
+        return {
+          error: `no registered DM matches the mention <@${id}>`,
+          candidates: dms.map((e) => e.descriptor.label ?? e.descriptor.id).slice(0, 6),
+        };
       }
-      return dms.length === 0
-        ? { error: `no DM found for "${trimmed}"` }
-        : { error: `"${trimmed}" matches several DMs`, candidates: dms.map((e) => e.descriptor.label ?? e.descriptor.id) };
+
+      const name = trimmed.slice(1).toLowerCase();
+      const exact = dms.filter((e) => dmName(e) === name);
+      const pool = exact.length > 0
+        ? exact
+        : dms.filter((e) => {
+            const n = dmName(e);
+            return n.length >= 3 && (n.startsWith(name) || name.startsWith(n) || n.includes(name));
+          });
+      if (pool.length === 1) {
+        return { channelId: pool[0]!.descriptor.id, label: pool[0]!.descriptor.label };
+      }
+      if (pool.length > 1) {
+        return {
+          error: `"${trimmed}" matches several DMs`,
+          candidates: pool.map((e) => e.descriptor.label ?? e.descriptor.id),
+        };
+      }
+      return {
+        error: `no registered DM found for "${trimmed}" — for someone without a registered DM channel, use the send_dm tool`,
+        ...(dms.length ? { candidates: dms.map((e) => e.descriptor.label ?? e.descriptor.id).slice(0, 6) } : {}),
+      };
     }
 
     const byLabel = entries.filter(
