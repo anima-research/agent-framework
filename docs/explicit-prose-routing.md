@@ -52,18 +52,22 @@ Explicit send tools (`send_message` etc.) are unchanged. Channel lifecycle
 invariants (send-opens-channel, subscribed⇒open) are unchanged — a `>>` send
 into a closed channel opens it, with the usual `[channels]` notice.
 
-## Teaching the grammar (system role only)
+## Teaching the grammar (teach-by-bounce)
 
-The grammar is appended to the agent's SYSTEM prompt at construction
-(`EXPLICIT_PROSE_GRAMMAR`). Mode switches append only a one-line durable
-notice pointing at it (persisted per agent, so reboots never re-notice).
-This split is load-bearing, not stylistic: the 2026-07-24 Fable ablation
-showed the full grammar as a user-role message draws a deterministic
-`reasoning_extraction` refusal ("instruct the assistant to redirect/withhold
-output" is injection-shaped from the user role), while the identical text in
-the system role — and short event-style bounce notices from the user role —
-pass cleanly. Symmetric: switching back to locus mode announces that plain
-text auto-routes again.
+The grammar is never injected into context. The mode switch appends one short
+durable notice (persisted per agent, so reboots never re-notice); the first
+undelivered text produces a bounce notice carrying the exact resend syntax —
+the model learns by doing, and the knowledge accretes into its own history.
+The full reference is available on demand via the **`prose_help` tool**, whose
+result is model-requested content. The system prompt is never touched: those
+bytes belong to the recipe, and the deepest KV prefix must not vary with
+framework code.
+
+Why this shape is load-bearing (2026-07-24 Fable ablation): the full grammar
+as a user-role message draws a deterministic `reasoning_extraction` refusal
+("instruct the assistant to redirect/withhold output" is injection-shaped from
+the user role), while short event-style notices pass cleanly. Symmetric:
+switching back to locus mode announces that plain text auto-routes again.
 
 ## KV / wire notes
 

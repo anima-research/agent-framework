@@ -202,14 +202,39 @@ function proseModePrimer(mode: 'explicit' | 'locus'): string {
       'conversational locus again. `>>` destination prefixes are no longer needed.';
   }
   // Deliberately terse: a short event-style notice is classifier-safe from
-  // the user role (ablation D), while the full grammar as a user message drew
-  // a deterministic reasoning_extraction refusal (ablation A/B). The grammar
-  // itself lives in the system prompt (EXPLICIT_PROSE_GRAMMAR, agent.ts).
+  // the user role (ablation D, 2026-07-24), while the full grammar as a user
+  // message drew a deterministic reasoning_extraction refusal (ablation A/B).
+  // The grammar is TAUGHT BY BOUNCE: the first undelivered text produces a
+  // notice with the exact resend syntax, and the full reference is available
+  // on demand via the prose_help tool (a tool RESULT is model-requested
+  // content — the safest role there is). Nothing is injected into the system
+  // prompt: those bytes belong to the recipe, and the deepest KV prefix must
+  // not vary with framework code.
   return (
-    '[prose-routing] Output mode changed: plain-text delivery now follows the ' +
-    'destination-prefix rules described in your system prompt.'
+    '[prose-routing] Output mode changed: plain text is delivered only with a ' +
+    'destination prefix line, e.g. ">>#channel-name your text". ' +
+    'The prose_help tool shows the full syntax.'
   );
 }
+
+/** Full `>>` routing reference, served as the prose_help TOOL RESULT (never
+ *  injected ambiently — see proseModePrimer note). */
+const PROSE_ROUTING_HELP =
+  'Plain-text output routing (explicit mode):\n' +
+  '  >>#channel-name …    or    >>@person …  (DM)    or    >>service:guild:id …\n' +
+  '  The first destination in a turn applies to the rest of that turn.\n' +
+  '  Append " !" after the destination (e.g. ">>#ops !") to start your next turn\n' +
+  '  immediately when this one ends, instead of pausing until the next event.\n' +
+  '  >>skip_reply — text stays in your context only, like the skip_reply tool.\n' +
+  'Text without a destination is not delivered: it is retained, and a notice will\n' +
+  'prompt you to resend — reply e.g. ">>#channel {{unsent}}" to deliver the retained\n' +
+  'text unchanged. Send tools (send_message, send_dm, …) are unaffected.';
+
+const PROSE_HELP_TOOL: import('./types/index.js').ToolDefinition = {
+  name: 'prose_help',
+  description: 'Show the plain-text output routing syntax (destination prefixes, resend token, skip).',
+  inputSchema: { type: 'object' as const, properties: {} },
+};
 /** Strip the `server--` MCPL prefix from a tool name. */
 const bareToolName = (n: string): string => n.split('--').pop()!;
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
@@ -4323,7 +4348,7 @@ export class AgentFramework {
       `[prose-routing] Your text (${text.length} chars) was not delivered — ${reason}.${cand} ` +
       'The text is retained; nothing is lost. To deliver it unchanged, reply with a ' +
       'destination plus the token {{unsent}}, e.g. ">>#channel {{unsent}}" or ">>@person {{unsent}}". ' +
-      '">>skip_reply {{unsent}}" keeps it in context only.';
+      '">>skip_reply {{unsent}}" keeps it in context only. The prose_help tool shows the full syntax.';
     try {
       // Through framework.addMessage, NOT the context manager directly: while
       // the turn is still streaming this defers the notice to the next tool
@@ -4472,6 +4497,9 @@ export class AgentFramework {
       const requestSnapshot = this.captureInferenceToolSnapshot(agent);
       const allTools = this.getToolsForAgent(agent.name, requestSnapshot);
       const tools = allTools.filter((t) => agent.canUseTool(t.name));
+      // Explicit-mode agents get the on-demand routing reference (teach-by-
+      // bounce: the grammar is never injected, only served when asked).
+      if (agent.proseRouting === 'explicit') tools.push(PROSE_HELP_TOOL);
 
       // Gather context from modules (pull-based) and MCPL hooks (push-based)
       // Both produce ContextInjection[] that get merged before inference.
@@ -5692,6 +5720,21 @@ export class AgentFramework {
     // need an explicit route here.
     if ((enrichedCall.name === 'think' || enrichedCall.name === 'skip_reply') && this.channelRegistry) {
       this.dispatchChannelToolCall(agentName, enrichedCall);
+      return;
+    }
+
+    // prose_help: on-demand routing reference for explicit-prose agents.
+    // Answered inline — the grammar is a tool RESULT (model-requested), never
+    // ambient context (see PROSE_ROUTING_HELP / teach-by-bounce).
+    if (enrichedCall.name === 'prose_help') {
+      this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'prose_help', callId: enrichedCall.id, durationMs: 0 });
+      this.pushEvent({
+        type: 'tool-result',
+        callId: enrichedCall.id,
+        agentName,
+        moduleName: 'framework',
+        result: { success: true, data: PROSE_ROUTING_HELP },
+      });
       return;
     }
 

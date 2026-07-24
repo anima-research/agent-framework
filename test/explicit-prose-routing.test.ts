@@ -262,4 +262,27 @@ describe('explicit prose routing', () => {
 
     await framework.stop();
   });
+
+  it('prose_help tool returns the routing reference on demand', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'prose_help', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha got it' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const stream = membrane.lastStream!;
+    assert.equal(stream.receivedToolResults.length, 1);
+    const result = JSON.stringify(stream.receivedToolResults[0]);
+    assert.ok(result.includes('destination'), 'help text served as tool result');
+    assert.deepEqual(routed, [{ text: 'got it', locus: 'chan-alpha' }]);
+
+    await framework.stop();
+  });
 });
