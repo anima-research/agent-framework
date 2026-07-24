@@ -56,7 +56,14 @@ export class MockYieldingStream implements YieldingStream {
     { injectedMessages?: Array<{ participant?: string; content: unknown[] }> } | undefined
   > = [];
 
-  constructor(private responses: NormalizedResponse[]) {
+  constructor(
+    private responses: NormalizedResponse[],
+    /** Mirrors membrane's emitBlocks stream option: block boundary events
+     *  are emitted only when the caller asked for them. Respecting the flag
+     *  here means every block-dependent test (bridge, e2e) doubles as a
+     *  regression pin on the agent actually requesting blocks. */
+    private readonly emitBlocks: boolean = true,
+  ) {
     this.processResponse(0);
   }
 
@@ -69,19 +76,23 @@ export class MockYieldingStream implements YieldingStream {
 
     const text = response.rawAssistantText;
     if (text) {
-      this.events.push({
-        type: 'block',
-        event: { event: 'block_start', index: 0, block: { type: 'text' } },
-      } as StreamEvent);
+      if (this.emitBlocks) {
+        this.events.push({
+          type: 'block',
+          event: { event: 'block_start', index: 0, block: { type: 'text' } },
+        } as StreamEvent);
+      }
       this.events.push({
         type: 'tokens',
         content: text,
         meta: { type: 'text', visible: true, blockIndex: 0 },
       } as StreamEvent);
-      this.events.push({
-        type: 'block',
-        event: { event: 'block_complete', index: 0, block: { type: 'text', content: text } },
-      } as StreamEvent);
+      if (this.emitBlocks) {
+        this.events.push({
+          type: 'block',
+          event: { event: 'block_complete', index: 0, block: { type: 'text', content: text } },
+        } as StreamEvent);
+      }
     }
 
     if (response.usage) {
@@ -181,11 +192,14 @@ export class MockMembrane {
     return this.responses[this.responseIndex++];
   }
 
-  streamYielding(request: NormalizedRequest, _options?: unknown): YieldingStream {
+  streamYielding(request: NormalizedRequest, options?: unknown): YieldingStream {
     this.calls.push(request);
     const remaining = this.responses.slice(this.responseIndex);
     this.responseIndex = this.responses.length;
-    const stream = new MockYieldingStream(remaining);
+    // Honor emitBlocks like the real membrane (default true) — see the
+    // MockYieldingStream constructor note.
+    const emitBlocks = (options as { emitBlocks?: boolean } | undefined)?.emitBlocks ?? true;
+    const stream = new MockYieldingStream(remaining, emitBlocks);
     this.lastStream = stream;
     return stream;
   }
