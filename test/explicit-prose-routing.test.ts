@@ -192,9 +192,9 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
-  it('>>private keeps the text as a note — nothing delivered, no bounce', async () => {
+  it('>>skip_reply keeps the text in context — nothing delivered, no bounce', async () => {
     membrane.pushResponse(createMockResponse([
-      { type: 'text', text: '>>private\nJust thinking out loud here.' },
+      { type: 'text', text: '>>skip_reply\nWorking through the plan here.' },
     ] as ContentBlock[]));
 
     const framework = await createFramework();
@@ -209,8 +209,8 @@ describe('explicit prose routing', () => {
     trigger(framework);
     await framework.runUntilIdle();
 
-    assert.equal(routed.length, 0, 'private notes are never delivered');
-    assert.equal(bounceNotices.length, 0, 'private notes never bounce');
+    assert.equal(routed.length, 0, 'skip_reply text is never delivered');
+    assert.equal(bounceNotices.length, 0, 'skip_reply text never bounces');
 
     await framework.stop();
   });

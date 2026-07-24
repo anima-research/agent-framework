@@ -185,7 +185,11 @@ function parseProsePrefix(text: string): {
   const target = m[1]!;
   const continueTurn = m[2] !== undefined;
   const body = text.slice(m[0].length);
-  if (target === 'private' || target === 'note') {
+  // `skip_reply` mirrors the tool the model already knows: text stays in
+  // context, nothing is delivered. (Deliberately NOT called "private"/"note" —
+  // that vocabulary sat adjacent to signed thinking in a live window and drew
+  // a reasoning_extraction classifier hit, 2026-07-24 Fable.)
+  if (target === 'skip_reply') {
     return { kind: 'private', continueTurn, body };
   }
   return { kind: 'target', target, continueTurn, body };
@@ -198,16 +202,15 @@ function proseModePrimer(mode: 'explicit' | 'locus'): string {
       'conversational locus again. `>>` destination prefixes are no longer needed.';
   }
   return (
-    '[prose-routing] NEW OUTPUT MODE — plain text no longer auto-routes to a channel.\n' +
-    'Start your text with a destination line to send it:\n' +
+    '[prose-routing] Output routing update: plain text now needs a destination line to be delivered.\n' +
     '  >>#channel-name …    or    >>@person …  (DM)    or    >>discord:guild:id …\n' +
-    '  The first destination in a turn sticks for the rest of that turn.\n' +
-    '  Add " !" right after the destination (e.g. ">>#ops !") to be woken again\n' +
-    '  immediately when this turn ends, instead of pausing until the next event.\n' +
-    '  >>private — keep the text as a private note (stored in context, sent nowhere).\n' +
-    'Unprefixed text is NOT sent: it is held on your clipboard and you will be asked\n' +
-    'to resend it — reply e.g. ">>#channel {{unsent}}" to send it verbatim without\n' +
-    'retyping. Explicit send tools (send_message, send_dm, …) work unchanged.'
+    '  The first destination in a turn applies to the rest of that turn.\n' +
+    '  Append " !" after the destination (e.g. ">>#ops !") to start your next turn\n' +
+    '  immediately when this one ends, instead of pausing until the next event.\n' +
+    '  >>skip_reply — text stays in your context only, like the skip_reply tool.\n' +
+    'Text without a destination is not delivered: it is retained, and a notice will\n' +
+    'prompt you to resend — reply e.g. ">>#channel {{unsent}}" to deliver the retained\n' +
+    'text unchanged. Send tools (send_message, send_dm, …) are unaffected.'
   );
 }
 /** Strip the `server--` MCPL prefix from a tool name. */
@@ -4261,10 +4264,10 @@ export class AgentFramework {
 
     if (parsed.kind === 'private') {
       // The text already lives in the assistant message (window/chronicle);
-      // "delivery" is deliberately a no-op. Consumes the clipboard if the
-      // note embedded it.
+      // "delivery" is deliberately a no-op. Consumes the retained text if the
+      // segment embedded it.
       if (parsed.body.includes('{{unsent}}')) this.proseClipboards.delete(name);
-      console.error(`[prose] ${name}: >>private — ${parsed.body.length} chars kept as note (not sent)`);
+      console.error(`[prose] ${name}: >>skip_reply — ${parsed.body.length} chars kept in context (not sent)`);
       return;
     }
 
@@ -4320,10 +4323,10 @@ export class AgentFramework {
     this.proseBounceStreaks.set(name, streak);
     const cand = candidates?.length ? ` Known channels it could mean: ${candidates.join(', ')}.` : '';
     const notice =
-      `[prose-routing] Your text (${text.length} chars) was NOT sent — ${reason}.${cand} ` +
-      'It is saved on your clipboard; nothing is lost. To send it verbatim without retyping, ' +
-      'reply with a destination plus the token, e.g. ">>#channel {{unsent}}" or ">>@person {{unsent}}" ' +
-      '(or ">>private {{unsent}}" to keep it as a note).';
+      `[prose-routing] Your text (${text.length} chars) was not delivered — ${reason}.${cand} ` +
+      'The text is retained; nothing is lost. To deliver it unchanged, reply with a ' +
+      'destination plus the token {{unsent}}, e.g. ">>#channel {{unsent}}" or ">>@person {{unsent}}". ' +
+      '">>skip_reply {{unsent}}" keeps it in context only.';
     try {
       // Through framework.addMessage, NOT the context manager directly: while
       // the turn is still streaming this defers the notice to the next tool

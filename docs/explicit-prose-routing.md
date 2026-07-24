@@ -18,24 +18,24 @@ A prose segment's FIRST line may carry a routing prefix:
 >>#channel-name          send to the channel with this label
 >>@person                send to the DM with this person
 >>discord:guild:id       send by exact channel id (always unambiguous)
->>private                do not send; keep as a private note in context
+>>skip_reply             do not send; text stays in context only (mirrors the skip_reply tool)
 ```
 
 - Body may start on the same line (`>>#ops deploy done`) or the next.
 - **Sticky within the turn:** the first resolved target applies to later
   unprefixed segments of the SAME turn. Cross-turn, nothing is implicit.
 - **Continuation modifier:** ` !` immediately after the target
-  (`>>#ops !` / `>>private !`) requests an immediate re-wake after this turn
+  (`>>#ops !` / `>>skip_reply !`) requests an immediate re-wake after this turn
   ends, instead of the default pause-until-next-event. Gives prose the same
   "keep going" ability tool turns have — wanted for robotics-like loops where
   an end-of-turn pause is undesirable.
 - `{{unsent}}` anywhere in the body is replaced at delivery with the
-  clipboard content (see below), enabling verbatim resend without retyping.
+  retained undelivered text (see below), enabling verbatim resend without retyping.
 
 ## The bounce (unprefixed prose)
 
-Unprefixed prose with no sticky target is **never delivered**. It is copied to
-a per-agent clipboard (latest-wins) and a system notice is appended telling the
+Unprefixed prose with no sticky target is **never delivered**. It is retained
+per-agent (latest-wins) and a system notice is appended telling the
 agent how to resend: `>>#channel {{unsent}}`. The notice requests inference so
 the resend can happen immediately — capped at 2 consecutive bounce-wakes per
 agent (then notices append without waking, breaking any loop).
