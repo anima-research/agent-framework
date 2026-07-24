@@ -201,16 +201,13 @@ function proseModePrimer(mode: 'explicit' | 'locus'): string {
     return '[prose-routing] Mode change: your plain text auto-routes to the ' +
       'conversational locus again. `>>` destination prefixes are no longer needed.';
   }
+  // Deliberately terse: a short event-style notice is classifier-safe from
+  // the user role (ablation D), while the full grammar as a user message drew
+  // a deterministic reasoning_extraction refusal (ablation A/B). The grammar
+  // itself lives in the system prompt (EXPLICIT_PROSE_GRAMMAR, agent.ts).
   return (
-    '[prose-routing] Output routing update: plain text now needs a destination line to be delivered.\n' +
-    '  >>#channel-name …    or    >>@person …  (DM)    or    >>discord:guild:id …\n' +
-    '  The first destination in a turn applies to the rest of that turn.\n' +
-    '  Append " !" after the destination (e.g. ">>#ops !") to start your next turn\n' +
-    '  immediately when this one ends, instead of pausing until the next event.\n' +
-    '  >>skip_reply — text stays in your context only, like the skip_reply tool.\n' +
-    'Text without a destination is not delivered: it is retained, and a notice will\n' +
-    'prompt you to resend — reply e.g. ">>#channel {{unsent}}" to deliver the retained\n' +
-    'text unchanged. Send tools (send_message, send_dm, …) are unaffected.'
+    '[prose-routing] Output mode changed: plain-text delivery now follows the ' +
+    'destination-prefix rules described in your system prompt.'
   );
 }
 /** Strip the `server--` MCPL prefix from a tool name. */

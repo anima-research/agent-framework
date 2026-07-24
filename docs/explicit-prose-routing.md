@@ -52,12 +52,18 @@ Explicit send tools (`send_message` etc.) are unchanged. Channel lifecycle
 invariants (send-opens-channel, subscribed⇒open) are unchanged — a `>>` send
 into a closed channel opens it, with the usual `[channels]` notice.
 
-## Mode switch primer
+## Teaching the grammar (system role only)
 
-Switching a resident's mode appends a one-time durable `[prose-routing]`
-primer explaining the grammar (persisted per agent in framework state, so
-reboots do not re-prime). Symmetric: switching back to locus mode announces
-that plain text auto-routes again.
+The grammar is appended to the agent's SYSTEM prompt at construction
+(`EXPLICIT_PROSE_GRAMMAR`). Mode switches append only a one-line durable
+notice pointing at it (persisted per agent, so reboots never re-notice).
+This split is load-bearing, not stylistic: the 2026-07-24 Fable ablation
+showed the full grammar as a user-role message draws a deterministic
+`reasoning_extraction` refusal ("instruct the assistant to redirect/withhold
+output" is injection-shaped from the user role), while the identical text in
+the system role — and short event-style bounce notices from the user role —
+pass cleanly. Symmetric: switching back to locus mode announces that plain
+text auto-routes again.
 
 ## KV / wire notes
 

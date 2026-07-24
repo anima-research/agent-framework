@@ -1,5 +1,21 @@
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
+
+/**
+ * The explicit-prose-routing grammar (docs/explicit-prose-routing.md),
+ * appended to the SYSTEM prompt of `proseRouting: 'explicit'` agents at
+ * construction. System role only — see the ablation note in the constructor.
+ */
+export const EXPLICIT_PROSE_GRAMMAR =
+  'Output routing: plain text needs a destination line to be delivered.\n' +
+  '  >>#channel-name …    or    >>@person …  (DM)    or    >>service:guild:id …\n' +
+  '  The first destination in a turn applies to the rest of that turn.\n' +
+  '  Append " !" after the destination (e.g. ">>#ops !") to start your next turn\n' +
+  '  immediately when this one ends, instead of pausing until the next event.\n' +
+  '  >>skip_reply — text stays in your context only, like the skip_reply tool.\n' +
+  'Text without a destination is not delivered: it is retained, and a notice will\n' +
+  'prompt you to resend — reply e.g. ">>#channel {{unsent}}" to deliver the retained\n' +
+  'text unchanged. Send tools (send_message, send_dm, …) are unaffected.';
 import { toolResultDataToHistoryString } from './tool-result-history.js';
 
 export interface StartStreamResult {
@@ -99,7 +115,16 @@ export class Agent {
   ) {
     this.name = config.name;
     this.model = config.model;
-    this.systemPrompt = config.systemPrompt;
+    // Explicit prose routing: the `>>` grammar rides in the SYSTEM prompt,
+    // never as an injected user message. Verified by ablation (2026-07-24,
+    // Fable): the identical instruction text as a user-role message drew a
+    // deterministic reasoning_extraction refusal — "instruct the assistant
+    // to redirect/withhold output" is injection-shaped from the user role,
+    // and ordinary formatting guidance from the system role.
+    this.systemPrompt =
+      (config.proseRouting ?? 'locus') === 'explicit'
+        ? config.systemPrompt + '\n\n' + EXPLICIT_PROSE_GRAMMAR
+        : config.systemPrompt;
     this.allowedTools = config.allowedTools ?? 'all';
     this.triggerSources = config.triggerSources ?? 'all';
     this.maxTokens = config.maxTokens ?? 4096;
