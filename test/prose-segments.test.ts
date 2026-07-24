@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
-import { splitProseSegments } from '../src/prose-segments.js';
+import { splitProseSegments, undeliveredSuffix, isWhitespaceInsensitivePrefix } from '../src/prose-segments.js';
 
 const textBlock = (text: string): ContentBlock => ({ type: 'text', text } as ContentBlock);
 const toolUse = (id: string): ContentBlock =>
@@ -59,4 +59,62 @@ test('a plain no-tool turn yields a single segment (unchanged behaviour)', () =>
 
 test('a tool-only turn (no prose) yields no segments', () => {
   assert.deepEqual(splitProseSegments([toolUse('t1'), toolResult('t1')]), []);
+});
+
+// ── undeliveredSuffix: matching a voice client's spokenText against
+//    live-routed prose (see the abort keepText path in framework.ts) ──
+
+test('undeliveredSuffix: spoken fully covered by delivered → null (nothing further to post)', () => {
+  assert.equal(undeliveredSuffix('The full sentence the mo', 'The full sentence the model intended'), null);
+  assert.equal(undeliveredSuffix('Same text.', 'Same text.'), null);
+});
+
+test('undeliveredSuffix: spoken extends past delivered → the raw suffix', () => {
+  assert.equal(undeliveredSuffix('Hello there general', 'Hello there'), 'general');
+});
+
+test('undeliveredSuffix: whitespace differences never break alignment', () => {
+  // Live-routed segments are joined with '\n'; the voice stream keeps its own
+  // spacing. Only the non-whitespace character sequence matters.
+  assert.equal(undeliveredSuffix('One two  three four', 'One\ntwo\nthree'), 'four');
+  assert.equal(undeliveredSuffix('One  two', 'One two'), null);
+});
+
+test('undeliveredSuffix: diverging spoken text is returned whole (per-block clients)', () => {
+  // A client that resets its accumulator per block sends only the current
+  // utterance's fragment — never posted, so all of it is undelivered.
+  assert.equal(
+    undeliveredSuffix('A new fragment entirely', 'The prose the live path posted'),
+    'A new fragment entirely',
+  );
+});
+
+test('undeliveredSuffix: suffix that is only whitespace → null', () => {
+  assert.equal(undeliveredSuffix('Hello there  ', 'Hello there'), null);
+});
+
+test('undeliveredSuffix: astral characters compare safely at the boundary', () => {
+  assert.equal(undeliveredSuffix('Great 🎉 and onward', 'Great 🎉'), 'and onward');
+  assert.equal(undeliveredSuffix('Great 🎉', 'Great 🎉'), null);
+});
+
+// ── isWhitespaceInsensitivePrefix: the staleness-guard predicate ──
+
+test('isWhitespaceInsensitivePrefix: matches across whitespace differences', () => {
+  assert.equal(isWhitespaceInsensitivePrefix('Hello there', 'Hello\nthere general'), true);
+  assert.equal(isWhitespaceInsensitivePrefix('Hello  there ', 'Hello there'), true);
+});
+
+test('isWhitespaceInsensitivePrefix: rejects diverging and over-long prefixes', () => {
+  assert.equal(isWhitespaceInsensitivePrefix('Something else', 'Hello there'), false);
+  assert.equal(
+    isWhitespaceInsensitivePrefix('Hello there general', 'Hello there'),
+    false,
+    'a report longer than what was streamed cannot be a prefix of it',
+  );
+});
+
+test('isWhitespaceInsensitivePrefix: empty prefix trivially matches', () => {
+  assert.equal(isWhitespaceInsensitivePrefix('', 'anything'), true);
+  assert.equal(isWhitespaceInsensitivePrefix('', ''), true);
 });

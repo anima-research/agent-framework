@@ -37,24 +37,38 @@ export type TraceEvent =
     })
 
   // Inference lifecycle
-  | (TraceEventBase & { type: 'inference:started'; agentName: string })
+  | (TraceEventBase & {
+      type: 'inference:started';
+      agentName: string;
+      /**
+       * Channel identity of this turn (the locus its speech routes to):
+       * the turn's pinned locus, else the triggering channel. Absent for
+       * channel-less turns (heartbeats, timers). Carried on the whole
+       * inference:* family so channel-scoped consumers (voice/streaming)
+       * can key per-channel streams without reaching into framework state.
+       */
+      channelId?: string;
+    })
   | (TraceEventBase & {
       type: 'inference:completed';
       agentName: string;
       durationMs: number;
       tokenUsage?: { input: number; output: number; cacheCreation?: number; cacheRead?: number };
+      channelId?: string;
     })
   | (TraceEventBase & {
       type: 'inference:aborted';
       agentName: string;
       durationMs: number;
       reason?: string;
+      channelId?: string;
     })
   | (TraceEventBase & {
       type: 'inference:failed';
       agentName: string;
       error: string;
       stack?: string;
+      channelId?: string;
     })
   | (TraceEventBase & {
       type: 'inference:exhausted';
@@ -82,6 +96,7 @@ export type TraceEvent =
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       /** 0-indexed block position in the current assistant turn. */
       blockIndex: number;
+      channelId?: string;
     })
   | (TraceEventBase & {
       /**
@@ -95,11 +110,13 @@ export type TraceEvent =
       phase: 'block_start' | 'block_complete';
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       blockIndex: number;
+      channelId?: string;
     })
   | (TraceEventBase & {
       type: 'inference:tool_calls_yielded';
       agentName: string;
       calls: Array<{ id: string; name: string; input?: unknown }>;
+      channelId?: string;
     })
   | (TraceEventBase & {
       type: 'inference:usage';
@@ -122,6 +139,7 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'inference:turn_ended';
       agentName: string;
+      channelId?: string;
     })
 
   // Tool lifecycle

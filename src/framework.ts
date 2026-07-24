@@ -64,7 +64,7 @@ import { ConversationRouter } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import { toolResultDataToHistoryString } from './tool-result-history.js';
-import { splitProseSegments } from './prose-segments.js';
+import { splitProseSegments, undeliveredSuffix } from './prose-segments.js';
 
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
@@ -486,6 +486,10 @@ export class AgentFramework {
    *  separate from ephemeralRuns deliberately: endTurn/budget cancels happen
    *  for resident agents too, and the key is per-stream, not per-agent. */
   private frameworkCancelledStreams: Map<string, 'turn_ended' | 'budget_restart'> = new Map();
+  /** Tracks the portion of an aborted message that was spoken/delivered
+   *  (supplied via abortInference({keepText})) and should be persisted
+   *  as a partial assistant turn. */
+  private abortKeepTexts: Map<string, string> = new Map();
   /** Active runEphemeralToCompletion runs, keyed by agent name. */
   private ephemeralRuns: Map<string, EphemeralRun> = new Map();
   /** Per-agent count of consecutive exhausted inferences (reset on any success).
@@ -1188,15 +1192,35 @@ export class AgentFramework {
 
   /**
    * Abort an in-flight inference for an agent.
+   *
+   * Any partial text that was already delivered before the interrupt and
+   * should be persisted may be passed via `keepText`. The abort handler
+   * will persist it as the assistant's turn and route it to the turn's
+   * locus instead of discarding everything.
    */
-  abortInference(agentName: string, reason?: string): boolean {
+  abortInference(
+    agentName: string,
+    reasonOrOpts?: string | { reason?: string; keepText?: string },
+  ): boolean {
+    const opts = typeof reasonOrOpts === 'string' ? { reason: reasonOrOpts } : reasonOrOpts ?? {};
     const agent = this.agents.get(agentName);
     if (!agent) {
       return false;
     }
-    const result = agent.abortInference(reason);
+    if (opts.keepText) {
+      this.abortKeepTexts.set(agentName, opts.keepText);
+    }
+    const result = agent.abortInference(opts.reason);
     if (result) {
-      this.emitTrace({ type: 'inference:aborted', agentName, reason, durationMs: result.durationMs });
+      this.emitTrace({
+        type: 'inference:aborted',
+        agentName,
+        reason: opts.reason,
+        durationMs: result.durationMs,
+        channelId: this.inferenceTraceChannel(agentName),
+      });
+    } else {
+      this.abortKeepTexts.delete(agentName);
     }
     return !!result;
   }
@@ -3362,7 +3386,11 @@ export class AgentFramework {
             // driveStream's finally is the backstop.)
             this.eventGate?.onInferenceEnded(agent.name);
             this.settleAgent(agent.name, { stopReason: 'turn_ended', speech: '' });
-            this.emitTrace({ type: 'inference:turn_ended', agentName: agent.name });
+            this.emitTrace({
+              type: 'inference:turn_ended',
+              agentName: agent.name,
+              channelId: this.inferenceTraceChannel(agent.name),
+            });
           } else if (overBudget) {
             // Context budget exceeded: break the stream, let compile() compress.
             // Mark the cancel as framework-initiated BEFORE cancelling: the
@@ -4252,7 +4280,11 @@ export class AgentFramework {
     }
 
     this.touchEphemeralRun(agent.name, true);
-    this.emitTrace({ type: 'inference:started', agentName: agent.name });
+    this.emitTrace({
+      type: 'inference:started',
+      agentName: agent.name,
+      channelId: this.inferenceTraceChannel(agent.name),
+    });
     this.eventGate?.onInferenceStarted(agent.name);
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
 
@@ -4316,6 +4348,7 @@ export class AgentFramework {
         agentName: agent.name,
         error: err.message,
         stack: err.stack,
+        channelId: this.inferenceTraceChannel(agent.name),
       });
       agent.reset();
 
@@ -4405,6 +4438,18 @@ export class AgentFramework {
     // delivered exactly once, at turn end.
     let liveProseRouting = false;
 
+    // Prose the live path has enqueued for posting to the locus during this
+    // driveStream, in emission order (enqueued, not confirmed: a failed post
+    // is swallowed by its chain link and never retried, same as at
+    // completion). The abort path compares an interruption's keepText
+    // against this so it never re-posts text a speak-while-acting round
+    // already delivered. A budget-restart continuation starts a fresh
+    // driveStream with this empty — which matches the voice side: a restart
+    // emits a fresh inference:started, the client's spoken-text accumulator
+    // resets with the new activation, so a post-restart keepText never spans
+    // pre-restart prose.
+    let liveRoutedProse = '';
+
     // Typing indicator: show "<agent> is typing…" in the channel her plain
     // prose will actually land in — the turn-frozen locus — for the whole
     // duration of this turn. Started here (paired with the finally below, so
@@ -4435,6 +4480,7 @@ export class AgentFramework {
               content: event.content,
               blockType: event.meta.type,
               blockIndex: event.meta.blockIndex,
+              channelId: this.inferenceTraceChannel(agent.name),
             });
             break;
 
@@ -4446,6 +4492,7 @@ export class AgentFramework {
               phase,
               blockType: block.type,
               blockIndex: index,
+              channelId: this.inferenceTraceChannel(agent.name),
             });
             break;
           }
@@ -4458,6 +4505,7 @@ export class AgentFramework {
               type: 'inference:tool_calls_yielded',
               agentName: agent.name,
               calls: event.calls.map((c) => ({ id: c.id, name: c.name, input: c.input })),
+              channelId: this.inferenceTraceChannel(agent.name),
             });
 
             // Build assistant content blocks for this round. Prefer the
@@ -4534,6 +4582,7 @@ export class AgentFramework {
                     );
                     for (const seg of roundSegments) {
                       enqueueSpeech(seg, locus);
+                      liveRoutedProse += (liveRoutedProse ? '\n' : '') + seg;
                     }
                   }
                 }
@@ -4688,6 +4737,7 @@ export class AgentFramework {
               agentName: agent.name,
               durationMs,
               tokenUsage,
+              channelId: this.inferenceTraceChannel(agent.name),
             });
 
             if (du) {
@@ -4931,6 +4981,7 @@ export class AgentFramework {
               agentName: agent.name,
               error: err.message,
               stack: err.stack,
+              channelId: this.inferenceTraceChannel(agent.name),
             });
 
             this.logInference({
@@ -4985,6 +5036,9 @@ export class AgentFramework {
             // reject an ephemeral's promise mid-run and bump the failure
             // streak). Gate release + stream teardown happen in `finally`.
             if (this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`)) {
+              // A keepText racing a framework cancel on the same stream must
+              // not survive to a later abort of this agent.
+              this.abortKeepTexts.delete(agent.name);
               this.eventGate?.onInferenceEnded(agent.name);
               return;
             }
@@ -4993,10 +5047,52 @@ export class AgentFramework {
             // may have already started a new stream, bumping streamId)
             if (agent.streamId === myStreamId) {
               const durationMs = Date.now() - startTime;
+
+              // If an external source interrupts generation (e.g. a voice
+              // client reporting a user talking over the agent), it passes
+              // the portion already delivered — the words spoken aloud — as
+              // keepText. The full keepText is persisted as the assistant's
+              // turn; the channel post routes only what the live path has not
+              // already posted this turn (speak-while-acting rounds were
+              // delivered as they happened — see undeliveredSuffix for how
+              // spoken text is matched against them). turnSilenced is honored
+              // as at completion. Without keepText the whole partial turn is
+              // discarded. Framework-internal cancels never reach this path
+              // (early return above).
+              const keepText = this.abortKeepTexts.get(agent.name);
+              this.abortKeepTexts.delete(agent.name);
+              if (keepText) {
+                agent.addAssistantResponse([{ type: 'text', text: keepText }]);
+                if (this.channelRegistry && !turnSilenced) {
+                  const undelivered = liveRoutedProse
+                    ? undeliveredSuffix(keepText, liveRoutedProse)
+                    : keepText;
+                  if (undelivered) {
+                    // Preserve in-channel ordering: live-routed segments were
+                    // enqueued without await, so let the chain drain first
+                    // (mirrors the 'complete' case).
+                    await turnSpeechChain;
+                    try {
+                      await this.channelRegistry.routeSpeech(
+                        agent.name,
+                        undelivered,
+                        resolveTurnLocus(),
+                      );
+                    } catch (err) {
+                      console.error('keepText speech routing failed:', err);
+                    }
+                  } else if (liveRoutedProse) {
+                    console.error(
+                      `[routing] ${agent.name}: abort keepText fully covered by live-routed prose -> nothing further posted`,
+                    );
+                  }
+                }
+              }
+
               agent.reset();
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
-                speech: '',
+                speech: keepText ?? '',
                 error: `Stream aborted: ${reason}`,
               });
               this.emitTrace({
@@ -5073,6 +5169,7 @@ export class AgentFramework {
         agentName: agent.name,
         error: err.message,
         stack: err.stack,
+        channelId: this.inferenceTraceChannel(agent.name),
       });
       this.settleAgent(agent.name, {
         stopReason: 'exhausted',
@@ -5584,6 +5681,23 @@ export class AgentFramework {
       },
       queueDepth: this.queue.depth,
     };
+  }
+
+  /**
+   * Exposes the speech locus of a turn for channel-scoped voice / streaming.
+   * This locus is set eagerly and pinned in startAgentStream before the turn's
+   * first trace, so the value here is stable for the whole turn. With a
+   * channelRegistry the pin is the ONLY source read: the freeze already
+   * incorporated the triggering channel, and a mid-turn channel_open mutates
+   * the trigger map without moving actual routing — falling back to it would
+   * stamp a channel the turn's speech never lands in. Without a
+   * channelRegistry there is no pin, so the triggering channel is the only
+   * identity available. Undefined for heartbeats/timers without a locus.
+   * Read-only (traces are observability-only and must never touch routing
+   * state). */
+  private inferenceTraceChannel(agentName: string): string | undefined {
+    if (this.channelRegistry) return this.turnLocusPins.get(agentName);
+    return this.activeTriggerChannels.get(agentName);
   }
 
   private emitTrace(event: { type: TraceEvent['type']; [key: string]: unknown }): void {
