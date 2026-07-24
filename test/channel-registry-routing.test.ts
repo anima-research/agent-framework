@@ -445,3 +445,27 @@ test('opened-by-delivery is announced to the delivering agent', async () => {
   assert.equal(autoOpened[0]!.conversationId, 'sol');
   assert.deepEqual(autoOpened[0]!.channels.map(c => c.channelId), ['dm-alice']);
 });
+
+test('resolveProseTarget matches the name segment of suffixed labels (#fable vs "#fable (guild)")', async () => {
+  const { registry } = makeRegistry({ delivered: true });
+  await registry.handleChanged('discord', {
+    added: [
+      { id: 'discord:g1:100', type: 'discord', label: "#fable (antra's server)", direction: 'bidirectional' },
+      { id: 'discord:g1:101', type: 'discord', label: '#ops (Connectome)', direction: 'bidirectional' },
+    ],
+  } as never);
+
+  const hit = registry.resolveProseTarget('#fable');
+  assert.ok('channelId' in hit && hit.channelId === 'discord:g1:100', 'suffix-blind name match resolves');
+
+  // Same name in two guilds = honest ambiguity with full labels.
+  await registry.handleChanged('discord', {
+    added: [{ id: 'discord:g2:200', type: 'discord', label: '#fable (Connectome)', direction: 'bidirectional' }],
+  } as never);
+  const amb = registry.resolveProseTarget('#fable');
+  assert.ok('error' in amb && amb.candidates!.length === 2, 'cross-guild name collision errors with candidates');
+
+  // No match offers near-candidates instead of a dead end.
+  const miss = registry.resolveProseTarget('#fabl');
+  assert.ok('error' in miss && (miss.candidates?.length ?? 0) >= 1, 'near-candidates on no-match');
+});

@@ -1401,7 +1401,31 @@ export class ChannelRegistry {
         candidates: byLabel.map((e) => e.descriptor.id),
       };
     }
-    return { error: `no channel matches "${trimmed}"` };
+
+    // Name-segment match: server labels carry a disambiguating suffix
+    // (`#fable (antra's server)`) that agents naturally omit — `>>#fable`
+    // must resolve. Strip a trailing parenthetical from the stored label and
+    // compare the bare channel name. Same name in several guilds is a real
+    // ambiguity: error with full labels so the agent can use the exact id.
+    const nameOf = (label: string) => norm(label.replace(/\s*\([^)]*\)\s*$/, ''));
+    const byName = entries.filter((e) => nameOf(e.descriptor.label ?? '') === norm(trimmed));
+    if (byName.length === 1) {
+      return { channelId: byName[0]!.descriptor.id, label: byName[0]!.descriptor.label };
+    }
+    if (byName.length > 1) {
+      return {
+        error: `"${trimmed}" matches several channels`,
+        candidates: byName.map((e) => `${e.descriptor.label} = ${e.descriptor.id}`),
+      };
+    }
+
+    // No match: offer near-candidates (labels containing the name) so the
+    // bounce notice is self-healing rather than a dead end.
+    const near = entries
+      .filter((e) => norm(e.descriptor.label ?? '').includes(norm(trimmed)))
+      .slice(0, 5)
+      .map((e) => `${e.descriptor.label} = ${e.descriptor.id}`);
+    return { error: `no channel matches "${trimmed}"`, ...(near.length ? { candidates: near } : {}) };
   }
 
   /**
