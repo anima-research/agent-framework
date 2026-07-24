@@ -222,6 +222,8 @@ function proseModePrimer(mode: 'explicit' | 'locus'): string {
 const PROSE_ROUTING_HELP =
   'Plain-text output routing (explicit mode):\n' +
   '  >>#channel-name …    or    >>@person …  (DM)    or    >>service:guild:id …\n' +
+  '  One message may hold several sections: each line starting with ">>" begins\n' +
+  '  a new envelope, routed to its own destination independently.\n' +
   '  The first destination in a turn applies to the rest of that turn.\n' +
   '  Append " !" after the destination (e.g. ">>#ops !") to start your next turn\n' +
   '  immediately when this one ends, instead of pausing until the next event.\n' +
@@ -4301,6 +4303,34 @@ export class AgentFramework {
    * or via the turn's sticky target).
    */
   private async deliverProse(agent: Agent, rawText: string): Promise<void> {
+    // Multi-envelope: a single prose block may address SEVERAL destinations —
+    // every line beginning with `>>` opens a new envelope, routed
+    // independently (first live use: Tilde 2026-07-24, one block carrying a
+    // letter to #tilde-mythos AND a `>>#tilde` aside; the single-envelope
+    // parser delivered the aside literally into the first destination —
+    // exactly the leak class this mode exists to kill). Text before the
+    // first `>>` is its own unprefixed envelope (sticky/bounce as usual).
+    const lines = rawText.split('\n');
+    const envelopes: string[] = [];
+    let current: string[] = [];
+    for (const line of lines) {
+      // Only a REAL prefix line opens an envelope: `>>` immediately followed
+      // by a target token. A quoted `>> arrow` (space after) stays body text.
+      if (/^>>\S/.test(line.trimStart()) && current.length > 0) {
+        envelopes.push(current.join('\n'));
+        current = [];
+      }
+      current.push(line);
+    }
+    if (current.length > 0) envelopes.push(current.join('\n'));
+
+    for (const envelope of envelopes) {
+      if (!envelope.trim()) continue;
+      await this.deliverProseEnvelope(agent, envelope.replace(/^\s+(?=>>)/, ''));
+    }
+  }
+
+  private async deliverProseEnvelope(agent: Agent, rawText: string): Promise<void> {
     const name = agent.name;
     const parsed = parseProsePrefix(rawText);
     if (parsed.continueTurn) this.proseContinuations.add(name);

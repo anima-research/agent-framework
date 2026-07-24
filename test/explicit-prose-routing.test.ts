@@ -285,4 +285,24 @@ describe('explicit prose routing', () => {
 
     await framework.stop();
   });
+
+  it('multi-envelope prose: each >> line routes independently (Tilde scenario)', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha part one for the channel\n>>@laria part two, just for you\nwith a second line\n>> quoted arrow stays in body' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubRegistry(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'part one for the channel', locus: 'chan-alpha' },
+      { text: 'part two, just for you\nwith a second line\n>> quoted arrow stays in body', locus: 'discord:dm:99' },
+    ], 'two envelopes, two destinations; quoted arrow not split');
+
+    await framework.stop();
+  });
+
 });
