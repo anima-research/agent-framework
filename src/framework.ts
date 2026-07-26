@@ -2210,6 +2210,12 @@ export class AgentFramework {
         context_budget_tokens: { type: 'number', description: 'Total input context budget, including the reserved response allowance.' },
         tail_tokens: { type: 'number', description: 'Recent raw context retained verbatim.' },
         transition_pace_tokens: { type: 'number', description: 'Maximum ordinary KV re-read/perturbation per compile while converging.' },
+        immediate: {
+          type: 'boolean',
+          description:
+            'With a context_budget_tokens DECREASE: apply it immediately instead of a paced descent — ' +
+            'the whole fold-down and its KV re-read land on the next compile, and any in-flight descent is cancelled.',
+        },
         same_round_think_text_policy: {
           type: 'string',
           enum: ['public', 'private'],
@@ -8459,6 +8465,7 @@ export class AgentFramework {
         tail_tokens?: unknown;
         transition_pace_tokens?: unknown;
         same_round_think_text_policy?: unknown;
+        immediate?: unknown;
         settings?: unknown;
       } & Record<string, unknown>;
       const extensions = this.collectAgentSettingsExtensions();
@@ -8490,6 +8497,9 @@ export class AgentFramework {
           if (input.same_round_think_text_policy !== undefined) {
             patch.sameRoundThinkTextPolicy = input.same_round_think_text_policy as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
           }
+          // Immediate budget decrease: skip the paced descent; the next
+          // compile plans straight at the new budget (one-shot fold-down).
+          if (input.immediate !== undefined) patch.immediate = Boolean(input.immediate);
           // Route extension-owned keys to their modules; apply the core patch
           // only when it touches core keys (an extension-only update must not
           // disturb a converging budget transition).

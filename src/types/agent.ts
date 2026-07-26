@@ -151,6 +151,18 @@ export interface AgentRuntimeSettingsPatch {
   tailTokens?: number;
   transitionPaceTokens?: number;
   sameRoundThinkTextPolicy?: SameRoundThinkTextPolicy;
+  /**
+   * Apply a `contextBudgetTokens` DECREASE immediately instead of starting a
+   * paced descent: the next compile plans straight at the new budget and the
+   * whole fold-down (and its KV invalidation) is paid on that one turn. Also
+   * cancels any in-flight descent. No effect on increases (already immediate)
+   * or on other keys. A MODE for this apply, not a setting — never persisted.
+   *
+   * This is the emergency lever: when window content must shrink NOW
+   * (refusal streaks, over-wall wedges), a converging descent is the wrong
+   * tool and used to be the only one (mythos, 2026-07-26).
+   */
+  immediate?: boolean;
 }
 
 export interface AgentRuntimeSettingsSnapshot {

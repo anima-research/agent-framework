@@ -256,3 +256,42 @@ it('fails closed on an invalid persisted same_round_think_text_policy override b
   }
 });
 });
+
+it('immediate: a budget decrease with immediate=true applies now — no descent, no persisted flag', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-settings-immediate-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane,
+    agents: [{
+      name: 'agent',
+      model: 'test-model',
+      systemPrompt: 'test',
+      strategy: strategy(),
+      contextBudgetTokens: 100_000,
+      maxTokens: 10_000,
+    }],
+    modules: [],
+  });
+  try {
+    // Baseline: a plain decrease starts a paced descent.
+    const gradual = framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 });
+    assert.equal(gradual.transition, 'converging');
+    assert.equal(gradual.contextBudgetTokens, 60_000, 'snapshot reports the TARGET while converging');
+
+    // Immediate: applies now AND cancels the in-flight descent.
+    const now = framework.updateAgentRuntimeSettings('agent', {
+      contextBudgetTokens: 50_000,
+      immediate: true,
+    });
+    assert.equal(now.transition, 'stable', 'no descent — the drop is live');
+    assert.equal(now.contextBudgetTokens, 50_000);
+
+    // The mode flag is never persisted as an override.
+    const overrides = framework.getAgent('agent')!.getRuntimeSettingsOverrides() as Record<string, unknown>;
+    assert.equal(overrides.immediate, undefined, 'immediate is a mode, not a setting');
+    assert.equal(overrides.contextBudgetTokens, 50_000);
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

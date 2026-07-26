@@ -270,7 +270,11 @@ export class Agent {
 
     if (patch.contextBudgetTokens !== undefined) {
       const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
-      if (patch.contextBudgetTokens >= live) {
+      if (patch.contextBudgetTokens >= live || patch.immediate) {
+        // Increases are always immediate. Decreases take this path only with
+        // the explicit `immediate` flag: the next compile plans straight at
+        // the new budget — one-shot fold-down, KV invalidation paid this
+        // turn — and any in-flight descent is cancelled.
         nextContextBudget = patch.contextBudgetTokens;
         nextContextTarget = undefined;
         if (this.getHotContextSettings()) hotPatch.preparedWindowTokens = null;
@@ -298,6 +302,7 @@ export class Agent {
     }
     for (const [key, value] of Object.entries(patch)) {
       if (key === 'sameRoundThinkTextPolicy') continue;
+      if (key === 'immediate') continue; // a mode for this apply, never a persisted setting
       if (value !== undefined) (this.runtimeSettingsOverrides as Record<string, unknown>)[key] = value;
     }
     if (patch.sameRoundThinkTextPolicy !== undefined) {
