@@ -6261,6 +6261,13 @@ export class AgentFramework {
     if (err.name === 'OverBudgetError') {
       return { errorType: 'over_budget' };
     }
+    // context-manager's fatal coverage invariant (fix/coverage-invariant-fatal,
+    // 2026-07-26): a compile REFUSES rather than shipping a context with
+    // silently-dropped messages. Recovery is identical to over_budget — kick
+    // the compression drain so summaries cover the un-represented span.
+    if (err.name === 'UncoveredDropError') {
+      return { errorType: 'context_refusal' };
+    }
     return {};
   }
 
@@ -6330,7 +6337,25 @@ export class AgentFramework {
     // (e.g. a reason string that crossed a serialization boundary). It matches
     // CM's current OverBudgetError wording and MAY rot if CM rewords it — the
     // errorType gate is the one that's load-bearing.
-    const overBudget = errorType === 'over_budget' || /exceed hard budget/i.test(reason);
+    const overBudget =
+      errorType === 'over_budget' ||
+      errorType === 'context_refusal' ||
+      /exceed hard budget|no summary covers/i.test(reason);
+    // Observability: a refused compile means the agent cannot think AT ALL
+    // this turn — surface it on the ops-alert pipeline (ops:alert trace +
+    // webhook → fleet-watch) immediately, not only at the hard-down streak.
+    // The per-(agent,kind) cooldown throttles repeats; failures.log already
+    // has the per-exhaustion record from logFailure above.
+    if (overBudget) {
+      this.opsAlert(
+        'context-refusal',
+        agentName,
+        `compile refused (${errorType ?? 'unclassified'}): ${reason.slice(0, 300)} — ` +
+        `drain breaker ${agent ? 'kicking' : 'unavailable (no agent handle)'}; ` +
+        `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`,
+        { skipLog: true },
+      );
+    }
     if (agent && overBudget && !this.overBudgetDrainInFlight.has(agentName)) {
       this.overBudgetDrainInFlight.add(agentName);
       void (async () => {
