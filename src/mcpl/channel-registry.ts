@@ -1764,6 +1764,59 @@ export class ChannelRegistry {
   /** Resolve the outbound locus (fork HOME → this-turn's TRIGGERING channel →
    *  process-global default). Public so a multi-segment caller can snapshot it
    *  ONCE and pin every segment to it via routeSpeech's `overrideChannelId`. */
+  /**
+   * MCPL Spec 14.3 outgoing streaming: forward a moderated text delta to the
+   * server owning the channel, AS THE MODEL GENERATES. Emitted only when that
+   * server declared `channels.streaming` in its initialize capabilities —
+   * servers that never opted in (the whole existing fleet) receive nothing.
+   * Fire-and-forget and never throws: streaming is an observer surface; the
+   * authoritative delivery is the eventual channels/publish.
+   */
+  sendOutgoingChunk(
+    channelId: string,
+    conversationId: string,
+    inferenceId: string,
+    index: number,
+    delta: string,
+  ): void {
+    const server = this.streamingServerFor(channelId);
+    if (!server) return;
+    try {
+      server.sendChannelsOutgoingChunk({ inferenceId, conversationId, channelId, index, delta });
+    } catch { /* observer surface — never disturb the turn */ }
+  }
+
+  /** Spec 14.3 companion: final moderated content per channel at stream end. */
+  sendOutgoingComplete(
+    channelId: string,
+    conversationId: string,
+    inferenceId: string,
+    text: string,
+  ): void {
+    const server = this.streamingServerFor(channelId);
+    if (!server) return;
+    try {
+      server.sendChannelsOutgoingComplete({
+        inferenceId,
+        conversationId,
+        channelId,
+        content: [{ type: 'text', text }],
+      });
+    } catch { /* observer surface — never disturb the turn */ }
+  }
+
+  private streamingServerFor(channelId: string) {
+    // The map is keyed `${serverId}:${channelId}`; stream targets arrive as
+    // bare descriptor ids (what resolveProseTarget returns). Scan like the
+    // resolver does, and fail closed on cross-server ambiguity — the same
+    // never-guess rule that governs delivery.
+    const matches = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
+    if (matches.length !== 1) return null;
+    const server = this.serverRegistry.getServer(matches[0]!.serverId);
+    if (!server?.capabilities?.channels?.streaming) return null;
+    return server;
+  }
+
   resolveLocus(conversationId: string): string | null {
     const home = this.homeChannelResolver?.(conversationId);
     return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;

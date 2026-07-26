@@ -67,6 +67,12 @@ import { ConversationRouter } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import { toolResultDataToHistoryString } from './tool-result-history.js';
+import { randomUUID } from 'node:crypto';
+import { PyRunner, buildInjectedTools } from './code-execution/py-runner.js';
+import {
+  buildCodeExecutionToolDefinition,
+  CODE_EXECUTION_TOOL_NAME,
+} from './code-execution/tool-definition.js';
 import { splitProseSegments } from './prose-segments.js';
 
 /** Detect a supported image media type from magic bytes (the model API
@@ -629,6 +635,18 @@ export class AgentFramework {
   /** Forks whose TTL closure turn has been queued — disposed (removed from
    * agents/agentConfigs/conversationAgentHomes) when their stream ends. */
   private closingConversationAgents: Set<string> = new Set();
+  // Client-side programmatic tool calling (`code_execution`). Null unless
+  // config.codeExecution.enabled. One PyRunner per agent (interpreter state
+  // is per-agent, like a per-agent container); waiters resolve script-inner
+  // tool calls dispatched through the normal dispatchToolCall path.
+  private codeExecutionConfig: import('./types/index.js').CodeExecutionConfig | null = null;
+  private codeExecutionRunners: Map<string, PyRunner> = new Map();
+  private scriptToolWaiters: Map<string, (result: ToolResult) => void> = new Map();
+  /** Agents whose running script hit an endTurn-carrying inner result —
+   *  deferred and applied to the final code_execution result instead of
+   *  cancelling the stream mid-script (which would wedge the turn). */
+  private scriptDeferredEndTurn: Set<string> = new Set();
+
   private mcplTools: import('./types/index.js').ToolDefinition[] = [];
   private mcplToolRefreshInFlight = false;
   private mcplToolRefreshPending = false;
@@ -896,6 +914,10 @@ export class AgentFramework {
     // that started with zero configured servers).
     framework.mcplInferenceRoutingConfig = config.inferenceRouting ?? null;
 
+    // Client-side programmatic tool calling (code_execution). Config is only
+    // retained when enabled — everything downstream gates on the field.
+    framework.codeExecutionConfig = config.codeExecution?.enabled ? config.codeExecution : null;
+
     // Initialize MCPL subsystems if configured
     if (config.mcplServers && config.mcplServers.length > 0) {
       // Validate tool prefixes: no collisions with module names or between servers
@@ -987,6 +1009,14 @@ export class AgentFramework {
   async stop(): Promise<void> {
     this.running = false;
     this.queue.close();
+
+    // Kill running code_execution scripts before cancelling streams: a
+    // zombie script must not keep firing side-effectful tool calls into a
+    // framework that is shutting down.
+    for (const runner of this.codeExecutionRunners.values()) {
+      runner.dispose();
+    }
+    this.codeExecutionRunners.clear();
 
     // Cancel all active streams
     for (const agent of this.agents.values()) {
@@ -1284,6 +1314,9 @@ export class AgentFramework {
       this.buildAgentSettingsTool(),
       ...(this.getWorkspaceModule()
         ? [AgentFramework.SAVE_IMAGE_TOOL, AgentFramework.READ_IMAGE_TOOL]
+        : []),
+      ...(this.codeExecutionConfig
+        ? [buildCodeExecutionToolDefinition(this.codeExecutionConfig)]
         : []),
     ];
   }
@@ -3354,6 +3387,19 @@ export class AgentFramework {
     // Anthropic API.  If we let modules or MCPL handlers run first they may add
     // messages between tool_use and tool_result, causing a 400 error.
     if (event.type === 'tool-result') {
+      // Script-inner tool calls (client-side programmatic tool calling):
+      // resolve the waiter and stop. These calls belong to a RUNNING
+      // code_execution script, not to the agent's pending tool round — they
+      // must not touch agent state (and must resolve even for ephemeral
+      // agents that aren't in this.agents, or after the agent's own round
+      // has already settled).
+      const scriptWaiter = this.scriptToolWaiters.get(event.callId);
+      if (scriptWaiter) {
+        this.scriptToolWaiters.delete(event.callId);
+        scriptWaiter(event.result);
+        return;
+      }
+
       const agent = this.agents.get(event.agentName);
       if (agent) {
         this.touchEphemeralRun(event.agentName, true);
@@ -5399,6 +5445,7 @@ export class AgentFramework {
             // Only reset + retry if this is still the active stream
             if (agent.streamId !== myStreamId) break;
 
+            this.abortAgentScript(agent.name, 'stream error');
             agent.reset();
 
             const action = this.errorPolicy.onInferenceError(err, agent.name, attempt);
@@ -5446,6 +5493,7 @@ export class AgentFramework {
             // may have already started a new stream, bumping streamId)
             if (agent.streamId === myStreamId) {
               const durationMs = Date.now() - startTime;
+              this.abortAgentScript(agent.name, `stream aborted (${reason})`);
               agent.reset();
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
@@ -5550,6 +5598,7 @@ export class AgentFramework {
         request: compiledRequest ?? { note: 'streaming request threw' },
         durationMs,
       });
+      this.abortAgentScript(agent.name, 'stream threw');
       agent.reset();
       this.eventGate?.onInferenceEnded(agent.name);
     } finally {
@@ -5602,6 +5651,13 @@ export class AgentFramework {
    * Used by SubagentModule to dispatch tool calls for ephemeral agents.
    */
   async executeToolCall(call: ToolCall): Promise<ToolResult> {
+    // Client-side programmatic tool calling for promise-based callers
+    // (SubagentModule ephemerals). Keyed by callerAgentName so each ephemeral
+    // gets its own interpreter state.
+    if (call.name === CODE_EXECUTION_TOOL_NAME && this.codeExecutionConfig) {
+      return this.runCodeExecution(call.callerAgentName ?? '__ephemeral__', call);
+    }
+
     // MCPL tools are dispatched via the MCPL subsystem
     if (this.mcplServerRegistry) {
       // Check if this is an MCPL-prefixed tool
@@ -5648,6 +5704,199 @@ export class AgentFramework {
         error: err instanceof Error ? err.message : String(err),
         isError: true,
       };
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Client-side programmatic tool calling (code_execution)
+  // ---------------------------------------------------------------------------
+
+  /** Event-pushing wrapper for the model-driven dispatch path. */
+  private dispatchCodeExecutionToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({
+      type: 'tool:started',
+      module: 'code_execution',
+      tool: call.name,
+      callId: call.id,
+      input: call.input,
+    });
+    const startTime = Date.now();
+    this.runCodeExecution(agentName, call)
+      .catch((error): ToolResult => {
+        // runCodeExecution is designed not to reject; this is the last-resort
+        // guard so a bug here can never strand the agent in waiting_for_tools.
+        const err = error instanceof Error ? error : new Error(String(error));
+        return { success: false, error: `code_execution failed: ${err.message}`, isError: true };
+      })
+      .then((result) => {
+        if (result.isError) {
+          this.emitTrace({
+            type: 'tool:failed',
+            module: 'code_execution',
+            tool: call.name,
+            callId: call.id,
+            error: result.error ?? 'unknown error',
+          });
+        } else {
+          this.emitTrace({
+            type: 'tool:completed',
+            module: 'code_execution',
+            tool: call.name,
+            callId: call.id,
+            durationMs: Date.now() - startTime,
+          });
+        }
+        this.pushEvent({
+          type: 'tool-result',
+          callId: call.id,
+          agentName,
+          moduleName: 'code_execution',
+          result,
+        });
+      });
+  }
+
+  /**
+   * Run one code_execution script for an agent. Never rejects.
+   *
+   * The script runs in the agent's persistent python interpreter with every
+   * tool on the agent's CURRENT surface injected (minus code_execution
+   * itself). Inner tool calls are dispatched through dispatchToolCall — the
+   * exact model path, including MCPL state/checkpoint handling, channel
+   * routing, and traces — and resolved via scriptToolWaiters, so their
+   * results reach the running script and never the model context.
+   */
+  private async runCodeExecution(agentName: string, call: ToolCall): Promise<ToolResult> {
+    const input = (call.input ?? {}) as { code?: unknown };
+    if (typeof input.code !== 'string' || input.code.trim() === '') {
+      return {
+        success: false,
+        error: 'code_execution requires a non-empty `code` string',
+        isError: true,
+      };
+    }
+
+    const agent = this.agents.get(agentName);
+    const surface = agent
+      ? this.getToolsForAgent(agentName).filter((t) => agent.canUseTool(t.name))
+      : this.getAllTools(); // ephemeral agents: full surface, matching executeToolCall
+    const injected = buildInjectedTools(
+      surface.map((t) => t.name).filter((name) => name !== CODE_EXECUTION_TOOL_NAME),
+    );
+
+    const runner = this.getOrCreateScriptRunner(agentName);
+    this.scriptDeferredEndTurn.delete(agentName);
+    const exec = await runner.exec(input.code, injected);
+    const endTurn = this.scriptDeferredEndTurn.delete(agentName);
+
+    return {
+      success: true,
+      data: { stdout: exec.stdout, stderr: exec.stderr, return_code: exec.returnCode },
+      isError: false,
+      ...(endTurn ? { endTurn: true } : {}),
+    };
+  }
+
+  private getOrCreateScriptRunner(agentName: string): PyRunner {
+    let runner = this.codeExecutionRunners.get(agentName);
+    if (!runner) {
+      const cfg = this.codeExecutionConfig;
+      runner = new PyRunner({
+        pythonPath: cfg?.pythonPath,
+        toolCallTimeoutMs: cfg?.toolCallTimeoutMs,
+        scriptTimeoutMs: cfg?.scriptTimeoutMs,
+        idleReclaimMs: cfg?.idleReclaimMs,
+        label: agentName,
+        onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args),
+      });
+      this.codeExecutionRunners.set(agentName, runner);
+    }
+    return runner;
+  }
+
+  /**
+   * Resolve one script-inner tool call to the string the script's tool
+   * function returns. Never rejects — errors become "Error: ..." strings,
+   * matching the managed PTC runtime ("Claude's code receives this error").
+   *
+   * Results are serialized with the HISTORY serializer (images become
+   * placeholders): programmatic tool results are text-only by contract, and
+   * a script variable holding megabytes of base64 helps nobody.
+   */
+  private async handleScriptToolCall(
+    agentName: string,
+    toolName: string,
+    args: Record<string, unknown>,
+  ): Promise<string> {
+    if (toolName === CODE_EXECUTION_TOOL_NAME) {
+      return 'Error: code_execution cannot be called from within a script';
+    }
+    const result = await this.dispatchScriptToolCall(agentName, toolName, args);
+    if (result.endTurn) {
+      // Deferred: applied to the final code_execution result (see
+      // scriptDeferredEndTurn) — ending the turn mid-script would cancel the
+      // stream while the script still runs and wedge the tool round.
+      this.scriptDeferredEndTurn.add(agentName);
+    }
+    if (result.isError) {
+      return `Error: ${result.error ?? 'tool call failed'}`;
+    }
+    if (result.data === undefined) return '';
+    const agent = this.agents.get(agentName);
+    const maxChars = agent ? this.getMaxToolResultChars(agent) : undefined;
+    return toolResultDataToHistoryString(result.data, maxChars);
+  }
+
+  /**
+   * Dispatch a script-inner tool call through the NORMAL dispatch path and
+   * resolve with its result. The waiter intercept in handleProcessEvent
+   * (keyed by the pytc- call ID) routes the tool-result event here instead
+   * of into the agent's pending tool round.
+   */
+  private dispatchScriptToolCall(
+    agentName: string,
+    toolName: string,
+    args: Record<string, unknown>,
+  ): Promise<ToolResult> {
+    return new Promise<ToolResult>((resolve) => {
+      const callId = `pytc-${randomUUID()}`;
+      // Host-side leak guard: the python runtime already raises TimeoutError
+      // at toolCallTimeoutMs; this only reclaims the waiter if a dispatch path
+      // loses the result entirely (so the map cannot grow unboundedly).
+      const safetyMs = (this.codeExecutionConfig?.toolCallTimeoutMs ?? 270_000) + 30_000;
+      const safety = setTimeout(() => {
+        if (this.scriptToolWaiters.delete(callId)) {
+          resolve({
+            success: false,
+            error: `tool '${toolName}' produced no result within ${Math.round(safetyMs / 1000)}s`,
+            isError: true,
+          });
+        }
+      }, safetyMs);
+      safety.unref?.();
+
+      this.scriptToolWaiters.set(callId, (result) => {
+        clearTimeout(safety);
+        resolve(result);
+      });
+
+      try {
+        this.dispatchToolCall(agentName, { id: callId, name: toolName, input: args });
+      } catch (error) {
+        if (this.scriptToolWaiters.delete(callId)) {
+          clearTimeout(safety);
+          const err = error instanceof Error ? error : new Error(String(error));
+          resolve({ success: false, error: err.message, isError: true });
+        }
+      }
+    });
+  }
+
+  /** Abort a running script when the agent's turn dies underneath it. */
+  private abortAgentScript(agentName: string, reason: string): void {
+    const runner = this.codeExecutionRunners.get(agentName);
+    if (runner?.busy) {
+      runner.abort(reason);
     }
   }
 
@@ -5887,6 +6136,14 @@ export class AgentFramework {
     // need an explicit route here.
     if ((enrichedCall.name === 'think' || enrichedCall.name === 'skip_reply') && this.channelRegistry) {
       this.dispatchChannelToolCall(agentName, enrichedCall);
+      return;
+    }
+
+    // Client-side programmatic tool calling: run a python script that calls
+    // the agent's other tools in-process (script-inner calls come back through
+    // this very dispatcher with waiter-tracked call IDs).
+    if (enrichedCall.name === CODE_EXECUTION_TOOL_NAME && this.codeExecutionConfig) {
+      this.dispatchCodeExecutionToolCall(agentName, enrichedCall);
       return;
     }
 

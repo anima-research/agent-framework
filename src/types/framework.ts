@@ -31,6 +31,35 @@ export interface ProcessLoggingConfig {
 /**
  * Configuration for the agent framework.
  */
+/**
+ * Client-side programmatic tool calling: a synthesized `code_execution` tool
+ * that runs model-authored Python on the host, with every framework tool
+ * injected as an async function. Mirrors the trained surface of Anthropic's
+ * server-side PTC; inner tool results never enter the model context.
+ *
+ * Robustness boundary, not a security sandbox (same doctrine as gate.js —
+ * the agent already has broader host access through its tools).
+ */
+export interface CodeExecutionConfig {
+  /** Master switch — the tool is only synthesized when true. */
+  enabled: boolean;
+  /** Python interpreter to spawn (default: 'python3' from PATH). */
+  pythonPath?: string;
+  /**
+   * Per-inner-tool-call timeout; exceeding it raises TimeoutError inside the
+   * script (default 270_000 ms, mirroring the managed runtime's message).
+   */
+  toolCallTimeoutMs?: number;
+  /** Whole-script deadline: cancel → grace → SIGKILL (default 600_000 ms). */
+  scriptTimeoutMs?: number;
+  /**
+   * Idle interpreter reclaim — script globals are lost after this much
+   * inactivity (default 300_000 ms, mirroring ~5-minute container reclaim).
+   * 0 disables reclaim.
+   */
+  idleReclaimMs?: number;
+}
+
 export interface FrameworkConfig {
   /**
    * IANA zone used only when rendering wall-clock times for the agent.
@@ -92,6 +121,12 @@ export interface FrameworkConfig {
 
   /** MCPL server configurations. If omitted or empty, no MCPL subsystems are created. */
   mcplServers?: McplServerConfig[];
+
+  /**
+   * Client-side programmatic tool calling (`code_execution` tool). Omitted or
+   * `enabled: false` → tool absent, no python is ever spawned.
+   */
+  codeExecution?: CodeExecutionConfig;
 
   /** Inference routing policy for server-initiated inference (optional). */
   inferenceRouting?: InferenceRoutingPolicy;
