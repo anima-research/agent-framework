@@ -59,6 +59,8 @@ import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { ScopeManager } from './mcpl/scope-manager.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
+import { parseProsePrefix } from './mcpl/prose-grammar.js';
+import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry } from './mcpl/channel-registry.js';
 import { ConversationRouter } from './mcpl/conversation-router.js';
@@ -168,33 +170,9 @@ const isAddressedMessage = (
   _metadata?: Record<string, unknown>,
 ): boolean => Array.isArray(tags) && tags.includes('chat:addressed');
 
-/**
- * Parse a prose segment's routing prefix (explicit prose routing —
- * docs/explicit-prose-routing.md). The FIRST line may be:
- *   `>>target [!] [body…]`   — target = channel spec or `private`
- * The ` !` continuation modifier must immediately follow the target,
- * whitespace-separated. Body may start on the same line or the next.
- */
-function parseProsePrefix(text: string): {
-  kind: 'target' | 'private' | 'none';
-  target?: string;
-  continueTurn: boolean;
-  body: string;
-} {
-  const m = /^>>(\S+)([ \t]+!)?[ \t]*\n?/.exec(text);
-  if (!m) return { kind: 'none', continueTurn: false, body: text };
-  const target = m[1]!;
-  const continueTurn = m[2] !== undefined;
-  const body = text.slice(m[0].length);
-  // `skip_reply` mirrors the tool the model already knows: text stays in
-  // context, nothing is delivered. (Deliberately NOT called "private"/"note" —
-  // that vocabulary sat adjacent to signed thinking in a live window and drew
-  // a reasoning_extraction classifier hit, 2026-07-24 Fable.)
-  if (target === 'skip_reply') {
-    return { kind: 'private', continueTurn, body };
-  }
-  return { kind: 'target', target, continueTurn, body };
-}
+// parseProsePrefix moved to ./mcpl/prose-grammar.ts — ONE grammar shared with
+// the outgoing-stream router (Spec 14.3), so streamed chunks and delivered
+// envelopes can never disagree on what is a prefix.
 
 /** One-time primer appended when an agent's proseRouting mode changes. */
 function proseModePrimer(mode: 'explicit' | 'locus'): string {
@@ -1623,6 +1601,7 @@ export class AgentFramework {
     agentName: string,
     budgetTokens: number,
     overrides?: Record<string, unknown>,
+    opts?: { render?: boolean },
   ): unknown {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
@@ -1630,14 +1609,18 @@ export class AgentFramework {
       previewContext?: (
         budget: TokenBudget,
         overrides?: Record<string, unknown>,
+        opts?: { render?: boolean },
       ) => unknown;
     };
     if (typeof cm.previewContext !== 'function') return null;
     // reserveForResponse mirrors the live compile so the previewed middle is
-    // comparable to what the agent actually gets.
+    // comparable to what the agent actually gets. `opts.render` additionally
+    // returns the rendered entries — opt-in, since they are megabytes on a
+    // large store, and older context-manager builds ignore the argument.
     return cm.previewContext(
       { maxTokens: budgetTokens, reserveForResponse: agent.maxTokens },
       overrides,
+      opts,
     );
   }
 
@@ -4782,6 +4765,32 @@ export class AgentFramework {
         : resolveTurnLocus();
     if (typingChannel) this.channelRegistry!.startTyping(typingChannel);
 
+    // MCPL Spec 14.3 outgoing streaming: route text deltas to their
+    // destination server AS THEY GENERATE (voice synthesis, live message
+    // rendering). Pure observer surface — suppression is fail-closed (nothing
+    // streams that delivery would refuse), emission is capability-gated in
+    // the registry (`channels.streaming`), and delivery via deliverProse
+    // remains the sole authoritative send.
+    const outgoingInferenceId = `inf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    let outgoingIndex = 0;
+    const proseStream = this.channelRegistry
+      ? new ProseStreamRouter({
+          mode: agent.proseRouting === 'explicit' ? 'explicit' : 'locus',
+          initialTarget: typingChannel,
+          resolve: (spec) => {
+            const r = this.channelRegistry!.resolveProseTarget(spec);
+            return 'channelId' in r ? r.channelId : null;
+          },
+        })
+      : null;
+    const emitOutgoing = (deltas: { channelId: string; delta: string }[]): void => {
+      for (const rd of deltas) {
+        this.channelRegistry!.sendOutgoingChunk(
+          rd.channelId, agent.name, outgoingInferenceId, outgoingIndex++, rd.delta,
+        );
+      }
+    };
+
     const adoptInjectedRound = (): void => {
       if (!this.midTurnInputSignals.has(agent.name)) return;
       this.midTurnInputSignals.delete(agent.name);
@@ -4808,6 +4817,9 @@ export class AgentFramework {
               // turn's prose is bound for, without re-deriving routing.
               channelId: typingChannel ?? undefined,
             });
+            if (proseStream && event.meta.type === 'text') {
+              emitOutgoing(proseStream.feed(event.content));
+            }
             break;
 
           case 'block': {
@@ -5554,6 +5566,16 @@ export class AgentFramework {
       // Stop the typing indicator on every exit path (complete, error,
       // exhausted, abort) so it never sticks after the turn ends.
       this.channelRegistry?.stopTyping();
+
+      // Spec 14.3: flush any held line-start text, then close each streamed
+      // channel with its final moderated content — the consumer's signal to
+      // finalize (end the TTS utterance, settle the rendered message).
+      if (proseStream) {
+        emitOutgoing(proseStream.finish());
+        for (const [channelId, text] of proseStream.byChannel()) {
+          this.channelRegistry!.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text);
+        }
+      }
       this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`);
       this.activeStreams.delete(agent.name);
       this.pendingAssistantBlocks.delete(agent.name);
