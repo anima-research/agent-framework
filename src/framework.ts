@@ -4776,13 +4776,30 @@ export class AgentFramework {
                 (b) => b.type !== 'tool_result'
               );
             } else {
-              // Fallback (older membrane / XML tool mode): preamble + calls
+              // Fallback (older membrane / XML tool mode): preamble + calls.
+              // XML mode: persist the verbatim generation on each tool_use
+              // (membrane#36 round-trip fidelity). context.rawText is the
+              // parser's fullMatch — the exact <function_calls> block the
+              // model wrote (plus the harness-appended close tag), shared by
+              // every call in the round; the anthropic-xml formatter replays
+              // it byte-identically instead of reconstructing. Guarded by
+              // shape so a native-path fallback can never attach non-XML.
+              const rawText = event.context.rawText;
+              const rawXml = rawText && /^<(antml:)?function_calls>/.test(rawText)
+                ? rawText
+                : undefined;
               assistantBlocks = [];
               if (event.context.preamble) {
                 assistantBlocks.push({ type: 'text', text: event.context.preamble });
               }
               for (const c of event.calls) {
-                assistantBlocks.push({ type: 'tool_use', id: c.id, name: c.name, input: c.input as Record<string, unknown> });
+                assistantBlocks.push({
+                  type: 'tool_use',
+                  id: c.id,
+                  name: c.name,
+                  input: c.input as Record<string, unknown>,
+                  ...(rawXml ? { rawXml } : {}),
+                });
               }
             }
             this.pendingAssistantBlocks.set(agent.name, assistantBlocks);
