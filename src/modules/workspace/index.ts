@@ -733,13 +733,13 @@ export class WorkspaceModule implements Module {
     return [
       {
         name: 'read',
-        description: 'Read a file from the workspace. Returns content with line numbers.',
+        description: 'Read a file from the workspace. Returns content with line numbers. Reads at most 2000 lines per call by default — use offset/limit to page through larger files.',
         inputSchema: {
           type: 'object' as const,
           properties: {
             path: { type: 'string', description: 'File path (mount-prefixed, e.g., "project/src/main.ts")' },
             offset: { type: 'number', description: 'Starting line number (1-indexed)' },
-            limit: { type: 'number', description: 'Maximum number of lines to return' },
+            limit: { type: 'number', description: 'Maximum number of lines to return (default 2000)' },
           },
           required: ['path'],
         },
@@ -1344,10 +1344,16 @@ export class WorkspaceModule implements Module {
     const content = blob.toString('utf-8');
     const lines = content.split('\n');
 
-    // Apply offset/limit
+    // Apply offset/limit. An unlimited read of a large file would inject the
+    // whole thing into the turn (a 2MB file ≈ 600k tokens → the request blows
+    // past the model context and 400s), so an omitted limit falls back to a
+    // default cap; the result reports total/from/to so the agent can page.
+    const DEFAULT_READ_LINE_LIMIT = 2000;
     const startLine = (input.offset ?? 1) - 1; // Convert to 0-indexed
-    const endLine = input.limit ? startLine + input.limit : lines.length;
+    const effectiveLimit = input.limit ?? DEFAULT_READ_LINE_LIMIT;
+    const endLine = startLine + effectiveLimit;
     const slice = lines.slice(startLine, endLine);
+    const truncated = endLine < lines.length;
 
     // Format with line numbers (cat -n style)
     const formatted = slice
@@ -1361,6 +1367,9 @@ export class WorkspaceModule implements Module {
         totalLines: lines.length,
         fromLine: startLine + 1,
         toLine: Math.min(endLine, lines.length),
+        ...(truncated
+          ? { note: `Truncated at ${effectiveLimit} lines (file has ${lines.length}). Use offset/limit to read more.` }
+          : {}),
         content: formatted,
       },
     };
