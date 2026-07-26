@@ -4649,6 +4649,21 @@ export class AgentFramework {
     this.eventGate?.onInferenceStarted(agent.name);
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
 
+    // Typing indicator, started at TURN START. It says "attending", which is
+    // true from the moment the turn is accepted — but it used to start inside
+    // driveStream, i.e. only after module gatherContext + MCPL beforeInference
+    // RPCs + the full context compile + stream initiation. All of that read as
+    // dead air to whoever just messaged the agent (30+ s during the 2026-07
+    // mythos compile regression; still seconds of hooks+compile after).
+    // Same channel choice as driveStream's own startTyping (which stays, is
+    // idempotent per channel, and owns the 7s refresh); the catch below stops
+    // it on the no-driveStream failure paths (e.g. a compile refusal).
+    const earlyTypingChannel =
+      agent.proseRouting === 'explicit'
+        ? trigger?.channelId ?? null
+        : this.turnLocusPins.get(agent.name) ?? null;
+    if (earlyTypingChannel) this.channelRegistry?.startTyping(earlyTypingChannel);
+
     try {
       const requestSnapshot = this.captureInferenceToolSnapshot(agent);
       const allTools = this.getToolsForAgent(agent.name, requestSnapshot);
@@ -4706,6 +4721,10 @@ export class AgentFramework {
       );
       this.activeStreams.set(agent.name, handle);
     } catch (error) {
+      // The early typing indicator has no driveStream `finally` on this path —
+      // a hook/compile/stream-setup failure must not leave "typing…" stuck.
+      // (Retries below restart it; stopTyping is idempotent.)
+      this.channelRegistry?.stopTyping();
       const err = error instanceof Error ? error : new Error(String(error));
       this.emitTrace({
         type: 'inference:failed',
