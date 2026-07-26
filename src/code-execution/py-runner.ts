@@ -404,10 +404,15 @@ export class PyRunner {
 }
 
 /**
- * Map framework tool names to python identifiers: `--` becomes `__`.
- * Names that still aren't valid identifiers, or that collide after
- * sanitization, are skipped loudly — a skipped tool is unreachable from
- * scripts (the exact-name tools[...] dict is built from this same list).
+ * Map framework tool names to python identifiers: `--` (the framework's
+ * prefix separator) becomes `__`, and every remaining character that is not
+ * valid in a python identifier becomes `_` (fleet reality: module and server
+ * ids contain single hyphens — `mcpl-admin`, `dog-events` — found live on
+ * the first canary run, 2026-07-26). A leading digit gets a `_` prefix.
+ *
+ * Names that sanitize to nothing, or that collide after sanitization, are
+ * skipped loudly — a skipped tool is unreachable from scripts (the
+ * exact-name tools[...] dict is built from this same list).
  */
 export function buildInjectedTools(
   toolNames: string[],
@@ -416,9 +421,10 @@ export function buildInjectedTools(
   const seen = new Map<string, string>();
   const injected: InjectedTool[] = [];
   for (const toolName of toolNames) {
-    const pyName = toolName.replace(/--/g, '__');
+    let pyName = toolName.replace(/--/g, '__').replace(/[^A-Za-z0-9_]/g, '_');
+    if (/^[0-9]/.test(pyName)) pyName = '_' + pyName;
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(pyName)) {
-      log(`[pytc] tool '${toolName}' skipped: '${pyName}' is not a valid python identifier`);
+      log(`[pytc] tool '${toolName}' skipped: cannot derive a python identifier`);
       continue;
     }
     const existing = seen.get(pyName);

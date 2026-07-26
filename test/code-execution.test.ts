@@ -39,12 +39,24 @@ describe('buildInjectedTools', () => {
     ]);
   });
 
-  it('skips names that do not sanitize to valid python identifiers', () => {
-    const logs: string[] = [];
-    const injected = buildInjectedTools(['bad-name', 'ok_name'], (m) => logs.push(m));
-    assert.deepStrictEqual(injected, [{ pyName: 'ok_name', toolName: 'ok_name' }]);
-    assert.strictEqual(logs.length, 1);
-    assert.match(logs[0], /bad-name/);
+  it('sanitizes single hyphens inside segments (live fleet names)', () => {
+    // Found on the first Mica canary run: module/server ids with single
+    // hyphens were skipped entirely. They must inject.
+    const injected = buildInjectedTools([
+      'mcpl-admin--mcpl_deploy',
+      'mcpl--dog-events--dog_events_status',
+      'channel-mode--set_channel_mode',
+    ]);
+    assert.deepStrictEqual(injected, [
+      { pyName: 'mcpl_admin__mcpl_deploy', toolName: 'mcpl-admin--mcpl_deploy' },
+      { pyName: 'mcpl__dog_events__dog_events_status', toolName: 'mcpl--dog-events--dog_events_status' },
+      { pyName: 'channel_mode__set_channel_mode', toolName: 'channel-mode--set_channel_mode' },
+    ]);
+  });
+
+  it('prefixes a leading digit', () => {
+    const injected = buildInjectedTools(['3d-tools--render']);
+    assert.deepStrictEqual(injected, [{ pyName: '_3d_tools__render', toolName: '3d-tools--render' }]);
   });
 
   it('skips colliding sanitized names loudly (first wins)', () => {

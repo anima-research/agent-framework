@@ -23,8 +23,10 @@ export function buildCodeExecutionToolDefinition(opts?: {
     description:
       'Run Python code that can call your other tools programmatically. ' +
       'Every tool you have is available inside the script as an async Python function: ' +
-      "the function name is the tool name with '--' replaced by '__' " +
-      "(e.g. tool 'mcpl--discord--fetch_history' is the function mcpl__discord__fetch_history). " +
+      "the function name is the tool name with '--' replaced by '__' and any other " +
+      "non-identifier character replaced by '_' " +
+      "(e.g. tool 'mcpl--discord--fetch_history' is the function mcpl__discord__fetch_history, " +
+      "and tool 'mcpl--dog-events--status' is mcpl__dog_events__status). " +
       'Each function takes a single dict of arguments and returns a string — the same text ' +
       'the tool would have returned to you directly; parse structured results with json.loads. ' +
       "An exact-name lookup dict is also available: tools['mcpl--discord--fetch_history']({...}). " +
