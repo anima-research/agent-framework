@@ -10,6 +10,7 @@ import type {
   MessageQuery,
   MessageQueryResult,
   StoredMessage,
+  TokenBudget,
 } from '@animalabs/context-manager';
 import type {
   FrameworkConfig,
@@ -1442,25 +1443,55 @@ export class AgentFramework {
     return agent.getRuntimeSettings();
   }
 
+  /**
+   * Apply runtime settings.
+   *
+   * `opts.persist: false` makes the change EPHEMERAL: it takes effect live but
+   * is not written to the `framework/state` slot, so a restart reverts it. That
+   * is the mode for operator experiments ("change it, watch, revert") — the
+   * default persists, because a durable operational change should survive a
+   * bounce like every other override.
+   *
+   * Nothing here notifies the agent. Discovery is deliberately PULL: the agent
+   * can read current settings any time via the `agent_settings` tool's `get`
+   * action, which costs no context perturbation. Pushing a notice injects text
+   * into the very context being tuned — it invalidates the KV prefix and can
+   * itself trip a classifier — so callers opt into that explicitly rather than
+   * getting it by default.
+   *
+   * KNOWN LIMITATION of `persist: false`: the change still lands in the agent's
+   * in-memory override map, and `persistAgentRuntimeSettings` writes that whole
+   * map. So a LATER persisting call promotes any still-live ephemeral change to
+   * durable as a side effect. Ephemeral means "not written by THIS call", not
+   * "can never be written". Reset the ephemeral key before persisting something
+   * else if that matters. Making it airtight needs per-key ephemeral tracking
+   * inside Agent.
+   */
   updateAgentRuntimeSettings(
     agentName: string,
     patch: AgentRuntimeSettingsPatch,
+    opts?: { persist?: boolean },
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
     const result = agent.updateRuntimeSettings(patch);
-    this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+    if (opts?.persist !== false) {
+      this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+    }
     return result;
   }
 
   resetAgentRuntimeSettings(
     agentName: string,
     keys?: Array<keyof AgentRuntimeSettingsPatch>,
+    opts?: { persist?: boolean },
   ): AgentRuntimeSettingsSnapshot {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
     const result = agent.resetRuntimeSettings(keys);
-    this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+    if (opts?.persist !== false) {
+      this.persistAgentRuntimeSettings(agentName, agent.getRuntimeSettingsOverrides());
+    }
     return result;
   }
 
@@ -1521,7 +1552,7 @@ export class AgentFramework {
    */
   async previewActivation(
     agentName: string,
-    opts?: { injections?: boolean }
+    opts?: { injections?: boolean; budget?: TokenBudget }
   ): Promise<NormalizedRequest> {
     const agent = this.agents.get(agentName);
     if (!agent) {
@@ -1530,10 +1561,14 @@ export class AgentFramework {
 
     const tools = this.getToolsForAgent(agentName).filter((t) => agent.canUseTool(t.name));
 
+    // An explicit budget compiles against a HYPOTHETICAL window instead of the
+    // agent's live one. That also suppresses transition-settling in
+    // compileWithInjections (which only settles when no budget is passed), so
+    // previewing a smaller window cannot advance a converging descent.
     // Default: no dynamic injection gathering → fully transparent (no
     // inference, no Chronicle writes, no external RPC). Opt in explicitly.
     if (!opts?.injections) {
-      return agent.buildActivationRequest(tools, undefined);
+      return agent.buildActivationRequest(tools, undefined, opts?.budget);
     }
 
     // Full-fidelity path: mirrors startAgentStream's injection gathering.
@@ -1568,7 +1603,42 @@ export class AgentFramework {
       }
     }
 
-    return agent.buildActivationRequest(tools, injections);
+    return agent.buildActivationRequest(tools, injections, opts?.budget);
+  }
+
+  /**
+   * Non-committing preview of the FOLD PLAN at a hypothetical budget and/or
+   * context settings — the numbers behind an operator's "what happens if I set
+   * the budget to X" before they apply it.
+   *
+   * Unlike `previewActivation` (which renders a request), this returns the
+   * picker's plan: resulting tokens, whether it fits, how many summaries would
+   * have to be produced first, and the per-chunk fold levels. Commits nothing:
+   * no resolution persistence, no compression enqueue, no transition
+   * bookkeeping — see `AutobiographicalStrategy.previewContext`.
+   *
+   * Returns null when the agent's strategy has no fold plan (non-adaptive).
+   */
+  previewContextSettings(
+    agentName: string,
+    budgetTokens: number,
+    overrides?: Record<string, unknown>,
+  ): unknown {
+    const agent = this.agents.get(agentName);
+    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    const cm = agent.getContextManager() as unknown as {
+      previewContext?: (
+        budget: TokenBudget,
+        overrides?: Record<string, unknown>,
+      ) => unknown;
+    };
+    if (typeof cm.previewContext !== 'function') return null;
+    // reserveForResponse mirrors the live compile so the previewed middle is
+    // comparable to what the agent actually gets.
+    return cm.previewContext(
+      { maxTokens: budgetTokens, reserveForResponse: agent.maxTokens },
+      overrides,
+    );
   }
 
   /**
