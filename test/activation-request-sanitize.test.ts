@@ -130,6 +130,54 @@ describe('buildActivationRequest signed-thinking sanitize', () => {
     );
   });
 
+  it('cleans the whole trailing assistant RUN (formatters merge it into one wire message)', async () => {
+    // membrane's mergeConsecutiveRoles concatenates consecutive same-role
+    // messages, so the provider's "latest assistant message" spans the run.
+    // Cleaning only the final member leaves the earlier members' blocks in the
+    // merged message and the 400 returns (labclaude, 2026-07-27).
+    const agent = agentCompiling([
+      { participant: 'human', content: [{ type: 'text', text: 'hello' }] },
+      { participant: 'tester', content: [{ ...emptySigned }] },
+      { participant: 'tester', content: [{ ...emptySigned }] },
+    ]);
+    const request = await agent.buildActivationRequest([]);
+    const stillPoisoned = request.messages.some(
+      (m) => m.participant === 'tester' && m.content.some((b) => b.type === 'thinking'),
+    );
+    assert.equal(stillPoisoned, false, 'no unverifiable thinking survives anywhere in the trailing run');
+  });
+
+  it('stops at the run boundary — an assistant message before a user message is untouched', async () => {
+    const agent = agentCompiling([
+      { participant: 'tester', content: [{ ...emptySigned }, { type: 'text', text: 'older' }] },
+      { participant: 'human', content: [{ type: 'text', text: 'hello' }] },
+      { participant: 'tester', content: [{ ...emptySigned }, { type: 'text', text: 'latest' }] },
+    ]);
+    const request = await agent.buildActivationRequest([]);
+    const assistants = request.messages.filter((m) => m.participant === 'tester');
+    assert.ok(assistants[0]!.content.some((b) => b.type === 'thinking'), 'pre-run assistant keeps its CoT');
+    assert.ok(!assistants[1]!.content.some((b) => b.type === 'thinking'), 'the run is cleaned');
+  });
+
+  it('cascades: dropping an emptied message re-cleans the newly promoted one', async () => {
+    // Removing the emptied assistant message promotes the previous assistant
+    // message into the checked position. If that one is poisoned too, the 400
+    // returns — the live regression (labclaude 2026-07-27, fix attempt 1).
+    const agent = agentCompiling([
+      { participant: 'tester', content: [{ ...emptySigned }, { type: 'tool_use', id: 't1', name: 'x', input: {} }] },
+      { participant: 'human', content: [{ type: 'text', text: 'result' }] },
+      { participant: 'tester', content: [{ ...emptySigned }] },
+      { participant: 'human', content: [{ type: 'text', text: 'ping' }] },
+    ]);
+    const request = await agent.buildActivationRequest([]);
+    const assistants = request.messages.filter((m) => m.participant === 'tester');
+    assert.equal(assistants.length, 1, 'the thinking-only message is gone');
+    assert.deepEqual(
+      assistants[0]!.content.map((b) => b.type), ['tool_use'],
+      'and the promoted message was re-cleaned, keeping its real content',
+    );
+  });
+
   it('keeps signed thinking that still carries its text', async () => {
     const agent = agentCompiling([
       { participant: 'tester', content: [

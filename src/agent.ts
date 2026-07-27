@@ -648,26 +648,67 @@ export class Agent {
     // exactly that reason — a blanket strip would discard real interiority.
     // Verified by replaying the failing request: verbatim → 400; with the last
     // assistant message's empty-text thinking blocks dropped → accepted.
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i]!.participant !== this.name) continue; // find the last assistant message
-      const content = messages[i]!.content;
-      const cleaned = content.filter(
-        (b: ContentBlock) => !(
-          b.type === 'thinking' &&
-          typeof (b as { signature?: unknown }).signature === 'string' &&
-          !((b as { thinking?: unknown }).thinking as string | undefined)?.length
-        ),
-      );
-      if (cleaned.length !== content.length) {
-        console.error(
-          `[activation-sanitize] agent=${this.name}: dropped ${content.length - cleaned.length} ` +
-          `signed-but-empty thinking block(s) from the last assistant message ` +
-          `(provider rejects unverifiable thinking there; earlier occurrences are kept).`,
-        );
-        messages = messages.map((m, idx) => (idx === i ? { ...m, content: cleaned } : m));
-        if (cleaned.length === 0) messages = messages.filter((_, idx) => idx !== i);
+    // NOTE the scope: the provider's "latest assistant message" is the merged
+    // one. Formatters concatenate consecutive same-role messages
+    // (membrane's `mergeConsecutiveRoles`), so a RUN of trailing assistant
+    // messages arrives as a single wire message and every block in that run is
+    // subject to the check. Cleaning only the last one leaves the earlier
+    // members' blocks at indices 0..n-1 of the merged message and the 400
+    // returns (labclaude, first attempt at this fix: two dangling
+    // thinking-only turns merged into one message; only the second was
+    // cleaned).
+    const isUnverifiableThinking = (b: ContentBlock): boolean =>
+      b.type === 'thinking' &&
+      typeof (b as { signature?: unknown }).signature === 'string' &&
+      !((b as { thinking?: unknown }).thinking as string | undefined)?.length;
+
+    // Two subtleties, both learned by replaying the live failing request:
+    //  1. Formatters merge consecutive same-role messages
+    //     (membrane `mergeConsecutiveRoles`), so the provider's "latest
+    //     assistant message" is the whole TRAILING RUN of assistant messages,
+    //     not just the final one — every block in that run is checked.
+    //  2. Emptying a message and DROPPING it promotes the previous assistant
+    //     message into the checked position; if that one is poisoned too, the
+    //     400 simply returns. So the cleanup must ITERATE: clean, drop what
+    //     became empty, then re-clean whatever is now latest, until the
+    //     checked message has real content. (labclaude's first fix attempt
+    //     dropped one message and re-broke on the next request this way.)
+    let dropped = 0;
+    let removedMessages = 0;
+    for (;;) {
+      let end = -1;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i]!.participant === this.name) { end = i; break; }
       }
-      break;
+      if (end < 0) break;
+      let start = end;
+      while (start > 0 && messages[start - 1]!.participant === this.name) start--; // the merged run
+      let cleanedAny = false;
+      const next = messages.slice();
+      for (let i = start; i <= end; i++) {
+        const content = next[i]!.content;
+        const cleaned = content.filter((b: ContentBlock) => !isUnverifiableThinking(b));
+        if (cleaned.length !== content.length) {
+          dropped += content.length - cleaned.length;
+          cleanedAny = true;
+          next[i] = { ...next[i]!, content: cleaned };
+        }
+      }
+      if (!cleanedAny) break; // the checked message is verifiable — done
+      const survivors = next.filter((m, i) => (i < start || i > end) || m.content.length > 0);
+      removedMessages += next.length - survivors.length;
+      messages = survivors;
+      // If anything in the run survived, it is now the checked message and it
+      // is clean; otherwise loop and clean whatever moved into the position.
+      if (survivors.length !== next.length - (end - start + 1)) break;
+    }
+    if (dropped > 0) {
+      console.error(
+        `[activation-sanitize] agent=${this.name}: dropped ${dropped} signed-but-empty thinking ` +
+        `block(s)${removedMessages > 0 ? ` and ${removedMessages} message(s) left empty by it` : ''} ` +
+        `from the latest assistant position — the provider rejects unverifiable thinking there; ` +
+        `earlier occurrences are kept.`,
+      );
     }
 
     // Safety: ensure messages don't end with an assistant message.
