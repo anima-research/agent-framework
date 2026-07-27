@@ -632,85 +632,6 @@ export class Agent {
       }))
       .filter((m) => m.content.length > 0);
 
-    // Sanitize 2: the LAST assistant message may not carry a signed thinking
-    // block whose text is gone. The provider verifies thinking blocks in the
-    // latest assistant message against their signature and rejects the whole
-    // request — 400 "`thinking` or `redacted_thinking` blocks in the latest
-    // assistant message cannot be modified" — which is unrecoverable by retry
-    // (labclaude, 2026-07-27: 13 consecutive failures, hard down ~2.5h).
-    //
-    // Signature-with-empty-text blocks are normal in these stores (fable-5
-    // narration mispackaging, 2026-07-07; summarized/redacted CoT, 2026-07-12)
-    // — labclaude carries 1064 of them. They are HARMLESS anywhere but the
-    // last assistant message: the provider replays their encrypted CoT to the
-    // model, so they are worth keeping in history and are only dropped where
-    // the strict check applies. Scoped to the last assistant message for
-    // exactly that reason — a blanket strip would discard real interiority.
-    // Verified by replaying the failing request: verbatim → 400; with the last
-    // assistant message's empty-text thinking blocks dropped → accepted.
-    // NOTE the scope: the provider's "latest assistant message" is the merged
-    // one. Formatters concatenate consecutive same-role messages
-    // (membrane's `mergeConsecutiveRoles`), so a RUN of trailing assistant
-    // messages arrives as a single wire message and every block in that run is
-    // subject to the check. Cleaning only the last one leaves the earlier
-    // members' blocks at indices 0..n-1 of the merged message and the 400
-    // returns (labclaude, first attempt at this fix: two dangling
-    // thinking-only turns merged into one message; only the second was
-    // cleaned).
-    const isUnverifiableThinking = (b: ContentBlock): boolean =>
-      b.type === 'thinking' &&
-      typeof (b as { signature?: unknown }).signature === 'string' &&
-      !((b as { thinking?: unknown }).thinking as string | undefined)?.length;
-
-    // Two subtleties, both learned by replaying the live failing request:
-    //  1. Formatters merge consecutive same-role messages
-    //     (membrane `mergeConsecutiveRoles`), so the provider's "latest
-    //     assistant message" is the whole TRAILING RUN of assistant messages,
-    //     not just the final one — every block in that run is checked.
-    //  2. Emptying a message and DROPPING it promotes the previous assistant
-    //     message into the checked position; if that one is poisoned too, the
-    //     400 simply returns. So the cleanup must ITERATE: clean, drop what
-    //     became empty, then re-clean whatever is now latest, until the
-    //     checked message has real content. (labclaude's first fix attempt
-    //     dropped one message and re-broke on the next request this way.)
-    let dropped = 0;
-    let removedMessages = 0;
-    for (;;) {
-      let end = -1;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        if (messages[i]!.participant === this.name) { end = i; break; }
-      }
-      if (end < 0) break;
-      let start = end;
-      while (start > 0 && messages[start - 1]!.participant === this.name) start--; // the merged run
-      let cleanedAny = false;
-      const next = messages.slice();
-      for (let i = start; i <= end; i++) {
-        const content = next[i]!.content;
-        const cleaned = content.filter((b: ContentBlock) => !isUnverifiableThinking(b));
-        if (cleaned.length !== content.length) {
-          dropped += content.length - cleaned.length;
-          cleanedAny = true;
-          next[i] = { ...next[i]!, content: cleaned };
-        }
-      }
-      if (!cleanedAny) break; // the checked message is verifiable — done
-      const survivors = next.filter((m, i) => (i < start || i > end) || m.content.length > 0);
-      removedMessages += next.length - survivors.length;
-      messages = survivors;
-      // If anything in the run survived, it is now the checked message and it
-      // is clean; otherwise loop and clean whatever moved into the position.
-      if (survivors.length !== next.length - (end - start + 1)) break;
-    }
-    if (dropped > 0) {
-      console.error(
-        `[activation-sanitize] agent=${this.name}: dropped ${dropped} signed-but-empty thinking ` +
-        `block(s)${removedMessages > 0 ? ` and ${removedMessages} message(s) left empty by it` : ''} ` +
-        `from the latest assistant position — the provider rejects unverifiable thinking there; ` +
-        `earlier occurrences are kept.`,
-      );
-    }
-
     // Safety: ensure messages don't end with an assistant message.
     // Some models reject trailing assistant messages ("prefill not supported"),
     // and after context compression a stale assistant turn can end up last.
@@ -790,6 +711,31 @@ export class Agent {
    * Called by framework when stream completes.
    */
   addAssistantResponse(content: ContentBlock[]): void {
+    // A turn whose entire output is thinking blocks produced NOTHING: no
+    // speech, no tool call. That is what a refusal looks like on the wire —
+    // the provider returns signed thinking (often with empty text, the
+    // fable-5 hidden-CoT packaging) and no content. Persisting it records an
+    // action that never happened, and two such records landing adjacent are
+    // actively toxic: formatters merge consecutive same-role messages
+    // (membrane `mergeConsecutiveRoles`), producing one assistant message
+    // carrying signed thinking from two different responses, which the
+    // provider cannot verify — 400 "`thinking` or `redacted_thinking` blocks
+    // in the latest assistant message cannot be modified", unrecoverable by
+    // retry (labclaude, 2026-07-27: hard down ~4h on exactly this pair).
+    //
+    // Refused turns are surfaced by the refusal path (stderr, failures.log,
+    // the [inference-failed] notice); the store does not also need a
+    // content-free artifact of them. Loud, never silent.
+    if (content.length > 0 && content.every(
+      (b) => b.type === 'thinking' || b.type === 'redacted_thinking',
+    )) {
+      console.error(
+        `[assistant-persist] agent=${this.name}: refusing to store a thinking-only assistant ` +
+        `message (${content.length} block(s), no text and no tool_use) — the turn produced no ` +
+        `output. See the refusal/inference-failed record for why.`,
+      );
+      return;
+    }
     this.contextManager.addMessage(this.name, content);
   }
 
