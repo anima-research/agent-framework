@@ -3760,7 +3760,27 @@ export class AgentFramework {
       return;
     }
 
-    const id = this.addMessage('user', event.content, metadata);
+    // Addressed-while-closed invitation — parity with the push-event path
+    // (channels.publish surfaces like portal-mcpl deliver mentions here).
+    const incomingContent = [...event.content];
+    {
+      const invitation = this.buildClosedChannelInvitation({
+        serverId: event.serverId,
+        channelId: event.channelId,
+        messageId: event.messageId,
+        authorName: event.author?.name || 'Someone',
+        guildName: typeof event.metadata?.guildName === 'string' && event.metadata.guildName
+          ? (event.metadata.guildName as string)
+          : undefined,
+        tags: event.tags,
+      });
+      if (invitation) {
+        incomingContent.push(invitation.block);
+        Object.assign(metadata, invitation.metadataPatch);
+      }
+    }
+
+    const id = this.addMessage('user', incomingContent, metadata);
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
     if (event.triggerInference) {
@@ -4044,6 +4064,67 @@ export class AgentFramework {
   }
 
   /**
+   * Build the addressed-while-CLOSED channel invitation block, shared by the
+   * push-event and channels/incoming ingest paths. Until 2026-07-27 only push
+   * events (discord-mcpl mentions) carried it; channels.publish surfaces
+   * (portal-mcpl) delivered bare mentions with no guidance and no route — an
+   * explicit-prose agent's natural plain reply bounced with nowhere to go
+   * (Rhys's first portal mention: a 2,320-char reply stranded).
+   *
+   * Wording: option 1 teaches the `>>` destination prefix, which delivers for
+   * BOTH legacy (host-inferred) and explicit prose-routing agents. The
+   * previous "simply write your reply as normal text" was a false promise
+   * under explicit routing (the metadata flags it set had no consumers).
+   *
+   * Human-readable names wherever the surface provided them — a mind reading
+   * this should see WHO addressed it WHERE, not a wall of snowflake ids. Raw
+   * ids remain only inside the tool-argument instructions, where they are the
+   * literal values to pass.
+   */
+  private buildClosedChannelInvitation(opts: {
+    serverId: string;
+    channelId: string;
+    channelLabel?: string;
+    messageId: string;
+    authorName: string;
+    guildName?: string;
+    tags?: string[];
+  }): { block: ContentBlock; metadataPatch: Record<string, unknown> } | null {
+    if (!this.channelRegistry) return null;
+    if (!opts.tags?.includes('chat:addressed')) return null;
+    if (this.channelRegistry.isChannelOpen(opts.channelId)) return null;
+    const descriptor = this.channelRegistry.getDescriptor(opts.channelId);
+    const maxBackscroll = descriptor?.capabilities?.history?.maxMessages ?? 0;
+    const label = opts.channelLabel ?? descriptor?.label;
+    const channelLabel = label ? `#${label}` : `"${opts.channelId}"`;
+    const place = opts.guildName ? `${channelLabel} in "${opts.guildName}"` : channelLabel;
+    const block: ContentBlock = {
+      type: 'text',
+      text:
+        `\n[Channel invitation] ${opts.authorName} addressed you in ${place} — ` +
+        `a channel you haven't joined. You're seeing this one message; you won't receive more from it unless you join. ` +
+        `Your options:\n` +
+        `1. Reply without joining — write your reply this turn prefixed with ">>${channelLabel}"; it will be delivered there.\n` +
+        `2. Join the channel — call channel_open with channelId "${opts.channelId}" and serverId "${opts.serverId}"` +
+        (maxBackscroll > 0
+          ? `; to also read recent history, add backscroll (a number up to ${maxBackscroll}) and beforeMessageId "${opts.messageId}".\n`
+          : `.\n`) +
+        `3. Stay out — call channel_decline with channelId "${opts.channelId}", serverId "${opts.serverId}", ` +
+        `and messageId "${opts.messageId}" (optionally set acknowledge to an emoji like 👀 so ${opts.authorName} isn't left hanging).\n` +
+        `Doing nothing is also fine.`,
+    };
+    return {
+      block,
+      metadataPatch: {
+        channelInvitation: true,
+        channelOpen: false,
+        channelId: opts.channelId,
+        invitationMessageId: opts.messageId,
+      },
+    };
+  }
+
+  /**
    * Convert an MCPL push event to a context message.
    */
   private handleMcplPushEvent(event: McplPushEvent): void {
@@ -4076,45 +4157,21 @@ export class AgentFramework {
     }
 
     const content = [...event.content];
-    const addressedWhileClosed = triggerChannel &&
-      event.tags?.includes('chat:addressed') &&
-      this.channelRegistry &&
-      !this.channelRegistry.isChannelOpen(triggerChannel.channelId);
-    if (addressedWhileClosed) {
-      const descriptor = this.channelRegistry!.getDescriptor(triggerChannel.channelId);
-      const messageId = typeof event.origin?.messageId === 'string'
-        ? event.origin.messageId
-        : event.eventId;
-      const maxBackscroll = descriptor?.capabilities?.history?.maxMessages ?? 0;
-      // Resolve human-readable names from the event origin wherever the
-      // surface provided them — a mind reading this should see WHO addressed
-      // it WHERE, not a wall of snowflake ids. Raw ids remain only inside the
-      // tool-argument instructions, where they are the literal values to pass.
+    if (triggerChannel) {
       const origin = (event.origin ?? {}) as Record<string, unknown>;
-      const authorName = typeof origin.authorName === 'string' && origin.authorName ? origin.authorName : 'Someone';
-      const channelLabel = triggerChannel.label ? `#${triggerChannel.label}` : `"${triggerChannel.channelId}"`;
-      const place = typeof origin.guildName === 'string' && origin.guildName
-        ? `${channelLabel} in "${origin.guildName}"`
-        : channelLabel;
-      content.push({
-        type: 'text',
-        text:
-          `\n[Channel invitation] ${authorName} addressed you in ${place} — ` +
-          `a channel you haven't joined. You're seeing this one message; you won't receive more from it unless you join. ` +
-          `Your options:\n` +
-          `1. Reply without joining — simply write your reply as normal text this turn; it will be delivered to ${channelLabel}.\n` +
-          `2. Join the channel — call channel_open with channelId "${triggerChannel.channelId}" and serverId "${event.serverId}"` +
-          (maxBackscroll > 0
-            ? `; to also read recent history, add backscroll (a number up to ${maxBackscroll}) and beforeMessageId "${messageId}".\n`
-            : `.\n`) +
-          `3. Stay out — call channel_decline with channelId "${triggerChannel.channelId}", serverId "${event.serverId}", ` +
-          `and messageId "${messageId}" (optionally set acknowledge to an emoji like 👀 so ${authorName} isn't left hanging).\n` +
-          `Doing nothing is also fine.`,
+      const invitation = this.buildClosedChannelInvitation({
+        serverId: event.serverId,
+        channelId: triggerChannel.channelId,
+        channelLabel: triggerChannel.label,
+        messageId: typeof origin.messageId === 'string' ? origin.messageId : event.eventId,
+        authorName: typeof origin.authorName === 'string' && origin.authorName ? origin.authorName : 'Someone',
+        guildName: typeof origin.guildName === 'string' && origin.guildName ? origin.guildName : undefined,
+        tags: event.tags,
       });
-      metadata.channelInvitation = true;
-      metadata.channelOpen = false;
-      metadata.channelId = triggerChannel.channelId;
-      metadata.invitationMessageId = messageId;
+      if (invitation) {
+        content.push(invitation.block);
+        Object.assign(metadata, invitation.metadataPatch);
+      }
     }
 
     const id = this.addMessage('user', content, metadata);
