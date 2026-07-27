@@ -98,3 +98,47 @@ describe('buildActivationRequest empty-text sanitize', () => {
     assert.deepEqual(last.content, [{ type: 'text', text: '[Continue]' }]);
   });
 });
+
+describe('buildActivationRequest signed-thinking sanitize', () => {
+  const emptySigned = { type: 'thinking', thinking: '', signature: 'sig-abc' };
+
+  it('drops signed-but-empty thinking from the LAST assistant message only', async () => {
+    // The provider verifies thinking blocks in the latest assistant message
+    // against their signature; one whose text was summarized/redacted away
+    // fails that check and 400s the whole request, unrecoverably by retry
+    // (labclaude 2026-07-27, 13 consecutive failures). Earlier occurrences are
+    // accepted and replay real CoT to the model — they must survive.
+    const agent = agentCompiling([
+      { participant: 'tester', content: [{ ...emptySigned }, { type: 'text', text: 'older turn' }] },
+      { participant: 'human', content: [{ type: 'text', text: 'hello' }] },
+      { participant: 'tester', content: [{ ...emptySigned }, { type: 'text', text: 'latest turn' }] },
+    ]);
+    const request = await agent.buildActivationRequest([]);
+    const assistants = request.messages.filter((m) => m.participant === 'tester');
+    assert.equal(assistants.length, 2, 'both assistant messages survive');
+    assert.ok(
+      assistants[0]!.content.some((b) => b.type === 'thinking'),
+      'the EARLIER assistant message keeps its signed thinking',
+    );
+    assert.ok(
+      !assistants[1]!.content.some((b) => b.type === 'thinking'),
+      'the LAST assistant message has the unverifiable block dropped',
+    );
+    assert.ok(
+      assistants[1]!.content.some((b) => (b as { text?: string }).text === 'latest turn'),
+      'its real content is untouched',
+    );
+  });
+
+  it('keeps signed thinking that still carries its text', async () => {
+    const agent = agentCompiling([
+      { participant: 'tester', content: [
+        { type: 'thinking', thinking: 'real chain of thought', signature: 'sig-xyz' },
+        { type: 'text', text: 'latest turn' },
+      ] },
+    ]);
+    const request = await agent.buildActivationRequest([]);
+    const assistant = request.messages.find((m) => m.participant === 'tester')!;
+    assert.ok(assistant.content.some((b) => b.type === 'thinking'), 'verifiable thinking is preserved');
+  });
+});
