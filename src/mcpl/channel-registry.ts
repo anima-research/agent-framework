@@ -870,7 +870,12 @@ export class ChannelRegistry {
         });
 
       case 'channel_close':
-        return this.handleToolClose(input as { channelId: string; serverId?: string });
+        return this.handleToolClose(input as {
+          channelId: string;
+          serverId?: string;
+          source?: string;
+          overrideExplicitOpen?: boolean;
+        });
 
       case 'channel_decline':
         return this.handleToolDecline(input as {
@@ -1588,7 +1593,19 @@ export class ChannelRegistry {
     }
   }
 
-  private async handleToolClose(input: { channelId: string; serverId?: string }): Promise<ToolResult> {
+  private async handleToolClose(input: {
+    channelId: string;
+    serverId?: string;
+    /** Machine callers (housekeeping modules) name themselves here so the
+     *  durable record carries honest provenance — e.g. 'subscription-gc'.
+     *  Undeclared in the agent-facing schema; absent = an agent/operator
+     *  decision, recorded as 'agent-tool' exactly as before. */
+    source?: string;
+    /** A machine close aimed at an explicitly-opened channel is refused
+     *  unless the caller certifies an explicit idle lease (an agent-set
+     *  per-channel budget is consent to close at that budget). */
+    overrideExplicitOpen?: boolean;
+  }): Promise<ToolResult> {
     const resolved = this.resolveToolChannelEntry(input.channelId, input.serverId);
     const entry = resolved.entry;
     if (!entry) {
@@ -1607,7 +1624,30 @@ export class ChannelRegistry {
       };
     }
 
-    this.setDesiredState(entry.serverId, input.channelId, 'closed', 'agent-tool');
+    const closeSource =
+      typeof input.source === 'string' && input.source.length > 0 ? input.source : 'agent-tool';
+
+    // Housekeeping must not override stated intent (issue #5: GC closes wore
+    // the agent's badge and reset explicitly-opened doors). A machine-sourced
+    // close of a channel whose current desired state is an agent/operator
+    // 'open' is refused — structurally, so the caller can stand down rather
+    // than retry — unless it certifies an explicit idle lease.
+    if (closeSource !== 'agent-tool' && !input.overrideExplicitOpen) {
+      const current = this.desiredStates.get(this.lifecycleKey(entry.serverId, input.channelId));
+      if (current?.state === 'open' && current.source === 'agent-tool') {
+        return {
+          success: false,
+          isError: false,
+          error:
+            `Channel ${input.channelId} was explicitly opened (source: agent-tool); ` +
+            `a '${closeSource}' close does not override stated intent. Machine closes ` +
+            `of explicit opens require an explicit idle lease (overrideExplicitOpen).`,
+          data: { refusal: 'explicit-open', channelId: input.channelId },
+        };
+      }
+    }
+
+    this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
     this.stopTyping(input.channelId);
 
     const server = this.serverRegistry.getServer(entry.serverId);

@@ -723,6 +723,7 @@ export class AgentFramework {
       pushEvent: (event) => this.pushEvent(event),
       onTrace: (listener) => this.onTrace(listener),
       callTool: (call) => this.executeToolCall(call),
+      notifyOps: (kind, agentName, message, data) => this.notifyOps(kind, agentName, message, data),
     });
   }
 
