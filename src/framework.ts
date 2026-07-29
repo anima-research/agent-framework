@@ -5754,6 +5754,19 @@ export class AgentFramework {
       }
     }
 
+    // Synthesized channel tools, for MODULE callers (ctx.callTool). This
+    // route was missing: when subscription-GC moved off the retired MCPL
+    // unsubscribe tool onto the generic channel_close (discord-mcpl
+    // b095a9f), module-originated closes started failing downstream as
+    // "Invalid tool name format" — the janitor has been silently broken
+    // since. The origin object is trusted dispatch context: this path
+    // alone may carry machine provenance (see handleToolClose). The
+    // agent-only synthesized verbs (think, skip_reply) are deliberately
+    // not routed here.
+    if (call.name.startsWith('channel_') && this.channelRegistry) {
+      return this.channelRegistry.handleChannelToolCall(call.name, call.input, { kind: 'module' });
+    }
+
     // Module tools
     return this.moduleRegistry.handleToolCall(call);
   }
@@ -8114,7 +8127,7 @@ export class AgentFramework {
     this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
 
-    this.channelRegistry!.handleChannelToolCall(call.name, call.input)
+    this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName })
       .then((result) => {
         const durationMs = Date.now() - startTime;
         this.emitTrace({ type: 'tool:completed', module: 'channels', tool: call.name, callId: call.id, durationMs });
