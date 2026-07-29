@@ -872,8 +872,9 @@ export class ChannelRegistry {
    * Handle a call to one of the synthesized channel tools.
    *
    * `origin` is TRUSTED DISPATCH CONTEXT, supplied by the framework's own
-   * routing (dispatchChannelToolCall for model-origin calls, executeToolCall
-   * for module ctx.callTool) — never derived from tool input. Machine
+   * routing (dispatchChannelToolCall and the public executeToolCall for
+   * model-origin calls, the framework's private ModuleRegistry closure for
+   * module ctx.callTool) — never derived from tool input. Machine
    * provenance on channel_close is honored only for module origin; a
    * model-origin call carrying the same fields is recorded as the agent
    * decision it actually is. Absent origin is treated as agent-origin (the

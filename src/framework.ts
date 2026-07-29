@@ -62,7 +62,7 @@ import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
 import { parseProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry } from './mcpl/channel-registry.js';
+import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
 import { ConversationRouter } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
@@ -722,7 +722,11 @@ export class AgentFramework {
       queryMessages: (filter) => this.queryMessages(filter),
       pushEvent: (event) => this.pushEvent(event),
       onTrace: (listener) => this.onTrace(listener),
-      callTool: (call) => this.executeToolCall(call),
+      // The ONLY entry that confers module origin — a private closure the
+      // framework hands to its own module registry. The public
+      // executeToolCall() is shared with model/ephemeral callers and always
+      // stamps agent origin (see there).
+      callTool: (call) => this.executeToolCallFrom(call, { kind: 'module' }),
       notifyOps: (kind, agentName, message, data) => this.notifyOps(kind, agentName, message, data),
     });
   }
@@ -5732,8 +5736,23 @@ export class AgentFramework {
    * Execute a tool call and return the result.
    * Routes to the appropriate handler (module registry or MCPL).
    * Used by SubagentModule to dispatch tool calls for ephemeral agents.
+   *
+   * This public entry always carries AGENT origin. Ephemeral/promise-based
+   * callers are models, and provenance must identify which internal path a
+   * call entered through — a public method shared with model callers can
+   * never confer module trust, whatever the input claims. Module origin
+   * exists only through the private closure handed to ModuleRegistry
+   * (ctx.callTool → executeToolCallFrom with {kind:'module'}). Callers that
+   * don't identify themselves fail safe to agent semantics too.
    */
   async executeToolCall(call: ToolCall): Promise<ToolResult> {
+    return this.executeToolCallFrom(call, {
+      kind: 'agent',
+      agentName: call.callerAgentName ?? '__ephemeral__',
+    });
+  }
+
+  private async executeToolCallFrom(call: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
     // Client-side programmatic tool calling for promise-based callers
     // (SubagentModule ephemerals). Keyed by callerAgentName so each ephemeral
     // gets its own interpreter state.
@@ -5754,17 +5773,18 @@ export class AgentFramework {
       }
     }
 
-    // Synthesized channel tools, for MODULE callers (ctx.callTool). This
-    // route was missing: when subscription-GC moved off the retired MCPL
-    // unsubscribe tool onto the generic channel_close (discord-mcpl
-    // b095a9f), module-originated closes started failing downstream as
-    // "Invalid tool name format" — the janitor has been silently broken
-    // since. The origin object is trusted dispatch context: this path
-    // alone may carry machine provenance (see handleToolClose). The
-    // agent-only synthesized verbs (think, skip_reply) are deliberately
-    // not routed here.
+    // Synthesized channel tools. This route was missing: when
+    // subscription-GC moved off the retired MCPL unsubscribe tool onto the
+    // generic channel_close (discord-mcpl b095a9f), module-originated
+    // closes started failing downstream as "Invalid tool name format" —
+    // the janitor had been silently broken since. `origin` is trusted
+    // dispatch context established at the call boundary above, not
+    // inferred from which method was used: only the ModuleRegistry closure
+    // carries module provenance (see handleToolClose). The agent-only
+    // synthesized verbs (think, skip_reply) are deliberately not routed
+    // here.
     if (call.name.startsWith('channel_') && this.channelRegistry) {
-      return this.channelRegistry.handleChannelToolCall(call.name, call.input, { kind: 'module' });
+      return this.channelRegistry.handleChannelToolCall(call.name, call.input, origin);
     }
 
     // Module tools
