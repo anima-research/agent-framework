@@ -525,6 +525,11 @@ export class WorkspaceModule implements Module {
   private config: WorkspaceConfig;
   private mounts = new Map<string, MountState>();
   private watchers = new Map<string, MountWatcher>();
+  /** Persisted state decoded in start(), held until mounts exist to apply it
+   *  to — in the Host ordering start() runs before initStore() creates the
+   *  mounts, so restoration must be second-callback-safe like watcher
+   *  startup already is (issue #72). Cleared after application. */
+  private savedState: WorkspaceModuleState | null = null;
 
   constructor(config: WorkspaceConfig) {
     // Detect overlapping mount paths: if mount A contains mount B,
@@ -593,30 +598,45 @@ export class WorkspaceModule implements Module {
       this.mounts.set(mount.name, mountState);
     }
 
+    this.applySavedState();
     this.ensureRunning();
   }
 
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
 
-    // Restore persisted state if restarting
+    // Decode persisted state if restarting; application waits until mounts
+    // exist (see applySavedState) — in the Host ordering they don't yet.
     if (ctx.isRestart) {
-      const saved = ctx.getState<WorkspaceModuleState>();
-      if (saved) {
-        for (const [name, meta] of Object.entries(saved.mounts)) {
-          const mount = this.mounts.get(name);
-          if (mount) {
-            mount.lastMaterializedSeq = meta.lastMaterializedSeq;
-            mount.lastMaterializedBranchId = meta.lastMaterializedBranchId ?? null;
-            // watcherReadyAt intentionally not restored — each session must
-            // observe its own watcher attach, otherwise a stale timestamp
-            // would hide a new-session attach failure.
-          }
-        }
-      }
+      this.savedState = ctx.getState<WorkspaceModuleState>() ?? null;
     }
 
+    this.applySavedState();
     this.ensureRunning();
+  }
+
+  /**
+   * Apply persisted per-mount state once both halves of the lifecycle have
+   * happened. Like watcher startup, either callback may fire second, so both
+   * start() and initStore() call this; it runs to effect exactly once — the
+   * saved payload is cleared after application so stale persisted values can
+   * never overwrite newer runtime state (e.g. a materialization that already
+   * happened this session).
+   */
+  private applySavedState(): void {
+    if (!this.savedState || this.mounts.size === 0) return;
+
+    for (const [name, meta] of Object.entries(this.savedState.mounts)) {
+      const mount = this.mounts.get(name);
+      if (mount) {
+        mount.lastMaterializedSeq = meta.lastMaterializedSeq;
+        mount.lastMaterializedBranchId = meta.lastMaterializedBranchId ?? null;
+        // watcherReadyAt intentionally not restored — each session must
+        // observe its own watcher attach, otherwise a stale timestamp
+        // would hide a new-session attach failure.
+      }
+    }
+    this.savedState = null;
   }
 
   /**
