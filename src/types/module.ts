@@ -298,6 +298,18 @@ export interface ModuleContext {
    * leaking listeners across teardown/recreate (e.g. session switch).
    */
   onTrace(listener: TraceEventListener): () => void;
+
+  /**
+   * Raise an operator-facing ops alert through the framework's ops channel
+   * (failures.log + `ops:alert` trace + the ops webhook, when configured).
+   * For module actions that change durable state the operator would otherwise
+   * discover by surprise — e.g. subscription GC closing a channel. Keep the
+   * message privacy-minimal: identifiers and thresholds, not content.
+   *
+   * Optional so modules built against this version degrade gracefully on an
+   * older framework: call as `ctx.notifyOps?.(...)`.
+   */
+  notifyOps?(kind: string, agentName: string, message: string, data?: Record<string, unknown>): void;
 }
 
 /**

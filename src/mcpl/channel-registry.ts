@@ -337,6 +337,21 @@ interface ChannelRegistryOptions {
 // ChannelRegistry
 // ============================================================================
 
+/**
+ * Who is actually making a channel tool call, as established by the
+ * framework's own dispatch — model-origin calls come through
+ * dispatchToolCall (which knows the agent), module calls come through
+ * ModuleContext.callTool. Tool INPUT can claim anything; this cannot.
+ */
+export type ChannelToolOrigin =
+  | { kind: 'module'; moduleName?: string }
+  | { kind: 'agent'; agentName: string };
+
+/** The machine decision sources a module-origin channel_close may record.
+ *  Closed on purpose: honest provenance means a small, auditable vocabulary,
+ *  not arbitrary self-description. */
+export const MACHINE_CLOSE_SOURCES = new Set(['subscription-gc', 'housekeeping']);
+
 export class ChannelRegistry {
   private serverRegistry: McplServerRegistry;
   private featureSetManager: FeatureSetManager;
@@ -855,8 +870,21 @@ export class ChannelRegistry {
 
   /**
    * Handle a call to one of the synthesized channel tools.
+   *
+   * `origin` is TRUSTED DISPATCH CONTEXT, supplied by the framework's own
+   * routing (dispatchChannelToolCall and the public executeToolCall for
+   * model-origin calls, the framework's private ModuleRegistry closure for
+   * module ctx.callTool) — never derived from tool input. Machine
+   * provenance on channel_close is honored only for module origin; a
+   * model-origin call carrying the same fields is recorded as the agent
+   * decision it actually is. Absent origin is treated as agent-origin (the
+   * untrusted-safe default).
    */
-  async handleChannelToolCall(toolName: string, input: unknown): Promise<ToolResult> {
+  async handleChannelToolCall(
+    toolName: string,
+    input: unknown,
+    origin?: ChannelToolOrigin,
+  ): Promise<ToolResult> {
     switch (toolName) {
       case 'channel_list':
         return this.handleToolList();
@@ -870,7 +898,15 @@ export class ChannelRegistry {
         });
 
       case 'channel_close':
-        return this.handleToolClose(input as { channelId: string; serverId?: string });
+        return this.handleToolClose(
+          input as {
+            channelId: string;
+            serverId?: string;
+            source?: string;
+            overrideExplicitOpen?: boolean;
+          },
+          origin,
+        );
 
       case 'channel_decline':
         return this.handleToolDecline(input as {
@@ -1588,7 +1624,25 @@ export class ChannelRegistry {
     }
   }
 
-  private async handleToolClose(input: { channelId: string; serverId?: string }): Promise<ToolResult> {
+  private async handleToolClose(
+    input: {
+      channelId: string;
+      serverId?: string;
+      /** Machine callers name their decision source ('subscription-gc',
+       *  'housekeeping') so the durable record carries honest provenance.
+       *  Honored ONLY for module-origin dispatch — tool input is untrusted,
+       *  so a model-origin call carrying this field is still recorded as
+       *  'agent-tool' (the resident may close their own channel; they may
+       *  not attribute the act to housekeeping). */
+      source?: string;
+      /** A machine close aimed at an explicitly-opened channel is refused
+       *  unless the caller certifies an explicit idle lease (a configured
+       *  per-channel budget is consent to close at that budget). Module
+       *  origin only, like `source`. */
+      overrideExplicitOpen?: boolean;
+    },
+    origin?: ChannelToolOrigin,
+  ): Promise<ToolResult> {
     const resolved = this.resolveToolChannelEntry(input.channelId, input.serverId);
     const entry = resolved.entry;
     if (!entry) {
@@ -1607,7 +1661,47 @@ export class ChannelRegistry {
       };
     }
 
-    this.setDesiredState(entry.serverId, input.channelId, 'closed', 'agent-tool');
+    // Provenance comes from trusted dispatch, not from self-description:
+    // only module-origin calls may record a machine source, and only from
+    // the closed vocabulary. Agent-origin (or origin-less — the safe
+    // default for any legacy caller) records 'agent-tool' and has its
+    // machine fields ignored entirely.
+    const isModuleOrigin = origin?.kind === 'module';
+    let closeSource = 'agent-tool';
+    if (isModuleOrigin && input.source !== undefined) {
+      if (!MACHINE_CLOSE_SOURCES.has(input.source)) {
+        return {
+          success: false,
+          isError: true,
+          error:
+            `Unknown machine close source '${input.source}'. Machine closes must use one of: ` +
+            `${[...MACHINE_CLOSE_SOURCES].join(', ')}.`,
+        };
+      }
+      closeSource = input.source;
+    }
+
+    // Housekeeping must not override stated intent (issue #5: GC closes wore
+    // the agent's badge and reset explicitly-opened doors). A machine-sourced
+    // close of a channel whose current desired state is an agent/operator
+    // 'open' is refused — structurally, so the caller can stand down rather
+    // than retry — unless it certifies an explicit idle lease.
+    if (isModuleOrigin && closeSource !== 'agent-tool' && !input.overrideExplicitOpen) {
+      const current = this.desiredStates.get(this.lifecycleKey(entry.serverId, input.channelId));
+      if (current?.state === 'open' && current.source === 'agent-tool') {
+        return {
+          success: false,
+          isError: false,
+          error:
+            `Channel ${input.channelId} was explicitly opened (source: agent-tool); ` +
+            `a '${closeSource}' close does not override stated intent. Machine closes ` +
+            `of explicit opens require an explicit idle lease (overrideExplicitOpen).`,
+          data: { refusal: 'explicit-open', channelId: input.channelId },
+        };
+      }
+    }
+
+    this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
     this.stopTyping(input.channelId);
 
     const server = this.serverRegistry.getServer(entry.serverId);
