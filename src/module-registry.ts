@@ -242,6 +242,25 @@ export class ModuleRegistry {
   }
 
   /**
+   * All utilities from all modules, namespaced exactly like tools
+   * (`module--name`). See Module.getUtilities — these are deliberately kept
+   * out of the model-facing tool list and surfaced through the framework's
+   * `utils` meta-tool; dispatch goes through the same handleToolCall.
+   */
+  getAllUtilities(): ToolDefinition[] {
+    const utilities: ToolDefinition[] = [];
+    for (const module of this.modules.values()) {
+      for (const util of module.getUtilities?.() ?? []) {
+        utilities.push({
+          ...util,
+          name: `${module.name}--${util.name}`,
+        });
+      }
+    }
+    return utilities;
+  }
+
+  /**
    * Handle a tool call by routing to the appropriate module.
    */
   async handleToolCall(call: ToolCall): Promise<ToolResult> {

@@ -224,6 +224,65 @@ const PROSE_HELP_TOOL: import('./types/index.js').ToolDefinition = {
 };
 /** Strip the `server--` MCPL prefix from a tool name. */
 const bareToolName = (n: string): string => n.split('--').pop()!;
+
+/** The single slot behind which every rarely-used capability lives. Only
+ *  advertised when at least one module contributes utilities — with none
+ *  registered the surface is byte-identical to before this existed. */
+const UTILS_TOOL: import('./types/index.js').ToolDefinition = {
+  name: 'utils',
+  description:
+    'Rarely-used utilities, behind one slot instead of each costing a tool. ' +
+    '"list" names them all with one-liners; "describe" returns one utility\'s full ' +
+    'input schema; "run" invokes it (args are validated against that schema — a ' +
+    'miss bounces back with the schema and the specific error).',
+  inputSchema: {
+    type: 'object' as const,
+    properties: {
+      action: { type: 'string', enum: ['list', 'describe', 'run'], description: 'What to do.' },
+      name: { type: 'string', description: 'Utility name from list (required for describe/run).' },
+      args: { type: 'object', description: "Arguments for run, per the utility's schema." },
+    },
+    required: ['action'],
+  },
+};
+
+/** First sentence (or line) of a description — what `utils list` shows. */
+const utilityOneLiner = (description: string): string => {
+  const line = description.split('\n')[0]!;
+  const dot = line.indexOf('. ');
+  return (dot >= 0 ? line.slice(0, dot + 1) : line).slice(0, 160);
+};
+
+/** Shallow validation of run args against a utility's declared inputSchema:
+ *  required keys, primitive types, enums. Deliberately not a full JSON-Schema
+ *  engine — handlers still hand-validate (they always did); this layer exists
+ *  so an arg-shape miss teaches by bounce instead of failing deep in a handler
+ *  with a less instructive message. Returns an error string or null. */
+function validateUtilityArgs(
+  input: unknown,
+  schema: import('./types/index.js').ToolDefinition['inputSchema'],
+): string | null {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    return 'args must be an object';
+  }
+  const obj = input as Record<string, unknown>;
+  for (const req of schema.required ?? []) {
+    if (!(req in obj) || obj[req] === undefined) return `missing required "${req}"`;
+  }
+  for (const [key, value] of Object.entries(obj)) {
+    const param = schema.properties?.[key];
+    if (!param || value === undefined) continue; // unknown keys: handler's business
+    if (param.enum && !(param.enum as unknown[]).includes(value)) {
+      return `"${key}" must be one of ${JSON.stringify(param.enum)}`;
+    }
+    if (param.type) {
+      const actual = Array.isArray(value) ? 'array' : value === null ? 'null' : typeof value;
+      const expected = param.type === 'integer' ? 'number' : param.type;
+      if (actual !== expected) return `"${key}" must be ${param.type}, got ${actual}`;
+    }
+  }
+  return null;
+}
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
 import { EventGate } from './gate/event-gate.js';
@@ -1313,6 +1372,8 @@ export class AgentFramework {
       : [];
     return [
       ...moduleTools,
+      // Utilities collapse into one slot; absent entirely when none exist.
+      ...(this.moduleRegistry.getAllUtilities().length > 0 ? [UTILS_TOOL] : []),
       ...this.mcplTools,
       ...channelTools,
       ...gateTools,
@@ -5787,6 +5848,13 @@ export class AgentFramework {
       return this.channelRegistry.handleChannelToolCall(call.name, call.input, origin);
     }
 
+    // The utils meta-tool — programmatic callers (code_execution scripts,
+    // ephemerals, ModuleContext.callTool) reach utilities the same way the
+    // model does.
+    if (call.name === 'utils') {
+      return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call);
+    }
+
     // Module tools
     return this.moduleRegistry.handleToolCall(call);
   }
@@ -6207,6 +6275,11 @@ export class AgentFramework {
     }
 
     // Route the agent's typed, allowlisted hot-settings surface.
+    if (enrichedCall.name === 'utils') {
+      this.dispatchUtilsToolCall(agentName, enrichedCall);
+      return;
+    }
+
     if (enrichedCall.name === 'agent_settings') {
       this.dispatchAgentSettingsToolCall(agentName, enrichedCall);
       return;
@@ -8557,6 +8630,83 @@ export class AgentFramework {
         });
       }
     })();
+  }
+
+  /** The `utils` meta-tool: list/describe/run over module utilities
+   *  (Module.getUtilities). Shared by the model-facing dispatcher and the
+   *  programmatic path (executeToolCall), so code_execution scripts and
+   *  ephemerals reach utilities too. */
+  private async handleUtilsToolCall(agentName: string, call: ToolCall): Promise<ToolResult> {
+    const input = (call.input ?? {}) as { action?: unknown; name?: unknown; args?: unknown };
+    const utilities = this.moduleRegistry.getAllUtilities();
+    const available = (): string =>
+      utilities.length ? utilities.map((u) => u.name).join(', ') : '(none registered)';
+    switch (input.action) {
+      case 'list':
+        return {
+          success: true,
+          data: utilities.map((u) => ({ name: u.name, description: utilityOneLiner(u.description) })),
+        };
+      case 'describe': {
+        const def = utilities.find((u) => u.name === input.name);
+        if (!def) {
+          return { success: false, isError: true, error: `No utility "${String(input.name)}". Available: ${available()}` };
+        }
+        return { success: true, data: def };
+      }
+      case 'run': {
+        const def = utilities.find((u) => u.name === input.name);
+        if (!def) {
+          return { success: false, isError: true, error: `No utility "${String(input.name)}". Available: ${available()}` };
+        }
+        const args = input.args ?? {};
+        const problem = validateUtilityArgs(args, def.inputSchema);
+        if (problem) {
+          // Teach by bounce: the error carries the schema, so the retry needs
+          // no describe round-trip.
+          return {
+            success: false,
+            isError: true,
+            error: `${problem}. Schema for ${def.name}: ${JSON.stringify(def.inputSchema)}`,
+          };
+        }
+        // Same dispatch as a first-class tool call — the module cannot tell
+        // which surface the call came through.
+        return this.moduleRegistry.handleToolCall({
+          id: call.id,
+          name: def.name,
+          input: args,
+          callerAgentName: agentName,
+        });
+      }
+      default:
+        return { success: false, isError: true, error: 'action must be "list", "describe", or "run"' };
+    }
+  }
+
+  private dispatchUtilsToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({ type: 'tool:started', module: 'framework', tool: 'utils', callId: call.id, input: call.input });
+    const startedAt = Date.now();
+    void this.handleUtilsToolCall(agentName, call)
+      .catch((err): ToolResult => ({
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+        isError: true,
+      }))
+      .then((result) => {
+        if (result.success) {
+          this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'utils', callId: call.id, durationMs: Date.now() - startedAt });
+        } else {
+          this.emitTrace({ type: 'tool:failed', module: 'framework', tool: 'utils', callId: call.id, error: result.error ?? 'unknown error' });
+        }
+        this.pushEvent({
+          type: 'tool-result',
+          callId: call.id,
+          agentName,
+          moduleName: 'framework',
+          result,
+        });
+      });
   }
 
   private dispatchAgentSettingsToolCall(agentName: string, call: ToolCall): void {

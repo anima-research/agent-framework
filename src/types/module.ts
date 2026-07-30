@@ -64,6 +64,18 @@ export interface Module {
   getTools(): ToolDefinition[];
 
   /**
+   * Utilities: agent-invocable operations that deliberately do NOT get a
+   * first-class tool slot. Every tool schema taxes every inference; a
+   * capability used twice a month shouldn't. Utilities are listed, described,
+   * and invoked through the framework's single `utils` tool instead — same
+   * ToolDefinition shape, same un-prefixed names, and dispatch arrives at the
+   * SAME handleToolCall as getTools() output, so a tool migrates between
+   * surfaces by moving its definition from one list to the other and nothing
+   * else. Optional; omitting it means the module contributes no utilities.
+   */
+  getUtilities?(): ToolDefinition[];
+
+  /**
    * Handle a tool call.
    * Tool name is without module prefix.
    */
