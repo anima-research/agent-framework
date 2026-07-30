@@ -200,8 +200,26 @@ export class WebSocketTransport extends McplTransport {
    * when `config.token` is set. Rejects on connect error / timeout (and tears
    * the socket down) so a failed dial never leaks an open handle.
    */
-  static open(config: McplServerConfig): Promise<WebSocketTransport> {
-    const url = buildWebSocketUrl(config);
+  static async open(config: McplServerConfig): Promise<WebSocketTransport> {
+    // Resolve the per-dial credential first: the provider runs on every
+    // connect AND reconnect, so rotation happens at the transport layer and
+    // nothing above it ever holds a credential.
+    let token: string | null = config.token ?? null;
+    if (config.tokenProvider) {
+      try {
+        token = (await config.tokenProvider()) ?? token;
+      } catch (err) {
+        // Fall back to the static token (if any) rather than failing the dial
+        // outright — the server will refuse a stale credential loudly anyway.
+        console.error(
+          `[mcpl] server "${config.id}": credential provider failed (${err instanceof Error ? err.message : err}) — dialing with static token`,
+        );
+      }
+    }
+    const url = buildWebSocketUrl(config, token);
+    // Error strings travel: traces, logs, tool results the model reads. They
+    // get the endpoint, never the credential.
+    const redacted = buildWebSocketUrl({ ...config, token: undefined }, null);
     const ws = new WebSocket(url);
 
     return new Promise<WebSocketTransport>((resolve, reject) => {
@@ -211,7 +229,7 @@ export class WebSocketTransport extends McplTransport {
         settled = true;
         ws.removeAllListeners();
         try { ws.terminate(); } catch { /* already gone */ }
-        reject(new Error(`MCPL server "${config.id}" WebSocket connect timed out after ${WS_OPEN_TIMEOUT_MS}ms (${url})`));
+        reject(new Error(`MCPL server "${config.id}" WebSocket connect timed out after ${WS_OPEN_TIMEOUT_MS}ms (${redacted})`));
       }, WS_OPEN_TIMEOUT_MS);
 
       ws.once('open', () => {
@@ -228,7 +246,7 @@ export class WebSocketTransport extends McplTransport {
         clearTimeout(timer);
         ws.removeAllListeners();
         try { ws.terminate(); } catch { /* already gone */ }
-        reject(new Error(`MCPL server "${config.id}" WebSocket connect failed: ${err.message} (${url})`));
+        reject(new Error(`MCPL server "${config.id}" WebSocket connect failed: ${err.message} (${redacted})`));
       });
     });
   }
@@ -261,7 +279,7 @@ export class WebSocketTransport extends McplTransport {
  * Build the dial URL: validate it's a ws(s):// URL and append the auth token as
  * a `token` query param when provided (preserving any existing query).
  */
-export function buildWebSocketUrl(config: McplServerConfig): string {
+export function buildWebSocketUrl(config: McplServerConfig, tokenOverride?: string | null): string {
   if (!config.url) {
     throw new Error(`MCPL server "${config.id}": websocket transport requires "url" (none provided)`);
   }
@@ -276,8 +294,9 @@ export function buildWebSocketUrl(config: McplServerConfig): string {
       `MCPL server "${config.id}": websocket url must be ws:// or wss://, got "${parsed.protocol}"`,
     );
   }
-  if (config.token) {
-    parsed.searchParams.set('token', config.token);
+  const token = tokenOverride !== undefined ? tokenOverride : config.token;
+  if (token) {
+    parsed.searchParams.set('token', token);
   }
   return parsed.toString();
 }

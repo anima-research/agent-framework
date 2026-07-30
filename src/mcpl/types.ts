@@ -198,6 +198,17 @@ export interface McplServerConfig {
    */
   token?: string;
 
+  /**
+   * Lazily resolves the connection credential at EVERY dial — first connect
+   * and each background reconnect — overriding `token` when it returns a
+   * value (null/throw falls back to `token`). Host-attached plumbing, never
+   * serialized: the point is that credentials stay out of the agent's
+   * context entirely (the agent asks for access by name; the host fetches
+   * something fresh each redial, which also makes short-lived credentials
+   * viable where a static `token` forced long ones).
+   */
+  tokenProvider?: () => Promise<string | null>;
+
   /** Feature sets to enable on connect */
   enabledFeatureSets?: string[];
 
