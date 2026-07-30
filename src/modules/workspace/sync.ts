@@ -40,7 +40,7 @@ export function hashContent(content: string | Buffer): string {
 /**
  * Check if content appears to be binary.
  */
-function isBinary(buffer: Buffer): boolean {
+export function isBinary(buffer: Buffer): boolean {
   // Check for null bytes in first 8KB
   const check = buffer.subarray(0, 8192);
   for (let i = 0; i < check.length; i++) {

@@ -34,7 +34,7 @@ import type {
 } from './types.js';
 import { WORKSPACE_FS_EVENT_TYPES, opToEventType } from './types.js';
 import { MountWatcher, type FsChange } from './watcher.js';
-import { syncFromFs, materializeToFs, hashContent, DEFAULT_MAX_FILE_SIZE, type ConflictInfo } from './sync.js';
+import { syncFromFs, materializeToFs, hashContent, isBinary, DEFAULT_MAX_FILE_SIZE, type ConflictInfo } from './sync.js';
 
 export type {
   WorkspaceConfig,
@@ -1328,6 +1328,11 @@ export class WorkspaceModule implements Module {
       if (!fileStat.isFile() || fileStat.size > maxSize) return;
 
       const buffer = await readFile(absolutePath);
+      // Binaries are never synced into the tree (mirrors syncFromFs): the old
+      // utf-8 round-trip here silently replaced non-UTF-8 bytes with U+FFFD,
+      // permanently mangling images in the blob store. Binary reads are served
+      // straight from disk (readImageFromFilesystem / read_image fallback).
+      if (isBinary(buffer)) return;
       const content = buffer.toString('utf-8');
       const blobHash = store.storeBlob(Buffer.from(content, 'utf-8'), 'text/plain');
 

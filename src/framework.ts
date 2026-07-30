@@ -8447,6 +8447,38 @@ export class AgentFramework {
         if (typeof input.path !== 'string' || input.path.length === 0) {
           throw new Error('read_image: `path` (mount-prefixed) is required');
         }
+        // Anthropic rejects images >5MB (and >8000px); guard the hard byte
+        // limit here — resizing is out of scope without an image library.
+        const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+        // Prefer the workspace module's own read_image handler when it exists:
+        // it reads tree-first with a FILESYSTEM FALLBACK, so binaries that live
+        // only on disk (shell-created files, pre-fix mangled tree blobs) still
+        // render. The legacy tree-only path below stays for older workspace
+        // modules that don't advertise the tool.
+        if (
+          typeof workspace.handleToolCall === 'function' &&
+          typeof workspace.getTools === 'function' &&
+          workspace.getTools().some((tool) => tool.name === 'read_image')
+        ) {
+          const result = await workspace.handleToolCall({ ...call, name: 'read_image' });
+          if (result.success && Array.isArray(result.data)) {
+            const image = result.data.find(
+              (block): block is { type: 'image'; data: string; mimeType: string } =>
+                typeof block === 'object' && block !== null &&
+                (block as { type?: unknown }).type === 'image' &&
+                typeof (block as { data?: unknown }).data === 'string',
+            );
+            const byteLength = image ? Math.floor((image.data.length * 3) / 4) : 0;
+            if (byteLength > MAX_IMAGE_BYTES) {
+              throw new Error(
+                `read_image: "${input.path}" is ~${byteLength} bytes — ` +
+                `over the ${MAX_IMAGE_BYTES}-byte model limit`,
+              );
+            }
+          }
+          finish(result);
+          return;
+        }
         const read = await workspace.readBinary(input.path);
         if ('error' in read) throw new Error(read.error);
         const mediaType = sniffImageMediaType(read.data);
@@ -8456,9 +8488,6 @@ export class AgentFramework {
             '(png/jpeg/gif/webp — checked by magic bytes, not extension)',
           );
         }
-        // Anthropic rejects images >5MB (and >8000px); guard the hard byte
-        // limit here — resizing is out of scope without an image library.
-        const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
         if (read.data.byteLength > MAX_IMAGE_BYTES) {
           throw new Error(
             `read_image: "${input.path}" is ${read.data.byteLength} bytes — ` +

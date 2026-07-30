@@ -590,3 +590,88 @@ test('process logging persists a redacted image receipt while the live round kee
     redacted: true,
   });
 });
+
+test('lazy sync never ingests binaries: tree stays clean and read_image serves shell-created files from disk', async (t) => {
+  const { mountDir, store, workspace, treeStateId } = setupWorkspace(t);
+  const image = TINY_IMAGES.png;
+  // A binary created OUTSIDE workspace tools (shell/curl) — the Fable avatar case.
+  writeFileSync(join(mountDir, 'shell-made.png'), image.bytes);
+
+  // readBinary triggers lazy sync; the binary must be SKIPPED, not utf-8-mangled.
+  const read = await workspace.readBinary('work/shell-made.png');
+  assert.ok('error' in read, 'binary must not be lazily synced into the tree');
+  assert.equal(store.treeGet(treeStateId, 'shell-made.png'), null);
+
+  // The module read_image handler serves it from disk, bytes exact.
+  const result = await callReadImage(workspace, 'work/shell-made.png');
+  expectImageResult(result, 'work/shell-made.png', image);
+
+  // Text files keep lazy-syncing as before.
+  writeFileSync(join(mountDir, 'note.txt'), 'plain text survives lazy sync');
+  const text = await workspace.readBinary('work/note.txt');
+  assert.ok('data' in text);
+  assert.equal(text.data.toString('utf-8'), 'plain text survives lazy sync');
+});
+
+test('bare read_image dispatch falls back to disk when the tree blob is utf-8 mangled (pre-fix stores)', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'af-read-image-mangled-'));
+  const mountDir = join(root, 'mount');
+  mkdirSync(mountDir, { recursive: true });
+  const image = TINY_IMAGES.png;
+  writeFileSync(join(mountDir, 'grid-1.png'), image.bytes);
+
+  const membrane = new MockMembrane();
+  const workspaceModule = new WorkspaceModule({
+    mounts: [{ name: 'work', path: mountDir, mode: 'read-write', watch: 'never' }],
+  });
+  // BARE tool name — the framework-synthesized surface Fable actually called.
+  membrane.pushResponse(createStreamResponse([
+    { type: 'tool_use', id: 'img-mangled-1', name: 'read_image', input: { path: 'work/grid-1.png' } },
+  ], 'tool_use'));
+  membrane.pushResponse(createStreamResponse([{ type: 'text', text: 'Done.' }]));
+
+  const framework = await AgentFramework.create({
+    storePath: join(root, 'framework.chronicle'),
+    membrane: membrane.asMembrane(),
+    agents: [{ name: 'assistant', model: 'mock', systemPrompt: 'test' }],
+    modules: [workspaceModule, createInferenceKickModule()],
+    syncIntervalMs: 0,
+    maintenanceIntervalMs: 0,
+  });
+  workspaceModule.initStore(framework.getStore());
+  t.after(async () => {
+    await framework.stop().catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  // Poison the tree exactly the way the old ensureSynced did: utf-8 round-trip.
+  const store = framework.getStore();
+  const mangled = Buffer.from(image.bytes.toString('utf-8'), 'utf-8');
+  assert.notDeepEqual(mangled, image.bytes, 'sanity: utf-8 round-trip must corrupt the PNG');
+  store.treeSet('workspace/work/tree', 'grid-1.png', {
+    blobHash: store.storeBlob(mangled, 'text/plain'),
+    size: mangled.byteLength,
+    mode: 0o644,
+  });
+
+  framework.pushEvent({
+    type: 'external-message',
+    source: 'test',
+    content: 'Read work/grid-1.png',
+    metadata: {},
+  });
+  await framework.runUntilIdle();
+
+  const live = membrane.lastStream?.receivedToolResults[0] as Array<{
+    toolUseId: string;
+    isError: boolean;
+    content: Array<{ type: string; source?: { data: string; mediaType: string } }>;
+  }> | undefined;
+  assert.ok(live, 'tool result must reach the live round');
+  assert.equal(live![0]!.toolUseId, 'img-mangled-1');
+  assert.equal(live![0]!.isError, false, 'mangled tree blob must fall back to disk, not error');
+  const imageBlock = live![0]!.content.find((b) => b.type === 'image');
+  assert.ok(imageBlock?.source);
+  assert.equal(imageBlock!.source!.data, image.bytes.toString('base64'), 'bytes must be the DISK bytes, exact');
+  assert.equal(imageBlock!.source!.mediaType, 'image/png');
+});
