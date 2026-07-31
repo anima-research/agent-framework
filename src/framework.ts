@@ -3620,6 +3620,73 @@ export class AgentFramework {
             && agent.lastStreamInputTokens > 0
             && agent.lastStreamInputTokens > agent.maxStreamTokens;
 
+          // Addressed re-pin (2026-07-31 Mythos misroutes, antra-ratified):
+          // when someone ADDRESSES the agent mid-turn from another channel
+          // (mention / reply / DM — the same chat:addressed signal the
+          // turn-START batch policy prefers), the agent's subsequent plain
+          // prose almost always answers THEM. Six recorded misroutes
+          // delivered those answers to the stale frozen locus instead (the
+          // LabClaude answer into #hospital_commons mid-examination; the
+          // hospital scene into antra's DM). Re-pin the turn locus to the
+          // LAST addressed conversational injection, at segment granularity:
+          // prose routed in earlier rounds already went to the old pin,
+          // which was correct when it was delivered. Ambient chatter,
+          // reactions, and system markers still cannot move the pin — the
+          // 2026-07-21 Cairn hijack protection is unchanged; this extends
+          // the ratified addressed-outranks-ambient principle from turn
+          // start to boundaries. Locus mode only (explicit mode has no pin).
+          // Skipped on endTurn/overBudget: no further prose this stream, and
+          // a stale "for this turn" notice would be pure noise.
+          //
+          // The notice rides the SAME injection batch — stored right after
+          // the flushed messages and appended to midTurnInjections — so the
+          // window byte-matches the wire (short event-style notice: the
+          // classifier-safe D-class from the 2026-07-24 ablation). It also
+          // updates lastAnnouncedLocus so the next turn's announce-on-change
+          // diffs against what the agent was actually last told.
+          if (
+            agent.proseRouting !== 'explicit' &&
+            !shouldEndTurn && !overBudget && currentState.stream
+          ) {
+            const lastAddressed = [...midTurnInjections].reverse().find((inj) => {
+              const m = inj.metadata as Record<string, unknown> | undefined;
+              return (
+                isConversationalInjection(inj.metadata) &&
+                typeof m?.channelId === 'string' &&
+                isAddressedMessage(m.tags as string[] | undefined, m)
+              );
+            });
+            const newLocus = (lastAddressed?.metadata as Record<string, unknown> | undefined)
+              ?.channelId as string | undefined;
+            if (newLocus && this.turnLocusPins.get(agent.name) !== newLocus) {
+              const prevPin = this.turnLocusPins.get(agent.name) ?? null;
+              this.turnLocusPins.set(agent.name, newLocus);
+              this.lastAnnouncedLocus.set(agent.name, newLocus);
+              const label = this.channelRegistry?.getDescriptor(newLocus)?.label;
+              const shown = label && label !== newLocus
+                ? `${label.startsWith('#') ? label : `#${label}`} (${newLocus})`
+                : newLocus;
+              const noticeContent: ContentBlock[] = [{
+                type: 'text',
+                text:
+                  `[routing] You were just addressed from ${shown} — your plain ` +
+                  'speech now lands there for the rest of this turn. Other ' +
+                  'channels need an explicit send tool.',
+              }];
+              const noticeMeta = { system: true, kind: 'routing-notice' } as MessageMetadata;
+              try {
+                const id = agent.getContextManager().addMessage('user', noticeContent, noticeMeta);
+                this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
+                midTurnInjections.push({ participant: 'user', content: noticeContent, metadata: noticeMeta });
+                console.error(
+                  `[routing] ${agent.name}: mid-turn addressed re-pin ${prevPin ?? '(none)'} -> ${newLocus}`,
+                );
+              } catch (err) {
+                console.error('mid-turn locus re-pin: failed to record routing notice:', err);
+              }
+            }
+          }
+
           if (shouldEndTurn) {
             // endTurn: messages already stored above, cancel stream, reset to idle.
             if (currentState.stream) {

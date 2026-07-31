@@ -321,6 +321,94 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it('an ADDRESSED mid-turn injection re-pins the locus for subsequent prose', async () => {
+    // 2026-07-31 Mythos misroutes (n=6): someone explicitly addresses the
+    // agent from another channel mid-turn (mention / reply / DM); the
+    // agent's trailing prose answers THEM but the frozen pin delivered it
+    // to the stale locus (the hospital scene into antra's DM, and its
+    // mirror). Addressed conversational injections — the chat:addressed
+    // signal turn-START batching already prefers — now move the pin, with a
+    // one-line [routing] notice riding the same injection batch so window
+    // and wire agree. Ambient injections still cannot (previous test).
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Answering the person who addressed me.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, quick question over here?';
+    module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
+
+    const notices: string[] = [];
+    framework.onTrace((event) => {
+      const e = event as { type: string; source?: string };
+      if (e.type === 'message:added' && e.source === 'routing-notice') notices.push(e.source!);
+    });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    // Round-1 prose predates the injection and belongs to the old pin;
+    // trailing prose follows the addressed speaker.
+    assert.deepEqual(routed, [
+      { text: 'Station four, proceeding.', locus: 'chan-live-1' },
+      { text: 'Answering the person who addressed me.', locus: 'discord:dm:antra' },
+    ]);
+    // Boot-baseline announcement + the mid-turn re-pin notice.
+    assert.equal(notices.length, 2, 'the re-pin produced exactly one routing notice');
+    // The notice rode the injection batch to the live stream (window == wire).
+    const injectedBatches = membrane.lastStream!.receivedToolResultOptions
+      .map((o) => o?.injectedMessages ?? []);
+    const wired = injectedBatches.flat().map((m) => JSON.stringify(m.content));
+    assert.ok(
+      wired.some((s) => s.includes('quick question')),
+      'the addressed message itself was injected',
+    );
+    assert.ok(
+      wired.some((s) => s.includes('[routing] You were just addressed from discord:dm:antra')),
+      'the re-pin notice was injected alongside it',
+    );
+
+    await framework.stop();
+  });
+
+  it('an addressed injection from the CURRENT locus does not chatter a notice', async () => {
+    // Same-channel addressed input is the ordinary case (the person the
+    // agent is already talking to sends another message mid-turn): the pin
+    // is already right, so no re-pin and — critically for KV — no notice.
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Continuing right here.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'and one more thing';
+    module.interjectionMetadata = { channelId: 'chan-live-1', tags: ['chat:addressed'] };
+
+    const notices: string[] = [];
+    framework.onTrace((event) => {
+      const e = event as { type: string; source?: string };
+      if (e.type === 'message:added' && e.source === 'routing-notice') notices.push(e.source!);
+    });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'Continuing right here.', locus: 'chan-live-1' }]);
+    assert.equal(notices.length, 1, 'only the boot-baseline announcement — no re-pin chatter');
+
+    await framework.stop();
+  });
+
   it('reactions and system markers injected mid-turn do not clear send suppression', async () => {
     // A reaction (`chat:reaction` tag) or a `system: true` marker is not
     // conversational input: prose following an explicit send stays suppressed,
