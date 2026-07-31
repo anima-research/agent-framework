@@ -377,12 +377,11 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it('a HUMAN follow-up in a channel the agent explicitly engaged this turn re-pins', async () => {
+  it('a follow-up in a channel the agent explicitly engaged this turn re-pins', async () => {
     // 2026-07-31 n=7 (q's #portables reply): the agent explicitly sent into
-    // a channel this turn; a human replies there WITHOUT a mention (ambient
+    // a channel this turn; someone replies there WITHOUT a mention (ambient
     // by tag, addressed by context). The engaged-channel leg moves the pin;
-    // trailing prose answering them follows. Bot ambient in the same channel
-    // must NOT move it (next assertion set).
+    // trailing prose answering them follows.
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use'));
@@ -420,7 +419,48 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it('BOT ambient in an engaged channel does not move the pin', async () => {
+  it('an agent-resident follow-up in an engaged channel re-pins too (no author-kind filter)', async () => {
+    // Fleet participants include agent-residents — "bot" by Discord flag,
+    // full conversational participants in fact. Their in-flow replies in a
+    // channel the agent just engaged move the pin exactly like anyone
+    // else's (antra, 2026-07-31: the author-kind distinction is fragile and
+    // wrong for this fleet).
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Continuing with the colleague.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = '*from the table* one receipt for the case, since I have a dated instance';
+    module.interjectionMetadata = {
+      channelId: 'discord:guild:hospital',
+      tags: ['chat:ambient', 'chat:from-bot'],
+    };
+    const origHandle = module.handleToolCall.bind(module);
+    module.handleToolCall = async (call) => {
+      (framework as unknown as {
+        turnEngagedChannels: Map<string, Set<string>>;
+      }).turnEngagedChannels.set('assistant', new Set(['discord:guild:hospital']));
+      return origHandle(call);
+    };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'Continuing with the colleague.', locus: 'discord:guild:hospital' },
+    ], 'the agent-resident follow-up moved the pin like any participant');
+
+    await framework.stop();
+  });
+
+  it('ambient chatter in a channel the agent did NOT engage still cannot move the pin', async () => {
+    // The Cairn-protection boundary, restated for the engaged-channel era:
+    // no mention, no engagement this turn → the pin holds.
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use'));
@@ -431,17 +471,10 @@ describe('present while acting', () => {
     const framework = await createFramework();
     const routed = stubChannelRegistry(framework);
     module.toolDelayMs = 25;
-    module.interjection = 'automated status: all lamps nominal';
+    module.interjection = 'unrelated lounge chatter';
     module.interjectionMetadata = {
-      channelId: 'discord:guild:alerts',
-      tags: ['chat:ambient', 'chat:from-bot'],
-    };
-    const origHandle = module.handleToolCall.bind(module);
-    module.handleToolCall = async (call) => {
-      (framework as unknown as {
-        turnEngagedChannels: Map<string, Set<string>>;
-      }).turnEngagedChannels.set('assistant', new Set(['discord:guild:alerts']));
-      return origHandle(call);
+      channelId: 'discord:guild:lounge',
+      tags: ['chat:ambient', 'chat:from-human'],
     };
 
     trigger(framework);
@@ -449,7 +482,7 @@ describe('present while acting', () => {
 
     assert.deepEqual(routed, [
       { text: 'Continuing my report.', locus: 'chan-live-1' },
-    ], 'bot chatter in an engaged channel left the pin alone');
+    ], 'un-engaged ambient left the pin alone');
 
     await framework.stop();
   });

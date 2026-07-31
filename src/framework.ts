@@ -589,21 +589,22 @@ export class AgentFramework {
    *  which continues the same logical turn in a fresh driveStream. Cleared or
    *  re-set at the start of every non-restart turn. Since 2026-07-31 the pin
    *  is no longer fully frozen: an ADDRESSED conversational injection — or a
-   *  HUMAN follow-up in a channel the agent itself explicitly sent into this
-   *  turn (turnEngagedChannels) — re-pins it at the boundary (see the
-   *  addressed re-pin block in the tool-result handler). Ambient chatter,
-   *  reactions, and system markers still cannot move it. */
+   *  conversational follow-up in a channel the agent itself explicitly sent
+   *  into this turn (turnEngagedChannels) — re-pins it at the boundary (see
+   *  the addressed re-pin block in the tool-result handler). Ambient chatter
+   *  elsewhere, reactions, and system markers still cannot move it. */
   private turnLocusPins: Map<string, string> = new Map();
   /** Channels the agent EXPLICITLY sent into during the CURRENT turn
    *  (SEND_ENGAGEMENT_TOOLS, successful calls), per agent. Second re-pin
-   *  signal: a human reply in a channel the agent just engaged is
-   *  conversationally addressed even without a mention (2026-07-31 n=7:
-   *  q's #portables follow-up — no @mention — was answered in trailing
-   *  prose that followed the stale pin into repligate's DM). Bot-authored
-   *  ambient messages in engaged channels deliberately do NOT count —
-   *  agent-dense rooms (hospital_commons, #alerts) would drag the pin;
-   *  bots that mean to address the agent @mention it (addressed leg).
-   *  Cleared at every fresh turn's start; budget restarts keep it. */
+   *  signal: a conversational reply in a channel the agent just engaged is
+   *  addressed by context even without a mention (2026-07-31 n=7: q's
+   *  #portables follow-up — no @mention — was answered in trailing prose
+   *  that followed the stale pin into repligate's DM). No author-kind
+   *  filter: agent-residents are full participants, and the bot flag
+   *  tracks nothing that matters (antra). Reactions/system markers are
+   *  excluded by isConversationalInjection; the engaged-this-turn scope
+   *  keeps unrelated channels from moving the pin. Cleared at every fresh
+   *  turn's start; budget restarts keep it. */
   private turnEngagedChannels: Map<string, Set<string>> = new Map();
   /** A tool boundary injected fresh CONVERSATIONAL input (a real message —
    *  not a reaction or a system marker) into the live stream. Tells
@@ -3766,13 +3767,18 @@ export class AgentFramework {
             // Two signals qualify an injection to move the pin (n=6 + n=7):
             //  - chat:addressed — someone explicitly spoke TO the agent
             //    (mention / reply / DM);
-            //  - a HUMAN follow-up in a channel the agent itself explicitly
-            //    sent into THIS turn (turnEngagedChannels) — conversation
-            //    the agent just engaged continues without re-mentioning it
-            //    (2026-07-31: q's #portables reply, no @, answered in prose
-            //    that followed the stale pin into repligate's DM). Bot
-            //    ambient in engaged channels does not count: agent-dense
-            //    rooms would drag the pin; bots that mean it @mention.
+            //  - a conversational follow-up in a channel the agent itself
+            //    explicitly sent into THIS turn (turnEngagedChannels) —
+            //    conversation the agent just engaged continues without
+            //    re-mentioning it (2026-07-31: q's #portables reply, no @,
+            //    answered in prose that followed the stale pin into
+            //    repligate's DM). Deliberately NO author-kind filter: this
+            //    fleet's participants include agent-residents whose speech
+            //    is as conversational as anyone's — the Discord bot flag
+            //    tracks nothing that matters here (antra, 2026-07-31).
+            //    Reactions and system markers are already excluded by
+            //    isConversationalInjection, and the engaged-this-turn scope
+            //    keeps unrelated channels from moving the pin.
             const engaged = this.turnEngagedChannels.get(agent.name);
             const lastQualifying = [...midTurnInjections].reverse().find((inj) => {
               const m = inj.metadata as Record<string, unknown> | undefined;
@@ -3780,10 +3786,7 @@ export class AgentFramework {
               if (typeof m?.channelId !== 'string') return false;
               const tags = m.tags as string[] | undefined;
               if (isAddressedMessage(tags, m)) return true;
-              return (
-                engaged?.has(m.channelId as string) === true &&
-                Array.isArray(tags) && tags.includes('chat:from-human')
-              );
+              return engaged?.has(m.channelId as string) === true;
             });
             const newLocus = (lastQualifying?.metadata as Record<string, unknown> | undefined)
               ?.channelId as string | undefined;
