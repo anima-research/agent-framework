@@ -313,7 +313,16 @@ class ScriptToolModule implements Module {
     return { success: true, data: { echoed: call.input } };
   }
 
-  async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    if (event.type === 'external-message') {
+      const content = Array.isArray((event as { content?: unknown }).content)
+        ? ((event as { content: unknown }).content as Array<{ type: string; text?: string }>)
+        : [{ type: 'text', text: String((event as { content?: unknown }).content) }];
+      return {
+        addMessages: [{ participant: 'User', content: content as never }],
+        requestInference: true,
+      };
+    }
     return {};
   }
 }
@@ -469,3 +478,340 @@ describe('framework code_execution integration (real python3)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Background scripts (wake_agent) + spill-to-file
+// ---------------------------------------------------------------------------
+
+describe('PyRunner background mode (real python3)', () => {
+  it('wake_agent reports the caller line and payload; log file journals output', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'pytc-bg-'));
+    const logPath = join(tempDir, 'nested', 'bg.log');
+    const wakes: Array<{ line: number; payload: unknown }> = [];
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const code = [
+        'print("watcher starting")',        // line 1
+        'x = 1',                            // line 2
+        'await wake_agent({"hit": x})',     // line 3
+        'print("after wake")',              // line 4
+      ].join('\n');
+      const result = await runner.exec(code, [], {
+        logPath,
+        lifetimeMs: 30_000,
+        onWake: async (line, payload) => {
+          wakes.push({ line, payload });
+          return null;
+        },
+      });
+      assert.strictEqual(result.returnCode, 0, result.tail ?? '');
+      assert.strictEqual(wakes.length, 1);
+      assert.strictEqual(wakes[0].line, 3);
+      assert.deepStrictEqual(wakes[0].payload, { hit: 1 });
+      const { readFileSync } = await import('node:fs');
+      const log = readFileSync(logPath, 'utf8');
+      assert.match(log, /watcher starting/);
+      assert.match(log, /after wake/);
+      assert.match(result.tail ?? '', /after wake/);
+    } finally {
+      runner.dispose();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a refused wake raises RuntimeError inside the script', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const result = await runner.exec('await wake_agent({"n": 1})', [], {
+        logPath: null,
+        lifetimeMs: 30_000,
+        onWake: async () => 'wake limit reached (test)',
+      });
+      assert.strictEqual(result.returnCode, 1);
+      assert.match(result.tail ?? '', /RuntimeError: wake_agent refused by host: wake limit reached/);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('wake_agent is absent in foreground scripts', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const result = await runner.exec('print("wake_agent" in globals())', []);
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.match(result.stdout, /False/);
+    } finally {
+      runner.dispose();
+    }
+  });
+});
+
+describe('framework background scripts + spill (real python3)', () => {
+  async function createBgFramework(storePath: string, membrane: MockMembrane, opts?: {
+    mountDir?: string;
+    codeExecution?: Record<string, unknown>;
+  }) {
+    const { WorkspaceModule } = await import('../src/modules/workspace/index.js');
+    const modules: Module[] = [new ScriptToolModule()];
+    let workspace: InstanceType<typeof WorkspaceModule> | null = null;
+    if (opts?.mountDir) {
+      workspace = new WorkspaceModule({
+        mounts: [{ name: 'files', path: opts.mountDir, mode: 'read-write', watch: 'never' }],
+      });
+      modules.push(workspace as unknown as Module);
+    }
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [{
+        name: 'prime',
+        model: 'test-model',
+        systemPrompt: 'You are prime.',
+        allowedTools: 'all',
+      }],
+      modules,
+      syncIntervalMs: 0,
+      codeExecution: {
+        enabled: true,
+        wakeMinIntervalMs: 0,
+        ...(opts?.codeExecution ?? {}),
+      },
+    });
+    // Host wiring (fkm does this in production): mounts populate in initStore.
+    workspace?.initStore(framework.getStore());
+    return framework;
+  }
+
+  it('background script detaches, wakes the agent with provenance, and triggers inference', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-bgfw-');
+    const mountDir = join(tempDir, 'mount');
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(mountDir, { recursive: true });
+    const membrane = new MockMembrane();
+
+    const bgCode = [
+      'import asyncio',
+      'await asyncio.sleep(0.2)',
+      'await wake_agent({"found": "signal"})',
+    ].join('\\n');
+
+    // Turn 1: spawn the background script, then finish the turn.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Arming watcher.' },
+      { type: 'tool_use', id: 'call_bg1', name: 'code_execution', input: { code: bgCode.split('\\n').join('\n'), background: true } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Watcher armed; resting.' }]));
+    // Turn 2 (the wake): agent answers.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Woke and handled.' }]));
+
+    const framework = await createBgFramework(storePath, membrane, { mountDir });
+    try {
+      framework.start();
+      framework.pushEvent({
+        type: 'external-message',
+        source: 'test',
+        content: [{ type: 'text', text: 'arm a watcher' }],
+        metadata: {},
+        triggerInference: true,
+      } as unknown as ProcessEvent);
+
+      // Wait for: turn 1 result mentions script started, then wake message lands.
+      const deadline = Date.now() + 20_000;
+      let wakeMessage: { content: ContentBlockLike[] } | null = null;
+      while (Date.now() < deadline && !wakeMessage) {
+        await new Promise((r) => setTimeout(r, 100));
+        const cm = framework.getAgent('prime')?.getContextManager();
+        const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
+        wakeMessage = msgs.find((m) => m.metadata?.source === 'background-script') ?? null;
+      }
+      assert.ok(wakeMessage, 'wake message should be injected');
+      const text = (wakeMessage.content[0] as { text?: string }).text ?? '';
+      assert.match(text, /\[background script bg-\d+\] Woke you/);
+      assert.match(text, /line 3 of your script/);
+      assert.match(text, /"found": "signal"/);
+      assert.match(text, /workspace file files\/background-scripts\/bg-\d+\.log/);
+      assert.match(text, /Script status: still running|Script status/);
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('list and cancel manage the daemon fleet; cap enforced', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-bglist-');
+    const membrane = new MockMembrane();
+    const framework = await createBgFramework(storePath, membrane, {
+      codeExecution: { maxBackgroundScripts: 1 },
+    });
+    try {
+      const idle = 'import asyncio\nawait asyncio.sleep(60)';
+      const first = await framework.executeToolCall({
+        id: 'c1', name: 'code_execution', input: { code: idle, background: true }, callerAgentName: 'prime',
+      });
+      assert.strictEqual(first.success, true, JSON.stringify(first));
+      const firstId = (first.data as { script_id: string }).script_id;
+
+      const second = await framework.executeToolCall({
+        id: 'c2', name: 'code_execution', input: { code: idle, background: true }, callerAgentName: 'prime',
+      });
+      assert.strictEqual(second.isError, true);
+      assert.match(String(second.error), /limit reached/);
+
+      const list = await framework.executeToolCall({
+        id: 'c3', name: 'code_execution', input: { action: 'list' }, callerAgentName: 'prime',
+      });
+      const scripts = (list.data as { background_scripts: Array<{ script_id: string; status: string }> }).background_scripts;
+      assert.strictEqual(scripts.filter((s) => s.status === 'running').length, 1);
+
+      const cancel = await framework.executeToolCall({
+        id: 'c4', name: 'code_execution', input: { action: 'cancel', script_id: firstId }, callerAgentName: 'prime',
+      });
+      assert.strictEqual(cancel.success, true);
+      assert.strictEqual((cancel.data as { status: string }).status, 'cancelled');
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('crashed background script wakes the agent with the error tail', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-bgcrash-');
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
+    const framework = await createBgFramework(storePath, membrane, {});
+    try {
+      framework.start();
+      const started = await framework.executeToolCall({
+        id: 'c1',
+        name: 'code_execution',
+        input: { code: 'import asyncio\nawait asyncio.sleep(0.1)\nraise ValueError("watcher exploded")', background: true },
+        callerAgentName: 'prime',
+      });
+      assert.strictEqual(started.success, true, JSON.stringify(started));
+
+      const deadline = Date.now() + 20_000;
+      let crashMessage: { content: ContentBlockLike[] } | null = null;
+      while (Date.now() < deadline && !crashMessage) {
+        await new Promise((r) => setTimeout(r, 100));
+        const cm = framework.getAgent('prime')?.getContextManager();
+        const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{ content: ContentBlockLike[]; metadata?: { source?: string } }>;
+        crashMessage = msgs.find((m) => m.metadata?.source === 'background-script') ?? null;
+      }
+      assert.ok(crashMessage, 'crash wake should be injected');
+      const text = (crashMessage.content[0] as { text?: string }).text ?? '';
+      assert.match(text, /DIED/);
+      assert.match(text, /ValueError: watcher exploded/);
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('oversized tool results spill to a workspace file with a reference', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-spill-');
+    const mountDir = join(tempDir, 'mount');
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(mountDir, { recursive: true });
+    const membrane = new MockMembrane();
+
+    // big module: returns ~600KB (strategy default maxMessageTokens absent →
+    // maxChars undefined → no spill). Force the cap via agent_settings-style
+    // override path by configuring a small maxMessageTokens on the agent.
+    class BigToolModule implements Module {
+      readonly name = 'big';
+      async start(): Promise<void> {}
+      async stop(): Promise<void> {}
+      getTools(): ToolDefinition[] {
+        return [{ name: 'blob', description: 'Returns JSON: huge string.', inputSchema: { type: 'object', properties: {} } }];
+      }
+      async handleToolCall(): Promise<ToolResult> {
+        return { success: true, data: { blob: 'x'.repeat(600_000) } };
+      }
+      async onProcess(event: ProcessEvent): Promise<EventResponse> {
+        if (event.type === 'external-message') {
+          return {
+            addMessages: [{ participant: 'User', content: (event as { content: unknown }).content as never }],
+            requestInference: true,
+          };
+        }
+        return {};
+      }
+    }
+
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Fetching blob.' },
+      { type: 'tool_use', id: 'call_blob', name: 'big--blob', input: {} },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Handled.' }]));
+
+    const { WorkspaceModule } = await import('../src/modules/workspace/index.js');
+    const spillWorkspace = new WorkspaceModule({
+      mounts: [{ name: 'files', path: mountDir, mode: 'read-write', watch: 'never' }],
+    });
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [{
+        name: 'prime',
+        model: 'test-model',
+        systemPrompt: 'You are prime.',
+        allowedTools: 'all',
+        strategy: new CappedPassthroughStrategy() as never,
+      }],
+      modules: [
+        new BigToolModule(),
+        spillWorkspace as unknown as Module,
+      ],
+      syncIntervalMs: 0,
+      codeExecution: { enabled: true },
+    });
+    spillWorkspace.initStore(framework.getStore());
+    try {
+      framework.start();
+      framework.pushEvent({
+        type: 'external-message',
+        source: 'test',
+        content: [{ type: 'text', text: 'get the blob' }],
+        metadata: {},
+        triggerInference: true,
+      } as unknown as ProcessEvent);
+
+      const deadline = Date.now() + 20_000;
+      let toolResultText: string | null = null;
+      while (Date.now() < deadline && !toolResultText) {
+        await new Promise((r) => setTimeout(r, 100));
+        const cm = framework.getAgent('prime')?.getContextManager();
+        const msgs = (cm?.queryMessages({}).messages ?? []) as unknown as Array<{ content: Array<{ type: string; content?: string }> }>;
+        for (const m of msgs) {
+          for (const b of m.content ?? []) {
+            if (b.type === 'tool_result' && typeof b.content === 'string' && b.content.includes('[truncated')) {
+              toolResultText = b.content;
+            }
+          }
+        }
+      }
+      assert.ok(toolResultText, 'spilled tool result should be stored');
+      assert.match(toolResultText, /full content: workspace file files\/tool-results\//);
+      assert.match(toolResultText, /tool_result_inline_max_chars/);
+      assert.ok(toolResultText.length < 20_000, 'inline copy must be capped');
+      // The full content lives in the chronicle tree — the same place the
+      // agent's own read tool looks (disk materialization is async and
+      // watch-mode-dependent; not what we're testing here).
+      const refMatch = toolResultText.match(/workspace file (files\/tool-results\/\S+\.txt)/);
+      assert.ok(refMatch, 'reference should name the spill file');
+      const spilledFile = await spillWorkspace.readBinary(refMatch[1]);
+      assert.ok('data' in spilledFile, `spill file should be readable: ${JSON.stringify(spilledFile)}`);
+      assert.ok((spilledFile as { data: Buffer }).data.byteLength >= 600_000, 'full content in file');
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+type ContentBlockLike = { type: string; text?: string };
+
+import { PassthroughStrategy } from '../src/index.js';
+class CappedPassthroughStrategy extends PassthroughStrategy {
+  readonly maxMessageTokens = 1000;
+}

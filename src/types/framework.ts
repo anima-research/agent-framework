@@ -58,6 +58,16 @@ export interface CodeExecutionConfig {
    * 0 disables reclaim.
    */
   idleReclaimMs?: number;
+  /** Max concurrent background (daemon) scripts per agent (default 3). */
+  maxBackgroundScripts?: number;
+  /** Background script lifetime ceiling, ms (default 86_400_000 = 24h). */
+  backgroundMaxLifetimeMs?: number;
+  /** Minimum interval between wake_agent() deliveries, ms (default 60_000).
+   *  Early wakes are delayed, not dropped (backpressure inside the script). */
+  wakeMinIntervalMs?: number;
+  /** Max wake_agent() calls per background script (default 100); further
+   *  calls raise RuntimeError inside the script. */
+  maxWakesPerScript?: number;
 }
 
 export interface FrameworkConfig {

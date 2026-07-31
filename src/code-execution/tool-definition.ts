@@ -39,7 +39,19 @@ export function buildCodeExecutionToolDefinition(opts?: {
       'Use this when fanning out across many items, looping over tool calls, or when tool ' +
       'results are large and you only need a slice or summary. Call tools directly (not via ' +
       'code) when a single call answers the question or when you need to reason about each ' +
-      'result before deciding the next step.',
+      'result before deciding the next step. ' +
+      'BACKGROUND MODE: pass background=true to run the script as a detached watcher that ' +
+      'outlives this turn — the tool returns immediately with a script_id and you can end ' +
+      'your turn (e.g. sleep). Inside a background script, await wake_agent(payload) wakes ' +
+      'you: the payload plus provenance (script id, the line number in your script, elapsed ' +
+      'time) is delivered into your context and starts a turn for you. A script that ends ' +
+      'without calling wake_agent wakes nobody — that silence is the point (poll cheaply, ' +
+      'wake only on signal). If your background script CRASHES you are woken with the error. ' +
+      'Its print() output streams to a workspace log file you can read any time. Wakes are ' +
+      'rate-limited (early wakes are delayed, not dropped) and capped per script. ' +
+      'CAUTION: background scripts die silently if the host process restarts — for a wake ' +
+      'you absolutely must not miss, also arm a wake rule as backup. ' +
+      'Manage your scripts with {"action": "list"} and {"action": "cancel", "script_id": "..."}.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -47,8 +59,21 @@ export function buildCodeExecutionToolDefinition(opts?: {
           type: 'string',
           description: 'Python code to execute. Top-level await is allowed.',
         },
+        background: {
+          type: 'boolean',
+          description: 'Run detached as a background watcher with wake_agent() available (default false).',
+        },
+        action: {
+          type: 'string',
+          enum: ['run', 'list', 'cancel'],
+          description: 'run (default) executes `code`; list shows your background scripts; cancel stops one.',
+        },
+        script_id: {
+          type: 'string',
+          description: 'Background script id (for action: cancel).',
+        },
       },
-      required: ['code'],
+      required: [],
     },
   };
 }

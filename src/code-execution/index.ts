@@ -14,6 +14,7 @@ export type {
   ExecResult,
   PyRunnerOptions,
   ScriptToolCallHandler,
+  BackgroundExecOptions,
 } from './py-runner.js';
 export { PYTHON_RUNTIME_SOURCE } from './runtime-py.js';
 export { buildCodeExecutionToolDefinition, CODE_EXECUTION_TOOL_NAME } from './tool-definition.js';

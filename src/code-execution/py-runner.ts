@@ -34,6 +34,23 @@ export interface ExecResult {
   returnCode: number;
   /** Set when the host killed the script (deadline / abort / crash). */
   aborted?: boolean;
+  /** Background execs: rolling tail of interleaved stdout+stderr (for the
+   *  crash/finish envelope; the full journal is in the log file). */
+  tail?: string;
+}
+
+/** Per-exec options for background (daemon) scripts. */
+export interface BackgroundExecOptions {
+  /** Absolute path for the line-buffered stdout+stderr journal (null: tail only). */
+  logPath: string | null;
+  /**
+   * Called on each wake_agent() from the script. Resolve with null to ack
+   * (deliver), or an error string to refuse (raises RuntimeError in-script).
+   * May resolve late — rate limiting backpressures inside wake_agent().
+   */
+  onWake: (line: number, payload: unknown) => Promise<string | null>;
+  /** Overrides the runner's scriptTimeoutMs (background lifetime). */
+  lifetimeMs: number;
 }
 
 /** Resolves inner tool calls. Must never reject — map errors to strings. */
@@ -76,6 +93,7 @@ export class PyRunner {
   private readonly onToolCall: ScriptToolCallHandler;
   private readonly label: string;
 
+  private onWake: ((line: number, payload: unknown) => Promise<string | null>) | null = null;
   private child: ChildProcessWithoutNullStreams | null = null;
   private childReady: Promise<void> | null = null;
   private reader: Interface | null = null;
@@ -102,8 +120,13 @@ export class PyRunner {
    * Run one script. Tools are (re-)injected before every exec so the
    * interpreter always reflects the current tool surface (list_changed etc.).
    * Never rejects: every failure mode resolves to an ExecResult.
+   *
+   * With `background` options the exec is a daemon: output journals to the
+   * log file, wake_agent() is available in-script, and the deadline is the
+   * background lifetime. A background runner should be DEDICATED to that one
+   * script (the framework creates one per background script).
    */
-  async exec(code: string, tools: InjectedTool[]): Promise<ExecResult> {
+  async exec(code: string, tools: InjectedTool[], background?: BackgroundExecOptions): Promise<ExecResult> {
     if (this.disposed) {
       return { stdout: '', stderr: 'code_execution runner disposed', returnCode: 1, aborted: true };
     }
@@ -131,6 +154,8 @@ export class PyRunner {
     }
 
     const execId = `e${++this.execCounter}`;
+    const deadlineMs = background?.lifetimeMs ?? this.scriptTimeoutMs;
+    this.onWake = background?.onWake ?? null;
     const result = await new Promise<ExecResult>((resolve) => {
       const pending: PendingExec = {
         id: execId,
@@ -148,23 +173,29 @@ export class PyRunner {
         pending.killTimer = setTimeout(() => {
           this.settlePending({
             stdout: '',
-            stderr: `script killed after exceeding ${Math.round(this.scriptTimeoutMs / 1000)}s deadline`,
+            stderr: `script killed after exceeding ${Math.round(deadlineMs / 1000)}s deadline`,
             returnCode: 1,
             aborted: true,
           });
           this.reclaim('deadline-kill');
         }, CANCEL_GRACE_MS);
-      }, this.scriptTimeoutMs);
+      }, deadlineMs);
+      // A day-scale background deadline must not hold the process open.
+      if (background) pending.deadlineTimer.unref?.();
 
       this.send({
         op: 'init',
         tools: tools.map((t) => ({ py_name: t.pyName, tool_name: t.toolName })),
         call_timeout_s: Math.round(this.toolCallTimeoutMs / 1000),
+        ...(background
+          ? { background: true, log_path: background.logPath ?? null }
+          : {}),
       });
       this.send({ op: 'exec', id: execId, code });
     });
 
-    this.armIdleTimer();
+    this.onWake = null;
+    if (!background) this.armIdleTimer();
     return result;
   }
 
@@ -308,12 +339,33 @@ export class PyRunner {
         return;
       }
 
+      case 'wake': {
+        const wakeId = msg.id;
+        if (!wakeId) return;
+        const line = typeof (msg as { line?: unknown }).line === 'number'
+          ? (msg as { line: number }).line
+          : -1;
+        const payload = (msg as { payload?: unknown }).payload;
+        const handler = this.onWake;
+        const refuse = handler
+          ? handler(line, payload).catch((err: unknown) =>
+              `wake handler failed: ${err instanceof Error ? err.message : String(err)}`)
+          : Promise.resolve('this script is not allowed to wake the agent');
+        void refuse.then((error) => {
+          this.send({ op: 'wake_ack', id: wakeId, ...(error ? { error } : {}) });
+        });
+        return;
+      }
+
       case 'exec_result': {
         if (this.pending && msg.id === this.pending.id) {
           this.settlePending({
             stdout: msg.stdout ?? '',
             stderr: msg.stderr ?? '',
             returnCode: typeof msg.return_code === 'number' ? msg.return_code : 1,
+            ...(typeof (msg as { tail?: unknown }).tail === 'string'
+              ? { tail: (msg as { tail: string }).tail }
+              : {}),
           });
         }
         return;

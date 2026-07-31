@@ -745,6 +745,15 @@ export class WorkspaceModule implements Module {
     this.ctx = null;
   }
 
+  /** Mount names + modes, for peer callers (framework spill/journal paths)
+   *  that need a writable mount without reaching into private state. */
+  getMounts(): Array<{ name: string; mode: 'read-write' | 'read-only' }> {
+    return [...this.mounts.values()].map((m) => ({
+      name: m.config.name,
+      mode: m.config.mode === 'read-only' ? 'read-only' : 'read-write',
+    }));
+  }
+
   // ==========================================================================
   // Tool Definitions
   // ==========================================================================

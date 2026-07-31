@@ -510,6 +510,23 @@ interface Deferred<T> {
  *  the caller awaits plus the liveness/progress bookkeeping the watchdogs and
  *  the stream driver share. One map entry per run — created and torn down in
  *  runEphemeralToCompletion — so the pieces cannot desync. */
+/** One model-authored background (daemon) script — see runCodeExecution. */
+interface BackgroundScriptRecord {
+  id: string;
+  agentName: string;
+  runner: PyRunner;
+  /** The agent-authored source (line numbers in wake envelopes index into it). */
+  code: string;
+  startedAt: number;
+  wakes: number;
+  lastWakeAt: number | null;
+  /** Mount-prefixed workspace path of the journal, null when no workspace. */
+  logPath: string | null;
+  status: 'running' | 'finished' | 'died' | 'cancelled';
+  /** Set when cancel/dispose already settled this script (suppresses wakes). */
+  cancelled: boolean;
+}
+
 interface EphemeralRun {
   settle: Deferred<AgentSettleResult>;
   inferenceStarted: boolean;
@@ -724,6 +741,15 @@ export class AgentFramework {
    *  deferred and applied to the final code_execution result instead of
    *  cancelling the stream mid-script (which would wedge the turn). */
   private scriptDeferredEndTurn: Set<string> = new Set();
+  /** Background (daemon) scripts: model-authored watchers that outlive their
+   *  spawning turn. Each gets a DEDICATED PyRunner; wake_agent() injects a
+   *  provenance envelope + payload and requests inference. Keyed by script id. */
+  private backgroundScripts: Map<string, BackgroundScriptRecord> = new Map();
+  private backgroundScriptCounter = 0;
+  /** Ephemeral per-agent override of the tool-result inline cap (chars).
+   *  Set via agent_settings `tool_result_inline_max_chars`; NOT persisted —
+   *  the lift is meant as a temporary gate, reverts on restart/reset. */
+  private toolResultInlineMaxCharsOverride: Map<string, number> = new Map();
 
   private mcplTools: import('./types/index.js').ToolDefinition[] = [];
   private mcplToolRefreshInFlight = false;
@@ -1100,6 +1126,17 @@ export class AgentFramework {
       runner.dispose();
     }
     this.codeExecutionRunners.clear();
+    // Background daemons die with the process (documented limitation) —
+    // mark cancelled FIRST so their settle path stays silent (no crash-wake
+    // into a framework that is shutting down).
+    for (const record of this.backgroundScripts.values()) {
+      if (record.status === 'running') {
+        record.cancelled = true;
+        record.status = 'cancelled';
+      }
+      record.runner.dispose();
+    }
+    this.backgroundScripts.clear();
 
     // Cancel all active streams
     for (const agent of this.agents.values()) {
@@ -1431,6 +1468,15 @@ export class AgentFramework {
   private collectAgentSettingsExtensions(): Map<string, AgentSettingsExtension> {
     const result = new Map<string, AgentSettingsExtension>();
     const taken = new Set<string>(AgentFramework.AGENT_SETTINGS_CORE_KEYS);
+    // Framework-owned extension: the tool-result inline cap lift. Registered
+    // through the same extension surface modules use so get/update/reset all
+    // work with zero extra plumbing. EPHEMERAL by design (a temporary gate —
+    // reverts on restart), unlike module extensions which persist their own.
+    {
+      const ext = this.spillSettingsExtension();
+      ext.keys.forEach((k) => taken.add(k));
+      result.set('_framework', ext);
+    }
     for (const module of this.moduleRegistry.getAllModules()) {
       const ext = module.getAgentSettingsExtension?.();
       if (!ext) continue;
@@ -1445,6 +1491,42 @@ export class AgentFramework {
       result.set(module.name, ext);
     }
     return result;
+  }
+
+  /** agent_settings extension for the spill gate (see spillOrTruncate). */
+  private spillSettingsExtension(): AgentSettingsExtension {
+    return {
+      properties: {
+        tool_result_inline_max_chars: {
+          type: 'number',
+          description:
+            'Inline size cap (chars) for tool results and background-script wake payloads. ' +
+            'Content over the cap is written to a workspace file under tool-results/ and ' +
+            'replaced by a truncated preview + file reference. Raise it temporarily when you ' +
+            'genuinely want a large result inline; reset restores the default (derived from ' +
+            'your strategy). Ephemeral — reverts on host restart.',
+        },
+      },
+      keys: ['tool_result_inline_max_chars'],
+      get: (agentName: string) => ({
+        tool_result_inline_max_chars:
+          this.toolResultInlineMaxCharsOverride.get(agentName) ?? null,
+      }),
+      update: (agentName: string, patch: Record<string, unknown>) => {
+        const n = Number(patch.tool_result_inline_max_chars);
+        if (!Number.isFinite(n) || n < 1000) {
+          throw new Error('tool_result_inline_max_chars must be a number >= 1000');
+        }
+        this.toolResultInlineMaxCharsOverride.set(agentName, Math.floor(n));
+        return { tool_result_inline_max_chars: Math.floor(n) };
+      },
+      reset: (agentName: string, keys?: string[]) => {
+        if (!keys || keys.includes('tool_result_inline_max_chars')) {
+          this.toolResultInlineMaxCharsOverride.delete(agentName);
+        }
+        return { tool_result_inline_max_chars: null };
+      },
+    };
   }
 
   private captureInferenceToolSnapshot(agent: Agent): InferenceToolSnapshot {
@@ -3537,6 +3619,23 @@ export class AgentFramework {
           // Compute truncation limit from agent's strategy (maxMessageTokens * 4 chars)
           const maxChars = this.getMaxToolResultChars(agent);
 
+          // Oversized results spill to a workspace file (truncated preview +
+          // file reference) instead of being blind-truncated. Computed ONCE
+          // per call and reused for both the history copy and the live wire
+          // copy below — the two must stay byte-matched (the window stores
+          // what the membrane sends; divergence breaks the compile prefix).
+          const spilled = new Map<string, string>();
+          const dateLabel = new Date().toISOString().slice(0, 10);
+          for (const tc of currentState.toolResults) {
+            if (tc.result.isError) continue;
+            spilled.set(tc.id, await this.spillOrTruncate(
+              toolResultDataToHistoryString(tc.result.data, undefined),
+              maxChars,
+              `${dateLabel}-${tc.id}`,
+              agent.name,
+            ));
+          }
+
           // Store tool results as a user message (tool_result blocks).
           // Use the history serializer so MCP image blocks become a short
           // `[image: type, size]` placeholder instead of megabytes of base64
@@ -3546,7 +3645,7 @@ export class AgentFramework {
             toolUseId: tc.id,
             content: tc.result.isError
               ? tc.result.error ?? 'Unknown error'
-              : toolResultDataToHistoryString(tc.result.data, maxChars),
+              : spilled.get(tc.id) ?? toolResultDataToHistoryString(tc.result.data, maxChars),
             isError: tc.result.isError,
           }));
           agent.getContextManager().addMessage('user', toolResultContent);
@@ -3742,7 +3841,7 @@ export class AgentFramework {
             // messages (membrane ≥0.5.72) — appended after the tool_result
             // envelope so the next round of THIS turn hears them.
             const membraneResults = currentState.toolResults.map(tc =>
-              this.toMembraneToolResult(tc.id, tc.result, maxChars)
+              this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
             );
             currentState.stream.provideToolResults(
               membraneResults,
@@ -6189,7 +6288,51 @@ export class AgentFramework {
    * results reach the running script and never the model context.
    */
   private async runCodeExecution(agentName: string, call: ToolCall): Promise<ToolResult> {
-    const input = (call.input ?? {}) as { code?: unknown };
+    const input = (call.input ?? {}) as {
+      code?: unknown;
+      background?: unknown;
+      action?: unknown;
+      script_id?: unknown;
+    };
+
+    // Management surface: the agent's own daemon fleet is inspectable and
+    // killable through the same tool that spawns it.
+    if (input.action === 'list') {
+      const scripts = [...this.backgroundScripts.values()]
+        .filter((s) => s.agentName === agentName)
+        .map((s) => ({
+          script_id: s.id,
+          status: s.status,
+          started_at: new Date(s.startedAt).toISOString(),
+          wakes: s.wakes,
+          last_wake_at: s.lastWakeAt ? new Date(s.lastWakeAt).toISOString() : null,
+          log: s.logPath,
+        }));
+      return { success: true, data: { background_scripts: scripts } };
+    }
+    if (input.action === 'cancel') {
+      if (typeof input.script_id !== 'string') {
+        return { success: false, error: 'cancel requires `script_id`', isError: true };
+      }
+      const record = this.backgroundScripts.get(input.script_id);
+      if (!record || record.agentName !== agentName) {
+        return { success: false, error: `no background script '${input.script_id}'`, isError: true };
+      }
+      if (record.status === 'running') {
+        record.cancelled = true;
+        record.status = 'cancelled';
+        record.runner.abort('cancelled by agent');
+        record.runner.dispose();
+      }
+      return {
+        success: true,
+        data: { script_id: record.id, status: record.status, log: record.logPath },
+      };
+    }
+    if (input.action !== undefined && input.action !== 'run') {
+      return { success: false, error: `unknown action ${JSON.stringify(input.action)}`, isError: true };
+    }
+
     if (typeof input.code !== 'string' || input.code.trim() === '') {
       return {
         success: false,
@@ -6206,6 +6349,10 @@ export class AgentFramework {
       surface.map((t) => t.name).filter((name) => name !== CODE_EXECUTION_TOOL_NAME),
     );
 
+    if (input.background === true) {
+      return this.startBackgroundScript(agentName, input.code, injected);
+    }
+
     const runner = this.getOrCreateScriptRunner(agentName);
     this.scriptDeferredEndTurn.delete(agentName);
     const exec = await runner.exec(input.code, injected);
@@ -6217,6 +6364,291 @@ export class AgentFramework {
       isError: false,
       ...(endTurn ? { endTurn: true } : {}),
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Background (daemon) scripts — model-authored watchers that outlive the turn
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Start a background script: dedicated interpreter, output journaled to a
+   * workspace file, wake_agent() available in-script. The tool result
+   * returns immediately; the script runs until it ends, hits the lifetime
+   * ceiling, or is cancelled. Scripts DIE WITH THE HOST PROCESS — that
+   * limitation is stated in the tool description so agents can calibrate
+   * how much to rely on an armed wake.
+   */
+  private startBackgroundScript(
+    agentName: string,
+    code: string,
+    injected: import('./code-execution/py-runner.js').InjectedTool[],
+  ): ToolResult {
+    // v1: primary-agent-only. A conversation fork's or ephemeral's daemon
+    // would outlive its owner and its wake would land in the primary
+    // conversation anyway — refuse loudly instead of surprising anyone.
+    if (this.primaryAgentName && agentName !== this.primaryAgentName) {
+      return {
+        success: false,
+        error: 'background scripts are available to the primary agent only',
+        isError: true,
+      };
+    }
+    const cfg = this.codeExecutionConfig;
+    const maxScripts = cfg?.maxBackgroundScripts ?? 3;
+    const runningCount = [...this.backgroundScripts.values()]
+      .filter((s) => s.agentName === agentName && s.status === 'running').length;
+    if (runningCount >= maxScripts) {
+      return {
+        success: false,
+        error: `background script limit reached (${maxScripts} running). ` +
+          'Use code_execution {"action": "list"} to inspect and {"action": "cancel", "script_id": ...} to free a slot.',
+        isError: true,
+      };
+    }
+
+    const scriptId = `bg-${++this.backgroundScriptCounter}`;
+    const lifetimeMs = cfg?.backgroundMaxLifetimeMs ?? 86_400_000;
+
+    // Journal: a file under the agent's first read-write workspace mount so
+    // their existing read/grep/shell tools work on it. Python appends
+    // directly to the materialized path; watch-mode mounts sync it back to
+    // the chronicle tree on their usual cadence.
+    let logPath: string | null = null;
+    let logAbsPath: string | null = null;
+    const workspace = this.getWorkspaceModule();
+    if (workspace) {
+      const mountName = this.firstWritableMountName(workspace);
+      if (mountName) {
+        logPath = `${mountName}/background-scripts/${scriptId}.log`;
+        logAbsPath = workspace.resolveAbsolutePath(logPath);
+      }
+    }
+
+    const runner = new PyRunner({
+      pythonPath: cfg?.pythonPath,
+      toolCallTimeoutMs: cfg?.toolCallTimeoutMs,
+      scriptTimeoutMs: cfg?.scriptTimeoutMs,
+      idleReclaimMs: 0, // dedicated runner; lifetime is the exec deadline
+      label: `${agentName}:${scriptId}`,
+      onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args),
+    });
+
+    const record: BackgroundScriptRecord = {
+      id: scriptId,
+      agentName,
+      runner,
+      code,
+      startedAt: Date.now(),
+      wakes: 0,
+      lastWakeAt: null,
+      logPath,
+      status: 'running',
+      cancelled: false,
+    };
+    this.backgroundScripts.set(scriptId, record);
+    this.emitTrace({
+      type: 'tool:started', module: 'code_execution', tool: `background:${scriptId}`,
+      callId: scriptId, input: { lines: code.split('\n').length },
+    });
+
+    void runner
+      .exec(code, injected, {
+        logPath: logAbsPath,
+        lifetimeMs,
+        onWake: (line, payload) => this.handleScriptWake(record, line, payload),
+      })
+      .then((exec) => this.settleBackgroundScript(record, exec))
+      .catch((err) => {
+        // exec never rejects by contract; this is the belt-and-suspenders.
+        console.error(`[pytc:${agentName}:${scriptId}] background exec rejected: ${String(err)}`);
+        this.settleBackgroundScript(record, {
+          stdout: '', stderr: String(err), returnCode: 1, aborted: true,
+        });
+      });
+
+    return {
+      success: true,
+      data: {
+        status: 'background script started',
+        script_id: scriptId,
+        log: logPath ?? 'no writable workspace mount — output is not retrievable; only wake_agent() reaches you',
+        lifetime_hours: Math.round(lifetimeMs / 3_600_000 * 10) / 10,
+        note: 'The script dies if the host process restarts. Manage with code_execution {"action": "list"|"cancel"}.',
+      },
+    };
+  }
+
+  /** First read-write mount name, or null. */
+  private firstWritableMountName(workspace: WorkspaceModule): string | null {
+    const mounts = (workspace as unknown as {
+      getMounts?: () => Array<{ name: string; mode: string }>;
+    }).getMounts?.();
+    if (mounts) {
+      const rw = mounts.find((m) => m.mode !== 'read-only');
+      return rw?.name ?? null;
+    }
+    return null;
+  }
+
+  /**
+   * wake_agent() from a background script: enforce the per-script wake cap
+   * and rate floor (delay, not drop — the script awaits the ack), then
+   * inject the provenance envelope + payload and request inference.
+   * Resolves null on delivery; an error string refuses the wake (raises
+   * RuntimeError inside the script).
+   */
+  private async handleScriptWake(
+    record: BackgroundScriptRecord,
+    line: number,
+    payload: unknown,
+  ): Promise<string | null> {
+    if (record.cancelled) return 'script was cancelled';
+    const cfg = this.codeExecutionConfig;
+    const maxWakes = cfg?.maxWakesPerScript ?? 100;
+    if (record.wakes >= maxWakes) {
+      return `wake limit reached (${maxWakes} per script)`;
+    }
+    const floorMs = cfg?.wakeMinIntervalMs ?? 60_000;
+    if (record.lastWakeAt !== null) {
+      const wait = record.lastWakeAt + floorMs - Date.now();
+      if (wait > 0) {
+        await new Promise((r) => {
+          const t = setTimeout(r, wait);
+          (t as { unref?: () => void }).unref?.();
+        });
+        if (record.cancelled) return 'script was cancelled';
+      }
+    }
+    record.wakes += 1;
+    record.lastWakeAt = Date.now();
+
+    const elapsedMin = Math.round((Date.now() - record.startedAt) / 60_000);
+    const payloadJson = payload === undefined || payload === null
+      ? 'null'
+      : JSON.stringify(payload, null, 1) ?? String(payload);
+    const agent = this.agents.get(record.agentName);
+    const maxChars = agent ? this.getMaxToolResultChars(agent) : undefined;
+    const payloadText = await this.spillOrTruncate(
+      payloadJson, maxChars, `${record.id}-wake${record.wakes}`,
+    );
+
+    const envelope =
+      `[background script ${record.id}] Woke you: wake_agent() called at line ${line} of your script, ` +
+      `${elapsedMin}m after you started it (wake ${record.wakes} of ${maxWakes}).\n` +
+      `Arguments:\n${payloadText}\n` +
+      (record.logPath ? `Script output so far: workspace file ${record.logPath}\n` : '') +
+      `Script status: still running`;
+
+    this.injectScriptWake(record, envelope);
+    return null;
+  }
+
+  /** Background script ended (clean, crash, deadline, cancel/dispose). */
+  private settleBackgroundScript(
+    record: BackgroundScriptRecord,
+    exec: import('./code-execution/py-runner.js').ExecResult,
+  ): void {
+    record.runner.dispose();
+    if (record.status === 'running') {
+      record.status = exec.returnCode === 0 ? 'finished' : 'died';
+    }
+    this.emitTrace({
+      type: 'tool:completed', module: 'code_execution', tool: `background:${record.id}`,
+      callId: record.id, durationMs: Date.now() - record.startedAt,
+    });
+    // Crash honesty: a resident sleeping on a promise must never have that
+    // promise die silently. Deliberate cancels/disposes stay silent (the
+    // agent or host chose them); clean exits stay silent (the null path).
+    if (record.status === 'died' && !record.cancelled) {
+      const tail = (exec.tail ?? exec.stderr ?? '').slice(-2000);
+      const elapsedMin = Math.round((Date.now() - record.startedAt) / 60_000);
+      const envelope =
+        `[background script ${record.id}] Your background script DIED ${elapsedMin}m after start ` +
+        `(it did not call wake_agent and is no longer watching).\n` +
+        `Last output:\n${tail || '(none)'}\n` +
+        (record.logPath ? `Full journal: workspace file ${record.logPath}` : '');
+      this.injectScriptWake(record, envelope);
+    }
+    // Keep a short memory of settled scripts for {"action":"list"}, then drop.
+    const settled = [...this.backgroundScripts.values()]
+      .filter((s) => s.agentName === record.agentName && s.status !== 'running');
+    for (const old of settled.slice(0, Math.max(0, settled.length - 5))) {
+      this.backgroundScripts.delete(old.id);
+    }
+  }
+
+  /**
+   * Deliver a background-script event: provenance envelope into the agent's
+   * context + an inference request. Deliberately does NOT consult the event
+   * gate — the agent armed this wake themselves (wake-through-sleep
+   * authority); it enters tagged so gate policies could be taught about it
+   * later if that ever needs revisiting.
+   */
+  private injectScriptWake(record: BackgroundScriptRecord, envelope: string): void {
+    try {
+      const messageId = this.addMessage('user', [{ type: 'text', text: envelope }], {
+        source: 'background-script',
+        scriptId: record.id,
+        tags: ['script:wake'],
+      });
+      this.pendingRequests.push({
+        agentName: record.agentName,
+        reason: 'script:wake',
+        source: 'code_execution',
+        timestamp: Date.now(),
+      });
+      this.emitTrace({
+        type: 'message:added',
+        messageId,
+        source: `background-script:${record.id}`,
+      });
+    } catch (err) {
+      console.error(
+        `[pytc:${record.agentName}:${record.id}] wake injection failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Oversized content policy (antra, 2026-07-31): never hit the agent in
+   * the face with a huge blob, never silently destroy it either. Content
+   * over the inline cap is materialized to a workspace file (readable with
+   * the agent's own tools) and replaced by a truncated head + a trailing
+   * file reference. Falls back to plain truncation when there is no
+   * writable workspace. The cap can be lifted temporarily via
+   * agent_settings `tool_result_inline_max_chars`.
+   */
+  private async spillOrTruncate(
+    content: string,
+    maxChars: number | undefined,
+    label: string,
+    agentName?: string,
+  ): Promise<string> {
+    const override = agentName !== undefined
+      ? this.toolResultInlineMaxCharsOverride.get(agentName)
+      : undefined;
+    const cap = override ?? maxChars;
+    if (!cap || content.length <= cap) return content;
+
+    const workspace = this.getWorkspaceModule();
+    const mountName = workspace ? this.firstWritableMountName(workspace) : null;
+    if (workspace && mountName) {
+      const safeLabel = label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
+      const path = `${mountName}/tool-results/${safeLabel}.txt`;
+      try {
+        const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain');
+        if (result.success) {
+          return safeSlice(content, 0, cap)
+            + `\n\n[truncated — showing ${cap} of ${content.length} chars; full content: workspace file ${path}. `
+            + 'Read/grep it with your file tools, or raise the inline cap temporarily via '
+            + 'agent_settings update tool_result_inline_max_chars.]';
+        }
+      } catch {
+        // fall through to plain truncation
+      }
+    }
+    return safeSlice(content, 0, cap)
+      + '\n\n[truncated — original was ' + content.length + ' chars]';
   }
 
   private getOrCreateScriptRunner(agentName: string): PyRunner {
@@ -6264,9 +6696,10 @@ export class AgentFramework {
       return `Error: ${result.error ?? 'tool call failed'}`;
     }
     if (result.data === undefined) return '';
-    const agent = this.agents.get(agentName);
-    const maxChars = agent ? this.getMaxToolResultChars(agent) : undefined;
-    return toolResultDataToHistoryString(result.data, maxChars);
+    // Scripts get (nearly) full data — the script environment IS the spill:
+    // filtering big results in code is the whole point. 5MB protocol safety
+    // cap only; no context-cap truncation, no file spill.
+    return toolResultDataToHistoryString(result.data, 5_000_000);
   }
 
   /**
@@ -6322,7 +6755,14 @@ export class AgentFramework {
     }
   }
 
-  private toMembraneToolResult(callId: string, afResult: ToolResult, maxChars?: number): MembraneToolResult {
+  private toMembraneToolResult(
+    callId: string,
+    afResult: ToolResult,
+    maxChars?: number,
+    /** Pre-spilled string from the history path — used for the non-image
+     *  path so the live wire copy byte-matches what the window stored. */
+    precomputed?: string,
+  ): MembraneToolResult {
     if (afResult.isError) {
       return { toolUseId: callId, content: afResult.error ?? 'Unknown error', isError: true };
     }
@@ -6333,6 +6773,9 @@ export class AgentFramework {
     const blocks = this.tryNativeToolResultContent(afResult.data, maxChars);
     if (blocks) {
       return { toolUseId: callId, content: blocks, isError: false };
+    }
+    if (precomputed !== undefined) {
+      return { toolUseId: callId, content: precomputed, isError: false };
     }
     // JSON.stringify returns the VALUE undefined (not a string) for undefined
     // input — a module tool returning `{ success: true }` with no data would
