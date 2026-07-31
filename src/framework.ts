@@ -606,6 +606,15 @@ export class AgentFramework {
    *  keeps unrelated channels from moving the pin. Cleared at every fresh
    *  turn's start; budget restarts keep it. */
   private turnEngagedChannels: Map<string, Set<string>> = new Map();
+  /** Channels this turn's PLAIN PROSE was actually delivered to, in delivery
+   *  order (deduped at render). Feeds the `[delivered]` receipt appended at
+   *  logical turn end: explicit sends receipt themselves via their
+   *  tool_result, but auto-routed prose previously vanished into the router
+   *  with no in-window record — the agent could never see where its own
+   *  words landed (2026-07-31 misroute series; antra: minimal receipts).
+   *  Cleared at every fresh turn's start; budget restarts keep it (same
+   *  logical turn, receipt covers the whole turn). */
+  private turnProseDeliveries: Map<string, string[]> = new Map();
   /** A tool boundary injected fresh CONVERSATIONAL input (a real message —
    *  not a reaction or a system marker) into the live stream. Tells
    *  driveStream to clear sticky explicit-send suppression before handling
@@ -4686,6 +4695,62 @@ export class AgentFramework {
     }
   }
 
+  /** Record a successful plain-prose delivery for this turn's receipt. */
+  private recordProseDelivery(
+    agentName: string,
+    outcome: { delivered: boolean; channelId: string } | null | undefined,
+  ): void {
+    if (!outcome?.delivered) return;
+    let list = this.turnProseDeliveries.get(agentName);
+    if (!list) {
+      list = [];
+      this.turnProseDeliveries.set(agentName, list);
+    }
+    list.push(outcome.channelId);
+  }
+
+  /**
+   * Append the turn's `[delivered]` receipt: one compact system message
+   * naming where this turn's plain prose actually landed (channels in
+   * delivery order, deduped). Explicit sends receipt themselves via their
+   * tool_result; auto-routed prose previously left no in-window trace, so
+   * the agent could never see where its own words went — misroutes were
+   * invisible to it until a human reported them (2026-07-31 series).
+   * Called ONLY at logical turn end (stream 'complete', or the endTurn
+   * cancel path after the speech chain settles) — never mid-stream, where a
+   * window-only insert would diverge from the wire. No-op when the turn
+   * delivered nothing. Failures are already marked separately
+   * ([discord-send-failed]); this is the success half.
+   */
+  private appendProseDeliveryReceipt(agent: Agent): void {
+    const list = this.turnProseDeliveries.get(agent.name);
+    if (!list || list.length === 0) return;
+    this.turnProseDeliveries.delete(agent.name);
+    const seen = new Set<string>();
+    const shown: string[] = [];
+    for (const id of list) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const label = this.channelRegistry?.getDescriptor(id)?.label;
+      shown.push(
+        label && label !== id
+          ? `${label.startsWith('#') ? label : `#${label}`} (${id})`
+          : id,
+      );
+    }
+    const text = `[delivered] plain speech → ${shown.join(' · ')}`;
+    try {
+      const mid = agent.getContextManager().addMessage(
+        'user',
+        [{ type: 'text', text }],
+        { system: true, kind: 'delivery-receipt' } as MessageMetadata,
+      );
+      this.emitTrace({ type: 'message:added', messageId: mid, source: 'delivery-receipt' });
+    } catch (err) {
+      console.error('delivery receipt append failed:', err);
+    }
+  }
+
   /**
    * Announce-on-change locus notice (turn-frozen routing). Appends a durable
    * `[routing]` window message when the turn's effective outbound locus
@@ -5080,10 +5145,11 @@ export class AgentFramework {
     // KV stability).
     if (trigger?.reason !== 'context_budget_restart') {
       if (attempt === 0) this.maybePrimeProseMode(agent);
-      // Fresh turn: forget the previous turn's explicit-send engagements —
-      // the engaged-channel re-pin signal is strictly turn-scoped (a restart
-      // continues the same logical turn and keeps it).
+      // Fresh turn: forget the previous turn's explicit-send engagements and
+      // prose deliveries — both are strictly turn-scoped (a restart continues
+      // the same logical turn and keeps them).
       this.turnEngagedChannels.delete(agent.name);
+      this.turnProseDeliveries.delete(agent.name);
       if (agent.proseRouting === 'explicit') {
         // Explicit prose routing: there is no locus. The model names every
         // destination in-band (`>>` prefixes); the only turn state is the
@@ -5286,7 +5352,8 @@ export class AgentFramework {
     const enqueueSpeech = (text: string, locus: string | null): void => {
       turnSpeechChain = turnSpeechChain
         .then(async () => {
-          await this.channelRegistry!.routeSpeech(agent.name, text, locus);
+          const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
+          this.recordProseDelivery(agent.name, outcome);
         })
         .catch((err) => console.error('mid-turn speech routing failed:', err));
     };
@@ -5835,7 +5902,8 @@ export class AgentFramework {
                     `[routing] ${agent.name}: text-only turn -> routing speech -> ${locus ?? '(none)'}`,
                   );
                   try {
-                    await this.channelRegistry.routeSpeech(agent.name, speechText, locus);
+                    const outcome = await this.channelRegistry.routeSpeech(agent.name, speechText, locus);
+                    this.recordProseDelivery(agent.name, outcome);
                   } catch (err) {
                     console.error('speech routing failed:', err);
                   }
@@ -5904,7 +5972,8 @@ export class AgentFramework {
                 // Deliver sequentially (await each) so the segments land in order.
                 for (const seg of segments) {
                   try {
-                    await this.channelRegistry.routeSpeech(agent.name, seg, locus);
+                    const outcome = await this.channelRegistry.routeSpeech(agent.name, seg, locus);
+                    this.recordProseDelivery(agent.name, outcome);
                   } catch (err) {
                     console.error('speech routing failed:', err);
                   }
@@ -5914,6 +5983,15 @@ export class AgentFramework {
             // NOTE: agent.reset() + onInferenceEnded() already ran above,
             // BEFORE dispatchSpeech. Locus routing is speech dispatch and
             // doesn't depend on the status field, so it correctly runs after.
+
+            // Logical turn end (normal completion): drop the `[delivered]`
+            // receipt. All deliveries are settled — the live chain was
+            // awaited before trailing dispatch, and trailing/text-only
+            // segments were awaited in-loop. Locus mode only; explicit-mode
+            // envelopes acknowledge themselves through the prose gateway.
+            if (agent.proseRouting !== 'explicit') {
+              this.appendProseDeliveryReceipt(agent);
+            }
 
             // Explicit-prose `!` continuation: a prose segment this turn asked
             // to keep going (`>>#x !` / `>>private !`) — start another turn
@@ -5995,9 +6073,25 @@ export class AgentFramework {
             // reset, no settle, no spurious inference:exhausted (which would
             // reject an ephemeral's promise mid-run and bump the failure
             // streak). Gate release + stream teardown happen in `finally`.
-            if (this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`)) {
-              this.eventGate?.onInferenceEnded(agent.name);
-              return;
+            {
+              const cancelKey = `${agent.name}:${myStreamId}`;
+              const cancelKind = this.frameworkCancelledStreams.get(cancelKey);
+              if (cancelKind !== undefined) {
+                this.frameworkCancelledStreams.delete(cancelKey);
+                this.eventGate?.onInferenceEnded(agent.name);
+                // endTurn IS a logical turn end — earlier rounds may have
+                // live-routed prose (narrate → skip_reply is a real shape),
+                // so settle the delivery chain and drop the receipt. A
+                // budget restart continues the same logical turn: the
+                // deliveries map persists (cleared only at fresh turn
+                // start) and the continuation stream's end writes ONE
+                // receipt for the whole turn.
+                if (cancelKind === 'turn_ended' && agent.proseRouting !== 'explicit') {
+                  await turnSpeechChain;
+                  this.appendProseDeliveryReceipt(agent);
+                }
+                return;
+              }
             }
             const reason = event.reason ?? 'unknown';
             // Only reset if this is still the active stream (a budget restart
@@ -8972,17 +9066,40 @@ export class AgentFramework {
         const durationMs = Date.now() - startTime;
         this.emitTrace({ type: 'tool:completed', module: 'channels', tool: call.name, callId: call.id, durationMs });
         // A successful channel_open plants the agent's feet in the opened
-        // channel: pin it as this turn's reply locus so plain-text speech
-        // written right after opening routes THERE. Found live 2026-07-21
-        // (Aria bring-up): open → plain-text reply → "no locus (no
-        // home/active channel, defaultPublishChannel null)" on a turn with
-        // no channel trigger (post-restart continuation). Next turn start
-        // re-resolves the locus as usual (startAgentStream set/delete).
+        // channel. The agent's own deliberate open is the strongest "my next
+        // words go here" signal in the system — stronger than any injection —
+        // so it MOVES the current turn's prose pin (turnLocusPins), not just
+        // the next turn's trigger state. (The original 2026-07-21 Aria fix
+        // set only activeTriggerChannels, which resolveLocus reads at the
+        // NEXT turn's freeze — the turn-frozen refactor had silently
+        // regressed the "reply right after opening" case; found while
+        // mapping the routing logic 2026-07-31, antra-ratified fix.) The
+        // announcement rides THIS TOOL RESULT — model-requested content,
+        // distance zero, the safest role there is — instead of a separate
+        // window notice. lastAnnouncedLocus tracks it so announce-on-change
+        // stays coherent. Locus-mode agents only: explicit mode has no pin.
         if (call.name === 'channel_open' && result?.success) {
           const opened =
             (result.data as { channelId?: string } | undefined)?.channelId
             ?? (call.input as { channelId?: string } | undefined)?.channelId;
-          if (opened) this.activeTriggerChannels.set(agentName, opened);
+          if (opened) {
+            this.activeTriggerChannels.set(agentName, opened);
+            const openerAgent = this.agents.get(agentName);
+            if (openerAgent && openerAgent.proseRouting !== 'explicit') {
+              this.turnLocusPins.set(agentName, opened);
+              this.lastAnnouncedLocus.set(agentName, opened);
+              result = {
+                ...result,
+                data: {
+                  ...(result.data as Record<string, unknown> | undefined),
+                  routing: 'Your plain speech now lands in this channel. Other channels need an explicit send tool.',
+                },
+              };
+              console.error(
+                `[routing] ${agentName}: channel_open -> pin moved to ${opened} (announced in tool result)`,
+              );
+            }
+          }
         }
         this.pushEvent({
           type: 'tool-result',

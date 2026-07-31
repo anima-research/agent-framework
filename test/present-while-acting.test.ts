@@ -128,6 +128,8 @@ function stubChannelRegistry(framework: AgentFramework) {
     },
     routeSpeech: async (_agent: string, text: string, locus?: string | null) => {
       routed.push({ text, locus: locus ?? null });
+      // Mirror the real registry's outcome shape (delivery receipts read it).
+      return locus ? { delivered: true, channelId: locus } : null;
     },
     getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
@@ -515,6 +517,103 @@ describe('present while acting', () => {
 
     assert.deepEqual(routed, [{ text: 'Continuing right here.', locus: 'chan-live-1' }]);
     assert.equal(notices.length, 1, 'only the boot-baseline announcement — no re-pin chatter');
+
+    await framework.stop();
+  });
+
+  it('a prose turn ends with a [delivered] receipt naming where the prose landed', async () => {
+    // Explicit sends receipt themselves via tool_result; auto-routed prose
+    // previously vanished with no in-window trace — the agent could never
+    // see where its own words went (2026-07-31 misroute series). One compact
+    // system message at logical turn end, channels deduped in delivery order.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'A quiet reply with no tools.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const cm = (framework as unknown as {
+      agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ content: Array<{ type: string; text?: string }> }> } }>;
+    }).agents.get('assistant')!.getContextManager();
+    const texts = cm.getAllMessages()
+      .flatMap((m) => m.content)
+      .filter((b) => b.type === 'text')
+      .map((b) => b.text ?? '');
+    const receipts = texts.filter((t) => t.startsWith('[delivered]'));
+    assert.deepEqual(receipts, ['[delivered] plain speech → chan-live-1']);
+    // The receipt is the LAST window message — after the assistant blocks.
+    assert.ok(texts[texts.length - 1].startsWith('[delivered]'), 'receipt sits at the settled tail');
+
+    await framework.stop();
+  });
+
+  it('a re-pinned turn\'s receipt names both channels in delivery order', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Answering the person who addressed me.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'quick question over here?';
+    module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const cm = (framework as unknown as {
+      agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ content: Array<{ type: string; text?: string }> }> } }>;
+    }).agents.get('assistant')!.getContextManager();
+    const receipts = cm.getAllMessages()
+      .flatMap((m) => m.content)
+      .filter((b) => b.type === 'text')
+      .map((b) => b.text ?? '')
+      .filter((t) => t.startsWith('[delivered]'));
+    assert.deepEqual(receipts, ['[delivered] plain speech → chan-live-1 · discord:dm:antra']);
+
+    await framework.stop();
+  });
+
+  it('channel_open moves the pin mid-turn and announces in its own tool result', async () => {
+    // The agent's own deliberate open is the strongest "my next words go
+    // here" signal — stronger than any injection. The original 2026-07-21
+    // Aria fix only set next-turn trigger state; the turn-frozen refactor
+    // silently regressed the reply-right-after-opening case. Now the pin
+    // moves immediately and the announcement rides the tool result itself
+    // (model-requested content: distance zero, safest role).
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Hello, observatory.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall =
+      async () => ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'Hello, observatory.', locus: 'discord:guild:observatory' },
+    ], 'prose right after channel_open lands in the opened channel');
+    // The announcement rode the tool result the model saw.
+    const results = membrane.lastStream!.receivedToolResults.flat() as Array<{ content?: unknown }>;
+    assert.ok(
+      JSON.stringify(results).includes('plain speech now lands in this channel'),
+      'routing note present in the channel_open tool result',
+    );
 
     await framework.stop();
   });
