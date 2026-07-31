@@ -12,6 +12,7 @@ interface FrameworkHarness {
   }>;
   agents: Map<string, { state: { status: string } }>;
   activeStreams: Map<string, Promise<void>>;
+  activeTurnTokens: Map<string, number>;
   staleWarnAt: Map<string, number>;
   sweepExpiredConversations(): void;
   createFrameworkState(): Record<string, never>;
@@ -32,6 +33,7 @@ function busyAgentHarness(): FrameworkHarness {
   }];
   framework.agents = new Map([['Sol', { state: { status: 'waiting_for_tools' } }]]);
   framework.activeStreams = new Map();
+  framework.activeTurnTokens = new Map();
   framework.staleWarnAt = new Map();
   framework.sweepExpiredConversations = () => {};
   framework.createFrameworkState = () => ({});

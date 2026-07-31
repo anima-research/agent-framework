@@ -662,6 +662,25 @@ export class AgentFramework {
   // tool_use → tool_result adjacency required by the Anthropic API).
   private deferredMessages: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
 
+  // Turn-alive markers (2026-07-31 Mythos phantom-skip incident): agentName →
+  // token of the turn currently in progress. Set at startAgentStream ENTRY —
+  // before hooks, compile, and stream setup, all of which await — and cleared
+  // token-matched when that turn's teardown finishes (driveStream finally /
+  // terminal failure path), so a successor turn's marker survives a
+  // predecessor's late finally. A turn is alive from dequeue to settled
+  // teardown: strictly longer than `activeStreams` membership, which begins
+  // only after the stream exists. Guarding addMessage on stream-liveness
+  // alone left the compile window open — a deferred message flushed by the
+  // previous turn's finally landed in the window MID-COMPILE of the turn its
+  // own wake had started: positioned before the new turn's blocks yet absent
+  // from its wire request. The agent then "skipped" a message it never saw
+  // (falsified history — it later confabulated an apology for the skip), and
+  // every subsequent compile diverged from the live prefix at that message
+  // (KV bust). Invariant: nothing enters the window between a turn's dequeue
+  // and its settle except that turn's own blocks.
+  private activeTurnTokens: Map<string, number> = new Map();
+  private nextTurnToken = 1;
+
   // Undo/redo state
   private turnCounters: Map<string, number> = new Map(); // agentName → next turnIndex
   private redoStacks: Map<string, RedoEntry[]> = new Map(); // agentName → redo entries
@@ -2038,6 +2057,12 @@ export class AgentFramework {
       // ephemeral agents leave checkpoint-tree keys and diagnostics map
       // entries behind for the life of the store/session.
       this.evictTurnCheckpoints(agent.name);
+      // Turn-alive marker, same spawn-and-dispose logic: a stalled ephemeral
+      // (watchdog fired, driveStream's terminal event lost) would strand its
+      // token forever — no wedge (ephemeral names are unique per run) but
+      // unbounded map growth. Blind delete is safe: the agent is already out
+      // of the map, and a late driveStream finally token-match no-ops.
+      this.activeTurnTokens.delete(agent.name);
     }
   }
 
@@ -3619,6 +3644,16 @@ export class AgentFramework {
             // endTurn above).
             if (currentState.stream) {
               this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'budget_restart');
+              // Cancel the LIVE stream object directly (like the endTurn
+              // branch above): at a tool boundary the state machine reads
+              // 'ready', and Agent.cancelStream only signals the stream from
+              // 'streaming'/'waiting_for_tools' — so the old call left the
+              // provider stream parked forever awaiting tool results that
+              // would never come (zombie: driveStream's finally never ran,
+              // its activeStreams entry survived until the restart's stream
+              // overwrote it). Harmless by accident before turn-alive
+              // tracking; a genuine teardown leak after it.
+              currentState.stream.cancel();
             }
             agent.cancelStream();
             this.emitTrace({
@@ -4358,8 +4393,24 @@ export class AgentFramework {
         continue;
       }
 
-      // Skip if agent is busy (inferring, streaming, or waiting for tools)
-      if (agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
+      // Skip if agent is busy (inferring, streaming, or waiting for tools) —
+      // or if a turn is alive at all (activeTurnTokens): the state machine
+      // goes idle at endTurn's reset while driveStream teardown is still
+      // pending, and a successor turn dequeued in that gap compiles while the
+      // predecessor's deferred flush can still write (2026-07-31 Mythos).
+      // Turn-alive spans dequeue → settled teardown; wakes wait it out.
+      //
+      // EXCEPT a context-budget restart: it CONTINUES the turn whose token is
+      // held — queueing it behind its own turn's teardown is a deadlock when
+      // that teardown lags (the cancelled stream's `aborted` event is
+      // asynchronous and, historically, not even guaranteed — see the
+      // overBudget branch). The restart's startAgentStream overwrites the
+      // token; the predecessor frame's late finally no-ops via token-match.
+      // This mirrors how the restart has always overwritten activeStreams
+      // rather than waiting for the old stream's teardown.
+      const isBudgetRestart = requests.some((r) => r.reason === 'context_budget_restart');
+      const turnAlive = !isBudgetRestart && this.activeTurnTokens.has(agentName);
+      if (turnAlive || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
         // Re-queue requests, but warn if they've been pending too long
         const oldest = Math.min(...requests.map(r => r.timestamp));
         if (
@@ -4371,15 +4422,22 @@ export class AgentFramework {
           // (up to 100/sec after the scheduler backoff), adding avoidable work
           // precisely while the agent was already under pressure.
           this.staleWarnAt.set(agentName, now);
+          // Surface turn-alive separately from the state machine: status can
+          // read 'idle' while a turn's teardown is pending, and a LEAKED turn
+          // token would look exactly like this — permanently requeued wakes.
+          // This line is the wedge's tell (idle+turn-alive, forever).
+          const shownStatus = turnAlive && agent.state.status === 'idle'
+            ? 'idle+turn-alive'
+            : agent.state.status;
           this.emitTrace({
             type: 'inference:request_stale',
             agentName,
-            agentStatus: agent.state.status,
+            agentStatus: shownStatus,
             requestCount: requests.length,
             oldestRequestAge: now - oldest,
           });
           console.error(
-            `[inference-stale] agent=${agentName} busy (${agent.state.status}) — ` +
+            `[inference-stale] agent=${agentName} busy (${shownStatus}) — ` +
             `${requests.length} request(s) waiting ${Math.round((now - oldest) / 1000)}s`,
           );
         }
@@ -4703,6 +4761,85 @@ export class AgentFramework {
   }
 
   private async startAgentStream(agent: Agent, trigger?: InferenceRequest, attempt = 0): Promise<void> {
+    // Mark the turn alive before ANYTHING awaits (hooks, compile, stream
+    // setup): from here until this turn's teardown, cross-turn writers defer
+    // (addMessage guard) instead of appending — nothing may enter the window
+    // between a turn's dequeue and its settle except the turn's own blocks.
+    // A retry re-enters with a fresh token; teardown clears token-matched.
+    //
+    // The try/finally is the leak-proofing: a token whose owner never clears
+    // it permanently requeues every wake for the agent (the 'idle+turn-alive'
+    // wedge — worse than any single lost turn). Ownership is handed off
+    // exactly once, to driveStream, the moment the stream handle is
+    // registered; on every other exit — including a throw from the turn-start
+    // flush, recordTurnCheckpoint, or locus resolution, none of which the
+    // inner catch covers (ENOSPC-class store writes live there) — the finally
+    // clears our own token. Token-matched, so when a retry frame has replaced
+    // the token, or the terminal-failure branch already deleted it, this
+    // no-ops instead of clobbering a successor's marker.
+    const turnToken = this.nextTurnToken++;
+    this.activeTurnTokens.set(agent.name, turnToken);
+    let tokenHandedOff = false;
+    try {
+      tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken);
+    } finally {
+      if (!tokenHandedOff && this.activeTurnTokens.get(agent.name) === turnToken) {
+        this.activeTurnTokens.delete(agent.name);
+      }
+    }
+  }
+
+  /**
+   * Body of startAgentStream, split out so the caller's try/finally owns the
+   * turn token unconditionally. Returns true iff the token was handed off to
+   * driveStream (whose finally then owns clearing it).
+   */
+  private async beginAgentTurn(
+    agent: Agent,
+    trigger: InferenceRequest | undefined,
+    attempt: number,
+    turnToken: number,
+  ): Promise<boolean> {
+    // Flush messages deferred during the PREVIOUS turn — before the
+    // checkpoint, the locus announcement, and the compile — so a turn started
+    // by a queued wake actually CONTAINS the message that woke it. (2026-07-31
+    // Mythos: a DM's wake fired a turn whose compile ran before the deferred
+    // DM flushed; the model saw only the routing-shift notice, reasonably
+    // skipped, and the DM then landed before the skip in the window — false
+    // "saw it and ignored it" history plus KV divergence. Flushed here, the
+    // payload rides its own wake, and the notice/payload can never split.)
+    // Primary agent only — deferred messages are framework-level, meant for
+    // the main conversation (same target rule as the tool-boundary flush).
+    // Fresh turns only: a context-budget restart continues the same logical
+    // turn, and flushing there would insert messages between its rounds.
+    // Before recordTurnCheckpoint: these are the turn's inputs, not its
+    // products — undoing the turn must not destroy them.
+    if (
+      attempt === 0 &&
+      trigger?.reason !== 'context_budget_restart' &&
+      this.deferredMessages.length > 0
+    ) {
+      const target = (this.primaryAgentName ? this.agents.get(this.primaryAgentName) : undefined) ?? agent;
+      if (target === agent) {
+        const deferred = this.deferredMessages.splice(0);
+        for (const msg of deferred) {
+          // Per-message try/catch (mirrors announceLocusIfChanged): one
+          // poison message — or a transient store-write failure — must not
+          // abort the turn or drop the messages behind it in the queue.
+          try {
+            const id = agent.getContextManager().addMessage(msg.participant, msg.content, msg.metadata);
+            this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
+          } catch (err) {
+            console.error(
+              `[deferred-flush] turn-start flush failed to store a message for ${agent.name} ` +
+              `(participant=${msg.participant}):`,
+              err,
+            );
+          }
+        }
+      }
+    }
+
     // Record turn checkpoint before inference (only on first attempt, not retries)
     if (attempt === 0) {
       this.recordTurnCheckpoint(agent.name);
@@ -4843,6 +4980,9 @@ export class AgentFramework {
         compiledRequest,
       );
       this.activeStreams.set(agent.name, handle);
+      // Handoff: driveStream captured the token in its synchronous prefix;
+      // its finally now owns clearing it. The caller's finally must not.
+      return true;
     } catch (error) {
       // The early typing indicator has no driveStream `finally` on this path —
       // a hook/compile/stream-setup failure must not leave "typing…" stuck.
@@ -4860,8 +5000,18 @@ export class AgentFramework {
       const action = this.errorPolicy.onInferenceError(err, agent.name, attempt);
       if (action.retry) {
         await new Promise((resolve) => setTimeout(resolve, action.delayMs));
+        // The retry re-enters startAgentStream, which replaces this frame's
+        // turn token with its own; cleanup belongs to the innermost frame.
         await this.startAgentStream(agent, trigger, attempt + 1);
       } else {
+        // Terminal failure with no driveStream: this frame owns teardown.
+        // Token-matched (like the finally in driveStream) so a stale frame
+        // can never clear a successor turn's marker. A leaked token would
+        // permanently requeue every wake for this agent (same wedge shape as
+        // the eventGate `inferring` leak) — every exit path must clear it.
+        if (this.activeTurnTokens.get(agent.name) === turnToken) {
+          this.activeTurnTokens.delete(agent.name);
+        }
         this.settleAgent(agent.name, {
           stopReason: 'exhausted',
           speech: '',
@@ -4885,6 +5035,12 @@ export class AgentFramework {
           this.pushEvent(action.emit);
         }
       }
+      // No handoff on either failure branch: the terminal branch deleted the
+      // token above; the retry branch's recursive startAgentStream replaced
+      // it with the inner frame's token. Returning false lets the caller's
+      // token-matched finally no-op in both cases (and actually clear it if
+      // something above threw before either branch ran).
+      return false;
     }
   }
 
@@ -4899,6 +5055,10 @@ export class AgentFramework {
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
+    // This turn's alive-marker, set at startAgentStream entry. Safe to read
+    // from the map here: the turn-alive busy check in processInferenceRequests
+    // means no successor turn can have replaced it while we compiled.
+    const myTurnToken = this.activeTurnTokens.get(agent.name);
     let hadToolCalls = false;
 
     // ---- Present-while-acting turn state ---------------------------------
@@ -5783,6 +5943,17 @@ export class AgentFramework {
         this.disposeConversationAgent(agent.name);
       }
 
+      // The turn is torn down — release the turn-alive marker BEFORE the
+      // deferred flush below, so the flush appends at the settled tail.
+      // Token-matched: if a successor turn already owns the agent (endTurn
+      // reset the state machine before this finally ran — the 2026-07-31
+      // interleave), leave its marker alone; the guarded addMessage below
+      // then re-defers, and the successor's own turn-start flush / boundary
+      // injection / teardown delivers the messages at a correct position.
+      if (myTurnToken !== undefined && this.activeTurnTokens.get(agent.name) === myTurnToken) {
+        this.activeTurnTokens.delete(agent.name);
+      }
+
       // Flush any deferred messages (e.g. if stream failed while tools were pending)
       if (this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
         const deferred = this.deferredMessages.splice(0);
@@ -6438,15 +6609,27 @@ export class AgentFramework {
 
     // Defer non-tool_result messages while a tool cycle is mid-flight
     // (pendingAssistantBlocks: preserves tool_use → tool_result adjacency)
-    // OR while the target agent has a live stream at all. A message stored
-    // mid-stream lands BEFORE the turn's assistant blocks in the window even
-    // though the live conversation never saw it — so the next compile
-    // diverges from the live prefix (prompt-cache bust) and the message
-    // misses mid-turn injection. Deferred messages flush at the agent's next
-    // tool boundary (where they are ALSO injected into the live stream —
-    // hear-while-acting) or in driveStream's finally when the turn ends.
+    // OR while the target agent has a turn in progress AT ALL. A message
+    // stored mid-turn lands BEFORE the turn's assistant blocks in the window
+    // even though the live conversation never saw it — so the next compile
+    // diverges from the live prefix (prompt-cache bust), the message misses
+    // mid-turn injection, and the window falsely testifies the agent saw it
+    // and moved on. Turn-alive (activeTurnTokens) is the guard, not stream-
+    // alive: a turn exists from dequeue through hooks + compile before its
+    // stream registers in activeStreams, and the 2026-07-31 Mythos incident
+    // was precisely a deferred flush landing inside that compile window.
+    // (activeStreams is kept as a belt-and-suspenders backstop.) Deferred
+    // messages flush at the next turn's START (before its compile — riding
+    // their own wake), at the agent's next tool boundary (where they are
+    // ALSO injected into the live stream — hear-while-acting), or in
+    // driveStream's finally when the turn ends.
     const hasToolResult = content.some(b => b.type === 'tool_result');
-    if (!hasToolResult && (this.pendingAssistantBlocks.size > 0 || this.activeStreams.has(agent.name))) {
+    if (
+      !hasToolResult &&
+      (this.pendingAssistantBlocks.size > 0 ||
+        this.activeTurnTokens.has(agent.name) ||
+        this.activeStreams.has(agent.name))
+    ) {
       this.deferredMessages.push({ participant, content, metadata });
       return '' as MessageId; // Deferred — flushed at the next boundary
     }
