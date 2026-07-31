@@ -370,9 +370,86 @@ describe('present while acting', () => {
       'the addressed message itself was injected',
     );
     assert.ok(
-      wired.some((s) => s.includes('[routing] You were just addressed from discord:dm:antra')),
+      wired.some((s) => s.includes('[routing] The conversation moved to discord:dm:antra')),
       'the re-pin notice was injected alongside it',
     );
+
+    await framework.stop();
+  });
+
+  it('a HUMAN follow-up in a channel the agent explicitly engaged this turn re-pins', async () => {
+    // 2026-07-31 n=7 (q's #portables reply): the agent explicitly sent into
+    // a channel this turn; a human replies there WITHOUT a mention (ambient
+    // by tag, addressed by context). The engaged-channel leg moves the pin;
+    // trailing prose answering them follows. Bot ambient in the same channel
+    // must NOT move it (next assertion set).
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Good plan on both counts.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'I need to swap out this eye screen';
+    module.interjectionMetadata = {
+      channelId: 'discord:guild:portables',
+      tags: ['chat:ambient', 'chat:from-human'],
+    };
+    // Simulate an explicit send into #portables earlier in THIS turn (the
+    // production record happens on the MCPL send path; the harness module's
+    // tools are not MCPL, so seed the turn-scoped set mid-turn — after the
+    // turn-start clear, before the injection boundary).
+    const origHandle = module.handleToolCall.bind(module);
+    module.handleToolCall = async (call) => {
+      (framework as unknown as {
+        turnEngagedChannels: Map<string, Set<string>>;
+      }).turnEngagedChannels.set('assistant', new Set(['discord:guild:portables']));
+      return origHandle(call);
+    };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'Good plan on both counts.', locus: 'discord:guild:portables' },
+    ], 'trailing prose followed the human reply into the engaged channel');
+
+    await framework.stop();
+  });
+
+  it('BOT ambient in an engaged channel does not move the pin', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Continuing my report.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'automated status: all lamps nominal';
+    module.interjectionMetadata = {
+      channelId: 'discord:guild:alerts',
+      tags: ['chat:ambient', 'chat:from-bot'],
+    };
+    const origHandle = module.handleToolCall.bind(module);
+    module.handleToolCall = async (call) => {
+      (framework as unknown as {
+        turnEngagedChannels: Map<string, Set<string>>;
+      }).turnEngagedChannels.set('assistant', new Set(['discord:guild:alerts']));
+      return origHandle(call);
+    };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'Continuing my report.', locus: 'chan-live-1' },
+    ], 'bot chatter in an engaged channel left the pin alone');
 
     await framework.stop();
   });

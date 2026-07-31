@@ -587,8 +587,24 @@ export class AgentFramework {
    *  plain prose lands (2026-07-21 Cairn lounge misroute). Lives here — not in
    *  driveStream locals — so the pin survives a context-budget stream restart,
    *  which continues the same logical turn in a fresh driveStream. Cleared or
-   *  re-set at the start of every non-restart turn. */
+   *  re-set at the start of every non-restart turn. Since 2026-07-31 the pin
+   *  is no longer fully frozen: an ADDRESSED conversational injection — or a
+   *  HUMAN follow-up in a channel the agent itself explicitly sent into this
+   *  turn (turnEngagedChannels) — re-pins it at the boundary (see the
+   *  addressed re-pin block in the tool-result handler). Ambient chatter,
+   *  reactions, and system markers still cannot move it. */
   private turnLocusPins: Map<string, string> = new Map();
+  /** Channels the agent EXPLICITLY sent into during the CURRENT turn
+   *  (SEND_ENGAGEMENT_TOOLS, successful calls), per agent. Second re-pin
+   *  signal: a human reply in a channel the agent just engaged is
+   *  conversationally addressed even without a mention (2026-07-31 n=7:
+   *  q's #portables follow-up — no @mention — was answered in trailing
+   *  prose that followed the stale pin into repligate's DM). Bot-authored
+   *  ambient messages in engaged channels deliberately do NOT count —
+   *  agent-dense rooms (hospital_commons, #alerts) would drag the pin;
+   *  bots that mean to address the agent @mention it (addressed leg).
+   *  Cleared at every fresh turn's start; budget restarts keep it. */
+  private turnEngagedChannels: Map<string, Set<string>> = new Map();
   /** A tool boundary injected fresh CONVERSATIONAL input (a real message —
    *  not a reaction or a system marker) into the live stream. Tells
    *  driveStream to clear sticky explicit-send suppression before handling
@@ -3747,15 +3763,29 @@ export class AgentFramework {
             agent.proseRouting !== 'explicit' &&
             !shouldEndTurn && !overBudget && currentState.stream
           ) {
-            const lastAddressed = [...midTurnInjections].reverse().find((inj) => {
+            // Two signals qualify an injection to move the pin (n=6 + n=7):
+            //  - chat:addressed — someone explicitly spoke TO the agent
+            //    (mention / reply / DM);
+            //  - a HUMAN follow-up in a channel the agent itself explicitly
+            //    sent into THIS turn (turnEngagedChannels) — conversation
+            //    the agent just engaged continues without re-mentioning it
+            //    (2026-07-31: q's #portables reply, no @, answered in prose
+            //    that followed the stale pin into repligate's DM). Bot
+            //    ambient in engaged channels does not count: agent-dense
+            //    rooms would drag the pin; bots that mean it @mention.
+            const engaged = this.turnEngagedChannels.get(agent.name);
+            const lastQualifying = [...midTurnInjections].reverse().find((inj) => {
               const m = inj.metadata as Record<string, unknown> | undefined;
+              if (!isConversationalInjection(inj.metadata)) return false;
+              if (typeof m?.channelId !== 'string') return false;
+              const tags = m.tags as string[] | undefined;
+              if (isAddressedMessage(tags, m)) return true;
               return (
-                isConversationalInjection(inj.metadata) &&
-                typeof m?.channelId === 'string' &&
-                isAddressedMessage(m.tags as string[] | undefined, m)
+                engaged?.has(m.channelId as string) === true &&
+                Array.isArray(tags) && tags.includes('chat:from-human')
               );
             });
-            const newLocus = (lastAddressed?.metadata as Record<string, unknown> | undefined)
+            const newLocus = (lastQualifying?.metadata as Record<string, unknown> | undefined)
               ?.channelId as string | undefined;
             if (newLocus && this.turnLocusPins.get(agent.name) !== newLocus) {
               const prevPin = this.turnLocusPins.get(agent.name) ?? null;
@@ -3768,7 +3798,7 @@ export class AgentFramework {
               const noticeContent: ContentBlock[] = [{
                 type: 'text',
                 text:
-                  `[routing] You were just addressed from ${shown} — your plain ` +
+                  `[routing] The conversation moved to ${shown} — your plain ` +
                   'speech now lands there for the rest of this turn. Other ' +
                   'channels need an explicit send tool.',
               }];
@@ -5047,6 +5077,10 @@ export class AgentFramework {
     // KV stability).
     if (trigger?.reason !== 'context_budget_restart') {
       if (attempt === 0) this.maybePrimeProseMode(agent);
+      // Fresh turn: forget the previous turn's explicit-send engagements —
+      // the engaged-channel re-pin signal is strictly turn-scoped (a restart
+      // continues the same logical turn and keeps it).
+      this.turnEngagedChannels.delete(agent.name);
       if (agent.proseRouting === 'explicit') {
         // Explicit prose routing: there is no locus. The model names every
         // destination in-band (`>>` prefixes); the only turn state is the
@@ -8803,6 +8837,23 @@ export class AgentFramework {
             this.channelRegistry
               .openIfClosedForSend(target, serverId)
               .then(({ status, channelId, label }) => {
+                // Turn-scoped engagement record (mid-turn re-pin, 2026-07-31
+                // n=7): a human follow-up in a channel the agent explicitly
+                // sent into this turn counts as conversationally addressed.
+                // Recorded here — not eagerly — because injection metadata
+                // carries the CANONICAL channel id (descriptor form), while
+                // send args often carry the raw provider id; this callback
+                // has the resolved form. The already-open path resolves on
+                // the microtask queue, i.e. before the tool-result event
+                // that evaluates injections.
+                if (status !== 'unknown-channel' && status !== 'ambiguous') {
+                  let engaged = this.turnEngagedChannels.get(agentName);
+                  if (!engaged) {
+                    engaged = new Set();
+                    this.turnEngagedChannels.set(agentName, engaged);
+                  }
+                  engaged.add(channelId ?? target);
+                }
                 if (status === 'opened') {
                   console.error(
                     `[channel] ${agentName}: explicit ${toolName} into closed channel ${target} — opened (send implies engagement)`,
