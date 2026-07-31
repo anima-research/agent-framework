@@ -355,17 +355,37 @@ export class CheckpointManager {
   }
 
   /**
-   * Get the first stateful feature set for a given server.
-   * Returns null if no stateful feature sets are registered.
+   * Resolve a server-managed stateful feature set for a server.
+   *
+   * An explicit feature set is returned only when it is registered and
+   * server-managed. Without one, the fallback is safe only when exactly one
+   * server-managed stateful set exists. Returns null for no match or ambiguity.
    */
-  getStatefulFeatureSet(serverId: string): string | null {
+  getStatefulFeatureSet(serverId: string, featureSet?: string): string | null {
     const prefix = `${serverId}:`;
-    for (const [key] of this.trees) {
-      if (key.startsWith(prefix)) {
-        return key.slice(prefix.length);
-      }
+
+    if (featureSet !== undefined) {
+      const tree = this.trees.get(this.key(serverId, featureSet));
+      return tree && !tree.hostState ? featureSet : null;
     }
-    return null;
+
+    let match: string | null = null;
+    for (const [key, tree] of this.trees) {
+      if (!key.startsWith(prefix) || tree.hostState) continue;
+      if (match !== null) return null;
+      match = key.slice(prefix.length);
+    }
+    return match;
+  }
+
+  /** Whether an untagged tool cannot safely select a server-managed set. */
+  hasAmbiguousServerManagedFeatureSets(serverId: string): boolean {
+    const prefix = `${serverId}:`;
+    let count = 0;
+    for (const [key, tree] of this.trees) {
+      if (key.startsWith(prefix) && !tree.hostState && ++count > 1) return true;
+    }
+    return false;
   }
 
   /**
