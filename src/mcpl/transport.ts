@@ -205,14 +205,14 @@ export class WebSocketTransport extends McplTransport {
     // connect AND reconnect, so rotation happens at the transport layer and
     // nothing above it ever holds a credential.
     let token: string | null = config.token ?? null;
-    if (config.tokenProvider) {
+    if (config.accessProvider) {
       try {
-        token = (await config.tokenProvider()) ?? token;
+        token = (await config.accessProvider()) ?? token;
       } catch (err) {
         // Fall back to the static token (if any) rather than failing the dial
         // outright — the server will refuse a stale credential loudly anyway.
         console.error(
-          `[mcpl] server "${config.id}": credential provider failed (${err instanceof Error ? err.message : err}) — dialing with static token`,
+          `[mcpl] server "${config.id}": access provider failed (${err instanceof Error ? err.message : err}) — dialing with configured fallback`,
         );
       }
     }

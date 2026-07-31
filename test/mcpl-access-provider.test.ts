@@ -1,4 +1,4 @@
-// Per-dial credential resolution: `tokenProvider` overrides `token` at URL
+// Per-dial credential resolution: `accessProvider` overrides `token` at URL
 // build time (transport.open runs it on every dial), and error-path URLs are
 // redacted so credentials never ride error strings into traces or the model.
 import { describe, it } from 'node:test';

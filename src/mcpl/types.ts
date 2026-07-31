@@ -207,7 +207,7 @@ export interface McplServerConfig {
    * something fresh each redial, which also makes short-lived credentials
    * viable where a static `token` forced long ones).
    */
-  tokenProvider?: () => Promise<string | null>;
+  accessProvider?: () => Promise<string | null>;
 
   /** Feature sets to enable on connect */
   enabledFeatureSets?: string[];
