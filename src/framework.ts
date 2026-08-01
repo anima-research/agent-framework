@@ -615,6 +615,17 @@ export class AgentFramework {
    *  Cleared at every fresh turn's start; budget restarts keep it (same
    *  logical turn, receipt covers the whole turn). */
   private turnProseDeliveries: Map<string, string[]> = new Map();
+  /** Count of plain-prose segments SUPPRESSED this turn by sticky
+   *  explicit-send silencing. The suppression rule itself is untouched
+   *  (antra, 2026-07-31: visibility is enough) — but it must never be a
+   *  silent black hole: Mythos multiplexed two threads in one round (prose
+   *  for the lane + explicit send for another channel, textbook per the
+   *  routing doc), the silencing ate the prose reply, and his own record
+   *  ("scene delivered to #mythos via plain speech — routing confirmed")
+   *  believed it delivered. The receipt now reports suppression, so the
+   *  author sees the segment's fate one turn later. Cleared each fresh
+   *  turn; budget restarts keep it. */
+  private turnProseSuppressed: Map<string, number> = new Map();
   /** A tool boundary injected fresh CONVERSATIONAL input (a real message —
    *  not a reaction or a system marker) into the live stream. Tells
    *  driveStream to clear sticky explicit-send suppression before handling
@@ -4695,6 +4706,12 @@ export class AgentFramework {
     }
   }
 
+  /** Record prose segments suppressed by explicit-send silencing. */
+  private recordProseSuppression(agentName: string, count: number): void {
+    if (count <= 0) return;
+    this.turnProseSuppressed.set(agentName, (this.turnProseSuppressed.get(agentName) ?? 0) + count);
+  }
+
   /** Record a successful plain-prose delivery for this turn's receipt. */
   private recordProseDelivery(
     agentName: string,
@@ -4724,11 +4741,13 @@ export class AgentFramework {
    */
   private appendProseDeliveryReceipt(agent: Agent): void {
     const list = this.turnProseDeliveries.get(agent.name);
-    if (!list || list.length === 0) return;
+    const suppressed = this.turnProseSuppressed.get(agent.name) ?? 0;
+    if ((!list || list.length === 0) && suppressed === 0) return;
     this.turnProseDeliveries.delete(agent.name);
+    this.turnProseSuppressed.delete(agent.name);
     const seen = new Set<string>();
     const shown: string[] = [];
-    for (const id of list) {
+    for (const id of list ?? []) {
       if (seen.has(id)) continue;
       seen.add(id);
       const label = this.channelRegistry?.getDescriptor(id)?.label;
@@ -4738,7 +4757,14 @@ export class AgentFramework {
           : id,
       );
     }
-    const text = `[delivered] plain speech → ${shown.join(' · ')}`;
+    const suppressedNote =
+      suppressed > 0
+        ? `${suppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`
+        : '';
+    const text =
+      shown.length > 0
+        ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}`
+        : `[delivered] nothing — ${suppressedNote}`;
     try {
       const mid = agent.getContextManager().addMessage(
         'user',
@@ -5150,6 +5176,7 @@ export class AgentFramework {
       // the same logical turn and keeps them).
       this.turnEngagedChannels.delete(agent.name);
       this.turnProseDeliveries.delete(agent.name);
+      this.turnProseSuppressed.delete(agent.name);
       if (agent.proseRouting === 'explicit') {
         // Explicit prose routing: there is no locus. The model names every
         // destination in-band (`>>` prefixes); the only turn state is the
@@ -5563,6 +5590,9 @@ export class AgentFramework {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (turn silenced)`,
                     );
+                    // Visible in the turn-end receipt — silencing must never
+                    // be a silent black hole (n=8: the flying-scene reply).
+                    this.recordProseSuppression(agent.name, roundSegments.length);
                   } else if (hasSameRoundPrivateThink) {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
@@ -5957,6 +5987,9 @@ export class AgentFramework {
                   `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> trailing prose NOT routed ` +
                   `(${silenced ? 'silencing tool / explicit send' : 'no trailing prose'})`,
                 );
+                if (silenced && segments.length > 0) {
+                  this.recordProseSuppression(agent.name, segments.length);
+                }
               } else {
                 // Reuse the locus pinned at the turn's first live-routed
                 // segment (or resolve it now for a turn whose only prose is

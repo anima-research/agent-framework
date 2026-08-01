@@ -582,6 +582,43 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it('suppressed prose is visible in the receipt (silencing is never a silent black hole)', async () => {
+    // n=8 (2026-07-31 ~22:46): one round multiplexing two threads — prose
+    // for the lane + an explicit send for another channel, textbook per the
+    // routing doc. Sticky silencing ate the prose reply and nothing told
+    // the author; their own record believed it delivered. The rule stands
+    // (antra: visibility is enough) — but the turn-end receipt now reports
+    // the suppression, so the segment's fate is visible one turn later.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'the reply that silencing will eat' },
+      { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'explicit send to the other thread' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'trailing prose, also suppressed (sticky)' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [], 'silencing semantics unchanged: nothing auto-routed');
+    const cm = (framework as unknown as {
+      agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ content: Array<{ type: string; text?: string }> }> } }>;
+    }).agents.get('assistant')!.getContextManager();
+    const receipts = cm.getAllMessages()
+      .flatMap((m) => m.content)
+      .filter((b) => b.type === 'text')
+      .map((b) => b.text ?? '')
+      .filter((t) => t.startsWith('[delivered]'));
+    assert.deepEqual(receipts, [
+      '[delivered] nothing — 2 plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)',
+    ]);
+
+    await framework.stop();
+  });
+
   it('channel_open moves the pin mid-turn and announces in its own tool result', async () => {
     // The agent's own deliberate open is the strongest "my next words go
     // here" signal — stronger than any injection. The original 2026-07-21
