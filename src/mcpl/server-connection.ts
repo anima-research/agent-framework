@@ -29,6 +29,7 @@ import type {
   FeatureSetsUpdateParams,
   FeatureSetsUpdateResult,
   InferenceChunkParams,
+  InferenceLifecycleParams,
   StateRollbackParams,
   StateRollbackResult,
   ChannelsOpenParams,
@@ -525,6 +526,11 @@ export class McplServerConnection extends EventEmitter {
     this.sendNotification(McplMethod.InferenceChunk, params as unknown as Record<string, unknown>);
   }
 
+  /** Send `inference/lifecycle` notification (§10.5). Best-effort. */
+  sendInferenceLifecycle(params: InferenceLifecycleParams): void {
+    this.sendNotification(McplMethod.InferenceLifecycle, params as unknown as Record<string, unknown>);
+  }
+
   /** Send `state/rollback` request and await result. */
   sendStateRollback(params: StateRollbackParams): Promise<StateRollbackResult> {
     return this.sendRequest(McplMethod.StateRollback, params as unknown as Record<string, unknown>) as Promise<StateRollbackResult>;
@@ -847,6 +853,11 @@ export class McplServerConnection extends EventEmitter {
     [McplMethod.ChannelsChanged]: 'channels-changed',
     [McplMethod.ChannelsIncoming]: 'channels-incoming',
     [McplMethod.FeatureSetsChanged]: 'feature-sets-changed',
+    // §6.6/§12: a request bearing an id MUST get a result or an error —
+    // neither of these had an entry, so callers hung forever (AUDIT-001
+    // item 4, which also poisoned the audit's own usage evidence).
+    [McplMethod.ModelInfo]: 'model-info',
+    [McplMethod.ChannelsList]: 'channels-list',
     'notifications/tools/list_changed': 'tools-list-changed',
     // Host-level admin commands initiated from a surface (e.g. a Discord
     // slash command). Params: { command, ... }; host responds with a

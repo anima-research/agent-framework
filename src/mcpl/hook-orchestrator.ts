@@ -3,8 +3,9 @@
  *
  * This is the bridge between the MCPL protocol and the agent-framework inference
  * pipeline. It collects ContextInjection[] from MCPL servers via beforeInference
- * and feeds them into context-manager's compile(). After inference, it notifies
- * servers of the result via afterInference.
+ * and feeds them into context-manager's compile(). Turn boundaries are announced
+ * via metadata-only `inference/lifecycle` notifications (§10.5) —
+ * context/afterInference and its modifiedResponse are removed in 0.5.0.
  *
  * Design principles:
  * - Fail-open: timeouts and errors never block inference
@@ -20,8 +21,7 @@ import type {
   McplContextInjection,
   BeforeInferenceParams,
   BeforeInferenceResult,
-  AfterInferenceParams,
-  AfterInferenceResult,
+  InferenceLifecycleParams,
 } from './types.js';
 import type { McplServerRegistry } from './server-registry.js';
 import type { McplServerConnection } from './server-connection.js';
@@ -38,9 +38,6 @@ const INJECT_LEAVES: ReadonlyArray<{ position: string; path: string }> = [
   { position: 'beforeUser', path: 'contextHooks.beforeInference.inject.beforeUser' },
   { position: 'afterUser', path: 'contextHooks.beforeInference.inject.afterUser' },
 ];
-
-/** Timeout for blocking afterInference per server. */
-const AFTER_INFERENCE_BLOCKING_TIMEOUT_MS = 10_000;
 
 /**
  * Races a promise against a timeout. Rejects with a descriptive error on timeout.
@@ -173,23 +170,20 @@ export class HookOrchestrator {
   }
 
   /**
-   * Fan out `context/afterInference` to all capable MCPL servers.
-   *
-   * Non-blocking servers receive a notification (fire-and-forget).
-   * Blocking servers receive a request with a 10s timeout.
-   * Returns the first valid AfterInferenceResult from a blocking server, or null.
+   * Fan out `inference/lifecycle` (§10.5) — the metadata-only replacement
+   * for context/afterInference. Notifications, fire-and-forget, gated on the
+   * inferenceLifecycle grant. BEST-EFFORT by design: the host attempts one
+   * terminal per `started` on every exit path it controls; consumers dedupe
+   * by inferenceId and keep a safety timeout. Never blocks the turn.
    */
-  async afterInference(params: AfterInferenceParams): Promise<AfterInferenceResult | null> {
-    const servers = this.registry.getServersWithCapability('contextHooks.afterInference');
-    if (servers.length === 0) {
-      return null;
-    }
-
-    this._isInHook = true;
-    try {
-      return await this.fanOutAfterInference(servers, params);
-    } finally {
-      this._isInHook = false;
+  emitLifecycle(params: InferenceLifecycleParams): void {
+    for (const server of this.registry.getAllServers()) {
+      if (!server.grant.has('inferenceLifecycle')) continue;
+      try {
+        server.sendInferenceLifecycle(params);
+      } catch {
+        /* best-effort — a failed notify never disturbs the turn */
+      }
     }
   }
 
@@ -261,60 +255,4 @@ export class HookOrchestrator {
     return injections;
   }
 
-  // ==========================================================================
-  // Private: afterInference fan-out
-  // ==========================================================================
-
-  private async fanOutAfterInference(
-    servers: McplServerConnection[],
-    params: AfterInferenceParams,
-  ): Promise<AfterInferenceResult | null> {
-    const blockingPromises: Promise<AfterInferenceResult | null>[] = [];
-
-    for (const server of servers) {
-      const isBlocking = this.isBlockingAfterInference(server);
-
-      if (isBlocking) {
-        // Send as request, await response with timeout
-        const promise = withTimeout(
-          server.sendAfterInference(params, true) as Promise<AfterInferenceResult>,
-          AFTER_INFERENCE_BLOCKING_TIMEOUT_MS,
-          `afterInference (blocking) to "${server.id}"`,
-        ).catch((): null => {
-          // Fail-open: timeout or error — treat as no modification
-          return null;
-        });
-        blockingPromises.push(promise);
-      } else {
-        // Send as notification (fire-and-forget)
-        server.sendAfterInference(params, false);
-      }
-    }
-
-    if (blockingPromises.length === 0) {
-      return null;
-    }
-
-    // Await all blocking responses and return the first valid result
-    const results = await Promise.all(blockingPromises);
-    for (const result of results) {
-      if (result && result.modifiedResponse) {
-        return result;
-      }
-    }
-
-    return null;
-  }
-
-  /**
-   * Check if a server's afterInference capability is blocking.
-   */
-  private isBlockingAfterInference(server: McplServerConnection): boolean {
-    const caps = server.capabilities;
-    if (!caps?.contextHooks?.afterInference) {
-      return false;
-    }
-    const afterCap = caps.contextHooks.afterInference;
-    return typeof afterCap === 'object' && afterCap !== null && 'blocking' in afterCap && afterCap.blocking === true;
-  }
 }

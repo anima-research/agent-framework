@@ -622,6 +622,22 @@ export interface PushEventResult {
  * Distinct from membrane's ModelInfo which tracks requested vs actual model.
  * Spec Section 10.1.
  */
+/**
+ * inference/lifecycle params (Host → Server, Notification). SPEC §10.5.
+ *
+ * BEST-EFFORT: the host attempts exactly one terminal phase per `started`
+ * on every exit path it controls, but an unacknowledged Notification cannot
+ * guarantee delivery — consumers MUST dedupe by inferenceId and MUST retain
+ * a safety timeout. Carries no content: `modifiedResponse` and the blocking
+ * hook form are gone with context/afterInference.
+ */
+export interface InferenceLifecycleParams {
+  inferenceId: string;
+  conversationId: string;
+  turnIndex: number;
+  phase: 'started' | 'completed' | 'aborted' | 'failed';
+}
+
 export interface McplModelInfo {
   /** Model identifier (e.g., "claude-opus-4-5-20251101") */
   id: string;
@@ -927,7 +943,14 @@ export interface ChannelsRegisterParams {
  * channels/register result (Host → Server).
  */
 export interface ChannelsRegisterResult {
+  /** Legacy pre-0.5 field: ids accepted. Kept for un-migrated servers. */
   registered: string[];
+  /**
+   * §14.5 itemized results — one entry per SUBMITTED descriptor. 0.5
+   * servers key off this: a missing verdict is not a verdict, and a result
+   * without `results` is read by strict servers as accepting nothing.
+   */
+  results: Array<{ id: string; accepted: boolean; reason?: string }>;
 }
 
 /**
@@ -1142,6 +1165,10 @@ export const McplMethod = {
 
   // Model info (Server → Host)
   ModelInfo: 'model/info',
+
+  // Inference lifecycle (Host → Server, Notification) — §10.5, replaces
+  // context/afterInference. Metadata only; BEST-EFFORT delivery.
+  InferenceLifecycle: 'inference/lifecycle',
 
   // Feature sets
   FeatureSetsUpdate: 'featureSets/update',

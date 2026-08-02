@@ -57,7 +57,6 @@ import { ModuleRegistry, isStateExistsError } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant } from './mcpl/capability-grant.js';
-import { ScopeManager } from './mcpl/scope-manager.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
 import { parseProsePrefix } from './mcpl/prose-grammar.js';
@@ -294,10 +293,7 @@ import type {
   McplServerConfig,
   McplHostCapabilities,
   FeatureSetsChangedParams,
-  ScopeElevateParams,
-  ScopeElevateResult,
   BeforeInferenceParams,
-  AfterInferenceParams,
   PushEventParams,
   McplInferenceRequestParams,
   ChannelsRegisterParams,
@@ -746,7 +742,6 @@ export class AgentFramework {
   // MCPL subsystems (null when no mcplServers configured)
   private mcplServerRegistry: McplServerRegistry | null = null;
   private featureSetManager: FeatureSetManager | null = null;
-  private scopeManager: ScopeManager | null = null;
   private hookOrchestrator: HookOrchestrator | null = null;
   private pushHandler: PushHandler | null = null;
   private inferenceRouter: InferenceRouter | null = null;
@@ -5425,6 +5420,19 @@ export class AgentFramework {
     // remains the sole authoritative send.
     const outgoingInferenceId = `inf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     let outgoingIndex = 0;
+
+    // §10.5 inference/lifecycle: `started` now, exactly one terminal in the
+    // finally below (the one block every exit path shares). Which terminal
+    // is decided by the paths themselves: default completed, catch sets
+    // failed, a framework-cancelled stream sets aborted. Best-effort
+    // notifications — consumers dedupe by inferenceId and keep a timeout.
+    let lifecyclePhase: 'completed' | 'aborted' | 'failed' = 'completed';
+    this.hookOrchestrator?.emitLifecycle({
+      inferenceId: outgoingInferenceId,
+      conversationId: agent.name,
+      turnIndex: 0,
+      phase: 'started',
+    });
     const proseStream = this.channelRegistry
       ? new ProseStreamRouter({
           mode: agent.proseRouting === 'explicit' ? 'explicit' : 'locus',
@@ -5680,40 +5688,10 @@ export class AgentFramework {
               agent.addAssistantResponse(terminalContent);
             }
 
-            // Run afterInference hooks (no-op if no MCPL servers)
-            if (this.hookOrchestrator) {
-              try {
-                const speechText = response.content
-                  .filter((block: ContentBlock): block is ContentBlock & { type: 'text' } => block.type === 'text')
-                  .map((b) => b.text)
-                  .join('\n');
-
-                const afterParams: AfterInferenceParams = {
-                  inferenceId: requestId,
-                  conversationId: agent.name,
-                  turnIndex: 0,
-                  userMessage: null,
-                  assistantMessage: speechText,
-                  model: {
-                    id: agent.model,
-                    vendor: 'unknown',
-                    contextWindow: 200000,
-                    capabilities: ['tools'],
-                  },
-                  usage: {
-                    inputTokens: response.usage?.inputTokens ?? 0,
-                    outputTokens: response.usage?.outputTokens ?? 0,
-                    cacheCreationTokens: response.details?.usage?.cacheCreationTokens,
-                    cacheReadTokens: response.details?.usage?.cacheReadTokens,
-                  },
-                };
-
-                await this.hookOrchestrator.afterInference(afterParams);
-              } catch (error) {
-                // Fail-open: continue with speech dispatch
-                console.error('afterInference hook error:', error);
-              }
-            }
+            // §10.5: context/afterInference is removed in 0.5.0 — no
+            // content leaves the host here. Turn boundaries are announced
+            // by the metadata-only inference/lifecycle notifications
+            // emitted in driveStream's start/exit paths.
 
             // Separate speech from thoughts — for MODULE dispatch only
             // (dispatchSpeech / TUI rendering below). This split does NOT
@@ -6112,6 +6090,7 @@ export class AgentFramework {
               const cancelKind = this.frameworkCancelledStreams.get(cancelKey);
               if (cancelKind !== undefined) {
                 this.frameworkCancelledStreams.delete(cancelKey);
+                lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
                 this.eventGate?.onInferenceEnded(agent.name);
                 // endTurn IS a logical turn end — earlier rounds may have
                 // live-routed prose (narrate → skip_reply is a real shape),
@@ -6238,9 +6217,21 @@ export class AgentFramework {
         durationMs,
       });
       this.abortAgentScript(agent.name, 'stream threw');
+      lifecyclePhase = 'failed'; // §10.5 — terminal emitted in finally
       agent.reset();
       this.eventGate?.onInferenceEnded(agent.name);
     } finally {
+      // §10.5: exactly one terminal per `started`, on every exit path the
+      // host controls. Which one was decided by the path taken (default
+      // completed; catch → failed; framework-cancel → aborted). A host
+      // crash emits nothing — that is the documented best-effort limit, and
+      // why consumers keep their safety timeout.
+      this.hookOrchestrator?.emitLifecycle({
+        inferenceId: outgoingInferenceId,
+        conversationId: agent.name,
+        turnIndex: 0,
+        phase: lifecyclePhase,
+      });
       // Clear the gate's inference flag on EVERY exit path (paired with the
       // onInferenceStarted in startAgentStream). The branch-level calls above
       // are kept but are best-effort; if any exit path bypassed them the agent
@@ -7816,7 +7807,6 @@ export class AgentFramework {
   ): Promise<void> {
     this.mcplServerRegistry = new McplServerRegistry();
     this.featureSetManager = new FeatureSetManager();
-    this.scopeManager = new ScopeManager();
     this.hookOrchestrator = new HookOrchestrator(this.mcplServerRegistry, this.featureSetManager);
 
     // Build prefix map and store configs for tool routing
@@ -7934,15 +7924,29 @@ export class AgentFramework {
 
     // Host capabilities advertised during the MCP handshake — stored so
     // servers can also be connected later at runtime (connectMcplServer).
+    // §5.2: the host advertises what it actually implements. 0.5.0-draft:
+    // afterInference is GONE (replaced by inference/lifecycle, §10.5), and
+    // the previously under-advertised inferenceRequest + channels — both
+    // implemented for years — are declared (AUDIT-001/issue #76 item 12).
     this.mcplHostCapabilities = {
-      version: '0.4',
+      version: '0.5',
       pushEvents: true,
       contextHooks: {
         beforeInference: true,
-        afterInference: { blocking: true },
+      },
+      inferenceLifecycle: true,
+      inferenceRequest: { streaming: true },
+      channels: {
+        register: true,
+        lifecycle: true,
+        publish: true,
+        incoming: true,
+        streaming: true,
+        acknowledge: true,
+        typing: true,
       },
       featureSets: true,
-    };
+    } as McplHostCapabilities;
 
     for (const config of serverConfigs) {
       try {
@@ -8467,9 +8471,8 @@ export class AgentFramework {
       return;
     }
 
-    // Configure scope whitelist/blacklist patterns
     if (config.scopes) {
-      this.scopeManager!.configureAll(config.scopes);
+      console.error(`[mcpl] ${config.id}: config \`scopes\` is ignored — §7 Scoped Access removed in 0.5.0`);
     }
 
     // Register stateful feature sets with checkpoint manager (Step 8)
@@ -8626,20 +8629,9 @@ export class AgentFramework {
     });
 
     // Handle scope elevation requests
-    connection.on('scope-elevate', async (
-      params: ScopeElevateParams,
-      responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
-    ) => {
-      if (this.scopeManager && responder) {
-        try {
-          const result: ScopeElevateResult = await this.scopeManager.handleElevation(params);
-          responder.respond(result);
-        } catch (error) {
-          const err = error instanceof Error ? error : new Error(String(error));
-          responder.respondError(-32603, err.message);
-        }
-      }
-    });
+    // §7 Scoped Access is removed in 0.5.0. scope/elevate is answered
+    // -32601 at the connection (server-connection.ts) and never reaches the
+    // framework; the ScopeManager and config `scopes` wiring went with it.
 
     // Handle push events (Step 6)
     connection.on('push-event', async (
@@ -8678,6 +8670,36 @@ export class AgentFramework {
     // Handle channel changes (Step 7)
     connection.on('channels-changed', async (params: ChannelsChangedParams) => {
       await this.channelRegistry?.handleChanged(connection.id, params);
+    });
+
+    // §6.6/§12: requests that previously had no handler and hung forever
+    // (AUDIT-001 item 4). The connection-level grant gate has already run.
+    connection.on('channels-list', (
+      _params: unknown,
+      responder?: { respond: (result: unknown) => void },
+    ) => {
+      responder?.respond({
+        channels: this.channelRegistry?.descriptorsForServer(connection.id) ?? [],
+      });
+    });
+
+    connection.on('model-info', (
+      _params: unknown,
+      responder?: { respond: (result: unknown) => void },
+    ) => {
+      // Host-level answer: the first registered agent's model. A
+      // per-conversation answer needs a conversation id in the params,
+      // which §12 does not define — this is the honest host-wide value,
+      // matching what beforeInference already reports.
+      const agent = this.agents.values().next().value;
+      responder?.respond({
+        model: {
+          id: agent?.model ?? 'unknown',
+          vendor: 'unknown',
+          contextWindow: 200000,
+          capabilities: ['tools'],
+        },
+      });
     });
 
     // Handle incoming channel messages (Step 7)

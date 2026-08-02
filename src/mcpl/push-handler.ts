@@ -16,6 +16,7 @@ import type {
 } from './types.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
+import { expandCoreTags } from './tags.js';
 
 // ============================================================================
 // McplPushEvent (the ProcessEvent shape pushed to the queue)
@@ -165,6 +166,12 @@ export class PushHandler {
     params: PushEventParams,
     responder?: Responder,
   ): void {
+    // §16.3: expand the normative chat:* core closure once, at entry, so
+    // every downstream consumer (wake matching, metadata, the queued event)
+    // sees the closed set. Producer `implies` edges are NOT consumed —
+    // advisory pending acceptance (§16.4). Tags were admitted before this
+    // point and grant nothing (§16.6).
+    if (params.tags) params.tags = expandCoreTags(params.tags);
     // 1. Validate feature set. §6.6: rejection is diagnostics, not
     // authorization, and MUST be a JSON-RPC error object — not a result
     // carrying a failure flag. (The old `{accepted:false, reason}` result

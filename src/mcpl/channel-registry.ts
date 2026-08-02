@@ -34,6 +34,7 @@ import type {
 import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
+import { expandCoreTags } from './tags.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -466,8 +467,19 @@ export class ChannelRegistry {
     responder?: Responder,
   ): Promise<void> {
     const registeredIds: string[] = [];
+    // §14.5: per-descriptor authorization with ITEMIZED results — one entry
+    // per submitted descriptor. Strict 0.5 servers treat a result without
+    // `results` (or a descriptor missing from it) as rejected, so the shape
+    // is interop-critical, not decorative. Rejection here is per-descriptor
+    // validation; the method-level channels.register gate already ran at the
+    // connection (§14.1).
+    const results: ChannelsRegisterResult['results'] = [];
 
     for (const channel of params.channels) {
+      if (!channel || typeof channel.id !== 'string' || channel.id.length === 0) {
+        results.push({ id: String(channel?.id ?? ''), accepted: false, reason: 'invalid descriptor: missing id' });
+        continue;
+      }
       const key = `${serverId}:${channel.id}`;
       this.channels.set(key, {
         serverId,
@@ -475,11 +487,12 @@ export class ChannelRegistry {
         open: false,
       });
       registeredIds.push(channel.id);
+      results.push({ id: channel.id, accepted: true });
     }
 
     // Respond before reconciliation — the server blocks on this response and
     // can't process channels/open until it arrives.
-    const result: ChannelsRegisterResult = { registered: registeredIds };
+    const result: ChannelsRegisterResult = { registered: registeredIds, results };
     responder?.respond(result);
 
     // One-time migration from the retired recipe policy, then reconcile the
@@ -561,6 +574,9 @@ export class ChannelRegistry {
     const results: ChannelIncomingMessageResult[] = [];
 
     for (const message of params.messages) {
+      // §16.3: expand the normative chat:* core closure at entry (see
+      // push-handler for the full rationale; same rule, same limits).
+      if (message.tags) message.tags = expandCoreTags(message.tags);
       // Convert MCPL content blocks to membrane ContentBlocks
       const convertedContent: ContentBlock[] = message.content.map(convertBlock);
 
@@ -1189,6 +1205,19 @@ export class ChannelRegistry {
     const server = this.serverRegistry.getServer(serverId);
     if (!server) return;
 
+    // §14.1: channels/open + channels/close require channels.lifecycle.
+    // Skipping reconciliation for an ungranted server is the enforcement —
+    // its channels simply stay in whatever state the server chose, and the
+    // host never directs lifecycle it was not granted authority over.
+    if (!server.grant.has('channels.lifecycle')) {
+      this.emitTraceFn({
+        type: 'mcpl:channel-reconcile-skipped',
+        serverId,
+        reason: 'channels.lifecycle not in effective grant (§14.1)',
+      });
+      return;
+    }
+
     // Channels the subscription policy freshly admitted in THIS pass —
     // announced to the agent as one batched notice after the loop, so a
     // first boot on a new policy doesn't produce one notice per channel.
@@ -1263,6 +1292,10 @@ export class ChannelRegistry {
    * (typing timer lifecycle is still managed for when the callback is wired).
    */
   private sendTypingNotification(serverId: string, channelId: string): void {
+    // §14.1: channels/typing requires channels.typing in the grant. Silent
+    // skip — a typing indicator is cosmetic and per-7s, so a diagnostic per
+    // tick would be noise.
+    if (!this.serverRegistry.getServer(serverId)?.grant.has('channels.typing')) return;
     if (this.sendTypingFn) {
       this.sendTypingFn(serverId, channelId, this.typingMetadata.get(channelId));
     }
@@ -1273,6 +1306,13 @@ export class ChannelRegistry {
   // ==========================================================================
   // Private: Channel Lookup
   // ==========================================================================
+
+  /** Descriptors registered by one server — the §14.3 channels/list answer. */
+  descriptorsForServer(serverId: string): ChannelDescriptor[] {
+    return [...this.channels.values()]
+      .filter((e) => e.serverId === serverId)
+      .map((e) => e.descriptor);
+  }
 
   /** Server id owning a registered channel (by descriptor id), or null. */
   getChannelServerId(channelId: string): string | null {
@@ -1377,6 +1417,11 @@ export class ChannelRegistry {
     const server = this.serverRegistry.getServer(entry.serverId);
     if (!server) {
       throw new Error(`Server not found: ${entry.serverId}`);
+    }
+    if (!server.grant.has('channels.lifecycle')) {
+      // Desired state is already recorded — intent sticks; reconciliation
+      // will retry if the grant later widens (§6.7 expansion-on-receipt).
+      throw new Error(`channels.lifecycle not in "${entry.serverId}"'s effective grant (§14.1)`);
     }
     const result: ChannelsOpenResult = await server.sendChannelsOpen({
       channelId: entry.descriptor.id,
@@ -1722,6 +1767,13 @@ export class ChannelRegistry {
     }
 
     try {
+      if (!server.grant.has('channels.lifecycle')) {
+        return {
+          success: false,
+          error: `channels.lifecycle not in "${entry.serverId}"'s effective grant (§14.1)`,
+          isError: true,
+        };
+      }
       await server.sendChannelsClose({ channelId: input.channelId });
       entry.open = false;
       return {
@@ -1767,6 +1819,8 @@ export class ChannelRegistry {
       const server = this.serverRegistry.getServer(entry.serverId);
       if (!server) {
         acknowledgmentError = `Server not found: ${entry.serverId}`;
+      } else if (!server.grant.has('channels.acknowledge')) {
+        acknowledgmentError = `channels.acknowledge not in "${entry.serverId}"'s effective grant (§14.1)`;
       } else {
         try {
           const result = await server.sendChannelsAcknowledge({
@@ -1924,7 +1978,12 @@ export class ChannelRegistry {
     const matches = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
     if (matches.length !== 1) return null;
     const server = this.serverRegistry.getServer(matches[0]!.serverId);
-    if (!server?.capabilities?.channels?.streaming) return null;
+    // §5.4: the GRANT gates streaming, not the raw advertisement. The old
+    // `capabilities?.channels?.streaming` check was doubly wrong: undefined
+    // for the boolean `channels: true` shape (masking discord-mcpl's latent
+    // double-post, AUDIT-001), and pre-policy it would have sent before the
+    // server was told anything was granted.
+    if (!server?.grant.has('channels.streaming')) return null;
     return server;
   }
 
@@ -2016,6 +2075,12 @@ export class ChannelRegistry {
     if (!server) {
       return fail(channelId, `server "${entry.serverId}" not found`);
     }
+    // §14.1: channels/publish requires channels.publish in the grant. The
+    // host not sending is the enforcement — a send to an ungranted server
+    // would have it act on authority it was never told it has.
+    if (!server.grant.has('channels.publish')) {
+      return fail(channelId, `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`);
+    }
 
     const publishParams: ChannelsPublishParams = {
       conversationId,
@@ -2092,6 +2157,13 @@ export class ChannelRegistry {
     }
 
     try {
+      if (!server.grant.has('channels.publish')) {
+        return {
+          success: false,
+          error: `channels.publish not in "${server.id}"'s effective grant (§14.1)`,
+          isError: true,
+        };
+      }
       const publishParams: ChannelsPublishParams = {
         conversationId: '', // Framework will fill this when wired
         channelId,
