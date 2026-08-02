@@ -32,7 +32,14 @@ function stateUpdateSizes(store: JsStore, match: (stateId: string) => boolean): 
   for (const id of store.getRecordIdsByType('state_update')) {
     const record = store.getRecord(id);
     if (!record) continue;
-    const update = JSON.parse(record.payload.toString()) as { state_id: string };
+    // state_update payloads are MessagePack on current chronicle (2026-08
+    // encoding migration) — decode via the store, with a raw-JSON fallback
+    // for older chronicle builds that lack the method.
+    const decoder = (store as unknown as { getStateUpdateJson?: (id: string) => string | null })
+      .getStateUpdateJson;
+    const json = decoder ? decoder.call(store, id) : record.payload.toString();
+    if (!json) continue;
+    const update = JSON.parse(json) as { state_id: string };
     if (match(update.state_id)) sizes.push(record.payload.length);
   }
   return sizes;

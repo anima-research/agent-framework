@@ -53,12 +53,17 @@ function logLogSlope(sizes: number[]): number {
 }
 
 /** All state_update payload sizes in append order, grouped by state id. */
-function sweepStateFamilies(store: { getRecordIdsByType(t: string): string[]; getRecord(id: string): { payload: Buffer } | null }): Map<string, number[]> {
+function sweepStateFamilies(store: { getRecordIdsByType(t: string): string[]; getRecord(id: string): { payload: Buffer } | null; getStateUpdateJson?: (id: string) => string | null }): Map<string, number[]> {
   const families = new Map<string, number[]>();
   for (const id of store.getRecordIdsByType('state_update')) {
     const record = store.getRecord(id);
     if (!record) continue;
-    const update = JSON.parse(record.payload.toString()) as { state_id: string };
+    // state_update payloads are MessagePack on current chronicle (2026-08
+    // encoding migration) — decode via the store, with a raw-JSON fallback
+    // for older chronicle builds that lack the method.
+    const json = store.getStateUpdateJson ? store.getStateUpdateJson(id) : record.payload.toString();
+    if (!json) continue;
+    const update = JSON.parse(json) as { state_id: string };
     let sizes = families.get(update.state_id);
     if (!sizes) families.set(update.state_id, (sizes = []));
     sizes.push(record.payload.length);
