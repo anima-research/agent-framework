@@ -383,15 +383,50 @@ export interface FeatureSetDeclaration {
  * Spec Section 6.7.
  */
 export interface FeatureSetsUpdateParams {
-  /** Feature sets to enable */
+  /**
+   * The effective capability grant (§5.4) — the sole normative allowlist.
+   * Full §6.2 paths. Absence of a path is denial. In the Request form an
+   * absent FIELD is a grant of nothing (§5.3 as pinned 2026-08-02), never
+   * "no change".
+   */
+  effectiveCapabilities?: string[];
+
+  /** Advertised-but-denied paths. Diagnostic only (§5.4) — MUST NOT
+   *  participate in any authorization decision on either side. */
+  deniedCapabilities?: string[];
+
+  /** Feature sets to enable. Absent = no constraint (derivation governs);
+   *  present = allowlist (§5.3 as pinned). */
   enabled?: string[];
 
   /** Feature sets to disable */
   disabled?: string[];
-
-  /** Scope configurations per feature set */
-  scopes?: Record<string, ScopeConfig>;
 }
+
+/**
+ * featureSets/update result — the degradation receipt (§6.7). Consequence
+ * testimony, never policy authority: the host MUST NOT widen any grant in
+ * response to anything in here.
+ */
+export type FeatureSetsUpdateResult =
+  | {
+      accepted: true;
+      /** Omitted when nothing degraded (§6.7). */
+      mode?: 'degraded';
+      unavailableFeatures?: Array<{
+        featureSet: string;
+        missingCapabilities: string[];
+        effect: string;
+      }>;
+      notes?: string[];
+    }
+  | {
+      accepted: false;
+      /** REQUIRED on refusal (§6.7): the server names which applies. */
+      fallback: 'mcp-only' | 'close';
+      missingCapabilities?: string[];
+      reason?: string;
+    };
 
 /**
  * featureSets/changed params (Server → Host, Notification).

@@ -165,7 +165,12 @@ export class PushHandler {
     params: PushEventParams,
     responder?: Responder,
   ): void {
-    // 1. Validate feature set
+    // 1. Validate feature set. §6.6: rejection is diagnostics, not
+    // authorization, and MUST be a JSON-RPC error object — not a result
+    // carrying a failure flag. (The old `{accepted:false, reason}` result
+    // was AUDIT-001's finding: the error factories existed and were never
+    // invoked.) Falls back to the result shape only for a legacy responder
+    // with no error path.
     try {
       this.featureSetManager.validateInbound(serverId, params.featureSet);
     } catch (err) {
@@ -175,7 +180,11 @@ export class PushHandler {
       // Loud rejection — a rejected push event is an agent that silently
       // never hears the message. (2026-07-09 diagnosability pass.)
       console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=${reason}`);
-      responder?.respond({ accepted: false, reason });
+      if (err instanceof McplFeatureSetError && responder?.respondError) {
+        responder.respondError(err.code, reason, { featureSet: err.featureSet });
+      } else {
+        responder?.respond({ accepted: false, reason });
+      }
       return;
     }
 

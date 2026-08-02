@@ -56,6 +56,7 @@ import { Agent } from './agent.js';
 import { ModuleRegistry, isStateExistsError } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
+import { computeGrant } from './mcpl/capability-grant.js';
 import { ScopeManager } from './mcpl/scope-manager.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
@@ -8354,8 +8355,10 @@ export class AgentFramework {
     // releases control traffic needed for registration and marker service.
     this.wireMcplEvents(connection);
 
-    // Initialize feature sets if server advertises MCPL capabilities
-    this.registerMcplServerFeatures(config, connection);
+    // Initialize feature sets if server advertises MCPL capabilities.
+    // §5.3 initial policy handshake — awaited, so the grant is established
+    // (or knowingly left empty) before startup staging releases any traffic.
+    await this.registerMcplServerFeatures(config, connection);
 
     if (deferAwareness) {
       this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
@@ -8393,11 +8396,17 @@ export class AgentFramework {
    * already has a tree), so checkpoint trees preserved across a transient
    * disconnect are resumed, not reset.
    */
-  private registerMcplServerFeatures(
+  private async registerMcplServerFeatures(
     config: import('./mcpl/types.js').McplServerConfig,
     connection: McplServerConnection,
-  ): void {
+  ): Promise<void> {
     if (!connection.capabilities) return;
+
+    // §5.4: compute the effective grant from the (config-masked)
+    // advertisement. Not yet active — expansion activates only after the
+    // receipt (§6.7); until then the connection's grant is empty and every
+    // privileged inbound method is rejected.
+    const grant = computeGrant(connection.capabilities, config);
 
     const updateParams = this.featureSetManager!.initializeServer(
       config.id,
@@ -8406,11 +8415,56 @@ export class AgentFramework {
         enabledFeatureSets: config.enabledFeatureSets,
         disabledFeatureSets: config.disabledFeatureSets,
       },
+      grant,
     );
 
-    // Inform server which feature sets are enabled/disabled
-    if (updateParams.enabled?.length || updateParams.disabled?.length) {
-      connection.sendFeatureSetsUpdate(updateParams);
+    // §5.3: initial policy MUST be a Request, MUST precede first fan-out,
+    // and MUST be sent even when nothing is enabled or disabled — a server
+    // defaulted to fully disabled has to be told. The response is a
+    // degradation receipt (§6.7): consequence testimony, never policy
+    // authority — nothing in it may widen the grant.
+    updateParams.effectiveCapabilities = grant.effectiveList();
+    if (grant.deniedPaths.length > 0) {
+      updateParams.deniedCapabilities = [...grant.deniedPaths];
+    }
+
+    try {
+      const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
+      if (receipt && receipt.accepted === false) {
+        const fallback = receipt.fallback ?? 'mcp-only';
+        console.error(
+          `[mcpl] ${config.id} refused initial policy (${receipt.reason ?? 'no reason'}) — fallback: ${fallback}`,
+        );
+        if (fallback === 'close') {
+          await connection.close();
+          return;
+        }
+        // mcp-only (§3.2): grant stays empty, MCPL privileged surface stays
+        // dark, plain MCP tools keep working. MUST NOT widen in response to
+        // the refusal — a human can change config; the policy engine cannot.
+        return;
+      }
+      // Expansion activates on receipt (§6.7).
+      connection.establishGrant(grant);
+      if (receipt?.accepted === true && receipt.mode === 'degraded') {
+        for (const uf of receipt.unavailableFeatures ?? []) {
+          console.error(
+            `[mcpl] ${config.id} degraded: ${uf.featureSet} (${uf.effect}; missing ${uf.missingCapabilities.join(', ')})`,
+          );
+        }
+      }
+    } catch (err) {
+      // A pre-0.5 server treats the Request as a notification and never
+      // answers. §6.7: an unanswered expansion simply does not activate —
+      // grant stays empty, connection is effectively MCP-only. This WILL
+      // dark every un-migrated MCPL server's privileged surface; accepted
+      // deliberately for the single-release rollout (issue #76 item 9).
+      console.error(
+        `[mcpl] ${config.id} did not answer the initial policy Request — ` +
+          `MCPL privileged surface stays disabled (§6.7 unanswered expansion): ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+      return;
     }
 
     // Configure scope whitelist/blacklist patterns
@@ -8682,19 +8736,25 @@ export class AgentFramework {
       // reconnect observes it before doing work that could wake an agent. The
       // connection paused its data plane before wiring the fresh transport.
       const awarenessBarrier = this.installMcplDataPlaneGate();
-      try {
-        const config = this.mcplServerConfigs.get(connection.id);
-        if (config) {
-          this.registerMcplServerFeatures(config, connection);
+      // Async: the §5.3 policy Request must be answered (re-establishing the
+      // grant) before the data-plane barrier releases — otherwise the first
+      // post-reconnect events land while the grant is still empty and are
+      // rejected fail-closed instead of delivered.
+      void (async () => {
+        try {
+          const config = this.mcplServerConfigs.get(connection.id);
+          if (config) {
+            await this.registerMcplServerFeatures(config, connection);
+          }
+        } catch (error) {
+          console.error(
+            `MCPL server "${connection.id}" re-registration after reconnect failed:`,
+            error instanceof Error ? error.message : error,
+          );
         }
-      } catch (error) {
-        console.error(
-          `MCPL server "${connection.id}" re-registration after reconnect failed:`,
-          error instanceof Error ? error.message : error,
-        );
-      }
-      this.releaseMcplDataPlaneGate(awarenessBarrier);
-      this.handleToolsListChanged(connection.id);
+        this.releaseMcplDataPlaneGate(awarenessBarrier);
+        this.handleToolsListChanged(connection.id);
+      })();
       void awarenessBarrier.promise.then(() => {
         if (
           awarenessBarrier.requiresBarrier

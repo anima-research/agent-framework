@@ -13,6 +13,7 @@ import { EventEmitter } from 'node:events';
 
 import { openTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
 import { maskNegotiatedCapabilities } from './capability-mask.js';
+import { CapabilityGrant } from './capability-grant.js';
 import { CAPABILITY_DISABLED } from './errors.js';
 
 import type {
@@ -26,6 +27,7 @@ import type {
   AfterInferenceParams,
   AfterInferenceResult,
   FeatureSetsUpdateParams,
+  FeatureSetsUpdateResult,
   InferenceChunkParams,
   StateRollbackParams,
   StateRollbackResult,
@@ -110,6 +112,31 @@ export class McplServerConnection extends EventEmitter {
    *  last handshake (empty when no scoping is configured). Inbound methods
    *  gated by a masked capability are rejected in setupMessageRouting. */
   droppedCapabilities: ReadonlySet<string> = new Set();
+
+  /**
+   * The effective capability grant (§5.4) — the sole authorization
+   * allowlist for this connection. Starts EMPTY: until the initial policy
+   * exchange completes (§5.3) nothing is granted and every privileged
+   * inbound method is rejected. The framework computes the grant from the
+   * masked advertisement and activates it via establishGrant() only after
+   * the featureSets/update Request is answered (expansion activates on
+   * receipt, §6.7); revocations re-call establishGrant() BEFORE the
+   * corresponding Request is sent (reduction applies first, §6.7).
+   */
+  grant: CapabilityGrant = CapabilityGrant.empty();
+
+  /** True once the §5.3 initial policy Request has been answered. */
+  policyEstablished = false;
+
+  /**
+   * Activate (or replace) the effective grant. Ordering is the caller's
+   * contract per §6.7: call BEFORE sending a reducing featureSets/update,
+   * AFTER the receipt for an expanding one.
+   */
+  establishGrant(grant: CapabilityGrant): void {
+    this.grant = grant;
+    this.policyEstablished = true;
+  }
 
   /** The active transport (stdio child or WebSocket). Null for a disconnected
    *  stub awaiting its first background reconnect. */
@@ -467,9 +494,30 @@ export class McplServerConnection extends EventEmitter {
     return Promise.resolve();
   }
 
-  /** Send `featureSets/update` notification. */
+  /** Send `featureSets/update` as a Notification. §6.7: valid ONLY for
+   *  purely descriptive metadata that does not alter the grant. Any grant
+   *  change — including the §5.3 initial policy — MUST use the Request form
+   *  below. */
   sendFeatureSetsUpdate(params: FeatureSetsUpdateParams): void {
     this.sendNotification(McplMethod.FeatureSetsUpdate, params as unknown as Record<string, unknown>);
+  }
+
+  /**
+   * Send `featureSets/update` as a Request (§5.3, §6.7) and await the
+   * degradation receipt. A short timeout, distinct from tool-call timeouts:
+   * a pre-0.5 server treats the Request as a notification and never
+   * answers, and per §6.7 an unanswered expansion simply does not activate
+   * — the caller leaves the grant empty and the connection MCP-only.
+   */
+  sendFeatureSetsUpdateRequest(
+    params: FeatureSetsUpdateParams,
+    timeoutMs = 15_000,
+  ): Promise<FeatureSetsUpdateResult> {
+    return this.sendRequest(
+      McplMethod.FeatureSetsUpdate,
+      params as unknown as Record<string, unknown>,
+      { timeoutMs },
+    ) as Promise<FeatureSetsUpdateResult>;
   }
 
   /** Send `inference/chunk` notification. */
@@ -807,21 +855,30 @@ export class McplServerConnection extends EventEmitter {
   };
 
   /**
-   * Server-initiated methods gated by a maskable capability. When host
-   * capability scoping dropped the named path at handshake, the method is
-   * rejected (requests) or discarded (notifications) instead of emitted —
-   * a masked capability behaves as if never advertised, in both directions.
-   * Channel methods key on the bare `channels` path: it is recorded only
-   * when the entire channels capability was masked, so flag-level masking
-   * (e.g. `channels.streaming`) affects host-initiated behavior without
-   * cutting off inbound channel traffic.
+   * Inbound (server-initiated) method → required capability path, per SPEC
+   * §14.1's table plus the non-channel privileged methods. **Positive-grant
+   * enforcement** (§5.4): the method is admitted only when the effective
+   * grant contains the named path — absence is denial, and before the
+   * initial policy exchange completes the grant is empty, so everything
+   * privileged is rejected (§5.3).
+   *
+   * This replaces the earlier `droppedCapabilities` deny-list check, which
+   * could only deny what had been advertised-then-masked: a server that
+   * never advertised a capability at all was never denied. (Adjudicated in
+   * review of PR #75; the mask itself is retained as the config-policy
+   * layer feeding the grant.)
+   *
+   * Channel methods key on their specific sub-capabilities, not the bare
+   * `channels` parent — a bare parent grants nothing (§5.4).
    */
   private static readonly METHOD_TO_REQUIRED_CAPABILITY: Record<string, string> = {
     [McplMethod.PushEvent]: 'pushEvents',
     [McplMethod.InferenceRequest]: 'inferenceRequest',
-    [McplMethod.ChannelsRegister]: 'channels',
-    [McplMethod.ChannelsChanged]: 'channels',
-    [McplMethod.ChannelsIncoming]: 'channels',
+    [McplMethod.ModelInfo]: 'modelInfo',
+    [McplMethod.ChannelsRegister]: 'channels.register',
+    [McplMethod.ChannelsChanged]: 'channels.register',
+    [McplMethod.ChannelsIncoming]: 'channels.incoming',
+    [McplMethod.ChannelsList]: 'channels.register',
   };
 
   /**
@@ -860,15 +917,34 @@ export class McplServerConnection extends EventEmitter {
       const request = msg as JsonRpcRequest;
       const eventName = McplServerConnection.METHOD_TO_EVENT[request.method];
 
-      // Enforce host capability scoping on server-initiated traffic.
+      // §7 is removed in 0.5.0: scope/elevate is no longer a method. Answer
+      // rather than hang (§6.6 — a method that will never be answered MUST
+      // return an error).
+      if (request.method === McplMethod.ScopeElevate) {
+        if (request.id != null) {
+          this.sendErrorResponse(request.id, -32601, 'scope/elevate removed in MCPL 0.5.0 (SPEC §7)');
+        }
+        return;
+      }
+
+      // Positive-grant enforcement on server-initiated traffic (§5.4, §14.1).
+      // The grant is empty until the initial policy exchange completes
+      // (§5.3), so privileged methods are rejected fail-closed in that
+      // window too. Requests get -32002 with data:{capability} (§6.6);
+      // notifications are discarded with a diagnostic — a rejection can
+      // never be smuggled back as authorization either way.
       const requiredCap = McplServerConnection.METHOD_TO_REQUIRED_CAPABILITY[request.method];
-      if (requiredCap && this.droppedCapabilities.has(requiredCap)) {
+      if (requiredCap && !this.grant.has(requiredCap)) {
+        const phase = this.policyEstablished ? 'not in the effective grant' : 'initial policy not yet established (§5.3)';
         if (request.id != null) {
           this.sendErrorResponse(
             request.id,
             CAPABILITY_DISABLED,
-            `${request.method} rejected: capability "${requiredCap}" is disabled for this server by host configuration`,
+            `${request.method} rejected: capability "${requiredCap}" ${phase}`,
+            { capability: requiredCap },
           );
+        } else {
+          console.error(`[mcpl] ${this.id}: discarded ${request.method} — "${requiredCap}" ${phase}`);
         }
         return;
       }

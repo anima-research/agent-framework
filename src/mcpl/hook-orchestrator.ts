@@ -30,6 +30,15 @@ import type { FeatureSetManager } from './feature-set-manager.js';
 /** Timeout for beforeInference per server (fail-open). */
 const BEFORE_INFERENCE_TIMEOUT_MS = 5_000;
 
+/** The three injection positions and their §6.2 capability paths. Position
+ *  is the TYPED field on the injection — authorization never reads the
+ *  response's featureSet (§5.4). */
+const INJECT_LEAVES: ReadonlyArray<{ position: string; path: string }> = [
+  { position: 'system', path: 'contextHooks.beforeInference.inject.system' },
+  { position: 'beforeUser', path: 'contextHooks.beforeInference.inject.beforeUser' },
+  { position: 'afterUser', path: 'contextHooks.beforeInference.inject.afterUser' },
+];
+
 /** Timeout for blocking afterInference per server. */
 const AFTER_INFERENCE_BLOCKING_TIMEOUT_MS = 10_000;
 
@@ -141,7 +150,16 @@ export class HookOrchestrator {
    * Fail-open: servers that time out or error are silently skipped.
    */
   async beforeInference(params: BeforeInferenceParams): Promise<ContextInjection[]> {
-    const servers = this.registry.getServersWithCapability('contextHooks.beforeInference');
+    // §5.4: the GRANT decides fan-out, not the raw advertisement — which
+    // also fixes selection for the recursive §5.1 shape, where
+    // `beforeInference: {observe: true, …}` is an object, not `true`. A
+    // server granted any inject.* leaf but not observe is still CALLED
+    // (§10.1 — the hook is how injection happens) and receives
+    // `userMessage: null` instead of the user's text.
+    const servers = this.registry.getAllServers().filter((s) =>
+      s.grant.has('contextHooks.beforeInference.observe')
+      || INJECT_LEAVES.some((leaf) => s.grant.has(leaf.path)),
+    );
     if (servers.length === 0) {
       return [];
     }
@@ -184,13 +202,21 @@ export class HookOrchestrator {
     params: BeforeInferenceParams,
   ): Promise<ContextInjection[]> {
     const results = await Promise.allSettled(
-      servers.map((server) =>
-        withTimeout(
-          server.sendBeforeInference(params),
+      servers.map((server) => {
+        // §10.1: a server not granted observe MUST receive
+        // `userMessage: null` — the field is ABSENT authority, not merely
+        // discouraged — while the hook is still invoked so granted
+        // injection positions keep working (write-without-read).
+        const perServer: BeforeInferenceParams =
+          server.grant.has('contextHooks.beforeInference.observe')
+            ? params
+            : { ...params, userMessage: null };
+        return withTimeout(
+          server.sendBeforeInference(perServer),
           BEFORE_INFERENCE_TIMEOUT_MS,
           `beforeInference to "${server.id}"`,
-        ).then((result) => ({ server, result })),
-      ),
+        ).then((result) => ({ server, result }));
+      }),
     );
 
     const injections: ContextInjection[] = [];
@@ -203,7 +229,9 @@ export class HookOrchestrator {
 
       const { server, result } = settled.value;
 
-      // Validate feature set
+      // Feature-set discipline (diagnostics; §5.4 forbids using the
+      // response-supplied featureSet as AUTHORIZATION — that is the
+      // position check below).
       try {
         this.featureSetManager.validateInbound(server.id, result.featureSet);
       } catch {
@@ -211,9 +239,20 @@ export class HookOrchestrator {
         continue;
       }
 
-      // Convert wire-format injections to context-manager format
+      // §5.4/§10.8: authorize EACH injection by its typed position against
+      // the grant CURRENT NOW, at response receipt — not when the request
+      // was sent. A revocation that landed while the hook was in flight is
+      // enforced here without extra machinery.
       if (result.contextInjections && result.contextInjections.length > 0) {
         for (const mcplInj of result.contextInjections) {
+          const leaf = INJECT_LEAVES.find((l) => l.position === mcplInj.position);
+          if (!leaf || !server.grant.has(leaf.path)) {
+            console.error(
+              `[mcpl] ${server.id}: dropped beforeInference injection at position ` +
+                `"${mcplInj.position}" — not in the effective grant (§10.8)`,
+            );
+            continue;
+          }
           injections.push(convertMcplInjection(mcplInj));
         }
       }
