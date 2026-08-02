@@ -233,6 +233,37 @@ export interface McplServerConfig {
    */
   disabledTools?: string[];
 
+  /**
+   * Capability allow-list: dotted paths as the server advertises them in its
+   * initialize response (`pushEvents`, `contextHooks.beforeInference`,
+   * `contextHooks.afterInference`, `inferenceRequest`, `modelInfo`,
+   * `channels`, `channels.streaming`, …). `*` matches one dot-segment
+   * (feature-set pattern rules), and a pattern matching a parent
+   * (`contextHooks`) covers every flag beneath it.
+   *
+   * If set, only advertised capabilities matching at least one pattern
+   * survive the handshake; everything else behaves as if the server had
+   * never advertised it. This is the host-side gate on hook fan-out: a
+   * server whose `contextHooks.afterInference` is masked never receives
+   * turn text, no matter what it self-advertises. Masked server-initiated
+   * capabilities (`pushEvents`, `inferenceRequest`, whole-`channels`) are
+   * also enforced inbound — the connection rejects those methods with
+   * CAPABILITY_DISABLED (-32002).
+   *
+   * `disabledCapabilities` takes precedence on conflict. `version` and
+   * `featureSets` are not maskable here — feature sets have their own
+   * enable/disable knobs above.
+   */
+  enabledCapabilities?: string[];
+
+  /**
+   * Capability deny-list (same paths and wildcard syntax as
+   * enabledCapabilities). Wins over enabledCapabilities on conflict.
+   * `disabledCapabilities: ['contextHooks.*']` is the one-line "this server
+   * gets no hook visibility" switch.
+   */
+  disabledCapabilities?: string[];
+
   /** Scope configurations per feature set */
   scopes?: Record<string, ScopeConfig>;
 

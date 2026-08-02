@@ -12,6 +12,8 @@
 import { EventEmitter } from 'node:events';
 
 import { openTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
+import { maskNegotiatedCapabilities } from './capability-mask.js';
+import { CAPABILITY_DISABLED } from './errors.js';
 
 import type {
   McplServerConfig,
@@ -99,8 +101,15 @@ export class McplServerConnection extends EventEmitter {
   /** Unique server identifier from config. */
   readonly id: string;
 
-  /** MCPL capabilities negotiated during the initialize handshake, or null if the server does not support MCPL. */
+  /** MCPL capabilities negotiated during the initialize handshake — after
+   *  host-side capability scoping (enabledCapabilities/disabledCapabilities)
+   *  — or null if the server does not support MCPL. */
   capabilities: McplCapabilities | null;
+
+  /** Dotted paths of advertised capabilities the host config masked at the
+   *  last handshake (empty when no scoping is configured). Inbound methods
+   *  gated by a masked capability are rejected in setupMessageRouting. */
+  droppedCapabilities: ReadonlySet<string> = new Set();
 
   /** The active transport (stdio child or WebSocket). Null for a disconnected
    *  stub awaiting its first background reconnect. */
@@ -273,9 +282,10 @@ export class McplServerConnection extends EventEmitter {
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
   ): Promise<McplServerConnection> {
-    const { transport, capabilities } = await McplServerConnection.handshake(config, hostCapabilities);
+    const { transport, capabilities, droppedCapabilities } = await McplServerConnection.handshake(config, hostCapabilities);
 
     const connection = new McplServerConnection(config.id, capabilities, transport);
+    connection.droppedCapabilities = droppedCapabilities;
     connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
     // Store config for reconnection
@@ -300,7 +310,7 @@ export class McplServerConnection extends EventEmitter {
   private static async handshake(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
-  ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null }> {
+  ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string> }> {
     const transport = await openTransport(config);
 
     try {
@@ -365,7 +375,15 @@ export class McplServerConnection extends EventEmitter {
       // Send `initialized` notification (no id)
       transport.writeLine(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
 
-      return { transport, capabilities };
+      // Host-side capability scoping: intersect the server's advertisement
+      // with config policy so a masked capability behaves exactly as if it
+      // had never been advertised (hooks, streaming, queries all read this).
+      const { capabilities: scoped, dropped } = maskNegotiatedCapabilities(capabilities, config);
+      if (dropped.length > 0) {
+        console.error(`MCPL server "${config.id}" capabilities masked by host config: ${dropped.join(', ')}`);
+      }
+
+      return { transport, capabilities: scoped, droppedCapabilities: new Set(dropped) };
     } catch (err) {
       // Never leak the child / socket if the handshake fails.
       await transport.close().catch(() => { /* best effort */ });
@@ -663,7 +681,7 @@ export class McplServerConnection extends EventEmitter {
     const attempt = Math.max(1, this.reconnectAttempts);
 
     try {
-      const { transport, capabilities } = await McplServerConnection.handshake(
+      const { transport, capabilities, droppedCapabilities } = await McplServerConnection.handshake(
         this.config,
         this.hostCapabilities,
       );
@@ -675,6 +693,7 @@ export class McplServerConnection extends EventEmitter {
       this.pauseDataPlane();
       this.transport = transport;
       this.capabilities = capabilities;
+      this.droppedCapabilities = droppedCapabilities;
       this.closed = false;
       this.nextRequestId = 1;
       this.pendingRequests.clear();
@@ -788,6 +807,24 @@ export class McplServerConnection extends EventEmitter {
   };
 
   /**
+   * Server-initiated methods gated by a maskable capability. When host
+   * capability scoping dropped the named path at handshake, the method is
+   * rejected (requests) or discarded (notifications) instead of emitted —
+   * a masked capability behaves as if never advertised, in both directions.
+   * Channel methods key on the bare `channels` path: it is recorded only
+   * when the entire channels capability was masked, so flag-level masking
+   * (e.g. `channels.streaming`) affects host-initiated behavior without
+   * cutting off inbound channel traffic.
+   */
+  private static readonly METHOD_TO_REQUIRED_CAPABILITY: Record<string, string> = {
+    [McplMethod.PushEvent]: 'pushEvents',
+    [McplMethod.InferenceRequest]: 'inferenceRequest',
+    [McplMethod.ChannelsRegister]: 'channels',
+    [McplMethod.ChannelsChanged]: 'channels',
+    [McplMethod.ChannelsIncoming]: 'channels',
+  };
+
+  /**
    * Bind all transport-level handlers (inbound routing, lifecycle, stderr) to a
    * transport. Called from the constructor and again from attemptReconnect when
    * a new transport is adopted.
@@ -822,6 +859,19 @@ export class McplServerConnection extends EventEmitter {
       // It is an inbound request or notification from the server
       const request = msg as JsonRpcRequest;
       const eventName = McplServerConnection.METHOD_TO_EVENT[request.method];
+
+      // Enforce host capability scoping on server-initiated traffic.
+      const requiredCap = McplServerConnection.METHOD_TO_REQUIRED_CAPABILITY[request.method];
+      if (requiredCap && this.droppedCapabilities.has(requiredCap)) {
+        if (request.id != null) {
+          this.sendErrorResponse(
+            request.id,
+            CAPABILITY_DISABLED,
+            `${request.method} rejected: capability "${requiredCap}" is disabled for this server by host configuration`,
+          );
+        }
+        return;
+      }
 
       if (eventName) {
         // Emit the typed event with params and (for requests) a respond callback
