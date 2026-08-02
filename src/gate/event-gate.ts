@@ -366,6 +366,13 @@ export class EventGate {
   private sleepTimer: ReturnType<typeof setTimeout> | null = null;
   private sleepAgent: string | undefined;
 
+  // Self-wake timers per agent (skip_reply's wake_in_seconds). Unlike sleep,
+  // a self-wake suppresses NOTHING — it means "if nothing else wakes me by
+  // then, wake me". Any turn start for the agent cancels its pending
+  // self-wake (an external wake supersedes it; the timer would otherwise
+  // land as a redundant empty wake right after the turn).
+  private selfWakeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
   // Privileged users who may wake the agent through sleep. Hot-reloaded from
   // privilegedUsersPath on change.
   private privilegedUsersPath: string | undefined;
@@ -1135,6 +1142,14 @@ export class EventGate {
 
   onInferenceStarted(agentName: string): void {
     this.inferring.add(agentName);
+    // A turn is starting — whatever caused it supersedes any pending
+    // self-wake. (Arming happens MID-turn via skip_reply, i.e. after this
+    // ran for the arming turn, so a fresh arm always survives its own turn.)
+    const selfWake = this.selfWakeTimers.get(agentName);
+    if (selfWake) {
+      clearTimeout(selfWake);
+      this.selfWakeTimers.delete(agentName);
+    }
   }
 
   onInferenceEnded(agentName: string): void {
@@ -1204,6 +1219,49 @@ export class EventGate {
       timestamp: this.now(),
     });
     return { until: this.sleepUntil };
+  }
+
+  // =========================================================================
+  // Self-wake (skip_reply wake_in_seconds)
+  // =========================================================================
+
+  /**
+   * Arm a one-shot self-wake for `agentName` in `seconds` (clamped to
+   * [1, 3600]). Fires a normal inference request when it elapses — no
+   * suppression window, unlike sleep. Re-arming replaces the pending timer.
+   * Cancelled by the agent's next turn start (see onInferenceStarted):
+   * the semantics are "if nothing else wakes me by then, wake me".
+   */
+  armSelfWake(agentName: string, seconds: number, source = 'skip_reply'): { inMs: number } {
+    const ms = Math.max(1_000, Math.min(3_600_000, Math.floor(seconds * 1000)));
+    const prev = this.selfWakeTimers.get(agentName);
+    if (prev) clearTimeout(prev);
+    const timer = setTimeout(() => {
+      this.selfWakeTimers.delete(agentName);
+      this.emitTrace({
+        type: 'gate:decision',
+        eventType: 'selfwake:fired',
+        matchedPolicy: 'self-wake',
+        trigger: true,
+        behavior: 'always',
+        timestamp: this.now(),
+      });
+      this.requestInferenceFn(
+        agentName,
+        `self-scheduled wake (${source}, ${Math.round(ms / 1000)}s)`,
+        'self-wake',
+      );
+    }, ms);
+    this.selfWakeTimers.set(agentName, timer);
+    this.emitTrace({
+      type: 'gate:decision',
+      eventType: 'selfwake:set',
+      matchedPolicy: 'self-wake',
+      trigger: false,
+      behavior: 'skip',
+      timestamp: this.now(),
+    });
+    return { inMs: ms };
   }
 
   /** End sleep immediately. Returns true if the agent was asleep. */
@@ -1387,6 +1445,10 @@ export class EventGate {
       clearTimeout(state.timer);
     }
     this.debounceTimers.clear();
+    for (const timer of this.selfWakeTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.selfWakeTimers.clear();
     this.rateLimitBuckets.clear();
     this.passiveSampleCounters.clear();
     this.rateLimitDenied.clear();

@@ -253,13 +253,21 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
       'End your turn WITHOUT sending anything to any channel or surface. Use when you have ' +
       'read the messages but deliberately choose not to reply right now — ambient chatter, ' +
       'nothing to add, or you are waiting. Any plain text you wrote this turn stays private ' +
-      'and is NOT posted. To reply instead, just write plain text (no tool call).',
+      'and is NOT posted. To reply instead, just write plain text (no tool call). ' +
+      'To end this turn but come back on your own shortly, set wake_in_seconds.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         reason: {
           type: 'string',
           description: 'Optional private note on why you are not replying (not sent anywhere).',
+        },
+        wake_in_seconds: {
+          type: 'number',
+          description:
+            'Optional self-wake: if nothing else wakes you first, you wake again after this ' +
+            'many seconds (1 = go again almost immediately; clamped to 1–3600). Any other ' +
+            'wake before then cancels it. Omit to stay idle until the next external wake.',
         },
       },
       required: [],
@@ -923,7 +931,7 @@ export class ChannelRegistry {
         return this.handleToolThink(input as { content?: string });
 
       case 'skip_reply':
-        return this.handleToolSkipReply(input as { reason?: string });
+        return this.handleToolSkipReply(input as { reason?: string; wake_in_seconds?: number });
 
       default:
         return { success: false, error: `Unknown channel tool: ${toolName}`, isError: true };
@@ -1827,7 +1835,14 @@ export class ChannelRegistry {
    * tool, so any trailing prose this turn is NOT posted. Replaces the old
    * overloaded use of `think` for staying silent.
    */
-  private handleToolSkipReply(input: { reason?: string }): ToolResult {
+  private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: number }): ToolResult {
+    // The self-wake itself is armed by the framework (which owns the
+    // EventGate) BEFORE this dispatch; when the gate is absent the framework
+    // strips the field so this confirmation stays truthful.
+    const wakeSecs = Number(input.wake_in_seconds);
+    const selfWake = Number.isFinite(wakeSecs) && wakeSecs > 0
+      ? Math.max(1, Math.min(3600, Math.floor(wakeSecs)))
+      : undefined;
     return {
       success: true,
       // The note says "ended the turn" — make it TRUE. Without endTurn the
@@ -1841,7 +1856,9 @@ export class ChannelRegistry {
       // on Fable: ~60% of skip_reply result bytes were verbatim input echo).
       data: {
         skipped: true,
-        note: 'Turn ended; nothing sent.',
+        note: selfWake !== undefined
+          ? `Turn ended; nothing sent. Self-wake in ~${selfWake}s unless something wakes you first.`
+          : 'Turn ended; nothing sent.',
       },
     };
   }

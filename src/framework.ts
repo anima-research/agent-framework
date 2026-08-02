@@ -7169,6 +7169,25 @@ export class AgentFramework {
     // synthesized channel tools, but they aren't `channel_`-prefixed so they
     // need an explicit route here.
     if ((enrichedCall.name === 'think' || enrichedCall.name === 'skip_reply') && this.channelRegistry) {
+      // skip_reply(wake_in_seconds): arm a gate self-wake so "not replying
+      // NOW" can also mean "back in a moment" — ends the turn, then wakes
+      // the agent after N seconds unless something else wakes it first
+      // (any turn start cancels the pending self-wake). Armed here because
+      // the framework owns the EventGate; the registry only words the
+      // confirmation. Without a gate the field is stripped so that
+      // confirmation never claims a wake that can't happen.
+      if (enrichedCall.name === 'skip_reply') {
+        const inputObj = (enrichedCall.input ?? {}) as Record<string, unknown>;
+        const secs = Number(inputObj.wake_in_seconds);
+        const wants = inputObj.wake_in_seconds !== undefined && Number.isFinite(secs) && secs > 0;
+        if (wants && this.eventGate) {
+          const { inMs } = this.eventGate.armSelfWake(agentName, secs, 'skip_reply');
+          console.error(`[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`);
+        } else if (inputObj.wake_in_seconds !== undefined && !this.eventGate) {
+          delete inputObj.wake_in_seconds;
+          console.error(`[self-wake] agent=${agentName} wake_in_seconds requested but no EventGate — ignored`);
+        }
+      }
       this.dispatchChannelToolCall(agentName, enrichedCall);
       return;
     }
