@@ -14,6 +14,11 @@
  * the already-masked object. Inbound server-initiated methods gated by a
  * masked capability are additionally rejected at the connection
  * (see METHOD_TO_REQUIRED_CAPABILITY in server-connection.ts).
+ *
+ * Matching is a generic recursive walk per SPEC 0.5 §5.4: every path at
+ * every depth is addressable (`contextHooks.beforeInference.inject.system`
+ * works the day the host stores that shape), and a pattern matching a parent
+ * masks the whole subtree. No hardcoded set of nestable keys.
  */
 
 import type { McplCapabilities, McplServerConfig } from './types.js';
@@ -24,9 +29,9 @@ export interface MaskedCapabilities {
   /**
    * Dotted paths of advertised capabilities removed by the mask (e.g.
    * `contextHooks.afterInference`). When an entire multi-flag capability is
-   * removed (`channels` advertised as a boolean, or every advertised channel
-   * flag masked), the bare parent path (`channels`) is included so inbound
-   * enforcement can key on it.
+   * removed (`channels` advertised as a boolean, denied as a parent, or
+   * every advertised flag masked), the bare parent path (`channels`) is
+   * included so inbound enforcement can key on it.
    */
   dropped: string[];
 }
@@ -59,8 +64,8 @@ function wildcardMatch(pattern: string, name: string): boolean {
 
 /**
  * Whether a pattern matches a capability path or any ancestor prefix of it —
- * `contextHooks` (or `*`) covers `contextHooks.afterInference`, so masking a
- * parent masks everything beneath it.
+ * `contextHooks` (or `*`) covers `contextHooks.beforeInference.inject.system`
+ * at any depth, so masking a parent masks everything beneath it.
  */
 function patternMatchesPath(pattern: string, path: string): boolean {
   const parts = path.split('.');
@@ -79,8 +84,22 @@ function anyMatches(patterns: string[], path: string): boolean {
 /** Keys that are negotiation metadata, not grantable capabilities. */
 const UNMASKABLE_KEYS = new Set(['version', 'featureSets']);
 
-/** Object-valued capabilities whose flags are maskable one level down. */
-const NESTED_KEYS = new Set(['contextHooks', 'channels']);
+/**
+ * Interior object paths whose object value is itself the capability, with
+ * children as refinements — dropping a refinement leaves the capability
+ * granted (`inferenceRequest` minus `.streaming` is still inferenceRequest).
+ * Every other interior object is a pure namespace (`contextHooks`,
+ * `channels`, a future `inject`): it holds no authority of its own and is
+ * pruned when all its advertised children are masked.
+ *
+ * This is a retention-shape distinction only — matching and addressability
+ * are fully generic and depth-unbounded either way.
+ */
+const OBJECT_CAPABILITY_PATHS = new Set(['inferenceRequest', 'contextHooks.afterInference']);
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 
 /**
  * Intersect a server's advertised MCPL capabilities with the host config's
@@ -90,7 +109,7 @@ const NESTED_KEYS = new Set(['contextHooks', 'channels']);
  * set, only advertised capabilities matching at least one pattern survive;
  * `disabledCapabilities` removes matches and wins on conflict. Patterns are
  * dotted paths with `*` matching one segment, and a pattern that matches a
- * parent (`contextHooks`) covers every flag beneath it. `version` and
+ * parent (`contextHooks`) covers every path beneath it. `version` and
  * `featureSets` are never masked here — feature sets have their own
  * enable/disable knobs.
  *
@@ -107,57 +126,97 @@ export function maskNegotiatedCapabilities(
     return { capabilities, dropped: [] };
   }
 
-  const keep = (path: string): boolean => {
-    if (disabled && anyMatches(disabled, path)) return false;
-    if (enabled) return anyMatches(enabled, path);
-    return true;
+  const denied = (path: string): boolean => !!disabled && anyMatches(disabled, path);
+  const allowed = (path: string): boolean => !enabled || anyMatches(enabled, path);
+  const keep = (path: string): boolean => !denied(path) && allowed(path);
+
+  const dropped: string[] = [];
+
+  /**
+   * Mask one interior object node. Returns the surviving object, or
+   * undefined when the node is pruned entirely. Falsy children are carried
+   * through untouched (they advertise nothing, so there is nothing to mask).
+   */
+  const maskNode = (node: Record<string, unknown>, path: string): Record<string, unknown> | undefined => {
+    if (denied(path)) {
+      dropped.push(path);
+      return undefined;
+    }
+
+    const survivors: Record<string, unknown> = {};
+    let advertised = 0;
+    let survived = 0;
+
+    for (const [key, value] of Object.entries(node)) {
+      if (value === undefined) continue;
+      if (!value) {
+        // false / 0 / '' advertise nothing — preserve for fidelity.
+        survivors[key] = value;
+        continue;
+      }
+      advertised++;
+      const childPath = path ? `${path}.${key}` : key;
+
+      if (isPlainObject(value)) {
+        const masked = maskNode(value, childPath);
+        if (masked !== undefined) {
+          survivors[key] = masked;
+          survived++;
+        }
+        continue;
+      }
+
+      // Truthy leaf.
+      if (keep(childPath)) {
+        survivors[key] = value;
+        survived++;
+      } else {
+        dropped.push(childPath);
+      }
+    }
+
+    if (advertised === 0) {
+      // No truthy children: the object itself is the advert (e.g.
+      // `inferenceRequest: {}`), so its own path decides.
+      if (keep(path)) return survivors;
+      dropped.push(path);
+      return undefined;
+    }
+    if (survived > 0) {
+      return survivors;
+    }
+
+    // Every advertised child was masked. An object-capability keeps its
+    // (still-granted) hull; a namespace holds no authority of its own and
+    // is pruned, recording the bare path for inbound enforcement.
+    if (OBJECT_CAPABILITY_PATHS.has(path) && keep(path)) {
+      return survivors;
+    }
+    dropped.push(path);
+    return undefined;
   };
 
   const masked: Record<string, unknown> = {};
-  const dropped: string[] = [];
   const source = capabilities as unknown as Record<string, unknown>;
 
   for (const [key, value] of Object.entries(source)) {
     if (value === undefined) continue;
 
-    if (UNMASKABLE_KEYS.has(key)) {
+    if (UNMASKABLE_KEYS.has(key) || !value) {
       masked[key] = value;
       continue;
     }
 
-    // Object-valued capability with individually maskable flags.
-    if (NESTED_KEYS.has(key) && typeof value === 'object' && value !== null) {
-      const flags = value as Record<string, unknown>;
-      const survivors: Record<string, unknown> = {};
-      let advertisedFlags = 0;
-
-      for (const [flag, flagValue] of Object.entries(flags)) {
-        if (flagValue === undefined || flagValue === false) continue;
-        advertisedFlags++;
-        const path = `${key}.${flag}`;
-        if (keep(path)) {
-          survivors[flag] = flagValue;
-        } else {
-          dropped.push(path);
-        }
-      }
-
-      if (Object.keys(survivors).length > 0) {
-        masked[key] = survivors;
-      } else if (advertisedFlags > 0) {
-        // Whole capability removed — record the bare parent for inbound
-        // enforcement (channels/* rejection keys on `channels`).
-        dropped.push(key);
+    if (isPlainObject(value)) {
+      const node = maskNode(value, key);
+      if (node !== undefined) {
+        masked[key] = node;
       }
       continue;
     }
 
-    // Leaf capability (boolean or opaque object, e.g. inferenceRequest,
-    // or `channels: true` from servers that advertise the boolean form).
-    if (value === false) {
-      masked[key] = value;
-      continue;
-    }
+    // Truthy leaf at the top level (booleans, or `channels: true` from
+    // servers that advertise the boolean form).
     if (keep(key)) {
       masked[key] = value;
     } else {

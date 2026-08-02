@@ -50,15 +50,38 @@ test('disabledCapabilities drops a single hook, preserving its sibling and value
   assert.deepEqual(dropped, ['contextHooks.afterInference']);
 });
 
-test('a parent pattern masks every flag beneath it', () => {
+test('a parent pattern prunes the whole subtree, recorded as the bare path', () => {
   const { capabilities, dropped } = maskNegotiatedCapabilities(FULL_ADVERT, {
     disabledCapabilities: ['contextHooks'],
   });
   assert.equal(capabilities?.contextHooks, undefined);
-  assert.deepEqual(
-    dropped.sort(),
-    ['contextHooks', 'contextHooks.afterInference', 'contextHooks.beforeInference'],
-  );
+  assert.deepEqual(dropped, ['contextHooks']);
+});
+
+test('refinement masking: inferenceRequest.streaming is addressable and leaves the capability granted', () => {
+  const { capabilities, dropped } = maskNegotiatedCapabilities(FULL_ADVERT, {
+    disabledCapabilities: ['inferenceRequest.streaming'],
+  });
+  // The capability hull survives — still truthy for getServersWithCapability.
+  assert.deepEqual(capabilities?.inferenceRequest, {});
+  assert.deepEqual(dropped, ['inferenceRequest.streaming']);
+});
+
+test('generic recursion: depth-3 paths are addressable (SPEC 0.5 §5.4 vocabulary shape)', () => {
+  const advert = {
+    version: '0.5',
+    contextHooks: {
+      beforeInference: { observe: true, inject: { system: true, beforeUser: true } },
+    },
+  } as unknown as McplCapabilities;
+  const { capabilities, dropped } = maskNegotiatedCapabilities(advert, {
+    disabledCapabilities: ['contextHooks.beforeInference.inject.system'],
+  });
+  const before = (capabilities as unknown as Record<string, Record<string, unknown>>)
+    .contextHooks.beforeInference as Record<string, unknown>;
+  assert.equal(before.observe, true);
+  assert.deepEqual(before.inject, { beforeUser: true });
+  assert.deepEqual(dropped, ['contextHooks.beforeInference.inject.system']);
 });
 
 test('wildcard pattern contextHooks.* masks both hooks', () => {
