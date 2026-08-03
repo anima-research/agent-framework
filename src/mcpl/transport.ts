@@ -222,12 +222,22 @@ export class WebSocketTransport extends McplTransport {
     const redacted = buildWebSocketUrl({ ...config, token: undefined }, null);
     const ws = new WebSocket(url);
 
+    // A failed dial can emit 'error' MORE THAN ONCE on the raw socket (seen
+    // live 2026-08-03: an HTTP 502 upgrade-reject emits the "Expected 101"
+    // error and then a teardown error). WebSocket is an EventEmitter, so any
+    // 'error' with no listener throws at the top level and KILLS THE WHOLE
+    // AGENT PROCESS — a crashloop, since the dial happens at boot. Every
+    // settle path below must therefore leave a swallow listener behind; a
+    // remote server being down must never be able to take the host down.
+    const swallowLateErrors = () => { /* settled; retry loop owns recovery */ };
+
     return new Promise<WebSocketTransport>((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
         ws.removeAllListeners();
+        ws.on('error', swallowLateErrors);
         try { ws.terminate(); } catch { /* already gone */ }
         reject(new Error(`MCPL server "${config.id}" WebSocket connect timed out after ${WS_OPEN_TIMEOUT_MS}ms (${redacted})`));
       }, WS_OPEN_TIMEOUT_MS);
@@ -245,6 +255,7 @@ export class WebSocketTransport extends McplTransport {
         settled = true;
         clearTimeout(timer);
         ws.removeAllListeners();
+        ws.on('error', swallowLateErrors);
         try { ws.terminate(); } catch { /* already gone */ }
         reject(new Error(`MCPL server "${config.id}" WebSocket connect failed: ${err.message} (${redacted})`));
       });
