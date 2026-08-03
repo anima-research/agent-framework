@@ -8609,23 +8609,44 @@ export class AgentFramework {
   listMcplServers(): Array<{
     id: string;
     connected: boolean;
+    retrying: boolean;
     toolPrefix: string;
     toolCount: number;
+    /** True only after the §5.3 policy receipt activated the grant. */
+    policyEstablished: boolean;
+    /** Sole normative authorization allowlist for the connection (§5.4). */
+    effectiveGrant: string[];
+    /** Advertised paths removed by host enabled/disabled capability config. */
+    maskedCapabilities: string[];
+    /** Advertised paths removed by a host deny-by-default rule (§13.4). */
+    deniedCapabilities: string[];
+    /** Host-owned authority; deliberately separate from the portable grant. */
+    allowHostCommands: boolean;
     command?: string;
     url?: string;
   }> {
     const result: Array<{
-      id: string; connected: boolean; toolPrefix: string; toolCount: number;
+      id: string; connected: boolean; retrying: boolean;
+      toolPrefix: string; toolCount: number; policyEstablished: boolean;
+      effectiveGrant: string[]; maskedCapabilities: string[];
+      deniedCapabilities: string[]; allowHostCommands: boolean;
       command?: string; url?: string;
     }> = [];
     for (const [id, config] of this.mcplServerConfigs) {
       const prefix = config.toolPrefix ?? `mcpl--${id}`;
       const connection = this.mcplServerRegistry?.getServer(id) ?? null;
+      const connected = connection?.isConnected ?? false;
       result.push({
         id,
-        connected: connection?.isConnected ?? false,
+        connected,
+        retrying: !connected && (connection?.willReconnect ?? false),
         toolPrefix: prefix,
         toolCount: this.mcplTools.filter(t => t.name.startsWith(`${prefix}--`)).length,
+        policyEstablished: connection?.policyEstablished ?? false,
+        effectiveGrant: connection?.grant.effectiveList() ?? [],
+        maskedCapabilities: [...(connection?.droppedCapabilities ?? [])].sort(),
+        deniedCapabilities: [...(connection?.grant.deniedPaths ?? [])].sort(),
+        allowHostCommands: config.allowHostCommands === true,
         command: config.command,
         url: config.url,
       });
