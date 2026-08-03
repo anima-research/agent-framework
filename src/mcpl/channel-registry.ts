@@ -526,23 +526,37 @@ export class ChannelRegistry {
     // channels/register — a changed-set cannot smuggle in what register
     // would have rejected (PR #79 review blocker 5).
     const addedResults: Array<{ id: string; accepted: boolean; reason?: string }> = [];
-    // Process removed channels
+    // Process removed channels — itemized truthfully: removal of a channel
+    // we never had is reported, not silently accepted.
     if (params.removed) {
       for (const channelId of params.removed) {
         const key = `${serverId}:${channelId}`;
-        this.channels.delete(key);
+        const existed = this.channels.delete(key);
         this.stopTyping(channelId);
+        addedResults.push({ id: channelId, accepted: existed, reason: existed ? undefined : 'not registered' });
       }
     }
 
-    // Process updated channels (replace descriptor, preserve open state)
+    // Process updated channels — validated itemwise exactly like added
+    // (§14.5: a changed-set cannot smuggle in what register would reject),
+    // and every submitted descriptor gets a verdict: a strict server reads
+    // absence from `results` as rejection.
     if (params.updated) {
       for (const channel of params.updated) {
+        if (!channel || typeof channel.id !== 'string' || channel.id.length === 0) {
+          addedResults.push({ id: String(channel?.id ?? ''), accepted: false, reason: 'invalid descriptor: missing id' });
+          this.emitTraceFn({ type: 'mcpl:channel-descriptor-rejected', serverId, reason: 'missing id (update)' });
+          continue;
+        }
         const key = `${serverId}:${channel.id}`;
         const existing = this.channels.get(key);
-        if (existing) {
-          existing.descriptor = channel;
+        if (!existing) {
+          addedResults.push({ id: channel.id, accepted: false, reason: 'not registered — update rejected (§14.5)' });
+          this.emitTraceFn({ type: 'mcpl:channel-descriptor-rejected', serverId, channelId: channel.id, reason: 'update for unregistered channel' });
+          continue;
         }
+        existing.descriptor = channel;
+        addedResults.push({ id: channel.id, accepted: true });
       }
     }
 
@@ -591,11 +605,11 @@ export class ChannelRegistry {
     const results: ChannelIncomingMessageResult[] = [];
 
     for (const message of params.messages) {
-      // §16.3: expand the normative chat:* core closure at entry (see
-      // push-handler for the full rationale; same rule, same limits).
-      if (message.tags) message.tags = expandCoreTags(message.tags);
-      // Convert MCPL content blocks to membrane ContentBlocks
-      const convertedContent: ContentBlock[] = message.content.map(convertBlock);
+      // §14.5 FIRST, before ANY semantic processing: admission against the
+      // actually-registered channel precedes tag expansion and content
+      // conversion — decoding an unregistered sender's payload (including
+      // inline base64) is allocation and parsing work done for a message
+      // that must be rejected (Sol, PR #79 re-review blocker 2).
 
       // Lazy-register the channel if we've never seen it. A channel can deliver
       // an incoming message before its channels/register (boot enumeration) or
@@ -632,6 +646,12 @@ export class ChannelRegistry {
         });
         continue;
       }
+
+      // ACCEPTED from here down: semantic processing only for admitted
+      // messages. §16.3 core-tag closure, then content conversion.
+      if (message.tags) message.tags = expandCoreTags(message.tags);
+      const convertedContent: ContentBlock[] = message.content.map(convertBlock);
+
       // Track default publish channel (most recent ACCEPTED incoming) —
       // deliberately after §14.5 validation: a rejected message from an
       // unregistered channel must not retarget outbound speech (the locus is

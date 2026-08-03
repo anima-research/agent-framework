@@ -666,14 +666,20 @@ export interface McplModelInfo {
   /** Model identifier (e.g., "claude-opus-4-5-20251101") */
   id: string;
 
-  /** Model vendor (e.g., "anthropic") */
-  vendor: string;
+  /** Model vendor (e.g., "anthropic"). Omitted when the host has no
+   *  truthful source — never fabricated. */
+  vendor?: string;
 
-  /** Context window size in tokens */
-  contextWindow: number;
+  /** Context window size in tokens. Omitted when unknown (a numeric field
+   *  cannot express "unknown", and a fabricated 200000 was false for
+   *  residents configured at 300k/600k — PR #79 review). The §12.2
+   *  model/info RESULT requires it, which is why this host does not
+   *  advertise modelInfo; hook params carry honesty-over-completeness. */
+  contextWindow?: number;
 
-  /** Model capabilities (e.g., ["vision", "tools"]) */
-  capabilities: string[];
+  /** Model capabilities (e.g., ["vision", "tools"]). Omitted when the
+   *  host has no truthful source. */
+  capabilities?: string[];
 }
 
 /**

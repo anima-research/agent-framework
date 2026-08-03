@@ -7935,7 +7935,12 @@ export class AgentFramework {
         beforeInference: true,
       },
       inferenceLifecycle: true,
-      modelInfo: true,
+      // modelInfo is NOT advertised: §12.2's result requires all four of
+      // {id, vendor, contextWindow, capabilities} and the host has no
+      // truthful source for contextWindow/capabilities (grep: none exists).
+      // Advertising a capability answered with a malformed partial response
+      // is worse than honest unsupported (Sol, PR #79 re-review). The
+      // handler below answers an explicit error rather than hanging (§6.6).
       inferenceRequest: { streaming: true },
       channels: {
         register: true,
@@ -8707,20 +8712,18 @@ export class AgentFramework {
 
     connection.on('model-info', (
       _params: unknown,
-      responder?: { respond: (result: unknown) => void },
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void },
     ) => {
-      // Host-level answer: the first registered agent's model id. §12 asks
-      // for honesty over completeness — fields the host does not actually
-      // know (contextWindow, vendor-specific capability lists) are OMITTED,
-      // never fabricated: a hardcoded 200000 was false for residents
-      // configured at 300k/600k (PR #79 review blocker 6).
-      const agent = this.agents.values().next().value;
-      responder?.respond({
-        model: {
-          id: agent?.model ?? 'unknown',
-          vendor: 'unknown',
-        },
-      });
+      // §12.2 requires ALL FOUR of {id, vendor, contextWindow, capabilities}
+      // in the DIRECT result shape, and numeric contextWindow cannot express
+      // "unknown". The host has no truthful source for it, so modelInfo is
+      // not advertised and this answers an explicit error instead of a
+      // malformed partial (§6.6: a method that will never be answered
+      // truthfully MUST error, not fabricate).
+      responder?.respondError?.(
+        -32601,
+        'model/info unavailable: host does not advertise modelInfo (no truthful contextWindow source)',
+      );
     });
 
     // Handle incoming channel messages (Step 7)
@@ -10007,12 +10010,11 @@ export class AgentFramework {
       conversationId: agent.name,
       turnIndex: 0, // Simplified; needs per-conversation counter TODO
       userMessage: null, // Could extract from trigger context
-      model: {
-        id: agent.model,
-        vendor: 'unknown',
-        contextWindow: 200000,
-        capabilities: ['tools'],
-      },
+      // Truthful fields only (§10.1 honesty over completeness): id is real,
+      // vendor/contextWindow/capabilities have no source in this host and
+      // are omitted rather than fabricated — the hardcoded 200000 was false
+      // for residents configured at 300k/600k.
+      model: { id: agent.model },
       channels: this.channelRegistry?.buildChannelContext(agent.name),
     };
   }
