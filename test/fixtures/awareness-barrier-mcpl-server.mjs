@@ -169,8 +169,17 @@ function handle(message) {
       capabilities: {
         experimental: {
           mcpl: {
-            version: '0.4',
+            version: '0.5',
+            // §5.4/§6.2: the grant is computed from this advertisement, and
+            // admission denies what it cannot contain. This fixture SENDS
+            // channels/register, channels/incoming and inference/request, so
+            // it must advertise them — with only pushEvents declared, the
+            // 0.5 host correctly rejected the released data requests
+            // (accepted:false), which is exactly what PR #79's ubuntu CI
+            // caught on the inference/request + channels/incoming matrix.
             pushEvents: true,
+            inferenceRequest: true,
+            channels: { register: true, incoming: true },
             featureSets: {
               chat: { description: 'chat', uses: ['pushEvents'] },
             },
