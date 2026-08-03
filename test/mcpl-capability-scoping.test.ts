@@ -14,6 +14,7 @@ import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { maskNegotiatedCapabilities } from '../src/mcpl/capability-mask.js';
+import { computeGrant } from '../src/mcpl/capability-grant.js';
 import { CAPABILITY_DISABLED } from '../src/mcpl/errors.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { McplServerRegistry } from '../src/mcpl/server-registry.js';
@@ -256,18 +257,38 @@ test('inbound push/event from a pushEvents-masked server is rejected with CAPABI
   assert.match(result.pushResponse?.error?.message ?? '', /pushEvents/);
 });
 
-test('without scoping, the same push/event reaches host handlers', async () => {
+test('§5.3 pre-policy deny-all, then the same push/event flows once the grant is established', async () => {
   registry = new McplServerRegistry();
   const connection = await registry.addServer(config(), HOST_CAPS);
   connection.ready();
 
-  const pushSeen = new Promise<void>((resolve) => {
-    connection.on('push-event', (_params: unknown, responder?: { respond: (r: unknown) => void }) => {
-      responder?.respond({ accepted: true });
-      resolve();
-    });
+  let pushEventEmitted = false;
+  connection.on('push-event', (_params: unknown, responder?: { respond: (r: unknown) => void }) => {
+    pushEventEmitted = true;
+    responder?.respond({ accepted: true });
   });
 
-  await connection.sendToolsList();
-  await pushSeen;
+  // Round 1: NO policy established. Even though pushEvents is advertised
+  // and unmasked, the grant is empty (§5.3) — the push must be rejected
+  // with -32002 and data:{capability}, and never reach host handlers.
+  // (This test originally asserted the pre-0.5 behavior — advertised ⇒
+  // delivered — and hung forever against the fail-closed gate.)
+  const round1 = await connection.sendToolsList() as {
+    tools: unknown[];
+    pushResponse?: { error?: { code: number; message: string; data?: { capability?: string } } };
+  };
+  assert.equal(pushEventEmitted, false, 'pre-policy push must not reach host handlers');
+  assert.equal(round1.pushResponse?.error?.code, CAPABILITY_DISABLED);
+  assert.equal(round1.pushResponse?.error?.data?.capability, 'pushEvents');
+
+  // Round 2: establish the grant (§6.7 — expansion activates on receipt;
+  // the framework does this after the featureSets/update Request is
+  // answered). Now the identical push flows.
+  connection.establishGrant(computeGrant(connection.capabilities, {}));
+  const round2 = await connection.sendToolsList() as {
+    tools: unknown[];
+    pushResponse?: { result?: { accepted?: boolean } };
+  };
+  assert.equal(pushEventEmitted, true, 'granted push must reach host handlers');
+  assert.equal(round2.pushResponse?.result?.accepted, true);
 });
