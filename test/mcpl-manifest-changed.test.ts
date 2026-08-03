@@ -43,8 +43,10 @@ class ManifestFake extends EventEmitter {
   events: Array<{ kind: string; detail?: unknown }> = [];
   /** Next mcpl/manifest answer; a function may throw to model fetch failure. */
   nextManifest: () => McplCapabilities = () => INITIAL;
-  /** Whether featureSets/update Requests are answered. */
-  answerPolicy = true;
+  /** How featureSets/update Requests are answered. */
+  answerPolicy: 'accept' | 'never' | 'refuse-mcp-only' | 'refuse-close' = 'accept';
+  closed = false;
+  close(): Promise<void> { this.closed = true; return Promise.resolve(); }
 
   establishGrant(grant: CapabilityGrant): void {
     this.grant = grant;
@@ -55,10 +57,14 @@ class ManifestFake extends EventEmitter {
     this.events.push({ kind: 'fetch' });
     return Promise.resolve(this.nextManifest());
   }
-  sendFeatureSetsUpdateRequest(params: unknown): Promise<{ accepted: true }> {
+  sendFeatureSetsUpdateRequest(params: unknown): Promise<unknown> {
     this.events.push({ kind: 'policy-request', detail: params });
-    if (!this.answerPolicy) return new Promise(() => {}); // never answers
-    return Promise.resolve({ accepted: true });
+    switch (this.answerPolicy) {
+      case 'never': return new Promise(() => {});
+      case 'refuse-mcp-only': return Promise.resolve({ accepted: false, fallback: 'mcp-only' });
+      case 'refuse-close': return Promise.resolve({ accepted: false, fallback: 'close' });
+      default: return Promise.resolve({ accepted: true });
+    }
   }
   sendFeatureSetsUpdate(): void {}
 }
@@ -128,12 +134,16 @@ test('reduction applies BEFORE the policy Request; receipt names it applied', as
 
 test('expansion activates only after the receipt; unanswered Request leaves it inactive', async () => {
   const { fw, connection } = makeHarness();
-  connection.answerPolicy = false; // server never answers the new policy
+  connection.answerPolicy = 'never'; // server never answers the new policy
   connection.nextManifest = () => ({
     version: '0.5',
     pushEvents: true,
     channels: { incoming: true, publish: true, streaming: true }, // + streaming
-    featureSets: { chat: { description: 'chat', uses: ['pushEvents', 'channels.incoming', 'channels.publish'] } },
+    featureSets: {
+      chat: { description: 'chat', uses: ['pushEvents', 'channels.incoming', 'channels.publish'] },
+      // NEW set backed by the NEW capability — the §84-review probe.
+      streamy: { description: 's', uses: ['channels.streaming'] },
+    },
   }) as unknown as McplCapabilities;
 
   // Fire and give the pipeline a beat; the policy Request hangs forever.
@@ -143,7 +153,36 @@ test('expansion activates only after the receipt; unanswered Request leaves it i
     'unanswered expansion must not activate (§6.7)');
   assert.ok(connection.grant.has('channels.publish'),
     'no reduction occurred, so the standing grant survives');
+  // Sol's #84 blocker: a NEW capability-backed feature set must not be
+  // host-enabled while its capability is absent from the ACTIVE grant.
+  assert.equal(fw.featureSetManager.isEnabled('srv', 'streamy'), false,
+    'feature state must not run ahead of active authority');
+  assert.equal(fw.featureSetManager.isEnabled('srv', 'chat'), true,
+    'interim-derived state keeps what active authority supports');
   void p; // intentionally left pending — models the wedged server
+});
+
+test('refusal with fallback mcp-only: empty grant, empty-derived feature state', async () => {
+  const { fw, connection } = makeHarness();
+  connection.answerPolicy = 'refuse-mcp-only';
+  connection.nextManifest = () => INITIAL;
+
+  await fw.handleManifestChanged(connection, { revision: 'sha256:r1', domains: ['capabilities'] });
+
+  assert.deepEqual(connection.grant.effectiveList(), [], 'mcp-only = empty grant, like the §5.3 path');
+  assert.equal(fw.featureSetManager.isEnabled('srv', 'chat'), false,
+    'feature state derives from the (empty) active grant');
+  assert.equal(connection.closed, false);
+});
+
+test('refusal with fallback close: the transport is closed', async () => {
+  const { fw, connection } = makeHarness();
+  connection.answerPolicy = 'refuse-close';
+  connection.nextManifest = () => INITIAL;
+
+  await fw.handleManifestChanged(connection, { revision: 'sha256:r2', domains: ['capabilities'] });
+
+  assert.equal(connection.closed, true, 'fallback close must be honored (§6.7)');
 });
 
 test('failed fetch: previous manifest and grant stand untouched', async () => {

@@ -167,6 +167,11 @@ export class McplServerConnection extends EventEmitter {
   private resetPolicyForTransportBoundary(): void {
     this.grant = CapabilityGrant.empty();
     this.policyEstablished = false;
+    // §17 tracking is per-epoch for the same reason the grant is: these are
+    // facts about what THIS host fetched/negotiated on THIS initialized
+    // transport, and a fresh initialize starts a fresh manifest history
+    // (Sol, PR #84 review — they previously survived into the new epoch).
+    this.manifestState = { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null };
   }
 
   /** The active transport (stdio child or WebSocket). Null for a disconnected

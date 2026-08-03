@@ -8500,43 +8500,61 @@ export class AgentFramework {
         connection.establishGrant(interim);
       }
 
-      // Re-derive feature-set state from the fetched declarations + the NEW
-      // grant (§6.4 fail-closed), replacing the stored declarations — a
-      // feature set absent from the new manifest is gone regardless of what
-      // else failed validation.
-      const updateParams = this.featureSetManager!.initializeServer(
-        connection.id,
-        masked ?? ({ version: '0.5' } as import('./mcpl/types.js').McplCapabilities),
-        { enabledFeatureSets: config.enabledFeatureSets, disabledFeatureSets: config.disabledFeatureSets },
-        newGrant,
-      );
+      // PHASE 1 — pre-receipt: live feature state derives from ACTIVE
+      // authority (the interim grant when reduced, the standing grant
+      // otherwise), never from the unactivated full grant. Feature state
+      // must obey the same §6.7 ordering the grant does: a newly added
+      // capability-backed feature set cannot be host-enabled while its
+      // capability is still absent from the active grant (Sol, PR #84
+      // review). Declarations come from the fetched manifest either way —
+      // a set absent from the new manifest is gone regardless.
+      const cfg = { enabledFeatureSets: config.enabledFeatureSets, disabledFeatureSets: config.disabledFeatureSets };
+      const maskedOrEmpty = masked ?? ({ version: '0.5' } as import('./mcpl/types.js').McplCapabilities);
+      this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, connection.grant);
+
+      // The Request DESCRIBES the proposed new policy — derived from the
+      // full new grant on a scratch manager, installing nothing.
+      const updateParams = new FeatureSetManager().initializeServer(connection.id, maskedOrEmpty, cfg, newGrant);
       updateParams.effectiveCapabilities = newGrant.effectiveList();
       if (newGrant.deniedPaths.length > 0) updateParams.deniedCapabilities = [...newGrant.deniedPaths];
 
-      // Tell → receipt → activate (§6.7): expansions and the full new grant
-      // take effect only after the server acknowledges the new policy. An
-      // unanswered Request leaves the interim (reduced) grant standing.
+      // Tell → receipt → activate (§6.7). PHASE 2 by outcome:
+      //  accepted  → full grant + full-derived feature state;
+      //  refused   → honor fallback: 'close' closes the transport;
+      //              'mcp-only' (or absent) = empty grant + empty-derived
+      //              feature state, mirroring the §5.3 initial path;
+      //  unanswered → interim grant and interim-derived state stand.
       let negotiated = false;
       try {
         const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
         if (receipt && receipt.accepted === false) {
-          console.error(`[mcpl] ${connection.id} refused post-manifest policy (${receipt.fallback}); grant stays ${hadReduction ? 'reduced' : 'unchanged'}`);
+          const fallback = receipt.fallback ?? 'mcp-only';
+          console.error(`[mcpl] ${connection.id} refused post-manifest policy — fallback: ${fallback}`);
+          if (fallback === 'close') {
+            await connection.close();
+            return;
+          }
+          connection.establishGrant(CapabilityGrant.empty());
+          this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, CapabilityGrant.empty());
         } else {
           connection.establishGrant(newGrant);
+          this.featureSetManager!.initializeServer(connection.id, maskedOrEmpty, cfg, newGrant);
           connection.manifestState.lastNegotiatedAt = Date.now();
           negotiated = true;
         }
       } catch {
-        console.error(`[mcpl] ${connection.id} did not answer post-manifest policy — expansion does not activate (§6.7)`);
+        console.error(`[mcpl] ${connection.id} did not answer post-manifest policy — expansion does not activate (§6.7); interim state stands`);
       }
 
-      // Adopt the validated manifest + tracking.
+      // Adopt the validated manifest + tracking. droppedCapabilities is
+      // REPLACED unconditionally — an empty new mask must clear stale paths
+      // (Sol, PR #84 review).
       connection.capabilities = masked;
       connection.manifestState.lastValidatedRevision =
         typeof (fetched as { revision?: unknown }).revision === 'string'
           ? (fetched as { revision: string }).revision : null;
       connection.manifestState.lastFetchedAt = Date.now();
-      if (dropped.length > 0) connection.droppedCapabilities = new Set(dropped);
+      connection.droppedCapabilities = new Set(dropped);
 
       const newDeclared = Object.keys(this.featureSetManager?.getDeclaredFeatureSets(connection.id) ?? {});
       const newEnabled = newDeclared.filter((n) => this.featureSetManager?.isEnabled(connection.id, n));
