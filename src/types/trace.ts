@@ -340,6 +340,15 @@ export type TraceEvent =
       willRetry: boolean;
     })
   | (TraceEventBase & {
+      /** §17.6: the ONE normalized receipt per manifest change — closed
+       *  host-derived impact vocabulary, never a server-authored flag. */
+      type: 'mcpl:manifest-change-receipt';
+      serverId: string;
+      revision: string | null;
+      announcedDomains: string[];
+      impacts: Array<{ impact: string; subject: string; disposition: string }>;
+    })
+  | (TraceEventBase & {
       type: 'mcpl:server-reconnected';
       serverId: string;
       /** How many attempts the reconnect loop needed (1 = first retry succeeded). */

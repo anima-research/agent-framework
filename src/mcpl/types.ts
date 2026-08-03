@@ -662,6 +662,14 @@ export interface InferenceLifecycleParams {
   phase: 'started' | 'completed' | 'aborted' | 'failed';
 }
 
+/** mcpl/manifestChanged params (Server → Host, Notification). §17.3. */
+export interface ManifestChangedParams {
+  /** §17.2 canonical content digest. Untrusted; equality-only. */
+  revision: string;
+  /** Subset of the three §17.1 domains. A hint the host MAY ignore. */
+  domains: Array<'capabilities' | 'featureSets' | 'tagOntology'>;
+}
+
 export interface McplModelInfo {
   /** Model identifier (e.g., "claude-opus-4-5-20251101") */
   id: string;
@@ -1201,6 +1209,14 @@ export const McplMethod = {
   // Inference lifecycle (Host → Server, Notification) — §10.5, replaces
   // context/afterInference. Metadata only; BEST-EFFORT delivery.
   InferenceLifecycle: 'inference/lifecycle',
+
+  // Server manifest changes (§17). manifestChanged is S→H Notification —
+  // an opaque revision plus changed domains, NO payload, deliberately
+  // ungated (§17.3: gating it would silence exactly the servers whose
+  // grants just narrowed). manifest is H→S Request returning the complete
+  // current experimental.mcpl object, never a delta.
+  ManifestChanged: 'mcpl/manifestChanged',
+  Manifest: 'mcpl/manifest',
 
   // Feature sets
   FeatureSetsUpdate: 'featureSets/update',

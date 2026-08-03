@@ -56,7 +56,8 @@ import { Agent } from './agent.js';
 import { ModuleRegistry, isStateExistsError } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
-import { computeGrant } from './mcpl/capability-grant.js';
+import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
+import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
 import { parseProsePrefix } from './mcpl/prose-grammar.js';
@@ -8406,6 +8407,169 @@ export class AgentFramework {
     this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
   }
 
+  /** Per-connection §17.8 fetch limiter: at most one in-flight fetch, at
+   *  most one queued behind it (announcements coalesce), floor between
+   *  completed fetches. Exceeding the floor drops the excess with a
+   *  diagnostic — the host bounds the rate; it never depends on server
+   *  coalescing. */
+  private manifestRefreshState: Map<string, { inFlight: boolean; queued: boolean; lastCompletedAt: number }> = new Map();
+  private static readonly MANIFEST_FETCH_FLOOR_MS = 5_000;
+
+  /**
+   * §17.5 host processing: fetch the complete manifest, validate exactly as
+   * at initialize, diff, apply §6.7 consequences (removals eagerly even
+   * when other declarations are invalid; additions only through
+   * tell→receipt→activate), emit ONE change receipt (§17.6).
+   */
+  private async handleManifestChanged(
+    connection: McplServerConnection,
+    announce: { revision?: string; domains?: string[] },
+  ): Promise<void> {
+    const st = this.manifestRefreshState.get(connection.id)
+      ?? { inFlight: false, queued: false, lastCompletedAt: 0 };
+    this.manifestRefreshState.set(connection.id, st);
+    if (st.inFlight) {
+      // Coalesce: one queued refresh re-runs after the current fetch — the
+      // fetch is always of the CURRENT manifest, so N announcements need at
+      // most one trailing fetch (§17.8).
+      st.queued = true;
+      return;
+    }
+    const sinceLast = Date.now() - st.lastCompletedAt;
+    if (sinceLast < AgentFramework.MANIFEST_FETCH_FLOOR_MS) {
+      if (!st.queued) {
+        st.queued = true;
+        setTimeout(() => {
+          const cur = this.manifestRefreshState.get(connection.id);
+          if (cur?.queued && !cur.inFlight) {
+            cur.queued = false;
+            void this.handleManifestChanged(connection, announce).catch(() => {});
+          }
+        }, AgentFramework.MANIFEST_FETCH_FLOOR_MS - sinceLast).unref?.();
+      }
+      return;
+    }
+
+    st.inFlight = true;
+    try {
+      const config = this.mcplServerConfigs.get(connection.id);
+      if (!config) return;
+
+      // §17.4 fetch. A server that cannot answer keeps its previous
+      // manifest in force — an unparseable/failed fetch teaches nothing and
+      // narrows nothing (§17.5 step 1).
+      let fetched: import('./mcpl/types.js').McplCapabilities | null;
+      try {
+        fetched = await connection.sendManifestRequest();
+      } catch (err) {
+        console.error(`[mcpl] ${connection.id}: mcpl/manifest fetch failed — previous manifest stands (§17.5): ${err instanceof Error ? err.message : err}`);
+        return;
+      }
+      if (!fetched || typeof fetched !== 'object') {
+        console.error(`[mcpl] ${connection.id}: mcpl/manifest returned no object — previous manifest stands (§17.5)`);
+        return;
+      }
+
+      // Validate exactly as at initialize: expand §5.1 shorthand, apply the
+      // config mask, recompute the grant. Unknown names mint nothing;
+      // invalid declarations fail closed in derivation — and REMOVALS still
+      // apply, because the new grant/derivation simply lacks whatever no
+      // longer validates (§17.5 step 1's partial-invalid rule falls out of
+      // computing forward from the fetched content).
+      const expanded = expandAdvertisementShorthand(fetched);
+      const { capabilities: masked, dropped } = maskNegotiatedCapabilities(expanded, config);
+      const newGrant = computeGrant(masked, config, { mcpToolsAdvertised: connection.mcpToolsAdvertised });
+
+      const oldEffective = new Set(connection.grant.effectiveList());
+      const newEffective = new Set(newGrant.effectiveList());
+      const revoked = [...oldEffective].filter((p) => !newEffective.has(p)).sort();
+      const added = [...newEffective].filter((p) => !oldEffective.has(p)).sort();
+
+      const oldDeclared = Object.keys(this.featureSetManager?.getDeclaredFeatureSets(connection.id) ?? {});
+      const oldEnabled = oldDeclared.filter((n) => this.featureSetManager?.isEnabled(connection.id, n));
+
+      // §6.7 REDUCTION FIRST, atomically, before the server is told:
+      // security cannot wait on consent. The interim grant is new∩old — no
+      // revoked path survives, no added path activates yet.
+      const hadReduction = revoked.length > 0;
+      if (hadReduction) {
+        const interim = new CapabilityGrant(
+          new Set([...newEffective].filter((p) => oldEffective.has(p))),
+          [...newGrant.deniedPaths],
+        );
+        connection.establishGrant(interim);
+      }
+
+      // Re-derive feature-set state from the fetched declarations + the NEW
+      // grant (§6.4 fail-closed), replacing the stored declarations — a
+      // feature set absent from the new manifest is gone regardless of what
+      // else failed validation.
+      const updateParams = this.featureSetManager!.initializeServer(
+        connection.id,
+        masked ?? ({ version: '0.5' } as import('./mcpl/types.js').McplCapabilities),
+        { enabledFeatureSets: config.enabledFeatureSets, disabledFeatureSets: config.disabledFeatureSets },
+        newGrant,
+      );
+      updateParams.effectiveCapabilities = newGrant.effectiveList();
+      if (newGrant.deniedPaths.length > 0) updateParams.deniedCapabilities = [...newGrant.deniedPaths];
+
+      // Tell → receipt → activate (§6.7): expansions and the full new grant
+      // take effect only after the server acknowledges the new policy. An
+      // unanswered Request leaves the interim (reduced) grant standing.
+      let negotiated = false;
+      try {
+        const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
+        if (receipt && receipt.accepted === false) {
+          console.error(`[mcpl] ${connection.id} refused post-manifest policy (${receipt.fallback}); grant stays ${hadReduction ? 'reduced' : 'unchanged'}`);
+        } else {
+          connection.establishGrant(newGrant);
+          connection.manifestState.lastNegotiatedAt = Date.now();
+          negotiated = true;
+        }
+      } catch {
+        console.error(`[mcpl] ${connection.id} did not answer post-manifest policy — expansion does not activate (§6.7)`);
+      }
+
+      // Adopt the validated manifest + tracking.
+      connection.capabilities = masked;
+      connection.manifestState.lastValidatedRevision =
+        typeof (fetched as { revision?: unknown }).revision === 'string'
+          ? (fetched as { revision: string }).revision : null;
+      connection.manifestState.lastFetchedAt = Date.now();
+      if (dropped.length > 0) connection.droppedCapabilities = new Set(dropped);
+
+      const newDeclared = Object.keys(this.featureSetManager?.getDeclaredFeatureSets(connection.id) ?? {});
+      const newEnabled = newDeclared.filter((n) => this.featureSetManager?.isEnabled(connection.id, n));
+      const degraded = oldEnabled.filter((n) => !newEnabled.includes(n)).sort();
+      const restored = newEnabled.filter((n) => !oldEnabled.includes(n)).sort();
+
+      // §17.6: ONE receipt per manifest change, closed host-derived impact
+      // vocabulary, never a server-authored flag.
+      const impacts: Array<{ impact: string; subject: string; disposition: string }> = [
+        ...revoked.map((p) => ({ impact: 'capability-revoked', subject: p, disposition: 'applied' })),
+        ...added.map((p) => ({ impact: 'capability-expansion-pending', subject: p, disposition: negotiated ? 'applied' : 'decision-needed' })),
+        ...degraded.map((n) => ({ impact: 'feature-degraded', subject: n, disposition: 'applied' })),
+        ...restored.map((n) => ({ impact: 'feature-restored', subject: n, disposition: negotiated ? 'applied' : 'decision-needed' })),
+      ];
+      this.emitTrace({
+        type: 'mcpl:manifest-change-receipt',
+        serverId: connection.id,
+        revision: connection.manifestState.lastValidatedRevision,
+        announcedDomains: announce.domains ?? [],
+        impacts,
+      });
+      this.handleToolsListChanged(connection.id);
+    } finally {
+      st.inFlight = false;
+      st.lastCompletedAt = Date.now();
+      if (st.queued) {
+        st.queued = false;
+        setTimeout(() => { void this.handleManifestChanged(connection, announce).catch(() => {}); },
+          AgentFramework.MANIFEST_FETCH_FLOOR_MS).unref?.();
+      }
+    }
+  }
+
   /**
    * (Re-)establish a server's host-side MCPL registration: feature-set state
    * (plus the featureSets/update sent to the server), scope patterns, and
@@ -8722,6 +8886,15 @@ export class AgentFramework {
 
     // §6.6/§12: requests that previously had no handler and hung forever
     // (AUDIT-001 item 4). The connection-level grant gate has already run.
+    // §17.3: a manifest-change announcement. Rate-limited re-fetch → diff
+    // → §6.7 consequences → one receipt. The announcement itself carries no
+    // payload and no authority; everything below acts on FETCHED content.
+    connection.on('manifest-changed', (params: { revision?: string; domains?: string[] }) => {
+      void this.handleManifestChanged(connection, params).catch((err) => {
+        console.error(`[mcpl] ${connection.id} manifest refresh failed:`, err instanceof Error ? err.message : err);
+      });
+    });
+
     connection.on('channels-list', (
       _params: unknown,
       responder?: { respond: (result: unknown) => void },
