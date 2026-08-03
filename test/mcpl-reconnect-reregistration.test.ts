@@ -24,6 +24,7 @@ import { AgentFramework } from '../src/framework.js';
 import { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import { ScopeManager } from '../src/mcpl/scope-manager.js';
 import { CheckpointManager } from '../src/mcpl/checkpoint-manager.js';
+import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import { PushHandler } from '../src/mcpl/push-handler.js';
 import type { McplCapabilities, McplServerConfig, PushEventResult } from '../src/mcpl/types.js';
 
@@ -39,7 +40,12 @@ function makeStoreStub() {
 }
 
 const CAPABILITIES: McplCapabilities = {
-  version: '0.4',
+  version: '0.5',
+  // §6.4 derivation runs against the computed grant now: the advertisement
+  // must cover each feature set's `uses` or derivation disables it before
+  // any push is attempted.
+  pushEvents: true,
+  tools: true,
   featureSets: {
     chat: { description: 'chat events', uses: ['pushEvents'] },
     mem: { description: 'stateful memory', uses: ['tools'], hostState: true, rollback: true },
@@ -52,6 +58,20 @@ class FakeConnection extends EventEmitter {
   willReconnect = true;
   featureSetUpdates: unknown[] = [];
   onReady: (() => void) | undefined;
+  // 0.5 surface (§5.3/§6.7): the framework now sends the initial policy as a
+  // Request and activates the grant on the receipt. The fake answers
+  // accepted — modeling a conforming 0.5 server — so registration reaches
+  // establishGrant and post-policy tests exercise delivery, not denial.
+  grant = CapabilityGrant.empty();
+  policyEstablished = false;
+  establishGrant(grant: CapabilityGrant): void {
+    this.grant = grant;
+    this.policyEstablished = true;
+  }
+  sendFeatureSetsUpdateRequest(params: unknown): Promise<{ accepted: true }> {
+    this.featureSetUpdates.push(params);
+    return Promise.resolve({ accepted: true });
+  }
   constructor(id: string) {
     super();
     this.id = id;
@@ -68,7 +88,7 @@ class FakeConnection extends EventEmitter {
   }
 }
 
-function makeHarness() {
+async function makeHarness() {
   const store = makeStoreStub();
   const traces: Array<{ type: string }> = [];
   const pushed: unknown[] = [];
@@ -110,9 +130,13 @@ function makeHarness() {
   fw.discordAwarenessBarrier = null;
   fw.discordAwarenessBarrierGeneration = 0;
   fw.wireMcplEvents(connection);
-  fw.registerMcplServerFeatures(config, connection);
+  await fw.registerMcplServerFeatures(config, connection);
 
-  const sendPush = (eventId: string): PushEventResult => {
+  // The push handler responds synchronously when no awareness barrier is
+  // up, but during reconnect the §5.3 policy round-trip holds the barrier
+  // across a microtask — so the harness settles the loop once before
+  // asserting. (Was 'must respond synchronously' pre-0.5.)
+  const sendPush = async (eventId: string): Promise<PushEventResult> => {
     let result: PushEventResult | undefined;
     connection.emit(
       'push-event',
@@ -124,21 +148,22 @@ function makeHarness() {
       },
       {
         respond: (r: PushEventResult) => { result = r; },
-        respondError: () => { assert.fail('push responded with a JSON-RPC error'); },
+        respondError: (_c: number, m: string) => { result = { accepted: false, reason: m }; },
       },
     );
-    assert.ok(result, 'push handler must respond synchronously');
+    if (!result) await new Promise((r) => setImmediate(r));
+    assert.ok(result, 'push handler must respond within one settle');
     return result!;
   };
 
   return { fw, store, connection, config, sendPush, pushed, traces };
 }
 
-test('reconnect re-registers the server: pushes are accepted again after close→reconnect', () => {
-  const { fw, connection, sendPush, pushed } = makeHarness();
+test('reconnect re-registers the server: pushes are accepted again after close→reconnect', async () => {
+  const { fw, connection, sendPush, pushed } = await makeHarness();
 
   // Sanity: initial registration accepts pushes.
-  assert.equal(sendPush('e1').accepted, true);
+  assert.equal((await sendPush('e1')).accepted, true);
   assert.equal(pushed.length, 1);
 
   // Transient crash: transport closed, background reconnect pending.
@@ -146,7 +171,7 @@ test('reconnect re-registers the server: pushes are accepted again after close�
   connection.emit('close', null, 'SIGKILL');
 
   // While down, the server is deregistered — pushes are rejected.
-  const down = sendPush('e2');
+  const down = await sendPush('e2');
   assert.equal(down.accepted, false);
   assert.match(down.reason ?? '', /Unknown server/);
 
@@ -155,12 +180,18 @@ test('reconnect re-registers the server: pushes are accepted again after close�
   // push already buffered on the fresh transport: ready() flushes it in the
   // reconnect listener's stack, after host-side feature re-registration.
   let duringReconnect: PushEventResult | undefined;
-  connection.onReady = () => { duringReconnect = sendPush('e3'); };
+  let e3: Promise<PushEventResult> | undefined;
+  connection.onReady = () => { e3 = sendPush('e3'); };
   connection.emit('reconnect', { attempts: 1 });
+  // Re-registration is async since the §5.3 policy Request: the reconnect
+  // listener awaits the receipt before releasing the data plane, so settle
+  // the microtask chain before asserting what happened at ready().
+  await new Promise((r) => setImmediate(r));
+  duringReconnect = await e3;
   assert.equal(duringReconnect?.accepted, true);
 
   // THE regression: before the fix this stayed rejected forever.
-  const revived = sendPush('e4');
+  const revived = await sendPush('e4');
   assert.equal(revived.accepted, true, `push after reconnect must be accepted, got: ${revived.reason}`);
   assert.equal(pushed.length, 3);
 
@@ -169,8 +200,8 @@ test('reconnect re-registers the server: pushes are accepted again after close�
   assert.ok(fw.featureSetManager.isEnabled('srv', 'chat'));
 });
 
-test('checkpoint state SURVIVES a transient close + reconnect', () => {
-  const { fw, store, connection } = makeHarness();
+test('checkpoint state SURVIVES a transient close + reconnect', async () => {
+  const { fw, store, connection } = await makeHarness();
 
   // Record durable checkpoint state for the stateful feature set.
   fw.checkpointManager.recordCheckpoint('srv', 'mem', {
@@ -196,7 +227,7 @@ test('checkpoint state SURVIVES a transient close + reconnect', () => {
   assert.deepEqual(fw.checkpointManager.getCurrentState('srv', 'mem'), { counter: 42 });
 });
 
-test('the close handler NEVER destroys checkpoints — even with willReconnect=false', () => {
+test('the close handler NEVER destroys checkpoints — even with willReconnect=false', async () => {
   // A clean AgentFramework.stop() sets reconnectEnabled=false BEFORE emitting
   // 'close', so willReconnect is false on an ordinary host restart just as much
   // as on a permanent teardown. Gating checkpoint destruction on willReconnect
@@ -204,7 +235,7 @@ test('the close handler NEVER destroys checkpoints — even with willReconnect=f
   // (while a SIGKILL, whose 'close' carries willReconnect=true, preserved them).
   // Permanent removal is owned solely by disconnectMcplServer; the close handler
   // must leave the persisted tree intact for loadFromStore() to resume.
-  const { fw, store, connection } = makeHarness();
+  const { fw, store, connection } = await makeHarness();
 
   fw.checkpointManager.recordCheckpoint('srv', 'mem', { checkpoint: 'cp1', data: { x: 1 } });
 
@@ -221,7 +252,7 @@ test('the close handler NEVER destroys checkpoints — even with willReconnect=f
 });
 
 test('disconnectMcplServer destroys checkpoints even when the connection already closed transiently', async () => {
-  const { fw, connection, config } = makeHarness();
+  const { fw, connection, config } = await makeHarness();
 
   fw.checkpointManager.recordCheckpoint('srv', 'mem', { checkpoint: 'cp1', data: { x: 1 } });
 

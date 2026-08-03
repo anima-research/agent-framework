@@ -8359,12 +8359,11 @@ export class AgentFramework {
     // releases control traffic needed for registration and marker service.
     this.wireMcplEvents(connection);
 
-    // Initialize feature sets if server advertises MCPL capabilities.
-    // §5.3 initial policy handshake — awaited, so the grant is established
-    // (or knowingly left empty) before startup staging releases any traffic.
-    await this.registerMcplServerFeatures(config, connection);
-
     if (deferAwareness) {
+      // Staged startup: both planes are closed, so the §5.3 policy
+      // round-trip cannot let any buffered traffic slip — establish the
+      // grant now, before staging ever releases.
+      await this.registerMcplServerFeatures(config, connection);
       this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
       return;
     }
@@ -8373,14 +8372,25 @@ export class AgentFramework {
     this.releaseMcplDataPlaneGate(awarenessBarrier);
     try {
       await awarenessBarrier.promise;
-      this.completeMcplDataPlaneGate(awarenessBarrier);
     } catch (error) {
       // Startup cannot fail open on a broken awareness ledger. Disable the
       // reconnecting stub/connection before propagating the distinct error to
       // initializeMcpl, which tears down any other servers and aborts create().
+      // Ordering matters: awareness accounting settles BEFORE the §5.3
+      // policy round-trip below, so an accounting failure aborts with the
+      // grant still empty and every buffered event still behind the gate —
+      // a failed startup never reports a released data plane. (The reverse
+      // order let a push arrive during the policy await and get flushed by
+      // teardown.)
       await connection.close().catch(() => {});
       throw error;
     }
+
+    // §5.3 initial policy handshake — after accounting, before the gate
+    // completes: the grant is established (or knowingly left empty) before
+    // any data-plane traffic flows.
+    await this.registerMcplServerFeatures(config, connection);
+    this.completeMcplDataPlaneGate(awarenessBarrier);
 
     this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
   }

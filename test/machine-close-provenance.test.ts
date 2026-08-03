@@ -1,3 +1,4 @@
+import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
@@ -16,6 +17,8 @@ import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 function makeRegistry() {
   const closeCalls: Array<{ channelId?: string }> = [];
   const mockServer = {
+    // Post-policy state: full grant, so tests exercise delivery, not §5.3 denial.
+    grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
     sendChannelsOpen: async () => ({}),
     sendChannelsClose: async (params: { channelId?: string }) => {
       closeCalls.push(params);

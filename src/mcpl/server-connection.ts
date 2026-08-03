@@ -270,11 +270,43 @@ export class McplServerConnection extends EventEmitter {
         ? this.controlPlaneReady
         : this.dataPlaneReady)
     ) {
+      // Positive-grant admission (§5.4/§14.1), at the single choke-point
+      // every path shares: live routing AND buffer flushes re-enter here, so
+      // an event buffered while the connection was staged is authorized
+      // against the grant current at ADMISSION — by which time the §5.3
+      // policy exchange has settled. Rejecting earlier (at line receipt)
+      // answered staged traffic with -32002 before the grant existed, which
+      // both bounced conforming servers' startup pushes and made a FAILED
+      // startup observable to the server (a response where the ledger said
+      // nothing was released).
+      const requiredCap = McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY[name];
+      if (requiredCap && !this.grant.has(requiredCap)) {
+        const phase = this.policyEstablished ? 'not in the effective grant' : 'initial policy not yet established (§5.3)';
+        const responder = args[1] as { respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
+        if (responder?.respondError) {
+          responder.respondError(CAPABILITY_DISABLED, `${name} rejected: capability "${requiredCap}" ${phase}`, { capability: requiredCap });
+        } else {
+          console.error(`[mcpl] ${this.id}: discarded ${name} — "${requiredCap}" ${phase}`);
+        }
+        return true;
+      }
       return super.emit(event, ...args);
     }
     this.bufferedEvents.push({ event: name, args });
     return true;
   }
+
+  /** Event-name form of METHOD_TO_REQUIRED_CAPABILITY, for admission-time
+   *  enforcement in emit(). */
+  private static readonly EVENT_TO_REQUIRED_CAPABILITY: Record<string, string> = {
+    'push-event': 'pushEvents',
+    'inference-request': 'inferenceRequest',
+    'model-info': 'modelInfo',
+    'channels-register': 'channels.register',
+    'channels-changed': 'channels.register',
+    'channels-incoming': 'channels.incoming',
+    'channels-list': 'channels.register',
+  };
 
   private static isControlPlaneEvent(event: string): boolean {
     return event === 'stderr'
@@ -938,27 +970,10 @@ export class McplServerConnection extends EventEmitter {
         return;
       }
 
-      // Positive-grant enforcement on server-initiated traffic (§5.4, §14.1).
-      // The grant is empty until the initial policy exchange completes
-      // (§5.3), so privileged methods are rejected fail-closed in that
-      // window too. Requests get -32002 with data:{capability} (§6.6);
-      // notifications are discarded with a diagnostic — a rejection can
-      // never be smuggled back as authorization either way.
-      const requiredCap = McplServerConnection.METHOD_TO_REQUIRED_CAPABILITY[request.method];
-      if (requiredCap && !this.grant.has(requiredCap)) {
-        const phase = this.policyEstablished ? 'not in the effective grant' : 'initial policy not yet established (§5.3)';
-        if (request.id != null) {
-          this.sendErrorResponse(
-            request.id,
-            CAPABILITY_DISABLED,
-            `${request.method} rejected: capability "${requiredCap}" ${phase}`,
-            { capability: requiredCap },
-          );
-        } else {
-          console.error(`[mcpl] ${this.id}: discarded ${request.method} — "${requiredCap}" ${phase}`);
-        }
-        return;
-      }
+      // Positive-grant enforcement (§5.4, §14.1) happens at ADMISSION, in
+      // the emit() override below — the one choke-point that live routing
+      // and staged-buffer flushes share. See the comment there for why
+      // rejecting here, at line receipt, was wrong for staged connections.
 
       if (eventName) {
         // Emit the typed event with params and (for requests) a respond callback

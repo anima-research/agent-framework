@@ -26,6 +26,7 @@ import type {
 import type { McplServerRegistry } from './server-registry.js';
 import type { McplServerConnection } from './server-connection.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
+import { CapabilityGrant } from './capability-grant.js';
 
 /** Timeout for beforeInference per server (fail-open). */
 const BEFORE_INFERENCE_TIMEOUT_MS = 5_000;
@@ -154,8 +155,8 @@ export class HookOrchestrator {
     // (§10.1 — the hook is how injection happens) and receives
     // `userMessage: null` instead of the user's text.
     const servers = this.registry.getAllServers().filter((s) =>
-      s.grant.has('contextHooks.beforeInference.observe')
-      || INJECT_LEAVES.some((leaf) => s.grant.has(leaf.path)),
+      CapabilityGrant.of(s).has('contextHooks.beforeInference.observe')
+      || INJECT_LEAVES.some((leaf) => CapabilityGrant.of(s).has(leaf.path)),
     );
     if (servers.length === 0) {
       return [];
@@ -178,7 +179,7 @@ export class HookOrchestrator {
    */
   emitLifecycle(params: InferenceLifecycleParams): void {
     for (const server of this.registry.getAllServers()) {
-      if (!server.grant.has('inferenceLifecycle')) continue;
+      if (!CapabilityGrant.of(server).has('inferenceLifecycle')) continue;
       try {
         server.sendInferenceLifecycle(params);
       } catch {
@@ -202,7 +203,7 @@ export class HookOrchestrator {
         // discouraged — while the hook is still invoked so granted
         // injection positions keep working (write-without-read).
         const perServer: BeforeInferenceParams =
-          server.grant.has('contextHooks.beforeInference.observe')
+          CapabilityGrant.of(server).has('contextHooks.beforeInference.observe')
             ? params
             : { ...params, userMessage: null };
         return withTimeout(
@@ -240,7 +241,7 @@ export class HookOrchestrator {
       if (result.contextInjections && result.contextInjections.length > 0) {
         for (const mcplInj of result.contextInjections) {
           const leaf = INJECT_LEAVES.find((l) => l.position === mcplInj.position);
-          if (!leaf || !server.grant.has(leaf.path)) {
+          if (!leaf || !CapabilityGrant.of(server).has(leaf.path)) {
             console.error(
               `[mcpl] ${server.id}: dropped beforeInference injection at position ` +
                 `"${mcplInj.position}" — not in the effective grant (§10.8)`,

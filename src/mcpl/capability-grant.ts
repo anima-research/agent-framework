@@ -206,6 +206,17 @@ export class CapabilityGrant {
   }
 
   /**
+   * The grant carried by a connection-like object, failing CLOSED when the
+   * object has none. Registry consumers receive whatever the registry holds
+   * — including test stubs and objects created before the field existed —
+   * and a missing grant must mean "nothing granted" (§5.4 absence is
+   * denial), never a TypeError that takes the gate down open-ended.
+   */
+  static of(conn: { grant?: CapabilityGrant } | null | undefined): CapabilityGrant {
+    return conn?.grant ?? CapabilityGrant.empty();
+  }
+
+  /**
    * A copy of this grant with the named paths removed — the reduction
    * primitive. §6.7's ordering contract lives at the call site: install the
    * narrowed grant (establishGrant) BEFORE sending the reducing

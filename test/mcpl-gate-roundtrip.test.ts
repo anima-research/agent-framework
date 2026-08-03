@@ -1,3 +1,4 @@
+import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert';
 import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
@@ -134,6 +135,9 @@ describe('ChannelRegistry subscriptionPolicy', () => {
     const opens: Array<{ type: string; address: unknown }> = [];
     const closes: Array<{ channelId: string }> = [];
     const server = {
+      // Post-policy state: full grant so subscription reconciliation runs
+      // (§14.1 skips lifecycle for ungranted servers).
+      grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
       sendChannelsOpen: async (args: { type: string; address: unknown }) => { opens.push(args); },
       sendChannelsClose: async (args: { channelId: string }) => { closes.push(args); return { closed: true }; },
     };
@@ -276,6 +280,7 @@ describe('ChannelRegistry durable lifecycle', () => {
   it('requires serverId only when two MCPLs expose the same channel id', async () => {
     const openedBy: string[] = [];
     const servers = new Map(['alpha', 'beta'].map((serverId) => [serverId, {
+      grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
       sendChannelsOpen: async () => {
         openedBy.push(serverId);
         return { channel: { ...oneChannel[0], id: 'shared' } };
@@ -310,6 +315,7 @@ describe('ChannelRegistry durable lifecycle', () => {
     const closes: string[] = [];
     const acks: unknown[] = [];
     const server = {
+      grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
       sendChannelsOpen: async (args: { channelId?: string }) => {
         opens.push(args.channelId ?? '');
         return { channel: oneChannel[0] };

@@ -1,3 +1,4 @@
+import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
@@ -30,6 +31,8 @@ function makeRegistry(
   let failOpens = false;
 
   const mockServer = {
+    // Post-policy state: full grant, so tests exercise delivery, not §5.3 denial.
+    grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
     sendChannelsPublish: async (params: { channelId?: string; conversationId?: string }) => {
       publishCalls.push(params);
       return publishResult;

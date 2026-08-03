@@ -35,6 +35,7 @@ import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
+import { CapabilityGrant } from './capability-grant.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -1209,7 +1210,7 @@ export class ChannelRegistry {
     // Skipping reconciliation for an ungranted server is the enforcement —
     // its channels simply stay in whatever state the server chose, and the
     // host never directs lifecycle it was not granted authority over.
-    if (!server.grant.has('channels.lifecycle')) {
+    if (!CapabilityGrant.of(server).has('channels.lifecycle')) {
       this.emitTraceFn({
         type: 'mcpl:channel-reconcile-skipped',
         serverId,
@@ -1295,7 +1296,7 @@ export class ChannelRegistry {
     // §14.1: channels/typing requires channels.typing in the grant. Silent
     // skip — a typing indicator is cosmetic and per-7s, so a diagnostic per
     // tick would be noise.
-    if (!this.serverRegistry.getServer(serverId)?.grant.has('channels.typing')) return;
+    if (!CapabilityGrant.of(this.serverRegistry.getServer(serverId)).has('channels.typing')) return;
     if (this.sendTypingFn) {
       this.sendTypingFn(serverId, channelId, this.typingMetadata.get(channelId));
     }
@@ -1418,7 +1419,7 @@ export class ChannelRegistry {
     if (!server) {
       throw new Error(`Server not found: ${entry.serverId}`);
     }
-    if (!server.grant.has('channels.lifecycle')) {
+    if (!CapabilityGrant.of(server).has('channels.lifecycle')) {
       // Desired state is already recorded — intent sticks; reconciliation
       // will retry if the grant later widens (§6.7 expansion-on-receipt).
       throw new Error(`channels.lifecycle not in "${entry.serverId}"'s effective grant (§14.1)`);
@@ -1767,7 +1768,7 @@ export class ChannelRegistry {
     }
 
     try {
-      if (!server.grant.has('channels.lifecycle')) {
+      if (!CapabilityGrant.of(server).has('channels.lifecycle')) {
         return {
           success: false,
           error: `channels.lifecycle not in "${entry.serverId}"'s effective grant (§14.1)`,
@@ -1819,7 +1820,7 @@ export class ChannelRegistry {
       const server = this.serverRegistry.getServer(entry.serverId);
       if (!server) {
         acknowledgmentError = `Server not found: ${entry.serverId}`;
-      } else if (!server.grant.has('channels.acknowledge')) {
+      } else if (!CapabilityGrant.of(server).has('channels.acknowledge')) {
         acknowledgmentError = `channels.acknowledge not in "${entry.serverId}"'s effective grant (§14.1)`;
       } else {
         try {
@@ -1983,7 +1984,7 @@ export class ChannelRegistry {
     // for the boolean `channels: true` shape (masking discord-mcpl's latent
     // double-post, AUDIT-001), and pre-policy it would have sent before the
     // server was told anything was granted.
-    if (!server?.grant.has('channels.streaming')) return null;
+    if (!CapabilityGrant.of(server).has('channels.streaming')) return null;
     return server;
   }
 
@@ -2078,7 +2079,7 @@ export class ChannelRegistry {
     // §14.1: channels/publish requires channels.publish in the grant. The
     // host not sending is the enforcement — a send to an ungranted server
     // would have it act on authority it was never told it has.
-    if (!server.grant.has('channels.publish')) {
+    if (!CapabilityGrant.of(server).has('channels.publish')) {
       return fail(channelId, `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`);
     }
 
@@ -2157,7 +2158,7 @@ export class ChannelRegistry {
     }
 
     try {
-      if (!server.grant.has('channels.publish')) {
+      if (!CapabilityGrant.of(server).has('channels.publish')) {
         return {
           success: false,
           error: `channels.publish not in "${server.id}"'s effective grant (§14.1)`,

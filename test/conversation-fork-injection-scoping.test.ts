@@ -24,6 +24,7 @@ type FrameworkInternals = {
   conversationAgentHomes: Map<string, string>;
   hookOrchestrator: {
     beforeInference(params: unknown): Promise<ContextInjection[]>;
+    emitLifecycle(params: unknown): void;
   } | null;
 };
 
@@ -111,6 +112,9 @@ function bindForkHome(framework: AgentFramework, agentName = FORK_AGENT, channel
 function installHookInjections(framework: AgentFramework, injections: ContextInjection[]): void {
   frameworkInternals(framework).hookOrchestrator = {
     beforeInference: async () => injections,
+    // §10.5: driveStream emits started/terminal lifecycle notifications
+    // through the orchestrator on every turn now.
+    emitLifecycle: () => {},
   };
 }
 

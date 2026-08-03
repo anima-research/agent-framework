@@ -180,6 +180,16 @@ function handle(message) {
     });
     return;
   }
+  if (message.method === 'featureSets/update') {
+    // MCPL 0.5 (§5.3/§6.7): the host sends initial policy as a Request and
+    // activates the grant only on this degradation receipt. Without it the
+    // host times out (15s), the grant stays empty, and every push/channel
+    // in these tests is rejected fail-closed.
+    if (message.id !== undefined && message.id !== null) {
+      reply(message.id, { accepted: true });
+    }
+    return;
+  }
   if (message.method === 'notifications/initialized') {
     beginServerTraffic();
     return;
