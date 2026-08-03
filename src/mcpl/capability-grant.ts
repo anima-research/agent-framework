@@ -204,6 +204,21 @@ export class CapabilityGrant {
   static empty(): CapabilityGrant {
     return new CapabilityGrant(new Set(), []);
   }
+
+  /**
+   * A copy of this grant with the named paths removed — the reduction
+   * primitive. §6.7's ordering contract lives at the call site: install the
+   * narrowed grant (establishGrant) BEFORE sending the reducing
+   * featureSets/update Request; security cannot wait on consent.
+   */
+  without(...paths: string[]): CapabilityGrant {
+    const granted = new Set(this.granted);
+    const denied = new Set(this.deniedPaths);
+    for (const p of paths) {
+      if (granted.delete(p)) denied.add(p);
+    }
+    return new CapabilityGrant(granted, [...denied].sort());
+  }
 }
 
 /**

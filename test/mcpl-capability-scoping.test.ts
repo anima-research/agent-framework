@@ -291,4 +291,22 @@ test('§5.3 pre-policy deny-all, then the same push/event flows once the grant i
   };
   assert.equal(pushEventEmitted, true, 'granted push must reach host handlers');
   assert.equal(round2.pushResponse?.result?.accepted, true);
+
+  // Round 3: REDUCTION ordering (§6.7 — "a security-reducing change takes
+  // effect atomically first, then the host sends the Request"). Re-establish
+  // a grant without pushEvents and verify enforcement is immediate: the next
+  // push is rejected with no Request sent, no receipt awaited, and no window
+  // in which the old, wider grant still answers. This is the half of the
+  // mirrored ordering the expansion rounds above cannot show.
+  pushEventEmitted = false;
+  connection.establishGrant(
+    computeGrant(connection.capabilities, {}).without('pushEvents'),
+  );
+  const round3 = await connection.sendToolsList() as {
+    tools: unknown[];
+    pushResponse?: { error?: { code: number; data?: { capability?: string } } };
+  };
+  assert.equal(pushEventEmitted, false, 'revoked push must stop immediately — reduction never waits on consent');
+  assert.equal(round3.pushResponse?.error?.code, CAPABILITY_DISABLED);
+  assert.equal(round3.pushResponse?.error?.data?.capability, 'pushEvents');
 });
