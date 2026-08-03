@@ -125,6 +125,12 @@ function collectSubtree(node: CapNode, path: string, out: Set<string>): void {
  * Generic recursive walk; `true` at any level advertises every leaf beneath
  * it; `false`/absent advertises nothing; unrecognized member names are
  * ignored — an unknown name cannot mint a capability.
+ *
+ * `tools` is deliberately NOT sourced here. §5.1 sources it from the OUTER
+ * standard MCP `capabilities.tools` only — the experimental manifest cannot
+ * mint standard MCP tool capability (review blocker 2 on PR #79). A nested
+ * `experimental.mcpl.tools` is treated as an unknown member. Callers join
+ * the outer signal via computeGrant's mcpToolsAdvertised.
  */
 export function advertisedPaths(capabilities: McplCapabilities | null): Set<string> {
   const out = new Set<string>();
@@ -133,6 +139,7 @@ export function advertisedPaths(capabilities: McplCapabilities | null): Set<stri
     if (vocab === null || !isPlainObject(value)) return;
     for (const [key, child] of Object.entries(vocab)) {
       const path = prefix ? `${prefix}.${key}` : key;
+      if (path === 'tools') continue; // outer MCP caps only — see doc comment
       const v = value[key];
       if (v === true) {
         collectSubtree(child, path, out);
@@ -147,6 +154,44 @@ export function advertisedPaths(capabilities: McplCapabilities | null): Set<stri
   };
   walk(VOCABULARY, capabilities as unknown as Record<string, unknown>, '');
   return out;
+}
+
+/**
+ * Expand §5.1 boolean shorthand into the explicit leaf tree, IN PLACE of the
+ * boolean, for every vocabulary node — so the config mask's generic child
+ * walk can address sub-leaves. Without this, `channels: true` is an atomic
+ * top-level leaf to the mask: `disabledCapabilities:['channels.streaming']`
+ * silently no-ops and `enabledCapabilities:['channels.publish']` drops the
+ * whole tree (review blocker 1 — live release geometry, since discord
+ * truthfully keeps `channels: true`).
+ *
+ * Unrecognized members and non-capability members (`version`, `revision`,
+ * `featureSets`) pass through untouched. The wire keeps its shorthand; this
+ * expanded form is the host's POLICY representation.
+ */
+export function expandAdvertisementShorthand(capabilities: McplCapabilities | null): McplCapabilities | null {
+  if (!capabilities) return capabilities;
+  const expandNode = (node: CapNode): unknown => {
+    if (node === null) return true;
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(node)) out[key] = expandNode(child);
+    return out;
+  };
+  const walk = (vocab: CapNodeMap, value: Record<string, unknown>): Record<string, unknown> => {
+    const out: Record<string, unknown> = { ...value };
+    for (const [key, child] of Object.entries(vocab)) {
+      if (key === 'tools') continue; // never expanded from experimental
+      const v = value[key];
+      if (child === null) continue; // leaf: boolean stays a boolean
+      if (v === true) {
+        out[key] = expandNode(child);
+      } else if (isPlainObject(v)) {
+        out[key] = walk(child, v);
+      }
+    }
+    return out;
+  };
+  return walk(VOCABULARY as CapNodeMap, capabilities as unknown as Record<string, unknown>) as unknown as McplCapabilities;
 }
 
 // ============================================================================
@@ -242,8 +287,16 @@ export class CapabilityGrant {
 export function computeGrant(
   capabilities: McplCapabilities | null,
   config: Pick<McplServerConfig, 'enabledCapabilities'>,
+  opts?: {
+    /** §5.1: `tools` is sourced from the OUTER standard MCP
+     *  `capabilities.tools` — pass its presence here. The experimental
+     *  manifest cannot mint it. Without this signal, every
+     *  `uses: ['tools']` feature set fails §6.4 derivation. */
+    mcpToolsAdvertised?: boolean;
+  },
 ): CapabilityGrant {
   const advertised = advertisedPaths(capabilities);
+  if (opts?.mcpToolsAdvertised) advertised.add('tools');
   const granted = new Set<string>();
   const denied: string[] = [];
 

@@ -13,7 +13,7 @@ import { EventEmitter } from 'node:events';
 
 import { openTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
 import { maskNegotiatedCapabilities } from './capability-mask.js';
-import { CapabilityGrant } from './capability-grant.js';
+import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
 import { CAPABILITY_DISABLED } from './errors.js';
 
 import type {
@@ -93,7 +93,6 @@ interface RequestOptions {
  * - `'channels-register'`  — Server sent `channels/register`
  * - `'channels-changed'`   — Server sent `channels/changed`
  * - `'channels-incoming'`  — Server sent `channels/incoming`
- * - `'feature-sets-changed'` — Server sent `featureSets/changed`
  * - `'error'`              — Connection-level error
  * - `'close'`              — Connection closed
  * - `'connect-failed'`     — Initial connect failed; background retry scheduled
@@ -113,6 +112,10 @@ export class McplServerConnection extends EventEmitter {
    *  last handshake (empty when no scoping is configured). Inbound methods
    *  gated by a masked capability are rejected in setupMessageRouting. */
   droppedCapabilities: ReadonlySet<string> = new Set();
+
+  /** OUTER standard MCP capabilities.tools was present at handshake (§5.1 —
+   *  the sole source of the `tools` capability path). */
+  mcpToolsAdvertised = false;
 
   /**
    * The effective capability grant (§5.4) — the sole authorization
@@ -313,7 +316,6 @@ export class McplServerConnection extends EventEmitter {
       || event === 'scope-elevate'
       || event === 'channels-register'
       || event === 'channels-changed'
-      || event === 'feature-sets-changed'
       || event === 'tools-list-changed'
       || event === 'connect-failed'
       || event === 'reconnect-failed'
@@ -342,10 +344,11 @@ export class McplServerConnection extends EventEmitter {
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
   ): Promise<McplServerConnection> {
-    const { transport, capabilities, droppedCapabilities } = await McplServerConnection.handshake(config, hostCapabilities);
+    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised } = await McplServerConnection.handshake(config, hostCapabilities);
 
     const connection = new McplServerConnection(config.id, capabilities, transport);
     connection.droppedCapabilities = droppedCapabilities;
+    connection.mcpToolsAdvertised = mcpToolsAdvertised;
     connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
     // Store config for reconnection
@@ -370,7 +373,7 @@ export class McplServerConnection extends EventEmitter {
   private static async handshake(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
-  ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string> }> {
+  ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean }> {
     const transport = await openTransport(config);
 
     try {
@@ -388,7 +391,7 @@ export class McplServerConnection extends EventEmitter {
 
       // Await the initialize response, racing an early transport close/error and
       // a timeout. All three paths clean up their listeners.
-      const capabilities = await new Promise<McplCapabilities | null>((resolve, reject) => {
+      const { mcpl: rawCapabilities, mcpToolsAdvertised } = await new Promise<{ mcpl: McplCapabilities | null; mcpToolsAdvertised: boolean }>((resolve, reject) => {
         const cleanup = () => {
           transport.off('line', onLine);
           transport.off('close', onClose);
@@ -411,7 +414,13 @@ export class McplServerConnection extends EventEmitter {
           const result = msg.result as Record<string, unknown> | undefined;
           const caps = result?.capabilities as Record<string, unknown> | undefined;
           const experimental = caps?.experimental as Record<string, unknown> | undefined;
-          resolve((experimental?.mcpl as McplCapabilities) ?? null);
+          // §5.1: `tools` capability is the OUTER standard MCP member — the
+          // experimental manifest cannot mint it. Carried alongside so the
+          // grant can join it into §6.4 derivation.
+          resolve({
+            mcpl: (experimental?.mcpl as McplCapabilities) ?? null,
+            mcpToolsAdvertised: caps?.tools !== undefined,
+          });
         };
         const onClose = (info: TransportCloseInfo) => {
           cleanup();
@@ -435,6 +444,11 @@ export class McplServerConnection extends EventEmitter {
       // Send `initialized` notification (no id)
       transport.writeLine(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }));
 
+      // §5.1 boolean shorthand expands to explicit leaves BEFORE the config
+      // mask runs, so sub-leaf policy is addressable — `channels: true` with
+      // `disabledCapabilities: ['channels.streaming']` must actually drop
+      // streaming (PR #79 review blocker 1).
+      const capabilities = expandAdvertisementShorthand(rawCapabilities);
       // Host-side capability scoping: intersect the server's advertisement
       // with config policy so a masked capability behaves exactly as if it
       // had never been advertised (hooks, streaming, queries all read this).
@@ -443,7 +457,7 @@ export class McplServerConnection extends EventEmitter {
         console.error(`MCPL server "${config.id}" capabilities masked by host config: ${dropped.join(', ')}`);
       }
 
-      return { transport, capabilities: scoped, droppedCapabilities: new Set(dropped) };
+      return { transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised };
     } catch (err) {
       // Never leak the child / socket if the handshake fails.
       await transport.close().catch(() => { /* best effort */ });
@@ -767,7 +781,7 @@ export class McplServerConnection extends EventEmitter {
     const attempt = Math.max(1, this.reconnectAttempts);
 
     try {
-      const { transport, capabilities, droppedCapabilities } = await McplServerConnection.handshake(
+      const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised } = await McplServerConnection.handshake(
         this.config,
         this.hostCapabilities,
       );
@@ -780,6 +794,7 @@ export class McplServerConnection extends EventEmitter {
       this.transport = transport;
       this.capabilities = capabilities;
       this.droppedCapabilities = droppedCapabilities;
+      this.mcpToolsAdvertised = mcpToolsAdvertised;
       this.closed = false;
       this.nextRequestId = 1;
       this.pendingRequests.clear();
@@ -884,7 +899,6 @@ export class McplServerConnection extends EventEmitter {
     [McplMethod.ChannelsRegister]: 'channels-register',
     [McplMethod.ChannelsChanged]: 'channels-changed',
     [McplMethod.ChannelsIncoming]: 'channels-incoming',
-    [McplMethod.FeatureSetsChanged]: 'feature-sets-changed',
     // §6.6/§12: a request bearing an id MUST get a result or an error —
     // neither of these had an entry, so callers hung forever (AUDIT-001
     // item 4, which also poisoned the audit's own usage evidence).
@@ -963,6 +977,20 @@ export class McplServerConnection extends EventEmitter {
       // §7 is removed in 0.5.0: scope/elevate is no longer a method. Answer
       // rather than hang (§6.6 — a method that will never be answered MUST
       // return an error).
+      // featureSets/changed is REMOVED in 0.5.0 (§6.7 — it carried a
+      // server-authored change payload, the self-attestation defect; the
+      // need is met by §17's host-diffed manifest fetch). It was still
+      // routed, control-plane classified, and mutating declarations — a
+      // live ungated self-attestation path (PR #79 review blocker 4).
+      if (request.method === McplMethod.FeatureSetsChanged) {
+        if (request.id != null) {
+          this.sendErrorResponse(request.id, -32601, 'featureSets/changed removed in MCPL 0.5.0 (superseded by mcpl/manifestChanged, SPEC §17)');
+        } else {
+          console.error(`[mcpl] ${this.id}: discarded featureSets/changed — removed in 0.5.0 (§6.7/§17)`);
+        }
+        return;
+      }
+
       if (request.method === McplMethod.ScopeElevate) {
         if (request.id != null) {
           this.sendErrorResponse(request.id, -32601, 'scope/elevate removed in MCPL 0.5.0 (SPEC §7)');

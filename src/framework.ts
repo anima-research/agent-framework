@@ -8420,7 +8420,7 @@ export class AgentFramework {
     // advertisement. Not yet active — expansion activates only after the
     // receipt (§6.7); until then the connection's grant is empty and every
     // privileged inbound method is rejected.
-    const grant = computeGrant(connection.capabilities, config);
+    const grant = computeGrant(connection.capabilities, config, { mcpToolsAdvertised: connection.mcpToolsAdvertised });
 
     const updateParams = this.featureSetManager!.initializeServer(
       config.id,
@@ -8633,10 +8633,10 @@ export class AgentFramework {
       this.emitTrace({ type: 'mcpl:server-stderr', serverId: connection.id, line: params.line });
     });
 
-    // Handle dynamic feature set changes from server
-    connection.on('feature-sets-changed', (params: FeatureSetsChangedParams) => {
-      this.featureSetManager?.handleFeatureSetsChanged(connection.id, params);
-    });
+    // featureSets/changed is REMOVED in 0.5.0 — the connection answers it
+    // -32601 (superseded by SPEC §17's host-diffed manifest fetch); no
+    // listener, and nothing mutates declarations off a server-authored
+    // change payload.
 
     // Handle scope elevation requests
     // §7 Scoped Access is removed in 0.5.0. scope/elevate is answered

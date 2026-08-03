@@ -63,6 +63,10 @@ class FakeConnection extends EventEmitter {
   // accepted — modeling a conforming 0.5 server — so registration reaches
   // establishGrant and post-policy tests exercise delivery, not denial.
   grant = CapabilityGrant.empty();
+  // §5.1: `tools` comes from the OUTER standard MCP capabilities — the
+  // experimental advert can't mint it. mem uses ['tools'], so the fake
+  // models a server whose initialize carried capabilities.tools.
+  mcpToolsAdvertised = true;
   policyEstablished = false;
   establishGrant(grant: CapabilityGrant): void {
     this.grant = grant;

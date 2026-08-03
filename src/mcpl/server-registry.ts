@@ -107,7 +107,10 @@ export class McplServerRegistry {
         case 'pushEvents':
           return caps.pushEvents === true;
         case 'contextHooks.beforeInference':
-          return caps.contextHooks?.beforeInference === true;
+          // Truthy, not ===true: §5.1 shorthand is expanded to the object
+          // form at handshake. (Prefer connection.grant for authorization —
+          // this query is advertisement-level only.)
+          return !!caps.contextHooks?.beforeInference;
         case 'contextHooks.afterInference':
           return !!caps.contextHooks?.afterInference;
         case 'inferenceRequest':

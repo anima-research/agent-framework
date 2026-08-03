@@ -226,7 +226,14 @@ test('masked afterInference is invisible to capability queries; unmasked hooks s
   );
   connection.ready();
 
-  assert.equal(connection.capabilities?.contextHooks?.beforeInference, true);
+  // §5.1 shorthand is expanded to explicit leaves at handshake (the host's
+  // POLICY representation — sub-leaf masking must be addressable), so the
+  // stored shape is the object form, not the wire's boolean.
+  const before = connection.capabilities?.contextHooks?.beforeInference as unknown as {
+    observe?: boolean; inject?: Record<string, boolean>;
+  };
+  assert.equal(before?.observe, true);
+  assert.deepEqual(before?.inject, { system: true, beforeUser: true, afterUser: true });
   assert.equal(connection.capabilities?.contextHooks?.afterInference, undefined);
   assert.deepEqual(registry.getServersWithCapability('contextHooks.afterInference'), []);
   assert.equal(registry.getServersWithCapability('contextHooks.beforeInference').length, 1);
