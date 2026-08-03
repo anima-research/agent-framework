@@ -28,7 +28,9 @@ rl.on('line', (line) => {
         id: msg.id,
         result: {
           protocolVersion: '2024-11-05',
-          capabilities: {},
+          capabilities: {
+            experimental: { mcpl: { version: '0.5', pushEvents: true } },
+          },
           serverInfo: { name: 'flaky-mcpl-server', version: '0.0.0' },
         },
       }) + '\n',
