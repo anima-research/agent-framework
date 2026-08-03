@@ -14,6 +14,7 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
 // The .mjs fixture is not compiled/copied by tsc, so when this test runs from
@@ -26,7 +27,7 @@ const TMP_DIR = join(import.meta.dirname, '../.test-tmp-reconnect');
 const FLAG_FILE = join(TMP_DIR, 'server-healthy');
 
 const HOST_CAPS: McplHostCapabilities = {
-  version: '0.4',
+  version: '0.5',
   pushEvents: true,
   contextHooks: { beforeInference: true },
   featureSets: true,
@@ -140,5 +141,33 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
     await new Promise((r) => setTimeout(r, 200));
     assert.strictEqual(reconnected.length, 0);
     connection = null;
+  });
+
+  it('clears the previous transport grant before publishing a reconnected handshake', async () => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    connection.establishGrant(new CapabilityGrant(new Set(['pushEvents']), []));
+    assert.strictEqual(connection.policyEstablished, true);
+    assert.deepStrictEqual(connection.grant.effectiveList(), ['pushEvents']);
+
+    let stateAtReconnect: { policyEstablished: boolean; grant: string[] } | null = null;
+    connection.on('reconnect', () => {
+      stateAtReconnect = {
+        policyEstablished: connection!.policyEstablished,
+        grant: connection!.grant.effectiveList(),
+      };
+    });
+    connection.ready();
+
+    // Crash the old transport. The replacement handshake is a fresh policy
+    // epoch: no authority from the prior process may survive until the host's
+    // new §5.3 Request receives its degradation receipt.
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => stateAtReconnect !== null, 5000, 'reconnect after granted transport');
+
+    assert.deepStrictEqual(stateAtReconnect, {
+      policyEstablished: false,
+      grant: [],
+    });
   });
 });

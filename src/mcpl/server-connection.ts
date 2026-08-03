@@ -147,6 +147,14 @@ export class McplServerConnection extends EventEmitter {
     this.policyEstablished = true;
   }
 
+  /** A §5.3 grant belongs to one initialized transport epoch. Reconnecting
+   * performs a fresh initialize handshake, so authority from the dead epoch
+   * must be revoked before the replacement transport is exposed. */
+  private resetPolicyForTransportBoundary(): void {
+    this.grant = CapabilityGrant.empty();
+    this.policyEstablished = false;
+  }
+
   /** The active transport (stdio child or WebSocket). Null for a disconnected
    *  stub awaiting its first background reconnect. */
   private transport: McplTransport | null;
@@ -719,6 +727,7 @@ export class McplServerConnection extends EventEmitter {
       return;
     }
     this.closed = true;
+    this.resetPolicyForTransportBoundary();
 
     // Reject all pending requests
     for (const [id, pending] of this.pendingRequests) {
@@ -807,6 +816,7 @@ export class McplServerConnection extends EventEmitter {
       // awareness barrier synchronously, then releases control traffic needed
       // to establish the server while data remains held.
       this.pauseDataPlane();
+      this.resetPolicyForTransportBoundary();
       this.transport = transport;
       this.capabilities = capabilities;
       this.droppedCapabilities = droppedCapabilities;
@@ -1125,6 +1135,7 @@ export class McplServerConnection extends EventEmitter {
     transport.on('close', (info: TransportCloseInfo) => {
       if (!this.closed) {
         this.closed = true;
+        this.resetPolicyForTransportBoundary();
 
         // Reject all pending requests
         for (const [id, pending] of this.pendingRequests) {
