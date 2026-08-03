@@ -117,6 +117,11 @@ export class McplServerConnection extends EventEmitter {
    *  the sole source of the `tools` capability path). */
   mcpToolsAdvertised = false;
 
+  /** Host-owned per-server authority for host/command (config
+   *  allowHostCommands, default false). No capability path exists and the
+   *  grant cannot confer it — server params never decide admin authority. */
+  allowHostCommands = false;
+
   /**
    * The effective capability grant (§5.4) — the sole authorization
    * allowlist for this connection. Starts EMPTY: until the initial policy
@@ -237,18 +242,15 @@ export class McplServerConnection extends EventEmitter {
   readyControlPlane(): void {
     this.controlPlaneReady = true;
     const pending = this.bufferedEvents;
-    const deferred: Array<{ event: string; args: unknown[] }> = [];
     this.bufferedEvents = [];
     for (const item of pending) {
-      if (McplServerConnection.isControlPlaneEvent(item.event)) {
-        super.emit(item.event, ...item.args);
-      } else {
-        deferred.push(item);
-      }
+      // Re-enter the ADMISSION gate (this.emit), never super.emit: control
+      // events include channels-register/changed, which are grant-gated —
+      // the old direct flush bypassed positive-grant enforcement entirely
+      // (PR #79 review blocker 3). Data-plane items re-buffer in order via
+      // the same call, since dataPlaneReady is still false.
+      this.emit(item.event, ...item.args);
     }
-    // Data events emitted by control handlers while the snapshot was flushing
-    // were appended to the new buffer. Preserve their order behind older data.
-    this.bufferedEvents = [...deferred, ...this.bufferedEvents];
   }
 
   /**
@@ -282,6 +284,19 @@ export class McplServerConnection extends EventEmitter {
       // both bounced conforming servers' startup pushes and made a FAILED
       // startup observable to the server (a response where the ledger said
       // nothing was released).
+      // host/command: host-owned authority, not a capability — no §6.2 path
+      // exists and none is invented here. Default DENY; only the operator's
+      // config confers it (PR #79 review blocker 9: any server could
+      // request undo/hide/unstick).
+      if (name === 'host-command' && !this.allowHostCommands) {
+        const responder = args[1] as { respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
+        if (responder?.respondError) {
+          responder.respondError(CAPABILITY_DISABLED, 'host/command requires host-owned authority (McplServerConfig.allowHostCommands)', {});
+        } else {
+          console.error(`[mcpl] ${this.id}: discarded host/command — allowHostCommands not set`);
+        }
+        return true;
+      }
       const requiredCap = McplServerConnection.EVENT_TO_REQUIRED_CAPABILITY[name];
       if (requiredCap && !this.grant.has(requiredCap)) {
         const phase = this.policyEstablished ? 'not in the effective grant' : 'initial policy not yet established (§5.3)';
@@ -349,6 +364,7 @@ export class McplServerConnection extends EventEmitter {
     const connection = new McplServerConnection(config.id, capabilities, transport);
     connection.droppedCapabilities = droppedCapabilities;
     connection.mcpToolsAdvertised = mcpToolsAdvertised;
+    connection.allowHostCommands = config.allowHostCommands === true;
     connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
     // Store config for reconnection
@@ -795,6 +811,7 @@ export class McplServerConnection extends EventEmitter {
       this.capabilities = capabilities;
       this.droppedCapabilities = droppedCapabilities;
       this.mcpToolsAdvertised = mcpToolsAdvertised;
+      this.allowHostCommands = this.config?.allowHostCommands === true;
       this.closed = false;
       this.nextRequestId = 1;
       this.pendingRequests.clear();

@@ -41,6 +41,14 @@ function makeRegistry(shouldTriggerInference?: (c: string, m: Record<string, unk
     () => {},
     shouldTriggerInference ? { shouldTriggerInference } : undefined,
   );
+  // §14.5: incoming no longer mints unknown channels — seed what a
+  // conforming server's channels/register would have created.
+  for (const id of ['zulip:tracker-miner-f', 'zulip:other-channel']) {
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set(`zulip:${id}`, {
+      serverId: 'zulip', descriptor: { id, type: 'zulip', label: id }, open: false,
+    });
+  }
+
   return { registry, pushed };
 }
 

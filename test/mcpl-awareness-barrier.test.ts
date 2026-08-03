@@ -113,6 +113,11 @@ function twoServerFrameworkConfig(
     id,
     command: process.execPath,
     args: [FIXTURE],
+    // The host/command matrix leg models the legitimate slash-command relay:
+    // host-owned authority is the operator's config decision (PR #79
+    // blocker 9), so the test config makes it, exactly as the fleet's
+    // discord config will at rollout.
+    allowHostCommands: true,
     requestTimeoutMs: 0,
     env: {
       STATUS_PATH: statusPath,

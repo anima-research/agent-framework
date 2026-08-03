@@ -518,7 +518,14 @@ export class ChannelRegistry {
   async handleChanged(
     serverId: string,
     params: ChannelsChangedParams,
+    responder?: Responder,
   ): Promise<void> {
+    // §14.5: dual-mode. Request form answers ITEMIZED per-descriptor
+    // results for added channels; Notification form filters itemwise with a
+    // diagnostic. Either way, added descriptors are validated exactly like
+    // channels/register — a changed-set cannot smuggle in what register
+    // would have rejected (PR #79 review blocker 5).
+    const addedResults: Array<{ id: string; accepted: boolean; reason?: string }> = [];
     // Process removed channels
     if (params.removed) {
       for (const channelId of params.removed) {
@@ -539,18 +546,27 @@ export class ChannelRegistry {
       }
     }
 
-    // Process added channels (register + reconcile durable desired state)
+    // Process added channels (validate per-descriptor, register, reconcile)
+    const accepted: typeof params.added = [];
     if (params.added) {
       for (const channel of params.added) {
+        if (!channel || typeof channel.id !== 'string' || channel.id.length === 0) {
+          addedResults.push({ id: String(channel?.id ?? ''), accepted: false, reason: 'invalid descriptor: missing id' });
+          this.emitTraceFn({ type: 'mcpl:channel-descriptor-rejected', serverId, reason: 'missing id' });
+          continue;
+        }
         const key = `${serverId}:${channel.id}`;
         this.channels.set(key, {
           serverId,
           descriptor: channel,
           open: false,
         });
+        addedResults.push({ id: channel.id, accepted: true });
+        accepted.push(channel);
       }
-      await this.reconcileChannels(serverId, params.added);
+      if (accepted.length > 0) await this.reconcileChannels(serverId, accepted);
     }
+    responder?.respond({ results: addedResults });
 
     this.emitTraceFn({
       type: 'mcpl:channels-changed',
@@ -581,11 +597,6 @@ export class ChannelRegistry {
       // Convert MCPL content blocks to membrane ContentBlocks
       const convertedContent: ContentBlock[] = message.content.map(convertBlock);
 
-      // Track default publish channel (most recent incoming)
-      this.defaultPublishChannel = message.channelId;
-      this.defaultPublishMessageId = message.messageId;
-      this.defaultPublishThreadId = message.threadId;
-
       // Lazy-register the channel if we've never seen it. A channel can deliver
       // an incoming message before its channels/register (boot enumeration) or
       // channels/changed (post-boot create / View-permission grant) round-trip
@@ -597,31 +608,38 @@ export class ChannelRegistry {
       // is reachable. The inbound message carries enough to make it publishable,
       // so register it here; a later authoritative channels/register or
       // channels/changed will overwrite this descriptor with the richer one.
+      // §14.5: channels/incoming is validated against the ACTUALLY
+      // REGISTERED channel. An unknown claimed channelId is rejected
+      // per-message with an itemized result — never minted by its first
+      // message (PR #79 review blocker 5: lazy-registration let a server
+      // self-attest a channel identity without ever passing
+      // channels/register authorization). A server whose channel genuinely
+      // exists registers it first; discord's DM case goes through
+      // ensureChannelRegistered on push/event, which creates a CLOSED
+      // routable entry rather than an open self-attested one.
       const incomingKey = `${serverId}:${message.channelId}`;
       if (!this.channels.has(incomingKey)) {
-        const channelLabel =
-          typeof message.metadata?.channelName === 'string' && message.metadata.channelName
-            ? (message.metadata.channelName as string)
-            : message.channelId;
-        this.channels.set(incomingKey, {
-          serverId,
-          descriptor: {
-            id: message.channelId,
-            type: serverId,
-            label: channelLabel,
-            direction: 'bidirectional',
-            address: message.threadId ? { threadId: message.threadId } : undefined,
-            metadata: { lazyRegistered: true },
-          },
-          open: true,
-        });
         this.emitTraceFn({
-          type: 'mcpl:channel-lazy-registered',
+          type: 'mcpl:channel-incoming-rejected',
           serverId,
           channelId: message.channelId,
-          label: channelLabel,
+          reason: 'unknown channel — not registered (§14.5)',
         });
-      } else {
+        results.push({
+          messageId: message.messageId,
+          accepted: false,
+          reason: `unknown channel "${message.channelId}" — register it first (§14.5)`,
+        });
+        continue;
+      }
+      // Track default publish channel (most recent ACCEPTED incoming) —
+      // deliberately after §14.5 validation: a rejected message from an
+      // unregistered channel must not retarget outbound speech (the locus is
+      // exactly the authority a self-attested channel would be stealing).
+      this.defaultPublishChannel = message.channelId;
+      this.defaultPublishMessageId = message.messageId;
+      this.defaultPublishThreadId = message.threadId;
+      {
         // A server sending channels/incoming is authoritative evidence that
         // the transport is actually open. This repairs transient status only;
         // durable desired state still changes exclusively through lifecycle

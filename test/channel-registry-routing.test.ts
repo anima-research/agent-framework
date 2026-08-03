@@ -90,7 +90,22 @@ function incoming(channelId: string, text: string, channelName?: string) {
   };
 }
 
-test('handleIncoming lazy-registers an unknown channel so it becomes a publishable locus', async () => {
+
+/** §14.5: channels/incoming no longer mints unknown channels — seed the
+ *  registered state a conforming server would have created via
+ *  channels/register before feeding incoming traffic. */
+function seedRegistered(registry: ChannelRegistry, serverId: string, ...ids: string[]): void {
+  const map = (registry as unknown as {
+    channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
+  }).channels;
+  for (const id of ids) {
+    if (!map.has(`${serverId}:${id}`)) {
+      map.set(`${serverId}:${id}`, { serverId, descriptor: { id, type: serverId, label: id }, open: false });
+    }
+  }
+}
+
+test('handleIncoming REJECTS an unknown channel instead of minting it (§14.5)', async () => {
   const { registry, traces, lookup } = makeRegistry({ delivered: true });
 
   // Channel "post-boot-ch" was never registered via channels/register|changed.
@@ -98,20 +113,17 @@ test('handleIncoming lazy-registers an unknown channel so it becomes a publishab
 
   registry.handleIncoming('discord', incoming('post-boot-ch', 'hi', '#cairn'));
 
-  const entry = lookup('post-boot-ch');
-  assert.ok(entry, 'channel should be lazy-registered from the inbound message');
-  assert.equal(entry!.serverId, 'discord');
-  assert.equal(entry!.descriptor.label, '#cairn');
-  assert.equal((entry!.descriptor.metadata as { lazyRegistered?: boolean })?.lazyRegistered, true);
-  assert.ok(traces.some(t => t.type === 'mcpl:channel-lazy-registered'));
-
-  // routeSpeech now resolves the locus and publishes (no failure).
-  const res = await registry.routeSpeech('cairn', 'my reply', registry.resolveLocus('cairn'));
-  assert.deepEqual(res, { delivered: true, channelId: 'post-boot-ch' });
+  // §14.5: the unknown channel is NOT minted, the message is rejected with
+  // a diagnostic, and the locus never becomes routable — a server cannot
+  // self-attest a channel identity by messaging it into existence.
+  assert.equal(lookup('post-boot-ch'), undefined, 'unknown channel must not be registered by its first message');
+  assert.ok(traces.some(t => t.type === 'mcpl:channel-incoming-rejected'));
+  assert.equal(registry.resolveLocus('cairn'), null, 'a rejected message must not establish a locus');
 });
 
 test('routeSpeech surfaces a failure when the server reports delivered:false', async () => {
   const { registry, failures, traces } = makeRegistry({ delivered: false });
+  seedRegistered(registry, 'discord', 'ch-x');
   registry.handleIncoming('discord', incoming('ch-x', 'hi'));
 
   const res = await registry.routeSpeech('cairn', 'undeliverable reply', registry.resolveLocus('cairn'));
@@ -133,7 +145,9 @@ test('routeSpeech routes a conversation fork to its HOME channel, not the global
     (agentName) => homes[agentName],
   );
 
+  seedRegistered(registry, 'discord', 'chanA');
   registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
+  seedRegistered(registry, 'discord', 'chanB');
   registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
   // Global locus is now chanB.
   assert.equal(registry.getDefaultPublishChannel(), 'chanB');
@@ -152,7 +166,9 @@ test('routeSpeech falls back to the global locus for the trunk agent (no home)',
     () => undefined, // no agent has a home
   );
 
+  seedRegistered(registry, 'discord', 'chanA');
   registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
+  seedRegistered(registry, 'discord', 'chanB');
   registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
 
   const res = await registry.routeSpeech('trunk', 'heartbeat reply', registry.resolveLocus('trunk'));
@@ -167,7 +183,9 @@ test('buildChannelContext advertises the fork home as defaultOutgoing (item 3)',
     (agentName) => homes[agentName],
   );
 
+  seedRegistered(registry, 'discord', 'chanA');
   registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
+  seedRegistered(registry, 'discord', 'chanB');
   registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
 
   // The fork is told chanA (where its speech actually lands)...
@@ -204,7 +222,9 @@ test('routeSpeech routes a TRUNK agent to its ACTIVE triggering channel, not the
     (agentName) => active[agentName],
   );
 
+  seedRegistered(registry, 'discord', 'chanA');
   registry.handleIncoming('discord', incoming('chanA', 'A: sleep && date'));
+  seedRegistered(registry, 'discord', 'chanB');
   registry.handleIncoming('discord', incoming('chanB', 'B: unrelated')); // flips global to chanB
   assert.equal(registry.getDefaultPublishChannel(), 'chanB');
 
@@ -222,7 +242,9 @@ test('routeSpeech precedence: fork HOME wins over the active triggering channel'
     (n) => (n === 'conversation-chanA-g1' ? 'chanA' : undefined),
     () => 'chanB',
   );
+  seedRegistered(registry, 'discord', 'chanA');
   registry.handleIncoming('discord', incoming('chanA', 'hi'));
+  seedRegistered(registry, 'discord', 'chanB');
   registry.handleIncoming('discord', incoming('chanB', 'hi'));
 
   const res = await registry.routeSpeech('conversation-chanA-g1', 'reply', registry.resolveLocus('conversation-chanA-g1'));
@@ -237,7 +259,9 @@ test('buildChannelContext advertises the active triggering channel as defaultOut
     () => undefined,
     (n) => active[n],
   );
+  seedRegistered(registry, 'discord', 'chanA');
   registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
+  seedRegistered(registry, 'discord', 'chanB');
   registry.handleIncoming('discord', incoming('chanB', 'hi from B')); // global → chanB
 
   // The trunk is TOLD chanA (where its speech will actually land), matching
@@ -299,6 +323,7 @@ test('routeSpeech into a closed locus opens the channel first, then delivers', a
   const { registry, publishCalls, openCalls, lookup } = makeRegistry({ delivered: true });
 
   // A DM-shaped situation: the channel is registered but closed.
+  seedRegistered(registry, 'discord', 'dm-alice');
   registry.handleIncoming('discord', incoming('dm-alice', 'hello?'));
   lookup('dm-alice')!.open = false;
 
@@ -316,6 +341,7 @@ test('routeSpeech into a closed locus opens the channel first, then delivers', a
 test('routeSpeech does NOT deliver when the open-on-delivery fails', async () => {
   const { registry, failures, publishCalls, lookup, setFailOpens } = makeRegistry({ delivered: true });
 
+  seedRegistered(registry, 'discord', 'dm-alice');
   registry.handleIncoming('discord', incoming('dm-alice', 'hello?'));
   lookup('dm-alice')!.open = false;
   const publishesBefore = publishCalls.length;
@@ -331,6 +357,7 @@ test('routeSpeech does NOT deliver when the open-on-delivery fails', async () =>
 
 test('routeSpeech with an omitted locus fails loudly as a routing bug', async () => {
   const { registry, failures } = makeRegistry({ delivered: true });
+  seedRegistered(registry, 'discord', 'ch-y');
   registry.handleIncoming('discord', incoming('ch-y', 'hi'));
 
   const res = await (registry.routeSpeech as unknown as (
@@ -438,6 +465,7 @@ test('opened-by-delivery is announced to the delivering agent', async () => {
   const autoOpened: Array<{ conversationId?: string; source: string; channels: Array<{ channelId: string }> }> = [];
   const { registry, lookup } = makeRegistry({ delivered: true }, undefined, undefined, (info) => autoOpened.push(info));
 
+  seedRegistered(registry, 'discord', 'dm-alice');
   registry.handleIncoming('discord', incoming('dm-alice', 'hello?'));
   lookup('dm-alice')!.open = false;
 

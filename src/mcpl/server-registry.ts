@@ -111,8 +111,6 @@ export class McplServerRegistry {
           // form at handshake. (Prefer connection.grant for authorization —
           // this query is advertisement-level only.)
           return !!caps.contextHooks?.beforeInference;
-        case 'contextHooks.afterInference':
-          return !!caps.contextHooks?.afterInference;
         case 'inferenceRequest':
           return !!caps.inferenceRequest;
         case 'modelInfo':

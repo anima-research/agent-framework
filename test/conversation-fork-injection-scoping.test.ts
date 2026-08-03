@@ -89,9 +89,11 @@ function installChannelRegistry(
     },
   );
   for (const channelId of channelIds) {
-    // An incoming lifecycle message is authoritative evidence that the
-    // transport is actually open. ensureChannelRegistered alone deliberately
-    // keeps one-shot/direct-address channels closed.
+    // §14.5: register first (a conforming server's channels/register),
+    // then the incoming message marks the registered channel open.
+    (registry as unknown as { channels: Map<string, unknown> }).channels.set(`srv:${channelId}`, {
+      serverId: 'srv', descriptor: { id: channelId, type: 'srv', label: channelId }, open: false,
+    });
     registry.handleIncoming('srv', {
       messages: [{
         channelId,

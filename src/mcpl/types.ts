@@ -99,22 +99,32 @@ export interface McplResourceContent {
  * Parsed from the server's `initialize` response.
  */
 export interface McplCapabilities {
-  /** MCPL protocol version (e.g., "0.4") */
+  /** MCPL protocol version (e.g., "0.5") */
   version: string;
+
+  /** §17.2 canonical content digest; absent = manifest fixed at initialize. */
+  revision?: string;
 
   /** Server supports push/event */
   pushEvents?: boolean;
 
-  /** Context hook capabilities */
+  /**
+   * Context hooks — §5.1 recursive shape. Boolean `true` at any level is
+   * shorthand for every leaf beneath it. `afterInference` is REMOVED in
+   * 0.5.0 (replaced by metadata-only inference/lifecycle, §10.5).
+   */
   contextHooks?: {
-    beforeInference?: boolean;
-    afterInference?: boolean | { blocking: boolean };
+    beforeInference?: boolean | {
+      observe?: boolean;
+      inject?: { system?: boolean; beforeUser?: boolean; afterUser?: boolean };
+    };
   };
 
-  /** Server-initiated inference capabilities */
-  inferenceRequest?: {
-    streaming?: boolean;
-  };
+  /** Server-initiated inference. `true` = the capability with no refinements. */
+  inferenceRequest?: boolean | { streaming?: boolean };
+
+  /** Server consumes inference/lifecycle notifications (§10.5). */
+  inferenceLifecycle?: boolean;
 
   /** Server supports model/info requests */
   modelInfo?: boolean;
@@ -122,8 +132,8 @@ export interface McplCapabilities {
   /** Declared feature sets (keyed by feature set name) */
   featureSets?: Record<string, FeatureSetDeclaration>;
 
-  /** Channel capabilities */
-  channels?: McplChannelCapabilities;
+  /** Channel capabilities — §14.1 object of leaves, or `true` for all. */
+  channels?: boolean | McplChannelCapabilities;
 }
 
 /**
@@ -134,23 +144,28 @@ export interface McplHostCapabilities {
   version: string;
   pushEvents?: boolean;
   contextHooks?: {
-    beforeInference?: boolean;
-    afterInference?: boolean | { blocking: boolean };
+    beforeInference?: boolean | {
+      observe?: boolean;
+      inject?: { system?: boolean; beforeUser?: boolean; afterUser?: boolean };
+    };
   };
-  inferenceRequest?: {
-    streaming?: boolean;
-  };
+  inferenceRequest?: boolean | { streaming?: boolean };
+  inferenceLifecycle?: boolean;
+  modelInfo?: boolean;
   featureSets?: boolean;
-  channels?: McplChannelCapabilities;
+  channels?: boolean | McplChannelCapabilities;
 }
 
-/** Channel-specific capability flags. */
+/** Channel capability leaves (§14.1). `observe` was the pre-0.5 name for
+ *  what split into `incoming` — removed, not aliased. */
 export interface McplChannelCapabilities {
   register?: boolean;
-  publish?: boolean;
-  observe?: boolean;
   lifecycle?: boolean;
+  publish?: boolean;
+  incoming?: boolean;
   streaming?: boolean;
+  acknowledge?: boolean;
+  typing?: boolean;
 }
 
 // ============================================================================
@@ -208,6 +223,15 @@ export interface McplServerConfig {
    * viable where a static `token` forced long ones).
    */
   accessProvider?: () => Promise<string | null>;
+
+  /**
+   * Host-owned authority for the `host/command` admin surface (undo / hide /
+   * unstick). DEFAULT FALSE: no §6.2 capability path exists for it, and the
+   * grant cannot confer it — only this config, decided by the operator, can
+   * (PR #79 review blocker 9). The one legitimate fleet user is
+   * discord-mcpl's slash-command relay.
+   */
+  allowHostCommands?: boolean;
 
   /** Feature sets to enable on connect */
   enabledFeatureSets?: string[];
@@ -1122,6 +1146,8 @@ export interface ChannelIncomingMessageResult {
   messageId: string;
   accepted: boolean;
   conversationId?: string;
+  /** §14.5: why a message was rejected (e.g. unknown/unregistered channel). */
+  reason?: string;
 }
 
 // ============================================================================

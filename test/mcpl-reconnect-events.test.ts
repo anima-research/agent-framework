@@ -28,7 +28,7 @@ const FLAG_FILE = join(TMP_DIR, 'server-healthy');
 const HOST_CAPS: McplHostCapabilities = {
   version: '0.4',
   pushEvents: true,
-  contextHooks: { beforeInference: true, afterInference: { blocking: true } },
+  contextHooks: { beforeInference: true },
   featureSets: true,
 };
 

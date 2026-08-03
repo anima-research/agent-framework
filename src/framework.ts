@@ -7935,6 +7935,7 @@ export class AgentFramework {
         beforeInference: true,
       },
       inferenceLifecycle: true,
+      modelInfo: true,
       inferenceRequest: { streaming: true },
       channels: {
         register: true,
@@ -8369,7 +8370,11 @@ export class AgentFramework {
     }
 
     const awarenessBarrier = this.installMcplDataPlaneGate();
-    this.releaseMcplDataPlaneGate(awarenessBarrier);
+    // NO early release: both planes stay closed through accounting AND the
+    // §5.3 policy round-trip below (PR #79 review blocker 3 — the early
+    // control flush released channels-register/changed before any grant
+    // existed). The awareness drain rides tools/call RESPONSES, which are
+    // never event-buffered, so it needs no plane release to make progress.
     try {
       await awarenessBarrier.promise;
     } catch (error) {
@@ -8388,7 +8393,8 @@ export class AgentFramework {
 
     // §5.3 initial policy handshake — after accounting, before the gate
     // completes: the grant is established (or knowingly left empty) before
-    // any data-plane traffic flows.
+    // ANY buffered traffic (control or data) flows. complete() then
+    // ready()s both planes through the admission gate.
     await this.registerMcplServerFeatures(config, connection);
     this.completeMcplDataPlaneGate(awarenessBarrier);
 
@@ -8677,9 +8683,15 @@ export class AgentFramework {
       await this.channelRegistry?.handleRegister(connection.id, params, responder as never);
     });
 
-    // Handle channel changes (Step 7)
-    connection.on('channels-changed', async (params: ChannelsChangedParams) => {
-      await this.channelRegistry?.handleChanged(connection.id, params);
+    // Handle channel changes (Step 7) — §14.5 dual-mode: the responder is
+    // present for the Request form and carries itemized added-descriptor
+    // results; absent for Notifications, where rejection is itemwise
+    // filtering plus a diagnostic trace.
+    connection.on('channels-changed', async (
+      params: ChannelsChangedParams,
+      responder?: { respond: (result: unknown) => void },
+    ) => {
+      await this.channelRegistry?.handleChanged(connection.id, params, responder as never);
     });
 
     // §6.6/§12: requests that previously had no handler and hung forever
@@ -8697,17 +8709,16 @@ export class AgentFramework {
       _params: unknown,
       responder?: { respond: (result: unknown) => void },
     ) => {
-      // Host-level answer: the first registered agent's model. A
-      // per-conversation answer needs a conversation id in the params,
-      // which §12 does not define — this is the honest host-wide value,
-      // matching what beforeInference already reports.
+      // Host-level answer: the first registered agent's model id. §12 asks
+      // for honesty over completeness — fields the host does not actually
+      // know (contextWindow, vendor-specific capability lists) are OMITTED,
+      // never fabricated: a hardcoded 200000 was false for residents
+      // configured at 300k/600k (PR #79 review blocker 6).
       const agent = this.agents.values().next().value;
       responder?.respond({
         model: {
           id: agent?.model ?? 'unknown',
           vendor: 'unknown',
-          contextWindow: 200000,
-          capabilities: ['tools'],
         },
       });
     });

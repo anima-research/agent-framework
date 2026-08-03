@@ -175,11 +175,16 @@ export class FeatureSetManager {
       enabled: new Set<string>(),
     };
 
-    // Resolve which feature sets to enable
-    const enablePatterns = config?.enabledFeatureSets ?? [];
+    // §5.3 as pinned (mcpl e869744): ABSENT enabledFeatureSets constrains
+    // nothing — every declared set is a candidate and §6.4 derivation
+    // governs. PRESENT is an allowlist ([] = deny-all selection). The old
+    // reading (unmentioned defaults disabled) reversed the pin (PR #79
+    // review blocker 7). FLEET BEHAVIOR CHANGE: configs that omitted
+    // enabledFeatureSets now enable every derivable declared set.
     const disablePatterns = config?.disabledFeatureSets ?? [];
-
-    const toEnable = resolvePatterns(enablePatterns, declared);
+    const toEnable = config?.enabledFeatureSets === undefined
+      ? Object.keys(declared)
+      : resolvePatterns(config.enabledFeatureSets, declared);
     const toDisable = resolvePatterns(disablePatterns, declared);
 
     // Enable matching sets

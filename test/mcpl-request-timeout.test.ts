@@ -34,7 +34,7 @@ setInterval(() => {}, 1 << 30); // stay alive
 const HOST_CAPS: McplHostCapabilities = {
   version: '0.4',
   pushEvents: true,
-  contextHooks: { beforeInference: true, afterInference: { blocking: true } },
+  contextHooks: { beforeInference: true },
   featureSets: true,
 };
 

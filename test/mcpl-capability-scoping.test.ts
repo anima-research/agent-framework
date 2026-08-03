@@ -27,7 +27,9 @@ import type { McplCapabilities, McplHostCapabilities, McplServerConfig } from '.
 const FULL_ADVERT: McplCapabilities = {
   version: '0.4',
   pushEvents: true,
-  contextHooks: { beforeInference: true, afterInference: { blocking: true } },
+  // afterInference is REMOVED in 0.5.0; the masked-hook example is the
+  // §13.4-sensitive inject.system leaf instead.
+  contextHooks: { beforeInference: { observe: true, inject: { system: true, beforeUser: true, afterUser: true } } },
   inferenceRequest: { streaming: true },
   modelInfo: true,
   featureSets: { 'memory.retrieval': { description: 'd', uses: [] } },
@@ -40,15 +42,16 @@ test('no scoping config: advertisement passes through untouched', () => {
   assert.deepEqual(dropped, []);
 });
 
-test('disabledCapabilities drops a single hook, preserving its sibling and value shapes', () => {
+test('disabledCapabilities drops a single deep leaf, preserving siblings and value shapes', () => {
   const { capabilities, dropped } = maskNegotiatedCapabilities(FULL_ADVERT, {
-    disabledCapabilities: ['contextHooks.afterInference'],
+    disabledCapabilities: ['contextHooks.beforeInference.inject.system'],
   });
-  assert.equal(capabilities?.contextHooks?.beforeInference, true);
-  assert.equal(capabilities?.contextHooks?.afterInference, undefined);
+  const before = capabilities?.contextHooks?.beforeInference as { observe?: boolean; inject?: Record<string, boolean> };
+  assert.equal(before?.observe, true);
+  assert.deepEqual(before?.inject, { beforeUser: true, afterUser: true });
   // Untouched capabilities keep their original (non-boolean) values.
   assert.deepEqual(capabilities?.inferenceRequest, { streaming: true });
-  assert.deepEqual(dropped, ['contextHooks.afterInference']);
+  assert.deepEqual(dropped, ['contextHooks.beforeInference.inject.system']);
 });
 
 test('a parent pattern prunes the whole subtree, recorded as the bare path', () => {
@@ -104,7 +107,7 @@ test('enabledCapabilities allow-list keeps only matches; disabled wins on confli
   assert.equal(capabilities?.inferenceRequest, undefined);
   assert.equal(capabilities?.modelInfo, undefined);
   assert.ok(dropped.includes('channels.streaming'));
-  assert.ok(dropped.includes('contextHooks.afterInference'));
+  assert.ok(dropped.includes('contextHooks'));
 });
 
 test('version and featureSets are never masked', () => {
@@ -197,9 +200,9 @@ setInterval(() => {}, 1 << 30);
 `;
 
 const HOST_CAPS: McplHostCapabilities = {
-  version: '0.4',
+  version: '0.5',
   pushEvents: true,
-  contextHooks: { beforeInference: true, afterInference: { blocking: true } },
+  contextHooks: { beforeInference: true },
   featureSets: true,
 };
 
@@ -234,8 +237,6 @@ test('masked afterInference is invisible to capability queries; unmasked hooks s
   };
   assert.equal(before?.observe, true);
   assert.deepEqual(before?.inject, { system: true, beforeUser: true, afterUser: true });
-  assert.equal(connection.capabilities?.contextHooks?.afterInference, undefined);
-  assert.deepEqual(registry.getServersWithCapability('contextHooks.afterInference'), []);
   assert.equal(registry.getServersWithCapability('contextHooks.beforeInference').length, 1);
   // pushEvents untouched — scoping is per-capability, not per-server.
   assert.equal(registry.getServersWithCapability('pushEvents').length, 1);
