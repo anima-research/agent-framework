@@ -12,6 +12,7 @@ import { join } from 'node:path';
 
 import { AgentFramework } from '../src/framework.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 import { DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -112,6 +113,11 @@ function twoServerFrameworkConfig(
     id,
     command: process.execPath,
     args: [FIXTURE],
+    // The host/command matrix leg models the legitimate slash-command relay:
+    // host-owned authority is the operator's config decision (PR #79
+    // blocker 9), so the test config makes it, exactly as the fleet's
+    // discord config will at rollout.
+    allowHostCommands: true,
     requestTimeoutMs: 0,
     env: {
       STATUS_PATH: statusPath,
@@ -770,6 +776,10 @@ test('synchronous zero-pending flush rechecks the gate after a nested list chang
   const connection = new (McplServerConnection as any)(
     'discord', null, null,
   ) as McplServerConnection;
+  // This test exercises plane-flush mechanics, not authorization: admission
+  // now enforces the grant (§5.4), so model the post-policy state or the
+  // push is correctly discarded before it can count.
+  connection.establishGrant(new CapabilityGrant(new Set(['pushEvents']), []));
   let dataDeliveries = 0;
   connection.on('tools-list-changed', () => connection.pauseDataPlane());
   connection.on('push-event', () => { dataDeliveries++; });

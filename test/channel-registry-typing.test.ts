@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 
@@ -23,7 +24,14 @@ function makeRegistry() {
   };
 
   const registry = new ChannelRegistry(
-    {} as McplServerRegistry,
+    // §14.1: the typing gate reads the server's grant now — a bare {} stub
+    // has no getServer and crashes. Model a post-policy server with
+    // channels.typing granted so the tests exercise dispatch, not denial.
+    {
+      getServer: () => ({
+        grant: new CapabilityGrant(new Set(['channels.typing']), []),
+      }),
+    } as unknown as McplServerRegistry,
     {} as FeatureSetManager,
     () => {},
     () => {},

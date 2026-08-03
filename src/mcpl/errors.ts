@@ -14,6 +14,13 @@ import type { JsonRpcError } from './types.js';
 /** Message used a disabled feature set. */
 export const FEATURE_SET_NOT_ENABLED = -32001;
 
+/**
+ * Method requires a capability the host has masked for this server
+ * (McplServerConfig.enabledCapabilities/disabledCapabilities). Host-side
+ * extension code, pending a spec assignment.
+ */
+export const CAPABILITY_DISABLED = -32002;
+
 /** Message used an undeclared feature set. */
 export const UNKNOWN_FEATURE_SET = -32003;
 

@@ -56,7 +56,7 @@ import { Agent } from './agent.js';
 import { ModuleRegistry, isStateExistsError } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
-import { ScopeManager } from './mcpl/scope-manager.js';
+import { computeGrant } from './mcpl/capability-grant.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
 import { parseProsePrefix } from './mcpl/prose-grammar.js';
@@ -293,10 +293,7 @@ import type {
   McplServerConfig,
   McplHostCapabilities,
   FeatureSetsChangedParams,
-  ScopeElevateParams,
-  ScopeElevateResult,
   BeforeInferenceParams,
-  AfterInferenceParams,
   PushEventParams,
   McplInferenceRequestParams,
   ChannelsRegisterParams,
@@ -745,7 +742,6 @@ export class AgentFramework {
   // MCPL subsystems (null when no mcplServers configured)
   private mcplServerRegistry: McplServerRegistry | null = null;
   private featureSetManager: FeatureSetManager | null = null;
-  private scopeManager: ScopeManager | null = null;
   private hookOrchestrator: HookOrchestrator | null = null;
   private pushHandler: PushHandler | null = null;
   private inferenceRouter: InferenceRouter | null = null;
@@ -5424,6 +5420,19 @@ export class AgentFramework {
     // remains the sole authoritative send.
     const outgoingInferenceId = `inf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     let outgoingIndex = 0;
+
+    // §10.5 inference/lifecycle: `started` now, exactly one terminal in the
+    // finally below (the one block every exit path shares). Which terminal
+    // is decided by the paths themselves: default completed, catch sets
+    // failed, a framework-cancelled stream sets aborted. Best-effort
+    // notifications — consumers dedupe by inferenceId and keep a timeout.
+    let lifecyclePhase: 'completed' | 'aborted' | 'failed' = 'completed';
+    this.hookOrchestrator?.emitLifecycle({
+      inferenceId: outgoingInferenceId,
+      conversationId: agent.name,
+      turnIndex: 0,
+      phase: 'started',
+    });
     const proseStream = this.channelRegistry
       ? new ProseStreamRouter({
           mode: agent.proseRouting === 'explicit' ? 'explicit' : 'locus',
@@ -5679,40 +5688,10 @@ export class AgentFramework {
               agent.addAssistantResponse(terminalContent);
             }
 
-            // Run afterInference hooks (no-op if no MCPL servers)
-            if (this.hookOrchestrator) {
-              try {
-                const speechText = response.content
-                  .filter((block: ContentBlock): block is ContentBlock & { type: 'text' } => block.type === 'text')
-                  .map((b) => b.text)
-                  .join('\n');
-
-                const afterParams: AfterInferenceParams = {
-                  inferenceId: requestId,
-                  conversationId: agent.name,
-                  turnIndex: 0,
-                  userMessage: null,
-                  assistantMessage: speechText,
-                  model: {
-                    id: agent.model,
-                    vendor: 'unknown',
-                    contextWindow: 200000,
-                    capabilities: ['tools'],
-                  },
-                  usage: {
-                    inputTokens: response.usage?.inputTokens ?? 0,
-                    outputTokens: response.usage?.outputTokens ?? 0,
-                    cacheCreationTokens: response.details?.usage?.cacheCreationTokens,
-                    cacheReadTokens: response.details?.usage?.cacheReadTokens,
-                  },
-                };
-
-                await this.hookOrchestrator.afterInference(afterParams);
-              } catch (error) {
-                // Fail-open: continue with speech dispatch
-                console.error('afterInference hook error:', error);
-              }
-            }
+            // §10.5: context/afterInference is removed in 0.5.0 — no
+            // content leaves the host here. Turn boundaries are announced
+            // by the metadata-only inference/lifecycle notifications
+            // emitted in driveStream's start/exit paths.
 
             // Separate speech from thoughts — for MODULE dispatch only
             // (dispatchSpeech / TUI rendering below). This split does NOT
@@ -6111,6 +6090,7 @@ export class AgentFramework {
               const cancelKind = this.frameworkCancelledStreams.get(cancelKey);
               if (cancelKind !== undefined) {
                 this.frameworkCancelledStreams.delete(cancelKey);
+                lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
                 this.eventGate?.onInferenceEnded(agent.name);
                 // endTurn IS a logical turn end — earlier rounds may have
                 // live-routed prose (narrate → skip_reply is a real shape),
@@ -6237,9 +6217,21 @@ export class AgentFramework {
         durationMs,
       });
       this.abortAgentScript(agent.name, 'stream threw');
+      lifecyclePhase = 'failed'; // §10.5 — terminal emitted in finally
       agent.reset();
       this.eventGate?.onInferenceEnded(agent.name);
     } finally {
+      // §10.5: exactly one terminal per `started`, on every exit path the
+      // host controls. Which one was decided by the path taken (default
+      // completed; catch → failed; framework-cancel → aborted). A host
+      // crash emits nothing — that is the documented best-effort limit, and
+      // why consumers keep their safety timeout.
+      this.hookOrchestrator?.emitLifecycle({
+        inferenceId: outgoingInferenceId,
+        conversationId: agent.name,
+        turnIndex: 0,
+        phase: lifecyclePhase,
+      });
       // Clear the gate's inference flag on EVERY exit path (paired with the
       // onInferenceStarted in startAgentStream). The branch-level calls above
       // are kept but are best-effort; if any exit path bypassed them the agent
@@ -7815,7 +7807,6 @@ export class AgentFramework {
   ): Promise<void> {
     this.mcplServerRegistry = new McplServerRegistry();
     this.featureSetManager = new FeatureSetManager();
-    this.scopeManager = new ScopeManager();
     this.hookOrchestrator = new HookOrchestrator(this.mcplServerRegistry, this.featureSetManager);
 
     // Build prefix map and store configs for tool routing
@@ -7933,15 +7924,35 @@ export class AgentFramework {
 
     // Host capabilities advertised during the MCP handshake — stored so
     // servers can also be connected later at runtime (connectMcplServer).
+    // §5.2: the host advertises what it actually implements. 0.5.0-draft:
+    // afterInference is GONE (replaced by inference/lifecycle, §10.5), and
+    // the previously under-advertised inferenceRequest + channels — both
+    // implemented for years — are declared (AUDIT-001/issue #76 item 12).
     this.mcplHostCapabilities = {
-      version: '0.4',
+      version: '0.5',
       pushEvents: true,
       contextHooks: {
         beforeInference: true,
-        afterInference: { blocking: true },
+      },
+      inferenceLifecycle: true,
+      // modelInfo is NOT advertised: §12.2's result requires all four of
+      // {id, vendor, contextWindow, capabilities} and the host has no
+      // truthful source for contextWindow/capabilities (grep: none exists).
+      // Advertising a capability answered with a malformed partial response
+      // is worse than honest unsupported (Sol, PR #79 re-review). The
+      // handler below answers an explicit error rather than hanging (§6.6).
+      inferenceRequest: { streaming: true },
+      channels: {
+        register: true,
+        lifecycle: true,
+        publish: true,
+        incoming: true,
+        streaming: true,
+        acknowledge: true,
+        typing: true,
       },
       featureSets: true,
-    };
+    } as McplHostCapabilities;
 
     for (const config of serverConfigs) {
       try {
@@ -8354,26 +8365,43 @@ export class AgentFramework {
     // releases control traffic needed for registration and marker service.
     this.wireMcplEvents(connection);
 
-    // Initialize feature sets if server advertises MCPL capabilities
-    this.registerMcplServerFeatures(config, connection);
-
     if (deferAwareness) {
+      // Staged startup: both planes are closed, so the §5.3 policy
+      // round-trip cannot let any buffered traffic slip — establish the
+      // grant now, before staging ever releases.
+      await this.registerMcplServerFeatures(config, connection);
       this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
       return;
     }
 
     const awarenessBarrier = this.installMcplDataPlaneGate();
-    this.releaseMcplDataPlaneGate(awarenessBarrier);
+    // NO early release: both planes stay closed through accounting AND the
+    // §5.3 policy round-trip below (PR #79 review blocker 3 — the early
+    // control flush released channels-register/changed before any grant
+    // existed). The awareness drain rides tools/call RESPONSES, which are
+    // never event-buffered, so it needs no plane release to make progress.
     try {
       await awarenessBarrier.promise;
-      this.completeMcplDataPlaneGate(awarenessBarrier);
     } catch (error) {
       // Startup cannot fail open on a broken awareness ledger. Disable the
       // reconnecting stub/connection before propagating the distinct error to
       // initializeMcpl, which tears down any other servers and aborts create().
+      // Ordering matters: awareness accounting settles BEFORE the §5.3
+      // policy round-trip below, so an accounting failure aborts with the
+      // grant still empty and every buffered event still behind the gate —
+      // a failed startup never reports a released data plane. (The reverse
+      // order let a push arrive during the policy await and get flushed by
+      // teardown.)
       await connection.close().catch(() => {});
       throw error;
     }
+
+    // §5.3 initial policy handshake — after accounting, before the gate
+    // completes: the grant is established (or knowingly left empty) before
+    // ANY buffered traffic (control or data) flows. complete() then
+    // ready()s both planes through the admission gate.
+    await this.registerMcplServerFeatures(config, connection);
+    this.completeMcplDataPlaneGate(awarenessBarrier);
 
     this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
   }
@@ -8393,11 +8421,17 @@ export class AgentFramework {
    * already has a tree), so checkpoint trees preserved across a transient
    * disconnect are resumed, not reset.
    */
-  private registerMcplServerFeatures(
+  private async registerMcplServerFeatures(
     config: import('./mcpl/types.js').McplServerConfig,
     connection: McplServerConnection,
-  ): void {
+  ): Promise<void> {
     if (!connection.capabilities) return;
+
+    // §5.4: compute the effective grant from the (config-masked)
+    // advertisement. Not yet active — expansion activates only after the
+    // receipt (§6.7); until then the connection's grant is empty and every
+    // privileged inbound method is rejected.
+    const grant = computeGrant(connection.capabilities, config, { mcpToolsAdvertised: connection.mcpToolsAdvertised });
 
     const updateParams = this.featureSetManager!.initializeServer(
       config.id,
@@ -8406,16 +8440,60 @@ export class AgentFramework {
         enabledFeatureSets: config.enabledFeatureSets,
         disabledFeatureSets: config.disabledFeatureSets,
       },
+      grant,
     );
 
-    // Inform server which feature sets are enabled/disabled
-    if (updateParams.enabled?.length || updateParams.disabled?.length) {
-      connection.sendFeatureSetsUpdate(updateParams);
+    // §5.3: initial policy MUST be a Request, MUST precede first fan-out,
+    // and MUST be sent even when nothing is enabled or disabled — a server
+    // defaulted to fully disabled has to be told. The response is a
+    // degradation receipt (§6.7): consequence testimony, never policy
+    // authority — nothing in it may widen the grant.
+    updateParams.effectiveCapabilities = grant.effectiveList();
+    if (grant.deniedPaths.length > 0) {
+      updateParams.deniedCapabilities = [...grant.deniedPaths];
     }
 
-    // Configure scope whitelist/blacklist patterns
+    try {
+      const receipt = await connection.sendFeatureSetsUpdateRequest(updateParams);
+      if (receipt && receipt.accepted === false) {
+        const fallback = receipt.fallback ?? 'mcp-only';
+        console.error(
+          `[mcpl] ${config.id} refused initial policy (${receipt.reason ?? 'no reason'}) — fallback: ${fallback}`,
+        );
+        if (fallback === 'close') {
+          await connection.close();
+          return;
+        }
+        // mcp-only (§3.2): grant stays empty, MCPL privileged surface stays
+        // dark, plain MCP tools keep working. MUST NOT widen in response to
+        // the refusal — a human can change config; the policy engine cannot.
+        return;
+      }
+      // Expansion activates on receipt (§6.7).
+      connection.establishGrant(grant);
+      if (receipt?.accepted === true && receipt.mode === 'degraded') {
+        for (const uf of receipt.unavailableFeatures ?? []) {
+          console.error(
+            `[mcpl] ${config.id} degraded: ${uf.featureSet} (${uf.effect}; missing ${uf.missingCapabilities.join(', ')})`,
+          );
+        }
+      }
+    } catch (err) {
+      // A pre-0.5 server treats the Request as a notification and never
+      // answers. §6.7: an unanswered expansion simply does not activate —
+      // grant stays empty, connection is effectively MCP-only. This WILL
+      // dark every un-migrated MCPL server's privileged surface; accepted
+      // deliberately for the single-release rollout (issue #76 item 9).
+      console.error(
+        `[mcpl] ${config.id} did not answer the initial policy Request — ` +
+          `MCPL privileged surface stays disabled (§6.7 unanswered expansion): ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+      return;
+    }
+
     if (config.scopes) {
-      this.scopeManager!.configureAll(config.scopes);
+      console.error(`[mcpl] ${config.id}: config \`scopes\` is ignored — §7 Scoped Access removed in 0.5.0`);
     }
 
     // Register stateful feature sets with checkpoint manager (Step 8)
@@ -8566,26 +8644,15 @@ export class AgentFramework {
       this.emitTrace({ type: 'mcpl:server-stderr', serverId: connection.id, line: params.line });
     });
 
-    // Handle dynamic feature set changes from server
-    connection.on('feature-sets-changed', (params: FeatureSetsChangedParams) => {
-      this.featureSetManager?.handleFeatureSetsChanged(connection.id, params);
-    });
+    // featureSets/changed is REMOVED in 0.5.0 — the connection answers it
+    // -32601 (superseded by SPEC §17's host-diffed manifest fetch); no
+    // listener, and nothing mutates declarations off a server-authored
+    // change payload.
 
     // Handle scope elevation requests
-    connection.on('scope-elevate', async (
-      params: ScopeElevateParams,
-      responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
-    ) => {
-      if (this.scopeManager && responder) {
-        try {
-          const result: ScopeElevateResult = await this.scopeManager.handleElevation(params);
-          responder.respond(result);
-        } catch (error) {
-          const err = error instanceof Error ? error : new Error(String(error));
-          responder.respondError(-32603, err.message);
-        }
-      }
-    });
+    // §7 Scoped Access is removed in 0.5.0. scope/elevate is answered
+    // -32601 at the connection (server-connection.ts) and never reaches the
+    // framework; the ScopeManager and config `scopes` wiring went with it.
 
     // Handle push events (Step 6)
     connection.on('push-event', async (
@@ -8621,9 +8688,42 @@ export class AgentFramework {
       await this.channelRegistry?.handleRegister(connection.id, params, responder as never);
     });
 
-    // Handle channel changes (Step 7)
-    connection.on('channels-changed', async (params: ChannelsChangedParams) => {
-      await this.channelRegistry?.handleChanged(connection.id, params);
+    // Handle channel changes (Step 7) — §14.5 dual-mode: the responder is
+    // present for the Request form and carries itemized added-descriptor
+    // results; absent for Notifications, where rejection is itemwise
+    // filtering plus a diagnostic trace.
+    connection.on('channels-changed', async (
+      params: ChannelsChangedParams,
+      responder?: { respond: (result: unknown) => void },
+    ) => {
+      await this.channelRegistry?.handleChanged(connection.id, params, responder as never);
+    });
+
+    // §6.6/§12: requests that previously had no handler and hung forever
+    // (AUDIT-001 item 4). The connection-level grant gate has already run.
+    connection.on('channels-list', (
+      _params: unknown,
+      responder?: { respond: (result: unknown) => void },
+    ) => {
+      responder?.respond({
+        channels: this.channelRegistry?.descriptorsForServer(connection.id) ?? [],
+      });
+    });
+
+    connection.on('model-info', (
+      _params: unknown,
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void },
+    ) => {
+      // §12.2 requires ALL FOUR of {id, vendor, contextWindow, capabilities}
+      // in the DIRECT result shape, and numeric contextWindow cannot express
+      // "unknown". The host has no truthful source for it, so modelInfo is
+      // not advertised and this answers an explicit error instead of a
+      // malformed partial (§6.6: a method that will never be answered
+      // truthfully MUST error, not fabricate).
+      responder?.respondError?.(
+        -32601,
+        'model/info unavailable: host does not advertise modelInfo (no truthful contextWindow source)',
+      );
     });
 
     // Handle incoming channel messages (Step 7)
@@ -8682,19 +8782,25 @@ export class AgentFramework {
       // reconnect observes it before doing work that could wake an agent. The
       // connection paused its data plane before wiring the fresh transport.
       const awarenessBarrier = this.installMcplDataPlaneGate();
-      try {
-        const config = this.mcplServerConfigs.get(connection.id);
-        if (config) {
-          this.registerMcplServerFeatures(config, connection);
+      // Async: the §5.3 policy Request must be answered (re-establishing the
+      // grant) before the data-plane barrier releases — otherwise the first
+      // post-reconnect events land while the grant is still empty and are
+      // rejected fail-closed instead of delivered.
+      void (async () => {
+        try {
+          const config = this.mcplServerConfigs.get(connection.id);
+          if (config) {
+            await this.registerMcplServerFeatures(config, connection);
+          }
+        } catch (error) {
+          console.error(
+            `MCPL server "${connection.id}" re-registration after reconnect failed:`,
+            error instanceof Error ? error.message : error,
+          );
         }
-      } catch (error) {
-        console.error(
-          `MCPL server "${connection.id}" re-registration after reconnect failed:`,
-          error instanceof Error ? error.message : error,
-        );
-      }
-      this.releaseMcplDataPlaneGate(awarenessBarrier);
-      this.handleToolsListChanged(connection.id);
+        this.releaseMcplDataPlaneGate(awarenessBarrier);
+        this.handleToolsListChanged(connection.id);
+      })();
       void awarenessBarrier.promise.then(() => {
         if (
           awarenessBarrier.requiresBarrier
@@ -9904,12 +10010,11 @@ export class AgentFramework {
       conversationId: agent.name,
       turnIndex: 0, // Simplified; needs per-conversation counter TODO
       userMessage: null, // Could extract from trigger context
-      model: {
-        id: agent.model,
-        vendor: 'unknown',
-        contextWindow: 200000,
-        capabilities: ['tools'],
-      },
+      // Truthful fields only (§10.1 honesty over completeness): id is real,
+      // vendor/contextWindow/capabilities have no source in this host and
+      // are omitted rather than fabricated — the hardcoded 200000 was false
+      // for residents configured at 300k/600k.
+      model: { id: agent.model },
       channels: this.channelRegistry?.buildChannelContext(agent.name),
     };
   }

@@ -31,7 +31,7 @@
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
     "pretest": "mkdir -p dist/test/fixtures && cp test/fixtures/*.mjs dist/test/fixtures/",
-    "test": "node --test dist/test/*.test.js",
+    "test": "node --test --test-force-exit dist/test/*.test.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
