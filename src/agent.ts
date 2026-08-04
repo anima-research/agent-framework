@@ -683,6 +683,12 @@ export class Agent {
       emitTokens: true,
       emitBlocks: false,
       emitUsage: true,
+      // Retry a content-policy refusal at the provider seam rather than at
+      // the framework level: membrane replays the SAME request immediately
+      // (cache-warm), where a framework-level requeue would recompile and
+      // land a different window. The framework's driveStream handles the
+      // resulting `retrying` event by discarding the abandoned attempt.
+      ...(this.refusalHandling?.retries ? { refusalRetries: this.refusalHandling.retries } : {}),
     });
 
     this._state = { status: 'streaming', stream };

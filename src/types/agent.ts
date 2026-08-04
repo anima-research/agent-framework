@@ -123,24 +123,28 @@ export interface AgentConfig {
    */
   refusalHandling?: {
     /**
-     * Plain same-model retries BEFORE any rewind or reaction. A content-policy
-     * refusal near the classifier's threshold is probabilistic, not a function
-     * of the payload: identical bytes have been observed to pass and refuse
-     * minutes apart (mythos, 2026-07-27 replay reps). So the first response to
-     * a refusal is simply to ask again — no context surgery, no fallback model.
-     * At an observed ~50% band, 2 retries take delivery from ~50% to ~87% —
-     * an estimate, not a guarantee: attempts are correlated, not independent
-     * draws (see below).
+     * Same-model retries on a content-policy refusal, performed by MEMBRANE
+     * at the provider seam (passed through as `refusalRetries`). Default 0.
      *
-     * What is guaranteed is that the agent's HISTORY is untouched — nothing
-     * shed, nothing injected. The request itself is NOT byte-identical: a
-     * retry goes through the normal queue, so it recompiles and any messages
-     * that arrived meanwhile are included. Queued requests coalesce per agent,
-     * so a retry racing with new traffic yields ONE inference, not several;
-     * and a retry can therefore also fail *because* the new material is hot.
+     * Near the classifier's threshold a refusal is probabilistic rather than a
+     * property of the payload: identical bytes pass and refuse minutes apart
+     * (mythos, 2026-07-27 replay reps). So the first response is to ask again
+     * — no context surgery, no fallback model. Membrane replays the SAME
+     * request immediately and cache-warm, so only the discarded output tokens
+     * are real spend.
      *
-     * Exhausting the retries falls through to autoRewind (if on) and then to
-     * the refusal reaction. Default 0 (off — prior behaviour).
+     * Retrying in the framework instead was tried and removed: a requeue
+     * recompiles, so the attempts are correlated rather than fresh draws, and
+     * it cannot tell a streaming consumer to drop the abandoned attempt.
+     * Membrane announces each retry with a `retrying` stream event, which
+     * driveStream handles by discarding what was streamed.
+     *
+     * Retries are spent before the framework sees the refusal at all, so the
+     * escalation order is: membrane retries -> autoRewind (if on) -> the
+     * refusal reaction, which therefore means "the border is close" rather
+     * than firing on every near-threshold flip.
+     *
+     * Native tool mode only — see the XML-mode warning in Membrane.
      */
     retries?: number;
     /** Auto-rewind the triggering turn on refusal and retry. Default false. */

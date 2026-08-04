@@ -59,6 +59,23 @@ export class ProseStreamRouter {
     return this.accumulated;
   }
 
+  /**
+   * Drop everything routed so far and return to the constructed state.
+   *
+   * For a membrane refusal retry (RetryingEvent): the abandoned attempt's
+   * prose must not survive into the new one, and `accumulated` feeds
+   * outgoing/complete — leaving it would finalize text the model never
+   * actually said in the attempt that stands.
+   */
+  reset(): void {
+    this.target = this.opts.initialTarget;
+    this.state = this.opts.mode === 'locus' ? 'body' : 'line-start';
+    this.held = '';
+    this.token = '';
+    this.sawBang = false;
+    this.accumulated = new Map();
+  }
+
   feed(delta: string): RoutedDelta[] {
     const out: RoutedDelta[] = [];
     for (const ch of delta) this.step(ch, out);

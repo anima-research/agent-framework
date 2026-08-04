@@ -681,12 +681,6 @@ export class AgentFramework {
    *  chain (reset when a turn completes without a refusal). Bounds the auto
    *  rewind loop — see refusalHandling + rewindTriggeringTurn. */
   private refusalRewinds: Map<string, number> = new Map();
-  /** Per-agent count of plain same-payload retries spent on the current
-   *  refusal episode (reset when a turn completes without a refusal). These
-   *  run BEFORE any rewind: the classifier band is probabilistic, so asking
-   *  again unchanged is the cheapest correct response. See
-   *  refusalHandling.retries. */
-  private refusalRetries: Map<string, number> = new Map();
   /** Per-agent count of poison-history rewinds performed by the hard-down
    *  breaker (noteInferenceExhausted). Reset on any successful inference.
    *  Bounds the automatic quarantine loop the same way refusalRewinds bounds
@@ -5424,7 +5418,13 @@ export class AgentFramework {
     // streams that delivery would refuse), emission is capability-gated in
     // the registry (`channels.streaming`), and delivery via deliverProse
     // remains the sole authoritative send.
-    const outgoingInferenceId = `inf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    const newOutgoingInferenceId = (): string =>
+      `inf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    // NOT const: a membrane refusal retry abandons everything streamed so
+    // far, and the surface must not concatenate two attempts. Re-minting the
+    // id makes the discarded attempt's chunk buffer orphaned (never
+    // finalized) instead of being appended to — see the 'retrying' case.
+    let outgoingInferenceId = newOutgoingInferenceId();
     let outgoingIndex = 0;
 
     // §10.5 inference/lifecycle: `started` now, exactly one terminal in the
@@ -5487,6 +5487,38 @@ export class AgentFramework {
               emitOutgoing(proseStream.feed(event.content));
             }
             break;
+
+          case 'retrying': {
+            // Membrane is re-issuing after a content-policy refusal. Per the
+            // RetryingEvent contract we must DISCARD everything this call has
+            // emitted: the tokens above were already streamed to the surface
+            // as outgoing chunks, and appending a second attempt to them
+            // would show the human two half-answers spliced together.
+            //
+            // Re-mint the outgoing id so the partial buffer is orphaned
+            // rather than continued (delivery is authoritative via
+            // deliverProse and has not happened yet — nothing has been
+            // *sent*, only previewed), and reset the prose router so its
+            // destination bookkeeping starts clean for the new attempt.
+            console.error(
+              `[refusal-retry] agent=${agent.name} membrane retry ` +
+                `${event.attempt}/${event.maxAttempts}` +
+                (event.category ? ` category=${event.category}` : '') +
+                ' — discarding the refused attempt',
+            );
+            outgoingInferenceId = newOutgoingInferenceId();
+            outgoingIndex = 0;
+            proseStream?.reset();
+            this.emitTrace({
+              type: 'inference:tokens',
+              agentName: agent.name,
+              content: '',
+              blockType: 'text',
+              blockIndex: 0,
+              channelId: typingChannel ?? undefined,
+            });
+            break;
+          }
 
           case 'block': {
             const { event: phase, index, block } = event.event;
@@ -5792,42 +5824,20 @@ export class AgentFramework {
               // admin `/unstick` (forced session) or the agent's autoRewind
               // config; both are bounded.
               let handledByRewind = false;
-              let handledByRetry = false;
               const rh = agent.refusalHandling;
               const forced = this.forcedRewind.get(agent.name);
 
-              // PLAIN RETRY FIRST (refusalHandling.retries). Near the
-              // threshold the verdict is a coin flip on identical bytes, so
-              // ask again before touching the agent's history: no turn is
-              // shed, no marker is injected, no fallback model. Only when the
-              // retries are spent do we fall through to rewind (if enabled)
-              // and finally to the reaction, which is the signal to humans
-              // that the border is close. Skipped while an operator-forced
-              // /unstick is driving, so the admin path keeps its semantics.
-              const retryCap = Math.max(0, rh?.retries ?? 0);
-              if (!forced && retryCap > 0) {
-                const retriesUsed = this.refusalRetries.get(agent.name) ?? 0;
-                if (retriesUsed < retryCap) {
-                  this.refusalRetries.set(agent.name, retriesUsed + 1);
-                  console.error(
-                    `[refusal-retry] agent=${agent.name} category=${category} ` +
-                      `attempt ${retriesUsed + 1}/${retryCap} (history untouched; recompiles)`,
-                  );
-                  this.pendingRequests.push({
-                    agentName: agent.name,
-                    reason: 'refusal-retry',
-                    source: 'framework',
-                    timestamp: Date.now(),
-                  });
-                  handledByRetry = true;
-                } else {
-                  console.error(
-                    `[refusal-retry] agent=${agent.name} exhausted ${retryCap} ` +
-                      `retr${retryCap === 1 ? 'y' : 'ies'} — falling through`,
-                  );
-                  this.refusalRetries.set(agent.name, 0);
-                }
-              }
+              // NOTE: plain retries are NOT done here. `refusalHandling.retries`
+              // is handed to membrane (see Agent.startActivation), which
+              // replays the SAME request at the provider seam — immediately,
+              // cache-warm, and without recompiling into a different window.
+              // A framework-level requeue was tried first and is strictly
+              // worse: it recompiles, so attempts are correlated rather than
+              // fresh draws against a probabilistic threshold, and it cannot
+              // tell a streaming consumer to discard the abandoned attempt.
+              // By the time a refusal reaches here, membrane's retries are
+              // already spent — so this path is the escalation: rewind (if
+              // enabled), then the reaction.
               // Shed exactly one more (newest, in-sequence) turn and keep the
               // single episode marker current. `budgetLeft` bounds the loop.
               const doRewind = (
@@ -5850,11 +5860,7 @@ export class AgentFramework {
                 handledByRewind = true;
               };
 
-              if (handledByRetry) {
-                // A retry is already queued for this same turn — do not also
-                // shed history for it. Rewind is the NEXT escalation step,
-                // reached only once the retries are spent.
-              } else if (forced) {
+              if (forced) {
                 doRewind(
                   forced.remaining > 0,
                   (count) => {
@@ -5896,7 +5902,7 @@ export class AgentFramework {
               // is suppressed at the surface via
               // DISCORD_SUPPRESS_REACTION_EMOJIS; without that, marking a
               // refusal feeds the next one.)
-              if (!handledByRewind && !handledByRetry) {
+              if (!handledByRewind) {
                 void this.reactToRefusal(agent.name, category);
               }
             } else {
@@ -5908,11 +5914,6 @@ export class AgentFramework {
               }
               if (this.refusalRewinds.get(agent.name)) {
                 this.refusalRewinds.set(agent.name, 0);
-              }
-              // A clean turn ends the retry episode too — the next refusal
-              // gets its own full budget rather than inheriting a spent one.
-              if (this.refusalRetries.get(agent.name)) {
-                this.refusalRetries.set(agent.name, 0);
               }
               this.rewindEpisode.delete(agent.name);
               this.refusalStreak.delete(agent.name);
