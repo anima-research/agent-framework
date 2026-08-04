@@ -24,8 +24,6 @@ import type {
   JsonRpcResponse,
   BeforeInferenceParams,
   BeforeInferenceResult,
-  AfterInferenceParams,
-  AfterInferenceResult,
   FeatureSetsUpdateParams,
   FeatureSetsUpdateResult,
   InferenceChunkParams,
@@ -552,18 +550,6 @@ export class McplServerConnection extends EventEmitter {
     return this.sendRequest(McplMethod.BeforeInference, params as unknown as Record<string, unknown>) as Promise<BeforeInferenceResult>;
   }
 
-  /**
-   * Send `context/afterInference`.
-   * When `blocking` is true, sends as a request and awaits the result.
-   * When `blocking` is false (or omitted), sends as a notification.
-   */
-  sendAfterInference(params: AfterInferenceParams, blocking?: boolean): Promise<AfterInferenceResult | void> {
-    if (blocking) {
-      return this.sendRequest(McplMethod.AfterInference, params as unknown as Record<string, unknown>) as Promise<AfterInferenceResult>;
-    }
-    this.sendNotification(McplMethod.AfterInference, params as unknown as Record<string, unknown>);
-    return Promise.resolve();
-  }
 
   /** Send `featureSets/update` as a Notification. §6.7: valid ONLY for
    *  purely descriptive metadata that does not alter the grant. Any grant
