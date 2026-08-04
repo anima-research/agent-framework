@@ -5811,7 +5811,7 @@ export class AgentFramework {
                   this.refusalRetries.set(agent.name, retriesUsed + 1);
                   console.error(
                     `[refusal-retry] agent=${agent.name} category=${category} ` +
-                      `attempt ${retriesUsed + 1}/${retryCap} (unchanged payload)`,
+                      `attempt ${retriesUsed + 1}/${retryCap} (history untouched; recompiles)`,
                   );
                   this.pendingRequests.push({
                     agentName: agent.name,

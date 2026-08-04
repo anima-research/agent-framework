@@ -128,10 +128,19 @@ export interface AgentConfig {
      * of the payload: identical bytes have been observed to pass and refuse
      * minutes apart (mythos, 2026-07-27 replay reps). So the first response to
      * a refusal is simply to ask again — no context surgery, no fallback model.
-     * At an observed ~50% band, 2 retries take delivery from ~50% to ~87%.
-     * Retries recompile normally, so any events that arrived meanwhile are
-     * included. Exhausting them falls through to autoRewind (if on) and then
-     * to the refusal reaction. Default 0 (off — prior behaviour).
+     * At an observed ~50% band, 2 retries take delivery from ~50% to ~87% —
+     * an estimate, not a guarantee: attempts are correlated, not independent
+     * draws (see below).
+     *
+     * What is guaranteed is that the agent's HISTORY is untouched — nothing
+     * shed, nothing injected. The request itself is NOT byte-identical: a
+     * retry goes through the normal queue, so it recompiles and any messages
+     * that arrived meanwhile are included. Queued requests coalesce per agent,
+     * so a retry racing with new traffic yields ONE inference, not several;
+     * and a retry can therefore also fail *because* the new material is hot.
+     *
+     * Exhausting the retries falls through to autoRewind (if on) and then to
+     * the refusal reaction. Default 0 (off — prior behaviour).
      */
     retries?: number;
     /** Auto-rewind the triggering turn on refusal and retry. Default false. */
