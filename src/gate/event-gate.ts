@@ -1246,6 +1246,16 @@ export class EventGate {
         behavior: 'always',
         timestamp: this.now(),
       });
+      // Compact in-window notice: without it the wake turn contains nothing
+      // new, so the agent can't tell WHAT woke it (its own timer vs. a
+      // heartbeat) or WHEN. One line, timestamped to the second. Added
+      // before the inference request so it rides the wake turn (addMessage's
+      // turn-alive guard defers it to that turn's start if needed).
+      const nowIso = new Date(this.now()).toISOString().slice(0, 19) + 'Z';
+      this.addMessageFn('user', [{
+        type: 'text',
+        text: `[self-wake] your ${source} timer (${Math.round(ms / 1000)}s) elapsed — now ${nowIso}`,
+      }], { source: 'gate:self-wake' });
       this.requestInferenceFn(
         agentName,
         `self-scheduled wake (${source}, ${Math.round(ms / 1000)}s)`,

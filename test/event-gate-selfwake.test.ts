@@ -22,14 +22,18 @@ const TMP_DIR = join(import.meta.dirname, '../.test-tmp-gate-selfwake');
 
 function makeGate() {
   const inferenceRequests: Array<{ agentName: string; reason: string; source: string }> = [];
+  const messages: Array<{ participant: string; text: string; metadata?: Record<string, unknown> }> = [];
   const gate = new EventGate({
     configPath: join(TMP_DIR, 'gate.json'),
     emitTrace: () => {},
-    addMessage: () => '',
+    addMessage: (p, c, m) => {
+      messages.push({ participant: p, text: c.map((b) => b.text).join('\n'), metadata: m });
+      return '';
+    },
     requestInference: (a, r, s) => inferenceRequests.push({ agentName: a, reason: r, source: s }),
     getAgentNames: () => ['agent'],
   });
-  return { gate, inferenceRequests };
+  return { gate, inferenceRequests, messages };
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -53,6 +57,31 @@ describe('EventGate self-wake', () => {
     assert.strictEqual(inferenceRequests[0]!.agentName, 'agent');
     assert.strictEqual(inferenceRequests[0]!.source, 'self-wake');
     assert.match(inferenceRequests[0]!.reason, /skip_reply/);
+    gate.dispose();
+  });
+
+  it('drops a compact timestamped notice into the window when it fires', async () => {
+    const { gate, messages } = makeGate();
+    gate.armSelfWake('agent', 1, 'skip_reply');
+    assert.strictEqual(messages.length, 0, 'arming must not add a message');
+    await sleep(1150);
+    assert.strictEqual(messages.length, 1);
+    const msg = messages[0]!;
+    assert.strictEqual(msg.participant, 'user');
+    assert.strictEqual(msg.metadata?.source, 'gate:self-wake');
+    // One line: what woke it (its own skip_reply timer, with the armed
+    // duration) and when (ISO to the second).
+    assert.match(msg.text, /^\[self-wake\] your skip_reply timer \(1s\) elapsed — now \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+    gate.dispose();
+  });
+
+  it('a superseded self-wake adds no notice', async () => {
+    const { gate, messages } = makeGate();
+    gate.armSelfWake('agent', 1);
+    gate.onInferenceStarted('agent');
+    gate.onInferenceEnded('agent');
+    await sleep(1150);
+    assert.strictEqual(messages.length, 0);
     gate.dispose();
   });
 
