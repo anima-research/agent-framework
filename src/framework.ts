@@ -681,6 +681,12 @@ export class AgentFramework {
    *  chain (reset when a turn completes without a refusal). Bounds the auto
    *  rewind loop — see refusalHandling + rewindTriggeringTurn. */
   private refusalRewinds: Map<string, number> = new Map();
+  /** Per-agent count of plain same-payload retries spent on the current
+   *  refusal episode (reset when a turn completes without a refusal). These
+   *  run BEFORE any rewind: the classifier band is probabilistic, so asking
+   *  again unchanged is the cheapest correct response. See
+   *  refusalHandling.retries. */
+  private refusalRetries: Map<string, number> = new Map();
   /** Per-agent count of poison-history rewinds performed by the hard-down
    *  breaker (noteInferenceExhausted). Reset on any successful inference.
    *  Bounds the automatic quarantine loop the same way refusalRewinds bounds
@@ -5786,8 +5792,42 @@ export class AgentFramework {
               // admin `/unstick` (forced session) or the agent's autoRewind
               // config; both are bounded.
               let handledByRewind = false;
+              let handledByRetry = false;
               const rh = agent.refusalHandling;
               const forced = this.forcedRewind.get(agent.name);
+
+              // PLAIN RETRY FIRST (refusalHandling.retries). Near the
+              // threshold the verdict is a coin flip on identical bytes, so
+              // ask again before touching the agent's history: no turn is
+              // shed, no marker is injected, no fallback model. Only when the
+              // retries are spent do we fall through to rewind (if enabled)
+              // and finally to the reaction, which is the signal to humans
+              // that the border is close. Skipped while an operator-forced
+              // /unstick is driving, so the admin path keeps its semantics.
+              const retryCap = Math.max(0, rh?.retries ?? 0);
+              if (!forced && retryCap > 0) {
+                const retriesUsed = this.refusalRetries.get(agent.name) ?? 0;
+                if (retriesUsed < retryCap) {
+                  this.refusalRetries.set(agent.name, retriesUsed + 1);
+                  console.error(
+                    `[refusal-retry] agent=${agent.name} category=${category} ` +
+                      `attempt ${retriesUsed + 1}/${retryCap} (unchanged payload)`,
+                  );
+                  this.pendingRequests.push({
+                    agentName: agent.name,
+                    reason: 'refusal-retry',
+                    source: 'framework',
+                    timestamp: Date.now(),
+                  });
+                  handledByRetry = true;
+                } else {
+                  console.error(
+                    `[refusal-retry] agent=${agent.name} exhausted ${retryCap} ` +
+                      `retr${retryCap === 1 ? 'y' : 'ies'} — falling through`,
+                  );
+                  this.refusalRetries.set(agent.name, 0);
+                }
+              }
               // Shed exactly one more (newest, in-sequence) turn and keep the
               // single episode marker current. `budgetLeft` bounds the loop.
               const doRewind = (
@@ -5810,7 +5850,11 @@ export class AgentFramework {
                 handledByRewind = true;
               };
 
-              if (forced) {
+              if (handledByRetry) {
+                // A retry is already queued for this same turn — do not also
+                // shed history for it. Rewind is the NEXT escalation step,
+                // reached only once the retries are spent.
+              } else if (forced) {
                 doRewind(
                   forced.remaining > 0,
                   (count) => {
@@ -5845,7 +5889,16 @@ export class AgentFramework {
                 );
               }
 
-              if (!handledByRewind) void this.reactToRefusal(agent.name, category);
+              // The reaction is the LAST resort: retries spent, rewind not
+              // applicable. That makes it an honest signal to humans that the
+              // border is close, rather than noise on every near-threshold
+              // flip. (It must not re-enter any agent's context — the emoji
+              // is suppressed at the surface via
+              // DISCORD_SUPPRESS_REACTION_EMOJIS; without that, marking a
+              // refusal feeds the next one.)
+              if (!handledByRewind && !handledByRetry) {
+                void this.reactToRefusal(agent.name, category);
+              }
             } else {
               // A turn that completed WITHOUT a refusal ends the rewind episode:
               // the model responded. Leave the consolidated marker in place as
@@ -5855,6 +5908,11 @@ export class AgentFramework {
               }
               if (this.refusalRewinds.get(agent.name)) {
                 this.refusalRewinds.set(agent.name, 0);
+              }
+              // A clean turn ends the retry episode too — the next refusal
+              // gets its own full budget rather than inheriting a spent one.
+              if (this.refusalRetries.get(agent.name)) {
+                this.refusalRetries.set(agent.name, 0);
               }
               this.rewindEpisode.delete(agent.name);
               this.refusalStreak.delete(agent.name);

@@ -122,6 +122,18 @@ export interface AgentConfig {
    * a poison turn. Default: off (a refusal just surfaces a marker + reaction).
    */
   refusalHandling?: {
+    /**
+     * Plain same-model retries BEFORE any rewind or reaction. A content-policy
+     * refusal near the classifier's threshold is probabilistic, not a function
+     * of the payload: identical bytes have been observed to pass and refuse
+     * minutes apart (mythos, 2026-07-27 replay reps). So the first response to
+     * a refusal is simply to ask again — no context surgery, no fallback model.
+     * At an observed ~50% band, 2 retries take delivery from ~50% to ~87%.
+     * Retries recompile normally, so any events that arrived meanwhile are
+     * included. Exhausting them falls through to autoRewind (if on) and then
+     * to the refusal reaction. Default 0 (off — prior behaviour).
+     */
+    retries?: number;
     /** Auto-rewind the triggering turn on refusal and retry. Default false. */
     autoRewind?: boolean;
     /** Max consecutive rewinds before giving up a turn. Default 3. */
