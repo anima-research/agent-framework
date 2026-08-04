@@ -2707,6 +2707,46 @@ export class AgentFramework {
   }
 
   /**
+   * Admin-level nudge: run an inference turn on the agent's CURRENT context
+   * without adding any message, event, or other context mutation. The turn
+   * compiles exactly what the agent already sees — useful after an /undo,
+   * a /hide, or whenever an operator wants the agent to take another look
+   * (or another swing) at where it stands, with zero context pollution.
+   *
+   * Queues a normal inference request (same path as gate wakes): if the
+   * agent is mid-turn it runs when the turn settles; a pending skip_reply
+   * self-wake is superseded like any other wake. Deliberately NOT gated on
+   * idle — "run when you're free" is the useful semantic. No suppression
+   * interplay: gate sleep filters events, not queued requests, so a nudge
+   * wakes even a sleeping agent (it's an admin override, like /unstick).
+   */
+  nudgeAgent(agentName?: string, requestedBy?: string): {
+    ok: boolean;
+    error?: string;
+    agentName?: string;
+    /** Agent state at queue time — 'idle' means the turn starts on the next
+     *  scheduler pass; anything else means it runs after the current turn. */
+    agentStatus?: string;
+  } {
+    const name = agentName ?? [...this.agents.keys()][0];
+    const agent = name ? this.agents.get(name) : undefined;
+    if (!name || !agent) {
+      return { ok: false, error: `Unknown agent: ${String(agentName ?? '(none registered)')}` };
+    }
+    const agentStatus = this.activeTurnTokens.has(name) && agent.state.status === 'idle'
+      ? 'idle+turn-alive'
+      : agent.state.status;
+    this.pendingRequests.push({
+      agentName: name,
+      reason: requestedBy ? `admin-nudge (${requestedBy})` : 'admin-nudge',
+      source: 'admin',
+      timestamp: Date.now(),
+    });
+    console.error(`[nudge] agent=${name} queued by=${requestedBy ?? 'unknown'} status=${agentStatus}`);
+    return { ok: true, agentName: name, agentStatus };
+  }
+
+  /**
    * Handle a `host/command` request from an MCPL surface server (e.g. a
    * Discord slash command). Currently supports:
    *
@@ -2714,6 +2754,9 @@ export class AgentFramework {
    *   `undoLastTurn`). The response includes the last message the agent
    *   would see in its context after the undo, obtained via the transparent
    *   `previewActivation` render (no inference, no Chronicle writes).
+   *
+   *   nudge — run inference on the current context with NO new events
+   *   (see `nudgeAgent`).
    */
   private async handleHostCommand(
     serverId: string,
@@ -2736,14 +2779,32 @@ export class AgentFramework {
      *  outcome report is posted to the channel asynchronously. */
     started?: boolean;
     cap?: number;
+    /** For `nudge`: agent state at queue time ('idle' = runs immediately,
+     *  else it runs once the current turn settles). */
+    agentStatus?: string;
   }> {
-    if (params.command !== 'undo' && params.command !== 'hide' && params.command !== 'unstick') {
+    if (
+      params.command !== 'undo' &&
+      params.command !== 'hide' &&
+      params.command !== 'unstick' &&
+      params.command !== 'nudge'
+    ) {
       return { ok: false, error: `Unknown host command: ${String(params.command)}` };
     }
 
     const agentName = params.agentName ?? [...this.agents.keys()][0];
     if (!agentName || !this.agents.has(agentName)) {
       return { ok: false, error: `Unknown agent: ${String(agentName)}` };
+    }
+
+    // nudge: queue an inference on the current context — no message, no
+    // event, no context mutation (see nudgeAgent).
+    if (params.command === 'nudge') {
+      const r = this.nudgeAgent(
+        agentName,
+        params.requesterName ?? params.requesterId ?? `mcpl:${serverId}`,
+      );
+      return { ok: r.ok, error: r.error, agentStatus: r.agentStatus };
     }
 
     // unstick: force the refusal-rewind loop on demand (even if the agent's
