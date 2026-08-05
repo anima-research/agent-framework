@@ -8926,6 +8926,16 @@ export class AgentFramework {
     deniedCapabilities: string[];
     /** Host-owned authority; deliberately separate from the portable grant. */
     allowHostCommands: boolean;
+    /**
+     * Per-transport §17 facts about the last manifest this host fetched and
+     * acted on. The revision is server-authored and equality-only; these are
+     * not the server's manifestChanged announcements.
+     */
+    manifestState: {
+      lastValidatedRevision: string | null;
+      lastFetchedAt: number | null;
+      lastNegotiatedAt: number | null;
+    };
     command?: string;
     url?: string;
   }> {
@@ -8934,6 +8944,11 @@ export class AgentFramework {
       toolPrefix: string; toolCount: number; policyEstablished: boolean;
       effectiveGrant: string[]; maskedCapabilities: string[];
       deniedCapabilities: string[]; allowHostCommands: boolean;
+      manifestState: {
+        lastValidatedRevision: string | null;
+        lastFetchedAt: number | null;
+        lastNegotiatedAt: number | null;
+      };
       command?: string; url?: string;
     }> = [];
     for (const [id, config] of this.mcplServerConfigs) {
@@ -8951,6 +8966,9 @@ export class AgentFramework {
         maskedCapabilities: [...(connection?.droppedCapabilities ?? [])].sort(),
         deniedCapabilities: [...(connection?.grant.deniedPaths ?? [])].sort(),
         allowHostCommands: config.allowHostCommands === true,
+        manifestState: connection
+          ? { ...connection.manifestState }
+          : { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null },
         command: config.command,
         url: config.url,
       });

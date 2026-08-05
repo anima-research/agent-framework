@@ -22,15 +22,22 @@ test('listMcplServers exposes the live grant layers and host-owned authority', (
     new Set(['channels.incoming', 'channels.publish']),
     ['contextHooks.beforeInference.inject.system'],
   );
-  const framework = frameworkWithConnection({
+  const connection = {
     isConnected: true,
     willReconnect: true,
     policyEstablished: true,
     grant,
     droppedCapabilities: new Set(['channels.streaming']),
-  });
+    manifestState: {
+      lastValidatedRevision: 'sha256:validated',
+      lastFetchedAt: 1_786_000_000_000,
+      lastNegotiatedAt: 1_786_000_000_100,
+    },
+  };
+  const framework = frameworkWithConnection(connection);
 
-  assert.deepEqual(framework.listMcplServers(), [{
+  const listed = framework.listMcplServers();
+  assert.deepEqual(listed, [{
     id: 'discord',
     connected: true,
     retrying: false,
@@ -41,9 +48,15 @@ test('listMcplServers exposes the live grant layers and host-owned authority', (
     maskedCapabilities: ['channels.streaming'],
     deniedCapabilities: ['contextHooks.beforeInference.inject.system'],
     allowHostCommands: true,
+    manifestState: {
+      lastValidatedRevision: 'sha256:validated',
+      lastFetchedAt: 1_786_000_000_000,
+      lastNegotiatedAt: 1_786_000_000_100,
+    },
     command: 'node',
     url: undefined,
   }]);
+  assert.notStrictEqual(listed[0]!.manifestState, connection.manifestState);
 });
 
 test('listMcplServers distinguishes a disconnected retrying stub from connected', () => {
@@ -53,6 +66,11 @@ test('listMcplServers distinguishes a disconnected retrying stub from connected'
     policyEstablished: false,
     grant: CapabilityGrant.empty(),
     droppedCapabilities: new Set<string>(),
+    manifestState: {
+      lastValidatedRevision: null,
+      lastFetchedAt: null,
+      lastNegotiatedAt: null,
+    },
   });
 
   const [status] = framework.listMcplServers();
@@ -60,4 +78,9 @@ test('listMcplServers distinguishes a disconnected retrying stub from connected'
   assert.equal(status.retrying, true);
   assert.equal(status.policyEstablished, false);
   assert.deepEqual(status.effectiveGrant, []);
+  assert.deepEqual(status.manifestState, {
+    lastValidatedRevision: null,
+    lastFetchedAt: null,
+    lastNegotiatedAt: null,
+  });
 });
