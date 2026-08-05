@@ -138,6 +138,20 @@ export class McplServerConnection extends EventEmitter {
   policyEstablished = false;
 
   /**
+   * §17 manifest tracking (host side of RFC-003): what this host actually
+   * fetched and acted on — never the server's announcement log (§17.10:
+   * those are different facts). Read by the legibility surface.
+   */
+  manifestState: {
+    /** revision of the last VALIDATED fetched manifest (server-authored,
+     *  untrusted, equality-only) — null until a §17.4 fetch succeeds. */
+    lastValidatedRevision: string | null;
+    lastFetchedAt: number | null;
+    /** epoch ms of the last §6.7 receipt that activated a grant change. */
+    lastNegotiatedAt: number | null;
+  } = { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null };
+
+  /**
    * Activate (or replace) the effective grant. Ordering is the caller's
    * contract per §6.7: call BEFORE sending a reducing featureSets/update,
    * AFTER the receipt for an expanding one.
@@ -153,6 +167,11 @@ export class McplServerConnection extends EventEmitter {
   private resetPolicyForTransportBoundary(): void {
     this.grant = CapabilityGrant.empty();
     this.policyEstablished = false;
+    // §17 tracking is per-epoch for the same reason the grant is: these are
+    // facts about what THIS host fetched/negotiated on THIS initialized
+    // transport, and a fresh initialize starts a fresh manifest history
+    // (Sol, PR #84 review — they previously survived into the new epoch).
+    this.manifestState = { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null };
   }
 
   /** The active transport (stdio child or WebSocket). Null for a disconnected
@@ -601,6 +620,16 @@ export class McplServerConnection extends EventEmitter {
     this.sendNotification(McplMethod.InferenceLifecycle, params as unknown as Record<string, unknown>);
   }
 
+  /**
+   * Fetch the server's complete current manifest (§17.4) — the
+   * experimental.mcpl object in the same shape initialize carries, never a
+   * delta. The fetched CONTENT is authoritative for every decision; the
+   * revision is only the cheap path (§17.1).
+   */
+  sendManifestRequest(timeoutMs = 15_000): Promise<McplCapabilities | null> {
+    return this.sendRequest(McplMethod.Manifest, {}, { timeoutMs }) as Promise<McplCapabilities | null>;
+  }
+
   /** Send `state/rollback` request and await result. */
   sendStateRollback(params: StateRollbackParams): Promise<StateRollbackResult> {
     return this.sendRequest(McplMethod.StateRollback, params as unknown as Record<string, unknown>) as Promise<StateRollbackResult>;
@@ -930,6 +959,11 @@ export class McplServerConnection extends EventEmitter {
     // neither of these had an entry, so callers hung forever (AUDIT-001
     // item 4, which also poisoned the audit's own usage evidence).
     [McplMethod.ModelInfo]: 'model-info',
+    // §17.3: deliberately UNGATED (not in EVENT_TO_REQUIRED_CAPABILITY) —
+    // announcing conveys no authority, and gating it would silence exactly
+    // the servers whose grants just narrowed. The cost is the host's
+    // re-fetch, which the framework rate-limits (§17.8).
+    [McplMethod.ManifestChanged]: 'manifest-changed',
     [McplMethod.ChannelsList]: 'channels-list',
     'notifications/tools/list_changed': 'tools-list-changed',
     // Host-level admin commands initiated from a surface (e.g. a Discord
