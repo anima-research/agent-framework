@@ -785,6 +785,8 @@ export class AgentFramework {
   private toolResultInlineMaxCharsOverride: Map<string, number> = new Map();
 
   private mcplTools: import('./types/index.js').ToolDefinition[] = [];
+  /** Namespaced tool name → stateful feature-set attribution from tools/list. */
+  private mcplToolFeatureSets: Map<string, string> = new Map();
   private mcplToolRefreshInFlight = false;
   private mcplToolRefreshPending = false;
   /** Maps tool prefix → serverId for dispatch routing. */
@@ -9056,6 +9058,7 @@ export class AgentFramework {
     if (!this.mcplServerRegistry) return;
 
     const tools: import('./types/index.js').ToolDefinition[] = [];
+    const toolFeatureSets = new Map<string, string>();
 
     for (const server of this.mcplServerRegistry.getAllServers()) {
       const config = this.mcplServerConfigs.get(server.id);
@@ -9064,13 +9067,26 @@ export class AgentFramework {
         const result = await server.sendToolsList();
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
+          const namespacedName = `${prefix}--${tool.name}`;
+          const attributedTool = tool as typeof tool & {
+            featureSet?: unknown;
+            _meta?: { featureSet?: unknown };
+          };
+          const featureSet = typeof attributedTool.featureSet === 'string'
+            ? attributedTool.featureSet
+            : typeof attributedTool._meta?.featureSet === 'string'
+              ? attributedTool._meta.featureSet
+              : undefined;
           // MCP tool schemas are generic JSON Schema; cast to membrane's ToolDefinition format
           const schema = tool.inputSchema as import('./types/index.js').ToolDefinition['inputSchema'];
           tools.push({
-            name: `${prefix}--${tool.name}`,
+            name: namespacedName,
             description: tool.description ?? '',
             inputSchema: schema,
           });
+          if (featureSet !== undefined) {
+            toolFeatureSets.set(namespacedName, featureSet);
+          }
         }
       } catch {
         // Server may not support tools/list — skip silently
@@ -9078,6 +9094,7 @@ export class AgentFramework {
     }
 
     this.mcplTools = tools;
+    this.mcplToolFeatureSets = toolFeatureSets;
   }
 
   /**
@@ -9175,20 +9192,47 @@ export class AgentFramework {
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
 
     // Build state params for stateful tools (Step 8).
-    // Host-managed state is single-valued per server, so inject the host-managed
-    // set's `state` for any call; otherwise fall back to a server-managed set's
-    // opaque `checkpoint`. Never blindly pick "first stateful" — when a server
-    // mixes host-managed (e.g. a feed) and server-managed (e.g. post/undo) sets,
-    // that misattributes the feed's state.
+    // A tools/list attribution selects that exact stateful set. Untagged tools
+    // retain the host-managed or unique server-managed fallback, but never guess
+    // between multiple server-managed sets.
     let stateParams: { state?: unknown; checkpoint?: string } | undefined;
+    let attributedFeatureSet: string | null = null;
     if (this.checkpointManager) {
-      const hostFs = this.checkpointManager.getHostManagedFeatureSet(serverId);
-      if (hostFs) {
-        stateParams = { state: this.checkpointManager.getCurrentState(serverId, hostFs) };
+      const toolFeatureSet = this.mcplToolFeatureSets.get(call.name);
+      if (toolFeatureSet !== undefined) {
+        if (
+          this.checkpointManager.isHostManaged(serverId, toolFeatureSet)
+          || this.checkpointManager.getStatefulFeatureSet(serverId, toolFeatureSet) !== null
+        ) {
+          attributedFeatureSet = toolFeatureSet;
+        } else {
+          console.warn(
+            `[mcpl] Tool "${call.name}" declares unknown or non-stateful feature set ` +
+            `"${toolFeatureSet}"; skipping state exchange.`,
+          );
+        }
       } else {
-        const fs = this.checkpointManager.getStatefulFeatureSet(serverId);
-        if (fs) {
-          const cp = this.checkpointManager.getCurrentCheckpoint(serverId, fs);
+        attributedFeatureSet = this.checkpointManager.getHostManagedFeatureSet(serverId)
+          ?? this.checkpointManager.getStatefulFeatureSet(serverId);
+        if (
+          attributedFeatureSet === null
+          && this.checkpointManager.hasAmbiguousServerManagedFeatureSets(serverId)
+        ) {
+          console.warn(
+            `[mcpl] Tool "${call.name}" has no feature-set attribution and server ` +
+            `"${serverId}" has multiple server-managed stateful feature sets; ` +
+            'skipping state exchange.',
+          );
+        }
+      }
+
+      if (attributedFeatureSet !== null) {
+        if (this.checkpointManager.isHostManaged(serverId, attributedFeatureSet)) {
+          stateParams = {
+            state: this.checkpointManager.getCurrentState(serverId, attributedFeatureSet),
+          };
+        } else {
+          const cp = this.checkpointManager.getCurrentCheckpoint(serverId, attributedFeatureSet);
           if (cp) stateParams = { checkpoint: cp };
         }
       }
@@ -9200,15 +9244,10 @@ export class AgentFramework {
         this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, durationMs });
 
         // Record checkpoint from stateful tool response (Step 8).
-        // Attribute to the set the server tagged (result.state.featureSet) first;
-        // else the host-managed set (host-managed checkpoints carry data/patch);
-        // else the single stateful set. Avoids recording a feed checkpoint onto a
-        // server-managed set just because it registered first.
+        // Explicit response attribution is authoritative. Otherwise use the
+        // tool-derived (or safe single-set) attribution chosen before the call.
         if (result.state && this.checkpointManager) {
-          const tagged = result.state.featureSet;
-          const fs = tagged
-            ?? this.checkpointManager.getHostManagedFeatureSet(serverId)
-            ?? this.checkpointManager.getStatefulFeatureSet(serverId);
+          const fs = result.state.featureSet ?? attributedFeatureSet;
           if (fs && this.checkpointManager.isStateful(serverId, fs)) {
             this.checkpointManager.recordCheckpoint(serverId, fs, result.state);
           }
