@@ -53,6 +53,7 @@ import type {
   SameRoundThinkTextPolicy,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
+import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reactions.js';
 import { Agent } from './agent.js';
 import { ModuleRegistry, isStateExistsError } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -2496,15 +2497,6 @@ export class AgentFramework {
     'chat:thread': 'Occurred in a thread',
   };
 
-  /** Refusal category → Discord reaction emoji. Unknown categories get 🛑. */
-  private static readonly REFUSAL_REACTIONS: Record<string, string> = {
-    bio: '☣️',
-    chem: '🧪',
-    nuclear: '☢️',
-    cyber: '💻',
-    reasoning_extraction: '🧠',
-  };
-
   /**
    * Mark an inference refusal visibly: react on the message that holds the
    * conversational locus (the most recent incoming channel message) with a
@@ -2521,7 +2513,7 @@ export class AgentFramework {
       const parts = incoming.channelId.split(':');
       if (parts[0] !== 'discord') return;
       const channelId = parts[parts.length - 1];
-      const emoji = AgentFramework.REFUSAL_REACTIONS[category] ?? '🛑';
+      const emoji = REFUSAL_REACTIONS[category] ?? REFUSAL_REACTION_FALLBACK;
       // Resolve the MCPL server that owns the locus channel and call
       // tools/call directly on its connection (bare tool name — no prefix
       // games), bypassing the agent event queue so no synthetic tool-result
