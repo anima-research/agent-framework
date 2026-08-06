@@ -86,6 +86,10 @@ export class Agent {
    *  cache read. THE window-shaped number — `lastStreamInputTokens` alone
    *  omits cached tokens, which are most of a warm stream's window. */
   lastStreamRealInputTokens = 0;
+  /** Output tokens of the last usage event — the prior round's generated
+   *  thinking/text/tool_use, which becomes part of the NEXT round's input
+   *  and so belongs in the physical-window projection. */
+  lastStreamOutputTokens = 0;
   maxStreamTokens: number;
   /** Provider hard context cap (see AgentConfig.physicalWindowTokens). */
   readonly physicalWindowTokens?: number;
@@ -687,6 +691,14 @@ export class Agent {
     this._streamId++;
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
+    // Reset the cache-inclusive counters too: a new stream must not inherit
+    // the prior stream's window size — on the physical-window restart path
+    // that inherited value IS the oversized number that caused the restart,
+    // and projecting on it before this stream's first usage event would
+    // restart again (loop). The `> 0` guard downstream means "no usage
+    // observed on THIS stream yet" only because of this reset.
+    this.lastStreamRealInputTokens = 0;
+    this.lastStreamOutputTokens = 0;
 
     const request = await this.buildActivationRequest(availableTools, injections, budget);
 

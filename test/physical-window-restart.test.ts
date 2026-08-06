@@ -40,6 +40,19 @@ class SequentialStreamMembrane extends MockMembrane {
   }
 }
 
+/** Explicit response queue per streamYielding call. */
+class QueuedStreamsMembrane extends MockMembrane {
+  constructor(private queues: NormalizedResponse[][]) {
+    super();
+  }
+  override streamYielding(request: NormalizedRequest, _options?: unknown): YieldingStream {
+    this.calls.push(request);
+    const stream = new MockYieldingStream(this.queues.shift() ?? []);
+    this.lastStream = stream;
+    return stream;
+  }
+}
+
 class BlobToolModule implements Module {
   readonly name = 'canned';
   async start(): Promise<void> {}
@@ -159,6 +172,60 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not inherit the pre-restart window size into the new stream', async () => {
+    // Regression pin for the reset (opus-rev review finding #1): after a
+    // physical-window restart, the fresh stream runs a tool round that emits
+    // NO usage event before reaching the tool-result boundary. Without the
+    // stream-start reset, the projection would run on the inherited 200k
+    // figure — the very number that caused the restart — and restart again
+    // into an empty queue (loop; this test would then time out).
+    const tempDir = mkdtempSync(join(tmpdir(), 'phys-window-'));
+    const noUsageToolResponse = createMockResponse([
+      { type: 'text', text: 'Continuing…' },
+      { type: 'tool_use', id: 'call_2', name: 'canned--fetch', input: {} },
+    ], 'tool_use');
+    (noUsageToolResponse as { usage: unknown }).usage = undefined;
+    const membrane = new QueuedStreamsMembrane([
+      [nearCapToolResponse()],
+      [noUsageToolResponse, createMockResponse([{ type: 'text', text: 'Recovered final answer' }])],
+    ]);
+
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{
+        name: 'prime',
+        model: 'test-model',
+        systemPrompt: 'You are prime.',
+        allowedTools: 'all',
+        maxTokens: 4_000,
+        physicalWindowTokens: 200_000,
+      }],
+      modules: [new BlobToolModule()],
+      syncIntervalMs: 0,
+    });
+    const traces: TraceEvent[] = [];
+    framework.onTrace((e) => traces.push(e));
+    framework.start();
+    framework.pushEvent({
+      type: 'external-message',
+      source: 'test',
+      content: [{ type: 'text', text: 'fetch it' }],
+      metadata: {},
+      triggerInference: true,
+    } as unknown as ProcessEvent);
+    try {
+      const done = await pollUntil(() => storedTexts(framework).includes('Recovered final answer'));
+      assert.ok(done, 'the post-restart stream must resume, not restart again');
+      assert.strictEqual(membrane.calls.length, 2, 'exactly one restart');
+      const restarts = traces.filter((e) => e.type === 'inference:stream_restarted');
+      assert.strictEqual(restarts.length, 1, 'the inherited value must not trigger a second restart');
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
     }
   });
 

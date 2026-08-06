@@ -3861,10 +3861,15 @@ export class AgentFramework {
           // the physical window, break the stream through the same
           // budget-restart path — a fresh compile folds the history back
           // under budget instead of dispatching a doomed request.
+          // Projection terms: prior round's real input + prior round's
+          // OUTPUT (the just-generated thinking/text/tool_use joins the next
+          // round's input — omitting it is a systematic underestimate) +
+          // blocks about to be appended + reserve for the next response.
           const projectedRealTokens = currentState.stream
             && agent.physicalWindowTokens !== undefined
             && agent.lastStreamRealInputTokens > 0
             ? agent.lastStreamRealInputTokens
+              + agent.lastStreamOutputTokens
               + estimateAppendedRoundTokens(currentState.toolResults, spilled, midTurnInjections)
               + agent.maxTokens
             : 0;
@@ -6361,6 +6366,7 @@ export class AgentFramework {
               (event.usage.inputTokens ?? 0) +
               (event.usage.cacheCreationTokens ?? 0) +
               (event.usage.cacheReadTokens ?? 0);
+            agent.lastStreamOutputTokens = event.usage.outputTokens ?? 0;
 
             // Closed-loop estimator calibration (2026-07-12). Sample the REAL
             // prefix size of THIS API call (fresh + cache write + cache read)
