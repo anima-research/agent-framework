@@ -37,6 +37,7 @@ import type {
   ToolCall,
   ToolCallEvent,
   ToolResult,
+  CompletedToolCall,
   AgentConfig,
   InferenceRequest,
   AgentState,
@@ -67,7 +68,11 @@ import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry
 import { ConversationRouter } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
-import { toolResultDataToHistoryString } from './tool-result-history.js';
+import {
+  toolResultDataToHistoryString,
+  truncateForHistory,
+  DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
+} from './tool-result-history.js';
 import { randomUUID } from 'node:crypto';
 import { PyRunner, buildInjectedTools } from './code-execution/py-runner.js';
 import {
@@ -784,6 +789,9 @@ export class AgentFramework {
    *  Set via agent_settings `tool_result_inline_max_chars`; NOT persisted —
    *  the lift is meant as a temporary gate, reverts on restart/reset. */
   private toolResultInlineMaxCharsOverride: Map<string, number> = new Map();
+  /** Durable residence-configured inline cap from
+   *  FrameworkConfig.toolResultInlineMaxChars; null → house default. */
+  private toolResultInlineMaxCharsConfig: number | null = null;
 
   private mcplTools: import('./types/index.js').ToolDefinition[] = [];
   /** Namespaced tool name → stateful feature-set attribution from tools/list. */
@@ -1062,6 +1070,14 @@ export class AgentFramework {
     // Client-side programmatic tool calling (code_execution). Config is only
     // retained when enabled — everything downstream gates on the field.
     framework.codeExecutionConfig = config.codeExecution?.enabled ? config.codeExecution : null;
+
+    if (config.toolResultInlineMaxChars !== undefined) {
+      const cap = config.toolResultInlineMaxChars;
+      if (!Number.isFinite(cap) || cap < 1000) {
+        throw new Error('FrameworkConfig.toolResultInlineMaxChars must be a number >= 1000');
+      }
+      framework.toolResultInlineMaxCharsConfig = Math.floor(cap);
+    }
 
     // Initialize MCPL subsystems if configured
     if (config.mcplServers && config.mcplServers.length > 0) {
@@ -1536,18 +1552,28 @@ export class AgentFramework {
         tool_result_inline_max_chars: {
           type: 'number',
           description:
-            'Inline size cap (chars) for tool results and background-script wake payloads. ' +
-            'Content over the cap is written to a workspace file under tool-results/ and ' +
-            'replaced by a truncated preview + file reference. Raise it temporarily when you ' +
-            'genuinely want a large result inline; reset restores the default (derived from ' +
-            'your strategy). Ephemeral — reverts on host restart.',
+            'Inline size cap (chars) for tool results (successes and errors) and ' +
+            'background-script wake payloads. Content over the cap is written to a workspace ' +
+            'file under tool-results/ and replaced by a truncated preview + file reference. ' +
+            'Raise it temporarily when you genuinely want a large result inline; reset ' +
+            'restores the durable residence default. Ephemeral — reverts on host restart. ' +
+            'The effective cap and its source are reported as ' +
+            'tool_result_inline_max_chars_effective / _source on get.',
         },
       },
       keys: ['tool_result_inline_max_chars'],
-      get: (agentName: string) => ({
-        tool_result_inline_max_chars:
-          this.toolResultInlineMaxCharsOverride.get(agentName) ?? null,
-      }),
+      get: (agentName: string) => {
+        const agent = this.agents.get(agentName);
+        const resolved = agent ? this.resolveToolResultInlineCap(agent) : null;
+        return {
+          tool_result_inline_max_chars:
+            this.toolResultInlineMaxCharsOverride.get(agentName) ?? null,
+          tool_result_inline_max_chars_effective: resolved?.cap ?? null,
+          tool_result_inline_max_chars_source: resolved
+            ? resolved.source + (resolved.strategyClamped ? ' (strategy-clamped)' : '')
+            : null,
+        };
+      },
       update: (agentName: string, patch: Record<string, unknown>) => {
         const n = Number(patch.tool_result_inline_max_chars);
         if (!Number.isFinite(n) || n < 1000) {
@@ -3713,38 +3739,18 @@ export class AgentFramework {
             this.pendingAssistantBlocks.delete(agent.name);
           }
 
-          // Compute truncation limit from agent's strategy (maxMessageTokens * 4 chars)
-          const maxChars = this.getMaxToolResultChars(agent);
+          // Effective inline cap: agent_settings override → durable config →
+          // house default, clamped to the strategy bound (see resolver).
+          const maxChars = this.resolveToolResultInlineCap(agent).cap;
 
-          // Oversized results spill to a workspace file (truncated preview +
-          // file reference) instead of being blind-truncated. Computed ONCE
-          // per call and reused for both the history copy and the live wire
-          // copy below — the two must stay byte-matched (the window stores
-          // what the membrane sends; divergence breaks the compile prefix).
-          const spilled = new Map<string, string>();
-          const dateLabel = new Date().toISOString().slice(0, 10);
-          for (const tc of currentState.toolResults) {
-            if (tc.result.isError) continue;
-            spilled.set(tc.id, await this.spillOrTruncate(
-              toolResultDataToHistoryString(tc.result.data, undefined),
-              maxChars,
-              `${dateLabel}-${tc.id}`,
-              agent.name,
-            ));
-          }
-
-          // Store tool results as a user message (tool_result blocks).
-          // Use the history serializer so MCP image blocks become a short
-          // `[image: type, size]` placeholder instead of megabytes of base64
-          // that would corrupt under truncation.
-          const toolResultContent: ContentBlock[] = currentState.toolResults.map(tc => ({
-            type: 'tool_result' as const,
-            toolUseId: tc.id,
-            content: tc.result.isError
-              ? tc.result.error ?? 'Unknown error'
-              : spilled.get(tc.id) ?? toolResultDataToHistoryString(tc.result.data, maxChars),
-            isError: tc.result.isError,
-          }));
+          // Oversized results — successes AND errors — spill to a workspace
+          // file (truncated preview + file reference) instead of being
+          // blind-truncated. Computed ONCE per call and reused for both the
+          // history copy and the live wire copy below — the two must stay
+          // byte-matched (the window stores what the membrane sends;
+          // divergence breaks the compile prefix).
+          const { blocks: toolResultContent, spilled } =
+            await this.buildStoredToolResultContent(currentState.toolResults, maxChars);
           agent.getContextManager().addMessage('user', toolResultContent);
 
           // Flush any messages that were deferred while this turn was in
@@ -5785,17 +5791,15 @@ export class AgentFramework {
                 agent.addAssistantResponse(pending);
                 this.pendingAssistantBlocks.delete(agent.name);
               }
-              // Store tool results
+              // Store tool results — same bounded spill policy as the
+              // ordinary path (issue #89: this guard path must not become the
+              // one door a giant blob still walks through).
               const readyState = agent.state as AgentState;
               if (readyState.status === 'ready') {
-                const toolResultContent: ContentBlock[] = readyState.toolResults.map(tc => ({
-                  type: 'tool_result' as const,
-                  toolUseId: tc.id,
-                  content: tc.result.isError
-                    ? (tc.result.error ?? 'Unknown error')
-                    : toolResultDataToHistoryString(tc.result.data),
-                  isError: tc.result.isError,
-                }));
+                const { blocks: toolResultContent } = await this.buildStoredToolResultContent(
+                  readyState.toolResults,
+                  this.resolveToolResultInlineCap(agent).cap,
+                );
                 agent.getContextManager().addMessage('user', toolResultContent);
               }
             }
@@ -6840,8 +6844,12 @@ export class AgentFramework {
       ? 'null'
       : JSON.stringify(payload, null, 1) ?? String(payload);
     const agent = this.agents.get(record.agentName);
-    const maxChars = agent ? this.getMaxToolResultChars(agent) : undefined;
-    const payloadText = await this.spillOrTruncate(
+    // Same resolved cap as tool results (override applies here too); an
+    // unknown agent still gets the bounded house default, never unbounded.
+    const maxChars = agent
+      ? this.resolveToolResultInlineCap(agent).cap
+      : DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
+    const { text: payloadText } = await this.spillOrTruncate(
       payloadJson, maxChars, `${record.id}-wake${record.wakes}`,
     );
 
@@ -6923,25 +6931,53 @@ export class AgentFramework {
   }
 
   /**
-   * Oversized content policy (antra, 2026-07-31): never hit the agent in
-   * the face with a huge blob, never silently destroy it either. Content
-   * over the inline cap is materialized to a workspace file (readable with
-   * the agent's own tools) and replaced by a truncated head + a trailing
-   * file reference. Falls back to plain truncation when there is no
-   * writable workspace. The cap can be lifted temporarily via
-   * agent_settings `tool_result_inline_max_chars`.
+   * Oversized content policy (antra, 2026-07-31; completed for issue #89):
+   * never hit the agent in the face with a huge blob, never silently destroy
+   * it either. Content over the inline cap is materialized to a workspace
+   * file (readable with the agent's own tools — deterministic name, kept
+   * until the workspace owner deletes it) and replaced by a truncated head +
+   * a trailing file reference. Falls back to EXPLICIT plain truncation when
+   * there is no writable workspace. Cap resolution lives in
+   * resolveToolResultInlineCap; callers pass the resolved cap.
    */
+  /**
+   * One spill policy for every stored tool_result block: serialize (history
+   * serializer — image blocks become placeholders), then spill/truncate at
+   * the resolved cap. Errors follow the same policy as successes — a giant
+   * error string is exactly as context-hostile as a giant success (issue
+   * #89). Returns the stored blocks plus the per-call spill outcomes so the
+   * live wire copy can reuse the identical strings.
+   */
+  private async buildStoredToolResultContent(
+    toolResults: CompletedToolCall[],
+    maxChars: number | undefined,
+  ): Promise<{
+    blocks: ContentBlock[];
+    spilled: Map<string, { text: string; filePath: string | null }>;
+  }> {
+    const spilled = new Map<string, { text: string; filePath: string | null }>();
+    const dateLabel = new Date().toISOString().slice(0, 10);
+    for (const tc of toolResults) {
+      const raw = tc.result.isError
+        ? tc.result.error ?? 'Unknown error'
+        : toolResultDataToHistoryString(tc.result.data, undefined);
+      spilled.set(tc.id, await this.spillOrTruncate(raw, maxChars, `${dateLabel}-${tc.id}`));
+    }
+    const blocks: ContentBlock[] = toolResults.map(tc => ({
+      type: 'tool_result' as const,
+      toolUseId: tc.id,
+      content: spilled.get(tc.id)!.text,
+      isError: tc.result.isError,
+    }));
+    return { blocks, spilled };
+  }
+
   private async spillOrTruncate(
     content: string,
-    maxChars: number | undefined,
+    cap: number | undefined,
     label: string,
-    agentName?: string,
-  ): Promise<string> {
-    const override = agentName !== undefined
-      ? this.toolResultInlineMaxCharsOverride.get(agentName)
-      : undefined;
-    const cap = override ?? maxChars;
-    if (!cap || content.length <= cap) return content;
+  ): Promise<{ text: string; filePath: string | null }> {
+    if (!cap || content.length <= cap) return { text: content, filePath: null };
 
     const workspace = this.getWorkspaceModule();
     const mountName = workspace ? this.firstWritableMountName(workspace) : null;
@@ -6951,17 +6987,23 @@ export class AgentFramework {
       try {
         const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain');
         if (result.success) {
-          return safeSlice(content, 0, cap)
-            + `\n\n[truncated — showing ${cap} of ${content.length} chars; full content: workspace file ${path}. `
-            + 'Read/grep it with your file tools, or raise the inline cap temporarily via '
-            + 'agent_settings update tool_result_inline_max_chars.]';
+          return {
+            text: safeSlice(content, 0, cap)
+              + `\n\n[truncated — showing ${cap} of ${content.length} chars; full content: workspace file ${path}. `
+              + 'Read/grep it with your file tools, or raise the inline cap temporarily via '
+              + 'agent_settings update tool_result_inline_max_chars.]',
+            filePath: path,
+          };
         }
       } catch {
         // fall through to plain truncation
       }
     }
-    return safeSlice(content, 0, cap)
-      + '\n\n[truncated — original was ' + content.length + ' chars]';
+    return {
+      text: safeSlice(content, 0, cap)
+        + '\n\n[truncated — original was ' + content.length + ' chars; no writable workspace, full content not retained]',
+      filePath: null,
+    };
   }
 
   private getOrCreateScriptRunner(agentName: string): PyRunner {
@@ -7072,23 +7114,30 @@ export class AgentFramework {
     callId: string,
     afResult: ToolResult,
     maxChars?: number,
-    /** Pre-spilled string from the history path — used for the non-image
+    /** Pre-spilled outcome from the history path — used for the non-image
      *  path so the live wire copy byte-matches what the window stored. */
-    precomputed?: string,
+    precomputed?: { text: string; filePath: string | null },
   ): MembraneToolResult {
     if (afResult.isError) {
-      return { toolUseId: callId, content: afResult.error ?? 'Unknown error', isError: true };
+      // Same spill policy as successes: reuse the history copy so a giant
+      // error string stays bounded on the wire too (byte-matched).
+      return {
+        toolUseId: callId,
+        content: precomputed?.text ?? truncateForHistory(
+          afResult.error ?? 'Unknown error', DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
+        isError: true,
+      };
     }
     // MCPL tool results arrive as `data: McpToolResultContent[]` — preserve image
     // blocks natively rather than JSON-stringifying them away. Anything else
     // (objects, scalars) falls through to JSON. The error path was handled
     // above, so isError is always false on these return paths.
-    const blocks = this.tryNativeToolResultContent(afResult.data, maxChars);
+    const blocks = this.tryNativeToolResultContent(afResult.data, maxChars, precomputed?.filePath ?? null);
     if (blocks) {
       return { toolUseId: callId, content: blocks, isError: false };
     }
     if (precomputed !== undefined) {
-      return { toolUseId: callId, content: precomputed, isError: false };
+      return { toolUseId: callId, content: precomputed.text, isError: false };
     }
     // JSON.stringify returns the VALUE undefined (not a string) for undefined
     // input — a module tool returning `{ success: true }` with no data would
@@ -7108,7 +7157,13 @@ export class AgentFramework {
    * `maxChars`, when provided, caps each accompanying text block so an image
    * inlined alongside an enormous text payload can't blow the context.
    */
-  private tryNativeToolResultContent(data: unknown, maxChars?: number): ToolResultContentBlock[] | null {
+  private tryNativeToolResultContent(
+    data: unknown,
+    maxChars?: number,
+    /** Spill file written by the history path — referenced from truncation
+     *  notices so an image-adjacent giant text block stays recoverable. */
+    spillPath: string | null = null,
+  ): ToolResultContentBlock[] | null {
     if (!Array.isArray(data)) return null;
     let hasImage = false;
     const blocks: ToolResultContentBlock[] = [];
@@ -7119,7 +7174,9 @@ export class AgentFramework {
         let text = b.text;
         if (maxChars && text.length > maxChars) {
           text = safeSlice(text, 0, maxChars)
-            + '\n\n[truncated — original was ' + text.length + ' chars]';
+            + '\n\n[truncated — original was ' + text.length + ' chars'
+            + (spillPath ? `; full serialized result: workspace file ${spillPath}` : '')
+            + ']';
         }
         blocks.push({ type: 'text', text });
       } else if (b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string') {
@@ -7135,11 +7192,40 @@ export class AgentFramework {
     return hasImage ? blocks : null;
   }
 
-  private getMaxToolResultChars(agent: Agent): number | undefined {
+  /** Strategy-derived per-message bound (maxMessageTokens * 4 chars). */
+  private strategyDerivedToolResultChars(agent: Agent): number | undefined {
     const strategy = agent.getContextManager().getStrategy();
     const maxTokens = strategy.maxMessageTokens;
     if (maxTokens && maxTokens > 0) return maxTokens * 4;
     return undefined;
+  }
+
+  /**
+   * Effective tool-result inline cap for an agent, with provenance:
+   * agent_settings hot override (wins outright, ephemeral) → durable
+   * FrameworkConfig.toolResultInlineMaxChars → house default (5000). The
+   * durable/default value is clamped down to the strategy-derived bound when
+   * that is smaller (a message must still fit maxMessageTokens); the explicit
+   * override escapes the clamp — a deliberate temporary lift.
+   */
+  private resolveToolResultInlineCap(agent: Agent): {
+    cap: number;
+    source: 'agent-settings-override' | 'framework-config' | 'default';
+    strategyClamped: boolean;
+  } {
+    const override = this.toolResultInlineMaxCharsOverride.get(agent.name);
+    if (override !== undefined) {
+      return { cap: override, source: 'agent-settings-override', strategyClamped: false };
+    }
+    const configured = this.toolResultInlineMaxCharsConfig;
+    const base = configured ?? DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
+    const strategyBound = this.strategyDerivedToolResultChars(agent);
+    const strategyClamped = strategyBound !== undefined && strategyBound < base;
+    return {
+      cap: strategyClamped ? strategyBound : base,
+      source: configured !== null ? 'framework-config' : 'default',
+      strategyClamped,
+    };
   }
 
   private approximateDecodedBase64Bytes(base64: string): number {
