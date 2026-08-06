@@ -45,14 +45,48 @@ import { CapabilityGrant } from './capability-grant.js';
 const TYPING_INTERVAL_MS = 7_000;
 const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
 
-type DesiredChannelState = 'open' | 'closed';
+type DesiredChannelState = 'open' | 'closed' | 'tuned-out';
+
+/**
+ * Parameters of an active tune-out (issue #77), carried on the
+ * 'desired-state' record entering the tuned-out state and projected into
+ * `desiredStates`. A tuned-out channel stays OPEN at the transport (traffic
+ * must keep arriving for the subconscious); the divert-don't-wake behavior
+ * is applied downstream at ingestion.
+ */
+export interface TuneOutParams {
+  /** Identity of this tune-out epoch. Stamped into diverted messages
+   *  (`metadata.tuneOut = { epochId }`) for permanent main-view exclusion
+   *  and per-epoch audit; also keys durable wake counting. */
+  epochId: string;
+  /** Subconscious summary cadence, in seconds. */
+  cadenceSeconds: number;
+  /** Maximum messages dumped raw at cancel; above the cap the subconscious
+   *  curates a digest and `fetch_history` covers the rest. */
+  backlogCap: number;
+  /** Wake invocations before the tune-out auto-cancels. */
+  maxWakes: number;
+  /** Chronicle sequence when the tune-out began — window anchor + audit bound. */
+  startedAtSequence: number;
+}
 
 interface ChannelLifecycleEvent {
-  kind: 'desired-state' | 'legacy-policy-migrated' | 'invitation-declined';
+  kind:
+    | 'desired-state'
+    | 'legacy-policy-migrated'
+    | 'invitation-declined'
+    | 'tune-out-wake';
   serverId: string;
   timestamp: string;
   channelId?: string;
   desired?: DesiredChannelState;
+  /** Present when desired === 'tuned-out'. */
+  tuneOut?: TuneOutParams;
+  /** kind 'tune-out-wake': durable running wake count for an epoch.
+   *  Lives in the lifecycle log (not gate stats) because gate runtime
+   *  state dies with the process and max-wakes must not reset on restart. */
+  epochId?: string;
+  wakeCount?: number;
   source?: string;
   messageId?: string;
   acknowledgment?: string;
@@ -438,7 +472,15 @@ export class ChannelRegistry {
   /** Chronicle-projected desired lifecycle state, keyed by server + channel.
    *  Provenance is kept so reconcile can tell a pure default (nobody ever
    *  decided) from a real decision (agent-tool, invitation-declined, …). */
-  private desiredStates = new Map<string, { state: DesiredChannelState; source: string }>();
+  private desiredStates = new Map<string, {
+    state: DesiredChannelState;
+    source: string;
+    /** Present iff state === 'tuned-out'. */
+    tuneOut?: TuneOutParams;
+    /** Durable wake count for the active tune-out epoch (replayed from
+     *  'tune-out-wake' lifecycle records; see recordTuneOutWake). */
+    wakeCount?: number;
+  }>();
 
   /** One-time migration inputs from the retired recipe auto-open policy. */
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
@@ -1146,12 +1188,31 @@ export class ChannelRegistry {
       if (
         event.kind === 'desired-state' &&
         typeof event.channelId === 'string' &&
-        (event.desired === 'open' || event.desired === 'closed')
+        (event.desired === 'open' || event.desired === 'closed' ||
+          (event.desired === 'tuned-out' && event.tuneOut))
       ) {
         this.desiredStates.set(
           this.lifecycleKey(event.serverId, event.channelId),
-          { state: event.desired, source: typeof event.source === "string" ? event.source : "unknown" },
+          {
+            state: event.desired,
+            source: typeof event.source === "string" ? event.source : "unknown",
+            tuneOut: event.desired === 'tuned-out' ? event.tuneOut : undefined,
+            wakeCount: 0,
+          },
         );
+      } else if (
+        event.kind === 'tune-out-wake' &&
+        typeof event.channelId === 'string' &&
+        typeof event.wakeCount === 'number'
+      ) {
+        // Fold durable wake counts into the projection — but only while the
+        // epoch that recorded them is still the active desired state
+        // (last-record-wins semantics, same as desired-state itself).
+        const key = this.lifecycleKey(event.serverId, event.channelId);
+        const current = this.desiredStates.get(key);
+        if (current?.state === 'tuned-out' && current.tuneOut?.epochId === event.epochId) {
+          current.wakeCount = event.wakeCount;
+        }
       } else if (event.kind === 'legacy-policy-migrated') {
         this.migratedLegacyPolicies.add(event.serverId);
       }
@@ -1179,6 +1240,104 @@ export class ChannelRegistry {
       source,
       timestamp: new Date().toISOString(),
     });
+  }
+
+  // ==========================================================================
+  // Tune-out state (issue #77) — durable in the lifecycle log
+  // ==========================================================================
+
+  /**
+   * Enter (or re-enter with fresh params) the tuned-out state for a channel.
+   * Re-entering under a new epochId replaces the active epoch; the previous
+   * epoch's stamped messages stay excluded (stamps are permanent) and its
+   * wake count is superseded. Transport stays open (see reconcile).
+   */
+  enterTuneOut(
+    serverId: string,
+    channelId: string,
+    params: TuneOutParams,
+    source: string,
+  ): void {
+    const key = this.lifecycleKey(serverId, channelId);
+    this.desiredStates.set(key, {
+      state: 'tuned-out',
+      source,
+      tuneOut: params,
+      wakeCount: 0,
+    });
+    this.appendLifecycleEvent({
+      kind: 'desired-state',
+      serverId,
+      channelId,
+      desired: 'tuned-out',
+      tuneOut: params,
+      source,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * End the active tune-out, returning the channel to `nextState`.
+   * The caller (tune-out coordinator) owns the dump/notice flow; this is
+   * only the durable state flip. No-op returning null if the channel is
+   * not tuned out.
+   */
+  cancelTuneOut(
+    serverId: string,
+    channelId: string,
+    nextState: 'open' | 'closed',
+    source: string,
+  ): { params: TuneOutParams; wakeCount: number } | null {
+    const key = this.lifecycleKey(serverId, channelId);
+    const current = this.desiredStates.get(key);
+    if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
+    const ended = { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
+    this.desiredStates.set(key, { state: nextState, source });
+    this.appendLifecycleEvent({
+      kind: 'desired-state',
+      serverId,
+      channelId,
+      desired: nextState,
+      source,
+      timestamp: new Date().toISOString(),
+    });
+    return ended;
+  }
+
+  /**
+   * Durably record one wake invocation against the active epoch and return
+   * the updated count with the params (the coordinator compares against
+   * maxWakes and decides auto-cancel). Durable here, not in gate stats:
+   * gate runtime state dies with the process, and a restart must not grant
+   * a hammered channel a fresh wake budget.
+   */
+  recordTuneOutWake(
+    serverId: string,
+    channelId: string,
+  ): { params: TuneOutParams; wakeCount: number } | null {
+    const key = this.lifecycleKey(serverId, channelId);
+    const current = this.desiredStates.get(key);
+    if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
+    current.wakeCount = (current.wakeCount ?? 0) + 1;
+    this.appendLifecycleEvent({
+      kind: 'tune-out-wake',
+      serverId,
+      channelId,
+      epochId: current.tuneOut.epochId,
+      wakeCount: current.wakeCount,
+      timestamp: new Date().toISOString(),
+    });
+    return { params: current.tuneOut, wakeCount: current.wakeCount };
+  }
+
+  /** Active tune-out params + wake count for a channel, or null. */
+  getTuneOutState(
+    serverId: string,
+    channelId: string,
+  ): { params: TuneOutParams; wakeCount: number } | null {
+    const current = this.desiredStates.get(this.lifecycleKey(serverId, channelId));
+    if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
+    return { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
   }
 
   /**
@@ -1297,7 +1456,10 @@ export class ChannelRegistry {
       const key = `${serverId}:${channel.id}`;
       const desired = this.getDesiredState(serverId, channel.id);
       const entry = this.channels.get(key);
-      if (desired !== 'open') {
+      // Tuned-out sits on the OPEN side of reconcile: traffic must keep
+      // arriving (the subconscious reads it); only main's wake/visibility
+      // is diverted, downstream at ingestion.
+      if (desired !== 'open' && desired !== 'tuned-out') {
         try {
           await server.sendChannelsClose({ channelId: channel.id });
           if (entry) entry.open = false;
@@ -1710,6 +1872,22 @@ export class ChannelRegistry {
       };
     }
 
+    // A tuned-out channel is transport-open but attention-diverted; a plain
+    // open would silently discard the epoch (and its pending backlog dump).
+    // Cancelling is the tune-out coordinator's flow, reached via its own
+    // tool — refuse with the pointer rather than eat the state.
+    if (this.getDesiredState(entry.serverId, input.channelId) === 'tuned-out') {
+      return {
+        success: false,
+        isError: false,
+        error:
+          `Channel ${input.channelId} is tuned out. Cancel the tune-out ` +
+          `(tune_out with mode: 'cancel') to resume normal attention — ` +
+          `cancelling delivers the diverted backlog.`,
+        data: { refusal: 'tuned-out', channelId: input.channelId },
+      };
+    }
+
     const alreadyDesiredOpen = this.getDesiredState(entry.serverId, input.channelId) === 'open';
     if (entry.open && alreadyDesiredOpen && !input.backscroll) {
       return {
@@ -1808,7 +1986,9 @@ export class ChannelRegistry {
     // than retry — unless it certifies an explicit idle lease.
     if (isModuleOrigin && closeSource !== 'agent-tool' && !input.overrideExplicitOpen) {
       const current = this.desiredStates.get(this.lifecycleKey(entry.serverId, input.channelId));
-      if (current?.state === 'open' && current.source === 'agent-tool') {
+      // Tuned-out is stated intent too: a GC/housekeeping close would
+      // silently end the epoch and orphan its backlog.
+      if ((current?.state === 'open' || current?.state === 'tuned-out') && current.source === 'agent-tool') {
         return {
           success: false,
           isError: false,
