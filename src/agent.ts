@@ -82,7 +82,13 @@ export class Agent {
   private _inferenceStartedAt = 0;
   private _streamId = 0;
   lastStreamInputTokens = 0;
+  /** Real prefix size of the last usage event: fresh + cache creation +
+   *  cache read. THE window-shaped number — `lastStreamInputTokens` alone
+   *  omits cached tokens, which are most of a warm stream's window. */
+  lastStreamRealInputTokens = 0;
   maxStreamTokens: number;
+  /** Provider hard context cap (see AgentConfig.physicalWindowTokens). */
+  readonly physicalWindowTokens?: number;
   /** Per-agent context compile budget (input tokens). When unset, the
    * ContextManager's built-in default applies. reserveForResponse uses
    * this agent's maxTokens. */
@@ -117,6 +123,7 @@ export class Agent {
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
+    this.physicalWindowTokens = config.physicalWindowTokens;
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.configuredContextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
