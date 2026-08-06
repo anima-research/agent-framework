@@ -1,6 +1,10 @@
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
-import { toolResultDataToHistoryString } from './tool-result-history.js';
+import {
+  toolResultDataToHistoryString,
+  truncateForHistory,
+  DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
+} from './tool-result-history.js';
 
 export interface StartStreamResult {
   stream: YieldingStream;
@@ -890,12 +894,17 @@ export class Agent {
     // Tool results go as a user message with tool_result blocks. The history
     // serializer turns MCP image blocks into `[image: type, size]` so the
     // persisted transcript stays small and survives truncation.
+    //
+    // This is the direct-Agent-API path (the framework stores results itself
+    // via buildStoredToolResultContent, with workspace spill). No workspace
+    // is reachable from here, so the house default cap applies as plain
+    // truncation — bounded beats unbounded, for errors too.
     const content = results.map((r) => ({
       type: 'tool_result' as const,
       toolUseId: r.id,
       content: r.result.isError
-        ? r.result.error ?? 'Unknown error'
-        : toolResultDataToHistoryString(r.result.data),
+        ? truncateForHistory(r.result.error ?? 'Unknown error', DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
+        : toolResultDataToHistoryString(r.result.data, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
       isError: r.result.isError,
     }));
 

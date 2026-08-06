@@ -16,14 +16,26 @@
 
 import { safeSlice } from './safe-slice.js';
 
+/**
+ * House-safe default inline cap (chars) for tool results, error results, and
+ * background-script wake payloads (issue #89: a resident should never eat a
+ * 42k blob they didn't ask for). Durable per-residence value comes from
+ * `FrameworkConfig.toolResultInlineMaxChars`; a temporary per-agent lift from
+ * agent_settings `tool_result_inline_max_chars`.
+ */
+export const DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS = 5000;
+
 export function toolResultDataToHistoryString(data: unknown, maxChars?: number): string {
   const fromArray = tryHistoryStringFromContentArray(data);
   const str = fromArray ?? JSON.stringify(data);
-  if (maxChars && str.length > maxChars) {
-    return safeSlice(str, 0, maxChars)
-      + '\n\n[truncated — original was ' + str.length + ' chars]';
-  }
-  return str;
+  return maxChars ? truncateForHistory(str, maxChars) : str;
+}
+
+/** Bounded copy of an arbitrary string with the standard truncation notice. */
+export function truncateForHistory(str: string, maxChars: number): string {
+  if (str.length <= maxChars) return str;
+  return safeSlice(str, 0, maxChars)
+    + '\n\n[truncated — original was ' + str.length + ' chars]';
 }
 
 /**

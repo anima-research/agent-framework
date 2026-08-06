@@ -138,6 +138,20 @@ export interface FrameworkConfig {
    */
   codeExecution?: CodeExecutionConfig;
 
+  /**
+   * Durable inline cap (chars) for tool results — successes AND errors — and
+   * background-script wake payloads. Content over the cap is written to a
+   * workspace file under `tool-results/` (deterministic `<date>-<callId>.txt`
+   * name, overwritten on collision, retained until the workspace owner
+   * deletes it — never auto-GC'd) and replaced inline by a bounded preview
+   * plus the file reference; with no writable workspace the fallback is
+   * explicit plain truncation. Default 5000 (house-safe; issue #89). Must be
+   * >= 1000. Values above the strategy-derived bound (maxMessageTokens * 4)
+   * are clamped down to it; the ephemeral agent_settings override
+   * `tool_result_inline_max_chars` still wins outright for one agent.
+   */
+  toolResultInlineMaxChars?: number;
+
   /** Inference routing policy for server-initiated inference (optional). */
   inferenceRouting?: InferenceRoutingPolicy;
 
