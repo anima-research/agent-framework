@@ -749,53 +749,6 @@ export interface BeforeInferenceResult {
   contextInjections: McplContextInjection[];
 }
 
-/**
- * context/afterInference params (Host → Server, Request or Notification).
- * Spec Section 10.5.
- */
-export interface AfterInferenceParams {
-  /** Inference identifier (matches beforeInference) */
-  inferenceId: string;
-
-  /** Persistent across turns */
-  conversationId: string;
-
-  /** 0-indexed turn number */
-  turnIndex: number;
-
-  /** Original user input */
-  userMessage: string | null;
-
-  /** Generated assistant response */
-  assistantMessage: string;
-
-  /** Model metadata */
-  model: McplModelInfo;
-
-  /** Token usage */
-  usage: {
-    inputTokens: number;
-    outputTokens: number;
-    cacheCreationTokens?: number;
-    cacheReadTokens?: number;
-  };
-}
-
-/**
- * context/afterInference result (Server → Host, only for blocking hooks).
- * Spec Section 10.5.
- */
-export interface AfterInferenceResult {
-  /** Feature set that provided this response */
-  featureSet: string;
-
-  /** Modified response text (replaces assistantMessage if present) */
-  modifiedResponse?: string;
-
-  /** Arbitrary metadata */
-  metadata?: Record<string, unknown>;
-}
-
 // ============================================================================
 // Section 11 — Server-Initiated Inference
 // ============================================================================
@@ -1195,9 +1148,13 @@ export const McplMethod = {
   // Push events (Server → Host)
   PushEvent: 'push/event',
 
-  // Context hooks (Host → Server)
+  // Context hooks (Host → Server). context/afterInference is gone with the
+  // rest of its surface: removed from the spec in 0.5.0 (§10.5, replaced by
+  // inference/lifecycle), never sent by the runtime, and not part of the
+  // package's public API. Pre-0.5 SERVERS' wire handlers for it are their
+  // own compatibility surface, retired on the fleet-on-0.5 evidence
+  // schedule, not here.
   BeforeInference: 'context/beforeInference',
-  AfterInference: 'context/afterInference',
 
   // Server-initiated inference (Server → Host / Host → Server)
   InferenceRequest: 'inference/request',

@@ -47,8 +47,6 @@ export type {
   BeforeInferenceParams,
   McplContextInjection,
   BeforeInferenceResult,
-  AfterInferenceParams,
-  AfterInferenceResult,
 
   // Server-initiated inference
   McplMessage,
