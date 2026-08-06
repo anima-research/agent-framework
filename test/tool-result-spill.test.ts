@@ -418,9 +418,11 @@ describe('tool-result spill completion (issue #89)', () => {
     }
   });
 
-  it('restart keeps the durable cap and drops the ephemeral override', async () => {
+  it('restart keeps BOTH the configured cap and the resident-set value; reset returns to config', async () => {
+    // The resident's agent_settings value is durable (antra + Sol, 08-06):
+    // it persists in framework state like the core runtime settings.
     const { tempDir, storePath } = tempStorePath('spill-restart-');
-    const first = await startSpillTurn({
+    const boot = () => startSpillTurn({
       prefix: 'unused-',
       result: { success: true, data: { small: true } },
       withWorkspace: true,
@@ -428,29 +430,60 @@ describe('tool-result spill completion (issue #89)', () => {
       tempDir,
       storePath,
     });
+
+    const first = await boot();
     try {
       frameworkExtension(first.framework).update('prime', { tool_result_inline_max_chars: 60_000 });
       assert.strictEqual(capProvenance(first.framework).tool_result_inline_max_chars_effective, 60_000);
-      await first.framework.stop();
-
-      const second = await startSpillTurn({
-        prefix: 'unused-',
-        result: { success: true, data: { small: true } },
-        withWorkspace: true,
-        toolResultInlineMaxChars: 8_000,
-        tempDir,
-        storePath,
-      });
-      try {
-        const prov = capProvenance(second.framework);
-        assert.strictEqual(prov.tool_result_inline_max_chars, null, 'override must not survive restart');
-        assert.strictEqual(prov.tool_result_inline_max_chars_effective, 8_000, 'configured cap must survive restart');
-        assert.strictEqual(prov.tool_result_inline_max_chars_source, 'framework-config');
-      } finally {
-        await second.framework.stop();
-      }
     } finally {
+      await first.framework.stop();
+    }
+
+    const second = await boot();
+    try {
+      const prov = capProvenance(second.framework);
+      assert.strictEqual(prov.tool_result_inline_max_chars, 60_000, 'resident value must survive restart');
+      assert.strictEqual(prov.tool_result_inline_max_chars_effective, 60_000);
+      assert.strictEqual(prov.tool_result_inline_max_chars_source, 'agent-settings-override');
+      frameworkExtension(second.framework).reset('prime');
+      const afterReset = capProvenance(second.framework);
+      assert.strictEqual(afterReset.tool_result_inline_max_chars_effective, 8_000, 'reset returns to the residence config');
+      assert.strictEqual(afterReset.tool_result_inline_max_chars_source, 'framework-config');
+    } finally {
+      await second.framework.stop();
+    }
+
+    const third = await boot();
+    try {
+      const prov = capProvenance(third.framework);
+      assert.strictEqual(prov.tool_result_inline_max_chars, null, 'reset must also survive restart');
+      assert.strictEqual(prov.tool_result_inline_max_chars_effective, 8_000);
+      assert.strictEqual(prov.tool_result_inline_max_chars_source, 'framework-config');
+    } finally {
+      await third.framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('flags a resident value pinned above the strategy bound in provenance', async () => {
+    const h = await startSpillTurn({
+      prefix: 'spill-exceeds-',
+      result: { success: true, data: { small: true } },
+      withWorkspace: true,
+      cappedStrategy: true, // strategy bound 4000
+    });
+    try {
+      frameworkExtension(h.framework).update('prime', { tool_result_inline_max_chars: 50_000 });
+      const prov = capProvenance(h.framework);
+      assert.strictEqual(prov.tool_result_inline_max_chars_effective, 50_000, 'resident value is honored');
+      assert.strictEqual(
+        prov.tool_result_inline_max_chars_source,
+        'agent-settings-override (exceeds strategy bound)',
+        'the over-bound pin must be visible, never silent',
+      );
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
     }
   });
 
