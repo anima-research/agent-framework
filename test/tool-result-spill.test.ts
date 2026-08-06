@@ -411,16 +411,19 @@ describe('tool-result spill completion (issue #89)', () => {
       assert.match(stored.content, /showing 4000 of \d+ chars/);
       const prov = capProvenance(h.framework);
       assert.strictEqual(prov.tool_result_inline_max_chars_effective, 4000);
-      assert.strictEqual(prov.tool_result_inline_max_chars_source, 'default (strategy-clamped)');
+      assert.strictEqual(prov.tool_result_inline_max_chars_source, 'default');
+      assert.strictEqual(prov.tool_result_inline_max_chars_clamped_by, 'strategy-bound');
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
     }
   });
 
-  it('restart keeps the durable cap and drops the ephemeral override', async () => {
+  it('restart keeps BOTH the configured cap and the resident-set value; reset returns to config', async () => {
+    // The resident's agent_settings value is durable (antra + Sol, 08-06):
+    // it persists in framework state like the core runtime settings.
     const { tempDir, storePath } = tempStorePath('spill-restart-');
-    const first = await startSpillTurn({
+    const boot = () => startSpillTurn({
       prefix: 'unused-',
       result: { success: true, data: { small: true } },
       withWorkspace: true,
@@ -428,29 +431,65 @@ describe('tool-result spill completion (issue #89)', () => {
       tempDir,
       storePath,
     });
+
+    const first = await boot();
     try {
       frameworkExtension(first.framework).update('prime', { tool_result_inline_max_chars: 60_000 });
       assert.strictEqual(capProvenance(first.framework).tool_result_inline_max_chars_effective, 60_000);
-      await first.framework.stop();
-
-      const second = await startSpillTurn({
-        prefix: 'unused-',
-        result: { success: true, data: { small: true } },
-        withWorkspace: true,
-        toolResultInlineMaxChars: 8_000,
-        tempDir,
-        storePath,
-      });
-      try {
-        const prov = capProvenance(second.framework);
-        assert.strictEqual(prov.tool_result_inline_max_chars, null, 'override must not survive restart');
-        assert.strictEqual(prov.tool_result_inline_max_chars_effective, 8_000, 'configured cap must survive restart');
-        assert.strictEqual(prov.tool_result_inline_max_chars_source, 'framework-config');
-      } finally {
-        await second.framework.stop();
-      }
     } finally {
+      await first.framework.stop();
+    }
+
+    const second = await boot();
+    try {
+      const prov = capProvenance(second.framework);
+      assert.strictEqual(prov.tool_result_inline_max_chars, 60_000, 'resident value must survive restart');
+      assert.strictEqual(prov.tool_result_inline_max_chars_effective, 60_000);
+      assert.strictEqual(prov.tool_result_inline_max_chars_source, 'agent-settings-override');
+      frameworkExtension(second.framework).reset('prime');
+      const afterReset = capProvenance(second.framework);
+      assert.strictEqual(afterReset.tool_result_inline_max_chars_effective, 8_000, 'reset returns to the residence config');
+      assert.strictEqual(afterReset.tool_result_inline_max_chars_source, 'framework-config');
+    } finally {
+      await second.framework.stop();
+    }
+
+    const third = await boot();
+    try {
+      const prov = capProvenance(third.framework);
+      assert.strictEqual(prov.tool_result_inline_max_chars, null, 'reset must also survive restart');
+      assert.strictEqual(prov.tool_result_inline_max_chars_effective, 8_000);
+      assert.strictEqual(prov.tool_result_inline_max_chars_source, 'framework-config');
+    } finally {
+      await third.framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('hard-clamps a resident value above the strategy bound, reporting desired AND effective', async () => {
+    // Sol's #94 ruling: persist the desired cap, but the effective inline
+    // cap is min(desired, strategy bound) — durable preference must not be a
+    // durable path past the per-message safety limit.
+    const h = await startSpillTurn({
+      prefix: 'spill-exceeds-',
+      result: { success: true, data: { blob: 'q'.repeat(42_000) } },
+      withWorkspace: true,
+      cappedStrategy: true, // strategy bound 4000
+    });
+    try {
+      frameworkExtension(h.framework).update('prime', { tool_result_inline_max_chars: 50_000 });
+      const prov = capProvenance(h.framework);
+      assert.strictEqual(prov.tool_result_inline_max_chars, 50_000, 'desired value is preserved');
+      assert.strictEqual(prov.tool_result_inline_max_chars_effective, 4_000, 'effective is hard-clamped');
+      assert.strictEqual(prov.tool_result_inline_max_chars_source, 'agent-settings-override');
+      assert.strictEqual(prov.tool_result_inline_max_chars_clamped_by, 'strategy-bound');
+      // The clamp is enforced on the wire, not just reported.
+      const stored = await waitForStoredToolResult(h.framework);
+      assert.ok(stored, 'tool result should be stored');
+      assert.match(stored.content, /showing 4000 of \d+ chars/);
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
     }
   });
 

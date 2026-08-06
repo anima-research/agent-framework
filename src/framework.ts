@@ -786,9 +786,10 @@ export class AgentFramework {
    *  provenance envelope + payload and requests inference. Keyed by script id. */
   private backgroundScripts: Map<string, BackgroundScriptRecord> = new Map();
   private backgroundScriptCounter = 0;
-  /** Ephemeral per-agent override of the tool-result inline cap (chars).
-   *  Set via agent_settings `tool_result_inline_max_chars`; NOT persisted —
-   *  the lift is meant as a temporary gate, reverts on restart/reset. */
+  /** Resident-set per-agent tool-result inline cap (chars), via
+   *  agent_settings `tool_result_inline_max_chars`. DURABLE: persisted in
+   *  framework state like the core runtime settings and restored at create
+   *  (antra + Sol, 08-06); reset clears it back to the residence default. */
   private toolResultInlineMaxCharsOverride: Map<string, number> = new Map();
   /** Durable residence-configured inline cap from
    *  FrameworkConfig.toolResultInlineMaxChars; null → house default. */
@@ -1078,6 +1079,12 @@ export class AgentFramework {
         throw new Error('FrameworkConfig.toolResultInlineMaxChars must be a number >= 1000');
       }
       framework.toolResultInlineMaxCharsConfig = Math.floor(cap);
+    }
+
+    // Restore resident-set inline caps (agent_settings) — durable like the
+    // core runtime settings, same framework/state slot (antra + Sol, 08-06).
+    for (const [agentName, cap] of Object.entries(framework.readPersistedToolResultInlineCaps())) {
+      framework.toolResultInlineMaxCharsOverride.set(agentName, cap);
     }
 
     // Initialize MCPL subsystems if configured
@@ -1521,10 +1528,11 @@ export class AgentFramework {
   private collectAgentSettingsExtensions(): Map<string, AgentSettingsExtension> {
     const result = new Map<string, AgentSettingsExtension>();
     const taken = new Set<string>(AgentFramework.AGENT_SETTINGS_CORE_KEYS);
-    // Framework-owned extension: the tool-result inline cap lift. Registered
-    // through the same extension surface modules use so get/update/reset all
-    // work with zero extra plumbing. EPHEMERAL by design (a temporary gate —
-    // reverts on restart), unlike module extensions which persist their own.
+    // Framework-owned extension: the resident's tool-result inline cap.
+    // Registered through the same extension surface modules use so
+    // get/update/reset all work with zero extra plumbing. DURABLE: persisted
+    // in framework state and restored at create, like the core runtime
+    // settings (antra + Sol, 08-06); reset returns to the residence default.
     {
       const ext = this.spillSettingsExtension();
       ext.keys.forEach((k) => taken.add(k));
@@ -1556,10 +1564,11 @@ export class AgentFramework {
             'Inline size cap (chars) for tool results (successes and errors) and ' +
             'background-script wake payloads. Content over the cap is written to a workspace ' +
             'file under tool-results/ and replaced by a truncated preview + file reference. ' +
-            'Raise it temporarily when you genuinely want a large result inline; reset ' +
-            'restores the durable residence default. Ephemeral — reverts on host restart. ' +
-            'The effective cap and its source are reported as ' +
-            'tool_result_inline_max_chars_effective / _source on get.',
+            'This is YOUR durable setting: it persists across restarts, like your other ' +
+            'agent_settings. Update it when you want a different inline size; reset restores ' +
+            'the residence default. The effective cap is min(your value, your strategy\'s ' +
+            'per-message bound) — the bound is a safety ceiling, and the full content is ' +
+            'always in the spill file. get reports desired/_effective/_source/_clamped_by.',
         },
       },
       keys: ['tool_result_inline_max_chars'],
@@ -1570,9 +1579,8 @@ export class AgentFramework {
           tool_result_inline_max_chars:
             this.toolResultInlineMaxCharsOverride.get(agentName) ?? null,
           tool_result_inline_max_chars_effective: resolved?.cap ?? null,
-          tool_result_inline_max_chars_source: resolved
-            ? resolved.source + (resolved.strategyClamped ? ' (strategy-clamped)' : '')
-            : null,
+          tool_result_inline_max_chars_source: resolved?.source ?? null,
+          tool_result_inline_max_chars_clamped_by: resolved?.clampedBy ?? null,
         };
       },
       update: (agentName: string, patch: Record<string, unknown>) => {
@@ -1581,11 +1589,13 @@ export class AgentFramework {
           throw new Error('tool_result_inline_max_chars must be a number >= 1000');
         }
         this.toolResultInlineMaxCharsOverride.set(agentName, Math.floor(n));
+        this.persistToolResultInlineCap(agentName, Math.floor(n));
         return { tool_result_inline_max_chars: Math.floor(n) };
       },
       reset: (agentName: string, keys?: string[]) => {
         if (!keys || keys.includes('tool_result_inline_max_chars')) {
           this.toolResultInlineMaxCharsOverride.delete(agentName);
+          this.persistToolResultInlineCap(agentName, null);
         }
         return { tool_result_inline_max_chars: null };
       },
@@ -2013,6 +2023,44 @@ export class AgentFramework {
       );
     }
     return overrides;
+  }
+
+  /** Load resident-set inline caps from framework state, dropping (loudly)
+   *  anything that fails the same validation the live update enforces. */
+  private readPersistedToolResultInlineCaps(): Record<string, number> {
+    try {
+      const data = this.store.getStateJson(FRAMEWORK_STATE_ID) as {
+        toolResultInlineCaps?: Record<string, unknown>;
+      } | null;
+      const out: Record<string, number> = {};
+      for (const [name, value] of Object.entries(data?.toolResultInlineCaps ?? {})) {
+        const n = Number(value);
+        if (Number.isFinite(n) && n >= 1000) {
+          out[name] = Math.floor(n);
+        } else {
+          console.error(
+            `[agent-settings] dropping invalid persisted tool_result_inline_max_chars for '${name}': ${JSON.stringify(value)}`,
+          );
+        }
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
+  /** Write (cap) or clear (null) one agent's resident-set inline cap. */
+  private persistToolResultInlineCap(agentName: string, cap: number | null): void {
+    const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+    const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+    const all = {
+      ...((state.toolResultInlineCaps as Record<string, number> | undefined) ?? {}),
+    };
+    if (cap === null) delete all[agentName];
+    else all[agentName] = cap;
+    if (Object.keys(all).length === 0) delete state.toolResultInlineCaps;
+    else state.toolResultInlineCaps = all;
+    this.store.setStateJson(FRAMEWORK_STATE_ID, state);
   }
 
   private persistAgentRuntimeSettings(
@@ -6983,7 +7031,7 @@ export class AgentFramework {
           return {
             text: safeSlice(content, 0, cap)
               + `\n\n[truncated — showing ${cap} of ${content.length} chars; full content: workspace file ${path}. `
-              + 'Read/grep it with your file tools, or raise the inline cap temporarily via '
+              + 'Read/grep it with your file tools, or raise the inline cap via '
               + 'agent_settings update tool_result_inline_max_chars.]',
             filePath: path,
           };
@@ -7215,30 +7263,33 @@ export class AgentFramework {
   }
 
   /**
-   * Effective tool-result inline cap for an agent, with provenance:
-   * agent_settings hot override (wins outright, ephemeral) → durable
-   * FrameworkConfig.toolResultInlineMaxChars → house default (5000). The
-   * durable/default value is clamped down to the strategy-derived bound when
-   * that is smaller (a message must still fit maxMessageTokens); the explicit
-   * override escapes the clamp — a deliberate temporary lift.
+   * Effective tool-result inline cap for an agent, with provenance. Desired
+   * value: resident's durable agent_settings value → residence
+   * FrameworkConfig.toolResultInlineMaxChars → house default (5000).
+   * Effective value: min(desired, strategy bound) for EVERY source — the
+   * strategy's per-message safety limit is a ceiling, not a suggestion
+   * (Sol's #94 ruling: a durable preference must not be a durable path for
+   * one tool result to exceed maxMessageTokens; the way to see the whole
+   * result is the spill file, not an over-bound blob in live context).
    */
   private resolveToolResultInlineCap(agent: Agent): {
     cap: number;
     source: 'agent-settings-override' | 'framework-config' | 'default';
-    strategyClamped: boolean;
+    /** Set when the desired value was reduced to the strategy bound. */
+    clampedBy: 'strategy-bound' | null;
   } {
     const override = this.toolResultInlineMaxCharsOverride.get(agent.name);
-    if (override !== undefined) {
-      return { cap: override, source: 'agent-settings-override', strategyClamped: false };
-    }
     const configured = this.toolResultInlineMaxCharsConfig;
-    const base = configured ?? DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
+    const desired = override ?? configured ?? DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
+    const source = override !== undefined
+      ? 'agent-settings-override' as const
+      : configured !== null ? 'framework-config' as const : 'default' as const;
     const strategyBound = this.strategyDerivedToolResultChars(agent);
-    const strategyClamped = strategyBound !== undefined && strategyBound < base;
+    const clamped = strategyBound !== undefined && strategyBound < desired;
     return {
-      cap: strategyClamped ? strategyBound : base,
-      source: configured !== null ? 'framework-config' : 'default',
-      strategyClamped,
+      cap: clamped ? strategyBound : desired,
+      source,
+      clampedBy: clamped ? 'strategy-bound' : null,
     };
   }
 

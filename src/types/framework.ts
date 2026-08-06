@@ -146,9 +146,12 @@ export interface FrameworkConfig {
    * deletes it — never auto-GC'd) and replaced inline by a bounded preview
    * plus the file reference; with no writable workspace the fallback is
    * explicit plain truncation. Default 5000 (house-safe; issue #89). Must be
-   * >= 1000. Values above the strategy-derived bound (maxMessageTokens * 4)
-   * are clamped down to it; the ephemeral agent_settings override
-   * `tool_result_inline_max_chars` still wins outright for one agent.
+   * >= 1000. A resident's own agent_settings value
+   * `tool_result_inline_max_chars` (durable, persisted in framework state)
+   * takes precedence over this for that agent; the EFFECTIVE cap for every
+   * source is min(desired, strategy bound) — desired values above the
+   * strategy-derived bound (maxMessageTokens * 4) are hard-clamped to it,
+   * with the clamp reported via agent_settings get.
    */
   toolResultInlineMaxChars?: number;
 
