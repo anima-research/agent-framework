@@ -169,6 +169,19 @@ export type TraceEvent =
       agentStatus: string;
       result: unknown;
     })
+  | (TraceEventBase & {
+      /**
+       * A writable workspace existed but the oversized-result spill write
+       * failed (size cap, storeBlob failure, …) — the over-cap tail was NOT
+       * retained. Distinct from the no-workspace fallback, which is silent
+       * by design (nothing unexpected happened).
+       */
+      type: 'tool:spill_failed';
+      label: string;
+      path: string;
+      contentLength: number;
+      error: string;
+    })
 
   // Module lifecycle
   | (TraceEventBase & { type: 'module:added'; moduleName: string })

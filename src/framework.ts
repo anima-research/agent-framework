@@ -6984,6 +6984,7 @@ export class AgentFramework {
     if (workspace && mountName) {
       const safeLabel = label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
       const path = `${mountName}/tool-results/${safeLabel}.txt`;
+      let failure: string;
       try {
         const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain');
         if (result.success) {
@@ -6995,9 +6996,30 @@ export class AgentFramework {
             filePath: path,
           };
         }
-      } catch {
-        // fall through to plain truncation
+        failure = result.error ?? 'write refused';
+      } catch (err) {
+        failure = err instanceof Error ? err.message : String(err);
       }
+      // A workspace was there and the write FAILED — say that, loudly and
+      // distinctly. Telling the agent "no writable workspace" would teach
+      // them their residence lacks a capability it actually has.
+      failure = failure.slice(0, 200);
+      this.emitTrace({
+        type: 'tool:spill_failed',
+        label: safeLabel,
+        path,
+        contentLength: content.length,
+        error: failure,
+      });
+      console.error(
+        `[spill] workspace write failed for ${path} (${content.length} chars): ${failure}`,
+      );
+      return {
+        text: safeSlice(content, 0, cap)
+          + `\n\n[truncated — showing ${cap} of ${content.length} chars; spill to workspace file ${path} FAILED`
+          + ` (${failure}); content over the cap was not retained]`,
+        filePath: null,
+      };
     }
     return {
       text: safeSlice(content, 0, cap)

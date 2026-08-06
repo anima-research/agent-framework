@@ -22,9 +22,13 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, PassthroughStrategy } from '../src/index.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
+
+class CappedPassthroughStrategy extends PassthroughStrategy {
+  readonly maxMessageTokens = 1000;
+}
 
 function tempStorePath(prefix: string): { tempDir: string; storePath: string } {
   const tempDir = mkdtempSync(join(tmpdir(), prefix));
@@ -71,6 +75,8 @@ async function startSpillTurn(opts: {
   result: ToolResult;
   withWorkspace: boolean;
   toolResultInlineMaxChars?: number;
+  workspaceMaxFileSize?: number;
+  cappedStrategy?: boolean;
   storePath?: string;
   tempDir?: string;
 }): Promise<SpillHarness> {
@@ -90,7 +96,15 @@ async function startSpillTurn(opts: {
     const mountDir = join(tempDir, 'mount');
     mkdirSync(mountDir, { recursive: true });
     workspace = new WorkspaceModule({
-      mounts: [{ name: 'files', path: mountDir, mode: 'read-write', watch: 'never' }],
+      mounts: [{
+        name: 'files',
+        path: mountDir,
+        mode: 'read-write',
+        watch: 'never',
+        ...(opts.workspaceMaxFileSize !== undefined
+          ? { maxFileSize: opts.workspaceMaxFileSize }
+          : {}),
+      }],
     });
     modules.push(workspace as unknown as Module);
   }
@@ -103,6 +117,7 @@ async function startSpillTurn(opts: {
       model: 'test-model',
       systemPrompt: 'You are prime.',
       allowedTools: 'all',
+      ...(opts.cappedStrategy ? { strategy: new CappedPassthroughStrategy() as never } : {}),
     }],
     modules,
     syncIntervalMs: 0,
@@ -343,6 +358,60 @@ describe('tool-result spill completion (issue #89)', () => {
       assert.ok(text?.text, 'text block expected');
       assert.ok(text.text.length < 6_000, 'text block must be capped');
       assert.match(text.text, /full serialized result: workspace file files\/tool-results\//);
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a FAILED spill write distinctly from having no workspace, with a trace', async () => {
+    // A writable mount exists but refuses the write (size cap). The agent
+    // must NOT be told "no writable workspace" — that teaches them their
+    // residence lacks a capability it actually has (opus-rev finding #1).
+    const h = await startSpillTurn({
+      prefix: 'spill-wfail-',
+      result: { success: true, data: { blob: 'w'.repeat(60_000) } },
+      withWorkspace: true,
+      workspaceMaxFileSize: 20_000,
+    });
+    const traces: Array<Record<string, unknown>> = [];
+    h.framework.onTrace((e) => {
+      if ((e as { type: string }).type === 'tool:spill_failed') {
+        traces.push(e as unknown as Record<string, unknown>);
+      }
+    });
+    try {
+      const stored = await waitForStoredToolResult(h.framework);
+      assert.ok(stored, 'tool result should be stored');
+      assert.match(stored.content, /spill to workspace file files\/tool-results\/\S+\.txt FAILED \(/);
+      assert.match(stored.content, /content over the cap was not retained/);
+      assert.doesNotMatch(stored.content, /no writable workspace/);
+      assert.strictEqual(traces.length, 1, 'exactly one tool:spill_failed trace expected');
+      assert.strictEqual(traces[0].contentLength, 60_011);
+      assert.match(String(traces[0].path), /files\/tool-results\//);
+      assert.ok(String(traces[0].error).length > 0, 'trace should carry the failure reason');
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('clamps the default down to the strategy bound and reports it', async () => {
+    // maxMessageTokens=1000 → strategy bound 4000 < default 5000. This branch
+    // decides the cap for every resident on a bounded strategy — pin it.
+    const h = await startSpillTurn({
+      prefix: 'spill-clamp-',
+      result: { success: true, data: { blob: 'c'.repeat(42_000) } },
+      withWorkspace: true,
+      cappedStrategy: true,
+    });
+    try {
+      const stored = await waitForStoredToolResult(h.framework);
+      assert.ok(stored, 'tool result should be stored');
+      assert.match(stored.content, /showing 4000 of \d+ chars/);
+      const prov = capProvenance(h.framework);
+      assert.strictEqual(prov.tool_result_inline_max_chars_effective, 4000);
+      assert.strictEqual(prov.tool_result_inline_max_chars_source, 'default (strategy-clamped)');
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
