@@ -5,8 +5,10 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
+import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
+import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
 import type {
   MessageId,
   MessageMetadata,
@@ -841,7 +843,23 @@ export class AgentFramework {
 
   // Messages deferred while an agent is waiting_for_tools (to preserve
   // tool_use → tool_result adjacency required by the Anthropic API).
-  private deferredMessages: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
+  /** The subconscious resident's registry name (issue #77), or null. */
+  private subconsciousAgentName: string | null = null;
+  /** Its windowed strategy — the coordinator moves the anchor on tune-out entry. */
+  private subconsciousStrategy: WindowedPassthroughStrategy | null = null;
+  /** Its config (speak_in_channel gate, voice block provenance). */
+  private subconsciousConfig: SubconsciousConfig | null = null;
+  /** Tune-out coordinator (issue #77); non-null iff subconscious + channels. */
+  private tuneOutCoordinator: TuneOutCoordinator | null = null;
+
+  private deferredMessages: Array<{
+    participant: string;
+    content: ContentBlock[];
+    metadata?: MessageMetadata;
+    /** Delivery target (registry name). Absent = the primary agent —
+     *  the historical behavior of every existing caller. */
+    forAgent?: string;
+  }> = [];
 
   // Turn-alive markers (2026-07-31 Mythos phantom-skip incident): agentName →
   // token of the turn currently in progress. Set at startAgentStream ENTRY —
@@ -1118,6 +1136,13 @@ export class AgentFramework {
       await framework.createAgent(agentConfig);
     }
 
+    // The subconscious resident (issue #77) registers after the residents so
+    // it can never become primary; it is excluded from every broadcast
+    // fan-out and woken only by the tune-out coordinator's explicit pushes.
+    if (config.subconscious?.enabled) {
+      await framework.createSubconsciousAgent(config.subconscious);
+    }
+
     // Finish any branch-local suppression interrupted after Chronicle switched
     // branches. This runs before modules, MCPL connections, or inbound traffic.
     await framework.resumePreparedDiscordSuppressions();
@@ -1167,11 +1192,12 @@ export class AgentFramework {
         initialConfig: config.gate.config,
         privilegedUsersPath: config.gate.privilegedUsersPath,
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
-        addMessage: (p, c, m) => framework.addMessage(p, c, m as MessageMetadata),
+        addMessage: (p, c, m, forAgent) => framework.addMessage(p, c, m as MessageMetadata, forAgent ? { forAgent } : undefined),
         requestInference: (agentName, reason, source) => {
           framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
         },
-        getAgentNames: () => [...framework.agents.keys()],
+        getAgentNames: () => [...framework.agents.keys()].filter(
+          (n) => n !== framework.subconsciousAgentName),
       });
     }
 
@@ -1232,6 +1258,40 @@ export class AgentFramework {
       }
 
       await framework.initializeMcpl(config.mcplServers, config.inferenceRouting);
+    }
+
+    // Tune-out coordinator (issue #77): needs both the subconscious resident
+    // and the MCPL channel subsystem; created after both exist.
+    if (framework.subconsciousAgentName && framework.channelRegistry) {
+      framework.tuneOutCoordinator = new TuneOutCoordinator(
+        framework.channelRegistry,
+        framework.mcplServerRegistry!,
+        {
+          addMessage: (participant, content, metadata, forAgent) =>
+            framework.addMessage(participant, content, metadata as MessageMetadata,
+              forAgent ? { forAgent } : undefined),
+          requestInference: (agentName, reason, source) => {
+            framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
+          },
+          subconsciousName: () => framework.subconsciousAgentName,
+          primaryName: () => framework.primaryAgentName,
+          getStoredMessages: () => {
+            const primary = framework.primaryAgentName
+              ? framework.agents.get(framework.primaryAgentName) : undefined;
+            return primary ? primary.getContextManager().getAllMessages() : [];
+          },
+          currentSequence: () => framework.store.currentSequence(),
+          setSubconsciousAnchor: (sequence) =>
+            framework.subconsciousStrategy?.setAnchor(sequence),
+          isForkBound: (channelId) =>
+            [...framework.conversationAgentHomes.values()].includes(channelId),
+          isPrivilegedAuthor: (authorId) =>
+            framework.eventGate?.isPrivilegedUser(authorId) ?? false,
+          allowChannelSpeech: () => !!framework.subconsciousConfig?.allowChannelSpeech,
+          emitTrace: (e) => framework.emitTrace(e as never),
+        },
+      );
+      framework.tuneOutCoordinator.resumeActiveEpochs();
     }
 
     // Diagnostics: `kill -USR2 <pid>` dumps live wake/inference state to stderr
@@ -1303,6 +1363,7 @@ export class AgentFramework {
     this.running = false;
     this.providerAdmissionClosed = true;
     this.queue.close();
+    this.tuneOutCoordinator?.stop();
 
     // Kill running code_execution scripts before cancelling streams: a
     // zombie script must not keep firing side-effectful tool calls into a
@@ -1739,6 +1800,9 @@ export class AgentFramework {
   getAllTools(): import('./types/index.js').ToolDefinition[] {
     const moduleTools = this.moduleRegistry.getAllTools();
     const channelTools = this.channelRegistry?.getChannelTools() ?? [];
+    if (this.tuneOutCoordinator) {
+      channelTools.push(AgentFramework.TUNE_OUT_TOOL);
+    }
     const gateTools = this.eventGate
       ? [
           this.eventGate.getToolDefinition(),
@@ -1988,6 +2052,20 @@ export class AgentFramework {
     agentName: string,
     snapshot?: InferenceToolSnapshot,
   ): import('./types/index.js').ToolDefinition[] {
+    // The subconscious gets its own small surface (plus think/skip_reply/
+    // end_turn), not the residents' tool board: no channel lifecycle, no
+    // gate rules, no workspace — it observes, judges, and reports.
+    if (agentName === this.subconsciousAgentName) {
+      const basics = this.getAllTools()
+        .filter((t) => t.name === 'think' || t.name === 'skip_reply' || t.name === 'end_turn')
+        .map((t) => t.name === 'think'
+          ? this.buildThinkTool(
+              snapshot?.sameRoundThinkTextPolicy
+                ?? this.getAgentRuntimeSettings(agentName).sameRoundThinkTextPolicy,
+            )
+          : t);
+      return [...SUBCONSCIOUS_TOOLS, ...basics];
+    }
     return this.getAllTools().map((tool) => {
       if (tool.name === 'think') {
         return this.buildThinkTool(
@@ -2583,6 +2661,31 @@ export class AgentFramework {
    * Query inference logs.
    * Returns entries with summary info (doesn't resolve blobs).
    */
+  /** Tune-out (issue #77): divert a channel to your subconscious. Present
+   *  only when the subconscious resident is configured. */
+  private static readonly TUNE_OUT_TOOL: import('./types/index.js').ToolDefinition = {
+    name: 'tune_out',
+    description:
+      'Divert a channel to your subconscious for a while: its traffic stops ' +
+      'entering your context and stops waking you. Your subconscious watches ' +
+      'it instead — summarizing on a cadence in its own voice, judging ' +
+      'whether mentions merit interrupting, and able to cancel. People who ' +
+      'mention you get an automatic reaction so they know you saw nothing. ' +
+      'Cancelling (mode "cancel") delivers the diverted backlog. The ' +
+      'tune-out auto-cancels after maxWakes mention-bursts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channelId: { type: 'string' },
+        mode: { type: 'string', enum: ['enter', 'cancel'], description: 'Default: enter.' },
+        cadenceSeconds: { type: 'number', description: `Summary cadence (default ${TUNE_OUT_DEFAULTS.cadenceSeconds}s).` },
+        backlogCap: { type: 'number', description: `Max raw messages delivered at cancel (default ${TUNE_OUT_DEFAULTS.backlogCap}).` },
+        maxWakes: { type: 'number', description: `Wake budget before auto-cancel (default ${TUNE_OUT_DEFAULTS.maxWakes}).` },
+      },
+      required: ['channelId'],
+    },
+  };
+
   /** Synthesized sleep/wake tool definitions (present when a gate is wired). */
   private static readonly SLEEP_TOOLS: import('./types/index.js').ToolDefinition[] = [
     {
@@ -4026,6 +4129,15 @@ export class AgentFramework {
       // streaming agent keeps the original Membrane.
       membrane: this.auxiliaryMembraneFor(config.name),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
+      // Tune-out (issue #77): messages stamped at ingestion as diverted
+      // (metadata.tuneOut = { epochId }) never enter a resident's compiled
+      // view — not at emission, not via chunking into the memory pyramid.
+      // The stamp is permanent: after cancel, the backlog arrives as one
+      // appended <tuned-out-backlog> dump instead of retro-inserting into
+      // the timeline (KV-prefix-stable delivery). The stored originals
+      // remain in the shared slot for the subconscious's merged view,
+      // fetch_history, and audit.
+      viewFilter: (message) => !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut,
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
@@ -4043,6 +4155,60 @@ export class AgentFramework {
       this.primaryAgentName = config.name;
     }
 
+    return agent;
+  }
+
+  /**
+   * Create and register the subconscious resident (issue #77): a persistent
+   * side-agent with an isolated slot (`subconscious/<primary>`) whose
+   * strategy view merges the residents' shared timeline with its own —
+   * including the tuned-out-stamped messages the residents' viewFilter
+   * excludes; the backlog is precisely what it exists to see. Windowed
+   * passthrough, no memory pyramid: its durable output is what it delivers
+   * into the resident's window, which accumulates there.
+   */
+  private async createSubconsciousAgent(cfg: SubconsciousConfig): Promise<Agent> {
+    const primaryName = this.primaryAgentName;
+    const primaryConfig = primaryName ? this.agentConfigs.get(primaryName) : undefined;
+    if (!primaryName || !primaryConfig) {
+      throw new Error('subconscious requires a primary agent to attend to');
+    }
+    const name = cfg.name ?? 'Subconscious';
+    if (this.agents.has(name)) {
+      throw new Error(`subconscious name "${name}" collides with a registered agent`);
+    }
+
+    const strategy = new WindowedPassthroughStrategy({
+      reAnchorFraction: cfg.reAnchorFraction,
+    });
+    const contextManager = await ContextManager.open({
+      store: this.store,
+      namespace: `subconscious/${primaryName}`,
+      isolate: true,
+      // The residents' shared un-namespaced slot, merged read-only and
+      // UNfiltered (no viewFilter here — stamped messages included).
+      auxiliaryMessageViews: [{}],
+      strategy,
+      membrane: this.membrane,
+      debugLogContext: !!process.env.DEBUG_CONTEXT,
+    });
+
+    const agentConfig: AgentConfig = {
+      name,
+      model: cfg.model ?? primaryConfig.model,
+      systemPrompt: cfg.systemPrompt,
+      // Prose is never auto-routed: a cadence-triggered turn carries no
+      // locus, and bare prose must not fall through to the default channel.
+      // Speech happens only via speak_in_channel (its own marked voice).
+      proseRouting: 'explicit',
+      allowedTools: [...SUBCONSCIOUS_TOOL_NAMES, 'think', 'skip_reply', 'end_turn'],
+    };
+    const agent = new Agent(agentConfig, contextManager, this.membrane);
+    this.agents.set(name, agent);
+    this.agentConfigs.set(name, agentConfig);
+    this.subconsciousAgentName = name;
+    this.subconsciousStrategy = strategy;
+    this.subconsciousConfig = cfg;
     return agent;
   }
 
@@ -4184,12 +4350,11 @@ export class AgentFramework {
           // queued, they flush at the target's own next boundary — with
           // injection — or in driveStream's finally when its turn ends.
           const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
-          if (this.deferredMessages.length > 0) {
-            const target = (this.primaryAgentName ? this.agents.get(this.primaryAgentName) : undefined) ?? agent;
-            if (target === agent) {
-              const deferred = this.deferredMessages.splice(0);
+          {
+            const deferred = this.drainDeferredFor(agent.name);
+            if (deferred.length > 0) {
               for (const msg of deferred) {
-                target.getContextManager().addMessage(msg.participant, msg.content, msg.metadata);
+                agent.getContextManager().addMessage(msg.participant, msg.content, msg.metadata);
                 // Injection guards: tool blocks would corrupt the tool-cycle
                 // structure the membrane enforces, and a message named as the
                 // agent itself would render as an ASSISTANT turn on the wire
@@ -4524,7 +4689,8 @@ export class AgentFramework {
       // their own channel's messages, not by framework-wide events.
       const targetAgents =
         response.requestInference === true
-          ? Array.from(this.agents.keys()).filter((n) => !this.conversationAgentHomes.has(n))
+          ? Array.from(this.agents.keys()).filter(
+              (n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName)
           : response.requestInference;
 
       for (const agentName of targetAgents) {
@@ -4561,6 +4727,7 @@ export class AgentFramework {
     metadata?: Record<string, unknown>;
     tags?: string[];
     triggerInference?: boolean;
+    targetAgents?: string[];
   }): Promise<void> {
     const metadata: Record<string, unknown> = {
       ...event.metadata,
@@ -4607,12 +4774,35 @@ export class AgentFramework {
       }
     }
 
+    // Tune-out divert (issue #77): stamped, stored, no resident wake. The
+    // coordinator has already handled wake bookkeeping (coalesced
+    // subconscious invocation, durable count, suppression ack) before we
+    // stamp; the subconscious reads the message through its merged view.
+    const divert = this.tuneOutCoordinator?.onIncoming(
+      event.serverId,
+      event.channelId,
+      event.messageId,
+      event.tags,
+      event.author?.id,
+    ) ?? null;
+    if (divert) {
+      metadata.tuneOut = { epochId: divert.epochId };
+    }
+
     const id = this.addMessage('user', incomingContent, metadata);
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
-    if (event.triggerInference) {
+    if (event.triggerInference && !divert) {
       const addressed = isAddressedMessage(event.tags, event.metadata);
-      for (const agentName of this.agents.keys()) {
+      // Honor explicit targeting, mirroring the push-event path: an event
+      // that names its agents wakes exactly those; an untargeted event
+      // keeps the historical broadcast. (targetAgents was declared on
+      // McplChannelIncomingEvent from the start but never honored here —
+      // tune-out's wake routing is the first setter.)
+      const targetAgents = event.targetAgents
+        ?? [...this.agents.keys()].filter((n) => n !== this.subconsciousAgentName);
+      for (const agentName of targetAgents) {
+        if (!this.agents.has(agentName)) continue;
         this.pendingRequests.push({
           agentName,
           reason: 'mcpl:channel-incoming',
@@ -5038,7 +5228,8 @@ export class AgentFramework {
     if (event.triggerInference) {
       // Default broadcast excludes conversation forks (channel-driven).
       const targetAgents = event.targetAgents
-        ?? [...this.agents.keys()].filter((n) => !this.conversationAgentHomes.has(n));
+        ?? [...this.agents.keys()].filter(
+          (n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName);
       for (const agentName of targetAgents) {
         this.pendingRequests.push({
           agentName,
@@ -5820,9 +6011,8 @@ export class AgentFramework {
       trigger?.reason !== 'context_budget_restart' &&
       this.deferredMessages.length > 0
     ) {
-      const target = (this.primaryAgentName ? this.agents.get(this.primaryAgentName) : undefined) ?? agent;
-      if (target === agent) {
-        const deferred = this.deferredMessages.splice(0);
+      {
+        const deferred = this.drainDeferredFor(agent.name);
         for (const msg of deferred) {
           // Per-message try/catch (mirrors announceLocusIfChanged): one
           // poison message — or a transient store-write failure — must not
@@ -7215,11 +7405,15 @@ export class AgentFramework {
         this.activeTurnTokens.delete(agent.name);
       }
 
-      // Flush any deferred messages (e.g. if stream failed while tools were pending)
+      // Flush any deferred messages (e.g. if stream failed while tools were
+      // pending). Only THIS agent's messages: other targets' entries wait
+      // for their own boundaries (re-adding via addMessage re-defers if the
+      // target has meanwhile started a turn).
       if (this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
-        const deferred = this.deferredMessages.splice(0);
+        const deferred = this.drainDeferredFor(agent.name);
         for (const msg of deferred) {
-          this.addMessage(msg.participant, msg.content, msg.metadata);
+          this.addMessage(msg.participant, msg.content, msg.metadata,
+            msg.forAgent ? { forAgent: msg.forAgent } : undefined);
         }
       }
     }
@@ -8320,6 +8514,30 @@ export class AgentFramework {
       return;
     }
 
+    // Route the tune-out tool (residents) and the subconscious's surface
+    if (enrichedCall.name === 'tune_out' && this.tuneOutCoordinator) {
+      this.dispatchTuneOutToolCall(agentName, enrichedCall);
+      return;
+    }
+    if (
+      this.tuneOutCoordinator &&
+      agentName === this.subconsciousAgentName &&
+      (SUBCONSCIOUS_TOOL_NAMES as readonly string[]).includes(enrichedCall.name)
+    ) {
+      void this.tuneOutCoordinator
+        .handleSubconsciousTool(enrichedCall.name, enrichedCall.input as Record<string, unknown>)
+        .then((result) => {
+          this.queue.push({
+            type: 'tool-result',
+            callId: enrichedCall.id,
+            agentName,
+            moduleName: 'tune-out',
+            result,
+          });
+        });
+      return;
+    }
+
     // Route sleep / wake tools
     if ((enrichedCall.name === 'sleep' || enrichedCall.name === 'wake') && this.eventGate) {
       this.dispatchSleepToolCall(agentName, enrichedCall);
@@ -8464,13 +8682,32 @@ export class AgentFramework {
   private addMessage(
     participant: string,
     content: ContentBlock[],
-    metadata?: MessageMetadata
+    metadata?: MessageMetadata,
+    opts?: {
+      /**
+       * Deliver into this registry agent's window instead of the primary's,
+       * with the deferral/turn-alive guard evaluated against THAT agent's
+       * turn state. Default (absent) is byte-identical to the historical
+       * primary-only behavior. Unknown names log and drop (loud, non-fatal:
+       * this is reachable from timer callbacks that may outlive an agent).
+       */
+      forAgent?: string;
+    }
   ): MessageId {
-    // Route to the primary agent's context manager (not ephemeral subagents).
-    const agent = this.primaryAgentName
-      ? this.agents.get(this.primaryAgentName)
-      : this.agents.values().next().value;
+    // Route to the named agent, else the primary (not ephemeral subagents).
+    const agent = opts?.forAgent
+      ? this.agents.get(opts.forAgent)
+      : this.primaryAgentName
+        ? this.agents.get(this.primaryAgentName)
+        : this.agents.values().next().value;
     if (!agent) {
+      if (opts?.forAgent) {
+        console.error(
+          `[addMessage] delivery target "${opts.forAgent}" is not a registered agent — message dropped ` +
+          `(participant=${participant})`,
+        );
+        return '' as MessageId;
+      }
       throw new Error('No agents configured');
     }
 
@@ -8491,17 +8728,46 @@ export class AgentFramework {
     // ALSO injected into the live stream — hear-while-acting), or in
     // driveStream's finally when the turn ends.
     const hasToolResult = content.some(b => b.type === 'tool_result');
+    // Explicitly-targeted deliveries scope the tool-cycle check to the
+    // target (pendingAssistantBlocks is keyed by agent); the default path
+    // keeps the historical GLOBAL check byte-for-byte (conservative: any
+    // agent's pending cycle defers primary-bound messages).
+    const midToolCycle = opts?.forAgent
+      ? this.pendingAssistantBlocks.has(agent.name)
+      : this.pendingAssistantBlocks.size > 0;
     if (
       !hasToolResult &&
-      (this.pendingAssistantBlocks.size > 0 ||
+      (midToolCycle ||
         this.activeTurnTokens.has(agent.name) ||
         this.activeStreams.has(agent.name))
     ) {
-      this.deferredMessages.push({ participant, content, metadata });
-      return '' as MessageId; // Deferred — flushed at the next boundary
+      this.deferredMessages.push({ participant, content, metadata, forAgent: opts?.forAgent });
+      return '' as MessageId; // Deferred — flushed at the target's next boundary
     }
 
     return agent.getContextManager().addMessage(participant, content, metadata);
+  }
+
+  /**
+   * Splice out the deferred messages addressed to `agentName` (explicitly
+   * via forAgent, or implicitly when it is the primary), leaving other
+   * targets' messages queued for their own boundaries.
+   */
+  private drainDeferredFor(agentName: string): Array<{
+    participant: string;
+    content: ContentBlock[];
+    metadata?: MessageMetadata;
+    forAgent?: string;
+  }> {
+    if (this.deferredMessages.length === 0) return [];
+    const mine: typeof this.deferredMessages = [];
+    const rest: typeof this.deferredMessages = [];
+    for (const msg of this.deferredMessages) {
+      const target = msg.forAgent ?? this.primaryAgentName;
+      (target === agentName ? mine : rest).push(msg);
+    }
+    this.deferredMessages = rest;
+    return mine;
   }
 
   private editMessage(id: MessageId, content: ContentBlock[]): void {
@@ -10894,6 +11160,51 @@ export class AgentFramework {
    * suppression window, optionally announces in the sticky channel, and ends
    * the turn (the agent goes idle immediately). `wake` clears sleep.
    */
+  /** tune_out tool (residents): enter or cancel a channel tune-out. */
+  private dispatchTuneOutToolCall(agentName: string, call: ToolCall): void {
+    const coordinator = this.tuneOutCoordinator!;
+    const input = (call.input ?? {}) as {
+      channelId?: string; mode?: string;
+      cadenceSeconds?: number; backlogCap?: number; maxWakes?: number;
+    };
+    const channelId = String(input.channelId ?? '');
+    const entry = this.channelRegistry?.listChannelsRaw()
+      .find((e) => e.descriptor.id === channelId);
+    let result: { success: boolean; data?: unknown; error?: string; isError?: boolean };
+    if (!entry) {
+      result = { success: false, error: `unknown channel: ${channelId}`, isError: false };
+    } else if (input.mode === 'cancel') {
+      const r = coordinator.cancel(entry.serverId, channelId, 'agent-tool', 'agent request');
+      result = r.ok
+        ? { success: true, data: { cancelled: channelId } }
+        : { success: false, error: r.error, isError: false };
+    } else {
+      const r = coordinator.enter(entry.serverId, channelId, {
+        cadenceSeconds: input.cadenceSeconds,
+        backlogCap: input.backlogCap,
+        maxWakes: input.maxWakes,
+      }, 'agent-tool');
+      result = r.ok
+        ? {
+            success: true,
+            data: {
+              tunedOut: channelId,
+              cadenceSeconds: r.params.cadenceSeconds,
+              backlogCap: r.params.backlogCap,
+              maxWakes: r.params.maxWakes,
+            },
+          }
+        : { success: false, error: r.error, isError: false };
+    }
+    this.queue.push({
+      type: 'tool-result',
+      callId: call.id,
+      agentName,
+      moduleName: 'tune-out',
+      result,
+    });
+  }
+
   private dispatchSleepToolCall(agentName: string, call: ToolCall): void {
     this.emitTrace({ type: 'tool:started', module: 'gate', tool: call.name, callId: call.id, input: call.input });
     const gate = this.eventGate!;

@@ -1340,6 +1340,49 @@ export class ChannelRegistry {
     return { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
   }
 
+  /** Registered channel entries (read-only iteration for the coordinator). */
+  listChannelsRaw(): Array<{ serverId: string; descriptor: ChannelDescriptor }> {
+    return [...this.channels.values()].map((e) => ({
+      serverId: e.serverId,
+      descriptor: e.descriptor,
+    }));
+  }
+
+  /**
+   * Small chronicle snapshot-state helpers for the tune-out coordinator
+   * (dispositions slot). Registration is idempotent; absent store = null/no-op
+   * (mirrors the lifecycle log's optional-store posture).
+   */
+  readCoordinatorState(stateId: string): unknown {
+    if (!this.store) return null;
+    try {
+      this.store.registerState({ id: stateId, strategy: 'snapshot' });
+    } catch { /* already registered */ }
+    return this.store.getStateJson(stateId);
+  }
+
+  writeCoordinatorState(stateId: string, value: unknown): void {
+    if (!this.store) return;
+    try {
+      this.store.registerState({ id: stateId, strategy: 'snapshot' });
+    } catch { /* already registered */ }
+    this.store.setStateJson(stateId, value);
+  }
+
+  /**
+   * Publish into a channel on behalf of a named non-resident agent (the
+   * subconscious's speak_in_channel). Same delivery path as the
+   * channel_publish tool; the agent name rides the speech-routed trace.
+   */
+  async publishForAgent(
+    channelId: string,
+    text: string,
+    agentName: string,
+  ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
+    this.emitTraceFn({ type: 'mcpl:speech-routed', conversationId: agentName, channelId, text });
+    return this.handleToolPublish({ channelId, content: text });
+  }
+
   /**
    * Consume the old recipe policy exactly once. It seeds Chronicle for
    * existing deployments, but is not an ongoing admission policy: channels

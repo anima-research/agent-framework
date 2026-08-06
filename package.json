@@ -47,7 +47,7 @@
   "license": "MIT",
   "dependencies": {
     "@animalabs/chronicle": "^0.3.0",
-    "@animalabs/context-manager": "^0.6.0",
+    "@animalabs/context-manager": "github:Meganeuridae/context-manager#feat/strategy-view-composition",
     "@animalabs/membrane": "^0.5.78",
     "chokidar": "^4.0.3",
     "discord.js": "^14.25.1",

@@ -515,7 +515,13 @@ export class EventGate {
 
   // Dependency-injected callbacks
   private emitTrace: (event: TraceEventLike) => void;
-  private addMessageFn: (participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>) => unknown;
+  private addMessageFn: (
+    participant: string,
+    content: Array<{ type: 'text'; text: string }>,
+    metadata?: Record<string, unknown>,
+    /** Registry agent to deliver into; absent = primary (historical). */
+    forAgent?: string,
+  ) => unknown;
   private requestInferenceFn: (agentName: string, reason: string, source: string) => void;
   private getAgentNamesFn: () => string[];
   /** Clock injection — keeps the new rate_limit / passive_sample paths
@@ -527,7 +533,12 @@ export class EventGate {
     initialConfig?: GateConfig;
     privilegedUsersPath?: string;
     emitTrace: (event: TraceEventLike) => void;
-    addMessage: (participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>) => unknown;
+    addMessage: (
+      participant: string,
+      content: Array<{ type: 'text'; text: string }>,
+      metadata?: Record<string, unknown>,
+      forAgent?: string,
+    ) => unknown;
     requestInference: (agentName: string, reason: string, source: string) => void;
     getAgentNames: () => string[];
     /** Optional clock — defaults to Date.now. Tests inject for deterministic time. */
@@ -1582,10 +1593,13 @@ export class EventGate {
       // before the inference request so it rides the wake turn (addMessage's
       // turn-alive guard defers it to that turn's start if needed).
       const nowIso = new Date(this.now()).toISOString().slice(0, 19) + 'Z';
+      // Deliver the notice into the WAKING agent's window — a self-wake
+      // armed by a non-primary agent (e.g. a subconscious cadence) must not
+      // narrate itself into the primary's context.
       this.addMessageFn('user', [{
         type: 'text',
         text: `[self-wake] your ${source} timer (${Math.round(ms / 1000)}s) elapsed — now ${nowIso}`,
-      }], { source: 'gate:self-wake' });
+      }], { source: 'gate:self-wake' }, agentName);
       this.requestInferenceFn(
         agentName,
         `self-scheduled wake (${source}, ${Math.round(ms / 1000)}s)`,
@@ -1659,6 +1673,17 @@ export class EventGate {
   }
 
   /** Load the privileged-users file (bare array or { userIds: [...] }). */
+  /**
+   * Whether an author id is on the privileged-users list (hot-reloaded).
+   * Shared by sleep bypass and tune-out wake classification (#77: wakes are
+   * "mentions, gate-privileged authors, etc.").
+   */
+  isPrivilegedUser(authorId: string | null | undefined): boolean {
+    if (!authorId) return false;
+    this.loadPrivileged();
+    return this.privilegedUserIds.has(authorId);
+  }
+
   private loadPrivileged(): void {
     if (!this.privilegedUsersPath) return;
     try {
