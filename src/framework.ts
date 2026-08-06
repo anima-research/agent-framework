@@ -4153,6 +4153,12 @@ export class AgentFramework {
           ? (event.metadata.guildName as string)
           : undefined,
         tags: event.tags,
+        missedMessages: typeof event.metadata?.missedMessages === 'number'
+          ? event.metadata.missedMessages
+          : undefined,
+        missedCharacters: typeof event.metadata?.missedCharacters === 'number'
+          ? event.metadata.missedCharacters
+          : undefined,
       });
       if (invitation) {
         incomingContent.push(invitation.block);
@@ -4460,6 +4466,17 @@ export class AgentFramework {
    * this should see WHO addressed it WHERE, not a wall of snowflake ids. Raw
    * ids remain only inside the tool-argument instructions, where they are the
    * literal values to pass.
+   *
+   * 2026-08-05 accuracy pass: the old "you won't receive more from it unless
+   * you join" was wrong in both directions — direct addresses (mentions,
+   * replies to the agent) DO still arrive, and nothing warned that answering
+   * via option 1 leaves the human's natural un-@'d follow-up invisible (Sol
+   * answered four #architecture mentions over four days while the follow-ups
+   * to her own replies were silently dropped). The wording now states the
+   * actual delivery model, and option 1 carries the consequence inline. When
+   * the surface tracks a missed-ambient tally (discord-mcpl sends
+   * `missedMessages`/`missedCharacters` in push origin), the invitation shows
+   * the count — the cost of staying out, as a number, at decision time.
    */
   private buildClosedChannelInvitation(opts: {
     serverId: string;
@@ -4469,6 +4486,10 @@ export class AgentFramework {
     authorName: string;
     guildName?: string;
     tags?: string[];
+    /** Ambient messages dropped in this channel while closed (surface-tracked). */
+    missedMessages?: number;
+    /** Characters across those dropped messages. */
+    missedCharacters?: number;
   }): { block: ContentBlock; metadataPatch: Record<string, unknown> } | null {
     if (!this.channelRegistry) return null;
     if (!opts.tags?.includes('chat:addressed')) return null;
@@ -4478,13 +4499,23 @@ export class AgentFramework {
     const label = opts.channelLabel ?? descriptor?.label;
     const channelLabel = label ? `#${label}` : `"${opts.channelId}"`;
     const place = opts.guildName ? `${channelLabel} in "${opts.guildName}"` : channelLabel;
+    const missedCount = opts.missedMessages ?? 0;
+    const missedNote =
+      missedCount > 0
+        ? `While closed, ${missedCount} message${missedCount === 1 ? '' : 's'}` +
+          (opts.missedCharacters ? ` (~${opts.missedCharacters} chars)` : '') +
+          ` have passed there without you. `
+        : '';
     const block: ContentBlock = {
       type: 'text',
       text:
         `\n[Channel invitation] ${opts.authorName} addressed you in ${place} — ` +
-        `a channel you haven't joined. You're seeing this one message; you won't receive more from it unless you join. ` +
+        `a channel you haven't joined. Only messages that address you directly (an @-mention or ` +
+        `a reply to one of your messages) reach you from it; the rest of its traffic is invisible to you. ` +
+        missedNote +
         `Your options:\n` +
-        `1. Reply without joining — write your reply this turn prefixed with ">>${channelLabel}"; it will be delivered there.\n` +
+        `1. Reply without joining — write your reply this turn prefixed with ">>${channelLabel}"; it will be delivered there. ` +
+        `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n` +
         `2. Join the channel — call channel_open with channelId "${opts.channelId}" and serverId "${opts.serverId}"` +
         (maxBackscroll > 0
           ? `; to also read recent history, add backscroll (a number up to ${maxBackscroll}) and beforeMessageId "${opts.messageId}".\n`
@@ -4547,6 +4578,9 @@ export class AgentFramework {
         authorName: typeof origin.authorName === 'string' && origin.authorName ? origin.authorName : 'Someone',
         guildName: typeof origin.guildName === 'string' && origin.guildName ? origin.guildName : undefined,
         tags: event.tags,
+        missedMessages: typeof origin.missedMessages === 'number' ? origin.missedMessages : undefined,
+        missedCharacters:
+          typeof origin.missedCharacters === 'number' ? origin.missedCharacters : undefined,
       });
       if (invitation) {
         content.push(invitation.block);

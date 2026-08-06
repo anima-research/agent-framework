@@ -182,6 +182,54 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.match(text, /channel_decline/);
     assert.match(text, /optionally set acknowledge/);
     assert.match(text, /Doing nothing is also fine\./);
+    // 2026-08-05 accuracy pass: the delivery model must be stated correctly —
+    // direct addresses still arrive; un-@'d follow-ups to a reply do not.
+    assert.match(text, /address you directly/);
+    assert.match(text, /follow-ups to your reply will NOT reach you/);
+    // No surface-tracked tally on this event → no missed-count sentence.
+    assert.doesNotMatch(text, /passed there without you/);
+    await framework.stop();
+  });
+
+  it('surfaces the missed-ambient tally in the closed-channel invitation', async () => {
+    const framework = await makeFramework();
+    const i = internals(framework);
+    i.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
+      stopAll: () => {},
+    };
+
+    i.handleMcplPushEvent({
+      type: 'mcpl:push-event',
+      serverId: 'discord',
+      featureSet: 'discord.messaging',
+      eventId: 'discord_msg_m2',
+      content: [{ type: 'text', text: 'Antra: still there?' }],
+      origin: {
+        source: 'discord',
+        messageId: 'm2',
+        mcplChannelId: 'discord:G1:C7',
+        channelName: 'portables',
+        // discord-mcpl attaches the missed-ambient tally for closed, tracked
+        // channels so the agent sees the cost of staying out at decision time.
+        missedMessages: 3,
+        missedCharacters: 2729,
+      },
+      tags: ['chat:mention', 'chat:addressed'],
+      timestamp: new Date().toISOString(),
+      inferenceId: 'i2',
+      triggerInference: false,
+    });
+
+    const messages = framework.getAgent('scout')!.getContextManager().queryMessages({}).messages;
+    const text = messages.at(-1)?.content
+      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n') ?? '';
+    assert.match(text, /Channel invitation/);
+    assert.match(text, /While closed, 3 messages \(~2729 chars\) have passed there without you\./);
     await framework.stop();
   });
 
