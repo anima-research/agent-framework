@@ -4180,6 +4180,9 @@ export class AgentFramework {
 
     const strategy = new WindowedPassthroughStrategy({
       reAnchorFraction: cfg.reAnchorFraction,
+      // Mirror the principal's per-message truncation ceiling so both see
+      // oversized tool results / attachments under the same policy.
+      maxMessageTokens: primaryConfig.strategy?.maxMessageTokens,
     });
     const contextManager = await ContextManager.open({
       store: this.store,
@@ -4193,10 +4196,18 @@ export class AgentFramework {
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
 
+    // Inherit the principal's inference settings wholesale (fork-template
+    // idiom): reasoning effort (thinking), provider params, token ceilings,
+    // caching, refusal handling, timezone — a same-model side-process must
+    // not silently run under different inference conditions than the
+    // resident it serves. Only identity- and surface-defining fields are
+    // overridden below.
     const agentConfig: AgentConfig = {
+      ...primaryConfig,
       name,
       model: cfg.model ?? primaryConfig.model,
       systemPrompt: cfg.systemPrompt,
+      strategy: undefined, // its CM owns the windowed strategy instance
       // Prose is never auto-routed: a cadence-triggered turn carries no
       // locus, and bare prose must not fall through to the default channel.
       // Speech happens only via speak_in_channel (its own marked voice).
