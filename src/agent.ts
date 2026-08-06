@@ -82,7 +82,17 @@ export class Agent {
   private _inferenceStartedAt = 0;
   private _streamId = 0;
   lastStreamInputTokens = 0;
+  /** Real prefix size of the last usage event: fresh + cache creation +
+   *  cache read. THE window-shaped number — `lastStreamInputTokens` alone
+   *  omits cached tokens, which are most of a warm stream's window. */
+  lastStreamRealInputTokens = 0;
+  /** Output tokens of the last usage event — the prior round's generated
+   *  thinking/text/tool_use, which becomes part of the NEXT round's input
+   *  and so belongs in the physical-window projection. */
+  lastStreamOutputTokens = 0;
   maxStreamTokens: number;
+  /** Provider hard context cap (see AgentConfig.physicalWindowTokens). */
+  readonly physicalWindowTokens?: number;
   /** Per-agent context compile budget (input tokens). When unset, the
    * ContextManager's built-in default applies. reserveForResponse uses
    * this agent's maxTokens. */
@@ -117,6 +127,7 @@ export class Agent {
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
+    this.physicalWindowTokens = config.physicalWindowTokens;
     this.contextBudgetTokens = config.contextBudgetTokens;
     this.configuredContextBudgetTokens = config.contextBudgetTokens;
     this.contextManager = contextManager;
@@ -680,6 +691,14 @@ export class Agent {
     this._streamId++;
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;
+    // Reset the cache-inclusive counters too: a new stream must not inherit
+    // the prior stream's window size — on the physical-window restart path
+    // that inherited value IS the oversized number that caused the restart,
+    // and projecting on it before this stream's first usage event would
+    // restart again (loop). The `> 0` guard downstream means "no usage
+    // observed on THIS stream yet" only because of this reset.
+    this.lastStreamRealInputTokens = 0;
+    this.lastStreamOutputTokens = 0;
 
     const request = await this.buildActivationRequest(availableTools, injections, budget);
 

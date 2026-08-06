@@ -142,6 +142,43 @@ const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
 };
 
 /**
+ * Rough token estimate for the blocks a continuation round is about to
+ * append to the live wire (issue #92 physical-window projection): the
+ * spilled tool-result strings at chars/4, a flat per-image cost for native
+ * image blocks the wire path preserves (provider vision tokens are
+ * resolution-dependent; 1600 ≈ a max-size Anthropic tile), mid-turn injected
+ * text at chars/4, and a small per-block envelope allowance. Deliberately a
+ * ceiling-ish heuristic — the cost of overestimating is one early recompile;
+ * the cost of underestimating is the 400 this projection exists to prevent.
+ */
+function estimateAppendedRoundTokens(
+  toolResults: CompletedToolCall[],
+  spilled: Map<string, { text: string; filePath: string | null }>,
+  injections: Array<{ content: ContentBlock[] }>,
+): number {
+  let chars = 0;
+  let images = 0;
+  for (const tc of toolResults) {
+    chars += spilled.get(tc.id)?.text.length ?? 0;
+    if (Array.isArray(tc.result.data)) {
+      for (const raw of tc.result.data) {
+        const b = raw as { type?: unknown };
+        if (b && typeof b === 'object' && b.type === 'image') images += 1;
+      }
+    }
+  }
+  for (const inj of injections) {
+    for (const block of inj.content) {
+      if (block.type === 'text' && typeof (block as { text?: unknown }).text === 'string') {
+        chars += (block as { text: string }).text.length;
+      }
+    }
+  }
+  const blockCount = toolResults.length + injections.length;
+  return Math.ceil(chars / 4) + images * 1600 + blockCount * 20;
+}
+
+/**
  * Explicit delivery tools whose successful use into a closed channel OPENS
  * it (send implies engagement — see openIfClosedForSend). Bare tool names,
  * matched after stripping the MCPL server prefix.
@@ -3862,6 +3899,30 @@ export class AgentFramework {
             && agent.lastStreamInputTokens > 0
             && agent.lastStreamInputTokens > agent.maxStreamTokens;
 
+          // Physical-window projection (issue #92): a turn's continuation
+          // rounds append to the compiled request without recompiling, so a
+          // turn that starts near the compile target can walk past the
+          // provider's HARD cap mid-turn and take a wire 400 — the compile
+          // was legal, the growth wasn't. Project the next round's real size
+          // (cache-inclusive input of the prior round + the blocks about to
+          // be appended + reserve for the response) and, when it would cross
+          // the physical window, break the stream through the same
+          // budget-restart path — a fresh compile folds the history back
+          // under budget instead of dispatching a doomed request.
+          // Projection terms: prior round's real input + prior round's
+          // OUTPUT (the just-generated thinking/text/tool_use joins the next
+          // round's input — omitting it is a systematic underestimate) +
+          // blocks about to be appended + reserve for the next response.
+          const projectedRealTokens = currentState.stream
+            && agent.physicalWindowTokens !== undefined
+            && agent.lastStreamRealInputTokens > 0
+            ? agent.lastStreamRealInputTokens
+              + agent.lastStreamOutputTokens
+              + estimateAppendedRoundTokens(currentState.toolResults, spilled, midTurnInjections)
+              + agent.maxTokens
+            : 0;
+          const overPhysical = projectedRealTokens > (agent.physicalWindowTokens ?? Infinity);
+
           // Addressed re-pin (2026-07-31 Mythos misroutes, antra-ratified):
           // when someone ADDRESSES the agent mid-turn from another channel
           // (mention / reply / DM — the same chat:addressed signal the
@@ -3959,7 +4020,7 @@ export class AgentFramework {
             this.eventGate?.onInferenceEnded(agent.name);
             this.settleAgent(agent.name, { stopReason: 'turn_ended', speech: '' });
             this.emitTrace({ type: 'inference:turn_ended', agentName: agent.name });
-          } else if (overBudget) {
+          } else if (overBudget || overPhysical) {
             // Context budget exceeded: break the stream, let compile() compress.
             // Mark the cancel as framework-initiated BEFORE cancelling: the
             // membrane delivers `aborted` before the restart bumps streamId,
@@ -3984,9 +4045,12 @@ export class AgentFramework {
             this.emitTrace({
               type: 'inference:stream_restarted',
               agentName: agent.name,
-              reason: 'context_budget',
-              inputTokens: agent.lastStreamInputTokens,
-              budget: agent.maxStreamTokens,
+              // 'physical_window' only when the budget check alone would
+              // have let the doomed request through — overBudget keeps its
+              // established label for existing consumers.
+              reason: overBudget ? 'context_budget' : 'physical_window',
+              inputTokens: overBudget ? agent.lastStreamInputTokens : projectedRealTokens,
+              budget: overBudget ? agent.maxStreamTokens : (agent.physicalWindowTokens ?? 0),
             });
             this.pendingRequests.push({
               agentName: agent.name,
@@ -6346,6 +6410,11 @@ export class AgentFramework {
 
           case 'usage': {
             agent.lastStreamInputTokens = event.usage.inputTokens;
+            agent.lastStreamRealInputTokens =
+              (event.usage.inputTokens ?? 0) +
+              (event.usage.cacheCreationTokens ?? 0) +
+              (event.usage.cacheReadTokens ?? 0);
+            agent.lastStreamOutputTokens = event.usage.outputTokens ?? 0;
 
             // Closed-loop estimator calibration (2026-07-12). Sample the REAL
             // prefix size of THIS API call (fresh + cache write + cache read)
