@@ -411,7 +411,8 @@ describe('tool-result spill completion (issue #89)', () => {
       assert.match(stored.content, /showing 4000 of \d+ chars/);
       const prov = capProvenance(h.framework);
       assert.strictEqual(prov.tool_result_inline_max_chars_effective, 4000);
-      assert.strictEqual(prov.tool_result_inline_max_chars_source, 'default (strategy-clamped)');
+      assert.strictEqual(prov.tool_result_inline_max_chars_source, 'default');
+      assert.strictEqual(prov.tool_result_inline_max_chars_clamped_by, 'strategy-bound');
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });
@@ -465,22 +466,27 @@ describe('tool-result spill completion (issue #89)', () => {
     }
   });
 
-  it('flags a resident value pinned above the strategy bound in provenance', async () => {
+  it('hard-clamps a resident value above the strategy bound, reporting desired AND effective', async () => {
+    // Sol's #94 ruling: persist the desired cap, but the effective inline
+    // cap is min(desired, strategy bound) — durable preference must not be a
+    // durable path past the per-message safety limit.
     const h = await startSpillTurn({
       prefix: 'spill-exceeds-',
-      result: { success: true, data: { small: true } },
+      result: { success: true, data: { blob: 'q'.repeat(42_000) } },
       withWorkspace: true,
       cappedStrategy: true, // strategy bound 4000
     });
     try {
       frameworkExtension(h.framework).update('prime', { tool_result_inline_max_chars: 50_000 });
       const prov = capProvenance(h.framework);
-      assert.strictEqual(prov.tool_result_inline_max_chars_effective, 50_000, 'resident value is honored');
-      assert.strictEqual(
-        prov.tool_result_inline_max_chars_source,
-        'agent-settings-override (exceeds strategy bound)',
-        'the over-bound pin must be visible, never silent',
-      );
+      assert.strictEqual(prov.tool_result_inline_max_chars, 50_000, 'desired value is preserved');
+      assert.strictEqual(prov.tool_result_inline_max_chars_effective, 4_000, 'effective is hard-clamped');
+      assert.strictEqual(prov.tool_result_inline_max_chars_source, 'agent-settings-override');
+      assert.strictEqual(prov.tool_result_inline_max_chars_clamped_by, 'strategy-bound');
+      // The clamp is enforced on the wire, not just reported.
+      const stored = await waitForStoredToolResult(h.framework);
+      assert.ok(stored, 'tool result should be stored');
+      assert.match(stored.content, /showing 4000 of \d+ chars/);
     } finally {
       await h.framework.stop();
       rmSync(h.tempDir, { recursive: true, force: true });

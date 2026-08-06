@@ -1565,8 +1565,9 @@ export class AgentFramework {
             'file under tool-results/ and replaced by a truncated preview + file reference. ' +
             'This is YOUR durable setting: it persists across restarts, like your other ' +
             'agent_settings. Update it when you want a different inline size; reset restores ' +
-            'the residence default. The effective cap and its source are reported as ' +
-            'tool_result_inline_max_chars_effective / _source on get.',
+            'the residence default. The effective cap is min(your value, your strategy\'s ' +
+            'per-message bound) — the bound is a safety ceiling, and the full content is ' +
+            'always in the spill file. get reports desired/_effective/_source/_clamped_by.',
         },
       },
       keys: ['tool_result_inline_max_chars'],
@@ -1577,11 +1578,8 @@ export class AgentFramework {
           tool_result_inline_max_chars:
             this.toolResultInlineMaxCharsOverride.get(agentName) ?? null,
           tool_result_inline_max_chars_effective: resolved?.cap ?? null,
-          tool_result_inline_max_chars_source: resolved
-            ? resolved.source
-              + (resolved.strategyClamped ? ' (strategy-clamped)' : '')
-              + (resolved.exceedsStrategyBound ? ' (exceeds strategy bound)' : '')
-            : null,
+          tool_result_inline_max_chars_source: resolved?.source ?? null,
+          tool_result_inline_max_chars_clamped_by: resolved?.clampedBy ?? null,
         };
       },
       update: (agentName: string, patch: Record<string, unknown>) => {
@@ -7273,43 +7271,33 @@ export class AgentFramework {
   }
 
   /**
-   * Effective tool-result inline cap for an agent, with provenance:
-   * resident's durable agent_settings value (wins outright) → residence
-   * FrameworkConfig.toolResultInlineMaxChars → house default (5000). The
-   * residence/default value is clamped down to the strategy-derived bound
-   * when that is smaller (a message must still fit maxMessageTokens); the
-   * resident's explicit value escapes the clamp but provenance flags it
-   * (`exceedsStrategyBound`) so the pin is never silent.
+   * Effective tool-result inline cap for an agent, with provenance. Desired
+   * value: resident's durable agent_settings value → residence
+   * FrameworkConfig.toolResultInlineMaxChars → house default (5000).
+   * Effective value: min(desired, strategy bound) for EVERY source — the
+   * strategy's per-message safety limit is a ceiling, not a suggestion
+   * (Sol's #94 ruling: a durable preference must not be a durable path for
+   * one tool result to exceed maxMessageTokens; the way to see the whole
+   * result is the spill file, not an over-bound blob in live context).
    */
   private resolveToolResultInlineCap(agent: Agent): {
     cap: number;
     source: 'agent-settings-override' | 'framework-config' | 'default';
-    strategyClamped: boolean;
-    /** Resident's durable setting sits ABOVE the strategy bound — honored
-     *  (the resident owns this), but provenance must say so: a silent
-     *  over-budget pin that survives restarts is how compiles break later. */
-    exceedsStrategyBound?: boolean;
+    /** Set when the desired value was reduced to the strategy bound. */
+    clampedBy: 'strategy-bound' | null;
   } {
     const override = this.toolResultInlineMaxCharsOverride.get(agent.name);
-    if (override !== undefined) {
-      const strategyBound = this.strategyDerivedToolResultChars(agent);
-      return {
-        cap: override,
-        source: 'agent-settings-override',
-        strategyClamped: false,
-        ...(strategyBound !== undefined && override > strategyBound
-          ? { exceedsStrategyBound: true }
-          : {}),
-      };
-    }
     const configured = this.toolResultInlineMaxCharsConfig;
-    const base = configured ?? DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
+    const desired = override ?? configured ?? DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
+    const source = override !== undefined
+      ? 'agent-settings-override' as const
+      : configured !== null ? 'framework-config' as const : 'default' as const;
     const strategyBound = this.strategyDerivedToolResultChars(agent);
-    const strategyClamped = strategyBound !== undefined && strategyBound < base;
+    const clamped = strategyBound !== undefined && strategyBound < desired;
     return {
-      cap: strategyClamped ? strategyBound : base,
-      source: configured !== null ? 'framework-config' : 'default',
-      strategyClamped,
+      cap: clamped ? strategyBound : desired,
+      source,
+      clampedBy: clamped ? 'strategy-bound' : null,
     };
   }
 
