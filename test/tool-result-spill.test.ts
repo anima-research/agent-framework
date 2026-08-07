@@ -2,7 +2,7 @@
  * Oversized tool-result spill — completion coverage for issue #89.
  *
  * The mechanism (spill to workspace file + bounded preview) landed in
- * f231bbf; these tests pin the completion semantics: the house-safe 5000
+ * f231bbf; these tests pin the completion semantics: the house-safe 24000
  * default (no more 42k accidental ingests), the durable
  * FrameworkConfig.toolResultInlineMaxChars cap, hot-override provenance and
  * restart behavior, error results under the same policy, the explicit
@@ -23,8 +23,18 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework, PassthroughStrategy } from '../src/index.js';
+import { DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS } from '../src/tool-result-history.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
+
+/**
+ * Bound for "inline copy is capped" assertions: the cap itself plus room for
+ * the truncation notice. Derived from the constant on purpose — these bounds
+ * were once hardcoded at the 5000-era value and so silently pinned the old
+ * default; raising it broke three tests that were only ever checking that
+ * SOMETHING capped the payload.
+ */
+const CAPPED = DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS + 1000;
 
 class CappedPassthroughStrategy extends PassthroughStrategy {
   readonly maxMessageTokens = 1000;
@@ -179,7 +189,7 @@ function frameworkExtension(framework: AgentFramework): {
 }
 
 describe('tool-result spill completion (issue #89)', () => {
-  it('caps at the house default 5000 with no config and no strategy bound', async () => {
+  it('caps at the house default 24000 with no config and no strategy bound', async () => {
     // Pre-#89 behavior: PassthroughStrategy has no maxMessageTokens, so the
     // cap was undefined and a 42k result went inline whole. This pins the fix.
     const h = await startSpillTurn({
@@ -190,11 +200,11 @@ describe('tool-result spill completion (issue #89)', () => {
     try {
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
-      assert.ok(stored.content.length < 6_000, `inline copy must be near the 5000 cap, got ${stored.content.length}`);
-      assert.match(stored.content, /showing 5000 of \d+ chars; full content: workspace file files\/tool-results\//);
+      assert.ok(stored.content.length < CAPPED, `inline copy must be near the cap, got ${stored.content.length}`);
+      assert.match(stored.content, /showing 24000 of \d+ chars; full content: workspace file files\/tool-results\//);
       const prov = capProvenance(h.framework);
       assert.strictEqual(prov.tool_result_inline_max_chars, null);
-      assert.strictEqual(prov.tool_result_inline_max_chars_effective, 5000);
+      assert.strictEqual(prov.tool_result_inline_max_chars_effective, 24000);
       assert.strictEqual(prov.tool_result_inline_max_chars_source, 'default');
       // Full content is recoverable from the spill file.
       const refMatch = stored.content.match(/workspace file (files\/tool-results\/\S+\.txt)/);
@@ -263,7 +273,7 @@ describe('tool-result spill completion (issue #89)', () => {
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'error tool result should be stored');
       assert.strictEqual(stored.isError, true);
-      assert.ok(stored.content.length < 6_000, `inline error copy must be capped, got ${stored.content.length}`);
+      assert.ok(stored.content.length < CAPPED, `inline error copy must be capped, got ${stored.content.length}`);
       assert.match(stored.content, /full content: workspace file files\/tool-results\//);
       // Wire copy byte-matches the stored copy.
       const wire = h.membrane.lastStream?.receivedToolResults[0] as
@@ -305,7 +315,7 @@ describe('tool-result spill completion (issue #89)', () => {
     try {
       const stored = await waitForStoredToolResult(h.framework);
       assert.ok(stored, 'tool result should be stored');
-      assert.ok(stored.content.length < 6_000, 'inline copy must be capped');
+      assert.ok(stored.content.length < CAPPED, 'inline copy must be capped');
       assert.match(stored.content, /no writable workspace, full content not retained/);
       assert.doesNotMatch(stored.content, /workspace file/);
     } finally {
@@ -356,7 +366,7 @@ describe('tool-result spill completion (issue #89)', () => {
       assert.strictEqual(image.source?.data, png, 'base64 must be byte-intact');
       const text = blocks.find((b) => b.type === 'text');
       assert.ok(text?.text, 'text block expected');
-      assert.ok(text.text.length < 6_000, 'text block must be capped');
+      assert.ok(text.text.length < CAPPED, 'text block must be capped');
       assert.match(text.text, /full serialized result: workspace file files\/tool-results\//);
     } finally {
       await h.framework.stop();
@@ -397,7 +407,7 @@ describe('tool-result spill completion (issue #89)', () => {
   });
 
   it('clamps the default down to the strategy bound and reports it', async () => {
-    // maxMessageTokens=1000 → strategy bound 4000 < default 5000. This branch
+    // maxMessageTokens=1000 → strategy bound 4000 < default 24000. This branch
     // decides the cap for every resident on a bounded strategy — pin it.
     const h = await startSpillTurn({
       prefix: 'spill-clamp-',

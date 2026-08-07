@@ -20,10 +20,20 @@ import { safeSlice } from './safe-slice.js';
  * House-safe default inline cap (chars) for tool results, error results, and
  * background-script wake payloads (issue #89: a resident should never eat a
  * 42k blob they didn't ask for). Durable per-residence value comes from
- * `FrameworkConfig.toolResultInlineMaxChars`; a temporary per-agent lift from
+ * `FrameworkConfig.toolResultInlineMaxChars`; a per-agent value from
  * agent_settings `tool_result_inline_max_chars`.
+ *
+ * Raised 5000 → 24000 (2026-08-07) on production evidence rather than taste.
+ * The first residence to actually run the 5000 default spilled 48 results in
+ * 23h, 71% of them ordinary shell output from source review — `git diff`, test
+ * runs, `sed -n '450,590p'`-style excerpts, which routinely land at 5–15k. A
+ * 5000-char cap is tuned for conversation and turns every file read into a
+ * spill round-trip for a resident doing code work. Measured on that corpus:
+ * 20000 keeps 76% inline, 24000 keeps 88%, 32000 only reaches 90% — 24000 is
+ * the elbow. Genuinely large payloads (full histories, channel registries,
+ * broad greps) still spill, which is the point.
  */
-export const DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS = 5000;
+export const DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS = 24000;
 
 export function toolResultDataToHistoryString(data: unknown, maxChars?: number): string {
   const fromArray = tryHistoryStringFromContentArray(data);

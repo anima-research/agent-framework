@@ -7334,7 +7334,7 @@ export class AgentFramework {
   /**
    * Effective tool-result inline cap for an agent, with provenance. Desired
    * value: resident's durable agent_settings value → residence
-   * FrameworkConfig.toolResultInlineMaxChars → house default (5000).
+   * FrameworkConfig.toolResultInlineMaxChars → house default (24000).
    * Effective value: min(desired, strategy bound) for EVERY source — the
    * strategy's per-message safety limit is a ceiling, not a suggestion
    * (Sol's #94 ruling: a durable preference must not be a durable path for
