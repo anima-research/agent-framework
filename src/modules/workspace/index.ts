@@ -1081,6 +1081,47 @@ export class WorkspaceModule implements Module {
   }
 
   /**
+   * Read a file's raw bytes straight from the mount's filesystem, bypassing
+   * the Chronicle tree.
+   *
+   * For material that is *passing through* rather than being kept: an upload,
+   * a render being shipped somewhere, a file handed to a service. The store
+   * path (`readBinary`) is append-only, so reading through it means every
+   * byte is retained forever and the mount's `maxFileSize` guard applies —
+   * correct for the resident's memory, wrong for egress, where paying a
+   * permanent cost to send something once is the wrong trade.
+   *
+   * Same mount boundary and traversal guard as every other path here: only
+   * declared mounts, nothing above their root. Deliberately does NOT sync,
+   * register, or hash anything — it reads and returns.
+   */
+  async readBinaryFromDisk(
+    mountPrefixedPath: string,
+    opts: { maxBytes?: number } = {},
+  ): Promise<{ data: Buffer; absolutePath: string } | { error: string }> {
+    let mount: MountState;
+    let relativePath: string;
+    try {
+      ({ mount, relativePath } = this.parsePath(mountPrefixedPath));
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+    const absolutePath = resolve(mount.config.path, relativePath);
+    try {
+      const info = await stat(absolutePath);
+      if (!info.isFile()) return { error: `Not a file: ${mountPrefixedPath}` };
+      if (opts.maxBytes !== undefined && info.size > opts.maxBytes) {
+        return { error: `File too large: ${info.size} > ${opts.maxBytes} bytes` };
+      }
+      return { data: await readFile(absolutePath), absolutePath };
+    } catch (error) {
+      const code = (error as { code?: string }).code;
+      if (code === 'ENOENT') return { error: `File not found on disk: ${mountPrefixedPath}` };
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /**
    * Parse a mount-prefixed path into (mountName, relativePath).
    */
   private parsePath(path: string): { mount: MountState; relativePath: string } {
@@ -1919,6 +1960,7 @@ export class WorkspaceModule implements Module {
   private async handleSync(input: SyncInput): Promise<ToolResult> {
     const store = this.getStore();
     const allResults: Array<{ mount: string; synced: string[]; conflicts: ConflictInfo[] }> = [];
+    const allSkipped: Array<{ mount: string; path: string; reason: string }> = [];
 
     let mountsToSync: Array<{ name: string; mount: MountState }>;
     if (input.mount) {
@@ -1951,6 +1993,11 @@ export class WorkspaceModule implements Module {
         });
         this.emitFsEvents(name, result.synced, result.conflicts);
       }
+      // Skips were previously computed and dropped, so "nothing synced" and
+      // "your file was refused" looked identical from the outside. Say which.
+      for (const s of result.skipped) {
+        allSkipped.push({ mount: name, path: s.path, reason: s.reason });
+      }
     }
 
     return {
@@ -1959,6 +2006,7 @@ export class WorkspaceModule implements Module {
         results: allResults,
         totalSynced: allResults.reduce((sum, r) => sum + r.synced.length, 0),
         totalConflicts: allResults.reduce((sum, r) => sum + r.conflicts.length, 0),
+        ...(allSkipped.length > 0 ? { skipped: allSkipped } : {}),
       },
     };
   }
