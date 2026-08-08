@@ -329,7 +329,7 @@ function validateUtilityArgs(
 }
 import { CheckpointManager } from './mcpl/checkpoint-manager.js';
 import { isToolAllowed } from './mcpl/tool-policy.js';
-import { EventGate } from './gate/event-gate.js';
+import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
@@ -1968,12 +1968,14 @@ export class AgentFramework {
   /**
    * Add or replace (upsert) a gate policy at runtime. Validated and persisted
    * to gate.json; hot-applied in memory. Throws if no gate is configured or the
-   * policy is invalid. `position: 'prepend'` puts a wake rule ahead of broad
-   * defer/debounce rules (first match wins).
+   * policy is invalid. Placement: `'prepend'` puts a rule ahead of EVERYTHING
+   * (including addressed-message wake rules — see EventGate.lintShadows);
+   * `{before: name}` / `{after: name}` anchor it against a specific rule,
+   * which is usually what a sampler or debounce actually wants.
    */
   addGatePolicy(
     rawPolicy: unknown,
-    options?: { position?: 'append' | 'prepend' },
+    options?: { position?: 'append' | 'prepend' | { before: string } | { after: string } },
   ): import('./gate/types.js').GatePolicy {
     if (!this.eventGate) {
       throw new Error('No EventGate configured (FrameworkConfig.gate is unset).');
@@ -2350,9 +2352,17 @@ export class AgentFramework {
       description:
         'Add or replace a wake rule (a gate.json policy) at runtime — no need to ' +
         'hand-edit the file. The rule is validated and hot-applied immediately. ' +
-        'A rule with the same `name` replaces the existing one in place. Use ' +
-        '`position: "prepend"` to put a wake rule ahead of broad defer/debounce ' +
-        'rules (first match wins). Two common shapes:\n' +
+        'A rule with the same `name` replaces the existing one in place (add a ' +
+        'position to move it). ⚠️ ORDERING IS SEMANTICS: first match wins, and a ' +
+        'matched rule CONSUMES the event — a broad rule placed early makes every ' +
+        'later rule unreachable for its scope, including your addressed-message ' +
+        '(DM/mention) wake rules. Prefer `insertBefore`/`insertAfter` to place a ' +
+        'rule relative to a specific existing rule; use `position: "prepend"` only ' +
+        'when the rule really must beat EVERYTHING. For "additionally wake me ' +
+        'every Nth event / at most N per hour" governors, set `passthrough: true` ' +
+        'so non-firing matches fall through to your normal rules instead of ' +
+        'swallowing them. The result includes a before/after probe table and any ' +
+        'shadow warnings — READ THEM before ending the turn. Two common shapes:\n' +
         '• Watch a FILE/workspace path: match on `mount` + `pathGlob`, e.g. ' +
         '`{ name: "watch-notes", match: { scope: ["workspace:modified"], mount: "project", pathGlob: "notes/*.md" }, behavior: "always" }`.\n' +
         '• Watch a CHANNEL: match on `source` + `channel` (and/or `tagsAny: ["chat:ambient"]`), ' +
@@ -2420,7 +2430,30 @@ export class AgentFramework {
           position: {
             type: 'string',
             enum: ['append', 'prepend'],
-            description: 'Where to insert a NEW rule (ignored when replacing by name). Default "append".',
+            description:
+              'Coarse placement. "append" (default) adds at the end; "prepend" puts the rule ' +
+              'ahead of EVERYTHING — including addressed-message wake rules — so prefer ' +
+              'insertBefore/insertAfter unless the rule really must beat every other rule. ' +
+              'When replacing an existing name, giving any placement MOVES the rule there; ' +
+              'omit all placement fields to update it in place.',
+          },
+          insertBefore: {
+            type: 'string',
+            description:
+              'Insert the rule immediately BEFORE the named existing rule (error if absent). ' +
+              'The safe way to order against a specific catch-all, e.g. insertBefore: "discord-ambient".',
+          },
+          insertAfter: {
+            type: 'string',
+            description: 'Insert the rule immediately AFTER the named existing rule (error if absent).',
+          },
+          passthrough: {
+            type: 'boolean',
+            description:
+              'Observer semantics for rateLimit/passiveSample rules: when the rule matches but ' +
+              'does not fire (below N, bucket empty), the event FALLS THROUGH to later rules ' +
+              'instead of being consumed. Use for "additionally wake me every Nth event" ' +
+              'governors so they never swallow DM/mention wakes.',
           },
           resets: {
             type: 'array',
@@ -9960,6 +9993,7 @@ export class AgentFramework {
       // range/shape checks.
       const input = (call.input ?? {}) as {
         name?: unknown; match?: unknown; resets?: unknown; position?: unknown;
+        insertBefore?: unknown; insertAfter?: unknown; passthrough?: unknown;
         behavior?: unknown; debounceMs?: unknown; rateLimit?: unknown; passiveSample?: unknown;
       };
       const behaviorSources = [
@@ -9990,17 +10024,72 @@ export class AgentFramework {
         : input.passiveSample !== undefined ? { passive_sample: input.passiveSample }
         : input.behavior;
 
-      const position = input.position === 'prepend' ? 'prepend' : 'append';
+      // Placement: at most one of position / insertBefore / insertAfter.
+      // With none given, a replaced rule stays where it was and a new rule
+      // appends (addPolicy's contract).
+      const placementSources = [
+        input.position !== undefined ? 'position' : null,
+        input.insertBefore !== undefined ? 'insertBefore' : null,
+        input.insertAfter !== undefined ? 'insertAfter' : null,
+      ].filter((s): s is string => s !== null);
+      if (placementSources.length > 1) {
+        finish({
+          success: false,
+          error: `wake_add_rule: give at most one placement, got [${placementSources.join(', ')}].`,
+          isError: true,
+        });
+        return;
+      }
+      let position: 'append' | 'prepend' | { before: string } | { after: string } | undefined;
+      if (typeof input.insertBefore === 'string' && input.insertBefore) {
+        position = { before: input.insertBefore };
+      } else if (typeof input.insertAfter === 'string' && input.insertAfter) {
+        position = { after: input.insertAfter };
+      } else if (input.position === 'prepend' || input.position === 'append') {
+        position = input.position;
+      }
+
       const rawPolicy = {
         name: input.name,
         match: input.match ?? {},
         behavior,
+        ...(input.passthrough !== undefined ? { passthrough: input.passthrough } : {}),
         ...(input.resets !== undefined ? { resets: input.resets } : {}),
       };
-      const policy = this.addGatePolicy(rawPolicy, { position });
+
+      // Before/after probe table + shadow lint: the moment a rule changes the
+      // evaluation order is the moment its real semantics must be legible
+      // (af#105 — a prepended catch-all sampler silently disabled the
+      // addressed-message wakes for 12h before anyone could see why).
+      const before = new Map(
+        this.eventGate!.probeTable().map((r) => [r.probe, r]),
+      );
+      const policy = this.addGatePolicy(rawPolicy, position ? { position } : undefined);
+      const after = this.eventGate!.probeTable();
+      const probes = after.map((r) => {
+        const prev = before.get(r.probe);
+        const changed = !!prev && (prev.policy !== r.policy || prev.wouldWake !== r.wouldWake);
+        return {
+          probe: r.probe,
+          rule: r.policy ?? '(default)',
+          behavior: r.behavior,
+          wouldWake: r.wouldWake,
+          ...(changed ? { changed: true, was: `${prev!.policy ?? '(default)'} (wouldWake=${prev!.wouldWake})` } : {}),
+        };
+      });
+      const shadowWarnings = this.eventGate!.lintShadows()
+        .map((w) => formatShadowWarning(w));
       finish({
         success: true,
-        data: { added: policy.name, policies: this.getGatePolicyNames() },
+        data: {
+          added: policy.name,
+          policies: this.getGatePolicyNames(),
+          ...(shadowWarnings.length > 0 ? { shadowWarnings } : {}),
+          probes,
+          ...(probes.some((p) => 'changed' in p)
+            ? {}
+            : { note: 'No canonical probe changed its winning rule — the new rule affects none of the common chat/heartbeat shapes, or only channel/path-specific events the probes do not model.' }),
+        },
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

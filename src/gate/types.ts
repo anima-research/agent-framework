@@ -118,6 +118,22 @@ export interface GatePolicy {
    * coupling the behaviors to each other in code. Unknown names are ignored.
    */
   resets?: string[];
+  /**
+   * Observer semantics for the counting behaviors (`passive_sample`,
+   * `rate_limit`): when the behavior does NOT fire for a matching event
+   * (sampler below N, bucket empty), evaluation CONTINUES to later policies
+   * instead of consuming the event with trigger=false. When it DOES fire,
+   * it triggers as usual and evaluation stops.
+   *
+   * This is how to express "additionally wake me every Nth event" without
+   * silently swallowing the events in between — a plain (consuming)
+   * `passive_sample` placed early makes every later rule unreachable for
+   * its scope, which is almost never what a density governor intends
+   * (2026-08-08 Mythos stand-back-density incident). Validation rejects
+   * `passthrough` on `always`/`defer`/`skip`/`debounce`, where "didn't
+   * fire" has no meaning distinct from the behavior itself.
+   */
+  passthrough?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +178,42 @@ export interface GateDecision {
   policyName: string | null;
   /** The behavior that was applied. */
   behavior: GateBehavior;
+  /**
+   * Names of `passthrough` policies that matched and counted this event but
+   * did not fire, so evaluation continued past them. Absent when none did.
+   */
+  observed?: string[];
+}
+
+/**
+ * A rule-ordering hazard: `earlier` matches (and consumes) every event that
+ * `later` would match, for the listed event types — so `later` can never
+ * fire for them. Produced by the conservative shadow lint; a warning here is
+ * always a true statement about the config, but a config with no warnings is
+ * not guaranteed hazard-free (the lint only proves what it can prove).
+ */
+export interface ShadowWarning {
+  /** Name of the earlier (consuming) policy. */
+  earlier: string;
+  /** Name of the later policy it makes unreachable. */
+  later: string;
+  /** Event types affected — 'all' when both rules are unscoped. */
+  eventTypes: string[] | 'all';
+}
+
+/** One row of the dry-run probe table (see EventGate.probeTable). */
+export interface GateProbeRow {
+  /** Short label for the synthetic event probed (e.g. "dm", "mention"). */
+  probe: string;
+  /** Event type the probe used. */
+  eventType: string;
+  /** Winning policy name, or null when the default applied. */
+  policy: string | null;
+  /** Compact behavior description (formatBehavior output or the default). */
+  behavior: string;
+  /** Whether this event WOULD trigger inference right now. For counting
+   *  behaviors this reflects current counter/bucket state. */
+  wouldWake: boolean;
 }
 
 /** Information about an event being evaluated. */
@@ -211,6 +263,12 @@ export interface GateStatus {
   script: import('./gate-script.js').GateScriptStatus;
   policies: GatePolicyStats[];
   errors: string[];
+  /**
+   * Active shadow-lint findings for the current policy order (see
+   * ShadowWarning). Rendered so an agent inspecting gate_status sees the
+   * same hazards wake_add_rule warns about at install time.
+   */
+  shadowWarnings: string[];
   /** Total events the gate has evaluated since startup. */
   totalEvaluations: number;
   /**
