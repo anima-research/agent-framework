@@ -25,6 +25,8 @@ import type {
   GateEventInfo,
   GatePolicyStats,
   GateStatus,
+  ShadowWarning,
+  GateProbeRow,
 } from './types.js';
 
 // Re-export types consumers need
@@ -310,9 +312,135 @@ function validatePolicy(raw: unknown): GatePolicy {
     if (names.length > 0) resets = names;
   }
 
+  // Validate passthrough — only meaningful on the counting behaviors, where
+  // "matched but didn't fire" is a distinct outcome that can fall through.
+  // On always/defer/skip/debounce the flag would be a no-op at best and a
+  // misleading promise at worst, so reject it loudly instead of ignoring it.
+  let passthrough: boolean | undefined;
+  if (obj.passthrough !== undefined) {
+    if (typeof obj.passthrough !== 'boolean') {
+      throw new Error(`Policy "${obj.name}": passthrough must be a boolean`);
+    }
+    if (obj.passthrough) {
+      const counting = typeof behavior === 'object'
+        && ('rate_limit' in behavior || 'passive_sample' in behavior);
+      if (!counting) {
+        throw new Error(
+          `Policy "${obj.name}": passthrough is only valid with rate_limit or `
+          + `passive_sample behaviors — for "${formatBehavior(behavior)}" there is `
+          + 'no non-firing match to fall through on',
+        );
+      }
+      passthrough = true;
+    }
+  }
+
   const policy: GatePolicy = { name: obj.name, match, behavior };
   if (resets) policy.resets = resets;
+  if (passthrough) policy.passthrough = passthrough;
   return policy;
+}
+
+// ---------------------------------------------------------------------------
+// Shadow lint — prove (conservatively) when rule ordering makes a rule dead
+// ---------------------------------------------------------------------------
+
+/** Set-inclusion helper for exact-string lists. */
+function subsetOf(a: string[], b: string[]): boolean {
+  return a.every((x) => b.includes(x));
+}
+
+/** A glob field on the EARLIER rule is at least as broad as the LATER rule's
+ *  when it's absent, the universal "*", or literally identical. Anything
+ *  cleverer (real glob subsumption) is out of conservative scope. */
+function globAtLeastAsBroad(earlier: string | undefined, later: string | undefined): boolean {
+  if (earlier === undefined || earlier === '*') return true;
+  return earlier === later;
+}
+
+/**
+ * Event types for which `earlier` provably matches EVERY event that `later`
+ * would match — i.e. the types for which `later` is unreachable when
+ * `earlier` sits before it and consumes its matches. Returns null when
+ * subsumption can't be proven (which is not proof of safety — the lint is
+ * deliberately one-sided so every warning it emits is true).
+ */
+function subsumedEventTypes(earlier: GatePolicy, later: GatePolicy): string[] | 'all' | null {
+  const e = earlier.match;
+  const l = later.match;
+
+  // Scope: which of `later`'s event types does `earlier` cover?
+  let covered: string[] | 'all';
+  if (!e.scope || e.scope.length === 0) {
+    covered = l.scope && l.scope.length > 0 ? l.scope : 'all';
+  } else if (!l.scope || l.scope.length === 0) {
+    // `later` matches all types; `earlier` only consumes its own scope, so
+    // the shadow is partial — exactly those types.
+    covered = e.scope;
+  } else {
+    const overlap = l.scope.filter((t) => e.scope!.includes(t));
+    if (overlap.length === 0) return null;
+    covered = overlap;
+  }
+
+  // Every remaining discriminator on `earlier` must be at least as broad as
+  // `later`'s, otherwise some `later` events slip past `earlier`.
+  if (!globAtLeastAsBroad(e.source, l.source)) return null;
+  if (!globAtLeastAsBroad(e.channel, l.channel)) return null;
+  if (!globAtLeastAsBroad(e.mount, l.mount)) return null;
+  if (!globAtLeastAsBroad(e.pathGlob, l.pathGlob)) return null;
+
+  if (e.filter) {
+    if (!l.filter || e.filter.type !== l.filter.type || e.filter.pattern !== l.filter.pattern) {
+      return null;
+    }
+  }
+
+  // metadataTrue / tagsAny are OR-lists: earlier subsumes when later's list
+  // is a subset of earlier's (any event satisfying later then satisfies
+  // earlier too). tagsAll / tagsNone are AND/NOT constraints: earlier
+  // subsumes when its constraints are a subset of later's.
+  if (e.metadataTrue && e.metadataTrue.length > 0) {
+    if (!l.metadataTrue || !subsetOf(l.metadataTrue, e.metadataTrue)) return null;
+  }
+  if (e.tagsAny && e.tagsAny.length > 0) {
+    if (!l.tagsAny || !subsetOf(l.tagsAny, e.tagsAny)) return null;
+  }
+  if (e.tagsAll && !subsetOf(e.tagsAll, l.tagsAll ?? [])) return null;
+  if (e.tagsNone && !subsetOf(e.tagsNone, l.tagsNone ?? [])) return null;
+
+  return covered;
+}
+
+/**
+ * Find rules made unreachable by earlier, broader rules (first match wins).
+ * The 2026-08-08 Mythos incident is the canonical catch: a prepended
+ * `{scope:[mcpl:channel-incoming]}` sampler silently made the
+ * direct-address and mention rules dead for the whole incoming lane.
+ * `passthrough` observers shadow nothing — non-firing matches fall through.
+ */
+export function findShadowedPolicies(policies: GatePolicy[]): ShadowWarning[] {
+  const out: ShadowWarning[] = [];
+  for (let i = 0; i < policies.length; i++) {
+    const earlier = policies[i];
+    if (earlier.passthrough) continue;
+    for (let j = i + 1; j < policies.length; j++) {
+      const covered = subsumedEventTypes(earlier, policies[j]);
+      if (covered) {
+        out.push({ earlier: earlier.name, later: policies[j].name, eventTypes: covered });
+      }
+    }
+  }
+  return out;
+}
+
+/** Human-readable one-liner for a ShadowWarning, used in tool results,
+ *  traces, and gate_status alike so the same hazard reads the same way
+ *  everywhere. */
+export function formatShadowWarning(w: ShadowWarning): string {
+  const types = w.eventTypes === 'all' ? 'ALL event types' : w.eventTypes.join(', ');
+  return `rule "${w.earlier}" makes "${w.later}" unreachable for ${types} `
+    + `(first match wins — every event "${w.later}" would match is consumed by "${w.earlier}" first)`;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +476,11 @@ export class EventGate {
 
   // Per-policy stats
   private stats = new Map<string, PolicyStats>();
+
+  // Shadow-lint cache (see refreshShadowWarnings) — recomputed on every
+  // config change, fingerprinted so an unchanged hazard set doesn't re-trace.
+  private shadowWarningsCache: ShadowWarning[] = [];
+  private shadowWarningsFingerprint = '[]';
 
   // Observability counters for events that didn't match any policy
   private totalEvaluations = 0;
@@ -455,6 +588,7 @@ export class EventGate {
     // Load config
     this.config = this.loadConfig() ?? opts.initialConfig ?? { ...DEFAULT_CONFIG };
     this.compiledPolicies = this.compilePolicies(this.config);
+    this.refreshShadowWarnings('startup');
 
     // Programmable gate: an optional agent-authored `gate.js` next to gate.json.
     // Absent ⇒ inactive (zero overhead beyond a throttled stat check).
@@ -568,6 +702,7 @@ export class EventGate {
       this.config = newConfig;
       this.compiledPolicies = this.compilePolicies(newConfig);
       this.lastReloadTimestamp = now;
+      this.refreshShadowWarnings('reload');
 
       this.emitTrace({
         type: 'gate:config-reloaded',
@@ -598,23 +733,46 @@ export class EventGate {
    * without waiting for the throttled mtime reload.
    *
    * The freshest on-disk config is re-read first, so a concurrent operator edit
-   * isn't clobbered. A policy with the same `name` is replaced IN PLACE (order
-   * preserved); otherwise it is appended, or prepended when `position:'prepend'`
-   * — first match wins, so a wake rule that must beat a broad defer/debounce
-   * belongs at the front.
+   * isn't clobbered. A policy with the same `name` is replaced IN PLACE when no
+   * `position` is given (order preserved); WITH a `position` it is moved there
+   * — so re-issuing a rule is also how you reposition it. New policies append
+   * by default; `'prepend'` puts one at the very front (ahead of EVERYTHING,
+   * including addressed-message wake rules — see the shadow lint), and the
+   * anchored forms `{before: name}` / `{after: name}` insert relative to an
+   * existing rule, which is almost always the safer way to order a sampler
+   * or debounce against a specific catch-all.
    */
-  addPolicy(rawPolicy: unknown, options?: { position?: 'append' | 'prepend' }): GatePolicy {
+  addPolicy(
+    rawPolicy: unknown,
+    options?: { position?: 'append' | 'prepend' | { before: string } | { after: string } },
+  ): GatePolicy {
     const policy = validatePolicy(rawPolicy);
     const current = this.loadConfig() ?? this.config;
     const policies = [...current.policies];
     const idx = policies.findIndex((p) => p.name === policy.name);
-    if (idx >= 0) {
-      policies[idx] = policy;
-    } else if (options?.position === 'prepend') {
-      policies.unshift(policy);
+    const position = options?.position;
+
+    if (idx >= 0 && position === undefined) {
+      policies[idx] = policy; // replace in place, order preserved
     } else {
-      policies.push(policy);
+      if (idx >= 0) policies.splice(idx, 1); // repositioning a known rule
+      if (position === 'prepend') {
+        policies.unshift(policy);
+      } else if (position !== undefined && typeof position === 'object') {
+        const anchorName = 'before' in position ? position.before : position.after;
+        const anchorIdx = policies.findIndex((p) => p.name === anchorName);
+        if (anchorIdx < 0) {
+          throw new Error(
+            `addPolicy: no policy named "${anchorName}" to anchor on — `
+            + `have: [${policies.map((p) => p.name).join(', ')}]`,
+          );
+        }
+        policies.splice('before' in position ? anchorIdx : anchorIdx + 1, 0, policy);
+      } else {
+        policies.push(policy);
+      }
     }
+
     this.writeConfig({ ...current, policies });
     this.emitTrace({
       type: 'gate:policy-added',
@@ -672,6 +830,7 @@ export class EventGate {
     writeFileSync(this.configPath, JSON.stringify(config, null, 2) + '\n');
     this.config = config;
     this.compiledPolicies = this.compilePolicies(config);
+    this.refreshShadowWarnings('policy-mutation');
     this.configSource = 'file';
     this.configErrors = [];
     this.lastReloadTimestamp = Date.now();
@@ -683,17 +842,9 @@ export class EventGate {
   }
 
   // =========================================================================
-  // Policy matching — first match wins
+  // Policy matching — first match wins (passthrough observers excepted; the
+  // match/decide loop lives inline in evaluate() and probe())
   // =========================================================================
-
-  private matchPolicy(info: GateEventInfo): GatePolicy | null {
-    for (const compiled of this.compiledPolicies) {
-      if (this.compiledMatches(compiled, info)) {
-        return compiled.policy;
-      }
-    }
-    return null;
-  }
 
   private compiledMatches(compiled: CompiledPolicy, info: GateEventInfo): boolean {
     const match = compiled.policy.match;
@@ -804,13 +955,32 @@ export class EventGate {
     // Programmable gate (gate.js) takes precedence when present and returns a
     // behavior; null/undefined (inactive, error, or a deliberate pass) falls
     // through to the declarative gate.json policies below.
+    //
+    // Declarative policies: first match wins — EXCEPT `passthrough` observers,
+    // which consume the event only when their counting behavior actually
+    // fires. A passthrough policy that matched-but-didn't-fire records its
+    // count and evaluation continues, so a density sampler placed early can
+    // no longer swallow the addressed-message rules behind it.
     const scripted = this.gateScript.evaluate(info);
-    const policy: GatePolicy | null =
-      scripted != null ? { name: 'gate.js', match: {}, behavior: scripted } : this.matchPolicy(info);
-    const decision = this.computeDecision(policy, info);
+    let decision: GateDecision | null = null;
+    const observed: string[] = [];
+    if (scripted != null) {
+      decision = this.computeDecision({ name: 'gate.js', match: {}, behavior: scripted }, info);
+    } else {
+      for (const compiled of this.compiledPolicies) {
+        if (!this.compiledMatches(compiled, info)) continue;
+        const candidate = this.computeDecision(compiled.policy, info);
+        if (candidate.trigger || !compiled.policy.passthrough) {
+          decision = candidate;
+          break;
+        }
+        observed.push(compiled.policy.name); // counted, didn't fire, fell through
+      }
+    }
 
     this.totalEvaluations++;
-    if (!policy) {
+    if (!decision) {
+      decision = this.computeDecision(null, info);
       const bucket = this.defaultByEventType.get(info.eventType)
         ?? { triggered: 0, skipped: 0 };
       if (decision.trigger) {
@@ -822,6 +992,7 @@ export class EventGate {
       }
       this.defaultByEventType.set(info.eventType, bucket);
     }
+    if (observed.length > 0) decision.observed = observed;
 
     this.emitTrace({
       type: 'gate:decision',
@@ -831,6 +1002,7 @@ export class EventGate {
       matchedPolicy: decision.policyName,
       trigger: decision.trigger,
       behavior: formatBehavior(decision.behavior),
+      ...(observed.length > 0 ? { observed } : {}),
       timestamp: this.now(),
     });
 
@@ -1000,6 +1172,164 @@ export class EventGate {
     this.passiveSampleCounters.delete(name);
     this.rateLimitDenied.delete(name);
     this.passiveSampleFires.delete(name);
+  }
+
+  // =========================================================================
+  // Dry-run probes — side-effect-free "what would this event do right now"
+  // =========================================================================
+
+  /**
+   * Non-mutating twin of the behavior decision: would this policy trigger for
+   * this event, given CURRENT counter/bucket state? Reads state, never writes
+   * it — no stats, no traces, no counter increments, no debounce batching.
+   */
+  private wouldTrigger(policy: GatePolicy, info: GateEventInfo): boolean {
+    const b = policy.behavior;
+    if (b === 'always') return true;
+    if (b === 'defer' || b === 'skip') return false;
+    if (typeof b === 'object') {
+      if ('debounce' in b) return false; // batches; never triggers inline
+      if ('rate_limit' in b) {
+        const cfg = b.rate_limit;
+        const key = this.resolveKey(info.metadata, cfg.keyBy);
+        const bucket = this.rateLimitBuckets.get(policy.name)?.get(key);
+        if (!bucket) return true; // fresh bucket starts full
+        let tokens = bucket.tokens;
+        if (tokens < cfg.tokens) {
+          const elapsed = Math.max(0, this.now() - bucket.lastRefill);
+          tokens = Math.min(cfg.tokens, tokens + Math.floor(elapsed / cfg.refillIntervalMs));
+        }
+        return tokens > 0;
+      }
+      if ('passive_sample' in b) {
+        const cfg = b.passive_sample;
+        const key = this.resolveKey(info.metadata, cfg.keyBy);
+        const count = this.passiveSampleCounters.get(policy.name)?.get(key) ?? 0;
+        return count + 1 >= cfg.every;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Evaluate an event against the declarative policy table WITHOUT side
+   * effects: no counters advance, no debounce batches form, no stats or
+   * traces are recorded, and sleep suppression is ignored (a probe asks
+   * about the table, not the moment). gate.js is not consulted — a script
+   * may be stateful, and a probe must never perturb state.
+   */
+  probe(info: GateEventInfo): GateDecision {
+    for (const compiled of this.compiledPolicies) {
+      if (!this.compiledMatches(compiled, info)) continue;
+      const trigger = this.wouldTrigger(compiled.policy, info);
+      if (trigger || !compiled.policy.passthrough) {
+        return { trigger, policyName: compiled.policy.name, behavior: compiled.policy.behavior };
+      }
+    }
+    const trigger = (this.config.default ?? 'always') === 'always';
+    return { trigger, policyName: null, behavior: this.config.default ?? 'always' };
+  }
+
+  /**
+   * Probe a canonical set of synthetic chat/heartbeat events and report which
+   * rule wins each and whether it would wake. Backs the before/after table in
+   * the wake_add_rule result — the point where a rule change's real semantics
+   * must become legible (af#105; the Mythos stand-back-density incident would
+   * have been visible as `dm: discord-direct-address → stand-back-density`).
+   * Probes are representative shapes, not an exhaustive event space — rules
+   * keyed on specific channels/mounts may not match any probe.
+   */
+  probeTable(): GateProbeRow[] {
+    const chat = (
+      label: string,
+      eventType: string,
+      metadata: Record<string, unknown>,
+      tags: string[],
+    ): { label: string; info: GateEventInfo } => ({
+      label,
+      info: {
+        content: `[probe] ${label}`,
+        eventType,
+        serverId: 'discord',
+        channelId: '',
+        metadata: { ...metadata, eventType },
+        tags,
+      },
+    });
+
+    const probes = [
+      chat('dm (open channel)', 'mcpl:channel-incoming', { isDM: true, isMention: true },
+        ['chat:dm', 'chat:private', 'chat:addressed', 'chat:from-human']),
+      chat('dm (closed channel)', 'mcpl:push-event', { isDM: true, isMention: true },
+        ['chat:dm', 'chat:private', 'chat:addressed', 'chat:from-human']),
+      chat('explicit mention (open channel)', 'mcpl:channel-incoming',
+        { isMention: true, isExplicitMention: true },
+        ['chat:mention', 'chat:addressed', 'chat:from-human']),
+      chat('explicit mention (closed channel)', 'mcpl:push-event',
+        { isMention: true, isExplicitMention: true },
+        ['chat:mention', 'chat:addressed', 'chat:from-human']),
+      chat('reply to you', 'mcpl:channel-incoming', { isMention: true, isReplyToBot: true },
+        ['chat:reply', 'chat:addressed', 'chat:from-human']),
+      chat('ambient (human)', 'mcpl:channel-incoming', {},
+        ['chat:ambient', 'chat:from-human']),
+      chat('ambient (bot)', 'mcpl:channel-incoming', { isBot: true },
+        ['chat:ambient', 'chat:from-bot']),
+      {
+        label: 'heartbeat',
+        info: {
+          content: '[probe] heartbeat',
+          eventType: 'mcpl:push-event',
+          serverId: 'heartbeat',
+          channelId: '',
+          metadata: { source: 'heartbeat', eventType: 'mcpl:push-event' },
+        } as GateEventInfo,
+      },
+    ];
+
+    return probes.map(({ label, info }) => {
+      const d = this.probe(info);
+      return {
+        probe: label,
+        eventType: info.eventType,
+        policy: d.policyName,
+        behavior: d.policyName === null
+          ? `default:${formatBehavior(d.behavior)}`
+          : formatBehavior(d.behavior),
+        wouldWake: d.trigger,
+      };
+    });
+  }
+
+  // =========================================================================
+  // Shadow lint surface
+  // =========================================================================
+
+  /** Current shadow-lint findings for the live policy order. Fresh compute —
+   *  cheap (policy lists are tens of entries at most). */
+  lintShadows(): ShadowWarning[] {
+    return findShadowedPolicies(this.config.policies);
+  }
+
+  /**
+   * Recompute shadow warnings and, when the set changed and is non-empty,
+   * emit a `gate:shadow-warnings` trace so the hazard lands in ops
+   * observability at the moment the order changed — not at the next missed
+   * DM. Called from writeConfig and reloadIfChanged.
+   */
+  private refreshShadowWarnings(reason: string): void {
+    const warnings = this.lintShadows();
+    const fingerprint = JSON.stringify(warnings);
+    if (fingerprint === this.shadowWarningsFingerprint) return;
+    this.shadowWarningsFingerprint = fingerprint;
+    this.shadowWarningsCache = warnings;
+    if (warnings.length > 0) {
+      this.emitTrace({
+        type: 'gate:shadow-warnings',
+        reason,
+        warnings: warnings.map(formatShadowWarning),
+        timestamp: this.now(),
+      });
+    }
   }
 
   // =========================================================================
@@ -1436,6 +1766,7 @@ export class EventGate {
       script: this.gateScript.status(),
       policies,
       errors: [...this.configErrors],
+      shadowWarnings: this.shadowWarningsCache.map(formatShadowWarning),
       totalEvaluations: this.totalEvaluations,
       defaultDecisions: {
         triggered: this.defaultTriggered,
