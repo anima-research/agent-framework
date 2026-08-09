@@ -7117,6 +7117,9 @@ export class AgentFramework {
     const blocks: ContentBlock[] = toolResults.map(tc => ({
       type: 'tool_result' as const,
       toolUseId: tc.id,
+      // Persisted so XML replay can reconstruct the legacy <tool_name>
+      // element byte-identically to the live injection.
+      toolName: tc.name,
       content: spilled.get(tc.id)!.text,
       isError: tc.result.isError,
     }));
