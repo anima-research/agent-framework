@@ -4795,6 +4795,9 @@ export class AgentFramework {
       event.messageId,
       event.tags,
       event.author?.id,
+      // The resident's gate verdict rides the event; it preconditions
+      // subconscious wakes (gate composes, it is not replaced).
+      event.triggerInference !== false,
     ) ?? null;
     if (divert) {
       metadata.tuneOut = { epochId: divert.epochId };
