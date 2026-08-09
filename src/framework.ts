@@ -5809,9 +5809,18 @@ export class AgentFramework {
               const rawXml = rawText && /^<(antml:)?function_calls>/.test(rawText)
                 ? rawText
                 : undefined;
+              // Persist THIS round's text only. `roundPreamble` (membrane
+              // ≥0.5.79) is the per-round delta; the legacy `preamble` is
+              // CUMULATIVE in XML mode — persisting it per round stored each
+              // round's text N times and re-persisted injected
+              // <function_results> as the agent's own words (the Evander
+              // 2026-08-08 scaffold-leak pyramid: r1 ×3, r2 ×2).
+              const roundText =
+                (event.context as { roundPreamble?: string }).roundPreamble ??
+                event.context.preamble;
               assistantBlocks = [];
-              if (event.context.preamble) {
-                assistantBlocks.push({ type: 'text', text: event.context.preamble });
+              if (roundText) {
+                assistantBlocks.push({ type: 'text', text: roundText });
               }
               for (const c of event.calls) {
                 assistantBlocks.push({
@@ -7108,6 +7117,9 @@ export class AgentFramework {
     const blocks: ContentBlock[] = toolResults.map(tc => ({
       type: 'tool_result' as const,
       toolUseId: tc.id,
+      // Persisted so XML replay can reconstruct the legacy <tool_name>
+      // element byte-identically to the live injection.
+      toolName: tc.name,
       content: spilled.get(tc.id)!.text,
       isError: tc.result.isError,
     }));
