@@ -15,10 +15,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 20
 
@@ -49,10 +51,21 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Require changelog section for this release
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          esc=$(printf '%s' "$ver" | sed 's/[.]/\\./g')
+          if ! grep -Eq "^## ${esc}([^0-9]|$)" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## ${ver}' section for tag ${GITHUB_REF_NAME}. Retitle the Unreleased section before tagging (see CONTRIBUTING.md)."
+            exit 1
+          fi
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           # node 24 ships npm >= 11.5.1, required for OIDC publishing.
           node-version: 24
@@ -66,3 +79,42 @@ jobs:
 
       - name: Publish
         run: npm publish --access public --provenance
+
+  github-release:
+    name: GitHub release notes
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    # Deliberately independent of the npm publish job: some consumers run
+    # github-clone checkouts, and release notes must exist even when npm
+    # publish fails — the two jobs succeed or fail on their own.
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Mirror changelog section into release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          # Section header is '## X.Y.Z — YYYY-MM-DD'; match the version
+          # field exactly (string compare, no regex escaping needed).
+          awk -v ver="$ver" '
+            /^## / { if (in_section) exit; if ($2 == ver) { in_section = 1; next } }
+            in_section { print }
+          ' CHANGELOG.md | sed '/./,$!d' > notes.md
+          if ! [ -s notes.md ]; then
+            echo "::error::No CHANGELOG.md section found for ${ver}."
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
+              --notes-file notes.md --verify-tag
+          fi
