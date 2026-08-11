@@ -183,6 +183,18 @@ export interface FrameworkConfig {
    * unchanged (all messages go to the primary agent).
    */
   conversations?: ConversationRouterConfig;
+
+  /**
+   * Provider-cap parked state (2026-08-11 Cairn workspace-cap incident).
+   * A structurally-classified fixed-future usage/billing cap parks the agent:
+   * no primary or compression dispatch, no history shedding, durable across
+   * restarts (metadata-only file, default 'state/provider-cap.json' under the
+   * host cwd — created only if a cap is ever hit). Release: authenticated
+   * operator `cap_clear`, or one jittered canary after the provider-stated
+   * reset. Omit for defaults; the mechanism itself is always on (it is a
+   * safety net in the same class as the poison-history breaker).
+   */
+  providerCap?: import('../provider-cap.js').ProviderCapGovernorConfig;
 }
 
 /** One agent's outcome within a periodic context-maintenance pass. */

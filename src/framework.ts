@@ -68,6 +68,12 @@ import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
 import { ConversationRouter } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
+import {
+  ProviderCapGovernor,
+  classifyProviderCapError,
+  capShapedButUnparsed,
+  type ProviderCapClassification,
+} from './provider-cap.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import {
   toolResultDataToHistoryString,
@@ -737,6 +743,15 @@ export class AgentFramework {
    *  tick counts in the success log stop meaning anything. One kick per agent
    *  at a time; cleared when the kick settles (success or failure). */
   private overBudgetDrainInFlight: Set<string> = new Set();
+  /** Provider-cap parked state (Cairn workspace-cap incident, 2026-08-11):
+   *  a fixed-future usage/billing cap is a 400 on the wire but means "the
+   *  ACCOUNT is capped", not "the history is poisoned" — while parked, all
+   *  provider dispatch (primary + maintenance) is suppressed and NO history
+   *  is shed. Durable across restarts via a metadata-only state file. */
+  private providerCapGovernor = new ProviderCapGovernor();
+  /** Throttle for the held-wake stderr line (one per agent per minute, not
+   *  one per dropped wake — a parked agent in a busy channel drops many). */
+  private capHeldWarnAt: Map<string, number> = new Map();
   /** Per-agent current rewind episode: the single consolidated marker's id and
    *  how many turns have been shed so far. One marker per episode, updated in
    *  place (see updateRewindMarker); cleared when the episode ends. */
@@ -1002,6 +1017,10 @@ export class AgentFramework {
       normalizeDiscordAwarenessDeadline(config.discordAwarenessDeadlineMs),
     );
 
+    if (config.providerCap) {
+      framework.providerCapGovernor = new ProviderCapGovernor(config.providerCap);
+    }
+
     // If an offline recovery process crashed after switching Chronicle but
     // before committing its prepared marker batch, the active branch is the
     // commit record. Promote it now; no quarantined content is read.
@@ -1184,6 +1203,30 @@ export class AgentFramework {
       return;
     }
 
+    // Restore any provider-cap park BEFORE the loop can dispatch: a restart
+    // must not spend "one probe" (or worse, hand the poison breaker three
+    // fresh sheds) rediscovering a cap the previous process already measured.
+    this.providerCapGovernor.load(Date.now());
+    const capStatus = this.providerCapGovernor.statusAll();
+    if (capStatus.loadError) {
+      console.error(`[provider-cap] state load problem: ${capStatus.loadError}`);
+      this.opsAlert('provider-cap-state', 'framework', capStatus.loadError);
+    }
+    for (const park of capStatus.parks) {
+      console.error(
+        `[provider-cap] agent=${park.agent} PARKED (${park.provider}/${park.scope} ${park.errorClass}, ` +
+        `reset ${new Date(park.resetAt).toISOString()}, canary from ${new Date(park.eligibleAt).toISOString()}, ` +
+        `attempts=${park.attemptCount}) — provider dispatch suppressed; ` +
+        `release via post-reset canary or host command cap_clear.`,
+      );
+      this.opsAlert(
+        'provider-cap-parked',
+        park.agent,
+        `still parked after restart: ${park.errorClass}, reset ${new Date(park.resetAt).toISOString()}`,
+        { skipLog: true },
+      );
+    }
+
     this.running = true;
     this.loopPromise = this.runLoop();
 
@@ -1327,6 +1370,31 @@ export class AgentFramework {
       const tools = this.getToolsForAgent(agent.name).filter((tool) => agent.canUseTool(tool.name));
       cm.setToolDefinitions(tools);
       if (cm.isReady()) return [];
+
+      // Provider-cap park: compression/maintenance dispatch is provider
+      // dispatch — while parked it hot-retried Cairn's cap 400 every ~3.4 s
+      // (12,774 failures, ~8.5 GB/day of logs). Suppressed while parked;
+      // once the canary window opens, ONE maintenance pass may run as the
+      // canary — for a backlogged agent this is also exactly the debt-
+      // retirement lane, already bounded by MAINTENANCE_TICKS_PER_PASS.
+      let capCanary = false;
+      if (this.providerCapGovernor?.isParked(agent.name)) {
+        const capNow = Date.now();
+        if (this.providerCapGovernor.noteModelChanged(agent.name, agent.model, capNow)) {
+          console.error(
+            `[provider-cap] agent=${agent.name} model changed while parked — canary now eligible`,
+          );
+        }
+        if (!this.providerCapGovernor.tryAcquireCanary(agent.name, capNow)) {
+          this.providerCapGovernor.noteHeldMaintenance(agent.name, capNow);
+          return [];
+        }
+        capCanary = true;
+        console.error(
+          `[provider-cap] agent=${agent.name} canary window open — one maintenance pass permitted`,
+        );
+      }
+
       const pending = cm.getPendingWork()?.description;
       const progress = this.contextProgress(cm);
       const record: ContextMaintenanceAgentRun = {
@@ -1341,6 +1409,7 @@ export class AgentFramework {
         agent,
         cm,
         record,
+        capCanary,
       }];
     });
     if (queued.length === 0) return;
@@ -1353,7 +1422,7 @@ export class AgentFramework {
     this.currentMaintenanceRun = run;
 
     try {
-      await Promise.all(queued.map(async ({ agent, cm, record }) => {
+      await Promise.all(queued.map(async ({ agent, cm, record, capCanary }) => {
         try {
           for (
             let i = 0;
@@ -1363,8 +1432,34 @@ export class AgentFramework {
             await cm.tick();
             record.ticks++;
           }
+          // A canary pass that completed without a cap error: the cap is off
+          // (or this pass had nothing left to dispatch — in which case the
+          // release is still safe: the next real dispatch either succeeds or
+          // re-parks in a single $0-rejected call).
+          if (capCanary && this.providerCapGovernor?.isParked(agent.name)) {
+            this.handleProviderCapRelease(agent.name, 'maintenance-canary');
+          }
         } catch (error) {
           record.error = error instanceof Error ? error.message : String(error);
+          const err = error instanceof Error ? error : new Error(String(error));
+          const cls = this.classifyInferenceError(err);
+          if (cls.errorType === 'provider_cap' && cls.capResetAt !== undefined) {
+            // The maintenance lane is where an account cap usually surfaces
+            // first (compression fires far more often than primary turns —
+            // this WAS Cairn's entry lane). Park here; the park alert covers
+            // observability, so skip the generic maintenance klaxon.
+            this.handleProviderCapFailure(agent.name, {
+              resetAt: cls.capResetAt,
+              scope: cls.capScope ?? 'unknown',
+              provider: cls.capProvider ?? 'unknown',
+              errorClass: cls.capErrorClass ?? 'usage_cap',
+            });
+            console.error(
+              `[context-maintenance] agent=${agent.name} hit provider cap — parked, retries stop`,
+            );
+            return;
+          }
+          if (capCanary) this.providerCapGovernor?.canaryAborted(agent.name);
           console.error(`[context-maintenance] agent=${agent.name} failed:`, record.error);
           this.opsAlert(
             'context-maintenance-failed',
@@ -2872,6 +2967,18 @@ export class AgentFramework {
     if (!name || !agent) {
       return { ok: false, error: `Unknown agent: ${String(agentName ?? '(none registered)')}` };
     }
+    // Nudges never bypass a provider-cap park (every caller funnels here):
+    // the wake would burn one capped call for nothing. cap_clear is the
+    // deliberate override and queues its own catch-up wake.
+    const parked = this.providerCapGovernor?.status(name);
+    if (parked) {
+      return {
+        ok: false,
+        error:
+          `Agent ${name} is provider-cap parked (reset ` +
+          `${new Date(parked.resetAt).toISOString()}) — use cap_clear to release deliberately.`,
+      };
+    }
     const agentStatus = this.activeTurnTokens.has(name) && agent.state.status === 'idle'
       ? 'idle+turn-alive'
       : agent.state.status;
@@ -2921,12 +3028,16 @@ export class AgentFramework {
     /** For `nudge`: agent state at queue time ('idle' = runs immediately,
      *  else it runs once the current turn settles). */
     agentStatus?: string;
+    /** For `cap_status`: the agent's provider-cap park record (null = not parked). */
+    providerCap?: Record<string, unknown> | null;
   }> {
     if (
       params.command !== 'undo' &&
       params.command !== 'hide' &&
       params.command !== 'unstick' &&
-      params.command !== 'nudge'
+      params.command !== 'nudge' &&
+      params.command !== 'cap_status' &&
+      params.command !== 'cap_clear'
     ) {
       return { ok: false, error: `Unknown host command: ${String(params.command)}` };
     }
@@ -2936,9 +3047,44 @@ export class AgentFramework {
       return { ok: false, error: `Unknown agent: ${String(agentName)}` };
     }
 
+    // cap_status: read-only provider-cap park state (also in /healthz).
+    if (params.command === 'cap_status') {
+      const st = this.providerCapGovernor.status(agentName);
+      return { ok: true, providerCap: st ? { ...st } : null };
+    }
+
+    // cap_clear: authenticated operator release of a provider-cap park. The
+    // one release path that does not require the provider's reset time to
+    // have passed. Queues exactly one catch-up wake; if the cap is in fact
+    // still on, that wake's first provider call re-parks in a single
+    // $0-rejected attempt — an operator clear can never start a retry storm.
+    if (params.command === 'cap_clear') {
+      if (!this.providerCapGovernor.isParked(agentName)) {
+        return { ok: false, error: `Agent ${agentName} is not provider-cap parked` };
+      }
+      const by = params.requesterName ?? params.requesterId ?? `mcpl:${serverId}`;
+      this.logFailure({
+        agent: agentName,
+        kind: 'provider-cap-cleared',
+        reason: `operator ${by} cleared the park`,
+      });
+      this.handleProviderCapRelease(agentName, `operator:${by}`);
+      return { ok: true };
+    }
+
     // nudge: queue an inference on the current context — no message, no
     // event, no context mutation (see nudgeAgent).
     if (params.command === 'nudge') {
+      const parked = this.providerCapGovernor.status(agentName);
+      if (parked) {
+        return {
+          ok: false,
+          error:
+            `Agent ${agentName} is provider-cap parked (${parked.errorClass}, ` +
+            `reset ${new Date(parked.resetAt).toISOString()}). A nudge would burn one ` +
+            `capped call — use cap_clear to release deliberately, or wait for the canary.`,
+        };
+      }
       const r = this.nudgeAgent(
         agentName,
         params.requesterName ?? params.requesterId ?? `mcpl:${serverId}`,
@@ -2955,6 +3101,20 @@ export class AgentFramework {
       const agent = this.agents.get(agentName)!;
       if (agent.state.status !== 'idle') {
         return { ok: false, error: `Cannot unstick while agent is ${agent.state.status}` };
+      }
+      // A provider-cap park is an ACCOUNT condition, not a history condition:
+      // every unstick retry would 400 on the cap and shed a good exchange per
+      // attempt — the exact damage the park exists to prevent.
+      const parked = this.providerCapGovernor.status(agentName);
+      if (parked) {
+        return {
+          ok: false,
+          error:
+            `Agent ${agentName} is provider-cap parked (${parked.errorClass}, ` +
+            `reset ${new Date(parked.resetAt).toISOString()}) — the history is fine; the ` +
+            `account is capped. unstick would shed good history against a capped provider. ` +
+            `Use cap_clear if the cap was raised.`,
+        };
       }
       const cap = Math.max(1, Math.min(10,
         Math.floor(params.maxRewinds ?? agent.refusalHandling?.maxRewinds ?? 3)));
@@ -4849,6 +5009,38 @@ export class AgentFramework {
         continue;
       }
 
+      // A provider/model change while parked makes the canary immediately
+      // eligible — the park's evidence describes a configuration that no
+      // longer exists (one probe decides; still-capped re-parks in one call).
+      if (this.providerCapGovernor?.noteModelChanged(agentName, agent.model, now)) {
+        console.error(
+          `[provider-cap] agent=${agentName} model changed while parked — canary now eligible`,
+        );
+      }
+
+      // Provider-cap park: while suppressed (window closed, or a canary is
+      // already in flight), wakes are DROPPED — not requeued: the triggering
+      // events are already durable in chronicle, and requeuing would spin the
+      // scheduler for weeks on an account-level cap. Once the canary window
+      // opens, requests fall through toward dispatch; the single canary
+      // permit is claimed at the dispatch point below (after the busy/policy
+      // checks), so a busy requeue can neither leak the permit nor lose the
+      // eligible wake.
+      if (this.providerCapGovernor?.shouldSuppress(agentName, now)) {
+        this.providerCapGovernor.noteHeldWakes(agentName, requests.length, now);
+        const lastWarn = this.capHeldWarnAt.get(agentName) ?? 0;
+        if (now - lastWarn > 60_000) {
+          this.capHeldWarnAt.set(agentName, now);
+          const st = this.providerCapGovernor.status(agentName);
+          console.error(
+            `[provider-cap] agent=${agentName} parked — wake(s) held ` +
+            `(${st?.heldWakes ?? '?'} total; events remain recorded; ` +
+            `canary from ${st ? new Date(st.eligibleAt).toISOString() : '?'})`,
+          );
+        }
+        continue;
+      }
+
       // Skip if agent is busy (inferring, streaming, or waiting for tools) —
       // or if a turn is alive at all (activeTurnTokens): the state machine
       // goes idle at endTurn's reset while driveStream teardown is still
@@ -4935,6 +5127,21 @@ export class AgentFramework {
       }
       const triggerChannel = addressedChannel ?? ambientChannel;
       const triggerAddressed = addressedChannel !== undefined;
+
+      // Parked agent at the dispatch point: claim the single canary permit
+      // now, after the busy/policy checks, so it is held only while a real
+      // dispatch is in flight. A lost race (another lane took it this pass)
+      // requeues rather than drops — the wake stays eligible.
+      if (this.providerCapGovernor?.isParked(agentName)) {
+        if (!this.providerCapGovernor.tryAcquireCanary(agentName, Date.now())) {
+          this.pendingRequests.push(...requests);
+          continue;
+        }
+        console.error(
+          `[provider-cap] agent=${agentName} canary window open — one dispatch permitted`,
+        );
+      }
+
       await this.startAgentStream(agent, {
         ...trigger,
         channelId: triggerChannel,
@@ -7809,12 +8016,28 @@ export class AgentFramework {
     // without this the only durable record of a failed inference is a field in
     // llm-calls.jsonl — invisible to operator, agent, and monitoring.
     if (event.type === 'inference:exhausted') {
+      const name = (event.agentName as string) ?? 'unknown';
+      const errorType = event.errorType as string | undefined;
       this.noteInferenceExhausted(
-        (event.agentName as string) ?? 'unknown',
+        name,
         (event.error as string) ?? 'unknown error',
         event.retryable as boolean | undefined,
-        event.errorType as string | undefined,
+        errorType,
+        typeof event.capResetAt === 'number'
+          ? {
+              resetAt: event.capResetAt,
+              scope: (event.capScope as string) ?? 'unknown',
+              provider: (event.capProvider as string) ?? 'unknown',
+              errorClass: (event.capErrorClass as string) ?? 'usage_cap',
+            }
+          : undefined,
       );
+      // A parked agent's canary that died on something OTHER than the cap
+      // (e.g. an over-budget compile never reached the provider) must free
+      // the single canary permit, or the park can never probe again.
+      if (errorType !== 'provider_cap' && this.providerCapGovernor?.isParked(name)) {
+        this.providerCapGovernor.canaryAborted(name);
+      }
     } else if (event.type === 'inference:completed') {
       // A successful response — even mid-turn between tool calls — proves the
       // agent isn't hard-down; clear its consecutive-failure streak (and the
@@ -7825,6 +8048,11 @@ export class AgentFramework {
       }
       if (name && this.exhaustionRewinds.get(name)) {
         this.exhaustionRewinds.set(name, 0);
+      }
+      // For a parked agent a completed inference IS the canary succeeding —
+      // nothing else is allowed to dispatch. Release the park.
+      if (name && this.providerCapGovernor?.isParked(name)) {
+        this.handleProviderCapRelease(name, 'canary');
       }
     }
 
@@ -7883,7 +8111,9 @@ export class AgentFramework {
         consecutiveInferenceFailures: this.consecutiveInferenceFailures.get(name) ?? 0,
         lastInference: this.lastInferenceAt.get(name) ?? null,
         refusalStats: this.refusalStats.get(name) ?? null,
+        providerCap: this.providerCapGovernor?.status(name) ?? null,
       })),
+      providerCap: this.providerCapGovernor?.statusAll() ?? null,
     };
   }
 
@@ -8012,9 +8242,50 @@ export class AgentFramework {
    * boundary. Deliberately NOT a message match: the message wording belongs to
    * CM and can be reworded without warning.
    */
-  private classifyInferenceError(err: Error): { retryable?: boolean; errorType?: string } {
-    if (err instanceof MembraneError) {
-      return { retryable: err.retryable, errorType: err.type };
+  private classifyInferenceError(err: Error): {
+    retryable?: boolean;
+    errorType?: string;
+    /** Set only for errorType 'provider_cap' — metadata the park needs
+     *  (never the error body; that stays in llm-calls/failures logs). */
+    capResetAt?: number;
+    capScope?: string;
+    capProvider?: string;
+    capErrorClass?: string;
+  } {
+    if (err instanceof MembraneError || (err instanceof Error && err.name === 'MembraneError')) {
+      // Fixed-future usage/billing cap: on the wire it is a 400
+      // invalid_request_error — the SAME shape as a poisoned history — but it
+      // means "the account is capped until <instant>". Classified structurally
+      // (invariants + anchored message parse, see provider-cap.ts) BEFORE the
+      // generic invalid_request mapping, because the downstream poison-history
+      // breaker keys on 'invalid_request' and shedding history over a billing
+      // cap is precisely the 2026-08-11 Cairn damage this exists to prevent.
+      const cap = classifyProviderCapError(err);
+      if (cap) {
+        return {
+          retryable: false,
+          errorType: 'provider_cap',
+          capResetAt: cap.resetAt,
+          capScope: cap.scope,
+          capProvider: cap.provider,
+          capErrorClass: cap.errorClass,
+        };
+      }
+      const m = err as MembraneError;
+      // Cap-shaped but the reset clause didn't parse (provider rewording):
+      // not enough to park, but a known cap sentence must never cost history —
+      // reclassify away from 'invalid_request' so the poison breaker cannot
+      // fire, and alert so the classifier pattern gets updated.
+      if (m.type === 'invalid_request' && capShapedButUnparsed(err)) {
+        this.opsAlert(
+          'provider-cap-unparsed',
+          'framework',
+          `cap-shaped provider error did not parse a reset time — NOT parking; ` +
+          `update provider-cap.ts patterns. message head: ${err.message.slice(0, 120)}`,
+        );
+        return { retryable: false, errorType: 'provider_cap_unparsed' };
+      }
+      return { retryable: m.retryable, errorType: m.type };
     }
     if (err.name === 'OverBudgetError') {
       return { errorType: 'over_budget' };
@@ -8045,6 +8316,7 @@ export class AgentFramework {
     reason: string,
     retryable?: boolean,
     errorType?: string,
+    cap?: { resetAt: number; scope: string; provider: string; errorClass: string },
   ): void {
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
@@ -8057,6 +8329,19 @@ export class AgentFramework {
     // redirects: logs/failures.log under the host's working directory. This is
     // what connectome-doctor reads. Legacy fields kept; `kind` is additive.
     this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted' });
+
+    // (1c) Provider-cap park. A classified fixed-future usage/billing cap is
+    // handled ENTIRELY here: park on the FIRST classified failure (waiting for
+    // the hard-down streak would burn two more $0-progress provider calls),
+    // one dedicated chronicle marker on entry, and return — the generic
+    // failure marker, the OverBudget drain kick and the poison-history
+    // breaker below must never see this errorType. Resident-agent scope only:
+    // ephemeral subagents are transient and their next primary dispatch parks
+    // the resident properly.
+    if (errorType === 'provider_cap' && cap && this.agents.has(agentName)) {
+      this.handleProviderCapFailure(agentName, cap);
+      return;
+    }
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
@@ -8114,7 +8399,12 @@ export class AgentFramework {
         { skipLog: true },
       );
     }
-    if (agent && overBudget && !this.overBudgetDrainInFlight.has(agentName)) {
+    // While provider-cap parked, the drain kick must not run: cm.tick() is
+    // provider dispatch (compression), and the kick is unbounded by the
+    // single-canary permit. Debt retirement while parked belongs to the
+    // maintenance-canary lane, which is permit-bounded.
+    if (agent && overBudget && !this.overBudgetDrainInFlight.has(agentName)
+        && !this.providerCapGovernor?.isParked(agentName)) {
       this.overBudgetDrainInFlight.add(agentName);
       void (async () => {
         let ticks = 0;
@@ -8162,6 +8452,147 @@ export class AgentFramework {
       if (errorType === 'invalid_request' && agent) {
         this.quarantinePoisonedHistory(agent, reason);
       }
+    }
+  }
+
+  /**
+   * A provider call hit a classified fixed-future usage/billing cap — park
+   * (entry) or refresh the park (failed canary). Entry writes ONE resident-
+   * facing chronicle marker; canary failures update metadata silently (the
+   * resident learns nothing new from "still capped").
+   */
+  private handleProviderCapFailure(
+    agentName: string,
+    cap: { resetAt: number; scope: string; provider: string; errorClass: string },
+  ): void {
+    const now = Date.now();
+    const { entered, record } = this.providerCapGovernor.recordCapError(
+      agentName,
+      {
+        provider: cap.provider as ProviderCapClassification['provider'],
+        scope: cap.scope,
+        errorClass: cap.errorClass as ProviderCapClassification['errorClass'],
+        resetAt: cap.resetAt,
+      },
+      now,
+      this.agents.get(agentName)?.model,
+    );
+    const resetIso = new Date(record.resetAt).toISOString();
+    const eligibleIso = new Date(record.eligibleAt).toISOString();
+
+    if (entered) {
+      console.error(
+        `[provider-cap] agent=${agentName} PARKED: ${record.provider}/${record.scope} ${record.errorClass}, ` +
+        `provider-stated reset ${resetIso}, canary from ${eligibleIso}. All provider dispatch ` +
+        `(primary + compression) suppressed; NO history will be shed. Release: reset-time canary ` +
+        `or host command cap_clear.`,
+      );
+      this.opsAlert(
+        'provider-cap-parked',
+        agentName,
+        `provider usage cap (${record.scope}) — parked until ${resetIso} (canary ${eligibleIso}); ` +
+        `dispatch suppressed, history preserved, events still recorded`,
+        { data: { scope: record.scope, resetAt: record.resetAt, eligibleAt: record.eligibleAt } },
+      );
+      const agent = this.agents.get(agentName);
+      if (agent) {
+        try {
+          agent.getContextManager().addMessage(
+            'user',
+            [{
+              type: 'text',
+              text:
+                `[provider-cap] Your provider account has reached its ${record.scope} usage cap; ` +
+                `the provider states access returns at ${resetIso}. Until then your inference is ` +
+                `paused — nothing you attempt will dispatch, and NOTHING in your history is being ` +
+                `removed. Incoming messages keep recording durably and will be in your context when ` +
+                `you next run (after the cap lifts, or earlier if an operator clears the park).`,
+            }],
+            {
+              system: true,
+              kind: 'provider-cap-parked',
+              scope: record.scope,
+              resetAt: record.resetAt,
+              eligibleAt: record.eligibleAt,
+            },
+          );
+        } catch (err) {
+          console.error(`[provider-cap] could not record park marker for ${agentName}:`, err);
+        }
+      }
+    } else {
+      console.error(
+        `[provider-cap] agent=${agentName} canary found the cap still on ` +
+        `(attempt ${record.attemptCount}); next canary ${eligibleIso} (reset ${resetIso}).`,
+      );
+      this.opsAlert(
+        'provider-cap-parked',
+        agentName,
+        `canary still capped (attempt ${record.attemptCount}); next ${eligibleIso}`,
+        { skipLog: true },
+      );
+    }
+
+    const persistError = this.providerCapGovernor.persistError;
+    if (persistError) {
+      this.opsAlert('provider-cap-state', agentName, `park persist failed: ${persistError}`);
+    }
+  }
+
+  /**
+   * A provider call SUCCEEDED for a parked agent — by construction the single
+   * canary. Releases the park, marks the chronicle, and (only for operator
+   * releases, where no turn ran) queues exactly one catch-up wake. A canary
+   * release queues nothing: the canary turn itself just compiled the full
+   * held backlog, and maintenance resumes on its own timer — bounded ticks,
+   * no thundering catch-up.
+   */
+  private handleProviderCapRelease(agentName: string, releasedBy: string): void {
+    const now = Date.now();
+    const rec = releasedBy.startsWith('operator:')
+      ? this.providerCapGovernor.operatorClear(agentName, releasedBy.slice('operator:'.length), now)
+      : this.providerCapGovernor.noteSuccess(agentName, now, releasedBy);
+    if (!rec) return;
+    const heldForMin = Math.round((now - rec.firstAt) / 60_000);
+    console.error(
+      `[provider-cap] agent=${agentName} RELEASED by ${releasedBy} after ${heldForMin} min ` +
+      `(${rec.attemptCount} capped attempt(s), ${rec.heldWakes} wake(s) and ` +
+      `${rec.heldMaintenance} maintenance pass(es) held). Dispatch restored.`,
+    );
+    this.opsAlert(
+      'provider-cap-released',
+      agentName,
+      `park released by ${releasedBy} after ${heldForMin} min (held ${rec.heldWakes} wakes)`,
+      { data: { releasedBy, parkedForMs: now - rec.firstAt, heldWakes: rec.heldWakes } },
+    );
+    const agent = this.agents.get(agentName);
+    if (agent) {
+      try {
+        agent.getContextManager().addMessage(
+          'user',
+          [{
+            type: 'text',
+            text:
+              `[provider-cap] Provider access is restored (${releasedBy === 'canary' || releasedBy === 'maintenance-canary'
+                ? 'the usage cap lifted'
+                : `an operator cleared the park`}). ` +
+              `While paused, ${rec.heldWakes} wake(s) were held; every message from that period is ` +
+              `already in your history. Nothing was removed.`,
+          }],
+          { system: true, kind: 'provider-cap-released', releasedBy, heldWakes: rec.heldWakes },
+        );
+      } catch (err) {
+        console.error(`[provider-cap] could not record release marker for ${agentName}:`, err);
+      }
+    }
+    if (releasedBy.startsWith('operator:')) {
+      // No canary turn ran — give the agent one wake to process the backlog.
+      this.pendingRequests.push({
+        agentName,
+        reason: 'provider-cap-cleared',
+        source: 'framework',
+        timestamp: now,
+      });
     }
   }
 
