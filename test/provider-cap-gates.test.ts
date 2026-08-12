@@ -12,7 +12,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MembraneError } from '@animalabs/membrane';
@@ -67,6 +67,7 @@ function makeHarness(opts?: { statePath?: string; capOnTick?: () => boolean }) {
 
   const agent = {
     name: 'cairn',
+    model: 'claude-opus-4-8',
     refusalHandling: { maxRewinds: 3 },
     state: { status: 'idle' },
     canUseTool: () => true,
@@ -97,6 +98,12 @@ function makeHarness(opts?: { statePath?: string; capOnTick?: () => boolean }) {
   fw.refusalRewinds = new Map();
   fw.logFailure = () => {};
   fw.getToolsForAgent = () => [];
+  fw.primaryAgentName = 'cairn';
+  fw.pendingAssistantBlocks = new Map();
+  fw.deferredMessages = [];
+  fw.activeStreams = new Map();
+  fw.refusalStats = new Map();
+  fw.eventGate = null;
   fw.sweepExpiredConversations = () => {};
   fw.startAgentStream = async () => { counters.dispatches++; return true; };
   fw.providerCapGovernor = new ProviderCapGovernor({ statePath, jitterMaxMs: 0 });
@@ -161,30 +168,57 @@ test('parked wakes are dropped-and-counted, not requeued; events were already du
   assert.equal(fw.providerCapGovernor.status('cairn').heldWakes, 5, 'held count visible');
 });
 
-test('maintenance canary after the window opens: cap lifted → released; still capped → one more call only', async () => {
-  // Case 1: the cap lifts — the canary pass succeeds and releases.
+test('REVIEW 1: clean maintenance passes NEVER clear the park — retirement proceeds, release needs real provider success', async () => {
   let stillCapped = true;
   const h1 = makeHarness({ capOnTick: () => stillCapped });
   try {
-    await h1.fw.runQueuedMaintenance();
+    await h1.fw.runQueuedMaintenance(); // entry: 1 call
     assert.equal(h1.counters.providerCalls, 1);
-    // Force the window open (operator-less time travel: rewrite eligibility).
-    h1.fw.providerCapGovernor.status('cairn'); // parked
     const rec = (h1.fw.providerCapGovernor as any).parks.get('cairn');
-    rec.eligibleAt = Date.now() - 1;
-    stillCapped = false;
-    // cm.isReady flips after one successful tick so the canary pass is bounded.
-    let ticked = false;
-    h1.cm.isReady = () => ticked;
-    const origTick = h1.cm.tick;
-    h1.cm.tick = async () => { await origTick(); ticked = true; };
-    await h1.fw.runQueuedMaintenance();
-  } finally { h1.restore(); }
-  assert.equal(h1.counters.providerCalls, 2, 'exactly one canary call');
-  assert.equal(h1.fw.providerCapGovernor.isParked('cairn'), false, 'released by the canary');
-  assert.ok(h1.added.some((m) => m.meta.kind === 'provider-cap-released'));
+    rec.eligibleAt = Date.now() - 1; // window open
+    assert.equal(h1.fw.providerCapGovernor.status('cairn').phase, 'canary-eligible');
+    stillCapped = false; // the cap genuinely lifts
 
-  // Case 2: the canary finds the cap still on — one call, re-parked, backoff.
+    // Real retirement work, several clean passes — the park must survive all
+    // of them: absence of a provider failure is not provider-success evidence.
+    await h1.fw.runQueuedMaintenance();
+    await h1.fw.runQueuedMaintenance();
+    assert.ok(h1.counters.providerCalls > 1, 'debt retirement proceeds at full cadence');
+    assert.equal(h1.fw.providerCapGovernor.isParked('cairn'), true, 'clean passes do not clear');
+    assert.equal(
+      h1.added.filter((m) => m.meta.kind === 'provider-cap-released').length, 0,
+      'no release marker without provider proof',
+    );
+
+    // A real successful provider response — the only self-release ground.
+    h1.fw.emitTrace({ type: 'inference:completed', agentName: 'cairn' });
+    assert.equal(h1.fw.providerCapGovernor.isParked('cairn'), false, 'released on real success');
+    assert.ok(h1.added.some((m) => m.meta.kind === 'provider-cap-released'));
+  } finally { h1.restore(); }
+
+  // No-op passes (nothing to dispatch): zero calls, park intact — including
+  // across a restart over the same durable state.
+  const h2 = makeHarness();
+  try {
+    await h2.fw.runQueuedMaintenance(); // entry
+    const rec2 = (h2.fw.providerCapGovernor as any).parks.get('cairn');
+    rec2.eligibleAt = Date.now() - 1;
+    h2.cm.isReady = () => true; // no pending work at all
+    for (let i = 0; i < 20; i++) await h2.fw.runQueuedMaintenance();
+    assert.equal(h2.counters.providerCalls, 1, 'no-op passes make zero calls');
+    assert.equal(h2.fw.providerCapGovernor.isParked('cairn'), true, 'and never clear');
+
+    const h3 = makeHarness({ statePath: h2.statePath }); // "restart"
+    h3.cm.isReady = () => true;
+    for (let i = 0; i < 20; i++) await h3.fw.runQueuedMaintenance();
+    assert.equal(h3.counters.providerCalls, 0, 'restart + no-op passes: zero calls');
+    assert.equal(h3.fw.providerCapGovernor.isParked('cairn'), true, 'still parked');
+    h3.restore();
+  } finally { h2.restore(); }
+});
+
+test('maintenance canary still capped → one more call only, then backoff', async () => {
+  // The canary finds the cap still on — one call, re-parked, backoff.
   const h2 = makeHarness();
   try {
     await h2.fw.runQueuedMaintenance();
@@ -261,6 +295,115 @@ test('healthSnapshot exposes the park to /healthz and doctor tooling', async () 
     assert.equal(snap.agents[0].providerCap.errorClass, 'usage_cap');
     assert.equal(snap.providerCap.parks.length, 1);
   } finally { restore(); }
+});
+
+test('REVIEW 2: model change makes ONE real canary eligible — it never clears by configuration difference or no-op', async () => {
+  const { fw, cm, counters, added, restore } = makeHarness();
+  try {
+    await fw.runQueuedMaintenance(); // entry, records model claude-opus-4-8
+    assert.equal(fw.providerCapGovernor.status('cairn').model, 'claude-opus-4-8');
+    assert.equal(fw.providerCapGovernor.status('cairn').phase, 'parked');
+
+    fw.agents.get('cairn').model = 'us.anthropic.bedrock-opus';
+    // No-op passes after the change: eligibility, but no calls and no clear.
+    cm.isReady = () => true;
+    for (let i = 0; i < 10; i++) await fw.runQueuedMaintenance();
+    assert.equal(counters.providerCalls, 1, 'model change + no-op passes: zero new calls');
+    assert.equal(fw.providerCapGovernor.isParked('cairn'), true, 'configuration difference never clears');
+    assert.equal(fw.providerCapGovernor.status('cairn').phase, 'canary-eligible');
+    assert.equal(
+      added.filter((m) => m.meta.kind === 'provider-cap-released').length, 0,
+      'no release marker from a config change',
+    );
+
+    // The one real canary: a pending wake consumes the permit and dispatches.
+    fw.pendingRequests.push({
+      agentName: 'cairn', reason: 'discord-message', source: 'discord', timestamp: Date.now(),
+    });
+    await fw.processInferenceRequests();
+    assert.equal(counters.dispatches, 1, 'one real dispatch permitted');
+    assert.equal(fw.providerCapGovernor.isParked('cairn'), true, 'still parked until that dispatch SUCCEEDS');
+    fw.emitTrace({ type: 'inference:completed', agentName: 'cairn' });
+    assert.equal(fw.providerCapGovernor.isParked('cairn'), false, 'released only on real success');
+  } finally { restore(); }
+});
+
+test('REVIEW 3: incoming events are Chronicle-durable while parked; one release wake, no duplicate effects', async () => {
+  const { fw, counters, added, restore } = makeHarness();
+  try {
+    await fw.runQueuedMaintenance(); // park
+    // An incoming message recorded while parked goes through the SAME durable
+    // append as ever — the park gates dispatch, never recording.
+    fw.addMessage('human', [{ type: 'text', text: 'hello while parked' }]);
+    const recorded = added.find((m) => m.content?.[0]?.text === 'hello while parked');
+    assert.ok(recorded, 'event durably recorded while parked');
+
+    // Its wakes (and four more) are held, not replayed.
+    for (let i = 0; i < 5; i++) {
+      fw.pendingRequests.push({
+        agentName: 'cairn', reason: 'discord-message', source: 'discord', timestamp: Date.now(),
+      });
+      await fw.processInferenceRequests();
+    }
+    assert.equal(counters.dispatches, 0);
+    assert.equal(fw.providerCapGovernor.status('cairn').heldWakes, 5);
+
+    // Operator release: exactly ONE catch-up wake → exactly one dispatch,
+    // and nothing further — held wakes never replay individually.
+    await fw.handleHostCommand('srv', { command: 'cap_clear', agentName: 'cairn', requesterName: 'antra' });
+    assert.equal(fw.pendingRequests.length, 1);
+    await fw.processInferenceRequests();
+    assert.equal(counters.dispatches, 1, 'one wake covers all held events');
+    await fw.processInferenceRequests();
+    assert.equal(counters.dispatches, 1, 'no duplicate inference effects');
+  } finally { restore(); }
+});
+
+test('REVIEW 4: park/release markers are inert — no provider work, no shedding, no recursive accounting, cause-minimal text', () => {
+  const { fw, counters, added, removed, restore } = makeHarness();
+  try {
+    fw.noteInferenceExhausted('cairn', CAP_MESSAGE, false, 'provider_cap', {
+      resetAt: Date.UTC(2026, 8, 1), scope: 'workspace', provider: 'anthropic', errorClass: 'usage_cap',
+    });
+    fw.handleProviderCapRelease('cairn', 'operator:antra');
+  } finally { restore(); }
+
+  const markers = added.filter((m) =>
+    m.meta.kind === 'provider-cap-parked' || m.meta.kind === 'provider-cap-released');
+  assert.equal(markers.length, 2, 'entry + release markers');
+  for (const m of markers) {
+    const text = m.content[0].text as string;
+    assert.ok(!text.includes('invalid_request_error'), 'no raw error type in marker');
+    assert.ok(!text.includes('req_'), 'no request ids in marker');
+    assert.ok(!text.includes('{'), 'no JSON bodies in marker');
+    assert.equal(m.meta.system, true, 'system marker — never requests inference');
+    assert.ok(!('rawError' in m.meta) && !('error' in m.meta), 'no error body in metadata');
+  }
+  assert.equal(counters.providerCalls, 0, 'markers triggered no provider work');
+  assert.equal(counters.dispatches, 0);
+  assert.equal(removed.length, 0, 'markers shed nothing');
+  // The operator release queued its one wake; the markers themselves never
+  // touched the held-work accounting (no recursion).
+  const lastRelease = fw.providerCapGovernor.statusAll().lastRelease;
+  assert.equal(lastRelease.heldWakes, 0, 'marker appends were not counted as held wakes');
+  assert.equal(lastRelease.heldMaintenance, 0);
+});
+
+test('REVIEW 6: corrupt state fails open → exactly one structured cap call → re-parks → never enters poison rewind', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cap-corrupt-'));
+  const statePath = join(dir, 'provider-cap.json');
+  writeFileSync(statePath, 'NOT VALID JSON {{{', 'utf8');
+  const { fw, counters, removed, added, restore } = makeHarness({ statePath });
+  try {
+    assert.ok(fw.providerCapGovernor.loadError, 'corruption is a visible load error');
+    assert.equal(fw.providerCapGovernor.isParked('cairn'), false, 'fails toward unparked');
+    for (let pass = 0; pass < 50; pass++) await fw.runQueuedMaintenance();
+  } finally { restore(); }
+  assert.equal(counters.providerCalls, 1, 'exactly one structured cap call after fail-open');
+  assert.equal(fw.providerCapGovernor.isParked('cairn'), true, 're-parked immediately');
+  assert.equal(removed.length, 0, 'poison rewind never engaged');
+  assert.equal(added.filter((m) => m.meta.kind === 'refusal-rewind').length, 0);
+  assert.equal(fw.exhaustionRewinds.get('cairn') ?? 0, 0);
 });
 
 test('the OverBudget drain kick stays down while parked (no unbounded compression dispatch)', () => {

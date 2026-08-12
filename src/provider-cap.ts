@@ -95,13 +95,32 @@ function capStructuralInvariants(err: unknown): { messages: string[]; ok: boolea
   const raw = e.rawError as Record<string, unknown> | undefined;
   const body = raw?.error as Record<string, unknown> | undefined;
   const inner = body?.error as Record<string, unknown> | undefined;
-  const bodyType = inner?.type ?? body?.type;
+  let bodyType = inner?.type ?? body?.type;
+  let bodyMessage = inner?.message ?? body?.message;
+
+  // Verified against a live Cairn record (2026-08-12, sha 01318c95…): the SDK
+  // sets APIError.message to `400 {<full JSON body>}`, and a MembraneError
+  // that crossed a serialization boundary can arrive with rawError stripped
+  // (the fkm log's error object keeps only name/message/stack). Recover the
+  // body STRUCTURALLY from the message in that case: strict `NNN {json}`
+  // shape, JSON.parse, and the same error-type invariant — never prose
+  // matching against the message itself.
+  if (bodyType === undefined && typeof e.message === 'string') {
+    const m = /^(?:\d{3}\s+)?(\{[\s\S]*\})\s*$/.exec(e.message.trim());
+    if (m) {
+      try {
+        const parsed = JSON.parse(m[1]) as Record<string, unknown>;
+        const pInner = parsed.error as Record<string, unknown> | undefined;
+        bodyType = pInner?.type ?? parsed.type;
+        bodyMessage = pInner?.message ?? parsed.message;
+      } catch { /* not a JSON-bodied message — fall through to fail closed */ }
+    }
+  }
   if (bodyType !== 'invalid_request_error') return { ok: false, messages: [] };
 
   // The provider body's own message field is the structured source; the
-  // Error message is a fallback (SDKs sometimes prefix it with the status).
+  // bare Error message is a last resort (older paths without a JSON body).
   const messages: string[] = [];
-  const bodyMessage = inner?.message ?? body?.message;
   if (typeof bodyMessage === 'string') messages.push(bodyMessage.trim());
   if (typeof e.message === 'string') {
     messages.push(e.message.trim(), e.message.trim().replace(/^400\s+/, ''));
@@ -412,13 +431,24 @@ export class ProviderCapGovernor {
     this.canaryInFlight.delete(agent);
   }
 
-  status(agent: string): (ProviderCapRecord & { canaryInFlight: boolean }) | null {
+  /** `phase` names the review's distinction explicitly: 'parked' (suppressed)
+   *  vs 'canary-eligible' (one real dispatch may probe). Eligibility is NEVER
+   *  release — only a real successful provider response or operator clear is. */
+  status(
+    agent: string,
+    now = Date.now(),
+  ): (ProviderCapRecord & { canaryInFlight: boolean; phase: 'parked' | 'canary-eligible' }) | null {
     const rec = this.parks.get(agent);
-    return rec ? { ...rec, canaryInFlight: this.canaryInFlight.has(agent) } : null;
+    if (!rec) return null;
+    return {
+      ...rec,
+      canaryInFlight: this.canaryInFlight.has(agent),
+      phase: now >= rec.eligibleAt ? 'canary-eligible' : 'parked',
+    };
   }
 
   statusAll(): {
-    parks: Array<ProviderCapRecord & { canaryInFlight: boolean }>;
+    parks: Array<ProviderCapRecord & { canaryInFlight: boolean; phase: 'parked' | 'canary-eligible' }>;
     lastRelease: ProviderCapFileState['lastRelease'] | null;
     loadError: string | null;
     persistError: string | null;

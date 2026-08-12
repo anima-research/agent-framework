@@ -1369,6 +1369,16 @@ export class AgentFramework {
       const cm = agent.getContextManager();
       const tools = this.getToolsForAgent(agent.name).filter((tool) => agent.canUseTool(tool.name));
       cm.setToolDefinitions(tools);
+
+      // A provider/model change while parked opens the canary window — a
+      // property of the PARK, not of pending work, so it is noticed before
+      // the isReady early-return (no-op when unparked or unchanged).
+      if (this.providerCapGovernor?.noteModelChanged(agent.name, agent.model, Date.now())) {
+        console.error(
+          `[provider-cap] agent=${agent.name} model changed while parked — canary now eligible`,
+        );
+      }
+
       if (cm.isReady()) return [];
 
       // Provider-cap park: compression/maintenance dispatch is provider
@@ -1380,11 +1390,6 @@ export class AgentFramework {
       let capCanary = false;
       if (this.providerCapGovernor?.isParked(agent.name)) {
         const capNow = Date.now();
-        if (this.providerCapGovernor.noteModelChanged(agent.name, agent.model, capNow)) {
-          console.error(
-            `[provider-cap] agent=${agent.name} model changed while parked — canary now eligible`,
-          );
-        }
         if (!this.providerCapGovernor.tryAcquireCanary(agent.name, capNow)) {
           this.providerCapGovernor.noteHeldMaintenance(agent.name, capNow);
           return [];
@@ -1432,13 +1437,15 @@ export class AgentFramework {
             await cm.tick();
             record.ticks++;
           }
-          // A canary pass that completed without a cap error: the cap is off
-          // (or this pass had nothing left to dispatch — in which case the
-          // release is still safe: the next real dispatch either succeeds or
-          // re-parks in a single $0-rejected call).
-          if (capCanary && this.providerCapGovernor?.isParked(agent.name)) {
-            this.handleProviderCapRelease(agent.name, 'maintenance-canary');
-          }
+          // A pass that completed without a cap error is NOT provider-success
+          // evidence (review blocker, 08-11: a no-op tick proves nothing about
+          // the cap). Return the permit and leave the park intact. Only a real
+          // successful provider response — primary inference:completed — or an
+          // authenticated cap_clear releases. Once the cap is genuinely off,
+          // each pass re-acquires the permit and retires debt at full cadence;
+          // the park label persists until the next real dispatch proves the
+          // provider, then clears.
+          if (capCanary) this.providerCapGovernor?.canaryAborted(agent.name);
         } catch (error) {
           record.error = error instanceof Error ? error.message : String(error);
           const err = error instanceof Error ? error : new Error(String(error));
@@ -8501,12 +8508,14 @@ export class AgentFramework {
             'user',
             [{
               type: 'text',
+              // Cause-minimal (review item 4): state the condition and the two
+              // facts the resident needs — history intact, events still
+              // recording — nothing that could re-trigger or invite retries.
               text:
-                `[provider-cap] Your provider account has reached its ${record.scope} usage cap; ` +
-                `the provider states access returns at ${resetIso}. Until then your inference is ` +
-                `paused — nothing you attempt will dispatch, and NOTHING in your history is being ` +
-                `removed. Incoming messages keep recording durably and will be in your context when ` +
-                `you next run (after the cap lifts, or earlier if an operator clears the park).`,
+                `[provider-cap] Provider ${record.scope} usage cap reached; access returns ` +
+                `${resetIso}. Inference is paused until then (or until an operator clears it). ` +
+                `Nothing in your history is being removed; incoming messages keep recording ` +
+                `and will be in your context when you next run.`,
             }],
             {
               system: true,
@@ -8540,12 +8549,13 @@ export class AgentFramework {
   }
 
   /**
-   * A provider call SUCCEEDED for a parked agent — by construction the single
-   * canary. Releases the park, marks the chronicle, and (only for operator
-   * releases, where no turn ran) queues exactly one catch-up wake. A canary
-   * release queues nothing: the canary turn itself just compiled the full
-   * held backlog, and maintenance resumes on its own timer — bounded ticks,
-   * no thundering catch-up.
+   * Release, on exactly two grounds (review-hardened 08-11): a REAL successful
+   * provider response for a parked agent (primary inference:completed — the
+   * only place provider success is observable; by construction that turn was
+   * the single canary), or an authenticated operator cap_clear. A clean or
+   * no-op maintenance pass never reaches here. Canary release queues nothing —
+   * the canary turn itself just compiled the full held backlog; operator
+   * release queues exactly one catch-up wake. Bounded either way.
    */
   private handleProviderCapRelease(agentName: string, releasedBy: string): void {
     const now = Date.now();
@@ -8573,11 +8583,10 @@ export class AgentFramework {
           [{
             type: 'text',
             text:
-              `[provider-cap] Provider access is restored (${releasedBy === 'canary' || releasedBy === 'maintenance-canary'
-                ? 'the usage cap lifted'
-                : `an operator cleared the park`}). ` +
-              `While paused, ${rec.heldWakes} wake(s) were held; every message from that period is ` +
-              `already in your history. Nothing was removed.`,
+              `[provider-cap] Provider access restored (${releasedBy === 'canary'
+                ? 'usage cap lifted' : 'operator cleared'}). ` +
+              `${rec.heldWakes} wake(s) were held while paused; every message from that period ` +
+              `is already in your history. Nothing was removed.`,
           }],
           { system: true, kind: 'provider-cap-released', releasedBy, heldWakes: rec.heldWakes },
         );

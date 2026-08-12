@@ -106,7 +106,7 @@ test('a classified cap parks on the FIRST failure: no shed, no retry, one marker
   assert.equal(fw.pendingRequests.length, 0, 'no blind retry queued');
   const marker = added.find((m) => m.meta.kind === 'provider-cap-parked');
   assert.ok(marker, 'park marker recorded for the resident');
-  assert.match(marker!.content[0].text, /NOTHING in your history is being removed/);
+  assert.match(marker!.content[0].text, /Nothing in your history is being removed/);
   assert.equal(marker!.meta.resetAt, CAP_INFO.resetAt);
   assert.ok(errs.some((e) => e.includes('[provider-cap]') && e.includes('PARKED')));
 });

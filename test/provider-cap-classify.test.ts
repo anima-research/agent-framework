@@ -134,6 +134,45 @@ test('cap-shaped but unparseable reset: no classification, but the shape is flag
   }
 });
 
+test('LIVE SHAPE (Cairn record f492eaec…, 2026-08-12): JSON-bodied SDK message with rawError stripped classifies', () => {
+  // The Anthropic SDK sets APIError.message to `400 {<full JSON body>}`, and a
+  // MembraneError that crossed a serialization boundary (logged, rehydrated)
+  // arrives with rawError gone — verified against a live Cairn 400. The body
+  // is recovered STRUCTURALLY (strict `NNN {json}` shape + JSON.parse + the
+  // same error-type invariant), never by prose-matching the message.
+  const body = {
+    type: 'error',
+    error: { type: 'invalid_request_error', message: CAP_MESSAGE },
+    request_id: 'req_test01',
+  };
+  const err = new MembraneError({
+    type: 'invalid_request',
+    message: `400 ${JSON.stringify(body)}`,
+    retryable: false,
+    httpStatus: 400,
+    rawError: undefined,
+  });
+  const cls = classifyProviderCapError(err);
+  assert.ok(cls, 'live message shape must classify without rawError');
+  assert.equal(cls!.resetAt, Date.UTC(2026, 8, 1));
+  assert.equal(cls!.scope, 'workspace');
+
+  // The same JSON-bodied shape with a different provider error type stays out.
+  const otherBody = { type: 'error', error: { type: 'permission_error', message: CAP_MESSAGE } };
+  const other = new MembraneError({
+    type: 'invalid_request', message: `400 ${JSON.stringify(otherBody)}`,
+    retryable: false, httpStatus: 400, rawError: undefined,
+  });
+  assert.equal(classifyProviderCapError(other), null);
+  assert.equal(capShapedButUnparsed(other), false);
+
+  // And a non-JSON message with no rawError still fails closed.
+  const bare = new MembraneError({
+    type: 'invalid_request', message: CAP_MESSAGE, retryable: false, httpStatus: 400, rawError: undefined,
+  });
+  assert.equal(classifyProviderCapError(bare), null, 'no structured body anywhere → no classification');
+});
+
 test('a past reset instant still classifies (the governor owns skew handling)', () => {
   const msg =
     'You have reached your specified workspace API usage limits. ' +
