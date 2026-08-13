@@ -406,6 +406,68 @@ test('REVIEW 6: corrupt state fails open → exactly one structured cap call →
   assert.equal(fw.exhaustionRewinds.get('cairn') ?? 0, 0);
 });
 
+test('BLOCKER 2: host-reported auxiliary provider success releases the park with ONE catch-up wake', async () => {
+  const { fw, counters, added, restore } = makeHarness();
+  try {
+    await fw.runQueuedMaintenance(); // park (1 call)
+    // Held traffic while parked.
+    for (let i = 0; i < 3; i++) {
+      fw.pendingRequests.push({
+        agentName: 'cairn', reason: 'discord-message', source: 'discord', timestamp: Date.now(),
+      });
+      await fw.processInferenceRequests();
+    }
+    assert.equal(counters.dispatches, 0);
+
+    // The host's logging adapter observed a REAL successful provider call on
+    // the compression lane (cap actually lifted) and reports it.
+    fw.noteProviderSuccess('cairn');
+    assert.equal(fw.providerCapGovernor.isParked('cairn'), false, 'aux success is real provider proof');
+    const marker = added.find((m) => m.meta.kind === 'provider-cap-released');
+    assert.ok(marker);
+    assert.match(marker!.content[0].text, /usage cap lifted/);
+    assert.equal(fw.pendingRequests.length, 1, 'exactly one catch-up wake');
+    assert.equal(fw.pendingRequests[0].reason, 'provider-cap-cleared');
+    await fw.processInferenceRequests();
+    assert.equal(counters.dispatches, 1, 'one wake covers the whole backlog');
+    await fw.processInferenceRequests();
+    assert.equal(counters.dispatches, 1, 'no duplicates');
+
+    // Unparked: the hook is a strict no-op (primary successes land here too).
+    fw.noteProviderSuccess('cairn');
+    assert.equal(fw.pendingRequests.length, 0, 'no-op when not parked');
+  } finally { restore(); }
+});
+
+test('BLOCKER 3: cap-class records are metadata-only — no provider JSON in stderr, failures.log, or markers', () => {
+  const { fw, added, errs, restore } = makeHarness();
+  const failureRecords: Array<Record<string, unknown>> = [];
+  fw.logFailure = (rec: Record<string, unknown>) => { failureRecords.push(rec); };
+  const RAW = `400 {"type":"error","error":{"type":"invalid_request_error","message":"${CAP_MESSAGE}"},"request_id":"req_SECRET"}`;
+  try {
+    fw.noteInferenceExhausted('cairn', RAW, false, 'provider_cap', {
+      resetAt: Date.UTC(2026, 8, 1), scope: 'workspace', provider: 'anthropic', errorClass: 'usage_cap',
+    });
+    fw.noteInferenceExhausted('cairn', RAW, false, 'provider_cap_unparsed');
+  } finally { restore(); }
+
+  for (const rec of failureRecords) {
+    const s = JSON.stringify(rec);
+    assert.ok(!s.includes('req_SECRET'), `no request id in failures.log: ${s.slice(0, 80)}`);
+    assert.ok(!s.includes('invalid_request_error'), 'no raw body in failures.log');
+  }
+  for (const line of errs) {
+    assert.ok(!line.includes('req_SECRET'), 'no request id on stderr');
+  }
+  for (const m of added) {
+    assert.ok(!(m.content[0].text as string).includes('req_SECRET'), 'no request id in any marker');
+    assert.ok(!(m.content[0].text as string).includes('{'), 'no JSON in any marker');
+  }
+  // The reduced class strings still say what happened.
+  assert.ok(failureRecords.some((r) => String(r.reason).startsWith('provider_cap:')));
+  assert.ok(failureRecords.some((r) => String(r.reason).startsWith('provider_cap_unparsed:')));
+});
+
 test('the OverBudget drain kick stays down while parked (no unbounded compression dispatch)', () => {
   const { fw, counters, restore } = makeHarness();
   try {

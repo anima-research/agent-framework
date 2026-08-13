@@ -11,11 +11,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   mkdtempSync, readFileSync, writeFileSync, readdirSync, existsSync,
-  fsyncSync as realFsyncSync, unlinkSync as realUnlinkSync,
+  fsyncSync as realFsyncSync, unlinkSync as realUnlinkSync, openSync as realOpenSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ProviderCapGovernor, type ProviderCapClassification } from '../src/provider-cap.js';
+import {
+  ProviderCapGovernor,
+  defaultProviderCapStatePath,
+  type ProviderCapClassification,
+} from '../src/provider-cap.js';
 
 const CLS: ProviderCapClassification = {
   provider: 'anthropic',
@@ -185,6 +189,37 @@ test('bug-14 discipline: failed persist keeps prior durable state, unlinks the o
   assert.equal(gov.persistError, null, 'recovery clears the visible error');
   assert.equal(gov.durableThrough, T0 + 20_000);
   assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).parks.cairn.attemptCount, 3);
+});
+
+test('BLOCKER 1: default state path is residence-scoped (store-anchored), and two stores never alias', () => {
+  const a = defaultProviderCapStatePath('/home/u/mythos-cm/data/store');
+  const b = defaultProviderCapStatePath('/home/u/cairn/data/store');
+  assert.equal(a, '/home/u/mythos-cm/data/store/provider-cap.json');
+  assert.notEqual(a, b, 'residences cannot share a park file through a common cwd');
+});
+
+test('BLOCKER 4: the corrupt-state preservation rename is fsynced like any other durability claim', () => {
+  const dirFsyncs: number[] = [];
+  let opened: string[] = [];
+  const { gov, statePath } = makeGovernor({
+    fsOps: {
+      openSync: ((p: string, flags: string, mode?: number) => {
+        opened.push(p);
+        return realOpenSync(p, flags as never, mode);
+      }) as never,
+      fsyncSync: (fd: number) => { dirFsyncs.push(fd); return realFsyncSync(fd); },
+    },
+  });
+  writeFileSync(statePath, '{ corrupt', 'utf8');
+  opened = []; dirFsyncs.length = 0;
+  gov.load(T0);
+  assert.ok(gov.loadError, 'visible error');
+  // After the move-aside rename, the PARENT DIRECTORY was opened and fsynced.
+  const dir = statePath.slice(0, statePath.lastIndexOf('/'));
+  assert.ok(opened.includes(dir), 'parent dir opened for fsync after preservation rename');
+  assert.ok(dirFsyncs.length >= 1, 'fsync issued');
+  const aside = readdirSync(dir).find((f) => f.includes('.corrupt-'));
+  assert.ok(aside, 'evidence preserved');
 });
 
 test('corrupt state: preserved aside, loudly surfaced, fails toward UNPARKED', () => {

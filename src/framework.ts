@@ -72,6 +72,7 @@ import {
   ProviderCapGovernor,
   classifyProviderCapError,
   capShapedButUnparsed,
+  defaultProviderCapStatePath,
   type ProviderCapClassification,
 } from './provider-cap.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
@@ -1017,9 +1018,13 @@ export class AgentFramework {
       normalizeDiscordAwarenessDeadline(config.discordAwarenessDeadlineMs),
     );
 
-    if (config.providerCap) {
-      framework.providerCapGovernor = new ProviderCapGovernor(config.providerCap);
-    }
+    // Residence-scoped park state: explicit config wins; otherwise anchor to
+    // the store directory (never a bare cwd two residences might share).
+    framework.providerCapGovernor = new ProviderCapGovernor({
+      ...config.providerCap,
+      statePath: config.providerCap?.statePath
+        ?? (config.storePath ? defaultProviderCapStatePath(config.storePath) : undefined),
+    });
 
     // If an offline recovery process crashed after switching Chronicle but
     // before committing its prepared marker batch, the active branch is the
@@ -8284,11 +8289,16 @@ export class AgentFramework {
       // reclassify away from 'invalid_request' so the poison breaker cannot
       // fire, and alert so the classifier pattern gets updated.
       if (m.type === 'invalid_request' && capShapedButUnparsed(err)) {
+        // Metadata-only (review blocker, 08-13): the alert names the class and
+        // structural facts, never any slice of the provider message — message
+        // fragments in alerts were exactly the 400-JSON feedback that padded
+        // Cairn's compression payloads.
         this.opsAlert(
           'provider-cap-unparsed',
           'framework',
-          `cap-shaped provider error did not parse a reset time — NOT parking; ` +
-          `update provider-cap.ts patterns. message head: ${err.message.slice(0, 120)}`,
+          'cap-shaped provider 400 without a parseable reset time — NOT parking; ' +
+          'update provider-cap.ts patterns',
+          { data: { membraneType: m.type, httpStatus: m.httpStatus ?? null, messageLength: err.message.length } },
         );
         return { retryable: false, errorType: 'provider_cap_unparsed' };
       }
@@ -8325,6 +8335,18 @@ export class AgentFramework {
     errorType?: string,
     cap?: { resetAt: number; scope: string; provider: string; errorClass: string },
   ): void {
+    // Cap-class failures: reduce the recorded reason to its structural class
+    // (review blocker, 08-13 — metadata-only). The raw message carries the
+    // full provider 400 JSON; recording it verbatim in stderr/failures.log/
+    // markers is how cap errors previously fed themselves back into
+    // compression payloads. The verbatim body still exists exactly once, in
+    // the provider log at the call site.
+    if (errorType === 'provider_cap') {
+      reason = `provider_cap: ${cap?.scope ?? 'unknown'} usage cap, ` +
+        `reset ${cap ? new Date(cap.resetAt).toISOString() : 'unknown'}`;
+    } else if (errorType === 'provider_cap_unparsed') {
+      reason = 'provider_cap_unparsed: cap-shaped provider 400 without a parseable reset';
+    }
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
     this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: reason.slice(0, 300) });
@@ -8549,6 +8571,22 @@ export class AgentFramework {
   }
 
   /**
+   * Host hook: a provider call SUCCEEDED for this agent on a lane the
+   * framework cannot observe itself — compression/summarizer/maintenance
+   * calls go host→membrane without touching the stream driver. Wired from
+   * the host's logging adapter exactly like its off-path refusal dragnet
+   * (fkm index.ts `adapter.onRefusal`), feature-detected so older hosts
+   * simply don't call it. This is REAL provider-success evidence — the
+   * review's bar for release — so a parked agent releases here with one
+   * catch-up wake. No-op when unparked (primary successes release via
+   * inference:completed first and land here as a no-op).
+   */
+  noteProviderSuccess(agentName: string): void {
+    if (!this.providerCapGovernor?.isParked(agentName)) return;
+    this.handleProviderCapRelease(agentName, 'aux-success');
+  }
+
+  /**
    * Release, on exactly two grounds (review-hardened 08-11): a REAL successful
    * provider response for a parked agent (primary inference:completed — the
    * only place provider success is observable; by construction that turn was
@@ -8583,8 +8621,8 @@ export class AgentFramework {
           [{
             type: 'text',
             text:
-              `[provider-cap] Provider access restored (${releasedBy === 'canary'
-                ? 'usage cap lifted' : 'operator cleared'}). ` +
+              `[provider-cap] Provider access restored (${releasedBy.startsWith('operator:')
+                ? 'operator cleared' : 'usage cap lifted'}). ` +
               `${rec.heldWakes} wake(s) were held while paused; every message from that period ` +
               `is already in your history. Nothing was removed.`,
           }],
@@ -8594,8 +8632,9 @@ export class AgentFramework {
         console.error(`[provider-cap] could not record release marker for ${agentName}:`, err);
       }
     }
-    if (releasedBy.startsWith('operator:')) {
-      // No canary turn ran — give the agent one wake to process the backlog.
+    if (releasedBy.startsWith('operator:') || releasedBy === 'aux-success') {
+      // No primary turn ran on these release grounds — give the agent ONE
+      // wake to process the whole held backlog (never one per held wake).
       this.pendingRequests.push({
         agentName,
         reason: 'provider-cap-cleared',

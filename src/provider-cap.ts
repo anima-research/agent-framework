@@ -221,8 +221,21 @@ interface ProviderCapFileState {
   };
 }
 
+/**
+ * Residence-scoped default (review blocker, 08-13): anchored to the agent's
+ * chronicle store directory — same convention as the discord-awareness outbox
+ * — so two residences on one box can never alias each other's park through a
+ * shared cwd, and the park record rides the store's own backups/archives.
+ */
+export function defaultProviderCapStatePath(storePath: string): string {
+  return join(storePath, 'provider-cap.json');
+}
+
 export interface ProviderCapGovernorConfig {
-  /** Durable state file (default 'state/provider-cap.json', relative cwd). */
+  /** Durable state file. Explicit path wins; otherwise the framework anchors
+   *  it to the store (defaultProviderCapStatePath); the bare-cwd
+   *  'state/provider-cap.json' fallback exists only for app-owned stores
+   *  with no storePath. */
   statePath?: string;
   /** Max deterministic jitter added to resetAt before the canary (default 5 min). */
   jitterMaxMs?: number;
@@ -332,6 +345,15 @@ export class ProviderCapGovernor {
       const aside = `${this.statePath}.corrupt-${new Date(now).toISOString().replace(/[:.]/g, '-')}`;
       try {
         this.fs.renameSync(this.statePath, aside);
+        // The preservation rename is itself a durability claim — fsync the
+        // parent directory so a crash cannot lose the evidence move (review
+        // blocker, 08-13: same discipline as the persist path).
+        try {
+          const dirFd = this.fs.openSync(dirname(this.statePath), 'r') as number;
+          try { this.fs.fsyncSync(dirFd); } finally { this.fs.closeSync(dirFd); }
+        } catch (fsErr) {
+          this.loadError += ` (preservation rename not fsynced: ${fsErr instanceof Error ? fsErr.message : String(fsErr)})`;
+        }
         this.loadError += ` (bytes preserved at ${basename(aside)})`;
       } catch {
         this.loadError += ' (could not move bytes aside; file left in place, persistence disabled)';
