@@ -8573,13 +8573,20 @@ export class AgentFramework {
   /**
    * Host hook: a provider call SUCCEEDED for this agent on a lane the
    * framework cannot observe itself — compression/summarizer/maintenance
-   * calls go host→membrane without touching the stream driver. Wired from
-   * the host's logging adapter exactly like its off-path refusal dragnet
-   * (fkm index.ts `adapter.onRefusal`), feature-detected so older hosts
-   * simply don't call it. This is REAL provider-success evidence — the
-   * review's bar for release — so a parked agent releases here with one
-   * catch-up wake. No-op when unparked (primary successes release via
-   * inference:completed first and land here as a no-op).
+   * calls go host→membrane via complete() without touching the stream
+   * driver. Wired from the host's logging adapter exactly like its off-path
+   * refusal dragnet (fkm index.ts `adapter.onRefusal`), feature-detected so
+   * older hosts simply don't call it.
+   *
+   * CONTRACT (Sol review, 08-13): the host fires this for `complete()`
+   * successes ONLY. Primary turns stream, and the adapter observes a
+   * stream's response BEFORE driveStream settles and emits
+   * inference:completed — a stream-fired call here would release the park
+   * as aux-success and queue a duplicate wake ahead of the primary release.
+   * This side is defensive regardless: strict no-op when unparked (so a
+   * late or duplicate report after any release cannot double-release), and
+   * the catch-up wake is suppressed while a turn is alive (see
+   * handleProviderCapRelease).
    */
   noteProviderSuccess(agentName: string): void {
     if (!this.providerCapGovernor?.isParked(agentName)) return;
@@ -8635,12 +8642,27 @@ export class AgentFramework {
     if (releasedBy.startsWith('operator:') || releasedBy === 'aux-success') {
       // No primary turn ran on these release grounds — give the agent ONE
       // wake to process the whole held backlog (never one per held wake).
-      this.pendingRequests.push({
-        agentName,
-        reason: 'provider-cap-cleared',
-        source: 'framework',
-        timestamp: now,
-      });
+      // UNLESS a turn is alive right now (an aux success can land while the
+      // canary turn is still streaming): that turn already compiled the
+      // backlog, and a wake queued behind it would fire a spurious extra
+      // turn on already-seen context (Sol review, 08-13 — the duplicate-
+      // wake half of the ordering blocker).
+      const turnAlive =
+        (this.activeTurnTokens?.has(agentName) ?? false) ||
+        (this.activeStreams?.has(agentName) ?? false);
+      if (turnAlive) {
+        console.error(
+          `[provider-cap] agent=${agentName} released by ${releasedBy} during a live turn — ` +
+          `no catch-up wake queued (the running turn already covers the backlog)`,
+        );
+      } else {
+        this.pendingRequests.push({
+          agentName,
+          reason: 'provider-cap-cleared',
+          source: 'framework',
+          timestamp: now,
+        });
+      }
     }
   }
 

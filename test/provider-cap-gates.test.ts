@@ -439,6 +439,52 @@ test('BLOCKER 2: host-reported auxiliary provider success releases the park with
   } finally { restore(); }
 });
 
+test('ORDERING REGRESSION: primary canary releases once via inference:completed with ZERO extra wakes, and a late aux report is a strict no-op', async () => {
+  const { fw, counters, added, restore } = makeHarness();
+  try {
+    await fw.runQueuedMaintenance(); // park
+    const rec = (fw.providerCapGovernor as any).parks.get('cairn');
+    rec.eligibleAt = Date.now() - 1;
+    fw.pendingRequests.push({
+      agentName: 'cairn', reason: 'discord-message', source: 'discord', timestamp: Date.now(),
+    });
+    await fw.processInferenceRequests(); // canary wake dispatches (stream)
+    assert.equal(counters.dispatches, 1);
+
+    // The primary turn completes: single release, no catch-up wake.
+    fw.emitTrace({ type: 'inference:completed', agentName: 'cairn' });
+    assert.equal(fw.providerCapGovernor.isParked('cairn'), false);
+    assert.equal(fw.pendingRequests.length, 0, 'primary release queues nothing');
+
+    // A late host aux-success report (any ordering slip, ever) is a no-op.
+    fw.noteProviderSuccess('cairn');
+    assert.equal(fw.pendingRequests.length, 0, 'no duplicate wake from a late report');
+    assert.equal(
+      added.filter((m) => m.meta.kind === 'provider-cap-released').length, 1,
+      'exactly one release marker',
+    );
+  } finally { restore(); }
+});
+
+test('ORDERING REGRESSION: an aux success landing DURING a live turn releases without a catch-up wake', async () => {
+  const { fw, added, restore } = makeHarness();
+  try {
+    await fw.runQueuedMaintenance(); // park
+    // A turn is alive (the canary is streaming) when a genuine concurrent
+    // compression success reports in.
+    fw.activeTurnTokens.set('cairn', 1);
+    fw.noteProviderSuccess('cairn');
+    assert.equal(fw.providerCapGovernor.isParked('cairn'), false, 'released — real provider proof');
+    assert.equal(fw.pendingRequests.length, 0, 'no wake behind a live turn (no spurious extra turn)');
+    assert.equal(added.filter((m) => m.meta.kind === 'provider-cap-released').length, 1);
+
+    // The live turn then completes normally: no second release, still no wake.
+    fw.emitTrace({ type: 'inference:completed', agentName: 'cairn' });
+    assert.equal(fw.pendingRequests.length, 0);
+    assert.equal(added.filter((m) => m.meta.kind === 'provider-cap-released').length, 1);
+  } finally { restore(); }
+});
+
 test('BLOCKER 3: cap-class records are metadata-only — no provider JSON in stderr, failures.log, or markers', () => {
   const { fw, added, errs, restore } = makeHarness();
   const failureRecords: Array<Record<string, unknown>> = [];
