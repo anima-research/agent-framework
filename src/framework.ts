@@ -62,7 +62,7 @@ import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './m
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
-import { parseProsePrefix } from './mcpl/prose-grammar.js';
+import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
@@ -125,6 +125,9 @@ function sniffImageMediaType(data: Buffer): string | undefined {
 const SILENCING_TOOLS = new Set([
   'skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
 ]);
+
+/** World-surface publication names that outrank hybrid prose envelopes. */
+const HYBRID_PUBLICATION_TOOLS = new Set(['say', 'whisper']);
 
 /**
  * True when an injected message is real conversational input — something the
@@ -225,10 +228,17 @@ const isAddressedMessage = (
 // envelopes can never disagree on what is a prefix.
 
 /** One-time primer appended when an agent's proseRouting mode changes. */
-function proseModePrimer(mode: 'explicit' | 'locus'): string {
+function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus'): string {
   if (mode === 'locus') {
     return '[prose-routing] Mode change: your plain text auto-routes to the ' +
       'conversational locus again. `>>` destination prefixes are no longer needed.';
+  }
+  if (mode === 'hybrid') {
+    return '[prose-routing] Hybrid routing enabled: unprefixed text still lands in the ' +
+      'current conversational locus. A leading `>>>destination` envelope instead routes ' +
+      'that prose to one uniquely resolved authorized Discord or Eidoverse channel. The ' +
+      'envelope remains in your memory but recipients see only its body; delivery or failure ' +
+      'is reported back to you.';
   }
   // Deliberately terse: a short event-style notice is classifier-safe from
   // the user role (ablation D, 2026-07-24), while the full grammar as a user
@@ -684,6 +694,8 @@ export class AgentFramework {
   /** Sticky per-TURN delivery target set by the turn's first `>>` prefix.
    *  Cleared at every non-restart turn start; survives context restarts. */
   private proseTargetPins: Map<string, string> = new Map();
+  /** Hybrid router is fail-closed after a malformed/unresolved envelope until a new valid target. */
+  private proseHybridSuppressed: Set<string> = new Set();
   /** Agents whose current turn requested `!` continuation — re-woken when the
    *  turn completes instead of pausing until the next external event. */
   private proseContinuations: Set<string> = new Set();
@@ -5143,6 +5155,97 @@ export class AgentFramework {
     }
   }
 
+  /** Locus-preserving explicit publication. Source remains byte-identical in Chronicle. */
+  private async deliverHybridProse(
+    agent: Agent,
+    rawText: string,
+    locus: string | null,
+    allowLocus: boolean,
+  ): Promise<void> {
+    const lines = rawText.split('\n');
+    const envelopes: string[] = [];
+    let current: string[] = [];
+    for (const line of lines) {
+      if (line.trimStart().startsWith('>>>') && current.length > 0) {
+        envelopes.push(current.join('\n'));
+        current = [];
+      }
+      current.push(line);
+    }
+    if (current.length > 0) envelopes.push(current.join('\n'));
+
+    for (const envelope of envelopes) {
+      if (!envelope.trim()) continue;
+      const normalized = envelope.replace(/^\s+(?=>>>)/, '');
+      const attempted = normalized.startsWith('>>>');
+      const parsed = parseHybridProsePrefix(normalized);
+      if (parsed.continueTurn) this.proseContinuations.add(agent.name);
+      if (parsed.kind === 'private') {
+        this.proseTargetPins.delete(agent.name);
+        this.proseHybridSuppressed.add(agent.name);
+        console.error(`[prose] ${agent.name}: >>>skip_reply — ${parsed.body.length} chars kept in context (not sent)`);
+        continue;
+      }
+      if (parsed.kind === 'target') {
+        const resolved = this.channelRegistry!.resolveProseTarget(parsed.target!);
+        if ('error' in resolved) {
+          this.proseTargetPins.delete(agent.name);
+          this.proseHybridSuppressed.add(agent.name);
+          this.bounceProse(agent, parsed.body, resolved.error, resolved.candidates, '>>>');
+          continue;
+        }
+        let body = parsed.body;
+        const usedClipboard = body.includes('{{unsent}}');
+        if (usedClipboard) body = body.replaceAll('{{unsent}}', this.proseClipboards.get(agent.name) ?? '');
+        this.proseTargetPins.set(agent.name, resolved.channelId);
+        this.proseHybridSuppressed.delete(agent.name);
+        if (!body.trim()) {
+          console.error(`[prose] ${agent.name}: >>>${parsed.target} established target; empty body — nothing sent yet`);
+          continue;
+        }
+        try {
+          const outcome = await this.channelRegistry!.routeSpeech(agent.name, body, resolved.channelId);
+          this.recordProseDelivery(agent.name, outcome);
+          if (outcome?.delivered) {
+            this.proseBounceStreaks.delete(agent.name);
+            if (usedClipboard) this.proseClipboards.delete(agent.name);
+          } else {
+            this.proseTargetPins.delete(agent.name);
+            this.proseHybridSuppressed.add(agent.name);
+            this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} was not confirmed`, undefined, '>>>');
+          }
+        } catch (err) {
+          this.proseTargetPins.delete(agent.name);
+          this.proseHybridSuppressed.add(agent.name);
+          this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>>');
+        }
+        continue;
+      }
+      if (attempted) {
+        this.proseTargetPins.delete(agent.name);
+        this.proseHybridSuppressed.add(agent.name);
+        this.bounceProse(agent, normalized, 'malformed >>> routing envelope: destination is missing', undefined, '>>>');
+        continue;
+      }
+      if (this.proseHybridSuppressed.has(agent.name)) {
+        this.recordProseSuppression(agent.name, 1);
+        continue;
+      }
+      const sticky = this.proseTargetPins.get(agent.name);
+      if (!allowLocus && !sticky) {
+        this.recordProseSuppression(agent.name, 1);
+        continue;
+      }
+      const target = sticky ?? locus;
+      try {
+        const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
+        this.recordProseDelivery(agent.name, outcome);
+      } catch (err) {
+        console.error('hybrid locus delivery failed:', err);
+      }
+    }
+  }
+
   private async deliverProseEnvelope(agent: Agent, rawText: string): Promise<void> {
     const name = agent.name;
     const parsed = parseProsePrefix(rawText);
@@ -5202,7 +5305,7 @@ export class AgentFramework {
   /** Cap on consecutive bounce-triggered wakes (notices still append after). */
   private static readonly PROSE_BOUNCE_WAKE_CAP = 2;
 
-  private bounceProse(agent: Agent, text: string, reason: string, candidates?: string[]): void {
+  private bounceProse(agent: Agent, text: string, reason: string, candidates?: string[], prefix: '>>' | '>>>' = '>>'): void {
     const name = agent.name;
     this.proseClipboards.set(name, text);
     const streak = (this.proseBounceStreaks.get(name) ?? 0) + 1;
@@ -5211,8 +5314,9 @@ export class AgentFramework {
     const notice =
       `[prose-routing] Your text (${text.length} chars) was not delivered — ${reason}.${cand} ` +
       'The text is retained; nothing is lost. To deliver it unchanged, reply with a ' +
-      'destination plus the token {{unsent}}, e.g. ">>#channel {{unsent}}" or ">>@person {{unsent}}". ' +
-      '">>skip_reply {{unsent}}" keeps it in context only. The prose_help tool shows the full syntax.';
+      `destination plus the token {{unsent}}, e.g. "${prefix}#channel {{unsent}}" or "${prefix}@person {{unsent}}". ` +
+      `"${prefix}skip_reply {{unsent}}" keeps it in context only.` +
+      (prefix === '>>' ? ' The prose_help tool shows the full syntax.' : '');
     try {
       // Through framework.addMessage, NOT the context manager directly: while
       // the turn is still streaming this defers the notice to the next tool
@@ -5414,6 +5518,8 @@ export class AgentFramework {
       this.turnEngagedChannels.delete(agent.name);
       this.turnProseDeliveries.delete(agent.name);
       this.turnProseSuppressed.delete(agent.name);
+      this.proseHybridSuppressed.delete(agent.name);
+      if (agent.proseRouting === 'hybrid') this.proseTargetPins.delete(agent.name);
       if (agent.proseRouting === 'explicit') {
         // Explicit prose routing: there is no locus. The model names every
         // destination in-band (`>>` prefixes); the only turn state is the
@@ -5682,7 +5788,7 @@ export class AgentFramework {
     });
     const proseStream = this.channelRegistry
       ? new ProseStreamRouter({
-          mode: agent.proseRouting === 'explicit' ? 'explicit' : 'locus',
+          mode: agent.proseRouting === 'explicit' ? 'explicit' : agent.proseRouting === 'hybrid' ? 'hybrid' : 'locus',
           initialTarget: typingChannel,
           resolve: (spec) => {
             const r = this.channelRegistry!.resolveProseTarget(spec);
@@ -5862,14 +5968,28 @@ export class AgentFramework {
               const hasSameRoundPrivateThink =
                 roundToolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
-              if (roundToolNames.some((n) => SILENCING_TOOLS.has(bareToolName(n)))) {
+              if (roundToolNames.some((n) =>
+                SILENCING_TOOLS.has(bareToolName(n)) ||
+                (agent.proseRouting === 'hybrid' && HYBRID_PUBLICATION_TOOLS.has(bareToolName(n)))
+              )) {
                 turnSilenced = true;
               }
               if (roundContent && roundContent.length > 0) {
                 liveProseRouting = true;
                 const roundSegments = splitProseSegments(assistantBlocks);
                 if (roundSegments.length > 0) {
-                  if (agent.proseRouting === 'explicit') {
+                  if (agent.proseRouting === 'hybrid') {
+                    if (turnSilenced) {
+                      this.recordProseSuppression(agent.name, roundSegments.length);
+                    } else if (!hasSameRoundPrivateThink) {
+                      const locus = resolveTurnLocus();
+                      for (const seg of roundSegments) {
+                        turnSpeechChain = turnSpeechChain
+                          .then(() => this.deliverHybridProse(agent, seg, locus, true))
+                          .catch((err) => console.error('mid-turn hybrid prose delivery failed:', err));
+                      }
+                    }
+                  } else if (agent.proseRouting === 'explicit') {
                     // Explicit mode: every segment through the prose gateway.
                     // Silencing does not apply — unprefixed prose bounces and
                     // prefixed prose is deliberate; think-privacy still holds.
@@ -6199,7 +6319,15 @@ export class AgentFramework {
                 .join('\n')
                 .trim();
               if (speechText) {
-                if (agent.proseRouting === 'explicit') {
+                if (agent.proseRouting === 'hybrid') {
+                  const locus = resolveTurnLocus();
+                  console.error(`[prose] ${agent.name}: text-only turn -> hybrid prose gateway`);
+                  try {
+                    await this.deliverHybridProse(agent, speechText, locus, true);
+                  } catch (err) {
+                    console.error('text-only hybrid prose delivery failed:', err);
+                  }
+                } else if (agent.proseRouting === 'explicit') {
                   console.error(`[prose] ${agent.name}: text-only turn -> prose gateway`);
                   try {
                     await this.deliverProse(agent, speechText);
@@ -6246,7 +6374,10 @@ export class AgentFramework {
                 .filter((n): n is string => typeof n === 'string');
               const silenced = liveProseRouting
                 ? turnSilenced
-                : turnSilenced || toolNames.some((n) => SILENCING_TOOLS.has(bareToolName(n)));
+                : turnSilenced || toolNames.some((n) =>
+                  SILENCING_TOOLS.has(bareToolName(n)) ||
+                  (agent.proseRouting === 'hybrid' && HYBRID_PUBLICATION_TOOLS.has(bareToolName(n)))
+                );
 
               const segments = splitProseSegments(liveProseRouting ? terminalContent : response.content);
 
@@ -6255,7 +6386,20 @@ export class AgentFramework {
               // the chain may still be flushing earlier rounds' posts.
               await turnSpeechChain;
 
-              if (agent.proseRouting === 'explicit') {
+              if (agent.proseRouting === 'hybrid') {
+                if (silenced && segments.length > 0) {
+                  this.recordProseSuppression(agent.name, segments.length);
+                } else if (segments.length > 0) {
+                  const locus = resolveTurnLocus();
+                  for (const seg of segments) {
+                    try {
+                      await this.deliverHybridProse(agent, seg, locus, true);
+                    } catch (err) {
+                      console.error('trailing hybrid prose delivery failed:', err);
+                    }
+                  }
+                }
+              } else if (agent.proseRouting === 'explicit') {
                 if (segments.length > 0) {
                   console.error(
                     `[prose] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> ${segments.length} trailing segment(s) via prose gateway`,

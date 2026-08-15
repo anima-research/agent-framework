@@ -38,3 +38,24 @@ export function parseProsePrefix(text: string): ProsePrefix {
   }
   return { kind: 'target', target, continueTurn, body };
 }
+
+/** A real hybrid routing line: exact triple-arrow plus an optional whitespace
+ * run and a non-whitespace target token. */
+export const HYBRID_PROSE_PREFIX_LINE = /^>>>[ \t]*\S/;
+
+/**
+ * Hybrid/locus-preserving routing grammar.
+ *
+ * `>>>#cafe body` and `>>> #cafe body` route this envelope explicitly while
+ * unprefixed prose remains ordinary frozen-locus speech. The authored source
+ * is never rewritten; callers consume this view only for publication.
+ */
+export function parseHybridProsePrefix(text: string): ProsePrefix {
+  const m = /^>>>[ \t]*(\S+)([ \t]+!)?[ \t]*\n?/.exec(text);
+  if (!m) return { kind: 'none', continueTurn: false, body: text };
+  const target = m[1]!;
+  const continueTurn = m[2] !== undefined;
+  const body = text.slice(m[0].length);
+  if (target === 'skip_reply') return { kind: 'private', continueTurn, body };
+  return { kind: 'target', target, continueTurn, body };
+}

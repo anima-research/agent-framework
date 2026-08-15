@@ -30,7 +30,7 @@ export interface RoutedDelta {
   delta: string;
 }
 
-type State = 'line-start' | 'maybe-prefix' | 'prefix-token' | 'after-token' | 'body';
+type State = 'line-start' | 'hybrid-indent' | 'maybe-prefix' | 'prefix-gap' | 'prefix-token' | 'after-token' | 'body';
 
 export class ProseStreamRouter {
   private target: string | null;
@@ -42,8 +42,8 @@ export class ProseStreamRouter {
 
   constructor(
     private opts: {
-      /** 'explicit' parses `>>` prefixes; 'locus' is pure passthrough. */
-      mode: 'explicit' | 'locus';
+      /** explicit parses `>>`; hybrid parses `>>>` while retaining locus fallback. */
+      mode: 'explicit' | 'hybrid' | 'locus';
       /** Initial destination: the frozen turn locus (locus mode) or null. */
       initialTarget: string | null;
       /** Resolve a `>>spec` to a channelId, or null (unresolved/ambiguous). */
@@ -87,7 +87,12 @@ export class ProseStreamRouter {
    *  no body — dropped, matching delivery which would deliver empty body). */
   finish(): RoutedDelta[] {
     const out: RoutedDelta[] = [];
-    if (this.state === 'maybe-prefix') this.emit(this.held, out); // "" | ">" | ">>"
+    if (this.state === 'hybrid-indent') this.emit(this.held, out);
+    if (this.state === 'maybe-prefix') {
+      const full = this.opts.mode === 'hybrid' ? '>>>' : '>>';
+      const arrows = this.opts.mode === 'hybrid' ? this.held.trimStart() : this.held;
+      if (arrows !== full) this.emit(this.held, out);
+    }
     // prefix-token / after-token at EOF: prefix without body — nothing to emit.
     this.held = '';
     this.state = 'line-start';
@@ -97,7 +102,7 @@ export class ProseStreamRouter {
   private step(ch: string, out: RoutedDelta[]): void {
     switch (this.state) {
       case 'body':
-        if (ch === '\n' && this.opts.mode === 'explicit') {
+        if (ch === '\n' && this.opts.mode !== 'locus') {
           this.emit('\n', out);
           this.state = 'line-start';
         } else {
@@ -106,33 +111,62 @@ export class ProseStreamRouter {
         return;
 
       case 'line-start':
+        if (this.opts.mode === 'hybrid' && (ch === ' ' || ch === '\t')) {
+          this.state = 'hybrid-indent';
+          this.held = ch;
+          return;
+        }
         if (ch === '>') { this.state = 'maybe-prefix'; this.held = '>'; return; }
         this.state = 'body';
         this.step(ch, out);
         return;
 
-      case 'maybe-prefix':
-        if (this.held === '>' && ch === '>') { this.held = '>>'; return; }
-        if (this.held === '>>') {
-          if (ch === '\n' || ch === ' ' || ch === '\t') {
-            // `>> quoted arrow` / bare `>>`: body text, not a prefix.
-            this.emit(this.held, out);
+      case 'hybrid-indent':
+        if (ch === ' ' || ch === '\t') { this.held += ch; return; }
+        if (ch === '>') { this.held += ch; this.state = 'maybe-prefix'; return; }
+        this.emit(this.held, out);
+        this.held = '';
+        this.state = 'body';
+        this.step(ch, out);
+        return;
+
+      case 'maybe-prefix': {
+        const prefix = this.opts.mode === 'hybrid' ? '>>>' : '>>';
+        const arrows = this.opts.mode === 'hybrid' ? this.held.trimStart() : this.held;
+        if (ch === '>' && arrows.length < prefix.length) {
+          this.held += '>';
+          return;
+        }
+        if (arrows === prefix) {
+          if (this.opts.mode === 'hybrid' && (ch === ' ' || ch === '\t')) {
             this.held = '';
-            this.state = 'body';
-            this.step(ch, out);
+            this.state = 'prefix-gap';
             return;
           }
-          // real prefix begins
+          if (ch === '\n' || ch === ' ' || ch === '\t') {
+            if (this.opts.mode === 'explicit') this.emit(this.held, out);
+            this.held = '';
+            this.state = ch === '\n' ? 'line-start' : 'body';
+            if (ch !== '\n') this.step(ch, out);
+            return;
+          }
           this.state = 'prefix-token';
           this.token = ch;
           this.held = '';
           return;
         }
-        // held === '>' and ch !== '>': plain body starting with '>'
         this.emit(this.held, out);
         this.held = '';
         this.state = 'body';
         this.step(ch, out);
+        return;
+      }
+
+      case 'prefix-gap':
+        if (ch === ' ' || ch === '\t') return;
+        if (ch === '\n') { this.target = null; this.state = 'line-start'; return; }
+        this.state = 'prefix-token';
+        this.token = ch;
         return;
 
       case 'prefix-token':

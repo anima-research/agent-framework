@@ -30,6 +30,7 @@ import type { ContentBlock } from '@animalabs/membrane';
 class ToolboxModule implements Module {
   readonly name = 'robot';
   framework: AgentFramework | null = null;
+  calls: ToolCall[] = [];
 
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
@@ -39,11 +40,16 @@ class ToolboxModule implements Module {
       name: 'move',
       description: 'Move the robot',
       inputSchema: { type: 'object', properties: { dir: { type: 'string' } } },
+    }, {
+      name: 'say',
+      description: 'Publish speech into the world',
+      inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
     }];
   }
 
-  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
-    return { success: true, data: { ok: true } };
+  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    this.calls.push(call);
+    return { success: true, data: { ok: true, published: call.name.endsWith('--say') } };
   }
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -59,10 +65,12 @@ class ToolboxModule implements Module {
 }
 
 /** Registry stub: two known channels (#alpha guild, laria's DM) + capture. */
-function stubRegistry(framework: AgentFramework) {
+function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'false' | 'throw'> = []) {
   const routed: Array<{ text: string; locus: string | null }> = [];
   const known: Record<string, { channelId: string; label: string }> = {
     '#alpha': { channelId: 'chan-alpha', label: '#alpha' },
+    '#cafe': { channelId: 'discord:g:cafe', label: '#cafe' },
+    'world:commons': { channelId: 'world:commons', label: 'world:commons' },
     'alpha': { channelId: 'chan-alpha', label: '#alpha' },
     'chan-alpha': { channelId: 'chan-alpha', label: '#alpha' },
     '@laria': { channelId: 'discord:dm:99', label: 'DM: laria' },
@@ -73,9 +81,11 @@ function stubRegistry(framework: AgentFramework) {
       known[spec] ?? { error: `no channel matches "${spec}"` },
     routeSpeech: async (_agent: string, text: string, locus?: string | null) => {
       routed.push({ text, locus: locus ?? null });
-      return { delivered: true, channelId: locus ?? '' };
+      const behavior = plan.shift() ?? 'delivered';
+      if (behavior === 'throw') throw new Error('synthetic publication failure');
+      return { delivered: behavior === 'delivered', channelId: locus ?? '' };
     },
-    resolveLocus: () => 'should-never-be-used',
+    resolveLocus: () => 'world:commons',
     getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
     getDescriptor: () => undefined,
@@ -102,7 +112,7 @@ describe('explicit prose routing', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  async function createFramework(): Promise<AgentFramework> {
+  async function createFramework(mode: 'explicit' | 'hybrid' = 'explicit'): Promise<AgentFramework> {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
@@ -110,7 +120,7 @@ describe('explicit prose routing', () => {
         name: 'assistant',
         model: 'test-model',
         systemPrompt: 'You are a test agent.',
-        proseRouting: 'explicit',
+        proseRouting: mode,
       }],
       modules: [module],
     });
@@ -302,6 +312,138 @@ describe('explicit prose routing', () => {
       { text: 'part two, just for you\nwith a second line\n>> quoted arrow stays in body', locus: 'discord:dm:99' },
     ], 'two envelopes, two destinations; quoted arrow not split');
 
+    await framework.stop();
+  });
+
+
+  it('hybrid preserves authored >>> envelope, publishes only body cross-surface, and records canonical receipt', async () => {
+    const authored = '>>>#cafe\nA message meant for the café.';
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: authored }] as ContentBlock[]));
+    const framework = await createFramework('hybrid');
+    const routed = stubRegistry(framework);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, [{ text: 'A message meant for the café.', locus: 'discord:g:cafe' }]);
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    const texts = cm.getAllMessages().flatMap(m => m.content)
+      .filter(b => b.type === 'text').map(b => (b as { text: string }).text);
+    assert.ok(texts.includes(authored), 'source/author view retains exact envelope');
+    assert.ok(texts.includes('[delivered] plain speech → discord:g:cafe'), 'canonical destination receipt enters context');
+    await framework.stop();
+  });
+
+  it('hybrid leaves unprefixed prose on the frozen locus', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary field speech.' }] as ContentBlock[]));
+    const framework = await createFramework('hybrid');
+    const routed = stubRegistry(framework);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, [{ text: 'Ordinary field speech.', locus: 'world:commons' }]);
+    await framework.stop();
+  });
+
+  it('hybrid accepts permissive whitespace but missing targets bounce and publish nowhere', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: '  >>>   #missing\nDo not guess.' }] as ContentBlock[]));
+    const framework = await createFramework('hybrid');
+    const routed = stubRegistry(framework);
+    feedTurn(framework, 2, [{ type: 'text', text: '>>>skip_reply {{unsent}}' }] as ContentBlock[]);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, []);
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    const texts = cm.getAllMessages().flatMap(m => m.content)
+      .filter(b => b.type === 'text').map(b => (b as { text: string }).text);
+    assert.ok(texts.some(t => t.includes('[prose-routing]') && t.includes('not delivered') && t.includes('>>>#channel {{unsent}}')));
+    await framework.stop();
+  });
+
+
+  it('hybrid keeps an explicit target sticky across tool-round segments in the same turn', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#cafe first segment' },
+      { type: 'tool_use', id: 'hc1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'second segment, no repeated envelope' },
+    ] as ContentBlock[]));
+    const framework = await createFramework('hybrid');
+    const routed = stubRegistry(framework);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, [
+      { text: 'first segment', locus: 'discord:g:cafe' },
+      { text: 'second segment, no repeated envelope', locus: 'discord:g:cafe' },
+    ]);
+    await framework.stop();
+  });
+
+
+  it('hybrid target-only envelope establishes the sticky destination for the next tool-round segment', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#cafe' },
+      { type: 'tool_use', id: 'hc2', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'body follows' }] as ContentBlock[]));
+    const framework = await createFramework('hybrid');
+    const routed = stubRegistry(framework);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, [{ text: 'body follows', locus: 'discord:g:cafe' }]);
+    await framework.stop();
+  });
+
+
+  it('hybrid >>>skip_reply clears a sticky target until a fresh valid envelope', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>#cafe first' }, { type: 'tool_use', id: 'sk1', name: 'robot--move', input: { dir: 'north' } }] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>skip_reply hidden' }, { type: 'tool_use', id: 'sk2', name: 'robot--move', input: { dir: 'north' } }] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'plain text must remain suppressed' }, { type: 'tool_use', id: 'sk3', name: 'robot--move', input: { dir: 'north' } }] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>world:commons recovered' }] as ContentBlock[]));
+    const framework = await createFramework('hybrid');
+    const routed = stubRegistry(framework);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, [{ text: 'first', locus: 'discord:g:cafe' }, { text: 'recovered', locus: 'world:commons' }]);
+    await framework.stop();
+  });
+
+  for (const failure of ['false', 'throw'] as const) {
+    it(`hybrid ${failure} delivery clears sticky authority, suppresses later prose, and a fresh target resumes`, async () => {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>#cafe first' }, { type: 'tool_use', id: 'fl1', name: 'robot--move', input: { dir: 'north' } }] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>#alpha fails' }, { type: 'tool_use', id: 'fl2', name: 'robot--move', input: { dir: 'north' } }] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'plain text must remain suppressed' }, { type: 'tool_use', id: 'fl3', name: 'robot--move', input: { dir: 'north' } }] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: '>>>world:commons recovered' }] as ContentBlock[]));
+      const framework = await createFramework('hybrid');
+      const routed = stubRegistry(framework, ['delivered', failure, 'delivered']);
+      feedTurn(framework, 2, [{ type: 'text', text: '>>>skip_reply {{unsent}}' }] as ContentBlock[]);
+      trigger(framework);
+      await framework.runUntilIdle();
+      assert.equal(routed.some(r => r.text.includes('plain text must remain suppressed')), false);
+      assert.deepEqual(routed.filter(r => r.text !== 'fails'), [{ text: 'first', locus: 'discord:g:cafe' }, { text: 'recovered', locus: 'world:commons' }]);
+      const cm = framework.getAgent('assistant')!.getContextManager();
+      const texts = cm.getAllMessages().flatMap(m => m.content).filter(b => b.type === 'text').map(b => (b as { text: string }).text);
+      assert.ok(texts.some(t => t.includes('[prose-routing]') && t.includes('>>>#channel {{unsent}}')));
+      await framework.stop();
+    });
+  }
+
+
+  it('hybrid same-round successful say tool outranks a contradictory prose envelope', async () => {
+    const authored = '>>>#cafe wrong-locus duplicate';
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: authored },
+      { type: 'tool_use', id: 'say1', name: 'robot--say', input: { text: 'Hello Sill in the world' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tool completed' }] as ContentBlock[]));
+    const framework = await createFramework('hybrid');
+    const routed = stubRegistry(framework);
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.equal(module.calls.filter(c => c.name === 'say' || c.name.endsWith('--say')).length, 1);
+    assert.deepEqual(routed, []);
+    const cm = framework.getAgent('assistant')!.getContextManager();
+    const texts = cm.getAllMessages().flatMap(m => m.content).filter(b => b.type === 'text').map(b => (b as { text: string }).text);
+    assert.ok(texts.includes(authored));
+    assert.ok(texts.some(t => t.startsWith('[delivered] nothing') && t.includes('suppressed')));
     await framework.stop();
   });
 

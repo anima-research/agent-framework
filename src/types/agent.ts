@@ -177,8 +177,11 @@ export interface AgentConfig {
    *   (`>>#channel` / `>>@person` / `>>skip_reply`); unprefixed prose is never
    *   delivered — it bounces to a clipboard for a cheap prefixed resend.
    *   See docs/explicit-prose-routing.md.
+   * - 'hybrid': unprefixed prose keeps locus routing; `>>>destination` routes
+   *   that publication envelope through the same authorized resolver.
+   *   See docs/hybrid-prose-routing.md.
    */
-  proseRouting?: 'locus' | 'explicit';
+  proseRouting?: 'locus' | 'explicit' | 'hybrid';
 }
 
 /** The intentionally small set of agent settings that may change in-process. */

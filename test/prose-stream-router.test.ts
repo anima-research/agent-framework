@@ -97,3 +97,53 @@ test('PROPERTY: char-by-char ≡ one-shot, across every chunk size', () => {
     }
   }
 });
+
+function hybrid(): ProseStreamRouter {
+  return new ProseStreamRouter({
+    mode: 'hybrid',
+    initialTarget: 'world:commons',
+    resolve: (spec) => RESOLVE[spec] ?? (spec === 'world:commons' ? 'world:commons' : null),
+  });
+}
+
+test('hybrid: unprefixed prose stays on the frozen locus', () => {
+  const out = run(hybrid(), 'ordinary world speech');
+  assert.equal(textFor(out, 'world:commons'), 'ordinary world speech');
+});
+
+test('hybrid: triple-arrow target switches publication and consumes the envelope', () => {
+  const out = run(hybrid(), '>>>#general cafe body');
+  assert.equal(textFor(out, 'discord:g:100'), 'cafe body');
+  assert.equal(out.every(d => !d.delta.includes('>>>')), true);
+  assert.equal(textFor(out, 'world:commons'), '');
+});
+
+test('hybrid: permissive whitespace and cross-surface canonical ids', () => {
+  const out = run(hybrid(), '  >>>   #ops spaced\n\t>>> world:commons home');
+  assert.equal(textFor(out, 'discord:g:200'), 'spaced\n');
+  assert.equal(textFor(out, 'world:commons'), 'home');
+});
+
+test('hybrid: double arrows and mid-line triple arrows remain ordinary locus prose', () => {
+  const text = '>>#ops old syntax is prose\nlook >>>#ops quoted';
+  const out = run(hybrid(), text);
+  assert.equal(textFor(out, 'world:commons'), text);
+  assert.equal(textFor(out, 'discord:g:200'), '');
+});
+
+test('hybrid: missing target suppresses that envelope; a later valid envelope resumes', () => {
+  const out = run(hybrid(), '>>>#missing nowhere\nplain remains on failed target\n>>>world:commons restored');
+  assert.equal(out.every(d => !d.delta.includes('nowhere') && !d.delta.includes('plain remains')), true);
+  assert.equal(textFor(out, 'world:commons'), 'restored');
+});
+
+test('hybrid PROPERTY: char-by-char equals one-shot', () => {
+  const text = 'locus first\n>>>#general alpha\nbeta\n>>> #ops delta\n>>>world:commons home';
+  const one = run(hybrid(), text);
+  for (const size of [1, 2, 3, 4, 7, 11]) {
+    const chunked = run(hybrid(), text, size);
+    for (const ch of ['world:commons', ...Object.values(RESOLVE)]) {
+      assert.equal(textFor(chunked, ch), textFor(one, ch));
+    }
+  }
+});
