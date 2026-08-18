@@ -68,6 +68,11 @@ export interface TuneOutParams {
   maxWakes: number;
   /** Chronicle sequence when the tune-out began — window anchor + audit bound. */
   startedAtSequence: number;
+  /** Absolute wall-clock deadline (epoch ms). When set, the tune-out
+   *  auto-cancels at this time via the standard cancel flow ("duration
+   *  elapsed") — the agent's self-binding attention budget (#77 "for a
+   *  period chosen by the agent"). Unset = until cancelled. */
+  expiresAtMs?: number;
 }
 
 interface ChannelLifecycleEvent {

@@ -2681,6 +2681,12 @@ export class AgentFramework {
         cadenceSeconds: { type: 'number', description: `Summary cadence (default ${TUNE_OUT_DEFAULTS.cadenceSeconds}s).` },
         backlogCap: { type: 'number', description: `Max raw messages delivered at cancel (default ${TUNE_OUT_DEFAULTS.backlogCap}).` },
         maxWakes: { type: 'number', description: `Wake budget before auto-cancel (default ${TUNE_OUT_DEFAULTS.maxWakes}).` },
+        durationSeconds: {
+          type: 'number',
+          description:
+            'Optional bounded duration: the tune-out auto-cancels (backlog ' +
+            'delivered) after this many seconds. Unset = until cancelled.',
+        },
       },
       required: ['channelId'],
     },
@@ -11180,6 +11186,7 @@ export class AgentFramework {
     const input = (call.input ?? {}) as {
       channelId?: string; mode?: string;
       cadenceSeconds?: number; backlogCap?: number; maxWakes?: number;
+      durationSeconds?: number;
     };
     const channelId = String(input.channelId ?? '');
     const entry = this.channelRegistry?.listChannelsRaw()
@@ -11197,6 +11204,7 @@ export class AgentFramework {
         cadenceSeconds: input.cadenceSeconds,
         backlogCap: input.backlogCap,
         maxWakes: input.maxWakes,
+        durationSeconds: input.durationSeconds,
       }, 'agent-tool');
       result = r.ok
         ? {

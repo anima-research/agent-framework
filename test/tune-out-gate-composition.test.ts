@@ -60,6 +60,106 @@ function harness(opts?: { privileged?: boolean }) {
   return { coordinator, wakes, acks };
 }
 
+describe('duration expiry', () => {
+  it('an expired deadline at resume cancels immediately via the standard flow', () => {
+    const cancels: string[] = [];
+    const registry = {
+      listChannelsRaw: () => [{ serverId: 'disc', descriptor: { id: '#a' } }],
+      getTuneOutState: () => ({
+        params: { ...PARAMS, expiresAtMs: Date.now() - 5_000 },
+        wakeCount: 0,
+      }),
+      cancelTuneOut: (_s: string, c: string) => {
+        cancels.push(c);
+        return { params: PARAMS, wakeCount: 0 };
+      },
+    } as unknown as ChannelRegistry;
+    const hooks = {
+      addMessage: () => '',
+      requestInference: () => {},
+      subconsciousName: () => 'Subconscious',
+      primaryName: () => 'scout',
+      getStoredMessages: () => [],
+      currentSequence: () => 1,
+      setSubconsciousAnchor: () => {},
+      isForkBound: () => false,
+      isPrivilegedAuthor: () => false,
+      allowChannelSpeech: () => false,
+      emitTrace: () => {},
+    } as unknown as TuneOutFrameworkHooks;
+    const coordinator = new TuneOutCoordinator(registry, {} as McplServerRegistry, hooks);
+    coordinator.resumeActiveEpochs();
+    assert.deepEqual(cancels, ['#a'], 'expired epoch cancelled at resume');
+    coordinator.stop();
+  });
+
+  it('a live deadline arms a timer that cancels on schedule', async () => {
+    const cancels: string[] = [];
+    const registry = {
+      listChannelsRaw: () => [],
+      getTuneOutState: () => null,
+      enterTuneOut: () => {},
+      cancelTuneOut: (_s: string, c: string) => {
+        cancels.push(c);
+        return { params: PARAMS, wakeCount: 0 };
+      },
+    } as unknown as ChannelRegistry;
+    const hooks = {
+      addMessage: () => '',
+      requestInference: () => {},
+      subconsciousName: () => 'Subconscious',
+      primaryName: () => 'scout',
+      getStoredMessages: () => [],
+      currentSequence: () => 1,
+      setSubconsciousAnchor: () => {},
+      isForkBound: () => false,
+      isPrivilegedAuthor: () => false,
+      allowChannelSpeech: () => false,
+      emitTrace: () => {},
+    } as unknown as TuneOutFrameworkHooks;
+    const coordinator = new TuneOutCoordinator(registry, {} as McplServerRegistry, hooks);
+    // armExpiry directly with a ~50ms deadline (enter() clamps duration to
+    // >=60s, which a unit test should not wait out).
+    (coordinator as unknown as {
+      armExpiry: (s: string, c: string, p: TuneOutParams) => void;
+    }).armExpiry('disc', '#a', { ...PARAMS, expiresAtMs: Date.now() + 50 });
+    await new Promise((r) => setTimeout(r, 150));
+    assert.deepEqual(cancels, ['#a'], 'deadline fired the standard cancel');
+    coordinator.stop();
+  });
+
+  it('enter() stamps expiresAtMs only when durationSeconds is given', () => {
+    const entered: TuneOutParams[] = [];
+    const registry = {
+      listChannelsRaw: () => [],
+      getTuneOutState: () => null,
+      enterTuneOut: (_s: string, _c: string, p: TuneOutParams) => { entered.push(p); },
+    } as unknown as ChannelRegistry;
+    const hooks = {
+      addMessage: () => '',
+      requestInference: () => {},
+      subconsciousName: () => 'Subconscious',
+      primaryName: () => 'scout',
+      getStoredMessages: () => [],
+      currentSequence: () => 42,
+      setSubconsciousAnchor: () => {},
+      isForkBound: () => false,
+      isPrivilegedAuthor: () => false,
+      allowChannelSpeech: () => false,
+      emitTrace: () => {},
+    } as unknown as TuneOutFrameworkHooks;
+    const coordinator = new TuneOutCoordinator(registry, {} as McplServerRegistry, hooks);
+    coordinator.enter('disc', '#a', {}, 'agent-tool');
+    assert.equal(entered[0].expiresAtMs, undefined, 'unset by default');
+    coordinator.enter('disc', '#b', { durationSeconds: 3600 }, 'agent-tool');
+    assert.ok(
+      entered[1].expiresAtMs !== undefined && entered[1].expiresAtMs > Date.now() + 3_500_000,
+      'deadline stamped from durationSeconds',
+    );
+    coordinator.stop();
+  });
+});
+
 describe('gate composition on subconscious wakes', () => {
   it('gate-passed addressed messages wake and get the reaction', () => {
     const { coordinator, wakes, acks } = harness();
