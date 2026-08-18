@@ -6188,6 +6188,17 @@ export class AgentFramework {
         }
       }
 
+      // The subconscious's standing dispositions ride a fixed system-position
+      // injection (antra, #tuneout-talk): never repeated in its timeline, and
+      // — since it has no long-term memory — structurally unable to wash out
+      // of its window. Bytes change only when a disposition changes.
+      if (agent.name === this.subconsciousAgentName && this.tuneOutCoordinator) {
+        const dispositionInjection = this.tuneOutCoordinator.getDispositionsInjection();
+        if (dispositionInjection) {
+          injections = injections ? [...injections, dispositionInjection] : [dispositionInjection];
+        }
+      }
+
       const {
         stream,
         request: compiledRequest,

@@ -160,6 +160,54 @@ describe('duration expiry', () => {
   });
 });
 
+describe('dispositions injection', () => {
+  function dispositionHarness() {
+    const registry = {
+      listChannelsRaw: () => [],
+      getTuneOutState: () => null,
+      readCoordinatorState: () => null,
+      writeCoordinatorState: (_id: string, v: unknown) => { stateStore = v; },
+    } as unknown as ChannelRegistry;
+    let stateStore: unknown = null;
+    const hooks = {
+      addMessage: () => '',
+      requestInference: () => {},
+      subconsciousName: () => 'Subconscious',
+      primaryName: () => 'scout',
+      getStoredMessages: () => [],
+      currentSequence: () => 1,
+      setSubconsciousAnchor: () => {},
+      isForkBound: () => false,
+      isPrivilegedAuthor: () => false,
+      allowChannelSpeech: () => false,
+      emitTrace: () => {},
+    } as unknown as TuneOutFrameworkHooks;
+    return new TuneOutCoordinator(registry, {} as McplServerRegistry, hooks);
+  }
+
+  it('empty dispositions produce no injection', () => {
+    const coordinator = dispositionHarness();
+    assert.equal(coordinator.getDispositionsInjection(), null);
+    coordinator.stop();
+  });
+
+  it('noted dispositions become a system-position injection; empty text deletes', () => {
+    const coordinator = dispositionHarness();
+    coordinator.noteDisposition('antra', 'pings always escalate');
+    coordinator.noteDisposition('release-bot', 'ignore');
+    const injection = coordinator.getDispositionsInjection();
+    assert.equal(injection?.position, 'system');
+    assert.equal(injection?.namespace, 'dispositions');
+    assert.match(injection!.content[0].text, /antra: pings always escalate/);
+    assert.match(injection!.content[0].text, /release-bot: ignore/);
+
+    coordinator.noteDisposition('release-bot', '');
+    const after = coordinator.getDispositionsInjection();
+    assert.ok(!after!.content[0].text.includes('release-bot'), 'empty text deletes the key');
+    coordinator.stop();
+  });
+});
+
 describe('gate composition on subconscious wakes', () => {
   it('gate-passed addressed messages wake and get the reaction', () => {
     const { coordinator, wakes, acks } = harness();
