@@ -10,6 +10,44 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.10.0 — 2026-08-18
+
+Minor release because it adds a third public prose-routing mode and expands the
+runtime wake-rule surface.
+
+### Added
+
+- **Hybrid prose routing** (#113) — `AgentConfig.proseRouting: "hybrid"` keeps
+  unprefixed prose in the frozen current locus while a leading
+  `>>>destination` envelope uses the existing authorized cross-surface router.
+  Exact authored source remains in resident context, recipients see only the
+  body, and delivery success/failure returns as a model-visible receipt.
+  Explicit publication tools outrank contradictory prose to prevent duplicate
+  sends.
+- **Composable wake-rule observers** (#106) — rate/sampling rules may fall
+  through without swallowing later addressed-message rules, rules support
+  anchored insertion, and the runtime reports before/after probes plus shadow
+  warnings so ordering failures are visible before they become silence.
+
+### Changed
+
+- **Default inline tool-result cap raised from 5,000 to 24,000 characters**
+  (#101). Durable resident overrides and strategy hard clamps remain unchanged;
+  larger results still spill to the workspace with a bounded notice.
+- **Workspace egress reads the current disk bytes** rather than trusting a stale
+  in-memory copy, and skipped syncs now return an explicit reason.
+
+### Fixed
+
+- **Legacy XML tool-round persistence** (#107) stores each round's delta prose
+  rather than the cumulative preamble and retains `toolName` on stored
+  `tool_result` blocks, preventing duplicate public text and malformed replay.
+
+### Security
+
+- CI actions are pinned to immutable SHAs and checkout no longer persists
+  credentials (#100).
+
 ## 0.9.0 — 2026-08-06
 
 Minor rather than patch because 0.x puts breaking changes in the minor, and
