@@ -733,10 +733,10 @@ export class DiscordModule implements Module {
     }
 
     const scrollback = this.config.historyScrollback ?? 50;
-    
+
     // Fetch recent history from Discord
     const discordMessages = await this.client.fetchHistory(channelId, { limit: scrollback });
-    
+
     // Build a map of Discord message ID -> content for comparison
     const discordMessageMap = new Map<string, { content: string; authorName: string; timestamp: Date }>();
     for (const msg of discordMessages) {
@@ -754,7 +754,11 @@ export class DiscordModule implements Module {
     });
 
     // Build a map of stored message external IDs -> internal data
-    const storedMessageMap = new Map<string, { internalId: string; content: string }>();
+    const storedMessageMap = new Map<string, {
+      internalId: string;
+      content: string;
+      sourceTimestamp?: number;
+    }>();
     for (const msg of storedMessages) {
       const external = msg.metadata?.external as { id?: string } | undefined;
       if (external?.id) {
@@ -766,6 +770,9 @@ export class DiscordModule implements Module {
         storedMessageMap.set(external.id, {
           internalId: msg.id,
           content: textContent,
+          sourceTimestamp: typeof msg.metadata?.timestamp === 'number'
+            ? msg.metadata.timestamp
+            : undefined,
         });
       }
     }
@@ -784,7 +791,7 @@ export class DiscordModule implements Module {
         // This ensures continuity of conversation history
         const isBotMessage = discordMsg.authorId === this.state.botUserId;
         const agentName = this.ctx.getAgents()[0]?.name;
-        const participantName = isBotMessage 
+        const participantName = isBotMessage
           ? (agentName ?? discordMsg.authorName)
           : discordMsg.authorName;
         
@@ -810,12 +817,22 @@ export class DiscordModule implements Module {
       }
     }
 
-    // Check for deletes - messages we have that Discord doesn't
-    // Only consider messages within the scrollback window (recent ones)
+    // Check for deletes only inside the history we actually fetched. When the
+    // response reaches the configured limit, older stored messages are outside
+    // the comparison window and their absence does not mean Discord deleted
+    // them. A short response covers the channel's complete available history.
+    const fetchedCompleteHistory = discordMessages.length < scrollback;
+    const oldestFetchedTimestamp = discordMessages.length > 0
+      ? Math.min(...discordMessages.map((msg) => msg.timestamp.getTime()))
+      : undefined;
     for (const [externalId, stored] of storedMessageMap) {
-      if (!discordMessageMap.has(externalId)) {
+      const isInsideFetchedWindow = fetchedCompleteHistory || (
+        stored.sourceTimestamp !== undefined &&
+        oldestFetchedTimestamp !== undefined &&
+        stored.sourceTimestamp >= oldestFetchedTimestamp
+      );
+      if (isInsideFetchedWindow && !discordMessageMap.has(externalId)) {
         // Message exists in our store but not in Discord - it was deleted
-        // Note: This only catches deletes within the scrollback window
         this.ctx.removeMessage(stored.internalId);
         deletedMessages++;
       }

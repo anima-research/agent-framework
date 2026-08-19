@@ -10,6 +10,11 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+### Fixed
+
+- Discord history sync no longer mistakes stored messages older than its
+  configured scrollback window for deleted messages and removes them.
+
 ## 0.10.0 — 2026-08-18
 
 Minor release because it adds a third public prose-routing mode and expands the
