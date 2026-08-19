@@ -4876,8 +4876,8 @@ export class AgentFramework {
       // token; the predecessor frame's late finally no-ops via token-match.
       // This mirrors how the restart has always overwritten activeStreams
       // rather than waiting for the old stream's teardown.
-      const isBudgetRestart = requests.some((r) => r.reason === 'context_budget_restart');
-      const turnAlive = !isBudgetRestart && this.activeTurnTokens.has(agentName);
+      const budgetRestart = requests.find((r) => r.reason === 'context_budget_restart');
+      const turnAlive = !budgetRestart && this.activeTurnTokens.has(agentName);
       if (turnAlive || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
         // Re-queue requests, but warn if they've been pending too long
         const oldest = Math.min(...requests.map(r => r.timestamp));
@@ -4926,7 +4926,12 @@ export class AgentFramework {
       }
 
       // Start streaming inference (non-blocking — driveStream runs in background)
-      const trigger = requests[0];
+      // The request that grants the turn-alive exception must also define the
+      // downstream turn semantics. An ordinary wake can already be pending
+      // when the tool boundary appends a context-budget restart; selecting
+      // requests[0] in that mixed batch bypassed the turn lock because a
+      // restart existed, then treated the continuation as a fresh turn.
+      const trigger = budgetRestart ?? requests[0];
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle):

@@ -14,10 +14,12 @@ interface FrameworkHarness {
   activeStreams: Map<string, Promise<void>>;
   activeTurnTokens: Map<string, number>;
   staleWarnAt: Map<string, number>;
+  inferencePolicy: { shouldInfer(): boolean };
   sweepExpiredConversations(): void;
   createFrameworkState(): Record<string, never>;
   emitTrace(): void;
   handleProcessEvent(event: unknown): Promise<void>;
+  startAgentStream(agent: unknown, trigger?: { reason: string; channelId?: string }): Promise<void>;
   processNextEvent(): Promise<void>;
   processInferenceRequests(): Promise<void>;
 }
@@ -39,6 +41,8 @@ function busyAgentHarness(): FrameworkHarness {
   framework.createFrameworkState = () => ({});
   framework.emitTrace = () => {};
   framework.handleProcessEvent = async () => {};
+  framework.inferencePolicy = { shouldInfer: () => true };
+  framework.startAgentStream = async () => {};
   return framework;
 }
 
@@ -88,4 +92,39 @@ test('stale busy-agent diagnostics are throttled with the warning', async () => 
 
   assert.equal(traceCount, 1, 'the stale trace shares the once-per-minute warning throttle');
   assert.equal(framework.pendingRequests.length, 1, 'diagnostics do not consume the deferred wake');
+});
+
+test('a budget restart defines turn semantics when batched behind an ordinary wake', async () => {
+  const framework = busyAgentHarness();
+  const now = Date.now();
+  framework.pendingRequests = [
+    {
+      agentName: 'Sol',
+      reason: 'mcpl:channel-incoming',
+      source: 'discord',
+      timestamp: now - 1,
+    },
+    {
+      agentName: 'Sol',
+      reason: 'context_budget_restart',
+      source: 'framework',
+      timestamp: now,
+    },
+  ];
+  framework.agents = new Map([['Sol', { state: { status: 'idle' } }]]);
+  framework.activeTurnTokens.set('Sol', 1);
+
+  let selectedTrigger: { reason: string; channelId?: string } | undefined;
+  framework.startAgentStream = async (_agent, trigger) => {
+    selectedTrigger = trigger;
+  };
+
+  await framework.processInferenceRequests();
+
+  assert.equal(
+    selectedTrigger?.reason,
+    'context_budget_restart',
+    'the request that bypasses the turn-alive lock must preserve continuation semantics',
+  );
+  assert.equal(framework.pendingRequests.length, 0, 'the mixed wake batch is consumed once');
 });
