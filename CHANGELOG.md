@@ -10,6 +10,11 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+### Fixed
+
+- Missed Discord messages imported during history sync are now appended
+  oldest-first so their stored conversation chronology remains intact.
+
 ## 0.10.0 — 2026-08-18
 
 Minor release because it adds a third public prose-routing mode and expands the
