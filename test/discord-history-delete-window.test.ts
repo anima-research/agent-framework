@@ -91,6 +91,24 @@ test('history sync preserves stored messages older than a full scrollback window
   assert.equal(result.deletedMessages, 1);
 });
 
+test('history sync preserves an unfetched message tied with the oldest fetched timestamp', async () => {
+  const { harness, removed } = historyHarness(
+    [historyMessage('3', 3_000), historyMessage('2', 2_000)],
+    [
+      storedMessage('stored-boundary-unseen', '1', 2_000),
+      storedMessage('stored-recent-deleted', 'deleted', 2_500),
+      storedMessage('stored-2', '2', 2_000),
+      storedMessage('stored-3', '3', 3_000),
+    ],
+    2,
+  );
+
+  const result = await harness.syncChannelHistory('channel-1');
+
+  assert.deepStrictEqual(removed, ['stored-recent-deleted']);
+  assert.equal(result.deletedMessages, 1);
+});
+
 test('history sync still detects older deletions when the fetch covers the whole channel', async () => {
   const { harness, removed } = historyHarness(
     [historyMessage('2', 2_000)],

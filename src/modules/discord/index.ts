@@ -829,7 +829,10 @@ export class DiscordModule implements Module {
       const isInsideFetchedWindow = fetchedCompleteHistory || (
         stored.sourceTimestamp !== undefined &&
         oldestFetchedTimestamp !== undefined &&
-        stored.sourceTimestamp >= oldestFetchedTimestamp
+        // Discord timestamps are millisecond-precise, so an older message just
+        // beyond the page can tie the oldest fetched timestamp. Preserve ties
+        // rather than guessing that an unseen boundary message was deleted.
+        stored.sourceTimestamp > oldestFetchedTimestamp
       );
       if (isInsideFetchedWindow && !discordMessageMap.has(externalId)) {
         // Message exists in our store but not in Discord - it was deleted
