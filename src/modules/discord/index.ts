@@ -774,8 +774,10 @@ export class DiscordModule implements Module {
     let editedMessages = 0;
     let deletedMessages = 0;
 
-    // Process Discord messages - check for new/edited
-    for (const discordMsg of discordMessages) {
+    // Discord history is newest-first, while addMessage appends to the stored
+    // conversation. Process oldest-first so missed messages retain chronology.
+    const chronologicalMessages = [...discordMessages].reverse();
+    for (const discordMsg of chronologicalMessages) {
       const stored = storedMessageMap.get(discordMsg.id);
       
       if (!stored) {
