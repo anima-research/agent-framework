@@ -305,6 +305,42 @@ describe('ProcessQueueImpl', () => {
     assert.strictEqual(queue.isEmpty, true);
   });
 
+  it('prioritizes external messages without reversing their arrival order', () => {
+    const queue = new ProcessQueueImpl();
+    const firstMessage: ProcessEvent = {
+      type: 'external-message',
+      source: 'test',
+      content: 'first',
+      metadata: {},
+    };
+    const secondMessage: ProcessEvent = {
+      type: 'external-message',
+      source: 'test',
+      content: 'second',
+      metadata: {},
+    };
+    const firstInternal: ProcessEvent = {
+      type: 'timer-fired',
+      timerId: 'first-internal',
+      reason: 'test',
+    };
+    const secondInternal: ProcessEvent = {
+      type: 'timer-fired',
+      timerId: 'second-internal',
+      reason: 'test',
+    };
+
+    queue.push(firstInternal);
+    queue.push(firstMessage);
+    queue.push(secondMessage);
+    queue.push(secondInternal);
+
+    assert.deepStrictEqual(queue.tryPop(), firstMessage);
+    assert.deepStrictEqual(queue.tryPop(), secondMessage);
+    assert.deepStrictEqual(queue.tryPop(), firstInternal);
+    assert.deepStrictEqual(queue.tryPop(), secondInternal);
+  });
+
   it('should return null when queue is empty', () => {
     const queue = new ProcessQueueImpl();
     assert.strictEqual(queue.tryPop(), null);

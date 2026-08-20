@@ -754,7 +754,7 @@ export class DiscordModule implements Module {
     });
 
     // Build a map of stored message external IDs -> internal data
-    const storedMessageMap = new Map<string, { internalId: string; content: string }>();
+    const storedMessageMap = new Map<string, { internalId: string; content: string; sourceTimestamp?: number }>();
     for (const msg of storedMessages) {
       const external = msg.metadata?.external as { id?: string } | undefined;
       if (external?.id) {
@@ -766,6 +766,9 @@ export class DiscordModule implements Module {
         storedMessageMap.set(external.id, {
           internalId: msg.id,
           content: textContent,
+          sourceTimestamp: typeof msg.metadata?.timestamp === 'number'
+            ? msg.metadata.timestamp
+            : undefined,
         });
       }
     }
@@ -774,8 +777,10 @@ export class DiscordModule implements Module {
     let editedMessages = 0;
     let deletedMessages = 0;
 
-    // Process Discord messages - check for new/edited
-    for (const discordMsg of discordMessages) {
+    // Discord history is newest-first, while addMessage appends to the stored
+    // conversation. Process oldest-first so missed messages retain chronology.
+    const chronologicalMessages = [...discordMessages].reverse();
+    for (const discordMsg of chronologicalMessages) {
       const stored = storedMessageMap.get(discordMsg.id);
       
       if (!stored) {
@@ -810,10 +815,23 @@ export class DiscordModule implements Module {
       }
     }
 
-    // Check for deletes - messages we have that Discord doesn't
-    // Only consider messages within the scrollback window (recent ones)
+    // Check for deletes only inside the history we actually fetched. A short
+    // response covers complete available history; a full page has an older
+    // boundary whose tied millisecond must be preserved.
+    const fetchedCompleteHistory = discordMessages.length < scrollback;
+    const oldestFetchedTimestamp = discordMessages.length > 0
+      ? Math.min(...discordMessages.map((msg) => msg.timestamp.getTime()))
+      : undefined;
     for (const [externalId, stored] of storedMessageMap) {
-      if (!discordMessageMap.has(externalId)) {
+      const isInsideFetchedWindow = fetchedCompleteHistory || (
+        stored.sourceTimestamp !== undefined &&
+        oldestFetchedTimestamp !== undefined &&
+        // Discord timestamps are millisecond-precise, so an older message just
+        // beyond the page can tie the oldest fetched timestamp. Preserve ties
+        // rather than guessing that an unseen boundary message was deleted.
+        stored.sourceTimestamp > oldestFetchedTimestamp
+      );
+      if (isInsideFetchedWindow && !discordMessageMap.has(externalId)) {
         // Message exists in our store but not in Discord - it was deleted
         // Note: This only catches deletes within the scrollback window
         this.ctx.removeMessage(stored.internalId);

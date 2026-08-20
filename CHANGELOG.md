@@ -12,6 +12,11 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ### Fixed
 
+- Discord downtime history is written to Context Manager in chronological order while newest-message tracking retains Discord order.
+
+- Rapid external messages now retain arrival order while remaining prioritized
+  ahead of queued internal framework events.
+
 - Mixed wake batches containing a context-budget restart now preserve the
   restart's same-turn semantics instead of taking the restart-only turn-lock
   exception and then starting from an older ordinary wake as a fresh turn.

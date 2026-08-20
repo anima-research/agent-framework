@@ -22,8 +22,14 @@ export class ProcessQueueImpl implements ProcessQueue {
     if (waiter) {
       waiter(event);
     } else if (event.type === 'external-message') {
-      // User input jumps to front so it's processed before queued internal events
-      this.queue.unshift(event);
+      // User input stays ahead of queued internal work, but joins the end of
+      // the external-message lane so rapid messages retain arrival order.
+      const firstInternal = this.queue.findIndex((queued) => queued.type !== 'external-message');
+      if (firstInternal === -1) {
+        this.queue.push(event);
+      } else {
+        this.queue.splice(firstInternal, 0, event);
+      }
     } else {
       this.queue.push(event);
     }
