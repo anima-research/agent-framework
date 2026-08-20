@@ -10,6 +10,8 @@ export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
 }
+import { applyHeadTailProjectionLease } from './context-projection-lease.js';
+
 import type {
   ContextManager,
   TokenBudget,
@@ -432,7 +434,7 @@ export class Agent {
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
     const result = await this.contextManager.compile(this.resolveBudget(budget));
     if (!budget) this.settleRuntimeSettingsTransition();
-    return result;
+    return this.applyProjectionLease(result);
   }
 
   /**
@@ -446,7 +448,17 @@ export class Agent {
   ): Promise<CompileResult> {
     const result = await this.contextManager.compile(this.resolveBudget(budget), injections);
     if (!budget) this.settleRuntimeSettingsTransition();
-    return result;
+    return this.applyProjectionLease(result);
+  }
+
+  private applyProjectionLease(result: CompileResult): CompileResult {
+    const leasedAgent = process.env.CONTEXT_HEAD_TAIL_LEASE_AGENT;
+    if (!leasedAgent || leasedAgent !== this.name) return result;
+    const strategy = this.contextManager.getStrategy() as { getRenderStats?: () => { total: { messages: number }; head: { messages: number }; tail: { messages: number } } };
+    if (typeof strategy.getRenderStats !== 'function') {
+      throw new Error(`Head/tail projection lease requires render statistics for agent ${this.name}`);
+    }
+    return applyHeadTailProjectionLease(result, strategy.getRenderStats(), this.name, leasedAgent);
   }
 
   // ==========================================================================
