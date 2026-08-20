@@ -10,6 +10,12 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+### Fixed
+
+- Mixed wake batches containing a context-budget restart now preserve the
+  restart's same-turn semantics instead of taking the restart-only turn-lock
+  exception and then starting from an older ordinary wake as a fresh turn.
+
 ## 0.10.0 — 2026-08-18
 
 Minor release because it adds a third public prose-routing mode and expands the
