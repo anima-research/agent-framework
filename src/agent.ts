@@ -67,7 +67,7 @@ export class Agent {
   /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
   readonly refusalHandling: AgentConfig['refusalHandling'];
   /** Prose delivery mode (see AgentConfig.proseRouting). Default 'locus'. */
-  readonly proseRouting: 'locus' | 'explicit' | 'hybrid';
+  readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
   /** Prompt-cache TTL forwarded to the provider (see AgentConfig.cacheTtl). */
   readonly cacheTtl: NonNullable<AgentConfig['cacheTtl']>;
   /** Emit prompt-cache markers on requests (see AgentConfig.promptCaching). */

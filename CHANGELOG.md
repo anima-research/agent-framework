@@ -10,6 +10,10 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+### Added
+
+- `proseRouting: "disabled"` keeps all generated plain prose private and permits external publication only through explicit tools, preventing ambient locus capture from publishing continuity output.
+
 ### Fixed
 
 - Discord downtime history is written to Context Manager in chronological order while newest-message tracking retains Discord order.

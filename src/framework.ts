@@ -228,7 +228,7 @@ const isAddressedMessage = (
 // envelopes can never disagree on what is a prefix.
 
 /** One-time primer appended when an agent's proseRouting mode changes. */
-function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus'): string {
+function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus' | 'disabled'): string {
   if (mode === 'locus') {
     return '[prose-routing] Mode change: your plain text auto-routes to the ' +
       'conversational locus again. `>>` destination prefixes are no longer needed.';
@@ -3993,7 +3993,7 @@ export class AgentFramework {
           // updates lastAnnouncedLocus so the next turn's announce-on-change
           // diffs against what the agent was actually last told.
           if (
-            agent.proseRouting !== 'explicit' &&
+            (agent.proseRouting === 'locus' || agent.proseRouting === 'hybrid') &&
             !shouldEndTurn && !overBudget && currentState.stream
           ) {
             // Two signals qualify an injection to move the pin (n=6 + n=7):
@@ -5013,7 +5013,9 @@ export class AgentFramework {
     }
     const suppressedNote =
       suppressed > 0
-        ? `${suppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`
+        ? agent.proseRouting === 'disabled'
+          ? `${suppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)`
+          : `${suppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`
         : '';
     const text =
       shown.length > 0
@@ -5383,6 +5385,13 @@ export class AgentFramework {
       console.error('maybePrimeProseMode: state read/write failed:', err);
       return;
     }
+    // Disabled mode is intentionally silent: no model-visible routing prose.
+    // The resident publishes only through explicit tools. This contains
+    // continuity-summary locus leaks (Host #96).
+    if (mode === 'disabled') {
+      console.error(`[prose] ${agent.name}: disabled mode recorded (no primer injected)`);
+      return;
+    }
     try {
       const id = agent.getContextManager().addMessage(
         'user',
@@ -5525,10 +5534,10 @@ export class AgentFramework {
       this.turnProseSuppressed.delete(agent.name);
       this.proseHybridSuppressed.delete(agent.name);
       if (agent.proseRouting === 'hybrid') this.proseTargetPins.delete(agent.name);
-      if (agent.proseRouting === 'explicit') {
-        // Explicit prose routing: there is no locus. The model names every
-        // destination in-band (`>>` prefixes); the only turn state is the
-        // sticky target, reset for each fresh turn. No freeze, no announce.
+      if (agent.proseRouting === 'explicit' || agent.proseRouting === 'disabled') {
+        // Explicit and disabled prose routing have no inferred locus.
+        // Explicit mode uses a turn-scoped `>>` target; disabled mode has no
+        // prose target at all. Neither mode freezes or announces a locus.
         this.proseTargetPins.delete(agent.name);
         this.proseContinuations.delete(agent.name);
         this.midTurnInputSignals.delete(agent.name);
@@ -5759,9 +5768,11 @@ export class AgentFramework {
     //     sent here", which is true regardless of where the reply goes.
     //     Heartbeat/no-trigger explicit turns show no indicator.
     const typingChannel =
-      agent.proseRouting === 'explicit'
-        ? trigger?.channelId ?? null
-        : resolveTurnLocus();
+      agent.proseRouting === 'disabled'
+        ? null
+        : agent.proseRouting === 'explicit'
+          ? trigger?.channelId ?? null
+          : resolveTurnLocus();
     if (typingChannel) this.channelRegistry!.startTyping(typingChannel);
 
     // MCPL Spec 14.3 outgoing streaming: route text deltas to their
@@ -5791,7 +5802,7 @@ export class AgentFramework {
       turnIndex: 0,
       phase: 'started',
     });
-    const proseStream = this.channelRegistry
+    const proseStream = this.channelRegistry && agent.proseRouting !== 'disabled'
       ? new ProseStreamRouter({
           mode: agent.proseRouting === 'explicit' ? 'explicit' : agent.proseRouting === 'hybrid' ? 'hybrid' : 'locus',
           initialTarget: typingChannel,
@@ -5983,7 +5994,12 @@ export class AgentFramework {
                 liveProseRouting = true;
                 const roundSegments = splitProseSegments(assistantBlocks);
                 if (roundSegments.length > 0) {
-                  if (agent.proseRouting === 'hybrid') {
+                  if (agent.proseRouting === 'disabled') {
+                    console.error(
+                      `[routing] ${agent.name}: mid-turn prose NOT routed (proseRouting=disabled)`,
+                    );
+                    this.recordProseSuppression(agent.name, roundSegments.length);
+                  } else if (agent.proseRouting === 'hybrid') {
                     if (turnSilenced) {
                       this.recordProseSuppression(agent.name, roundSegments.length);
                     } else if (!hasSameRoundPrivateThink) {
@@ -6324,7 +6340,10 @@ export class AgentFramework {
                 .join('\n')
                 .trim();
               if (speechText) {
-                if (agent.proseRouting === 'hybrid') {
+                if (agent.proseRouting === 'disabled') {
+                  console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
+                  this.recordProseSuppression(agent.name, 1);
+                } else if (agent.proseRouting === 'hybrid') {
                   const locus = resolveTurnLocus();
                   console.error(`[prose] ${agent.name}: text-only turn -> hybrid prose gateway`);
                   try {
@@ -6391,7 +6410,14 @@ export class AgentFramework {
               // the chain may still be flushing earlier rounds' posts.
               await turnSpeechChain;
 
-              if (agent.proseRouting === 'hybrid') {
+              if (agent.proseRouting === 'disabled') {
+                if (segments.length > 0) {
+                  console.error(
+                    `[routing] ${agent.name}: tool-call trailing prose NOT routed (proseRouting=disabled)`,
+                  );
+                  this.recordProseSuppression(agent.name, segments.length);
+                }
+              } else if (agent.proseRouting === 'hybrid') {
                 if (silenced && segments.length > 0) {
                   this.recordProseSuppression(agent.name, segments.length);
                 } else if (segments.length > 0) {
@@ -10080,7 +10106,7 @@ export class AgentFramework {
           if (opened) {
             this.activeTriggerChannels.set(agentName, opened);
             const openerAgent = this.agents.get(agentName);
-            if (openerAgent && openerAgent.proseRouting !== 'explicit') {
+            if (openerAgent && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')) {
               this.turnLocusPins.set(agentName, opened);
               this.lastAnnouncedLocus.set(agentName, opened);
               result = {
@@ -10298,7 +10324,9 @@ export class AgentFramework {
     if (announce && this.channelRegistry) {
       const text = input.message ?? `💤 Going quiet for ${human}. I'll still see messages, but won't respond until I wake.`;
       const agent = this.agents.get(agentName);
-      if (agent?.proseRouting === 'explicit') {
+      if (agent?.proseRouting === 'disabled') {
+        console.error(`[sleep] ${agentName}: proseRouting=disabled — sleep announcement not posted`);
+      } else if (agent?.proseRouting === 'explicit') {
         // Explicit mode: announce to the turn's sticky prose target if the
         // model has set one; otherwise stay quiet — never guess a channel.
         const target = this.proseTargetPins.get(agentName);

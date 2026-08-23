@@ -112,7 +112,7 @@ describe('explicit prose routing', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  async function createFramework(mode: 'explicit' | 'hybrid' = 'explicit'): Promise<AgentFramework> {
+  async function createFramework(mode: 'explicit' | 'hybrid' | 'disabled' = 'explicit'): Promise<AgentFramework> {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
@@ -444,6 +444,58 @@ describe('explicit prose routing', () => {
     const texts = cm.getAllMessages().flatMap(m => m.content).filter(b => b.type === 'text').map(b => (b as { text: string }).text);
     assert.ok(texts.includes(authored));
     assert.ok(texts.some(t => t.startsWith('[delivered] nothing') && t.includes('suppressed')));
+    await framework.stop();
+  });
+
+
+  it('disabled mode suppresses text-only prose without a bounce, primer, or channel delivery', async () => {
+    const authored = 'Internal continuity summary that must never publish.';
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: authored }] as ContentBlock[]));
+    const framework = await createFramework('disabled');
+    const routed = stubRegistry(framework);
+    const sources: string[] = [];
+    framework.onTrace((e) => {
+      const ev = e as { type: string; source?: string };
+      if (ev.type === 'message:added' && ev.source) sources.push(ev.source);
+    });
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [], 'disabled prose never reaches a channel');
+    assert.equal(sources.includes('prose-bounce'), false, 'disabled prose does not bounce');
+    assert.equal(sources.includes('prose-routing-primer'), false, 'disabled mode injects no model-visible primer');
+    const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+      .flatMap(m => m.content).filter(b => b.type === 'text').map(b => (b as { text: string }).text);
+    assert.ok(texts.includes(authored), 'authored prose remains in Chronicle');
+    assert.ok(texts.some(t => t.includes('[delivered] nothing') && t.includes('proseRouting=disabled')),
+      'private suppression receipt explains the unsent prose');
+
+    await framework.stop();
+  });
+
+  it('disabled mode ignores destination prefixes but explicit publish tools still execute', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>#alpha this prefix must not bypass disabled mode' },
+      { type: 'tool_use', id: 'd1', name: 'robot--say', input: { text: 'published explicitly' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'trailing prose must also remain private' },
+    ] as ContentBlock[]));
+    const framework = await createFramework('disabled');
+    const routed = stubRegistry(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [], 'neither prefixed nor trailing prose routed');
+    assert.equal(module.calls.length, 1, 'explicit tool call executed');
+    assert.equal(module.calls[0]!.name, 'say');
+    const texts = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+      .flatMap(m => m.content).filter(b => b.type === 'text').map(b => (b as { text: string }).text);
+    assert.ok(texts.some(t => t.includes('[delivered] nothing') && t.includes('2 plain-speech segment(s) suppressed')),
+      'one receipt accounts for mid-turn and trailing prose');
+
     await framework.stop();
   });
 
