@@ -340,6 +340,19 @@ export type TraceEvent =
       textLen: number;
     })
 
+  // Admin puppet: an operator executed a tool AS an agent and stored the
+  // tool_use + tool_result pair in that agent's window (Framework.
+  // puppetToolCall). Provenance lives HERE and in the host log — the stored
+  // messages deliberately byte-match a model-initiated call.
+  | (TraceEventBase & {
+      type: 'puppet:tool-call';
+      agentName: string;
+      toolName: string;
+      toolUseId: string;
+      isError: boolean;
+      durationMs: number;
+    })
+
   // MCPL server connection lifecycle (spawn / handshake / reconnect health).
   // Previously these outcomes were visible only on the host process's own
   // stderr, so a server that lost the boot handshake race just went missing.

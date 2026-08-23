@@ -6767,6 +6767,107 @@ export class AgentFramework {
     });
   }
 
+  /**
+   * Admin puppet: execute ONE tool call AS an agent and persist the
+   * tool_use + tool_result pair in that agent's window exactly as a
+   * model-initiated call is stored.
+   *
+   * Born from the princess exemplar surgery (2026-08-23). Her folded
+   * narrative said "I have no tools"; every past tool_use/tool_result pair
+   * had folded out of her context, so the act of calling had no in-context
+   * exemplar and she could not emit her first call despite 30 eidoverse
+   * tools riding every request. Placing one first-person pair restored the
+   * capacity. That repair required stop → store surgery → restart; this
+   * method is the live path — and the general lever for demonstrating an
+   * affordance to a model that cannot find it (older models especially).
+   *
+   * Semantics:
+   * - Refused unless the agent is idle: puppeting mid-turn would corrupt
+   *   the turn state machine and the live stream's wire ordering.
+   * - Refused for tools outside the agent's own surface (canUseTool): the
+   *   stored pair must be an act the agent could genuinely have taken.
+   * - The call executes FOR REAL through the shared dispatch (MCPL,
+   *   channel tools, utils, modules) with the agent's provenance — a
+   *   puppeted walk_to actually moves the avatar.
+   * - Storage byte-follows the ordinary path: a bare tool_use assistant
+   *   message (no fabricated thinking or text — a stored assistant turn
+   *   with unverifiable thinking is the labclaude 400 class) plus a
+   *   tool_result under the same bounded spill policy (issue #89).
+   * - Does NOT request inference; the agent sees the pair on its next
+   *   wake. Speak to the agent afterward if a wake is wanted.
+   * - Provenance is loud in traces (puppet:tool-call) and the host log,
+   *   deliberately NOT in the stored messages — metadata there would break
+   *   byte-parity with real turns. Whether to disclose to the resident is
+   *   the operator's call; the princess precedent was disclosed first.
+   */
+  async puppetToolCall(
+    agentName: string,
+    toolName: string,
+    input: Record<string, unknown>,
+  ): Promise<{ toolUseId: string; result: ToolResult }> {
+    const agent = this.agents.get(agentName);
+    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    if (agent.state.status !== 'idle') {
+      throw new Error(
+        `puppet refused: agent ${agentName} is ${agent.state.status} (requires idle — ` +
+        `injecting a turn under an active stream corrupts wire ordering)`,
+      );
+    }
+    const onSurface = this.getToolsForAgent(agentName)
+      .some((t) => t.name === toolName && agent.canUseTool(t.name));
+    if (!onSurface) {
+      throw new Error(
+        `puppet refused: tool ${toolName} is not on ${agentName}'s surface — ` +
+        `the stored pair must be an act the agent could genuinely have taken`,
+      );
+    }
+
+    // Anthropic-shaped id so the stored pair is indistinguishable from a
+    // provider-issued call.
+    const alphabet = 'ABCDEFGHJKMNPQRSTVWXYZabcdefghjkmnpqrstvwxyz0123456789';
+    let suffix = '';
+    for (let i = 0; i < 22; i++) suffix += alphabet[Math.floor(Math.random() * alphabet.length)];
+    const toolUseId = `toolu_01${suffix}`;
+
+    const started = Date.now();
+    const result = await this.executeToolCall({
+      id: toolUseId,
+      name: toolName,
+      input,
+      callerAgentName: agentName,
+    });
+    const durationMs = Date.now() - started;
+
+    // Store the pair through the same shapes the ordinary path uses. Build
+    // the result blocks BEFORE storing the tool_use: the spill path awaits,
+    // and a message arriving during that await must land before the pair,
+    // never between tool_use and its tool_result. The two addMessage calls
+    // below are synchronous and adjacent — nothing can interleave.
+    const { blocks } = await this.buildStoredToolResultContent(
+      [{ id: toolUseId, name: toolName, input, result, durationMs }],
+      this.resolveToolResultInlineCap(agent).cap,
+    );
+    const cm = agent.getContextManager();
+    cm.addMessage(agentName, [
+      { type: 'tool_use', id: toolUseId, name: toolName, input } as ContentBlock,
+    ]);
+    cm.addMessage('user', blocks);
+
+    this.emitTrace({
+      type: 'puppet:tool-call',
+      agentName,
+      toolName,
+      toolUseId,
+      isError: !!result.isError,
+      durationMs,
+    });
+    console.log(
+      `[puppet] ${agentName}: ${toolName} → ${result.isError ? 'ERROR' : 'ok'} ` +
+      `in ${durationMs}ms (${toolUseId})`,
+    );
+    return { toolUseId, result };
+  }
+
   private async executeToolCallFrom(call: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
     // Client-side programmatic tool calling for promise-based callers
     // (SubagentModule ephemerals). Keyed by callerAgentName so each ephemeral
