@@ -180,8 +180,10 @@ export interface AgentConfig {
    * - 'hybrid': unprefixed prose keeps locus routing; `>>>destination` routes
    *   that publication envelope through the same authorized resolver.
    *   See docs/hybrid-prose-routing.md.
+   * - 'disabled': generated prose is never published. Only explicit tools may
+   *   send externally; prose remains in Chronicle with a private suppression receipt.
    */
-  proseRouting?: 'locus' | 'explicit' | 'hybrid';
+  proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
 }
 
 /** The intentionally small set of agent settings that may change in-process. */
