@@ -16,6 +16,8 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ### Fixed
 
+- Anthropic organization-acceleration 429s now enter a per-residence provider cooldown instead of immediate same-window retries: later arrivals are retained for one fresh compile after the quiet window, local Context Manager maintenance waits behind the primary lane, and capacity errors never enter the poisoned-history breaker (AF #114 bounded first slice).
+
 - Discord downtime history is written to Context Manager in chronological order while newest-message tracking retains Discord order.
 
 - Rapid external messages now retain arrival order while remaining prioritized

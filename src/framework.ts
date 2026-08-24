@@ -475,6 +475,53 @@ const DEFAULT_MAINTENANCE_INTERVAL_MS = 5000;
 /** Bound one pass so a large backlog yields to inference and other agents. */
 const MAINTENANCE_TICKS_PER_PASS = 8;
 
+/** Local per-residence provider admission (AF #114 bounded first slice). */
+interface LocalProviderGate {
+  primaryDepth: number;
+  primaryPending: boolean;
+  auxiliaryInFlight: number;
+  auxiliaryWaiters: Array<() => void>;
+  idleWaiters: Array<() => void>;
+  deferredAuxiliary: number;
+}
+interface ProviderAccelerationCooldown {
+  startedAt: number;
+  until: number;
+  timer: ReturnType<typeof setTimeout>;
+  heldRequests: InferenceRequest[];
+  reason: string;
+  failures: number;
+}
+interface ProviderAccelerationRecovery {
+  startedAt: number;
+  releasedAt?: number;
+  failures: number;
+  heldRequests: number;
+  reason: string;
+}
+interface ProviderAccelerationReceipt {
+  startedAt: number;
+  releasedAt: number;
+  completedAt: number;
+  cooldownMs: number;
+  waitedMs: number;
+  failures: number;
+  heldRequests: number;
+  messageCount: number;
+  toolCount: number;
+  stopReason: string;
+}
+const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
+const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
+const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
+function isOrganizationAccelerationRateLimit(error: Error): error is MembraneError {
+  if (!(error instanceof MembraneError) || error.type !== 'rate_limit') return false;
+  return (
+    /organization(?:'s)?[^\n]{0,120}maximum(?:\s+usage)?\s+increase\s+rate/i.test(error.message) ||
+    /organization(?:'s)?[^\n]{0,120}acceleration(?:\s+limit)?/i.test(error.message)
+  );
+}
+
 /**
  * Extract fields the EventGate cares about from a ProcessEvent. The set of
  * event variants that carry `content`/`mount`/`paths`/`metadata` is open-ended
@@ -623,6 +670,13 @@ export class AgentFramework {
   private maintenanceRunId = 0;
   private currentMaintenanceRun: ContextMaintenanceRun | null = null;
   private maintenanceHistory: ContextMaintenanceRun[] = [];
+  private providerGates: Map<string, LocalProviderGate> = new Map();
+  private providerAccelerationCooldowns: Map<string, ProviderAccelerationCooldown> = new Map();
+  private providerAccelerationRecoveries: Map<string, ProviderAccelerationRecovery> = new Map();
+  private providerAccelerationLastRecovery: Map<string, ProviderAccelerationReceipt> = new Map();
+  private providerAccelerationDefaultCooldownMs = PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS;
+  private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
+  private providerAdmissionClosed = false;
   /** Last time we reported stale (busy-requeued) inference requests, per agent. */
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
@@ -1197,6 +1251,7 @@ export class AgentFramework {
     }
 
     this.running = true;
+    this.providerAdmissionClosed = false;
     this.loopPromise = this.runLoop();
 
     // Start periodic sync timer (if enabled)
@@ -1226,6 +1281,7 @@ export class AgentFramework {
    */
   async stop(): Promise<void> {
     this.running = false;
+    this.providerAdmissionClosed = true;
     this.queue.close();
 
     // Kill running code_execution scripts before cancelling streams: a
@@ -1246,6 +1302,9 @@ export class AgentFramework {
       record.runner.dispose();
     }
     this.backgroundScripts.clear();
+
+    // A stopped host must never hang behind its own cooldown.
+    this.cancelProviderAdmission();
 
     // Cancel all active streams
     for (const agent of this.agents.values()) {
@@ -1312,6 +1371,138 @@ export class AgentFramework {
    * schemas are absent. Passes never overlap; each agent gets a bounded drain
    * so maintenance cannot monopolize the framework event loop.
    */
+  private providerGate(agentName: string): LocalProviderGate {
+    let gate = this.providerGates.get(agentName);
+    if (!gate) {
+      gate = { primaryDepth: 0, primaryPending: false, auxiliaryInFlight: 0,
+        auxiliaryWaiters: [], idleWaiters: [], deferredAuxiliary: 0 };
+      this.providerGates.set(agentName, gate);
+    }
+    return gate;
+  }
+  private providerGateBlocked(agentName: string): boolean {
+    const gate = this.providerGates.get(agentName);
+    return (gate?.primaryDepth ?? 0) > 0 || (gate?.primaryPending ?? false) ||
+      this.providerAccelerationCooldowns.has(agentName);
+  }
+  private acquirePrimaryProviderGate(agentName: string): void {
+    const gate = this.providerGate(agentName); gate.primaryPending = false; gate.primaryDepth++;
+  }
+  private releasePrimaryProviderGate(agentName: string): void {
+    const gate = this.providerGate(agentName); gate.primaryDepth = Math.max(0, gate.primaryDepth - 1);
+    this.flushAuxiliaryAdmission(agentName);
+  }
+  private flushAuxiliaryAdmission(agentName: string): void {
+    const gate = this.providerGate(agentName);
+    if (gate.primaryDepth > 0 || gate.primaryPending || this.providerAccelerationCooldowns.has(agentName)) return;
+    for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
+  }
+  private async waitForAuxiliaryIdle(agentName: string): Promise<void> {
+    const gate = this.providerGate(agentName);
+    if (gate.auxiliaryInFlight === 0) return;
+    await new Promise<void>((resolve) => gate.idleWaiters.push(resolve));
+  }
+  private async withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>): Promise<T> {
+    const gate = this.providerGate(agentName);
+    if (this.providerGateBlocked(agentName)) {
+      gate.deferredAuxiliary++;
+      try {
+        await new Promise<void>((resolve) => gate.auxiliaryWaiters.push(resolve));
+      } finally {
+        gate.deferredAuxiliary = Math.max(0, gate.deferredAuxiliary - 1);
+      }
+    }
+    if (this.providerAdmissionClosed) {
+      throw new Error(`Provider admission closed while stopping (${agentName})`);
+    }
+    gate.auxiliaryInFlight++;
+    try { return await run(); }
+    finally {
+      gate.auxiliaryInFlight = Math.max(0, gate.auxiliaryInFlight - 1);
+      if (gate.auxiliaryInFlight === 0) for (const resolve of gate.idleWaiters.splice(0)) resolve();
+    }
+  }
+  private auxiliaryMembraneFor(agentName: string): Membrane {
+    const target = this.membrane as unknown as Record<PropertyKey, unknown>;
+    return new Proxy(target, { get: (obj, prop, receiver) => {
+      const value = Reflect.get(obj, prop, receiver);
+      if (prop === 'complete' && typeof value === 'function') {
+        return (...args: unknown[]) => this.withAuxiliaryAdmission(
+          agentName, () => Reflect.apply(value, this.membrane, args) as Promise<unknown>);
+      }
+      return typeof value === 'function' ? value.bind(this.membrane) : value;
+    }}) as unknown as Membrane;
+  }
+  private accelerationCooldownMs(agentName: string, error: MembraneError): number {
+    const base = error.retryAfterMs ?? this.providerAccelerationDefaultCooldownMs;
+    let hash = 0; for (const ch of agentName) hash = ((hash * 31) + ch.charCodeAt(0)) >>> 0;
+    const jitter = this.providerAccelerationJitterMs > 0 ? hash % (this.providerAccelerationJitterMs + 1) : 0;
+    return Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, base) + jitter);
+  }
+  private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
+    return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
+      a.timestamp === b.timestamp && a.channelId === b.channelId;
+  }
+  private holdProviderAcceleration(agent: Agent, error: Error, trigger?: InferenceRequest): boolean {
+    if (this.ephemeralRuns.has(agent.name) || this.conversationAgentHomes.has(agent.name) || !isOrganizationAccelerationRateLimit(error)) return false;
+    const now = Date.now(); const delayMs = this.accelerationCooldownMs(agent.name, error);
+    const existing = this.providerAccelerationCooldowns.get(agent.name);
+    const held = existing?.heldRequests ?? [];
+    if (trigger && !held.some((r) => this.sameInferenceRequest(r, trigger))) held.push(trigger);
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), delayMs); timer.unref?.();
+    this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
+      until: now + delayMs, timer, heldRequests: held, reason: error.message,
+      failures: (existing?.failures ?? 0) + 1 });
+    const gate = this.providerGate(agent.name); gate.primaryPending = true;
+    this.providerAccelerationRecoveries.set(agent.name, { startedAt: existing?.startedAt ?? now,
+      failures: (existing?.failures ?? 0) + 1, heldRequests: held.length, reason: error.message });
+    console.error(`[provider-cooldown] agent=${agent.name} organization acceleration 429 — ` +
+      `holding primary/auxiliary for ${delayMs}ms; ${held.length} request(s) retained`);
+    return true;
+  }
+  private releaseProviderAccelerationCooldown(agentName: string): void {
+    const cooldown = this.providerAccelerationCooldowns.get(agentName); if (!cooldown) return;
+    clearTimeout(cooldown.timer); this.providerAccelerationCooldowns.delete(agentName);
+    const recovery = this.providerAccelerationRecoveries.get(agentName);
+    if (recovery) { recovery.releasedAt = Date.now(); recovery.heldRequests = cooldown.heldRequests.length; }
+    const requests = cooldown.heldRequests.length > 0 ? cooldown.heldRequests : [{ agentName,
+      reason: 'provider-acceleration-retry', source: 'framework', timestamp: Date.now() } satisfies InferenceRequest];
+    this.pendingRequests.push(...requests);
+    console.error(`[provider-cooldown] agent=${agentName} released after ${Date.now() - cooldown.startedAt}ms — ` +
+      `fresh compile queued with ${requests.length} retained request(s)`);
+  }
+  private recordProviderAccelerationRecovery(agent: Agent, request: NormalizedRequest | undefined, stopReason: string): void {
+    const recovery = this.providerAccelerationRecoveries.get(agent.name); if (!recovery?.releasedAt) return;
+    this.providerAccelerationRecoveries.delete(agent.name);
+    const completedAt = Date.now();
+    const receipt: ProviderAccelerationReceipt = {
+      startedAt: recovery.startedAt,
+      releasedAt: recovery.releasedAt,
+      completedAt,
+      cooldownMs: recovery.releasedAt - recovery.startedAt,
+      waitedMs: completedAt - recovery.startedAt,
+      failures: recovery.failures,
+      heldRequests: recovery.heldRequests,
+      messageCount: request?.messages.length ?? 0,
+      toolCount: request?.tools?.length ?? 0,
+      stopReason,
+    };
+    this.providerAccelerationLastRecovery.set(agent.name, receipt);
+    // Operational receipt only: provider admission must never author resident memory.
+    console.error(`[provider-cooldown] recovered ${JSON.stringify({ agent: agent.name, ...receipt })}`);
+  }
+  private cancelProviderAdmission(): void {
+    for (const cooldown of this.providerAccelerationCooldowns.values()) clearTimeout(cooldown.timer);
+    this.providerAccelerationCooldowns.clear(); this.providerAccelerationRecoveries.clear();
+    for (const gate of this.providerGates.values()) {
+      gate.primaryDepth = 0; gate.primaryPending = false;
+      for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
+      for (const resolve of gate.idleWaiters.splice(0)) resolve();
+    }
+    this.providerGates.clear();
+  }
+
   private startQueuedMaintenance(): void {
     if (this.maintenancePass || !this.running) return;
     const pass = this.runQueuedMaintenance().catch((error) => {
@@ -1338,6 +1529,7 @@ export class AgentFramework {
       const cm = agent.getContextManager();
       const tools = this.getToolsForAgent(agent.name).filter((tool) => agent.canUseTool(tool.name));
       cm.setToolDefinitions(tools);
+      if (this.providerGateBlocked(agent.name)) return [];
       if (cm.isReady()) return [];
       const pending = cm.getPendingWork()?.description;
       const progress = this.contextProgress(cm);
@@ -3738,7 +3930,9 @@ export class AgentFramework {
       store: this.store,
       namespace: `agents/${config.name}`,
       strategy: config.strategy ?? new PassthroughStrategy(),
-      membrane: this.membrane,
+      // Context Manager complete() calls are auxiliary work; the primary
+      // streaming agent keeps the original Membrane.
+      membrane: this.auxiliaryMembraneFor(config.name),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
 
@@ -4462,6 +4656,9 @@ export class AgentFramework {
       isolate: true,
       // Strategy instances are stateful — never share the template's.
       strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
+      // Dynamic conversation forks retain the established provider policy in
+      // this bounded first slice. Provider cooldown ownership belongs to the
+      // persistent resident only; generation-unique forks must not leak gates.
       membrane: this.membrane,
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
@@ -4845,7 +5042,8 @@ export class AgentFramework {
     this.pendingRequests = [];
 
     // Check each agent
-    for (const [agentName, requests] of requestsByAgent) {
+    for (const [agentName, groupedRequests] of requestsByAgent) {
+      let requests = groupedRequests;
       const agent = this.agents.get(agentName);
       if (!agent) {
         // Agent not found — request is orphaned. Emit warning and drop.
@@ -4859,6 +5057,28 @@ export class AgentFramework {
         });
         console.error(`[inference-dropped] agent=${agentName} reason=agent_not_found requests=${requests.length}`);
         continue;
+      }
+
+      const providerCooldown = this.providerAccelerationCooldowns?.get(agentName);
+      if (providerCooldown) {
+        if (now < providerCooldown.until) {
+          for (const req of requests) {
+            if (!providerCooldown.heldRequests.some((r) => this.sameInferenceRequest(r, req))) {
+              providerCooldown.heldRequests.push(req);
+            }
+          }
+          const recovery = this.providerAccelerationRecoveries.get(agentName);
+          if (recovery) recovery.heldRequests = providerCooldown.heldRequests.length;
+          // The timer owns release. Do not hot-poll these requests.
+          continue;
+        }
+        // Timers can deliver late under load. Release synchronously and merge
+        // the held causes into this one current compile.
+        clearTimeout(providerCooldown.timer);
+        this.providerAccelerationCooldowns.delete(agentName);
+        const recovery = this.providerAccelerationRecoveries.get(agentName);
+        if (recovery) recovery.releasedAt = now;
+        requests = [...providerCooldown.heldRequests, ...requests];
       }
 
       // Skip if agent is busy (inferring, streaming, or waiting for tools) —
@@ -4878,7 +5098,12 @@ export class AgentFramework {
       // rather than waiting for the old stream's teardown.
       const budgetRestart = requests.find((r) => r.reason === 'context_budget_restart');
       const turnAlive = !budgetRestart && this.activeTurnTokens.has(agentName);
-      if (turnAlive || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
+      const providerGate = this.providerGates?.get(agentName);
+      // A primary can own provider admission while yielding to an already in-flight
+      // auxiliary call. Keep this agent's later wakes queued, but do not block the
+      // framework event loop or other residents while that auxiliary call settles.
+      const providerPrimaryWaiting = (providerGate?.primaryDepth ?? 0) > 0 && !this.activeTurnTokens.has(agentName);
+      if (providerPrimaryWaiting || turnAlive || agent.state.status === 'inferring' || agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
         // Re-queue requests, but warn if they've been pending too long
         const oldest = Math.min(...requests.map(r => r.timestamp));
         if (
@@ -4922,6 +5147,12 @@ export class AgentFramework {
           `[inference-dropped] agent=${agentName} reason=policy-skip ` +
           `requests=${requests.length} triggers=${requests.map((r) => r.reason).join(',')}`,
         );
+        const gate = this.providerGates.get(agentName);
+        if (gate?.primaryPending && this.providerAccelerationRecoveries.has(agentName)) {
+          gate.primaryPending = false;
+          this.providerAccelerationRecoveries.delete(agentName);
+          this.flushAuxiliaryAdmission(agentName);
+        }
         continue;
       }
 
@@ -5405,7 +5636,38 @@ export class AgentFramework {
     }
   }
 
-  private async startAgentStream(agent: Agent, trigger?: InferenceRequest, attempt = 0): Promise<void> {
+  private async startAgentStream(
+    agent: Agent,
+    trigger?: InferenceRequest,
+    attempt = 0,
+    providerGateAlreadyHeld = false,
+  ): Promise<void> {
+    const ownsProviderGate =
+      !this.ephemeralRuns.has(agent.name) && !this.conversationAgentHomes.has(agent.name);
+    if (ownsProviderGate && !providerGateAlreadyHeld) {
+      this.acquirePrimaryProviderGate(agent.name);
+      const gate = this.providerGate(agent.name);
+      if (gate.auxiliaryInFlight > 0) {
+        // Do not await inside processInferenceRequests: one slow auxiliary call for
+        // this resident must not block events or other residents. Admission stays
+        // owned and the continuation receives it after the in-flight call settles.
+        void this.waitForAuxiliaryIdle(agent.name).then(async () => {
+          if (this.providerAdmissionClosed) {
+            this.releasePrimaryProviderGate(agent.name);
+            return;
+          }
+          await this.startAgentStream(agent, trigger, attempt, true);
+        }).catch((error) => {
+          this.releasePrimaryProviderGate(agent.name);
+          console.error(`[provider-cooldown] failed to resume primary for ${agent.name}:`, error);
+        });
+        return;
+      }
+      if (this.providerAdmissionClosed) {
+        this.releasePrimaryProviderGate(agent.name);
+        return;
+      }
+    }
     // Mark the turn alive before ANYTHING awaits (hooks, compile, stream
     // setup): from here until this turn's teardown, cross-turn writers defer
     // (addMessage guard) instead of appending — nothing may enter the window
@@ -5426,11 +5688,12 @@ export class AgentFramework {
     this.activeTurnTokens.set(agent.name, turnToken);
     let tokenHandedOff = false;
     try {
-      tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken);
+      tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate);
     } finally {
       if (!tokenHandedOff && this.activeTurnTokens.get(agent.name) === turnToken) {
         this.activeTurnTokens.delete(agent.name);
       }
+      if (!tokenHandedOff && ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
     }
   }
 
@@ -5444,6 +5707,7 @@ export class AgentFramework {
     trigger: InferenceRequest | undefined,
     attempt: number,
     turnToken: number,
+    ownsProviderGate: boolean,
   ): Promise<boolean> {
     // Flush messages deferred during the PREVIOUS turn — before the
     // checkpoint, the locus announcement, and the compile — so a turn started
@@ -5631,6 +5895,7 @@ export class AgentFramework {
         trigger,
         attempt,
         compiledRequest,
+        ownsProviderGate,
       );
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
@@ -5649,6 +5914,13 @@ export class AgentFramework {
         stack: err.stack,
       });
       agent.reset();
+
+      if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
+        // Capacity scheduling is not poisoned history. The cooldown timer owns
+        // one later fresh compile; no immediate retry or exhaustion marker.
+        this.eventGate?.onInferenceEnded(agent.name);
+        return false;
+      }
 
       const action = this.errorPolicy.onInferenceError(err, agent.name, attempt);
       if (action.retry) {
@@ -5703,7 +5975,8 @@ export class AgentFramework {
     requestSnapshot: InferenceToolSnapshot,
     trigger?: InferenceRequest,
     attempt = 0,
-    compiledRequest?: NormalizedRequest
+    compiledRequest?: NormalizedRequest,
+    ownsProviderGate = false,
   ): Promise<void> {
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
@@ -6114,6 +6387,10 @@ export class AgentFramework {
             } else {
               agent.addAssistantResponse(terminalContent);
             }
+
+            // Bind the cooldown receipt to this fresh, successful request —
+            // never to the frozen request that received the 429.
+            this.recordProviderAccelerationRecovery(agent, compiledRequest, response.stopReason);
 
             // §10.5: context/afterInference is removed in 0.5.0 — no
             // content leaves the host here. Turn boundaries are announced
@@ -6531,6 +6808,12 @@ export class AgentFramework {
             this.abortAgentScript(agent.name, 'stream error');
             agent.reset();
 
+            if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
+              lifecyclePhase = 'failed';
+              this.eventGate?.onInferenceEnded(agent.name);
+              break;
+            }
+
             const action = this.errorPolicy.onInferenceError(err, agent.name, attempt);
             if (action.retry) {
               await new Promise((resolve) => setTimeout(resolve, action.delayMs));
@@ -6670,10 +6953,19 @@ export class AgentFramework {
         }
       }
     } catch (error) {
-      // Stream itself threw (unexpected) — no retry path here, so also emit
-      // inference:exhausted so ephemeral agent promises can settle.
+      // Stream itself threw. Organization acceleration is deferred from a
+      // fresh compile; every other throw keeps the ordinary exhausted path.
       const err = error instanceof Error ? error : new Error(String(error));
       const durationMs = Date.now() - startTime;
+      if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
+        this.emitTrace({ type: 'inference:failed', agentName: agent.name, error: err.message, stack: err.stack });
+        this.logInference({ timestamp: startTime, agentName: agent.name, requestId, success: false,
+          error: `Provider acceleration cooldown: ${err.message}`,
+          request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
+        this.abortAgentScript(agent.name, 'provider acceleration cooldown');
+        lifecyclePhase = 'failed'; agent.reset(); this.eventGate?.onInferenceEnded(agent.name);
+        return;
+      }
       this.emitTrace({
         type: 'inference:failed',
         agentName: agent.name,
@@ -6728,6 +7020,7 @@ export class AgentFramework {
       // wedge). onInferenceEnded is idempotent, so a redundant call is safe.
       this.eventGate?.onInferenceEnded(agent.name);
       this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+      if (ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
 
       // Stop the typing indicator on every exit path (complete, error,
       // exhausted, abort) so it never sticks after the turn ends.
@@ -8056,6 +8349,19 @@ export class AgentFramework {
         name,
         status: agent.state.status,
         consecutiveInferenceFailures: this.consecutiveInferenceFailures.get(name) ?? 0,
+        providerAdmission: (() => {
+          const gate = this.providerGates?.get(name);
+          const cooldown = this.providerAccelerationCooldowns?.get(name);
+          return {
+            primaryActive: (gate?.primaryDepth ?? 0) > 0,
+            primaryPending: gate?.primaryPending ?? false,
+            auxiliaryInFlight: gate?.auxiliaryInFlight ?? 0,
+            auxiliaryDeferred: gate?.deferredAuxiliary ?? 0,
+            cooldownUntil: cooldown?.until ?? null,
+            heldRequests: cooldown?.heldRequests.length ?? 0,
+            lastRecovery: this.providerAccelerationLastRecovery?.get(name) ?? null,
+          };
+        })(),
         lastInference: this.lastInferenceAt.get(name) ?? null,
         refusalStats: this.refusalStats.get(name) ?? null,
       })),
