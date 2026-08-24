@@ -49,9 +49,20 @@ if (existsSync(FRAGMENT_DIR)) {
     }
     const body = readFileSync(join(FRAGMENT_DIR, name), "utf8").trim();
     if (!body) fail(`${FRAGMENT_DIR}/${name}: empty fragment.`);
-    if (!/^[-*] /.test(body)) {
+    // Every line must start a bullet or continue one (indented). A line of
+    // top-level prose — or worse, a '## ' heading — would splice a fake
+    // section boundary into the released changelog.
+    const badLine = body
+      .split("\n")
+      .find((l) => l.trim() !== "" && !/^[-*] /.test(l) && !/^\s/.test(l));
+    if (!/^[-*] /.test(body) || badLine !== undefined) {
       fail(
-        `${FRAGMENT_DIR}/${name}: a fragment is one or more markdown bullets ('- …').`,
+        `${FRAGMENT_DIR}/${name}: a fragment is one or more markdown bullets ` +
+          `('- …', continuation lines indented)` +
+          (badLine !== undefined && /^[-*] /.test(body)
+            ? ` — offending line: '${badLine}'`
+            : "") +
+          ".",
       );
     }
     fragments.push({ name, category: m[1], body });
