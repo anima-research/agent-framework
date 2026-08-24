@@ -21,8 +21,9 @@
 
 ---
 
-- [ ] `CHANGELOG.md` updated under `## Unreleased` — or this change is
-      internal-only / test-only / docs-only (apply the `no-changelog` label).
+- [ ] Changelog fragment added — `changelog.d/<slug>.<breaking|added|changed|fixed>.md`
+      (see `changelog.d/README.md`) — or this change is internal-only /
+      test-only / docs-only (apply the `no-changelog` label).
 
 <!-- AI-assisted contributions are welcome and normal here — see
      CONTRIBUTING.md for the attribution convention (footer + Co-Authored-By). -->

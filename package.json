@@ -32,7 +32,7 @@
     "typecheck": "tsc --noEmit",
     "pretest": "mkdir -p dist/test/fixtures && cp test/fixtures/*.mjs dist/test/fixtures/",
     "test": "node --test --test-force-exit dist/test/*.test.js",
-    "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md",
+    "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md changelog.d",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
