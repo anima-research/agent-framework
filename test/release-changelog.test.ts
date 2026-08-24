@@ -159,6 +159,14 @@ test("accepts nested bullets and multi-line continuations", () => {
   assert.equal(section(changelog(dir), "1.1.0"), "### Fixed\n\n- one\n  - nested\n  more text\n- two");
 });
 
+test("accepts bullet content that merely resembles headings or rules", () => {
+  const body = "- **Module authors:** bold opener.\n- -1 is now the sentinel.\n- #123 is referenced inline.\n- ***emphasis*** then text.\n";
+  const dir = setup({ fragments: { "r.fixed.md": body } });
+  const r = run(dir);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(section(changelog(dir), "1.1.0"), `### Fixed\n\n${body.trim()}`);
+});
+
 const refusals: Array<[string, Fixture, RegExp]> = [
   ["nothing to release", {}, /nothing to release as 1\.1\.0/],
   ["duplicate version section", { version: "1.0.0", fragments: { "a.fixed.md": "- x\n" } }, /'## 1\.0\.0' section already exists/],
@@ -171,6 +179,11 @@ const refusals: Array<[string, Fixture, RegExp]> = [
   ["top-level heading after a bullet", { fragments: { "h.fixed.md": "- ok\n\n## 9.9.9 — fake\n" } }, /offending line: '## 9\.9\.9 — fake'/],
   ["indented ATX heading", { fragments: { "h.fixed.md": "- ok\n  ## 8.8.8 — injected\n  - beneath\n" } }, /offending line: '  ## 8\.8\.8 — injected'/],
   ["indented setext underline / rule", { fragments: { "s.fixed.md": "- ok\n  ---\n" } }, /offending line: '  ---'/],
+  ["spaced thematic break shaped like a bullet", { fragments: { "s.fixed.md": "- ok\n- - -\n" } }, /offending line: '- - -'/],
+  ["asterisk thematic break with spaces", { fragments: { "s.fixed.md": "- ok\n* * *\n" } }, /offending line: '\* \* \*'/],
+  ["rule as bullet content", { fragments: { "s.fixed.md": "- ---\n" } }, /offending line: '- ---'/],
+  ["heading as bullet content", { fragments: { "h.fixed.md": "- ## 9.9.9 — embedded heading\n" } }, /offending line: '- ## 9\.9\.9 — embedded heading'/],
+  ["heading as nested bullet content", { fragments: { "h.fixed.md": "- ok\n  - ### nested heading\n" } }, /offending line: '  - ### nested heading'/],
   ["tab-indented continuation", { fragments: { "t.fixed.md": "- ok\n\tcontinued\n" } }, /offending line: '\tcontinued'/],
   ["no Unreleased heading", { changelog: "# Changelog\n\n## 1.0.0 — 2026-01-01\n\n- x\n", fragments: { "a.fixed.md": "- x\n" } }, /no '## Unreleased' section/],
   ["two Unreleased headings", { changelog: BASE_CHANGELOG + "\n## Unreleased\n\n- stranded\n", fragments: { "a.fixed.md": "- x\n" } }, /2 '## Unreleased' headings/],
