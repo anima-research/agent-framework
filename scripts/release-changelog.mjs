@@ -36,33 +36,56 @@ const fail = (msg) => {
   process.exit(1);
 };
 
+// Fragment grammar: every non-blank line starts a bullet or continues one
+// (indented two or more spaces; nested bullets included). Headings and
+// horizontal rules are refused even when indented — a '## ' line would
+// splice a fake section boundary into the released changelog, and an
+// indented one still renders as a heading inside the entry.
+const isBulletStart = (l) => /^[-*] /.test(l);
+const isContinuation = (l) => /^ {2,}\S/.test(l);
+const isBlockConstruct = (l) =>
+  /^\s*#{1,6}(\s|$)/.test(l) || /^\s*([-=*_])\1{2,}\s*$/.test(l);
+
+// The directory is scanned fail-closed: anything that is not README.md or
+// a well-formed fragment file aborts the release, so an entry can never be
+// silently left out (e.g. a fragment created under a 'fix/' subdirectory
+// because the slug was taken verbatim from a branch name).
 const fragments = [];
 if (existsSync(FRAGMENT_DIR)) {
-  for (const name of readdirSync(FRAGMENT_DIR).sort()) {
-    if (name === "README.md" || !name.endsWith(".md")) continue;
+  const entries = readdirSync(FRAGMENT_DIR, { withFileTypes: true }).sort(
+    (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0),
+  );
+  for (const entry of entries) {
+    const { name } = entry;
+    if (name === "README.md") continue;
+    if (!entry.isFile()) {
+      fail(
+        `${FRAGMENT_DIR}/${name}: not a file. Fragments are flat files directly ` +
+          `in ${FRAGMENT_DIR}/ — a slug cannot contain '/'; use the PR number, ` +
+          "or the branch name with '/' replaced by '-'.",
+      );
+    }
     const m = name.match(/\.(breaking|added|changed|fixed)\.md$/);
     if (!m) {
       fail(
-        `${FRAGMENT_DIR}/${name}: unrecognized category — name fragments ` +
+        `${FRAGMENT_DIR}/${name}: unrecognized file — name fragments ` +
           `'<slug>.<${CATEGORIES.join("|")}>.md' so the entry is not silently stranded.`,
       );
     }
     const body = readFileSync(join(FRAGMENT_DIR, name), "utf8").trim();
     if (!body) fail(`${FRAGMENT_DIR}/${name}: empty fragment.`);
-    // Every line must start a bullet or continue one (indented). A line of
-    // top-level prose — or worse, a '## ' heading — would splice a fake
-    // section boundary into the released changelog.
-    const badLine = body
+    const offending = body
       .split("\n")
-      .find((l) => l.trim() !== "" && !/^[-*] /.test(l) && !/^\s/.test(l));
-    if (!/^[-*] /.test(body) || badLine !== undefined) {
+      .find(
+        (l) =>
+          l.trim() !== "" &&
+          (!(isBulletStart(l) || isContinuation(l)) || isBlockConstruct(l)),
+      );
+    if (offending !== undefined) {
       fail(
         `${FRAGMENT_DIR}/${name}: a fragment is one or more markdown bullets ` +
-          `('- …', continuation lines indented)` +
-          (badLine !== undefined && /^[-*] /.test(body)
-            ? ` — offending line: '${badLine}'`
-            : "") +
-          ".",
+          "('- …'; continuation lines indented two spaces; no headings or " +
+          `rules) — offending line: '${offending}'.`,
       );
     }
     fragments.push({ name, category: m[1], body });

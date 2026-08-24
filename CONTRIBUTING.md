@@ -93,12 +93,18 @@ conflicting: when every PR edited the same `## Unreleased` section, any PR
 that outlived another merge hit a conflict in `CHANGELOG.md`; distinct files
 never do.
 
-- **Format:** `changelog.d/<slug>.<breaking|added|changed|fixed>.md`,
-  containing one or more markdown bullets (`- …`), written exactly as they
-  should appear in `CHANGELOG.md` (continuation lines indent two spaces).
-  The slug just has to be unique among pending fragments — the PR number or
-  branch name works (`115-tune-out.added.md`). The release script refuses
-  unrecognized category suffixes rather than silently stranding an entry.
+- **Format:** `changelog.d/<slug>.<breaking|added|changed|fixed>.md`, a flat
+  file directly in `changelog.d/`, containing one or more markdown bullets
+  (`- …`) written exactly as they should appear in `CHANGELOG.md`:
+  continuation lines indent two spaces, nested bullets are fine, headings
+  and horizontal rules are refused (even indented — a heading inside a
+  fragment would corrupt the section structure). The slug just has to be
+  unique among pending fragments and filesystem-safe — the PR number works,
+  and so does the branch name with `/` replaced by `-`
+  (`115-tune-out.added.md`, `fix-locus-routing.fixed.md`). The release
+  script scans the directory fail-closed: a subdirectory, an unrecognized
+  category suffix, or any other stray file aborts the release rather than
+  silently stranding an entry.
 - **The fragment lands with the change** — same commit, or at least the same
   PR. This binds direct pushes to `main` just as much as PRs. On PRs, CI
   enforces it softly: touching `src/` without adding a fragment (or editing
