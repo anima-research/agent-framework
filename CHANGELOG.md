@@ -2,7 +2,9 @@
 
 Notable changes to `@animalabs/agent-framework`, loosely following
 [Keep a Changelog](https://keepachangelog.com/). Entries land with the change
-that causes them — see [CONTRIBUTING.md](CONTRIBUTING.md#changelog).
+that causes them, as fragment files in [`changelog.d/`](changelog.d/) that are
+folded into a version section at release time — see
+[CONTRIBUTING.md](CONTRIBUTING.md#changelog).
 
 Releases up to and including 0.7.3 predate this file; for their contents see
 `git log` and the
@@ -17,6 +19,17 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 ### Fixed
 
 - Anthropic organization-acceleration 429s now enter a per-residence provider cooldown instead of immediate same-window retries: later arrivals are retained for one fresh compile after the quiet window, local Context Manager maintenance waits behind the primary lane, and capacity errors never enter the poisoned-history breaker (AF #114 bounded first slice).
+
+- **Workspace mounts are usable on native Windows.** The mount containment
+  checks (the `parsePath` traversal guard and sync's `safePath`) appended a
+  POSIX `'/'` to the mount root before prefix-matching, but `resolve()` emits
+  backslash-separated paths on Windows — so every legitimate in-mount path
+  was rejected: read/write threw "Path traversal detected" and `syncFromFs`
+  reported every real file as outside its mount (`ls` was unaffected, making
+  a populated mount look empty). Containment now compares with the platform
+  separator; the sync walker and the watcher additionally normalize relative
+  paths to the `'/'`-separated logical form used everywhere else. No
+  behavior change on POSIX.
 
 - Discord downtime history is written to Context Manager in chronological order while newest-message tracking retains Discord order.
 

@@ -7,7 +7,7 @@
 
 import { watch, type FSWatcher } from 'chokidar';
 import { mkdirSync, statSync } from 'node:fs';
-import { basename } from 'node:path';
+import { basename, sep } from 'node:path';
 import { type MountConfig } from './types.js';
 
 export type FsOp = 'created' | 'modified' | 'deleted';
@@ -363,20 +363,23 @@ export class MountWatcher {
   }
 
   private toRelative(absolutePath: string): string | null {
-    const base = this.config.path.endsWith('/')
+    // Chokidar hands back platform-separated absolute paths; compare with
+    // the platform separator and normalize the result to the '/'-separated
+    // logical form the rest of the workspace uses. No-op on POSIX.
+    const base = this.config.path.endsWith(sep)
       ? this.config.path
-      : this.config.path + '/';
+      : this.config.path + sep;
     if (absolutePath.startsWith(base)) {
-      return absolutePath.slice(base.length);
+      return absolutePath.slice(base.length).split(sep).join('/');
     }
     return null;
   }
 
   private isRootPath(absolutePath: string): boolean {
-    const root = this.config.path.endsWith('/')
+    const root = this.config.path.endsWith(sep)
       ? this.config.path.slice(0, -1)
       : this.config.path;
-    const candidate = absolutePath.endsWith('/')
+    const candidate = absolutePath.endsWith(sep)
       ? absolutePath.slice(0, -1)
       : absolutePath;
     return candidate === root;
