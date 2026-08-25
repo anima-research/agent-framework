@@ -1134,10 +1134,12 @@ export class WorkspaceModule implements Module {
       throw new Error(`Unknown mount: "${mountName}". Available: ${[...this.mounts.keys()].join(', ')}`);
     }
 
-    // Path traversal guard (CWE-22): ensure resolved path stays within mount
+    // Path traversal guard (CWE-22): ensure resolved path stays within mount.
+    // Containment must compare with the PLATFORM separator (isContainedPath):
+    // resolve() emits backslashes on Windows, so a '/'-suffixed root never
+    // prefix-matches there and every in-mount path was rejected as traversal.
     const resolved = resolve(mount.config.path, relativePath);
-    const mountRoot = mount.config.path.endsWith('/') ? mount.config.path : mount.config.path + '/';
-    if (resolved !== mount.config.path && !resolved.startsWith(mountRoot)) {
+    if (!isContainedPath(mount.config.path, resolved)) {
       throw new Error(`Path traversal detected: "${path}" resolves outside mount "${mountName}"`);
     }
 

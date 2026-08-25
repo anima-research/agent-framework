@@ -8,7 +8,7 @@
 
 import { createHash } from 'node:crypto';
 import { readFile, writeFile, mkdir, readdir, stat, access } from 'node:fs/promises';
-import { join, dirname, relative, resolve } from 'node:path';
+import { join, dirname, relative, resolve, sep } from 'node:path';
 import type { JsStore, JsTreeEntry } from '@animalabs/chronicle';
 import type { MountState } from './types.js';
 
@@ -19,8 +19,11 @@ export const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
  * Returns the absolute path, or null if the path is outside the mount.
  */
 function safePath(mountPath: string, relativePath: string): string | null {
+  // Compare with the PLATFORM separator: resolve() emits backslashes on
+  // Windows, so a '/'-suffixed root never prefix-matches there and every
+  // in-mount path was reported as outside the mount.
   const resolved = resolve(mountPath, relativePath);
-  const root = mountPath.endsWith('/') ? mountPath : mountPath + '/';
+  const root = mountPath.endsWith(sep) ? mountPath : mountPath + sep;
   if (resolved !== mountPath && !resolved.startsWith(root)) {
     return null;
   }
@@ -299,7 +302,10 @@ async function walkDirectory(
       if (results.length >= maxFiles) break;
 
       const fullPath = join(dir, entry.name);
-      const relativePath = relative(basePath, fullPath);
+      // Logical workspace paths are '/'-separated everywhere (mount-prefixed
+      // paths, chronicle tree paths); node's relative() emits backslashes on
+      // Windows, so normalize. No-op on POSIX (sep === '/').
+      const relativePath = relative(basePath, fullPath).split(sep).join('/');
 
       // Check ignore patterns (simple glob matching)
       if (shouldIgnore(relativePath, entry.name, ignorePatterns)) continue;

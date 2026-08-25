@@ -18,6 +18,17 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ### Fixed
 
+- **Workspace mounts are usable on native Windows.** The mount containment
+  checks (the `parsePath` traversal guard and sync's `safePath`) appended a
+  POSIX `'/'` to the mount root before prefix-matching, but `resolve()` emits
+  backslash-separated paths on Windows — so every legitimate in-mount path
+  was rejected: read/write threw "Path traversal detected" and `syncFromFs`
+  reported every real file as outside its mount (`ls` was unaffected, making
+  a populated mount look empty). Containment now compares with the platform
+  separator; the sync walker and the watcher additionally normalize relative
+  paths to the `'/'`-separated logical form used everywhere else. No
+  behavior change on POSIX.
+
 - Discord downtime history is written to Context Manager in chronological order while newest-message tracking retains Discord order.
 
 - Rapid external messages now retain arrival order while remaining prioritized
