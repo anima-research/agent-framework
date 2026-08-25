@@ -18,6 +18,8 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ### Fixed
 
+- Anthropic organization-acceleration 429s now enter a per-residence provider cooldown instead of immediate same-window retries: later arrivals are retained for one fresh compile after the quiet window, local Context Manager maintenance waits behind the primary lane, and capacity errors never enter the poisoned-history breaker (AF #114 bounded first slice).
+
 - **Workspace mounts are usable on native Windows.** The mount containment
   checks (the `parsePath` traversal guard and sync's `safePath`) appended a
   POSIX `'/'` to the mount root before prefix-matching, but `resolve()` emits
