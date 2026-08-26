@@ -12,9 +12,19 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.11.0 — 2026-08-26
+
 ### Added
 
 - `proseRouting: "disabled"` keeps all generated plain prose private and permits external publication only through explicit tools, preventing ambient locus capture from publishing continuity output.
+
+### Changed
+
+- Changelog entries now land as per-change fragment files in `changelog.d/`
+  (`<slug>.<breaking|added|changed|fixed>.md`), folded into the version
+  section at release time — concurrent PRs no longer conflict in
+  `CHANGELOG.md`. Editing `## Unreleased` directly still works and is merged
+  at the same point.
 
 ### Fixed
 
