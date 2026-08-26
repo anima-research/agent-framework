@@ -284,4 +284,60 @@ describe('Conversation routing', () => {
 
     await framework.stop();
   });
+
+  it('fork channel_publish: omitted channelId defaults to home; foreign publish is rejected', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
+    const framework = await makeFramework();
+    framework.pushEvent(incomingEvent({ channelId: 'slack:C7', text: 'bot, help', mentioned: true }));
+    await framework.runUntilIdle();
+    const forkName = 'conversation-slack-C7-g1';
+    assert.ok(framework.getAgent(forkName), 'fork should exist');
+
+    // tool:started is emitted AFTER the fence with the (possibly rewritten)
+    // input, so home-defaulting is observable there; a fence rejection emits
+    // tool:failed and never reaches tool:started.
+    const started: Array<{ tool: string; input?: { channelId?: string } }> = [];
+    const failures: Array<{ callId: string; error: string }> = [];
+    framework.onTrace((e: TraceEvent) => {
+      if (e.type === 'tool:started') started.push(e as unknown as (typeof started)[number]);
+      if (e.type === 'tool:failed') failures.push(e as unknown as (typeof failures)[number]);
+    });
+
+    const fw = framework as unknown as {
+      dispatchChannelToolCall(agentName: string, call: { id: string; name: string; input: Record<string, unknown> }): void;
+      channelRegistry: {
+        handleChannelToolCall(name: string, input: unknown, origin?: unknown): Promise<{ success: boolean }>;
+        stopAll(): void;
+      } | null;
+    };
+
+    // This harness runs no MCPL servers, so the framework never builds a real
+    // ChannelRegistry (the public dispatch path guards on it before routing
+    // channel_* tools). Stub the downstream boundary — the unit under test is
+    // the fence ABOVE it, and a home-defaulted publish must get past the fence
+    // to be observable at tool:started.
+    fw.channelRegistry = { handleChannelToolCall: async () => ({ success: true }), stopAll: () => {} };
+
+    // (a) omitted channelId → rewritten to the home channel, passes the fence
+    fw.dispatchChannelToolCall(forkName, { id: 'p1', name: 'channel_publish', input: { content: 'hello home' } });
+    const homePublish = started.find((t) => t.tool === 'channel_publish');
+    assert.ok(homePublish, 'home-defaulted publish should pass the fence and reach tool:started');
+    assert.equal(homePublish!.input?.channelId, 'slack:C7', 'omitted channelId is rewritten to the home channel');
+    assert.ok(
+      !failures.some((f) => f.callId === 'p1'),
+      'home-defaulted publish must not be rejected by the fence',
+    );
+
+    // (b) foreign channelId → rejected by the fence, never starts
+    fw.dispatchChannelToolCall(forkName, { id: 'p2', name: 'channel_publish', input: { channelId: 'slack:C8', content: 'sneaky' } });
+    const rejection = failures.find((f) => f.callId === 'p2');
+    assert.ok(rejection, 'foreign publish should be rejected');
+    assert.ok(rejection!.error.includes('publishing to slack:C8 is not allowed'), 'rejection names the foreign channel');
+    assert.equal(
+      started.filter((t) => t.tool === 'channel_publish').length, 1,
+      'foreign publish never reaches tool:started',
+    );
+
+    await framework.stop();
+  });
 });
