@@ -200,6 +200,13 @@ export interface MaterializeInput {
   path?: string;
   /** Specific mount (optional — defaults to all read-write mounts) */
   mount?: string;
+  /**
+   * Materialize even when the current branch has genuinely diverged from the
+   * branch last materialized to disk (default: false). Not needed for linear
+   * continuations (child branches forked at or after the last materialized
+   * point) — those pass the guard automatically.
+   */
+  force?: boolean;
 }
 
 export interface SyncInput {

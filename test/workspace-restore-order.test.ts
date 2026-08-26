@@ -151,7 +151,7 @@ test('materialize branch guard survives restart in both orders', async (t) => {
 
     const res = await module.handleToolCall({ id: 'm', name: 'materialize', input: {} });
     assert.equal(res.success, false, `${order}: branch guard must refuse`);
-    assert.match(String(res.error), /differs from last materialized branch/, `${order}: guard reason`);
+    assert.match(String(res.error), /diverged from the branch last materialized/, `${order}: guard reason`);
   }
 });
 

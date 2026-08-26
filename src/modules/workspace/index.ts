@@ -714,6 +714,95 @@ export class WorkspaceModule implements Module {
       }
     }
     this.savedState = null;
+
+    // Absorb out-of-band branch switches (e.g. an offline repair that left
+    // the store on a child branch): if the pinned branch is a strict ancestor
+    // of the current branch and disk state is fully contained in the current
+    // branch's history, re-pin. Without this, every materialize refuses
+    // forever after a repair, even though nothing on disk can be clobbered.
+    this.healBranchPins();
+  }
+
+  /**
+   * True when everything last materialized to disk for a mount is part of the
+   * CURRENT branch's history — i.e. the current branch is a linear
+   * continuation of the pinned branch as of the pinned sequence.
+   *
+   * Walks the current branch's parent chain. Safe iff the pinned branch is on
+   * the chain AND every fork point along the way is at or after `pinnedSeq`
+   * (a fork before `pinnedSeq` means disk holds records the current branch
+   * never had — genuine divergence). A missing/GC'd intermediate branch or a
+   * child without fork metadata is treated as unsafe: ancestry can't be
+   * proven, so the guard stays closed and `force` is the escape hatch.
+   */
+  private isLinearContinuation(
+    store: JsStore,
+    pinnedBranchId: string,
+    pinnedSeq: number,
+  ): boolean {
+    const current = store.currentBranch();
+    if (current.id === pinnedBranchId) return true;
+    const byId = new Map(store.listBranches().map((b) => [b.id, b]));
+    const visited = new Set<string>();
+    let cursor = byId.get(current.id);
+    while (cursor && !visited.has(cursor.id)) {
+      visited.add(cursor.id);
+      if (cursor.id === pinnedBranchId) return true;
+      if (cursor.parentId === undefined || cursor.branchPoint === undefined) return false;
+      if (cursor.branchPoint < pinnedSeq) return false;
+      cursor = byId.get(cursor.parentId);
+    }
+    return false;
+  }
+
+  /**
+   * Why materializing this mount is blocked on the current branch, or null if
+   * it isn't. Single source of truth for the materialize guard AND the
+   * `canMaterialize` status field, so status can never report `true` for a
+   * mount that materialize would refuse (the pre-fix defect: status computed
+   * per-mount id-equality while the guard checked ALL mounts).
+   */
+  private mountMaterializeBlockReason(store: JsStore, mount: MountState): string | null {
+    if (this.config.materializeOnlyActiveBranch === false) return null;
+    if (!mount.lastMaterializedBranchId) return null;
+    const current = store.currentBranch();
+    if (mount.lastMaterializedBranchId === current.id) return null;
+    if (this.isLinearContinuation(store, mount.lastMaterializedBranchId, mount.lastMaterializedSeq)) {
+      return null;
+    }
+    const pinned = store.listBranches().find((b) => b.id === mount.lastMaterializedBranchId);
+    const pinnedName = pinned ? `"${pinned.name}"` : `id ${mount.lastMaterializedBranchId} (branch no longer exists)`;
+    return (
+      `current branch "${current.name}" has diverged from the branch last materialized to disk ` +
+      `(${pinnedName} at seq ${mount.lastMaterializedSeq}) — disk may hold state the current branch ` +
+      `never had. Pass force: true to overwrite disk from the current branch if it is canonical.`
+    );
+  }
+
+  /**
+   * Re-pin mounts whose last-materialized branch is a proven ancestor of the
+   * current branch. Runs after persisted state is applied on restart, so an
+   * out-of-band branch switch (offline repair/treatment branches) heals at
+   * boot instead of wedging materialize until manual surgery.
+   */
+  private healBranchPins(): void {
+    const store = this.store;
+    if (!store) return;
+    const current = store.currentBranch();
+    for (const mount of this.mounts.values()) {
+      if (
+        mount.lastMaterializedBranchId &&
+        mount.lastMaterializedBranchId !== current.id &&
+        this.isLinearContinuation(store, mount.lastMaterializedBranchId, mount.lastMaterializedSeq)
+      ) {
+        console.warn(
+          `[workspace] Mount "${mount.config.name}": branch pin ${mount.lastMaterializedBranchId} → ` +
+          `${current.id} ("${current.name}") — current branch linearly continues the last ` +
+          `materialized branch (out-of-band switch, e.g. repair); disk state is preserved history.`,
+        );
+        mount.lastMaterializedBranchId = current.id;
+      }
+    }
   }
 
   /**
@@ -954,6 +1043,7 @@ export class WorkspaceModule implements Module {
           properties: {
             path: { type: 'string', description: 'Specific path to materialize (optional — defaults to all changed)' },
             mount: { type: 'string', description: 'Specific mount (optional)' },
+            force: { type: 'boolean', description: 'Materialize even if the current branch has diverged from the branch last written to disk (default false). Only needed for genuine divergence — descendant branches pass automatically.' },
           },
         },
       },
@@ -2107,7 +2197,7 @@ export class WorkspaceModule implements Module {
         initialSyncDone: mount.initialSyncDone,
         currentBranch: currentBranch.name,
         lastMaterializedBranch: mount.lastMaterializedBranchId,
-        canMaterialize: !mount.lastMaterializedBranchId || mount.lastMaterializedBranchId === currentBranch.id,
+        canMaterialize: this.mountMaterializeBlockReason(store, mount) === null,
       };
     }
 
@@ -2116,20 +2206,6 @@ export class WorkspaceModule implements Module {
 
   private async handleMaterialize(input: MaterializeInput): Promise<ToolResult> {
     const store = this.getStore();
-
-    // Guard: only materialize on the active branch
-    if (this.config.materializeOnlyActiveBranch !== false) {
-      const currentBranch = store.currentBranch();
-      for (const mount of this.mounts.values()) {
-        if (mount.lastMaterializedBranchId && mount.lastMaterializedBranchId !== currentBranch.id) {
-          return {
-            success: false,
-            error: `Cannot materialize: current branch "${currentBranch.name}" differs from last materialized branch. Switch back or set materializeOnlyActiveBranch: false.`,
-            isError: true,
-          };
-        }
-      }
-    }
 
     const allWritten: Array<{ mount: string; path: string }> = [];
 
@@ -2144,6 +2220,36 @@ export class WorkspaceModule implements Module {
       mountsToMaterialize = [...this.mounts.entries()]
         .filter(([, m]) => m.config.mode === 'read-write')
         .map(([name, mount]) => ({ name, mount }));
+    }
+
+    // Branch guard, scoped to the mounts actually being materialized: a
+    // linear continuation (current branch descends from the pinned branch at
+    // or after the pinned seq) passes; genuine divergence refuses unless
+    // force. One mount's stale pin must never block another mount.
+    const blocked: Array<{ mount: string; reason: string }> = [];
+    for (const { name, mount } of mountsToMaterialize) {
+      const reason = this.mountMaterializeBlockReason(store, mount);
+      if (!reason) continue;
+      if (input.force) {
+        // Disk reflects another line of history, so an incremental diff from
+        // the pinned seq is meaningless — reset tracking and re-materialize
+        // the full tree, exactly like materializeMount() after a deliberate
+        // branch switch.
+        mount.lastMaterializedSeq = 0;
+        mount.lastMaterializedBranchId = null;
+      } else {
+        blocked.push({ mount: name, reason });
+      }
+    }
+    mountsToMaterialize = mountsToMaterialize.filter(
+      ({ name }) => !blocked.some((b) => b.mount === name),
+    );
+    if (mountsToMaterialize.length === 0 && blocked.length > 0) {
+      return {
+        success: false,
+        error: `Cannot materialize: ${blocked.map((b) => `[${b.mount}] ${b.reason}`).join('; ')}`,
+        isError: true,
+      };
     }
 
     for (const { name, mount } of mountsToMaterialize) {
@@ -2163,8 +2269,12 @@ export class WorkspaceModule implements Module {
         allWritten.push({ mount: name, path: p });
       }
 
-      // Track which branch we materialized on
-      if (written.length > 0) {
+      // Track which branch we materialized on. Re-pin on a clean empty
+      // materialize too (previously-pinned mount, nothing pending): disk
+      // already reflects the current branch's tree, and leaving the old pin
+      // would keep force required forever after a cross-branch materialize
+      // that happened to write nothing.
+      if (written.length > 0 || mount.lastMaterializedBranchId !== null) {
         mount.lastMaterializedBranchId = store.currentBranch().id;
       }
     }
@@ -2174,6 +2284,7 @@ export class WorkspaceModule implements Module {
       data: {
         materialized: allWritten,
         count: allWritten.length,
+        ...(blocked.length > 0 ? { skipped: blocked } : {}),
       },
     };
   }
