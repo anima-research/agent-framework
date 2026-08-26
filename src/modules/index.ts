@@ -8,7 +8,8 @@ export type { ApiEvent } from './api/index.js';
 export { HealthModule } from './health/index.js';
 export type { HealthModuleConfig } from './health/index.js';
 
-export { WorkspaceModule } from './workspace/index.js';
+export { WorkspaceModule, WorkspaceReadError } from './workspace/index.js';
+export type { WorkspaceReadErrorCode, WorkspaceReadStage, WorkspaceDiskReadResult, ReadFileFromDiskOptions } from './workspace/index.js';
 export type {
   WorkspaceConfig,
   MountConfig,

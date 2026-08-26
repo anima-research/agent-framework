@@ -6,6 +6,7 @@
  */
 
 import { constants as fsConstants } from 'node:fs';
+import type { Stats } from 'node:fs';
 import { open, readFile, stat, access, writeFile, unlink, mkdir, lstat, realpath } from 'node:fs/promises';
 import { join, resolve, relative, dirname, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
@@ -76,6 +77,82 @@ class WorkspaceImageReadError extends Error {
     super(message);
     this.name = 'WorkspaceImageReadError';
   }
+}
+
+/**
+ * Why a workspace-owned filesystem read was refused. Distinguishes the cases a
+ * peer needs to react to differently: a path that never resolved inside the
+ * mount (`unknown_mount`, `traversal`), a mount whose root is gone
+ * (`mount_unavailable`), an ordinary missing file (`not_found`), a directory
+ * (`directory`), a symlink refused by the mount's `followSymlinks` policy
+ * (`symlink`), a symlink whose canonical target lands outside the canonical
+ * mount root (`escape`), and a file swapped underneath the read (`changed`).
+ */
+export type WorkspaceReadErrorCode =
+  | 'unknown_mount'
+  | 'traversal'
+  | 'mount_unavailable'
+  | 'not_found'
+  | 'directory'
+  | 'symlink'
+  | 'escape'
+  | 'changed';
+
+/** Where in the open sequence a `WorkspaceReadError` originated (diagnostics). */
+export type WorkspaceReadStage =
+  | 'parse'
+  | 'lstat'
+  | 'realpath_root'
+  | 'open'
+  | 'fstat'
+  | 'post_lstat'
+  | 'realpath'
+  | 'stat'
+  | 'read';
+
+/**
+ * Thrown by `WorkspaceModule.readFileFromDisk()`. Messages carry the
+ * mount-prefixed path only — never absolute filesystem paths — so they can be
+ * surfaced to the agent or logged without leaking host layout.
+ */
+export class WorkspaceReadError extends Error {
+  constructor(
+    readonly code: WorkspaceReadErrorCode,
+    message: string,
+    readonly stage: WorkspaceReadStage,
+    /** Underlying errno code (e.g. 'ENOENT', 'ELOOP') when a syscall failed. */
+    readonly errno?: string,
+  ) {
+    super(message);
+    this.name = 'WorkspaceReadError';
+  }
+}
+
+/** Successful `readFileFromDisk()` result. */
+export interface WorkspaceDiskReadResult {
+  /** File bytes — the whole file, or its first `maxBytes` when `truncated`. */
+  bytes: Buffer;
+  /** Full on-disk size in bytes, regardless of truncation. */
+  size: number;
+  /** True when `maxBytes` was set and the file was larger; `bytes` is a prefix. */
+  truncated: boolean;
+  /** mtime of the file actually read (for change-detection caches). */
+  mtimeMs: number;
+  /** Canonical (realpath) location of the file read — inside the canonical mount root by construction. */
+  realPath: string;
+  /** Mount the path resolved into. */
+  mount: string;
+}
+
+export interface ReadFileFromDiskOptions {
+  /** Read at most this many bytes (a bounded prefix read — the rest of the file is never loaded). */
+  maxBytes?: number;
+}
+
+function errnoOf(err: unknown): string | undefined {
+  return typeof err === 'object' && err !== null && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
+    ? (err as { code: string }).code
+    : undefined;
 }
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
@@ -994,8 +1071,17 @@ export class WorkspaceModule implements Module {
   /**
    * Resolve a mount-prefixed path (e.g. "tickets/2026-04-22-foo.md") to its
    * absolute filesystem path. Returns null if the mount is unknown or the
-   * resolved path escapes the mount root (path-traversal guard). Public API
-   * for peer modules that need to read workspace files directly.
+   * resolved path escapes the mount root.
+   *
+   * **Lexical containment only.** The guard reasons about `..` segments in the
+   * path string; it knows nothing about what is on disk. A symlink inside the
+   * mount that targets an outside file passes this check, and a caller that
+   * then does `fs.readFile(path)` reads the outside content. Use the returned
+   * path for resolution-only purposes (write targets, nonexistent paths,
+   * display); for reading file content, use {@link readFileFromDisk}, which
+   * enforces the mount's `followSymlinks` policy and canonical containment.
+   *
+   * @deprecated for direct filesystem reads — call `readFileFromDisk()`.
    */
   resolveAbsolutePath(mountPrefixedPath: string): string | null {
     try {
@@ -1189,82 +1275,107 @@ export class WorkspaceModule implements Module {
     return this.validateImageBytes(blob, mountPrefixedPath, maxSize);
   }
 
-  private async readImageFromFilesystem(
+  /**
+   * Open a mount-relative file for reading with the mount boundary enforced on
+   * the *filesystem*, not just the path string:
+   *
+   * 1. `lstat` the lexical path — refuse directories; refuse a final-component
+   *    symlink when the mount does not `followSymlinks`.
+   * 2. Open with `O_NOFOLLOW` where the platform has it (POSIX) so the refusal
+   *    holds against a symlink swapped in between lstat and open; where it
+   *    doesn't (Windows), re-`lstat` after opening instead.
+   * 3. `realpath` both the mount root and the opened path and require canonical
+   *    containment — this is what catches an *intermediate* symlinked
+   *    directory escaping the mount, and a followed symlink whose target lands
+   *    outside, on every platform (junctions included).
+   * 4. Confirm the descriptor and the canonical path are the same inode.
+   *
+   * `inspect` runs right after the descriptor is stat'd and before the
+   * containment work, so callers can impose size policy in the same order the
+   * image reader always has. The returned handle is the caller's to close.
+   */
+  private async openContainedFile(
     mount: MountState,
     relativePath: string,
     mountPrefixedPath: string,
-    maxSize: number,
-  ): Promise<{ bytes: Buffer; mimeType: SupportedImageMimeType }> {
+    inspect?: (fileStat: Stats) => void,
+  ): Promise<{ handle: Awaited<ReturnType<typeof open>>; fileStat: Stats; realFilePath: string }> {
     const lexicalPath = resolve(mount.config.path, relativePath);
-    const useNoFollow = !mount.config.followSymlinks && typeof fsConstants.O_NOFOLLOW === 'number';
+    const follow = mount.config.followSymlinks === true;
+    const useNoFollow = !follow && typeof fsConstants.O_NOFOLLOW === 'number';
 
     let fileInfo: Awaited<ReturnType<typeof lstat>>;
     try {
       fileInfo = await lstat(lexicalPath);
     } catch (err) {
-      if (isErrnoCode(err, 'ENOENT')) {
-        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      const code = errnoOf(err);
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        throw new WorkspaceReadError('not_found', `File not found: ${mountPrefixedPath}`, 'lstat', code);
       }
-      throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+      throw new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}`, 'lstat', code);
     }
-
     if (fileInfo.isDirectory()) {
-      throw new WorkspaceImageReadError('directory', `Path is a directory: ${mountPrefixedPath}`);
+      throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'lstat');
     }
-    if (fileInfo.isSymbolicLink() && !mount.config.followSymlinks) {
-      throw new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`);
+    if (fileInfo.isSymbolicLink() && !follow) {
+      throw new WorkspaceReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`, 'lstat');
     }
 
     let realMountRoot: string;
     try {
       realMountRoot = await realpath(mount.config.path);
-    } catch {
-      throw new WorkspaceImageReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}`);
+    } catch (err) {
+      throw new WorkspaceReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}`, 'realpath_root', errnoOf(err));
     }
 
-    let handle: Awaited<ReturnType<typeof open>> | null = null;
+    let handle: Awaited<ReturnType<typeof open>>;
     try {
       handle = await open(lexicalPath, fsConstants.O_RDONLY | (useNoFollow ? fsConstants.O_NOFOLLOW : 0));
     } catch (err) {
-      if (isErrnoCode(err, 'ENOENT')) {
-        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      const code = errnoOf(err);
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        throw new WorkspaceReadError('not_found', `File not found: ${mountPrefixedPath}`, 'open', code);
       }
-      if (!mount.config.followSymlinks && isErrnoCode(err, 'ELOOP')) {
-        throw new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`);
+      if (!follow && code === 'ELOOP') {
+        throw new WorkspaceReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`, 'open', code);
       }
-      throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+      throw new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}`, 'open', code);
     }
 
     try {
-      const fileStat = await handle.stat();
-      if (fileStat.isDirectory()) {
-        throw new WorkspaceImageReadError('directory', `Path is a directory: ${mountPrefixedPath}`);
-      }
-      if (!fileStat.isFile()) {
-        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
-      }
-      if (fileStat.size === 0) {
-        throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
-      }
-      if (fileStat.size > maxSize) {
-        throw new WorkspaceImageReadError(
-          'too_large',
-          `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`,
+      let fileStat: Stats;
+      try {
+        fileStat = await handle.stat();
+      } catch (err) {
+        const code = errnoOf(err);
+        throw new WorkspaceReadError(
+          'not_found',
+          code === 'ENOENT' ? `File not found: ${mountPrefixedPath}` : `Unable to read file: ${mountPrefixedPath}`,
+          'fstat',
+          code,
         );
       }
+      if (fileStat.isDirectory()) {
+        throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'fstat');
+      }
+      if (!fileStat.isFile()) {
+        throw new WorkspaceReadError('not_found', `File not found: ${mountPrefixedPath}`, 'fstat');
+      }
+      inspect?.(fileStat);
 
-      if (!mount.config.followSymlinks && !useNoFollow) {
+      if (!follow && !useNoFollow) {
         let postOpenInfo: Awaited<ReturnType<typeof lstat>>;
         try {
           postOpenInfo = await lstat(lexicalPath);
         } catch (err) {
-          if (isErrnoCode(err, 'ENOENT')) {
-            throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+          const code = errnoOf(err);
+          if (code === 'ENOENT') {
+            throw new WorkspaceReadError('changed', `File changed during read: ${mountPrefixedPath}`, 'post_lstat', code);
           }
-          throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+          throw new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}`, 'post_lstat', code);
         }
         if (postOpenInfo.isSymbolicLink()) {
-          throw new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`);
+          throw new WorkspaceReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`, 'post_lstat');
         }
       }
 
@@ -1272,29 +1383,162 @@ export class WorkspaceModule implements Module {
       try {
         realFilePath = await realpath(lexicalPath);
       } catch (err) {
-        if (isErrnoCode(err, 'ENOENT')) {
-          throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+        const code = errnoOf(err);
+        if (code === 'ENOENT') {
+          throw new WorkspaceReadError('changed', `File changed during read: ${mountPrefixedPath}`, 'realpath', code);
         }
-        throw new WorkspaceImageReadError('not_found', `Unable to resolve image file: ${mountPrefixedPath}`);
+        throw new WorkspaceReadError('not_found', `Unable to resolve file: ${mountPrefixedPath}`, 'realpath', code);
       }
 
       if (!isContainedPath(realMountRoot, realFilePath)) {
-        throw new WorkspaceImageReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`);
+        throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
       }
 
-      let pathStat: Awaited<ReturnType<typeof stat>>;
+      let pathStat: Stats;
       try {
         pathStat = await stat(realFilePath);
       } catch (err) {
-        if (isErrnoCode(err, 'ENOENT')) {
-          throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+        const code = errnoOf(err);
+        if (code === 'ENOENT') {
+          throw new WorkspaceReadError('changed', `File changed during read: ${mountPrefixedPath}`, 'stat', code);
         }
-        throw new WorkspaceImageReadError('not_found', `Unable to stat image file: ${mountPrefixedPath}`);
+        throw new WorkspaceReadError('not_found', `Unable to stat file: ${mountPrefixedPath}`, 'stat', code);
       }
       if (pathStat.dev !== fileStat.dev || pathStat.ino !== fileStat.ino) {
-        throw new WorkspaceImageReadError('changed', `Image file changed during read: ${mountPrefixedPath}`);
+        throw new WorkspaceReadError('changed', `File changed during read: ${mountPrefixedPath}`, 'stat');
       }
 
+      return { handle, fileStat, realFilePath };
+    } catch (err) {
+      await handle.close();
+      throw err;
+    }
+  }
+
+  /**
+   * Read a workspace file from disk with the mount boundary enforced on the
+   * filesystem (see {@link openContainedFile}). Public API for peer modules
+   * that read mounted files outside the Chronicle tree — the safe replacement
+   * for `resolveAbsolutePath()` + `fs.readFile()`, whose lexical-only guard let
+   * an in-mount symlink smuggle outside content into context (agent-framework
+   * #129, found via connectome-host #101).
+   *
+   * - Honors the mount's `followSymlinks` policy (default: refuse).
+   * - With symlinks allowed, the canonical target must stay beneath the
+   *   canonical mount root; a sibling-prefix root (`/mount-other`) does not count.
+   * - `maxBytes` performs a bounded prefix read: at most `maxBytes` bytes are
+   *   ever loaded, and `truncated` reports that the file was larger.
+   *
+   * Throws {@link WorkspaceReadError} with a `code` distinguishing unknown
+   * mount, lexical traversal, unavailable mount, missing file, directory,
+   * policy-denied symlink, outside-mount target, and file-changed-during-read.
+   */
+  async readFileFromDisk(
+    mountPrefixedPath: string,
+    options: ReadFileFromDiskOptions = {},
+  ): Promise<WorkspaceDiskReadResult> {
+    if (options.maxBytes !== undefined && !(Number.isInteger(options.maxBytes) && options.maxBytes >= 0)) {
+      throw new RangeError('readFileFromDisk: maxBytes must be a non-negative integer');
+    }
+    let mount: MountState;
+    let relativePath: string;
+    try {
+      ({ mount, relativePath } = this.parsePath(mountPrefixedPath));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const code: WorkspaceReadErrorCode = message.startsWith('Unknown mount') ? 'unknown_mount' : 'traversal';
+      throw new WorkspaceReadError(code, message, 'parse');
+    }
+    if (!relativePath) {
+      throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'parse');
+    }
+
+    const { handle, fileStat, realFilePath } = await this.openContainedFile(mount, relativePath, mountPrefixedPath);
+    try {
+      const size = fileStat.size;
+      const cap = options.maxBytes;
+      let bytes: Buffer;
+      let truncated = false;
+      if (cap !== undefined && size > cap) {
+        truncated = true;
+        bytes = Buffer.alloc(cap);
+        let offset = 0;
+        while (offset < cap) {
+          const { bytesRead } = await handle.read(bytes, offset, cap - offset, offset);
+          if (bytesRead === 0) break;
+          offset += bytesRead;
+        }
+        if (offset < cap) bytes = bytes.subarray(0, offset);
+      } else {
+        bytes = await handle.readFile();
+      }
+      return { bytes, size, truncated, mtimeMs: fileStat.mtimeMs, realPath: realFilePath, mount: mount.config.name };
+    } catch (err) {
+      if (err instanceof WorkspaceReadError) throw err;
+      throw new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}`, 'read', errnoOf(err));
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /** Map a core read refusal onto the image reader's historical error vocabulary and wording. */
+  private imageErrorFromRead(err: WorkspaceReadError, mount: MountState, mountPrefixedPath: string): WorkspaceImageReadError {
+    const p = mountPrefixedPath;
+    switch (err.code) {
+      case 'mount_unavailable':
+        return new WorkspaceImageReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}`);
+      case 'directory':
+        return new WorkspaceImageReadError('directory', `Path is a directory: ${p}`);
+      case 'symlink':
+        return new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${p}`);
+      case 'escape':
+        return new WorkspaceImageReadError('escape', `Symlink escape detected: ${p}`);
+      case 'changed':
+        return new WorkspaceImageReadError('changed', `Image file changed during read: ${p}`);
+      case 'not_found':
+      default:
+        if (err.message.startsWith('File not found')) {
+          return new WorkspaceImageReadError('not_found', `File not found: ${p}`);
+        }
+        if (err.stage === 'realpath') {
+          return new WorkspaceImageReadError('not_found', `Unable to resolve image file: ${p}`);
+        }
+        if (err.stage === 'stat') {
+          return new WorkspaceImageReadError('not_found', `Unable to stat image file: ${p}`);
+        }
+        return new WorkspaceImageReadError('not_found', `Unable to read image file: ${p}`);
+    }
+  }
+
+  private async readImageFromFilesystem(
+    mount: MountState,
+    relativePath: string,
+    mountPrefixedPath: string,
+    maxSize: number,
+  ): Promise<{ bytes: Buffer; mimeType: SupportedImageMimeType }> {
+    let opened: Awaited<ReturnType<WorkspaceModule['openContainedFile']>>;
+    try {
+      opened = await this.openContainedFile(mount, relativePath, mountPrefixedPath, (fileStat) => {
+        if (fileStat.size === 0) {
+          throw new WorkspaceImageReadError('empty', `Image file is empty: ${mountPrefixedPath}`);
+        }
+        if (fileStat.size > maxSize) {
+          throw new WorkspaceImageReadError(
+            'too_large',
+            `Image file exceeds max size (${maxSize} bytes): ${mountPrefixedPath}`,
+          );
+        }
+      });
+    } catch (err) {
+      if (err instanceof WorkspaceImageReadError) throw err;
+      if (err instanceof WorkspaceReadError) throw this.imageErrorFromRead(err, mount, mountPrefixedPath);
+      if (isErrnoCode(err, 'ENOENT')) {
+        throw new WorkspaceImageReadError('not_found', `File not found: ${mountPrefixedPath}`);
+      }
+      throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
+    }
+    const { handle } = opened;
+    try {
       const bytes = await handle.readFile();
       return this.validateImageBytes(bytes, mountPrefixedPath, maxSize);
     } catch (err) {
@@ -1304,7 +1548,7 @@ export class WorkspaceModule implements Module {
       }
       throw new WorkspaceImageReadError('not_found', `Unable to read image file: ${mountPrefixedPath}`);
     } finally {
-      await handle?.close();
+      await handle.close();
     }
   }
 
