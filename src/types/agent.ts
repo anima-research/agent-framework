@@ -184,6 +184,14 @@ export interface AgentConfig {
    *   send externally; prose remains in Chronicle with a private suppression receipt.
    */
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
+
+  /**
+   * Fail-closed containment for a text response whose entire visible prose is
+   * an invocation-shaped wrapper naming a tool registered on that exact turn.
+   * The wrapper is neither executed nor stored as assistant continuity; a
+   * content-free system receipt is stored instead. Default false.
+   */
+  toolWrapperProseGuard?: boolean;
 }
 
 /** The intentionally small set of agent settings that may change in-process. */
