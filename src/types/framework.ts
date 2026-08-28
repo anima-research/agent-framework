@@ -101,6 +101,14 @@ export interface FrameworkConfig {
   /** Or existing store (app-owned) */
   store?: JsStore;
 
+  /**
+   * Branch-independent append-only retirement seal. Defaults to
+   * `<storePath>/resident-retirements.jsonl`. Required when an app-owned
+   * `store` enables any resident's retirement, because Chronicle branches are
+   * intentionally reversible while retirement is not.
+   */
+  retirementPath?: string;
+
   /** Membrane instance for LLM calls */
   membrane: Membrane;
 

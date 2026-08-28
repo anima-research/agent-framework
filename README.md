@@ -257,6 +257,37 @@ framework.abortInference('assistant', 'user requested stop');
 
 The non-streaming path uses `AbortSignal` forwarded to `membrane.stream()`, which returns an `AbortedResponse` with partial content. The streaming path cancels the `YieldingStream` directly.
 
+### Resident retirement
+
+Configured resident agents can opt into the framework's neutral irreversible
+seal and enforcement primitive:
+
+```ts
+agents: [{
+  name: 'assistant',
+  model: 'claude-opus-4-6',
+  systemPrompt: '...',
+  retirement: { enabled: true },
+}]
+```
+
+After applying its own resident-facing policy, a host calls
+`framework.retireResident(name, reason?)`. The framework fsyncs the terminal
+seal, denies future conversational and maintenance inference, clears queued
+wakes and process-local gate state, stops resident-authored scripts, and keeps
+Chronicle/workspace history readable. Confirmation wording, cooling-off,
+health gates, and notifications deliberately belong to the host. Retirement
+is distinct from end-turn, sleep/dormancy, and erasure.
+
+Modules can expose host-owned ceremony through `getLiveTools(agentName)`.
+Those tools are available only to a provider-issued live stream, never public
+programmatic dispatch, code execution, ephemeral agents, or `puppetToolCall`.
+
+The terminal seal is append-only and branch-independent at
+`<storePath>/resident-retirements.jsonl`, so Chronicle undo/redo or a branch
+switch cannot resume the identity. Apps that supply an owned `store` must also
+supply `retirementPath`. See [Resident lifecycle](docs/resident-lifecycle.md).
+
 ## API Server
 
 WebSocket server for external clients (UIs, scripts, other agents).

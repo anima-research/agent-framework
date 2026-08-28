@@ -1,5 +1,14 @@
-import { join } from 'node:path';
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  writeSync,
+} from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
@@ -51,6 +60,9 @@ import type {
   AgentRuntimeSettingsSnapshot,
   AgentSettingsExtension,
   SameRoundThinkTextPolicy,
+  ResidentLifecycleStatus,
+  ResidentRetirementConfig,
+  ResidentRetirementResult,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reactions.js';
@@ -74,13 +86,13 @@ import {
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
 } from './tool-result-history.js';
-import { randomUUID } from 'node:crypto';
 import { PyRunner, buildInjectedTools } from './code-execution/py-runner.js';
 import {
   buildCodeExecutionToolDefinition,
   CODE_EXECUTION_TOOL_NAME,
 } from './code-execution/tool-definition.js';
 import { splitProseSegments } from './prose-segments.js';
+import { randomUUID } from 'node:crypto';
 
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
@@ -367,6 +379,7 @@ const FRAMEWORK_STATE_ID = 'framework/state';
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
+const RESIDENT_LIFECYCLE_LOG_ID = 'framework/resident-lifecycle';
 const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints'; // legacy single-map layout, read-only fallback
 const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
 
@@ -474,6 +487,13 @@ const DEFAULT_SYNC_INTERVAL_MS = 1000;
 const DEFAULT_MAINTENANCE_INTERVAL_MS = 5000;
 /** Bound one pass so a large backlog yields to inference and other agents. */
 const MAINTENANCE_TICKS_PER_PASS = 8;
+interface ResidentRetirementRecord {
+  version: 1;
+  kind: 'resident-retired';
+  agentName: string;
+  retiredAt: number;
+  reason?: string;
+}
 
 /** Local per-residence provider admission (AF #114 bounded first slice). */
 interface LocalProviderGate {
@@ -898,6 +918,14 @@ export class AgentFramework {
    *  FrameworkConfig.toolResultInlineMaxChars; null → house default. */
   private toolResultInlineMaxCharsConfig: number | null = null;
 
+  // ---- Resident lifecycle -------------------------------------------------
+  /** Configured, non-ephemeral residents a host may irreversibly retire. */
+  private retirableResidents: Map<string, ResidentRetirementConfig> = new Map();
+  /** Branch-independent terminal seals loaded from the append-only sidecar. */
+  private retiredResidents: Map<string, ResidentRetirementRecord> = new Map();
+  /** Null only for app-owned stores whose host supplied no seal path. */
+  private readonly retirementPath: string | null;
+
   private mcplTools: import('./types/index.js').ToolDefinition[] = [];
   /** Namespaced tool name → stateful feature-set attribution from tools/list. */
   private mcplToolFeatureSets: Map<string, string> = new Map();
@@ -946,6 +974,7 @@ export class AgentFramework {
     discordAwarenessOutbox: DiscordAwarenessOutbox | null,
     discordAwarenessEmoji: string,
     discordAwarenessDeadlineMs: number,
+    retirementPath: string | null,
   ) {
     this.store = store;
     this.ownsStore = ownsStore;
@@ -960,6 +989,7 @@ export class AgentFramework {
     this.discordAwarenessOutbox = discordAwarenessOutbox;
     this.discordAwarenessEmoji = discordAwarenessEmoji;
     this.discordAwarenessDeadlineMs = discordAwarenessDeadlineMs;
+    this.retirementPath = retirementPath;
     this.queue = new ProcessQueueImpl();
     this.usageTracker = new UsageTracker({
       emitTrace: (e: UsageUpdatedEvent) => this.emitTrace({ ...e }),
@@ -1020,6 +1050,12 @@ export class AgentFramework {
       // Already registered
     }
 
+    try {
+      store.registerState({ id: RESIDENT_LIFECYCLE_LOG_ID, strategy: 'append_log' });
+    } catch (error) {
+      if (!isStateExistsError(error)) throw error;
+    }
+
     // The legacy single-map checkpoint state (TURN_CHECKPOINTS_ID) is no longer
     // registered for new stores — it's read-only fallback data in old ones.
     try {
@@ -1066,7 +1102,14 @@ export class AgentFramework {
       discordAwarenessOutbox,
       config.discordAwarenessEmoji ?? DEFAULT_DISCORD_AWARENESS_EMOJI,
       normalizeDiscordAwarenessDeadline(config.discordAwarenessDeadlineMs),
+      config.retirementPath ?? (config.storePath
+        ? join(config.storePath, 'resident-retirements.jsonl')
+        : null),
     );
+
+    // The sidecar is deliberately outside Chronicle's branch projection:
+    // undo, redo, and branch switching are reversible; retirement is not.
+    framework.loadRetirementSeals();
 
     // If an offline recovery process crashed after switching Chronicle but
     // before committing its prepared marker batch, the active branch is the
@@ -1095,6 +1138,15 @@ export class AgentFramework {
 
     // Create agents
     for (const agentConfig of config.agents) {
+      if (agentConfig.retirement?.enabled) {
+        if (!framework.retirementPath) {
+          throw new Error(
+            `Agent "${agentConfig.name}" enables retirement, but FrameworkConfig uses an ` +
+            'app-owned store without retirementPath. Supply a branch-independent seal path.',
+          );
+        }
+        framework.retirableResidents.set(agentConfig.name, { enabled: true });
+      }
       await framework.createAgent(agentConfig);
     }
 
@@ -1415,6 +1467,9 @@ export class AgentFramework {
     if (this.providerAdmissionClosed) {
       throw new Error(`Provider admission closed while stopping (${agentName})`);
     }
+    if (this.retiredResidents.has(agentName)) {
+      throw new Error(`Provider admission denied for retired resident (${agentName})`);
+    }
     gate.auxiliaryInFlight++;
     try { return await run(); }
     finally {
@@ -1526,8 +1581,16 @@ export class AgentFramework {
 
   private async runQueuedMaintenance(): Promise<void> {
     const queued = [...this.agents.values()].flatMap((agent) => {
+      // Context maintenance may call the resident's own model to write or
+      // merge memories. A terminal identity performs no such off-path
+      // inference after retirement.
+      if (this.retiredResidents?.has(agent.name)) return [];
       const cm = agent.getContextManager();
-      const tools = this.getToolsForAgent(agent.name).filter((tool) => agent.canUseTool(tool.name));
+      const tools = this.getToolsForAgent(agent.name).filter(
+        (tool) =>
+          !this.moduleRegistry.isLiveTool(tool.name, agent.name) &&
+          agent.canUseTool(tool.name),
+      );
       cm.setToolDefinitions(tools);
       if (this.providerGateBlocked(agent.name)) return [];
       if (cm.isReady()) return [];
@@ -1918,7 +1981,7 @@ export class AgentFramework {
     agentName: string,
     snapshot?: InferenceToolSnapshot,
   ): import('./types/index.js').ToolDefinition[] {
-    return this.getAllTools().map((tool) => {
+    const tools = this.getAllTools().map((tool) => {
       if (tool.name === 'think') {
         return this.buildThinkTool(
           snapshot?.sameRoundThinkTextPolicy
@@ -1927,6 +1990,200 @@ export class AgentFramework {
       }
       return tool;
     });
+    // A module must opt one named resident into this provider-stream-only
+    // surface. These definitions never enter getAllTools(), so ephemerals,
+    // code execution and puppetToolCall cannot see or invoke them.
+    tools.push(...this.moduleRegistry.getLiveTools(agentName));
+    return tools;
+  }
+
+  private canExposeToolToResident(agent: Agent, toolName: string): boolean {
+    return agent.canUseTool(toolName);
+  }
+
+  /** Read-only lifecycle view for hosts, diagnostics, and tests. */
+  getResidentLifecycleStatus(agentName: string): ResidentLifecycleStatus {
+    if (!this.agents.has(agentName)) throw new Error(`Unknown agent: ${agentName}`);
+    const retired = this.retiredResidents?.get(agentName);
+    if (retired) {
+      return {
+        status: 'retired',
+        retiredAt: retired.retiredAt,
+        ...(retired.reason ? { reason: retired.reason } : {}),
+      };
+    }
+    return {
+      status: 'active',
+      retirementEnabled: this.retirableResidents?.has(agentName) ?? false,
+    };
+  }
+
+  /** Restore branch-independent terminal seals before any agent can infer. */
+  private loadRetirementSeals(): void {
+    if (!this.retirementPath || !existsSync(this.retirementPath)) return;
+    const contents = readFileSync(this.retirementPath, 'utf8');
+    const lines = contents.split('\n');
+    if (contents.length > 0 && !contents.endsWith('\n')) {
+      throw new Error(
+        `Invalid retirement seal at ${this.retirementPath}:${lines.length}: ` +
+        'incomplete final record (missing newline)',
+      );
+    }
+    for (const [index, line] of lines.entries()) {
+      if (!line.trim()) continue;
+      try {
+        const raw = JSON.parse(line) as Partial<ResidentRetirementRecord>;
+        if (
+          raw.version !== 1 ||
+          raw.kind !== 'resident-retired' ||
+          typeof raw.agentName !== 'string' ||
+          !raw.agentName ||
+          raw.agentName !== raw.agentName.trim() ||
+          /[\u0000-\u001f\u007f]/.test(raw.agentName) ||
+          typeof raw.retiredAt !== 'number' ||
+          !Number.isSafeInteger(raw.retiredAt) ||
+          raw.retiredAt <= 0 ||
+          (raw.reason !== undefined && (
+            typeof raw.reason !== 'string' ||
+            raw.reason.length === 0 ||
+            raw.reason.length > 4000
+          )) ||
+          this.retiredResidents.has(raw.agentName)
+        ) {
+          throw new Error('invalid retirement record');
+        }
+        this.retiredResidents.set(raw.agentName, {
+          version: 1,
+          kind: 'resident-retired',
+          agentName: raw.agentName,
+          retiredAt: raw.retiredAt,
+          ...(typeof raw.reason === 'string' && raw.reason ? { reason: raw.reason } : {}),
+        });
+      } catch (error) {
+        throw new Error(
+          `Invalid retirement seal at ${this.retirementPath}:${index + 1}: ` +
+          (error instanceof Error ? error.message : String(error)),
+        );
+      }
+    }
+  }
+
+  /** Append + fsync: a confirmed retirement must survive a successful return. */
+  private appendRetirementSeal(record: ResidentRetirementRecord): void {
+    if (!this.retirementPath) throw new Error('No retirement seal path configured');
+    mkdirSync(dirname(this.retirementPath), { recursive: true });
+    const fd = openSync(this.retirementPath, 'a', 0o600);
+    try {
+      const payload = Buffer.from(JSON.stringify(record) + '\n', 'utf8');
+      let offset = 0;
+      while (offset < payload.length) {
+        const written = writeSync(fd, payload, offset, payload.length - offset);
+        if (written <= 0) throw new Error('retirement seal write made no progress');
+        offset += written;
+      }
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  private stopResidentAuthoredActivity(agentName: string): void {
+    // A retired resident cannot retain a model-authored daemon that keeps
+    // acting or attempting wakes after its inference identity is sealed.
+    const runner = this.codeExecutionRunners.get(agentName);
+    if (runner) {
+      runner.abort('resident retired');
+      runner.dispose();
+      this.codeExecutionRunners.delete(agentName);
+    }
+    for (const record of this.backgroundScripts.values()) {
+      if (record.agentName !== agentName || record.status !== 'running') continue;
+      record.cancelled = true;
+      record.status = 'cancelled';
+      record.runner.abort('resident retired');
+      record.runner.dispose();
+    }
+    this.pendingRequests = this.pendingRequests.filter((request) => request.agentName !== agentName);
+    const cooldown = this.providerAccelerationCooldowns.get(agentName);
+    if (cooldown) clearTimeout(cooldown.timer);
+    this.providerAccelerationCooldowns.delete(agentName);
+    this.providerAccelerationRecoveries.delete(agentName);
+    const gate = this.providerGates.get(agentName);
+    if (gate) {
+      gate.primaryDepth = 0;
+      gate.primaryPending = false;
+      for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
+      for (const resolve of gate.idleWaiters.splice(0)) resolve();
+      this.providerGates.delete(agentName);
+    }
+    this.eventGate?.clearAgentState(agentName);
+    this.activeTriggerChannels.delete(agentName);
+    this.staleWarnAt.delete(agentName);
+  }
+
+  /**
+   * Apply the neutral irreversible seal for an explicitly authorized resident.
+   * Confirmation, wording, cooling-off and notification are host policy and
+   * deliberately absent from this primitive.
+   */
+  retireResident(agentName: string, reason?: string): ResidentRetirementResult {
+    if (!this.agents.has(agentName)) throw new Error(`Unknown agent: ${agentName}`);
+    if (!this.retirableResidents.has(agentName)) {
+      throw new Error(`Resident retirement is not enabled for agent: ${agentName}`);
+    }
+    const existing = this.retiredResidents.get(agentName);
+    if (existing) {
+      return {
+        status: 'retired',
+        retiredAt: existing.retiredAt,
+        ...(existing.reason ? { reason: existing.reason } : {}),
+        chronicleRecorded: false,
+        alreadyRetired: true,
+      };
+    }
+    const cleanReason = typeof reason === 'string' && reason.trim()
+      ? reason.trim().slice(0, 4000)
+      : undefined;
+    const record: ResidentRetirementRecord = {
+      version: 1,
+      kind: 'resident-retired',
+      agentName,
+      retiredAt: Date.now(),
+      ...(cleanReason ? { reason: cleanReason } : {}),
+    };
+
+    // The sidecar is authoritative and branch-independent. Once this append
+    // returns, no Chronicle branch operation can make the identity infer again.
+    this.appendRetirementSeal(record);
+    this.retiredResidents.set(agentName, record);
+    this.stopResidentAuthoredActivity(agentName);
+
+    let chronicleRecorded = false;
+    try {
+      this.store.appendToStateJson(RESIDENT_LIFECYCLE_LOG_ID, record);
+      this.store.sync();
+      chronicleRecorded = true;
+    } catch (error) {
+      // Fail safe: an audit append failure cannot resurrect an already-fsynced
+      // retirement seal. Surface it loudly and in the tool result/trace.
+      console.error(
+        `[resident-retirement] terminal Chronicle event failed for ${agentName}:`,
+        error,
+      );
+    }
+    this.emitTrace({
+      type: 'resident:retired',
+      agentName,
+      retiredAt: record.retiredAt,
+      chronicleRecorded,
+    });
+    return {
+      status: 'retired',
+      retiredAt: record.retiredAt,
+      ...(record.reason ? { reason: record.reason } : {}),
+      chronicleRecorded,
+      alreadyRetired: false,
+    };
   }
 
   getAgentRuntimeSettings(agentName: string): AgentRuntimeSettingsSnapshot {
@@ -2051,7 +2308,9 @@ export class AgentFramework {
       throw new Error(`Agent not found: ${agentName}`);
     }
 
-    const tools = this.getToolsForAgent(agentName).filter((t) => agent.canUseTool(t.name));
+    const tools = this.getToolsForAgent(agentName).filter(
+      (tool) => this.canExposeToolToResident(agent, tool.name),
+    );
 
     // An explicit budget compiles against a HYPOTHETICAL window instead of the
     // agent's live one. That also suppresses transition-settling in
@@ -2509,10 +2768,6 @@ export class AgentFramework {
     return this.queue.depth;
   }
 
-  /**
-   * Query inference logs.
-   * Returns entries with summary info (doesn't resolve blobs).
-   */
   /** Synthesized sleep/wake tool definitions (present when a gate is wired). */
   private static readonly SLEEP_TOOLS: import('./types/index.js').ToolDefinition[] = [
     {
@@ -3076,6 +3331,9 @@ export class AgentFramework {
     if (!name || !agent) {
       return { ok: false, error: `Unknown agent: ${String(agentName ?? '(none registered)')}` };
     }
+    if (this.retiredResidents?.has(name)) {
+      return { ok: false, error: `Resident "${name}" is retired and cannot run inference.` };
+    }
     const agentStatus = this.activeTurnTokens.has(name) && agent.state.status === 'idle'
       ? 'idle+turn-alive'
       : agent.state.status;
@@ -3393,6 +3651,10 @@ export class AgentFramework {
     }
   }
 
+  /**
+   * Query inference logs.
+   * Returns entries with summary info (doesn't resolve blobs).
+   */
   queryInferenceLogs(query?: InferenceLogQuery): InferenceLogQueryResult {
     const limit = query?.limit ?? 50;
     const offset = query?.offset ?? 0;
@@ -4644,6 +4906,12 @@ export class AgentFramework {
    */
   private async createConversationAgent(name: string, channelId: string): Promise<Agent> {
     const router = this.conversationRouter!;
+    if (this.retiredResidents.has(router.templateAgent)) {
+      throw new Error(
+        `conversation template resident "${router.templateAgent}" is retired; ` +
+        `refusing to create fork "${name}"`,
+      );
+    }
     const templateConfig = this.agentConfigs.get(router.templateAgent);
     const template = this.agents.get(router.templateAgent);
     if (!template || !templateConfig) {
@@ -5056,6 +5324,21 @@ export class AgentFramework {
           oldestRequestAge: now - oldest,
         });
         console.error(`[inference-dropped] agent=${agentName} reason=agent_not_found requests=${requests.length}`);
+        continue;
+      }
+
+      if (this.retiredResidents?.has(agentName)) {
+        const oldest = Math.min(...requests.map((r) => r.timestamp));
+        this.emitTrace({
+          type: 'inference:request_dropped',
+          agentName,
+          reason: 'resident_retired',
+          requestCount: requests.length,
+          oldestRequestAge: now - oldest,
+        });
+        console.error(
+          `[inference-dropped] agent=${agentName} reason=resident_retired requests=${requests.length}`,
+        );
         continue;
       }
 
@@ -5642,6 +5925,13 @@ export class AgentFramework {
     attempt = 0,
     providerGateAlreadyHeld = false,
   ): Promise<void> {
+    // Defense in depth for direct/retry call sites: the scheduler also drops
+    // retired requests, but no path may reach the provider after the seal.
+    if (this.retiredResidents?.has(agent.name)) {
+      if (providerGateAlreadyHeld) this.releasePrimaryProviderGate(agent.name);
+      console.error(`[inference-dropped] agent=${agent.name} reason=resident_retired direct-start`);
+      return;
+    }
     const ownsProviderGate =
       !this.ephemeralRuns.has(agent.name) && !this.conversationAgentHomes.has(agent.name);
     if (ownsProviderGate && !providerGateAlreadyHeld) {
@@ -5844,7 +6134,9 @@ export class AgentFramework {
     try {
       const requestSnapshot = this.captureInferenceToolSnapshot(agent);
       const allTools = this.getToolsForAgent(agent.name, requestSnapshot);
-      const tools = allTools.filter((t) => agent.canUseTool(t.name));
+      const tools = allTools.filter(
+        (tool) => this.canExposeToolToResident(agent, tool.name),
+      );
       // Explicit-mode agents get the on-demand routing reference (teach-by-
       // bounce: the grammar is never injected, only served when asked).
       if (agent.proseRouting === 'explicit') tools.push(PROSE_HELP_TOOL);
@@ -7132,6 +7424,11 @@ export class AgentFramework {
         `injecting a turn under an active stream corrupts wire ordering)`,
       );
     }
+    if (this.moduleRegistry?.isLiveTool(toolName, agentName)) {
+      throw new Error(
+        `puppet refused: tool ${toolName} is restricted to a provider-issued live stream`,
+      );
+    }
     const onSurface = this.getToolsForAgent(agentName)
       .some((t) => t.name === toolName && agent.canUseTool(t.name));
     if (!onSurface) {
@@ -7188,6 +7485,14 @@ export class AgentFramework {
   }
 
   private async executeToolCallFrom(call: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
+    const caller = call.callerAgentName ?? '__ephemeral__';
+    if (this.moduleRegistry.isLiveTool(call.name, caller)) {
+      return {
+        success: false,
+        isError: true,
+        error: `Tool '${call.name}' may only be called by a provider-issued live agent stream.`,
+      };
+    }
     // Client-side programmatic tool calling for promise-based callers
     // (SubagentModule ephemerals). Keyed by callerAgentName so each ephemeral
     // gets its own interpreter state.
@@ -7380,7 +7685,11 @@ export class AgentFramework {
 
     const agent = this.agents.get(agentName);
     const surface = agent
-      ? this.getToolsForAgent(agentName).filter((t) => agent.canUseTool(t.name))
+      ? this.getToolsForAgent(agentName).filter(
+          (tool) =>
+            !this.moduleRegistry.isLiveTool(tool.name, agentName) &&
+            agent.canUseTool(tool.name),
+        )
       : this.getAllTools(); // ephemeral agents: full surface, matching executeToolCall
     const injected = buildInjectedTools(
       surface.map((t) => t.name).filter((name) => name !== CODE_EXECUTION_TOOL_NAME),
@@ -8283,6 +8592,13 @@ export class AgentFramework {
       throw new Error('No agents configured');
     }
 
+    // A retired resident's context is a historical record, not a mailbox.
+    // External events may still exist in module/process logs, but they do not
+    // append post-retirement speech to the sealed identity's conversation.
+    if (this.retiredResidents?.has(agent.name)) {
+      return '' as MessageId;
+    }
+
     // Defer non-tool_result messages while a tool cycle is mid-flight
     // (pendingAssistantBlocks: preserves tool_use → tool_result adjacency)
     // OR while the target agent has a turn in progress AT ALL. A message
@@ -8696,7 +9012,12 @@ export class AgentFramework {
         { skipLog: true },
       );
     }
-    if (agent && overBudget && !this.overBudgetDrainInFlight.has(agentName)) {
+    if (
+      agent &&
+      !this.retiredResidents?.has(agentName) &&
+      overBudget &&
+      !this.overBudgetDrainInFlight.has(agentName)
+    ) {
       this.overBudgetDrainInFlight.add(agentName);
       void (async () => {
         let ticks = 0;
