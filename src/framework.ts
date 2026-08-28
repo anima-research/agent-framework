@@ -2114,8 +2114,11 @@ export class AgentFramework {
   }
 
   private agentTerminalReason(agentName: string): string | null {
-    if (this.retiredResidents.has(agentName)) return 'resident retired';
-    if (this.terminatedConversationAgents.has(agentName)) {
+    // Optional access preserves compatibility with narrow test/admin harnesses
+    // that construct a partial Framework object around one public method.
+    // Fully-created Framework instances always initialize both collections.
+    if (this.retiredResidents?.has(agentName)) return 'resident retired';
+    if (this.terminatedConversationAgents?.has(agentName)) {
       return 'template resident retired';
     }
     return null;
