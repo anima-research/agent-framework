@@ -241,6 +241,22 @@ export class ModuleRegistry {
     return tools;
   }
 
+  /** Provider-stream-only module tools for one configured resident. */
+  getLiveTools(agentName: string): ToolDefinition[] {
+    const tools: ToolDefinition[] = [];
+    for (const module of this.modules.values()) {
+      for (const tool of module.getLiveTools?.(agentName) ?? []) {
+        tools.push({ ...tool, name: `${module.name}--${tool.name}` });
+      }
+    }
+    return tools;
+  }
+
+  /** True when a name is reserved to the live-stream-only surface. */
+  isLiveTool(toolName: string, agentName: string): boolean {
+    return this.getLiveTools(agentName).some((tool) => tool.name === toolName);
+  }
+
   /**
    * All utilities from all modules, namespaced exactly like tools
    * (`module--name`). See Module.getUtilities — these are deliberately kept
