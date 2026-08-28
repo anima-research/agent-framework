@@ -8693,6 +8693,11 @@ export class AgentFramework {
           durationMs,
         });
 
+        // A live lifecycle handler may have applied an irreversible seal.
+        // The active stream was cancelled at that instant, so do not enqueue
+        // a result that could resume it or arrive as a misleading late event.
+        if (this.isAgentTerminal(agentName)) return;
+
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
@@ -8711,6 +8716,8 @@ export class AgentFramework {
           error: err.message,
           stack: err.stack,
         });
+
+        if (this.isAgentTerminal(agentName)) return;
 
         this.pushEvent({
           type: 'tool-result',

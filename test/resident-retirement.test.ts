@@ -82,7 +82,8 @@ class AlwaysQueuedStrategy implements ContextStrategy {
 class LiveOnlyModule implements Module {
   readonly name = 'resident';
   handled = 0;
-  async start(_ctx: ModuleContext): Promise<void> {}
+  context: ModuleContext | null = null;
+  async start(ctx: ModuleContext): Promise<void> { this.context = ctx; }
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] { return []; }
   getLiveTools(agentName: string): ToolDefinition[] {
@@ -93,6 +94,26 @@ class LiveOnlyModule implements Module {
   async handleToolCall(_call: ToolCall): Promise<ToolResult> {
     this.handled++;
     return { success: true, data: { ok: true } };
+  }
+  async onProcess(_event: ProcessEvent): Promise<EventResponse> { return {}; }
+}
+
+class RetiringLiveModule implements Module {
+  readonly name = 'resident';
+  handled = 0;
+  framework: AgentFramework | null = null;
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] { return []; }
+  getLiveTools(agentName: string): ToolDefinition[] {
+    return agentName === 'resident'
+      ? [{ name: 'lifecycle', description: 'retire now', inputSchema: { type: 'object' } }]
+      : [];
+  }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
+    this.handled++;
+    const retirement = this.framework!.retireResident('resident', 'live handler test');
+    return { success: true, data: retirement };
   }
   async onProcess(_event: ProcessEvent): Promise<EventResponse> { return {}; }
 }
@@ -318,6 +339,14 @@ describe('resident retirement', () => {
       maintenanceIntervalMs: 0,
     });
     try {
+      const omittedCaller = await framework.executeToolCall({
+        id: 'omitted-caller',
+        name: 'resident--lifecycle',
+        input: {},
+      });
+      assert.equal(omittedCaller.success, false);
+      assert.match(omittedCaller.error ?? '', /provider-issued live agent stream/);
+
       const forgedCaller = await framework.executeToolCall({
         id: 'forged-caller',
         name: 'resident--lifecycle',
@@ -327,6 +356,15 @@ describe('resident retirement', () => {
       assert.equal(forgedCaller.success, false);
       assert.match(forgedCaller.error ?? '', /provider-issued live agent stream/);
       assert.equal(liveModule.handled, 0, 'live-only names are globally reserved before preview');
+
+      const moduleCall = await liveModule.context!.callTool({
+        id: 'module-context-call',
+        name: 'resident--lifecycle',
+        input: {},
+      });
+      assert.equal(moduleCall.success, false);
+      assert.match(moduleCall.error ?? '', /provider-issued live agent stream/);
+      assert.equal(liveModule.handled, 0, 'trusted module provenance does not bypass live-only reservation');
 
       const preview = await framework.previewActivation('resident');
       assert.ok(preview.tools?.some((tool) => tool.name === 'resident--lifecycle'));
@@ -346,6 +384,42 @@ describe('resident retirement', () => {
       await framework.runUntilIdle();
       assert.equal(membrane.calls, 1);
       assert.equal(liveModule.handled, 1, 'the same tool dispatches from a real resident stream');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('terminates the stream when the live tool handler applies retirement', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-live-handler-retirement-'));
+    const membrane = new LiveToolMembrane();
+    const retiringModule = new RetiringLiveModule();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{
+        name: 'resident',
+        model: 'test-model',
+        systemPrompt: 'test',
+        retirement: { enabled: true },
+      }],
+      modules: [retiringModule],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    retiringModule.framework = framework;
+    try {
+      framework.nudgeAgent('resident', 'live-handler-retirement-test');
+      await framework.runUntilIdle();
+      assert.equal(retiringModule.handled, 1);
+      assert.equal(framework.getResidentLifecycleStatus('resident').status, 'retired');
+      assert.equal(membrane.calls, 1, 'the provider stream starts only once');
+      const context = await framework.getAgent('resident')!.compileContext();
+      assert.doesNotMatch(
+        JSON.stringify(context),
+        /live call completed/,
+        'the second provider round is never resumed or persisted after the seal',
+      );
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
