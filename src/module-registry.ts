@@ -252,9 +252,17 @@ export class ModuleRegistry {
     return tools;
   }
 
-  /** True when a name is reserved to the live-stream-only surface. */
-  isLiveTool(toolName: string, agentName: string): boolean {
-    return this.getLiveTools(agentName).some((tool) => tool.name === toolName);
+  /**
+   * True when a name is reserved to any live-stream-only surface.
+   *
+   * Reservation is deliberately global rather than caller-dependent: a
+   * programmatic caller must not bypass the protected boundary merely by
+   * claiming an agent for which the module does not expose the definition.
+   */
+  isLiveTool(toolName: string): boolean {
+    return this.getAgents().some((agent) =>
+      this.getLiveTools(agent.name).some((tool) => tool.name === toolName),
+    );
   }
 
   /**

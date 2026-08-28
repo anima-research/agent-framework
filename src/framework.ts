@@ -777,15 +777,18 @@ export class AgentFramework {
    *  emitting unprefixed prose can't wake-loop (notices still append). */
   private proseBounceStreaks: Map<string, number> = new Map();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
-  /** Streams the FRAMEWORK cancelled for non-terminal reasons, keyed
-   *  `${agentName}:${streamId}`: an endTurn tool result or a context-budget
-   *  restart. The membrane still delivers an `aborted` event for these, and
+  /** Streams the FRAMEWORK cancelled, keyed `${agentName}:${streamId}`: an
+   *  endTurn tool result, a context-budget restart, or a lifecycle seal. The
+   *  membrane still delivers an `aborted` event for these, and
    *  without the marker the abort handler would treat it as a terminal
    *  failure — settling ephemerals with a rejection and emitting a spurious
    *  `inference:exhausted` (which also pollutes the failure streak). Kept
-   *  separate from ephemeralRuns deliberately: endTurn/budget cancels happen
-   *  for resident agents too, and the key is per-stream, not per-agent. */
-  private frameworkCancelledStreams: Map<string, 'turn_ended' | 'budget_restart'> = new Map();
+   *  separate from ephemeralRuns deliberately: these cancellations happen
+   *  for resident/fork agents too, and the key is per-stream, not per-agent. */
+  private frameworkCancelledStreams: Map<
+    string,
+    'turn_ended' | 'budget_restart' | 'resident_retired' | 'template_retired'
+  > = new Map();
   /** Active runEphemeralToCompletion runs, keyed by agent name. */
   private ephemeralRuns: Map<string, EphemeralRun> = new Map();
   /** Per-agent count of consecutive exhausted inferences (reset on any success).
@@ -923,6 +926,12 @@ export class AgentFramework {
   private retirableResidents: Map<string, ResidentRetirementConfig> = new Map();
   /** Branch-independent terminal seals loaded from the append-only sidecar. */
   private retiredResidents: Map<string, ResidentRetirementRecord> = new Map();
+  /**
+   * Conversation forks terminated because their template resident retired.
+   * Names are generation-unique, so retaining the tombstone prevents stale
+   * public call provenance from becoming usable after the Agent is disposed.
+   */
+  private terminatedConversationAgents: Set<string> = new Set();
   /** Null only for app-owned stores whose host supplied no seal path. */
   private readonly retirementPath: string | null;
 
@@ -1588,7 +1597,7 @@ export class AgentFramework {
       const cm = agent.getContextManager();
       const tools = this.getToolsForAgent(agent.name).filter(
         (tool) =>
-          !this.moduleRegistry.isLiveTool(tool.name, agent.name) &&
+          !this.moduleRegistry.isLiveTool(tool.name) &&
           agent.canUseTool(tool.name),
       );
       cm.setToolDefinitions(tools);
@@ -2071,7 +2080,9 @@ export class AgentFramework {
   /** Append + fsync: a confirmed retirement must survive a successful return. */
   private appendRetirementSeal(record: ResidentRetirementRecord): void {
     if (!this.retirementPath) throw new Error('No retirement seal path configured');
-    mkdirSync(dirname(this.retirementPath), { recursive: true });
+    const containingDirectory = dirname(this.retirementPath);
+    mkdirSync(containingDirectory, { recursive: true });
+    const created = !existsSync(this.retirementPath);
     const fd = openSync(this.retirementPath, 'a', 0o600);
     try {
       const payload = Buffer.from(JSON.stringify(record) + '\n', 'utf8');
@@ -2085,14 +2096,55 @@ export class AgentFramework {
     } finally {
       closeSync(fd);
     }
+    // fsync(file) makes the bytes durable, but on filesystems with separate
+    // directory metadata it does not make a newly-created directory entry
+    // durable. Sync the containing directory before claiming success.
+    if (created && process.platform !== 'win32') {
+      const directoryFd = openSync(containingDirectory, 'r');
+      try {
+        fsyncSync(directoryFd);
+      } finally {
+        closeSync(directoryFd);
+      }
+    }
   }
 
-  private stopResidentAuthoredActivity(agentName: string): void {
+  private isAgentTerminal(agentName: string): boolean {
+    return this.agentTerminalReason(agentName) !== null;
+  }
+
+  private agentTerminalReason(agentName: string): string | null {
+    if (this.retiredResidents.has(agentName)) return 'resident retired';
+    if (this.terminatedConversationAgents.has(agentName)) {
+      return 'template resident retired';
+    }
+    return null;
+  }
+
+  private sealAgentInference(
+    agentName: string,
+    reason: string,
+    cancelKind: 'resident_retired' | 'template_retired',
+  ): void {
+    const agent = this.agents.get(agentName);
+    if (!agent) return;
+    if (agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
+      this.frameworkCancelledStreams.set(`${agentName}:${agent.streamId}`, cancelKind);
+    }
+    agent.abortInference(reason);
+  }
+
+  private stopResidentAuthoredActivity(
+    agentName: string,
+    reason = 'resident retired',
+    cancelKind: 'resident_retired' | 'template_retired' = 'resident_retired',
+  ): void {
+    this.sealAgentInference(agentName, reason, cancelKind);
     // A retired resident cannot retain a model-authored daemon that keeps
     // acting or attempting wakes after its inference identity is sealed.
     const runner = this.codeExecutionRunners.get(agentName);
     if (runner) {
-      runner.abort('resident retired');
+      runner.abort(reason);
       runner.dispose();
       this.codeExecutionRunners.delete(agentName);
     }
@@ -2100,7 +2152,7 @@ export class AgentFramework {
       if (record.agentName !== agentName || record.status !== 'running') continue;
       record.cancelled = true;
       record.status = 'cancelled';
-      record.runner.abort('resident retired');
+      record.runner.abort(reason);
       record.runner.dispose();
     }
     this.pendingRequests = this.pendingRequests.filter((request) => request.agentName !== agentName);
@@ -2119,6 +2171,23 @@ export class AgentFramework {
     this.eventGate?.clearAgentState(agentName);
     this.activeTriggerChannels.delete(agentName);
     this.staleWarnAt.delete(agentName);
+  }
+
+  private terminateConversationForksForTemplate(templateAgent: string): void {
+    if (!this.conversationRouter || this.conversationRouter.templateAgent !== templateAgent) return;
+    const bindings = this.conversationRouter.getBindings();
+    for (const forkName of [...this.conversationAgentHomes.keys()]) {
+      this.terminatedConversationAgents.add(forkName);
+      const binding = bindings.find((candidate) => candidate.agentName === forkName);
+      if (binding) this.conversationRouter.unbind(binding.channelId);
+      this.stopResidentAuthoredActivity(
+        forkName,
+        `template resident ${templateAgent} retired`,
+        'template_retired',
+      );
+      this.disposeConversationAgent(forkName);
+    }
+    this.persistConversationRouterState();
   }
 
   /**
@@ -2157,6 +2226,10 @@ export class AgentFramework {
     this.appendRetirementSeal(record);
     this.retiredResidents.set(agentName, record);
     this.stopResidentAuthoredActivity(agentName);
+    // Conversation forks are dependent continuations of their template, not
+    // independent ephemeral subagents. Existing forks are sealed, unbound,
+    // and disposed immediately; their Chronicle namespaces remain intact.
+    this.terminateConversationForksForTemplate(agentName);
 
     let chronicleRecorded = false;
     try {
@@ -2608,7 +2681,12 @@ export class AgentFramework {
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
 
-    const agent = new Agent(config, contextManager, this.membrane);
+    const agent = new Agent(
+      config,
+      contextManager,
+      this.membrane,
+      () => this.agentTerminalReason(config.name),
+    );
 
     const cleanup = () => {
       // Don't close the store — it's shared. Just release the CM.
@@ -3327,6 +3405,12 @@ export class AgentFramework {
     agentStatus?: string;
   } {
     const name = agentName ?? [...this.agents.keys()][0];
+    if (name && this.terminatedConversationAgents.has(name)) {
+      return {
+        ok: false,
+        error: `Conversation fork "${name}" was terminated when its template resident retired.`,
+      };
+    }
     const agent = name ? this.agents.get(name) : undefined;
     if (!name || !agent) {
       return { ok: false, error: `Unknown agent: ${String(agentName ?? '(none registered)')}` };
@@ -4198,7 +4282,12 @@ export class AgentFramework {
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
 
-    const agent = new Agent(config, contextManager, this.membrane);
+    const agent = new Agent(
+      config,
+      contextManager,
+      this.membrane,
+      () => this.agentTerminalReason(config.name),
+    );
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
     if (restoredSettings) {
       agent.restoreRuntimeSettings(
@@ -4947,7 +5036,12 @@ export class AgentFramework {
     }
 
     const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
-    const agent = new Agent(config, contextManager, this.membrane);
+    const agent = new Agent(
+      config,
+      contextManager,
+      this.membrane,
+      () => this.agentTerminalReason(name),
+    );
     this.agents.set(name, agent);
     this.agentConfigs.set(name, config);
     this.conversationAgentHomes.set(name, channelId);
@@ -5927,9 +6021,9 @@ export class AgentFramework {
   ): Promise<void> {
     // Defense in depth for direct/retry call sites: the scheduler also drops
     // retired requests, but no path may reach the provider after the seal.
-    if (this.retiredResidents?.has(agent.name)) {
+    if (this.isAgentTerminal(agent.name)) {
       if (providerGateAlreadyHeld) this.releasePrimaryProviderGate(agent.name);
-      console.error(`[inference-dropped] agent=${agent.name} reason=resident_retired direct-start`);
+      console.error(`[inference-dropped] agent=${agent.name} reason=terminal direct-start`);
       return;
     }
     const ownsProviderGate =
@@ -6198,6 +6292,11 @@ export class AgentFramework {
       // a hook/compile/stream-setup failure must not leave "typing…" stuck.
       // (Retries below restart it; stopTyping is idempotent.)
       this.channelRegistry?.stopTyping();
+      if (this.isAgentTerminal(agent.name)) {
+        agent.reset();
+        this.eventGate?.onInferenceEnded(agent.name);
+        return false;
+      }
       const err = error instanceof Error ? error : new Error(String(error));
       this.emitTrace({
         type: 'inference:failed',
@@ -6397,6 +6496,15 @@ export class AgentFramework {
 
     try {
       for await (const event of stream) {
+        // Cancellation is advisory at the Membrane seam. A provider/stream
+        // implementation may yield buffered or even successful events after
+        // cancel(); the terminal identity guard prevents any such event from
+        // invoking tools, routing prose, or entering history.
+        if (this.isAgentTerminal(agent.name)) {
+          lifecyclePhase = 'aborted';
+          this.eventGate?.onInferenceEnded(agent.name);
+          return;
+        }
         this.touchEphemeralRun(agent.name, true);
         switch (event.type) {
           case 'tokens':
@@ -7418,13 +7526,16 @@ export class AgentFramework {
   ): Promise<{ toolUseId: string; result: ToolResult }> {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    if (this.isAgentTerminal(agentName)) {
+      throw new Error(`puppet refused: agent ${agentName} is terminal`);
+    }
     if (agent.state.status !== 'idle') {
       throw new Error(
         `puppet refused: agent ${agentName} is ${agent.state.status} (requires idle — ` +
         `injecting a turn under an active stream corrupts wire ordering)`,
       );
     }
-    if (this.moduleRegistry?.isLiveTool(toolName, agentName)) {
+    if (this.moduleRegistry?.isLiveTool(toolName)) {
       throw new Error(
         `puppet refused: tool ${toolName} is restricted to a provider-issued live stream`,
       );
@@ -7453,6 +7564,12 @@ export class AgentFramework {
       callerAgentName: agentName,
     });
     const durationMs = Date.now() - started;
+
+    // Execution can await external work. If retirement raced it, never append
+    // a fabricated first-person tool exchange after the terminal seal.
+    if (this.isAgentTerminal(agentName)) {
+      throw new Error(`puppet refused: agent ${agentName} became terminal during tool execution`);
+    }
 
     // Store the pair through the same shapes the ordinary path uses. Build
     // the result blocks BEFORE storing the tool_use: the spill path awaits,
@@ -7486,7 +7603,14 @@ export class AgentFramework {
 
   private async executeToolCallFrom(call: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
     const caller = call.callerAgentName ?? '__ephemeral__';
-    if (this.moduleRegistry.isLiveTool(call.name, caller)) {
+    if (origin.kind === 'agent' && this.isAgentTerminal(caller)) {
+      return {
+        success: false,
+        isError: true,
+        error: `Agent '${caller}' is terminal and cannot execute tools.`,
+      };
+    }
+    if (this.moduleRegistry.isLiveTool(call.name)) {
       return {
         success: false,
         isError: true,
@@ -7687,7 +7811,7 @@ export class AgentFramework {
     const surface = agent
       ? this.getToolsForAgent(agentName).filter(
           (tool) =>
-            !this.moduleRegistry.isLiveTool(tool.name, agentName) &&
+            !this.moduleRegistry.isLiveTool(tool.name) &&
             agent.canUseTool(tool.name),
         )
       : this.getAllTools(); // ephemeral agents: full surface, matching executeToolCall
@@ -8395,6 +8519,16 @@ export class AgentFramework {
   }
 
   private dispatchToolCall(agentName: string, call: ToolCall): void {
+    if (this.isAgentTerminal(agentName)) {
+      this.emitTrace({
+        type: 'tool:failed',
+        module: 'framework',
+        tool: call.name,
+        callId: call.id,
+        error: `Agent '${agentName}' is terminal and cannot execute tools.`,
+      });
+      return;
+    }
     // Enrich call with caller identity so modules can resolve the calling agent
     const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
 
@@ -8524,6 +8658,16 @@ export class AgentFramework {
 
   private dispatchToolCallEvent(event: ToolCallEvent): void {
     const { call, agentName, moduleName } = event;
+    if (this.isAgentTerminal(agentName)) {
+      this.emitTrace({
+        type: 'tool:failed',
+        module: moduleName,
+        tool: call.name,
+        callId: call.id,
+        error: `Agent '${agentName}' is terminal and cannot execute tools.`,
+      });
+      return;
+    }
     this.emitTrace({
       type: 'tool:started',
       module: moduleName,

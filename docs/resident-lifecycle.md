@@ -56,6 +56,11 @@ tools, but have a stronger call boundary:
 - public `executeToolCall`, `ModuleContext.callTool`, `code_execution`, and
   `puppetToolCall` cannot invoke them.
 
+The name reservation is global: if a module exposes a namespaced tool as
+live-only for any registered resident, a programmatic caller cannot bypass the
+boundary by claiming another agent name. Exposure remains resident-specific;
+protection of the reserved name does not.
+
 The module still handles a valid live call through its ordinary
 `handleToolCall`. This lets a host own all resident-facing semantics while the
 framework enforces that administrative puppeting cannot counterfeit consent.
@@ -63,17 +68,24 @@ framework enforces that administrative puppeting cannot counterfeit consent.
 ## Terminal enforcement
 
 `retireResident` appends and fsyncs one record in
-`resident-retirements.jsonl`. That sidecar is authoritative across Chronicle
-undo, redo, and branch switching. The framework then:
+`resident-retirements.jsonl`; when creating the sidecar it also fsyncs the
+containing directory before returning. That sidecar is authoritative across
+Chronicle undo, redo, and branch switching. The framework then:
 
-- drops queued and future inference requests for the resident;
+- cancels the current yielding stream and drops queued inference requests;
+- rejects future inference through the scheduler and through public `Agent`
+  inference/streaming methods, including stale references retained by callers;
 - rejects direct starts and operator nudges;
+- rejects resident-attributed programmatic and puppet tool calls before
+  handler invocation or history append;
 - skips context-maintenance ticks that could invoke the resident's model;
 - stops resident-authored foreground/background code runners;
 - clears resident-owned gate sleep and self-wake timers, provider cooldowns,
   and queued wake state;
 - freezes the resident conversation against later message appends;
-- refuses to create a conversation fork from a retired template resident; and
+- seals, unbinds, and unregisters conversation forks already derived from the
+  retired template while preserving their Chronicle namespaces;
+- refuses to create any later conversation fork from that template; and
 - appends `framework/resident-lifecycle` in Chronicle and emits a
   `resident:retired` trace.
 
@@ -83,6 +95,12 @@ work, but any attempt to deliver a wake or append into the retired resident is
 rejected by the seal. New resident inference and new resident-authored
 background activity are denied. Hosts that want parent-scoped cancellation
 must track and cancel those ephemeral jobs before invoking `retireResident`.
+
+Conversation forks use a different policy because they are persistent,
+addressable continuations of one configured template identity. They terminate
+with that template rather than finishing independently. A stale public
+reference to such a fork remains inference-sealed, and its generation-unique
+name remains tombstoned against later tool provenance.
 
 ## Seal location and startup integrity
 
