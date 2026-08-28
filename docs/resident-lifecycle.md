@@ -69,8 +69,9 @@ framework enforces that administrative puppeting cannot counterfeit consent.
 
 `retireResident` appends and fsyncs one record in
 `resident-retirements.jsonl`; when creating the sidecar it also fsyncs the
-containing directory before returning. That sidecar is authoritative across
-Chronicle undo, redo, and branch switching. The framework then:
+containing directory and each newly created directory entry in a custom path
+before returning. That sidecar is authoritative across Chronicle undo, redo,
+and branch switching. The framework then:
 
 - cancels the current yielding stream and drops queued inference requests;
 - rejects future inference through the scheduler and through public `Agent`
