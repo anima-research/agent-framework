@@ -67,7 +67,9 @@ export interface Module {
    * Tools that may be invoked only by a provider-issued live agent stream.
    * They are excluded from public programmatic dispatch, code execution,
    * ephemeral agents, and admin puppeting. The module decides which resident
-   * names receive the surface by returning definitions for that name.
+   * names receive the surface by returning definitions for that name; once
+   * returned for any resident, the namespaced tool name is globally reserved
+   * against programmatic callers claiming a different identity.
    */
   getLiveTools?(agentName: string): ToolDefinition[];
 
