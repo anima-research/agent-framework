@@ -290,7 +290,9 @@ protected globally against forged caller identities.
 The terminal seal is append-only and branch-independent at
 `<storePath>/resident-retirements.jsonl`, so Chronicle undo/redo or a branch
 switch cannot resume the identity. Apps that supply an owned `store` must also
-supply `retirementPath`. See [Resident lifecycle](docs/resident-lifecycle.md).
+supply `retirementPath`. Newly created directories in a custom seal path are
+also fsynced through their existing ancestor. See
+[Resident lifecycle](docs/resident-lifecycle.md).
 
 ## API Server
 

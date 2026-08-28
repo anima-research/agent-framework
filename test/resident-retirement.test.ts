@@ -642,6 +642,36 @@ describe('resident retirement', () => {
     }
   });
 
+  it('durably creates a nested sidecar before appending later resident records', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-retirement-durable-create-'));
+    const storePath = join(dir, 'store');
+    const retirementPath = join(dir, 'new', 'nested', 'resident-retirements.jsonl');
+    const framework = await AgentFramework.create({
+      storePath,
+      retirementPath,
+      membrane: new RejectInferenceMembrane().asMembrane(),
+      agents: [
+        { name: 'first', model: 'test-model', systemPrompt: 'test', retirement: { enabled: true } },
+        { name: 'second', model: 'test-model', systemPrompt: 'test', retirement: { enabled: true } },
+      ],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    try {
+      framework.retireResident('first');
+      let records = readFileSync(retirementPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      assert.deepEqual(records.map((record) => record.agentName), ['first']);
+
+      framework.retireResident('second');
+      records = readFileSync(retirementPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      assert.deepEqual(records.map((record) => record.agentName), ['first', 'second']);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('requires a branch-independent seal path for app-owned stores', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-resident-retirement-owned-'));
     const store = JsStore.openOrCreate({ path: join(dir, 'store') });

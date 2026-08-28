@@ -2081,6 +2081,11 @@ export class AgentFramework {
   private appendRetirementSeal(record: ResidentRetirementRecord): void {
     if (!this.retirementPath) throw new Error('No retirement seal path configured');
     const containingDirectory = dirname(this.retirementPath);
+    const missingDirectories: string[] = [];
+    for (let cursor = containingDirectory; !existsSync(cursor); cursor = dirname(cursor)) {
+      missingDirectories.push(cursor);
+      if (dirname(cursor) === cursor) break;
+    }
     mkdirSync(containingDirectory, { recursive: true });
     const created = !existsSync(this.retirementPath);
     const fd = openSync(this.retirementPath, 'a', 0o600);
@@ -2100,11 +2105,19 @@ export class AgentFramework {
     // directory metadata it does not make a newly-created directory entry
     // durable. Sync the containing directory before claiming success.
     if (created && process.platform !== 'win32') {
-      const directoryFd = openSync(containingDirectory, 'r');
-      try {
-        fsyncSync(directoryFd);
-      } finally {
-        closeSync(directoryFd);
+      // Inner-to-outer ordering: first commit the file entry in its containing
+      // directory, then each newly-created directory entry in its parent.
+      const directoriesToSync = new Set([
+        containingDirectory,
+        ...missingDirectories.map((directory) => dirname(directory)),
+      ]);
+      for (const directory of directoriesToSync) {
+        const directoryFd = openSync(directory, 'r');
+        try {
+          fsyncSync(directoryFd);
+        } finally {
+          closeSync(directoryFd);
+        }
       }
     }
   }
