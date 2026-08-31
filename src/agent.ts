@@ -10,8 +10,8 @@ import {
 export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
-  kvSubmissionId?: string;
-  getKvWireReceipt?: () => CacheWireReceipt | undefined;
+  takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined;
+  drainKvSubmissionIds?: () => string[];
 }
 import type {
   ContextManager,
@@ -743,19 +743,19 @@ export class Agent {
       beginKvUnifiedSubmission?: (args: { submissionId: string; requestHash: string; layoutHash: string }) => void;
       isKvUnifiedEnabled?: () => boolean;
     };
-    const kvSubmissionId = receiptAware?.isKvUnifiedEnabled?.() === true
-      ? `${this.name}:${this._streamId}:${Date.now()}`
-      : undefined;
-    let kvWireReceipt: CacheWireReceipt | undefined;
-    if (kvSubmissionId) {
+    const kvEnabled = receiptAware?.isKvUnifiedEnabled?.() === true;
+    const kvQueue: Array<{ submissionId: string; wireReceipt: CacheWireReceipt }> = [];
+    let kvCall = 0;
+    if (kvEnabled) {
       const layoutHash = stableHash(request.messages);
       request.onCacheWireReceipt = (receipt) => {
-        kvWireReceipt = receipt;
+        const submissionId = `${this.name}:${this._streamId}:${Date.now()}:${kvCall++}`;
         receiptAware.beginKvUnifiedSubmission!({
-          submissionId: kvSubmissionId,
+          submissionId,
           requestHash: receipt.requestHash,
           layoutHash,
         });
+        kvQueue.push({ submissionId, wireReceipt: receipt });
       };
     }
 
@@ -775,8 +775,12 @@ export class Agent {
     return {
       stream,
       request,
-      kvSubmissionId,
-      ...(kvSubmissionId ? { getKvWireReceipt: () => kvWireReceipt } : {}),
+      ...(kvEnabled
+        ? {
+            takeKvSubmission: () => kvQueue.shift(),
+            drainKvSubmissionIds: () => kvQueue.splice(0).map((item) => item.submissionId),
+          }
+        : {}),
     };
   }
 

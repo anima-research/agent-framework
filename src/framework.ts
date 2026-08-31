@@ -5905,8 +5905,8 @@ export class AgentFramework {
       const {
         stream,
         request: compiledRequest,
-        kvSubmissionId,
-        getKvWireReceipt,
+        takeKvSubmission,
+        drainKvSubmissionIds,
       } = await agent.startStreamWithInjections(tools, injections);
 
       const handle = this.driveStream(
@@ -5917,8 +5917,8 @@ export class AgentFramework {
         attempt,
         compiledRequest,
         ownsProviderGate,
-        kvSubmissionId,
-        getKvWireReceipt,
+        takeKvSubmission,
+        drainKvSubmissionIds,
       );
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
@@ -6000,8 +6000,8 @@ export class AgentFramework {
     attempt = 0,
     compiledRequest?: NormalizedRequest,
     ownsProviderGate = false,
-    kvSubmissionId?: string,
-    getKvWireReceipt?: () => CacheWireReceipt | undefined,
+    takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined,
+    drainKvSubmissionIds?: () => string[],
   ): Promise<void> {
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
@@ -6955,7 +6955,8 @@ export class AgentFramework {
                 | { reportRealInputTokens?: (n: number) => void }
                 | undefined;
               strat?.reportRealInputTokens?.(realTotal);
-              if (kvSubmissionId) {
+              const kvSubmission = takeKvSubmission?.();
+              if (kvSubmission) {
                 (strat as {
                   reportKvUnifiedAccepted?: (args: {
                     submissionId: string;
@@ -6963,9 +6964,9 @@ export class AgentFramework {
                     wireReceipt?: CacheWireReceipt;
                   }) => void;
                 })?.reportKvUnifiedAccepted?.({
-                  submissionId: kvSubmissionId,
+                  submissionId: kvSubmission.submissionId,
                   acceptedAt: Date.now(),
-                  wireReceipt: getKvWireReceipt?.(),
+                  wireReceipt: kvSubmission.wireReceipt,
                 });
               }
             } catch { /* calibration is best-effort */ }
@@ -7032,12 +7033,15 @@ export class AgentFramework {
       agent.reset();
       this.eventGate?.onInferenceEnded(agent.name);
     } finally {
-      if (kvSubmissionId) {
+      const unsettledKvSubmissions = drainKvSubmissionIds?.() ?? [];
+      if (unsettledKvSubmissions.length > 0) {
         try {
           const strategy = agent.getContextManager().getStrategy() as unknown as {
             reportKvUnifiedFailed?: (submissionId: string) => void;
           };
-          strategy.reportKvUnifiedFailed?.(kvSubmissionId);
+          for (const submissionId of unsettledKvSubmissions) {
+            strategy.reportKvUnifiedFailed?.(submissionId);
+          }
         } catch { /* receipt cleanup must not mask inference teardown */ }
       }
       // §10.5: exactly one terminal per `started`, on every exit path the

@@ -33,10 +33,12 @@ test('agent wires immutable-prefix and exact wire receipt only for kv-unified', 
   const started = await agent.startStreamWithInjections([], undefined);
   assert.equal(started.request.cacheMarkers, 'cm-owned');
   assert.equal(typeof (compileOptions as { kvUnifiedImmutablePrefixHash?: string }).kvUnifiedImmutablePrefixHash, 'string');
-  assert.equal(typeof started.kvSubmissionId, 'string');
   started.request.onCacheWireReceipt?.({ requestHash: 'wire-hash', markers: [] });
+  const submission = started.takeKvSubmission?.();
+  assert.equal(typeof submission?.submissionId, 'string');
+  assert.equal(submission?.wireReceipt.requestHash, 'wire-hash');
   assert.deepEqual(begun, {
-    submissionId: started.kvSubmissionId,
+    submissionId: submission?.submissionId,
     requestHash: 'wire-hash',
     layoutHash: (begun as { layoutHash: string }).layoutHash,
   });
