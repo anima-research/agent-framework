@@ -1,5 +1,6 @@
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
+import { createHash } from 'node:crypto';
 import {
   toolResultDataToHistoryString,
   truncateForHistory,
@@ -9,6 +10,7 @@ import {
 export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
+  kvSubmissionId?: string;
 }
 import type {
   ContextManager,
@@ -36,6 +38,18 @@ import type {
   AgentRuntimeSettingsSnapshot,
   AgentRuntimeSettingsOverrides,
 } from './types/index.js';
+
+function stableHash(value: unknown): string {
+  const encode = (item: unknown): string => {
+    if (Array.isArray(item)) return `[${item.map(encode).join(',')}]`;
+    if (item && typeof item === 'object') {
+      const record = item as Record<string, unknown>;
+      return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${encode(record[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(item) ?? 'null';
+  };
+  return createHash('sha256').update(encode(value)).digest('hex');
+}
 
 const DEFAULT_CONTEXT_BUDGET_TOKENS = 100_000;
 const DEFAULT_TRANSITION_PACE_TOKENS = 16_000;
@@ -442,9 +456,10 @@ export class Agent {
    */
   async compileWithInjections(
     budget?: TokenBudget,
-    injections?: ContextInjection[]
+    injections?: ContextInjection[],
+    opts?: { kvUnifiedImmutablePrefixHash?: string },
   ): Promise<CompileResult> {
-    const result = await this.contextManager.compile(this.resolveBudget(budget), injections);
+    const result = await this.contextManager.compile(this.resolveBudget(budget), injections, opts);
     if (!budget) this.settleRuntimeSettingsTransition();
     return result;
   }
@@ -623,7 +638,26 @@ export class Agent {
     (this.contextManager as unknown as { setToolDefinitions?: (t: ToolDefinition[]) => void })
       .setToolDefinitions?.(availableTools);
 
-    let { messages, systemInjections } = await this.compileWithInjections(budget, injections);
+    const strategy = (this.contextManager as unknown as { getStrategy?: () => unknown })
+      .getStrategy?.() as {
+      beginKvUnifiedSubmission?: (args: { submissionId: string; requestHash: string; layoutHash: string }) => void;
+      isKvUnifiedEnabled?: () => boolean;
+    };
+    const kvUnified = strategy?.isKvUnifiedEnabled?.() === true;
+    const prospectiveSystemInjections = (injections ?? [])
+      .filter((injection) => injection.position === 'system')
+      .flatMap((injection) => injection.content);
+    const immutablePrefixHash = kvUnified
+      ? stableHash({
+          tools: availableTools.length > 0 ? availableTools : undefined,
+          system: this.buildSystemPrompt(prospectiveSystemInjections),
+        })
+      : undefined;
+    let { messages, systemInjections } = await this.compileWithInjections(
+      budget,
+      injections,
+      immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : undefined,
+    );
 
     // Sanitize: strip empty/whitespace text blocks and drop messages left with
     // no content. The Anthropic API rejects empty text blocks with 400
@@ -668,6 +702,7 @@ export class Agent {
       },
       tools: availableTools.length > 0 ? availableTools : undefined,
       promptCaching: this.promptCaching,
+      ...(kvUnified ? { cacheMarkers: 'cm-owned' as const } : {}),
       cacheTtl: this.cacheTtl,
       ...(this.prefillUserMessage && { prefillUserMessage: this.prefillUserMessage }),
       ...(this.providerParams && { providerParams: this.providerParams }),
@@ -702,6 +737,25 @@ export class Agent {
 
     const request = await this.buildActivationRequest(availableTools, injections, budget);
 
+    const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
+      .getStrategy?.() as {
+      beginKvUnifiedSubmission?: (args: { submissionId: string; requestHash: string; layoutHash: string }) => void;
+      isKvUnifiedEnabled?: () => boolean;
+    };
+    const kvSubmissionId = receiptAware?.isKvUnifiedEnabled?.() === true
+      ? `${this.name}:${this._streamId}:${Date.now()}`
+      : undefined;
+    if (kvSubmissionId) {
+      const layoutHash = stableHash(request.messages);
+      request.onCacheWireReceipt = (receipt) => {
+        receiptAware.beginKvUnifiedSubmission!({
+          submissionId: kvSubmissionId,
+          requestHash: receipt.requestHash,
+          layoutHash,
+        });
+      };
+    }
+
     const stream = this.membrane.streamYielding(request, {
       emitTokens: true,
       emitBlocks: false,
@@ -715,7 +769,7 @@ export class Agent {
     });
 
     this._state = { status: 'streaming', stream };
-    return { stream, request };
+    return { stream, request, kvSubmissionId };
   }
 
   /**

@@ -5902,7 +5902,11 @@ export class AgentFramework {
         }
       }
 
-      const { stream, request: compiledRequest } = await agent.startStreamWithInjections(tools, injections);
+      const {
+        stream,
+        request: compiledRequest,
+        kvSubmissionId,
+      } = await agent.startStreamWithInjections(tools, injections);
 
       const handle = this.driveStream(
         agent,
@@ -5912,6 +5916,7 @@ export class AgentFramework {
         attempt,
         compiledRequest,
         ownsProviderGate,
+        kvSubmissionId,
       );
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
@@ -5993,6 +5998,7 @@ export class AgentFramework {
     attempt = 0,
     compiledRequest?: NormalizedRequest,
     ownsProviderGate = false,
+    kvSubmissionId?: string,
   ): Promise<void> {
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
@@ -6946,6 +6952,14 @@ export class AgentFramework {
                 | { reportRealInputTokens?: (n: number) => void }
                 | undefined;
               strat?.reportRealInputTokens?.(realTotal);
+              if (kvSubmissionId) {
+                (strat as {
+                  reportKvUnifiedAccepted?: (args: { submissionId: string; acceptedAt?: number }) => void;
+                })?.reportKvUnifiedAccepted?.({
+                  submissionId: kvSubmissionId,
+                  acceptedAt: Date.now(),
+                });
+              }
             } catch { /* calibration is best-effort */ }
 
             this.emitTrace({
@@ -7010,6 +7024,14 @@ export class AgentFramework {
       agent.reset();
       this.eventGate?.onInferenceEnded(agent.name);
     } finally {
+      if (kvSubmissionId) {
+        try {
+          const strategy = agent.getContextManager().getStrategy() as unknown as {
+            reportKvUnifiedFailed?: (submissionId: string) => void;
+          };
+          strategy.reportKvUnifiedFailed?.(kvSubmissionId);
+        } catch { /* receipt cleanup must not mask inference teardown */ }
+      }
       // §10.5: exactly one terminal per `started`, on every exit path the
       // host controls. Which one was decided by the path taken (default
       // completed; catch → failed; framework-cancel → aborted). A host
