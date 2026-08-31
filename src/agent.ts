@@ -1,4 +1,4 @@
-import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
+import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream, CacheWireReceipt } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import {
@@ -11,6 +11,7 @@ export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
   kvSubmissionId?: string;
+  getKvWireReceipt?: () => CacheWireReceipt | undefined;
 }
 import type {
   ContextManager,
@@ -745,9 +746,11 @@ export class Agent {
     const kvSubmissionId = receiptAware?.isKvUnifiedEnabled?.() === true
       ? `${this.name}:${this._streamId}:${Date.now()}`
       : undefined;
+    let kvWireReceipt: CacheWireReceipt | undefined;
     if (kvSubmissionId) {
       const layoutHash = stableHash(request.messages);
       request.onCacheWireReceipt = (receipt) => {
+        kvWireReceipt = receipt;
         receiptAware.beginKvUnifiedSubmission!({
           submissionId: kvSubmissionId,
           requestHash: receipt.requestHash,
@@ -769,7 +772,12 @@ export class Agent {
     });
 
     this._state = { status: 'streaming', stream };
-    return { stream, request, kvSubmissionId };
+    return {
+      stream,
+      request,
+      kvSubmissionId,
+      ...(kvSubmissionId ? { getKvWireReceipt: () => kvWireReceipt } : {}),
+    };
   }
 
   /**

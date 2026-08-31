@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock, CacheWireReceipt } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
 import type {
@@ -5906,6 +5906,7 @@ export class AgentFramework {
         stream,
         request: compiledRequest,
         kvSubmissionId,
+        getKvWireReceipt,
       } = await agent.startStreamWithInjections(tools, injections);
 
       const handle = this.driveStream(
@@ -5917,6 +5918,7 @@ export class AgentFramework {
         compiledRequest,
         ownsProviderGate,
         kvSubmissionId,
+        getKvWireReceipt,
       );
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
@@ -5999,6 +6001,7 @@ export class AgentFramework {
     compiledRequest?: NormalizedRequest,
     ownsProviderGate = false,
     kvSubmissionId?: string,
+    getKvWireReceipt?: () => CacheWireReceipt | undefined,
   ): Promise<void> {
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
@@ -6954,10 +6957,15 @@ export class AgentFramework {
               strat?.reportRealInputTokens?.(realTotal);
               if (kvSubmissionId) {
                 (strat as {
-                  reportKvUnifiedAccepted?: (args: { submissionId: string; acceptedAt?: number }) => void;
+                  reportKvUnifiedAccepted?: (args: {
+                    submissionId: string;
+                    acceptedAt?: number;
+                    wireReceipt?: CacheWireReceipt;
+                  }) => void;
                 })?.reportKvUnifiedAccepted?.({
                   submissionId: kvSubmissionId,
                   acceptedAt: Date.now(),
+                  wireReceipt: getKvWireReceipt?.(),
                 });
               }
             } catch { /* calibration is best-effort */ }
