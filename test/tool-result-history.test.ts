@@ -156,3 +156,21 @@ test('RFC-005: invalid disposition value on uri-form still stubs (conservative)'
   assert.ok(/\[ref_[a-z0-9_]+\]/.test(out));
   assert.ok(!out.includes('"type":"resource"'));
 });
+
+test('RFC-005: dispatch pre-registration and stub share ONE record (reviewer probe)', async () => {
+  // register with a serverId (as dispatchMcplToolCall does), mark fetched,
+  // then serialize the block the way the history lane does.
+  const { referenceRegistry, classifyBlock } = await import('../src/mcpl/references.js');
+  const uri = 'https://host/files?path=%2Fprobe-' + Date.now() + '.wav';
+  const block = { ...RFC005_REF, uri };
+  const c = classifyBlock(block);
+  assert.equal(c.kind, 'reference');
+  const dispatchRecord = referenceRegistry.register(
+    (c as Extract<ReturnType<typeof classifyBlock>, { kind: 'reference' }>).testimony, 'srv');
+  dispatchRecord.fetchedPath = 'scratch/refs/' + dispatchRecord.refId + '.wav';
+  const out = toolResultDataToHistoryString([block]);
+  const stubId = out.match(/\[(ref_[a-z0-9_]+)\]/)?.[1];
+  assert.equal(stubId, dispatchRecord.refId, 'stub id must equal dispatch id');
+  assert.ok(out.includes('saved: scratch/refs/'), 'eager-fetched path must surface in the stub');
+  assert.equal(referenceRegistry.get(stubId!)?.serverId, 'srv', 'visible id must be server-bound');
+});

@@ -1,5 +1,6 @@
 import { join } from 'node:path';
-import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
+import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceRegistry, referenceStubOrNull } from './mcpl/references.js';
+import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
@@ -1753,7 +1754,8 @@ export class AgentFramework {
       ...gateTools,
       this.buildAgentSettingsTool(),
       ...(this.getWorkspaceModule()
-        ? [AgentFramework.SAVE_IMAGE_TOOL, AgentFramework.READ_IMAGE_TOOL]
+        ? [AgentFramework.SAVE_IMAGE_TOOL, AgentFramework.READ_IMAGE_TOOL,
+           AgentFramework.FETCH_REFERENCE_TOOL]
         : []),
       ...(this.codeExecutionConfig
         ? [buildCodeExecutionToolDefinition(this.codeExecutionConfig)]
@@ -1767,6 +1769,55 @@ export class AgentFramework {
     return module && typeof (module as WorkspaceModule).writeBinary === 'function'
       ? (module as WorkspaceModule)
       : undefined;
+  }
+
+  /** RFC-005 host-mediated reference fetcher (lazy; needs server configs +
+   *  a writable workspace mount for storage). */
+  private referenceFetcherInstance?: ReferenceFetcher;
+  private getReferenceFetcher(): ReferenceFetcher {
+    if (!this.referenceFetcherInstance) {
+      this.referenceFetcherInstance = new ReferenceFetcher(
+        (serverId) => {
+          const cfg = this.mcplServerConfigs.get(serverId);
+          if (!cfg?.url) return undefined;
+          return { url: cfg.url, token: cfg.token, autofetch: cfg.autofetch };
+        },
+        async (fileName, data, mimeType) => {
+          const workspace = this.getWorkspaceModule();
+          if (!workspace) return null;
+          const mount = this.firstWritableMountName(workspace);
+          if (!mount) return null;
+          const path = `${mount}/refs/${fileName}`;
+          const res = await workspace.writeBinary(path, data, mimeType);
+          return res.success ? path : null;
+        },
+      );
+    }
+    return this.referenceFetcherInstance;
+  }
+
+  /** Register every RFC-005 reference in a tool-result content array against
+   *  its server, then eagerly fetch the ones inside the autofetch envelope
+   *  (below the eager ceiling, connection origin — never worse than the
+   *  server having inlined the bytes). Failures are non-fatal: the stub then
+   *  says fetch_reference instead of a path. */
+  private async autoFetchReferences(content: unknown[] | undefined, serverId: string, eager: boolean): Promise<void> {
+    if (!content) return;
+    const fetcher = this.getReferenceFetcher();
+    const eligible: import('./mcpl/references.js').ReferenceRecord[] = [];
+    for (const block of content) {
+      const c = classifyBlock(block);
+      if (c.kind !== 'reference') continue;
+      const record = referenceRegistry.register(c.testimony, serverId);
+      if (eager && fetcher.isEagerEligible(record)) eligible.push(record);
+    }
+    // Parallel with a count cap: N small fetches cost one round-trip of
+    // wall-clock, and anything past the cap stays lazy (stub says so).
+    const MAX_EAGER_PER_RESULT = 8;
+    await Promise.all(eligible.slice(0, MAX_EAGER_PER_RESULT).map(async (record) => {
+      const outcome = await fetcher.fetch(record, { timeoutMs: EAGER_FETCH_TIMEOUT_MS });
+      if (!outcome.ok) console.error(`[rfc005] eager fetch of ${record.refId} failed: ${outcome.error}`);
+    }));
   }
 
   /** Core agent_settings keys — extension keys must not collide with these. */
@@ -2744,6 +2795,28 @@ export class AgentFramework {
         },
       },
       required: ['path'],
+    },
+  };
+
+  /** Synthesized fetch_reference tool — RFC-005 on-demand dereference.
+   *  Present when a workspace module is registered (storage target). */
+  private static readonly FETCH_REFERENCE_TOOL: import('./types/index.js').ToolDefinition = {
+    name: 'fetch_reference',
+    description:
+      'Fetch a referenced payload (a [ref_…] id from a tool result or event) ' +
+      'to a workspace file via the host-mediated fetcher. The fetch is ' +
+      'origin-bound to the server that sent the reference, size-capped, and ' +
+      'digest-verified when the reference carries one. Returns the workspace ' +
+      'path plus verified size/type; then use ordinary workspace tools on it. ' +
+      'Small payloads may already be fetched automatically — their stubs show ' +
+      'a saved path instead.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ref_id: { type: 'string', description: 'The reference id, e.g. "ref_1a_x9z2".' },
+        max_bytes: { type: 'number', description: 'Optional per-call byte ceiling (default host policy).' },
+      },
+      required: ['ref_id'],
     },
   };
 
@@ -7807,6 +7880,21 @@ export class AgentFramework {
       return `Error: ${result.error ?? 'tool call failed'}`;
     }
     if (result.data === undefined) return '';
+    // RFC-005 "eagerly lazy": a script receiving a result is the strongest
+    // available signal that the bytes are wanted (scripts process, they do
+    // not browse) — materialize every referenced payload now, so the stub
+    // the script receives carries a workspace path it can open directly.
+    if (Array.isArray(result.data)) {
+      const fetcher = this.getReferenceFetcher();
+      for (const block of result.data) {
+        const c = classifyBlock(block);
+        if (c.kind !== 'reference') continue;
+        const record = referenceRegistry.findByUri(c.testimony.uri)
+          ?? referenceRegistry.register(c.testimony);
+        const outcome = await fetcher.fetch(record);
+        if (!outcome.ok) console.error(`[rfc005] script-demand fetch of ${record.refId} failed: ${outcome.error}`);
+      }
+    }
     // Scripts get (nearly) full data — the script environment IS the spill:
     // filtering big results in code is the whole point. 5MB protocol safety
     // cap only; no context-cap truncation, no file spill.
@@ -8143,6 +8231,11 @@ export class AgentFramework {
 
     if (enrichedCall.name === 'read_image') {
       this.dispatchReadImageToolCall(agentName, enrichedCall);
+      return;
+    }
+
+    if (enrichedCall.name === 'fetch_reference') {
+      this.dispatchFetchReferenceToolCall(agentName, enrichedCall);
       return;
     }
 
@@ -10352,6 +10445,13 @@ export class AgentFramework {
     }
 
     server.sendToolsCall(toolName, args, stateParams)
+      .then(async (result) => {
+        // RFC-005: register references and eagerly fetch the small ones
+        // before serialization, so their stubs carry a saved path.
+        await this.autoFetchReferences(result.content, serverId, true)
+          .catch((e) => console.error('[rfc005] autofetch error:', (e as Error).message));
+        return result;
+      })
       .then((result) => {
         const durationMs = Date.now() - startTime;
         this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, durationMs });
@@ -10797,6 +10897,43 @@ export class AgentFramework {
    * blocks) delivers the actual image to the model; history storage keeps
    * the standard compact `[image: …]` placeholder.
    */
+  /** RFC-005 on-demand dereference: [ref id] → workspace file, via the
+   *  origin-bound, ceiling-bounded, digest-verified host fetcher. */
+  private dispatchFetchReferenceToolCall(agentName: string, call: ToolCall): void {
+    this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
+    const startTime = Date.now();
+    void (async () => {
+      const args = (call.input ?? {}) as Record<string, unknown>;
+      const refId = String(args.ref_id ?? '');
+      const record = referenceRegistry.get(refId);
+      let result: { success: boolean; data?: string; error?: string; isError?: boolean };
+      if (!record) {
+        // Vector 20: a stale or unknown id is a defined miss, never a
+        // different record.
+        result = { success: false, isError: true,
+          error: `unknown reference: ${refId || '(missing ref_id)'} — it may have been evicted; ids are never reused` };
+      } else {
+        const maxBytes = typeof args.max_bytes === 'number'
+          ? Math.min(args.max_bytes, DEFAULT_FETCH_MAX_BYTES) : undefined;
+        const outcome = await this.getReferenceFetcher().fetch(record, { maxBytes });
+        result = outcome.ok
+          ? { success: true, data: JSON.stringify({ path: outcome.path, bytes: outcome.bytes,
+              mime_type: outcome.mimeType, digest_verified: outcome.digestVerified ?? 'no digest claimed' }) }
+          : { success: false, isError: true, error: outcome.error };
+      }
+      this.emitTrace({
+        type: result.isError ? 'tool:failed' : 'tool:completed',
+        module: 'workspace', tool: call.name, callId: call.id,
+        durationMs: Date.now() - startTime,
+        ...(result.isError ? { error: result.error } : {}),
+      });
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, agentName, moduleName: 'workspace',
+        result: { ...result, isError: result.isError ?? false },
+      });
+    })();
+  }
+
   private dispatchReadImageToolCall(agentName: string, call: ToolCall): void {
     this.emitTrace({ type: 'tool:started', module: 'workspace', tool: call.name, callId: call.id, input: call.input });
     const finish = (result: ToolResult): void => {

@@ -167,6 +167,11 @@ export interface ReferenceRecord {
   serverId?: string;
   testimony: ReferenceTestimony;
   receivedAt: number;
+  /** Set by the host-mediated fetcher after a successful, verified fetch. */
+  fetchedPath?: string;
+  verifiedBytes?: number;
+  verifiedMimeType?: string;
+  digestVerified?: boolean;
 }
 
 const MAX_RECORDS = 2000;
@@ -184,34 +189,44 @@ const MAX_RECORDS = 2000;
  */
 export class ReferenceRegistry {
   private records = new Map<string, ReferenceRecord>();
-  /** (serverId|uri) → refId: repeated references to the same payload share a
-   *  record, so the id a model sees is stable across serializations (each
-   *  tool result is serialized twice: native wire + history) and across
-   *  repeated mentions — RFC §5's "stable for the life of the session". */
+  /** uri → refId. The uri ALONE is the identity key: stub sites (the two
+   *  tool-result serializers and the three converters) are free functions
+   *  with no server context, while dispatch-time pre-registration carries a
+   *  serverId — keying on both split every reference into two records, the
+   *  model-visible one unbound (fetch_reference failed on it) and the bound
+   *  one invisible. One key, and a later registration that knows the server
+   *  UPGRADES the record's binding instead of forking it. If two servers ever
+   *  reference the same uri, the first binding wins (the record's serverId
+   *  feeds the origin check, which fails closed on a mismatch). */
   private byKey = new Map<string, string>();
   private counter = 0;
 
-  private key(uri: string, serverId?: string): string {
-    return `${serverId ?? '?'}|${uri}`;
-  }
-
   register(testimony: ReferenceTestimony, serverId?: string): ReferenceRecord {
-    const k = this.key(testimony.uri, serverId);
-    const existingId = this.byKey.get(k);
+    const existingId = this.byKey.get(testimony.uri);
     if (existingId !== undefined) {
       const existing = this.records.get(existingId);
-      if (existing) return existing;
+      if (existing) {
+        if (serverId !== undefined && existing.serverId === undefined) {
+          existing.serverId = serverId;
+        }
+        // Refresh testimony while unfetched: a re-issued reference with a new
+        // digest/expiry supersedes the stale claims. Once fetched, the record
+        // describes verified bytes on disk and keeps the testimony they were
+        // verified against.
+        if (!existing.fetchedPath) existing.testimony = testimony;
+        return existing;
+      }
     }
     const refId = `ref_${(++this.counter).toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
     const record: ReferenceRecord = { refId, serverId, testimony, receivedAt: Date.now() };
     this.records.set(refId, record);
-    this.byKey.set(k, refId);
+    this.byKey.set(testimony.uri, refId);
     if (this.records.size > MAX_RECORDS) {
       const oldest = this.records.keys().next().value;
       if (oldest !== undefined) {
         const old = this.records.get(oldest);
         this.records.delete(oldest);
-        if (old) this.byKey.delete(this.key(old.testimony.uri, old.serverId));
+        if (old) this.byKey.delete(old.testimony.uri);
       }
     }
     return record;
@@ -219,6 +234,12 @@ export class ReferenceRegistry {
 
   get(refId: string): ReferenceRecord | undefined {
     return this.records.get(refId);
+  }
+
+  /** Find the record for a uri. */
+  findByUri(uri: string): ReferenceRecord | undefined {
+    const id = this.byKey.get(uri);
+    return id !== undefined ? this.records.get(id) : undefined;
   }
 }
 
@@ -244,6 +265,13 @@ export function buildReferenceStub(t: ReferenceTestimony, provenance?: string, s
   if (t.sizeBytes !== undefined) meta.push(`${formatSizeBytes(t.sizeBytes)} claimed`);
   if (meta.length) parts.push(meta.join(', '));
   if (provenance) parts.push(sanitizeLabel(provenance, STUB_FIELD_CHARS));
+  if (record.fetchedPath) {
+    // Already materialized by the host-mediated fetcher: hand the model the
+    // workspace path (host-generated, §7.3) so existing tools just work.
+    parts.push(`saved: ${sanitizeLabel(record.fetchedPath, 256)}`);
+  } else {
+    parts.push('fetch with fetch_reference');
+  }
   return `[${record.refId}] ${parts.join(' — ') || 'referenced content'}`;
 }
 

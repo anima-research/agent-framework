@@ -374,6 +374,10 @@ export interface McplServerConfig {
    * Chronicle and changed with channel_open/channel_close.
    */
   channelSubscription?: 'auto' | 'manual' | string[];
+  /** RFC-005 autofetch envelope for this server: per-fetch eager ceiling and
+   *  cumulative per-server byte budget (reference-fetcher.ts defaults apply
+   *  when absent). */
+  autofetch?: { maxBytes?: number; maxTotalBytes?: number };
 }
 
 // ============================================================================
