@@ -6,6 +6,7 @@ import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
+import type { CacheWireReceipt } from './kv-unified-wire.js';
 import type {
   MessageId,
   MessageMetadata,
@@ -83,6 +84,7 @@ import {
   CODE_EXECUTION_TOOL_NAME,
 } from './code-execution/tool-definition.js';
 import { splitProseSegments } from './prose-segments.js';
+import { cumulativeDelta } from './usage-accounting.js';
 
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
@@ -5976,7 +5978,12 @@ export class AgentFramework {
         }
       }
 
-      const { stream, request: compiledRequest } = await agent.startStreamWithInjections(tools, injections);
+      const {
+        stream,
+        request: compiledRequest,
+        takeKvSubmission,
+        drainKvSubmissionIds,
+      } = await agent.startStreamWithInjections(tools, injections);
 
       const handle = this.driveStream(
         agent,
@@ -5986,6 +5993,8 @@ export class AgentFramework {
         attempt,
         compiledRequest,
         ownsProviderGate,
+        takeKvSubmission,
+        drainKvSubmissionIds,
       );
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
@@ -6067,10 +6076,22 @@ export class AgentFramework {
     attempt = 0,
     compiledRequest?: NormalizedRequest,
     ownsProviderGate = false,
+    takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined,
+    drainKvSubmissionIds?: () => string[],
   ): Promise<void> {
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
+    // Membrane usage events are cumulative across the native/XML tool loop.
+    // Keep the previous cumulative sample so consumers that operate at the
+    // physical provider-call boundary (estimator calibration and kv receipt
+    // acceptance) see this call only, not an ever-growing turn total.
+    let previousUsage = {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheCreationTokens: 0,
+      cacheReadTokens: 0,
+    };
     // This turn's alive-marker, set at startAgentStream entry. Safe to read
     // from the map here: the turn-alive busy check in processInferenceRequests
     // means no successor turn can have replaced it while we compiled.
@@ -7009,18 +7030,61 @@ export class AgentFramework {
             // loop (5 calls x ~160k reported as 884k), which is not a
             // window-shaped number and drove the multiplier to 2.37 before
             // the guards caught it.
+            const cumulativeUsage = {
+              inputTokens: event.usage.inputTokens ?? 0,
+              outputTokens: event.usage.outputTokens ?? 0,
+              cacheCreationTokens: event.usage.cacheCreationTokens ?? 0,
+              cacheReadTokens: event.usage.cacheReadTokens ?? 0,
+            };
+            const perCallUsage = {
+              inputTokens: cumulativeDelta(cumulativeUsage.inputTokens, previousUsage.inputTokens),
+              outputTokens: cumulativeDelta(cumulativeUsage.outputTokens, previousUsage.outputTokens),
+              cacheCreationTokens: cumulativeDelta(
+                cumulativeUsage.cacheCreationTokens,
+                previousUsage.cacheCreationTokens,
+              ),
+              cacheReadTokens: cumulativeDelta(
+                cumulativeUsage.cacheReadTokens,
+                previousUsage.cacheReadTokens,
+              ),
+            };
+            previousUsage = cumulativeUsage;
+            const strat = (agent as unknown as {
+              getContextManager?: () => { getStrategy?: () => unknown };
+            }).getContextManager?.()?.getStrategy?.() as
+              | {
+                  reportRealInputTokens?: (n: number) => void;
+                  reportKvUnifiedAccepted?: (args: {
+                    submissionId: string;
+                    acceptedAt?: number;
+                    wireReceipt?: CacheWireReceipt;
+                  }) => void;
+                  reportKvUnifiedFailed?: (submissionId: string) => void;
+                }
+              | undefined;
             try {
               const realTotal =
-                (event.usage.inputTokens ?? 0) +
-                (event.usage.cacheCreationTokens ?? 0) +
-                (event.usage.cacheReadTokens ?? 0);
-              const strat = (agent as unknown as {
-                getContextManager?: () => { getStrategy?: () => unknown };
-              }).getContextManager?.()?.getStrategy?.() as
-                | { reportRealInputTokens?: (n: number) => void }
-                | undefined;
+                perCallUsage.inputTokens +
+                perCallUsage.cacheCreationTokens +
+                perCallUsage.cacheReadTokens;
               strat?.reportRealInputTokens?.(realTotal);
             } catch { /* calibration is best-effort */ }
+
+            const kvSubmission = takeKvSubmission?.();
+            if (kvSubmission) {
+              try {
+                strat?.reportKvUnifiedAccepted?.({
+                  submissionId: kvSubmission.submissionId,
+                  acceptedAt: Date.now(),
+                  wireReceipt: kvSubmission.wireReceipt,
+                });
+              } catch {
+                // The queue item has already been consumed. Explicitly close
+                // the receipt flight so one persistence error cannot wedge
+                // every later provider call on this branch.
+                try { strat?.reportKvUnifiedFailed?.(kvSubmission.submissionId); } catch { /* teardown only */ }
+              }
+            }
 
             this.emitTrace({
               type: 'inference:usage',
@@ -7084,6 +7148,17 @@ export class AgentFramework {
       agent.reset();
       this.eventGate?.onInferenceEnded(agent.name);
     } finally {
+      const unsettledKvSubmissions = drainKvSubmissionIds?.() ?? [];
+      if (unsettledKvSubmissions.length > 0) {
+        try {
+          const strategy = agent.getContextManager().getStrategy() as unknown as {
+            reportKvUnifiedFailed?: (submissionId: string) => void;
+          };
+          for (const submissionId of unsettledKvSubmissions) {
+            strategy.reportKvUnifiedFailed?.(submissionId);
+          }
+        } catch { /* receipt cleanup must not mask inference teardown */ }
+      }
       // §10.5: exactly one terminal per `started`, on every exit path the
       // host controls. Which one was decided by the path taken (default
       // completed; catch → failed; framework-cancel → aborted). A host

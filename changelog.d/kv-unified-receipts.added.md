@@ -1,0 +1,2 @@
+- Wire `kv-unified` immutable-prefix identity and caller-owned cache markers through activation requests, and commit context presentation/cache receipts only after the corresponding provider call is accepted.
+- Calibrate context estimates from per-provider-call usage deltas instead of cumulative tool-loop totals.
