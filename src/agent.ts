@@ -1,6 +1,7 @@
-import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream, CacheWireReceipt } from '@animalabs/membrane';
+import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
+import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import {
   toolResultDataToHistoryString,
   truncateForHistory,
@@ -460,7 +461,9 @@ export class Agent {
     injections?: ContextInjection[],
     opts?: { kvUnifiedImmutablePrefixHash?: string },
   ): Promise<CompileResult> {
-    const result = await this.contextManager.compile(this.resolveBudget(budget), injections, opts);
+    const result = await this.contextManager.compile(
+      this.resolveBudget(budget), injections, opts as never,
+    );
     if (!budget) this.settleRuntimeSettingsTransition();
     return result;
   }
@@ -748,7 +751,8 @@ export class Agent {
     let kvCall = 0;
     if (kvEnabled) {
       const layoutHash = stableHash(request.messages);
-      request.onCacheWireReceipt = (receipt) => {
+      const kvRequest = request as NormalizedRequest & KvUnifiedRequestHooks;
+      kvRequest.onCacheWireReceipt = (receipt) => {
         const submissionId = `${this.name}:${this._streamId}:${Date.now()}:${kvCall++}`;
         receiptAware.beginKvUnifiedSubmission!({
           submissionId,

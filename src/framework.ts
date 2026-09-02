@@ -1,9 +1,10 @@
 import { join } from 'node:path';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock, CacheWireReceipt } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
+import type { CacheWireReceipt } from './kv-unified-wire.js';
 import type {
   MessageId,
   MessageMetadata,

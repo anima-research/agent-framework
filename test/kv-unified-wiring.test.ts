@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { Agent } from '../src/agent.js';
 import type { ContextManager } from '@animalabs/context-manager';
 import type { Membrane } from '@animalabs/membrane';
+import type { KvUnifiedRequestHooks } from '../src/kv-unified-wire.js';
 
 test('agent wires immutable-prefix and exact wire receipt only for kv-unified', async () => {
   let compileOptions: unknown;
@@ -31,9 +32,10 @@ test('agent wires immutable-prefix and exact wire receipt only for kv-unified', 
     membrane,
   );
   const started = await agent.startStreamWithInjections([], undefined);
-  assert.equal(started.request.cacheMarkers, 'cm-owned');
+  const kvRequest = started.request as typeof started.request & KvUnifiedRequestHooks;
+  assert.equal(kvRequest.cacheMarkers, 'cm-owned');
   assert.equal(typeof (compileOptions as { kvUnifiedImmutablePrefixHash?: string }).kvUnifiedImmutablePrefixHash, 'string');
-  started.request.onCacheWireReceipt?.({ requestHash: 'wire-hash', markers: [] });
+  kvRequest.onCacheWireReceipt?.({ requestHash: 'wire-hash', markers: [] });
   const submission = started.takeKvSubmission?.();
   assert.equal(typeof submission?.submissionId, 'string');
   assert.equal(submission?.wireReceipt.requestHash, 'wire-hash');
@@ -61,6 +63,6 @@ test('agent leaves marker ownership unchanged for non-kv strategies', async () =
     {} as Membrane,
   );
   const request = await agent.buildActivationRequest([]);
-  assert.equal(request.cacheMarkers, undefined);
+  assert.equal((request as typeof request & KvUnifiedRequestHooks).cacheMarkers, undefined);
   assert.equal(compileOptions, undefined);
 });
