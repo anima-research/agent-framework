@@ -8,6 +8,7 @@
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
+import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './references.js';
 
 import type {
   McplContentBlock,
@@ -51,12 +52,22 @@ export interface McplPushEvent {
  * Convert a single MCPL wire-format content block to a membrane ContentBlock.
  * Same logic as hook-orchestrator.ts.
  */
-function convertBlock(block: McplContentBlock): ContentBlock {
+export function convertBlock(block: McplContentBlock): ContentBlock {
   switch (block.type) {
     case 'text':
       return { type: 'text', text: block.text };
 
     case 'image':
+      if (isInlineContradiction(block)) {
+        // RFC-005 vector 2: inline data claiming bulk disposition — fail
+        // closed, withhold the data (checked BEFORE the data branch).
+        return { type: 'text', text: INLINE_WITHHELD_TEXT };
+      }
+      if (block.uri && block.disposition) {
+        // RFC-005 uri-form media with a disposition claim: stub, do not
+        // hand the URI to the provider or inline it.
+        return { type: 'text', text: referenceStubOrNull(block, 'attachment on push event') ?? '[reference]' };
+      }
       if (block.data && block.mimeType) {
         return {
           type: 'image',
@@ -72,6 +83,16 @@ function convertBlock(block: McplContentBlock): ContentBlock {
       return { type: 'text', text: '[Image: no data]' };
 
     case 'audio':
+      if (isInlineContradiction(block)) {
+        // RFC-005 vector 2: inline data claiming bulk disposition — fail
+        // closed, withhold the data (checked BEFORE the data branch).
+        return { type: 'text', text: INLINE_WITHHELD_TEXT };
+      }
+      if (block.uri && block.disposition) {
+        // RFC-005 uri-form media with a disposition claim: stub, do not
+        // hand the URI to the provider or inline it.
+        return { type: 'text', text: referenceStubOrNull(block, 'attachment on push event') ?? '[reference]' };
+      }
       if (block.data && block.mimeType) {
         return {
           type: 'audio',
@@ -81,7 +102,14 @@ function convertBlock(block: McplContentBlock): ContentBlock {
       return { type: 'text', text: '[Audio: no data]' };
 
     case 'resource':
-      return { type: 'text', text: `[Resource: ${block.uri}]` };
+      // RFC-005: reference blocks become bounded stubs — never raw URIs
+      // (a signed URL is a bearer credential that looks like a location).
+      return { type: 'text', text: referenceStubOrNull(block, 'attachment on push event') ?? '[reference]' };
+
+    default:
+      // Unknown wire block types previously fell off the exhaustive switch
+      // and propagated `undefined` into ContentBlock[]. Fail visibly.
+      return { type: 'text', text: `[unrecognized content block: ${(block as { type?: string }).type ?? 'untyped'}]` };
   }
 }
 

@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
@@ -7925,6 +7926,11 @@ export class AgentFramework {
     for (const raw of data) {
       if (!raw || typeof raw !== 'object') return null;
       const b = raw as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
+      if (isInlineContradiction(b)) {
+        // RFC-005 vector 2: withhold inline data claiming bulk disposition.
+        blocks.push({ type: 'text', text: INLINE_WITHHELD_TEXT });
+        continue;
+      }
       if (b.type === 'text' && typeof b.text === 'string') {
         let text = b.text;
         if (maxChars && text.length > maxChars) {
@@ -7940,6 +7946,13 @@ export class AgentFramework {
           type: 'image',
           source: { type: 'base64', data: b.data, mediaType: b.mimeType },
         });
+      } else if (b.type === 'resource' || ((b.type === 'image' || b.type === 'audio') && typeof (b as { uri?: unknown }).uri === 'string')) {
+        // RFC-005 reference block → bounded stub. Previously this bailed the
+        // whole array to JSON, which both inlined the reference verbatim and
+        // demoted any adjacent image block to stringified base64.
+        const stub = referenceStubOrNull(b, 'from tool result');
+        if (stub === null) return null;
+        blocks.push({ type: 'text', text: stub });
       } else {
         return null; // unknown shape — bail to JSON path
       }

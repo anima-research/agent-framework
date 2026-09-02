@@ -72,6 +72,12 @@ export interface McplImageContent {
   mimeType?: string;
   /** URI reference (present when using URI form) */
   uri?: string;
+  /** RFC-005 reference testimony (uri form only). */
+  sizeBytes?: number;
+  digest?: string;
+  expiresAt?: string;
+  name?: string;
+  disposition?: 'never' | 'ref';
 }
 
 export interface McplAudioContent {
@@ -82,12 +88,25 @@ export interface McplAudioContent {
   mimeType?: string;
   /** URI reference (present when using URI form) */
   uri?: string;
+  /** RFC-005 reference testimony (uri form only). */
+  sizeBytes?: number;
+  digest?: string;
+  expiresAt?: string;
+  name?: string;
+  disposition?: 'never' | 'ref';
 }
 
 export interface McplResourceContent {
   type: 'resource';
   /** Resource URI (e.g., "memory://facts/12345") */
   uri: string;
+  /** RFC-005 §3 reference testimony (all optional, all server claims). */
+  mimeType?: string;
+  sizeBytes?: number;
+  digest?: string;
+  expiresAt?: string;
+  name?: string;
+  disposition?: 'never' | 'ref';
 }
 
 // ============================================================================
@@ -1233,4 +1252,10 @@ export interface McpToolResultContent {
   data?: string;
   mimeType?: string;
   uri?: string;
+  /** RFC-005 §3 reference testimony (uri form only; server claims). */
+  sizeBytes?: number;
+  digest?: string;
+  expiresAt?: string;
+  name?: string;
+  disposition?: 'never' | 'ref';
 }

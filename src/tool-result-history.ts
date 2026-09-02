@@ -15,6 +15,7 @@
  */
 
 import { safeSlice } from './safe-slice.js';
+import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
 
 /**
  * House-safe default inline cap (chars) for tool results, error results, and
@@ -61,10 +62,20 @@ function tryHistoryStringFromContentArray(data: unknown): string | null {
     const b = raw as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
     if (b.type === 'text' && typeof b.text === 'string') {
       parts.push(b.text);
+    } else if (isInlineContradiction(b)) {
+      // RFC-005 vector 2: checked before the data branch so inline data
+      // claiming bulk disposition is withheld, not rendered.
+      parts.push(INLINE_WITHHELD_TEXT);
     } else if (b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string') {
       // Decoded byte estimate from base64 length (3/4 ratio, rounded).
       const approxBytes = Math.floor(b.data.length * 3 / 4);
       parts.push(`[image: ${b.mimeType}, ${formatSize(approxBytes)}]`);
+    } else if (b.type === 'resource' || ((b.type === 'image' || b.type === 'audio') && typeof (b as { uri?: unknown }).uri === 'string')) {
+      // RFC-005 reference block: a bounded stub, never the raw block JSON
+      // (which used to inline the URI — and the whole array — into history).
+      const stub = referenceStubOrNull(b, 'from tool result');
+      if (stub === null) return null;
+      parts.push(stub);
     } else {
       return null;
     }

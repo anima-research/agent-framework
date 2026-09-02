@@ -85,3 +85,74 @@ test('null entry in array falls back to JSON', () => {
 test('empty array: empty string', () => {
   assert.equal(toolResultDataToHistoryString([]), '');
 });
+
+// ── RFC-005 bulk content references (vst-mcpl is the live emitter) ──
+
+const RFC005_REF = {
+  type: 'resource',
+  uri: 'https://mythoss-mac-mini.tail01efee.ts.net/files?path=%2Fchord.wav',
+  mimeType: 'audio/wav',
+  sizeBytes: 4233704,
+  digest: 'sha256:' + 'A'.repeat(43),
+  name: 'chord.wav',
+  disposition: 'never',
+};
+
+test('RFC-005 resource block becomes a stub, never JSON, never the URI', () => {
+  const data = [
+    { type: 'text', text: '{"peak":0.6}' },
+    RFC005_REF,
+  ];
+  const out = toolResultDataToHistoryString(data);
+  assert.ok(out.includes('{"peak":0.6}'));
+  assert.ok(out.includes('chord.wav') && out.includes('audio/wav'), out);
+  assert.ok(/\[ref_[a-z0-9_]+\]/.test(out), 'stub must carry a reference id');
+  assert.ok(!out.includes('mythoss-mac-mini'), 'raw URI leaked under disposition:never');
+  assert.ok(!out.includes('"type":"resource"'), 'raw block JSON leaked');
+});
+
+test('RFC-005: oversized metadata cannot inflate the history string (vector 17)', () => {
+  const data = [{ ...RFC005_REF, name: 'x'.repeat(1_000_000) }];
+  const out = toolResultDataToHistoryString(data);
+  assert.ok(out.length < 600, `stub is ${out.length} chars`);
+});
+
+test('RFC-005: uri-form audio with disposition stubs like a resource', () => {
+  const data = [{ type: 'audio', uri: 'https://x/y.wav', sizeBytes: 10, disposition: 'ref' }];
+  const out = toolResultDataToHistoryString(data);
+  assert.ok(/\[ref_[a-z0-9_]+\]/.test(out));
+  assert.ok(!out.includes('https://x/y.wav'), 'default policy is the opaque id');
+});
+
+test('RFC-005: invalid sizeBytes is dropped as a field, block still stubs (vector 15)', () => {
+  const data = [{ ...RFC005_REF, sizeBytes: -1 }];
+  const out = toolResultDataToHistoryString(data);
+  assert.ok(/\[ref_[a-z0-9_]+\]/.test(out));
+  assert.ok(!out.includes('claimed'), 'rejected sizeBytes must not be rendered');
+  assert.ok(!out.includes('mythoss-mac-mini'), 'never survives field rejection');
+});
+
+test('RFC-005 vector 2: inline data claiming bulk disposition is withheld', () => {
+  const fakeBase64 = 'A'.repeat(4096);
+  const data = [{ type: 'image', data: fakeBase64, mimeType: 'image/png', disposition: 'never' }];
+  const out = toolResultDataToHistoryString(data);
+  assert.ok(out.includes('withheld'), out.slice(0, 120));
+  assert.ok(!out.includes(fakeBase64), 'inline data leaked through bulk disposition');
+  assert.ok(!out.includes('[image:'), 'must not render as a normal image');
+});
+
+test('RFC-005: reference ids are stable across serializations (§5)', () => {
+  const data = [RFC005_REF];
+  const id = (s: string) => s.match(/\[(ref_[a-z0-9_]+)\]/)?.[1];
+  const first = id(toolResultDataToHistoryString(data));
+  const second = id(toolResultDataToHistoryString(data));
+  assert.ok(first, 'no ref id in stub');
+  assert.equal(first, second, 'same reference must keep one id (wire + history serialize twice)');
+});
+
+test('RFC-005: invalid disposition value on uri-form still stubs (conservative)', () => {
+  const data = [{ ...RFC005_REF, disposition: 'inline-ok' }];
+  const out = toolResultDataToHistoryString(data);
+  assert.ok(/\[ref_[a-z0-9_]+\]/.test(out));
+  assert.ok(!out.includes('"type":"resource"'));
+});
