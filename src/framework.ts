@@ -126,8 +126,24 @@ const SILENCING_TOOLS = new Set([
   'skip_reply', 'channel_publish', 'send_message', 'reply_message', 'send_dm',
 ]);
 
-/** World-surface publication names that outrank hybrid prose envelopes. */
-const HYBRID_PUBLICATION_TOOLS = new Set(['say', 'whisper']);
+/**
+ * World-surface publication tools (Eidoverse `say` / `whisper`). An explicit
+ * world utterance is the resident's chosen public speech for that round, so
+ * it silences adjacent auto-routed prose exactly like a channel send — in
+ * EVERY prose-routing mode. Until 2026-09-01 this set was consulted only in
+ * hybrid mode; in locus mode a round of ordinary text + `say` published twice
+ * (Cairn world seq 15146 = the say text, 15147 = the adjacent prose,
+ * byte-for-byte). Hybrid additionally lets these outrank a same-round
+ * `>>>destination` envelope.
+ */
+const WORLD_PUBLICATION_TOOLS = new Set(['say', 'whisper']);
+
+/** True when a tool call (possibly MCPL-prefixed) is an explicit delivery
+ *  that silences the round's auto-routed prose, regardless of mode. */
+const isSilencingTool = (name: string): boolean => {
+  const bare = bareToolName(name);
+  return SILENCING_TOOLS.has(bare) || WORLD_PUBLICATION_TOOLS.has(bare);
+};
 
 /**
  * True when an injected message is real conversational input — something the
@@ -6257,10 +6273,7 @@ export class AgentFramework {
               const hasSameRoundPrivateThink =
                 roundToolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
-              if (roundToolNames.some((n) =>
-                SILENCING_TOOLS.has(bareToolName(n)) ||
-                (agent.proseRouting === 'hybrid' && HYBRID_PUBLICATION_TOOLS.has(bareToolName(n)))
-              )) {
+              if (roundToolNames.some(isSilencingTool)) {
                 turnSilenced = true;
               }
               if (roundContent && roundContent.length > 0) {
@@ -6675,10 +6688,7 @@ export class AgentFramework {
                 .filter((n): n is string => typeof n === 'string');
               const silenced = liveProseRouting
                 ? turnSilenced
-                : turnSilenced || toolNames.some((n) =>
-                  SILENCING_TOOLS.has(bareToolName(n)) ||
-                  (agent.proseRouting === 'hybrid' && HYBRID_PUBLICATION_TOOLS.has(bareToolName(n)))
-                );
+                : turnSilenced || toolNames.some(isSilencingTool);
 
               const segments = splitProseSegments(liveProseRouting ? terminalContent : response.content);
 

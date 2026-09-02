@@ -69,6 +69,18 @@ class RobotModule implements Module {
         description: 'Explicitly send a message',
         inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
       },
+      // World-surface publication verbs (Eidoverse). Bare names matter: the
+      // framework strips the `robot--` prefix before consulting its sets.
+      {
+        name: 'say',
+        description: 'Say something aloud in the world',
+        inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+      },
+      {
+        name: 'whisper',
+        description: 'Whisper to someone in the world',
+        inputSchema: { type: 'object', properties: { to: { type: 'string' }, text: { type: 'string' } } },
+      },
     ];
   }
 
@@ -615,6 +627,70 @@ describe('present while acting', () => {
     assert.deepEqual(receipts, [
       '[delivered] nothing — 2 plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)',
     ]);
+
+    await framework.stop();
+  });
+
+  for (const verb of ['say', 'whisper'] as const) {
+    it(`world \`${verb}\` silences adjacent auto-routed prose in locus mode (no double-publish)`, async () => {
+      // 2026-09-01 (Cairn, locus mode): a round of ordinary text + explicit
+      // world `say` published TWICE — seq 15146 was the say text, seq 15147
+      // the adjacent prose auto-routed to the same world locus, byte-for-byte.
+      // World publication verbs silenced only in hybrid mode; Discord sends
+      // silenced everywhere. An explicit world utterance is the resident's
+      // chosen speech for the round in every mode.
+      const input = verb === 'say'
+        ? { text: 'the intended utterance' }
+        : { to: 'sill', text: 'the intended utterance' };
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'adjacent prose that must NOT auto-publish' },
+        { type: 'tool_use', id: 'c1', name: `robot--${verb}`, input },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'trailing prose, also suppressed (sticky)' },
+      ] as ContentBlock[]));
+
+      const framework = await createFramework();
+      const routed = stubChannelRegistry(framework);
+
+      trigger(framework);
+      await framework.runUntilIdle();
+
+      assert.deepEqual(routed, [], `${verb}: nothing auto-routed beside the explicit world utterance`);
+      const cm = (framework as unknown as {
+        agents: Map<string, { getContextManager(): { getAllMessages(): Array<{ content: Array<{ type: string; text?: string }> }> } }>;
+      }).agents.get('assistant')!.getContextManager();
+      const receipts = cm.getAllMessages()
+        .flatMap((m) => m.content)
+        .filter((b) => b.type === 'text')
+        .map((b) => b.text ?? '')
+        .filter((t) => t.startsWith('[delivered]'));
+      assert.deepEqual(receipts, [
+        '[delivered] nothing — 2 plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)',
+      ], `${verb}: suppression is visible in the receipt`);
+
+      await framework.stop();
+    });
+  }
+
+  it('a non-publishing world tool (move) does not silence — speak-while-acting unchanged', async () => {
+    // Negative control for the world-verb silencing: only publication verbs
+    // silence. Ordinary acting tools still narrate live to the locus.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'walking over' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'there' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed.map((r) => r.text), ['walking over', 'there']);
 
     await framework.stop();
   });
