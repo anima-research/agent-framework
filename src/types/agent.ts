@@ -9,6 +9,41 @@ export type SameRoundThinkTextPolicySource =
   | 'compatibility_default';
 
 /**
+ * Opt-in authorization for the framework's neutral irreversible retirement
+ * primitive. Resident-facing policy and confirmation belong to the host.
+ *
+ * Retirement is distinct from ending a turn, sleeping, and deleting data:
+ * it permanently denies future inference for this resident while leaving its
+ * Chronicle and workspace data intact. The agent confirms its own request in
+ * a separate inference turn; no human approval callback is involved.
+ */
+export interface ResidentRetirementConfig {
+  /** Permit a host to seal this configured resident through retireResident(). */
+  enabled: boolean;
+}
+
+/** Durable public view of a resident's lifecycle. */
+export type ResidentLifecycleStatus =
+  | {
+      status: 'active';
+      retirementEnabled: boolean;
+    }
+  | {
+      status: 'retired';
+      retiredAt: number;
+      reason?: string;
+    };
+
+/** Result of applying (or observing) the irreversible resident seal. */
+export interface ResidentRetirementResult {
+  status: 'retired';
+  retiredAt: number;
+  reason?: string;
+  chronicleRecorded: boolean;
+  alreadyRetired: boolean;
+}
+
+/**
  * Configuration for an agent.
  */
 export interface AgentConfig {
@@ -30,6 +65,12 @@ export interface AgentConfig {
    * - string[]: specific tool names (with module prefix)
    */
   allowedTools?: 'all' | string[];
+
+  /**
+   * Optional resident-controlled irreversible retirement. This applies only
+   * to configured residents, never ephemeral or per-channel fork agents.
+   */
+  retirement?: ResidentRetirementConfig;
 
   /**
    * Which modules can trigger inference for this agent.

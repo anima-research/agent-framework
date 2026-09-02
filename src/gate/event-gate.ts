@@ -1493,6 +1493,28 @@ export class EventGate {
     }
   }
 
+  /**
+   * Forget process-local wake state owned by a terminal resident. Global
+   * debounce policies remain live for other residents; any later evaluation
+   * aimed at this name is still rejected by the framework's durable seal.
+   */
+  clearAgentState(agentName: string): void {
+    this.inferring.delete(agentName);
+    const selfWake = this.selfWakeTimers.get(agentName);
+    if (selfWake) {
+      clearTimeout(selfWake);
+      this.selfWakeTimers.delete(agentName);
+    }
+    if (this.sleepAgent === agentName) {
+      if (this.sleepTimer) clearTimeout(this.sleepTimer);
+      this.sleepTimer = null;
+      this.sleepUntil = 0;
+      this.sleepNote = undefined;
+      this.sleepAgent = undefined;
+      this.sleepSuppressed = 0;
+    }
+  }
+
   /** Live inference-gating snapshot for diagnostics (e.g. a SIGUSR2 dump).
    *  A non-empty `inferring` with a stale timestamp + growing `bufferedEvents`
    *  is the signature of the wake-wedge: an agent stuck mid-"inference" so all

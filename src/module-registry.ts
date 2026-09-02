@@ -241,6 +241,30 @@ export class ModuleRegistry {
     return tools;
   }
 
+  /** Provider-stream-only module tools for one configured resident. */
+  getLiveTools(agentName: string): ToolDefinition[] {
+    const tools: ToolDefinition[] = [];
+    for (const module of this.modules.values()) {
+      for (const tool of module.getLiveTools?.(agentName) ?? []) {
+        tools.push({ ...tool, name: `${module.name}--${tool.name}` });
+      }
+    }
+    return tools;
+  }
+
+  /**
+   * True when a name is reserved to any live-stream-only surface.
+   *
+   * Reservation is deliberately global rather than caller-dependent: a
+   * programmatic caller must not bypass the protected boundary merely by
+   * claiming an agent for which the module does not expose the definition.
+   */
+  isLiveTool(toolName: string): boolean {
+    return this.getAgents().some((agent) =>
+      this.getLiveTools(agent.name).some((tool) => tool.name === toolName),
+    );
+  }
+
   /**
    * All utilities from all modules, namespaced exactly like tools
    * (`module--name`). See Module.getUtilities — these are deliberately kept

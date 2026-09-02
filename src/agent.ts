@@ -105,11 +105,14 @@ export class Agent {
   private runtimeSettingsOverrides: AgentRuntimeSettingsOverrides = {};
   private contextManager: ContextManager;
   private membrane: Membrane;
+  /** Framework-owned terminal-state view for this Agent identity. */
+  private readonly inferenceSealReason: () => string | null;
 
   constructor(
     config: AgentConfig,
     contextManager: ContextManager,
-    membrane: Membrane
+    membrane: Membrane,
+    inferenceSealReason?: () => string | null,
   ) {
     this.name = config.name;
     this.model = config.model;
@@ -126,6 +129,7 @@ export class Agent {
     this.prefillUserMessage = config.prefillUserMessage;
     this.providerParams = config.providerParams;
     this.sameRoundThinkTextPolicy = config.sameRoundThinkTextPolicy;
+    this.inferenceSealReason = inferenceSealReason ?? (() => null);
     this.maxStreamTokens = config.maxStreamTokens ?? 150_000;
     this.physicalWindowTokens = config.physicalWindowTokens;
     this.contextBudgetTokens = config.contextBudgetTokens;
@@ -475,6 +479,7 @@ export class Agent {
     budget?: TokenBudget,
     options?: InferenceOptions
   ): Promise<InferenceResult> {
+    this.assertInferenceAllowed();
     if (this._state.status === 'inferring') {
       throw new Error(`Agent ${this.name} is already inferring`);
     }
@@ -488,6 +493,9 @@ export class Agent {
 
     // Compile context (with optional injections)
     const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
+    // Compilation may await maintenance work. Re-check immediately before
+    // building/starting the provider request so a concurrent seal wins.
+    this.assertInferenceAllowed();
 
     // If we have pending tool results, add them
     if (this._state.status === 'ready') {
@@ -684,6 +692,7 @@ export class Agent {
     injections?: ContextInjection[],
     budget?: TokenBudget
   ): Promise<StartStreamResult> {
+    this.assertInferenceAllowed();
     if (this._state.status !== 'idle') {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
     }
@@ -701,6 +710,9 @@ export class Agent {
     this.lastStreamOutputTokens = 0;
 
     const request = await this.buildActivationRequest(availableTools, injections, budget);
+    // Hooks/context compilation above may yield while retirement is sealed.
+    // Never let a stale public Agent reference start a provider afterward.
+    this.assertInferenceAllowed();
 
     const stream = this.membrane.streamYielding(request, {
       emitTokens: true,
@@ -740,6 +752,9 @@ export class Agent {
    * Called by framework when stream completes.
    */
   addAssistantResponse(content: ContentBlock[]): void {
+    // A provider that ignores cancellation may still yield a late completion.
+    // The seal is authoritative: no post-seal model output enters history.
+    if (this.inferenceSealReason() !== null) return;
     // A turn whose entire output is thinking blocks produced NOTHING: no
     // speech, no tool call. That is what a refusal looks like on the wire —
     // the provider returns signed thinking (often with empty text, the
@@ -811,6 +826,20 @@ export class Agent {
     this._state = { status: 'idle' };
   }
 
+  /** True once inference for this Agent identity has been irreversibly sealed. */
+  get inferenceSealed(): boolean {
+    return this.inferenceSealReason() !== null;
+  }
+
+  private assertInferenceAllowed(): void {
+    const reason = this.inferenceSealReason();
+    if (reason !== null) {
+      throw new Error(
+        `Agent ${this.name} inference is permanently disabled: ${reason}`,
+      );
+    }
+  }
+
   /**
    * Get the context manager.
    */
@@ -859,6 +888,20 @@ export class Agent {
     signal?: AbortSignal
   ): Promise<InferenceResult> {
     const response = await this.membrane.stream(request, { signal });
+
+    // AbortController is advisory; a provider implementation may resolve a
+    // successful response after cancellation. Discard it without mutating
+    // history when an irreversible seal landed while the request was active.
+    const sealReason = this.inferenceSealReason();
+    if (sealReason !== null) {
+      return {
+        toolCalls: [],
+        speechContent: [],
+        stopReason: 'abort',
+        aborted: true,
+        abortReason: sealReason,
+      };
+    }
 
     if (isAbortedResponse(response)) {
       const partialContent = response.partialContent ?? [];

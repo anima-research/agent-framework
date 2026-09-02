@@ -187,6 +187,15 @@ export type TraceEvent =
   | (TraceEventBase & { type: 'module:added'; moduleName: string })
   | (TraceEventBase & { type: 'module:removed'; moduleName: string })
 
+  // Resident lifecycle
+  | (TraceEventBase & {
+      type: 'resident:retired';
+      agentName: string;
+      retiredAt: number;
+      /** Whether the terminal lifecycle event was also appended to Chronicle. */
+      chronicleRecorded: boolean;
+    })
+
   // Inference request health
   | (TraceEventBase & {
       type: 'inference:request_dropped';
