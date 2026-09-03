@@ -310,4 +310,12 @@ export interface InferenceRequest {
    * not capture the agent's voice just by being newest.
    */
   addressed?: boolean;
+  /**
+   * Who spoke the message that triggered this inference, as an adapter-
+   * namespaced opaque id (`<serverId>:user:<authorId>`) — never a display
+   * name. Undefined for wakes without an author (heartbeat, timers, module
+   * events). Read by the host to stamp gateway telemetry (x-gate-counterparty)
+   * so a household ledger can say who woke whom; carries no content.
+   */
+  counterparty?: string;
 }
