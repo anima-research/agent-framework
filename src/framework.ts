@@ -5282,19 +5282,27 @@ export class AgentFramework {
       // newest (2026-07-21 Cairn lounge misroute, turn-start variant).
       // Non-channel wakes (heartbeats, module events, reactions — which never
       // carry channelId) leave both undefined → global fallback.
-      let ambientChannel: string | undefined;
-      let addressedChannel: string | undefined;
+      // Track the winning REQUEST, not just its channel: channel, addressed
+      // and counterparty must come from the same message, or a batch of
+      // "ambient from A, then addressed from B" would report B's channel
+      // with A's author (review finding on the provenance change).
+      let ambientReq: InferenceRequest | undefined;
+      let addressedReq: InferenceRequest | undefined;
       for (const r of requests) {
         if (!r.channelId) continue;
-        ambientChannel = r.channelId;
-        if (r.addressed) addressedChannel = r.channelId;
+        ambientReq = r;
+        if (r.addressed) addressedReq = r;
       }
-      const triggerChannel = addressedChannel ?? ambientChannel;
-      const triggerAddressed = addressedChannel !== undefined;
+      const channelReq = addressedReq ?? ambientReq;
       await this.startAgentStream(agent, {
         ...trigger,
-        channelId: triggerChannel,
-        addressed: triggerAddressed,
+        channelId: channelReq?.channelId,
+        addressed: addressedReq !== undefined,
+        // A context-budget restart continues the same logical turn: it keeps
+        // the channel for routing but names no author — the restart is its
+        // own cause, and borrowing another request's author would be false
+        // provenance.
+        counterparty: budgetRestart ? undefined : channelReq?.counterparty,
       });
     }
   }
