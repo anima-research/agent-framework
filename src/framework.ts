@@ -2678,14 +2678,25 @@ export class AgentFramework {
       properties: {
         channelId: { type: 'string' },
         mode: { type: 'string', enum: ['enter', 'cancel'], description: 'Default: enter.' },
-        cadenceSeconds: { type: 'number', description: `Summary cadence (default ${TUNE_OUT_DEFAULTS.cadenceSeconds}s).` },
-        backlogCap: { type: 'number', description: `Max raw messages delivered at cancel (default ${TUNE_OUT_DEFAULTS.backlogCap}).` },
-        maxWakes: { type: 'number', description: `Wake budget before auto-cancel (default ${TUNE_OUT_DEFAULTS.maxWakes}).` },
+        cadenceSeconds: {
+          type: 'number',
+          description: `Summary cadence in seconds (default ${TUNE_OUT_DEFAULTS.cadenceSeconds}; floors at 30).`,
+        },
+        backlogCap: {
+          type: 'number',
+          description:
+            `Max raw messages delivered at cancel (default ${TUNE_OUT_DEFAULTS.backlogCap}). ` +
+            '0 = deliver no raw backlog at all: your subconscious\'s report is the whole delivery.',
+        },
+        maxWakes: {
+          type: 'number',
+          description: `Wake budget before auto-cancel (default ${TUNE_OUT_DEFAULTS.maxWakes}; floors at 1).`,
+        },
         durationSeconds: {
           type: 'number',
           description:
             'Optional bounded duration: the tune-out auto-cancels (backlog ' +
-            'delivered) after this many seconds. Unset = until cancelled.',
+            'delivered) after this many seconds; floors at 60. Unset = until cancelled.',
         },
       },
       required: ['channelId'],
