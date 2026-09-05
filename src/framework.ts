@@ -860,6 +860,19 @@ export class AgentFramework {
   // (KV bust). Invariant: nothing enters the window between a turn's dequeue
   // and its settle except that turn's own blocks.
   private activeTurnTokens: Map<string, number> = new Map();
+  /**
+   * The InferenceRequest that started each agent's turn in progress — set and
+   * cleared exactly where the turn token is. Read-only outside: the host
+   * stamps gateway telemetry (why this call exists, in which channel, woken
+   * by whom) from it, so a household ledger can attribute wakes without
+   * guessing from the newest message in the window.
+   */
+  private activeTurnTriggers: Map<string, InferenceRequest | undefined> = new Map();
+
+  /** The trigger of `agentName`'s turn in progress, if a turn is running. */
+  getActiveTurnTrigger(agentName: string): InferenceRequest | undefined {
+    return this.activeTurnTriggers.get(agentName);
+  }
   private nextTurnToken = 1;
 
   // Undo/redo state
@@ -2569,6 +2582,7 @@ export class AgentFramework {
       // unbounded map growth. Blind delete is safe: the agent is already out
       // of the map, and a late driveStream finally token-match no-ops.
       this.activeTurnTokens.delete(agent.name);
+      this.activeTurnTriggers.delete(agent.name);
     }
   }
 
@@ -4621,6 +4635,7 @@ export class AgentFramework {
           // Route this turn's auto-published speech back to THIS channel, not
           // the global most-recent-inbound locus (item-3 redux, trunk agents).
           channelId: event.channelId,
+          counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
           // Addressed messages outrank ambient chatter when a batched wake
           // picks the turn's frozen speech locus.
           addressed,
@@ -4722,6 +4737,7 @@ export class AgentFramework {
         // A fork's home channel wins in routeSpeech regardless, but carry the
         // triggering channel too so the trunk/active path stays consistent.
         channelId: event.channelId,
+        counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
         addressed: isAddressedMessage(event.tags, event.metadata),
       });
     }
@@ -5266,19 +5282,27 @@ export class AgentFramework {
       // newest (2026-07-21 Cairn lounge misroute, turn-start variant).
       // Non-channel wakes (heartbeats, module events, reactions — which never
       // carry channelId) leave both undefined → global fallback.
-      let ambientChannel: string | undefined;
-      let addressedChannel: string | undefined;
+      // Track the winning REQUEST, not just its channel: channel, addressed
+      // and counterparty must come from the same message, or a batch of
+      // "ambient from A, then addressed from B" would report B's channel
+      // with A's author (review finding on the provenance change).
+      let ambientReq: InferenceRequest | undefined;
+      let addressedReq: InferenceRequest | undefined;
       for (const r of requests) {
         if (!r.channelId) continue;
-        ambientChannel = r.channelId;
-        if (r.addressed) addressedChannel = r.channelId;
+        ambientReq = r;
+        if (r.addressed) addressedReq = r;
       }
-      const triggerChannel = addressedChannel ?? ambientChannel;
-      const triggerAddressed = addressedChannel !== undefined;
+      const channelReq = addressedReq ?? ambientReq;
       await this.startAgentStream(agent, {
         ...trigger,
-        channelId: triggerChannel,
-        addressed: triggerAddressed,
+        channelId: channelReq?.channelId,
+        addressed: addressedReq !== undefined,
+        // A context-budget restart continues the same logical turn: it keeps
+        // the channel for routing but names no author — the restart is its
+        // own cause, and borrowing another request's author would be false
+        // provenance.
+        counterparty: budgetRestart ? undefined : channelReq?.counterparty,
       });
     }
   }
@@ -5778,12 +5802,14 @@ export class AgentFramework {
     // no-ops instead of clobbering a successor's marker.
     const turnToken = this.nextTurnToken++;
     this.activeTurnTokens.set(agent.name, turnToken);
+    this.activeTurnTriggers.set(agent.name, trigger);
     let tokenHandedOff = false;
     try {
       tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate);
     } finally {
       if (!tokenHandedOff && this.activeTurnTokens.get(agent.name) === turnToken) {
         this.activeTurnTokens.delete(agent.name);
+        this.activeTurnTriggers.delete(agent.name);
       }
       if (!tokenHandedOff && ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
     }
@@ -6035,6 +6061,7 @@ export class AgentFramework {
         // the eventGate `inferring` leak) — every exit path must clear it.
         if (this.activeTurnTokens.get(agent.name) === turnToken) {
           this.activeTurnTokens.delete(agent.name);
+          this.activeTurnTriggers.delete(agent.name);
         }
         this.settleAgent(agent.name, {
           stopReason: 'exhausted',
@@ -7213,6 +7240,7 @@ export class AgentFramework {
       // injection / teardown delivers the messages at a correct position.
       if (myTurnToken !== undefined && this.activeTurnTokens.get(agent.name) === myTurnToken) {
         this.activeTurnTokens.delete(agent.name);
+        this.activeTurnTriggers.delete(agent.name);
       }
 
       // Flush any deferred messages (e.g. if stream failed while tools were pending)
