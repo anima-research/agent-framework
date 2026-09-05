@@ -53,6 +53,38 @@ class ToolThenFrameworkRetryMembrane {
   asMembrane(): import('@animalabs/membrane').Membrane { return this as unknown as import('@animalabs/membrane').Membrane; }
 }
 
+class LateCompletionAfterIdleStream implements YieldingStream {
+  private events: StreamEvent[] = [];
+  private wake: (() => void) | null = null;
+  get isWaitingForTools() { return false; }
+  get pendingToolCallIds() { return []; }
+  get toolDepth() { return 0; }
+  provideToolResults(): void {}
+  cancel(): void { /* Simulate a provider that ignores cancellation and terminates later. */ }
+  constructor() {
+    setTimeout(() => {
+      this.events.push({ type: 'complete', response: createMockResponse([{ type: 'text', text: 'late answer' }] as ContentBlock[]) } as StreamEvent);
+      this.wake?.(); this.wake = null;
+    }, 120);
+  }
+  async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    yield { type: 'tokens', content: 'partial', meta: { type: 'text', visible: true, blockIndex: 0 } } as StreamEvent;
+    while (true) {
+      while (this.events.length) {
+        const event = this.events.shift()!;
+        yield event;
+        if (event.type === 'complete') return;
+      }
+      await new Promise<void>((resolve) => { this.wake = resolve; });
+    }
+  }
+}
+class LateCompletionAfterIdleMembrane {
+  async complete(): Promise<NormalizedResponse> { throw new Error('not used'); }
+  streamYielding(): YieldingStream { return new LateCompletionAfterIdleStream(); }
+  asMembrane(): import('@animalabs/membrane').Membrane { return this as unknown as import('@animalabs/membrane').Membrane; }
+}
+
 class RetryingWrapperMembrane {
   readonly response = createMockResponse([{ type: 'text', text: '<mcpl--heartbeat--heartbeat_status>\n</mcpl--heartbeat--heartbeat_status>' }] as ContentBlock[]);
   async complete(_request: NormalizedRequest): Promise<NormalizedResponse> { return this.response; }
@@ -416,6 +448,33 @@ describe('tool wrapper prose guard integration', () => {
     internals.store = goodStore;
     const retried = await internals.createConversationAgent('trunk-chan-g1', 'world:chan');
     assert.equal(retried.name, 'trunk-chan-g1');
+    await framework.stop();
+  });
+
+
+  it('idle-disposed ephemeral stops typing and finalizes every started outgoing stream', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-idle-terminal-')); dirs.push(dir);
+    const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: new LateCompletionAfterIdleMembrane().asMembrane(), agents: [], modules: [] });
+    const events: string[] = [];
+    (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+      resolveLocus: () => 'world:test',
+      startTyping: (channel: string) => events.push(`start:${channel}`),
+      stopTyping: (channel?: string) => events.push(`stop:${channel ?? '(all)'}`),
+      routeSpeech: async () => ({ delivered: true, channelId: 'world:test' }),
+      sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => events.push(`chunk:${delta}`),
+      sendOutgoingComplete: (_channel: string, _agent: string, _id: string, text: string) => events.push(`complete:${text}`),
+      getDefaultPublishChannel: () => 'world:test', isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
+      resolveProseTarget: () => ({ channelId: 'world:test' }),
+    }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
+    const created = await framework.createEphemeralAgent({ name: 'idle-terminal', model: 'test', systemPrompt: 'sys', allowedTools: 'all' });
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'go' }]);
+    const run = framework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 500, idleTimeoutMs: 20, idlePollMs: 5 });
+    framework.start();
+    await assert.rejects(run, /stalled/);
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    assert.ok(events.includes('stop:(all)'), 'disposer-owned frame stops typing');
+    assert.ok(events.some((event) => event.startsWith('chunk:')), 'probe actually opened an outgoing stream');
+    assert.ok(events.some((event) => event.startsWith('complete:')), 'every started outgoing stream receives a terminal complete');
     await framework.stop();
   });
 

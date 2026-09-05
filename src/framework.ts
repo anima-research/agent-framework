@@ -795,6 +795,10 @@ export class AgentFramework {
   private usedEphemeralAgentNames: Set<string> = new Set();
   /** One-shot generation tickets minted by createEphemeralAgent. */
   private ephemeralCandidates: WeakMap<Agent, ContextManager> = new WeakMap();
+  /** Physical ephemeral frames deliberately disposed by their run watchdog/caller.
+   * The name is single-generation, so these frames still own their terminal
+   * typing/outgoing close even after runEphemeralToCompletion deregisters them. */
+  private disposedEphemeralFrames: WeakSet<Agent> = new WeakSet();
   /** Per-agent count of consecutive exhausted inferences (reset on any success).
    *  Drives hard-down escalation — see noteInferenceExhausted. */
   private consecutiveInferenceFailures: Map<string, number> = new Map();
@@ -2616,6 +2620,10 @@ export class AgentFramework {
     } finally {
       if (startupWatchdog) clearTimeout(startupWatchdog);
       if (completionWatchdog) clearInterval(completionWatchdog);
+      // Mark before cancellation: an adapter may synchronously settle its
+      // iterator, and this physical frame still owns terminal typing/outgoing
+      // closure even though the ephemeral name is about to be deregistered.
+      this.disposedEphemeralFrames.add(agent);
       // Cancel before deregistration. Adapters may still yield a queued event;
       // driveStream's Agent-identity check above discards it before dispatch.
       agent.cancelStream();
@@ -7369,7 +7377,13 @@ export class AgentFramework {
       // runEphemeralToCompletion may already have deregistered the name. The
       // terminal frame still owns its typing/outgoing completion unless it was
       // genuinely superseded or handed EventGate liveness to a budget restart.
-      const frameReachedTerminal = !generationLost && !preserveEventGateForSuccessor;
+      const disposedEphemeralWithoutSuccessor =
+        generationLost &&
+        this.disposedEphemeralFrames.has(agent) &&
+        !this.agents.has(agent.name);
+      const frameReachedTerminal =
+        (!generationLost || disposedEphemeralWithoutSuccessor) &&
+        !preserveEventGateForSuccessor;
       // §10.5: exactly one terminal per `started`, on every exit path the
       // host controls. Which one was decided by the path taken (default
       // completed; catch → failed; framework-cancel → aborted). A host
