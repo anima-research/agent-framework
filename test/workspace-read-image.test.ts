@@ -331,6 +331,15 @@ test('valid tiny PNG, JPEG, GIF, and WebP return native image content with exact
   }
 });
 
+test('JPEG with trailing pad bytes after EOI is accepted (hardware encoders pad to 4-byte boundary)', async (t) => {
+  const { mountDir, workspace } = setupWorkspace(t);
+  // Raspberry Pi camera stills end `ff d9 00 00 00`; decoders stop at EOI.
+  const padded = { mimeType: 'image/jpeg', bytes: Buffer.concat([TINY_IMAGES.jpeg.bytes, Buffer.from([0x00, 0x00, 0x00])]) };
+  writeFileSync(join(mountDir, 'padded.jpg'), padded.bytes);
+  const result = await callReadImage(workspace, 'work/padded.jpg');
+  expectImageResult(result, 'work/padded.jpg', padded);
+});
+
 test('pre-existing Chronicle binary blob is preferred even when the filesystem file is absent', async (t) => {
   const { mountDir, store, workspace, treeStateId } = setupWorkspace(t);
   const image = TINY_IMAGES.png;
