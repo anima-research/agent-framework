@@ -369,4 +369,54 @@ describe('tool wrapper prose guard integration', () => {
     assert.equal(receiptText, '[tool-boundary] No tool was called.');
     assert.ok(!receiptText.includes('heartbeat'), 'receipt does not echo the tool name or wrapper syntax');
   });
+
+  it('successful ephemeral completion stops typing and finalizes outgoing after caller disposal', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-ephemeral-terminal-')); dirs.push(dir);
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary ephemeral answer.' }] as ContentBlock[]));
+    const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(), agents: [], modules: [] });
+    const typing: string[] = [];
+    const outgoing: Array<[string, string]> = [];
+    (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+      resolveLocus: () => 'world:test',
+      startTyping: (channel: string) => typing.push(`start:${channel}`),
+      stopTyping: (channel?: string) => typing.push(`stop:${channel ?? '(all)'}`),
+      routeSpeech: async () => ({ delivered: true, channelId: 'world:test' }),
+      sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => outgoing.push(['chunk', delta]),
+      sendOutgoingComplete: (_channel: string, _agent: string, _id: string, text: string) => outgoing.push(['complete', text]),
+      getDefaultPublishChannel: () => 'world:test', isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
+      resolveProseTarget: () => ({ channelId: 'world:test' }),
+    }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
+    const created = await framework.createEphemeralAgent({ name: 'ephemeral-terminal', model: 'test', systemPrompt: 'sys', allowedTools: 'all' });
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'go' }]);
+    const run = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+    framework.start();
+    assert.deepEqual(await run, { speech: 'Ordinary ephemeral answer.', toolCallsCount: 0 });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(typing.includes('stop:(all)'), 'terminal physical frame stops typing after ephemeral caller disposal');
+    assert.ok(outgoing.some(([kind, text]) => kind === 'complete' && text === 'Ordinary ephemeral answer.'), 'terminal physical frame finalizes outgoing stream');
+    await framework.stop();
+  });
+
+  it('releases a conversation name reservation after transient creation failure', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-conversation-retry-')); dirs.push(dir);
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'trunk', model: 'test', systemPrompt: 'sys' }], modules: [],
+      conversations: { templateAgent: 'trunk', bind: { channel: 'mention' } },
+    });
+    const internals = framework as unknown as { store: Record<PropertyKey, unknown>; createConversationAgent(name: string, channelId: string): Promise<{ name: string }> };
+    const goodStore = internals.store;
+    internals.store = new Proxy(goodStore, { get(target, prop) {
+      if (prop === 'getMessages' || prop === 'appendMessage' || prop === 'getStateJson') throw new Error('transient store failure');
+      const value = Reflect.get(target, prop);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    await assert.rejects(internals.createConversationAgent('trunk-chan-g1', 'world:chan'), /transient store failure/);
+    internals.store = goodStore;
+    const retried = await internals.createConversationAgent('trunk-chan-g1', 'world:chan');
+    assert.equal(retried.name, 'trunk-chan-g1');
+    await framework.stop();
+  });
+
 });

@@ -2439,26 +2439,31 @@ export class AgentFramework {
       throw new Error(`Ephemeral agent name \"${config.name}\" is already registered or has been used in this framework`);
     }
     this.usedEphemeralAgentNames.add(config.name);
-    const namespace = `subagent/${config.name}`;
+    try {
+      const namespace = `subagent/${config.name}`;
 
-    const contextManager = await ContextManager.open({
-      store: this.store,
-      namespace,
-      isolate: true,
-      strategy: config.strategy ?? new PassthroughStrategy(),
-      membrane: this.membrane,
-      debugLogContext: !!process.env.DEBUG_CONTEXT,
-    });
+      const contextManager = await ContextManager.open({
+        store: this.store,
+        namespace,
+        isolate: true,
+        strategy: config.strategy ?? new PassthroughStrategy(),
+        membrane: this.membrane,
+        debugLogContext: !!process.env.DEBUG_CONTEXT,
+      });
 
-    const agent = new Agent(config, contextManager, this.membrane);
-    this.ephemeralCandidates.set(agent, contextManager);
+      const agent = new Agent(config, contextManager, this.membrane);
+      this.ephemeralCandidates.set(agent, contextManager);
 
-    const cleanup = () => {
-      // Don't close the store — it's shared. Just release the CM.
-      // Data persists in the store under the namespace for investigation.
-    };
+      const cleanup = () => {
+        // Don't close the store — it's shared. Just release the CM.
+        // Data persists in the store under the namespace for investigation.
+      };
 
-    return { agent, contextManager, cleanup };
+      return { agent, contextManager, cleanup };
+    } catch (error) {
+      this.usedEphemeralAgentNames.delete(config.name);
+      throw error;
+    }
   }
 
   private createDeferred<T>(): Deferred<T> {
@@ -4816,41 +4821,46 @@ export class AgentFramework {
       throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
     }
     this.usedEphemeralAgentNames.add(name);
+    try {
 
-    const contextManager = await ContextManager.open({
-      store: this.store,
-      namespace: `conversations/${name}`,
-      isolate: true,
-      // Strategy instances are stateful — never share the template's.
-      strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
-      // Dynamic conversation forks retain the established provider policy in
-      // this bounded first slice. Provider cooldown ownership belongs to the
-      // persistent resident only; generation-unique forks must not leak gates.
-      membrane: this.membrane,
-      debugLogContext: !!process.env.DEBUG_CONTEXT,
-    });
+      const contextManager = await ContextManager.open({
+        store: this.store,
+        namespace: `conversations/${name}`,
+        isolate: true,
+        // Strategy instances are stateful — never share the template's.
+        strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
+        // Dynamic conversation forks retain the established provider policy in
+        // this bounded first slice. Provider cooldown ownership belongs to the
+        // persistent resident only; generation-unique forks must not leak gates.
+        membrane: this.membrane,
+        debugLogContext: !!process.env.DEBUG_CONTEXT,
+      });
 
-    // Seed with the template's compiled context, renaming the template
-    // participant so the fork reads its inheritance as its own history.
-    // Guard: only seed a genuinely fresh namespace. Generation counters are
-    // persisted precisely so names aren't reused, but if this namespace has
-    // history anyway (counter state lost, crash between spawn and persist),
-    // seeding again would stack another template copy on top of it.
-    const { messages: existing } = await contextManager.compile();
-    if (existing.length === 0) {
-      const { messages: compiled } = await template.getContextManager().compile();
-      for (const msg of compiled) {
-        const participant = msg.participant === template.name ? name : msg.participant;
-        contextManager.addMessage(participant, msg.content);
+      // Seed with the template's compiled context, renaming the template
+      // participant so the fork reads its inheritance as its own history.
+      // Guard: only seed a genuinely fresh namespace. Generation counters are
+      // persisted precisely so names aren't reused, but if this namespace has
+      // history anyway (counter state lost, crash between spawn and persist),
+      // seeding again would stack another template copy on top of it.
+      const { messages: existing } = await contextManager.compile();
+      if (existing.length === 0) {
+        const { messages: compiled } = await template.getContextManager().compile();
+        for (const msg of compiled) {
+          const participant = msg.participant === template.name ? name : msg.participant;
+          contextManager.addMessage(participant, msg.content);
+        }
       }
-    }
 
-    const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
-    const agent = new Agent(config, contextManager, this.membrane);
-    this.agents.set(name, agent);
-    this.agentConfigs.set(name, config);
-    this.conversationAgentHomes.set(name, channelId);
-    return agent;
+      const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
+      const agent = new Agent(config, contextManager, this.membrane);
+      this.agents.set(name, agent);
+      this.agentConfigs.set(name, config);
+      this.conversationAgentHomes.set(name, channelId);
+      return agent;
+    } catch (error) {
+      this.usedEphemeralAgentNames.delete(name);
+      throw error;
+    }
   }
 
   /** Persist the router's generation counters (see hydration in create()). */
@@ -5316,6 +5326,9 @@ export class AgentFramework {
           `[inference-dropped] agent=${agentName} reason=policy-skip ` +
           `requests=${requests.length} triggers=${requests.map((r) => r.reason).join(',')}`,
         );
+        // A context-budget restart inherits the predecessor's EventGate liveness.
+        // If policy drops the queued successor, no driveStream remains to release it.
+        if (budgetRestart) this.eventGate?.onInferenceEnded(agentName);
         const gate = this.providerGates.get(agentName);
         if (gate?.primaryPending && this.providerAccelerationRecoveries.has(agentName)) {
           gate.primaryPending = false;
@@ -6087,8 +6100,6 @@ export class AgentFramework {
       if (this.agents.get(agent.name) !== agent) {
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
-        if (ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
-        if (this.activeTurnTokens.get(agent.name) === turnToken) this.activeTurnTokens.delete(agent.name);
         return false;
       }
       const {
@@ -6102,8 +6113,6 @@ export class AgentFramework {
         agent.cancelStream();
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
-        if (ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
-        if (this.activeTurnTokens.get(agent.name) === turnToken) this.activeTurnTokens.delete(agent.name);
         return false;
       }
 
@@ -7356,6 +7365,11 @@ export class AgentFramework {
       // current stream generation may mutate name-keyed teardown state.
       const ownsPhysicalStream =
         this.agents.get(agent.name) === agent && agent.streamId === myStreamId;
+      // Ephemeral completion resolves its caller before this finally runs, so
+      // runEphemeralToCompletion may already have deregistered the name. The
+      // terminal frame still owns its typing/outgoing completion unless it was
+      // genuinely superseded or handed EventGate liveness to a budget restart.
+      const frameReachedTerminal = !generationLost && !preserveEventGateForSuccessor;
       // §10.5: exactly one terminal per `started`, on every exit path the
       // host controls. Which one was decided by the path taken (default
       // completed; catch → failed; framework-cancel → aborted). A host
@@ -7384,12 +7398,12 @@ export class AgentFramework {
 
       // Stop the typing indicator on every exit path (complete, error,
       // exhausted, abort) so it never sticks after the turn ends.
-      if (ownsPhysicalStream && !preserveEventGateForSuccessor) this.channelRegistry?.stopTyping();
+      if (frameReachedTerminal) this.channelRegistry?.stopTyping();
 
       // Spec 14.3: flush any held line-start text, then close each streamed
       // channel with its final moderated content — the consumer's signal to
       // finalize (end the TTS utterance, settle the rendered message).
-      if (!generationLost && ownsPhysicalStream && proseStream) {
+      if (frameReachedTerminal && proseStream) {
         emitOutgoing(proseStream.finish());
         for (const [channelId, text] of proseStream.byChannel()) {
           this.channelRegistry!.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text);
@@ -7420,7 +7434,7 @@ export class AgentFramework {
       }
 
       // Flush any deferred messages (e.g. if stream failed while tools were pending)
-      if (ownsPhysicalStream && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
+      if (frameReachedTerminal && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
         const deferred = this.deferredMessages.splice(0);
         for (const msg of deferred) {
           this.addMessage(msg.participant, msg.content, msg.metadata);
