@@ -12,6 +12,61 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.12.0 — 2026-09-05
+
+### Added
+
+- **`WorkspaceModule.readFileFromDisk(mountPath, { maxBytes })`** — a
+  workspace-owned filesystem read for peer modules that enforces the mount
+  boundary on disk, not just on the path string (#129). Honors the mount's
+  `followSymlinks` policy (default: refuse), requires the canonical target to
+  stay beneath the canonical mount root when symlinks are allowed (so an
+  intermediate symlinked directory or a sibling-prefix root cannot escape), and
+  performs a bounded prefix read when `maxBytes` is set, reporting `truncated`
+  alongside the full `size`, `mtimeMs` and canonical `realPath`. Refusals throw
+  the exported `WorkspaceReadError` with a `code` distinguishing unknown mount,
+  lexical traversal, unavailable mount, missing file, directory, policy-denied
+  symlink, outside-mount target and file-changed-during-read.
+  `resolveAbsolutePath()` is now documented as lexical-only and deprecated for
+  direct reads; `read_image` shares the same containment core with its error
+  wording unchanged.
+
+- `InferenceRequest.counterparty` carries the adapter-namespaced author id of
+  the channel message that triggered the turn, and
+  `getActiveTurnTrigger(agentName)` exposes the trigger of the turn in
+  progress (kept beside the turn token, cleared wherever it is) so a host can
+  stamp gateway telemetry with why the call exists and who woke the agent
+  (#141).
+
+- Wire `kv-unified` immutable-prefix identity and caller-owned cache markers through activation requests, and commit context presentation/cache receipts only after the corresponding provider call is accepted.
+- Calibrate context estimates from per-provider-call usage deltas instead of cumulative tool-loop totals.
+
+### Fixed
+
+- The workspace materialize branch guard checks lineage instead of branch
+  identity: a branch that linearly continues the last-materialized branch
+  (every fork point at or after the materialized sequence) materializes
+  normally, and proven-ancestor pins are re-pinned at boot — so an
+  out-of-band repair that leaves the store on a fork-at-head child branch no
+  longer wedges every materialize until manual surgery. The guard is scoped
+  to the mounts being materialized (one mount's stale pin no longer blocks
+  the rest, blocked mounts are reported as `skipped`), `canMaterialize` in
+  `status` shares the guard's exact predicate instead of a divergent
+  computation, and genuine divergence can be overridden with the new
+  `force: true` input, which resets tracking and re-materializes the full
+  tree (an incremental diff across divergent history silently writes
+  nothing).
+
+- **World `say` / `whisper` now silence adjacent auto-routed prose in every
+  prose-routing mode**, not only `hybrid`. In `locus` mode a round of ordinary
+  text plus an explicit Eidoverse `say` published twice — the say text, then the
+  adjacent prose auto-routed to the same world locus (Cairn, 2026-09-01, world
+  seq 15146/15147 byte-for-byte). An explicit world utterance is the resident's
+  chosen public speech for that round and is treated exactly like a channel
+  send: sticky silencing from that round on, suppression visible in the
+  `[delivered]` receipt. Discord send/reply/DM, `skip_reply`, `think()` privacy,
+  text-only turns and non-publishing tool rounds are unchanged.
+
 ## 0.11.0 — 2026-08-26
 
 ### Added
