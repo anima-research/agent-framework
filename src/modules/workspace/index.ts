@@ -369,9 +369,13 @@ function validateJpeg(bytes: Buffer, mountPrefixedPath: string): void {
     offset += 1;
 
     if (marker === JPEG_EOI) {
-      if (!sawSof || !sawSos || offset !== bytes.length) {
+      if (!sawSof || !sawSos) {
         invalidImage('JPEG', mountPrefixedPath);
       }
+      // Bytes after EOI are tolerated: hardware encoders (e.g. Raspberry Pi
+      // camera stills) pad each frame to a 4-byte boundary with NULs after
+      // the EOI marker, and every mainstream decoder stops at EOI. The image
+      // proper (SOI..EOI) has been fully validated by this point.
       return;
     }
     if (marker === JPEG_TEM || (marker >= 0xd0 && marker <= 0xd7)) {
