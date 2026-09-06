@@ -78,6 +78,21 @@ interface PendingEvent {
    *  metadata carries one — batched-wake lines render this instead of the raw
    *  composite channel id. */
   channelLabel?: string;
+  /** Author id of the event (discord snowflake etc.), when the metadata carries
+   *  one — a debounced wake names the newest such author as its counterparty. */
+  authorId?: string;
+}
+
+/**
+ * Where a gate-requested wake came from, handed to the framework alongside the
+ * reason so the turn's InferenceRequest can carry it (host telemetry stamps
+ * "who woke the agent" from it). Ids only, never content or display names.
+ */
+export interface WakeProvenance {
+  channelId?: string;
+  /** Adapter-namespaced author id: `<adapter>:user:<id>`, adapter = the
+   *  channel id's first segment (`discord:...`). */
+  counterparty?: string;
 }
 
 interface DebounceState {
@@ -150,6 +165,21 @@ function isMetadataTruthy(value: unknown): boolean {
 }
 
 /** Compact, log-friendly serialization of a GateBehavior. */
+/** Newest channel-bearing event of a batch → channel + namespaced author (ids only). */
+export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefined {
+  let pick: PendingEvent | undefined;
+  for (const e of events) {
+    if (!e.channelId) continue;
+    if (!pick || e.timestamp >= pick.timestamp) pick = e;
+  }
+  if (!pick) return undefined;
+  const adapter = pick.channelId!.split(':')[0] || 'channel';
+  return {
+    channelId: pick.channelId,
+    ...(pick.authorId ? { counterparty: `${adapter}:user:${pick.authorId}` } : {}),
+  };
+}
+
 function formatBehavior(b: import('./types.js').GateBehavior): string {
   if (typeof b === 'string') return b;
   if ('debounce' in b) return `debounce:${b.debounce}`;
@@ -516,7 +546,7 @@ export class EventGate {
   // Dependency-injected callbacks
   private emitTrace: (event: TraceEventLike) => void;
   private addMessageFn: (participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>) => unknown;
-  private requestInferenceFn: (agentName: string, reason: string, source: string) => void;
+  private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
   private getAgentNamesFn: () => string[];
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
@@ -528,7 +558,7 @@ export class EventGate {
     privilegedUsersPath?: string;
     emitTrace: (event: TraceEventLike) => void;
     addMessage: (participant: string, content: Array<{ type: 'text'; text: string }>, metadata?: Record<string, unknown>) => unknown;
-    requestInference: (agentName: string, reason: string, source: string) => void;
+    requestInference: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
     getAgentNames: () => string[];
     /** Optional clock — defaults to Date.now. Tests inject for deterministic time. */
     now?: () => number;
@@ -1374,6 +1404,7 @@ export class EventGate {
         typeof info.metadata?.channelName === 'string' && info.metadata.channelName
           ? (info.metadata.channelName as string)
           : undefined,
+      authorId: this.extractAuthorId(info.metadata) ?? undefined,
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1461,8 +1492,13 @@ export class EventGate {
       policies: policyNames,
     });
 
+    // Provenance of the batched wake: the newest event that names a channel
+    // (and, when it carries one, its author). A batch is one wake; the newest
+    // channel-bearing event is what the framework's own locus rule prefers,
+    // and channel + author come from the SAME event so they never disagree.
+    const provenance = wakeProvenance(events);
     for (const agentName of this.getAgentNamesFn()) {
-      this.requestInferenceFn(agentName, 'gate:debounce', 'gate');
+      this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
     }
   }
 
