@@ -67,6 +67,7 @@ import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
+import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
 import { ConversationRouter } from './mcpl/conversation-router.js';
@@ -788,6 +789,16 @@ export class AgentFramework {
   private frameworkCancelledStreams: Map<string, 'turn_ended' | 'budget_restart'> = new Map();
   /** Active runEphemeralToCompletion runs, keyed by agent name. */
   private ephemeralRuns: Map<string, EphemeralRun> = new Map();
+  /** Ephemeral namespaces/names are single-generation for this framework
+   * lifetime. Reusing one while an old stream drains would let name-keyed
+   * liveness/settlement state cross generations. */
+  private usedEphemeralAgentNames: Set<string> = new Set();
+  /** One-shot generation tickets minted by createEphemeralAgent. */
+  private ephemeralCandidates: WeakMap<Agent, ContextManager> = new WeakMap();
+  /** Physical ephemeral frames deliberately disposed by their run watchdog/caller.
+   * The name is single-generation, so these frames still own their terminal
+   * typing/outgoing close even after runEphemeralToCompletion deregisters them. */
+  private disposedEphemeralFrames: WeakSet<Agent> = new WeakSet();
   /** Per-agent count of consecutive exhausted inferences (reset on any success).
    *  Drives hard-down escalation — see noteInferenceExhausted. */
   private consecutiveInferenceFailures: Map<string, number> = new Map();
@@ -873,6 +884,10 @@ export class AgentFramework {
   getActiveTurnTrigger(agentName: string): InferenceRequest | undefined {
     return this.activeTurnTriggers.get(agentName);
   }
+
+  /** Structured calls executed in the current logical turn. Unlike the
+   * per-stream local this survives framework retries and budget restarts. */
+  private logicalTurnToolCalls: WeakMap<Agent, { turnToken: number; count: number }> = new WeakMap();
   private nextTurnToken = 1;
 
   // Undo/redo state
@@ -2421,25 +2436,38 @@ export class AgentFramework {
     contextManager: ContextManager;
     cleanup: () => void;
   }> {
-    const namespace = `subagent/${config.name}`;
+    // Names are Chronicle namespaces and generation identities. Reserve before
+    // opening the namespace so a second creation cannot append to an earlier
+    // generation before runEphemeralToCompletion has a chance to reject it.
+    if (this.usedEphemeralAgentNames.has(config.name) || this.agents.has(config.name)) {
+      throw new Error(`Ephemeral agent name \"${config.name}\" is already registered or has been used in this framework`);
+    }
+    this.usedEphemeralAgentNames.add(config.name);
+    try {
+      const namespace = `subagent/${config.name}`;
 
-    const contextManager = await ContextManager.open({
-      store: this.store,
-      namespace,
-      isolate: true,
-      strategy: config.strategy ?? new PassthroughStrategy(),
-      membrane: this.membrane,
-      debugLogContext: !!process.env.DEBUG_CONTEXT,
-    });
+      const contextManager = await ContextManager.open({
+        store: this.store,
+        namespace,
+        isolate: true,
+        strategy: config.strategy ?? new PassthroughStrategy(),
+        membrane: this.membrane,
+        debugLogContext: !!process.env.DEBUG_CONTEXT,
+      });
 
-    const agent = new Agent(config, contextManager, this.membrane);
+      const agent = new Agent(config, contextManager, this.membrane);
+      this.ephemeralCandidates.set(agent, contextManager);
 
-    const cleanup = () => {
-      // Don't close the store — it's shared. Just release the CM.
-      // Data persists in the store under the namespace for investigation.
-    };
+      const cleanup = () => {
+        // Don't close the store — it's shared. Just release the CM.
+        // Data persists in the store under the namespace for investigation.
+      };
 
-    return { agent, contextManager, cleanup };
+      return { agent, contextManager, cleanup };
+    } catch (error) {
+      this.usedEphemeralAgentNames.delete(config.name);
+      throw error;
+    }
   }
 
   private createDeferred<T>(): Deferred<T> {
@@ -2460,6 +2488,17 @@ export class AgentFramework {
       run.inferenceStarted = true;
     }
     run.lastActivity = Date.now();
+  }
+
+  /** Record structured calls for the current logical turn. Ignore late stream
+   * events after an ephemeral/conversation agent has been disposed. */
+  private recordLogicalTurnToolCalls(agent: Agent, turnToken: number, count: number): void {
+    if (count <= 0 || this.agents.get(agent.name) !== agent) return;
+    const state = this.logicalTurnToolCalls.get(agent);
+    // The Agent object is the generation: a late stream from a disposed
+    // ephemeral/conversation fork cannot contaminate a same-name successor.
+    if (!state || state.turnToken !== turnToken) return;
+    this.logicalTurnToolCalls.set(agent, { turnToken, count: state.count + count });
   }
 
   private recordEphemeralToolCalls(agentName: string, count: number): void {
@@ -2505,7 +2544,18 @@ export class AgentFramework {
     contextManager: ContextManager,
     watchdogs?: { startupTimeoutMs?: number; idleTimeoutMs?: number; idlePollMs?: number },
   ): Promise<{ speech: string; toolCallsCount: number }> {
-    // Register temporarily so the event loop can drive it
+    // Only a fresh object returned by createEphemeralAgent may enter this path.
+    // Never overwrite a resident/conversation owner or a concurrent run: their
+    // cleanup is name-keyed and could cancel/deregister the legitimate owner.
+    if (this.ephemeralCandidates.get(agent) !== contextManager) {
+      throw new Error(`Ephemeral agent "${agent.name}" has no fresh generation ticket from this framework`);
+    }
+    // Consume before any await/registration: the exact (Agent, ContextManager)
+    // generation is one-shot even if startup later fails.
+    this.ephemeralCandidates.delete(agent);
+    if (this.agents.has(agent.name) || this.ephemeralRuns.has(agent.name)) {
+      throw new Error(`Ephemeral agent "${agent.name}" is already registered or running`);
+    }
     this.agents.set(agent.name, agent);
     const run: EphemeralRun = {
       settle: this.createDeferred<AgentSettleResult>(),
@@ -2570,8 +2620,25 @@ export class AgentFramework {
     } finally {
       if (startupWatchdog) clearTimeout(startupWatchdog);
       if (completionWatchdog) clearInterval(completionWatchdog);
-      this.ephemeralRuns.delete(agent.name);
-      this.agents.delete(agent.name);
+      // Mark before cancellation: an adapter may synchronously settle its
+      // iterator, and this physical frame still owns terminal typing/outgoing
+      // closure even though the ephemeral name is about to be deregistered.
+      this.disposedEphemeralFrames.add(agent);
+      // Cancel before deregistration. Adapters may still yield a queued event;
+      // driveStream's Agent-identity check above discards it before dispatch.
+      agent.cancelStream();
+      if (this.ephemeralRuns.get(agent.name) === run) this.ephemeralRuns.delete(agent.name);
+      if (this.agents.get(agent.name) === agent) {
+        // Exact-generation disposal owns these name-keyed entries. Remove them
+        // before deregistration; the late driveStream finally will see the
+        // generation mismatch and leave any future owner untouched.
+        this.activeStreams.delete(agent.name);
+        this.pendingAssistantBlocks.delete(agent.name);
+        // The late stream finalizer intentionally refuses name-keyed cleanup once
+        // deregistered, so disposal must release EventGate liveness itself.
+        this.eventGate?.onInferenceEnded(agent.name);
+        this.agents.delete(agent.name);
+      }
       // Spawn-and-dispose bookkeeping (main, d453165/fee96a7): without this,
       // ephemeral agents leave checkpoint-tree keys and diagnostics map
       // entries behind for the life of the store/session.
@@ -2583,6 +2650,7 @@ export class AgentFramework {
       // of the map, and a late driveStream finally token-match no-ops.
       this.activeTurnTokens.delete(agent.name);
       this.activeTurnTriggers.delete(agent.name);
+      this.logicalTurnToolCalls.delete(agent);
     }
   }
 
@@ -4757,41 +4825,50 @@ export class AgentFramework {
     if (!template || !templateConfig) {
       throw new Error(`conversation template agent "${router.templateAgent}" not found`);
     }
-
-    const contextManager = await ContextManager.open({
-      store: this.store,
-      namespace: `conversations/${name}`,
-      isolate: true,
-      // Strategy instances are stateful — never share the template's.
-      strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
-      // Dynamic conversation forks retain the established provider policy in
-      // this bounded first slice. Provider cooldown ownership belongs to the
-      // persistent resident only; generation-unique forks must not leak gates.
-      membrane: this.membrane,
-      debugLogContext: !!process.env.DEBUG_CONTEXT,
-    });
-
-    // Seed with the template's compiled context, renaming the template
-    // participant so the fork reads its inheritance as its own history.
-    // Guard: only seed a genuinely fresh namespace. Generation counters are
-    // persisted precisely so names aren't reused, but if this namespace has
-    // history anyway (counter state lost, crash between spawn and persist),
-    // seeding again would stack another template copy on top of it.
-    const { messages: existing } = await contextManager.compile();
-    if (existing.length === 0) {
-      const { messages: compiled } = await template.getContextManager().compile();
-      for (const msg of compiled) {
-        const participant = msg.participant === template.name ? name : msg.participant;
-        contextManager.addMessage(participant, msg.content);
-      }
+    if (this.usedEphemeralAgentNames.has(name) || this.agents.has(name)) {
+      throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
     }
+    this.usedEphemeralAgentNames.add(name);
+    try {
 
-    const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
-    const agent = new Agent(config, contextManager, this.membrane);
-    this.agents.set(name, agent);
-    this.agentConfigs.set(name, config);
-    this.conversationAgentHomes.set(name, channelId);
-    return agent;
+      const contextManager = await ContextManager.open({
+        store: this.store,
+        namespace: `conversations/${name}`,
+        isolate: true,
+        // Strategy instances are stateful — never share the template's.
+        strategy: router.strategyFactory?.() ?? new PassthroughStrategy(),
+        // Dynamic conversation forks retain the established provider policy in
+        // this bounded first slice. Provider cooldown ownership belongs to the
+        // persistent resident only; generation-unique forks must not leak gates.
+        membrane: this.membrane,
+        debugLogContext: !!process.env.DEBUG_CONTEXT,
+      });
+
+      // Seed with the template's compiled context, renaming the template
+      // participant so the fork reads its inheritance as its own history.
+      // Guard: only seed a genuinely fresh namespace. Generation counters are
+      // persisted precisely so names aren't reused, but if this namespace has
+      // history anyway (counter state lost, crash between spawn and persist),
+      // seeding again would stack another template copy on top of it.
+      const { messages: existing } = await contextManager.compile();
+      if (existing.length === 0) {
+        const { messages: compiled } = await template.getContextManager().compile();
+        for (const msg of compiled) {
+          const participant = msg.participant === template.name ? name : msg.participant;
+          contextManager.addMessage(participant, msg.content);
+        }
+      }
+
+      const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
+      const agent = new Agent(config, contextManager, this.membrane);
+      this.agents.set(name, agent);
+      this.agentConfigs.set(name, config);
+      this.conversationAgentHomes.set(name, channelId);
+      return agent;
+    } catch (error) {
+      this.usedEphemeralAgentNames.delete(name);
+      throw error;
+    }
   }
 
   /** Persist the router's generation counters (see hydration in create()). */
@@ -4815,10 +4892,12 @@ export class AgentFramework {
   private disposeConversationAgent(agentName: string): void {
     this.closingConversationAgents.delete(agentName);
     const channelId = this.conversationAgentHomes.get(agentName);
+    const agent = this.agents.get(agentName);
     this.agents.delete(agentName);
     this.agentConfigs.delete(agentName);
     this.conversationAgentHomes.delete(agentName);
     this.evictTurnCheckpoints(agentName);
+    if (agent) this.logicalTurnToolCalls.delete(agent);
     this.emitTrace({
       type: 'mcpl:conversation-disposed',
       agentName,
@@ -5255,6 +5334,9 @@ export class AgentFramework {
           `[inference-dropped] agent=${agentName} reason=policy-skip ` +
           `requests=${requests.length} triggers=${requests.map((r) => r.reason).join(',')}`,
         );
+        // A context-budget restart inherits the predecessor's EventGate liveness.
+        // If policy drops the queued successor, no driveStream remains to release it.
+        if (budgetRestart) this.eventGate?.onInferenceEnded(agentName);
         const gate = this.providerGates.get(agentName);
         if (gate?.primaryPending && this.providerAccelerationRecoveries.has(agentName)) {
           gate.primaryPending = false;
@@ -5906,8 +5988,21 @@ export class AgentFramework {
     // BEFORE this turn compiles, so the agent always knows where its voice
     // goes (announce-on-change only — no per-turn chatter, append-only for
     // KV stability).
+    if (trigger?.reason === 'context_budget_restart') {
+      const previousLogicalToolState = this.logicalTurnToolCalls.get(agent);
+      this.logicalTurnToolCalls.set(agent, { turnToken, count: previousLogicalToolState?.count ?? 0 });
+    }
+
     if (trigger?.reason !== 'context_budget_restart') {
       if (attempt === 0) this.maybePrimeProseMode(agent);
+      const previousLogicalToolState = this.logicalTurnToolCalls.get(agent);
+      if (attempt === 0) {
+        // A true new turn gets a fresh generation and count.
+        this.logicalTurnToolCalls.set(agent, { turnToken, count: 0 });
+      } else {
+        // A framework retry is a new physical stream in the same logical turn.
+        this.logicalTurnToolCalls.set(agent, { turnToken, count: previousLogicalToolState?.count ?? 0 });
+      }
       // Fresh turn: forget the previous turn's explicit-send engagements and
       // prose deliveries — both are strictly turn-scoped (a restart continues
       // the same logical turn and keeps them).
@@ -5941,7 +6036,11 @@ export class AgentFramework {
       // context-budget restart, which skips the re-pin but re-emits this).
       channelId: this.turnLocusPins.get(agent.name),
     });
-    this.eventGate?.onInferenceStarted(agent.name);
+    // A budget restart continues the same logical inference window. The
+    // predecessor keeps EventGate liveness until its successor terminates.
+    if (trigger?.reason !== 'context_budget_restart') {
+      this.eventGate?.onInferenceStarted(agent.name);
+    }
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
 
     // Typing indicator, started at TURN START. It says "attending", which is
@@ -6004,12 +6103,26 @@ export class AgentFramework {
         }
       }
 
+      // An ephemeral watchdog may dispose this Agent while hooks/compile await.
+      // Do not create a provider stream after its generation lost ownership.
+      if (this.agents.get(agent.name) !== agent) {
+        this.channelRegistry?.stopTyping();
+        this.eventGate?.onInferenceEnded(agent.name);
+        return false;
+      }
       const {
         stream,
         request: compiledRequest,
         takeKvSubmission,
         drainKvSubmissionIds,
       } = await agent.startStreamWithInjections(tools, injections);
+      if (this.agents.get(agent.name) !== agent) {
+        stream.cancel();
+        agent.cancelStream();
+        this.channelRegistry?.stopTyping();
+        this.eventGate?.onInferenceEnded(agent.name);
+        return false;
+      }
 
       const handle = this.driveStream(
         agent,
@@ -6021,6 +6134,7 @@ export class AgentFramework {
         ownsProviderGate,
         takeKvSubmission,
         drainKvSubmissionIds,
+        new Set(tools.map((tool) => tool.name)),
       );
       this.activeStreams.set(agent.name, handle);
       // Handoff: driveStream captured the token in its synchronous prefix;
@@ -6105,6 +6219,7 @@ export class AgentFramework {
     ownsProviderGate = false,
     takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined,
     drainKvSubmissionIds?: () => string[],
+    knownToolNames: ReadonlySet<string> = new Set(),
   ): Promise<void> {
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
@@ -6124,6 +6239,7 @@ export class AgentFramework {
     // means no successor turn can have replaced it while we compiled.
     const myTurnToken = this.activeTurnTokens.get(agent.name);
     let hadToolCalls = false;
+    let generationLost = false;
 
     // ---- Present-while-acting turn state ---------------------------------
     // Output locus for the WHOLE logical turn: frozen in startAgentStream
@@ -6207,13 +6323,20 @@ export class AgentFramework {
     // failed, a framework-cancelled stream sets aborted. Best-effort
     // notifications — consumers dedupe by inferenceId and keep a timeout.
     let lifecyclePhase: 'completed' | 'aborted' | 'failed' = 'completed';
+    let preserveEventGateForSuccessor = false;
     this.hookOrchestrator?.emitLifecycle({
       inferenceId: outgoingInferenceId,
       conversationId: agent.name,
       turnIndex: 0,
       phase: 'started',
     });
-    const proseStream = this.channelRegistry && agent.proseRouting !== 'disabled'
+    // The wrapper guard needs the complete response before it can distinguish
+    // an exact invocation-shaped body from ordinary XML/prose. Buffer guarded
+    // turns until completion: otherwise speculative outgoing chunks could
+    // expose the wrapper before the fail-closed classifier runs.
+    const proseStream = this.channelRegistry &&
+      agent.proseRouting !== 'disabled' &&
+      !agent.toolWrapperProseGuard
       ? new ProseStreamRouter({
           mode: agent.proseRouting === 'explicit' ? 'explicit' : agent.proseRouting === 'hybrid' ? 'hybrid' : 'locus',
           initialTarget: typingChannel,
@@ -6243,6 +6366,14 @@ export class AgentFramework {
 
     try {
       for await (const event of stream) {
+        // Ignore every late event from an Agent generation that no longer owns
+        // this name (ephemeral watchdog/disposal, conversation replacement).
+        if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
+          generationLost = true;
+          lifecyclePhase = 'aborted';
+          stream.cancel();
+          break;
+        }
         this.touchEphemeralRun(agent.name, true);
         switch (event.type) {
           case 'tokens':
@@ -6310,6 +6441,7 @@ export class AgentFramework {
           case 'tool-calls': {
             adoptInjectedRound();
             hadToolCalls = true;
+            this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, event.calls.length);
             this.recordEphemeralToolCalls(agent.name, event.calls.length);
             this.emitTrace({
               type: 'inference:tool_calls_yielded',
@@ -6515,7 +6647,30 @@ export class AgentFramework {
             const terminalContent = lastToolIdx >= 0
               ? response.content.slice(lastToolIdx + 1)
               : response.content;
-            if (lastToolIdx >= 0) {
+            // This is a whole-response boundary, not a trailing-prose
+            // classifier. If the turn executed any genuine structured tool
+            // call, preserve its later prose exactly as ordinary history.
+            const logicalToolState = this.logicalTurnToolCalls.get(agent);
+            const logicalTurnHadToolCalls = logicalToolState?.turnToken === myTurnToken && (logicalToolState?.count ?? 0) > 0;
+            const guardedWrapperTool = agent.toolWrapperProseGuard && !logicalTurnHadToolCalls
+              ? detectKnownToolWrapperProse(response.content, knownToolNames)
+              : null;
+            if (guardedWrapperTool) {
+              // AF #133: containment only. Never execute wrapper text, never
+              // publish it, and never retain it as the freshest assistant
+              // self-seed. Exact raw output remains in the provider ledger.
+              agent.getContextManager().addMessage('user', [{
+                type: 'text',
+                text: '[tool-boundary] No tool was called.',
+              }], {
+                system: true,
+                kind: 'tool-wrapper-prose-contained',
+                toolName: guardedWrapperTool,
+              });
+              console.error(
+                `[tool-boundary] ${agent.name}: contained whole-response prose wrapper for registered tool ${guardedWrapperTool}; no tool called`,
+              );
+            } else if (lastToolIdx >= 0) {
               if (terminalContent.length > 0) {
                 agent.addAssistantResponse(terminalContent);
               }
@@ -6541,7 +6696,9 @@ export class AgentFramework {
             // text is speech.
             const isTextBlock = (block: ContentBlock): block is ContentBlock & { type: 'text' } =>
               block.type === 'text';
-            const allText = response.content.filter(isTextBlock);
+            const allText = guardedWrapperTool
+              ? []
+              : response.content.filter(isTextBlock);
 
             const speechContent = hadToolCalls ? [] : allText;
             const thoughts = hadToolCalls ? allText : [];
@@ -6556,19 +6713,30 @@ export class AgentFramework {
                 }
               : undefined;
 
+            // Async completion work may overlap a replacement stream. Recheck
+            // physical ownership before any terminal state/settlement side effect.
+            if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
+              generationLost = true;
+              lifecyclePhase = 'aborted';
+              stream.cancel();
+              return;
+            }
+
             // Reset agent state before emitting inference:completed. Traces are
             // observability-only, but external synchronous listeners should
             // still see the terminal state at the terminal trace boundary.
             // Speech dispatch happens after but doesn't depend on the status
             // field.
             agent.reset();
-            this.eventGate?.onInferenceEnded(agent.name);
+            if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
             this.settleAgent(agent.name, {
               stopReason: 'completed',
-              speech: terminalContent
-                .filter((block: ContentBlock): block is ContentBlock & { type: 'text' } => block.type === 'text')
-                .map((block) => block.text)
-                .join('\n'),
+              speech: guardedWrapperTool
+                ? ''
+                : terminalContent
+                    .filter((block: ContentBlock): block is ContentBlock & { type: 'text' } => block.type === 'text')
+                    .map((block) => block.text)
+                    .join('\n'),
             });
 
             this.emitTrace({
@@ -6942,7 +7110,7 @@ export class AgentFramework {
 
             if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
               lifecyclePhase = 'failed';
-              this.eventGate?.onInferenceEnded(agent.name);
+              if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
 
@@ -6966,7 +7134,7 @@ export class AgentFramework {
                 // itself) means retrying the same context can never succeed.
                 ...this.classifyInferenceError(err),
               });
-              this.eventGate?.onInferenceEnded(agent.name);
+              if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               if (action.emit) {
                 this.pushEvent(action.emit);
               }
@@ -6988,7 +7156,13 @@ export class AgentFramework {
               if (cancelKind !== undefined) {
                 this.frameworkCancelledStreams.delete(cancelKey);
                 lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
-                this.eventGate?.onInferenceEnded(agent.name);
+                // A budget restart continues the same EventGate window. Do not
+                // end it here or in finally; the replacement owns final release.
+                if (cancelKind === 'budget_restart') {
+                  preserveEventGateForSuccessor = true;
+                } else if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
+                  this.eventGate?.onInferenceEnded(agent.name);
+                }
                 // endTurn IS a logical turn end — earlier rounds may have
                 // live-routed prose (narrate → skip_reply is a real shape),
                 // so settle the delivery chain and drop the receipt. A
@@ -7035,7 +7209,7 @@ export class AgentFramework {
                 request: compiledRequest ?? { note: 'streaming request aborted' },
                 durationMs,
               });
-              this.eventGate?.onInferenceEnded(agent.name);
+              if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
             }
             break;
           }
@@ -7128,6 +7302,14 @@ export class AgentFramework {
         }
       }
     } catch (error) {
+      // A superseded physical stream may throw after its replacement starts.
+      // It has no authority to settle, reset, gate-release, or publish failure.
+      if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
+        generationLost = true;
+        lifecyclePhase = 'aborted';
+        stream.cancel();
+        return;
+      }
       // Stream itself threw. Organization acceleration is deferred from a
       // fresh compile; every other throw keeps the ordinary exhausted path.
       const err = error instanceof Error ? error : new Error(String(error));
@@ -7138,7 +7320,7 @@ export class AgentFramework {
           error: `Provider acceleration cooldown: ${err.message}`,
           request: compiledRequest ?? { note: 'streaming request rate-limited' }, durationMs });
         this.abortAgentScript(agent.name, 'provider acceleration cooldown');
-        lifecyclePhase = 'failed'; agent.reset(); this.eventGate?.onInferenceEnded(agent.name);
+        lifecyclePhase = 'failed'; agent.reset(); if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
         return;
       }
       this.emitTrace({
@@ -7173,7 +7355,7 @@ export class AgentFramework {
       this.abortAgentScript(agent.name, 'stream threw');
       lifecyclePhase = 'failed'; // §10.5 — terminal emitted in finally
       agent.reset();
-      this.eventGate?.onInferenceEnded(agent.name);
+      if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
     } finally {
       const unsettledKvSubmissions = drainKvSubmissionIds?.() ?? [];
       if (unsettledKvSubmissions.length > 0) {
@@ -7186,6 +7368,22 @@ export class AgentFramework {
           }
         } catch { /* receipt cleanup must not mask inference teardown */ }
       }
+      // A framework retry/budget restart can overlap physical streams on the
+      // same Agent object. Name + Agent identity is not enough: only the
+      // current stream generation may mutate name-keyed teardown state.
+      const ownsPhysicalStream =
+        this.agents.get(agent.name) === agent && agent.streamId === myStreamId;
+      // Ephemeral completion resolves its caller before this finally runs, so
+      // runEphemeralToCompletion may already have deregistered the name. The
+      // terminal frame still owns its typing/outgoing completion unless it was
+      // genuinely superseded or handed EventGate liveness to a budget restart.
+      const disposedEphemeralWithoutSuccessor =
+        generationLost &&
+        this.disposedEphemeralFrames.has(agent) &&
+        !this.agents.has(agent.name);
+      const frameReachedTerminal =
+        (!generationLost || disposedEphemeralWithoutSuccessor) &&
+        !preserveEventGateForSuccessor;
       // §10.5: exactly one terminal per `started`, on every exit path the
       // host controls. Which one was decided by the path taken (default
       // completed; catch → failed; framework-cancel → aborted). A host
@@ -7204,30 +7402,36 @@ export class AgentFramework {
       // all incoming events → the agent silently stops waking on messages
       // (typing still stops, compression still runs — matching the observed
       // wedge). onInferenceEnded is idempotent, so a redundant call is safe.
-      this.eventGate?.onInferenceEnded(agent.name);
-      this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+      if (ownsPhysicalStream && !preserveEventGateForSuccessor) {
+        this.eventGate?.onInferenceEnded(agent.name);
+      }
+      if (!generationLost && ownsPhysicalStream) {
+        this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), endedAt: Date.now() });
+      }
       if (ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
 
       // Stop the typing indicator on every exit path (complete, error,
       // exhausted, abort) so it never sticks after the turn ends.
-      this.channelRegistry?.stopTyping();
+      if (frameReachedTerminal) this.channelRegistry?.stopTyping();
 
       // Spec 14.3: flush any held line-start text, then close each streamed
       // channel with its final moderated content — the consumer's signal to
       // finalize (end the TTS utterance, settle the rendered message).
-      if (proseStream) {
+      if (frameReachedTerminal && proseStream) {
         emitOutgoing(proseStream.finish());
         for (const [channelId, text] of proseStream.byChannel()) {
           this.channelRegistry!.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text);
         }
       }
       this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`);
-      this.activeStreams.delete(agent.name);
-      this.pendingAssistantBlocks.delete(agent.name);
+      if (ownsPhysicalStream) {
+        this.activeStreams.delete(agent.name);
+        this.pendingAssistantBlocks.delete(agent.name);
+      }
 
       // A conversation fork whose TTL closure turn just finished is done for
       // good — dispose it so the agent map doesn't grow monotonically.
-      if (this.closingConversationAgents.has(agent.name)) {
+      if (ownsPhysicalStream && this.closingConversationAgents.has(agent.name)) {
         this.disposeConversationAgent(agent.name);
       }
 
@@ -7244,7 +7448,7 @@ export class AgentFramework {
       }
 
       // Flush any deferred messages (e.g. if stream failed while tools were pending)
-      if (this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
+      if (frameReachedTerminal && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
         const deferred = this.deferredMessages.splice(0);
         for (const msg of deferred) {
           this.addMessage(msg.participant, msg.content, msg.metadata);
