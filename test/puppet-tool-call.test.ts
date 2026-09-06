@@ -42,6 +42,7 @@ function puppetHarness(opts?: {
   const framework = Object.create(AgentFramework.prototype) as AgentFramework;
   (framework as unknown as { agents: Map<string, unknown> }).agents =
     new Map([['princess', agent]]);
+  (framework as unknown as { toolImageLedgers: Map<string, unknown> }).toolImageLedgers = new Map();
   (framework as unknown as Record<string, unknown>).getToolsForAgent =
     () => surface.map((name) => ({ name }));
   (framework as unknown as Record<string, unknown>).executeToolCall =

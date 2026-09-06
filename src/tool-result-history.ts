@@ -16,6 +16,17 @@
 
 import { safeSlice } from './safe-slice.js';
 import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './mcpl/references.js';
+import { formatToolImagePlaceholder } from './tool-image-ledger.js';
+
+export interface HistorySerializeOptions {
+  /**
+   * Called for every image block the serializer replaces with a placeholder
+   * (issue #104). Returns the retention ref to embed in the placeholder —
+   * `[image: image/png, ~691KB, ref img_7]` — so the image keeps a saveable
+   * handle in history; null leaves the legacy ref-less form.
+   */
+  imageRef?: (blockIndex: number, image: { data: string; mimeType: string }) => string | null;
+}
 
 /**
  * House-safe default inline cap (chars) for tool results, error results, and
@@ -36,8 +47,12 @@ import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from
  */
 export const DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS = 24000;
 
-export function toolResultDataToHistoryString(data: unknown, maxChars?: number): string {
-  const fromArray = tryHistoryStringFromContentArray(data);
+export function toolResultDataToHistoryString(
+  data: unknown,
+  maxChars?: number,
+  options?: HistorySerializeOptions,
+): string {
+  const fromArray = tryHistoryStringFromContentArray(data, options);
   const str = fromArray ?? JSON.stringify(data);
   return maxChars ? truncateForHistory(str, maxChars) : str;
 }
@@ -54,10 +69,10 @@ export function truncateForHistory(str: string, maxChars: number): string {
  * recognize, return a history-safe string (images → placeholders). Otherwise
  * return `null` to defer to the caller's fallback (JSON, usually).
  */
-function tryHistoryStringFromContentArray(data: unknown): string | null {
+function tryHistoryStringFromContentArray(data: unknown, options?: HistorySerializeOptions): string | null {
   if (!Array.isArray(data)) return null;
   const parts: string[] = [];
-  for (const raw of data) {
+  for (const [blockIndex, raw] of data.entries()) {
     if (!raw || typeof raw !== 'object') return null;
     const b = raw as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
     if (b.type === 'text' && typeof b.text === 'string') {
@@ -69,10 +84,14 @@ function tryHistoryStringFromContentArray(data: unknown): string | null {
     } else if (b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string') {
       // Decoded byte estimate from base64 length (3/4 ratio, rounded).
       const approxBytes = Math.floor(b.data.length * 3 / 4);
-      parts.push(`[image: ${b.mimeType}, ${formatSize(approxBytes)}]`);
+      const ref = options?.imageRef?.(blockIndex, { data: b.data, mimeType: b.mimeType }) ?? null;
+      parts.push(formatToolImagePlaceholder(b.mimeType, formatSize(approxBytes), ref));
     } else if (b.type === 'resource' || ((b.type === 'image' || b.type === 'audio') && typeof (b as { uri?: unknown }).uri === 'string')) {
       // RFC-005 reference block: a bounded stub, never the raw block JSON
       // (which used to inline the URI — and the whole array — into history).
+      // Image-typed stubs still occupy a slot in save_recent_image's
+      // inventory (a failing one — bytes live behind fetch_reference), so
+      // the index never slides past an image the resident saw.
       const stub = referenceStubOrNull(b, 'from tool result');
       if (stub === null) return null;
       parts.push(stub);
