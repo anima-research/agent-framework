@@ -72,6 +72,13 @@ export interface CodeExecutionConfig {
 
 export interface FrameworkConfig {
   /**
+   * The subconscious resident (issue #77): a persistent side-agent that
+   * receives diverted traffic from tuned-out channels and reports to the
+   * resident in its own voice. See src/tune-out/tools.ts.
+   */
+  subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
+
+  /**
    * IANA zone used only when rendering wall-clock times for the agent.
    * Stored/protocol timestamps remain epoch/UTC. Defaults to AGENT_TIMEZONE,
    * then the process zone.
