@@ -1513,7 +1513,18 @@ export class EventGate {
   private bufferForInference(events: PendingEvent[]): void {
     for (const event of events) {
       if (this.inferenceBuffer.length >= MAX_INFERENCE_BUFFER) {
-        this.inferenceBuffer.shift(); // Drop oldest
+        // Never drop silently: a discarded event here is a message that was
+        // persisted but will never trigger a wake — from the outside it
+        // looks like "sent, ignored, queue depth 0". If this line ever
+        // shows up in logs, the buffer is wedged (see flush gate on
+        // `inferring`) or genuinely overwhelmed; either way the operator
+        // needs to know which events died.
+        const dropped = this.inferenceBuffer.shift()!;
+        console.error(
+          `[event-gate] inference buffer full (${MAX_INFERENCE_BUFFER}): dropping oldest ` +
+          `pending event (policy=${dropped.policyName}, type=${dropped.eventType}) to admit ` +
+          `a newer one. Dropped events never trigger inference.`,
+        );
       }
       this.inferenceBuffer.push(event);
     }

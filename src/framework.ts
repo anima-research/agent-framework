@@ -7004,6 +7004,17 @@ export class AgentFramework {
               }
             }
             const reason = event.reason ?? 'unknown';
+            // Membrane emits reason 'user' exactly when someone called
+            // stream.cancel() — the host's Stop button / Escape / an admin
+            // abort. That is a DELIBERATE cancellation, not a failure: it
+            // must not feed the consecutive-failure streak, ops alerts, or
+            // the "[inference-failed] the model call failed" chronicle
+            // marker, all of which told the agent (in the user's voice!)
+            // that its turn failed and advised remediation for a failure
+            // that never happened. For long-lived residents whose transcript
+            // is memory, those mislabeled cancellations accumulate as false
+            // self-knowledge.
+            const deliberate = reason === 'user';
             // Only reset if this is still the active stream (a budget restart
             // may have already started a new stream, bumping streamId)
             if (agent.streamId === myStreamId) {
@@ -7013,13 +7024,45 @@ export class AgentFramework {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
                 speech: '',
-                error: `Stream aborted: ${reason}`,
+                error: deliberate ? 'Stream stopped by user' : `Stream aborted: ${reason}`,
               });
-              this.emitTrace({
-                type: 'inference:exhausted',
-                agentName: agent.name,
-                error: `Stream aborted: ${reason}`,
-              });
+              if (deliberate) {
+                // Distinct trace type: emitTrace funnels every
+                // inference:exhausted into noteInferenceExhausted (streak,
+                // failures.log, marker); inference:aborted carries the
+                // honest cause without any of that.
+                this.emitTrace({
+                  type: 'inference:aborted',
+                  agentName: agent.name,
+                  reason: 'user',
+                  durationMs,
+                });
+                // Agent-facing marker, honest about what happened and who
+                // acted (no inference triggered → no loop). Same system
+                // envelope as the failure marker so surfaces render it
+                // the same way.
+                try {
+                  agent.getContextManager().addMessage(
+                    'user',
+                    [{
+                      type: 'text',
+                      text:
+                        `[turn-interrupted] Your previous turn was stopped mid-stream ` +
+                        `by the user — a deliberate cancellation, not a failure. Any ` +
+                        `partial output was cut off by the stop and was not delivered.`,
+                    }],
+                    { system: true, kind: 'turn-interrupted', reason },
+                  );
+                } catch (err) {
+                  console.error(`[turn-interrupted] could not record chronicle marker for ${agent.name}:`, err);
+                }
+              } else {
+                this.emitTrace({
+                  type: 'inference:exhausted',
+                  agentName: agent.name,
+                  error: `Stream aborted: ${reason}`,
+                });
+              }
               // Postmortem 2026-05-28 P2 #7: persist the abort to the
               // inference log so future investigations can attribute the
               // terminal cause without relying on live in-memory reducer
@@ -9123,12 +9166,19 @@ export class AgentFramework {
                 ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
                 : channelId
               : 'the channel';
+            // No-locus failures (headless/WebUI turns with no home or
+            // trigger channel) are not Discord failures: a "[discord-send-
+            // failed] could not be delivered to the channel" marker sent
+            // the agent debugging a Discord problem that doesn't exist.
+            // The machine-readable `kind` stays stable — the gate's
+            // discord-send-failed-skip intent keys on it — but the text
+            // the agent reads names the real situation.
+            const text = channelId
+              ? `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`
+              : `[send-undeliverable] Your previous reply (${textLen} chars) had no delivery destination — ${reason}. This is a routing/configuration situation, not a channel failure. The reply was saved to your archive but was not delivered anywhere.`;
             this.addMessage(
               'user',
-              [{
-                type: 'text',
-                text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
-              }],
+              [{ type: 'text', text }],
               { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason },
             );
           } catch (err) {
