@@ -1181,8 +1181,15 @@ export class AgentFramework {
         privilegedUsersPath: config.gate.privilegedUsersPath,
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
         addMessage: (p, c, m) => framework.addMessage(p, c, m as MessageMetadata),
-        requestInference: (agentName, reason, source) => {
-          framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
+        requestInference: (agentName, reason, source, provenance) => {
+          framework.pendingRequests.push({
+            agentName, reason, source, timestamp: Date.now(),
+            // gate-requested wakes carry where/who (EventGate wakeProvenance)
+            // so the turn's trigger — and the host's telemetry stamp — can
+            // name the channel and counterparty instead of just 'gate'
+            ...(provenance?.channelId ? { channelId: provenance.channelId } : {}),
+            ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
+          });
         },
         getAgentNames: () => [...framework.agents.keys()],
       });
