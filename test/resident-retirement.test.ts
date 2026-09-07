@@ -1,12 +1,13 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import {
+import fs, {
   mkdtempSync,
   mkdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -667,6 +668,59 @@ describe('resident retirement', () => {
       records = readFileSync(retirementPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
       assert.deepEqual(records.map((record) => record.agentName), ['first', 'second']);
     } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed if directory durability syncing throws after the seal file is fsynced', {
+    skip: process.platform === 'win32',
+  }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-retirement-durability-error-'));
+    const storePath = join(dir, 'store');
+    const retirementPath = join(dir, 'new', 'nested', 'resident-retirements.jsonl');
+    const membrane = new RejectInferenceMembrane();
+    const framework = await AgentFramework.create({
+      storePath,
+      retirementPath,
+      membrane: membrane.asMembrane(),
+      agents: [{
+        name: 'resident',
+        model: 'test-model',
+        systemPrompt: 'test',
+        retirement: { enabled: true },
+      }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    const originalFsyncSync = fs.fsyncSync;
+    let fsyncCalls = 0;
+    fs.fsyncSync = ((fd: number) => {
+      originalFsyncSync(fd);
+      fsyncCalls++;
+      if (fsyncCalls === 2) {
+        throw new Error('injected directory-fsync failure');
+      }
+    }) as typeof fs.fsyncSync;
+    syncBuiltinESMExports();
+    try {
+      assert.throws(
+        () => framework.retireResident('resident'),
+        /injected directory-fsync failure/,
+      );
+      assert.equal(fsyncCalls, 2, 'file fsync succeeded before the directory failure');
+      const seals = readFileSync(retirementPath, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      assert.deepEqual(seals.map((record) => record.agentName), ['resident']);
+      assert.equal(framework.getResidentLifecycleStatus('resident').status, 'retired');
+      await assert.rejects(
+        framework.getAgent('resident')!.runInference([]),
+        /inference is permanently disabled: resident retired/,
+      );
+      assert.equal(membrane.calls, 0, 'an ambiguous seal outcome cannot reach the provider');
+    } finally {
+      fs.fsyncSync = originalFsyncSync;
+      syncBuiltinESMExports();
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
     }

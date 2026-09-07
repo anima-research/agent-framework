@@ -2842,6 +2842,34 @@ export class AgentFramework {
   }
 
   /**
+   * A seal append can fail after some or all bytes have become durable. Keep
+   * that ambiguous identity terminal in this process before surfacing the
+   * storage error; startup will validate the authoritative ledger separately.
+   */
+  private failClosedAfterRetirementSealError(
+    agentName: string,
+    record: ResidentRetirementRecord,
+  ): void {
+    this.retiredResidents.set(agentName, record);
+    try {
+      this.stopResidentAuthoredActivity(agentName);
+    } catch (error) {
+      console.error(
+        `[resident-retirement] fail-closed activity teardown failed for ${agentName}:`,
+        error,
+      );
+    }
+    try {
+      this.terminateConversationForksForTemplate(agentName);
+    } catch (error) {
+      console.error(
+        `[resident-retirement] fail-closed conversation teardown failed for ${agentName}:`,
+        error,
+      );
+    }
+  }
+
+  /**
    * Apply the neutral irreversible seal for an explicitly authorized resident.
    * Confirmation, wording, cooling-off and notification are host policy and
    * deliberately absent from this primitive.
@@ -2872,9 +2900,16 @@ export class AgentFramework {
       ...(cleanReason ? { reason: cleanReason } : {}),
     };
 
-    // The sidecar is authoritative and branch-independent. Once this append
-    // returns, no Chronicle branch operation can make the identity infer again.
-    this.appendRetirementSeal(record);
+    // The sidecar is authoritative and branch-independent. A failed append may
+    // still have written a valid record (for example, when directory fsync
+    // throws after file fsync), so an uncertain outcome must fail closed in
+    // this process before the storage error escapes.
+    try {
+      this.appendRetirementSeal(record);
+    } catch (error) {
+      this.failClosedAfterRetirementSealError(agentName, record);
+      throw error;
+    }
     this.retiredResidents.set(agentName, record);
     this.stopResidentAuthoredActivity(agentName);
     // Conversation forks are dependent continuations of their template, not
