@@ -70,8 +70,13 @@ framework enforces that administrative puppeting cannot counterfeit consent.
 `retireResident` appends and fsyncs one record in
 `resident-retirements.jsonl`; when creating the sidecar it also fsyncs the
 containing directory and each newly created directory entry in a custom path
-before returning. That sidecar is authoritative across Chronicle undo, redo,
-and branch switching. The framework then:
+before returning. If applying the seal throws, the framework conservatively
+assumes the append may have begun: the API still throws, but the identity is
+immediately treated as terminal for the lifetime of the current process. Keep
+the host stopped and inspect the ledger before restarting; startup then
+validates whether the authoritative record is complete or torn. That sidecar
+is authoritative across Chronicle undo, redo, and branch switching. The
+framework then:
 
 - cancels the current yielding stream and drops queued inference requests;
 - rejects future inference through the scheduler and through public `Agent`
