@@ -527,6 +527,14 @@ interface ResidentRetirementRecord {
   reason?: string;
 }
 
+/** Identity grammar shared by retirement seal writes and strict reload. */
+function isPersistedResidentIdentity(value: unknown): value is string {
+  return typeof value === 'string' &&
+    value.length > 0 &&
+    value === value.trim() &&
+    !/[\u0000-\u001f\u007f]/.test(value);
+}
+
 /** Local per-residence provider admission (AF #114 bounded first slice). */
 interface LocalProviderGate {
   primaryDepth: number;
@@ -1107,6 +1115,19 @@ export class AgentFramework {
    * Create and start the framework.
    */
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
+    // Validate before opening or mutating the store. Normalizing would change
+    // which configured identity an irreversible record seals, so reject any
+    // name that the strict ledger loader could not later accept verbatim.
+    for (const agentConfig of config.agents) {
+      if (agentConfig.retirement?.enabled && !isPersistedResidentIdentity(agentConfig.name)) {
+        throw new Error(
+          `Invalid persisted resident identity ${JSON.stringify(agentConfig.name)}: ` +
+          'retirement-enabled agent names must be non-empty, have no surrounding whitespace, ' +
+          'and contain no control characters',
+        );
+      }
+    }
+
     // Create or use existing store
     let store: JsStore;
     let ownsStore: boolean;
@@ -2240,10 +2261,7 @@ export class AgentFramework {
         if (
           raw.version !== 1 ||
           raw.kind !== 'resident-retired' ||
-          typeof raw.agentName !== 'string' ||
-          !raw.agentName ||
-          raw.agentName !== raw.agentName.trim() ||
-          /[\u0000-\u001f\u007f]/.test(raw.agentName) ||
+          !isPersistedResidentIdentity(raw.agentName) ||
           typeof raw.retiredAt !== 'number' ||
           !Number.isSafeInteger(raw.retiredAt) ||
           raw.retiredAt <= 0 ||
@@ -2350,21 +2368,30 @@ export class AgentFramework {
     reason = 'resident retired',
     cancelKind: 'resident_retired' | 'template_retired' = 'resident_retired',
   ): void {
-    this.sealAgentInference(agentName, reason, cancelKind);
+    const cleanupErrors: unknown[] = [];
+    const attempt = (operation: () => void): void => {
+      try {
+        operation();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    };
+
+    attempt(() => this.sealAgentInference(agentName, reason, cancelKind));
     // A retired resident cannot retain a model-authored daemon that keeps
     // acting or attempting wakes after its inference identity is sealed.
     const runner = this.codeExecutionRunners.get(agentName);
     if (runner) {
-      runner.abort(reason);
-      runner.dispose();
+      attempt(() => runner.abort(reason));
+      attempt(() => runner.dispose());
       this.codeExecutionRunners.delete(agentName);
     }
     for (const record of this.backgroundScripts.values()) {
       if (record.agentName !== agentName || record.status !== 'running') continue;
       record.cancelled = true;
       record.status = 'cancelled';
-      record.runner.abort(reason);
-      record.runner.dispose();
+      attempt(() => record.runner.abort(reason));
+      attempt(() => record.runner.dispose());
     }
     this.pendingRequests = this.pendingRequests.filter((request) => request.agentName !== agentName);
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
@@ -2379,26 +2406,60 @@ export class AgentFramework {
       for (const resolve of gate.idleWaiters.splice(0)) resolve();
       this.providerGates.delete(agentName);
     }
-    this.eventGate?.clearAgentState(agentName);
+    attempt(() => this.eventGate?.clearAgentState(agentName));
     this.activeTriggerChannels.delete(agentName);
     this.staleWarnAt.delete(agentName);
+    if (cleanupErrors.length === 1) throw cleanupErrors[0];
+    if (cleanupErrors.length > 1) {
+      throw new AggregateError(
+        cleanupErrors,
+        `Multiple retirement cleanup operations failed for ${agentName}`,
+      );
+    }
   }
 
-  private terminateConversationForksForTemplate(templateAgent: string): void {
+  private tombstoneConversationForksForTemplate(templateAgent: string): string[] {
+    if (!this.conversationRouter || this.conversationRouter.templateAgent !== templateAgent) return [];
+    const forkNames = [...this.conversationAgentHomes.keys()];
+    for (const forkName of forkNames) {
+      this.terminatedConversationAgents.add(forkName);
+    }
+    return forkNames;
+  }
+
+  private terminateConversationForksForTemplate(
+    templateAgent: string,
+    forkNames = this.tombstoneConversationForksForTemplate(templateAgent),
+  ): void {
     if (!this.conversationRouter || this.conversationRouter.templateAgent !== templateAgent) return;
     const bindings = this.conversationRouter.getBindings();
-    for (const forkName of [...this.conversationAgentHomes.keys()]) {
-      this.terminatedConversationAgents.add(forkName);
+    const cleanupErrors: unknown[] = [];
+    const attempt = (operation: () => void): void => {
+      try {
+        operation();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    };
+
+    for (const forkName of forkNames) {
       const binding = bindings.find((candidate) => candidate.agentName === forkName);
-      if (binding) this.conversationRouter.unbind(binding.channelId);
-      this.stopResidentAuthoredActivity(
+      if (binding) attempt(() => this.conversationRouter!.unbind(binding.channelId));
+      attempt(() => this.stopResidentAuthoredActivity(
         forkName,
         `template resident ${templateAgent} retired`,
         'template_retired',
-      );
-      this.disposeConversationAgent(forkName);
+      ));
+      attempt(() => this.disposeConversationAgent(forkName));
     }
     this.persistConversationRouterState();
+    if (cleanupErrors.length === 1) throw cleanupErrors[0];
+    if (cleanupErrors.length > 1) {
+      throw new AggregateError(
+        cleanupErrors,
+        `Multiple conversation-fork retirement operations failed for ${templateAgent}`,
+      );
+    }
   }
 
   /**
@@ -2406,27 +2467,28 @@ export class AgentFramework {
    * that ambiguous identity terminal in this process before surfacing the
    * storage error; startup will validate the authoritative ledger separately.
    */
-  private failClosedAfterRetirementSealError(
+  private enforceResidentRetirementInProcess(
     agentName: string,
     record: ResidentRetirementRecord,
-  ): void {
+  ): unknown[] {
+    const cleanupErrors: unknown[] = [];
     this.retiredResidents.set(agentName, record);
+    // Install dependent tombstones before invoking even the resident stream's
+    // provider-owned cancel callback. A hostile or faulty callback may re-enter
+    // the framework synchronously; every dependent identity must already be
+    // terminal at that boundary.
+    const forkNames = this.tombstoneConversationForksForTemplate(agentName);
     try {
       this.stopResidentAuthoredActivity(agentName);
     } catch (error) {
-      console.error(
-        `[resident-retirement] fail-closed activity teardown failed for ${agentName}:`,
-        error,
-      );
+      cleanupErrors.push(error);
     }
     try {
-      this.terminateConversationForksForTemplate(agentName);
+      this.terminateConversationForksForTemplate(agentName, forkNames);
     } catch (error) {
-      console.error(
-        `[resident-retirement] fail-closed conversation teardown failed for ${agentName}:`,
-        error,
-      );
+      cleanupErrors.push(error);
     }
+    return cleanupErrors;
   }
 
   /**
@@ -2438,6 +2500,9 @@ export class AgentFramework {
     if (!this.agents.has(agentName)) throw new Error(`Unknown agent: ${agentName}`);
     if (!this.retirableResidents.has(agentName)) {
       throw new Error(`Resident retirement is not enabled for agent: ${agentName}`);
+    }
+    if (!isPersistedResidentIdentity(agentName)) {
+      throw new Error(`Invalid persisted resident identity ${JSON.stringify(agentName)}`);
     }
     const existing = this.retiredResidents.get(agentName);
     if (existing) {
@@ -2467,15 +2532,19 @@ export class AgentFramework {
     try {
       this.appendRetirementSeal(record);
     } catch (error) {
-      this.failClosedAfterRetirementSealError(agentName, record);
+      const cleanupErrors = this.enforceResidentRetirementInProcess(agentName, record);
+      for (const cleanupError of cleanupErrors) {
+        console.error(
+          `[resident-retirement] fail-closed teardown failed for ${agentName}:`,
+          cleanupError,
+        );
+      }
       throw error;
     }
-    this.retiredResidents.set(agentName, record);
-    this.stopResidentAuthoredActivity(agentName);
-    // Conversation forks are dependent continuations of their template, not
-    // independent ephemeral subagents. Existing forks are sealed, unbound,
-    // and disposed immediately; their Chronicle namespaces remain intact.
-    this.terminateConversationForksForTemplate(agentName);
+    // Install every terminal/tombstone state before surfacing provider-owned
+    // cleanup failures. Existing forks are dependent continuations of their
+    // template; their Chronicle namespaces remain intact after disposal.
+    const cleanupErrors = this.enforceResidentRetirementInProcess(agentName, record);
 
     let chronicleRecorded = false;
     try {
@@ -2496,6 +2565,13 @@ export class AgentFramework {
       retiredAt: record.retiredAt,
       chronicleRecorded,
     });
+    if (cleanupErrors.length === 1) throw cleanupErrors[0];
+    if (cleanupErrors.length > 1) {
+      throw new AggregateError(
+        cleanupErrors,
+        `Multiple retirement cleanup operations failed for ${agentName}`,
+      );
+    }
     return {
       status: 'retired',
       retiredAt: record.retiredAt,

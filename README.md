@@ -277,6 +277,11 @@ seal file and its containing directory on first creation, cancels an active
 stream, denies every future inference surface (including public `Agent`
 references), clears queued wakes and process-local gate state, stops
 resident-authored scripts, and keeps Chronicle/workspace history readable.
+Terminal state and dependent conversation-fork tombstones are installed before
+cleanup; cancellation failures are surfaced only after all independent cleanup
+attempts run. Retirement-enabled resident names must be non-empty, unpadded,
+and free of control characters so the write and strict-reload identity grammar
+is identical.
 Confirmation wording, cooling-off, health gates, and notifications
 deliberately belong to the host. Retirement is distinct from end-turn,
 sleep/dormancy, and erasure.
