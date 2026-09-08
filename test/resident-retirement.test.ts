@@ -221,6 +221,54 @@ class LateStreamingMembrane {
   }
 }
 
+class ThrowingCancellationStream implements YieldingStream {
+  cancelCalls = 0;
+  onCancel: (() => void) | null = null;
+  private release!: () => void;
+  private readonly released = new Promise<void>((resolve) => { this.release = resolve; });
+  readonly isWaitingForTools = false;
+  readonly pendingToolCallIds: string[] = [];
+  readonly toolDepth = 0;
+
+  provideToolResults(): void { throw new Error('not waiting for tools'); }
+  cancel(): void {
+    this.cancelCalls++;
+    this.onCancel?.();
+    this.release();
+    throw new Error('provider cancel failed');
+  }
+  finish(): void { this.release(); }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<import('@animalabs/membrane').StreamEvent> {
+    await this.released;
+    yield {
+      type: 'complete',
+      response: createMockResponse([{ type: 'text', text: 'completion after throwing cancel' }]),
+    } as import('@animalabs/membrane').StreamEvent;
+  }
+}
+
+class ThrowingCancellationMembrane {
+  calls = 0;
+  readonly stream = new ThrowingCancellationStream();
+  readonly created: Promise<void>;
+  private markCreated!: () => void;
+
+  constructor() {
+    this.created = new Promise<void>((resolve) => { this.markCreated = resolve; });
+  }
+
+  streamYielding(_request: NormalizedRequest): YieldingStream {
+    this.calls++;
+    this.markCreated();
+    return this.stream;
+  }
+
+  asMembrane(): import('@animalabs/membrane').Membrane {
+    return this as unknown as import('@animalabs/membrane').Membrane;
+  }
+}
+
 describe('resident retirement', () => {
   it('seals through the neutral API, clears wake state, preserves history, and blocks restart inference', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-resident-retirement-'));
@@ -596,6 +644,110 @@ describe('resident retirement', () => {
     }
   });
 
+  it('terminalizes every fork before surfacing a provider cancellation failure', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-retirement-throwing-cancel-'));
+    const storePath = join(dir, 'store');
+    const membrane = new ThrowingCancellationMembrane();
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: membrane.asMembrane(),
+      agents: [{
+        name: 'template',
+        model: 'test-model',
+        systemPrompt: 'test',
+        retirement: { enabled: true },
+      }],
+      modules: [],
+      conversations: { templateAgent: 'template' },
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    try {
+      const oldFork = await (framework as unknown as {
+        createConversationAgent(name: string, channel: string): Promise<unknown>;
+      }).createConversationAgent('conversation-dm-throwing', 'dm') as {
+        runInference(tools: ToolDefinition[]): Promise<unknown>;
+      };
+      const reentrantForkNudge: {
+        result: ReturnType<AgentFramework['nudgeAgent']> | null;
+      } = { result: null };
+      membrane.stream.onCancel = () => {
+        reentrantForkNudge.result = framework.nudgeAgent('conversation-dm-throwing');
+      };
+
+      framework.start();
+      framework.nudgeAgent('template', 'throwing-cancel-retirement-test');
+      await membrane.created;
+      assert.throws(
+        () => framework.retireResident('template'),
+        /provider cancel failed/,
+      );
+
+      assert.equal(membrane.stream.cancelCalls, 1);
+      assert.equal(
+        reentrantForkNudge.result?.ok,
+        false,
+        'fork is terminal before provider cancellation',
+      );
+      assert.match(
+        reentrantForkNudge.result?.error ?? '',
+        /terminated when its template resident retired/,
+      );
+      assert.equal(framework.getResidentLifecycleStatus('template').status, 'retired');
+      assert.equal(framework.getAgent('template')!.state.status, 'idle');
+      assert.equal(framework.getAgent('conversation-dm-throwing'), null);
+      assert.match(
+        framework.nudgeAgent('conversation-dm-throwing').error ?? '',
+        /terminated when its template resident retired/,
+      );
+      await assert.rejects(
+        oldFork.runInference([]),
+        /inference is permanently disabled: template resident retired/,
+      );
+      assert.equal(membrane.calls, 1, 'the retained fork cannot reach the provider');
+
+      const seals = readFileSync(
+        join(storePath, 'resident-retirements.jsonl'),
+        'utf8',
+      ).trim().split('\n').map((line) => JSON.parse(line));
+      assert.deepEqual(seals.map((record) => record.agentName), ['template']);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const context = await framework.getAgent('template')!.compileContext();
+      assert.doesNotMatch(JSON.stringify(context), /completion after throwing cancel/);
+    } finally {
+      membrane.stream.finish();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects every invalid persisted identity before opening the store', async () => {
+    const invalidNames = ['', ' resident ', 'resident\n'];
+    for (const [index, name] of invalidNames.entries()) {
+      const dir = mkdtempSync(join(tmpdir(), `af-retirement-invalid-name-${index}-`));
+      const storePath = join(dir, 'store');
+      try {
+        await assert.rejects(
+          AgentFramework.create({
+            storePath,
+            membrane: new RejectInferenceMembrane().asMembrane(),
+            agents: [{
+              name,
+              model: 'test-model',
+              systemPrompt: 'test',
+              retirement: { enabled: true },
+            }],
+            modules: [],
+          }),
+          /Invalid persisted resident identity/,
+        );
+        assert.equal(fs.existsSync(storePath), false, 'validation precedes store creation');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
   it('fails closed on torn, malformed, semantically invalid, and duplicate seal records', async () => {
     const cases = [
       { name: 'torn', content: '{"version":1', message: /incomplete final record/ },
@@ -610,6 +762,36 @@ describe('resident retirement', () => {
         content:
           '{"version":1,"kind":"resident-retired","agentName":"resident","retiredAt":1}\n' +
           '{"version":1,"kind":"resident-retired","agentName":"resident","retiredAt":2}\n',
+        message: /invalid retirement record/,
+      },
+      {
+        name: 'empty-agent-name',
+        content: `${JSON.stringify({
+          version: 1,
+          kind: 'resident-retired',
+          agentName: '',
+          retiredAt: 1,
+        })}\n`,
+        message: /invalid retirement record/,
+      },
+      {
+        name: 'padded-agent-name',
+        content: `${JSON.stringify({
+          version: 1,
+          kind: 'resident-retired',
+          agentName: ' resident ',
+          retiredAt: 1,
+        })}\n`,
+        message: /invalid retirement record/,
+      },
+      {
+        name: 'control-character-agent-name',
+        content: `${JSON.stringify({
+          version: 1,
+          kind: 'resident-retired',
+          agentName: 'resident\n',
+          retiredAt: 1,
+        })}\n`,
         message: /invalid retirement record/,
       },
     ];

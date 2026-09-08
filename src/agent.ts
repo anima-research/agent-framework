@@ -977,12 +977,18 @@ export class Agent {
    * Cancel any active stream and reset to idle.
    */
   cancelStream(): void {
-    if (this._state.status === 'streaming') {
-      this._state.stream.cancel();
-    } else if (this._state.status === 'waiting_for_tools' && this._state.stream) {
-      this._state.stream.cancel();
+    try {
+      if (this._state.status === 'streaming') {
+        this._state.stream.cancel();
+      } else if (this._state.status === 'waiting_for_tools' && this._state.stream) {
+        this._state.stream.cancel();
+      }
+    } finally {
+      // Provider-owned cancellation is allowed to throw. State teardown is
+      // framework-owned and must still complete so a sealed agent cannot be
+      // stranded in streaming/waiting_for_tools.
+      this._state = { status: 'idle' };
     }
-    this._state = { status: 'idle' };
   }
 
   /**

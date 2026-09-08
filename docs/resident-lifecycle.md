@@ -43,6 +43,11 @@ enforcement, status, and observability.
 
 `getResidentLifecycleStatus(name)` returns the durable host view. A configured
 resident without `retirement.enabled` cannot be retired through this API.
+Because the configured name is also the exact durable identity written to the
+seal ledger, a retirement-enabled resident name must be non-empty, have no
+surrounding whitespace, and contain no control characters. Invalid names are
+rejected before the framework opens or creates its store; they are never
+silently normalized to another identity.
 
 ## Host-owned live tools
 
@@ -94,6 +99,13 @@ framework then:
 - refuses to create any later conversation fork from that template; and
 - appends `framework/resident-lifecycle` in Chronicle and emits a
   `resident:retired` trace.
+
+Terminal state and every dependent conversation-fork tombstone are installed
+before provider- or module-owned cleanup runs. Cleanup attempts are isolated:
+one cancellation or disposal failure does not prevent later resident/fork
+cleanup. If cleanup does fail, `retireResident` surfaces the error only after
+the durable seal and in-process terminal boundaries are in place; a successful
+seal therefore cannot be undone by a throwing provider cancellation.
 
 Already-running ephemeral subagents are separate, short-lived inference
 identities. Retirement does not kill them mid-call. They may finish their own
