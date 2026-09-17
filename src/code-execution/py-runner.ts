@@ -139,36 +139,21 @@ export class PyRunner {
       };
     }
     this.clearIdleTimer();
-
-    try {
-      await this.ensureChild();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      this.reclaim('spawn-failed');
-      return {
-        stdout: '',
-        stderr: `Failed to start python runtime (${this.pythonPath}): ${message}`,
-        returnCode: 1,
-        aborted: true,
-      };
-    }
-
     const execId = `e${++this.execCounter}`;
     const deadlineMs = background?.lifetimeMs ?? this.scriptTimeoutMs;
     this.onWake = background?.onWake ?? null;
-    const result = await new Promise<ExecResult>((resolve) => {
-      const pending: PendingExec = {
-        id: execId,
-        resolve,
-        deadlineTimer: null,
-        killTimer: null,
-        settled: false,
-      };
-      this.pending = pending;
-
+    let resolve!: (result: ExecResult) => void;
+    const completion = new Promise<ExecResult>((r) => { resolve = r; });
+    // Reserve before the first await. Startup is part of the execution:
+    // concurrent calls must not overwrite its result resolver, and abort /
+    // dispose must be able to settle it even before Python says ready.
+    const pending: PendingExec = {
+      id: execId, resolve, deadlineTimer: null, killTimer: null, settled: false,
+    };
+    this.pending = pending;
+    void this.ensureChild().then(() => {
+      if (this.pending !== pending || pending.settled) return;
       pending.deadlineTimer = setTimeout(() => {
-        // Deadline: ask politely first (script sees CancelledError and its
-        // exec_result still flows back), then kill on unresponsiveness.
         this.send({ op: 'cancel', id: execId, reason: 'deadline' });
         pending.killTimer = setTimeout(() => {
           this.settlePending({
@@ -180,22 +165,31 @@ export class PyRunner {
           this.reclaim('deadline-kill');
         }, CANCEL_GRACE_MS);
       }, deadlineMs);
-      // A day-scale background deadline must not hold the process open.
       if (background) pending.deadlineTimer.unref?.();
-
       this.send({
         op: 'init',
         tools: tools.map((t) => ({ py_name: t.pyName, tool_name: t.toolName })),
-        call_timeout_s: Math.round(this.toolCallTimeoutMs / 1000),
-        ...(background
-          ? { background: true, log_path: background.logPath ?? null }
-          : {}),
+        call_timeout_s: this.toolCallTimeoutMs / 1000,
+        ...(background ? { background: true, log_path: background.logPath ?? null } : {}),
       });
       this.send({ op: 'exec', id: execId, code });
+    }).catch((err) => {
+      if (this.pending !== pending || pending.settled) return;
+      const message = err instanceof Error ? err.message : String(err);
+      this.settlePending({
+        stdout: '',
+        stderr: `Failed to start python runtime (${this.pythonPath}): ${message}`,
+        returnCode: 1,
+        aborted: true,
+      });
+      this.reclaim('spawn-failed');
     });
+    const result = await completion;
 
-    this.onWake = null;
-    if (!background) this.armIdleTimer();
+    if (!this.pending) {
+      this.onWake = null;
+      if (!background) this.armIdleTimer();
+    }
     return result;
   }
 
@@ -261,6 +255,7 @@ export class PyRunner {
     });
 
     child.on('exit', (exitCode, signal) => {
+      if (this.child !== child) return;
       if (this.pending) {
         this.settlePending({
           stdout: '',
@@ -275,7 +270,9 @@ export class PyRunner {
     });
 
     this.reader = createInterface({ input: child.stdout });
-    this.reader.on('line', (line) => this.handleLine(line));
+    this.reader.on('line', (line) => {
+      if (this.child === child) this.handleLine(line);
+    });
 
     this.childReady = new Promise<void>((resolve, reject) => {
       const onReady = () => {
@@ -297,10 +294,12 @@ export class PyRunner {
       const cleanup = () => {
         clearTimeout(timeout);
         this.readyResolver = null;
+        this.readyRejecter = null;
         child.off('exit', onExit);
         child.off('error', onError);
       };
       this.readyResolver = onReady;
+      this.readyRejecter = onError;
       child.on('exit', onExit);
       child.on('error', onError);
     });
@@ -308,9 +307,10 @@ export class PyRunner {
   }
 
   private readyResolver: (() => void) | null = null;
+  private readyRejecter: ((error: Error) => void) | null = null;
 
   private handleLine(line: string): void {
-    let msg: { op?: string; id?: string; name?: string; args?: unknown; stdout?: string; stderr?: string; return_code?: number };
+    let msg: { op?: string; id?: string; exec_id?: string; name?: string; args?: unknown; stdout?: string; stderr?: string; return_code?: number };
     try {
       msg = JSON.parse(line);
     } catch {
@@ -324,6 +324,9 @@ export class PyRunner {
         return;
 
       case 'tool_call': {
+        const child = this.child;
+        const pending = this.pending;
+        if (!pending || msg.exec_id !== pending.id) return;
         const callId = msg.id;
         const toolName = msg.name;
         if (!callId || !toolName) return;
@@ -334,12 +337,19 @@ export class PyRunner {
         this.onToolCall(toolName, args)
           .catch((err) => `Error: ${err instanceof Error ? err.message : String(err)}`)
           .then((result) => {
-            this.send({ op: 'tool_result', id: callId, result });
+            // A reclaimed interpreter starts call ids again at t1. Late
+            // results from its predecessor must never satisfy the new call.
+            if (this.child === child && this.pending === pending) {
+              this.send({ op: 'tool_result', id: callId, result });
+            }
           });
         return;
       }
 
       case 'wake': {
+        const child = this.child;
+        const pending = this.pending;
+        if (!pending || msg.exec_id !== pending.id) return;
         const wakeId = msg.id;
         if (!wakeId) return;
         const line = typeof (msg as { line?: unknown }).line === 'number'
@@ -352,7 +362,9 @@ export class PyRunner {
               `wake handler failed: ${err instanceof Error ? err.message : String(err)}`)
           : Promise.resolve('this script is not allowed to wake the agent');
         void refuse.then((error) => {
-          this.send({ op: 'wake_ack', id: wakeId, ...(error ? { error } : {}) });
+          if (this.child === child && this.pending === pending) {
+            this.send({ op: 'wake_ack', id: wakeId, ...(error ? { error } : {}) });
+          }
         });
         return;
       }
@@ -408,6 +420,7 @@ export class PyRunner {
   }
 
   private teardownChild(): void {
+    this.readyRejecter?.(new Error('python runtime reclaimed during startup'));
     if (this.reader) {
       this.reader.close();
       this.reader = null;

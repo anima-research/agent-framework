@@ -1,3 +1,4 @@
+import { ScriptRun, type TimeoutPolicy } from './code-execution/script-run.js';
 import { join } from 'node:path';
 import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceRegistry, referenceStubOrNull } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
@@ -640,9 +641,14 @@ interface Deferred<T> {
  *  the caller awaits plus the liveness/progress bookkeeping the watchdogs and
  *  the stream driver share. One map entry per run — created and torn down in
  *  runEphemeralToCompletion — so the pieces cannot desync. */
-/** One model-authored background (daemon) script — see runCodeExecution. */
-interface BackgroundScriptRecord {
+/** A Python execution, independent of the tool call currently observing it. */
+interface CodeExecutionRecord {
   id: string;
+  mode: 'foreground' | 'background';
+  run: ScriptRun;
+  endTurn: boolean;
+  wakeQueue: Promise<unknown>;
+  wakeAbort: AbortController;
   agentName: string;
   runner: PyRunner;
   /** The agent-authored source (line numbers in wake envelopes index into it). */
@@ -955,15 +961,11 @@ export class AgentFramework {
   private codeExecutionConfig: import('./types/index.js').CodeExecutionConfig | null = null;
   private codeExecutionRunners: Map<string, PyRunner> = new Map();
   private scriptToolWaiters: Map<string, (result: ToolResult) => void> = new Map();
-  /** Agents whose running script hit an endTurn-carrying inner result —
-   *  deferred and applied to the final code_execution result instead of
-   *  cancelling the stream mid-script (which would wedge the turn). */
-  private scriptDeferredEndTurn: Set<string> = new Set();
-  /** Background (daemon) scripts: model-authored watchers that outlive their
-   *  spawning turn. Each gets a DEDICATED PyRunner; wake_agent() injects a
-   *  provenance envelope + payload and requests inference. Keyed by script id. */
-  private backgroundScripts: Map<string, BackgroundScriptRecord> = new Map();
-  private backgroundScriptCounter = 0;
+  /** Running executions and the five most recently settled results per owner.
+   * Foreground runs share their owner's interpreter; background runs have a
+   * dedicated one. Observation and wake state belong to the run, not a turn. */
+  private codeExecutionScripts: Map<string, CodeExecutionRecord> = new Map();
+  private codeExecutionScriptCounter = 0;
   /** Resident-set per-agent tool-result inline cap (chars), via
    *  agent_settings `tool_result_inline_max_chars`. DURABLE: persisted in
    *  framework state like the core runtime settings and restored at create
@@ -1419,21 +1421,15 @@ export class AgentFramework {
     // Kill running code_execution scripts before cancelling streams: a
     // zombie script must not keep firing side-effectful tool calls into a
     // framework that is shutting down.
-    for (const runner of this.codeExecutionRunners.values()) {
-      runner.dispose();
-    }
-    this.codeExecutionRunners.clear();
-    // Background daemons die with the process (documented limitation) —
-    // mark cancelled FIRST so their settle path stays silent (no crash-wake
-    // into a framework that is shutting down).
-    for (const record of this.backgroundScripts.values()) {
-      if (record.status === 'running') {
-        record.cancelled = true;
-        record.status = 'cancelled';
-      }
+    for (const record of this.codeExecutionScripts.values()) {
+      record.cancelled = true;
+      if (record.status === 'running') record.status = 'cancelled';
+      record.wakeAbort.abort();
       record.runner.dispose();
     }
-    this.backgroundScripts.clear();
+    this.codeExecutionScripts.clear();
+    for (const runner of this.codeExecutionRunners.values()) runner.dispose();
+    this.codeExecutionRunners.clear();
     // Retained tool images are per-process by design; a retained stopped
     // framework must not keep up to the whole ledger budget referenced.
     this.toolImageLedgers.clear();
@@ -2743,6 +2739,7 @@ export class AgentFramework {
         // The late stream finalizer intentionally refuses name-keyed cleanup once
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
+        this.disposeAgentScripts(agent.name);
         this.agents.delete(agent.name);
       }
       this.toolImageLedgers.delete(agent.name);
@@ -5156,6 +5153,7 @@ export class AgentFramework {
     this.closingConversationAgents.delete(agentName);
     const channelId = this.conversationAgentHomes.get(agentName);
     const agent = this.agents.get(agentName);
+    this.disposeAgentScripts(agentName);
     this.agents.delete(agentName);
     this.toolImageLedgers.delete(agentName);
     this.agentConfigs.delete(agentName);
@@ -8090,36 +8088,54 @@ export class AgentFramework {
       background?: unknown;
       action?: unknown;
       script_id?: unknown;
+      wait_ms?: unknown;
+      on_timeout?: unknown;
     };
 
-    // Management surface: the agent's own daemon fleet is inspectable and
+    const waitMs = input.wait_ms ?? this.codeExecutionConfig?.foregroundWaitMs ?? 10_000;
+    if (typeof waitMs !== 'number' || !Number.isInteger(waitMs) || waitMs < 0 || waitMs > 60_000) {
+      return { success: false, error: 'wait_ms must be an integer from 0 to 60000', isError: true };
+    }
+    const onTimeout = input.on_timeout ?? 'continue';
+    if (onTimeout !== 'continue' && onTimeout !== 'end_turn') {
+      return { success: false, error: 'on_timeout must be continue or end_turn', isError: true };
+    }
+
+    if (onTimeout === 'end_turn' && (!this.agents.has(agentName) || this.ephemeralRuns.has(agentName))) {
+      return { success: false, isError: true, error: 'end_turn requires a persistent registered agent that can receive the completion wake' };
+    }
+
+    // Management surface: the agent's own execution fleet is inspectable and
     // killable through the same tool that spawns it.
     if (input.action === 'list') {
-      const scripts = [...this.backgroundScripts.values()]
+      const scripts = [...this.codeExecutionScripts.values()]
         .filter((s) => s.agentName === agentName)
         .map((s) => ({
           script_id: s.id,
           status: s.status,
+          mode: s.mode,
           started_at: new Date(s.startedAt).toISOString(),
           wakes: s.wakes,
           last_wake_at: s.lastWakeAt ? new Date(s.lastWakeAt).toISOString() : null,
           log: s.logPath,
         }));
-      return { success: true, data: { background_scripts: scripts } };
+      return { success: true, data: { scripts, background_scripts: scripts.filter(s => s.mode === 'background') } };
     }
-    if (input.action === 'cancel') {
+    if (input.action === 'cancel' || input.action === 'wait') {
       if (typeof input.script_id !== 'string') {
-        return { success: false, error: 'cancel requires `script_id`', isError: true };
+        return { success: false, error: `${input.action} requires \`script_id\``, isError: true };
       }
-      const record = this.backgroundScripts.get(input.script_id);
+      const record = this.codeExecutionScripts.get(input.script_id);
       if (!record || record.agentName !== agentName) {
-        return { success: false, error: `no background script '${input.script_id}'`, isError: true };
+        return { success: false, error: `no script '${input.script_id}'`, isError: true };
       }
+      if (input.action === 'wait') return this.observeCodeExecution(record, waitMs, onTimeout);
       if (record.status === 'running') {
+        record.wakeAbort.abort();
         record.cancelled = true;
         record.status = 'cancelled';
         record.runner.abort('cancelled by agent');
-        record.runner.dispose();
+        if (record.mode === 'background') record.runner.dispose();
       }
       return {
         success: true,
@@ -8147,20 +8163,71 @@ export class AgentFramework {
     );
 
     if (input.background === true) {
-      return this.startBackgroundScript(agentName, input.code, injected);
+      const started = this.startBackgroundScript(agentName, input.code, injected);
+      if (!started.success || (input.wait_ms === undefined && input.on_timeout === undefined)) return started;
+      const id = (started.data as { script_id: string }).script_id;
+      return this.observeCodeExecution(this.codeExecutionScripts.get(id)!, waitMs, onTimeout);
     }
 
+    const active = [...this.codeExecutionScripts.values()].find(s =>
+      s.agentName === agentName && s.mode === 'foreground' && s.status === 'running');
+    if (active) {
+      return { success: false, isError: true,
+        error: `Python context is busy with ${active.id}; wait/cancel it, or use background=true for an independent interpreter`,
+        data: { script_id: active.id, status: active.status } };
+    }
     const runner = this.getOrCreateScriptRunner(agentName);
-    this.scriptDeferredEndTurn.delete(agentName);
-    const exec = await runner.exec(input.code, injected);
-    const endTurn = this.scriptDeferredEndTurn.delete(agentName);
+    const record: CodeExecutionRecord = {
+      id: `py-${++this.codeExecutionScriptCounter}`, agentName, runner,
+      mode: 'foreground', code: input.code, startedAt: Date.now(),
+      wakes: 0, lastWakeAt: null, logPath: null, status: 'running', cancelled: false,
+      endTurn: false, wakeQueue: Promise.resolve(), wakeAbort: new AbortController(),
+      run: undefined!,
+    };
+    this.codeExecutionScripts.set(record.id, record);
+    this.emitTrace({ type: 'tool:started', module: 'code_execution', tool: `foreground:${record.id}`,
+      callId: record.id, input: { lines: record.code.split('\n').length } });
+    record.run = new ScriptRun(runner.exec(input.code, injected), (exec, notify, observed) =>
+      this.settleCodeExecution(record, exec, notify, observed));
+    return this.observeCodeExecution(record, waitMs, onTimeout);
+  }
 
+  private async observeCodeExecution(
+    record: CodeExecutionRecord, waitMs: number, onTimeout: TimeoutPolicy,
+  ): Promise<ToolResult> {
+    const observed = await record.run.observe(waitMs, onTimeout);
+    const exec = observed.result;
+    const endTurn = observed.endTurn || record.endTurn;
+    record.endTurn = false;
     return {
-      success: true,
-      data: { stdout: exec.stdout, stderr: exec.stderr, return_code: exec.returnCode },
-      isError: false,
+      success: true, isError: false,
+      data: {
+        script_id: record.id, status: exec ? record.status : 'running', mode: record.mode,
+        ...(exec ? { stdout: exec.stdout, stderr: exec.stderr, return_code: exec.returnCode,
+          ...(exec.aborted ? { aborted: true } : {}), ...(exec.tail ? { tail: exec.tail } : {}) }
+          : { note: 'Still running. Completion will notify you; use action=wait to retrieve the result. Waiting does not cancel execution.' }),
+        ...(record.logPath ? { log: record.logPath } : {}),
+      },
       ...(endTurn ? { endTurn: true } : {}),
     };
+  }
+
+  /** Release a stuck observation through its normal tool-result boundary.
+   * The script survives; its completion wakes its owner. No stream surgery.
+   */
+  releaseCodeExecutionWait(agentName: string, scriptId?: string): { released: number } {
+    if (!this.agents.has(agentName) || this.ephemeralRuns.has(agentName)) {
+      throw new Error('Releasing a wait requires a persistent registered agent');
+    }
+    const records = [...this.codeExecutionScripts.values()].filter(s => s.agentName === agentName);
+    if (scriptId && !records.some(s => s.id === scriptId)) {
+      throw new Error(`No script '${scriptId}' for '${agentName}'`);
+    }
+    let released = 0;
+    for (const record of records) {
+      if (!scriptId || record.id === scriptId) released += record.run.release();
+    }
+    return { released };
   }
 
   // ---------------------------------------------------------------------------
@@ -8181,8 +8248,8 @@ export class AgentFramework {
     injected: import('./code-execution/py-runner.js').InjectedTool[],
   ): ToolResult {
     // v1: primary-agent-only. A conversation fork's or ephemeral's daemon
-    // would outlive its owner and its wake would land in the primary
-    // conversation anyway — refuse loudly instead of surprising anyone.
+    // would outlive its owner. Keep the existing restriction rather than
+    // promising a watcher whose lifetime depends on a short-lived fork.
     if (this.primaryAgentName && agentName !== this.primaryAgentName) {
       return {
         success: false,
@@ -8192,8 +8259,8 @@ export class AgentFramework {
     }
     const cfg = this.codeExecutionConfig;
     const maxScripts = cfg?.maxBackgroundScripts ?? 3;
-    const runningCount = [...this.backgroundScripts.values()]
-      .filter((s) => s.agentName === agentName && s.status === 'running').length;
+    const runningCount = [...this.codeExecutionScripts.values()]
+      .filter((s) => s.agentName === agentName && s.mode === 'background' && s.status === 'running').length;
     if (runningCount >= maxScripts) {
       return {
         success: false,
@@ -8203,7 +8270,7 @@ export class AgentFramework {
       };
     }
 
-    const scriptId = `bg-${++this.backgroundScriptCounter}`;
+    const scriptId = `bg-${++this.codeExecutionScriptCounter}`;
     const lifetimeMs = cfg?.backgroundMaxLifetimeMs ?? 86_400_000;
 
     // Journal: a file under the agent's first read-write workspace mount so
@@ -8230,8 +8297,13 @@ export class AgentFramework {
       onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args),
     });
 
-    const record: BackgroundScriptRecord = {
+    const record: CodeExecutionRecord = {
       id: scriptId,
+      mode: 'background',
+      run: undefined!,
+      endTurn: false,
+      wakeQueue: Promise.resolve(),
+      wakeAbort: new AbortController(),
       agentName,
       runner,
       code,
@@ -8242,26 +8314,17 @@ export class AgentFramework {
       status: 'running',
       cancelled: false,
     };
-    this.backgroundScripts.set(scriptId, record);
+    this.codeExecutionScripts.set(scriptId, record);
     this.emitTrace({
       type: 'tool:started', module: 'code_execution', tool: `background:${scriptId}`,
       callId: scriptId, input: { lines: code.split('\n').length },
     });
 
-    void runner
-      .exec(code, injected, {
-        logPath: logAbsPath,
-        lifetimeMs,
-        onWake: (line, payload) => this.handleScriptWake(record, line, payload),
-      })
-      .then((exec) => this.settleBackgroundScript(record, exec))
-      .catch((err) => {
-        // exec never rejects by contract; this is the belt-and-suspenders.
-        console.error(`[pytc:${agentName}:${scriptId}] background exec rejected: ${String(err)}`);
-        this.settleBackgroundScript(record, {
-          stdout: '', stderr: String(err), returnCode: 1, aborted: true,
-        });
-      });
+    record.run = new ScriptRun(runner.exec(code, injected, {
+      logPath: logAbsPath,
+      lifetimeMs,
+      onWake: (line, payload) => this.handleScriptWake(record, line, payload),
+    }), (exec, notify, observed) => this.settleCodeExecution(record, exec, notify, observed));
 
     return {
       success: true,
@@ -8295,11 +8358,17 @@ export class AgentFramework {
    * RuntimeError inside the script).
    */
   private async handleScriptWake(
-    record: BackgroundScriptRecord,
+    record: CodeExecutionRecord,
     line: number,
     payload: unknown,
   ): Promise<string | null> {
-    if (record.cancelled) return 'script was cancelled';
+    const delivery = record.wakeQueue.then(() => this.deliverScriptWake(record, line, payload));
+    record.wakeQueue = delivery.catch(() => {});
+    return delivery;
+  }
+
+  private async deliverScriptWake(record: CodeExecutionRecord, line: number, payload: unknown): Promise<string | null> {
+    if (record.cancelled || record.status !== 'running') return 'script is no longer running';
     const cfg = this.codeExecutionConfig;
     const maxWakes = cfg?.maxWakesPerScript ?? 100;
     if (record.wakes >= maxWakes) {
@@ -8309,15 +8378,15 @@ export class AgentFramework {
     if (record.lastWakeAt !== null) {
       const wait = record.lastWakeAt + floorMs - Date.now();
       if (wait > 0) {
-        await new Promise((r) => {
-          const t = setTimeout(r, wait);
-          (t as { unref?: () => void }).unref?.();
+        await new Promise<void>((resolve) => {
+          const finish = () => { clearTimeout(timer); record.wakeAbort.signal.removeEventListener('abort', finish); resolve(); };
+          const timer = setTimeout(finish, wait);
+          timer.unref?.();
+          record.wakeAbort.signal.addEventListener('abort', finish, { once: true });
         });
-        if (record.cancelled) return 'script was cancelled';
+        if (record.cancelled || record.status !== 'running') return 'script is no longer running';
       }
     }
-    record.wakes += 1;
-    record.lastWakeAt = Date.now();
 
     const elapsedMin = Math.round((Date.now() - record.startedAt) / 60_000);
     const payloadJson = payload === undefined || payload === null
@@ -8330,51 +8399,62 @@ export class AgentFramework {
       ? this.resolveToolResultInlineCap(agent).cap
       : DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS;
     const { text: payloadText } = await this.spillOrTruncate(
-      payloadJson, maxChars, `${record.id}-wake${record.wakes}`,
+      payloadJson, maxChars, `${record.id}-wake${record.wakes + 1}`,
     );
 
     const envelope =
       `[background script ${record.id}] Woke you: wake_agent() called at line ${line} of your script, ` +
-      `${elapsedMin}m after you started it (wake ${record.wakes} of ${maxWakes}).\n` +
+      `${elapsedMin}m after you started it (wake ${record.wakes + 1} of ${maxWakes}).\n` +
       `Arguments:\n${payloadText}\n` +
       (record.logPath ? `Script output so far: workspace file ${record.logPath}\n` : '') +
       `Script status: still running`;
 
-    this.injectScriptWake(record, envelope);
-    return null;
+    if (record.cancelled || record.status !== 'running') return 'script is no longer running';
+    const error = this.injectScriptWake(record, envelope);
+    if (!error) { record.wakes += 1; record.lastWakeAt = Date.now(); }
+    return error;
   }
 
-  /** Background script ended (clean, crash, deadline, cancel/dispose). */
-  private settleBackgroundScript(
-    record: BackgroundScriptRecord,
+  /** Execution ended (clean, crash, deadline, cancel/dispose). */
+  private settleCodeExecution(
+    record: CodeExecutionRecord,
     exec: import('./code-execution/py-runner.js').ExecResult,
+    notify = false,
+    observed = false,
   ): void {
-    record.runner.dispose();
+    record.wakeAbort.abort();
+    if (record.mode === 'background') record.runner.dispose();
     if (record.status === 'running') {
       record.status = exec.returnCode === 0 ? 'finished' : 'died';
     }
     this.emitTrace({
-      type: 'tool:completed', module: 'code_execution', tool: `background:${record.id}`,
+      type: 'tool:completed', module: 'code_execution', tool: `${record.mode}:${record.id}`,
       callId: record.id, durationMs: Date.now() - record.startedAt,
     });
-    // Crash honesty: a resident sleeping on a promise must never have that
-    // promise die silently. Deliberate cancels/disposes stay silent (the
-    // agent or host chose them); clean exits stay silent (the null path).
-    if (record.status === 'died' && !record.cancelled) {
-      const tail = (exec.tail ?? exec.stderr ?? '').slice(-2000);
+    // An unobserved completion after yielding wakes once. Legacy watchers
+    // remain silent on clean exit unless observed/yielded; crashes wake.
+    // Explicit cancellation and owner disposal suppress notifications.
+    if ((notify || (record.mode === 'background' && record.status === 'died' && !observed)) && !record.cancelled) {
+      const tail = (exec.tail || exec.stderr || exec.stdout).slice(-2000);
       const elapsedMin = Math.round((Date.now() - record.startedAt) / 60_000);
       const envelope =
-        `[background script ${record.id}] Your background script DIED ${elapsedMin}m after start ` +
-        `(it did not call wake_agent and is no longer watching).\n` +
+        `[${record.mode} script ${record.id}] Script ${record.status === 'died' ? 'DIED' : 'finished'} ${elapsedMin}m after start ` +
+        `(return_code=${exec.returnCode}). Retrieve the retained result with code_execution action=wait, script_id=${record.id}.\n` +
         `Last output:\n${tail || '(none)'}\n` +
         (record.logPath ? `Full journal: workspace file ${record.logPath}` : '');
       this.injectScriptWake(record, envelope);
     }
-    // Keep a short memory of settled scripts for {"action":"list"}, then drop.
-    const settled = [...this.backgroundScripts.values()]
+    // Refresh insertion order on settlement so a long-running older job
+    // isn't immediately evicted by five newer jobs that finished before it.
+    if (this.codeExecutionScripts.has(record.id)) {
+      this.codeExecutionScripts.delete(record.id);
+      this.codeExecutionScripts.set(record.id, record);
+    }
+    // Keep a short memory of settled scripts for list/wait, then drop.
+    const settled = [...this.codeExecutionScripts.values()]
       .filter((s) => s.agentName === record.agentName && s.status !== 'running');
     for (const old of settled.slice(0, Math.max(0, settled.length - 5))) {
-      this.backgroundScripts.delete(old.id);
+      this.codeExecutionScripts.delete(old.id);
     }
   }
 
@@ -8385,13 +8465,15 @@ export class AgentFramework {
    * authority); it enters tagged so gate policies could be taught about it
    * later if that ever needs revisiting.
    */
-  private injectScriptWake(record: BackgroundScriptRecord, envelope: string): void {
+  private injectScriptWake(record: CodeExecutionRecord, envelope: string): string | null {
+    if (!this.agents.has(record.agentName)) return 'script owner is no longer registered';
     try {
       const messageId = this.addMessage('user', [{ type: 'text', text: envelope }], {
         source: 'background-script',
         scriptId: record.id,
         tags: ['script:wake'],
-      });
+        system: true,
+      }, { forAgent: record.agentName });
       this.pendingRequests.push({
         agentName: record.agentName,
         reason: 'script:wake',
@@ -8403,10 +8485,11 @@ export class AgentFramework {
         messageId,
         source: `background-script:${record.id}`,
       });
+      return null;
     } catch (err) {
-      console.error(
-        `[pytc:${record.agentName}:${record.id}] wake injection failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      const error = `wake injection failed: ${err instanceof Error ? err.message : String(err)}`;
+      console.error(`[pytc:${record.agentName}:${record.id}] ${error}`);
+      return error;
     }
   }
 
@@ -8550,7 +8633,11 @@ export class AgentFramework {
         scriptTimeoutMs: cfg?.scriptTimeoutMs,
         idleReclaimMs: cfg?.idleReclaimMs,
         label: agentName,
-        onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args),
+        onToolCall: (toolName, args) => {
+          const record = [...this.codeExecutionScripts.values()].find(s =>
+            s.agentName === agentName && s.mode === 'foreground' && s.status === 'running');
+          return this.handleScriptToolCall(agentName, toolName, args, () => { if (record) record.endTurn = true; });
+        },
       });
       this.codeExecutionRunners.set(agentName, runner);
     }
@@ -8570,17 +8657,15 @@ export class AgentFramework {
     agentName: string,
     toolName: string,
     args: Record<string, unknown>,
+    onEndTurn?: () => void,
   ): Promise<string> {
     if (toolName === CODE_EXECUTION_TOOL_NAME) {
       return 'Error: code_execution cannot be called from within a script';
     }
     const result = await this.dispatchScriptToolCall(agentName, toolName, args);
-    if (result.endTurn) {
-      // Deferred: applied to the final code_execution result (see
-      // scriptDeferredEndTurn) — ending the turn mid-script would cancel the
-      // stream while the script still runs and wedge the tool round.
-      this.scriptDeferredEndTurn.add(agentName);
-    }
+    // Bound to this execution; background or late inner results must never
+    // request endTurn on an unrelated later foreground script.
+    if (result.endTurn) onEndTurn?.();
     if (result.isError) {
       return `Error: ${result.error ?? 'tool call failed'}`;
     }
@@ -8651,12 +8736,24 @@ export class AgentFramework {
     });
   }
 
-  /** Abort a running script when the agent's turn dies underneath it. */
-  private abortAgentScript(agentName: string, reason: string): void {
-    const runner = this.codeExecutionRunners.get(agentName);
-    if (runner?.busy) {
-      runner.abort(reason);
+  private disposeAgentScripts(agentName: string): void {
+    for (const record of this.codeExecutionScripts.values()) {
+      if (record.agentName !== agentName) continue;
+      record.cancelled = true;
+      record.status = 'cancelled';
+      record.wakeAbort.abort();
+      record.runner.dispose();
+      this.codeExecutionScripts.delete(record.id);
     }
+    this.codeExecutionRunners.get(agentName)?.dispose();
+    this.codeExecutionRunners.delete(agentName);
+  }
+
+  /** Abort a failed observation; unrelated later stream failures leave yielded work alone. */
+  private abortAgentScript(agentName: string, reason: string): void {
+    const record = [...this.codeExecutionScripts.values()].find(s =>
+      s.agentName === agentName && s.mode === 'foreground' && s.status === 'running');
+    if (record?.run.observing) record.runner.abort(reason);
   }
 
   private toMembraneToolResult(

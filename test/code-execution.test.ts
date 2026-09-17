@@ -261,6 +261,73 @@ describe('PyRunner (real python3)', () => {
     }
   });
 
+  it('reserves the runner during cold startup and allows immediate cancellation', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const first = runner.exec('import asyncio\nawait asyncio.sleep(60)', []);
+      assert.strictEqual(runner.busy, true, 'startup must count as busy');
+      const second = await runner.exec('print("must not run")', []);
+      assert.match(second.stderr, /already running/);
+      runner.abort('startup cancelled');
+      assert.strictEqual((await first).aborted, true);
+      const next = await runner.exec('print("fresh")', []);
+      assert.strictEqual(next.returnCode, 0, next.stderr);
+      assert.match(next.stdout, /fresh/);
+    } finally { runner.dispose(); }
+  });
+
+  it('disposal during startup settles promptly', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    const result = runner.exec('print("must not run")', []);
+    runner.dispose();
+    assert.strictEqual((await result).aborted, true);
+    assert.strictEqual(runner.busy, false);
+  });
+
+  it('keeps sub-second inner-tool timeouts instead of rounding them to zero', async () => {
+    const runner = new PyRunner({
+      toolCallTimeoutMs: 50,
+      onToolCall: async () => { await new Promise(r => setTimeout(r, 300)); return 'too late'; },
+    });
+    try {
+      const result = await runner.exec('print(await test__echo({}))', ECHO_TOOLS);
+      assert.strictEqual(result.returnCode, 1);
+      assert.match(result.stderr, /TimeoutError/);
+    } finally { runner.dispose(); }
+  });
+
+  it('does not deliver a late tool result to a replacement interpreter', async () => {
+    let resolveOld!: (value: string) => void;
+    let resolveNew!: (value: string) => void;
+    let startedOld!: () => void;
+    let startedNew!: () => void;
+    const oldStarted = new Promise<void>(r => { startedOld = r; });
+    const newStarted = new Promise<void>(r => { startedNew = r; });
+    let calls = 0;
+    const runner = new PyRunner({ onToolCall: async () => {
+      if (++calls === 1) {
+        startedOld();
+        return new Promise<string>(r => { resolveOld = r; });
+      }
+      startedNew();
+      return new Promise<string>(r => { resolveNew = r; });
+    } });
+    try {
+      const old = runner.exec('print(await test__echo({}))', ECHO_TOOLS);
+      await oldStarted;
+      runner.abort('replace interpreter');
+      await old;
+      const fresh = runner.exec('print(await test__echo({}))', ECHO_TOOLS);
+      await newStarted;
+      resolveOld('STALE RESULT');
+      // Give the old reply a chance to reach the new interpreter's t1 call.
+      await new Promise(r => setTimeout(r, 100));
+      resolveNew('CURRENT RESULT');
+      const result = await fresh;
+      assert.strictEqual(result.stdout.trim(), 'CURRENT RESULT');
+    } finally { runner.dispose(); }
+  });
+
   it('fails gracefully when the python binary is missing', async () => {
     const runner = new PyRunner({
       pythonPath: '/definitely/not/a/python',
@@ -581,6 +648,144 @@ describe('framework background scripts + spill (real python3)', () => {
     workspace?.initStore(framework.getStore());
     return framework;
   }
+
+  it('yields foreground await, retains its result, and preserves interpreter state', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-yield-');
+    const framework = await createBgFramework(storePath, new MockMembrane(), {
+      codeExecution: { foregroundWaitMs: 5 },
+    });
+    const call = (input: Record<string, unknown>) => framework.executeToolCall({
+      id: `test-${Math.random()}`, name: 'code_execution', callerAgentName: 'prime', input,
+    });
+    try {
+      const started = await call({ code: 'import asyncio\nx = 41\nawait asyncio.sleep(0.25)\nprint("finished")' });
+      const id = (started.data as { script_id: string }).script_id;
+      assert.equal((started.data as { status: string }).status, 'running');
+      assert.equal(started.endTurn, undefined);
+      const busy = await call({ code: 'print("must not run")' });
+      assert.equal(busy.isError, true);
+      assert.match(busy.error ?? '', new RegExp(id));
+      const done = await call({ action: 'wait', script_id: id, wait_ms: 3000 });
+      assert.equal((done.data as { stdout: string }).stdout.trim(), 'finished');
+      assert.equal((done.data as { return_code: number }).return_code, 0);
+      assert.equal((done.data as { status: string }).status, 'finished');
+      const reused = await call({ code: 'print(x + 1)', wait_ms: 3000 });
+      assert.equal((reused.data as { stdout: string }).stdout.trim(), '42');
+      const reread = await call({ action: 'wait', script_id: id, wait_ms: 0 });
+      assert.equal((reread.data as { stdout: string }).stdout.trim(), 'finished');
+      const wrongOwner = await framework.executeToolCall({
+        id: 'wrong-owner', name: 'code_execution', callerAgentName: 'someone-else',
+        input: { action: 'wait', script_id: id },
+      });
+      assert.equal(wrongOwner.isError, true);
+    } finally { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); }
+  });
+
+  for (const releaseBy of ['agent', 'operator'] as const) {
+    it(`${releaseBy} can end a waiting turn while the script survives to wake it`, async () => {
+      const { tempDir, storePath } = tempStorePath('pytc-wait-wake-');
+      const membrane = new MockMembrane();
+      membrane.pushResponse(createMockResponse([{
+        type: 'tool_use', id: 'wait-call', name: 'code_execution', input: {
+          code: 'import asyncio\nawait asyncio.sleep(0.4)\nprint("completion payload")',
+          wait_ms: releaseBy === 'agent' ? 0 : 60_000,
+          on_timeout: releaseBy === 'agent' ? 'end_turn' : 'continue',
+        },
+      }], 'tool_use'));
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'I saw completion.' }]));
+      const framework = await createBgFramework(storePath, membrane);
+      try {
+        framework.start();
+        framework.pushEvent({ type: 'external-message', source: 'test',
+          content: [{ type: 'text', text: 'run and rest' }], metadata: {}, triggerInference: true } as ProcessEvent);
+        const deadline = Date.now() + 5000;
+        if (releaseBy === 'operator') {
+          let released = false;
+          while (!released && Date.now() < deadline) {
+            const list = await framework.executeToolCall({ id: 'list', name: 'code_execution',
+              callerAgentName: 'prime', input: { action: 'list' } });
+            const scripts = (list.data as { scripts: { script_id: string; status: string }[] }).scripts;
+            if (scripts[0]?.status === 'running') {
+              assert.deepEqual(framework.releaseCodeExecutionWait('prime'), { released: 1 });
+              released = true;
+            } else await new Promise(r => setTimeout(r, 5));
+          }
+          assert.ok(released, 'operator should find an active wait');
+        }
+        while (membrane.calls.length < 2 && Date.now() < deadline) await new Promise(r => setTimeout(r, 10));
+        assert.equal(membrane.calls.length, 2, 'completion must start a second inference');
+        assert.match(JSON.stringify(membrane.calls[1]), /completion payload/);
+        const messages = framework.getAgent('prime')!.getContextManager().queryMessages({}).messages;
+        const results = messages.flatMap(m => m.content).filter(b => b.type === 'tool_result');
+        assert.ok(results.some(b => JSON.parse((b as { content: string }).content).status === 'running'));
+        // The second response must not be consumed by a continuation BEFORE completion.
+        assert.match(JSON.stringify(messages), /I saw completion|completion payload/);
+      } finally { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); }
+    });
+  }
+
+  it('cancels a yielded foreground run and reports its retained cancellation', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-yield-cancel-');
+    const framework = await createBgFramework(storePath, new MockMembrane());
+    const call = (input: Record<string, unknown>) => framework.executeToolCall({
+      id: 'test', name: 'code_execution', callerAgentName: 'prime', input,
+    });
+    try {
+      const started = await call({ code: 'import asyncio\nawait asyncio.sleep(60)', wait_ms: 0 });
+      const id = (started.data as { script_id: string }).script_id;
+      await call({ action: 'cancel', script_id: id });
+      const result = await call({ action: 'wait', script_id: id });
+      assert.equal((result.data as { status: string }).status, 'cancelled');
+      assert.equal((result.data as { aborted: boolean }).aborted, true);
+      const next = await call({ code: 'print("fresh context")' });
+      assert.match((next.data as { stdout: string }).stdout, /fresh context/);
+    } finally { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); }
+  });
+
+  it('serializes concurrent wake requests across the rate floor and cap', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-wake-limit-');
+    const framework = await createBgFramework(storePath, new MockMembrane(), {
+      codeExecution: { wakeMinIntervalMs: 30, maxWakesPerScript: 2 },
+    });
+    const times: number[] = [];
+    const delivery = framework as unknown as { addMessage: (...args: unknown[]) => string };
+    const add = delivery.addMessage.bind(framework);
+    delivery.addMessage = (...args) => { times.push(Date.now()); return add(...args); };
+    try {
+      const result = await framework.executeToolCall({ id: 'wake-limit', name: 'code_execution', callerAgentName: 'prime',
+        input: { background: true, wait_ms: 3000, code:
+          'import asyncio\nawait wake_agent("first")\nr = await asyncio.gather(wake_agent("second"), wake_agent("third"), return_exceptions=True)\nprint(r)' } });
+      assert.match((result.data as { tail: string }).tail, /wake limit reached/);
+      assert.equal(times.length, 2);
+      assert.ok(times[1] - times[0] >= 25, `wakes were only ${times[1] - times[0]}ms apart`);
+    } finally { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); }
+  });
+
+  it('refuses a wake if context delivery failed instead of falsely acknowledging it', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-wake-fail-');
+    const framework = await createBgFramework(storePath, new MockMembrane());
+    (framework as unknown as { addMessage: () => string }).addMessage = () => { throw new Error('storage unavailable'); };
+    try {
+      const result = await framework.executeToolCall({ id: 'wake-fail', name: 'code_execution', callerAgentName: 'prime',
+        input: { background: true, wait_ms: 3000, code:
+          'try:\n    await wake_agent("signal")\nexcept RuntimeError as e:\n    print(str(e))' } });
+      assert.match((result.data as { tail: string }).tail, /wake injection failed: storage unavailable/);
+    } finally { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); }
+  });
+
+  it('returns an observed background failure without an extra crash wake', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-observed-crash-');
+    const framework = await createBgFramework(storePath, new MockMembrane());
+    let notifications = 0;
+    (framework as unknown as { addMessage: () => string }).addMessage = () => { notifications++; return ''; };
+    try {
+      const result = await framework.executeToolCall({ id: 'observed-crash', name: 'code_execution', callerAgentName: 'prime',
+        input: { background: true, wait_ms: 3000, code: 'raise ValueError("observed failure")' } });
+      assert.equal((result.data as { return_code: number }).return_code, 1);
+      assert.match((result.data as { tail: string }).tail, /observed failure/);
+      assert.equal(notifications, 0);
+    } finally { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); }
+  });
 
   it('background script detaches, wakes the agent with provenance, and triggers inference', async () => {
     const { tempDir, storePath } = tempStorePath('pytc-bgfw-');
