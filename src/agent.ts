@@ -2,6 +2,7 @@ import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, Yiel
 import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
+import { ToolResultGuard, TOOL_RESULT_GUARD_NOTICE } from './tool-result-guard.js';
 import {
   toolResultDataToHistoryString,
   truncateForHistory,
@@ -82,6 +83,7 @@ export class Agent {
   readonly thinking: AgentConfig['thinking'];
   /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
   readonly refusalHandling: AgentConfig['refusalHandling'];
+  readonly toolResultGuard: ToolResultGuard;
   /** Prose delivery mode (see AgentConfig.proseRouting). Default 'locus'. */
   readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
   /** Exact whole-response known-tool wrapper containment (default off). */
@@ -143,6 +145,7 @@ export class Agent {
     this.temperature = config.temperature;
     this.thinking = config.thinking;
     this.refusalHandling = config.refusalHandling;
+    this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard);
     this.proseRouting = config.proseRouting ?? 'locus';
     this.toolWrapperProseGuard = config.toolWrapperProseGuard ?? false;
     this.cacheTtl = config.cacheTtl ?? '1h';
@@ -582,17 +585,28 @@ export class Agent {
     // Filter tools to only allowed ones
     const tools = availableTools.filter((t) => this.canUseTool(t.name));
 
+    // The direct Agent API uses the same admission rules as framework-driven
+    // streams. Stage before compiling so compression only sees placeholders.
+    const guardedResults = this._state.status === 'ready' && this.toolResultGuard.enabled;
+    if (guardedResults && this._state.status === 'ready') {
+      const content = this.buildToolResultMessages(this._state.toolResults)[0].content;
+      const wireResults = content.flatMap((block) => block.type === 'tool_result'
+        // buildToolResultMessages serializes every payload to a string.
+        ? [{ toolUseId: block.toolUseId, content: block.content as string, isError: block.isError }] : []);
+      this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults);
+    }
+
     // Compile context (with optional injections)
     const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
 
     // If we have pending tool results, add them
-    if (this._state.status === 'ready') {
+    if (this._state.status === 'ready' && !guardedResults) {
       const toolResultMessages = this.buildToolResultMessages(this._state.toolResults);
       messages.push(...toolResultMessages);
     }
 
     const request: NormalizedRequest = {
-      messages,
+      messages: this.toolResultGuard.prepareRequest(messages, true),
       system: this.buildSystemPrompt(systemInjections),
       config: {
         model: this.model,
@@ -648,6 +662,7 @@ export class Agent {
     } catch (error) {
       // On error, go back to idle
       this._state = { status: 'idle' };
+      this.toolResultGuard.recovering = false;
       throw error;
     }
   }
@@ -773,7 +788,7 @@ export class Agent {
     }
 
     return {
-      messages,
+      messages: this.toolResultGuard.prepareRequest(messages),
       system: this.buildSystemPrompt(systemInjections),
       config: {
         model: this.model,
@@ -830,6 +845,7 @@ export class Agent {
     this.lastStreamOutputTokens = 0;
 
     const request = await this.buildActivationRequest(availableTools, injections, budget);
+    request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
       .getStrategy?.() as {
@@ -854,6 +870,7 @@ export class Agent {
       };
     }
 
+    const agent = this;
     const stream = this.membrane.streamYielding(request, {
       emitTokens: true,
       emitBlocks: false,
@@ -863,7 +880,13 @@ export class Agent {
       // (cache-warm), where a framework-level requeue would recompile and
       // land a different window. The framework's driveStream handles the
       // resulting `retrying` event by discarding the abandoned attempt.
-      ...(this.refusalHandling?.retries ? { refusalRetries: this.refusalHandling.retries } : {}),
+      // Membrane reads this per physical round, including after settings
+      // tools run. A guarded result must reach the host on its FIRST refusal;
+      // never spend retries resubmitting unchanged guarded content.
+      get refusalRetries() {
+        return agent.toolResultGuard.hasPending || agent.toolResultGuard.recovering
+          ? 0 : agent.refusalHandling?.retries ?? 0;
+      },
     });
 
     this._state = { status: 'streaming', stream };
@@ -1041,9 +1064,21 @@ export class Agent {
     request: NormalizedRequest,
     signal?: AbortSignal
   ): Promise<InferenceResult> {
-    const response = await this.membrane.stream(request, { signal });
+    let response = await this.membrane.stream(request, { signal });
+    if (!isAbortedResponse(response) && response.stopReason === 'refusal') {
+      const ids = this.toolResultGuard.withhold('unknown');
+      if (ids) {
+        const withheld = new Set(ids);
+        request = { ...request, messages: request.messages.map((message) => ({
+          ...message, content: message.content.map((block) => block.type === 'tool_result' && withheld.has(block.toolUseId)
+            ? { type: 'tool_result', toolUseId: block.toolUseId, content: TOOL_RESULT_GUARD_NOTICE, isError: block.isError } : block),
+        })) };
+        response = await this.membrane.stream(request, { signal });
+      }
+    }
 
     if (isAbortedResponse(response)) {
+      this.toolResultGuard.recovering = false;
       const partialContent = response.partialContent ?? [];
       const { toolCalls, speechContent } = this.extractToolCallsAndSpeech(partialContent);
       return {
@@ -1056,10 +1091,14 @@ export class Agent {
       };
     }
 
-    const { toolCalls, speechContent } = this.extractToolCallsAndSpeech(response.content);
+    const guardedRefusal = response.stopReason === 'refusal' && this.toolResultGuard.recovering;
+    if (response.stopReason !== 'refusal') this.toolResultGuard.accept();
+    this.toolResultGuard.recovering = false;
+    const content = guardedRefusal ? [] : response.content;
+    const { toolCalls, speechContent } = this.extractToolCallsAndSpeech(content);
 
     // Add assistant response to context
-    this.contextManager.addMessage(this.name, response.content);
+    if (!guardedRefusal) this.contextManager.addMessage(this.name, content);
 
     return {
       toolCalls,

@@ -170,6 +170,12 @@ export interface AgentConfig {
     announceHumanTurns?: boolean;
   };
 
+  /** Opt-in tool-output admission and one guarded retry after a provider
+   * refusal. Agents can persistently override this via agent_settings
+   * tool_result_guard. Full originals remain in Chronicle's audit history.
+   * Default false. Disabling does not restore previously withheld output. */
+  toolResultGuard?: boolean;
+
   /**
    * How the agent's PLAIN PROSE (non-tool output) reaches channels.
    * - 'locus' (default): host-inferred — the turn-frozen locus machinery.
