@@ -10953,11 +10953,11 @@ export class AgentFramework {
       return;
     }
 
-    // Route synthesized 'think' (private reasoning) and 'skip_reply' (deliberate
-    // stay-silent) tools — handled by the channel registry like the other
+    // Route synthesized 'think' (private reasoning), 'journal' (private
+    // long-form notes) and 'skip_reply' (deliberate stay-silent) tools — handled by the channel registry like the other
     // synthesized channel tools, but they aren't `channel_`-prefixed so they
     // need an explicit route here.
-    if ((enrichedCall.name === 'think' || enrichedCall.name === 'skip_reply') && this.channelRegistry) {
+    if ((enrichedCall.name === 'think' || enrichedCall.name === 'journal' || enrichedCall.name === 'skip_reply') && this.channelRegistry) {
       // skip_reply(wake_in_seconds): arm a gate self-wake so "not replying
       // NOW" can also mean "back in a moment" — ends the turn, then wakes
       // the agent after N seconds unless something else wakes it first
