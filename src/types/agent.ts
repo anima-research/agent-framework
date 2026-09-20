@@ -12,6 +12,7 @@ export type SameRoundThinkTextPolicySource =
  * Configuration for an agent.
  */
 export interface AgentConfig {
+  toolPresentation?: import("../tool-presentation.js").ToolPresentationConfig;
   /** Unique name for this agent */
   name: string;
 
