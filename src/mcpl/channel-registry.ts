@@ -35,7 +35,7 @@ import type {
 import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
-import { expandCoreTags } from './tags.js';
+import { expandCoreTags, hasNonConversationalTag } from './tags.js';
 import { CapabilityGrant } from './capability-grant.js';
 
 // ============================================================================
@@ -870,9 +870,14 @@ export class ChannelRegistry {
       // deliberately after §14.5 validation: a rejected message from an
       // unregistered channel must not retarget outbound speech (the locus is
       // exactly the authority a self-attested channel would be stealing).
-      this.defaultPublishChannel = message.channelId;
-      this.defaultPublishMessageId = message.messageId;
-      this.defaultPublishThreadId = message.threadId;
+      // Non-conversational markers (reactions, edits, deletions) are ABOUT a
+      // message, not one the agent replies to: they must not retarget the
+      // default publish locus or become `context.incoming`'s reply anchor.
+      if (!hasNonConversationalTag(message.tags)) {
+        this.defaultPublishChannel = message.channelId;
+        this.defaultPublishMessageId = message.messageId;
+        this.defaultPublishThreadId = message.threadId;
+      }
       {
         // A server sending channels/incoming is authoritative evidence that
         // the transport is actually open. This repairs transient status only;

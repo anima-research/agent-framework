@@ -757,6 +757,36 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  for (const tag of ['chat:reaction-remove', 'chat:edited', 'chat:deleted']) {
+    it(`a ${tag} marker injected mid-turn does not clear send suppression (#157)`, async () => {
+      // Edits, deletions and reaction removals (RFC-001 core tags, delivered
+      // as synthetic incoming messages by e.g. zulip_mcp#23) are markers
+      // ABOUT a message the agent has seen — the same category as a
+      // reaction. Before #157 only `chat:reaction` was exempt, so an
+      // "[edited] Ann: typo fix" arriving right after an explicit send
+      // re-opened auto-routing and double-posted the same-round prose.
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'reply to room4' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'Sent it.' },
+      ] as ContentBlock[]));
+
+      const framework = await createFramework();
+      const routed = stubChannelRegistry(framework);
+      module.interjection = `[${tag}] marker about an earlier message`;
+      module.interjectionChannelId = null;
+      module.interjectionMetadata = { channelId: '999888777', tags: [tag] };
+
+      trigger(framework);
+      await framework.runUntilIdle();
+
+      assert.deepEqual(routed, [], `post-send prose stayed suppressed after a ${tag} marker`);
+
+      await framework.stop();
+    });
+  }
+
   it('text-only turns route to the turn-frozen locus, not a live re-resolution', async () => {
     // The text-only dispatch runs after the agent is idle; a live resolution
     // there can read the NEXT turn's trigger state or a post-restart cleared
