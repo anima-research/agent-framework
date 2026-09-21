@@ -11775,7 +11775,7 @@ export class AgentFramework {
         activeChannelResolver: (agentName) => this.activeTriggerChannels.get(agentName),
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
-        // agent sees, on her next turn, that her reply never reached the human.
+        // agent sees, on her next turn, that delivery of her reply was not confirmed.
         // addMessage() alone does not request inference, so this never wakes
         // her (matching the `discord-send-failed-skip` gate intent: context
         // yes, wake no).
@@ -11798,7 +11798,7 @@ export class AgentFramework {
               'user',
               [{
                 type: 'text',
-                text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
+                text: `[discord-send-failed] Delivery of your previous reply (${textLen} chars) to ${where} was not confirmed (${reason}). It was saved to your archive. Check delivery status before resending; a missing receipt does not prove the human did not receive it.`,
               }],
               { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason },
             );

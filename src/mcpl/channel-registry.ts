@@ -2794,9 +2794,9 @@ export class ChannelRegistry {
   ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
     // Surface a routing failure: emit a trace AND notify the host (which drops
     // a `[discord-send-failed]` marker into chronicle) so the agent learns her
-    // reply never reached the human, instead of it vanishing silently.
+    // reply delivery was not confirmed, instead of it vanishing silently.
     const fail = (channelId: string | null, reason: string): null => {
-      console.error(`[routeSpeech] ${conversationId}: ${reason} — speech NOT routed (${text.length} chars stay in chronicle)`);
+      console.error(`[routeSpeech] ${conversationId}: ${reason} — speech delivery NOT confirmed (${text.length} chars stay in chronicle)`);
       this.emitTraceFn({
         type: 'mcpl:speech-route-failed',
         conversationId,
@@ -2876,7 +2876,7 @@ export class ChannelRegistry {
       content: [{ type: 'text', text }],
     };
     const result = await server.sendChannelsPublish(publishParams);
-    const delivered = (result as { delivered?: boolean } | undefined)?.delivered ?? true;
+    const delivered = (result as { delivered?: unknown } | undefined)?.delivered;
     // Surface the posted message's id (ChannelsPublishResult.messageId) so
     // trace consumers can act on the just-posted message — e.g. a TTS-relay
     // tap editing it down to the words actually voiced on interruption.
@@ -2888,6 +2888,12 @@ export class ChannelRegistry {
     // this returned `{ delivered: true }`, masking the failure. Surface it.
     if (delivered === false) {
       return fail(channelId, `server "${entry.serverId}" reported delivered:false for "${channelId}"`);
+    }
+
+    // Final publish is a request, so success requires an explicit receipt.
+    // Missing/malformed responses leave delivery uncertain; do not retry here.
+    if (delivered !== true) {
+      return fail(channelId, `server "${entry.serverId}" returned no valid delivery receipt for "${channelId}" (delivery uncertain)`);
     }
 
     console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${channelId} (server=${entry.serverId}, delivered=${delivered})`);

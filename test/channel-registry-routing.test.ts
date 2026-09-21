@@ -526,3 +526,23 @@ test('DM prose targets resolve people-first: @name, prefix-lenient names, and <@
   assert.ok('error' in missing && /send_dm/.test(missing.error), 'no-match points at send_dm');
   assert.ok('error' in missing && (missing.candidates?.length ?? 0) === 2, 'lists known DMs by name');
 });
+
+for (const [label, receipt] of [
+  ['absent', undefined],
+  ['missing delivered', {}],
+  ['null delivered', { delivered: null }],
+  ['string delivered', { delivered: 'true' }],
+] as const) {
+  test(`routeSpeech does not claim delivery with ${label} receipt`, async () => {
+    // Malformed responses cross the JSON-RPC boundary despite static types.
+    const { registry, failures, traces, publishCalls } = makeRegistry(receipt as unknown as { delivered?: boolean } | undefined);
+    seedRegistered(registry, 'fixture', 'fixture-channel');
+    registry.handleIncoming('fixture', incoming('fixture-channel', 'synthetic input'));
+    const result = await registry.routeSpeech('fixture-agent', 'synthetic reply', 'fixture-channel');
+    assert.equal(result, null);
+    assert.equal(publishCalls.length, 1, 'uncertain delivery must not automatically retry');
+    assert.equal(failures.length, 1);
+    assert.ok(traces.some(t => t.type === 'mcpl:speech-route-failed'));
+    assert.ok(!traces.some(t => t.type === 'mcpl:speech-routed'));
+  });
+}
