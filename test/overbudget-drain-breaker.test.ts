@@ -6,15 +6,18 @@
  * hard-down, zero self-rescue). noteInferenceExhausted breaks it by kicking
  * the strategy drain (cm.tick()) directly.
  *
- * The trigger is the classified errorType 'over_budget' (err.name ===
- * 'OverBudgetError' — CM does not export the class, so no cross-package
- * instanceof; the message-prose match is only a fallback). These tests pin
- * that classification so a CM message rewording cannot silently kill the
+ * The trigger is the classified errorType 'over_budget'. Since
+ * context-manager#41/#71 the classes are exported from CM's root, so the
+ * primary match is a real cross-package `instanceof`; `err.name` stays as a
+ * fallback for dual-CM-copy deployments, and the message-prose match remains
+ * a last resort for serialized reasons. These tests pin all of it so a CM
+ * message rewording — or a second CM copy — cannot silently kill the
  * breaker.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentFramework } from '../src/framework.js';
+import { OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import { MembraneError } from '@animalabs/membrane';
 
 function makeHarness(tick: () => Promise<void>) {
@@ -54,6 +57,28 @@ async function settle(rounds = 3) {
 
 const OVER_BUDGET_REASON =
   'Compile plan would exceed hard budget: head=41200 tail=8100 middle=62000 budget=100000';
+
+test('classification: a REAL context-manager OverBudgetError classifies via instanceof', () => {
+  const { fw, restore } = makeHarness(async () => {});
+  restore();
+  const real = new OverBudgetError({
+    budget: 4000,
+    actual: 8000,
+    diagnostics: { headTokens: 1, tailTokens: 2, middleTokens: 3, middleChunkCount: 1, deepestLevel: 1 },
+  });
+  assert.deepEqual(fw.classifyInferenceError(real), { errorType: 'over_budget' });
+});
+
+test('classification: a REAL UncoveredDropError classifies as context_refusal via instanceof', () => {
+  const { fw, restore } = makeHarness(async () => {});
+  restore();
+  const real = new UncoveredDropError({
+    droppedIds: ['m1'],
+    site: 'selectHierarchical',
+    diagnostics: { budget: 4000, totalTokens: 8000 },
+  });
+  assert.deepEqual(fw.classifyInferenceError(real), { errorType: 'context_refusal' });
+});
 
 test('classification: err.name OverBudgetError → over_budget, regardless of message wording', () => {
   const fw = Object.create(AgentFramework.prototype) as any;
