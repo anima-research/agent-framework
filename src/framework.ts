@@ -1046,7 +1046,7 @@ export class AgentFramework {
    *  `inference:exhausted` (which also pollutes the failure streak). Kept
    *  separate from ephemeralRuns deliberately: endTurn/budget cancels happen
    *  for resident agents too, and the key is per-stream, not per-agent. */
-  private frameworkCancelledStreams: Map<string, 'turn_ended' | 'budget_restart' | 'quiesce_abandoned'> = new Map();
+  private frameworkCancelledStreams: Map<string, 'turn_ended' | 'budget_restart' | 'quiesce_abandoned' | 'shutdown'> = new Map();
   /** Active runEphemeralToCompletion runs, keyed by agent name. */
   private ephemeralRuns: Map<string, EphemeralRun> = new Map();
   /** Ephemeral namespaces/names are single-generation for this framework
@@ -1814,10 +1814,17 @@ export class AgentFramework {
     // A stopped host must never hang behind its own cooldown.
     this.cancelProviderAdmission();
 
-    // Cancel all active streams
+    // Cancel all active streams. Membrane reports every stream.cancel() as
+    // reason 'user' — it names the call, not the actor — so the provenance
+    // is recorded HERE, before the cancel, the same way endTurn, budget
+    // restarts and quiesce do. driveStream's tracked branch then settles the
+    // turn as a shutdown: no [turn-interrupted] marker (nobody stopped the
+    // agent; the host went away), no inference:exhausted (not a failure),
+    // one inference:aborted with reason 'shutdown'.
     for (const agent of this.agents.values()) {
       if (agent.state.status === 'streaming' ||
           (agent.state.status === 'waiting_for_tools' && agent.state.stream)) {
+        this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'shutdown');
         agent.cancelStream();
       }
     }
@@ -2263,8 +2270,15 @@ export class AgentFramework {
     if (!agent) {
       return false;
     }
+    const hadStream = agent.state.status === 'streaming' ||
+      (agent.state.status === 'waiting_for_tools' && !!agent.state.stream);
     const result = agent.abortInference(reason);
-    if (result) {
+    // A streaming abort is reported by driveStream when the stream's own
+    // `aborted` event lands — once, carrying this reason (Agent hands it
+    // over via takeCancelReason). Emitting here as well produced two
+    // inference:aborted traces per abort. Only the non-streaming inference
+    // path has no stream driver to report for it.
+    if (result && !hadStream) {
       this.emitTrace({ type: 'inference:aborted', agentName, reason, durationMs: result.durationMs });
     }
     return !!result;
@@ -9372,7 +9386,8 @@ export class AgentFramework {
             // the failure streak / hard-down / poison-history accounting).
             {
               const cancelKey = `${agent.name}:${myStreamId}`;
-              if (this.frameworkCancelledStreams.get(cancelKey) === 'quiesce_abandoned') {
+              const cancelKind = this.frameworkCancelledStreams.get(cancelKey);
+              if (cancelKind === 'quiesce_abandoned' || cancelKind === 'shutdown') {
                 this.frameworkCancelledStreams.delete(cancelKey);
                 // Same terminal as the `aborted` twin: §10.5 lifecycle reads
                 // 'aborted' (not 'completed'), and the gate is released only
@@ -9384,13 +9399,13 @@ export class AgentFramework {
                 this.settleAgent(agent.name, {
                   stopReason: 'exhausted',
                   speech: '',
-                  error: 'Turn abandoned by operator quiesce',
+                  error: cancelKind === 'shutdown' ? 'Framework shutting down' : 'Turn abandoned by operator quiesce',
                 });
                 this.emitTrace({
                   type: 'inference:aborted',
                   agentName: agent.name,
                   durationMs,
-                  reason: 'quiesce_abandoned',
+                  reason: cancelKind,
                 });
                 if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
                   this.eventGate?.onInferenceEnded(agent.name);
@@ -9478,6 +9493,42 @@ export class AgentFramework {
                   });
                   return;
                 }
+                if (cancelKind === 'shutdown') {
+                  // AgentFramework.stop() with this stream still live. Same
+                  // contract as quiesce: settle honestly so an ephemeral
+                  // run's promise rejects now instead of riding out its
+                  // idle watchdog, no inference:exhausted, and no chronicle
+                  // marker of any kind — nobody stopped the agent, and a
+                  // resident must not read after restart that someone did.
+                  const durationMs = Date.now() - startTime;
+                  if (agent.streamId === myStreamId) {
+                    this.abortAgentScript(agent.name, 'framework shutting down');
+                    agent.reset();
+                    this.settleAgent(agent.name, {
+                      stopReason: 'exhausted',
+                      speech: '',
+                      error: 'Framework shutting down',
+                    });
+                  }
+                  // Postmortem 2026-05-28 P2 #7: the abort is a terminal the
+                  // inference log must be able to attribute later.
+                  this.logInference({
+                    timestamp: startTime,
+                    agentName: agent.name,
+                    requestId,
+                    success: false,
+                    error: 'Stream aborted: shutdown',
+                    request: compiledRequest ?? { note: 'streaming request aborted by shutdown' },
+                    durationMs,
+                  });
+                  this.emitTrace({
+                    type: 'inference:aborted',
+                    agentName: agent.name,
+                    durationMs,
+                    reason: 'shutdown',
+                  });
+                  return;
+                }
                 // endTurn IS a logical turn end — earlier rounds may have
                 // live-routed prose (narrate → skip_reply is a real shape),
                 // so settle the delivery chain and drop the receipt. A
@@ -9493,22 +9544,77 @@ export class AgentFramework {
               }
             }
             const reason = event.reason ?? 'unknown';
+            // Membrane (>= 0.5.81) reports reason 'user' exactly when the
+            // request's signal was aborted, i.e. someone called cancel():
+            // the host's Stop button, an admin abort, a subagent reclaim.
+            // That is a DELIBERATE cancellation, not a failure, and it must
+            // not feed the consecutive-failure streak, ops alerts, or the
+            // "[inference-failed] the model call failed" marker — all of
+            // which told the agent, in the user's voice, that its turn
+            // failed and advised remediation for a failure that never
+            // happened. For a long-lived resident whose transcript is
+            // memory, those accumulate as false self-knowledge.
+            //
+            // What 'user' does NOT say is WHO cancelled: the wire reason
+            // names the call, not the actor. Framework-owned cancels record
+            // their provenance in frameworkCancelledStreams and returned
+            // above; a caller of Agent.cancelStream(reason) /
+            // framework.abortInference(reason) hands its reason over here.
+            // The marker text therefore names the act and not an actor, and
+            // says nothing about delivery: earlier rounds of this turn may
+            // have been live-routed already, so "your output was not
+            // delivered" would be a false claim.
+            const deliberate = reason === 'user';
+            const callerReason = agent.takeCancelReason();
             // Only reset if this is still the active stream (a budget restart
             // may have already started a new stream, bumping streamId)
             if (agent.streamId === myStreamId) {
               const durationMs = Date.now() - startTime;
-              this.abortAgentScript(agent.name, `stream aborted (${reason})`);
+              const terminal = deliberate ? 'Stream cancelled' : `Stream aborted: ${reason}`;
+              this.abortAgentScript(agent.name, deliberate ? 'stream cancelled' : `stream aborted (${reason})`);
               agent.reset();
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
                 speech: '',
-                error: `Stream aborted: ${reason}`,
+                error: terminal,
               });
-              this.emitTrace({
-                type: 'inference:exhausted',
-                agentName: agent.name,
-                error: `Stream aborted: ${reason}`,
-              });
+              if (deliberate) {
+                lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
+                // Distinct trace type: emitTrace funnels every
+                // inference:exhausted into noteInferenceExhausted (streak,
+                // failures.log, marker); inference:aborted carries the
+                // honest cause without any of that.
+                this.emitTrace({
+                  type: 'inference:aborted',
+                  agentName: agent.name,
+                  reason: callerReason ?? 'user',
+                  durationMs,
+                });
+                // Agent-facing marker in the same system envelope as the
+                // failure marker so surfaces render it the same way.
+                // addMessage alone requests no inference: no loop.
+                try {
+                  agent.getContextManager().addMessage(
+                    'user',
+                    [{
+                      type: 'text',
+                      text:
+                        `[turn-interrupted] Your previous turn was cancelled mid-stream — ` +
+                        `a deliberate stop, not a failure. Whatever you were still ` +
+                        `producing when it stopped was cut off there.`,
+                    }],
+                    { system: true, kind: 'turn-interrupted', reason: callerReason ?? reason },
+                  );
+                } catch (err) {
+                  console.error(`[turn-interrupted] could not record chronicle marker for ${agent.name}:`, err);
+                }
+              } else {
+                this.emitTrace({
+                  type: 'inference:exhausted',
+                  agentName: agent.name,
+                  error: terminal,
+                });
+              }
               // Postmortem 2026-05-28 P2 #7: persist the abort to the
               // inference log so future investigations can attribute the
               // terminal cause without relying on live in-memory reducer
@@ -9520,7 +9626,7 @@ export class AgentFramework {
                 agentName: agent.name,
                 requestId,
                 success: false,
-                error: `Stream aborted: ${reason}`,
+                error: deliberate ? `Stream cancelled (${callerReason ?? 'user'})` : terminal,
                 request: compiledRequest ?? { note: 'streaming request aborted' },
                 durationMs,
               });
@@ -11873,12 +11979,21 @@ export class AgentFramework {
                 ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
                 : channelId
               : 'the channel';
+            // No-locus failures (headless / WebUI turns with no home or
+            // trigger channel) are not Discord failures: "[discord-send-
+            // failed] could not be delivered to the channel" sent the agent
+            // debugging a Discord problem that doesn't exist. The text names
+            // the real situation; the machine-readable `kind` is kept stable
+            // for downstream consumers (gate intents, surfaces) that key on
+            // it. Neither text claims the reply reached no one: only channel
+            // routing failed here, and other dispatchSpeech handlers may
+            // have shown it.
+            const text = channelId
+              ? `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`
+              : `[send-undeliverable] Your previous reply (${textLen} chars) had no channel to go to — ${reason}. This is a routing/configuration situation, not a channel failure. It reached no channel; it is saved in your archive.`;
             this.addMessage(
               'user',
-              [{
-                type: 'text',
-                text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
-              }],
+              [{ type: 'text', text }],
               { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason },
             );
           } catch (err) {

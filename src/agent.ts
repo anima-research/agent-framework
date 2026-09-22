@@ -958,16 +958,35 @@ export class Agent {
     this._state = { status: 'streaming', stream };
   }
 
+  /** Reason handed to the most recent cancelStream(), if any, until the
+   *  stream driver collects it. Membrane reports every cancel() as reason
+   *  'user' — the call, not the actor — so the caller's own word is the
+   *  only provenance a host-side cancel has. */
+  private _pendingCancelReason: string | undefined;
+
   /**
-   * Cancel any active stream and reset to idle.
+   * Cancel any active stream and reset to idle. `reason` is provenance for
+   * the framework's inference:aborted trace and marker metadata (e.g.
+   * 'zombie_reclaim', 'subagent_cancel'); it never reaches the provider.
    */
-  cancelStream(): void {
+  cancelStream(reason?: string): void {
+    const hadStream = this._state.status === 'streaming' ||
+      (this._state.status === 'waiting_for_tools' && !!this._state.stream);
+    if (hadStream) this._pendingCancelReason = reason;
     if (this._state.status === 'streaming') {
       this._state.stream.cancel();
     } else if (this._state.status === 'waiting_for_tools' && this._state.stream) {
       this._state.stream.cancel();
     }
     this._state = { status: 'idle' };
+  }
+
+  /** Collect (and clear) the reason of the cancel that ended the current
+   *  stream. Called once by the stream driver on the `aborted` event. */
+  takeCancelReason(): string | undefined {
+    const r = this._pendingCancelReason;
+    this._pendingCancelReason = undefined;
+    return r;
   }
 
   /**
@@ -1030,7 +1049,7 @@ export class Agent {
     if (this._state.status === 'streaming' ||
         (this._state.status === 'waiting_for_tools' && this._state.stream)) {
       const durationMs = Date.now() - this._inferenceStartedAt;
-      this.cancelStream();
+      this.cancelStream(reason);
       return { aborted: true, durationMs };
     }
 
