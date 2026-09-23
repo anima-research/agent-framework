@@ -2275,13 +2275,95 @@ export class AgentFramework {
     const result = agent.abortInference(reason);
     // A streaming abort is reported by driveStream when the stream's own
     // `aborted` event lands — once, carrying this reason (Agent hands it
-    // over via takeCancelReason). Emitting here as well produced two
+    // over via takeCancel). Emitting here as well produced two
     // inference:aborted traces per abort. Only the non-streaming inference
     // path has no stream driver to report for it.
     if (result && !hadStream) {
       this.emitTrace({ type: 'inference:aborted', agentName, reason, durationMs: result.durationMs });
     }
     return !!result;
+  }
+
+  /**
+   * Terminal for a deliberate cancellation of a live stream: the host's Stop
+   * button, an admin abort, a subagent reclaim — anything that went through
+   * Agent.cancelStream(reason) / abortInference(reason). Both of a stream's
+   * cancel twins land here (`aborted` with wire reason 'user', or `error`
+   * for implementations that report cancel() that way — see
+   * host-quiesce.test.ts), so the two cannot drift: settle the turn, ONE
+   * inference:aborted carrying the caller's reason, the neutral
+   * [turn-interrupted] marker, an attributable inference-log terminal, gate
+   * release. Deliberately none of the failure accounting: inference:failed /
+   * inference:exhausted feed the consecutive-failure streak, hard-down ops
+   * alerts, the poison-history breaker and the "[inference-failed]" marker —
+   * all of which told a resident, in the user's voice, that its turn failed
+   * and advised remediation for a failure that never happened — and
+   * errorPolicy would relaunch the very inference someone just stopped.
+   *
+   * Only called while `agent` still owns stream `myStreamId`.
+   */
+  private settleDeliberateCancel(args: {
+    agent: Agent;
+    myStreamId: number;
+    startTime: number;
+    requestId: string;
+    compiledRequest: NormalizedRequest | undefined;
+    reason: string;
+  }): void {
+    const { agent, myStreamId, startTime, requestId, compiledRequest, reason } = args;
+    const durationMs = Date.now() - startTime;
+    this.abortAgentScript(agent.name, 'stream cancelled');
+    agent.reset();
+    this.settleAgent(agent.name, {
+      stopReason: 'exhausted',
+      speech: '',
+      error: 'Stream cancelled',
+    });
+    // Distinct trace type: emitTrace funnels every inference:exhausted into
+    // noteInferenceExhausted (streak, failures.log, marker); inference:aborted
+    // carries the honest cause without any of that.
+    this.emitTrace({
+      type: 'inference:aborted',
+      agentName: agent.name,
+      reason,
+      durationMs,
+    });
+    // Agent-facing marker in the same system envelope as the failure marker
+    // so surfaces render it the same way. The text names the act and not an
+    // actor (the wire reason names the call, not who made it) and says
+    // nothing about delivery: earlier rounds of this turn may have been
+    // live-routed already, so "your output was not delivered" would be a
+    // false claim. addMessage alone requests no inference: no loop.
+    try {
+      agent.getContextManager().addMessage(
+        'user',
+        [{
+          type: 'text',
+          text:
+            `[turn-interrupted] Your previous turn was cancelled mid-stream — ` +
+            `a deliberate stop, not a failure. Whatever you were still ` +
+            `producing when it stopped was cut off there.`,
+        }],
+        { system: true, kind: 'turn-interrupted', reason },
+      );
+    } catch (err) {
+      console.error(`[turn-interrupted] could not record chronicle marker for ${agent.name}:`, err);
+    }
+    // Postmortem 2026-05-28 P2 #7: persist the abort to the inference log so
+    // future investigations can attribute the terminal cause without relying
+    // on live in-memory reducer state. Without this, abort-terminated
+    // inferences are invisible to forensic queries (only request-side
+    // telemetry via llm-calls.jsonl shows them, and only by absence).
+    this.logInference({
+      timestamp: startTime,
+      agentName: agent.name,
+      requestId,
+      success: false,
+      error: `Stream cancelled (${reason})`,
+      request: compiledRequest ?? { note: 'streaming request aborted' },
+      durationMs,
+    });
+    if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
   }
 
   /**
@@ -9355,6 +9437,82 @@ export class AgentFramework {
           case 'error': {
             const err = event.error;
             const durationMs = Date.now() - startTime;
+
+            // A cancel may surface as `error` instead of `aborted` depending
+            // on how the stream implementation reports the cancellation
+            // (host-quiesce.test.ts pins that shape). Read the cancel
+            // provenance BEFORE any failure accounting: a deliberate stop
+            // must not first emit a contradictory inference:failed / failed
+            // inference-log row, and the caller's pending cancel is consumed
+            // here exactly as the `aborted` twin consumes it — once, by the
+            // stream it ended.
+            const cancelKey = `${agent.name}:${myStreamId}`;
+            const cancelKind = this.frameworkCancelledStreams.get(cancelKey);
+            const callerCancel = agent.takeCancel();
+
+            if (cancelKind === 'quiesce_abandoned' || cancelKind === 'shutdown') {
+              // Same contract as the aborted branch: settle honestly, no
+              // errorPolicy retry (which would relaunch inference
+              // mid-maintenance-window), no inference:exhausted (which feeds
+              // the failure streak / hard-down / poison-history accounting),
+              // and — a framework-owned cancel — no [turn-interrupted]
+              // marker: nobody stopped the agent. §10.5 lifecycle reads
+              // 'aborted' (not 'completed'), and the gate is released only
+              // for THIS agent instance — a name re-registered meanwhile
+              // (ephemeral disposal, conversation replacement) owns its own
+              // gate liveness.
+              this.frameworkCancelledStreams.delete(cancelKey);
+              lifecyclePhase = 'aborted';
+              if (agent.streamId === myStreamId) {
+                this.abortAgentScript(agent.name, cancelKind === 'shutdown' ? 'framework shutting down' : 'turn abandoned by quiesce');
+                agent.reset();
+                this.settleAgent(agent.name, {
+                  stopReason: 'exhausted',
+                  speech: '',
+                  error: cancelKind === 'shutdown' ? 'Framework shutting down' : 'Turn abandoned by operator quiesce',
+                });
+              }
+              // Postmortem 2026-05-28 P2 #7: the abort is a terminal the
+              // inference log must be able to attribute later.
+              this.logInference({
+                timestamp: startTime,
+                agentName: agent.name,
+                requestId,
+                success: false,
+                error: `Stream aborted: ${cancelKind}`,
+                request: compiledRequest ?? { note: `streaming request aborted by ${cancelKind}` },
+                durationMs,
+              });
+              this.emitTrace({
+                type: 'inference:aborted',
+                agentName: agent.name,
+                durationMs,
+                reason: cancelKind,
+              });
+              if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
+                this.eventGate?.onInferenceEnded(agent.name);
+              }
+              break;
+            }
+
+            if (callerCancel !== undefined) {
+              // The caller-cancel twin: Agent.cancelStream(reason) /
+              // framework.abortInference(reason) on a stream that reports
+              // cancel() as `error`. Same terminal as `aborted` with wire
+              // reason 'user' — settleDeliberateCancel is the one place both
+              // twins end. Without this the Stop fell through to errorPolicy
+              // and relaunched the inference it had just stopped
+              // (inference:started → failed → started; Sol, 2026-09-23).
+              lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
+              if (agent.streamId === myStreamId) {
+                this.settleDeliberateCancel({
+                  agent, myStreamId, startTime, requestId, compiledRequest,
+                  reason: callerCancel.reason ?? 'user',
+                });
+              }
+              break;
+            }
+
             this.emitTrace({
               type: 'inference:failed',
               agentName: agent.name,
@@ -9377,42 +9535,6 @@ export class AgentFramework {
 
             this.abortAgentScript(agent.name, 'stream error');
             agent.reset();
-
-            // A quiesce-abandoned cancel may surface as `error` instead of
-            // `aborted` depending on how the stream implementation reports
-            // the cancellation. Same contract as the aborted branch: settle
-            // honestly, no errorPolicy retry (which would relaunch inference
-            // mid-maintenance-window), no inference:exhausted (which feeds
-            // the failure streak / hard-down / poison-history accounting).
-            {
-              const cancelKey = `${agent.name}:${myStreamId}`;
-              const cancelKind = this.frameworkCancelledStreams.get(cancelKey);
-              if (cancelKind === 'quiesce_abandoned' || cancelKind === 'shutdown') {
-                this.frameworkCancelledStreams.delete(cancelKey);
-                // Same terminal as the `aborted` twin: §10.5 lifecycle reads
-                // 'aborted' (not 'completed'), and the gate is released only
-                // for THIS agent instance — a name re-registered meanwhile
-                // (ephemeral disposal, conversation replacement) owns its own
-                // gate liveness. The inference-log terminal was already
-                // written at the top of this case (`Stream error`).
-                lifecyclePhase = 'aborted';
-                this.settleAgent(agent.name, {
-                  stopReason: 'exhausted',
-                  speech: '',
-                  error: cancelKind === 'shutdown' ? 'Framework shutting down' : 'Turn abandoned by operator quiesce',
-                });
-                this.emitTrace({
-                  type: 'inference:aborted',
-                  agentName: agent.name,
-                  durationMs,
-                  reason: cancelKind,
-                });
-                if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
-                  this.eventGate?.onInferenceEnded(agent.name);
-                }
-                break;
-              }
-            }
 
             if (ownsProviderGate && this.holdProviderAcceleration(agent, err, trigger)) {
               lifecyclePhase = 'failed';
@@ -9449,6 +9571,10 @@ export class AgentFramework {
           }
 
           case 'aborted': {
+            // Consumed once per terminal event, whichever path follows: a
+            // framework-owned cancel (stop() also goes through cancelStream)
+            // must not leave a caller record behind for a later stream.
+            const callerCancel = agent.takeCancel();
             // Framework-initiated, non-terminal cancels (endTurn tool result,
             // context-budget restart) also surface here as `aborted` — but
             // the turn either already settled (endTurn) or a replacement
@@ -9565,72 +9691,45 @@ export class AgentFramework {
             // have been live-routed already, so "your output was not
             // delivered" would be a false claim.
             const deliberate = reason === 'user';
-            const callerReason = agent.takeCancelReason();
             // Only reset if this is still the active stream (a budget restart
             // may have already started a new stream, bumping streamId)
             if (agent.streamId === myStreamId) {
-              const durationMs = Date.now() - startTime;
-              const terminal = deliberate ? 'Stream cancelled' : `Stream aborted: ${reason}`;
-              this.abortAgentScript(agent.name, deliberate ? 'stream cancelled' : `stream aborted (${reason})`);
-              agent.reset();
-              this.settleAgent(agent.name, {
-                stopReason: 'exhausted',
-                speech: '',
-                error: terminal,
-              });
               if (deliberate) {
                 lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
-                // Distinct trace type: emitTrace funnels every
-                // inference:exhausted into noteInferenceExhausted (streak,
-                // failures.log, marker); inference:aborted carries the
-                // honest cause without any of that.
-                this.emitTrace({
-                  type: 'inference:aborted',
-                  agentName: agent.name,
-                  reason: callerReason ?? 'user',
-                  durationMs,
+                this.settleDeliberateCancel({
+                  agent, myStreamId, startTime, requestId, compiledRequest,
+                  reason: callerCancel?.reason ?? 'user',
                 });
-                // Agent-facing marker in the same system envelope as the
-                // failure marker so surfaces render it the same way.
-                // addMessage alone requests no inference: no loop.
-                try {
-                  agent.getContextManager().addMessage(
-                    'user',
-                    [{
-                      type: 'text',
-                      text:
-                        `[turn-interrupted] Your previous turn was cancelled mid-stream — ` +
-                        `a deliberate stop, not a failure. Whatever you were still ` +
-                        `producing when it stopped was cut off there.`,
-                    }],
-                    { system: true, kind: 'turn-interrupted', reason: callerReason ?? reason },
-                  );
-                } catch (err) {
-                  console.error(`[turn-interrupted] could not record chronicle marker for ${agent.name}:`, err);
-                }
               } else {
+                const durationMs = Date.now() - startTime;
+                const terminal = `Stream aborted: ${reason}`;
+                this.abortAgentScript(agent.name, `stream aborted (${reason})`);
+                agent.reset();
+                this.settleAgent(agent.name, {
+                  stopReason: 'exhausted',
+                  speech: '',
+                  error: terminal,
+                });
                 this.emitTrace({
                   type: 'inference:exhausted',
                   agentName: agent.name,
                   error: terminal,
                 });
+                // Postmortem 2026-05-28 P2 #7: persist the abort to the
+                // inference log so future investigations can attribute the
+                // terminal cause without relying on live in-memory reducer
+                // state.
+                this.logInference({
+                  timestamp: startTime,
+                  agentName: agent.name,
+                  requestId,
+                  success: false,
+                  error: terminal,
+                  request: compiledRequest ?? { note: 'streaming request aborted' },
+                  durationMs,
+                });
+                if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               }
-              // Postmortem 2026-05-28 P2 #7: persist the abort to the
-              // inference log so future investigations can attribute the
-              // terminal cause without relying on live in-memory reducer
-              // state. Without this, abort-terminated inferences are
-              // invisible to forensic queries (only request-side telemetry
-              // via llm-calls.jsonl shows them, and only by absence).
-              this.logInference({
-                timestamp: startTime,
-                agentName: agent.name,
-                requestId,
-                success: false,
-                error: deliberate ? `Stream cancelled (${callerReason ?? 'user'})` : terminal,
-                request: compiledRequest ?? { note: 'streaming request aborted' },
-                durationMs,
-              });
-              if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
             }
             break;
           }

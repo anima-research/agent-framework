@@ -579,6 +579,10 @@ test('a cancel that surfaces as a stream ERROR still settles as an operator abor
     assert.ok(traces.some((t) => t.type === 'inference:aborted'
       && (t as { reason?: string }).reason === 'quiesce_abandoned'));
     assert.ok(!traces.some((t) => t.type === 'inference:exhausted'));
+    // The cancel provenance is read BEFORE the failure accounting: the same
+    // stream must not be reported failed and then aborted.
+    assert.ok(!traces.some((t) => t.type === 'inference:failed'),
+      'an abandoned turn is not first recorded as a provider failure');
     const lifecycle = traces
       .filter((t) => String(t.type).includes('lifecycle'))
       .map((t) => (t as { phase?: string }).phase);

@@ -9,8 +9,13 @@
   not "the user did it"), and makes no claim about delivery. Callers can pass
   their own provenance — `cancelStream(reason)` / `abortInference(reason)` —
   which the trace and the marker's metadata carry; `abortInference` no longer
-  emits a second `inference:aborted` on top of the stream driver's. (#134,
-  by Lari; reworked after review.)
+  emits a second `inference:aborted` on top of the stream driver's. This
+  holds on both of a stream's cancel twins: a stream implementation that
+  reports `cancel()` through `error` rather than `aborted` reaches the same
+  terminal (one `inference:aborted`, the marker, no `inference:failed`, no
+  `errorPolicy` retry of the inference that was just stopped), and the
+  quiesce/shutdown twins no longer emit a contradictory `inference:failed`
+  before settling as aborted. (#134, by Lari; reworked after review.)
 - Speech-route failures with no delivery locus (headless/WebUI turns with no
   home or trigger channel) now read `[send-undeliverable] … had no channel
   to go to` instead of claiming a Discord delivery failure to "the channel".

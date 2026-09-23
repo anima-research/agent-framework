@@ -14,6 +14,7 @@ import type {
   ToolResult,
   TraceEvent,
 } from '../src/index.js';
+import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
@@ -118,6 +119,74 @@ describe('graceful shutdown is not attributed to the user', () => {
       assert.equal(traces.filter((t) => t.type === 'inference:exhausted').length, 0,
         'a shutdown is not a failure: no inference:exhausted');
       assert.equal(agent.state.status, 'idle', 'the shutdown settles the agent instead of leaving it waiting_for_tools');
+    } finally {
+      if (!stopped) await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  // The error twin: a stream implementation may report cancel() through
+  // `error` rather than `aborted` (host-quiesce.test.ts pins the shape).
+  // Shutdown provenance must be read there BEFORE any failure accounting —
+  // no inference:failed, no failure marker, no errorPolicy retry — and the
+  // agent still settles.
+  it('stop() with a stream that reports cancel() as `error`: same terminal, no failure trace first', async () => {
+    class ErroringOnCancelStream implements YieldingStream {
+      private release: (() => void) | null = null;
+      private cancelled = false;
+      cancel(): void { this.cancelled = true; this.release?.(); }
+      provideToolResults(): void {}
+      get isWaitingForTools() { return false; }
+      get pendingToolCallIds(): string[] { return []; }
+      get toolDepth() { return 0; }
+      async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+        if (!this.cancelled) await new Promise<void>((resolve) => { this.release = resolve; });
+        yield { type: 'error', error: new Error('stream cancelled') } as StreamEvent;
+      }
+    }
+    class ErroringMembrane extends MockMembrane {
+      override streamYielding(request: NormalizedRequest): YieldingStream {
+        this.calls.push(request);
+        return new ErroringOnCancelStream();
+      }
+    }
+    const tempDir = mkdtempSync(join(tmpdir(), 'shutdown-error-twin-'));
+    const membrane = new ErroringMembrane();
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Assist.' }],
+      modules: [],
+    });
+    const traces: TraceEvent[] = [];
+    framework.onTrace((t) => { traces.push(t); });
+    let stopped = false;
+    try {
+      framework.start();
+      framework.nudgeAgent('assistant', 'operator');
+      const agent = framework.getAgent('assistant')!;
+      await waitFor(() => agent.state.status === 'streaming');
+
+      const cm = agent.getContextManager();
+      const written: string[] = [];
+      const orig = cm.addMessage.bind(cm);
+      (cm as unknown as { addMessage: unknown }).addMessage = (role: never, content: Array<{ type: string; text?: string }>, meta: never) => {
+        for (const b of content) if (b.type === 'text' && b.text) written.push(b.text);
+        return orig(role, content as never, meta);
+      };
+
+      stopped = true;
+      await framework.stop();
+
+      const markers = written.filter((t) => t.includes('[turn-interrupted]') || t.includes('[inference-failed]'));
+      assert.deepEqual(markers, [], `graceful shutdown wrote a marker: ${JSON.stringify(markers)}`);
+      const kinds = traces.map((t) => String(t.type))
+        .filter((t) => ['inference:started', 'inference:failed', 'inference:exhausted', 'inference:aborted'].includes(t));
+      assert.deepEqual(kinds, ['inference:started', 'inference:aborted'], `expected started → aborted only, got ${JSON.stringify(kinds)}`);
+      const aborted = traces.find((t): t is Extract<TraceEvent, { type: 'inference:aborted' }> => t.type === 'inference:aborted')!;
+      assert.equal(aborted.reason, 'shutdown');
+      assert.equal(membrane.calls.length, 1, 'no errorPolicy relaunch of the cancelled inference');
+      assert.equal(agent.state.status, 'idle');
     } finally {
       if (!stopped) await framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
