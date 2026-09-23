@@ -290,7 +290,14 @@ export class SemanticIndexer {
         for (const m of msgs) {
           const item = messageToItem(m, this.cfg);
           if (!item) continue;
-          pending.push(item); budget--;
+          pending.push(item);
+          // Only NEW items spend the budget. The overlap re-walk behind the
+          // watermark is a dedup no-op for the service, and it must be one
+          // for the budget too: when the overlap window held more messages
+          // than a tick's budget, every tick spent it all re-sending the same
+          // indexed items and never reached the first new one — the index
+          // froze at the watermark while reporting merely `more: true`.
+          if (msgWm === null || item.cursor === undefined || item.cursor > msgWm) budget--;
           if (pending.length >= batchSize) await flush();
         }
         if (msgs.length < pageSize) break;

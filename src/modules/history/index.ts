@@ -188,6 +188,7 @@ export class HistoryModule implements Module {
   private semanticClient: SemanticIndexClient | null = null;
   private indexer: SemanticIndexer | null = null;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
+  private firstSyncTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(options: HistoryModuleOptions = {}) {
     this.semanticCfg = options.semantic ?? null;
@@ -300,6 +301,7 @@ export class HistoryModule implements Module {
   async stop(): Promise<void> {
     this.ctx = null;
     if (this.syncTimer) { clearInterval(this.syncTimer); this.syncTimer = null; }
+    if (this.firstSyncTimer) { clearTimeout(this.firstSyncTimer); this.firstSyncTimer = null; }
   }
 
   /**
@@ -315,7 +317,8 @@ export class HistoryModule implements Module {
     if (interval <= 0) return;
     const perTick = this.semanticCfg.maxSyncPerTick ?? 1024;
     const tick = (): void => { void this.indexer?.catchUp(perTick); };
-    const first = setTimeout(tick, 5_000); first.unref?.();
+    this.firstSyncTimer = setTimeout(() => { this.firstSyncTimer = null; tick(); }, 5_000);
+    this.firstSyncTimer.unref?.();
     this.syncTimer = setInterval(tick, interval); this.syncTimer.unref?.();
   }
 
