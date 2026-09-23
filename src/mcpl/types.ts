@@ -209,8 +209,19 @@ export interface McplServerConfig {
   /** Arguments for the command */
   args?: string[];
 
-  /** Environment variables for the child process */
+  /**
+   * Environment variables for the child process. Stdio children do NOT inherit
+   * the host environment wholesale: they get a small allowlist (PATH, HOME,
+   * LANG, LC_*, TMPDIR, ... — see CHILD_ENV_ALLOWLIST) plus exactly these.
+   */
   env?: Record<string, string>;
+
+  /**
+   * Escape hatch: pass the host's entire environment (including secrets) to
+   * the stdio child, as older versions did. Only for servers that genuinely
+   * need it. Default false.
+   */
+  inheritEnv?: boolean;
 
   /**
    * WebSocket URL for the network transport (`ws://` or `wss://`). Mutually
