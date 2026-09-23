@@ -60,6 +60,9 @@ interface StatsInput {
   channelId?: string;
 }
 
+/** One author spec or several — see `matchesAuthorFilter`. */
+type AuthorSpec = string | string[];
+
 interface ExtractInput {
   from?: string;
   to?: string;
@@ -67,15 +70,26 @@ interface ExtractInput {
   limit?: number;
   offset?: number;
   format?: 'text' | 'raw';
+  author?: AuthorSpec;
+  excludeAuthor?: AuthorSpec;
+  maxScan?: number;
+  aroundId?: string;
+  before?: number;
+  after?: number;
+  allChannels?: boolean;
 }
 
 interface SearchInput {
   query: string;
   regex?: boolean;
   caseSensitive?: boolean;
+  wholeWord?: boolean;
   from?: string;
   to?: string;
   channelId?: string;
+  author?: AuthorSpec;
+  excludeAuthor?: AuthorSpec;
+  order?: 'oldest' | 'newest';
   limit?: number;
   maxScan?: number;
 }
@@ -108,6 +122,25 @@ const EXTRACT_MAX_LIMIT = 200;
  * reach, i.e. a correctly-empty page, rather than wrapping onto a wrong one.
  */
 const NATIVE_OFFSET_MAX = 0xffffffff; // 4294967295
+
+/**
+ * `extract` with an author filter can't lean on a native index (chronicle
+ * indexes time and channel, not author), so it pages through the time/channel
+ * window and filters in-process. Bounded like `search`'s maxScan, with the
+ * same explicit truncated/scannedThrough signal when the window is larger.
+ */
+const EXTRACT_FILTER_DEFAULT_MAX_SCAN = 10000;
+const EXTRACT_FILTER_MAX_MAX_SCAN = 50000;
+/** Native page size for the in-process filtered scans above. */
+const FILTER_SCAN_PAGE = 1000;
+
+/** `extract({aroundId})` window sizes, per side. */
+const AROUND_DEFAULT = 10;
+const AROUND_MAX = 100;
+/** Upper bound on same-millisecond neighbours fetched around an anchor —
+ *  real stores see a handful at most; this only keeps a pathological burst
+ *  from turning one call into an unbounded fetch. */
+const AROUND_TIE_CAP = 500;
 
 const SEARCH_DEFAULT_LIMIT = 20;
 const SEARCH_MAX_LIMIT = 100;
@@ -156,6 +189,21 @@ const SEARCH_REGEX_TIMEOUT_MS = 2000;
  *  way gate-script.ts locates gate-script-worker.js, so it tracks whatever
  *  directory this module's own compiled output lives in. */
 const SEARCH_WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), 'search-regex-worker.js');
+
+// Declared as an array (tool-schema dialects vary on anyOf); a bare string is
+// also accepted at runtime — see toAuthorSet.
+const AUTHOR_SPEC_JSON_SCHEMA = { type: 'array', items: { type: 'string' } };
+const AUTHOR_SCHEMA = {
+  ...AUTHOR_SPEC_JSON_SCHEMA,
+  description:
+    'Only messages written by one of these authors (a single string is fine too). Matches, case-insensitively and exactly, ' +
+    'the author\'s display name or user id (a leading "@" or a <@id> mention is accepted), or the ' +
+    'stored participant for messages without author metadata — e.g. your own turns, under your name.',
+};
+const EXCLUDE_AUTHOR_SCHEMA = {
+  ...AUTHOR_SPEC_JSON_SCHEMA,
+  description: 'Drop messages written by any of these authors (a single string is fine too). Same matching as `author`.',
+};
 
 export class HistoryModule implements Module {
   readonly name = 'history';
@@ -258,6 +306,83 @@ export class HistoryModule implements Module {
     return cm.queryMessagesByTime({ fromMs: ms, toMs: ms }).messages;
   }
 
+  /**
+   * The `n` messages of a time/channel range nearest one of its edges, in
+   * TIMESTAMP order walking away from that edge (newest-first for
+   * side:"newest", oldest-first for side:"oldest"), plus whether the range
+   * holds more than `n`.
+   *
+   * Why not just `queryMessagesByTimeAndChannel` + offset: (a) a time-only
+   * query's `matchedCount` is the returned PAGE size, not a total (see
+   * context-manager MessageStore.queryByTime), so it can't locate a tail;
+   * (b) channel-scoped results come back in APPEND (ordinal) order, and
+   * Discord catch-up appends old-timestamped messages late — an ordinal
+   * tail is not the timestamp tail.
+   *
+   * No channel: chronicle's timestamp index answers directly (`reverse`
+   * for the newest edge). With a channel: channel queries report an exact
+   * matchedCount, so grow a time window out from the edge (×4 per step)
+   * until it holds ≥ n channel messages or covers the whole range, then
+   * fetch just that window and sort. A window that overshoots wildly (a
+   * burst) falls back to its ordinal tail rather than decoding thousands
+   * of messages — correct for everything but same-burst backfill.
+   */
+  private edgeWindow(opts: {
+    fromMs?: number;
+    toMs?: number;
+    channelId?: string;
+    n: number;
+    side: 'newest' | 'oldest';
+  }): { messages: StoredMessage[]; more: boolean } {
+    const cm = this.cm as ContextManager;
+    const { fromMs, toMs, channelId, n, side } = opts;
+    const cmp = (a: StoredMessage, b: StoredMessage) =>
+      a.timestamp.getTime() - b.timestamp.getTime() || a.sequence - b.sequence;
+    const dirSort = (ms: StoredMessage[]) => ms.sort(side === 'newest' ? (a, b) => cmp(b, a) : cmp);
+
+    if (channelId === undefined) {
+      const r = cm.queryMessagesByTime({ fromMs, toMs, limit: n + 1, reverse: side === 'newest' });
+      return { messages: r.messages.slice(0, n), more: r.messages.length > n };
+    }
+
+    const count = (f?: number, t?: number) =>
+      cm.queryMessagesByTimeAndChannel({ fromMs: f, toMs: t, channelId, limit: 0 }).matchedCount;
+    const total = count(fromMs, toMs);
+    if (n === 0) return { messages: [], more: total > 0 };
+    let wFrom = fromMs;
+    let wTo = toMs;
+    if (total > n) {
+      // Concrete bounds of the range (open ends resolved to the store's
+      // first message / now), so growth always terminates.
+      const lo = fromMs ?? this.earliestMessageMs(toMs) ?? 0;
+      const hi = toMs ?? Date.now();
+      for (let width = 10 * 60_000; ; width *= 4) {
+        const f = side === 'newest' ? Math.max(hi - width, lo) : lo;
+        const t = side === 'newest' ? hi : Math.min(lo + width, hi);
+        const covered = side === 'newest' ? f <= lo : t >= hi;
+        if (covered) break; // whole range: keep wFrom/wTo = the range itself
+        if (count(f, t) >= n) {
+          wFrom = f;
+          wTo = t;
+          break;
+        }
+      }
+    }
+    const inWindow = count(wFrom, wTo);
+    const fetchCap = Math.max(4 * n, n + 1000);
+    const page =
+      inWindow <= fetchCap
+        ? cm.queryMessagesByTimeAndChannel({ fromMs: wFrom, toMs: wTo, channelId, limit: inWindow }).messages
+        : cm.queryMessagesByTimeAndChannel({
+            fromMs: wFrom,
+            toMs: wTo,
+            channelId,
+            limit: n,
+            offset: side === 'newest' ? inWindow - n : 0,
+          }).messages;
+    return { messages: dirSort(page).slice(0, n), more: total > n };
+  }
+
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
   }
@@ -291,15 +416,28 @@ export class HistoryModule implements Module {
           'Fetch raw, uncompressed messages for a time range and/or channel, paginated oldest-first. ' +
           'Use after `stats` to pull the actual content. format:"text" flattens each message to a short ' +
           'readable string (tool_use/tool_result/thinking/images rendered as bracketed labels); ' +
-          'format:"raw" returns the content blocks unmodified.',
+          'format:"raw" returns the content blocks unmodified. ' +
+          'Two extra modes: (1) aroundId — pass a message id (e.g. from `search`) to get the conversation ' +
+          'around it: `before` messages before it, the message itself (anchor:true), and `after` messages ' +
+          'after it, in the anchor\'s own channel unless channelId/allChannels says otherwise; from/to/offset ' +
+          'do not apply in this mode. (2) author/excludeAuthor — keep only (or drop) messages by these ' +
+          'authors; this is filtered in-process over at most maxScan messages of the window, so a response ' +
+          'may report truncated:true + scannedThrough (continue with from:scannedThrough).',
         inputSchema: {
           type: 'object' as const,
           properties: {
             from: { type: 'string', description: 'ISO 8601 inclusive lower bound. Omit for open-ended.' },
             to: { type: 'string', description: 'ISO 8601 inclusive upper bound. Omit for open-ended.' },
             channelId: { type: 'string', description: 'Restrict to one channel. Accepts a channel label (e.g. "#general") or the raw internal channel id.' },
+            author: AUTHOR_SCHEMA,
+            excludeAuthor: EXCLUDE_AUTHOR_SCHEMA,
+            aroundId: { type: 'string', description: 'Message id to center on (as returned by search/extract). Returns the surrounding conversation instead of a range.' },
+            before: { type: 'number', description: `With aroundId: messages to include before the anchor (default ${AROUND_DEFAULT}, cap ${AROUND_MAX}).` },
+            after: { type: 'number', description: `With aroundId: messages to include after the anchor (default ${AROUND_DEFAULT}, cap ${AROUND_MAX}).` },
+            allChannels: { type: 'boolean', description: 'With aroundId: interleave every channel around the anchor\'s time instead of staying in its channel (default false).' },
             limit: { type: 'number', description: `Max messages to return (default ${EXTRACT_DEFAULT_LIMIT}, hard cap ${EXTRACT_MAX_LIMIT}). Must be a non-negative integer.` },
             offset: { type: 'number', description: `Number of matching messages to skip (default 0, capped to ${NATIVE_OFFSET_MAX}). Must be a non-negative integer.` },
+            maxScan: { type: 'number', description: `With author/excludeAuthor: max window messages to examine (default ${EXTRACT_FILTER_DEFAULT_MAX_SCAN}, hard cap ${EXTRACT_FILTER_MAX_MAX_SCAN}).` },
             format: { type: 'string', enum: ['text', 'raw'], description: 'Content rendering (default "text").' },
           },
         },
@@ -311,7 +449,13 @@ export class HistoryModule implements Module {
           'range/channel window. Narrows candidates via the same query as `extract` before matching, up ' +
           'to maxScan candidates — if the narrowed window is larger than maxScan, the response reports ' +
           'truncated:true up front rather than silently missing later matches; narrow the filter or raise ' +
-          'maxScan and retry. regex:true matching runs under a wall-clock deadline and is cleanly failed ' +
+          'maxScan and retry. When the scan stops early (truncated, or `limit` matches reached) the response ' +
+          'carries scannedThrough: pass it as `from` (order:"oldest") or `to` (order:"newest") to continue. ' +
+          'order:"newest" scans the most recent maxScan messages of the window first — usually what you want ' +
+          'for "when did this last come up". author/excludeAuthor narrow by who wrote the message; ' +
+          'wholeWord:true stops "mission" from matching inside "uncommissioned". Each match carries an `id` ' +
+          'you can hand to extract({aroundId}) to read the conversation around it. ' +
+          'regex:true matching runs under a wall-clock deadline and is cleanly failed ' +
           `(not silently empty) if a pattern is too slow — avoid nested-quantifier patterns like (a+)+.`,
         inputSchema: {
           type: 'object' as const,
@@ -319,9 +463,13 @@ export class HistoryModule implements Module {
             query: { type: 'string', description: 'Substring (or regex source, when regex:true) to search for.' },
             regex: { type: 'boolean', description: 'Treat query as a regular expression (default false).' },
             caseSensitive: { type: 'boolean', description: 'Case-sensitive match (default false).' },
+            wholeWord: { type: 'boolean', description: 'Substring mode only: match whole words, not inside longer words (default false). In regex mode use \\b yourself.' },
             from: { type: 'string', description: 'ISO 8601 inclusive lower bound. Omit for open-ended.' },
             to: { type: 'string', description: 'ISO 8601 inclusive upper bound. Omit for open-ended.' },
             channelId: { type: 'string', description: 'Restrict to one channel. Accepts a channel label (e.g. "#general") or the raw internal channel id.' },
+            author: AUTHOR_SCHEMA,
+            excludeAuthor: EXCLUDE_AUTHOR_SCHEMA,
+            order: { type: 'string', enum: ['oldest', 'newest'], description: 'Scan and return oldest-first (default) or newest-first.' },
             limit: { type: 'number', description: `Max matches to return (default ${SEARCH_DEFAULT_LIMIT}, hard cap ${SEARCH_MAX_LIMIT}). Must be a non-negative integer.` },
             maxScan: { type: 'number', description: `Max candidate messages to scan (default ${SEARCH_DEFAULT_MAX_SCAN}, hard cap ${SEARCH_MAX_MAX_SCAN}). Must be a non-negative integer.` },
           },
@@ -459,28 +607,172 @@ export class HistoryModule implements Module {
   // ==========================================================================
 
   private handleExtract(input: ExtractInput): ToolResult {
+    if (input.aroundId !== undefined) return this.handleExtractAround(input);
+    if (input.before !== undefined || input.after !== undefined || input.allChannels !== undefined) {
+      throw new Error('"before"/"after"/"allChannels" only apply together with "aroundId".');
+    }
     const channelId = this.resolveChannel(input.channelId);
     const fromMs = parseIsoDate(input.from, 'from');
     const toMs = parseIsoDate(input.to, 'to');
     const limit = clampCount(input.limit, EXTRACT_DEFAULT_LIMIT, EXTRACT_MAX_LIMIT, 'limit');
     const offset = clampCount(input.offset, 0, NATIVE_OFFSET_MAX, 'offset');
     const format = input.format ?? 'text';
+    const authorFilter = buildAuthorFilter(input.author, input.excludeAuthor);
 
     const cm = this.cm as ContextManager;
+
+    if (authorFilter) {
+      // No native author index: page through the time/channel window and
+      // filter here. offset/limit apply to the FILTERED sequence. Stop as
+      // soon as the requested page is full; otherwise scan to maxScan. Only
+      // an exhausted window yields an exact matchedCount — anything else is
+      // reported as truncated with a resume point, never as a total.
+      const maxScan = clampCount(input.maxScan, EXTRACT_FILTER_DEFAULT_MAX_SCAN, EXTRACT_FILTER_MAX_MAX_SCAN, 'maxScan');
+      const page: StoredMessage[] = [];
+      let kept = 0;
+      let scanned = 0;
+      let lastScanned: StoredMessage | undefined;
+      let exhausted = false;
+      let pageFull = false;
+      outer: for (;;) {
+        const want = Math.min(FILTER_SCAN_PAGE, maxScan - scanned);
+        if (want <= 0) break;
+        const chunk = cm.queryMessagesByTimeAndChannel({ fromMs, toMs, channelId, limit: want, offset: scanned }).messages;
+        for (const m of chunk) {
+          scanned++;
+          lastScanned = m;
+          if (!authorFilter(m)) continue;
+          if (kept >= offset && page.length < limit) page.push(m);
+          kept++;
+          if (page.length >= limit && kept > offset + limit) {
+            // One filtered match beyond the page proves there is more;
+            // no need to keep scanning.
+            pageFull = true;
+            break outer;
+          }
+        }
+        if (chunk.length < want) {
+          exhausted = true;
+          break;
+        }
+      }
+      if (!exhausted && !pageFull && scanned >= maxScan) {
+        // Probe one past maxScan: a window of exactly maxScan is complete.
+        const next = cm.queryMessagesByTimeAndChannel({ fromMs, toMs, channelId, limit: 1, offset: scanned }).messages;
+        if (next.length === 0) exhausted = true;
+      }
+      return {
+        success: true,
+        data: {
+          ...(exhausted ? { matchedCount: kept } : { matchedCountAtLeast: kept }),
+          returned: page.length,
+          scanned,
+          truncated: !exhausted,
+          ...(!exhausted && lastScanned
+            ? {
+                scannedThrough: lastScanned.timestamp.toISOString(),
+                hint: pageFull
+                  ? 'More matching messages exist; raise offset (or continue with from:scannedThrough and offset:0).'
+                  : `Stopped after scanning ${scanned} messages of the window without reaching its end; continue with ` +
+                    'from:scannedThrough (messages at exactly that instant may repeat), or narrow with channelId/dates.',
+              }
+            : {}),
+          messages: page.map((msg) => projectMessage(msg, format)),
+        },
+      };
+    }
+
+    // One extra row answers "is there another page" in every case. The
+    // native matchedCount is a true total only for channel-scoped queries;
+    // for time-only/unfiltered ones it is just the page size (see
+    // edgeWindow), so it is reported only where it means what it says.
     const result = cm.queryMessagesByTimeAndChannel({
       fromMs,
       toMs,
       channelId,
-      limit,
+      limit: limit + 1,
       offset,
     });
+    const page = result.messages.slice(0, limit);
 
     return {
       success: true,
       data: {
-        matchedCount: result.matchedCount,
-        returned: result.messages.length,
-        messages: result.messages.map((msg) => projectMessage(msg, format)),
+        ...(channelId !== undefined ? { matchedCount: result.matchedCount } : {}),
+        returned: page.length,
+        hasMore: result.messages.length > limit,
+        messages: page.map((msg) => projectMessage(msg, format)),
+      },
+    };
+  }
+
+  /**
+   * `extract({aroundId})` — the conversation around one message, like
+   * Discord's fetch_around. Built from two index-backed time queries meeting
+   * at the anchor's millisecond: the newest of [.., t] and the oldest of
+   * [t, ..] (both via edgeWindow). Both include every message sharing t, so each side is
+   * over-fetched by that tie count; the union is deduped by id, ordered by
+   * (timestamp, sequence), and cut to `before`/`after` around the anchor.
+   */
+  private handleExtractAround(input: ExtractInput): ToolResult {
+    if (input.from !== undefined || input.to !== undefined || input.offset !== undefined) {
+      throw new Error('"aroundId" cannot be combined with from/to/offset — it picks its own window.');
+    }
+    if (input.author !== undefined || input.excludeAuthor !== undefined) {
+      throw new Error('"aroundId" returns the whole conversation around a message; author filters do not apply. Use search/extract with author instead.');
+    }
+    if (input.allChannels && input.channelId !== undefined) {
+      throw new Error('Pass either "channelId" or "allChannels", not both.');
+    }
+    const before = clampCount(input.before, AROUND_DEFAULT, AROUND_MAX, 'before');
+    const after = clampCount(input.after, AROUND_DEFAULT, AROUND_MAX, 'after');
+    const format = input.format ?? 'text';
+    const cm = this.cm as ContextManager;
+
+    const anchor = cm.getMessage(String(input.aroundId));
+    if (!anchor) {
+      throw new Error(`No message with id ${JSON.stringify(input.aroundId)} in this history.`);
+    }
+    const anchorId = String(anchor.id);
+    const anchorChannel = getChannelId(anchor);
+    const channelId = input.allChannels ? undefined : (this.resolveChannel(input.channelId) ?? anchorChannel);
+    const t = anchor.timestamp.getTime();
+
+    // Every message sharing the anchor's millisecond lands on BOTH sides
+    // below, so over-fetch each side by that count; the dedupe + sort then
+    // orders them by sequence around the anchor.
+    const ties = Math.min(
+      cm.queryMessagesByTimeAndChannel({ fromMs: t, toMs: t, channelId, limit: AROUND_TIE_CAP }).messages.length,
+      AROUND_TIE_CAP,
+    );
+    const beforeSide = this.edgeWindow({ toMs: t, channelId, n: before + ties, side: 'newest' }).messages;
+    const afterSide = this.edgeWindow({ fromMs: t, channelId, n: after + ties, side: 'oldest' }).messages;
+
+    const byId = new Map<string, StoredMessage>();
+    for (const m of [...beforeSide, ...afterSide]) byId.set(String(m.id), m);
+    const ordered = [...byId.values()].sort(
+      (a, b) => a.timestamp.getTime() - b.timestamp.getTime() || a.sequence - b.sequence,
+    );
+    const idx = ordered.findIndex((m) => String(m.id) === anchorId);
+    if (idx === -1) {
+      // Only reachable when an explicit channelId excludes the anchor.
+      throw new Error(
+        `Message ${anchorId} is not in channel ${JSON.stringify(input.channelId)}` +
+          (anchorChannel ? ` (it is in ${anchorChannel}).` : '.') +
+          ' Omit channelId to use the anchor\'s own channel.',
+      );
+    }
+    const window = ordered.slice(Math.max(0, idx - before), idx + after + 1);
+    return {
+      success: true,
+      data: {
+        anchorId,
+        channelId: channelId ?? null,
+        returned: window.length,
+        messages: window.map((m) => ({
+          ...projectMessage(m, format),
+          ...(String(m.id) === anchorId ? { anchor: true } : {}),
+        })),
       },
     };
   }
@@ -500,6 +792,14 @@ export class HistoryModule implements Module {
     const maxScan = clampCount(input.maxScan, SEARCH_DEFAULT_MAX_SCAN, SEARCH_MAX_MAX_SCAN, 'maxScan');
     const caseSensitive = input.caseSensitive ?? false;
     const flags = caseSensitive ? '' : 'i';
+    const order = input.order ?? 'oldest';
+    if (order !== 'oldest' && order !== 'newest') {
+      throw new Error(`"order" must be "oldest" or "newest", got ${JSON.stringify(input.order)}.`);
+    }
+    if (input.wholeWord && input.regex) {
+      throw new Error('"wholeWord" applies to substring search only; in regex mode write \\b around the pattern instead.');
+    }
+    const authorFilter = buildAuthorFilter(input.author, input.excludeAuthor);
 
     // Validate regex SYNTAX up front — an invalid pattern is a clean tool
     // error, not a crash mid-scan. This does NOT bound match TIME (a
@@ -516,19 +816,49 @@ export class HistoryModule implements Module {
     const needle = caseSensitive ? input.query : input.query.toLowerCase();
 
     const cm = this.cm as ContextManager;
-    // Fetch one more than maxScan so an oversized candidate window is
-    // detected up front (before any matching is attempted), rather than
+    // The candidate window is the oldest (order:"oldest") or newest
+    // (order:"newest", via edgeWindow — see there for why not an offset
+    // tail) maxScan messages of the time/channel range. Oversize is
+    // detected up front rather than
     // silently scanning maxScan candidates and returning as if that were the
     // whole window. See the tool description's `truncated` contract.
-    const probe = cm.queryMessagesByTimeAndChannel({
-      fromMs,
-      toMs,
-      channelId,
-      limit: maxScan + 1,
-      offset: 0,
-    });
-    const truncated = probe.messages.length > maxScan;
-    const candidates = truncated ? probe.messages.slice(0, maxScan) : probe.messages;
+    let windowMessages: StoredMessage[];
+    let truncated: boolean;
+    {
+      const w = this.edgeWindow({ fromMs, toMs, channelId, n: maxScan, side: order });
+      truncated = w.more;
+      windowMessages = w.messages;
+    }
+    const candidatePoolSize = windowMessages.length;
+    const candidates = authorFilter ? windowMessages.filter(authorFilter) : windowMessages;
+    const poolInfo = {
+      candidatePoolSize,
+      ...(authorFilter ? { afterAuthorFilter: candidates.length } : {}),
+      order,
+    };
+    // Where the scan stopped, when it stopped before the end of the window
+    // the caller asked about: either `limit` matches came first (the rest of
+    // the pool was never looked at) or the pool itself was truncated. The
+    // timestamp is the continuation point — from: (oldest) / to: (newest).
+    // Boundary is inclusive, so a message at exactly that instant may repeat.
+    const resumeInfo = (scanned: number): Record<string, unknown> => {
+      const stoppedEarly = scanned < candidates.length;
+      if (!stoppedEarly && !truncated) return {};
+      // Stopped at limit: the last candidate actually looked at. Scanned the
+      // whole (truncated) pool: the pool's own far edge — which may lie past
+      // the last author-filtered candidate.
+      const last = stoppedEarly ? candidates[scanned - 1] : windowMessages[windowMessages.length - 1];
+      if (!last) return {};
+      const at = last.timestamp.toISOString();
+      const bound = order === 'oldest' ? 'from' : 'to';
+      return {
+        scannedThrough: at,
+        hint: stoppedEarly
+          ? `Stopped at limit; more candidates remain. Continue with ${bound}:"${at}" (or raise limit).`
+          : `Only the ${order} ${candidatePoolSize} messages of this range were scanned (maxScan); continue with ` +
+            `${bound}:"${at}", raise maxScan, or narrow with channelId/author/dates.`,
+      };
+    };
 
     if (input.regex) {
       // Regex matching against caller-supplied patterns is ReDoS-shaped: a
@@ -541,7 +871,7 @@ export class HistoryModule implements Module {
       // on a deadline. See search-regex-worker.ts's header for the full
       // rationale.
       const { matches, scanned } = await this.searchWithRegexWorker(candidates, input.query, flags, limit);
-      return { success: true, data: { scanned, candidatePoolSize: candidates.length, truncated, matches } };
+      return { success: true, data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned), matches } };
     }
 
     // Plain substring search (String.prototype.indexOf) is inherently
@@ -559,12 +889,13 @@ export class HistoryModule implements Module {
       if (matches.length >= limit) break;
       scanned++;
       const text = flattenContent(msg.content);
-      const hit = matchSubstring(text, needle, caseSensitive);
+      const hit = matchSubstring(text, needle, caseSensitive, input.wholeWord ?? false);
       if (!hit) continue;
       matches.push({
         id: String(msg.id),
         timestamp: msg.timestamp.toISOString(),
         participant: msg.participant,
+        author: authorName(msg),
         channelId: getChannelId(msg) ?? null,
         snippet: snippetAround(text, hit.index, hit.length),
       });
@@ -572,7 +903,7 @@ export class HistoryModule implements Module {
 
     return {
       success: true,
-      data: { scanned, candidatePoolSize: candidates.length, truncated, matches },
+      data: { scanned, ...poolInfo, truncated, ...resumeInfo(scanned), matches },
     };
   }
 
@@ -632,6 +963,7 @@ export class HistoryModule implements Module {
           id: String(msg.id),
           timestamp: msg.timestamp.toISOString(),
           participant: msg.participant,
+          author: authorName(msg),
           channelId: getChannelId(msg) ?? null,
           snippet: snippetAround(text, matchIndex, matchLength),
         };
@@ -1200,6 +1532,7 @@ function projectMessage(msg: StoredMessage, format: 'text' | 'raw'): Record<stri
     id: String(msg.id),
     timestamp: msg.timestamp.toISOString(),
     participant: msg.participant,
+    author: authorName(msg),
     channelId: getChannelId(msg) ?? null,
     content: format === 'raw' ? msg.content : flattenContent(msg.content),
   };
@@ -1252,15 +1585,104 @@ interface SearchMatch {
   id: string;
   timestamp: string;
   participant: string;
+  /** Display name from metadata.author (null when absent — e.g. the agent's own turns; see participant). */
+  author: string | null;
   channelId: string | null;
   snippet: string;
 }
 
-function matchSubstring(text: string, needle: string, caseSensitive: boolean): MatchHit | null {
+const WORD_CHAR_RE = /[\p{L}\p{N}_]/u;
+
+function isWordChar(ch: string | undefined): boolean {
+  return ch !== undefined && WORD_CHAR_RE.test(ch);
+}
+
+/**
+ * First occurrence of `needle` in `text`. With `wholeWord`, an occurrence
+ * only counts when it isn't glued to a letter/digit/underscore on either
+ * side (Unicode-aware, so Cyrillic words work too) — "mission" no longer
+ * hits inside "uncommissioned". Word-ness is checked only on the sides
+ * where the needle itself starts/ends with a word character, so a needle
+ * like "#general" or "v2." still matches the way a person would expect.
+ */
+function matchSubstring(text: string, needle: string, caseSensitive: boolean, wholeWord = false): MatchHit | null {
   const haystack = caseSensitive ? text : text.toLowerCase();
-  const index = haystack.indexOf(needle);
-  if (index === -1) return null;
-  return { index, length: needle.length };
+  if (!wholeWord) {
+    const index = haystack.indexOf(needle);
+    return index === -1 ? null : { index, length: needle.length };
+  }
+  const checkLeft = isWordChar(needle[0]);
+  const checkRight = isWordChar(needle[needle.length - 1]);
+  for (let from = 0; ; ) {
+    const index = haystack.indexOf(needle, from);
+    if (index === -1) return null;
+    const end = index + needle.length;
+    if ((!checkLeft || !isWordChar(haystack[index - 1])) && (!checkRight || !isWordChar(haystack[end]))) {
+      return { index, length: needle.length };
+    }
+    from = index + 1;
+  }
+}
+
+// ============================================================================
+// author filtering
+// ============================================================================
+
+/** metadata.author as written by MCPL channel ingestion ({id, name}). Every
+ *  incoming channel message is stored with participant "user" — the real
+ *  author lives only here. */
+function authorOf(msg: StoredMessage): { id?: string; name?: string } | undefined {
+  const a = (msg.metadata as { author?: unknown } | undefined)?.author;
+  if (!a || typeof a !== 'object') return undefined;
+  const { id, name } = a as { id?: unknown; name?: unknown };
+  return {
+    ...(typeof id === 'string' || typeof id === 'number' ? { id: String(id) } : {}),
+    ...(typeof name === 'string' ? { name } : {}),
+  };
+}
+
+function authorName(msg: StoredMessage): string | null {
+  return authorOf(msg)?.name ?? null;
+}
+
+/** Normalize one author spec: trim, case-fold, strip a leading "@", unwrap a
+ *  <@id>/<@!id> mention to its id. */
+function normalizeAuthorSpec(spec: string): string {
+  const s = spec.trim();
+  const mention = /^<@!?(\d+)>$/.exec(s);
+  if (mention) return mention[1]!;
+  return s.replace(/^@/, '').toLowerCase();
+}
+
+function toAuthorSet(spec: AuthorSpec | undefined, field: string): Set<string> | null {
+  if (spec === undefined) return null;
+  const list = Array.isArray(spec) ? spec : [spec];
+  if (list.some((s) => typeof s !== 'string')) {
+    throw new Error(`"${field}" must be a string or an array of strings.`);
+  }
+  const set = new Set(list.map(normalizeAuthorSpec).filter((s) => s.length > 0));
+  if (set.size === 0) throw new Error(`"${field}" must name at least one author.`);
+  return set;
+}
+
+/**
+ * Predicate for `author`/`excludeAuthor`, or null when neither is given.
+ * A message's identities are its metadata.author name and id plus its
+ * stored participant — the last is what identifies the agent's own turns
+ * (and anything else ingested without author metadata). Exact match after
+ * normalization, never substring: "ann" must not pull in "joanne".
+ */
+function buildAuthorFilter(include: AuthorSpec | undefined, exclude: AuthorSpec | undefined): ((m: StoredMessage) => boolean) | null {
+  const inc = toAuthorSet(include, 'author');
+  const exc = toAuthorSet(exclude, 'excludeAuthor');
+  if (!inc && !exc) return null;
+  return (m) => {
+    const a = authorOf(m);
+    const keys = [a?.name?.toLowerCase(), a?.id, m.participant?.toLowerCase()].filter((k): k is string => !!k);
+    if (inc && !keys.some((k) => inc.has(k))) return false;
+    if (exc && keys.some((k) => exc.has(k))) return false;
+    return true;
+  };
 }
 
 /** ~SNIPPET_CONTEXT_CHARS of surrounding context on each side of a match, or
