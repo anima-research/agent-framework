@@ -83,6 +83,19 @@ describe('ChannelRegistry → shouldTriggerInference contract', () => {
     assert.strictEqual(seen[0].serverId, 'zulip');
     assert.strictEqual(seen[0].channelId, 'zulip:tracker-miner-f');
   });
+
+  it('honors transport context-only suppression before a permissive gate', () => {
+    const { registry, pushed } = makeRegistry(() => true);
+    const params = incomingParams('zulip:tracker-miner-f', '🧵 first half');
+    params.messages[0].metadata = { suppressWake: true };
+
+    registry.handleIncoming('zulip', params);
+
+    assert.strictEqual(pushed.length, 1);
+    const event = pushed[0] as { triggerInference?: boolean; metadata?: Record<string, unknown> };
+    assert.strictEqual(event.triggerInference, false);
+    assert.strictEqual(event.metadata?.suppressWake, true);
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -882,8 +882,11 @@ export class ChannelRegistry {
       }
 
       // Determine whether to trigger inference
-      let triggerInference = true;
-      if (this.shouldTriggerInference) {
+      // A transport may explicitly mark a message as context-only. This is a
+      // hard suppression, evaluated before the optional gate, so a permissive
+      // gate cannot accidentally turn a continuation chunk into a wake.
+      let triggerInference = message.metadata?.suppressWake !== true;
+      if (triggerInference && this.shouldTriggerInference) {
         const textContent = message.content
           .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
           .map((b) => b.text)
