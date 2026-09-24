@@ -84,6 +84,8 @@ export class Agent {
   readonly refusalHandling: AgentConfig['refusalHandling'];
   /** Prose delivery mode (see AgentConfig.proseRouting). Default 'locus'. */
   readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
+  /** Post a room notice when a turn fails (see AgentConfig.failureNotices). */
+  readonly failureNotices: boolean;
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
   /** Prompt-cache TTL forwarded to the provider (see AgentConfig.cacheTtl). */
@@ -144,6 +146,7 @@ export class Agent {
     this.thinking = config.thinking;
     this.refusalHandling = config.refusalHandling;
     this.proseRouting = config.proseRouting ?? 'locus';
+    this.failureNotices = config.failureNotices === true;
     this.toolWrapperProseGuard = config.toolWrapperProseGuard ?? false;
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching ?? true;
