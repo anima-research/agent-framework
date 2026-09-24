@@ -269,6 +269,49 @@ class ThrowingCancellationMembrane {
   }
 }
 
+/** cancel() throws WITHOUT releasing the iterator — the provider behavior the
+ *  production comment allows, which ThrowingCancellationStream masks by
+ *  releasing before it throws. */
+class NonSettlingThrowingCancelStream implements YieldingStream {
+  cancelCalls = 0;
+  private release!: () => void;
+  private readonly released = new Promise<void>((resolve) => { this.release = resolve; });
+  readonly isWaitingForTools = false;
+  readonly pendingToolCallIds: string[] = [];
+  readonly toolDepth = 0;
+
+  provideToolResults(): void { throw new Error('not waiting for tools'); }
+  cancel(): void {
+    this.cancelCalls++;
+    throw new Error('cancel failed before aborting provider');
+  }
+  finish(): void { this.release(); }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<import('@animalabs/membrane').StreamEvent> {
+    await this.released;
+    yield {
+      type: 'complete',
+      response: createMockResponse([{ type: 'text', text: 'output after unsettled cancel' }]),
+    } as import('@animalabs/membrane').StreamEvent;
+  }
+}
+
+class NonSettlingCancelMembrane {
+  readonly stream = new NonSettlingThrowingCancelStream();
+  readonly created: Promise<void>;
+  private markCreated!: () => void;
+  constructor() {
+    this.created = new Promise<void>((resolve) => { this.markCreated = resolve; });
+  }
+  streamYielding(_request: NormalizedRequest): YieldingStream {
+    this.markCreated();
+    return this.stream;
+  }
+  asMembrane(): import('@animalabs/membrane').Membrane {
+    return this as unknown as import('@animalabs/membrane').Membrane;
+  }
+}
+
 describe('resident retirement', () => {
   it('seals through the neutral API, clears wake state, preserves history, and blocks restart inference', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-resident-retirement-'));
@@ -585,6 +628,47 @@ describe('resident retirement', () => {
     } finally {
       membrane.stream.finishLate();
       await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('stop() completes when a provider cancel() throws without settling its iterator', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-retired-unsettled-cancel-'));
+    const membrane = new NonSettlingCancelMembrane();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{
+        name: 'resident',
+        model: 'test-model',
+        systemPrompt: 'test',
+        retirement: { enabled: true },
+      }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    try {
+      framework.start();
+      framework.nudgeAgent('resident', 'unsettled-cancel-retirement-test');
+      await membrane.created;
+      // Let the framework register the iteration handle in activeStreams.
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      assert.ok((framework as unknown as { activeStreams: Map<string, unknown> }).activeStreams.has('resident'));
+      assert.throws(() => framework.retireResident('resident'), /cancel failed before aborting provider/);
+      assert.equal(framework.getResidentLifecycleStatus('resident').status, 'retired');
+      assert.equal(framework.getAgent('resident')!.state.status, 'idle');
+      assert.equal(membrane.stream.cancelCalls, 1);
+
+      // The iterator is still pending. stop() must settle anyway.
+      const outcome = await Promise.race([
+        framework.stop().then(() => 'stopped'),
+        new Promise((resolve) => setTimeout(() => resolve('timed-out'), 2000)),
+      ]);
+      assert.equal(outcome, 'stopped', 'framework.stop() must not wait on an iterator the provider failed to cancel');
+    } finally {
+      membrane.stream.finish();
+      await framework.stop().catch(() => {});
       rmSync(dir, { recursive: true, force: true });
     }
   });

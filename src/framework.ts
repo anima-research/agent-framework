@@ -2800,7 +2800,16 @@ export class AgentFramework {
     if (agent.state.status === 'streaming' || agent.state.status === 'waiting_for_tools') {
       this.frameworkCancelledStreams.set(`${agentName}:${agent.streamId}`, cancelKind);
     }
-    agent.abortInference(reason);
+    try {
+      agent.abortInference(reason);
+    } catch (error) {
+      // The provider's cancel() threw, so its iterator may never settle. The
+      // agent is already sealed and this stream is marked framework-cancelled
+      // (late events are discarded), so release the framework's ownership of
+      // it: stop() must not stay hostage to a provider that failed to cancel.
+      this.activeStreams.delete(agentName);
+      throw error;
+    }
   }
 
   private stopResidentAuthoredActivity(
