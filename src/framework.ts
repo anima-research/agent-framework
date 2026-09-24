@@ -1307,7 +1307,9 @@ export class AgentFramework {
    * Names are generation-unique, so retaining the tombstone prevents stale
    * public call provenance from becoming usable after the Agent is disposed.
    */
-  private terminatedConversationAgents: Set<string> = new Set();
+  /** Dependent continuations of a retired template — conversation forks and
+   *  the subconscious — terminal by name even after their Agent is disposed. */
+  private terminatedDependentAgents: Set<string> = new Set();
   /** Null only for app-owned stores whose host supplied no seal path. */
   private readonly retirementPath: string | null;
 
@@ -2786,7 +2788,7 @@ export class AgentFramework {
     // that construct a partial Framework object around one public method.
     // Fully-created Framework instances always initialize both collections.
     if (this.retiredResidents?.has(agentName)) return 'resident retired';
-    if (this.terminatedConversationAgents?.has(agentName)) {
+    if (this.terminatedDependentAgents?.has(agentName)) {
       return 'template resident retired';
     }
     return null;
@@ -2873,7 +2875,7 @@ export class AgentFramework {
     if (!this.conversationRouter || this.conversationRouter.templateAgent !== templateAgent) return [];
     const forkNames = [...this.conversationAgentHomes.keys()];
     for (const forkName of forkNames) {
-      this.terminatedConversationAgents.add(forkName);
+      this.terminatedDependentAgents.add(forkName);
     }
     return forkNames;
   }
@@ -2914,6 +2916,57 @@ export class AgentFramework {
   }
 
   /**
+   * The subconscious (issue #77) is a same-model side-process serving exactly
+   * one resident: built from the primary's inference config, reading the
+   * primary's shared message slot. It is on the fork side of the retirement
+   * doctrine — a dependent continuation of the template identity — so it
+   * terminates with the primary. Tombstone first (before any provider-owned
+   * cancel can re-enter), like the forks.
+   */
+  private tombstoneSubconsciousForPrimary(agentName: string): string | null {
+    const name = this.subconsciousAgentName;
+    if (!name || agentName !== this.primaryAgentName) return null;
+    this.terminatedDependentAgents.add(name);
+    return name;
+  }
+
+  private terminateSubconsciousForPrimary(primaryName: string, name: string): void {
+    const cleanupErrors: unknown[] = [];
+    const attempt = (operation: () => void): void => {
+      try {
+        operation();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    };
+    attempt(() => this.stopResidentAuthoredActivity(
+      name,
+      `template resident ${primaryName} retired`,
+      'template_retired',
+    ));
+    // Dispose like a fork: unregistered, its Chronicle namespace
+    // (`subconscious/<primary>`) left intact. With the name cleared, the
+    // tune-out coordinator has nothing to push to and says so.
+    const agent = this.agents.get(name);
+    this.agents.delete(name);
+    this.agentConfigs.delete(name);
+    this.toolImageLedgers.delete(name);
+    this.evictTurnCheckpoints(name);
+    if (agent) this.logicalTurnToolCalls.delete(agent);
+    this.subconsciousAgentName = null;
+    this.subconsciousStrategy = null;
+    this.subconsciousConfig = null;
+    console.error(`[subconscious-retired] agent=${name} template=${primaryName}`);
+    if (cleanupErrors.length === 1) throw cleanupErrors[0];
+    if (cleanupErrors.length > 1) {
+      throw new AggregateError(
+        cleanupErrors,
+        `Multiple subconscious retirement operations failed for ${primaryName}`,
+      );
+    }
+  }
+
+  /**
    * A seal append can fail after some or all bytes have become durable. Keep
    * that ambiguous identity terminal in this process before surfacing the
    * storage error; startup will validate the authoritative ledger separately.
@@ -2929,6 +2982,7 @@ export class AgentFramework {
     // the framework synchronously; every dependent identity must already be
     // terminal at that boundary.
     const forkNames = this.tombstoneConversationForksForTemplate(agentName);
+    const subconsciousName = this.tombstoneSubconsciousForPrimary(agentName);
     try {
       this.stopResidentAuthoredActivity(agentName);
     } catch (error) {
@@ -2938,6 +2992,13 @@ export class AgentFramework {
       this.terminateConversationForksForTemplate(agentName, forkNames);
     } catch (error) {
       cleanupErrors.push(error);
+    }
+    if (subconsciousName) {
+      try {
+        this.terminateSubconsciousForPrimary(agentName, subconsciousName);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
     }
     return cleanupErrors;
   }
@@ -5195,10 +5256,10 @@ export class AgentFramework {
     quiesced?: boolean;
   } {
     const name = agentName ?? [...this.agents.keys()][0];
-    if (name && this.terminatedConversationAgents.has(name)) {
+    if (name && this.terminatedDependentAgents.has(name)) {
       return {
         ok: false,
-        error: `Conversation fork "${name}" was terminated when its template resident retired.`,
+        error: `"${name}" was terminated when its template resident retired.`,
       };
     }
     const agent = name ? this.agents.get(name) : undefined;
@@ -6673,7 +6734,7 @@ export class AgentFramework {
    * passthrough, no memory pyramid: its durable output is what it delivers
    * into the resident's window, which accumulates there.
    */
-  private async createSubconsciousAgent(cfg: SubconsciousConfig): Promise<Agent> {
+  private async createSubconsciousAgent(cfg: SubconsciousConfig): Promise<Agent | null> {
     const primaryName = this.primaryAgentName;
     const primaryConfig = primaryName ? this.agentConfigs.get(primaryName) : undefined;
     if (!primaryName || !primaryConfig) {
@@ -6682,6 +6743,17 @@ export class AgentFramework {
     const name = cfg.name ?? 'Subconscious';
     if (this.agents.has(name)) {
       throw new Error(`subconscious name "${name}" collides with a registered agent`);
+    }
+    // Seals load before agents are created. A retired primary's side-process
+    // terminated with it; re-creating one at boot would be the resurrection
+    // path the seal exists to close. Not an error: the config is still valid
+    // for a host that keeps a retired resident's history around.
+    if (this.retiredResidents.has(primaryName)) {
+      this.terminatedDependentAgents.add(name);
+      console.error(
+        `[subconscious] not created: primary resident "${primaryName}" is retired`,
+      );
+      return null;
     }
 
     const strategy = new WindowedPassthroughStrategy({

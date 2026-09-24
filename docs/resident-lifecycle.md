@@ -96,11 +96,15 @@ framework then:
 - freezes the resident conversation against later message appends;
 - seals, unbinds, and unregisters conversation forks already derived from the
   retired template while preserving their Chronicle namespaces;
-- refuses to create any later conversation fork from that template; and
+- refuses to create any later conversation fork from that template;
+- seals and unregisters the subconscious side-process when the retired
+  resident is the primary it attends, and does not re-create one at boot for
+  an already-sealed primary (its `subconscious/<primary>` namespace stays); and
 - appends `framework/resident-lifecycle` in Chronicle and emits a
   `resident:retired` trace.
 
-Terminal state and every dependent conversation-fork tombstone are installed
+Terminal state and every dependent tombstone (conversation forks, the
+subconscious) are installed
 before provider- or module-owned cleanup runs. Cleanup attempts are isolated:
 one cancellation or disposal failure does not prevent later resident/fork
 cleanup. If cleanup does fail, `retireResident` surfaces the error only after
@@ -116,7 +120,10 @@ must track and cancel those ephemeral jobs before invoking `retireResident`.
 
 Conversation forks use a different policy because they are persistent,
 addressable continuations of one configured template identity. They terminate
-with that template rather than finishing independently. A stale public
+with that template rather than finishing independently. The subconscious is on
+the same side of that line: a same-model side-process built from the primary's
+inference config and reading its shared slot, serving that one resident. It
+terminates with the primary. A stale public
 reference to such a fork remains inference-sealed, and its generation-unique
 name remains tombstoned against later tool provenance.
 
