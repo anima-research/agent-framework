@@ -4295,6 +4295,7 @@ export class AgentFramework {
         } : {}),
         ...(judge && judgeOptions?.timeoutMs !== undefined ? { judgeTimeoutMs: judgeOptions.timeoutMs } : {}),
         ...(judge && judgeOptions?.onError !== undefined ? { judgeOnError: judgeOptions.onError } : {}),
+        messageQuietPeriod: config.gate.messageQuietPeriod,
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
         addMessage: (p, c, m, forAgent, placement) => framework.addMessage(p, c, m as MessageMetadata,
           forAgent || placement ? { ...(forAgent ? { forAgent } : {}), ...(placement ? { placement } : {}) } : undefined),
