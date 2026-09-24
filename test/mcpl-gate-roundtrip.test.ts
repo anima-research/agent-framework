@@ -6,6 +6,7 @@ import { join } from 'node:path';
 
 import { EventGate } from '../src/gate/event-gate.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { PushHandler } from '../src/mcpl/push-handler.js';
 import type { GateConfig } from '../src/gate/types.js';
 import type { ChannelsIncomingParams } from '../src/mcpl/types.js';
 import type { ProcessEvent } from '../src/types/index.js';
@@ -357,4 +358,42 @@ describe('ChannelRegistry durable lifecycle', () => {
       registry: { getServer: () => server } as unknown as ConstructorParameters<typeof ChannelRegistry>[0],
     };
   }
+});
+
+// ---------------------------------------------------------------------------
+// Push-event lane: same context-only contract (origin.suppressWake)
+// ---------------------------------------------------------------------------
+
+describe('PushHandler → context-only suppression', () => {
+  const run = (origin: Record<string, unknown>) => {
+    const pushed: Array<{ triggerInference?: boolean }> = [];
+    let gateCalls = 0;
+    const handler = new PushHandler(
+      { validateInbound: () => {} } as never,
+      (event) => { pushed.push(event as { triggerInference?: boolean }); },
+      () => {},
+      () => { gateCalls++; return true; }, // permissive gate: wake on everything
+    );
+    handler.handlePushEvent('discord', {
+      featureSet: 'discord.messaging',
+      eventId: `e-${Math.random()}`,
+      timestamp: new Date().toISOString(),
+      origin,
+      payload: { content: [{ type: 'text', text: 'replayed message' }] },
+    } as never);
+    return { pushed, gateCalls };
+  };
+
+  it('a context-only push event is stored without inference, before the gate is consulted', () => {
+    const { pushed, gateCalls } = run({ source: 'discord', suppressWake: true });
+    assert.strictEqual(pushed.length, 1);
+    assert.strictEqual(pushed[0].triggerInference, false);
+    assert.strictEqual(gateCalls, 0);
+  });
+
+  it('without the flag the same event still wakes under a permissive gate', () => {
+    const { pushed, gateCalls } = run({ source: 'discord' });
+    assert.strictEqual(pushed[0].triggerInference, true);
+    assert.strictEqual(gateCalls, 1);
+  });
 });
