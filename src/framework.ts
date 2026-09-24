@@ -1012,6 +1012,9 @@ export class AgentFramework {
    *  author sees the segment's fate one turn later. Cleared each fresh
    *  turn; budget restarts keep it. */
   private turnProseSuppressed: Map<string, number> = new Map();
+  /** Per agent: tool call id -> whether its result was an error, for the
+   *  round most recently handed back to the stream (failed-send release). */
+  private roundToolErrors: Map<string, Map<string, boolean>> = new Map();
   /** A tool boundary injected fresh CONVERSATIONAL input (a real message —
    *  not a reaction or a system marker) into the live stream. Tells
    *  driveStream to clear sticky explicit-send suppression before handling
@@ -6589,6 +6592,10 @@ export class AgentFramework {
             const membraneResults = currentState.toolResults.map(tc =>
               this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
             );
+            this.roundToolErrors.set(agent.name, new Map(currentState.toolResults.map((tc) => {
+              const r = tc.result as { success?: boolean; isError?: boolean } | undefined;
+              return [tc.id, r?.isError === true || r?.success === false];
+            })));
             currentState.stream.provideToolResults(
               membraneResults,
               midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections } : undefined,
@@ -8524,6 +8531,28 @@ export class AgentFramework {
     // to prevent a redundant "sent it" postscript. Fresh injected input
     // clears it, because the following prose is a reply to a new message.
     let turnSilenced = false;
+    // Prose held because its round contained a send. If every send in that
+    // round then FAILS, the round did not actually speak: release the prose
+    // and lift the silence (a failed send must not cost the turn its words).
+    let heldSilence: { callIds: string[]; segments: string[] } | null = null;
+    const roundScopedSilencing = agent.proseSilencing === 'round';
+    const releaseFailedSilence = (): void => {
+      if (!heldSilence) return;
+      const errors = this.roundToolErrors.get(agent.name);
+      const known = heldSilence.callIds.filter((id) => errors?.has(id));
+      if (known.length < heldSilence.callIds.length) return; // results not in yet
+      const hold = heldSilence;
+      heldSilence = null;
+      if (!hold.callIds.every((id) => errors!.get(id) === true)) return; // a send landed
+      turnSilenced = false;
+      const locus = resolveTurnLocus();
+      console.error(
+        `[routing] ${agent.name}: silencing send(s) failed -> releasing ${hold.segments.length} held prose segment(s) -> ${locus ?? '(default)'}`,
+      );
+      const suppressed = this.turnProseSuppressed.get(agent.name) ?? 0;
+      this.turnProseSuppressed.set(agent.name, Math.max(0, suppressed - hold.segments.length));
+      for (const seg of hold.segments) enqueueSpeech(seg, locus);
+    };
 
     // Live routing is only trusted when the membrane provides verbatim
     // round-scoped blocks (roundContent, native tool mode, membrane ≥0.5.64).
@@ -8691,6 +8720,7 @@ export class AgentFramework {
 
           case 'tool-calls': {
             adoptInjectedRound();
+            releaseFailedSilence();
             hadToolCalls = true;
             this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, event.calls.length);
             this.recordEphemeralToolCalls(agent.name, event.calls.length);
@@ -8780,7 +8810,10 @@ export class AgentFramework {
               const hasSameRoundPrivateThink =
                 roundToolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
-              if (roundToolNames.some(isSilencingTool)) {
+              if (roundScopedSilencing) {
+                // proseSilencing 'round': a send silences only its own round.
+                turnSilenced = roundToolNames.some(isSilencingTool);
+              } else if (roundToolNames.some(isSilencingTool)) {
                 turnSilenced = true;
               }
               if (roundContent && roundContent.length > 0) {
@@ -8821,6 +8854,8 @@ export class AgentFramework {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (turn silenced)`,
                     );
+                    const sendIds = event.calls.filter((c) => isSilencingTool(c.name) && c.name !== 'skip_reply').map((c) => c.id);
+                    if (sendIds.length > 0) heldSilence = { callIds: sendIds, segments: roundSegments.map(String) };
                     // Visible in the turn-end receipt — silencing must never
                     // be a silent black hole (n=8: the flying-scene reply).
                     this.recordProseSuppression(agent.name, roundSegments.length);
@@ -8846,6 +8881,7 @@ export class AgentFramework {
 
           case 'complete': {
             adoptInjectedRound();
+            releaseFailedSilence();
             const durationMs = Date.now() - startTime;
             const response = event.response;
 
@@ -9232,7 +9268,7 @@ export class AgentFramework {
                 .filter((b) => b.type === 'tool_use')
                 .map((b) => (b as unknown as { name?: string }).name)
                 .filter((n): n is string => typeof n === 'string');
-              const silenced = liveProseRouting
+              const silenced = liveProseRouting || roundScopedSilencing
                 ? turnSilenced
                 : turnSilenced || toolNames.some(isSilencingTool);
 

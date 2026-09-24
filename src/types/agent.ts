@@ -186,6 +186,17 @@ export interface AgentConfig {
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
 
   /**
+   * How far an explicit send (send_message, channel_publish, skip_reply, …)
+   * silences the turn's auto-routed prose.
+   * - 'turn' (default): from the round it occurs to the end of the turn.
+   * - 'round': only that round's prose; later rounds, including the final
+   *   prose, deliver normally. For long tool-using turns where an early send
+   *   should not discard the turn's closing words.
+   * Either way, a round whose sends all FAILED releases its held prose.
+   */
+  proseSilencing?: 'turn' | 'round';
+
+  /**
    * Fail-closed containment for a text response whose entire visible prose is
    * an invocation-shaped wrapper naming a tool registered on that exact turn.
    * The wrapper is neither executed nor stored as assistant continuity; a
