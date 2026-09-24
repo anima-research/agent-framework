@@ -1548,6 +1548,7 @@ export class AgentFramework {
         configPath,
         initialConfig: config.gate.config,
         privilegedUsersPath: config.gate.privilegedUsersPath,
+        messageQuietPeriod: config.gate.messageQuietPeriod,
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
         addMessage: (p, c, m, forAgent) => framework.addMessage(p, c, m as MessageMetadata, forAgent ? { forAgent } : undefined),
         requestInference: (agentName, reason, source, provenance) => {
