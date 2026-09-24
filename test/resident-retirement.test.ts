@@ -382,11 +382,26 @@ describe('resident retirement', () => {
 
       const before = await framework.getAgent('resident')!.compileContext();
       assert.match(JSON.stringify(before), /history survives/);
-      (framework as unknown as {
-        addMessage(participant: string, content: Array<{ type: 'text'; text: string }>): void;
-      }).addMessage('User', [{ type: 'text', text: 'must not append' }]);
+      const logged: string[] = [];
+      const originalError = console.error;
+      console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+      try {
+        for (let i = 0; i < 100; i++) {
+          (framework as unknown as {
+            addMessage(participant: string, content: Array<{ type: 'text'; text: string }>): void;
+          }).addMessage('User', [{ type: 'text', text: 'must not append' }]);
+        }
+      } finally {
+        console.error = originalError;
+      }
       const after = await framework.getAgent('resident')!.compileContext();
       assert.doesNotMatch(JSON.stringify(after), /must not append/);
+      const drops = logged.filter((line) => line.startsWith('[message-dropped] agent=resident reason=resident_retired'));
+      assert.deepEqual(
+        drops.map((line) => line.match(/dropped=(\d+)/)?.[1]),
+        ['1', '100'],
+        'the post-retirement drop is traced on the first append and every 100th, not per message',
+      );
 
       await framework.stop();
       const reject = new RejectInferenceMembrane();

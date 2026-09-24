@@ -1298,6 +1298,8 @@ export class AgentFramework {
   // ---- Resident lifecycle -------------------------------------------------
   /** Configured, non-ephemeral residents a host may irreversibly retire. */
   private retirableResidents: Map<string, ResidentRetirementConfig> = new Map();
+  /** Post-retirement appends dropped per resident (drives the rate-limited trace). */
+  private readonly retiredMessageDrops = new Map<string, number>();
   /** Branch-independent terminal seals loaded from the append-only sidecar. */
   private retiredResidents: Map<string, ResidentRetirementRecord> = new Map();
   /**
@@ -11798,6 +11800,16 @@ export class AgentFramework {
     // External events may still exist in module/process logs, but they do not
     // append post-retirement speech to the sealed identity's conversation.
     if (this.retiredResidents?.has(agent.name)) {
+      // Traced, but rate-limited: a retired resident still subscribed to a
+      // busy channel would otherwise log every message it no longer hears.
+      const dropped = (this.retiredMessageDrops.get(agent.name) ?? 0) + 1;
+      this.retiredMessageDrops.set(agent.name, dropped);
+      if (dropped === 1 || dropped % 100 === 0) {
+        console.error(
+          `[message-dropped] agent=${agent.name} reason=resident_retired ` +
+          `participant=${participant} dropped=${dropped}`,
+        );
+      }
       return '' as MessageId;
     }
 
