@@ -1,5 +1,6 @@
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
+import { correctImageMediaTypes } from './image-media-type.js';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import {
@@ -525,7 +526,7 @@ export class Agent {
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
     const result = await this.contextManager.compile(this.resolveBudget(budget));
     if (!budget) this.settleRuntimeSettingsTransition();
-    return result;
+    return { ...result, messages: correctImageMediaTypes(result.messages) };
   }
 
   /**
@@ -542,7 +543,7 @@ export class Agent {
       this.resolveBudget(budget), injections, opts as never,
     );
     if (!budget) this.settleRuntimeSettingsTransition();
-    return result;
+    return { ...result, messages: correctImageMediaTypes(result.messages) };
   }
 
   // ==========================================================================
