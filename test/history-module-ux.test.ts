@@ -159,13 +159,15 @@ describe('HistoryModule UX: author filter', () => {
     assert.equal(all.scanned, 7);
   });
 
-  it('extract author: maxScan bound reports truncated + scannedThrough, and a window of exactly maxScan is complete', async () => {
+  it('extract author: maxScan bound reports truncated + a positional resume, and a window of exactly maxScan is complete', async () => {
     const { mod } = stub(fixture);
     const d = data(await call(mod, 'extract', { author: 'antra', maxScan: 3 }));
     assert.equal(d.truncated, true);
     assert.equal(d.scanned, 3);
-    assert.equal(d.scannedThrough, new Date(min(3)).toISOString());
+    assert.deepEqual(d.resume, { windowOffset: 3, offset: 0 });
     assert.deepEqual(d.messages.map((m: any) => m.id), ['m1']);
+    const rest = data(await call(mod, 'extract', { author: 'antra', maxScan: 4, ...d.resume }));
+    assert.deepEqual(rest.messages.map((m: any) => m.id), ['m4', 'm5', 'm7']);
     const exact = data(await call(mod, 'extract', { author: 'antra', maxScan: 7 }));
     assert.equal(exact.truncated, false);
     assert.equal(exact.matchedCount, 4);

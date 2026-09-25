@@ -73,6 +73,8 @@ interface ExtractInput {
   author?: AuthorSpec;
   excludeAuthor?: AuthorSpec;
   maxScan?: number;
+  /** Resume point of an author-filtered scan (from a previous `resume`). */
+  windowOffset?: number;
   aroundId?: string;
   before?: number;
   after?: number;
@@ -141,6 +143,9 @@ const AROUND_MAX = 100;
  *  real stores see a handful at most; this only keeps a pathological burst
  *  from turning one call into an unbounded fetch. */
 const AROUND_TIE_CAP = 500;
+
+/** Largest valid Date value (ms) — an open newest edge. */
+const MAX_DATE_MS = 8.64e15;
 
 const SEARCH_DEFAULT_LIMIT = 20;
 const SEARCH_MAX_LIMIT = 100;
@@ -322,10 +327,15 @@ export class HistoryModule implements Module {
    * No channel: chronicle's timestamp index answers directly (`reverse`
    * for the newest edge). With a channel: channel queries report an exact
    * matchedCount, so grow a time window out from the edge (×4 per step)
-   * until it holds ≥ n channel messages or covers the whole range, then
-   * fetch just that window and sort. A window that overshoots wildly (a
-   * burst) falls back to its ordinal tail rather than decoding thousands
-   * of messages — correct for everything but same-burst backfill.
+   * until it holds ≥ n channel messages or covers the whole range. If that
+   * window holds more than `fetchCap` (a density jump across one step, or a
+   * burst), bisect its far bound between the last step that held < n and
+   * this one — counts are exact, so it lands on a window of [n, fetchCap].
+   * Only when a single millisecond holds the overflow does bisection bottom
+   * out; then the window is everything strictly nearer the edge plus that
+   * millisecond's nearest messages by sequence, which within one millisecond
+   * IS the (timestamp, sequence) order — still exact. The newest side is
+   * left open when `toMs` is (clock-skewed future stamps stay visible).
    */
   private edgeWindow(opts: {
     fromMs?: number;
@@ -336,51 +346,76 @@ export class HistoryModule implements Module {
   }): { messages: StoredMessage[]; more: boolean } {
     const cm = this.cm as ContextManager;
     const { fromMs, toMs, channelId, n, side } = opts;
+    const newest = side === 'newest';
     const cmp = (a: StoredMessage, b: StoredMessage) =>
       a.timestamp.getTime() - b.timestamp.getTime() || a.sequence - b.sequence;
-    const dirSort = (ms: StoredMessage[]) => ms.sort(side === 'newest' ? (a, b) => cmp(b, a) : cmp);
+    const dirSort = (ms: StoredMessage[]) => ms.sort(newest ? (a, b) => cmp(b, a) : cmp);
 
     if (channelId === undefined) {
-      const r = cm.queryMessagesByTime({ fromMs, toMs, limit: n + 1, reverse: side === 'newest' });
+      const r = cm.queryMessagesByTime({ fromMs, toMs, limit: n + 1, reverse: newest });
       return { messages: r.messages.slice(0, n), more: r.messages.length > n };
     }
 
     const count = (f?: number, t?: number) =>
       cm.queryMessagesByTimeAndChannel({ fromMs: f, toMs: t, channelId, limit: 0 }).matchedCount;
+    const fetch = (f: number | undefined, t: number | undefined, limit: number, offset = 0) =>
+      limit <= 0 ? [] : cm.queryMessagesByTimeAndChannel({ fromMs: f, toMs: t, channelId, limit, offset }).messages;
     const total = count(fromMs, toMs);
     if (n === 0) return { messages: [], more: total > 0 };
-    let wFrom = fromMs;
-    let wTo = toMs;
-    if (total > n) {
-      // Concrete bounds of the range (open ends resolved to the store's
-      // first message / now), so growth always terminates.
-      const lo = fromMs ?? this.earliestMessageMs(toMs) ?? 0;
-      const hi = toMs ?? Date.now();
-      for (let width = 10 * 60_000; ; width *= 4) {
-        const f = side === 'newest' ? Math.max(hi - width, lo) : lo;
-        const t = side === 'newest' ? hi : Math.min(lo + width, hi);
-        const covered = side === 'newest' ? f <= lo : t >= hi;
-        if (covered) break; // whole range: keep wFrom/wTo = the range itself
-        if (count(f, t) >= n) {
-          wFrom = f;
-          wTo = t;
-          break;
+    if (total <= n) return { messages: dirSort(fetch(fromMs, toMs, total)), more: false };
+
+    // The window is parameterised by its FAR bound `e`: [e, toMs] for the
+    // newest side, [fromMs, e] for the oldest; its count is monotone in e.
+    const win = (e: number): [number | undefined, number | undefined] => (newest ? [e, toMs] : [fromMs, e]);
+    const cnt = (e: number) => count(...win(e));
+    const lo = fromMs ?? this.earliestMessageMs(toMs) ?? 0;
+    const hi = toMs ?? Date.now(); // growth anchor only — never a bound
+    // `outside`: a far bound whose window holds < n (initially empty).
+    // `inside`: one whose window holds ≥ n (initially the whole range).
+    let outside: number | null = null;
+    let inside = newest ? lo : (toMs ?? MAX_DATE_MS);
+    let inCount = total;
+    for (let width = 10 * 60_000; ; width *= 4) {
+      const e = newest ? hi - width : lo + width;
+      if (newest ? e <= lo : e >= hi) break; // covered: keep the whole range
+      const c = cnt(e);
+      if (c >= n) {
+        inside = e;
+        inCount = c;
+        break;
+      }
+      outside = e;
+    }
+    const fetchCap = Math.max(4 * n, n + 1000);
+    if (inCount <= fetchCap) {
+      return { messages: dirSort(fetch(...win(inside), inCount)).slice(0, n), more: true };
+    }
+    // Overshoot: bisect the far bound. The empty side starts one past the
+    // range's near end (newest: past toMs / any date; oldest: before lo).
+    const emptyOut = newest ? (toMs ?? MAX_DATE_MS) + 1 : lo - 1;
+    let out = outside ?? emptyOut;
+    while (Math.abs(inside - out) > 1) {
+      const mid = Math.floor((inside + out) / 2);
+      const c = cnt(mid);
+      if (c < n) {
+        out = mid;
+      } else {
+        inside = mid;
+        inCount = c;
+        if (c <= fetchCap) {
+          return { messages: dirSort(fetch(...win(mid), c)).slice(0, n), more: true };
         }
       }
     }
-    const inWindow = count(wFrom, wTo);
-    const fetchCap = Math.max(4 * n, n + 1000);
-    const page =
-      inWindow <= fetchCap
-        ? cm.queryMessagesByTimeAndChannel({ fromMs: wFrom, toMs: wTo, channelId, limit: inWindow }).messages
-        : cm.queryMessagesByTimeAndChannel({
-            fromMs: wFrom,
-            toMs: wTo,
-            channelId,
-            limit: n,
-            offset: side === 'newest' ? inWindow - n : 0,
-          }).messages;
-    return { messages: dirSort(page).slice(0, n), more: total > n };
+    // Millisecond `inside` alone carries the overflow. Everything nearer the
+    // edge (the `out` window, < n messages) plus the nearest-by-sequence
+    // messages of that millisecond (channel pages are append = sequence
+    // ordered, which is the tie order within one millisecond).
+    const near = out === emptyOut ? [] : fetch(...win(out), cnt(out));
+    const need = n - near.length;
+    const ties = count(inside, inside);
+    const edgeMs = fetch(inside, inside, need, newest ? Math.max(0, ties - need) : 0);
+    return { messages: dirSort([...near, ...edgeMs]).slice(0, n), more: true };
   }
 
   async start(ctx: ModuleContext): Promise<void> {
@@ -422,7 +457,8 @@ export class HistoryModule implements Module {
           'after it, in the anchor\'s own channel unless channelId/allChannels says otherwise; from/to/offset ' +
           'do not apply in this mode. (2) author/excludeAuthor — keep only (or drop) messages by these ' +
           'authors; this is filtered in-process over at most maxScan messages of the window, so a response ' +
-          'may report truncated:true + scannedThrough (continue with from:scannedThrough).',
+          'may report truncated:true with a `resume` object ({windowOffset, offset}) — repeat the call with those ' +
+          'fields added to continue exactly where it stopped.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -438,6 +474,7 @@ export class HistoryModule implements Module {
             limit: { type: 'number', description: `Max messages to return (default ${EXTRACT_DEFAULT_LIMIT}, hard cap ${EXTRACT_MAX_LIMIT}). Must be a non-negative integer.` },
             offset: { type: 'number', description: `Number of matching messages to skip (default 0, capped to ${NATIVE_OFFSET_MAX}). Must be a non-negative integer.` },
             maxScan: { type: 'number', description: `With author/excludeAuthor: max window messages to examine (default ${EXTRACT_FILTER_DEFAULT_MAX_SCAN}, hard cap ${EXTRACT_FILTER_MAX_MAX_SCAN}).` },
+            windowOffset: { type: 'number', description: 'With author/excludeAuthor: resume a truncated scan at this position of the window — copy it from the previous response\'s `resume`.' },
             format: { type: 'string', enum: ['text', 'raw'], description: 'Content rendering (default "text").' },
           },
         },
@@ -620,6 +657,9 @@ export class HistoryModule implements Module {
     const authorFilter = buildAuthorFilter(input.author, input.excludeAuthor);
 
     const cm = this.cm as ContextManager;
+    if (!authorFilter && input.windowOffset !== undefined) {
+      throw new Error('"windowOffset" only applies together with author/excludeAuthor (it resumes a filtered scan). Use offset.');
+    }
 
     if (authorFilter) {
       // No native author index: page through the time/channel window and
@@ -627,22 +667,37 @@ export class HistoryModule implements Module {
       // soon as the requested page is full; otherwise scan to maxScan. Only
       // an exhausted window yields an exact matchedCount — anything else is
       // reported as truncated with a resume point, never as a total.
+      //
+      // Resume is by WINDOW POSITION (`windowOffset`), never by timestamp: a
+      // channel-scoped window pages in append order, and Discord catch-up
+      // appends old-timestamped messages late, so "continue from the last
+      // timestamp seen" would skip them.
       const maxScan = clampCount(input.maxScan, EXTRACT_FILTER_DEFAULT_MAX_SCAN, EXTRACT_FILTER_MAX_MAX_SCAN, 'maxScan');
+      const windowOffset = clampCount(input.windowOffset, 0, NATIVE_OFFSET_MAX, 'windowOffset');
       const page: StoredMessage[] = [];
       let kept = 0;
       let scanned = 0;
-      let lastScanned: StoredMessage | undefined;
+      // Window position just past the last message put on the page.
+      let afterPage = windowOffset;
       let exhausted = false;
       let pageFull = false;
       outer: for (;;) {
         const want = Math.min(FILTER_SCAN_PAGE, maxScan - scanned);
         if (want <= 0) break;
-        const chunk = cm.queryMessagesByTimeAndChannel({ fromMs, toMs, channelId, limit: want, offset: scanned }).messages;
+        const chunk = cm.queryMessagesByTimeAndChannel({
+          fromMs,
+          toMs,
+          channelId,
+          limit: want,
+          offset: Math.min(windowOffset + scanned, NATIVE_OFFSET_MAX),
+        }).messages;
         for (const m of chunk) {
           scanned++;
-          lastScanned = m;
           if (!authorFilter(m)) continue;
-          if (kept >= offset && page.length < limit) page.push(m);
+          if (kept >= offset && page.length < limit) {
+            page.push(m);
+            afterPage = windowOffset + scanned;
+          }
           kept++;
           if (page.length >= limit && kept > offset + limit) {
             // One filtered match beyond the page proves there is more;
@@ -658,7 +713,13 @@ export class HistoryModule implements Module {
       }
       if (!exhausted && !pageFull && scanned >= maxScan) {
         // Probe one past maxScan: a window of exactly maxScan is complete.
-        const next = cm.queryMessagesByTimeAndChannel({ fromMs, toMs, channelId, limit: 1, offset: scanned }).messages;
+        const next = cm.queryMessagesByTimeAndChannel({
+          fromMs,
+          toMs,
+          channelId,
+          limit: 1,
+          offset: Math.min(windowOffset + scanned, NATIVE_OFFSET_MAX),
+        }).messages;
         if (next.length === 0) exhausted = true;
       }
       return {
@@ -668,14 +729,24 @@ export class HistoryModule implements Module {
           returned: page.length,
           scanned,
           truncated: !exhausted,
-          ...(!exhausted && lastScanned
-            ? {
-                scannedThrough: lastScanned.timestamp.toISOString(),
-                hint: pageFull
-                  ? 'More matching messages exist; raise offset (or continue with from:scannedThrough and offset:0).'
-                  : `Stopped after scanning ${scanned} messages of the window without reaching its end; continue with ` +
-                    'from:scannedThrough (messages at exactly that instant may repeat), or narrow with channelId/dates.',
-              }
+          ...(!exhausted
+            ? (() => {
+                // pageFull: resume just past the last returned message, no
+                // skip. maxScan: resume past everything scanned, still owing
+                // whatever part of `offset` was not yet consumed.
+                const resume = pageFull
+                  ? { windowOffset: afterPage, offset: 0 }
+                  : { windowOffset: windowOffset + scanned, offset: Math.max(0, offset - kept) };
+                return {
+                  resume,
+                  hint:
+                    (pageFull
+                      ? 'More matching messages exist. '
+                      : `Stopped after scanning ${scanned} messages of the window without reaching its end. `) +
+                    `Continue by repeating this call with the same from/to/channelId/author plus ` +
+                    `windowOffset:${resume.windowOffset} and offset:${resume.offset} (the fields of \`resume\`).`,
+                };
+              })()
             : {}),
           messages: page.map((msg) => projectMessage(msg, format)),
         },
@@ -715,8 +786,8 @@ export class HistoryModule implements Module {
    * (timestamp, sequence), and cut to `before`/`after` around the anchor.
    */
   private handleExtractAround(input: ExtractInput): ToolResult {
-    if (input.from !== undefined || input.to !== undefined || input.offset !== undefined) {
-      throw new Error('"aroundId" cannot be combined with from/to/offset — it picks its own window.');
+    if (input.from !== undefined || input.to !== undefined || input.offset !== undefined || input.windowOffset !== undefined) {
+      throw new Error('"aroundId" cannot be combined with from/to/offset/windowOffset — it picks its own window.');
     }
     if (input.author !== undefined || input.excludeAuthor !== undefined) {
       throw new Error('"aroundId" returns the whole conversation around a message; author filters do not apply. Use search/extract with author instead.');
@@ -755,7 +826,14 @@ export class HistoryModule implements Module {
     );
     const idx = ordered.findIndex((m) => String(m.id) === anchorId);
     if (idx === -1) {
-      // Only reachable when an explicit channelId excludes the anchor.
+      if (input.channelId === undefined || channelId === anchorChannel) {
+        // edgeWindow is exact, so the anchor can only be missed when more
+        // than AROUND_TIE_CAP messages share its millisecond.
+        throw new Error(
+          `Could not place message ${anchorId} among its neighbours: more than ${AROUND_TIE_CAP} messages share ` +
+            'its timestamp. Use extract with from/to set to that instant instead.',
+        );
+      }
       throw new Error(
         `Message ${anchorId} is not in channel ${JSON.stringify(input.channelId)}` +
           (anchorChannel ? ` (it is in ${anchorChannel}).` : '.') +
@@ -1591,7 +1669,8 @@ interface SearchMatch {
   snippet: string;
 }
 
-const WORD_CHAR_RE = /[\p{L}\p{N}_]/u;
+/** Letters, combining marks (NFD accents, Indic vowel signs), digits, underscore. */
+const WORD_CHAR_RE = /[\p{L}\p{M}\p{N}_]/u;
 
 function isWordChar(ch: string | undefined): boolean {
   return ch !== undefined && WORD_CHAR_RE.test(ch);
@@ -1678,7 +1757,12 @@ function buildAuthorFilter(include: AuthorSpec | undefined, exclude: AuthorSpec 
   if (!inc && !exc) return null;
   return (m) => {
     const a = authorOf(m);
-    const keys = [a?.name?.toLowerCase(), a?.id, m.participant?.toLowerCase()].filter((k): k is string => !!k);
+    // participant only for messages WITHOUT author metadata (the agent's own
+    // turns): every MCPL-ingested message has participant "user", which
+    // would otherwise make author:"user" match everyone.
+    const keys = (a ? [a.name?.toLowerCase(), a.id?.toLowerCase()] : [m.participant?.toLowerCase()]).filter(
+      (k): k is string => !!k,
+    );
     if (inc && !keys.some((k) => inc.has(k))) return false;
     if (exc && keys.some((k) => exc.has(k))) return false;
     return true;
