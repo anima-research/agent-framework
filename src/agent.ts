@@ -84,6 +84,8 @@ export class Agent {
   readonly refusalHandling: AgentConfig['refusalHandling'];
   /** Prose delivery mode (see AgentConfig.proseRouting). Default 'locus'. */
   readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
+  /** Silencing scope (see AgentConfig.proseSilencing). Default 'turn'. */
+  readonly proseSilencing: NonNullable<AgentConfig['proseSilencing']>;
   /** Exact whole-response known-tool wrapper containment (default off). */
   readonly toolWrapperProseGuard: boolean;
   /** Prompt-cache TTL forwarded to the provider (see AgentConfig.cacheTtl). */
@@ -144,6 +146,7 @@ export class Agent {
     this.thinking = config.thinking;
     this.refusalHandling = config.refusalHandling;
     this.proseRouting = config.proseRouting ?? 'locus';
+    this.proseSilencing = config.proseSilencing ?? 'turn';
     this.toolWrapperProseGuard = config.toolWrapperProseGuard ?? false;
     this.cacheTtl = config.cacheTtl ?? '1h';
     this.promptCaching = config.promptCaching ?? true;
