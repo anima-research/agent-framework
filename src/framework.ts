@@ -5,7 +5,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeF
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
@@ -11557,24 +11557,27 @@ export class AgentFramework {
    * quarantine, OverBudget drain kick) gate on `errorType`, so classification
    * drift between sites would silently disable a safety net.
    *
-   * context-manager's OverBudgetError is recognized by `err.name`: CM does not
-   * export the class from its package root, so a cross-package `instanceof` is
-   * unavailable — but `name` is set in its constructor and survives the package
-   * boundary. Deliberately NOT a message match: the message wording belongs to
-   * CM and can be reworded without warning.
+   * context-manager's refusal errors are matched by a real `instanceof` since
+   * CM exports them from its package root (context-manager#41 / #71; floor
+   * `^0.7.0`, ours is higher). The `err.name` comparison stays as a FALLBACK
+   * only: a deployment that ends up with two CM copies (a peer package
+   * pinning a different version) constructs errors from a different class
+   * object, and `name` — set in the constructor — survives that boundary.
+   * Deliberately NOT a message match: the message wording belongs to CM and
+   * can be reworded without warning.
    */
   private classifyInferenceError(err: Error): { retryable?: boolean; errorType?: string } {
     if (err instanceof MembraneError) {
       return { retryable: err.retryable, errorType: err.type };
     }
-    if (err.name === 'OverBudgetError') {
+    if (err instanceof OverBudgetError || err.name === 'OverBudgetError') {
       return { errorType: 'over_budget' };
     }
     // context-manager's fatal coverage invariant (fix/coverage-invariant-fatal,
     // 2026-07-26): a compile REFUSES rather than shipping a context with
     // silently-dropped messages. Recovery is identical to over_budget — kick
     // the compression drain so summaries cover the un-represented span.
-    if (err.name === 'UncoveredDropError') {
+    if (err instanceof UncoveredDropError || err.name === 'UncoveredDropError') {
       return { errorType: 'context_refusal' };
     }
     return {};
