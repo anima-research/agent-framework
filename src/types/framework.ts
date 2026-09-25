@@ -70,6 +70,21 @@ export interface CodeExecutionConfig {
   maxWakesPerScript?: number;
 }
 
+/** See `FrameworkConfig.providerHold`. */
+export interface ProviderHold {
+  holdMs: number;
+  /** Operator-facing explanation, logged with the hold. */
+  reason?: string;
+}
+/** What the framework knows about the failing call. */
+export interface ProviderHoldContext {
+  /** Model of the agent whose call failed — a quota window may be model-scoped. */
+  model?: string;
+}
+export type ProviderHoldHook = (
+  error: Error, agentName: string, context: ProviderHoldContext,
+) => ProviderHold | undefined;
+
 export interface FrameworkConfig {
   /**
    * The subconscious resident (issue #77): a persistent side-agent that
@@ -149,6 +164,27 @@ export interface FrameworkConfig {
 
   /** Custom error policy */
   errorPolicy?: ErrorPolicy;
+
+  /**
+   * Host verdict on a failed inference: "this cannot succeed until later".
+   * Consulted before the error policy and before the built-in
+   * organization-acceleration classification, for a persistent agent's
+   * primary inference and for its auxiliary (compression) calls. Ephemeral
+   * runs (subagents) and conversation forks are NOT covered: they have no
+   * provider-admission gate and keep the ordinary error policy. A hold parks the agent's provider
+   * admission (primary and auxiliary) instead of retrying, and — like the
+   * built-in organization-acceleration cooldown — records no failed turn and
+   * does not feed the hard-down streak. The motivating case is a subscription
+   * credential whose quota window is spent: its 429 looks like a throttle,
+   * but retrying cannot help until the window resets.
+   *
+   * Holds are served in slices of at most 10 minutes. When a slice expires
+   * the hook is consulted again with the same error, before any inference is
+   * attempted; it extends the hold by returning another, or releases it by
+   * returning undefined. Must be synchronous and cheap; a throwing hook is
+   * treated as "no hold".
+   */
+  providerHold?: ProviderHoldHook;
 
   /** Interval for periodic store sync in milliseconds (default: 1000ms, 0 to disable) */
   syncIntervalMs?: number;

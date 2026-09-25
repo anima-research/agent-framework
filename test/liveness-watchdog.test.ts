@@ -1,12 +1,29 @@
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const WATCHDOG = pathToFileURL(join(import.meta.dirname, '../src/runtime/liveness-watchdog.js')).href;
+
+/** On Linux desktops the kernel pipes every SIGABRT of a packaged binary to a
+ *  crash handler (apport), so the 'abort' case below produces a crash report
+ *  and a desktop popup per run. RLIMIT_CORE == 1 is a kernel sentinel that
+ *  disables piped core handling for the process, so wrap the child in
+ *  `prlimit --core=1:1` when that tool is available. The child still dies by
+ *  SIGABRT, which is all the test asserts. */
+const PRLIMIT_PREFIX: string[] = (() => {
+  if (process.platform !== 'linux') return [];
+  const r = spawnSync('prlimit', ['--version'], { stdio: 'ignore' });
+  return r.error ? [] : ['prlimit', '--core=1:1', '--'];
+})();
+
+function spawnChild(script: string) {
+  const argv = [...PRLIMIT_PREFIX, process.execPath, script];
+  return spawn(argv[0], argv.slice(1), { stdio: 'ignore' });
+}
 
 /** Spawn a child that starts the watchdog then wedges its main thread; resolve
  *  with how it died. */
@@ -29,7 +46,7 @@ function runWedgedChild(action: 'exit' | 'abort', reportPath: string | null): Pr
     `,
   );
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [script], { stdio: 'ignore' });
+    const child = spawnChild(script);
     const killTimer = setTimeout(() => child.kill('SIGTERM'), 8000); // safety net
     child.on('exit', (code, signal) => {
       clearTimeout(killTimer);

@@ -21,6 +21,7 @@ import type {
   FrameworkConfig,
   InferencePolicy,
   ErrorPolicy,
+  ProviderHoldHook,
   ErrorAction,
   FrameworkState,
   TraceEvent,
@@ -97,6 +98,7 @@ import {
 } from './code-execution/tool-definition.js';
 import { splitProseSegments } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
+import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 
 /** Detect a supported image media type from magic bytes (the model API
  *  rejects mislabeled media types, so trust bytes over extensions).
@@ -745,6 +747,12 @@ interface ProviderAccelerationCooldown {
   heldRequests: InferenceRequest[];
   reason: string;
   failures: number;
+  /** Set on a host-requested hold (config.providerHold): the error to
+   *  re-present to the hook when this slice expires. */
+  hostHoldError?: Error;
+  /** Armed by an auxiliary (compression) failure with no primary involved:
+   *  release reopens auxiliary admission without synthesising an inference. */
+  auxiliaryOrigin?: boolean;
 }
 interface ProviderAccelerationRecovery {
   startedAt: number;
@@ -949,6 +957,7 @@ export class AgentFramework {
   private providerAccelerationLastRecovery: Map<string, ProviderAccelerationReceipt> = new Map();
   private providerAccelerationDefaultCooldownMs = PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS;
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
+  private providerHoldHook: ProviderHoldHook | undefined;
   private providerAdmissionClosed = false;
   /** Last time we reported stale (busy-requeued) inference requests, per agent. */
   private staleWarnAt = new Map<string, number>();
@@ -1453,6 +1462,7 @@ export class AgentFramework {
       normalizeDiscordAwarenessDeadline(config.discordAwarenessDeadlineMs),
       new OperatorLog(operatorLogPath),
     );
+    framework.providerHoldHook = config.providerHold;
 
     // If an offline recovery process crashed after switching Chronicle but
     // before committing its prepared marker batch, the active branch is the
@@ -1916,6 +1926,14 @@ export class AgentFramework {
     }
     gate.auxiliaryInFlight++;
     try { return await run(); }
+    catch (error) {
+      // Compression can be the first call to find a spent quota (idle agent,
+      // scheduled maintenance). Arm the host hold so later passes wait at the
+      // gate instead of retrying into it; this pass still fails to its caller.
+      const agent = this.agents.get(agentName);
+      if (agent && error instanceof Error) this.holdProviderAcceleration(agent, error, undefined, true);
+      throw error;
+    }
     finally {
       gate.auxiliaryInFlight = Math.max(0, gate.auxiliaryInFlight - 1);
       if (gate.auxiliaryInFlight === 0) for (const resolve of gate.idleWaiters.splice(0)) resolve();
@@ -1942,27 +1960,75 @@ export class AgentFramework {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
       a.timestamp === b.timestamp && a.channelId === b.channelId;
   }
-  private holdProviderAcceleration(agent: Agent, error: Error, trigger?: InferenceRequest): boolean {
-    if (this.ephemeralRuns.has(agent.name) || this.conversationAgentHomes.has(agent.name) || !isOrganizationAccelerationRateLimit(error)) return false;
-    const now = Date.now(); const delayMs = this.accelerationCooldownMs(agent.name, error);
+  private consultProviderHold(error: Error, agentName: string): { holdMs: number; reason: string } | undefined {
+    if (!this.providerHoldHook) return undefined;
+    try {
+      const hold = this.providerHoldHook(error, agentName, { model: this.agents.get(agentName)?.model });
+      if (!hold || !Number.isFinite(hold.holdMs) || hold.holdMs <= 0) return undefined;
+      return { holdMs: Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, hold.holdMs)),
+        reason: typeof hold.reason === 'string' && hold.reason ? hold.reason : error.message };
+    } catch (err) {
+      console.error(`[provider-cooldown] providerHold hook threw for ${agentName}; treating as no hold:`, err);
+      return undefined;
+    }
+  }
+  /** A host hold whose slice expired: ask the host again before spending an
+   *  inference on it. True = extended in place (held requests stay held). */
+  private extendHostProviderHold(agentName: string, cooldown: ProviderAccelerationCooldown): boolean {
+    if (!cooldown.hostHoldError) return false;
+    const hold = this.consultProviderHold(cooldown.hostHoldError, agentName);
+    if (!hold) return false;
+    clearTimeout(cooldown.timer);
+    cooldown.until = Date.now() + hold.holdMs;
+    cooldown.timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agentName), hold.holdMs);
+    cooldown.timer.unref?.();
+    if (hold.reason !== cooldown.reason) {
+      cooldown.reason = hold.reason;
+      console.error(`[provider-cooldown] agent=${agentName} host hold extended — ${hold.reason}`);
+    }
+    return true;
+  }
+  private holdProviderAcceleration(agent: Agent, error: Error, trigger?: InferenceRequest, auxiliary = false): boolean {
+    if (this.ephemeralRuns.has(agent.name) || this.conversationAgentHomes.has(agent.name)) return false;
+    // The host knows more than the message wording does: ask it first. An
+    // auxiliary failure arms host holds only — the built-in acceleration
+    // cooldown stays a primary-path mechanism.
+    const hostHold = this.consultProviderHold(error, agent.name);
+    const acceleration = !hostHold && !auxiliary && isOrganizationAccelerationRateLimit(error);
+    if (!acceleration && !hostHold) return false;
+    const now = Date.now(); const delayMs = hostHold ? hostHold.holdMs : this.accelerationCooldownMs(agent.name, error as MembraneError);
     const existing = this.providerAccelerationCooldowns.get(agent.name);
     const held = existing?.heldRequests ?? [];
     if (trigger && !held.some((r) => this.sameInferenceRequest(r, trigger))) held.push(trigger);
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), delayMs); timer.unref?.();
     this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
-      until: now + delayMs, timer, heldRequests: held, reason: error.message,
-      failures: (existing?.failures ?? 0) + 1 });
+      until: now + delayMs, timer, heldRequests: held, reason: hostHold?.reason ?? error.message,
+      failures: (existing?.failures ?? 0) + 1, ...(hostHold ? { hostHoldError: error } : {}),
+      ...(auxiliary && (!existing || existing.auxiliaryOrigin) ? { auxiliaryOrigin: true } : {}) });
+    if (auxiliary && !existing) {
+      console.error(`[provider-cooldown] agent=${agent.name} host hold (${hostHold!.reason}) from an auxiliary call — ` +
+        `holding primary/auxiliary for ${delayMs}ms`);
+      return true;
+    }
     const gate = this.providerGate(agent.name); gate.primaryPending = true;
     this.providerAccelerationRecoveries.set(agent.name, { startedAt: existing?.startedAt ?? now,
       failures: (existing?.failures ?? 0) + 1, heldRequests: held.length, reason: error.message });
-    console.error(`[provider-cooldown] agent=${agent.name} organization acceleration 429 — ` +
+    console.error(`[provider-cooldown] agent=${agent.name} ` +
+      `${hostHold ? `host hold (${hostHold.reason})` : 'organization acceleration 429'} — ` +
       `holding primary/auxiliary for ${delayMs}ms; ${held.length} request(s) retained`);
     return true;
   }
   private releaseProviderAccelerationCooldown(agentName: string): void {
     const cooldown = this.providerAccelerationCooldowns.get(agentName); if (!cooldown) return;
+    if (this.extendHostProviderHold(agentName, cooldown)) return;
     clearTimeout(cooldown.timer); this.providerAccelerationCooldowns.delete(agentName);
+    if (cooldown.auxiliaryOrigin && cooldown.heldRequests.length === 0) {
+      // Nobody asked for an inference while parked: just reopen the gate.
+      console.error(`[provider-cooldown] agent=${agentName} auxiliary hold released after ${Date.now() - cooldown.startedAt}ms`);
+      this.flushAuxiliaryAdmission(agentName);
+      return;
+    }
     const recovery = this.providerAccelerationRecoveries.get(agentName);
     if (recovery) { recovery.releasedAt = Date.now(); recovery.heldRequests = cooldown.heldRequests.length; }
     const requests = cooldown.heldRequests.length > 0 ? cooldown.heldRequests : [{ agentName,
@@ -7383,7 +7449,7 @@ export class AgentFramework {
 
       const providerCooldown = this.providerAccelerationCooldowns?.get(agentName);
       if (providerCooldown) {
-        if (now < providerCooldown.until) {
+        if (now < providerCooldown.until || this.extendHostProviderHold(agentName, providerCooldown)) {
           for (const req of requests) {
             if (!providerCooldown.heldRequests.some((r) => this.sameInferenceRequest(r, req))) {
               providerCooldown.heldRequests.push(req);
@@ -8476,6 +8542,12 @@ export class AgentFramework {
       cacheCreationTokens: 0,
       cacheReadTokens: 0,
     };
+    // Output tokens billed since this turn's assistant blocks were last
+    // persisted. The residual over the round's visible blocks is the price of
+    // its hidden thinking, stamped on the signed blocks at persist time
+    // (thinking-token-stamp.ts). Accumulates across max_tokens continuations
+    // within a round; reset at each stamp.
+    let outputTokensSinceStamp = 0;
     // This turn's alive-marker, set at startAgentStream entry. Safe to read
     // from the map here: the turn-alive busy check in processInferenceRequests
     // means no successor turn can have replaced it while we compiled.
@@ -8743,6 +8815,8 @@ export class AgentFramework {
                 });
               }
             }
+            assistantBlocks = stampThinkingTokenEstimates(assistantBlocks, outputTokensSinceStamp);
+            outputTokensSinceStamp = 0;
             this.pendingAssistantBlocks.set(agent.name, assistantBlocks);
 
             // Note: max_tokens truncation cannot produce tool-calls events here.
@@ -8946,9 +9020,11 @@ export class AgentFramework {
                 b.type === 'tool_use' || b.type === 'tool_result' ? i : last,
               -1
             );
-            const terminalContent = lastToolIdx >= 0
-              ? response.content.slice(lastToolIdx + 1)
-              : response.content;
+            const terminalContent = stampThinkingTokenEstimates(
+              lastToolIdx >= 0 ? response.content.slice(lastToolIdx + 1) : response.content,
+              outputTokensSinceStamp,
+            );
+            outputTokensSinceStamp = 0;
             // This is a whole-response boundary, not a trailing-prose
             // classifier. If the turn executed any genuine structured tool
             // call, preserve its later prose exactly as ordinary history.
@@ -9611,6 +9687,7 @@ export class AgentFramework {
               ),
             };
             previousUsage = cumulativeUsage;
+            outputTokensSinceStamp += perCallUsage.outputTokens;
             const strat = (agent as unknown as {
               getContextManager?: () => { getStrategy?: () => unknown };
             }).getContextManager?.()?.getStrategy?.() as
@@ -11076,11 +11153,11 @@ export class AgentFramework {
       return;
     }
 
-    // Route synthesized 'think' (private reasoning) and 'skip_reply' (deliberate
-    // stay-silent) tools — handled by the channel registry like the other
+    // Route synthesized 'think' (private reasoning), 'journal' (private
+    // long-form notes) and 'skip_reply' (deliberate stay-silent) tools — handled by the channel registry like the other
     // synthesized channel tools, but they aren't `channel_`-prefixed so they
     // need an explicit route here.
-    if ((enrichedCall.name === 'think' || enrichedCall.name === 'skip_reply') && this.channelRegistry) {
+    if ((enrichedCall.name === 'think' || enrichedCall.name === 'journal' || enrichedCall.name === 'skip_reply') && this.channelRegistry) {
       // skip_reply(wake_in_seconds): arm a gate self-wake so "not replying
       // NOW" can also mean "back in a moment" — ends the turn, then wakes
       // the agent after N seconds unless something else wakes it first
@@ -11472,6 +11549,8 @@ export class AgentFramework {
             auxiliaryInFlight: gate?.auxiliaryInFlight ?? 0,
             auxiliaryDeferred: gate?.deferredAuxiliary ?? 0,
             cooldownUntil: cooldown?.until ?? null,
+            cooldownReason: cooldown?.reason ?? null,
+            hostHold: cooldown?.hostHoldError !== undefined,
             heldRequests: cooldown?.heldRequests.length ?? 0,
             lastRecovery: this.providerAccelerationLastRecovery?.get(name) ?? null,
           };

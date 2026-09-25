@@ -313,3 +313,162 @@ test('local provider gate settles in-flight auxiliary work and parks later auxil
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+class SpentQuotaThenSuccessMembrane extends MockMembrane {
+  failing = true;
+  override streamYielding(request: NormalizedRequest): YieldingStream {
+    this.calls.push(request);
+    if (this.failing) return new ErrorStream(new MembraneError({
+      type: 'rate_limit', retryable: true, httpStatus: 429,
+      message: "This request would exceed your account's rate limit. Please try again later.",
+      rawError: { status: 429 }, rawRequest: request,
+    }));
+    return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'window reset' }])]);
+  }
+}
+
+test('providerHold parks a spent-quota 429, re-consults the host per slice without inferring, and records no failure', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-provider-host-hold-'));
+  const membrane = new SpentQuotaThenSuccessMembrane();
+  let spent = true;
+  const consulted: string[] = [];
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }],
+    modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    providerHold: (error, agentName) => {
+      consulted.push(`${agentName}:${(error as MembraneError).type}`);
+      return spent ? { holdMs: 1_000, reason: 'weekly quota spent' } : undefined;
+    },
+  });
+  const internal = framework as unknown as {
+    consecutiveInferenceFailures: Map<string, number>;
+    providerAccelerationCooldowns: Map<string, { heldRequests: unknown[]; reason: string }>;
+  };
+  try {
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} });
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 1, 'no retry into a spent quota');
+    assert.deepEqual(consulted, ['resident:rate_limit']);
+    assert.equal(internal.providerAccelerationCooldowns.get('resident')?.reason, 'weekly quota spent');
+    assert.equal(internal.consecutiveInferenceFailures.get('resident') ?? 0, 0, 'a spent quota is not a hard-down streak');
+
+    // Slice expires while the window is still spent: the host is asked again
+    // and the hold extends — no inference is burned finding out.
+    await sleep(1_200);
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 1, 'slice expiry does not infer while the host still holds');
+    assert.ok(consulted.length >= 2, 'host re-consulted at slice expiry');
+    assert.equal(internal.providerAccelerationCooldowns.size, 1);
+
+    spent = false; membrane.failing = false;
+    await sleep(1_200);
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 2, 'released once the host stops holding');
+    assert.match(textOf(membrane.calls[1]!), /first/);
+    assert.equal(internal.providerAccelerationCooldowns.size, 0);
+
+    const messages = framework.getAgent('resident')!.getContextManager().queryMessages({}).messages;
+    const failed = messages.filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'inference-failed');
+    assert.equal(failed.length, 0, 'no [inference-failed] marker accumulates while parked');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('providerHold returning nothing, or throwing, leaves the ordinary retry path untouched', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-provider-host-nohold-'));
+  const membrane = new GenericRateLimitThenSuccessMembrane();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }],
+    modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    providerHold: () => { throw new Error('meter exploded'); },
+  });
+  const internal = framework as unknown as { providerAccelerationCooldowns: Map<string, unknown> };
+  try {
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'first', metadata: {} });
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 2, 'ordinary policy retry happened');
+    assert.equal(internal.providerAccelerationCooldowns.size, 0);
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('providerHold: a spent-quota failure in an auxiliary call arms the hold and releases without inferring', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-provider-aux-hold-'));
+  const membrane = new MockMembrane();
+  let spent = true;
+  const seen: Array<string | undefined> = [];
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }], modules: [],
+    syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    providerHold: (_error, _agentName, context) => {
+      seen.push(context.model);
+      // A non-string reason must fall back to the error text, not throw in a log line.
+      return spent ? { holdMs: 1_000, reason: Symbol('quota') as unknown as string } : undefined;
+    },
+  });
+  const internal = framework as unknown as {
+    withAuxiliaryAdmission<T>(name: string, run: () => Promise<T>): Promise<T>;
+    providerAccelerationCooldowns: Map<string, { reason: string }>;
+  };
+  const quota = new MembraneError({
+    type: 'rate_limit', retryable: true, httpStatus: 429,
+    message: "This request would exceed your account's rate limit.", rawError: { status: 429 },
+  });
+  try {
+    await assert.rejects(internal.withAuxiliaryAdmission('resident', async () => { throw quota; }), /rate limit/);
+    assert.deepEqual(seen, ['test-model'], 'hook receives the failing agent\'s model');
+    assert.equal(internal.providerAccelerationCooldowns.get('resident')?.reason, quota.message);
+
+    let ran = false;
+    const later = internal.withAuxiliaryAdmission('resident', async () => { ran = true; return 1; });
+    await sleep(20);
+    assert.equal(ran, false, 'the next compression waits at the gate instead of retrying into the quota');
+
+    spent = false;
+    await sleep(1_200); // the cooldown timer is unref'd; keep the loop alive across the slice
+    assert.equal(await later, 1, 'released when the host stops holding');
+    assert.equal(internal.providerAccelerationCooldowns.size, 0);
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 0, 'an auxiliary-origin hold never synthesises an inference');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('providerHold is consulted before the built-in acceleration classification', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-provider-hold-first-'));
+  const membrane = new MockMembrane();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store.chronicle'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'system' }], modules: [],
+    syncIntervalMs: 0, maintenanceIntervalMs: 0,
+    providerHold: () => ({ holdMs: 5_000, reason: 'weekly quota spent' }),
+  });
+  const internal = framework as unknown as {
+    holdProviderAcceleration(agent: unknown, error: Error): boolean;
+    providerAccelerationCooldowns: Map<string, { reason: string; hostHoldError?: Error }>;
+    healthSnapshot(): { agents: Array<{ providerAdmission: { cooldownReason: string | null; hostHold: boolean } }> };
+  };
+  try {
+    const acceleration = new MembraneError({
+      type: 'rate_limit', retryable: true, httpStatus: 429,
+      message: "This request would exceed your organization's maximum usage increase rate.", rawError: { status: 429 },
+    });
+    assert.equal(internal.holdProviderAcceleration(framework.getAgent('resident'), acceleration), true);
+    assert.equal(internal.providerAccelerationCooldowns.get('resident')?.reason, 'weekly quota spent');
+    const admission = internal.healthSnapshot().agents[0]!.providerAdmission;
+    assert.equal(admission.cooldownReason, 'weekly quota spent');
+    assert.equal(admission.hostHold, true);
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
