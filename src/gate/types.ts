@@ -164,6 +164,15 @@ export interface GateOptions {
    * missing, no one bypasses sleep.
    */
   privilegedUsersPath?: string;
+  /**
+   * Hold message-driven wakes (MCPL channel-incoming / push-event that the
+   * policies would trigger) until no further message has arrived for
+   * `quietMs`, capped at `maxWaitMs` (default 30000) from the first held
+   * message; then wake once. Messages still enter context at arrival. Other
+   * wake sources (scheduled, tool results, heartbeat) are unaffected.
+   * Default off.
+   */
+  messageQuietPeriod?: { quietMs: number; maxWaitMs?: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +187,8 @@ export interface GateDecision {
   policyName: string | null;
   /** The behavior that was applied. */
   behavior: GateBehavior;
+  /** The trigger was converted into a held quiet-period wake. */
+  quietHeld?: boolean;
   /**
    * Names of `passthrough` policies that matched and counted this event but
    * did not fire, so evaluation continued past them. Absent when none did.
