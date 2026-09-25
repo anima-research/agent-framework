@@ -1,0 +1,1 @@
+- Require an explicit `delivered: true` receipt before reporting final channel speech as delivered. Missing or malformed publish receipts surface a routing failure with uncertain delivery and do not trigger an automatic resend.
