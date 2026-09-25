@@ -10035,6 +10035,7 @@ export class AgentFramework {
       return {
         success: true,
         data: result.content,
+        structuredContent: result.structuredContent,
       };
     } catch (err) {
       return {
@@ -10582,9 +10583,8 @@ export class AgentFramework {
    * function returns. Never rejects — errors become "Error: ..." strings,
    * matching the managed PTC runtime ("Claude's code receives this error").
    *
-   * Results are serialized with the HISTORY serializer (images become
-   * placeholders): programmatic tool results are text-only by contract, and
-   * a script variable holding megabytes of base64 helps nobody.
+   * Structured results are JSON strings. Other results use the HISTORY
+   * serializer (images become placeholders), preserving the legacy fallback.
    */
   private async handleScriptToolCall(
     agentName: string,
@@ -10603,6 +10603,21 @@ export class AgentFramework {
     }
     if (result.isError) {
       return `Error: ${result.error ?? 'tool call failed'}`;
+    }
+    if (result.structuredContent !== undefined) {
+      // Do not run machine-readable data through the content-block renderer.
+      // Keep the existing script protocol cap (5,000,000 characters), but
+      // report overflow explicitly instead of returning malformed JSON.
+      try {
+        const json = JSON.stringify(result.structuredContent);
+        if (json === undefined) return 'Error: tool structuredContent is not JSON-serializable';
+        if (json.length > 5_000_000) {
+          return 'Error: tool structuredContent exceeds the 5000000-character script result limit; request a smaller result';
+        }
+        return json;
+      } catch {
+        return 'Error: tool structuredContent is not JSON-serializable';
+      }
     }
     if (result.data === undefined) return '';
     // RFC-005 "eagerly lazy": a script receiving a result is the strongest
@@ -13412,6 +13427,7 @@ export class AgentFramework {
           result: {
             success: !result.isError,
             data,
+            structuredContent: result.structuredContent,
             error: result.isError ? (textContent || 'Tool call failed') : undefined,
             isError: result.isError ?? false,
           },

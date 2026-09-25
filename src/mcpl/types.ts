@@ -1242,6 +1242,8 @@ export interface McpToolDefinition {
  */
 export interface McpToolCallResult {
   content: McpToolResultContent[];
+  /** Optional machine-readable result alongside the human-readable content. */
+  structuredContent?: Record<string, unknown>;
   isError?: boolean;
   /** State checkpoint returned by stateful tools (Section 8.2). */
   state?: StateCheckpoint;

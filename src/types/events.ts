@@ -184,6 +184,8 @@ export interface ToolResult {
   success: boolean;
   /** Result data (if success) */
   data?: unknown;
+  /** Machine-readable result for programmatic callers; data remains the model-facing rendering. */
+  structuredContent?: Record<string, unknown>;
   /** Error message (if failure) */
   error?: string;
   /** Whether this was an error (for LLM) */
