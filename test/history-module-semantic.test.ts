@@ -148,6 +148,15 @@ describe('HistoryModule semantic_search', () => {
       const res = await mod.handleToolCall({ id: 'v', name: 'semantic_search', input });
       assert.equal(res.success, false, JSON.stringify(input));
     }
+    // contradictory filters are an error, not a silent empty result
+    const searchesBefore = svc.searches.length;
+    for (const input of [{ query: 'x', channelId: 'chan-A', kinds: 'summaries' }, { query: 'x', channelId: 'chan-A', level: 1 }, { query: 'x', kinds: 'messages', level: 1 }]) {
+      const res = await mod.handleToolCall({ id: 'v', name: 'semantic_search', input });
+      assert.equal(res.success, false, JSON.stringify(input));
+      assert.match(String(res.error), /summaries|level/);
+    }
+    assert.equal(svc.searches.length, searchesBefore);
+    await mod.stop();
     const unconfigured = await new HistoryModule().handleToolCall({ id: 'u', name: 'semantic_search', input: { query: 'x' } });
     assert.equal(unconfigured.success, false);
   });

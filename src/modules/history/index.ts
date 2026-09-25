@@ -449,7 +449,8 @@ export class HistoryModule implements Module {
         '`extract` or `overview`. Results are ranked by cosine similarity (score ~0.6+ is a strong match, ' +
         '~0.3 is thematic, below ~0.2 is noise); each hit carries its id (`msg:<id>` or `sum:<id>`), ' +
         'timestamp, channel, kind/level and a snippet. The index catches up with recent messages before ' +
-        'searching (bounded, so a huge backlog is reported as `index.behind` rather than blocking). ' +
+        'searching (bounded, so a huge backlog is reported as `index.behind` rather than blocking; if a ' +
+        'background sync is already running, the search waits for that run to finish instead). ' +
         'Purely a read: nothing is written to your history.',
       inputSchema: {
         type: 'object' as const,
@@ -458,7 +459,7 @@ export class HistoryModule implements Module {
           limit: { type: 'number', description: `Max hits (default ${SEMANTIC_DEFAULT_LIMIT}, cap ${SEMANTIC_MAX_LIMIT}).` },
           from: { type: 'string', description: 'ISO 8601 inclusive lower bound on the message timestamp / summary span start. Omit for open-ended.' },
           to: { type: 'string', description: 'ISO 8601 inclusive upper bound. Omit for open-ended.' },
-          channelId: { type: 'string', description: 'Only raw messages from this channel (label like "#general" or the raw internal id). Summaries are not per-channel and are excluded when this is set.' },
+          channelId: { type: 'string', description: 'Only raw messages from this channel (label like "#general" or the raw internal id). Summaries are not per-channel and are excluded when this is set; combining it with kinds="summaries" or level is an error.' },
           kinds: { type: 'string', enum: ['messages', 'summaries', 'both'], description: 'What to search: raw messages, compression summaries, or both (default).' },
           level: { type: 'number', description: 'Only summaries of this exact level (implies kinds=summaries).' },
           minScore: { type: 'number', description: 'Drop hits below this cosine score (0..1). Default none.' },
@@ -754,8 +755,17 @@ export class HistoryModule implements Module {
     const toMs = parseIsoDate(input.to, 'to');
     if (fromMs !== undefined && toMs !== undefined && fromMs > toMs) throw new Error('`from` must not be after `to`');
     const channelId = this.resolveChannel(input.channelId);
+    // Summaries carry no channel, so a channel filter on a summaries-only
+    // search can only ever match nothing. Say so instead of returning [].
+    const wantsSummariesOnly = input.level !== undefined || input.kinds === 'summaries';
+    if (channelId && wantsSummariesOnly) {
+      throw new Error('channelId cannot be combined with kinds="summaries" or level: summaries are not per-channel. Drop channelId, or search kinds="messages".');
+    }
+    if (input.level !== undefined && input.kinds === 'messages') {
+      throw new Error('level applies to summaries only and cannot be combined with kinds="messages".');
+    }
     let kinds: string[] | undefined;
-    if (input.level !== undefined || input.kinds === 'summaries') kinds = ['summary'];
+    if (wantsSummariesOnly) kinds = ['summary'];
     else if (input.kinds === 'messages' || channelId) kinds = ['message'];
     if (input.level !== undefined && (!Number.isInteger(input.level) || input.level < 0)) throw new Error('level must be a non-negative integer');
     if (input.minScore !== undefined && (typeof input.minScore !== 'number' || input.minScore < -1 || input.minScore > 1)) {
