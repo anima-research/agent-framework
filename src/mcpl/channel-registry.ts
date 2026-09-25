@@ -402,6 +402,22 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
     },
   },
   {
+    name: 'journal',
+    description:
+      'Write an entry in your private journal. The entry stays in your own context and ' +
+      'memory and is NOT sent to any channel, surface or person. Use it for anything longer ' +
+      'than a line that you want to keep for yourself — reflections, what you decided and ' +
+      'why, notes for later. It does not end your turn and does not affect where ordinary ' +
+      'text is routed; to end the turn without replying, call skip_reply afterwards.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        content: { type: 'string', description: 'The journal entry (private; not sent anywhere).' },
+      },
+      required: ['content'],
+    },
+  },
+  {
     name: 'skip_reply',
     description:
       'End your turn WITHOUT sending anything to any channel or surface. Use when you have ' +
@@ -414,7 +430,9 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
       properties: {
         reason: {
           type: 'string',
-          description: 'Optional private note on why you are not replying (not sent anywhere).',
+          description:
+            'Optional ONE short line on why you are not replying (private; not sent anywhere). ' +
+            'Keep it under ~100 characters — put anything longer in journal() first.',
         },
         wake_in_seconds: {
           type: 'number',
@@ -1222,6 +1240,9 @@ export class ChannelRegistry {
 
       case 'think':
         return this.handleToolThink(input as { content?: string });
+
+      case 'journal':
+        return this.handleToolJournal(input as { content?: string });
 
       case 'skip_reply':
         return this.handleToolSkipReply(input as { reason?: string; wake_in_seconds?: number });
@@ -2672,6 +2693,28 @@ export class ChannelRegistry {
           'your current same_round_think_text_policy; use agent_settings get to inspect it, or ' +
           'call skip_reply to end the turn without replying.',
       },
+    };
+  }
+
+  /**
+   * Handle the synthesized `journal` tool — a private place for long-form
+   * notes. Sends nothing, does not end the turn, does not touch prose routing.
+   *
+   * Why it exists (sill, 2026-09-19): residents were keeping 2–3KB diaries in
+   * `skip_reply.reason`. Long prose in a private-REASONING tool argument
+   * (`skip_reply.reason`, `think.content`) makes replayed history read as a
+   * reasoning trace, and every memory-compression request over it is refused
+   * `reasoning_extraction` regardless of content; the same prose in a
+   * note-taking tool passes (canary record: context-manager
+   * `tool-prose-hoist.ts`, whose fallback rung rewrites old history into calls
+   * to THIS tool — so the result wording below is mirrored there as
+   * DEFAULT_TOOL_PROSE_RESULT; keep the two in step).
+   */
+  private handleToolJournal(_input: { content?: string }): ToolResult {
+    return {
+      success: true,
+      // No echo: the entry is already in the tool_use block.
+      data: { recorded: true, note: 'Journal entry recorded (private — not sent anywhere).' },
     };
   }
 
