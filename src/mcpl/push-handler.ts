@@ -234,8 +234,10 @@ export class PushHandler {
     const content: ContentBlock[] = params.payload.content.map(convertBlock);
 
     // 4. Check shouldTriggerInference callback
-    let triggerInference = true;
-    if (this.shouldTriggerInference) {
+    // Same context-only contract as channels/incoming: a transport may mark
+    // an event (e.g. a continuation chunk) as context-only.
+    let triggerInference = params.origin?.suppressWake !== true;
+    if (triggerInference && this.shouldTriggerInference) {
       const textContent = content
         .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
         .map((b) => b.text)
