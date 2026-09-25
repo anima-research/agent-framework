@@ -389,7 +389,8 @@ import type {
   ChannelsIncomingParams,
 } from './mcpl/types.js';
 import type { ContextInjection } from '@animalabs/context-manager';
-import { formatZonedDateTime, resolveTimeZone } from './timezone.js';
+import { formatZonedDateTime, formatZonedTime, resolveTimeZone } from './timezone.js';
+import { defaultProseOutboxPath, type OutboxEvent, type ProseOutboxConfig } from './mcpl/prose-outbox.js';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   DiscordAwarenessOutbox,
@@ -1282,6 +1283,8 @@ export class AgentFramework {
   private discordAwarenessOutbox: DiscordAwarenessOutbox | null = null;
   private discordAwarenessEmoji = DEFAULT_DISCORD_AWARENESS_EMOJI;
   private discordAwarenessDeadlineMs = DEFAULT_DISCORD_AWARENESS_DEADLINE_MS;
+  /** FrameworkConfig.proseOutbox with its queue path resolved. */
+  private proseOutboxConfig: ProseOutboxConfig | undefined;
   /** Durable JSONL record of operator-initiated mutations (see operator-log.ts). */
   private readonly operatorLog: OperatorLog;
   /**
@@ -1678,6 +1681,14 @@ export class AgentFramework {
         prefixesSeen.set(prefix, serverConfig.id);
       }
 
+      if (config.proseOutbox?.enabled) {
+        const path = config.proseOutbox.path
+          ?? (config.storePath ? defaultProseOutboxPath(config.storePath) : undefined);
+        if (!path) {
+          console.error('[prose-outbox] no path and no storePath: the queue is memory-only and will not survive a restart');
+        }
+        framework.proseOutboxConfig = { ...config.proseOutbox, ...(path ? { path } : {}) };
+      }
       await framework.initializeMcpl(config.mcplServers, config.inferenceRouting);
     }
 
@@ -7609,6 +7620,68 @@ export class AgentFramework {
     list.push(outcome.channelId);
   }
 
+  /** A channel as the agent should read it: `#label (id)` when known. */
+  private describeChannelForAgent(channelId: string | null): string {
+    if (!channelId) return 'the channel';
+    const label = this.channelRegistry?.getDescriptor(channelId)?.label;
+    return label && label !== channelId
+      ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
+      : channelId;
+  }
+
+  /**
+   * Non-waking notices for the prose outbox (FrameworkConfig.proseOutbox), so
+   * the agent's picture of what was said stays true: queued, delivered late,
+   * or given up. Given-up speech reuses the `discord-send-failed` kind so
+   * existing gates treat it like any other failed send.
+   */
+  private recordOutboxNotice(event: OutboxEvent): void {
+    const { entry } = event;
+    const where = this.describeChannelForAgent(entry.channelId);
+    const at = (t: number) => formatZonedTime(t, this.timeZone);
+    // Name WHICH reply: several can be queued at once, in order.
+    const words = entry.text.replace(/\s+/g, ' ').trim();
+    const what = entry.tool ? `Your ${entry.tool.name}` : 'Your reply';
+    const which = words
+      ? `${what} to ${where} starting "${words.slice(0, 40)}${words.length > 40 ? '…' : ''}"`
+      : `${what} to ${where} (attachments only)`;
+    // A queued tool call already told the agent so in its tool result.
+    if (event.kind === 'queued' && entry.tool) return;
+    let text: string;
+    let kind: string;
+    switch (event.kind) {
+      case 'queued':
+        kind = 'delivery-delayed';
+        text = `[delivery-delayed] ${which} couldn't be delivered yet (${event.reason}). ` +
+          (this.proseOutboxConfig?.path
+            ? `It is queued, kept across restarts, and will be retried until ${at(event.expiresAt)}; you don't need to resend it.`
+            : `It is queued and will be retried until ${at(event.expiresAt)}, but only in memory: a restart before then loses it, so keep your own copy if it matters.`);
+        break;
+      case 'delivered-late':
+        kind = 'delivered-late';
+        text = `[delivered-late] ${which}, written at ${at(entry.writtenAt)}, was delivered at ${at(event.deliveredAt)}.`;
+        break;
+      case 'dropped':
+        kind = 'discord-send-failed';
+        text = event.mayHaveArrived
+          ? `[discord-send-failed] ${which}, written at ${at(entry.writtenAt)}, could not be confirmed (${event.reason}). ` +
+            'It is no longer held and won\'t be retried. It may already be in the channel: check before sending it again.'
+          : `[discord-send-failed] ${which}, written at ${at(entry.writtenAt)}, was never delivered (${event.reason}). ` +
+            'It is no longer held and won\'t be retried; the human did not receive it. If it still matters, send it again.';
+        break;
+    }
+    try {
+      this.addMessage(
+        'user',
+        [{ type: 'text', text }],
+        { system: true, kind, channelId: entry.channelId, outboxId: entry.id },
+        this.agents.has(entry.conversationId) ? { forAgent: entry.conversationId } : undefined,
+      );
+    } catch (err) {
+      console.error('recordOutboxNotice: failed to record notice:', err);
+    }
+  }
+
   /**
    * Append the turn's `[delivered]` receipt: one compact system message
    * naming where this turn's plain prose actually landed (channels in
@@ -10030,6 +10103,16 @@ export class AgentFramework {
         isError: true,
       };
     }
+    // Send tools the recipe marked queueable (proseOutbox.tools) are held,
+    // not failed, when the server can't be reached.
+    if (this.channelRegistry?.isQueueableTool(toolName)) {
+      return this.channelRegistry.callQueueableTool(
+        call.callerAgentName ?? this.primaryAgentName ?? '',
+        config.id,
+        toolName,
+        (call.input ?? {}) as Record<string, unknown>,
+      );
+    }
     try {
       const result = await server.sendToolsCall(toolName, call.input as Record<string, unknown>);
       return {
@@ -11858,26 +11941,21 @@ export class AgentFramework {
         // addMessage() alone does not request inference, so this never wakes
         // her (matching the `discord-send-failed-skip` gate intent: context
         // yes, wake no).
-        onRouteFailure: ({ channelId, reason, textLen }) => {
+        onRouteFailure: ({ channelId, reason, textLen, mayHaveArrived }) => {
           try {
             // Render a human-readable channel name when we can — a bare
             // snowflake in the marker is unresolvable for the agent (the
             // 2026-07-21 incident read as "a stale artifact", not a live
             // failure). The marker is `system: true`, so it is never
             // conversational and never influences routing.
-            const label = channelId
-              ? this.channelRegistry?.getDescriptor(channelId)?.label
-              : undefined;
-            const where = channelId
-              ? label && label !== channelId
-                ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
-                : channelId
-              : 'the channel';
+            const where = this.describeChannelForAgent(channelId);
             this.addMessage(
               'user',
               [{
                 type: 'text',
-                text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
+                text: mayHaveArrived
+                  ? `[discord-send-failed] Your previous reply (${textLen} chars) to ${where} could not be confirmed (${reason}). It may or may not have reached the channel. It was saved to your archive.`
+                  : `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
               }],
               { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason },
             );
@@ -11892,6 +11970,9 @@ export class AgentFramework {
         onChannelAutoOpened: ({ conversationId, source, channels }) => {
           this.recordChannelAutoOpenNotice(conversationId, channels, source);
         },
+        proseOutbox: this.proseOutboxConfig,
+        onOutboxEvent: (event) => this.recordOutboxNotice(event),
+        formatTime: (ms) => formatZonedTime(ms, this.timeZone),
       },
     );
 
@@ -11971,6 +12052,9 @@ export class AgentFramework {
 
     // Discover tools from all connected servers
     await this.refreshMcplTools();
+
+    // Speech queued by a previous run can go now that servers are ready.
+    this.channelRegistry?.kickOutbox();
   }
 
   /** Reconcile the durable ledger with Chronicle, then deliver every server's work. */
@@ -13015,6 +13099,11 @@ export class AgentFramework {
         }
         this.releaseMcplDataPlaneGate(awarenessBarrier);
         this.handleToolsListChanged(connection.id);
+        // Undelivered speech can go now. Deliberately here, after the grant
+        // is re-established, not on the mcpl:server-reconnected trace below:
+        // with no awareness work pending that barrier promise is already
+        // settled, so the trace fires before the policy exchange completes.
+        this.channelRegistry?.kickOutbox();
       })();
       void awarenessBarrier.promise.then(() => {
         if (
@@ -13310,15 +13399,38 @@ export class AgentFramework {
       }
     }
 
-    server.sendToolsCall(toolName, args, stateParams)
+    // Send tools the recipe marked queueable (proseOutbox.tools): a send that
+    // can't reach its target is held and the agent told "queued", instead
+    // of an error that invites a retry loop.
+    const queueable = this.channelRegistry?.isQueueableTool(toolName)
+      ? this.channelRegistry.beginQueueableCall(agentName, serverId, toolName, args)
+      : null;
+    const pushQueued = (result: ToolResult): void => {
+      this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, durationMs: Date.now() - startTime });
+      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: `mcpl:${serverId}`, result });
+    };
+    if (queueable && 'queuedResult' in queueable) {
+      pushQueued(queueable.queuedResult);
+      return;
+    }
+    const ticket = queueable && 'ticket' in queueable ? queueable : null;
+
+    server.sendToolsCall(toolName, args, stateParams, ticket?.meta)
       .then(async (result) => {
+        const held = ticket ? this.channelRegistry!.settleQueueableCall(ticket.ticket, { result }) : null;
+        if (held) return { held } as const;
         // RFC-005: register references and eagerly fetch the small ones
         // before serialization, so their stubs carry a saved path.
         await this.autoFetchReferences(result.content, serverId, true)
           .catch((e) => console.error('[rfc005] autofetch error:', (e as Error).message));
         return result;
       })
-      .then((result) => {
+      .then((outcome) => {
+        if ('held' in outcome) {
+          pushQueued(outcome.held);
+          return;
+        }
+        const result = outcome;
         const durationMs = Date.now() - startTime;
         this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, durationMs });
 
@@ -13418,6 +13530,11 @@ export class AgentFramework {
         });
       })
       .catch((error) => {
+        const held = ticket ? this.channelRegistry!.settleQueueableCall(ticket.ticket, { error }) : null;
+        if (held) {
+          pushQueued(held);
+          return;
+        }
         const err = error instanceof Error ? error : new Error(String(error));
         this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: err.message, stack: err.stack });
 

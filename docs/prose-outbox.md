@@ -1,0 +1,101 @@
+# Prose outbox
+
+`FrameworkConfig.proseOutbox` (opt-in) keeps an agent's plain speech when it
+can't be delivered right now, and delivers it later: in order, without double
+posts, and with the agent told what happened.
+
+```ts
+proseOutbox: {
+  enabled: true,
+  maxAgeMs: 6 * 60 * 60_000,   // give up after this (default 6 h)
+  maxEntriesPerAgent: 50,       // defaults shown
+  maxEntries: 200,
+  retryBaseMs: 60_000,          // doubles per attempt…
+  retryMaxMs: 15 * 60_000,      // …up to this
+  tools: ['send_message', 'reply_message'], // send tools held the same way
+  path: '<storePath>/recovery/prose-outbox.json', // default
+}
+```
+
+## What happens to a failed publish
+
+All plain-speech paths (locus, explicit `>>` prefixes, hybrid, streamed
+segments, trailing prose) deliver through `ChannelRegistry.routeSpeech`, so
+the outbox sits there and covers all of them.
+
+| Failure | Classified as | With the outbox |
+|---|---|---|
+| Connection closed / server disconnected / connector says the platform is not connected | `not-sent`: provably never posted | queued, retried |
+| Request timed out; connection died while awaiting the answer; partial multi-part send | `unknown`: may have posted | queued and retried **only** if the server confirmed dedupe (below); otherwise reported as "may or may not have reached the channel" |
+| `delivered: false`, missing grant, unknown channel, any other error | `permanent` | reported as before |
+
+Without the outbox, thrown failures are no longer lost to a log line either:
+they produce the `[discord-send-failed]` marker (with the "may or may not"
+wording for `unknown`).
+
+## No double posts
+
+Every first attempt already carries `idempotencyKey` (stable across retries)
+and `writtenAt` on `channels/publish`; a retry adds `delayReason`
+(`disconnected` or `unanswered`) so the server can say why it is late. A server that dedupes by the key (a
+repeat returns the original result instead of posting again) echoes the key
+in its result; the host remembers, per server, whether the latest result
+echoed it. Outcome-unknown speech is resent only to a server that did.
+Servers that ignore the fields are unaffected and never receive a
+possibly-duplicate resend.
+
+## Send tools (`tools`)
+
+Agents that talk through explicit send tools get the same hold for the tools
+listed in `tools` (unprefixed MCPL names). Only list tools that are safe to
+perform later: sends, never deletes or edits.
+
+- Both MCPL tool routes (model dispatch and programmatic `callTool`) go
+  through `ChannelRegistry.beginQueueableCall` / `settleQueueableCall`.
+- Every call carries `_meta: { idempotencyKey, writtenAt }` (and on replay
+  `delayReason`); a server that dedupes echoes the key in the result's
+  `_meta`. Dedupe is tracked per server AND tool: a server may dedupe
+  `send_message` but not `send_dm`.
+- A call that can't reach its target (thrown not-sent, or the server's own
+  error saying its platform is unreachable), or whose outcome is unknown on
+  a tool that confirmed dedupe, is queued with its full input (channel,
+  reply target, files) and the agent gets a successful `[queued] …` tool
+  result, "you don't need to resend it", instead of an error. Any other
+  error is returned exactly as before.
+- Queued sends share per-channel order with queued speech (a raw provider
+  channel id is matched to the registry's id).
+- A queued send still counts as the round's explicit delivery, so the
+  round's prose stays silenced (no double speaking).
+
+## Order, durability, bounds
+
+- Per-channel FIFO: while a channel has queued speech, new speech to it is
+  queued behind (and the queue drained), never sent ahead.
+- The queue is a JSON file written atomically before `routeSpeech` returns,
+  not Chronicle state: a historical rollback must not resurrect delivered
+  speech (double post) or lose undelivered speech.
+- Drains run when a server connects or reconnects (after its grant is
+  re-established), and on a timer while anything is queued. A drain never
+  blocks generation.
+- Entries past `maxAgeMs` or over a cap are dropped, oldest first.
+
+## What the agent sees
+
+Non-waking system notices in its window. Each names the reply (channel and
+first words: several can be queued at once) and says what, if anything, the
+agent needs to do:
+- `[delivery-delayed]`: queued, kept across restarts, retried until a stated
+  time; no need to resend. (Without a queue file it says the hold is
+  memory-only, so the agent keeps its own copy.)
+- `[delivered-late]`: written at X, delivered at Y. Nothing to do.
+- `[discord-send-failed]`: no longer held and won't be retried; either it
+  never arrived ("send it again if it still matters") or it may already be
+  in the channel ("check before sending it again").
+
+## Not covered
+
+- Tools not listed in `tools` (and `channel_publish`): their failures still
+  return to the agent as tool results, and the agent decides.
+- Marking late messages for readers is the server's job: `writtenAt` and
+  `delayReason` are passed so it can.
+- Detecting a hung connector, and restarting it, is not part of this.

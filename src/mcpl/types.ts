@@ -1070,6 +1070,20 @@ export interface ChannelsPublishParams {
   channelId: string;
   stream?: boolean;
   content: McplContentBlock[];
+  /**
+   * Optional, host-generated, stable across retries of the same speech. A
+   * server that dedupes by it (a repeat with a key it already posted returns
+   * the original result instead of posting again) echoes it in the result.
+   * Servers that don't understand it ignore it.
+   */
+  idempotencyKey?: string;
+  /** Optional ISO time the speech was written; lets a server mark a late
+   *  delivery (a retry sent long after it was written). */
+  writtenAt?: string;
+  /** On a retry: why the earlier attempt didn't deliver. 'disconnected': the
+   *  server or its platform was unreachable; 'unanswered': an attempt got no
+   *  answer. Lets a late delivery say why it is late. */
+  delayReason?: 'disconnected' | 'unanswered';
 }
 
 /**
@@ -1078,6 +1092,8 @@ export interface ChannelsPublishParams {
 export interface ChannelsPublishResult {
   delivered: boolean;
   messageId?: string;
+  /** Echo of params.idempotencyKey: the server deduped by it (see above). */
+  idempotencyKey?: string;
 }
 
 /**
@@ -1243,6 +1259,8 @@ export interface McpToolDefinition {
 export interface McpToolCallResult {
   content: McpToolResultContent[];
   isError?: boolean;
+  /** A server that deduped by the tools/call `_meta.idempotencyKey` echoes it. */
+  _meta?: { idempotencyKey?: string; [k: string]: unknown };
   /** State checkpoint returned by stateful tools (Section 8.2). */
   state?: StateCheckpoint;
 }

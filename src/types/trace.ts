@@ -343,6 +343,8 @@ export type TraceEvent =
       text: string;
       /** Surface message id (e.g. Discord message id), when reported. */
       messageId?: string;
+      /** Delivered by a prose-outbox retry, after the turn that wrote it. */
+      late?: boolean;
     })
   | (TraceEventBase & {
       type: 'mcpl:speech-route-failed';
@@ -352,6 +354,29 @@ export type TraceEvent =
       channelId: string;
       reason: string;
       textLen: number;
+      /** The publish's outcome is unknown (timed out): it may have posted. */
+      mayHaveArrived?: boolean;
+    })
+  | (TraceEventBase & {
+      /** Speech went into the prose outbox instead of the channel. */
+      type: 'mcpl:speech-queued';
+      conversationId: string;
+      channelId: string;
+      outboxId: string;
+      textLen: number;
+      reason?: string;
+    })
+  | (TraceEventBase & {
+      /** Prose-outbox lifecycle (FrameworkConfig.proseOutbox). */
+      type: 'mcpl:speech-outbox';
+      kind: 'queued' | 'delivered-late' | 'dropped';
+      conversationId: string;
+      channelId: string;
+      outboxId: string;
+      attempts: number;
+      textLen: number;
+      reason?: string;
+      mayHaveArrived?: boolean;
     })
 
   // Admin puppet: an operator executed a tool AS an agent and stored the
