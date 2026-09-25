@@ -319,6 +319,10 @@ test('native Membrane observes the first refusal even when guard is enabled by a
     getDefaultPublishChannel: () => null, isChannelOpen: () => true,
     getDescriptor: () => undefined, getChannelTools: () => [],
   }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
+  const tokenTraces: string[] = [];
+  framework.onTrace((event) => {
+    if (event.type === 'inference:tokens') tokenTraces.push(String((event as { content?: unknown }).content));
+  });
   try {
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: {} });
     await framework.runUntilIdle();
@@ -331,6 +335,9 @@ test('native Membrane observes the first refusal even when guard is enabled by a
     assert.deepEqual(h.module.speeches, ['continued']);
     assert.deepEqual(routed, ['continued']);
     assert.doesNotMatch(outgoing.join(''), /discard-native-partial/);
+    assert.match(outgoing.join(''), /continued/, 'accepted answer must reach outgoing-stream consumers');
+    assert.doesNotMatch(tokenTraces.join(''), /discard-native-partial/, 'inference:tokens must not leak refused text');
+    assert.match(tokenTraces.join(''), /continued/);
   } finally { await framework.stop(); }
 });
 
@@ -353,6 +360,7 @@ test('backward-compatible direct Agent inference also guards tool results', asyn
     const final = await agent.runInference(h.framework.getAllTools());
     assert.deepEqual(final.speechContent, [{ type: 'text', text: 'continued' }]);
     assert.equal(requests.length, 3);
+    assert.equal(final.usage?.inputTokens, 20, 'abandoned refused attempt usage is included');
     assert.match(JSON.stringify(requests[1]), /direct-original/);
     assert.doesNotMatch(JSON.stringify(requests[2]), /direct-original|discard-this/);
     assert.equal(toolResults(h.framework)[0].content, TOOL_RESULT_GUARD_NOTICE);
@@ -381,4 +389,135 @@ test('full oversized output survives withholding and reopening as a Chronicle bl
       assert.equal(toolResults(restarted)[0].content, TOOL_RESULT_GUARD_NOTICE);
     } finally { await restarted.stop(); }
   } finally { if (!originalStopped) await h.framework.stop(); }
+});
+
+// ---------------------------------------------------------------------------
+// Review regressions (PR #159): guard effects apply only to a batch that was
+// actually SUBMITTED to the provider in the current turn.
+// ---------------------------------------------------------------------------
+
+class OmitToolExchange extends PassthroughStrategy {
+  select(...args: Parameters<PassthroughStrategy['select']>) {
+    return super.select(...args).filter((entry) =>
+      !entry.content.some((block) => block.type === 'tool_use' || block.type === 'tool_result'));
+  }
+}
+
+test('a staged batch omitted by compilation does not claim the refusal; autoRewind proceeds', async () => {
+  const h = await harness([[calls('one')], [refused()], [answer()]], {
+    toolResultGuard: true, maxStreamTokens: 1, strategy: new OmitToolExchange(),
+    refusalHandling: { autoRewind: true },
+  });
+  try {
+    await h.run();
+    const guard = h.framework.getAgent('assistant')!.toolResultGuard;
+    assert.equal(guard.hasPending, false, 'unsubmitted batch must be settled, not stranded');
+    assert.equal(guard.recovering, false);
+    assert.doesNotMatch(JSON.stringify(h.membrane.requests[1]), /payload-one/);
+    assert.equal(h.membrane.requests.length, 3, 'ordinary refusal rewind retry must run');
+    const messages = h.framework.getAgent('assistant')!.getContextManager().getAllMessages();
+    assert.match(JSON.stringify(messages), /\[refusal-rewind\]/);
+    const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    assert.ok(audit.some((r) => r.type === 'withheld' && r.reason === 'unsubmitted'));
+  } finally { await h.framework.stop(); }
+});
+
+test('a turn ended by an endTurn tool settles (accepts) its batch', async () => {
+  const h = await harness([[calls('one')]], { toolResultGuard: true },
+    { one: { success: true, data: 'payload-one', endTurn: true } });
+  try {
+    await h.run();
+    const guard = h.framework.getAgent('assistant')!.toolResultGuard;
+    assert.equal(guard.hasPending, false);
+    assert.match(String(toolResults(h.framework)[0].content), /payload-one/);
+    const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    assert.equal(audit.at(-1)?.type, 'accepted');
+    assert.equal(audit.at(-1)?.reason, 'turn_ended');
+  } finally { await h.framework.stop(); }
+});
+
+test('a refusal on the next turn after endTurn uses ordinary refusal handling', async () => {
+  const h = await harness([[calls('one')], [refused()], [answer()]], {
+    toolResultGuard: true, refusalHandling: { autoRewind: true, retries: 2 },
+  }, { one: { success: true, data: 'payload-one', endTurn: true } });
+  try {
+    await h.run();
+    await h.run();
+    const messages = h.framework.getAgent('assistant')!.getContextManager().getAllMessages();
+    assert.match(JSON.stringify(messages), /\[refusal-rewind\]/, 'autoRewind must not be suppressed');
+    assert.equal(h.membrane.requests.length, 3);
+  } finally { await h.framework.stop(); }
+});
+
+test('budget restart reserves the real wire cost of the pending batch', async () => {
+  const big = 'x'.repeat(40_000); // ~10k tokens on the wire, notice is ~20
+  const budget = 14_000;
+  const h = await harness([[calls('one')], [answer()]], {
+    toolResultGuard: true, maxStreamTokens: 1, contextBudgetTokens: budget, maxTokens: 1_000,
+  }, { one: { success: true, data: big } });
+  try {
+    const cm = h.framework.getAgent('assistant')!.getContextManager();
+    for (let i = 0; i < 20; i++) {
+      cm.addMessage('user', [{ type: 'text', text: `filler-${i} ` + 'y'.repeat(2_000) }]);
+    }
+    await h.run();
+    const rebuilt = h.membrane.requests[1];
+    assert.match(JSON.stringify(rebuilt), /xxxxxxxx/, 'pending original still submitted');
+    const chars = rebuilt.messages.flatMap((m) => m.content).reduce((n, b) =>
+      n + JSON.stringify(b).length, 0);
+    assert.ok(Math.ceil(chars / 4) <= budget - 1_000,
+      `rebuilt request ~${Math.ceil(chars / 4)} tokens exceeds budget ${budget - 1_000}`);
+  } finally { await h.framework.stop(); }
+});
+
+test('audit is synced before the pending batch is submitted', async () => {
+  const h = await harness([[calls('one'), answer()]], { toolResultGuard: true });
+  const store = h.framework.getStore();
+  const sync = store.sync.bind(store);
+  let syncedWhilePending = false;
+  (store as { sync: () => void }).sync = () => {
+    if (h.framework.getAgent('assistant')!.toolResultGuard.hasPending) syncedWhilePending = true;
+    sync();
+  };
+  let durableAtSubmit = false;
+  h.membrane.onSubmit = () => { durableAtSubmit = syncedWhilePending; };
+  try {
+    await h.run();
+    assert.equal(durableAtSubmit, true);
+  } finally { (store as { sync: () => void }).sync = sync; await h.framework.stop(); }
+});
+
+test('direct API: a transient compile failure does not wedge the guard', async () => {
+  const h = await harness([], { toolResultGuard: true });
+  const responses = [calls('one'), answer()];
+  (h.membrane as unknown as { stream: (request: NormalizedRequest) => Promise<NormalizedResponse> }).stream =
+    async () => responses.shift()!;
+  try {
+    const agent = h.framework.getAgent('assistant')!;
+    agent.getContextManager().addMessage('user', [{ type: 'text', text: 'read' }]);
+    await agent.runInference(h.framework.getAllTools());
+    agent.provideToolResult('one', { success: true, data: 'direct-original' });
+    const compile = agent.compileWithInjections.bind(agent);
+    let failed = false;
+    agent.compileWithInjections = async (...args) => {
+      if (!failed) { failed = true; throw new Error('transient compile failure'); }
+      return compile(...args);
+    };
+    await assert.rejects(agent.runInference(h.framework.getAllTools()), /transient compile failure/);
+    const final = await agent.runInference(h.framework.getAllTools());
+    assert.deepEqual(final.speechContent, [{ type: 'text', text: 'continued' }]);
+    assert.equal(toolResults(h.framework).length, 1, 'batch staged exactly once');
+    assert.match(String(toolResults(h.framework)[0].content), /direct-original/);
+  } finally { await h.framework.stop(); }
+});
+
+test('usage of an abandoned guarded round is counted in session totals', async () => {
+  const withUsage = (r: NormalizedResponse, input: number) =>
+    ({ ...r, details: { ...(r.details ?? {}), usage: { inputTokens: input, outputTokens: 1 } } }) as NormalizedResponse;
+  const h = await harness([[calls('one'), withUsage(refused(), 1_000)], [withUsage(answer(), 7)]], { toolResultGuard: true });
+  try {
+    await h.run();
+    const totals = h.framework.getSessionUsage().totals as unknown as Record<string, number>;
+    assert.ok(totals.inputTokens >= 1_007, `refused round usage missing: ${JSON.stringify(totals)}`);
+  } finally { await h.framework.stop(); }
 });

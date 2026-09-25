@@ -41,6 +41,30 @@ export class ToolResultGuard {
   setOverride(value: boolean | undefined): void { this.override = value; }
   get settingOverride(): boolean | undefined { return this.override; }
   get hasPending(): boolean { return this.pending !== undefined; }
+  /** True only once the pending batch's originals were actually put on the
+   * wire. Guard effects (retry suppression, refusal claim, prose buffering)
+   * are scoped to this state; a merely staged batch never claims a refusal. */
+  get hasSubmittedPending(): boolean { return this.pending?.submitted === true; }
+
+  /** Extra input tokens the pending batch costs on the wire beyond the
+   * placeholder the strategy selected against (chars/4 + flat per image,
+   * the same heuristic as the physical-window projection). Compilation
+   * reserves this so substituting originals cannot exceed the budget. */
+  get pendingWireReserveTokens(): number {
+    const pending = this.pending;
+    if (!pending) return 0;
+    let chars = 0;
+    let images = 0;
+    for (const result of pending.wireResults) {
+      if (typeof result.content === 'string') chars += result.content.length;
+      else for (const block of result.content as ContentBlock[]) {
+        if (block.type === 'image') images += 1;
+        else chars += JSON.stringify(block).length;
+      }
+      chars -= TOOL_RESULT_GUARD_NOTICE.length;
+    }
+    return Math.max(0, Math.ceil(chars / 4) + images * 1600);
+  }
 
   private append(record: Record<string, unknown>): void {
     const store = this.cm.getStore();
@@ -68,7 +92,16 @@ export class ToolResultGuard {
 
   storeResults(content: ContentBlock[], wireResults: ToolResult[], originals: CompletedToolCall[]): MessageId {
     if (!this.enabled) return this.cm.addMessage('user', content);
-    if (this.pending) throw new Error('Tool result guard already has a pending batch');
+    if (this.pending) {
+      // Idempotent for the same not-yet-submitted batch: a caller that
+      // retries after a failure between staging and submission (e.g. a
+      // transient compile error on the direct Agent API) must not wedge.
+      const same = !this.pending.submitted
+        && this.pending.wireResults.map((r) => r.toolUseId).join('\0')
+          === wireResults.map((r) => r.toolUseId).join('\0');
+      if (same) return this.pending.messageId;
+      throw new Error('Tool result guard already has a pending batch');
+    }
     const id = randomUUID();
     // Includes full pre-truncation/error/image payloads, not just the wire
     // preview. This slot is audit data, never a context/compression source.
@@ -80,6 +113,15 @@ export class ToolResultGuard {
     const messageId = this.cm.addMessage('user', withheld);
     this.pending = { id, messageId, content, wireResults, submitted: false };
     this.append({ type: 'linked', batchId: id, messageId });
+    // Durability barrier: the audit must reach Chronicle's chain heads before
+    // the originals can go to a provider. A failed sync is reported loudly;
+    // the batch still proceeds (failing here would strand a live stream),
+    // and the record carries on as best-effort like any unsynced write.
+    try {
+      this.cm.getStore().sync();
+    } catch (error) {
+      console.error(`[tool-result-guard] agent=${this.agentName} audit sync failed before submission:`, error);
+    }
     return messageId;
   }
 
@@ -106,11 +148,36 @@ export class ToolResultGuard {
     }) }));
   }
 
+  /** The turn ended (endTurn/skip_reply) before the batch was submitted:
+   * nothing was refused, so admit it exactly as an unguarded agent would.
+   * Leaving it pending would turn it into a permanent withheld notice on
+   * restart and disable ordinary refusal handling on the next turn. */
+  settleTurnEnded(): void {
+    const pending = this.pending;
+    if (!pending) return;
+    this.pending = undefined;
+    this.append({ type: 'accepted', batchId: pending.id, messageId: pending.messageId, reason: 'turn_ended' });
+    this.cm.editMessage(pending.messageId, pending.content);
+  }
+
+  /** A refusal arrived while the pending batch was never on the wire (the
+   * strategy omitted the exchange). The guard cannot have caused it: record
+   * the batch as withheld, clear it, and let ordinary refusal handling run.
+   * Returns true when it settled such a batch. */
+  settleUnsubmitted(category: string): boolean {
+    const pending = this.pending;
+    if (!pending || pending.submitted) return false;
+    this.pending = undefined;
+    this.append({ type: 'withheld', batchId: pending.id, messageId: pending.messageId, reason: 'unsubmitted', category });
+    return true;
+  }
+
   /** A clean physical response accepts precisely the last submitted batch. */
   accept(): void {
     const pending = this.pending;
     if (pending) {
-      this.append({ type: pending.submitted ? 'accepted' : 'withheld', batchId: pending.id, messageId: pending.messageId });
+      this.append({ type: pending.submitted ? 'accepted' : 'withheld', batchId: pending.id, messageId: pending.messageId,
+        ...(pending.submitted ? {} : { reason: 'unsubmitted' }) });
       if (pending.submitted) this.cm.editMessage(pending.messageId, pending.content);
       this.pending = undefined;
     }

@@ -6593,6 +6593,9 @@ export class AgentFramework {
 
           if (shouldEndTurn) {
             // endTurn: messages already stored above, cancel stream, reset to idle.
+            // The batch is never submitted, so nothing can refuse it: admit
+            // it now instead of leaving it pending across the idle gap.
+            agent.toolResultGuard.settleTurnEnded();
             if (currentState.stream) {
               this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'turn_ended');
               currentState.stream.cancel();
@@ -8668,6 +8671,23 @@ export class AgentFramework {
       }
     };
 
+    // Tool-result-guard publication boundary. While a SUBMITTED batch is
+    // pending (or a guard recovery is running), a refusal can still abandon
+    // this physical round, so its streamed text must not reach any surface
+    // yet — neither the prose router nor the inference:tokens trace (TTS and
+    // other trace consumers voice it). Hold both; release in order on a clean
+    // round (tool-calls / non-guard completion), discard on a guard refusal.
+    let guardHeld: Array<{ trace: Parameters<AgentFramework['emitTrace']>[0]; text?: string }> = [];
+    const releaseGuardHeld = (): void => {
+      const held = guardHeld;
+      guardHeld = [];
+      for (const item of held) {
+        this.emitTrace(item.trace);
+        if (proseStream && item.text !== undefined) emitOutgoing(proseStream.feed(item.text));
+      }
+    };
+    const discardGuardHeld = (): void => { guardHeld = []; };
+
     const adoptInjectedRound = (): void => {
       if (!this.midTurnInputSignals.has(agent.name)) return;
       this.midTurnInputSignals.delete(agent.name);
@@ -8690,8 +8710,8 @@ export class AgentFramework {
         }
         this.touchEphemeralRun(agent.name, true);
         switch (event.type) {
-          case 'tokens':
-            this.emitTrace({
+          case 'tokens': {
+            const trace: Parameters<AgentFramework['emitTrace']>[0] = {
               type: 'inference:tokens',
               agentName: agent.name,
               content: event.content,
@@ -8701,12 +8721,16 @@ export class AgentFramework {
               // lets trace consumers tag every chunk with the channel this
               // turn's prose is bound for, without re-deriving routing.
               channelId: typingChannel ?? undefined,
-            });
-            if (proseStream && event.meta.type === 'text'
-              && !agent.toolResultGuard.hasPending && !agent.toolResultGuard.recovering) {
-              emitOutgoing(proseStream.feed(event.content));
+            };
+            const text = event.meta.type === 'text' ? event.content : undefined;
+            if (agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering) {
+              guardHeld.push({ trace, text });
+            } else {
+              this.emitTrace(trace);
+              if (proseStream && text !== undefined) emitOutgoing(proseStream.feed(text));
             }
             break;
+          }
 
           case 'retrying': {
             // Membrane is re-issuing after a content-policy refusal. Per the
@@ -8728,6 +8752,7 @@ export class AgentFramework {
             );
             outgoingInferenceId = newOutgoingInferenceId();
             outgoingIndex = 0;
+            discardGuardHeld();
             proseStream?.reset();
             this.emitTrace({
               type: 'inference:tokens',
@@ -8757,6 +8782,7 @@ export class AgentFramework {
             // A tool-call response is a clean physical round: admit its
             // preceding results before storing/dispatching this new round.
             agent.toolResultGuard.accept();
+            releaseGuardHeld();
             adoptInjectedRound();
             hadToolCalls = true;
             this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, event.calls.length);
@@ -8915,12 +8941,18 @@ export class AgentFramework {
             adoptInjectedRound();
             const durationMs = Date.now() - startTime;
             let response = event.response;
+            const guardCategory = (response.raw?.response as {
+              stop_details?: { category?: string };
+            } | undefined)?.stop_details?.category ?? 'unknown';
+            // A staged batch the strategy omitted from the request cannot
+            // have caused this refusal: settle it and fall through to the
+            // ordinary refusal handling (rewind/reaction) below.
+            if (response.stopReason === 'refusal') agent.toolResultGuard.settleUnsubmitted(guardCategory);
             const guardRefusal = response.stopReason === 'refusal'
-              && (agent.toolResultGuard.hasPending || agent.toolResultGuard.recovering);
+              && (agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering);
             if (guardRefusal) {
-              const category = (response.raw?.response as {
-                stop_details?: { category?: string };
-              } | undefined)?.stop_details?.category ?? 'unknown';
+              discardGuardHeld();
+              const category = guardCategory;
               const withheld = agent.toolResultGuard.withhold(category);
               // Nothing from the abandoned physical attempt is published or
               // persisted as assistant speech, including a terminal refusal
@@ -8933,6 +8965,21 @@ export class AgentFramework {
                   cacheCreation: usage.cacheCreationTokens, cacheRead: usage.cacheReadTokens,
                 } : undefined;
                 this.noteRefusal(agent.name, category, tokenUsage);
+                // The abandoned stream was billed (membrane usage here is
+                // cumulative across this physical tool loop): count it before
+                // the retry opens a fresh stream with its own usage.
+                const abandonedUsage = response.details?.usage;
+                if (abandonedUsage) {
+                  this.usageTracker.onInferenceCompleted(agent.name, {
+                    inputTokens: abandonedUsage.inputTokens,
+                    outputTokens: abandonedUsage.outputTokens,
+                    cacheCreationTokens: abandonedUsage.cacheCreationTokens,
+                    cacheReadTokens: abandonedUsage.cacheReadTokens,
+                  }, abandonedUsage.estimatedCost
+                    ? { total: abandonedUsage.estimatedCost.total, currency: abandonedUsage.estimatedCost.currency }
+                    : undefined);
+                  this.persistUsageState();
+                }
                 this.logInference({
                   timestamp: startTime, agentName: agent.name, requestId,
                   success: false, error: 'Tool output withheld by the guard',
@@ -8968,6 +9015,7 @@ export class AgentFramework {
             } else if (response.stopReason !== 'refusal') {
               agent.toolResultGuard.accept();
             }
+            if (!guardRefusal) releaseGuardHeld();
 
             // If the agent is still waiting_for_tools when 'complete' fires
             // (shouldn't happen after incomplete-tool-call fix, but guard anyway),
@@ -9004,6 +9052,9 @@ export class AgentFramework {
                 );
                 agent.toolResultGuard.storeResults(toolResultContent, readyState.toolResults.map((tc) =>
                   this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id))), readyState.toolResults);
+                // The response is already complete: this batch is never
+                // submitted in this turn, so it cannot be refused. Admit it.
+                agent.toolResultGuard.settleTurnEnded();
               }
             }
 

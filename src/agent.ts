@@ -228,6 +228,20 @@ export class Agent {
     return { maxTokens: this.contextBudgetTokens, reserveForResponse: this.maxTokens };
   }
 
+  /** Compile budget with the tool-result guard's reservation applied. While
+   * a batch is pending the strategy selects against short placeholders, but
+   * prepareRequest substitutes the originals on the wire; reserve their real
+   * cost so the final request still fits (a budget restart that recompiles
+   * small must not re-inflate past the same window). */
+  private compileBudget(budget?: TokenBudget): TokenBudget | undefined {
+    const resolved = this.resolveBudget(budget);
+    const reserve = this.toolResultGuard.pendingWireReserveTokens;
+    if (reserve === 0) return resolved;
+    // Mirrors ContextManager.compile's own default when no budget is set.
+    const base = resolved ?? { maxTokens: 100_000, reserveForResponse: 4_000 };
+    return { ...base, reserveForResponse: base.reserveForResponse + reserve };
+  }
+
   /** Structural compatibility keeps lightweight test/host ContextManager
    * doubles working while making the new capability optional at runtime. */
   private getHotContextSettings(): HotContextSettingsStatus | null {
@@ -526,7 +540,7 @@ export class Agent {
   }
 
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
-    const result = await this.contextManager.compile(this.resolveBudget(budget));
+    const result = await this.contextManager.compile(this.compileBudget(budget));
     if (!budget) this.settleRuntimeSettingsTransition();
     return result;
   }
@@ -542,7 +556,7 @@ export class Agent {
     opts?: { kvUnifiedImmutablePrefixHash?: string },
   ): Promise<CompileResult> {
     const result = await this.contextManager.compile(
-      this.resolveBudget(budget), injections, opts as never,
+      this.compileBudget(budget), injections, opts as never,
     );
     if (!budget) this.settleRuntimeSettingsTransition();
     return result;
@@ -884,7 +898,7 @@ export class Agent {
       // tools run. A guarded result must reach the host on its FIRST refusal;
       // never spend retries resubmitting unchanged guarded content.
       get refusalRetries() {
-        return agent.toolResultGuard.hasPending || agent.toolResultGuard.recovering
+        return agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering
           ? 0 : agent.refusalHandling?.retries ?? 0;
       },
     });
@@ -1065,9 +1079,15 @@ export class Agent {
     signal?: AbortSignal
   ): Promise<InferenceResult> {
     let response = await this.membrane.stream(request, { signal });
+    // Usage of a refused attempt abandoned by the guard; it was billed and
+    // is added to the retry's usage below rather than overwritten.
+    let abandonedUsage: { inputTokens: number; outputTokens: number } | undefined;
     if (!isAbortedResponse(response) && response.stopReason === 'refusal') {
+      // A staged batch never on the wire cannot have caused the refusal.
+      this.toolResultGuard.settleUnsubmitted('unknown');
       const ids = this.toolResultGuard.withhold('unknown');
       if (ids) {
+        abandonedUsage = response.usage;
         const withheld = new Set(ids);
         request = { ...request, messages: request.messages.map((message) => ({
           ...message, content: message.content.map((block) => block.type === 'tool_result' && withheld.has(block.toolUseId)
@@ -1104,7 +1124,11 @@ export class Agent {
       toolCalls,
       speechContent,
       raw: response.raw,
-      usage: response.usage,
+      usage: abandonedUsage && response.usage ? {
+        ...response.usage,
+        inputTokens: response.usage.inputTokens + abandonedUsage.inputTokens,
+        outputTokens: response.usage.outputTokens + abandonedUsage.outputTokens,
+      } : response.usage,
       stopReason: response.stopReason,
     };
   }
