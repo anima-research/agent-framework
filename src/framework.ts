@@ -62,6 +62,7 @@ import { ProcessQueueImpl } from './queue.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reactions.js';
 import { Agent } from './agent.js';
 import { ModuleRegistry, isStateExistsError } from './module-registry.js';
+import { hasNonConversationalTag } from './mcpl/tags.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
@@ -167,14 +168,16 @@ const isSilencingTool = (name: string): boolean => {
  * True when an injected message is real conversational input — something the
  * agent might actually be replying to — rather than ambient machinery.
  * System markers (`system: true` — send-failed notices, routing notices) and
- * reactions (`chat:reaction` tag, MCPL RFC-001) don't count: they must not
- * clear explicit-send suppression, and they never influence routing.
+ * non-conversational marker tags (reactions added/removed, edits, deletions
+ * — MCPL RFC-001) don't count: they are about a message the agent has
+ * already seen, so they must not clear explicit-send suppression, and they
+ * never influence routing.
  */
 const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
   if (!metadata) return true;
   const m = metadata as Record<string, unknown>;
   if (m.system === true) return false;
-  if (Array.isArray(m.tags) && m.tags.includes('chat:reaction')) return false;
+  if (hasNonConversationalTag(m.tags)) return false;
   return true;
 };
 
