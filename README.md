@@ -53,6 +53,11 @@ await server.start();
 
 An agent wraps an LLM identity: model, system prompt, context strategy, and tool permissions. Multiple agents can coexist, each with independent context and inference state.
 
+Agents can opt into the [tool result guard](docs/tool-result-guard.md) through
+`agent_settings` with `{"action":"update","tool_result_guard":true}`. The
+setting persists across restarts; withheld results remain recoverable in
+Chronicle's audit history.
+
 ```typescript
 {
   name: 'researcher',

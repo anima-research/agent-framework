@@ -438,7 +438,8 @@ function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string):
 }
 
 function isTurnContinuation(reason: string): boolean {
-  return reason === 'context_budget_restart' || reason === 'tool_results_ready';
+  return reason === 'context_budget_restart' || reason === 'tool_results_ready'
+    || reason === 'tool_result_guard_retry';
 }
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
@@ -2398,6 +2399,11 @@ export class AgentFramework {
       ext.keys.forEach((k) => taken.add(k));
       result.set('_framework', ext);
     }
+    {
+      const ext = this.toolResultGuardSettingsExtension();
+      ext.keys.forEach((key) => taken.add(key));
+      result.set('_toolResultGuard', ext);
+    }
     for (const module of this.moduleRegistry.getAllModules()) {
       const ext = module.getAgentSettingsExtension?.();
       if (!ext) continue;
@@ -2466,6 +2472,56 @@ export class AgentFramework {
     return {
       sameRoundThinkTextPolicy: agent.getEffectiveSameRoundThinkTextPolicy(),
     };
+  }
+
+  private toolResultGuardSettingsExtension(): AgentSettingsExtension {
+    const get = (name: string): Record<string, unknown> => {
+      const guard = this.agents.get(name)?.toolResultGuard;
+      return {
+        tool_result_guard: guard?.enabled ?? false,
+        tool_result_guard_source: guard?.settingOverride !== undefined ? 'runtime_override' : 'recipe_default',
+      };
+    };
+    const set = (name: string, enabled: boolean | undefined): Record<string, unknown> => {
+      const agent = this.agents.get(name);
+      if (!agent) throw new Error(`Unknown agent: ${name}`);
+      const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+      const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      const values = { ...((state.toolResultGuards as Record<string, boolean> | undefined) ?? {}) };
+      if (enabled === undefined) delete values[name];
+      else values[name] = enabled;
+      state.toolResultGuards = values;
+      this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+      agent.toolResultGuard.setOverride(enabled);
+      return get(name);
+    };
+    return {
+      properties: {
+        tool_result_guard: {
+          type: 'boolean',
+          description: 'Enable the tool result guard. It can withhold a batch of tool output and retry inference once. ' +
+            'Tools are not re-executed. Persists across turns and restarts until explicitly changed. ' +
+            'Disabling affects future results only; previously withheld results stay withheld.',
+        },
+      },
+      keys: ['tool_result_guard'],
+      get,
+      update: (name, patch) => {
+        if (typeof patch.tool_result_guard !== 'boolean') throw new Error('tool_result_guard must be a boolean');
+        return set(name, patch.tool_result_guard);
+      },
+      reset: (name) => set(name, undefined),
+    };
+  }
+
+  private restoreToolResultGuardSetting(agent: Agent): void {
+    const enabled = (this.store.getStateJson(FRAMEWORK_STATE_ID) as {
+      toolResultGuards?: Record<string, unknown>;
+    } | null)?.toolResultGuards?.[agent.name];
+    if (enabled !== undefined && typeof enabled !== 'boolean') {
+      throw new Error(`Invalid persisted tool_result_guard for ${agent.name}: expected a boolean`);
+    }
+    agent.toolResultGuard.setOverride(enabled);
   }
 
   private buildThinkTool(
@@ -3849,6 +3905,7 @@ export class AgentFramework {
       });
 
       const agent = new Agent(config, contextManager, this.membrane);
+      this.restoreToolResultGuardSetting(agent);
       this.ephemeralCandidates.set(agent, contextManager);
 
       const cleanup = () => {
@@ -6153,6 +6210,7 @@ export class AgentFramework {
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
+    this.restoreToolResultGuardSetting(agent);
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
     if (restoredSettings) {
       agent.restoreRuntimeSettings(
@@ -6227,6 +6285,7 @@ export class AgentFramework {
       allowedTools: [...SUBCONSCIOUS_TOOL_NAMES, 'think', 'skip_reply', 'end_turn'],
     };
     const agent = new Agent(agentConfig, contextManager, this.membrane);
+    this.restoreToolResultGuardSetting(agent);
     this.agents.set(name, agent);
     this.agentConfigs.set(name, agentConfig);
     this.subconsciousAgentName = name;
@@ -6348,7 +6407,10 @@ export class AgentFramework {
           // divergence breaks the compile prefix).
           const { blocks: toolResultContent, spilled } =
             await this.buildStoredToolResultContent(agent.name, currentState.toolResults, maxChars);
-          agent.getContextManager().addMessage('user', toolResultContent);
+          const membraneResults = currentState.toolResults.map(tc =>
+            this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
+          );
+          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults);
 
           // Flush any messages that were deferred while this turn was in
           // flight. Route to the PRIMARY agent — deferred messages are
@@ -6531,6 +6593,9 @@ export class AgentFramework {
 
           if (shouldEndTurn) {
             // endTurn: messages already stored above, cancel stream, reset to idle.
+            // The batch is never submitted, so nothing can refuse it: admit
+            // it now instead of leaving it pending across the idle gap.
+            agent.toolResultGuard.settleTurnEnded();
             if (currentState.stream) {
               this.frameworkCancelledStreams.set(`${agent.name}:${agent.streamId}`, 'turn_ended');
               currentState.stream.cancel();
@@ -6586,9 +6651,7 @@ export class AgentFramework {
             // Mid-turn messages collected above ride along as injected user
             // messages (membrane ≥0.5.72) — appended after the tool_result
             // envelope so the next round of THIS turn hears them.
-            const membraneResults = currentState.toolResults.map(tc =>
-              this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
-            );
+            agent.toolResultGuard.markSubmitted();
             currentState.stream.provideToolResults(
               membraneResults,
               midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections } : undefined,
@@ -6999,6 +7062,7 @@ export class AgentFramework {
 
       const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
       const agent = new Agent(config, contextManager, this.membrane);
+      this.restoreToolResultGuardSetting(agent);
       this.agents.set(name, agent);
       this.agentConfigs.set(name, config);
       this.conversationAgentHomes.set(name, channelId);
@@ -8140,6 +8204,8 @@ export class AgentFramework {
     turnToken: number,
     ownsProviderGate: boolean,
   ): Promise<boolean> {
+    const continuingTurn = trigger?.reason === 'context_budget_restart'
+      || trigger?.reason === 'tool_result_guard_retry';
     // Flush messages deferred during the PREVIOUS turn — before the
     // checkpoint, the locus announcement, and the compile — so a turn started
     // by a queued wake actually CONTAINS the message that woke it. (2026-07-31
@@ -8156,7 +8222,7 @@ export class AgentFramework {
     // products — undoing the turn must not destroy them.
     if (
       attempt === 0 &&
-      trigger?.reason !== 'context_budget_restart' &&
+      !continuingTurn &&
       this.deferredMessages.length > 0
     ) {
       {
@@ -8183,7 +8249,7 @@ export class AgentFramework {
     }
 
     // Record turn checkpoint before inference (only on first attempt, not retries)
-    if (attempt === 0) {
+    if (attempt === 0 && trigger?.reason !== 'tool_result_guard_retry') {
       this.recordTurnCheckpoint(agent.name);
       this.redoStacks.delete(agent.name); // new work invalidates redo
     }
@@ -8201,7 +8267,7 @@ export class AgentFramework {
     // after the restart fell through to the hours-old defaultPublishChannel.
     // Keep the turn's trigger channel across restarts; only real new turns
     // reset it.
-    if (trigger?.reason !== 'context_budget_restart') {
+    if (!continuingTurn) {
       if (trigger?.channelId) {
         this.activeTriggerChannels.set(agent.name, trigger.channelId);
       } else {
@@ -8221,12 +8287,12 @@ export class AgentFramework {
     // BEFORE this turn compiles, so the agent always knows where its voice
     // goes (announce-on-change only — no per-turn chatter, append-only for
     // KV stability).
-    if (trigger?.reason === 'context_budget_restart') {
+    if (continuingTurn) {
       const previousLogicalToolState = this.logicalTurnToolCalls.get(agent);
       this.logicalTurnToolCalls.set(agent, { turnToken, count: previousLogicalToolState?.count ?? 0 });
     }
 
-    if (trigger?.reason !== 'context_budget_restart') {
+    if (!continuingTurn) {
       if (attempt === 0) this.maybePrimeProseMode(agent);
       const previousLogicalToolState = this.logicalTurnToolCalls.get(agent);
       if (attempt === 0) {
@@ -8271,7 +8337,7 @@ export class AgentFramework {
     });
     // A budget restart continues the same logical inference window. The
     // predecessor keeps EventGate liveness until its successor terminates.
-    if (trigger?.reason !== 'context_budget_restart') {
+    if (!continuingTurn) {
       this.eventGate?.onInferenceStarted(agent.name);
     }
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
@@ -8605,6 +8671,23 @@ export class AgentFramework {
       }
     };
 
+    // Tool-result-guard publication boundary. While a SUBMITTED batch is
+    // pending (or a guard recovery is running), a refusal can still abandon
+    // this physical round, so its streamed text must not reach any surface
+    // yet — neither the prose router nor the inference:tokens trace (TTS and
+    // other trace consumers voice it). Hold both; release in order on a clean
+    // round (tool-calls / non-guard completion), discard on a guard refusal.
+    let guardHeld: Array<{ trace: Parameters<AgentFramework['emitTrace']>[0]; text?: string }> = [];
+    const releaseGuardHeld = (): void => {
+      const held = guardHeld;
+      guardHeld = [];
+      for (const item of held) {
+        this.emitTrace(item.trace);
+        if (proseStream && item.text !== undefined) emitOutgoing(proseStream.feed(item.text));
+      }
+    };
+    const discardGuardHeld = (): void => { guardHeld = []; };
+
     const adoptInjectedRound = (): void => {
       if (!this.midTurnInputSignals.has(agent.name)) return;
       this.midTurnInputSignals.delete(agent.name);
@@ -8627,8 +8710,8 @@ export class AgentFramework {
         }
         this.touchEphemeralRun(agent.name, true);
         switch (event.type) {
-          case 'tokens':
-            this.emitTrace({
+          case 'tokens': {
+            const trace: Parameters<AgentFramework['emitTrace']>[0] = {
               type: 'inference:tokens',
               agentName: agent.name,
               content: event.content,
@@ -8638,11 +8721,16 @@ export class AgentFramework {
               // lets trace consumers tag every chunk with the channel this
               // turn's prose is bound for, without re-deriving routing.
               channelId: typingChannel ?? undefined,
-            });
-            if (proseStream && event.meta.type === 'text') {
-              emitOutgoing(proseStream.feed(event.content));
+            };
+            const text = event.meta.type === 'text' ? event.content : undefined;
+            if (agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering) {
+              guardHeld.push({ trace, text });
+            } else {
+              this.emitTrace(trace);
+              if (proseStream && text !== undefined) emitOutgoing(proseStream.feed(text));
             }
             break;
+          }
 
           case 'retrying': {
             // Membrane is re-issuing after a content-policy refusal. Per the
@@ -8664,6 +8752,7 @@ export class AgentFramework {
             );
             outgoingInferenceId = newOutgoingInferenceId();
             outgoingIndex = 0;
+            discardGuardHeld();
             proseStream?.reset();
             this.emitTrace({
               type: 'inference:tokens',
@@ -8690,6 +8779,10 @@ export class AgentFramework {
           }
 
           case 'tool-calls': {
+            // A tool-call response is a clean physical round: admit its
+            // preceding results before storing/dispatching this new round.
+            agent.toolResultGuard.accept();
+            releaseGuardHeld();
             adoptInjectedRound();
             hadToolCalls = true;
             this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, event.calls.length);
@@ -8847,7 +8940,82 @@ export class AgentFramework {
           case 'complete': {
             adoptInjectedRound();
             const durationMs = Date.now() - startTime;
-            const response = event.response;
+            let response = event.response;
+            const guardCategory = (response.raw?.response as {
+              stop_details?: { category?: string };
+            } | undefined)?.stop_details?.category ?? 'unknown';
+            // A staged batch the strategy omitted from the request cannot
+            // have caused this refusal: settle it and fall through to the
+            // ordinary refusal handling (rewind/reaction) below.
+            if (response.stopReason === 'refusal') agent.toolResultGuard.settleUnsubmitted(guardCategory);
+            const guardRefusal = response.stopReason === 'refusal'
+              && (agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering);
+            if (guardRefusal) {
+              discardGuardHeld();
+              const category = guardCategory;
+              const withheld = agent.toolResultGuard.withhold(category);
+              // Nothing from the abandoned physical attempt is published or
+              // persisted as assistant speech, including a terminal refusal
+              // after the single recovery retry.
+              proseStream?.reset();
+              if (withheld) {
+                const usage = response.details?.usage ?? response.usage;
+                const tokenUsage = usage ? {
+                  input: usage.inputTokens, output: usage.outputTokens,
+                  cacheCreation: usage.cacheCreationTokens, cacheRead: usage.cacheReadTokens,
+                } : undefined;
+                this.noteRefusal(agent.name, category, tokenUsage);
+                // The abandoned stream was billed (membrane usage here is
+                // cumulative across this physical tool loop): count it before
+                // the retry opens a fresh stream with its own usage.
+                const abandonedUsage = response.details?.usage;
+                if (abandonedUsage) {
+                  this.usageTracker.onInferenceCompleted(agent.name, {
+                    inputTokens: abandonedUsage.inputTokens,
+                    outputTokens: abandonedUsage.outputTokens,
+                    cacheCreationTokens: abandonedUsage.cacheCreationTokens,
+                    cacheReadTokens: abandonedUsage.cacheReadTokens,
+                  }, abandonedUsage.estimatedCost
+                    ? { total: abandonedUsage.estimatedCost.total, currency: abandonedUsage.estimatedCost.currency }
+                    : undefined);
+                  this.persistUsageState();
+                }
+                this.logInference({
+                  timestamp: startTime, agentName: agent.name, requestId,
+                  success: false, error: 'Tool output withheld by the guard',
+                  request: compiledRequest ?? {}, response, durationMs, tokenUsage, stopReason: 'refusal',
+                });
+                console.error(`[tool-result-guard] agent=${agent.name} withheld ${withheld.length} result(s); retrying inference`);
+                this.emitTrace({
+                  type: 'inference:stream_restarted', agentName: agent.name,
+                  reason: 'tool_result_guard', inputTokens: agent.lastStreamInputTokens,
+                  budget: agent.maxStreamTokens,
+                });
+                await turnSpeechChain;
+                if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
+                  generationLost = true;
+                  lifecyclePhase = 'aborted';
+                  return;
+                }
+                agent.reset();
+                preserveEventGateForSuccessor = true;
+                lifecyclePhase = 'aborted';
+                // Restart inference inside this logical turn. No tool is
+                // executed again and no settle/checkpoint/locus reset occurs.
+                await this.startAgentStream(agent, {
+                  ...trigger, agentName: agent.name, reason: 'tool_result_guard_retry',
+                  source: trigger?.source ?? 'framework', timestamp: Date.now(),
+                }, attempt);
+                return;
+              }
+              const lastResult = response.content.reduce((last, block, index) =>
+                block.type === 'tool_result' ? index : last, -1);
+              response = { ...response, content: response.content.slice(0, lastResult + 1), rawAssistantText: '' };
+              agent.toolResultGuard.recovering = false;
+            } else if (response.stopReason !== 'refusal') {
+              agent.toolResultGuard.accept();
+            }
+            if (!guardRefusal) releaseGuardHeld();
 
             // If the agent is still waiting_for_tools when 'complete' fires
             // (shouldn't happen after incomplete-tool-call fix, but guard anyway),
@@ -8876,12 +9044,17 @@ export class AgentFramework {
               // one door a giant blob still walks through).
               const readyState = agent.state as AgentState;
               if (readyState.status === 'ready') {
-                const { blocks: toolResultContent } = await this.buildStoredToolResultContent(
+                const cap = this.resolveToolResultInlineCap(agent).cap;
+                const { blocks: toolResultContent, spilled } = await this.buildStoredToolResultContent(
                   agent.name,
                   readyState.toolResults,
-                  this.resolveToolResultInlineCap(agent).cap,
+                  cap,
                 );
-                agent.getContextManager().addMessage('user', toolResultContent);
+                agent.toolResultGuard.storeResults(toolResultContent, readyState.toolResults.map((tc) =>
+                  this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id))), readyState.toolResults);
+                // The response is already complete: this batch is never
+                // submitted in this turn, so it cannot be refused. Admit it.
+                agent.toolResultGuard.settleTurnEnded();
               }
             }
 
@@ -9097,7 +9270,7 @@ export class AgentFramework {
                   },
                   () => this.finishUnstick(agent.name, false, category),
                 );
-              } else if (rh?.autoRewind) {
+              } else if (rh?.autoRewind && !guardRefusal) {
                 const cap = Math.max(1, rh.maxRewinds ?? 3);
                 const used = this.refusalRewinds.get(agent.name) ?? 0;
                 doRewind(
@@ -9719,6 +9892,7 @@ export class AgentFramework {
       // (typing still stops, compression still runs — matching the observed
       // wedge). onInferenceEnded is idempotent, so a redundant call is safe.
       if (ownsPhysicalStream && !preserveEventGateForSuccessor) {
+        agent.toolResultGuard.recovering = false;
         this.eventGate?.onInferenceEnded(agent.name);
       }
       if (!generationLost && ownsPhysicalStream) {
