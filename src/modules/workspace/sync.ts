@@ -286,8 +286,21 @@ export async function materializeToFs(
     let diskBuffer: Buffer | null = null;
     try {
       diskBuffer = await readFile(absolutePath);
-    } catch {
-      // No readable disk copy — creating a file overwrites nobody's work.
+    } catch (err) {
+      // Only absence proves there is nothing to overwrite. Any other read
+      // failure (EACCES on a write-only file, EISDIR, EIO...) means freshness
+      // cannot be verified, and writeFile may still succeed — so refuse
+      // rather than treat "unreadable" as "not there".
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && !opts?.force) {
+        skipped.push({
+          path: relativePath,
+          reason:
+            `cannot verify disk copy (${code ?? (err as Error).message}) — ` +
+            'fix its permissions and materialize again, or pass force to overwrite it',
+        });
+        continue;
+      }
     }
     if (diskBuffer) {
       const diskHash = hashContent(diskBuffer);

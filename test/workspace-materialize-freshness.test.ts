@@ -14,7 +14,7 @@
 
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -126,6 +126,42 @@ test('sync-then-materialize resolves the divergence in the disk direction', asyn
   assert.equal(((res.data as MaterializeData).skipped ?? []).length, 0,
     'after sync the tree matches disk — nothing left to refuse');
   assert.equal(readFileSync(join(dir, 'script.sh'), 'utf8'), 'echo edited-by-shell');
+});
+
+test('an unreadable but writable disk copy is refused, not treated as absent', async (t) => {
+  const { dir, module } = setup(t);
+  await module.start(makeCtx());
+  await seedBaseline(module, dir);
+
+  // Another hand edits the file and leaves it write-only: readFile fails
+  // with EACCES while writeFile would still succeed.
+  const file = join(dir, 'script.sh');
+  writeFileSync(file, 'echo edited-by-shell');
+  chmodSync(file, 0o200);
+  try {
+    readFileSync(file);
+    t.skip('platform/user can still read a mode-0200 file (Windows or root)');
+    return;
+  } catch { /* unreadable, as intended */ }
+
+  await call(module, 'write', { path: 'work/script.sh', content: 'echo v2' });
+  const res = await call(module, 'materialize', {});
+  const data = res.data as MaterializeData;
+  chmodSync(file, 0o600);
+  assert.equal(readFileSync(file, 'utf8'), 'echo edited-by-shell',
+    'an edit we could not verify must survive the materialize');
+  assert.equal(data.materialized.length, 0, 'nothing silently written');
+  const skip = (data.skipped ?? []).find((s) => s.reason.includes('script.sh'));
+  assert.ok(skip, `the unverifiable path must be listed, got: ${JSON.stringify(data)}`);
+  assert.match(skip!.reason, /EACCES/, 'reason carries the filesystem error');
+  assert.match(skip!.reason, /force/, 'reason names the override');
+
+  // force still overwrites deliberately.
+  chmodSync(file, 0o200);
+  const forced = await call(module, 'materialize', { force: true });
+  assert.deepEqual((forced.data as MaterializeData).materialized.map((m) => m.path), ['script.sh']);
+  chmodSync(file, 0o600);
+  assert.equal(readFileSync(file, 'utf8'), 'echo v2');
 });
 
 test('untouched disk copies and brand-new files materialize exactly as before', async (t) => {
