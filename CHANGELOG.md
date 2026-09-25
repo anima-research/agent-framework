@@ -12,6 +12,19 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.18.0 — 2026-09-25
+
+### Changed
+
+- Depend on `@animalabs/context-manager` `^0.11.0`: the kv-unified solver no longer
+  grows its label set with the forest once a cache is relevant (#105), solves are
+  packed and selectively rescored (#110), and signed thinking blocks are priced by
+  signature (#113, the store-side half of #170).
+
+### Fixed
+
+- Signed `thinking` / `redacted_thinking` blocks are stamped with a `tokenEstimate` when persisted: this call's `usage.output_tokens` minus the visible blocks, split across carriers by signature length (per tool round, and on the trailing content at completion; cumulative membrane usage is diffed per call). On keep-all models the hidden chain of thought is replayed and billed as input on every later call, and context-manager's budget had no measure of it beyond a flat default — the compiled request ran ~1.5× over budget on long agentic histories, with dead `max_tokens` turns at the context ceiling.
+
 ## 0.17.0 — 2026-09-21
 
 ### Added
