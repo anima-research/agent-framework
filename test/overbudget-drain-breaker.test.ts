@@ -58,7 +58,7 @@ async function settle(rounds = 3) {
 const OVER_BUDGET_REASON =
   'Compile plan would exceed hard budget: head=41200 tail=8100 middle=62000 budget=100000';
 
-test('classification: a REAL context-manager OverBudgetError classifies via instanceof', () => {
+test('classification: a REAL context-manager OverBudgetError classifies as over_budget', () => {
   const { fw, restore } = makeHarness(async () => {});
   restore();
   const real = new OverBudgetError({
@@ -69,7 +69,7 @@ test('classification: a REAL context-manager OverBudgetError classifies via inst
   assert.deepEqual(fw.classifyInferenceError(real), { errorType: 'over_budget' });
 });
 
-test('classification: a REAL UncoveredDropError classifies as context_refusal via instanceof', () => {
+test('classification: a REAL UncoveredDropError classifies as context_refusal', () => {
   const { fw, restore } = makeHarness(async () => {});
   restore();
   const real = new UncoveredDropError({
@@ -77,6 +77,25 @@ test('classification: a REAL UncoveredDropError classifies as context_refusal vi
     site: 'selectHierarchical',
     diagnostics: { budget: 4000, totalTokens: 8000 },
   });
+  assert.deepEqual(fw.classifyInferenceError(real), { errorType: 'context_refusal' });
+});
+
+// A real instance still carries the constructor's `name`, so the two cases
+// above classify through the name fallback too. Overwriting `name` leaves
+// instanceof as the only path that can decide, which pins it.
+test('classification: a real OverBudgetError classifies by instanceof even when its name is overwritten', () => {
+  const { fw, restore } = makeHarness(async () => {});
+  restore();
+  const real = new OverBudgetError({ budget: 1, actual: 2, diagnostics: { headTokens: 1, tailTokens: 1, middleTokens: 1, middleChunkCount: 1, deepestLevel: 1 } });
+  Object.defineProperty(real, 'name', { value: 'Wrapped' });
+  assert.deepEqual(fw.classifyInferenceError(real), { errorType: 'over_budget' });
+});
+
+test('classification: a real UncoveredDropError classifies by instanceof even when its name is overwritten', () => {
+  const { fw, restore } = makeHarness(async () => {});
+  restore();
+  const real = new UncoveredDropError({ droppedIds: ['m1'], site: 's', diagnostics: { budget: 1, totalTokens: 2 } });
+  Object.defineProperty(real, 'name', { value: 'Wrapped' });
   assert.deepEqual(fw.classifyInferenceError(real), { errorType: 'context_refusal' });
 });
 
