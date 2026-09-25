@@ -186,6 +186,13 @@ export interface AgentConfig {
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
 
   /**
+   * Post a short automatic notice to the agent's speaking room when a turn
+   * fails outright (model call error, refusal, over-budget) — first failure
+   * of a streak and every 5th after. Default false.
+   */
+  failureNotices?: boolean;
+
+  /**
    * Fail-closed containment for a text response whose entire visible prose is
    * an invocation-shaped wrapper naming a tool registered on that exact turn.
    * The wrapper is neither executed nor stored as assistant continuity; a

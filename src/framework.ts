@@ -11531,6 +11531,7 @@ export class AgentFramework {
 
     const streak = (this.refusalStreak.get(agentName) ?? 0) + 1;
     this.refusalStreak.set(agentName, streak);
+    this.postFailureNotice(agentName, streak, `the model declined to respond (safety category: ${category})`);
 
     this.logFailure({
       agent: agentName,
@@ -11591,6 +11592,30 @@ export class AgentFramework {
     this.opsAlert(kind, agentName, message, { data });
   }
 
+  /**
+   * AgentConfig.failureNotices: tell the ROOM when a turn produced nothing.
+   * The chronicle marker already tells the resident; without this, people
+   * see only silence and can't tell a dead turn from a quiet one. Posted on
+   * the first failure of a streak and every 5th after, so a stuck loop can't
+   * flood the channel. Best-effort: a notice that can't be delivered is
+   * dropped (the stderr/failures.log records remain).
+   */
+  private postFailureNotice(agentName: string, streak: number, what: string): void {
+    const agent = this.agents.get(agentName);
+    if (!agent?.failureNotices || !this.channelRegistry) return;
+    if (streak !== 1 && streak % 5 !== 0) return;
+    const locus = this.channelRegistry.resolveLocus(agentName) ?? null;
+    if (!locus) return;
+    const oneLine = what.replace(/\s+/g, ' ').trim();
+    const reason = oneLine.length > 160 ? `${oneLine.slice(0, 157)}…` : oneLine;
+    const text =
+      `⚠️ [automatic notice] ${agentName}'s reply failed to generate` +
+      `${streak > 1 ? ` (${streak} in a row)` : ''}: ${reason}. ` +
+      'Nothing was lost from the conversation; it will see this and your messages on its next turn.';
+    void this.channelRegistry.routeSpeech(agentName, text, locus)
+      .catch((err) => console.error(`[inference-failed] failure notice not delivered for ${agentName}:`, err));
+  }
+
   private noteInferenceExhausted(
     agentName: string,
     reason: string,
@@ -11603,6 +11628,7 @@ export class AgentFramework {
 
     // (1) Durable stderr line — works in headless/daemon mode with no client.
     console.error(`[inference-failed] agent=${agentName} consecutive=${streak}: ${reason}`);
+    this.postFailureNotice(agentName, streak, reason);
 
     // (1b) Machine-greppable durable record, independent of journald/unit log
     // redirects: logs/failures.log under the host's working directory. This is
