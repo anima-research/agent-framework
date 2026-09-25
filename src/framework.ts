@@ -909,6 +909,29 @@ function truncateReason(reason: string, max = 160): string {
   return reason.length <= max ? reason : reason.slice(0, max) + '…';
 }
 
+/** Longest undelivered text a give-up notice carries inline. */
+const UNDELIVERED_INLINE_CHARS = 8000;
+
+/**
+ * The words of a message the outbox gave up on, for the give-up notice:
+ * nothing depends on the agent having kept its own copy.
+ */
+function undeliveredCopy(
+  entry: { text: string; tool?: { input: Record<string, unknown> } },
+  savedTo: string | undefined,
+): string {
+  const files = Array.isArray(entry.tool?.input.files) ? entry.tool!.input.files as Array<{ path?: unknown }> : [];
+  const attachments = files.length
+    ? `\nIt had ${files.length} attachment(s): ${files.map((f) => String(f?.path ?? '?')).join(', ')}.`
+    : '';
+  if (!entry.text) return attachments + (savedTo ? `\nA copy is saved at ${savedTo}.` : '');
+  const clipped = entry.text.length > UNDELIVERED_INLINE_CHARS;
+  return `\nHere is the full text, so nothing is lost${clipped ? ` (first ${UNDELIVERED_INLINE_CHARS} characters; the rest is in the saved copy)` : ''}:\n` +
+    `"""\n${entry.text.slice(0, UNDELIVERED_INLINE_CHARS)}\n"""` +
+    attachments +
+    (savedTo ? `\nA copy is also saved at ${savedTo}.` : '');
+}
+
 export class AgentFramework {
   private store: JsStore;
   private ownsStore: boolean;
@@ -7652,14 +7675,21 @@ export class AgentFramework {
     switch (event.kind) {
       case 'queued':
         kind = 'delivery-delayed';
-        text = `[delivery-delayed] ${which} couldn't be delivered yet (${event.reason}). ` +
+        text = (entry.outcome === 'unknown'
+          // No answer is not "didn't arrive" (the Librarian, 2026-09-25).
+          ? `[delivery-delayed] ${which} got no answer (${event.reason}), so it may already have arrived. ` +
+            'The retry checks the channel first and won\'t post it twice if it finds it; if that check can\'t be made, a duplicate is possible. '
+          : `[delivery-delayed] ${which} couldn't be delivered yet (${event.reason}). `) +
           (this.proseOutboxConfig?.path
             ? `It is queued, kept across restarts, and will be retried until ${at(event.expiresAt)}; you don't need to resend it.`
             : `It is queued and will be retried until ${at(event.expiresAt)}, but only in memory: a restart before then loses it, so keep your own copy if it matters.`);
         break;
       case 'delivered-late':
         kind = 'delivered-late';
-        text = `[delivered-late] ${which}, written at ${at(entry.writtenAt)}, was delivered at ${at(event.deliveredAt)}.`;
+        text = entry.outcome === 'unknown'
+          ? `[delivered-late] ${which}, written at ${at(entry.writtenAt)}, was confirmed in the channel at ${at(event.deliveredAt)} ` +
+            '(it may have arrived on the first attempt; the retry checked before sending).'
+          : `[delivered-late] ${which}, written at ${at(entry.writtenAt)}, was delivered at ${at(event.deliveredAt)}.`;
         break;
       case 'dropped':
         kind = 'discord-send-failed';
@@ -7668,6 +7698,7 @@ export class AgentFramework {
             'It is no longer held and won\'t be retried. It may already be in the channel: check before sending it again.'
           : `[discord-send-failed] ${which}, written at ${at(entry.writtenAt)}, was never delivered (${event.reason}). ` +
             'It is no longer held and won\'t be retried; the human did not receive it. If it still matters, send it again.';
+        text += undeliveredCopy(entry, event.savedTo);
         break;
     }
     try {

@@ -459,3 +459,28 @@ test('a queued send survives a restart and is replayed after boot', async () => 
   await b.registry.drainOutboxNow();
   assert.deepEqual(t.calls.map((c) => c.input.content), ['kept']);
 });
+
+test('giving up keeps the words: a copy beside the queue file, and the event says where', async () => {
+  const dir = tempDir();
+  const path = join(dir, 'recovery', 'prose-outbox.json');
+  const m = mockServer();
+  const h = makeRegistry({ server: m.server, outbox: { enabled: true, path, maxAgeMs: 60_000 } });
+  m.state.down = true;
+  await h.registry.routeSpeech('agent', 'the finished message', 'chat:1');
+  h.clock.t += 61_000;
+  h.registry.kickOutbox();
+  await h.registry.drainOutboxNow();
+  const dropped = h.events.find((e) => e.kind === 'dropped') as { savedTo?: string } | undefined;
+  assert.ok(dropped?.savedTo?.startsWith(join(dir, 'recovery', 'undelivered')));
+  assert.equal(JSON.parse(readFileSync(dropped!.savedTo!, 'utf8')).text, 'the finished message');
+});
+
+test('an outcome-unknown queued send says it may already have arrived', async () => {
+  const t = toolServer();
+  const h = makeRegistry({ server: t.server, outbox: TOOLS });
+  await h.registry.callQueueableTool('agent', 'chat', 'send_message', { channelId: 'chat:1', content: 'first' }); // confirms dedupe
+  t.state.mode = 'throw-timeout';
+  const r = await h.registry.callQueueableTool('agent', 'chat', 'send_message', { channelId: 'chat:1', content: 'second' });
+  assert.match(resultText(r), /^\[queued\] No answer .*may already have arrived/);
+  assert.match(resultText(r), /won't post it twice if it finds it/);
+});

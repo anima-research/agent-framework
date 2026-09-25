@@ -9,7 +9,9 @@
   echoes the key in its result. The agent gets non-waking notices naming
   which reply and what, if anything, to do: `[delivery-delayed]` (kept
   across restarts, no need to resend), `[delivered-late]`, and
-  `[discord-send-failed]` (no longer held) when speech is given up.
+  `[discord-send-failed]` (no longer held; carries the full text, and a copy
+  is saved to `recovery/undelivered/`) when speech is given up. After a
+  timeout the notes say the message may already have arrived.
   - `proseOutbox.tools` (e.g. `["send_message", "reply_message"]`) holds
     those send tools the same way: a call that can't reach its target is
     queued with its full input and the agent gets a `[queued]` result

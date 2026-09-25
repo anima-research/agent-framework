@@ -106,12 +106,13 @@ test('connector dies after posting: queued, retried after respawn, deduped, resi
     const delayed = notices.find((n) => n.kind === 'delivery-delayed');
     const late = notices.find((n) => n.kind === 'delivered-late');
     assert.ok(delayed, 'queued notice recorded');
-    assert.match(delayed!.text, /couldn't be delivered yet/);
+    // The connector died mid-send: no answer is not "didn't arrive".
+    assert.match(delayed!.text, /got no answer .*so it may already have arrived/);
     assert.match(delayed!.text, /you don't need to resend it/);
     assert.match(delayed!.text, /starting "during the outage"/, 'names which reply');
     assert.match(delayed!.text, /kept across restarts/);
     assert.ok(late, 'late-delivery notice recorded');
-    assert.match(late!.text, /was delivered at \d\d:\d\d/);
+    assert.match(late!.text, /was confirmed in the channel at \d\d:\d\d \(it may have arrived on the first attempt/);
     assert.match(late!.text, /starting "during the outage"/);
     assert.equal(membrane.calls.length, 0, 'notices never wake the agent');
   } finally {
@@ -168,7 +169,7 @@ test('send_message through a real agent turn: connector dies → "[queued]" tool
     writeFileSync(modeFile, 'crash-before idem');
     await turn('during the outage');
     const last = toolResults().at(-1) ?? '';
-    assert.match(last, /\[queued\] Not sent yet/, 'the agent sees "queued", not an error');
+    assert.match(last, /\[queued\] No answer .*may already have arrived/, 'the agent sees "queued", not an error');
     assert.match(last, /don't need to resend/);
 
     writeFileSync(modeFile, 'ok idem');
@@ -179,8 +180,39 @@ test('send_message through a real agent turn: connector dies → "[queued]" tool
 
     const notices = fw.agents.get('assistant')!.getContextManager().getAllMessages()
       .filter((m) => m.metadata?.system === true).map((m) => m.content[0]?.text ?? '');
-    assert.ok(notices.some((t) => /^\[delivered-late\] Your send_message to #room \(chat:room\) starting "during the outage"/.test(t)));
+    assert.ok(notices.some((t) => /^\[delivered-late\] Your send_message to #room \(chat:room\) starting "during the outage".*confirmed in the channel/.test(t)));
     assert.ok(!notices.some((t) => t.startsWith('[delivery-delayed]')), 'no duplicate notice: the tool result already said so');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('notices: a give-up carries the full text; an unanswered send says it may have arrived', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'prose-outbox-notice-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  try {
+    const entry = {
+      id: 'e1', conversationId: 'assistant', channelId: 'chat:room', text: 'Every word of the essay.',
+      writtenAt: Date.parse('2026-09-25T13:10:00Z'), attempts: 3, nextAttemptAt: 0, outcome: 'not-sent' as const, lastError: 'x',
+    };
+    const record = (e: unknown) => (framework as unknown as { recordOutboxNotice(e: unknown): void }).recordOutboxNotice(e);
+    record({ kind: 'dropped', entry, reason: 'it was too old to send', mayHaveArrived: false, savedTo: '/q/undelivered/e1.json' });
+    record({ kind: 'queued', entry: { ...entry, id: 'e2', outcome: 'unknown' }, reason: 'timed out', expiresAt: entry.writtenAt + 6 * 3_600_000 });
+    const texts = (framework as unknown as Internals).agents.get('assistant')!.getContextManager().getAllMessages()
+      .filter((m) => m.metadata?.system === true).map((m) => m.content[0]?.text ?? '');
+    const gaveUp = texts.find((t) => t.startsWith('[discord-send-failed]'))!;
+    assert.match(gaveUp, /no longer held/);
+    assert.match(gaveUp, /Here is the full text, so nothing is lost:\n"""\nEvery word of the essay\.\n"""/);
+    assert.match(gaveUp, /A copy is also saved at \/q\/undelivered\/e1\.json/);
+    const unanswered = texts.find((t) => t.startsWith('[delivery-delayed]'))!;
+    assert.match(unanswered, /got no answer \(timed out\), so it may already have arrived/);
+    assert.doesNotMatch(unanswered, /couldn't be delivered/);
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });

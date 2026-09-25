@@ -86,11 +86,20 @@ first words: several can be queued at once) and says what, if anything, the
 agent needs to do:
 - `[delivery-delayed]`: queued, kept across restarts, retried until a stated
   time; no need to resend. (Without a queue file it says the hold is
-  memory-only, so the agent keeps its own copy.)
-- `[delivered-late]`: written at X, delivered at Y. Nothing to do.
+  memory-only, so the agent keeps its own copy.) After a timeout it says
+  the message **got no answer and may already have arrived**: a timeout is
+  the absence of an answer, not a failure, and the retry checks the channel
+  before sending (a duplicate is possible only if that check can't be made:
+  at-least-once, marked as such).
+- `[delivered-late]`: written at X, delivered at Y. Nothing to do. (After a
+  timeout: "confirmed in the channel", since it may have arrived the first
+  time.)
 - `[discord-send-failed]`: no longer held and won't be retried; either it
   never arrived ("send it again if it still matters") or it may already be
-  in the channel ("check before sending it again").
+  in the channel ("check before sending it again"). **It carries the full
+  text** (up to 8,000 characters inline; attachments listed), and a copy is
+  saved to `undelivered/` beside the queue file, so giving up never loses
+  the words and the agent needs no shadow copy of its own.
 
 ## Not covered
 

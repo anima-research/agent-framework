@@ -87,7 +87,12 @@ export type OutboxEvent =
   /** Dropped without delivery: expired, over a cap, a permanent error on
    *  retry, or an unknown outcome the server can't dedupe. `mayHaveArrived`
    *  is true when some attempt's outcome was unknown. */
-  | { kind: 'dropped'; entry: OutboxEntry; reason: string; mayHaveArrived: boolean };
+  | {
+      kind: 'dropped'; entry: OutboxEntry; reason: string; mayHaveArrived: boolean;
+      /** Where the undelivered text was saved (queue file's directory,
+       *  `undelivered/`), when there is a queue file. */
+      savedTo?: string;
+    };
 
 interface PersistedState {
   version: 1;
@@ -196,9 +201,7 @@ export class ProseOutbox {
     this.entries = this.entries.filter((e) => !overflow.includes(e));
     while (this.entries.length > this.maxEntries) overflow.push(this.entries.shift()!);
     this.persist();
-    for (const e of overflow) {
-      this.onEvent({ kind: 'dropped', entry: e, reason: 'the delivery queue is full', mayHaveArrived: e.outcome === 'unknown' });
-    }
+    for (const e of overflow) this.emitDropped(e, 'the delivery queue is full', e.outcome === 'unknown');
     if (this.entries.includes(entry)) {
       this.onEvent({ kind: 'queued', entry, reason, expiresAt: entry.writtenAt + this.maxAgeMs });
     }
@@ -259,7 +262,38 @@ export class ProseOutbox {
   drop(id: string, reason: string, mayHaveArrived?: boolean): void {
     const entry = this.take(id);
     if (!entry) return;
-    this.onEvent({ kind: 'dropped', entry, reason, mayHaveArrived: mayHaveArrived ?? entry.outcome === 'unknown' });
+    this.emitDropped(entry, reason, mayHaveArrived ?? entry.outcome === 'unknown');
+  }
+
+  /**
+   * Giving up must not lose the words: keep a copy beside the queue file
+   * (`undelivered/`), and hand the event the path. The notice to the agent
+   * carries the text itself, so nothing depends on the agent keeping its
+   * own shadow copy (the Librarian's question: "where does the text go?").
+   */
+  private emitDropped(entry: OutboxEntry, reason: string, mayHaveArrived: boolean): void {
+    let savedTo: string | undefined;
+    if (this.path) {
+      try {
+        const dir = join(dirname(this.path), 'undelivered');
+        mkdirSync(dir, { recursive: true });
+        savedTo = join(dir, `${new Date(entry.writtenAt).toISOString().replace(/[:.]/g, '-')}-${entry.id}.json`);
+        writeFileSync(savedTo, `${JSON.stringify({
+          conversationId: entry.conversationId,
+          channelId: entry.channelId,
+          writtenAt: new Date(entry.writtenAt).toISOString(),
+          droppedAt: new Date(this.now()).toISOString(),
+          reason,
+          mayHaveArrived,
+          text: entry.text,
+          ...(entry.tool ? { tool: entry.tool } : {}),
+        }, null, 2)}\n`, { mode: 0o600 });
+      } catch (err) {
+        console.error('[prose-outbox] failed to save undelivered text:', err);
+        savedTo = undefined;
+      }
+    }
+    this.onEvent({ kind: 'dropped', entry, reason, mayHaveArrived, ...(savedTo ? { savedTo } : {}) });
   }
 
   snapshot(): readonly OutboxEntry[] {
@@ -272,9 +306,7 @@ export class ProseOutbox {
     if (expired.length === 0) return;
     this.entries = this.entries.filter((e) => e.writtenAt >= cutoff);
     this.persist();
-    for (const e of expired) {
-      this.onEvent({ kind: 'dropped', entry: e, reason: 'it was too old to send', mayHaveArrived: e.outcome === 'unknown' });
-    }
+    for (const e of expired) this.emitDropped(e, 'it was too old to send', e.outcome === 'unknown');
   }
 
   private take(id: string): OutboxEntry | undefined {

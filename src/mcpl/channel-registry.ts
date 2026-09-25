@@ -3234,7 +3234,7 @@ export class ChannelRegistry {
     return `${serverId}:${raw || 'unknown'}`;
   }
 
-  private queuedToolResult(entry: { tool?: { name: string }; writtenAt: number }, reason: string): ToolResult {
+  private queuedToolResult(entry: { tool?: { name: string }; writtenAt: number; outcome?: OutboxOutcome }, reason: string): ToolResult {
     const at = entry.writtenAt + (this.proseOutbox?.maxAgeMs ?? 0);
     const until = this.formatTime ? this.formatTime(at) : new Date(at).toISOString();
     const durable = this.proseOutboxDurable
@@ -3244,7 +3244,11 @@ export class ChannelRegistry {
       success: true,
       data: [{
         type: 'text',
-        text: `[queued] Not sent yet (${reason}). This ${entry.tool?.name ?? 'send'} is ${durable} and will be ` +
+        text: (entry.outcome === 'unknown'
+          ? `[queued] No answer (${reason}), so this may already have arrived. The retry checks the channel first ` +
+            'and won\'t post it twice if it finds it; if that check can\'t be made, a duplicate is possible. '
+          : `[queued] Not sent yet (${reason}). `) +
+          `This ${entry.tool?.name ?? 'send'} is ${durable} and will be ` +
           `delivered when the connection is back, until ${until}; you don't need to resend it.`,
       }],
     };
