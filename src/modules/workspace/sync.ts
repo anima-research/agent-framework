@@ -193,24 +193,45 @@ export async function syncFromFs(
   return result;
 }
 
+export interface MaterializeResult {
+  /** Paths actually written to disk */
+  written: string[];
+  /** Paths refused by the freshness guard, each with the reason — a silently
+   *  overwritten shell edit is unrecoverable, so divergence must surface
+   *  instead of being resolved toward the workspace copy (issue #109: a bulk
+   *  materialize reverted 217 shell-edited files to a stale snapshot). */
+  skipped: SkippedFile[];
+}
+
 /**
  * Materialize Chronicle tree state to filesystem.
+ *
+ * Freshness guard (#109): files get modified by two hands — this layer AND
+ * direct shell/tool edits. Before overwriting, the disk content's hash is
+ * compared against `materializedHashes` (the hash this layer last wrote): a
+ * mismatch means another writer changed the file since, and the path is
+ * refused loudly instead of silently reverted, unless `force`. Symmetric
+ * with syncFromFs's conflict detection, and with the same blind spot: no
+ * baseline (fresh process, never materialized) means no guard.
  *
  * @param store Chronicle store
  * @param mount Mount state
  * @param paths Specific paths to materialize. If undefined, materializes all changed since last.
- * @returns List of paths that were written
+ * @param opts force: overwrite even where the disk copy changed under us.
+ * @returns Paths written, and paths the freshness guard refused
  */
 export async function materializeToFs(
   store: JsStore,
   mount: MountState,
   paths?: string[],
-): Promise<string[]> {
+  opts?: { force?: boolean },
+): Promise<MaterializeResult> {
   if (mount.config.mode === 'read-only') {
-    return [];
+    return { written: [], skipped: [] };
   }
 
   const written: string[] = [];
+  const skipped: SkippedFile[] = [];
 
   // Get changed files since last materialization
   const currentSeq = store.currentSequence();
@@ -262,6 +283,45 @@ export async function materializeToFs(
     const blob = store.getBlob(blobHash);
     if (!blob) continue;
 
+    let diskBuffer: Buffer | null = null;
+    try {
+      diskBuffer = await readFile(absolutePath);
+    } catch (err) {
+      // Only absence proves there is nothing to overwrite. Any other read
+      // failure (EACCES on a write-only file, EISDIR, EIO...) means freshness
+      // cannot be verified, and writeFile may still succeed — so refuse
+      // rather than treat "unreadable" as "not there".
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && !opts?.force) {
+        skipped.push({
+          path: relativePath,
+          reason:
+            `cannot verify disk copy (${code ?? (err as Error).message}) — ` +
+            'fix its permissions and materialize again, or pass force to overwrite it',
+        });
+        continue;
+      }
+    }
+    if (diskBuffer) {
+      const diskHash = hashContent(diskBuffer);
+      if (diskHash === blobHash) {
+        // Disk already holds exactly these bytes: re-pin the baseline and
+        // leave the file (and its mtime) alone.
+        mount.materializedHashes.set(relativePath, blobHash);
+        continue;
+      }
+      const baselineHash = mount.materializedHashes.get(relativePath);
+      if (!opts?.force && baselineHash !== undefined && diskHash !== baselineHash) {
+        skipped.push({
+          path: relativePath,
+          reason:
+            'stale copy: disk changed since last materialize (another writer) — ' +
+            'sync first to adopt the disk version, or pass force to overwrite it',
+        });
+        continue;
+      }
+    }
+
     // Create parent directories
     await mkdir(dirname(absolutePath), { recursive: true });
 
@@ -273,9 +333,15 @@ export async function materializeToFs(
     mount.materializedHashes.set(relativePath, blobHash);
   }
 
-  mount.lastMaterializedSeq = currentSeq;
+  // A skipped path must stay pending: advancing the watermark past it would
+  // drop it from every future incremental diff, turning a loud refusal into
+  // a permanent silent one. Re-attempting already-written files is free —
+  // they short-circuit on the identical-bytes check above.
+  if (skipped.length === 0) {
+    mount.lastMaterializedSeq = currentSeq;
+  }
 
-  return written;
+  return { written, skipped };
 }
 
 /**

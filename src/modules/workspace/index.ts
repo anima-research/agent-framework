@@ -1053,7 +1053,7 @@ export class WorkspaceModule implements Module {
           properties: {
             path: { type: 'string', description: 'Specific path to materialize (optional — defaults to all changed)' },
             mount: { type: 'string', description: 'Specific mount (optional)' },
-            force: { type: 'boolean', description: 'Materialize even if the current branch has diverged from the branch last written to disk (default false). Only needed for genuine divergence — descendant branches pass automatically.' },
+            force: { type: 'boolean', description: 'Overwrite files whose disk copy changed since the last materialize (another writer), and materialize even if the current branch has diverged from the branch last written to disk (default false). Without it, divergent files are skipped and listed.' },
           },
         },
       },
@@ -2307,11 +2307,16 @@ export class WorkspaceModule implements Module {
 
       // Suppress watcher for paths we're about to write
       const watcher = this.watchers.get(name);
-      const written = await materializeToFs(store, mount, paths);
+      const { written, skipped } = await materializeToFs(store, mount, paths, { force: input.force });
 
       for (const p of written) {
         watcher?.suppress(p);
         allWritten.push({ mount: name, path: p });
+      }
+      // Freshness-guard refusals (#109) ride the same skipped list as branch
+      // blocks: divergence must be visible, not resolved silently either way.
+      for (const s of skipped) {
+        blocked.push({ mount: name, reason: `${s.path}: ${s.reason}` });
       }
 
       // Track which branch we materialized on. Re-pin on a clean empty
@@ -2349,7 +2354,10 @@ export class WorkspaceModule implements Module {
     mount.lastMaterializedSeq = 0;
 
     const watcher = this.watchers.get(mountName);
-    const written = await materializeToFs(store, mount);
+    // force: this path only runs after a deliberate undo/redo/branch switch
+    // on the framework's own _config mount — restoring disk to the branch
+    // state IS the operator intent, so the freshness guard yields.
+    const { written } = await materializeToFs(store, mount, undefined, { force: true });
     for (const p of written) {
       watcher?.suppress(p);
     }
