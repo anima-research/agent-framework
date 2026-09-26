@@ -15,8 +15,14 @@
  *   - retries only what is safe to resend: `not-sent` (the request provably
  *     never reached the server), or `unknown` (timed out; may have posted)
  *     when the server confirms it honours `idempotencyKey`;
- *   - expires entries past `maxAgeMs` and caps its size, telling the
- *     resident either way.
+ *   - expires the resident's own words past `maxAgeMs` (a stale reply may
+ *     no longer fit the conversation), but keeps automatic notices until
+ *     delivered by default (`noticeMaxAgeMs`): what they report stays true,
+ *     and they are written at the START of an outage, so a shared age limit
+ *     drops exactly the entries that report drops (the Librarian,
+ *     2026-09-26);
+ *   - caps its size, dropping the oldest of the resident's own entries
+ *     before any notice, and tells the resident either way.
  *
  * Pure bookkeeping: the registry performs the publishes and wires events to
  * resident notices.
@@ -36,8 +42,12 @@ export interface ProseOutboxConfig {
   /** Queue file. Defaults to `<storePath>/recovery/prose-outbox.json`;
    *  without either the queue is memory-only (lost on restart). */
   path?: string;
-  /** Entries older than this are not sent (default 6 h). */
+  /** The resident's own speech and sends older than this are not sent (default 6 h). */
   maxAgeMs?: number;
+  /** Automatic notices (entries marked `notice`) older than this are not
+   *  sent. Default: no age limit, kept until delivered (still bounded by
+   *  the size caps). */
+  noticeMaxAgeMs?: number;
   /** Cap across all agents (default 200); the oldest entry expires first. */
   maxEntries?: number;
   /** Cap per agent (default 50). */
@@ -79,9 +89,14 @@ export interface OutboxEntry {
   lastError: string;
   /** Present for a queued tool call (config.tools); absent for plain speech. */
   tool?: { serverId: string; name: string; input: Record<string, unknown> };
+  /** An automatic notice posted by the framework (e.g. a failure notice),
+   *  not the resident's own words: expires by `noticeMaxAgeMs`, and is
+   *  dropped for space only after the resident's own entries. */
+  notice?: true;
 }
 
 export type OutboxEvent =
+  /** `expiresAt` is Infinity for an entry with no age limit. */
   | { kind: 'queued'; entry: OutboxEntry; reason: string; expiresAt: number }
   | { kind: 'delivered-late'; entry: OutboxEntry; deliveredAt: number; messageId?: string }
   /** Dropped without delivery: expired, over a cap, a permanent error on
@@ -129,6 +144,7 @@ export function classifyPublishError(err: unknown): PublishFailureClass {
 
 export class ProseOutbox {
   readonly maxAgeMs: number;
+  readonly noticeMaxAgeMs: number;
   private readonly maxEntries: number;
   private readonly maxPerAgent: number;
   private readonly retryBaseMs: number;
@@ -143,6 +159,7 @@ export class ProseOutbox {
     private readonly now: () => number = Date.now,
   ) {
     this.maxAgeMs = config.maxAgeMs ?? 6 * HOUR;
+    this.noticeMaxAgeMs = config.noticeMaxAgeMs ?? Number.POSITIVE_INFINITY;
     this.maxEntries = Math.max(1, config.maxEntries ?? 200);
     this.maxPerAgent = Math.max(1, config.maxEntriesPerAgent ?? 50);
     this.retryBaseMs = Math.max(1, config.retryBaseMs ?? 60_000);
@@ -182,6 +199,7 @@ export class ProseOutbox {
     input: {
       id: string; conversationId: string; channelId: string; text: string; writtenAt: number;
       tool?: OutboxEntry['tool'];
+      notice?: true;
     },
     outcome: OutboxOutcome,
     reason: string,
@@ -197,13 +215,15 @@ export class ProseOutbox {
     this.entries.push(entry);
     const overflow: OutboxEntry[] = [];
     const agentEntries = this.entries.filter((e) => e.conversationId === entry.conversationId);
-    for (let i = 0; i < agentEntries.length - this.maxPerAgent; i++) overflow.push(agentEntries[i]!);
+    overflow.push(...evictionOrder(agentEntries).slice(0, Math.max(0, agentEntries.length - this.maxPerAgent)));
     this.entries = this.entries.filter((e) => !overflow.includes(e));
-    while (this.entries.length > this.maxEntries) overflow.push(this.entries.shift()!);
+    const globalOver = evictionOrder(this.entries).slice(0, Math.max(0, this.entries.length - this.maxEntries));
+    overflow.push(...globalOver);
+    this.entries = this.entries.filter((e) => !globalOver.includes(e));
     this.persist();
     for (const e of overflow) this.emitDropped(e, 'the delivery queue is full', e.outcome === 'unknown');
     if (this.entries.includes(entry)) {
-      this.onEvent({ kind: 'queued', entry, reason, expiresAt: entry.writtenAt + this.maxAgeMs });
+      this.onEvent({ kind: 'queued', entry, reason, expiresAt: this.expiresAt(entry) });
     }
     return entry;
   }
@@ -300,11 +320,16 @@ export class ProseOutbox {
     return this.entries.map((e) => ({ ...e }));
   }
 
+  /** When an entry stops being sent: by class (Infinity = no age limit). */
+  expiresAt(entry: OutboxEntry): number {
+    return entry.writtenAt + (entry.notice ? this.noticeMaxAgeMs : this.maxAgeMs);
+  }
+
   private expire(): void {
-    const cutoff = this.now() - this.maxAgeMs;
-    const expired = this.entries.filter((e) => e.writtenAt < cutoff);
+    const now = this.now();
+    const expired = this.entries.filter((e) => this.expiresAt(e) < now);
     if (expired.length === 0) return;
-    this.entries = this.entries.filter((e) => e.writtenAt >= cutoff);
+    this.entries = this.entries.filter((e) => !expired.includes(e));
     this.persist();
     for (const e of expired) this.emitDropped(e, 'it was too old to send', e.outcome === 'unknown');
   }
@@ -353,6 +378,13 @@ export class ProseOutbox {
   }
 }
 
+/** Order in which entries give way to a size cap: the resident's own words
+ *  oldest first, then notices oldest first (a notice is short and reports a
+ *  failure the room otherwise never hears about). */
+function evictionOrder(entries: readonly OutboxEntry[]): OutboxEntry[] {
+  return [...entries.filter((e) => !e.notice), ...entries.filter((e) => e.notice)];
+}
+
 function isEntry(v: unknown): v is OutboxEntry {
   const e = v as Partial<OutboxEntry> | null;
   return !!e && typeof e.id === 'string' && typeof e.conversationId === 'string' &&
@@ -360,6 +392,7 @@ function isEntry(v: unknown): v is OutboxEntry {
     typeof e.writtenAt === 'number' && typeof e.attempts === 'number' &&
     typeof e.nextAttemptAt === 'number' && (e.outcome === 'not-sent' || e.outcome === 'unknown') &&
     typeof e.lastError === 'string' &&
+    (e.notice === undefined || e.notice === true) &&
     (e.tool === undefined || (
       typeof e.tool === 'object' && e.tool !== null && typeof e.tool.serverId === 'string' &&
       typeof e.tool.name === 'string' && typeof e.tool.input === 'object' && e.tool.input !== null

@@ -218,3 +218,34 @@ test('notices: a give-up carries the full text; an unanswered send says it may h
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('notices about a queued automatic notice do not credit it to the resident', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'prose-outbox-notice-class-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  try {
+    const entry = {
+      id: 'n1', conversationId: 'assistant', channelId: 'chat:room', text: "⚠️ [automatic notice] assistant's reply failed to generate",
+      writtenAt: Date.parse('2026-09-26T05:11:00Z'), attempts: 1, nextAttemptAt: 0, outcome: 'not-sent' as const, lastError: 'x', notice: true as const,
+    };
+    const record = (e: unknown) => (framework as unknown as { recordOutboxNotice(e: unknown): void }).recordOutboxNotice(e);
+    record({ kind: 'queued', entry, reason: 'connection closed', expiresAt: Number.POSITIVE_INFINITY });
+    record({ kind: 'dropped', entry: { ...entry, id: 'n2' }, reason: 'the delivery queue is full', mayHaveArrived: false });
+    const texts = (framework as unknown as Internals).agents.get('assistant')!.getContextManager().getAllMessages()
+      .filter((m) => m.metadata?.system === true).map((m) => m.content[0]?.text ?? '');
+    const delayed = texts.find((t) => t.startsWith('[delivery-delayed]'))!;
+    assert.match(delayed, /^\[delivery-delayed\] The automatic notice to /);
+    assert.match(delayed, /retried until it is delivered/);
+    assert.doesNotMatch(delayed, /Invalid|NaN|Your reply/);
+    const gaveUp = texts.find((t) => t.startsWith('[discord-send-failed]'))!;
+    assert.match(gaveUp, /The automatic notice to .* the room was not told/);
+    assert.doesNotMatch(gaveUp, /Your reply|the human did not receive it/);
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

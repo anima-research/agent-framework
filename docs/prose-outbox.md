@@ -7,7 +7,8 @@ posts, and with the agent told what happened.
 ```ts
 proseOutbox: {
   enabled: true,
-  maxAgeMs: 6 * 60 * 60_000,   // give up after this (default 6 h)
+  maxAgeMs: 6 * 60 * 60_000,   // give up on the agent's own words after this (default 6 h)
+  noticeMaxAgeMs: Infinity,     // automatic notices: kept until delivered (default)
   maxEntriesPerAgent: 50,       // defaults shown
   maxEntries: 200,
   retryBaseMs: 60_000,          // doubles per attempt…
@@ -77,7 +78,16 @@ perform later: sends, never deletes or edits.
 - Drains run when a server connects or reconnects (after its grant is
   re-established), and on a timer while anything is queued. A drain never
   blocks generation.
-- Entries past `maxAgeMs` or over a cap are dropped, oldest first.
+- Two classes. The agent's own speech and sends expire after `maxAgeMs`,
+  because a reply hours late may no longer fit the conversation. Automatic
+  notices (`routeSpeech(..., { notice: true })`, e.g. a failure notice)
+  are kept until delivered unless `noticeMaxAgeMs` is set. What a notice
+  reports stays true. It is also written at the start of an outage, so a
+  shared age limit would drop exactly the entries that report drops.
+- Over a cap, the agent's own entries give way oldest first, and notices only
+  after them. The survivors keep their order.
+- A notice is never credited to the agent: its notes say "The automatic
+  notice", not "Your reply".
 
 ## What the agent sees
 

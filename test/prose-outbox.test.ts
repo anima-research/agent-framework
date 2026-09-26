@@ -81,7 +81,7 @@ interface Harness {
 
 function makeRegistry(opts: {
   server: unknown;
-  outbox?: { enabled: boolean; path?: string; maxAgeMs?: number; maxEntriesPerAgent?: number };
+  outbox?: { enabled: boolean; path?: string; maxAgeMs?: number; noticeMaxAgeMs?: number; maxEntriesPerAgent?: number };
   channels?: string[];
   clock?: { t: number };
 }): Harness {
@@ -314,6 +314,69 @@ test('per-agent cap: the oldest entry is dropped first, with a notice', async ()
   const dropped = h.events.filter((e) => e.kind === 'dropped');
   assert.equal(dropped.length, 1);
   assert.equal(dropped[0]!.entry.text, 'a');
+});
+
+// Automatic notices (the Librarian, 2026-09-26): a failure notice is written
+// at the START of an outage, so under the speech age limit it was the entry
+// most likely to expire: the class that reports drops was the class dropped.
+test('an automatic notice outlives the speech age limit and is still delivered, first', async () => {
+  const m = mockServer();
+  const h = makeRegistry({ server: m.server, outbox: { enabled: true, maxAgeMs: 60_000 } });
+  m.state.down = true;
+  await h.registry.routeSpeech('agent', '⚠️ notice', 'chat:1', { notice: true });
+  await h.registry.routeSpeech('agent', 'reply', 'chat:1');
+  const queued = h.events.find((e) => e.kind === 'queued' && e.entry.notice);
+  assert.equal((queued as { expiresAt: number }).expiresAt, Number.POSITIVE_INFINITY);
+  h.clock.t += 12 * 3_600_000; // a long outage
+  m.state.down = false;
+  h.registry.kickOutbox();
+  await h.registry.drainOutboxNow();
+  assert.deepEqual(m.sent.map((s) => s.text), ['⚠️ notice']);
+  const dropped = h.events.filter((e) => e.kind === 'dropped');
+  assert.deepEqual(dropped.map((e) => e.entry.text), ['reply'], 'the stale reply expires as before');
+});
+
+test('noticeMaxAgeMs, when set, bounds notices too', async () => {
+  const m = mockServer();
+  const h = makeRegistry({ server: m.server, outbox: { enabled: true, maxAgeMs: 60_000, noticeMaxAgeMs: 120_000 } });
+  m.state.down = true;
+  await h.registry.routeSpeech('agent', '⚠️ notice', 'chat:1', { notice: true });
+  h.clock.t += 121_000;
+  m.state.down = false;
+  h.registry.kickOutbox();
+  await h.registry.drainOutboxNow();
+  assert.equal(m.sent.length, 0);
+  assert.equal(h.events.at(-1)!.kind, 'dropped');
+});
+
+test('size cap: the resident\'s oldest words give way before an older notice', async () => {
+  const m = mockServer();
+  const h = makeRegistry({ server: m.server, outbox: { enabled: true, maxEntriesPerAgent: 2 } });
+  m.state.down = true;
+  await h.registry.routeSpeech('agent', 'N', 'chat:1', { notice: true });
+  for (const t of ['a', 'b']) await h.registry.routeSpeech('agent', t, 'chat:1');
+  const dropped = h.events.filter((e) => e.kind === 'dropped');
+  assert.deepEqual(dropped.map((e) => e.entry.text), ['a']);
+  m.state.down = false;
+  h.registry.kickOutbox();
+  await h.registry.drainOutboxNow();
+  assert.deepEqual(m.sent.map((s) => s.text), ['N', 'b'], 'order is kept among the survivors');
+});
+
+test('the notice class survives a restart', async () => {
+  const path = join(tempDir(), 'recovery', 'prose-outbox.json');
+  const m = mockServer();
+  m.state.down = true;
+  const clock = { t: Date.parse('2026-09-25T12:00:00Z') };
+  const a = makeRegistry({ server: m.server, outbox: { enabled: true, path, maxAgeMs: 60_000 }, clock });
+  await a.registry.routeSpeech('agent', '⚠️ notice', 'chat:1', { notice: true });
+  a.registry.stopAll();
+  clock.t += 3_600_000;
+  m.state.down = false;
+  const b = makeRegistry({ server: m.server, outbox: { enabled: true, path, maxAgeMs: 60_000 }, clock });
+  b.registry.kickOutbox();
+  await b.registry.drainOutboxNow();
+  assert.deepEqual(m.sent.map((s) => s.text), ['⚠️ notice']);
 });
 
 test('a retry that fails permanently is dropped with the reason', async () => {

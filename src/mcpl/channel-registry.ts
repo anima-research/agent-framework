@@ -2868,6 +2868,10 @@ export class ChannelRegistry {
      *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
      *  "this turn is pinned to no locus": fail loudly rather than guess. */
     locusChannelId: string | null,
+    /** `notice`: an automatic notice from the framework, not the resident's
+     *  own words; if it has to be queued it gets the notice class
+     *  (ProseOutboxConfig.noticeMaxAgeMs, dropped for space last). */
+    opts?: { notice?: boolean },
   ): Promise<{ delivered: boolean; channelId: string; messageId?: string; queued?: boolean } | null> {
     // Surface a routing failure: emit a trace AND notify the host (which drops
     // a `[discord-send-failed]` marker into chronicle) so the agent learns her
@@ -2905,7 +2909,7 @@ export class ChannelRegistry {
     if (outbox?.hasQueued(channelId)) {
       // Keep order: earlier undelivered speech to this channel goes first.
       const entry = outbox.enqueue(
-        { id: ProseOutbox.newId(), conversationId, channelId, text, writtenAt },
+        { id: ProseOutbox.newId(), conversationId, channelId, text, writtenAt, ...(opts?.notice ? { notice: true as const } : {}) },
         'not-sent',
         'an earlier reply to this channel is still waiting to be delivered',
       );
@@ -2926,7 +2930,11 @@ export class ChannelRegistry {
       (attempt.retry === 'unknown' && attempt.serverId !== undefined && outbox?.isIdempotent(attempt.serverId) === true);
     if (outbox && id && resendable) {
       console.error(`[routeSpeech] ${conversationId}: ${attempt.reason} — ${text.length} chars queued for retry (${id})`);
-      outbox.enqueue({ id, conversationId, channelId, text, writtenAt }, attempt.retry as OutboxOutcome, attempt.reason);
+      outbox.enqueue(
+        { id, conversationId, channelId, text, writtenAt, ...(opts?.notice ? { notice: true as const } : {}) },
+        attempt.retry as OutboxOutcome,
+        attempt.reason,
+      );
       this.emitTraceFn({ type: 'mcpl:speech-queued', conversationId, channelId, outboxId: id, textLen: text.length, reason: attempt.reason });
       this.scheduleOutbox();
       return { delivered: false, queued: true, channelId };
