@@ -39,7 +39,7 @@ import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
 import { CapabilityGrant } from './capability-grant.js';
-import { ProseOutbox, classifyPublishError, type OutboxEvent, type OutboxOutcome, type ProseOutboxConfig, type PublishFailureClass } from './prose-outbox.js';
+import { ProseOutbox, classifyPublishError, type OutboxEntry, type OutboxEvent, type OutboxOutcome, type ProseOutboxConfig, type PublishFailureClass } from './prose-outbox.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -521,6 +521,8 @@ export interface QueueTicket {
   text: string;
   writtenAt: number;
   tool: { serverId: string; name: string; input: Record<string, unknown> };
+  /** Set when queued: kept copies of the call's files (ProseOutbox.keepAttachments). */
+  attachments?: OutboxEntry['attachments'];
 }
 
 function toolResultText(result: McpToolCallResult): string {
@@ -592,6 +594,8 @@ export class ChannelRegistry {
   private onOutboxEvent?: (event: OutboxEvent) => void;
   private outboxTimer: ReturnType<typeof setTimeout> | null = null;
   private outboxDraining: Promise<void> | null = null;
+  /** The entry whose retry is being attempted right now (cancel refuses it). */
+  private outboxInFlight: string | null = null;
   private outboxStopped = false;
   /** ProseOutboxConfig.tools. */
   private queueableTools = new Set<string>();
@@ -3121,6 +3125,8 @@ export class ChannelRegistry {
       tool: { serverId, name: toolName, input },
     };
     if (outbox.hasQueued(ticket.channelId)) {
+      const unkept = this.keepTicketFiles(ticket);
+      if (unkept) return { queuedResult: unkept };
       const queued = outbox.enqueue(ticket, 'not-sent', 'an earlier message to this channel is still waiting to be delivered');
       void this.drainOutboxNow();
       return { queuedResult: this.queuedToolResult(queued, 'an earlier message to this channel is still waiting') };
@@ -3155,10 +3161,85 @@ export class ChannelRegistry {
     }
     const resendable = retry === 'not-sent' || (retry === 'unknown' && outbox.isIdempotent(scope));
     if (!resendable) return null;
+    const unkept = this.keepTicketFiles(ticket, reason);
+    if (unkept) return unkept;
     console.error(`[prose-outbox] ${ticket.conversationId}: ${ticket.tool.name} ${reason.slice(0, 200)} — queued for retry (${ticket.id})`);
     const queued = outbox.enqueue(ticket, retry as OutboxOutcome, `${ticket.tool.name} failed: ${reason.slice(0, 300)}`);
     this.scheduleOutbox();
     return this.queuedToolResult(queued, reason.slice(0, 300));
+  }
+
+  /**
+   * Keep the ticket's files before it is queued (sends what was chosen, not
+   * whatever is at the path later). Returns null when queueing may proceed,
+   * or the error result to give the agent instead: the call was not queued,
+   * and nothing was sent without its files.
+   */
+  private keepTicketFiles(ticket: QueueTicket, failure?: string): ToolResult | null {
+    const kept = this.proseOutbox!.keepAttachments(ticket.id, ticket.tool.input);
+    if (kept.ok) {
+      ticket.tool = { ...ticket.tool, input: kept.input };
+      if (kept.attachments) ticket.attachments = kept.attachments;
+      return null;
+    }
+    console.error(`[prose-outbox] ${ticket.conversationId}: ${ticket.tool.name} not queued: ${kept.reason}`);
+    return {
+      success: false,
+      isError: true,
+      error:
+        `${failure ? `${ticket.tool.name} failed (${failure.slice(0, 200)}). ` : `Not sent: an earlier message to this channel is still waiting. `}` +
+        `It was not queued for retry because ${kept.reason}. Nothing was sent, with or without the files; ` +
+        'send it again when the connection is back.',
+    };
+  }
+
+  /**
+   * Withdraw a queued entry before delivery (an agent's own, or any for an
+   * operator). An entry whose retry is in flight right now can't be
+   * withdrawn: it may already be posting.
+   */
+  cancelOutboxEntry(ref: string, by: 'agent' | 'operator', conversationId?: string):
+    { ok: true; id: string; channelId: string; text: string; tool?: string } | { ok: false; reason: string } {
+    const outbox = this.proseOutbox;
+    if (!outbox) return { ok: false, reason: 'the delivery queue is not enabled' };
+    const inFlight = this.outboxInFlight;
+    if (inFlight && inFlight.startsWith(ref.trim()) && ref.trim().length >= 6 &&
+        (conversationId === undefined || outbox.snapshot().some((e) => e.id === inFlight && e.conversationId === conversationId))) {
+      return { ok: false, reason: 'it is being sent right now, so it can no longer be withdrawn; it may already be in the channel' };
+    }
+    const r = outbox.cancel(ref, by, conversationId);
+    if (!r.ok) return r;
+    // Whatever was queued behind it keeps its own schedule (a withdrawal
+    // never triggers a send by itself).
+    this.scheduleOutbox();
+    return { ok: true, id: r.entry.id, channelId: r.entry.channelId, text: r.entry.text, ...(r.entry.tool ? { tool: r.entry.tool.name } : {}) };
+  }
+
+  /** Pending entries (optionally one agent's) and that agent's recent give-ups. */
+  outboxStatus(conversationId?: string): {
+    enabled: boolean;
+    durable: boolean;
+    pending: Array<{ id: string; conversationId: string; channelId: string; writtenAt: number; attempts: number;
+      outcome: OutboxOutcome; lastError: string; preview: string; tool?: string; notice?: boolean; attachments: number; expiresAt: number }>;
+    givenUp: Array<{ id: string; channelId: string; writtenAt: string; reason: string; savedTo: string }>;
+  } {
+    const outbox = this.proseOutbox;
+    if (!outbox) return { enabled: false, durable: false, pending: [], givenUp: [] };
+    const pending = outbox.snapshot()
+      .filter((e) => conversationId === undefined || e.conversationId === conversationId)
+      .map((e) => ({
+        id: e.id, conversationId: e.conversationId, channelId: e.channelId, writtenAt: e.writtenAt,
+        attempts: e.attempts, outcome: e.outcome, lastError: e.lastError,
+        preview: e.text.replace(/\s+/g, ' ').trim().slice(0, 60),
+        ...(e.tool ? { tool: e.tool.name } : {}), ...(e.notice ? { notice: true } : {}),
+        attachments: e.attachments?.length ?? 0, expiresAt: outbox.expiresAt(e),
+      }));
+    return {
+      enabled: true,
+      durable: this.proseOutboxDurable,
+      pending,
+      givenUp: conversationId === undefined ? [] : outbox.recentlyGivenUp(conversationId),
+    };
   }
 
   /** Programmatic route (ModuleContext.callTool, code_execution): the same
@@ -3242,7 +3323,7 @@ export class ChannelRegistry {
     return `${serverId}:${raw || 'unknown'}`;
   }
 
-  private queuedToolResult(entry: { tool?: { name: string }; writtenAt: number; outcome?: OutboxOutcome }, reason: string): ToolResult {
+  private queuedToolResult(entry: { id: string; tool?: { name: string }; writtenAt: number; outcome?: OutboxOutcome; attachments?: unknown[] }, reason: string): ToolResult {
     const at = entry.writtenAt + (this.proseOutbox?.maxAgeMs ?? 0);
     const until = this.formatTime ? this.formatTime(at) : new Date(at).toISOString();
     const durable = this.proseOutboxDurable
@@ -3257,7 +3338,9 @@ export class ChannelRegistry {
             'and won\'t post it twice if it finds it; if that check can\'t be made, a duplicate is possible. '
           : `[queued] Not sent yet (${reason}). `) +
           `This ${entry.tool?.name ?? 'send'} is ${durable} and will be ` +
-          `delivered when the connection is back, until ${until}; you don't need to resend it.`,
+          `delivered when the connection is back, until ${until}; you don't need to resend it.` +
+          `${entry.attachments?.length ? ` Its ${entry.attachments.length} file(s) were copied when it was queued, so exactly those are sent.` : ''}` +
+          ` Outbox id ${entry.id.slice(0, 8)} (to withdraw it before it's sent: outbox_cancel).`,
       }],
     };
   }
@@ -3300,13 +3383,24 @@ export class ChannelRegistry {
           for (const entry of outbox.due()) {
             if (this.outboxStopped) return;
             const delayReason = entry.outcome === 'unknown' ? 'unanswered' : 'disconnected';
-            const attempt = entry.tool
-              ? await this.callToolOnce(entry, delayReason)
-              : await this.publishSpeech(
-                entry.conversationId, entry.channelId, entry.text,
-                { id: entry.id, writtenAt: entry.writtenAt, delayReason },
-                'retry',
-              );
+            const kept = outbox.verifyAttachments(entry);
+            if (!kept.ok) {
+              outbox.drop(entry.id, kept.reason);
+              continue;
+            }
+            this.outboxInFlight = entry.id;
+            let attempt;
+            try {
+              attempt = entry.tool
+                ? await this.callToolOnce(entry, delayReason)
+                : await this.publishSpeech(
+                  entry.conversationId, entry.channelId, entry.text,
+                  { id: entry.id, writtenAt: entry.writtenAt, delayReason },
+                  'retry',
+                );
+            } finally {
+              this.outboxInFlight = null;
+            }
             if (attempt.ok) {
               outbox.delivered(entry.id, attempt.messageId);
               // The next entry for this channel was waiting on this one.

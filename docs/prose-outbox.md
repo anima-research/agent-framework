@@ -14,6 +14,7 @@ proseOutbox: {
   retryBaseMs: 60_000,          // doubles per attempt…
   retryMaxMs: 15 * 60_000,      // …up to this
   tools: ['send_message', 'reply_message'], // send tools held the same way
+  fileArgs: ['files'],          // args of those tools carrying files by path (default)
   path: '<storePath>/recovery/prose-outbox.json', // default
 }
 ```
@@ -118,3 +119,26 @@ agent needs to do:
 - Marking late messages for readers is the server's job: `writtenAt` and
   `delayReason` are passed so it can.
 - Detecting a hung connector, and restarting it, is not part of this.
+
+## Files, withdrawal, status (Sol, 2026-09-26)
+- **Exact files.** A queued send tool call that carries files (`fileArgs`,
+  arrays of `{ path }`) gets each file copied, owner-only, into
+  `recovery/attachments/<id>/` when it is queued. The queued call points at
+  the copies. Before each retry their SHA-256 is checked; a changed or
+  missing copy means the entry is given up visibly, never sent altered or
+  without it. If a copy can't be made (or the queue is memory-only), the call
+  isn't queued at all and the agent gets an error saying nothing was sent.
+  Copies are removed on delivery or withdrawal, and kept with the dead letter
+  (`undelivered/<id>-attachments/`) when an entry is given up.
+- **Withdrawal.** `outbox_cancel { id }` (the agent's own entries; the id or a
+  unique prefix of 6+ characters) and `AgentFramework.cancelOutboxEntry(ref)`
+  (operators, any entry; the agent is told). An entry whose retry is in flight
+  can't be withdrawn: it may already be posting. A withdrawal never triggers a
+  send by itself.
+- **Status.** `outbox_status` lists the agent's waiting entries (id, where,
+  written, attempts, kept files, retry deadline) and recent give-ups;
+  `AgentFramework.getOutboxStatus()` gives operators the whole queue. Every
+  delivery note carries the entry's short id. Both tools are present whenever
+  the outbox is enabled.
+- The queue's directories are owner-only (0700), like its files (0600).
+

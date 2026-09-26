@@ -2322,6 +2322,9 @@ export class AgentFramework {
     if (this.tuneOutCoordinator) {
       channelTools.push(AgentFramework.TUNE_OUT_TOOL);
     }
+    if (this.proseOutboxConfig?.enabled && this.channelRegistry) {
+      channelTools.push(...AgentFramework.OUTBOX_TOOLS);
+    }
     const gateTools = this.eventGate
       ? [
           this.eventGate.getToolDefinition(),
@@ -4156,6 +4159,28 @@ export class AgentFramework {
       required: ['channelId'],
     },
   };
+  /** Delivery-queue tools: present whenever the prose outbox is enabled. */
+  private static readonly OUTBOX_TOOLS: import('./types/index.js').ToolDefinition[] = [
+    {
+      name: 'outbox_status',
+      description:
+        'List your messages waiting in the delivery queue (written, but not delivered yet because ' +
+        'a connection failed) and the ones recently given up. Each has an id for outbox_cancel.',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'outbox_cancel',
+      description:
+        'Withdraw one of your queued messages before it is delivered. Give its id, or at least ' +
+        'the first 6 characters, from a delivery note or outbox_status. A message whose retry is ' +
+        'in progress right now can no longer be withdrawn.',
+      inputSchema: {
+        type: 'object',
+        properties: { id: { type: 'string', description: 'The outbox id (or its first 6+ characters).' } },
+        required: ['id'],
+      },
+    },
+  ];
 
   /** Synthesized sleep/wake tool definitions (present when a gate is wired). */
   private static readonly SLEEP_TOOLS: import('./types/index.js').ToolDefinition[] = [
@@ -7658,6 +7683,57 @@ export class AgentFramework {
    * or given up. Given-up speech reuses the `discord-send-failed` kind so
    * existing gates treat it like any other failed send.
    */
+  /** outbox_status / outbox_cancel for an agent's own entries. */
+  private runOutboxTool(agentName: string, name: string, input: Record<string, unknown>): import('./types/index.js').ToolResult {
+    const registry = this.channelRegistry!;
+    const at = (t: number) => formatZonedTime(t, this.timeZone);
+    if (name === 'outbox_cancel') {
+      const id = typeof input.id === 'string' ? input.id : '';
+      const r = registry.cancelOutboxEntry(id, 'agent', agentName);
+      if (!r.ok) return { success: false, isError: true, error: `Not withdrawn: ${r.reason}.` };
+      const words = r.text.replace(/\s+/g, ' ').trim();
+      return {
+        success: true,
+        data: [{ type: 'text', text:
+          `Withdrawn: ${r.tool ? `your ${r.tool}` : 'your reply'} to ${this.describeChannelForAgent(r.channelId)}` +
+          `${words ? ` starting "${words.slice(0, 40)}${words.length > 40 ? '…' : ''}"` : ''} (outbox id ${r.id.slice(0, 8)}). ` +
+          'It was not sent and will not be retried.' }],
+      };
+    }
+    const s = registry.outboxStatus(agentName);
+    const lines: string[] = [];
+    if (s.pending.length === 0) lines.push('Nothing of yours is waiting in the delivery queue.');
+    else {
+      lines.push(`Waiting (${s.pending.length}; ${s.durable ? 'kept across restarts' : 'memory only'}), oldest first:`);
+      for (const e of s.pending) {
+        lines.push(
+          `- ${e.id.slice(0, 8)} · ${e.notice ? 'automatic notice' : e.tool ?? 'reply'} to ${this.describeChannelForAgent(e.channelId)} · ` +
+          `written ${at(e.writtenAt)} · ${e.attempts} attempt(s)` +
+          `${e.attachments ? ` · ${e.attachments} file(s) kept` : ''}` +
+          ` · retried ${Number.isFinite(e.expiresAt) ? `until ${at(e.expiresAt)}` : 'until delivered'}` +
+          `${e.outcome === 'unknown' ? ' · may already have arrived' : ''}` +
+          `${e.preview ? ` · "${e.preview}"` : ''}`,
+        );
+      }
+    }
+    if (s.givenUp.length) {
+      lines.push('Recently given up (not retried; full text saved):');
+      for (const g of s.givenUp) lines.push(`- ${g.id.slice(0, 8)} · ${this.describeChannelForAgent(g.channelId)} · written ${g.writtenAt} · ${g.reason}`);
+    }
+    return { success: true, data: [{ type: 'text', text: lines.join('\n') }] };
+  }
+
+  /** Operator view of the delivery queue (all agents); for hosts and dashboards. */
+  getOutboxStatus(): ReturnType<ChannelRegistry['outboxStatus']> | null {
+    return this.channelRegistry?.outboxStatus() ?? null;
+  }
+
+  /** Operator withdrawal of any queued entry; the agent is told. */
+  cancelOutboxEntry(ref: string): ReturnType<ChannelRegistry['cancelOutboxEntry']> {
+    if (!this.channelRegistry) return { ok: false, reason: 'no channel registry' };
+    return this.channelRegistry.cancelOutboxEntry(ref, 'operator');
+  }
+
   private recordOutboxNotice(event: OutboxEvent): void {
     const { entry } = event;
     const where = this.describeChannelForAgent(entry.channelId);
@@ -7667,11 +7743,16 @@ export class AgentFramework {
     const words = entry.text.replace(/\s+/g, ' ').trim();
     // A notice is the framework's words, not the agent's: don't credit it.
     const what = entry.tool ? `Your ${entry.tool.name}` : entry.notice ? 'The automatic notice' : 'Your reply';
+    const ref = `outbox id ${entry.id.slice(0, 8)}`;
     const which = words
-      ? `${what} to ${where} starting "${words.slice(0, 40)}${words.length > 40 ? '…' : ''}"`
-      : `${what} to ${where} (attachments only)`;
-    // A queued tool call already told the agent so in its tool result.
+      ? `${what} to ${where} starting "${words.slice(0, 40)}${words.length > 40 ? '…' : ''}" (${ref})`
+      : `${what} to ${where} (attachments only; ${ref})`;
+    // Withdrawing is the agent's own call; say how, for its own words.
+    const withdraw = entry.notice ? '' : ` To withdraw it before it's sent: outbox_cancel with id ${entry.id.slice(0, 8)}.`;
+    // A queued tool call already told the agent so in its tool result, and
+    // an agent's own withdrawal was answered by outbox_cancel.
     if (event.kind === 'queued' && entry.tool) return;
+    if (event.kind === 'cancelled' && event.by === 'agent') return;
     let text: string;
     let kind: string;
     switch (event.kind) {
@@ -7684,7 +7765,8 @@ export class AgentFramework {
           : `[delivery-delayed] ${which} couldn't be delivered yet (${event.reason}). `) +
           (this.proseOutboxConfig?.path
             ? `It is queued, kept across restarts, and will be retried ${until(event.expiresAt)}; you don't need to resend it.`
-            : `It is queued and will be retried ${until(event.expiresAt)}, but only in memory: a restart before then loses it, so keep your own copy if it matters.`);
+            : `It is queued and will be retried ${until(event.expiresAt)}, but only in memory: a restart before then loses it, so keep your own copy if it matters.`) +
+          withdraw;
         break;
       case 'delivered-late':
         kind = 'delivered-late';
@@ -7692,6 +7774,10 @@ export class AgentFramework {
           ? `[delivered-late] ${which}, written at ${at(entry.writtenAt)}, was confirmed in the channel at ${at(event.deliveredAt)} ` +
             '(it may have arrived on the first attempt; the retry checked before sending).'
           : `[delivered-late] ${which}, written at ${at(entry.writtenAt)}, was delivered at ${at(event.deliveredAt)}.`;
+        break;
+      case 'cancelled':
+        kind = 'delivery-cancelled';
+        text = `[delivery-cancelled] ${which}, written at ${at(entry.writtenAt)}, was withdrawn by an operator before delivery. It was not sent.`;
         break;
       case 'dropped':
         kind = 'discord-send-failed';
@@ -11101,6 +11187,18 @@ export class AgentFramework {
     }
 
     // Route gate_status tool
+    if ((enrichedCall.name === 'outbox_status' || enrichedCall.name === 'outbox_cancel') &&
+        this.proseOutboxConfig?.enabled && this.channelRegistry) {
+      this.pushEvent({
+        type: 'tool-result',
+        callId: enrichedCall.id,
+        agentName,
+        moduleName: 'outbox',
+        result: this.runOutboxTool(agentName, enrichedCall.name, enrichedCall.input as Record<string, unknown>),
+      });
+      return;
+    }
+
     if (enrichedCall.name === 'gate_status' && this.eventGate) {
       this.dispatchGateToolCall(agentName, enrichedCall);
       return;

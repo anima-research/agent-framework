@@ -28,9 +28,9 @@
  * resident notices.
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
 
 export function defaultProseOutboxPath(storePath: string): string {
   return join(storePath, 'recovery', 'prose-outbox.json');
@@ -63,6 +63,16 @@ export interface ProseOutboxConfig {
    * "queued" result to the agent instead of an error.
    */
   tools?: string[];
+  /**
+   * Arguments of those tools that carry files by local path: arrays of
+   * `{ path, ... }` (default `["files"]`, discord-mcpl's shape). A queued call
+   * must send what was chosen, not whatever is at that path later, so each
+   * file is copied beside the queue when the call is queued and the copy is
+   * sent, after checking its hash. If a copy can't be made (or the queue is
+   * memory-only), the call is not queued and the agent gets an error: never a
+   * text-only send that looks complete (Sol, 2026-09-26).
+   */
+  fileArgs?: string[];
 }
 
 /** Why a failed publish may be retried. */
@@ -89,6 +99,9 @@ export interface OutboxEntry {
   lastError: string;
   /** Present for a queued tool call (config.tools); absent for plain speech. */
   tool?: { serverId: string; name: string; input: Record<string, unknown> };
+  /** Kept copies of the call's files (see ProseOutboxConfig.fileArgs); the
+   *  queued input points at `kept`. */
+  attachments?: Array<{ original: string; kept: string; sha256: string; bytes: number }>;
   /** An automatic notice posted by the framework (e.g. a failure notice),
    *  not the resident's own words: expires by `noticeMaxAgeMs`, and is
    *  dropped for space only after the resident's own entries. */
@@ -102,6 +115,8 @@ export type OutboxEvent =
   /** Dropped without delivery: expired, over a cap, a permanent error on
    *  retry, or an unknown outcome the server can't dedupe. `mayHaveArrived`
    *  is true when some attempt's outcome was unknown. */
+  /** Withdrawn before delivery, by the agent (its own entry) or an operator. */
+  | { kind: 'cancelled'; entry: OutboxEntry; by: 'agent' | 'operator' }
   | {
       kind: 'dropped'; entry: OutboxEntry; reason: string; mayHaveArrived: boolean;
       /** Where the undelivered text was saved (queue file's directory,
@@ -145,6 +160,7 @@ export function classifyPublishError(err: unknown): PublishFailureClass {
 export class ProseOutbox {
   readonly maxAgeMs: number;
   readonly noticeMaxAgeMs: number;
+  private readonly fileArgs: string[];
   private readonly maxEntries: number;
   private readonly maxPerAgent: number;
   private readonly retryBaseMs: number;
@@ -160,6 +176,7 @@ export class ProseOutbox {
   ) {
     this.maxAgeMs = config.maxAgeMs ?? 6 * HOUR;
     this.noticeMaxAgeMs = config.noticeMaxAgeMs ?? Number.POSITIVE_INFINITY;
+    this.fileArgs = config.fileArgs ?? ['files'];
     this.maxEntries = Math.max(1, config.maxEntries ?? 200);
     this.maxPerAgent = Math.max(1, config.maxEntriesPerAgent ?? 50);
     this.retryBaseMs = Math.max(1, config.retryBaseMs ?? 60_000);
@@ -200,6 +217,7 @@ export class ProseOutbox {
       id: string; conversationId: string; channelId: string; text: string; writtenAt: number;
       tool?: OutboxEntry['tool'];
       notice?: true;
+      attachments?: OutboxEntry['attachments'];
     },
     outcome: OutboxOutcome,
     reason: string,
@@ -263,6 +281,7 @@ export class ProseOutbox {
   delivered(id: string, messageId?: string): void {
     const entry = this.take(id);
     if (!entry) return;
+    this.removeAttachments(entry);
     this.onEvent({ kind: 'delivered-late', entry, deliveredAt: this.now(), ...(messageId ? { messageId } : {}) });
   }
 
@@ -296,9 +315,16 @@ export class ProseOutbox {
     if (this.path) {
       try {
         const dir = join(dirname(this.path), 'undelivered');
-        mkdirSync(dir, { recursive: true });
+        ensurePrivateDir(dir);
+        let keptFiles: string | undefined;
+        if (entry.attachments?.length) {
+          const from = join(dirname(this.path), 'attachments', entry.id);
+          keptFiles = join(dir, `${entry.id}-attachments`);
+          if (existsSync(from)) renameSync(from, keptFiles);
+        }
         savedTo = join(dir, `${new Date(entry.writtenAt).toISOString().replace(/[:.]/g, '-')}-${entry.id}.json`);
         writeFileSync(savedTo, `${JSON.stringify({
+          id: entry.id,
           conversationId: entry.conversationId,
           channelId: entry.channelId,
           writtenAt: new Date(entry.writtenAt).toISOString(),
@@ -307,6 +333,7 @@ export class ProseOutbox {
           mayHaveArrived,
           text: entry.text,
           ...(entry.tool ? { tool: entry.tool } : {}),
+          ...(keptFiles ? { attachmentsKeptIn: keptFiles, attachments: entry.attachments } : {}),
         }, null, 2)}\n`, { mode: 0o600 });
       } catch (err) {
         console.error('[prose-outbox] failed to save undelivered text:', err);
@@ -314,6 +341,103 @@ export class ProseOutbox {
       }
     }
     this.onEvent({ kind: 'dropped', entry, reason, mayHaveArrived, ...(savedTo ? { savedTo } : {}) });
+  }
+
+  /**
+   * Withdraw a queued entry before delivery. `ref` is its id or a unique
+   * prefix of at least 6 characters. With `conversationId`, only that
+   * agent's entries match (an agent can withdraw only its own).
+   */
+  cancel(ref: string, by: 'agent' | 'operator', conversationId?: string):
+    { ok: true; entry: OutboxEntry } | { ok: false; reason: string } {
+    const want = ref.trim();
+    if (want.length < 6) return { ok: false, reason: 'give the id, or at least its first 6 characters' };
+    const matches = this.entries.filter((e) =>
+      e.id.startsWith(want) && (conversationId === undefined || e.conversationId === conversationId));
+    if (matches.length === 0) return { ok: false, reason: `nothing queued matches "${want}" (it may already have been delivered or given up)` };
+    if (matches.length > 1) return { ok: false, reason: `"${want}" matches ${matches.length} queued entries; give more of the id` };
+    const entry = this.take(matches[0]!.id)!;
+    this.removeAttachments(entry);
+    this.onEvent({ kind: 'cancelled', entry, by });
+    return { ok: true, entry };
+  }
+
+  /**
+   * Keep copies of a tool call's files before it is queued (fileArgs), and
+   * point the input at them. Returns the rewritten input and the records, or
+   * why it can't be done (then the call must not be queued).
+   */
+  keepAttachments(id: string, input: Record<string, unknown>):
+    { ok: true; input: Record<string, unknown>; attachments?: OutboxEntry['attachments'] } | { ok: false; reason: string } {
+    const specs: Array<{ arg: string; index: number; path: string }> = [];
+    for (const arg of this.fileArgs) {
+      const list = input[arg];
+      if (!Array.isArray(list)) continue;
+      list.forEach((f, index) => {
+        const path = (f as { path?: unknown } | null)?.path;
+        if (typeof path === 'string' && path) specs.push({ arg, index, path });
+      });
+    }
+    if (specs.length === 0) return { ok: true, input };
+    if (!this.path) return { ok: false, reason: 'the delivery queue is memory-only, so its attached files could not be kept safely' };
+    const dir = join(dirname(this.path), 'attachments', id);
+    const records: NonNullable<OutboxEntry['attachments']> = [];
+    const rewritten: Record<string, unknown> = { ...input };
+    try {
+      ensurePrivateDir(dir);
+      for (const [n, s] of specs.entries()) {
+        const kept = join(dir, `${n}-${basename(s.path)}`);
+        copyFileSync(s.path, kept);
+        chmodSync(kept, 0o600);
+        const bytes = readFileSync(kept);
+        records.push({ original: s.path, kept, sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length });
+        const list = [...(rewritten[s.arg] as unknown[])];
+        list[s.index] = { ...(list[s.index] as Record<string, unknown>), path: kept };
+        rewritten[s.arg] = list;
+      }
+    } catch (err) {
+      rmSync(dir, { recursive: true, force: true });
+      return { ok: false, reason: `an attached file could not be kept for a later retry (${(err as Error).message.slice(0, 160)})` };
+    }
+    return { ok: true, input: rewritten, attachments: records };
+  }
+
+  /** Before a retry: are the kept files still exactly what was queued? */
+  verifyAttachments(entry: OutboxEntry): { ok: true } | { ok: false; reason: string } {
+    for (const a of entry.attachments ?? []) {
+      let digest: string;
+      try {
+        digest = createHash('sha256').update(readFileSync(a.kept)).digest('hex');
+      } catch {
+        return { ok: false, reason: `the kept copy of ${basename(a.original)} is missing, so it was not sent without it` };
+      }
+      if (digest !== a.sha256) return { ok: false, reason: `the kept copy of ${basename(a.original)} changed, so it was not sent` };
+    }
+    return { ok: true };
+  }
+
+  private removeAttachments(entry: OutboxEntry): void {
+    if (!entry.attachments?.length || !this.path) return;
+    rmSync(join(dirname(this.path), 'attachments', entry.id), { recursive: true, force: true });
+  }
+
+  /** Given-up entries of one agent, newest first (from `undelivered/`). */
+  recentlyGivenUp(conversationId: string, limit = 5): Array<{ id: string; channelId: string; writtenAt: string; reason: string; savedTo: string }> {
+    if (!this.path) return [];
+    const dir = join(dirname(this.path), 'undelivered');
+    if (!existsSync(dir)) return [];
+    const out: Array<{ id: string; channelId: string; writtenAt: string; reason: string; savedTo: string }> = [];
+    for (const name of readdirSync(dir).filter((n) => n.endsWith('.json')).sort().reverse()) {
+      if (out.length >= limit) break;
+      try {
+        const path = join(dir, name);
+        if (!statSync(path).isFile()) continue;
+        const rec = JSON.parse(readFileSync(path, 'utf8')) as { conversationId?: string; channelId?: string; writtenAt?: string; reason?: string; id?: string };
+        if (rec.conversationId !== conversationId) continue;
+        out.push({ id: rec.id ?? name.replace(/\.json$/, '').slice(-36), channelId: rec.channelId ?? '', writtenAt: rec.writtenAt ?? '', reason: rec.reason ?? '', savedTo: path });
+      } catch { /* skip unreadable records */ }
+    }
+    return out;
   }
 
   snapshot(): readonly OutboxEntry[] {
@@ -368,7 +492,7 @@ export class ProseOutbox {
       idempotentServers: this.idempotentServers,
     };
     try {
-      mkdirSync(dirname(this.path), { recursive: true });
+      ensurePrivateDir(dirname(this.path));
       const temporary = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
       writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
       renameSync(temporary, this.path);
@@ -381,6 +505,12 @@ export class ProseOutbox {
 /** Order in which entries give way to a size cap: the resident's own words
  *  oldest first, then notices oldest first (a notice is short and reports a
  *  failure the room otherwise never hears about). */
+/** Owner-only directory (created 0700; tightened if it already existed). */
+function ensurePrivateDir(dir: string): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { chmodSync(dir, 0o700); } catch { /* best effort */ }
+}
+
 function evictionOrder(entries: readonly OutboxEntry[]): OutboxEntry[] {
   return [...entries.filter((e) => !e.notice), ...entries.filter((e) => e.notice)];
 }
@@ -393,6 +523,8 @@ function isEntry(v: unknown): v is OutboxEntry {
     typeof e.nextAttemptAt === 'number' && (e.outcome === 'not-sent' || e.outcome === 'unknown') &&
     typeof e.lastError === 'string' &&
     (e.notice === undefined || e.notice === true) &&
+    (e.attachments === undefined || (Array.isArray(e.attachments) && e.attachments.every((a) =>
+      !!a && typeof a.kept === 'string' && typeof a.sha256 === 'string' && typeof a.original === 'string'))) &&
     (e.tool === undefined || (
       typeof e.tool === 'object' && e.tool !== null && typeof e.tool.serverId === 'string' &&
       typeof e.tool.name === 'string' && typeof e.tool.input === 'object' && e.tool.input !== null

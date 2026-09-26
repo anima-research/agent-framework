@@ -449,7 +449,7 @@ test('a send tool that cannot reach its server is queued: "queued" result, repla
   const t = toolServer();
   const h = makeRegistry({ server: t.server, outbox: TOOLS });
   t.state.down = true;
-  const input = { channelId: 'chat:1', content: 'hello from the outage', files: [{ path: '/tmp/a.png' }] };
+  const input = { channelId: 'chat:1', content: 'hello from the outage', messageId: 'reply-target' };
   const r = await h.registry.callQueueableTool('agent', 'chat', 'send_message', input);
   assert.equal(r.success, true);
   assert.match(resultText(r), /^\[queued\] Not sent yet/);
@@ -460,7 +460,7 @@ test('a send tool that cannot reach its server is queued: "queued" result, repla
   h.registry.kickOutbox();
   await h.registry.drainOutboxNow();
   assert.equal(t.calls.length, 1);
-  assert.deepEqual(t.calls[0]!.input, input, 'the whole call is replayed: channel, content, files');
+  assert.deepEqual(t.calls[0]!.input, input, 'the whole call is replayed: channel, content, reply target');
   assert.equal(t.calls[0]!.meta?.delayReason, 'disconnected');
   assert.ok(t.calls[0]!.meta?.idempotencyKey);
   assert.equal(h.events.at(-1)?.kind, 'delivered-late');
@@ -547,3 +547,144 @@ test('an outcome-unknown queued send says it may already have arrived', async ()
   assert.match(resultText(r), /^\[queued\] No answer .*may already have arrived/);
   assert.match(resultText(r), /won't post it twice if it finds it/);
 });
+
+// ---------------------------------------------------------------------------
+// Sol's requirements (2026-09-26): exact files, visible failure, withdrawal
+// ---------------------------------------------------------------------------
+
+function fileIn(dir: string, name: string, body: string): string {
+  const p = join(dir, name);
+  writeFileSync(p, body);
+  return p;
+}
+
+test('files are kept when a send is queued: the copy is sent even if the original changes', async () => {
+  const dir = tempDir();
+  const path = join(dir, 'recovery', 'prose-outbox.json');
+  const original = fileIn(dir, 'drawing.png', 'the chosen bytes');
+  const t = toolServer();
+  const h = makeRegistry({ server: t.server, outbox: { ...TOOLS, path } });
+  t.state.down = true;
+  const r = await h.registry.callQueueableTool('agent', 'chat', 'send_message',
+    { channelId: 'chat:1', content: 'look', files: [{ path: original, description: 'alt' }] });
+  assert.match(resultText(r), /1 file\(s\) were copied when it was queued/);
+  writeFileSync(original, 'edited later'); // the workspace moves on
+  let sentBytes = '';
+  const send = t.server.sendToolsCall;
+  t.server.sendToolsCall = async (name: string, input: Record<string, unknown>, s?: unknown, meta?: Record<string, unknown>) => {
+    sentBytes = readFileSync((input.files as Array<{ path: string }>)[0]!.path, 'utf8');
+    return send(name, input, s, meta);
+  };
+  t.state.down = false;
+  h.registry.kickOutbox();
+  await h.registry.drainOutboxNow();
+  assert.equal(t.calls.length, 1);
+  const sent = (t.calls[0]!.input.files as Array<{ path: string; description: string }>)[0]!;
+  assert.notEqual(sent.path, original);
+  assert.equal(sentBytes, 'the chosen bytes', 'the file as it was when chosen');
+  assert.equal(sent.description, 'alt', 'other file fields are kept');
+  assert.equal(existsSync(sent.path), false, 'the kept copy is removed once delivered');
+  const { statSync } = await import('node:fs');
+  assert.equal(statSync(join(dir, 'recovery')).mode & 0o777, 0o700);
+});
+
+test('a kept file that changed is not sent: given up visibly, never sent altered or without it', async () => {
+  const dir = tempDir();
+  const path = join(dir, 'recovery', 'prose-outbox.json');
+  const t = toolServer();
+  const h = makeRegistry({ server: t.server, outbox: { ...TOOLS, path } });
+  t.state.down = true;
+  await h.registry.callQueueableTool('agent', 'chat', 'send_message',
+    { channelId: 'chat:1', content: 'look', files: [{ path: fileIn(dir, 'a.txt', 'one') }] });
+  const kept = JSON.parse(readFileSync(path, 'utf8')).entries[0].attachments[0].kept as string;
+  writeFileSync(kept, 'tampered');
+  t.state.down = false;
+  h.registry.kickOutbox();
+  await h.registry.drainOutboxNow();
+  assert.equal(t.calls.length, 0, 'nothing sent');
+  const dropped = h.events.find((e) => e.kind === 'dropped') as { reason: string; savedTo?: string } | undefined;
+  assert.match(dropped!.reason, /changed, so it was not sent/);
+  assert.ok(dropped!.savedTo && JSON.parse(readFileSync(dropped!.savedTo, 'utf8')).attachmentsKeptIn, 'dead letter keeps the files');
+});
+
+test('files that cannot be kept (memory-only queue, or unreadable) mean not queued, with a clear error', async () => {
+  const t = toolServer();
+  const h = makeRegistry({ server: t.server, outbox: TOOLS }); // memory-only
+  t.state.down = true;
+  const r = await h.registry.callQueueableTool('agent', 'chat', 'send_message',
+    { channelId: 'chat:1', content: 'look', files: [{ path: '/nonexistent/x.png' }] });
+  assert.equal(r.isError, true);
+  assert.match(String(r.error), /not queued for retry because the delivery queue is memory-only/);
+  assert.match(String(r.error), /Nothing was sent, with or without the files/);
+  assert.equal(h.registry.outboxStatus().pending.length, 0);
+
+  const dir = tempDir();
+  const h2 = makeRegistry({ server: t.server, outbox: { ...TOOLS, path: join(dir, 'q.json') } });
+  const r2 = await h2.registry.callQueueableTool('agent', 'chat', 'send_message',
+    { channelId: 'chat:1', content: 'look', files: [{ path: '/nonexistent/x.png' }] });
+  assert.match(String(r2.error), /could not be kept for a later retry/);
+  assert.equal(h2.registry.outboxStatus().pending.length, 0);
+});
+
+test('withdrawal: an agent cancels its own queued entry by id prefix; never another agent\'s', async () => {
+  const m = mockServer();
+  const h = makeRegistry({ server: m.server, outbox: { enabled: true } });
+  m.state.down = true;
+  await h.registry.routeSpeech('agent', 'on second thought', 'chat:1');
+  await h.registry.routeSpeech('other', 'keep me', 'chat:1');
+  const [mine, theirs] = h.registry.outboxStatus().pending;
+  assert.equal(h.registry.cancelOutboxEntry(theirs!.id.slice(0, 8), 'agent', 'agent').ok, false, 'not yours');
+  assert.equal(h.registry.cancelOutboxEntry(mine!.id.slice(0, 3), 'agent', 'agent').ok, false, 'too short a prefix');
+  const r = h.registry.cancelOutboxEntry(mine!.id.slice(0, 8), 'agent', 'agent');
+  assert.equal(r.ok, true);
+  assert.equal(h.events.at(-1)?.kind, 'cancelled');
+  m.state.down = false;
+  h.registry.kickOutbox();
+  await h.registry.drainOutboxNow();
+  assert.deepEqual(m.sent.map((s) => s.text), ['keep me'], 'the withdrawn one never goes; the one behind it does');
+});
+
+test('withdrawal is refused while that entry\'s retry is in flight (it may already be posting)', async () => {
+  let release!: () => void;
+  const sent: string[] = [];
+  const server = {
+    grant: FULL_GRANT(),
+    isConnected: true,
+    sendChannelsPublish: async (params: { content: Array<{ text: string }> }) => {
+      await new Promise<void>((r) => { release = r; });
+      sent.push(params.content[0]!.text);
+      return { delivered: true, messageId: 'm1' };
+    },
+  };
+  const down = { isConnected: false, grant: FULL_GRANT(), sendChannelsPublish: async () => { throw new Error('Cannot send request: connection to "chat" is closed'); } };
+  const h = makeRegistry({ server: down, outbox: { enabled: true } });
+  await h.registry.routeSpeech('agent', 'slow one', 'chat:1');
+  const id = h.registry.outboxStatus().pending[0]!.id;
+  h.setServer(server);
+  h.registry.kickOutbox();
+  const draining = h.registry.drainOutboxNow();
+  await new Promise((r) => setTimeout(r, 10));
+  const r = h.registry.cancelOutboxEntry(id.slice(0, 8), 'agent', 'agent');
+  assert.equal(r.ok, false);
+  assert.match((r as { reason: string }).reason, /being sent right now/);
+  release();
+  await draining;
+  assert.deepEqual(sent, ['slow one']);
+});
+
+test('status: pending entries with ids and kept-file counts', async () => {
+  const dir = tempDir();
+  const t = toolServer();
+  const h = makeRegistry({ server: t.server, outbox: { ...TOOLS, path: join(dir, 'recovery', 'q.json') } });
+  t.state.down = true;
+  await h.registry.callQueueableTool('agent', 'chat', 'send_message',
+    { channelId: 'chat:1', content: 'with a file', files: [{ path: fileIn(dir, 'f.txt', 'x') }] });
+  const s = h.registry.outboxStatus('agent');
+  assert.equal(s.enabled, true);
+  assert.equal(s.durable, true);
+  assert.equal(s.pending.length, 1);
+  assert.equal(s.pending[0]!.attachments, 1);
+  assert.equal(s.pending[0]!.tool, 'send_message');
+  assert.match(s.pending[0]!.id, /^[0-9a-f-]{36}$/);
+});
+
