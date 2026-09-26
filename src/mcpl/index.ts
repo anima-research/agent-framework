@@ -128,6 +128,10 @@ export { InferenceRouter } from './inference-router.js';
 // Channel registry (channel lifecycle, incoming messages, synthesized tools)
 export { ChannelRegistry } from './channel-registry.js';
 
+// Durable retry of undelivered speech (FrameworkConfig.proseOutbox)
+export { ProseOutbox, classifyPublishError, defaultProseOutboxPath } from './prose-outbox.js';
+export type { ProseOutboxConfig, OutboxEntry, OutboxEvent, OutboxOutcome, PublishFailureClass } from './prose-outbox.js';
+
 // Per-channel conversation routing (fork-per-channel agents)
 export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './conversation-router.js';
 export type {

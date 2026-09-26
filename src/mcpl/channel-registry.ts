@@ -27,6 +27,8 @@ import type {
   ChannelsIncomingResult,
   ChannelIncomingMessageResult,
   ChannelsPublishParams,
+  ChannelsPublishResult,
+  McpToolCallResult,
   ChannelsOpenResult,
   ChannelHistoryRequest,
   McplContentBlock,
@@ -37,6 +39,7 @@ import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
 import { CapabilityGrant } from './capability-grant.js';
+import { ProseOutbox, classifyPublishError, type OutboxEntry, type OutboxEvent, type OutboxOutcome, type ProseOutboxConfig, type PublishFailureClass } from './prose-outbox.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -469,6 +472,8 @@ interface ChannelRegistryOptions {
     channelId: string | null;
     reason: string;
     textLen: number;
+    /** The publish's outcome is unknown (timed out): it may have posted. */
+    mayHaveArrived?: boolean;
   }) => void;
   /**
    * Called when channels were opened WITHOUT the agent asking (subscription
@@ -511,7 +516,54 @@ interface ChannelRegistryOptions {
    * wins), BEFORE `defaultPublishChannel`.
    */
   activeChannelResolver?: (agentName: string) => string | undefined;
+  /**
+   * Durable retry for plain speech whose publish failed transiently (see
+   * prose-outbox.ts). Absent or `enabled: false`: failures behave as before.
+   * `path` is the queue file (the framework resolves its default).
+   */
+  proseOutbox?: ProseOutboxConfig;
+  /** Outbox lifecycle (queued / delivered late / dropped). The host wires
+   *  this to non-waking notices in the agent's window. */
+  onOutboxEvent?: (event: OutboxEvent) => void;
+  /** Clock for the outbox (tests). */
+  now?: () => number;
+  /** Render a time for the agent (the framework's zone). Default ISO. */
+  formatTime?: (ms: number) => string;
 }
+
+/** A queueable send-tool call in progress (see beginQueueableCall). */
+export interface QueueTicket {
+  id: string;
+  conversationId: string;
+  channelId: string;
+  text: string;
+  writtenAt: number;
+  tool: { serverId: string; name: string; input: Record<string, unknown> };
+  /** Set when queued: kept copies of the call's files (ProseOutbox.keepAttachments). */
+  attachments?: OutboxEntry['attachments'];
+}
+
+function toolResultText(result: McpToolCallResult): string {
+  return (result.content ?? [])
+    .map((b) => (b as { text?: unknown }).text)
+    .filter((t): t is string => typeof t === 'string')
+    .join(' ');
+}
+
+/** Outcome of one publish attempt (routeSpeech and outbox retries). */
+type PublishAttempt =
+  | { ok: true; serverId: string; messageId?: string }
+  | {
+      ok: false;
+      channelId: string | null;
+      serverId?: string;
+      /** Idempotency scope: serverId (publish) or serverId#tool. */
+      scope?: string;
+      reason: string;
+      retry: OutboxOutcome | 'permanent';
+      /** A tool's own error result, returned to the agent unchanged when not queued. */
+      toolResult?: McpToolCallResult;
+    };
 
 // ============================================================================
 // ChannelRegistry
@@ -544,12 +596,7 @@ export class ChannelRegistry {
     op?: 'start' | 'stop',
   ) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
-  private onRouteFailure?: (info: {
-    conversationId: string;
-    channelId: string | null;
-    reason: string;
-    textLen: number;
-  }) => void;
+  private onRouteFailure?: ChannelRegistryOptions['onRouteFailure'];
   private onChannelAutoOpened?: (info: {
     conversationId?: string;
     serverId: string;
@@ -559,6 +606,20 @@ export class ChannelRegistry {
   private homeChannelResolver?: (agentName: string) => string | undefined;
   private activeChannelResolver?: (agentName: string) => string | undefined;
   private store?: JsStore;
+
+  /** Durable retry for undelivered speech (null when not enabled). */
+  private proseOutbox: ProseOutbox | null = null;
+  private onOutboxEvent?: (event: OutboxEvent) => void;
+  private outboxTimer: ReturnType<typeof setTimeout> | null = null;
+  private outboxDraining: Promise<void> | null = null;
+  /** The entry whose retry is being attempted right now (cancel refuses it). */
+  private outboxInFlight: string | null = null;
+  private outboxStopped = false;
+  /** ProseOutboxConfig.tools. */
+  private queueableTools = new Set<string>();
+  /** The outbox has a queue file (survives restarts). */
+  private proseOutboxDurable = false;
+  private formatTime?: (ms: number) => string;
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
@@ -671,6 +732,22 @@ export class ChannelRegistry {
     this.store = options?.store;
     this.initializeLifecycleStore();
     this.initializeLabelHistoryStore();
+    if (options?.proseOutbox?.enabled) {
+      this.onOutboxEvent = options.onOutboxEvent;
+      this.proseOutbox = new ProseOutbox(
+        options.proseOutbox,
+        options.proseOutbox.path,
+        (event) => this.handleOutboxEvent(event),
+        options.now,
+      );
+      this.outboxClock = options.now;
+      this.queueableTools = new Set(options.proseOutbox.tools ?? []);
+      this.proseOutboxDurable = !!options.proseOutbox.path;
+      this.formatTime = options.formatTime;
+      // Entries persisted by a previous run wait for their server's first
+      // (re)connect, which calls kickOutbox; the timer is the backstop.
+      this.scheduleOutbox();
+    }
   }
 
   /**
@@ -1328,6 +1405,10 @@ export class ChannelRegistry {
    * Stop all typing intervals and clear all channel registrations.
    */
   stopAll(): void {
+    this.outboxStopped = true;
+    if (this.outboxTimer) clearTimeout(this.outboxTimer);
+    this.outboxTimer = null;
+
     // Clear all typing intervals
     for (const interval of this.typingIntervals.values()) {
       clearInterval(interval);
@@ -2834,11 +2915,15 @@ export class ChannelRegistry {
      *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
      *  "this turn is pinned to no locus": fail loudly rather than guess. */
     locusChannelId: string | null,
-  ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
+    /** `notice`: an automatic notice from the framework, not the resident's
+     *  own words; if it has to be queued it gets the notice class
+     *  (ProseOutboxConfig.noticeMaxAgeMs, dropped for space last). */
+    opts?: { notice?: boolean },
+  ): Promise<{ delivered: boolean; channelId: string; messageId?: string; queued?: boolean } | null> {
     // Surface a routing failure: emit a trace AND notify the host (which drops
     // a `[discord-send-failed]` marker into chronicle) so the agent learns her
     // reply never reached the human, instead of it vanishing silently.
-    const fail = (channelId: string | null, reason: string): null => {
+    const fail = (channelId: string | null, reason: string, mayHaveArrived = false): null => {
       console.error(`[routeSpeech] ${conversationId}: ${reason} — speech NOT routed (${text.length} chars stay in chronicle)`);
       this.emitTraceFn({
         type: 'mcpl:speech-route-failed',
@@ -2846,8 +2931,9 @@ export class ChannelRegistry {
         channelId: channelId ?? '',
         reason,
         textLen: text.length,
+        ...(mayHaveArrived ? { mayHaveArrived } : {}),
       });
-      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length });
+      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length, ...(mayHaveArrived ? { mayHaveArrived } : {}) });
       return null;
     };
 
@@ -2865,9 +2951,74 @@ export class ChannelRegistry {
       return fail(null, 'turn has no locus (no home/trigger channel; nothing to deliver into)');
     }
 
+    const outbox = this.proseOutbox;
+    const writtenAt = this.outboxNow();
+    if (outbox?.hasQueued(channelId)) {
+      // Keep order: earlier undelivered speech to this channel goes first.
+      const entry = outbox.enqueue(
+        { id: ProseOutbox.newId(), conversationId, channelId, text, writtenAt, ...(opts?.notice ? { notice: true as const } : {}) },
+        'not-sent',
+        'an earlier reply to this channel is still waiting to be delivered',
+      );
+      this.emitTraceFn({ type: 'mcpl:speech-queued', conversationId, channelId, outboxId: entry.id, textLen: text.length });
+      void this.drainOutboxNow();
+      return { delivered: false, queued: true, channelId };
+    }
+
+    const id = outbox ? ProseOutbox.newId() : undefined;
+    const attempt = await this.publishSpeech(conversationId, channelId, text, id ? { id, writtenAt } : undefined, 'fresh');
+    if (attempt.ok) {
+      return { delivered: true, channelId, ...(attempt.messageId !== undefined ? { messageId: attempt.messageId } : {}) };
+    }
+
+    // An outcome-unknown send is only safe to repeat when the server has
+    // confirmed it dedupes by idempotencyKey; otherwise say so and stop.
+    const resendable = attempt.retry === 'not-sent' ||
+      (attempt.retry === 'unknown' && attempt.serverId !== undefined && outbox?.isIdempotent(attempt.serverId) === true);
+    if (outbox && id && resendable) {
+      console.error(`[routeSpeech] ${conversationId}: ${attempt.reason} — ${text.length} chars queued for retry (${id})`);
+      outbox.enqueue(
+        { id, conversationId, channelId, text, writtenAt, ...(opts?.notice ? { notice: true as const } : {}) },
+        attempt.retry as OutboxOutcome,
+        attempt.reason,
+      );
+      this.emitTraceFn({ type: 'mcpl:speech-queued', conversationId, channelId, outboxId: id, textLen: text.length, reason: attempt.reason });
+      this.scheduleOutbox();
+      return { delivered: false, queued: true, channelId };
+    }
+    return fail(attempt.channelId, attempt.reason, attempt.retry === 'unknown');
+  }
+
+  /**
+   * One publish attempt of plain speech: resolve the channel entry, open a
+   * closed locus, check the grant, publish. Never throws: failures come back
+   * classified by whether a retry could help. `phase: 'retry'` (the outbox)
+   * treats a not-yet-registered channel as transient (servers re-register
+   * their channels after a reconnect).
+   */
+  private async publishSpeech(
+    conversationId: string,
+    channelId: string,
+    text: string,
+    key: { id: string; writtenAt: number; delayReason?: 'disconnected' | 'unanswered' } | undefined,
+    phase: 'fresh' | 'retry',
+  ): Promise<PublishAttempt> {
     const entry = this.findChannelEntry(channelId);
     if (!entry) {
-      return fail(channelId, `no registered channel for locus "${channelId}"`);
+      return {
+        ok: false,
+        channelId,
+        reason: `no registered channel for locus "${channelId}"`,
+        retry: phase === 'retry' ? 'not-sent' : 'permanent',
+      };
+    }
+
+    const server = this.serverRegistry.getServer(entry.serverId);
+    if (!server) {
+      return { ok: false, channelId, reason: `server "${entry.serverId}" not found`, retry: 'not-sent' };
+    }
+    if ((server as { isConnected?: boolean }).isConnected === false) {
+      return { ok: false, channelId, serverId: entry.serverId, reason: `server "${entry.serverId}" is disconnected`, retry: 'not-sent' };
     }
 
     // INVARIANT: it is not possible to send into a closed channel. Speech
@@ -2898,39 +3049,74 @@ export class ChannelRegistry {
           console.error('onChannelAutoOpened (delivery) failed:', err);
         }
       } catch (err) {
-        return fail(channelId, `locus channel is closed and open failed: ${(err as Error).message}`);
+        return {
+          ok: false,
+          channelId,
+          serverId: entry.serverId,
+          reason: `locus channel is closed and open failed: ${(err as Error).message}`,
+          retry: classifyPublishError(err) === 'not-sent' ? 'not-sent' : 'permanent',
+        };
       }
     }
 
-    const server = this.serverRegistry.getServer(entry.serverId);
-    if (!server) {
-      return fail(channelId, `server "${entry.serverId}" not found`);
-    }
     // §14.1: channels/publish requires channels.publish in the grant. The
     // host not sending is the enforcement — a send to an ungranted server
     // would have it act on authority it was never told it has.
     if (!CapabilityGrant.of(server).has('channels.publish')) {
-      return fail(channelId, `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`);
+      return {
+        ok: false,
+        channelId,
+        serverId: entry.serverId,
+        reason: `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`,
+        // A reconnected server has an empty grant until its policy exchange
+        // completes; a retry that races it should wait, not give up.
+        retry: phase === 'retry' ? 'not-sent' : 'permanent',
+      };
     }
 
     const publishParams: ChannelsPublishParams = {
       conversationId,
       channelId,
       content: [{ type: 'text', text }],
+      ...(key ? { idempotencyKey: key.id, writtenAt: new Date(key.writtenAt).toISOString() } : {}),
+      ...(key?.delayReason ? { delayReason: key.delayReason } : {}),
     };
-    const result = await server.sendChannelsPublish(publishParams);
+    let result: ChannelsPublishResult | void;
+    try {
+      result = await server.sendChannelsPublish(publishParams);
+    } catch (err) {
+      // Previously this escaped to the callers, which only logged it: a
+      // timed-out publish left no marker, so the agent never learned its
+      // reply may not have arrived.
+      return {
+        ok: false,
+        channelId,
+        serverId: entry.serverId,
+        reason: `publish to "${entry.serverId}" failed: ${(err as Error).message ?? String(err)}`,
+        retry: classifyPublishError(err),
+      };
+    }
     const delivered = (result as { delivered?: boolean } | undefined)?.delivered ?? true;
     // Surface the posted message's id (ChannelsPublishResult.messageId) so
     // trace consumers can act on the just-posted message — e.g. a TTS-relay
     // tap editing it down to the words actually voiced on interruption.
     // Previously this was silently dropped here.
     const messageId = (result as { messageId?: string } | undefined)?.messageId;
+    if (key && this.proseOutbox && result) {
+      this.proseOutbox.noteIdempotency(entry.serverId, (result as ChannelsPublishResult).idempotencyKey === key.id);
+    }
 
     // The server accepted the publish RPC but reported the message was not
     // actually delivered (e.g. missing Send Messages permission). Previously
     // this returned `{ delivered: true }`, masking the failure. Surface it.
     if (delivered === false) {
-      return fail(channelId, `server "${entry.serverId}" reported delivered:false for "${channelId}"`);
+      return {
+        ok: false,
+        channelId,
+        serverId: entry.serverId,
+        reason: `server "${entry.serverId}" reported delivered:false for "${channelId}"`,
+        retry: 'permanent',
+      };
     }
 
     console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${channelId} (server=${entry.serverId}, delivered=${delivered})`);
@@ -2943,9 +3129,396 @@ export class ChannelRegistry {
       textLen: text.length,
       text,
       ...(messageId !== undefined ? { messageId } : {}),
+      ...(phase === 'retry' ? { late: true } : {}),
     });
+    return { ok: true, serverId: entry.serverId, ...(messageId !== undefined ? { messageId } : {}) };
+  }
 
-    return { delivered, channelId, ...(messageId !== undefined ? { messageId } : {}) };
+  // ==========================================================================
+  // Prose outbox (durable retry of undelivered speech)
+  // ==========================================================================
+
+  /** Is this MCPL tool (unprefixed name) held by the outbox when it can't
+   *  reach its server (ProseOutboxConfig.tools)? */
+  isQueueableTool(toolName: string): boolean {
+    return this.queueableTools.has(toolName);
+  }
+
+  /**
+   * Start a queueable send-tool call (ProseOutboxConfig.tools). Either the
+   * call must wait behind earlier queued sends to the same channel (it is
+   * queued now, and `queuedResult` goes straight back to the agent), or the
+   * caller makes the call with `meta` (idempotencyKey, writtenAt) and then
+   * hands the outcome to settleQueueableCall. Both MCPL tool routes (model
+   * dispatch and programmatic calls) go through this pair.
+   */
+  beginQueueableCall(
+    conversationId: string,
+    serverId: string,
+    toolName: string,
+    input: Record<string, unknown>,
+  ): { queuedResult: ToolResult } | { ticket: QueueTicket; meta: Record<string, unknown> } {
+    const outbox = this.proseOutbox!;
+    const ticket: QueueTicket = {
+      id: ProseOutbox.newId(),
+      conversationId,
+      channelId: this.sendTargetKey(serverId, input),
+      text: typeof input.content === 'string' ? input.content : '',
+      writtenAt: this.outboxNow(),
+      tool: { serverId, name: toolName, input },
+    };
+    if (outbox.hasQueued(ticket.channelId)) {
+      const unkept = this.keepTicketFiles(ticket);
+      if (unkept) return { queuedResult: unkept };
+      const queued = outbox.enqueue(ticket, 'not-sent', 'an earlier message to this channel is still waiting to be delivered');
+      void this.drainOutboxNow();
+      return { queuedResult: this.queuedToolResult(queued, 'an earlier message to this channel is still waiting') };
+    }
+    return { ticket, meta: { idempotencyKey: ticket.id, writtenAt: new Date(ticket.writtenAt).toISOString() } };
+  }
+
+  /**
+   * Finish a queueable call. Returns the "queued" result to give the agent
+   * instead of the failure when the send could not reach its target (or its
+   * outcome is unknown and this tool has confirmed dedupe); null means use
+   * the call's own result or error unchanged.
+   */
+  settleQueueableCall(
+    ticket: QueueTicket,
+    outcome: { result: McpToolCallResult } | { error: unknown },
+  ): ToolResult | null {
+    const outbox = this.proseOutbox;
+    if (!outbox) return null;
+    const scope = `${ticket.tool.serverId}#${ticket.tool.name}`;
+    let retry: PublishFailureClass;
+    let reason: string;
+    if ('error' in outcome) {
+      retry = classifyPublishError(outcome.error);
+      reason = (outcome.error as Error)?.message ?? String(outcome.error);
+    } else if (outcome.result?.isError) {
+      reason = toolResultText(outcome.result);
+      retry = classifyPublishError(new Error(reason));
+    } else {
+      outbox.noteIdempotency(scope, outcome.result?._meta?.idempotencyKey === ticket.id);
+      return null;
+    }
+    const resendable = retry === 'not-sent' || (retry === 'unknown' && outbox.isIdempotent(scope));
+    if (!resendable) return null;
+    const unkept = this.keepTicketFiles(ticket, reason);
+    if (unkept) return unkept;
+    console.error(`[prose-outbox] ${ticket.conversationId}: ${ticket.tool.name} ${reason.slice(0, 200)} — queued for retry (${ticket.id})`);
+    const queued = outbox.enqueue(ticket, retry as OutboxOutcome, `${ticket.tool.name} failed: ${reason.slice(0, 300)}`);
+    this.scheduleOutbox();
+    return this.queuedToolResult(queued, reason.slice(0, 300));
+  }
+
+  /**
+   * Keep the ticket's files before it is queued (sends what was chosen, not
+   * whatever is at the path later). Returns null when queueing may proceed,
+   * or the error result to give the agent instead: the call was not queued,
+   * and nothing was sent without its files.
+   */
+  private keepTicketFiles(ticket: QueueTicket, failure?: string): ToolResult | null {
+    const kept = this.proseOutbox!.keepAttachments(ticket.id, ticket.tool.input);
+    if (kept.ok) {
+      ticket.tool = { ...ticket.tool, input: kept.input };
+      if (kept.attachments) ticket.attachments = kept.attachments;
+      return null;
+    }
+    console.error(`[prose-outbox] ${ticket.conversationId}: ${ticket.tool.name} not queued: ${kept.reason}`);
+    return {
+      success: false,
+      isError: true,
+      error:
+        `${failure ? `${ticket.tool.name} failed (${failure.slice(0, 200)}). ` : `Not sent: an earlier message to this channel is still waiting. `}` +
+        `It was not queued for retry because ${kept.reason}. Nothing was sent, with or without the files; ` +
+        'send it again when the connection is back.',
+    };
+  }
+
+  /**
+   * Withdraw a queued entry before delivery (an agent's own, or any for an
+   * operator). An entry whose retry is in flight right now can't be
+   * withdrawn: it may already be posting.
+   */
+  cancelOutboxEntry(ref: string, by: 'agent' | 'operator', conversationId?: string):
+    { ok: true; id: string; channelId: string; text: string; tool?: string } | { ok: false; reason: string } {
+    const outbox = this.proseOutbox;
+    if (!outbox) return { ok: false, reason: 'the delivery queue is not enabled' };
+    const inFlight = this.outboxInFlight;
+    if (inFlight && inFlight.startsWith(ref.trim()) && ref.trim().length >= 6 &&
+        (conversationId === undefined || outbox.snapshot().some((e) => e.id === inFlight && e.conversationId === conversationId))) {
+      return { ok: false, reason: 'it is being sent right now, so it can no longer be withdrawn; it may already be in the channel' };
+    }
+    const r = outbox.cancel(ref, by, conversationId);
+    if (!r.ok) return r;
+    // Whatever was queued behind it keeps its own schedule (a withdrawal
+    // never triggers a send by itself).
+    this.scheduleOutbox();
+    return { ok: true, id: r.entry.id, channelId: r.entry.channelId, text: r.entry.text, ...(r.entry.tool ? { tool: r.entry.tool.name } : {}) };
+  }
+
+  /** Pending entries (optionally one agent's) and that agent's recent give-ups. */
+  outboxStatus(conversationId?: string): {
+    enabled: boolean;
+    durable: boolean;
+    pending: Array<{ id: string; conversationId: string; channelId: string; writtenAt: number; attempts: number;
+      outcome: OutboxOutcome; lastError: string; preview: string; tool?: string; notice?: boolean; attachments: number; expiresAt: number }>;
+    givenUp: Array<{ id: string; channelId: string; writtenAt: string; reason: string; savedTo: string }>;
+  } {
+    const outbox = this.proseOutbox;
+    if (!outbox) return { enabled: false, durable: false, pending: [], givenUp: [] };
+    const pending = outbox.snapshot()
+      .filter((e) => conversationId === undefined || e.conversationId === conversationId)
+      .map((e) => ({
+        id: e.id, conversationId: e.conversationId, channelId: e.channelId, writtenAt: e.writtenAt,
+        attempts: e.attempts, outcome: e.outcome, lastError: e.lastError,
+        preview: e.text.replace(/\s+/g, ' ').trim().slice(0, 60),
+        ...(e.tool ? { tool: e.tool.name } : {}), ...(e.notice ? { notice: true } : {}),
+        attachments: e.attachments?.length ?? 0, expiresAt: outbox.expiresAt(e),
+      }));
+    return {
+      enabled: true,
+      durable: this.proseOutboxDurable,
+      pending,
+      givenUp: conversationId === undefined ? [] : outbox.recentlyGivenUp(conversationId),
+    };
+  }
+
+  /** Programmatic route (ModuleContext.callTool, code_execution): the same
+   *  begin/settle pair around one call. */
+  async callQueueableTool(
+    conversationId: string,
+    serverId: string,
+    toolName: string,
+    input: Record<string, unknown>,
+  ): Promise<ToolResult> {
+    const begun = this.beginQueueableCall(conversationId, serverId, toolName, input);
+    if ('queuedResult' in begun) return begun.queuedResult;
+    const server = this.serverRegistry.getServer(serverId);
+    if (!server) {
+      return this.settleQueueableCall(begun.ticket, { error: new Error(`Cannot send request: connection to "${serverId}" is closed`) })
+        ?? { success: false, error: `MCPL server ${serverId} not found`, isError: true };
+    }
+    try {
+      const result = await server.sendToolsCall(toolName, input, undefined, begun.meta);
+      return this.settleQueueableCall(begun.ticket, { result }) ?? { success: true, data: result.content };
+    } catch (err) {
+      return this.settleQueueableCall(begun.ticket, { error: err })
+        ?? { success: false, error: err instanceof Error ? err.message : String(err), isError: true };
+    }
+  }
+
+  /** One attempt of a queued/queueable tool call. Never throws. */
+  private async callToolOnce(
+    entry: { id: string; writtenAt: number; channelId: string; tool?: { serverId: string; name: string; input: Record<string, unknown> } },
+    delayReason: 'disconnected' | 'unanswered' | undefined,
+  ): Promise<{ ok: true; serverId: string; messageId?: string; content: unknown } | Extract<PublishAttempt, { ok: false }>> {
+    const { serverId, name, input } = entry.tool!;
+    const scope = `${serverId}#${name}`;
+    const server = this.serverRegistry.getServer(serverId);
+    if (!server) {
+      return { ok: false, channelId: entry.channelId, serverId, scope, reason: `server "${serverId}" not found`, retry: 'not-sent' };
+    }
+    if ((server as { isConnected?: boolean }).isConnected === false) {
+      return { ok: false, channelId: entry.channelId, serverId, scope, reason: `server "${serverId}" is disconnected`, retry: 'not-sent' };
+    }
+    let result: McpToolCallResult;
+    try {
+      result = await server.sendToolsCall(name, input, undefined, {
+        idempotencyKey: entry.id,
+        writtenAt: new Date(entry.writtenAt).toISOString(),
+        ...(delayReason ? { delayReason } : {}),
+      });
+    } catch (err) {
+      return {
+        ok: false, channelId: entry.channelId, serverId, scope,
+        reason: `${name} failed: ${(err as Error).message ?? String(err)}`,
+        retry: classifyPublishError(err),
+      };
+    }
+    if (result?.isError) {
+      const text = toolResultText(result);
+      return {
+        ok: false, channelId: entry.channelId, serverId, scope,
+        reason: `${name} failed: ${text.slice(0, 300)}`,
+        retry: classifyPublishError(new Error(text)),
+        toolResult: result,
+      };
+    }
+    this.proseOutbox?.noteIdempotency(scope, result?._meta?.idempotencyKey === entry.id);
+    return { ok: true, serverId, content: result?.content };
+  }
+
+  /** Where a send tool's call lands, as a queue-ordering key: the channel
+   *  registry's id when the input names a known channel (so it orders with
+   *  plain speech to that channel), else a server-scoped raw key. */
+  private sendTargetKey(serverId: string, input: Record<string, unknown>): string {
+    const raw = typeof input.channelId === 'string' ? input.channelId.trim()
+      : typeof input.userId === 'string' ? `user:${input.userId.trim()}`
+      : '';
+    if (raw && this.findChannelEntry(raw)) return raw;
+    if (raw) {
+      for (const entry of this.channels.values()) {
+        if (entry.serverId === serverId && entry.descriptor.id.endsWith(`:${raw}`)) return entry.descriptor.id;
+      }
+    }
+    return `${serverId}:${raw || 'unknown'}`;
+  }
+
+  private queuedToolResult(entry: { id: string; tool?: { name: string }; writtenAt: number; outcome?: OutboxOutcome; attachments?: unknown[] }, reason: string): ToolResult {
+    const at = entry.writtenAt + (this.proseOutbox?.maxAgeMs ?? 0);
+    const until = this.formatTime ? this.formatTime(at) : new Date(at).toISOString();
+    const durable = this.proseOutboxDurable
+      ? 'kept across restarts'
+      : 'held in memory only (a restart before then loses it, so keep your own copy if it matters)';
+    return {
+      success: true,
+      data: [{
+        type: 'text',
+        text: (entry.outcome === 'unknown'
+          ? `[queued] No answer (${reason}), so this may already have arrived. The retry checks the channel first ` +
+            'and won\'t post it twice if it finds it; if that check can\'t be made, a duplicate is possible. '
+          : `[queued] Not sent yet (${reason}). `) +
+          `This ${entry.tool?.name ?? 'send'} is ${durable} and will be ` +
+          `delivered when the connection is back, until ${until}; you don't need to resend it.` +
+          `${entry.attachments?.length ? ` Its ${entry.attachments.length} file(s) were copied when it was queued, so exactly those are sent.` : ''}` +
+          ` Outbox id ${entry.id.slice(0, 8)} (to withdraw it before it's sent: outbox_cancel).`,
+      }],
+    };
+  }
+
+  /** Queued speech, oldest first (read-only copy; dashboards, tests). */
+  getOutboxEntries(): ReadonlyArray<{ id: string; conversationId: string; channelId: string; writtenAt: number; attempts: number; outcome: OutboxOutcome; lastError: string; textLen: number }> {
+    return (this.proseOutbox?.snapshot() ?? []).map((e) => ({
+      id: e.id, conversationId: e.conversationId, channelId: e.channelId, writtenAt: e.writtenAt,
+      attempts: e.attempts, outcome: e.outcome, lastError: e.lastError, textLen: e.text.length,
+    }));
+  }
+
+  /**
+   * A server connected or reconnected: everything queued is due now. The
+   * framework calls this once the server's data plane is ready.
+   */
+  kickOutbox(): void {
+    if (!this.proseOutbox || this.proseOutbox.size === 0) return;
+    this.proseOutbox.expedite();
+    void this.drainOutboxNow();
+  }
+
+  /**
+   * Attempt every due channel head, in per-channel FIFO order, until nothing
+   * more can go. Serialized: a call while a drain runs joins it and a
+   * follow-up pass runs after. Never throws.
+   */
+  drainOutboxNow(): Promise<void> {
+    const outbox = this.proseOutbox;
+    if (!outbox || this.outboxStopped) return Promise.resolve();
+    if (this.outboxDraining) {
+      this.outboxRedrain = true;
+      return this.outboxDraining;
+    }
+    const run = async (): Promise<void> => {
+      try {
+        do {
+          this.outboxRedrain = false;
+          let progressed = false;
+          for (const entry of outbox.due()) {
+            if (this.outboxStopped) return;
+            const delayReason = entry.outcome === 'unknown' ? 'unanswered' : 'disconnected';
+            const kept = outbox.verifyAttachments(entry);
+            if (!kept.ok) {
+              outbox.drop(entry.id, kept.reason);
+              continue;
+            }
+            this.outboxInFlight = entry.id;
+            let attempt;
+            try {
+              attempt = entry.tool
+                ? await this.callToolOnce(entry, delayReason)
+                : await this.publishSpeech(
+                  entry.conversationId, entry.channelId, entry.text,
+                  { id: entry.id, writtenAt: entry.writtenAt, delayReason },
+                  'retry',
+                );
+            } finally {
+              this.outboxInFlight = null;
+            }
+            if (attempt.ok) {
+              outbox.delivered(entry.id, attempt.messageId);
+              // The next entry for this channel was waiting on this one.
+              outbox.expedite(new Set([entry.channelId]));
+              progressed = true;
+            } else if (attempt.retry === 'permanent') {
+              outbox.drop(entry.id, attempt.reason);
+            } else if (
+              attempt.retry === 'unknown' &&
+              !outbox.isIdempotent(attempt.scope ?? attempt.serverId ?? '')
+            ) {
+              outbox.drop(entry.id, `${attempt.reason}; resending could post it twice`, true);
+            } else {
+              outbox.retryLater(entry.id, attempt.retry, attempt.reason);
+            }
+          }
+          if (progressed) this.outboxRedrain = true;
+        } while (this.outboxRedrain && !this.outboxStopped);
+      } catch (err) {
+        console.error('[prose-outbox] drain failed:', err);
+      }
+    };
+    // Cleared in .finally (always a later microtask), never inside run():
+    // a pass with nothing due completes synchronously, and clearing there
+    // would run BEFORE this assignment, leaving the flag stuck forever.
+    const draining: Promise<void> = run().finally(() => {
+      if (this.outboxDraining === draining) this.outboxDraining = null;
+      this.scheduleOutbox();
+    });
+    this.outboxDraining = draining;
+    return this.outboxDraining;
+  }
+
+  private outboxRedrain = false;
+
+  private outboxNow(): number {
+    return this.outboxClock ? this.outboxClock() : Date.now();
+  }
+
+  private outboxClock?: () => number;
+
+  /** Arm the backstop timer: the next due head, and at least every minute
+   *  (expiry has to run even while every head is backing off). */
+  private scheduleOutbox(): void {
+    if (this.outboxTimer) clearTimeout(this.outboxTimer);
+    this.outboxTimer = null;
+    const outbox = this.proseOutbox;
+    if (!outbox || this.outboxStopped || outbox.size === 0) return;
+    const next = outbox.nextDueAt() ?? this.outboxNow();
+    const delay = Math.min(Math.max(next - this.outboxNow(), 1_000), 60_000);
+    this.outboxTimer = setTimeout(() => {
+      this.outboxTimer = null;
+      void this.drainOutboxNow();
+    }, delay);
+    this.outboxTimer.unref?.();
+  }
+
+  private handleOutboxEvent(event: OutboxEvent): void {
+    const { entry } = event;
+    this.emitTraceFn({
+      type: 'mcpl:speech-outbox',
+      kind: event.kind,
+      conversationId: entry.conversationId,
+      channelId: entry.channelId,
+      outboxId: entry.id,
+      attempts: entry.attempts,
+      textLen: entry.text.length,
+      ...(event.kind === 'dropped' ? { reason: event.reason, mayHaveArrived: event.mayHaveArrived } : {}),
+      ...(event.kind === 'queued' ? { reason: event.reason } : {}),
+    });
+    try {
+      this.onOutboxEvent?.(event);
+    } catch (err) {
+      console.error('onOutboxEvent failed:', err);
+    }
   }
 
   private async handleToolPublish(input: { channelId?: string; content?: string; text?: string }): Promise<ToolResult> {

@@ -111,6 +111,16 @@ export interface FrameworkConfig {
   discordAwarenessOutboxPath?: string;
 
   /**
+   * Durable retry of plain speech that could not be delivered (a connector
+   * down or timing out). Opt-in. Queued speech is retried in order, without
+   * double posts, for up to `maxAgeMs` (default 6 h); the agent gets a
+   * non-waking notice when speech is queued, delivered late, or given up.
+   * The queue file defaults to `<storePath>/recovery/prose-outbox.json`.
+   * See src/mcpl/prose-outbox.ts.
+   */
+  proseOutbox?: import('../mcpl/prose-outbox.js').ProseOutboxConfig;
+
+  /**
    * Branch-INDEPENDENT record of the host's quiesce state (issue #122).
    * Defaults to `<storePath>/recovery/host-mode.json`. Lives outside the
    * chronicle because a historical rollback (branchAt + switchBranch) would

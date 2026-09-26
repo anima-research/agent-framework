@@ -758,10 +758,13 @@ export class McplServerConnection extends EventEmitter {
     name: string,
     args: Record<string, unknown>,
     stateParams?: { state?: unknown; checkpoint?: string },
+    /** MCP request `_meta` (e.g. the prose outbox's idempotencyKey). */
+    meta?: Record<string, unknown>,
   ): Promise<McpToolCallResult> {
     const params: Record<string, unknown> = { name, arguments: args };
     if (stateParams?.state !== undefined) params.state = stateParams.state;
     if (stateParams?.checkpoint !== undefined) params.checkpoint = stateParams.checkpoint;
+    if (meta !== undefined) params._meta = meta;
     return this.sendRequest('tools/call', params) as Promise<McpToolCallResult>;
   }
 
