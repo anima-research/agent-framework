@@ -13131,6 +13131,8 @@ export class AgentFramework {
 
     const tools: import('./types/index.js').ToolDefinition[] = [];
     const toolFeatureSets = new Map<string, string>();
+    const previousTools = this.mcplTools;
+    const previousFeatureSets = this.mcplToolFeatureSets;
 
     for (const server of this.mcplServerRegistry.getAllServers()) {
       const config = this.mcplServerConfigs.get(server.id);
@@ -13160,8 +13162,25 @@ export class AgentFramework {
             toolFeatureSets.set(namespacedName, featureSet);
           }
         }
-      } catch {
-        // Server may not support tools/list — skip silently
+      } catch (error) {
+        // A server that can't answer right now (mid-reconnect, hung, briefly
+        // down) keeps the tools it had: dropping them would change the tool
+        // list, which is the top of every request, forcing a full prompt-cache
+        // rewrite now and another when they come back, and hiding the tools
+        // unannounced in between. A call to a down server fails on its own.
+        // A server that never listed tools (none known) contributes nothing.
+        const kept = previousTools.filter((t) => t.name.startsWith(`${prefix}--`));
+        for (const tool of kept) {
+          tools.push(tool);
+          const fs = previousFeatureSets.get(tool.name);
+          if (fs !== undefined) toolFeatureSets.set(tool.name, fs);
+        }
+        if (kept.length > 0) {
+          console.error(
+            `[mcpl-tools] server "${server.id}" did not answer tools/list ` +
+              `(${error instanceof Error ? error.message : String(error)}); keeping its ${kept.length} known tool(s)`,
+          );
+        }
       }
     }
 
