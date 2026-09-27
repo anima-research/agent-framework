@@ -588,6 +588,17 @@ test('files are kept when a send is queued: the copy is sent even if the origina
   assert.equal(statSync(join(dir, 'recovery')).mode & 0o777, 0o700);
 });
 
+test('an existing recovery directory is made owner-only at start-up, before any write', async () => {
+  const dir = tempDir();
+  const { mkdirSync, chmodSync, statSync } = await import('node:fs');
+  mkdirSync(join(dir, 'recovery'));
+  chmodSync(join(dir, 'recovery'), 0o755); // e.g. created earlier by another recovery file
+  const t = toolServer();
+  makeRegistry({ server: t.server, outbox: { ...TOOLS, path: join(dir, 'recovery', 'prose-outbox.json') } });
+  assert.equal(statSync(join(dir, 'recovery')).mode & 0o777, 0o700);
+  assert.equal(existsSync(join(dir, 'recovery', 'prose-outbox.json')), false, 'nothing written');
+});
+
 test('a kept file that changed is not sent: given up visibly, never sent altered or without it', async () => {
   const dir = tempDir();
   const path = join(dir, 'recovery', 'prose-outbox.json');

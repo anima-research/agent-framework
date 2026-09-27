@@ -468,6 +468,9 @@ export class ProseOutbox {
 
   private load(): void {
     if (!this.path) return;
+    // A directory that already exists (shared with other recovery files) is
+    // tightened now, not at the first write: owner-only from start-up.
+    if (existsSync(dirname(this.path))) ensurePrivateDir(dirname(this.path));
     let state: Partial<PersistedState> | null;
     try {
       state = JSON.parse(readFileSync(this.path, 'utf8')) as Partial<PersistedState> | null;
