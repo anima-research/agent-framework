@@ -68,6 +68,12 @@ export interface CodeExecutionConfig {
   /** Max wake_agent() calls per background script (default 100); further
    *  calls raise RuntimeError inside the script. */
   maxWakesPerScript?: number;
+  /** Environment for the python interpreter on top of the operating
+   *  allowlist (see CHILD_ENV_ALLOWLIST); the host's secrets are not passed
+   *  to model-authored code. `${VAR}`-substitute from .env in a recipe. */
+  env?: Record<string, string>;
+  /** Escape hatch: the interpreter inherits the host's whole environment. */
+  inheritEnv?: boolean;
 }
 
 /** See `FrameworkConfig.providerHold`. */

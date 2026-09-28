@@ -5,3 +5,8 @@
   are no longer readable by another. A server that relied on an inherited
   variable must declare it in its `env` (recipes can `${VAR}`-substitute), or
   set `inheritEnv: true` to restore full inheritance.
+- **Operators with `codeExecution` enabled:** the python interpreter that runs
+  model-authored scripts gets the same allowlist plus `codeExecution.env`;
+  `codeExecution.inheritEnv: true` restores full inheritance. Before this,
+  any agent with code execution could read every host secret via
+  `os.environ`.

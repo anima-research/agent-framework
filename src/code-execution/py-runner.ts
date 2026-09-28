@@ -15,6 +15,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { buildChildEnv } from '../mcpl/transport.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -70,6 +71,13 @@ export interface PyRunnerOptions {
   onToolCall: ScriptToolCallHandler;
   /** Log prefix, typically the agent name. */
   label?: string;
+  /** Extra environment for the interpreter (PYTHONPATH, a venv, …). The
+   *  child gets the same operating allowlist stdio MCPL children get
+   *  (CHILD_ENV_ALLOWLIST + LC_*) plus exactly these — never the host's
+   *  secrets, since the code it runs is the model's. */
+  env?: Record<string, string>;
+  /** Escape hatch: pass the host's entire environment, as before. */
+  inheritEnv?: boolean;
 }
 
 const DEFAULT_TOOL_CALL_TIMEOUT_MS = 270_000;
@@ -92,6 +100,7 @@ export class PyRunner {
   private readonly idleReclaimMs: number;
   private readonly onToolCall: ScriptToolCallHandler;
   private readonly label: string;
+  private readonly childEnv: NodeJS.ProcessEnv;
 
   private onWake: ((line: number, payload: unknown) => Promise<string | null>) | null = null;
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -110,6 +119,9 @@ export class PyRunner {
     this.idleReclaimMs = options.idleReclaimMs ?? DEFAULT_IDLE_RECLAIM_MS;
     this.onToolCall = options.onToolCall;
     this.label = options.label ?? 'pytc';
+    // The interpreter runs model-authored code: the same env discipline as an
+    // MCPL connector child (#175), for a child that deserves it more.
+    this.childEnv = { ...buildChildEnv({ env: options.env, inheritEnv: options.inheritEnv }), PYTHONUNBUFFERED: '1' };
   }
 
   get busy(): boolean {
@@ -244,7 +256,7 @@ export class PyRunner {
 
     const child = spawn(this.pythonPath, [runtimePath], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      env: this.childEnv,
     });
     this.child = child;
 
