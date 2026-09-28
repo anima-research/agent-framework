@@ -15,8 +15,14 @@
   terminal (one `inference:aborted`, the marker, no `inference:failed`, no
   `errorPolicy` retry of the inference that was just stopped), and the
   quiesce/shutdown twins no longer emit a contradictory `inference:failed`
-  before settling as aborted. (#134, by Lari; reworked after review.)
+  before settling as aborted. A third shape — an implementation whose
+  `cancel()` simply closes the iterator, with no terminal event — reaches the
+  same terminal too, at the loop's end, instead of leaving the turn unsettled
+  under a `completed` lifecycle terminal. (#134, by Lari; reworked after
+  review.)
 - Speech-route failures with no delivery locus (headless/WebUI turns with no
   home or trigger channel) now read `[send-undeliverable] … had no channel
-  to go to` instead of claiming a Discord delivery failure to "the channel".
-  The machine-readable marker `kind` is unchanged.
+  to go to` instead of claiming a Discord delivery failure to "the channel",
+  and say that this route delivered nowhere rather than that the reply
+  reached no one — another `dispatchSpeech` handler may have shown it. The
+  machine-readable marker `kind` is unchanged.

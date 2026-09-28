@@ -8670,6 +8670,9 @@ export class AgentFramework {
     // failed, a framework-cancelled stream sets aborted. Best-effort
     // notifications — consumers dedupe by inferenceId and keep a timeout.
     let lifecyclePhase: 'completed' | 'aborted' | 'failed' = 'completed';
+    // Set by the complete / aborted / error cases: the stream SAID how it
+    // ended. An iterator that just closes says nothing (see after the loop).
+    let streamTerminal = false;
     let preserveEventGateForSuccessor = false;
     this.hookOrchestrator?.emitLifecycle({
       inferenceId: outgoingInferenceId,
@@ -8941,6 +8944,7 @@ export class AgentFramework {
           }
 
           case 'complete': {
+            streamTerminal = true;
             adoptInjectedRound();
             const durationMs = Date.now() - startTime;
             const response = event.response;
@@ -9435,6 +9439,7 @@ export class AgentFramework {
           }
 
           case 'error': {
+            streamTerminal = true;
             const err = event.error;
             const durationMs = Date.now() - startTime;
 
@@ -9571,6 +9576,7 @@ export class AgentFramework {
           }
 
           case 'aborted': {
+            streamTerminal = true;
             // Consumed once per terminal event, whichever path follows: a
             // framework-owned cancel (stop() also goes through cancelStream)
             // must not leave a caller record behind for a later stream.
@@ -9820,6 +9826,26 @@ export class AgentFramework {
             });
             break;
           }
+        }
+      }
+      // The third cancel shape: a stream whose cancel() just closes the
+      // iterator, with no `aborted` or `error` event at all. The loop ends
+      // having been told nothing, so nothing above settled the turn — the
+      // lifecycle terminal would read `completed`, no inference:aborted would
+      // be emitted, and an in-flight runEphemeralToCompletion would ride out
+      // its watchdog. If THIS side cancelled the stream, that cancel is the
+      // terminal: the same end as the `aborted` and `error` twins, the
+      // caller's reason consumed here by the stream it ended. A silent end
+      // nobody asked for keeps the prior behaviour (the finally still
+      // releases the gate). Greptile on #172, 2026-09-28.
+      if (!streamTerminal && this.agents.get(agent.name) === agent && agent.streamId === myStreamId) {
+        const callerCancel = agent.takeCancel();
+        if (callerCancel !== undefined) {
+          lifecyclePhase = 'aborted'; // §10.5 — terminal emitted in finally
+          this.settleDeliberateCancel({
+            agent, myStreamId, startTime, requestId, compiledRequest,
+            reason: callerCancel.reason ?? 'user',
+          });
         }
       }
     } catch (error) {
@@ -12089,7 +12115,7 @@ export class AgentFramework {
             // have shown it.
             const text = channelId
               ? `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`
-              : `[send-undeliverable] Your previous reply (${textLen} chars) had no channel to go to — ${reason}. This is a routing/configuration situation, not a channel failure. It reached no channel; it is saved in your archive.`;
+              : `[send-undeliverable] Your previous reply (${textLen} chars) had no channel to go to — ${reason}. This is a routing/configuration situation, not a channel failure. This route delivered it nowhere; if another surface showed it (a reply thread, the console), that copy stands. It is saved in your archive.`;
             this.addMessage(
               'user',
               [{ type: 'text', text }],

@@ -819,9 +819,11 @@ export class Agent {
 
     this._streamId++;
     // A pending cancel belongs to the stream that was live when cancelStream()
-    // ran. If that stream ended without a terminal event (iterator closed,
-    // no `aborted`/`error`) nothing collected it; a fresh stream must not
-    // inherit it and read its own later error as a deliberate stop.
+    // ran. The stream driver collects it on that stream's terminal event, or
+    // at the loop's end when the iterator closed without one; this clear is
+    // the belt for a driver that never got there (a stream that never
+    // started iterating). A fresh stream must not inherit it and read its
+    // own later error as a deliberate stop.
     this._pendingCancel = undefined;
     this._inferenceStartedAt = Date.now();
     this.lastStreamInputTokens = 0;

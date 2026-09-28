@@ -42,6 +42,14 @@ class ErroringOnCancelStream implements YieldingStream {
   }
 }
 
+/** Parks until cancel(), then just ENDS — no `aborted`, no `error`. The
+ *  third shape: an implementation whose cancel() closes the iterator. */
+class SilentlyEndingOnCancelStream extends ErroringOnCancelStream {
+  override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+    await new Promise<void>((resolve) => { (this as unknown as { release: () => void }).release = resolve; });
+  }
+}
+
 /** Fails spontaneously — the genuine provider error the failure pipeline is for. */
 class SpontaneouslyErroringStream extends ErroringOnCancelStream {
   override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
@@ -163,27 +171,50 @@ describe('a cancel that the stream reports as `error` is still a deliberate stop
     }
   });
 
+  it('a cancel whose stream ends with NO terminal event still ends as a deliberate stop', async () => {
+    // Greptile on #172 (2026-09-28): an iterator that closes on cancel()
+    // without `aborted` or `error` told the driver nothing, so nothing
+    // settled the turn — no inference:aborted, the lifecycle terminal read
+    // `completed`, and an ephemeral run would ride out its watchdog. The
+    // caller's cancel IS the terminal for that shape too.
+    const { framework, membrane, agent, traces, teardown } = await boot('cancel-silent-', () => new SilentlyEndingOnCancelStream());
+    try {
+      framework.abortInference('assistant', 'silent_stop');
+      await waitFor(() => traces.some((t) => t.type === 'inference:aborted'));
+      await new Promise((r) => setTimeout(r, 150));
+      assert.deepEqual(types(traces, 'inference:aborted', 'inference:failed', 'inference:exhausted'), ['inference:aborted'],
+        `terminals: ${JSON.stringify(types(traces, 'inference:aborted', 'inference:failed', 'inference:exhausted'))}`);
+      const aborted = traces.find((t) => t.type === 'inference:aborted') as { reason?: string };
+      assert.equal(aborted.reason, 'silent_stop', 'the caller\'s reason rides the terminal');
+      assert.equal(agent.state.status, 'idle');
+      assert.equal(membrane.calls.length, 1, 'no retry of the inference that was stopped');
+      assert.ok(contextTexts(framework).some((t) => t.startsWith('[turn-interrupted]')), 'the neutral marker is written');
+    } finally {
+      await teardown();
+    }
+  });
+
   it('the reason of a cancel is consumed by the stream it ended, never by the next one', async () => {
     // A cancel whose stream reports NO terminal event at all (iterator just
-    // ends) leaves the pending reason uncollected. The next stream must
-    // start clean: an error there is a genuine failure, not a stale stop.
-    class SilentlyEndingStream extends ErroringOnCancelStream {
-      override async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
-        await new Promise<void>((resolve) => { (this as unknown as { release: () => void }).release = resolve; });
-      }
-    }
+    // ends) is collected at that stream's loop end — one inference:aborted,
+    // the first stream's. The next stream must start clean: an error there
+    // is a genuine failure, not a stale stop, and adds no second abort.
     let n = 0;
     const { framework, membrane, agent, traces, teardown } = await boot('cancel-error-stale-', () =>
-      n++ === 0 ? new SilentlyEndingStream() : new SpontaneouslyErroringStream());
+      n++ === 0 ? new SilentlyEndingOnCancelStream() : new SpontaneouslyErroringStream());
     try {
       agent.cancelStream('stale_reason');
       await waitFor(() => agent.state.status === 'idle');
+      await waitFor(() => traces.some((t) => t.type === 'inference:aborted'));
+      const firstStreamAborts = traces.filter((t) => t.type === 'inference:aborted').length;
+      assert.equal(firstStreamAborts, 1, 'the silent end is settled by the cancel that ended it');
       await new Promise((r) => setTimeout(r, 100));
       framework.nudgeAgent('assistant', 'operator');
       await waitFor(() => membrane.calls.length === 2);
       await waitFor(() => traces.some((t) => t.type === 'inference:failed'), 3000);
+      await new Promise((r) => setTimeout(r, 100));
       const aborted = traces.filter((t) => t.type === 'inference:aborted') as Array<{ reason?: string }>;
-      assert.ok(!aborted.some((t) => t.reason === 'stale_reason'),
+      assert.equal(aborted.length, firstStreamAborts,
         `the first stream's reason leaked into the second: ${JSON.stringify(aborted)}`);
     } finally {
       await teardown();
