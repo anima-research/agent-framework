@@ -8909,7 +8909,17 @@ export class AgentFramework {
         this.midTurnInputSignals.delete(agent.name);
         this.turnLocusPins.delete(agent.name);
       } else {
-        const locus = this.channelRegistry?.resolveLocus(agent.name) ?? null;
+        // A non-channel surface is the turn's destination. Its source is
+        // preserved on the InferenceRequest at enqueue (applyProcessResponse),
+        // so fail closed BEFORE home/active/global channel resolution. WebUI
+        // already receives the stream; routing it elsewhere would be a leak.
+        const nonChannelSurfaceTurn =
+          trigger?.reason === 'external-message' &&
+          trigger.channelId === undefined &&
+          ['tui', 'cli', 'headless', 'api'].includes(trigger.source);
+        const locus = nonChannelSurfaceTurn
+          ? null
+          : this.channelRegistry?.resolveLocus(agent.name) ?? null;
         if (locus !== null) this.turnLocusPins.set(agent.name, locus);
         else this.turnLocusPins.delete(agent.name);
         this.midTurnInputSignals.delete(agent.name);
