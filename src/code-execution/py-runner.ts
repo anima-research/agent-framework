@@ -100,7 +100,7 @@ export class PyRunner {
   private readonly idleReclaimMs: number;
   private readonly onToolCall: ScriptToolCallHandler;
   private readonly label: string;
-  private readonly childEnv: NodeJS.ProcessEnv;
+  private readonly envOptions: { env?: Record<string, string>; inheritEnv?: boolean };
 
   private onWake: ((line: number, payload: unknown) => Promise<string | null>) | null = null;
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -120,8 +120,11 @@ export class PyRunner {
     this.onToolCall = options.onToolCall;
     this.label = options.label ?? 'pytc';
     // The interpreter runs model-authored code: the same env discipline as an
-    // MCPL connector child (#175), for a child that deserves it more.
-    this.childEnv = { ...buildChildEnv({ env: options.env, inheritEnv: options.inheritEnv }), PYTHONUNBUFFERED: '1' };
+    // MCPL connector child (#175), for a child that deserves it more. Stored
+    // as options, not a snapshot — the env is rebuilt at every spawn so a
+    // respawn after idle reclaim sees current host values, as the old
+    // per-spawn `{ ...process.env }` did.
+    this.envOptions = { env: options.env, inheritEnv: options.inheritEnv };
   }
 
   get busy(): boolean {
@@ -256,7 +259,7 @@ export class PyRunner {
 
     const child = spawn(this.pythonPath, [runtimePath], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: this.childEnv,
+      env: { ...buildChildEnv(this.envOptions), PYTHONUNBUFFERED: '1' },
     });
     this.child = child;
 

@@ -40,3 +40,18 @@ test('declared env reaches the interpreter; inheritEnv restores the host env', a
     delete process.env[key];
   }
 });
+
+test('the child env is rebuilt per spawn, not snapshotted at construction', async () => {
+  const key = 'AF_CODE_EXEC_TEST_LATE_VAR';
+  const runner = new PyRunner({ onToolCall: async () => '', inheritEnv: true });
+  process.env[key] = 'set-after-construction';
+  try {
+    const r = await runner.exec(`import os; print(repr(os.environ.get(${JSON.stringify(key)})))`, []);
+    assert.equal(r.returnCode, 0, r.stderr);
+    assert.match(r.stdout, /set-after-construction/,
+      `a var set after construction must reach the next spawn: ${r.stdout.trim()}`);
+  } finally {
+    runner.dispose();
+    delete process.env[key];
+  }
+});

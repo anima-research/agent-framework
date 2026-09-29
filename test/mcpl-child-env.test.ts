@@ -72,3 +72,24 @@ test('a real spawned stdio child sees only allowlist + declared env', async () =
     delete process.env[secretKey];
   }
 });
+
+test('win32: allowlist matches case-insensitively, original spelling kept', () => {
+  const env = buildChildEnv({}, {
+    Path: 'C:\\Windows;C:\\Windows\\System32',
+    SystemRoot: 'C:\\Windows',
+    ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+    lc_ctype: 'UTF-8',
+    ANTHROPIC_AUTH_TOKEN: 'host-anthropic-secret',
+  }, 'win32');
+  assert.deepEqual(env, {
+    Path: 'C:\\Windows;C:\\Windows\\System32',
+    SystemRoot: 'C:\\Windows',
+    ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+    lc_ctype: 'UTF-8',
+  });
+});
+
+test('posix: allowlist stays case-sensitive (`Path` is a different variable)', () => {
+  const env = buildChildEnv({}, { Path: '/spoofed', PATH: '/usr/bin' }, 'linux');
+  assert.deepEqual(env, { PATH: '/usr/bin' });
+});
