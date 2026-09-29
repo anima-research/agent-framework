@@ -122,3 +122,37 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 });
+
+describe('private non-channel trigger batching', () => {
+  let tempDir: string;
+  beforeEach(() => { tempDir = mkdtempSync(join(tmpdir(), 'private-batch-test-')); });
+  afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
+
+  it('does not borrow a sibling channel request from the same batch', async () => {
+    const membrane = new MockMembrane();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'private reply' }]));
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'), membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout' }], modules: [],
+    });
+    const i = internals(framework);
+    const captured: { handed?: InferenceRequest } = {};
+    const orig = i.startAgentStream.bind(framework);
+    i.startAgentStream = async (agent: unknown, trigger?: InferenceRequest) => {
+      captured.handed = trigger;
+      return orig(agent, trigger);
+    };
+    const t = Date.now();
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: t, nonChannelOrigin: true },
+      { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t + 1,
+        channelId: 'discord:g:room', addressed: true },
+    );
+    await i.processInferenceRequests();
+    await framework.runUntilIdle();
+    assert.equal(captured.handed?.nonChannelOrigin, true);
+    assert.equal(captured.handed?.channelId, undefined);
+    assert.equal(captured.handed?.addressed, false);
+    await framework.stop();
+  });
+});

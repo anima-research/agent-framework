@@ -303,6 +303,8 @@ export interface InferenceRequest {
   reason: string;
   source: string;
   timestamp: number;
+  /** True when a private non-channel surface requested this inference. */
+  nonChannelOrigin?: boolean;
   /**
    * The MCPL channel whose message triggered this inference, if any (composite
    * id, e.g. `discord:guild:channel` / `discord:dm:id`). The framework routes

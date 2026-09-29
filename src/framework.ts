@@ -6588,6 +6588,7 @@ export class AgentFramework {
           // updates lastAnnouncedLocus so the next turn's announce-on-change
           // diffs against what the agent was actually last told.
           if (
+            this.activeTurnTriggers.get(agent.name)?.nonChannelOrigin !== true &&
             (agent.proseRouting === 'locus' || agent.proseRouting === 'hybrid') &&
             !shouldEndTurn && !overBudget && currentState.stream
           ) {
@@ -6858,6 +6859,9 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
+            nonChannelOrigin:
+              (event.type === 'external-message' && ['tui', 'cli', 'headless'].includes(source))
+              || event.type === 'api:message',
           });
         }
       }
@@ -8219,8 +8223,8 @@ export class AgentFramework {
         ...trigger,
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
-        channelId: channelReq?.channelId,
-        addressed: addressedReq !== undefined,
+        channelId: trigger.nonChannelOrigin ? undefined : channelReq?.channelId,
+        addressed: trigger.nonChannelOrigin ? false : addressedReq !== undefined,
         // A context-budget restart continues the same logical turn: it keeps
         // the channel for routing but names no author — the restart is its
         // own cause, and borrowing another request's author would be false
@@ -8236,6 +8240,13 @@ export class AgentFramework {
   private recordProseSuppression(agentName: string, count: number): void {
     if (count <= 0) return;
     this.turnProseSuppressed.set(agentName, (this.turnProseSuppressed.get(agentName) ?? 0) + count);
+  }
+
+  /** Keep prose from a private non-channel turn in Chronicle/WebUI only. */
+  private suppressPrivateTurnProse(agentName: string, count: number): void {
+    if (count <= 0) return;
+    console.error(`[routing] ${agentName}: prose NOT auto-published (private non-channel turn)`);
+    this.recordProseSuppression(agentName, count);
   }
 
   /** Record a successful plain-prose delivery for this turn's receipt. */
@@ -8265,7 +8276,7 @@ export class AgentFramework {
    * delivered nothing. Failures are already marked separately
    * ([discord-send-failed]); this is the success half.
    */
-  private appendProseDeliveryReceipt(agent: Agent): void {
+  private appendProseDeliveryReceipt(agent: Agent, privateTurn = false): void {
     const list = this.turnProseDeliveries.get(agent.name);
     const suppressed = this.turnProseSuppressed.get(agent.name) ?? 0;
     if ((!list || list.length === 0) && suppressed === 0) return;
@@ -8285,9 +8296,11 @@ export class AgentFramework {
     }
     const suppressedNote =
       suppressed > 0
-        ? agent.proseRouting === 'disabled'
-          ? `${suppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)`
-          : `${suppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`
+        ? privateTurn
+          ? `${suppressed} plain-speech segment(s) kept private (non-channel turn — publish only with an explicit send tool)`
+          : agent.proseRouting === 'disabled'
+            ? `${suppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)`
+            : `${suppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`
         : '';
     const text =
       shown.length > 0
@@ -8913,10 +8926,7 @@ export class AgentFramework {
         // preserved on the InferenceRequest at enqueue (applyProcessResponse),
         // so fail closed BEFORE home/active/global channel resolution. WebUI
         // already receives the stream; routing it elsewhere would be a leak.
-        const nonChannelSurfaceTurn =
-          trigger?.reason === 'external-message' &&
-          trigger.channelId === undefined &&
-          ['tui', 'cli', 'headless', 'api'].includes(trigger.source);
+        const nonChannelSurfaceTurn = trigger?.nonChannelOrigin === true;
         const locus = nonChannelSurfaceTurn
           ? null
           : this.channelRegistry?.resolveLocus(agent.name) ?? null;
@@ -9521,6 +9531,8 @@ export class AgentFramework {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
                     );
+                  } else if (trigger?.nonChannelOrigin) {
+                    this.suppressPrivateTurnProse(agent.name, roundSegments.length);
                   } else {
                     const locus = resolveTurnLocus();
                     console.error(
@@ -9887,6 +9899,8 @@ export class AgentFramework {
                   } catch (err) {
                     console.error('text-only prose delivery failed:', err);
                   }
+                } else if (trigger?.nonChannelOrigin) {
+                  this.suppressPrivateTurnProse(agent.name, 1);
                 } else {
                   // Route to the TURN-FROZEN locus, like every other speech
                   // path. This dispatch runs AFTER the agent is idle, so a live
@@ -9969,6 +9983,8 @@ export class AgentFramework {
                     }
                   }
                 }
+              } else if (trigger?.nonChannelOrigin) {
+                this.suppressPrivateTurnProse(agent.name, segments.length);
               } else if (silenced || segments.length === 0) {
                 console.error(
                   `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> trailing prose NOT routed ` +
@@ -10010,7 +10026,7 @@ export class AgentFramework {
             // segments were awaited in-loop. Locus mode only; explicit-mode
             // envelopes acknowledge themselves through the prose gateway.
             if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
-              this.appendProseDeliveryReceipt(agent);
+              this.appendProseDeliveryReceipt(agent, trigger?.nonChannelOrigin === true);
             }
 
             // Explicit-prose `!` continuation: a prose segment this turn asked
@@ -10180,7 +10196,7 @@ export class AgentFramework {
                 // receipt for the whole turn.
                 if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
                   await turnSpeechChain;
-                  this.appendProseDeliveryReceipt(agent);
+                  this.appendProseDeliveryReceipt(agent, trigger?.nonChannelOrigin === true);
                 }
                 return;
               }

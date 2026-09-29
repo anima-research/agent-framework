@@ -311,13 +311,16 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const scout = framework.getAgent('scout')!;
     await (framework as unknown as { startAgentStream(agent: unknown, trigger?: unknown): Promise<void> })
       .startAgentStream(scout, {
-        agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: Date.now(),
+        agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
       });
     await framework.runUntilIdle();
 
     assert.equal(resolveCalls, 0, 'non-channel origin must bypass global last-inbound');
     assert.equal(i.turnLocusPins.has('scout'), false, 'WebUI turn must freeze no Discord locus');
-    assert.deepEqual(routedLoci, [null], 'routeSpeech receives null and can emit its no-locus marker');
+    assert.deepEqual(routedLoci, [], 'private prose is retained without calling routeSpeech');
+    const texts = scout.getContextManager().getAllMessages().flatMap((m) => m.content)
+      .filter((b): b is { type: 'text'; text: string } => b.type === 'text').map((b) => b.text);
+    assert.ok(texts.some((t) => t.includes('[delivered] nothing') && t.includes('kept private')));
     await framework.stop();
   });
 
@@ -337,7 +340,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const scout = framework.getAgent('scout')!;
     await (framework as unknown as { startAgentStream(agent: unknown, trigger?: unknown): Promise<void> })
       .startAgentStream(scout, {
-        agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: Date.now(),
+        agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
       });
     await framework.runUntilIdle();
 
