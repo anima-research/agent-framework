@@ -1829,6 +1829,10 @@ export class AgentFramework {
       // SIGUSR2 not available on this platform — non-fatal.
     }
 
+    // Reconcile wake promises only after every module/server/startup invariant
+    // above succeeded. A failed create must leave due intents durable.
+    framework.eventGate?.recoverWakeIntents();
+
     return framework;
   }
 
