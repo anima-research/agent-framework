@@ -94,6 +94,13 @@ export interface FrameworkConfig {
   subconscious?: import('../tune-out/tools.js').SubconsciousConfig;
 
   /**
+   * Focus mode: the primary resident can narrow attention to one channel for
+   * a bounded time; everything else is held and delivered at unfocus. Exposes
+   * the `focus` tool when enabled. See src/focus/coordinator.ts.
+   */
+  focus?: import('../focus/coordinator.js').FocusConfig;
+
+  /**
    * IANA zone used only when rendering wall-clock times for the agent.
    * Stored/protocol timestamps remain epoch/UTC. Defaults to AGENT_TIMEZONE,
    * then the process zone.

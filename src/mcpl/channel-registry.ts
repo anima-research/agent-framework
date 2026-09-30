@@ -87,18 +87,46 @@ export interface TuneOutParams {
   expiresAtMs?: number;
 }
 
+/**
+ * Parameters of the active focus epoch (per resident, not per channel):
+ * only `channelId` reaches the resident; everything else is held with
+ * `metadata.focusHeld = { epochId }` (permanent main-view exclusion) until
+ * the epoch ends. Durable in the lifecycle log as a `focus` record
+ * (null = ended), last-record-wins on replay.
+ */
+export interface FocusParams {
+  epochId: string;
+  /** The one channel that stays live. */
+  serverId: string;
+  channelId: string;
+  startedAtMs: number;
+  /** Chronicle sequence when focus began (audit bound). */
+  startedAtSequence: number;
+  /** Absolute deadline; the epoch ends itself here. */
+  expiresAtMs: number;
+  /** Newest raw messages delivered PER CHANNEL at unfocus. */
+  backlogCap: number;
+  /** Re-target release points: held messages of `channelId` with
+   *  sequence <= value were already delivered (a re-target dumps the new
+   *  focus channel's backlog early). Stamps are never mutated. */
+  released?: Record<string, number>;
+}
+
 interface ChannelLifecycleEvent {
   kind:
     | 'desired-state'
     | 'legacy-policy-migrated'
     | 'invitation-declined'
-    | 'tune-out-wake';
+    | 'tune-out-wake'
+    | 'focus';
   serverId: string;
   timestamp: string;
   channelId?: string;
   desired?: DesiredChannelState;
   /** Present when desired === 'tuned-out'. */
   tuneOut?: TuneOutParams;
+  /** kind 'focus': the active epoch, or null when focus ended. */
+  focus?: FocusParams | null;
   /** kind 'tune-out-wake': durable running wake count for an epoch.
    *  Lives in the lifecycle log (not gate stats) because gate runtime
    *  state dies with the process and max-wakes must not reset on restart. */
@@ -639,6 +667,9 @@ export class ChannelRegistry {
      *  'tune-out-wake' lifecycle records; see recordTuneOutWake). */
     wakeCount?: number;
   }>();
+
+  /** Chronicle-projected focus epoch (one per resident), or null. */
+  private focusState: FocusParams | null = null;
 
   /** One-time migration inputs from the retired recipe auto-open policy. */
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
@@ -1408,6 +1439,15 @@ export class ChannelRegistry {
         }
       } else if (event.kind === 'legacy-policy-migrated') {
         this.migratedLegacyPolicies.add(event.serverId);
+      } else if (event.kind === 'focus') {
+        // Last record wins; a malformed epoch (no id / channel) reads as
+        // ended rather than crashing boot on a corrupt log.
+        const f = event.focus;
+        this.focusState =
+          f && typeof f === 'object' && typeof f.epochId === 'string' &&
+          typeof f.channelId === 'string' && typeof f.expiresAtMs === 'number'
+            ? f
+            : null;
       }
     }
   }
@@ -1866,6 +1906,34 @@ export class ChannelRegistry {
     const current = this.desiredStates.get(this.lifecycleKey(serverId, channelId));
     if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
     return { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
+  }
+
+  /**
+   * Durably set (params) or end (null) the resident's focus epoch. The
+   * focus coordinator owns the hold/dump flow; this is only the state flip.
+   */
+  setFocus(params: FocusParams | null, source: string): void {
+    const serverId = params?.serverId ?? this.focusState?.serverId ?? 'host';
+    this.focusState = params;
+    this.appendLifecycleEvent({
+      kind: 'focus',
+      serverId,
+      ...(params ? { channelId: params.channelId } : {}),
+      focus: params,
+      source,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /** The active focus epoch, or null. */
+  getFocus(): FocusParams | null {
+    return this.focusState;
+  }
+
+  /** Human label of a registered channel, when known. */
+  channelLabel(serverId: string, channelId: string): string | undefined {
+    const label = this.channels.get(`${serverId}:${channelId}`)?.descriptor.label;
+    return typeof label === 'string' && label ? label : undefined;
   }
 
   /** Registered channel entries (read-only iteration for the coordinator). */

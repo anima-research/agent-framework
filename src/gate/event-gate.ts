@@ -534,6 +534,8 @@ export class EventGate {
   private inferenceBuffer: PendingEvent[] = [];
   /** Host quiesce suppression — see setQuiesced. */
   private quiesced = false;
+  /** Focus hold — see setHoldPredicate. */
+  private holdPredicate: ((info: GateEventInfo) => boolean) | null = null;
   /** Lifetime count of buffer-cap evictions (see bufferForInference). */
   private droppedBufferedEvents = 0;
 
@@ -996,6 +998,25 @@ export class EventGate {
 
   evaluate(info: GateEventInfo): GateDecision {
     this.reloadIfChanged();
+
+    // Focus hold (strict — nothing breaks through): a held event must not
+    // reach ANY policy. In particular a debounce policy would otherwise queue
+    // it here and later deliver a "[Gate: N events]" wake for traffic the
+    // framework is holding out of the window.
+    if (this.holdPredicate?.(info)) {
+      this.totalEvaluations++;
+      this.emitTrace({
+        type: 'gate:decision',
+        eventType: info.eventType,
+        serverId: info.serverId || undefined,
+        channelId: info.channelId || undefined,
+        matchedPolicy: 'focus-held',
+        trigger: false,
+        behavior: 'skip',
+        timestamp: this.now(),
+      });
+      return { trigger: false, policyName: 'focus-held', behavior: 'skip' };
+    }
 
     // Sleep suppression: while asleep, drop EXTERNAL wakes. Two things still
     // rouse the agent — its own heartbeat (an internal clock, not an outside
@@ -1586,6 +1607,39 @@ export class EventGate {
     if (this.quiesced === quiesced) return;
     this.quiesced = quiesced;
     if (!quiesced) this.flushInferenceBufferIfClear();
+  }
+
+  /**
+   * Install (or clear with null) the focus hold: events the predicate
+   * accepts are dropped before policy evaluation (no trigger, no debounce
+   * queueing). Installing also purges already-queued debounce/buffered
+   * events the predicate would hold, so a wake queued seconds before focus
+   * began cannot land inside it.
+   */
+  setHoldPredicate(predicate: ((info: GateEventInfo) => boolean) | null): number {
+    this.holdPredicate = predicate;
+    if (!predicate) return 0;
+    const held = (e: PendingEvent): boolean => predicate({
+      content: e.content,
+      eventType: e.eventType,
+      serverId: e.serverId ?? '',
+      channelId: e.channelId ?? '',
+      metadata: e.channelId ? { channelId: e.channelId } : undefined,
+    });
+    let purged = 0;
+    for (const [name, state] of this.debounceTimers) {
+      const before = state.events.length;
+      state.events = state.events.filter((e) => !held(e));
+      purged += before - state.events.length;
+      if (state.events.length === 0) {
+        clearTimeout(state.timer);
+        this.debounceTimers.delete(name);
+      }
+    }
+    const beforeBuffer = this.inferenceBuffer.length;
+    this.inferenceBuffer = this.inferenceBuffer.filter((e) => !held(e));
+    purged += beforeBuffer - this.inferenceBuffer.length;
+    return purged;
   }
 
   private flushInferenceBufferIfClear(): void {
