@@ -846,6 +846,10 @@ export class ChannelRegistry {
     const results: ChannelIncomingMessageResult[] = [];
 
     for (const message of params.messages) {
+      if ('coalesce' in message) {
+        results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+        continue; // channelsIncoming is explicitly not advertised by this host.
+      }
       // §14.5 FIRST, before ANY semantic processing: admission against the
       // actually-registered channel precedes tag expansion and content
       // conversion — decoding an unregistered sender's payload (including

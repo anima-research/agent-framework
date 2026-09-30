@@ -48,6 +48,8 @@ const RELOAD_THROTTLE_MS = 1000;
 const MIN_DEBOUNCE_MS = 100;
 /** Maximum debounce value (ms). */
 const MAX_DEBOUNCE_MS = 300_000;
+/** Symbols cannot be supplied by a server's JSON origin/metadata. */
+export const COALESCING_SUBJECT = Symbol('mcpl.coalescingSubject');
 
 // ---------------------------------------------------------------------------
 // Default config
@@ -63,6 +65,8 @@ const DEFAULT_CONFIG: GateConfig = {
 // ---------------------------------------------------------------------------
 
 interface PendingEvent {
+  /** Host-minted RFC-006 subject; updates keep the original debounce deadline. */
+  coalescingSubject?: string;
   policyName: string;
   content: string;
   eventType: string;
@@ -1436,6 +1440,7 @@ export class EventGate {
     const debounceMs = (policy.behavior as { debounce: number }).debounce;
 
     const event: PendingEvent = {
+      coalescingSubject: (info.metadata as Record<PropertyKey, unknown> | undefined)?.[COALESCING_SUBJECT] as string | undefined,
       policyName: policy.name,
       content: info.content.length > MAX_CONTENT_SNIPPET
         ? info.content.slice(0, MAX_CONTENT_SNIPPET) + '...'
@@ -1453,10 +1458,20 @@ export class EventGate {
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
     };
 
+    if (event.coalescingSubject) {
+      // A tag/rule change still corrects the SAME pending wake. Keep its first
+      // deadline even when the replacement now matches a different policy.
+      for (const state of this.debounceTimers.values()) {
+        const index = state.events.findIndex(e => e.coalescingSubject === event.coalescingSubject);
+        if (index !== -1) { state.events[index] = event; return; }
+      }
+    }
     const existing = this.debounceTimers.get(policy.name);
     if (existing) {
-      clearTimeout(existing.timer);
       existing.events.push(event);
+      // Unrelated traffic must not postpone a coalesced wake indefinitely either.
+      if (existing.events.some(e => e.coalescingSubject)) return;
+      clearTimeout(existing.timer);
       existing.timer = setTimeout(() => this.fireDebounce(policy.name), debounceMs);
     } else {
       const timer = setTimeout(() => this.fireDebounce(policy.name), debounceMs);
@@ -1493,6 +1508,15 @@ export class EventGate {
     });
   }
 
+  /** Withdraw a coalesced wake when its subject is consumed, removed, or revoked. */
+  cancelCoalesced(subject: string): void {
+    for (const [name, state] of this.debounceTimers) {
+      state.events = state.events.filter(e => e.coalescingSubject !== subject);
+      if (!state.events.length) { clearTimeout(state.timer); this.debounceTimers.delete(name); }
+    }
+    this.inferenceBuffer = this.inferenceBuffer.filter(e => e.coalescingSubject !== subject);
+  }
+
   // =========================================================================
   // Event delivery
   // =========================================================================
@@ -1507,8 +1531,11 @@ export class EventGate {
     // them here would inject a duplicate copy of the message minutes after
     // the fact, reading as fresh input the agent may have already handled.
     // Only events with no context entry of their own carry their content.
-    const quoted = events.filter(e => !e.inContext);
-    const referenced = events.filter(e => e.inContext);
+    // Coalesced pushes have no arrival-time context row. Their current content is
+    // materialized at assembly; a gate marker would leave traces of withdrawn work.
+    const contextEvents = events.filter(e => !e.coalescingSubject);
+    const quoted = contextEvents.filter(e => !e.inContext);
+    const referenced = contextEvents.filter(e => e.inContext);
 
     const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
     if (referenced.length > 0) {
@@ -1534,9 +1561,9 @@ export class EventGate {
       }
     }
 
-    const text = `[Gate: ${events.length} event${events.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
+    const text = `[Gate: ${contextEvents.length} event${contextEvents.length > 1 ? 's' : ''} matched]\n\n${lines.join('\n')}`;
 
-    this.addMessageFn('user', [{ type: 'text', text }], {
+    if (contextEvents.length) this.addMessageFn('user', [{ type: 'text', text }], {
       source: 'gate:debounce',
       policies: policyNames,
     });

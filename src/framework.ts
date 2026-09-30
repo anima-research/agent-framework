@@ -67,7 +67,9 @@ import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
-import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
+import { PushHandler, convertBlock as convertPushBlock, type McplPushEvent } from './mcpl/push-handler.js';
+import { PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, type CoalescedPush, type CoalescingSnapshot } from './mcpl/push-coalescer.js';
+import { COALESCING_SUBJECT } from './gate/event-gate.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
@@ -443,6 +445,8 @@ function isTurnContinuation(reason: string): boolean {
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
+const COALESCING_AUDIT_ID = 'mcpl/coalescing-audit';
+const COALESCING_PENDING_ID = 'mcpl/coalescing-pending';
 const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints'; // legacy single-map layout, read-only fallback
 const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
 
@@ -1213,6 +1217,12 @@ export class AgentFramework {
   private featureSetManager: FeatureSetManager | null = null;
   private hookOrchestrator: HookOrchestrator | null = null;
   private pushHandler: PushHandler | null = null;
+  private pushCoalescer: PushCoalescer | null = null;
+  private coalescingEpochs = new Map<string, string>();
+  private coalescingWakes = new Map<string, InferenceRequest[]>();
+  private coalescingSharedReaders = new WeakSet<Agent>();
+  private coalescingBranch: string | null = null;
+  private coalescingTriggerFilter?: (content: string, metadata: Record<string, unknown>) => boolean;
   private inferenceRouter: InferenceRouter | null = null;
   private channelRegistry: ChannelRegistry | null = null;
   private checkpointManager: CheckpointManager | null = null;
@@ -1781,6 +1791,7 @@ export class AgentFramework {
    * Stop the event loop.
    */
   async stop(): Promise<void> {
+    this.pushCoalescer?.suspend();
     this.running = false;
     // Flushed-but-unsynced deferred writes: sync and ack now, while the
     // store is still open, rather than leaving them to a reboot replay.
@@ -6153,6 +6164,7 @@ export class AgentFramework {
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
+    this.coalescingSharedReaders.add(agent);
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
     if (restoredSettings) {
       agent.restoreRuntimeSettings(
@@ -6227,6 +6239,7 @@ export class AgentFramework {
       allowedTools: [...SUBCONSCIOUS_TOOL_NAMES, 'think', 'skip_reply', 'end_turn'],
     };
     const agent = new Agent(agentConfig, contextManager, this.membrane);
+    this.coalescingSharedReaders.add(agent); // merges the residents' shared message slot
     this.agents.set(name, agent);
     this.agentConfigs.set(name, agentConfig);
     this.subconsciousAgentName = name;
@@ -7213,9 +7226,95 @@ export class AgentFramework {
     };
   }
 
-  /**
-   * Convert an MCPL push event to a context message.
-   */
+  /** The shared message slot is the audience of ordinary feature-set pushes. */
+  private coalescingAudience(): string {
+    return JSON.stringify([this.store.currentBranch().name, 'shared-messages']);
+  }
+
+  private materializeCoalescedPush(push: CoalescedPush, agent: Agent, recovering = false): void {
+    if (push.audience !== this.coalescingAudience() || this.agents.get(agent.name) !== agent) return;
+    const deliveryId = JSON.stringify([push.serverId, push.epoch, push.params.eventId, push.audience]);
+    // Crash between the context write and pending-snapshot removal must not
+    // duplicate delivery. This metadata is host-authored, never wire testimony.
+    if ((recovering || push.recovered) && agent.getContextManager().getAllMessages().some(m => m.metadata?.coalescingDeliveryId === deliveryId)) return;
+    agent.getContextManager().addMessage('user', push.params.payload.content.map(convertPushBlock), {
+      ...push.params.origin,
+      serverId: push.serverId,
+      featureSet: push.params.featureSet,
+      eventId: push.params.eventId,
+      tags: push.params.tags,
+      coalescingDeliveryId: deliveryId,
+    });
+  }
+
+  private initializePushCoalescer(triggerFilter?: (content: string, metadata: Record<string, unknown>) => boolean): void {
+    const branch = this.store.currentBranch().name;
+    this.coalescingBranch = branch;
+    this.coalescingTriggerFilter = triggerFilter;
+    for (const [id, strategy] of [[COALESCING_AUDIT_ID, 'append_log'], [COALESCING_PENDING_ID, 'snapshot']] as const) {
+      if (!this.store.listStates().some(s => s.id === id)) this.store.registerState({ id, strategy });
+    }
+    const restored = this.store.getStateJson(COALESCING_PENDING_ID) as CoalescingSnapshot | null;
+    // Recovery still waits for current policy and assembly; it cannot smuggle a
+    // formerly admitted fallback past a newly denied grant at startup.
+    this.pushCoalescer = new PushCoalescer({
+      historyUnknown: restored?.version === 1,
+      authorized: push => {
+        const server = this.mcplServerRegistry?.getServer(push.serverId);
+        if (this.store.currentBranch().name !== branch || !server?.isConnected || !server.policyEstablished || !server.grant.has('pushEvents') ||
+            (!push.recovered && this.coalescingEpochs.get(push.serverId) !== push.epoch)) return false;
+        try { this.featureSetManager!.validateInbound(push.serverId, push.params.featureSet); return true; }
+        catch { return false; }
+      },
+      render: (push, params) => this.mcplServerRegistry!.getServer(push.serverId)!.sendPushRender(params),
+      wake: (push, subject) => {
+        const agentName = this.primaryAgentName;
+        if (!agentName || push.audience !== this.coalescingAudience()) return false;
+        // Stub references before gate text, just as ordinary push handling does.
+        const text = push.params.payload.content.map(convertPushBlock)
+          .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text').map(b => b.text).join('\n');
+        const trigger = triggerFilter?.(text, {
+          ...push.params.origin,
+          serverId: push.serverId, featureSet: push.params.featureSet,
+          eventId: push.params.eventId, eventType: 'mcpl:push-event',
+          tags: push.params.tags, [COALESCING_SUBJECT]: subject,
+        }) ?? true;
+        if (!trigger) return false;
+        this.eventGate?.cancelCoalesced(subject);
+        const requests: InferenceRequest[] = [...this.agents.values()]
+          .filter(agent => this.coalescingSharedReaders.has(agent) && agent.name !== this.subconsciousAgentName)
+          .map(agent => ({ agentName: agent.name, reason: 'mcpl:push-event', source: push.serverId, timestamp: Date.now() }));
+        this.coalescingWakes.set(subject, requests);
+        this.pendingRequests.push(...requests);
+        return true;
+      },
+      cancelWake: subject => {
+        this.eventGate?.cancelCoalesced(subject);
+        const requests = this.coalescingWakes.get(subject);
+        if (requests) this.pendingRequests = this.pendingRequests.filter(r => !requests.includes(r));
+        this.coalescingWakes.delete(subject);
+      },
+      audit: record => this.store.appendToStateJson(COALESCING_AUDIT_ID, { ...record, timestamp: Date.now() }),
+      save: snapshot => {
+        // A render begun on a previous branch must not overwrite this branch's
+        // recovery state when its Promise settles after a rollback or fork.
+        if (this.store.currentBranch().name === branch) this.store.setStateJson(COALESCING_PENDING_ID, snapshot);
+      },
+    });
+    if (restored?.version === 1) {
+      this.pushCoalescer.restore(restored.pending.filter(push => push.audience === this.coalescingAudience()));
+    } else this.store.setStateJson(COALESCING_PENDING_ID, { version: 1, pending: [] });
+  }
+
+  private ensureCoalescingBranch(): void {
+    if (this.pushCoalescer && this.coalescingBranch !== this.store.currentBranch().name) {
+      this.pushCoalescer.suspend();
+      this.initializePushCoalescer(this.coalescingTriggerFilter);
+      this.pushCoalescer?.wakeRecovered();
+    }
+  }
+
+  /** Convert an ordinary MCPL push event to a context message. */
   private handleMcplPushEvent(event: McplPushEvent): void {
     const triggerChannel = this.derivePushEventChannel(event.origin);
     if (triggerChannel && this.channelRegistry) {
@@ -8353,6 +8452,22 @@ export class AgentFramework {
         if (dispositionInjection) {
           injections = injections ? [...injections, dispositionInjection] : [dispositionInjection];
         }
+      }
+
+      // RFC-006: pending content is absent from all context managers until this
+      // assembly boundary, so background compression cannot consume it early.
+      if (this.coalescingSharedReaders?.has(agent)) {
+        this.ensureCoalescingBranch();
+        const primary = this.primaryAgentName ? this.agents.get(this.primaryAgentName) : undefined;
+        if (primary) await this.pushCoalescer?.assemble(this.coalescingAudience(), push => {
+          this.materializeCoalescedPush(push, primary);
+        });
+      }
+      if (this.providerAdmissionClosed || this.agents.get(agent.name) !== agent ||
+          this.activeTurnTokens.get(agent.name) !== turnToken) {
+        this.channelRegistry?.stopTyping();
+        this.eventGate?.onInferenceEnded(agent.name);
+        return false;
       }
 
       const {
@@ -11798,11 +11913,20 @@ export class AgentFramework {
       ?? (this.eventGate ? this.eventGate.asShouldTriggerCallback() : undefined);
 
     // Push events handler (Step 6)
+    this.initializePushCoalescer(triggerFilter);
     this.pushHandler = new PushHandler(
       this.featureSetManager,
       (event) => this.pushEvent(event as unknown as ProcessEvent),
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       triggerFilter,
+      (serverId, params) => {
+        this.ensureCoalescingBranch();
+        const agentName = this.primaryAgentName;
+        if (!agentName) throw new CoalesceError('audience', 'no primary agent is configured', -32000);
+        const epoch = this.coalescingEpochs.get(serverId);
+        if (!epoch) throw new CoalesceError('serverId', 'no initialized connection', -32002);
+        return this.pushCoalescer!.accept({ serverId, epoch, params, audience: this.coalescingAudience() });
+      },
     );
 
     // Server-initiated inference router (Step 6)
@@ -11906,6 +12030,7 @@ export class AgentFramework {
     // implemented for years — are declared (AUDIT-001/issue #76 item 12).
     this.mcplHostCapabilities = {
       version: '0.5',
+      eventCoalescing: PUSH_COALESCING_SUPPORT,
       pushEvents: true,
       contextHooks: {
         beforeInference: true,
@@ -11974,6 +12099,7 @@ export class AgentFramework {
 
     // Discover tools from all connected servers
     await this.refreshMcplTools();
+    this.pushCoalescer?.wakeRecovered();
   }
 
   /** Reconcile the durable ledger with Chronicle, then deliver every server's work. */
@@ -12847,6 +12973,12 @@ export class AgentFramework {
    * Push events and inference requests are deferred to Steps 6/7.
    */
   private wireMcplEvents(connection: McplServerConnection): void {
+    (this.coalescingEpochs ??= new Map()).set(connection.id, randomUUID());
+    connection.on('orphaned-render-response', (response: Record<string, unknown>) => {
+      this.store.appendToStateJson(COALESCING_AUDIT_ID, {
+        kind: 'late-render', serverId: connection.id, ...response, timestamp: Date.now(),
+      });
+    });
     // Forward subprocess stderr lines as trace events so consumers (conhost,
     // log sinks, TUI badges) can persist and surface them.
     connection.on('stderr', (params: { line: string }) => {
@@ -12878,6 +13010,10 @@ export class AgentFramework {
       params: McplInferenceRequestParams,
       responder?: { id: string | number; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
+      if (this.pushCoalescer?.isRendering(connection.id)) {
+        responder?.respondError(-32600, 'Cannot request inference while push/render is in progress');
+        return;
+      }
       if (this.inferenceRouter && responder) {
         const barrier = this.discordAwarenessBarrier;
         if (barrier) await barrier.promise;
@@ -12996,6 +13132,7 @@ export class AgentFramework {
     // preserved across the transient close are resumed by idempotent
     // registration. Then refresh tools (server may have different tools).
     connection.on('reconnect', (info?: { attempts?: number }) => {
+      this.coalescingEpochs.set(connection.id, randomUUID());
       // Install the barrier synchronously so any inbound event emitted after
       // reconnect observes it before doing work that could wake an agent. The
       // connection paused its data plane before wiring the fresh transport.
@@ -13113,6 +13250,8 @@ export class AgentFramework {
     // a SIGKILL preserves them. Permanent removal is owned solely by
     // disconnectMcplServer, which deletes the trees explicitly.
     connection.on('close', (code?: number | null, signal?: string | null) => {
+      this.pushCoalescer?.disconnect(connection.id);
+      this.coalescingEpochs.delete(connection.id);
       this.featureSetManager?.removeServer(connection.id);
       this.emitTrace({
         type: 'mcpl:server-closed',

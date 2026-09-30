@@ -1,0 +1,1 @@
+- Support RFC-006 feature-set-scoped `push/event` coalescing: unread snapshots replace pending content, deferred notices render at assembly, and retractions preserve consumed history. Persist pending fallbacks and audit records; bound deferred rendering and recheck authorization. Channel coalescing remains explicitly unadvertised.

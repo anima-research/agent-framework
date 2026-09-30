@@ -171,6 +171,7 @@ export class PushHandler {
     pushEventFn: (event: McplPushEvent) => void,
     emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
     shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean,
+    private readonly handleCoalesced?: (serverId: string, params: PushEventParams) => PushEventResult,
   ) {
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -219,6 +220,18 @@ export class PushHandler {
         responder.respondError(err.code, reason, { featureSet: err.featureSet });
       } else {
         responder?.respond({ accepted: false, reason });
+      }
+      return;
+    }
+
+    if (params.coalesce !== undefined && this.handleCoalesced) {
+      try {
+        const result = this.handleCoalesced(serverId, params);
+        responder?.respond(result);
+      } catch (error) {
+        const err = error as Error & { code?: number; field?: string };
+        if (responder?.respondError) responder.respondError(typeof err.code === 'number' ? err.code : -32603, err.message, { field: err.field });
+        else responder?.respond({ accepted: false, reason: err.message });
       }
       return;
     }

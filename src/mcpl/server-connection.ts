@@ -186,7 +186,7 @@ export class McplServerConnection extends EventEmitter {
   private pendingRequests = new Map<string | number, PendingRequest>();
   /** Metadata retained after selected request deadlines so a late response is
    * observable even though its original promise has already been rejected. */
-  private orphanedRequests = new Map<string | number, { method: string }>();
+  private orphanedRequests = new Map<string | number, { method: string; renderParams?: Record<string, unknown> }>();
   private closed = false;
 
   /** Per-request timeout in ms (0 disables). See McplServerConfig.requestTimeoutMs. */
@@ -629,6 +629,11 @@ export class McplServerConnection extends EventEmitter {
     return this.sendRequest(McplMethod.BeforeInference, params as unknown as Record<string, unknown>) as Promise<BeforeInferenceResult>;
   }
 
+  /** RFC-006 deferred push rendering; its own timeout bounds context assembly. */
+  sendPushRender(params: import('./push-coalescer.js').PushRenderParams): Promise<import('./push-coalescer.js').PushRenderResult> {
+    return this.sendRequest('push/render', params as unknown as Record<string, unknown>, { timeoutMs: 5000, surfaceOrphanedResponse: true }) as Promise<import('./push-coalescer.js').PushRenderResult>;
+  }
+
 
   /** Send `featureSets/update` as a Notification. §6.7: valid ONLY for
    *  purely descriptive metadata that does not alter the grant. Any grant
@@ -952,7 +957,8 @@ export class McplServerConnection extends EventEmitter {
         pending.timer = setTimeout(() => {
           this.pendingRequests.delete(id);
           if (options.surfaceOrphanedResponse) {
-            this.orphanedRequests.set(id, { method });
+            this.orphanedRequests.set(id, { method, ...(method === 'push/render' ? { renderParams: { featureSet: params.featureSet, key: params.key, eventId: params.eventId } } : {}) });
+            if (this.orphanedRequests.size > 4096) this.orphanedRequests.delete(this.orphanedRequests.keys().next().value!);
           }
           reject(new Error(
             `MCPL server "${this.id}" did not respond to ${method} (id=${id}) ` +
@@ -1142,6 +1148,10 @@ export class McplServerConnection extends EventEmitter {
       // re-inject either result because the original dispatch context is gone.
       const orphaned = this.orphanedRequests.get(response.id);
       this.orphanedRequests.delete(response.id);
+      if (orphaned?.renderParams) {
+        this.emit('orphaned-render-response', { params: orphaned.renderParams, result: response.result, error: response.error });
+        return; // audit only: a timeout fallback can never be replaced
+      }
       const result = response.result;
       if (result && typeof result === 'object') {
         const r = result as { state?: unknown; checkpoint?: unknown };

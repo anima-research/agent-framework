@@ -161,6 +161,13 @@ export interface McplCapabilities {
  */
 export interface McplHostCapabilities {
   version: string;
+  /** RFC-006 support, independent of capability grants. */
+  eventCoalescing?: boolean | {
+    pushEvents?: boolean;
+    channelsIncoming?: boolean;
+    deferred?: boolean;
+    channelScopedPush?: boolean;
+  };
   pushEvents?: boolean;
   contextHooks?: {
     beforeInference?: boolean | {
@@ -634,6 +641,13 @@ export interface StateRollbackResult {
  * Spec Section 9.1.
  */
 export interface PushEventParams {
+  coalesce?: {
+    key: string;
+    channelId?: string;
+    deferred?: boolean;
+    retract?: boolean;
+    data?: unknown;
+  };
   /** Declaring feature set */
   featureSet: string;
 
@@ -661,6 +675,10 @@ export interface PushEventParams {
  * Spec Section 9.3.
  */
 export interface PushEventResult {
+  coalesce?: {
+    outcome: 'first' | 'replaced' | 'appended' | 'retracted' | 'noted' | 'consumed';
+    priorEventId?: string;
+  };
   /** Whether the event was accepted */
   accepted: boolean;
 

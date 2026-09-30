@@ -239,6 +239,25 @@ Optional host-side implementation of the MCP Live protocol. External servers (ga
 }
 ```
 
+Feature-set-scoped pushes may use [RFC-006](https://github.com/anima-research/mcpl/pull/5)
+coalescing. The host advertises `eventCoalescing` with `pushEvents` and `deferred` enabled;
+`channelsIncoming` and `channelScopedPush` remain false. A producer must check those flags.
+
+An optional `coalesce: { key }` retains the newest unread snapshot. Add `deferred: true`
+to send notices and answer `push/render` with content at the next activation assembly.
+Use `retract: true` to withdraw unread content; deletion notices remain when earlier content
+was consumed or its history is uncertain. Occurrences need distinct `eventId`s; retries
+reuse their original ID and receive the original receipt.
+
+Pending pushes remain outside context managers until activation assembly, so compression,
+fork copies, previews, and live tool continuations cannot accidentally consume an editable
+occurrence. Materialization seals the occurrence conservatively before context compilation;
+the host never edits stored model history. The durable `mcpl/coalescing-audit` log records
+notices, replacements, and render outcomes. `mcpl/coalescing-pending` saves fallbacks for
+restart recovery without repeating a server render. Rendering times out after five seconds;
+the host retains 64 notices per batch, caps notice data at 4 KiB, content at 1 MiB, and
+tracked subjects at 128. Excess pending subjects are rejected rather than silently dropped.
+
 ### Streaming Lifecycle
 
 1. **Start**: Framework calls `agent.startStreamWithInjections()` → `YieldingStream`
