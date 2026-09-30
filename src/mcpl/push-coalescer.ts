@@ -1,21 +1,31 @@
-/** RFC-006 feature-set push profile. Pending content never enters a context manager:
+/** RFC-006 event coalescing. Both delivery lanes share this state machine. Pending content never enters a context manager:
  * compression, forks, and tool continuations can only see materialized history.
  * All state transitions are synchronous; only deferred rendering yields. */
-import type { McplContentBlock, PushEventParams, PushEventResult } from './types.js';
+import type { McplContentBlock, PushEventParams, PushEventResult, ChannelIncomingMessage } from './types.js';
 
 export const PUSH_COALESCING_SUPPORT = {
-  pushEvents: true, deferred: true, channelsIncoming: false, channelScopedPush: false,
+  pushEvents: true, deferred: true, channelsIncoming: true, channelScopedPush: true,
 } as const;
 
 export interface CoalescedPush {
   /** Host-only recovery marker: never read from wire params or origin. */
   recovered?: boolean;
   serverId: string;
+  /** Host-owned configured binding; changes when the endpoint/command is reassigned. */
+  binding?: string;
   epoch: string;
   audience: string;
   params: PushEventParams;
+  channelMessage?: ChannelIncomingMessage;
+  /** Host-resolved delivery, independent of the untrusted coalescing scope. */
+  routing?: {
+    channelId?: string; messageId?: string; author?: { id: string; name: string };
+    threadId?: string; metadata?: Record<string, unknown>;
+    targetAgents: string[]; triggerAllowed?: boolean; generation?: number;
+  };
 }
 export interface PushRenderParams {
+  channelId?: string;
   featureSet: string;
   key: string;
   eventId: string;
@@ -34,7 +44,9 @@ interface Rendering {
   cancel: () => void;
   done: Promise<void>;
 }
+type MessageIdentity = Pick<NonNullable<CoalescedPush['routing']>, 'messageId' | 'author' | 'threadId'>;
 interface Subject {
+  identity?: MessageIdentity;
   history: 'none' | 'some' | 'unknown';
   consumedEventId?: string;
   slot?: Slot;
@@ -42,16 +54,21 @@ interface Subject {
   wakeQueued: boolean;
 }
 export interface CoalescingSnapshot {
-  version: 1;
-  /** Recovery is append-only: fallbacks, never replay of a source-backed render. */
+  version: 1 | 2;
+  receipt?: [string, PushEventResult];
+  history?: Array<{ key: string; history: Subject['history']; consumedEventId?: string; identity?: MessageIdentity }>;
+  /** Pending fallbacks remain replaceable after recovery; old renders are not replayed. */
   pending: CoalescedPush[];
 }
 export interface CoalescerOptions {
   authorized(push: CoalescedPush): boolean;
+  available?(push: CoalescedPush): boolean;
+  lookupReceipt?(key: string): PushEventResult | undefined;
+  recordReceipt?(key: string, result: PushEventResult): void;
   render(push: CoalescedPush, params: PushRenderParams): Promise<PushRenderResult>;
   /** Evaluate host policy and queue at most one wake; false may mean a gate timer. */
   wake(push: CoalescedPush, subject: string): boolean;
-  cancelWake(subject: string): void;
+  cancelWake(subject: string, consumed?: boolean): void;
   audit(record: Record<string, unknown>): void;
   save(snapshot: CoalescingSnapshot): void;
   timeoutMs?: number;
@@ -78,29 +95,82 @@ export function validateCoalescedContent(content: unknown, maxBytes = 1024 * 102
   if (Buffer.byteLength(JSON.stringify(content)) > maxBytes) throw new CoalesceError('payload.content', 'content exceeds host byte limit');
 }
 
+/** A configured server binding survives transport reconnects. Epoch gates authority,
+ * not subject or occurrence identity. Channel scope is NEVER inferred from origin. */
+export function coalescingChannel(push: CoalescedPush): string | undefined {
+  return push.channelMessage?.channelId ?? push.params.coalesce?.channelId;
+}
+export function coalescingSubject(push: CoalescedPush): string {
+  const channel = coalescingChannel(push);
+  return JSON.stringify([push.serverId, push.binding ?? '', channel === undefined ? 'featureSet' : 'channel',
+    channel ?? push.params.featureSet, push.params.coalesce!.key]);
+}
+
 export class PushCoalescer {
   private subjects = new Map<string, Subject>();
   private receipts = new Map<string, PushEventResult>();
   private uncertain = false;
+  private lastReceipt?: [string, PushEventResult];
   private activeRenders = new Map<string, number>();
   private suspended = false;
   constructor(private readonly options: CoalescerOptions) { this.uncertain = options.historyUnknown ?? false; }
 
   isRendering(serverId: string): boolean { return (this.activeRenders.get(serverId) ?? 0) > 0; }
 
-  restore(pending: CoalescedPush[]): void {
+  restore(snapshot: CoalescingSnapshot | CoalescedPush[]): void {
     this.uncertain = true;
-    for (const original of pending) {
+    if (!Array.isArray(snapshot)) {
+      if (snapshot.receipt) {
+        this.lastReceipt = snapshot.receipt;
+        this.receipts.set(...snapshot.receipt);
+        this.options.recordReceipt?.(...snapshot.receipt);
+      }
+      for (const { key, history, consumedEventId, identity } of snapshot.history ?? []) {
+        this.subjects.set(key, { history, consumedEventId, identity, wakeQueued: false });
+      }
+    }
+    for (const original of Array.isArray(snapshot) ? snapshot : snapshot.pending) {
       const push = { ...structuredClone(original), recovered: true };
-      // Recovery appends fallbacks conservatively, without re-rendering or
-      // pretending we know whether a previous model consumed this subject.
-      const key = JSON.stringify(['recovered', push.serverId, push.epoch, push.params.eventId, push.audience]);
-      this.subjects.set(key, { history: 'unknown', wakeQueued: false, slot: { push, dropped: 0 } });
+      const key = coalescingSubject(push);
+      const state = this.subjects.get(key) ?? { history: 'unknown' as const, wakeQueued: false };
+      // A frozen batch and its newer pending batch are both unread. Recovery keeps
+      // the latest self-contained fallback, without replaying either render.
+      state.slot = { push, dropped: 0 };
+      this.subjects.set(key, state);
     }
     this.save();
   }
 
+  canAssemble(audience: string): boolean {
+    return this.pendingPushes().some(push => push.audience === audience &&
+      (this.options.available?.(push) ?? true) && this.options.authorized(push));
+  }
+
+  pendingPushes(): CoalescedPush[] { return [...this.subjects.values()].flatMap(s => s.slot ? [s.slot.push] : []); }
+
+  pending(subject: string): CoalescedPush | undefined {
+    return this.subjects.get(subject)?.slot?.push;
+  }
+
+  identity(subject: string): MessageIdentity | undefined {
+    const state = this.subjects.get(subject);
+    const routing = (state?.slot ?? state?.rendering?.slot)?.push.routing;
+    return routing ? { messageId: routing.messageId, author: routing.author, threadId: routing.threadId } : state?.identity;
+  }
+
+  occurrence(subject: string): string | undefined {
+    const state = this.subjects.get(subject);
+    return (state?.slot ?? state?.rendering?.slot)?.push.params.eventId ?? state?.consumedEventId;
+  }
+
+  receipt(push: CoalescedPush): PushEventResult | undefined {
+    const key = JSON.stringify([push.serverId, push.binding ?? '', push.params.eventId]);
+    const result = this.receipts.get(key) ?? this.options.lookupReceipt?.(key);
+    return result && structuredClone(result);
+  }
+
   wakeRecovered(): void {
+    if (this.suspended) return;
     for (const [key, s] of this.subjects) {
       if (s.slot?.push.recovered && !s.wakeQueued && this.options.authorized(s.slot.push)) {
         s.wakeQueued = this.options.wake(s.slot.push, key);
@@ -108,7 +178,7 @@ export class PushCoalescer {
     }
   }
 
-  accept(push: CoalescedPush): PushEventResult {
+  validate(push: CoalescedPush): void {
     if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000);
     const { params } = push;
     const c = params.coalesce;
@@ -116,7 +186,10 @@ export class PushCoalescer {
     if (typeof c.key !== 'string' || !Buffer.byteLength(c.key) || Buffer.byteLength(c.key) > 256) {
       throw new CoalesceError('coalesce.key', 'key must be 1..256 UTF-8 bytes');
     }
-    if (c.channelId !== undefined) throw new CoalesceError('coalesce.channelId', 'channelScopedPush is not supported');
+    if (c.channelId !== undefined && (typeof c.channelId !== 'string' || !c.channelId))
+      throw new CoalesceError('coalesce.channelId', 'channelId must be non-empty');
+    if (push.channelMessage && ('channelId' in c || 'deferred' in c))
+      throw new CoalesceError('coalesce', 'channel messages cannot select scope or deferred mode');
     for (const field of ['deferred', 'retract'] as const) {
       if (c[field] !== undefined && typeof c[field] !== 'boolean') throw new CoalesceError(`coalesce.${field}`, 'expected boolean');
     }
@@ -126,11 +199,20 @@ export class PushCoalescer {
     if (typeof params.eventId !== 'string' || !params.eventId) throw new CoalesceError('eventId', 'eventId is required');
     if (typeof params.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
     validateCoalescedContent(params.payload?.content, this.options.maxContentBytes);
+    if (coalescingChannel(push) !== undefined && c.retract && !params.payload.content.length)
+      throw new CoalesceError('payload.content', 'channel retractions require a deletion notice');
     if (!this.options.authorized(push)) throw new CoalesceError('featureSet', 'push is no longer authorized', -32002);
-    const dedup = JSON.stringify([push.serverId, push.epoch, params.eventId]);
-    const receipt = this.receipts.get(dedup);
-    if (receipt) return structuredClone(receipt);
-    const key = JSON.stringify([push.serverId, push.epoch, params.featureSet, c.key]);
+  }
+
+  accept(push: CoalescedPush): PushEventResult {
+    if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000);
+    this.validate(push);
+    const { params } = push;
+    const c = params.coalesce!;
+    const receipt = this.receipt(push);
+    if (receipt) return receipt;
+    const dedup = JSON.stringify([push.serverId, push.binding ?? '', params.eventId]);
+    const key = coalescingSubject(push);
     let s = this.subjects.get(key);
     if (!s) {
       while (this.subjects.size >= (this.options.maxSubjects ?? 128)) {
@@ -150,7 +232,8 @@ export class PushCoalescer {
     let outcome: NonNullable<PushEventResult['coalesce']>['outcome'];
     // This profile has one recipient. A replacement cannot move into a different
     // agent/branch even when the operator changes the current primary or branch.
-    const sameAudience = !prior || prior.push.audience === push.audience;
+    const sameAudience = !prior || prior.push.audience === push.audience &&
+      JSON.stringify(prior.push.routing?.metadata?.tuneOut ?? null) === JSON.stringify(push.routing?.metadata?.tuneOut ?? null);
     if (c.retract || !c.deferred) {
       this.cancelRender(s);
       if (prior) this.options.audit({ kind: 'displaced', subject: key, push: prior.push });
@@ -158,16 +241,16 @@ export class PushCoalescer {
       if (c.retract) {
         s.consumedEventId = undefined;
         outcome = s.history === 'none' ? 'retracted' : params.payload.content.length ? 'noted' : 'consumed';
-        if (outcome === 'noted' && sameAudience) s.slot = { push, dropped: 0 };
+        if (outcome === 'noted' && sameAudience && push.audience) s.slot = { push, dropped: 0 };
       } else {
         outcome = prior ? 'replaced' : s.consumedEventId || s.history === 'unknown' ? 'appended' : 'first';
-        if (sameAudience) s.slot = { push, dropped: 0 };
+        if (sameAudience && push.audience) s.slot = { push, dropped: 0 };
       }
     } else {
       const pending = s.slot;
       outcome = pending ? 'replaced' : 'first';
       if (pending) this.options.audit({ kind: pending.notices ? 'folded' : 'displaced', subject: key, push: pending.push });
-      if (sameAudience) {
+      if (sameAudience && push.audience) {
         const notices = pending?.notices ?? [];
         notices.push({ eventId: params.eventId, timestamp: params.timestamp, ...(c.data !== undefined ? { data: structuredClone(c.data) } : {}) });
         let dropped = pending?.dropped ?? 0;
@@ -175,11 +258,16 @@ export class PushCoalescer {
         s.slot = { push, notices, dropped };
       } else s.slot = undefined;
     }
+    if (push.routing && coalescingChannel(push)) {
+      s.identity = { messageId: push.routing.messageId, author: push.routing.author, threadId: push.routing.threadId };
+    }
     const result: PushEventResult = { accepted: true, coalesce: { outcome, ...(priorId ? { priorEventId: priorId } : {}) } };
+    this.lastReceipt = [dedup, result];
     this.receipts.set(dedup, result);
     if (this.receipts.size > 4096) this.receipts.delete(this.receipts.keys().next().value!);
     this.save();
-    if (s.slot && !s.wakeQueued) s.wakeQueued = this.options.wake(s.slot.push, key);
+    this.options.recordReceipt?.(dedup, result);
+    if (s.slot) s.wakeQueued = this.options.wake(s.slot.push, key);
     if (!s.slot && !s.rendering) { s.wakeQueued = false; this.options.cancelWake(key); }
     return structuredClone(result);
   }
@@ -188,14 +276,14 @@ export class PushCoalescer {
    * before context compilation can expose content to any model or compressor. */
   async assemble(audience: string, publish: (push: CoalescedPush) => void): Promise<void> {
     if (this.suspended) return;
-    const selected = [...this.subjects].filter(([, s]) => (s.slot ?? s.rendering?.slot)?.push.audience === audience);
+    const selected = [...this.subjects].filter(([, s]) => { const push = (s.slot ?? s.rendering?.slot)?.push; return push?.audience === audience && (this.options.available?.(push) ?? true); });
     await Promise.all(selected.map(async ([key, s]) => {
       if (s.rendering) { await s.rendering.done; return; }
       if (!s.slot?.notices) return;
       const slot = s.slot;
       s.slot = undefined;
       s.wakeQueued = false;
-      this.options.cancelWake(key);
+      this.options.cancelWake(key, true);
       let cancel!: () => void;
       const cancelled = new Promise<'cancelled'>(resolve => { cancel = () => resolve('cancelled'); });
       const rendering: Rendering = { slot, cancel, cancelled: false, done: Promise.resolve() };
@@ -208,6 +296,7 @@ export class PushCoalescer {
     for (const [key, s] of selected) {
       const slot = s.slot;
       if (!slot || slot.notices || slot.push.audience !== audience) continue;
+      if (!(this.options.available?.(slot.push) ?? true)) continue;
       if (!this.options.authorized(slot.push)) {
         this.options.audit({ kind: 'revoked', subject: key, push: slot.push });
       } else {
@@ -218,7 +307,7 @@ export class PushCoalescer {
       }
       s.slot = undefined;
       s.wakeQueued = false;
-      this.options.cancelWake(key);
+      this.options.cancelWake(key, true);
     }
     this.save();
   }
@@ -231,7 +320,7 @@ export class PushCoalescer {
     this.activeRenders.set(push.serverId, count + 1);
     try {
       if (!this.options.authorized(push)) return;
-      const params: PushRenderParams = { featureSet: push.params.featureSet, key: push.params.coalesce!.key,
+      const params: PushRenderParams = { featureSet: push.params.featureSet, ...(coalescingChannel(push) ? { channelId: coalescingChannel(push) } : {}), key: push.params.coalesce!.key,
         eventId: push.params.eventId, notices: r.slot.notices!, dropped: r.slot.dropped };
       const request = Promise.resolve().then(() => this.options.render(push, structuredClone(params)))
         .then(result => {
@@ -287,18 +376,19 @@ export class PushCoalescer {
       if (s.rendering) pending.push(s.rendering.slot.push);
       if (s.slot) pending.push(s.slot.push);
     }
-    this.options.save({ version: 1, pending: structuredClone(pending) });
+    this.options.save({ version: 2, receipt: this.lastReceipt, pending: structuredClone(pending), history: [...this.subjects].map(([key, s]) => ({key, history: s.history, consumedEventId: s.consumedEventId, identity: s.identity})) });
   }
 
-  /** A new transport cannot mutate an old epoch's pending work. */
+  /** Transport loss cancels rendering but preserves acknowledged unread work. The
+   * next initialized connection must reauthorize it before delivery or replacement. */
   disconnect(serverId: string): void {
     if (this.suspended) return;
     for (const [key, s] of this.subjects) {
-      if ((s.slot ?? s.rendering?.slot)?.push.serverId !== serverId) continue;
-      this.options.audit({ kind: 'disconnected', subject: key, push: (s.slot ?? s.rendering?.slot)?.push });
+      const slot = s.slot ?? s.rendering?.slot;
+      if (slot?.push.serverId !== serverId) continue;
+      this.options.audit({ kind: 'disconnected', subject: key, push: slot.push });
       this.cancelRender(s);
-      s.slot = undefined;
-      s.history = 'unknown';
+      s.slot = { push: { ...slot.push, recovered: true }, dropped: 0 };
       s.wakeQueued = false;
       this.options.cancelWake(key);
     }

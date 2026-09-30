@@ -203,6 +203,9 @@ export interface McplChannelCapabilities {
  * Provided in FrameworkConfig.mcplServers[].
  */
 export interface McplServerConfig {
+  /** Optional host allow-list for inbound channel IDs (`*` glob). Empty denies all.
+   * Applies to channels/incoming AND explicitly channel-scoped push/event. */
+  allowedIncomingChannels?: string[];
   /** Unique server identifier */
   id: string;
 
@@ -1115,6 +1118,8 @@ export interface ChannelsPublishResult {
  * Spec Section 14.3.
  */
 export interface ChannelIncomingMessage {
+  eventId?: string;
+  coalesce?: Omit<NonNullable<PushEventParams['coalesce']>, 'channelId' | 'deferred'>;
   /** Channel this message came from */
   channelId: string;
 
@@ -1162,6 +1167,7 @@ export interface ChannelsIncomingResult {
 
 /** Result for a single incoming message. */
 export interface ChannelIncomingMessageResult {
+  coalesce?: PushEventResult['coalesce'];
   messageId: string;
   accepted: boolean;
   conversationId?: string;

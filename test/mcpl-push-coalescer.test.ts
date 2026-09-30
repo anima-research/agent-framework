@@ -37,7 +37,7 @@ test('vectors 1–6: replace until assembly, then append forever (including comp
   assert.equal(result(s,push('create')), 'first');
   for (let i=1;i<=3;i++) assert.equal(result(s,push(`edit${i}`)), 'replaced');
   assert.deepEqual(s.texts(), []);
-  assert.equal(s.wakes.length, 1);
+  assert.equal(s.wakes.length, 4); // policy is re-evaluated for every replacement
   await s.assemble();
   assert.deepEqual(s.texts(), ['edit3']);
   // Publication at assembly is the only boundary; no provider response is needed.
@@ -67,12 +67,12 @@ test('vectors 9/35: namespace isolation and retries return the original receipt'
   assert.deepEqual(s.texts(),['same','other']);
 });
 
-test('epoch, feature-set and key are independent namespaces', async () => {
+test('feature-set and key isolate subjects; transport epochs do not', async () => {
   const s=setup();
   const cases=[push('1'),push('2','2',{key:'J'}),push('3','3',{},{epoch:'new'})];
   const fourth=push('4'); fourth.params.featureSet='other'; cases.push(fourth);
-  for(const p of cases) assert.equal(result(s,p),'first');
-  await s.assemble(); assert.deepEqual(s.texts(),['1','2','3','4']);
+  assert.deepEqual(cases.map(p=>result(s,p)),['first','first','replaced','first']);
+  await s.assemble(); assert.deepEqual(s.texts(),['3','2','4']);
 });
 
 test('vector 12: replacing a subject cannot widen its audience', async () => {
@@ -176,7 +176,7 @@ test('vectors 28–30/34: retraction removes unread content but retains consumed
   await s.assemble(); assert.deepEqual(s.texts(),['create','deleted']);
 });
 
-for(const flags of [{key:''},{key:'é'.repeat(129)},{deferred:true,retract:true},{data:{}},{deferred:true,data:'x'.repeat(4097)},{channelId:'chat'}, {deferred:'yes'}])
+for(const flags of [{key:''},{key:'é'.repeat(129)},{deferred:true,retract:true},{data:{}},{deferred:true,data:'x'.repeat(4097)},{channelId:''}, {deferred:'yes'}])
   test(`vector 38: malformed ${JSON.stringify(flags).slice(0,70)} leaves subject untouched`,async()=>{
     const s=setup(); s.c.accept(push('good'));
     assert.throws(()=>s.c.accept(push('bad','bad',flags)),CoalesceError);
@@ -193,14 +193,16 @@ test('receipts and snapshots cannot be mutated by callers; audit keeps private n
   await s.assemble(); assert(!JSON.stringify(s.deliveries.map(d=>d.params.payload)).includes('notice'));
 });
 
-test('disconnect cancels render and prevents old-epoch mutation; unsupported lanes are not advertised',async()=>{
-  const r=pending<PushRenderResult>(); const s=setup({render:()=>r.promise});
-  s.c.accept(push('one','fallback',{deferred:true})); const work=s.assemble();
-  s.c.disconnect('server'); r.resolve(rendered('old')); await work;
-  assert.deepEqual(s.texts(),[]);
-  assert.equal(result(s,push('one','fresh',{},{epoch:'next'})),'first');
-  await s.assemble(); assert.deepEqual(s.texts(),['fresh']);
-  assert.deepEqual(PUSH_COALESCING_SUPPORT,{pushEvents:true,deferred:true,channelsIncoming:false,channelScopedPush:false});
+test('disconnect preserves acknowledged fallback; reconnect retry has no second effect',async()=>{
+  const r=pending<PushRenderResult>(); let available=true;
+  const s=setup({available:()=>available,render:()=>r.promise});
+  const first=s.c.accept(push('one','fallback',{deferred:true})); const work=s.assemble();
+  available=false; s.c.disconnect('server'); r.resolve(rendered('old')); await work;
+  assert.deepEqual(s.texts(),[]); assert.equal(s.snapshot().pending.length,1);
+  available=true;
+  assert.deepEqual(s.c.accept(push('one','fallback',{deferred:true},{epoch:'next'})),first);
+  await s.assemble(); assert.deepEqual(s.texts(),['fallback']);
+  assert.deepEqual(PUSH_COALESCING_SUPPORT,{pushEvents:true,deferred:true,channelsIncoming:true,channelScopedPush:true});
 });
 
 test('resource limit rejects new pending subject without evicting admitted content',async()=>{
@@ -208,4 +210,39 @@ test('resource limit rejects new pending subject without evicting admitted conte
   assert.throws(()=>s.c.accept(push('two','two',{key:'another'})),/limit/);
   await s.assemble(); assert.deepEqual(s.texts(),['one']);
   assert.equal(result(s,push('two','two',{key:'another'})),'appended');
+});
+
+test('restored pending subject keeps identity and unread history across transport epochs',async()=>{
+  const before=setup();before.c.accept(push('c','pending'));
+  const after=setup();after.c.restore(before.snapshot());
+  assert.equal(result(after,push('d','deleted',{retract:true},{epoch:'new'})),'retracted');
+  await after.assemble();assert.deepEqual(after.texts(),[]);
+});
+
+test('receipt eviction in memory cannot duplicate an occurrence stored in the durable index',()=>{
+  const receipts=new Map();const s=setup({lookupReceipt:key=>receipts.get(key),recordReceipt:(key,value)=>receipts.set(key,structuredClone(value))});
+  const first=s.c.accept(push('original'));
+  for(let i=0;i<4100;i++)s.c.accept(push(`update-${i}`));
+  const count=s.audit.length;
+  assert.deepEqual(s.c.accept(push('original')),first);assert.equal(s.audit.length,count);
+});
+
+test('snapshot bridges a crash between pending-state persistence and receipt-index persistence',async()=>{
+  let crash=true;const before=setup({recordReceipt:()=>{if(crash)throw Error('crash');}});
+  assert.throws(()=>before.c.accept(push('once')),/crash/);crash=false;
+  const after=setup();after.c.restore(before.snapshot());
+  assert.equal(result(after,push('once','once',{},{epoch:'reconnected'})),'first');
+  await after.assemble();assert.deepEqual(after.texts(),['once']);
+});
+
+test('reassigning a server binding cannot replace or deduplicate the former principal',async()=>{
+  const s=setup();assert.equal(result(s,push('same','old',{},{binding:'old'})),'first');
+  assert.equal(result(s,push('same','new',{},{binding:'new'})),'first');
+  await s.assemble();assert.deepEqual(s.texts(),['old','new']);
+});
+
+test('replacement cannot remove tune-out visibility restrictions',async()=>{
+  const s=setup();s.c.accept(push('old','private',{},{routing:{targetAgents:['subconscious'],metadata:{tuneOut:{epochId:'muted'}}}}));
+  s.c.accept(push('new','public',{},{routing:{targetAgents:['resident'],metadata:{}}}));
+  await s.assemble();assert.deepEqual(s.texts(),[]);
 });

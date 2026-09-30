@@ -171,7 +171,7 @@ export class PushHandler {
     pushEventFn: (event: McplPushEvent) => void,
     emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
     shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean,
-    private readonly handleCoalesced?: (serverId: string, params: PushEventParams) => PushEventResult,
+    private readonly handleCoalesced?: (serverId: string, params: PushEventParams) => PushEventResult | Promise<PushEventResult>,
   ) {
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -190,11 +190,11 @@ export class PushHandler {
    * 6. Emit trace
    * 7. Respond with accepted + inferenceId
    */
-  handlePushEvent(
+  async handlePushEvent(
     serverId: string,
     params: PushEventParams,
     responder?: Responder,
-  ): void {
+  ): Promise<void> {
     // §16.3: expand the normative chat:* core closure once, at entry, so
     // every downstream consumer (wake matching, metadata, the queued event)
     // sees the closed set. Producer `implies` edges are NOT consumed —
@@ -226,7 +226,7 @@ export class PushHandler {
 
     if (params.coalesce !== undefined && this.handleCoalesced) {
       try {
-        const result = this.handleCoalesced(serverId, params);
+        const result = await this.handleCoalesced(serverId, params);
         responder?.respond(result);
       } catch (error) {
         const err = error as Error & { code?: number; field?: string };

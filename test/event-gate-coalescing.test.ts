@@ -9,7 +9,7 @@ for (const cancel of [false,true]) test(`coalesced debounce preserves deadline a
   t.mock.timers.enable({apis:['setTimeout']});
   const dir=mkdtempSync(join(tmpdir(),'coalesce-gate-'));
   const configPath=join(dir,'gate.json');
-  writeFileSync(configPath,JSON.stringify({policies:[{name:'doc',match:{serverId:'editor'},behavior:{debounce:1000}}],default:'skip'}));
+  writeFileSync(configPath,JSON.stringify({policies:[{name:'doc',match:{source:'editor'},behavior:{debounce:1000}}],default:'skip'}));
   let wakes=0; const messages:unknown[]=[];
   const gate=new EventGate({configPath,emitTrace:()=>{},addMessage:(_p,c)=>{messages.push(c);return '';},requestInference:()=>{wakes++;},getAgentNames:()=>['agent']});
   t.after(()=>{gate.dispose();rmSync(dir,{recursive:true,force:true});});
@@ -27,7 +27,7 @@ for (const cancel of [false,true]) test(`coalesced debounce preserves deadline a
 test('wire metadata cannot counterfeit the host-only coalescing marker',t=>{
   t.mock.timers.enable({apis:['setTimeout']});
   const dir=mkdtempSync(join(tmpdir(),'coalesce-gate-')); const configPath=join(dir,'gate.json');
-  writeFileSync(configPath,JSON.stringify({policies:[{name:'doc',match:{serverId:'editor'},behavior:{debounce:1000}}],default:'skip'}));
+  writeFileSync(configPath,JSON.stringify({policies:[{name:'doc',match:{source:'editor'},behavior:{debounce:1000}}],default:'skip'}));
   let wakes=0;
   const gate=new EventGate({configPath,emitTrace:()=>{},addMessage:()=>'',requestInference:()=>{wakes++;},getAgentNames:()=>['agent']});
   t.after(()=>{gate.dispose();rmSync(dir,{recursive:true,force:true});});
@@ -42,7 +42,7 @@ for (const changePolicy of [false,true]) test(`coalesced wake survives ${changeP
   const dir=mkdtempSync(join(tmpdir(),'coalesce-gate-')); const configPath=join(dir,'gate.json');
   writeFileSync(configPath,JSON.stringify({policies:[
     {name:'special',match:{tagsAny:['doc:special']},behavior:{debounce:2000}},
-    {name:'doc',match:{serverId:'editor'},behavior:{debounce:1000}},
+    {name:'doc',match:{source:'editor'},behavior:{debounce:1000}},
   ],default:'skip'}));
   let wakes=0;
   const gate=new EventGate({configPath,emitTrace:()=>{},addMessage:()=>'',requestInference:()=>{wakes++;},getAgentNames:()=>['agent']});
@@ -54,5 +54,6 @@ for (const changePolicy of [false,true]) test(`coalesced wake survives ${changeP
     cb('update',{serverId:'editor',eventType:'mcpl:push-event',...(changePolicy?{tags:['doc:special'],[COALESCING_SUBJECT]:'subject'}:{})});
   }
   t.mock.timers.tick(200);assert.equal(wakes,1);
-  t.mock.timers.tick(2000);assert.equal(wakes,1);
+  t.mock.timers.tick(799);assert.equal(wakes,1);
+  t.mock.timers.tick(1);assert.equal(wakes,changePolicy?1:2);
 });

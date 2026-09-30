@@ -68,7 +68,7 @@ import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './m
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { PushHandler, convertBlock as convertPushBlock, type McplPushEvent } from './mcpl/push-handler.js';
-import { PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, type CoalescedPush, type CoalescingSnapshot } from './mcpl/push-coalescer.js';
+import { PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, coalescingChannel, coalescingSubject, type CoalescedPush, type CoalescingSnapshot } from './mcpl/push-coalescer.js';
 import { COALESCING_SUBJECT } from './gate/event-gate.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
@@ -92,7 +92,9 @@ import {
   splitPreservingImageSlots,
   type ParsedImagePlaceholder,
 } from './tool-image-ledger.js';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import { expandCoreTags } from './mcpl/tags.js';
+import type { ChannelIncomingMessage, PushEventResult } from './mcpl/types.js';
 import { PyRunner, buildInjectedTools } from './code-execution/py-runner.js';
 import {
   buildCodeExecutionToolDefinition,
@@ -447,6 +449,7 @@ const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
 const COALESCING_AUDIT_ID = 'mcpl/coalescing-audit';
 const COALESCING_PENDING_ID = 'mcpl/coalescing-pending';
+const COALESCING_RECEIPTS_ID = 'mcpl/coalescing-receipts';
 const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints'; // legacy single-map layout, read-only fallback
 const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
 
@@ -1219,7 +1222,8 @@ export class AgentFramework {
   private pushHandler: PushHandler | null = null;
   private pushCoalescer: PushCoalescer | null = null;
   private coalescingEpochs = new Map<string, string>();
-  private coalescingWakes = new Map<string, InferenceRequest[]>();
+  private coalescingAdmission: Promise<void> = Promise.resolve();
+  private coalescingAssemblyOwner?: { agent: Agent; token: number };
   private coalescingSharedReaders = new WeakSet<Agent>();
   private coalescingBranch: string | null = null;
   private coalescingTriggerFilter?: (content: string, metadata: Record<string, unknown>) => boolean;
@@ -1561,6 +1565,7 @@ export class AgentFramework {
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
         addMessage: (p, c, m, forAgent) => framework.addMessage(p, c, m as MessageMetadata, forAgent ? { forAgent } : undefined),
         requestInference: (agentName, reason, source, provenance) => {
+          if (provenance?.coalescingSubject) { framework.queueCoalescedWake(provenance.coalescingSubject); return; }
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
@@ -7226,84 +7231,270 @@ export class AgentFramework {
     };
   }
 
-  /** The shared message slot is the audience of ordinary feature-set pushes. */
-  private coalescingAudience(): string {
-    return JSON.stringify([this.store.currentBranch().name, 'shared-messages']);
+  /** Coalescing addresses a delivery context, never an untrusted origin claim. */
+  private coalescingAudience(agentName?: string): string {
+    return JSON.stringify(agentName === undefined
+      ? [this.store.currentBranch().name, 'shared-messages']
+      : [this.store.currentBranch().name, 'agent', agentName]);
   }
 
-  private materializeCoalescedPush(push: CoalescedPush, agent: Agent, recovering = false): void {
-    if (push.audience !== this.coalescingAudience() || this.agents.get(agent.name) !== agent) return;
-    const deliveryId = JSON.stringify([push.serverId, push.epoch, push.params.eventId, push.audience]);
-    // Crash between the context write and pending-snapshot removal must not
-    // duplicate delivery. This metadata is host-authored, never wire testimony.
-    if ((recovering || push.recovered) && agent.getContextManager().getAllMessages().some(m => m.metadata?.coalescingDeliveryId === deliveryId)) return;
-    agent.getContextManager().addMessage('user', push.params.payload.content.map(convertPushBlock), {
-      ...push.params.origin,
-      serverId: push.serverId,
-      featureSet: push.params.featureSet,
-      eventId: push.params.eventId,
-      tags: push.params.tags,
-      coalescingDeliveryId: deliveryId,
+  private coalescingBinding(serverId: string): string {
+    const config = this.mcplServerConfigs.get(serverId);
+    // Transport credentials may rotate without changing this configured binding.
+    // Reassigning an ID to another endpoint or command gives it a new namespace.
+    return createHash('sha256').update(JSON.stringify([serverId, config?.url,
+      config?.command, config?.args])).digest('hex');
+  }
+
+  private assertIncomingChannel(serverId: string, channelId: string): void {
+    const server = this.mcplServerRegistry?.getServer(serverId);
+    if (!server?.policyEstablished || !server.grant.has('channels.incoming')) {
+      throw new CoalesceError('channelId', 'Channel not permitted', -32017);
+    }
+    if (!this.channelRegistry?.registeredDescriptor(serverId, channelId)) {
+      throw new CoalesceError('channelId', 'Unknown channel', -32023);
+    }
+    const allowed = this.mcplServerConfigs.get(serverId)?.allowedIncomingChannels;
+    if (allowed && !allowed.some(pattern => new RegExp('^' + pattern
+      .replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$').test(channelId))) {
+      throw new CoalesceError('channelId', 'Channel not permitted', -32017);
+    }
+  }
+
+  private authorizeCoalesced(push: CoalescedPush): void {
+    const server = this.mcplServerRegistry?.getServer(push.serverId);
+    if (!server?.isConnected || !server.policyEstablished ||
+        push.binding !== this.coalescingBinding(push.serverId) ||
+        (!push.recovered && this.coalescingEpochs.get(push.serverId) !== push.epoch)) {
+      throw new CoalesceError('serverId', 'Connection is not authorized', -32002);
+    }
+    if (!push.channelMessage) {
+      if (!server.grant.has('pushEvents')) throw new CoalesceError('pushEvents', 'Capability denied', -32002);
+      this.featureSetManager!.validateInbound(push.serverId, push.params.featureSet);
+    }
+    const channelId = coalescingChannel(push);
+    if (channelId !== undefined) this.assertIncomingChannel(push.serverId, channelId);
+  }
+
+  private cancelCoalescedRequest(subject: string): void {
+    this.pendingRequests = this.pendingRequests.filter(r => r.coalescingSubject !== subject);
+    for (const cooldown of this.providerAccelerationCooldowns.values()) {
+      cooldown.heldRequests = cooldown.heldRequests.filter(r => r.coalescingSubject !== subject);
+    }
+  }
+
+  private queueCoalescedWake(subject: string): boolean {
+    const push = this.pushCoalescer?.pending(subject);
+    if (!push || push.routing?.triggerAllowed === false) return false;
+    try { this.authorizeCoalesced(push); } catch { return false; }
+    this.cancelCoalescedRequest(subject);
+    const routing = push.routing;
+    const targets = routing?.targetAgents ?? [...this.agents.values()]
+      .filter(a => this.coalescingSharedReaders.has(a) && a.name !== this.subconsciousAgentName).map(a => a.name);
+    for (const agentName of targets) {
+      if (!this.agents.has(agentName)) continue;
+      this.pendingRequests.push({
+        agentName, reason: push.channelMessage ? 'mcpl:channel-incoming' : 'mcpl:push-event',
+        source: push.serverId, timestamp: Date.now(), coalescingSubject: subject, coalescingEventId: push.params.eventId,
+        channelId: routing?.channelId,
+        counterparty: routing?.author?.id ? `${push.serverId}:user:${routing.author.id}` : undefined,
+        addressed: isAddressedMessage(push.params.tags, routing?.metadata ?? push.params.origin),
+      });
+    }
+    return targets.some(name => this.agents.has(name));
+  }
+
+  private async resolveCoalescedRoute(push: CoalescedPush): Promise<void> {
+    const message = push.channelMessage;
+    const explicitChannel = coalescingChannel(push);
+    const derived = !message && explicitChannel === undefined ? this.derivePushEventChannel(push.params.origin) : null;
+    const channelId = explicitChannel ?? derived?.channelId;
+    // Legacy feature-scoped pushes keep their ordinary provenance/routing behavior.
+    // This registration NEVER authorizes a channel-scoped coalescing operation.
+    if (derived) this.channelRegistry?.ensureChannelRegistered(push.serverId, derived.channelId, derived.label, derived.metadata);
+    const previousIdentity = explicitChannel ? this.pushCoalescer?.identity(coalescingSubject(push)) : undefined;
+    const metadata = { ...(message?.metadata ?? push.params.origin) };
+    const origin = push.params.origin;
+    const author = message?.author ?? (typeof origin?.authorId === 'string'
+      ? { id: origin.authorId, name: typeof origin.authorName === 'string' ? origin.authorName : origin.authorId } : previousIdentity?.author);
+    const routing: NonNullable<CoalescedPush['routing']> = {
+      channelId, messageId: message?.messageId ?? (typeof origin?.messageId === 'string' ? origin.messageId : previousIdentity?.messageId ?? push.params.eventId),
+      threadId: message?.threadId ?? previousIdentity?.threadId, author, metadata,
+      targetAgents: [...this.agents.values()].filter(a => this.coalescingSharedReaders.has(a) && a.name !== this.subconsciousAgentName).map(a => a.name),
+    };
+    push.audience = this.coalescingAudience();
+    if (explicitChannel && this.conversationRouter) {
+      const router = this.conversationRouter;
+      const prior = this.pushCoalescer?.pending(coalescingSubject(push));
+      const oldTarget = prior?.routing?.targetAgents[0];
+      if (oldTarget && prior?.routing?.generation && !router.getBinding(explicitChannel) &&
+          router.exportGenerations()[explicitChannel] === prior.routing.generation) {
+        if (!this.agents.has(oldTarget)) await this.createConversationAgent(oldTarget, explicitChannel);
+        router.bind(explicitChannel, oldTarget, prior.routing.generation);
+      }
+      const decision = router.route({ channelId: explicitChannel,
+        mentioned: metadata.mentioned === true, // same bind/trigger predicate as ordinary channel input
+        kind: ConversationRouter.classifyChannel(this.channelRegistry?.registeredDescriptor(push.serverId, explicitChannel), metadata) });
+      if (decision.kind === 'unbound') { push.audience = ''; routing.targetAgents = []; }
+      else {
+        if (decision.kind === 'spawn') {
+          await this.createConversationAgent(decision.agentName, explicitChannel);
+          router.bind(explicitChannel, decision.agentName, decision.generation);
+          this.persistConversationRouterState();
+        }
+        push.audience = this.coalescingAudience(decision.agentName);
+        routing.targetAgents = [decision.agentName];
+        routing.generation = router.getBinding(explicitChannel)?.generation;
+        routing.triggerAllowed = decision.trigger;
+      }
+    }
+    if (channelId && !this.conversationRouter) {
+      const divert = this.channelRegistry?.getTuneOutState(push.serverId, channelId);
+      if (divert) {
+        metadata.tuneOut = { epochId: divert.params.epochId };
+        routing.targetAgents = this.subconsciousAgentName ? [this.subconsciousAgentName] : [];
+        routing.triggerAllowed = isAddressedMessage(push.params.tags, metadata) || (this.eventGate?.isPrivilegedUser(author?.id) ?? false);
+      }
+    }
+    push.routing = routing;
+  }
+
+  private admitCoalesced(push: CoalescedPush): Promise<PushEventResult> {
+    // Routing may spawn a conversation agent. Serialize both delivery lanes so a
+    // create, edit, and delete cannot overtake one another while routing awaits.
+    const work = this.coalescingAdmission.then(async () => {
+      this.ensureCoalescingBranch();
+      this.authorizeCoalesced(push);
+      this.pushCoalescer!.validate(push);
+      const duplicate = this.pushCoalescer!.receipt(push);
+      if (duplicate) return duplicate;
+      push.params.tags = push.params.tags ? expandCoreTags(push.params.tags) : undefined;
+      await this.resolveCoalescedRoute(push);
+      this.authorizeCoalesced(push); // routing awaited; authority may have changed
+      const result = this.pushCoalescer!.accept(push);
+      if (result.accepted && push.routing?.metadata?.tuneOut && push.routing.channelId) {
+        // Record diversion for the existing cadence path. Immediate/gated wakes
+        // remain subject-keyed and cancellable in the coalescing wake path.
+        this.tuneOutCoordinator?.onIncoming(push.serverId, push.routing.channelId,
+          push.routing.messageId!, push.params.tags, push.routing.author?.id, false);
+      }
+      return result;
     });
+    this.coalescingAdmission = work.then(() => {}, () => {});
+    return work;
+  }
+
+  private async resumeCoalescedChannels(serverId?: string): Promise<void> {
+    if (!this.pushCoalescer) return;
+    const work = this.coalescingAdmission.then(async () => {
+      this.ensureCoalescingBranch();
+      for (const push of this.pushCoalescer!.pendingPushes()) {
+        if (!push.recovered || serverId && push.serverId !== serverId) continue;
+        const channel = coalescingChannel(push);
+        if (channel && !this.channelRegistry?.registeredDescriptor(push.serverId, channel)) continue;
+        try { this.authorizeCoalesced(push); } catch { continue; }
+        const router = this.conversationRouter;
+        const target = push.routing?.targetAgents[0];
+        const generation = push.routing?.generation;
+        if (channel && router && target && generation && !router.getBinding(channel) &&
+            router.exportGenerations()[channel] === generation) {
+          if (!this.agents.has(target)) await this.createConversationAgent(target, channel);
+          router.bind(channel, target, generation);
+        } else if (!channel) {
+          await this.resolveCoalescedRoute(push);
+        }
+      }
+      this.pushCoalescer!.wakeRecovered();
+    });
+    this.coalescingAdmission = work.then(() => {}, () => {});
+    await work;
+  }
+
+  private materializeCoalescedPush(push: CoalescedPush, agent: Agent, consumer = agent.name): void {
+    const shared = push.audience === this.coalescingAudience();
+    if ((!shared && push.audience !== this.coalescingAudience(agent.name)) || this.agents.get(agent.name) !== agent) return;
+    const deliveryId = JSON.stringify([push.serverId, push.binding ?? '', push.params.eventId, push.audience]);
+    const legacyId = JSON.stringify([push.serverId, push.epoch, push.params.eventId, push.audience]);
+    if (push.recovered && agent.getContextManager().getAllMessages().some(m =>
+      m.metadata?.coalescingDeliveryId === deliveryId || m.metadata?.coalescingDeliveryId === legacyId)) return;
+    const routing = push.routing;
+    const metadata: Record<string, unknown> = {
+      ...push.params.origin, ...routing?.metadata,
+      serverId: push.serverId, featureSet: push.params.featureSet, eventId: push.params.eventId,
+      channelId: routing?.channelId, messageId: routing?.messageId, author: routing?.author,
+      threadId: routing?.threadId, tags: push.params.tags, coalescingDeliveryId: deliveryId,
+    };
+    const content = push.params.payload.content.map(convertPushBlock);
+    if (routing?.channelId && !this.conversationRouter && !metadata.tuneOut) {
+      const invitation = this.buildClosedChannelInvitation({ serverId: push.serverId,
+        channelId: routing.channelId, messageId: routing.messageId!,
+        authorName: routing.author?.name ?? 'Someone', tags: push.params.tags });
+      if (invitation) { content.push(invitation.block); Object.assign(metadata, invitation.metadataPatch); }
+    }
+    agent.getContextManager().addMessage('user', content, metadata);
+    const consumedWake = (r: InferenceRequest) => r.agentName === consumer &&
+      r.coalescingSubject === coalescingSubject(push) && r.coalescingEventId === push.params.eventId;
+    this.pendingRequests = this.pendingRequests.filter(r => !consumedWake(r));
+    for (const cooldown of this.providerAccelerationCooldowns.values()) {
+      cooldown.heldRequests = cooldown.heldRequests.filter(r => !consumedWake(r));
+    }
   }
 
   private initializePushCoalescer(triggerFilter?: (content: string, metadata: Record<string, unknown>) => boolean): void {
     const branch = this.store.currentBranch().name;
     this.coalescingBranch = branch;
     this.coalescingTriggerFilter = triggerFilter;
-    for (const [id, strategy] of [[COALESCING_AUDIT_ID, 'append_log'], [COALESCING_PENDING_ID, 'snapshot']] as const) {
+    for (const [id, strategy] of [[COALESCING_AUDIT_ID, 'append_log'], [COALESCING_PENDING_ID, 'snapshot'], [COALESCING_RECEIPTS_ID, 'tree']] as const) {
       if (!this.store.listStates().some(s => s.id === id)) this.store.registerState({ id, strategy });
     }
     const restored = this.store.getStateJson(COALESCING_PENDING_ID) as CoalescingSnapshot | null;
-    // Recovery still waits for current policy and assembly; it cannot smuggle a
-    // formerly admitted fallback past a newly denied grant at startup.
+    const receiptKey = (key: string) => createHash('sha256').update(key).digest('hex');
     this.pushCoalescer = new PushCoalescer({
-      historyUnknown: restored?.version === 1,
-      authorized: push => {
+      historyUnknown: !!restored,
+      available: push => {
         const server = this.mcplServerRegistry?.getServer(push.serverId);
-        if (this.store.currentBranch().name !== branch || !server?.isConnected || !server.policyEstablished || !server.grant.has('pushEvents') ||
-            (!push.recovered && this.coalescingEpochs.get(push.serverId) !== push.epoch)) return false;
-        try { this.featureSetManager!.validateInbound(push.serverId, push.params.featureSet); return true; }
-        catch { return false; }
+        const channel = coalescingChannel(push);
+        return !!server?.isConnected && server.policyEstablished && (!channel || !!this.channelRegistry?.registeredDescriptor(push.serverId, channel));
+      },
+      authorized: push => {
+        if (this.store.currentBranch().name !== branch) return false;
+        try { this.authorizeCoalesced(push); return true; } catch { return false; }
+      },
+      lookupReceipt: key => {
+        const entry = this.store.treeGet(COALESCING_RECEIPTS_ID, receiptKey(key));
+        const bytes = entry && this.store.getBlob(entry.blobHash);
+        return bytes ? JSON.parse(bytes.toString()) as PushEventResult : undefined;
+      },
+      recordReceipt: (key, result) => {
+        const bytes = Buffer.from(JSON.stringify(result));
+        this.store.treeSet(COALESCING_RECEIPTS_ID, receiptKey(key), { blobHash: this.store.storeBlob(bytes, 'application/json'), size: bytes.length, mode: 0o644 });
       },
       render: (push, params) => this.mcplServerRegistry!.getServer(push.serverId)!.sendPushRender(params),
       wake: (push, subject) => {
-        const agentName = this.primaryAgentName;
-        if (!agentName || push.audience !== this.coalescingAudience()) return false;
-        // Stub references before gate text, just as ordinary push handling does.
+        this.cancelCoalescedRequest(subject);
+        if (push.routing?.triggerAllowed === false) { this.eventGate?.cancelCoalesced(subject); return false; }
         const text = push.params.payload.content.map(convertPushBlock)
           .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text').map(b => b.text).join('\n');
         const trigger = triggerFilter?.(text, {
-          ...push.params.origin,
-          serverId: push.serverId, featureSet: push.params.featureSet,
-          eventId: push.params.eventId, eventType: 'mcpl:push-event',
+          ...push.params.origin, ...push.routing?.metadata,
+          serverId: push.serverId, featureSet: push.params.featureSet, eventId: push.params.eventId,
+          eventType: push.channelMessage ? 'mcpl:channel-incoming' : 'mcpl:push-event',
+          channelId: push.routing?.channelId, author: push.routing?.author,
           tags: push.params.tags, [COALESCING_SUBJECT]: subject,
         }) ?? true;
         if (!trigger) return false;
         this.eventGate?.cancelCoalesced(subject);
-        const requests: InferenceRequest[] = [...this.agents.values()]
-          .filter(agent => this.coalescingSharedReaders.has(agent) && agent.name !== this.subconsciousAgentName)
-          .map(agent => ({ agentName: agent.name, reason: 'mcpl:push-event', source: push.serverId, timestamp: Date.now() }));
-        this.coalescingWakes.set(subject, requests);
-        this.pendingRequests.push(...requests);
-        return true;
+        return this.queueCoalescedWake(subject);
       },
-      cancelWake: subject => {
-        this.eventGate?.cancelCoalesced(subject);
-        const requests = this.coalescingWakes.get(subject);
-        if (requests) this.pendingRequests = this.pendingRequests.filter(r => !requests.includes(r));
-        this.coalescingWakes.delete(subject);
-      },
+      cancelWake: (subject, consumed) => { this.eventGate?.cancelCoalesced(subject); if (!consumed) this.cancelCoalescedRequest(subject); },
       audit: record => this.store.appendToStateJson(COALESCING_AUDIT_ID, { ...record, timestamp: Date.now() }),
       save: snapshot => {
-        // A render begun on a previous branch must not overwrite this branch's
-        // recovery state when its Promise settles after a rollback or fork.
         if (this.store.currentBranch().name === branch) this.store.setStateJson(COALESCING_PENDING_ID, snapshot);
       },
     });
-    if (restored?.version === 1) {
-      this.pushCoalescer.restore(restored.pending.filter(push => push.audience === this.coalescingAudience()));
-    } else this.store.setStateJson(COALESCING_PENDING_ID, { version: 1, pending: [] });
+    if (restored) this.pushCoalescer.restore({ ...restored,
+      pending: restored.pending.filter(push => JSON.parse(push.audience || '[]')[0] === branch) });
+    else this.store.setStateJson(COALESCING_PENDING_ID, { version: 2, pending: [], history: [] });
   }
 
   private ensureCoalescingBranch(): void {
@@ -7469,7 +7660,8 @@ export class AgentFramework {
 
     // Check each agent
     for (const [agentName, groupedRequests] of requestsByAgent) {
-      let requests = groupedRequests;
+      let requests = groupedRequests.filter(r => !r.coalescingSubject || this.pushCoalescer?.occurrence(r.coalescingSubject) === r.coalescingEventId);
+      if (!requests.length) continue;
       const agent = this.agents.get(agentName);
       if (!agent) {
         // Agent not found — request is orphaned. Emit warning and drop.
@@ -8212,13 +8404,25 @@ export class AgentFramework {
     // clears our own token. Token-matched, so when a retry frame has replaced
     // the token, or the terminal-failure branch already deleted it, this
     // no-ops instead of clobbering a successor's marker.
+    const sharedReader = this.coalescingSharedReaders?.has(agent);
+    this.ensureCoalescingBranch();
+    const hasPending = this.pushCoalescer?.canAssemble(this.coalescingAudience());
+    if (sharedReader && (this.coalescingAssemblyOwner && this.coalescingAssemblyOwner.agent !== agent ||
+        hasPending && [...this.agents.values()].some(a => a !== agent && this.coalescingSharedReaders.has(a) &&
+          (this.activeTurnTokens.has(a.name) || this.activeStreams.has(a.name))))) {
+      this.pendingRequests.push(trigger ?? { agentName: agent.name, reason: 'mcpl:coalescing-boundary', source: 'scheduler', timestamp: Date.now() });
+      if (ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
+      return;
+    }
     const turnToken = this.nextTurnToken++;
+    if (sharedReader) this.coalescingAssemblyOwner = { agent, token: turnToken };
     this.activeTurnTokens.set(agent.name, turnToken);
     this.activeTurnTriggers.set(agent.name, trigger);
     let tokenHandedOff = false;
     try {
       tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken, ownsProviderGate);
     } finally {
+      if (this.coalescingAssemblyOwner?.agent === agent && this.coalescingAssemblyOwner.token === turnToken) this.coalescingAssemblyOwner = undefined;
       if (!tokenHandedOff && this.activeTurnTokens.get(agent.name) === turnToken) {
         this.activeTurnTokens.delete(agent.name);
         this.activeTurnTriggers.delete(agent.name);
@@ -8456,12 +8660,14 @@ export class AgentFramework {
 
       // RFC-006: pending content is absent from all context managers until this
       // assembly boundary, so background compression cannot consume it early.
+      this.ensureCoalescingBranch();
       if (this.coalescingSharedReaders?.has(agent)) {
-        this.ensureCoalescingBranch();
+        const otherBusy = [...this.agents.values()].some(a => a !== agent && this.coalescingSharedReaders.has(a) &&
+          (this.activeTurnTokens.has(a.name) || this.activeStreams.has(a.name)));
         const primary = this.primaryAgentName ? this.agents.get(this.primaryAgentName) : undefined;
-        if (primary) await this.pushCoalescer?.assemble(this.coalescingAudience(), push => {
-          this.materializeCoalescedPush(push, primary);
-        });
+        if (primary && !otherBusy) await this.pushCoalescer?.assemble(this.coalescingAudience(), push => this.materializeCoalescedPush(push, primary, agent.name));
+      } else {
+        await this.pushCoalescer?.assemble(this.coalescingAudience(agent.name), push => this.materializeCoalescedPush(push, agent));
       }
       if (this.providerAdmissionClosed || this.agents.get(agent.name) !== agent ||
           this.activeTurnTokens.get(agent.name) !== turnToken) {
@@ -11925,7 +12131,7 @@ export class AgentFramework {
         if (!agentName) throw new CoalesceError('audience', 'no primary agent is configured', -32000);
         const epoch = this.coalescingEpochs.get(serverId);
         if (!epoch) throw new CoalesceError('serverId', 'no initialized connection', -32002);
-        return this.pushCoalescer!.accept({ serverId, epoch, params, audience: this.coalescingAudience() });
+        return this.admitCoalesced({ serverId, binding: this.coalescingBinding(serverId), epoch, params, audience: this.coalescingAudience() });
       },
     );
 
@@ -11956,6 +12162,15 @@ export class AgentFramework {
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       {
         store: this.store,
+        authorizeIncoming: (serverId, channelId) => this.assertIncomingChannel(serverId, channelId),
+        handleCoalescedIncoming: async (serverId, message) => {
+          const params: PushEventParams = { featureSet: '', eventId: message.eventId ?? '',
+            timestamp: message.timestamp, tags: message.tags, coalesce: message.coalesce,
+            payload: { content: message.content } };
+          const result = await this.admitCoalesced({ serverId, binding: this.coalescingBinding(serverId),
+            epoch: this.coalescingEpochs.get(serverId) ?? '', audience: this.coalescingAudience(), params, channelMessage: message });
+          return { messageId: message.messageId, accepted: result.accepted, coalesce: result.coalesce, reason: result.reason };
+        },
         sendTypingFn: (serverId, channelId, metadata, op) => {
           const server = this.mcplServerRegistry!.getServer(serverId);
           if (server) {
@@ -12099,7 +12314,7 @@ export class AgentFramework {
 
     // Discover tools from all connected servers
     await this.refreshMcplTools();
-    this.pushCoalescer?.wakeRecovered();
+    await this.resumeCoalescedChannels();
   }
 
   /** Reconcile the durable ledger with Chronicle, then deliver every server's work. */
@@ -13002,7 +13217,7 @@ export class AgentFramework {
     ) => {
       const barrier = this.discordAwarenessBarrier;
       if (barrier) await barrier.promise;
-      this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+      await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
     });
 
     // Handle server-initiated inference requests (Step 6)
@@ -13031,6 +13246,7 @@ export class AgentFramework {
       responder?: { respond: (result: unknown) => void },
     ) => {
       await this.channelRegistry?.handleRegister(connection.id, params, responder as never);
+      await this.resumeCoalescedChannels(connection.id);
     });
 
     // Handle channel changes (Step 7) — §14.5 dual-mode: the responder is
@@ -13087,7 +13303,7 @@ export class AgentFramework {
     ) => {
       const barrier = this.discordAwarenessBarrier;
       if (barrier) await barrier.promise;
-      this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
+      await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
 
     // Handle host-level admin commands from a surface (e.g. Discord /undo)
@@ -13141,7 +13357,7 @@ export class AgentFramework {
       // grant) before the data-plane barrier releases — otherwise the first
       // post-reconnect events land while the grant is still empty and are
       // rejected fail-closed instead of delivered.
-      void (async () => {
+      const policyReady = (async () => {
         try {
           const config = this.mcplServerConfigs.get(connection.id);
           if (config) {
@@ -13156,11 +13372,12 @@ export class AgentFramework {
         this.releaseMcplDataPlaneGate(awarenessBarrier);
         this.handleToolsListChanged(connection.id);
       })();
-      void awarenessBarrier.promise.then(() => {
+      void Promise.all([policyReady, awarenessBarrier.promise]).then(async () => {
         if (
           awarenessBarrier.requiresBarrier
           && !this.completeMcplDataPlaneGate(awarenessBarrier)
         ) return;
+        await this.resumeCoalescedChannels(connection.id);
         this.emitTrace({
           type: 'mcpl:server-reconnected',
           serverId: connection.id,
@@ -13251,6 +13468,7 @@ export class AgentFramework {
     // disconnectMcplServer, which deletes the trees explicitly.
     connection.on('close', (code?: number | null, signal?: string | null) => {
       this.pushCoalescer?.disconnect(connection.id);
+      this.channelRegistry?.invalidateServerRegistration?.(connection.id);
       this.coalescingEpochs.delete(connection.id);
       this.featureSetManager?.removeServer(connection.id);
       this.emitTrace({

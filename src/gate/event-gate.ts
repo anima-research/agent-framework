@@ -100,6 +100,7 @@ interface PendingEvent {
  * "who woke the agent" from it). Ids only, never content or display names.
  */
 export interface WakeProvenance {
+  coalescingSubject?: string;
   /** Composite channel id of the chosen event — telemetry only, never a
    *  speech locus. Omitted for `mcpl:push-event` events, whose channel ids
    *  are raw server ids (unroutable and a second spelling of the same
@@ -523,6 +524,7 @@ export class EventGate {
   private configErrors: string[] = [];
 
   // Debounce state
+  private coalescedDebounce = new Map<string, { timer: ReturnType<typeof setTimeout>; event: PendingEvent }>();
   private debounceTimers = new Map<string, DebounceState>();
 
   // Rate-limit state — policy name → key → bucket.
@@ -1238,6 +1240,9 @@ export class EventGate {
     name: string,
     options: { deliverPendingDebounce: boolean },
   ): void {
+    for (const [subject, state] of this.coalescedDebounce) {
+      if (state.event.policyName === name) this.cancelCoalesced(subject);
+    }
     const debounce = this.debounceTimers.get(name);
     if (debounce) {
       clearTimeout(debounce.timer);
@@ -1428,6 +1433,10 @@ export class EventGate {
         metadata,
         tags: Array.isArray(metadata.tags) ? (metadata.tags as string[]) : undefined,
       });
+      const subject = (metadata as Record<PropertyKey, unknown>)[COALESCING_SUBJECT];
+      if (typeof subject === 'string' && !(typeof decision.behavior === 'object' && 'debounce' in decision.behavior)) {
+        this.cancelCoalesced(subject);
+      }
       return decision.trigger;
     };
   }
@@ -1459,19 +1468,25 @@ export class EventGate {
     };
 
     if (event.coalescingSubject) {
-      // A tag/rule change still corrects the SAME pending wake. Keep its first
-      // deadline even when the replacement now matches a different policy.
-      for (const state of this.debounceTimers.values()) {
-        const index = state.events.findIndex(e => e.coalescingSubject === event.coalescingSubject);
-        if (index !== -1) { state.events[index] = event; return; }
-      }
+      const key = event.coalescingSubject;
+      const existing = this.coalescedDebounce.get(key);
+      if (existing) { existing.event = event; return; }
+      const timer = setTimeout(() => {
+        const current = this.coalescedDebounce.get(key);
+        this.coalescedDebounce.delete(key);
+        if (!current) return;
+        if (this.inferring.size || this.quiesced) this.bufferForInference([current.event]);
+        else this.deliverEvents([current.event]);
+      }, debounceMs);
+      this.coalescedDebounce.set(key, { timer, event });
+      return;
     }
+    // Ordinary events retain their own quiet-period debounce. A subject's fixed
+    // deadline must neither postpone nor accelerate an unrelated event.
     const existing = this.debounceTimers.get(policy.name);
     if (existing) {
-      existing.events.push(event);
-      // Unrelated traffic must not postpone a coalesced wake indefinitely either.
-      if (existing.events.some(e => e.coalescingSubject)) return;
       clearTimeout(existing.timer);
+      existing.events.push(event);
       existing.timer = setTimeout(() => this.fireDebounce(policy.name), debounceMs);
     } else {
       const timer = setTimeout(() => this.fireDebounce(policy.name), debounceMs);
@@ -1510,6 +1525,9 @@ export class EventGate {
 
   /** Withdraw a coalesced wake when its subject is consumed, removed, or revoked. */
   cancelCoalesced(subject: string): void {
+    const pending = this.coalescedDebounce.get(subject);
+    if (pending) clearTimeout(pending.timer);
+    this.coalescedDebounce.delete(subject);
     for (const [name, state] of this.debounceTimers) {
       state.events = state.events.filter(e => e.coalescingSubject !== subject);
       if (!state.events.length) { clearTimeout(state.timer); this.debounceTimers.delete(name); }
@@ -1522,6 +1540,14 @@ export class EventGate {
   // =========================================================================
 
   private deliverEvents(events: PendingEvent[]): void {
+    for (const event of events.filter(e => e.coalescingSubject)) {
+      this.requestInferenceFn(this.getAgentNamesFn()[0] ?? '', 'gate:debounce', 'gate', {
+        ...wakeProvenance([event]), coalescingSubject: event.coalescingSubject,
+      });
+    }
+    events = events.filter(e => !e.coalescingSubject);
+    if (!events.length) return;
+
     if (events.length === 0) return;
 
     const policyNames = [...new Set(events.map(e => e.policyName))];
@@ -1664,7 +1690,9 @@ export class EventGate {
           );
         }
       }
-      this.inferenceBuffer.push(event);
+      const prior = event.coalescingSubject ? this.inferenceBuffer.findIndex(e => e.coalescingSubject === event.coalescingSubject) : -1;
+      if (prior >= 0) this.inferenceBuffer[prior] = event;
+      else this.inferenceBuffer.push(event);
     }
   }
 
@@ -1886,7 +1914,7 @@ export class EventGate {
       };
       if (typeof p.behavior === 'object' && 'debounce' in p.behavior) {
         result.debounceState = {
-          pendingCount: debounce?.events.length ?? 0,
+          pendingCount: (debounce?.events.length ?? 0) + [...this.coalescedDebounce.values()].filter(state => state.event.policyName === p.name).length,
           nextDeliveryMs: null, // Timer internals not easily inspectable
         };
       }
@@ -1949,6 +1977,8 @@ export class EventGate {
       clearTimeout(state.timer);
     }
     this.debounceTimers.clear();
+    for (const state of this.coalescedDebounce.values()) clearTimeout(state.timer);
+    this.coalescedDebounce.clear();
     for (const timer of this.selfWakeTimers.values()) {
       clearTimeout(timer);
     }

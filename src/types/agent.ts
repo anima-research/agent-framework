@@ -296,6 +296,9 @@ export interface CompletedToolCall {
  * Inference request for an agent.
  */
 export interface InferenceRequest {
+  /** Host-owned identity for withdrawal of an unconsumed coalesced wake. */
+  coalescingSubject?: string;
+  coalescingEventId?: string;
   agentName: string;
   reason: string;
   source: string;

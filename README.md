@@ -239,24 +239,37 @@ Optional host-side implementation of the MCP Live protocol. External servers (ga
 }
 ```
 
-Feature-set-scoped pushes may use [RFC-006](https://github.com/anima-research/mcpl/pull/5)
-coalescing. The host advertises `eventCoalescing` with `pushEvents` and `deferred` enabled;
-`channelsIncoming` and `channelScopedPush` remain false. A producer must check those flags.
+[RFC-006](https://github.com/anima-research/mcpl/pull/5) coalescing works across
+`push/event` and `channels/incoming`. The host advertises `pushEvents`, `deferred`,
+`channelsIncoming`, and `channelScopedPush` under `eventCoalescing`.
 
-An optional `coalesce: { key }` retains the newest unread snapshot. Add `deferred: true`
-to send notices and answer `push/render` with content at the next activation assembly.
-Use `retract: true` to withdraw unread content; deletion notices remain when earlier content
-was consumed or its history is uncertain. Occurrences need distinct `eventId`s; retries
-reuse their original ID and receive the original receipt.
+An optional `coalesce: { key }` keeps the newest unread occurrence. Channel messages
+require an occurrence `eventId` while retaining their stable platform `messageId`.
+A push with `coalesce.channelId` shares that registered channel's subject namespace, so a
+create arriving through one method can be edited or deleted through the other. Scope is
+never inferred from `origin`. Both lanes check `channels.incoming`, current registration,
+and the server config's optional `allowedIncomingChannels` allow-list (`*` globs; an empty
+list denies all). A channel-scoped push also needs ordinary push authorization.
 
-Pending pushes remain outside context managers until activation assembly, so compression,
-fork copies, previews, and live tool continuations cannot accidentally consume an editable
-occurrence. Materialization seals the occurrence conservatively before context compilation;
-the host never edits stored model history. The durable `mcpl/coalescing-audit` log records
-notices, replacements, and render outcomes. `mcpl/coalescing-pending` saves fallbacks for
-restart recovery without repeating a server render. Rendering times out after five seconds;
-the host retains 64 notices per batch, caps notice data at 4 KiB, content at 1 MiB, and
-tracked subjects at 128. Excess pending subjects are rejected rather than silently dropped.
+Add `deferred: true` to a push to render a batch through `push/render` at activation
+assembly; deferred mode is not valid on `channels/incoming`. Use `retract: true` to remove
+unread work. Channel retractions require a deletion notice, which is appended when earlier
+versions were consumed or their history is uncertain. Reply targets, conversation-fork
+routing, and channel provenance survive mixed-lane updates.
+
+Pending events stay outside context managers until activation assembly. Shared-context
+publication waits for the other residents' live turns to finish; isolated conversation
+forks receive their own events. Consumed history is never rewritten. Pending snapshots,
+subject history, and occurrence receipts survive restart and reconnect; recovery waits for
+a fresh grant and channel registration, and does not repeat old source-backed renders.
+Changing a configured endpoint/command creates a separate server-binding namespace.
+
+`mcpl/coalescing-audit` records receipts, replacements, and render outcomes;
+`mcpl/coalescing-pending` stores recovery state; `mcpl/coalescing-receipts` is a durable
+idempotency index. Rendering times out after five seconds. The host retains 64 notices per
+batch, caps notice data at 4 KiB and content at 1 MiB, and tracks up to 128 active subjects.
+Excess pending subjects are rejected rather than silently dropped. Coalesced debounce
+uses its own fixed deadline and does not change unrelated events' quiet periods.
 
 ### Streaming Lifecycle
 

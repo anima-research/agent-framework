@@ -26,6 +26,7 @@ import type {
   ChannelsIncomingParams,
   ChannelsIncomingResult,
   ChannelIncomingMessageResult,
+  ChannelIncomingMessage,
   ChannelsPublishParams,
   ChannelsOpenResult,
   ChannelHistoryRequest,
@@ -452,6 +453,8 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 // ============================================================================
 
 interface ChannelRegistryOptions {
+  authorizeIncoming?: (serverId: string, channelId: string) => void;
+  handleCoalescedIncoming?: (serverId: string, message: ChannelIncomingMessage) => Promise<ChannelIncomingMessageResult>;
   /** Chronicle store used for durable desired channel lifecycle state. */
   store?: JsStore;
   /** Callback to determine whether an incoming message should trigger inference. */
@@ -644,6 +647,19 @@ export class ChannelRegistry {
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
   private migratedLegacyPolicies = new Set<string>();
 
+  private incomingRegistrations = new Set<string>();
+  private authorizeIncoming?: ChannelRegistryOptions['authorizeIncoming'];
+  private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
+
+  invalidateServerRegistration(serverId: string): void {
+    this.removeServer(serverId);
+  }
+
+  registeredDescriptor(serverId: string, channelId: string): ChannelDescriptor | undefined {
+    const key = `${serverId}:${channelId}`;
+    return this.incomingRegistrations.has(key) ? this.channels.get(key)?.descriptor : undefined;
+  }
+
   constructor(
     serverRegistry: McplServerRegistry,
     featureSetManager: FeatureSetManager,
@@ -658,6 +674,8 @@ export class ChannelRegistry {
       ) => void;
     },
   ) {
+    this.authorizeIncoming = options?.authorizeIncoming;
+    this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
     this.serverRegistry = serverRegistry;
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -711,6 +729,7 @@ export class ChannelRegistry {
         continue;
       }
       const key = `${serverId}:${channel.id}`;
+      this.incomingRegistrations.add(key);
       this.channels.set(key, {
         serverId,
         descriptor: channel,
@@ -762,6 +781,7 @@ export class ChannelRegistry {
       for (const channelId of params.removed) {
         const key = `${serverId}:${channelId}`;
         const existed = this.channels.delete(key);
+        this.incomingRegistrations.delete(key);
         this.stopTyping(channelId);
         addedResults.push({ id: channelId, accepted: existed, reason: existed ? undefined : 'not registered' });
       }
@@ -786,6 +806,7 @@ export class ChannelRegistry {
           continue;
         }
         existing.descriptor = channel;
+        this.incomingRegistrations.add(key);
         this.appendLabelSighting(channel.id, channel.label, extractDmMeta(channel.metadata));
         addedResults.push({ id: channel.id, accepted: true });
       }
@@ -802,6 +823,7 @@ export class ChannelRegistry {
           continue;
         }
         const key = `${serverId}:${channel.id}`;
+        this.incomingRegistrations.add(key);
         this.channels.set(key, {
           serverId,
           descriptor: channel,
@@ -838,17 +860,19 @@ export class ChannelRegistry {
    * Converts each message's content, pushes McplChannelIncomingEvent to the
    * queue, and responds with per-message results.
    */
-  handleIncoming(
+  async handleIncoming(
     serverId: string,
     params: ChannelsIncomingParams,
     responder?: Responder,
-  ): void {
+  ): Promise<void> {
     const results: ChannelIncomingMessageResult[] = [];
 
     for (const message of params.messages) {
-      if ('coalesce' in message) {
-        results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
-        continue; // channelsIncoming is explicitly not advertised by this host.
+      if (!message || typeof message.channelId !== 'string' || !message.channelId ||
+          typeof message.messageId !== 'string' || !message.messageId) {
+        results.push({ messageId: typeof message?.messageId === 'string' ? message.messageId : '',
+          accepted: false, reason: message?.coalesce !== undefined ? 'coalesce_invalid' : 'invalid channel/message identity' });
+        continue;
       }
       // §14.5 FIRST, before ANY semantic processing: admission against the
       // actually-registered channel precedes tag expansion and content
@@ -889,6 +913,31 @@ export class ChannelRegistry {
           accepted: false,
           reason: `unknown channel "${message.channelId}" — register it first (§14.5)`,
         });
+        continue;
+      }
+
+      try {
+        this.authorizeIncoming?.(serverId, message.channelId);
+        if (message.coalesce !== undefined) {
+          if (!this.handleCoalescedIncoming) {
+            results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+            continue;
+          }
+          const result = await this.handleCoalescedIncoming(serverId, message);
+          results.push(result);
+          if (result.accepted) {
+            this.defaultPublishChannel = message.channelId;
+            this.defaultPublishMessageId = message.messageId;
+            this.defaultPublishThreadId = message.threadId;
+            const entry = this.channels.get(incomingKey);
+            if (entry) entry.open = true;
+          }
+          continue;
+        }
+      } catch (error) {
+        const err = error as Error & { code?: number };
+        results.push({ messageId: message.messageId, accepted: false,
+          reason: err.code === -32602 ? 'coalesce_invalid' : err.message });
         continue;
       }
 
@@ -1327,6 +1376,7 @@ export class ChannelRegistry {
     for (const [key, entry] of this.channels) {
       if (entry.serverId !== serverId) continue;
       this.channels.delete(key);
+      this.incomingRegistrations.delete(key);
       this.stopTyping(entry.descriptor.id);
       if (this.defaultPublishChannel === entry.descriptor.id) {
         this.defaultPublishChannel = null;
@@ -2233,6 +2283,13 @@ export class ChannelRegistry {
       address: entry.descriptor.address,
       ...(history ? { history } : {}),
     });
+    // A typed response to a host-authorized open is a server declaration too;
+    // an origin-derived outbound placeholder by itself is not.
+    const key = `${entry.serverId}:${entry.descriptor.id}`;
+    if (result?.channel?.id === entry.descriptor.id && this.channels.get(key) === entry &&
+        server.policyEstablished && CapabilityGrant.of(server).has('channels.lifecycle')) {
+      this.incomingRegistrations.add(key);
+    }
     entry.open = true;
     return result;
   }
