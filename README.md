@@ -262,7 +262,8 @@ publication waits for the other residents' live turns to finish; isolated conver
 forks receive their own events. Consumed history is never rewritten. Pending snapshots,
 subject history, and occurrence receipts survive restart and reconnect; recovery waits for
 a fresh grant and channel registration, and does not repeat old source-backed renders.
-Changing a configured endpoint/command creates a separate server-binding namespace.
+Changing a configured endpoint/command creates a separate server-binding namespace. Use a
+different server ID if credentials switch to another principal at the same endpoint.
 
 `mcpl/coalescing-audit` records receipts, replacements, and render outcomes;
 `mcpl/coalescing-pending` stores recovery state; `mcpl/coalescing-receipts` is a durable

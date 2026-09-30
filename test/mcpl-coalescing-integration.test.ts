@@ -329,8 +329,8 @@ test('an idle resident cannot materialize coalesced content into a different res
 test('opening or closing a channel does not change a subject coalescing identity',async t=>{
   const f=await fixture();t.after(f.close);await f.register();
   await f.send('channels/incoming',{messages:[f.channel('create','before_close')]});
-  await f.send('channels/changed',{updated:[{id:'chat',type:'discord',label:'chat'}]});
-  await eventually(()=>f.framework.channels!.isChannelOpen('chat')===false);
+  const closed=await f.framework.channels!.handleChannelToolCall('channel_close',{channelId:'chat',serverId:'editor'});
+  assert.equal(closed.success,true);assert.equal(f.framework.channels!.isChannelOpen('chat'),false);
   const edit=await f.send('push/event',f.params('edit','after_close',{channelId:'chat',key:'message:m'}));
   assert.equal(edit.result.coalesce.outcome,'replaced');
   await f.framework.runUntilIdle();assert(JSON.stringify(f.membrane.calls[0]).includes('after_close'));assert(!JSON.stringify(f.membrane.calls[0]).includes('before_close'));
