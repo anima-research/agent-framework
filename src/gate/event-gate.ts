@@ -627,6 +627,8 @@ export class EventGate {
     now?: () => number;
     /** Per-event timeout (ms) for the optional gate.js script. Default 50. */
     scriptTimeoutMs?: number;
+    /** Recover durable wake intents during construction (default false). */
+    autoRecover?: boolean;
   }) {
     this.configPath = opts.configPath;
     const gateStem = basename(this.configPath, '.json');
@@ -692,6 +694,7 @@ export class EventGate {
       opts.scriptTimeoutMs ?? 50,
       this.now,
     );
+    if (opts.autoRecover === true) this.recoverWakeIntents();
   }
 
   // =========================================================================
@@ -1891,38 +1894,41 @@ export class EventGate {
     }
   }
 
-  /** Reconcile durable intents after AgentFramework initialization succeeds. */
+  /**
+   * Reconcile durable wake intents once an embedding host can accept messages
+   * and inference requests. Hosts should call this before releasing inbound
+   * traffic; `autoRecover` is available for standalone embedders.
+   */
   recoverWakeIntents(): void {
     const state = this.readWakeState();
     if (!state) return;
     const now = this.now();
-    const due: Array<{ intent: PersistedWakeIntent; kind: 'sleep' | 'self-wake' }> = [];
-
     if (state.sleep) {
-      if (state.sleep.wakeAt > now) {
-        this.sleepUntil = state.sleep.wakeAt;
-        this.sleepArmedAt = state.sleep.armedAt;
-        this.sleepNote = state.sleep.note;
-        this.sleepAgent = state.sleep.agentName;
-        // Suppressed is intentionally process-local; a recovered process starts
-        // counting again from zero (also reflected by getSleepState()).
-        this.sleepSuppressed = 0;
-        this.armSleepTimer();
-      } else due.push({ intent: state.sleep, kind: 'sleep' });
+      this.sleepUntil = state.sleep.wakeAt; this.sleepArmedAt = state.sleep.armedAt;
+      this.sleepNote = state.sleep.note; this.sleepAgent = state.sleep.agentName; this.sleepSuppressed = 0;
+      if (state.sleep.wakeAt > now) this.armSleepTimer();
     }
     for (const intent of state.selfWakes) {
-      if (intent.wakeAt > now) {
-        this.selfWakeIntents.set(intent.agentName!, intent);
-        this.armRestoredSelfWake(intent);
-      } else due.push({ intent, kind: 'self-wake' });
+      this.selfWakeIntents.set(intent.agentName!, intent);
+      if (intent.wakeAt > now) this.armRestoredSelfWake(intent);
     }
-    if (due.length === 0) return;
-
-    // Recovery is called only after full framework initialization. Clear each
-    // due item after requestInference returns (the framework callback enqueued
-    // it); if delivery throws, retain the durable item for the next boot.
+    const due: Array<{ intent: PersistedWakeIntent; kind: 'sleep' | 'self-wake' }> = [];
+    if (state.sleep && state.sleep.wakeAt <= now) due.push({ intent: state.sleep, kind: 'sleep' });
+    for (const intent of state.selfWakes) if (intent.wakeAt <= now) due.push({ intent, kind: 'self-wake' });
     const woken = new Set<string>();
     for (const item of due) {
+      if (item.kind === 'sleep') {
+        this.sleepUntil = 0; this.sleepArmedAt = 0; this.sleepAgent = undefined; this.sleepNote = undefined;
+      } else this.selfWakeIntents.delete(item.intent.agentName!);
+      // Journal admission precedes side effects. Failure restores the intent
+      // in memory and leaves its durable copy for the next startup.
+      if (!this.tryPersistWakeState('admitting overdue wake recovery')) {
+        if (item.kind === 'sleep') {
+          this.sleepUntil = item.intent.wakeAt; this.sleepArmedAt = item.intent.armedAt;
+          this.sleepAgent = item.intent.agentName; this.sleepNote = item.intent.note;
+        } else this.selfWakeIntents.set(item.intent.agentName!, item.intent);
+        continue;
+      }
       const targets = item.intent.agentName ? [item.intent.agentName] : this.getAgentNamesFn();
       for (const target of targets) {
         const overdueMs = Math.max(0, now - item.intent.wakeAt);
@@ -1936,10 +1942,6 @@ export class EventGate {
           woken.add(target);
         }
       }
-      if (item.kind === 'sleep') {
-        this.sleepUntil = 0; this.sleepArmedAt = 0; this.sleepAgent = undefined; this.sleepNote = undefined;
-      } else this.selfWakeIntents.delete(item.intent.agentName!);
-      this.tryPersistWakeState('admitting overdue wake recovery');
     }
   }
 

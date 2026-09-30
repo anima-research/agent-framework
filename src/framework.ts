@@ -1746,6 +1746,9 @@ export class AgentFramework {
       }
     }
 
+    // Restore sleep suppression before MCPL startup can release buffered input.
+    framework.eventGate?.recoverWakeIntents();
+
     // Initialize MCPL subsystems if configured
     if (config.mcplServers && config.mcplServers.length > 0) {
       // Validate tool prefixes: no collisions with module names or between servers
@@ -1828,10 +1831,6 @@ export class AgentFramework {
     } catch {
       // SIGUSR2 not available on this platform — non-fatal.
     }
-
-    // Reconcile wake promises only after every module/server/startup invariant
-    // above succeeded. A failed create must leave due intents durable.
-    framework.eventGate?.recoverWakeIntents();
 
     return framework;
   }

@@ -131,6 +131,12 @@ describe('EventGate self-wake', () => {
     const { gate, inferenceRequests } = makeGate();
     gate.armSelfWake('agent', 1);
     gate.dispose();
+    const internals = gate as unknown as {
+      sleepTimer: ReturnType<typeof setTimeout> | null;
+      selfWakeTimers: Map<string, ReturnType<typeof setTimeout>>;
+    };
+    assert.strictEqual(internals.sleepTimer, null);
+    assert.strictEqual(internals.selfWakeTimers.size, 0);
     await sleep(1150);
     assert.strictEqual(inferenceRequests.length, 0);
   });
@@ -315,6 +321,18 @@ describe('durable wake intent recovery', () => {
     h.gate.dispose();
   });
 
+  it('autoRecover lets standalone embedders restore during construction', () => {
+    writeFileSync(join(TMP_DIR, 'gate.wake-intents.json'), JSON.stringify({
+      version: 1, sleep: { agentName: 'agent', armedAt: 1, wakeAt: 60_000, source: 'sleep' }, selfWakes: [],
+    }));
+    const gate = new EventGate({
+      configPath: join(TMP_DIR, 'gate.json'), now: () => 1_000, autoRecover: true,
+      emitTrace: () => {}, addMessage: () => '', requestInference: () => {}, getAgentNames: () => ['agent'],
+    });
+    assert.strictEqual(gate.getSleepState()!.until, 60_000);
+    gate.dispose();
+  });
+
   it('constructor with no journal performs no wake-journal write', () => {
     const path = join(TMP_DIR, 'gate.wake-intents.json');
     const h = harness(() => 1_000);
@@ -361,5 +379,55 @@ describe('durable wake intent recovery', () => {
     assert.strictEqual(h.inferenceRequests.length, 0);
     if (internals.sleepTimer) clearTimeout(internals.sleepTimer);
     h.gate.dispose();
+  });
+});
+
+describe('wake recovery startup ordering', () => {
+  it('AgentFramework.create recovers wake intent before MCPL initialization', async () => {
+    const order: string[] = [];
+    const gateProto = EventGate.prototype as unknown as { recoverWakeIntents(): void };
+    const frameworkProto = AgentFramework.prototype as unknown as {
+      initializeMcpl(configs: unknown[], routing?: unknown): Promise<void>;
+    };
+    const originalRecover = gateProto.recoverWakeIntents;
+    const originalMcpl = frameworkProto.initializeMcpl;
+    gateProto.recoverWakeIntents = function () { order.push('recover'); };
+    frameworkProto.initializeMcpl = async function () { order.push('mcpl'); };
+    const dir = join(TMP_DIR, 'ordering');
+    try {
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+        gate: { configPath: join(dir, 'gate.json') },
+        mcplServers: [{ id: 'fixture', command: 'unused', args: [] }],
+      });
+      assert.deepStrictEqual(order, ['recover', 'mcpl']);
+      await framework.stop();
+    } finally {
+      gateProto.recoverWakeIntents = originalRecover;
+      frameworkProto.initializeMcpl = originalMcpl;
+    }
+  });
+
+  it('does not emit an overdue marker or inference when journal admission fails', () => {
+    const messages: string[] = [];
+    const requests: string[] = [];
+    mkdirSync(TMP_DIR, { recursive: true });
+    writeFileSync(join(TMP_DIR, 'gate.wake-intents.json'), JSON.stringify({
+      version: 1,
+      sleep: { agentName: 'agent', armedAt: 1, wakeAt: 2, source: 'sleep' }, selfWakes: [],
+    }));
+    const gate = new EventGate({
+      configPath: join(TMP_DIR, 'gate.json'), now: () => 10,
+      emitTrace: () => {}, addMessage: (_p, c) => { messages.push(c[0]!.text); return ''; },
+      requestInference: (_a, reason) => requests.push(reason), getAgentNames: () => ['agent'],
+    });
+    (gate as unknown as { persistWakeState(): void }).persistWakeState = () => { throw new Error('disk full'); };
+    gate.recoverWakeIntents();
+    assert.deepStrictEqual(messages, []);
+    assert.deepStrictEqual(requests, []);
+    const state = JSON.parse(readFileSync(join(TMP_DIR, 'gate.wake-intents.json'), 'utf8'));
+    assert.ok(state.sleep, 'durable due intent remains for next startup');
+    gate.dispose();
   });
 });
