@@ -130,17 +130,14 @@ describe('private non-channel trigger batching', () => {
 
   it('does not borrow a sibling channel request from the same batch', async () => {
     const membrane = new MockMembrane();
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'private reply' }]));
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'), membrane: membrane.asMembrane(),
       agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout' }], modules: [],
     });
     const i = internals(framework);
-    const captured: { handed?: InferenceRequest } = {};
-    const orig = i.startAgentStream.bind(framework);
-    i.startAgentStream = async (agent: unknown, trigger?: InferenceRequest) => {
-      captured.handed = trigger;
-      return orig(agent, trigger);
+    const captured: InferenceRequest[] = [];
+    i.startAgentStream = async (_agent: unknown, trigger?: InferenceRequest) => {
+      if (trigger) captured.push(trigger);
     };
     const t = Date.now();
     i.pendingRequests.push(
@@ -149,10 +146,51 @@ describe('private non-channel trigger batching', () => {
         channelId: 'discord:g:room', addressed: true },
     );
     await i.processInferenceRequests();
-    await framework.runUntilIdle();
-    assert.equal(captured.handed?.nonChannelOrigin, true);
-    assert.equal(captured.handed?.channelId, undefined);
-    assert.equal(captured.handed?.addressed, false);
+    assert.ok(i.pendingRequests.some((r) => r.channelId === 'discord:g:room'));
+    await i.processInferenceRequests();
+    assert.equal(captured[0]?.nonChannelOrigin, true);
+    assert.equal(captured[0]?.channelId, undefined);
+    assert.equal(captured[0]?.addressed, false);
+    assert.equal(captured[1]?.channelId, 'discord:g:room', 'requeued channel request gets its own turn');
+    assert.equal(captured[1]?.addressed, true);
     await framework.stop();
+  });
+});
+
+describe('channel_open turn binding', () => {
+  it('a stale completion updates active channel but not a newer private turn pin', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'stale-open-test-'));
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'), membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test', systemPrompt: 'scout' }], modules: [],
+    });
+    let resolveOpen!: (value: unknown) => void;
+    const pending = new Promise((resolve) => { resolveOpen = resolve; });
+    const i = framework as unknown as {
+      activeTurnTokens: Map<string, number>; activeTriggerChannels: Map<string, string>;
+      turnLocusPins: Map<string, string>; activeTurnTriggers: Map<string, InferenceRequest>;
+      channelRegistry: { handleChannelToolCall(...args: unknown[]): Promise<unknown> };
+      dispatchChannelToolCall(agent: string, call: unknown): void;
+    };
+    i.channelRegistry = new Proxy({
+      handleChannelToolCall: async () => pending,
+    }, { get: (target, prop: string) => prop in target ? target[prop as keyof typeof target] : () => undefined }) as never;
+    i.activeTurnTokens.set('scout', 1);
+    i.activeTurnTriggers.set('scout', { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: 1 });
+    i.turnLocusPins.set('scout', 'discord:g:old');
+    i.dispatchChannelToolCall('scout', { id: 'open-1', name: 'channel_open', input: { channelId: 'discord:g:opened' } });
+
+    // A new private turn starts before the old tool resolves.
+    i.activeTurnTokens.set('scout', 2);
+    i.activeTurnTriggers.set('scout', { agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: 2, nonChannelOrigin: true });
+    i.turnLocusPins.delete('scout');
+    resolveOpen({ success: true, data: { channelId: 'discord:g:opened', opened: true } });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(i.activeTriggerChannels.get('scout'), 'discord:g:opened');
+    assert.equal(i.turnLocusPins.has('scout'), false, 'stale completion cannot redirect the new private turn');
+    assert.equal(i.activeTurnTriggers.get('scout')!.nonChannelOrigin, true, 'new turn privacy remains set');
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
   });
 });

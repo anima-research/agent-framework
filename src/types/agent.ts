@@ -303,8 +303,6 @@ export interface InferenceRequest {
   reason: string;
   source: string;
   timestamp: number;
-  /** True when a private non-channel surface requested this inference. */
-  nonChannelOrigin?: boolean;
   /**
    * The MCPL channel whose message triggered this inference, if any (composite
    * id, e.g. `discord:guild:channel` / `discord:dm:id`). The framework routes
@@ -347,4 +345,6 @@ export interface InferenceRequest {
   /** Ephemeral system-position prompt for this turn only. Never written to
    * Chronicle; callers must supply bounded non-secret control text. */
   ephemeralSystemPrompt?: string;
+  /** True when a private non-channel surface requested this inference. */
+  nonChannelOrigin?: boolean;
 }

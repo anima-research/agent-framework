@@ -1051,6 +1051,8 @@ export class AgentFramework {
    *  author sees the segment's fate one turn later. Cleared each fresh
    *  turn; budget restarts keep it. */
   private turnProseSuppressed: Map<string, number> = new Map();
+  /** Subset suppressed specifically by a private non-channel turn. */
+  private turnPrivateProseSuppressed: Map<string, number> = new Map();
   /** A tool boundary injected fresh CONVERSATIONAL input (a real message —
    *  not a reaction or a system marker) into the live stream. Tells
    *  driveStream to clear sticky explicit-send suppression before handling
@@ -8182,6 +8184,14 @@ export class AgentFramework {
       // requests[0] in that mixed batch bypassed the turn lock because a
       // restart existed, then treated the continuation as a fresh turn.
       const trigger = budgetRestart ?? requests[0];
+      if (trigger.nonChannelOrigin) {
+        // A private surface wake is its own turn. Channel-bearing siblings are
+        // not merely stripped: requeue them so their addressed/channel context
+        // receives a distinct subsequent turn.
+        const channelSiblings = requests.filter((r) => r !== trigger && !!r.channelId);
+        if (channelSiblings.length > 0) this.pendingRequests.push(...channelSiblings);
+        requests = requests.filter((r) => r === trigger || !r.channelId);
+      }
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle):
@@ -8247,6 +8257,9 @@ export class AgentFramework {
     if (count <= 0) return;
     console.error(`[routing] ${agentName}: prose NOT auto-published (private non-channel turn)`);
     this.recordProseSuppression(agentName, count);
+    this.turnPrivateProseSuppressed.set(
+      agentName, (this.turnPrivateProseSuppressed.get(agentName) ?? 0) + count,
+    );
   }
 
   /** Record a successful plain-prose delivery for this turn's receipt. */
@@ -8279,9 +8292,11 @@ export class AgentFramework {
   private appendProseDeliveryReceipt(agent: Agent, privateTurn = false): void {
     const list = this.turnProseDeliveries.get(agent.name);
     const suppressed = this.turnProseSuppressed.get(agent.name) ?? 0;
+    const privateSuppressed = this.turnPrivateProseSuppressed.get(agent.name) ?? 0;
     if ((!list || list.length === 0) && suppressed === 0) return;
     this.turnProseDeliveries.delete(agent.name);
     this.turnProseSuppressed.delete(agent.name);
+    this.turnPrivateProseSuppressed.delete(agent.name);
     const seen = new Set<string>();
     const shown: string[] = [];
     for (const id of list ?? []) {
@@ -8294,14 +8309,17 @@ export class AgentFramework {
           : id,
       );
     }
-    const suppressedNote =
-      suppressed > 0
-        ? privateTurn
-          ? `${suppressed} plain-speech segment(s) kept private (non-channel turn — publish only with an explicit send tool)`
-          : agent.proseRouting === 'disabled'
-            ? `${suppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)`
-            : `${suppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`
-        : '';
+    const notes: string[] = [];
+    if (privateSuppressed > 0) {
+      notes.push(`${privateSuppressed} plain-speech segment(s) kept private (non-channel turn — publish only with an explicit send tool)`);
+    }
+    const otherSuppressed = Math.max(0, suppressed - privateSuppressed);
+    if (otherSuppressed > 0) {
+      notes.push(agent.proseRouting === 'disabled'
+        ? `${otherSuppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)`
+        : `${otherSuppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`);
+    }
+    const suppressedNote = notes.join(' · ');
     const text =
       shown.length > 0
         ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}`
@@ -8911,6 +8929,7 @@ export class AgentFramework {
       this.turnEngagedChannels.delete(agent.name);
       this.turnProseDeliveries.delete(agent.name);
       this.turnProseSuppressed.delete(agent.name);
+      this.turnPrivateProseSuppressed.delete(agent.name);
       this.proseHybridSuppressed.delete(agent.name);
       if (turnProseRouting === 'hybrid') this.proseTargetPins.delete(agent.name);
       if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') {
@@ -14394,6 +14413,10 @@ export class AgentFramework {
 
     this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
+    // Bind async channel_open completion to the logical turn that issued it.
+    // A stale completion may update next-turn active state, but must never
+    // rewrite a newer turn's frozen pin/privacy.
+    const issuingTurnToken = this.activeTurnTokens.get(agentName);
 
     this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName })
       .then((result) => {
@@ -14419,9 +14442,13 @@ export class AgentFramework {
           if (opened) {
             this.activeTriggerChannels.set(agentName, opened);
             const openerAgent = this.agents.get(agentName);
-            if (openerAgent && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')) {
+            const stillIssuingTurn = issuingTurnToken !== undefined
+              && this.activeTurnTokens.get(agentName) === issuingTurnToken;
+            if (stillIssuingTurn && openerAgent && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')) {
               this.turnLocusPins.set(agentName, opened);
               this.lastAnnouncedLocus.set(agentName, opened);
+              const activeTrigger = this.activeTurnTriggers.get(agentName);
+              if (activeTrigger?.nonChannelOrigin) activeTrigger.nonChannelOrigin = false;
               result = {
                 ...result,
                 data: {
