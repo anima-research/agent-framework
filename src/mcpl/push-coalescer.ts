@@ -1,82 +1,41 @@
-/** RFC-006 event coalescing. Both delivery lanes share this state machine. Pending content never enters a context manager:
- * compression, forks, and tool continuations can only see materialized history.
- * All state transitions are synchronous; only deferred rendering yields. */
-import type { McplContentBlock, PushEventParams, PushEventResult, ChannelIncomingMessage } from './types.js';
+/** Runtime orchestration for RFC-006. The journal is authoritative; the projection
+ * is rebuilt by the same reducer used after every live append. Timers and RPCs are
+ * process-local effects, never facts reconstructed from a snapshot. */
+import { randomUUID } from 'node:crypto';
+import type { McplContentBlock, PushEventResult } from './types.js';
+import {
+  CoalescingProjection, replayCoalescingJournal, coalescingSubject, coalescingChannel, coalescingReceiptKey,
+  type CoalescedPush, type CoalescingJournal, type CoalescingOperation, type CoalescingRecord,
+  type PushRenderParams, type PushRenderResult,
+} from './coalescing-journal.js';
+export { coalescingSubject, coalescingChannel, coalescingReceiptKey } from './coalescing-journal.js';
+export type { CoalescedPush, CoalescingJournal, CoalescingRecord, PushRenderParams, PushRenderResult } from './coalescing-journal.js';
 
 export const PUSH_COALESCING_SUPPORT = {
   pushEvents: true, deferred: true, channelsIncoming: true, channelScopedPush: true,
 } as const;
-
-export interface CoalescedPush {
-  /** Host-only recovery marker: never read from wire params or origin. */
-  recovered?: boolean;
-  serverId: string;
-  /** Host-owned configured binding; changes when the endpoint/command is reassigned. */
-  binding?: string;
-  epoch: string;
-  audience: string;
-  params: PushEventParams;
-  channelMessage?: ChannelIncomingMessage;
-  /** Host-resolved delivery, independent of the untrusted coalescing scope. */
-  routing?: {
-    channelId?: string; messageId?: string; author?: { id: string; name: string };
-    threadId?: string; metadata?: Record<string, unknown>;
-    targetAgents: string[]; triggerAllowed?: boolean; generation?: number;
-  };
-}
-export interface PushRenderParams {
-  channelId?: string;
-  featureSet: string;
-  key: string;
-  eventId: string;
-  notices: Array<{ eventId: string; timestamp: string; data?: unknown }>;
-  dropped: number;
-}
-export interface PushRenderResult { content: McplContentBlock[]; timestamp?: string }
-interface Slot {
-  push: CoalescedPush;
-  notices?: PushRenderParams['notices'];
-  dropped: number;
-}
-interface Rendering {
-  slot: Slot;
-  cancelled: boolean;
-  cancel: () => void;
-  done: Promise<void>;
-}
-type MessageIdentity = Pick<NonNullable<CoalescedPush['routing']>, 'messageId' | 'author' | 'threadId'>;
-interface Subject {
-  identity?: MessageIdentity;
-  history: 'none' | 'some' | 'unknown';
-  consumedEventId?: string;
-  slot?: Slot;
-  rendering?: Rendering;
-  wakeQueued: boolean;
-}
-export interface CoalescingSnapshot {
-  version: 1 | 2;
-  receipt?: [string, PushEventResult];
-  history?: Array<{ key: string; history: Subject['history']; consumedEventId?: string; identity?: MessageIdentity }>;
-  /** Pending fallbacks remain replaceable after recovery; old renders are not replayed. */
-  pending: CoalescedPush[];
-}
 export interface CoalescerOptions {
+  journal: CoalescingJournal;
   authorized(push: CoalescedPush): boolean;
   available?(push: CoalescedPush): boolean;
-  lookupReceipt?(key: string): PushEventResult | undefined;
-  recordReceipt?(key: string, result: PushEventResult): void;
   render(push: CoalescedPush, params: PushRenderParams): Promise<PushRenderResult>;
-  /** Evaluate host policy and queue at most one wake; false may mean a gate timer. */
   wake(push: CoalescedPush, subject: string): boolean;
   cancelWake(subject: string, consumed?: boolean): void;
-  audit(record: Record<string, unknown>): void;
-  save(snapshot: CoalescingSnapshot): void;
+  /** Route late observations to the currently active branch's journal. */
+  observeLate?(detail: Record<string, unknown>): void;
   timeoutMs?: number;
   maxSubjects?: number;
   maxContentBytes?: number;
-  historyUnknown?: boolean;
 }
-
+type PublishCoalesced = (push: CoalescedPush) => boolean | void;
+interface RunningRender {
+  id: string;
+  subject: string;
+  serverId: string;
+  cancel(): void;
+  done: Promise<void>;
+  settled: boolean;
+}
 export class CoalesceError extends Error {
   constructor(readonly field: string, message: string, readonly code = -32602) { super(message); }
 }
@@ -95,91 +54,134 @@ export function validateCoalescedContent(content: unknown, maxBytes = 1024 * 102
   if (Buffer.byteLength(JSON.stringify(content)) > maxBytes) throw new CoalesceError('payload.content', 'content exceeds host byte limit');
 }
 
-/** A configured server binding survives transport reconnects. Epoch gates authority,
- * not subject or occurrence identity. Channel scope is NEVER inferred from origin. */
-export function coalescingChannel(push: CoalescedPush): string | undefined {
-  return push.channelMessage?.channelId ?? push.params.coalesce?.channelId;
-}
-export function coalescingSubject(push: CoalescedPush): string {
-  const channel = coalescingChannel(push);
-  return JSON.stringify([push.serverId, push.binding ?? '', channel === undefined ? 'featureSet' : 'channel',
-    channel ?? push.params.featureSet, push.params.coalesce!.key]);
-}
-
 export class PushCoalescer {
-  private subjects = new Map<string, Subject>();
-  private receipts = new Map<string, PushEventResult>();
-  private uncertain = false;
-  private lastReceipt?: [string, PushEventResult];
-  private activeRenders = new Map<string, number>();
+  private readonly projection: CoalescingProjection;
+  private readonly renders = new Map<string, RunningRender>();
+  private readonly queuedWakes = new Set<string>();
+  private readonly publicationAttempts = new Set<string>();
   private suspended = false;
-  constructor(private readonly options: CoalescerOptions) { this.uncertain = options.historyUnknown ?? false; }
+  private faulted = false;
 
-  isRendering(serverId: string): boolean { return (this.activeRenders.get(serverId) ?? 0) > 0; }
-
-  restore(snapshot: CoalescingSnapshot | CoalescedPush[]): void {
-    this.uncertain = true;
-    if (!Array.isArray(snapshot)) {
-      if (snapshot.receipt) {
-        this.lastReceipt = snapshot.receipt;
-        this.receipts.set(...snapshot.receipt);
-        this.options.recordReceipt?.(...snapshot.receipt);
-      }
-      for (const { key, history, consumedEventId, identity } of snapshot.history ?? []) {
-        this.subjects.set(key, { history, consumedEventId, identity, wakeQueued: false });
-      }
-    }
-    for (const original of Array.isArray(snapshot) ? snapshot : snapshot.pending) {
-      const push = { ...structuredClone(original), recovered: true };
-      const key = coalescingSubject(push);
-      const state = this.subjects.get(key) ?? { history: 'unknown' as const, wakeQueued: false };
-      // A frozen batch and its newer pending batch are both unread. Recovery keeps
-      // the latest self-contained fallback, without replaying either render.
-      state.slot = { push, dropped: 0 };
-      this.subjects.set(key, state);
-    }
-    this.save();
+  constructor(private readonly options: CoalescerOptions) {
+    this.projection = replayCoalescingJournal(options.journal);
+    // A prepared effect from a former process may already exist in context.
+    for (const id of this.projection.publications.keys()) this.publicationAttempts.add(id);
   }
 
+  /** Observation only: disposable, deterministic projection data for inspection. */
+  inspect() {
+    return structuredClone({ cursor: this.projection.cursor, uncertain: this.projection.uncertain,
+      subjects: [...this.projection.subjects], receipts: [...this.projection.receipts],
+      publications: [...this.projection.publications] });
+  }
+
+  /** Record the new process/branch boundary explicitly. Replaying the journal alone
+   * performs no recovery writes, network requests, context writes, or wakes. */
+  recover(branch?: string): void { this.commit({ kind: 'recovered', ...(branch === undefined ? {} : { branch }) }); }
+  forgetHistory(): void { this.commit({ kind: 'history-unknown' }); }
+
+  private authorized(push: CoalescedPush): boolean { return this.options.authorized(structuredClone(push)); }
+  private available(push: CoalescedPush): boolean { return this.options.available?.(structuredClone(push)) ?? true; }
+
+  private assertActive(): void {
+    if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000);
+    if (this.faulted) throw new Error('Coalescing journal append failed; rebuild the controller from the journal before continuing');
+  }
+
+  private commit(operation: CoalescingOperation): CoalescingRecord {
+    this.assertActive();
+    const index = this.projection.cursor;
+    const record: CoalescingRecord = { version: 1, id: randomUUID(), at: Date.now(), operation: structuredClone(operation) };
+    try {
+      if (this.options.journal.length() !== index) throw new Error('Coalescing journal changed outside this controller');
+      this.options.journal.append(record); // write-ahead and durable BEFORE any effect
+      const committed = this.options.journal.read(index);
+      if (committed.id !== record.id) throw new Error('Coalescing journal append identity mismatch');
+      this.projection.apply(committed, index);
+      // Cancellation follows the committed projection, never an independent flag.
+      for (const render of this.renders.values()) {
+        if (!this.isCurrentRender(render.subject, render.id)) render.cancel();
+      }
+      return committed;
+    } catch (error) {
+      // An append may have committed before the storage error. Never retry from a
+      // guessed in-memory state; a fresh replay resolves that uncertainty.
+      this.faulted = true;
+      for (const render of this.renders.values()) render.cancel();
+      for (const subject of this.projection.subjects.keys()) this.cancelWake(subject);
+      throw error;
+    }
+  }
+
+  observe(detail: Record<string, unknown>): void {
+    if (!this.suspended) this.commit({ kind: 'observed', detail });
+  }
+
+  isRendering(serverId: string): boolean {
+    return [...this.renders.values()].some(r => r.serverId === serverId && !r.settled);
+  }
+  private isCurrentRender(subject: string, id: string): boolean {
+    return this.projection.subjects.get(subject)?.rendering?.id === id;
+  }
+  private pendingValue(subject: string): CoalescedPush | undefined {
+    const state = this.projection.subjects.get(subject);
+    return state?.slot?.push ?? state?.rendering?.slot.push ??
+      [...this.projection.publications.values()].find(p => p.subject === subject)?.push;
+  }
+  pending(subject: string): CoalescedPush | undefined {
+    const push = this.pendingValue(subject);
+    return push && structuredClone(push);
+  }
+  pendingPushes(): CoalescedPush[] {
+    return [...this.projection.subjects.keys()].flatMap(key => { const push = this.pending(key); return push ? [push] : []; });
+  }
   canAssemble(audience: string): boolean {
     return this.pendingPushes().some(push => push.audience === audience &&
-      (this.options.available?.(push) ?? true) && this.options.authorized(push));
+      this.available(push) && this.authorized(push));
   }
-
-  pendingPushes(): CoalescedPush[] { return [...this.subjects.values()].flatMap(s => s.slot ? [s.slot.push] : []); }
-
-  pending(subject: string): CoalescedPush | undefined {
-    return this.subjects.get(subject)?.slot?.push;
-  }
-
-  identity(subject: string): MessageIdentity | undefined {
-    const state = this.subjects.get(subject);
+  identity(subject: string) {
+    const state = this.projection.subjects.get(subject);
     const routing = (state?.slot ?? state?.rendering?.slot)?.push.routing;
-    return routing ? { messageId: routing.messageId, author: routing.author, threadId: routing.threadId } : state?.identity;
+    return structuredClone(routing
+      ? { messageId: routing.messageId, author: routing.author, threadId: routing.threadId }
+      : state?.identity);
   }
-
   occurrence(subject: string): string | undefined {
-    const state = this.subjects.get(subject);
+    const state = this.projection.subjects.get(subject);
     return (state?.slot ?? state?.rendering?.slot)?.push.params.eventId ?? state?.consumedEventId;
   }
-
   receipt(push: CoalescedPush): PushEventResult | undefined {
-    const key = JSON.stringify([push.serverId, push.binding ?? '', push.params.eventId]);
-    const result = this.receipts.get(key) ?? this.options.lookupReceipt?.(key);
-    return result && structuredClone(result);
+    this.assertActive();
+    const key = coalescingReceiptKey(push);
+    const ref = this.projection.receipts.get(key);
+    if (!ref) return undefined;
+    // The index stores only a journal position. The receipt itself is read from
+    // the authoritative operation, not from a separately persisted lookup table.
+    const op = this.options.journal.read(ref.record).operation;
+    if (op.kind === 'accepted' && coalescingReceiptKey(op.push) === key) return structuredClone(op.result);
+    if (op.kind === 'legacy-import' && ref.imported !== undefined && op.initial.receipts[ref.imported]?.key === key) {
+      return structuredClone(op.initial.receipts[ref.imported].result);
+    }
+    throw new Error('Coalescing receipt projection does not match its journal record');
   }
-
   wakeRecovered(): void {
-    if (this.suspended) return;
-    for (const [key, s] of this.subjects) {
-      if (s.slot?.push.recovered && !s.wakeQueued && this.options.authorized(s.slot.push)) {
-        s.wakeQueued = this.options.wake(s.slot.push, key);
-      }
+    if (this.suspended || this.faulted) return;
+    for (const key of this.projection.subjects.keys()) {
+      const push = this.pendingValue(key);
+      if (push?.recovered && !this.queuedWakes.has(key) && this.authorized(push)) this.wake(key);
     }
   }
-
+  private wake(subject: string): void {
+    const push = this.pending(subject);
+    if (push && this.options.wake(push, subject)) this.queuedWakes.add(subject);
+    else this.queuedWakes.delete(subject);
+  }
+  private cancelWake(subject: string, consumed = false): void {
+    this.queuedWakes.delete(subject);
+    this.options.cancelWake(subject, consumed);
+  }
   validate(push: CoalescedPush): void {
-    if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000);
+    this.assertActive();
     const { params } = push;
     const c = params.coalesce;
     if (!c || typeof c !== 'object' || Array.isArray(c)) throw new CoalesceError('coalesce', 'coalesce must be an object');
@@ -201,207 +203,153 @@ export class PushCoalescer {
     validateCoalescedContent(params.payload?.content, this.options.maxContentBytes);
     if (coalescingChannel(push) !== undefined && c.retract && !params.payload.content.length)
       throw new CoalesceError('payload.content', 'channel retractions require a deletion notice');
-    if (!this.options.authorized(push)) throw new CoalesceError('featureSet', 'push is no longer authorized', -32002);
+    if (!this.authorized(push)) throw new CoalesceError('featureSet', 'push is no longer authorized', -32002);
   }
 
   accept(push: CoalescedPush): PushEventResult {
-    if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000);
+    this.assertActive();
     this.validate(push);
-    const { params } = push;
-    const c = params.coalesce!;
-    const receipt = this.receipt(push);
-    if (receipt) return receipt;
-    const dedup = JSON.stringify([push.serverId, push.binding ?? '', params.eventId]);
-    const key = coalescingSubject(push);
-    let s = this.subjects.get(key);
-    if (!s) {
-      while (this.subjects.size >= (this.options.maxSubjects ?? 128)) {
-        const idle = [...this.subjects].find(([, v]) => !v.slot && !v.rendering);
+    const duplicate = this.receipt(push);
+    if (duplicate) return duplicate;
+    const subject = coalescingSubject(push);
+    if (!this.projection.subjects.has(subject)) {
+      while (this.projection.subjects.size >= (this.options.maxSubjects ?? 128)) {
+        const idle = [...this.projection.subjects].find(([key, state]) => !state.slot && !state.rendering &&
+          ![...this.projection.publications.values()].some(p => p.subject === key));
         if (!idle) throw new CoalesceError('coalesce.key', 'host pending-subject limit reached', -32000);
-        this.subjects.delete(idle[0]);
-        this.uncertain = true;
+        this.commit({ kind: 'forgotten', subject: idle[0] });
       }
-      s = { history: this.uncertain || c.retract ? 'unknown' : 'none', wakeQueued: false };
-      this.subjects.set(key, s);
     }
-    // Snapshot wire objects: later caller mutation must not alter admitted content.
-    push = structuredClone(push);
-    this.options.audit({ kind: 'received', subject: key, push });
-    const prior = s.slot ?? s.rendering?.slot;
-    const priorId = prior?.push.params.eventId ?? s.consumedEventId;
-    let outcome: NonNullable<PushEventResult['coalesce']>['outcome'];
-    // This profile has one recipient. A replacement cannot move into a different
-    // agent/branch even when the operator changes the current primary or branch.
-    const sameAudience = !prior || prior.push.audience === push.audience &&
-      JSON.stringify(prior.push.routing?.metadata?.tuneOut ?? null) === JSON.stringify(push.routing?.metadata?.tuneOut ?? null);
-    if (c.retract || !c.deferred) {
-      this.cancelRender(s);
-      if (prior) this.options.audit({ kind: 'displaced', subject: key, push: prior.push });
-      s.slot = undefined; // supersedes BOTH rendering and newer pending batch
-      if (c.retract) {
-        s.consumedEventId = undefined;
-        outcome = s.history === 'none' ? 'retracted' : params.payload.content.length ? 'noted' : 'consumed';
-        if (outcome === 'noted' && sameAudience && push.audience) s.slot = { push, dropped: 0 };
-      } else {
-        outcome = prior ? 'replaced' : s.consumedEventId || s.history === 'unknown' ? 'appended' : 'first';
-        if (sameAudience && push.audience) s.slot = { push, dropped: 0 };
-      }
-    } else {
-      const pending = s.slot;
-      outcome = pending ? 'replaced' : 'first';
-      if (pending) this.options.audit({ kind: pending.notices ? 'folded' : 'displaced', subject: key, push: pending.push });
-      if (sameAudience && push.audience) {
-        const notices = pending?.notices ?? [];
-        notices.push({ eventId: params.eventId, timestamp: params.timestamp, ...(c.data !== undefined ? { data: structuredClone(c.data) } : {}) });
-        let dropped = pending?.dropped ?? 0;
-        if (notices.length > 64) { notices.shift(); dropped++; }
-        s.slot = { push, notices, dropped };
-      } else s.slot = undefined;
-    }
-    if (push.routing && coalescingChannel(push)) {
-      s.identity = { messageId: push.routing.messageId, author: push.routing.author, threadId: push.routing.threadId };
-    }
-    const result: PushEventResult = { accepted: true, coalesce: { outcome, ...(priorId ? { priorEventId: priorId } : {}) } };
-    this.lastReceipt = [dedup, result];
-    this.receipts.set(dedup, result);
-    if (this.receipts.size > 4096) this.receipts.delete(this.receipts.keys().next().value!);
-    this.save();
-    this.options.recordReceipt?.(dedup, result);
-    if (s.slot) s.wakeQueued = this.options.wake(s.slot.push, key);
-    if (!s.slot && !s.rendering) { s.wakeQueued = false; this.options.cancelWake(key); }
+    const result = this.projection.resultFor(push);
+    this.commit({ kind: 'accepted', push, result });
+    if (this.projection.subjects.get(subject)?.slot) this.wake(subject);
+    else if (!this.pendingValue(subject)) this.cancelWake(subject);
     return structuredClone(result);
   }
 
-  /** Await only batches present at this assembly. Then publish and seal synchronously,
-   * before context compilation can expose content to any model or compressor. */
-  async assemble(audience: string, publish: (push: CoalescedPush) => void): Promise<void> {
-    if (this.suspended) return;
-    const selected = [...this.subjects].filter(([, s]) => { const push = (s.slot ?? s.rendering?.slot)?.push; return push?.audience === audience && (this.options.available?.(push) ?? true); });
-    await Promise.all(selected.map(async ([key, s]) => {
-      if (s.rendering) { await s.rendering.done; return; }
-      if (!s.slot?.notices) return;
-      const slot = s.slot;
-      s.slot = undefined;
-      s.wakeQueued = false;
-      this.options.cancelWake(key, true);
-      let cancel!: () => void;
-      const cancelled = new Promise<'cancelled'>(resolve => { cancel = () => resolve('cancelled'); });
-      const rendering: Rendering = { slot, cancel, cancelled: false, done: Promise.resolve() };
-      s.rendering = rendering;
-      rendering.done = this.render(key, s, rendering, cancelled, publish);
-      this.save();
-      await rendering.done;
-    }));
-    if (this.suspended) return;
-    for (const [key, s] of selected) {
-      const slot = s.slot;
-      if (!slot || slot.notices || slot.push.audience !== audience) continue;
-      if (!(this.options.available?.(slot.push) ?? true)) continue;
-      if (!this.options.authorized(slot.push)) {
-        this.options.audit({ kind: 'revoked', subject: key, push: slot.push });
-      } else {
-        publish(slot.push);
-        s.history = 'some';
-        s.consumedEventId = slot.push.params.eventId;
-        this.options.audit({ kind: 'consumed', subject: key, eventId: slot.push.params.eventId });
+  /** The prepared operation is an irreversible assembly fence and durable outbox
+   * intent. Context publication is idempotent; completion is another append. */
+  private deliver(audience: string, publish: PublishCoalesced): void {
+    for (const publication of [...this.projection.publications.values()]) {
+      if (publication.push.audience !== audience || !this.available(publication.push)) continue;
+      if (!this.authorized(publication.push)) {
+        this.commit({ kind: 'delivered', publication: publication.id, disposition: 'suppressed' });
+        this.publicationAttempts.delete(publication.id);
+        continue;
       }
-      s.slot = undefined;
-      s.wakeQueued = false;
-      this.options.cancelWake(key, true);
+      const recovered = publication.push.recovered || this.publicationAttempts.has(publication.id);
+      this.publicationAttempts.add(publication.id);
+      const published = publish({ ...structuredClone(publication.push), publicationId: publication.id, recovered });
+      this.commit({ kind: 'delivered', publication: publication.id, disposition: published === false ? 'suppressed' : 'published' });
+      this.publicationAttempts.delete(publication.id);
     }
-    this.save();
   }
 
-  private async render(key: string, s: Subject, r: Rendering, cancelled: Promise<'cancelled'>, publish: (push: CoalescedPush) => void): Promise<void> {
-    const push = r.slot.push;
+  async assemble(audience: string, publish: PublishCoalesced): Promise<void> {
+    if (this.suspended) return;
+    this.assertActive();
+    this.deliver(audience, publish);
+    const selected = [...this.projection.subjects].filter(([, state]) => {
+      const push = (state.slot ?? state.rendering?.slot)?.push;
+      return push?.audience === audience && this.available(push);
+    }).map(([key]) => key);
+    await Promise.all(selected.map(async subject => {
+      const state = this.projection.subjects.get(subject)!;
+      if (state.rendering) {
+        const running = this.renders.get(state.rendering.id);
+        if (!running) throw new Error('Unfinished journal render requires recovery before assembly');
+        await running.done;
+        return;
+      }
+      if (!state.slot?.notices) return;
+      if (!this.authorized(state.slot.push)) {
+        this.commit({ kind: 'discarded', subject, target: { slot: state.slot.push.params.eventId }, reason: 'authority' });
+        this.cancelWake(subject);
+        return;
+      }
+      const record = this.commit({ kind: 'render-started', subject });
+      this.cancelWake(subject, true);
+      let cancel!: () => void;
+      const cancelled = new Promise<'cancelled'>(resolve => { cancel = () => resolve('cancelled'); });
+      const render: RunningRender = { id: record.id, subject, serverId: state.rendering!.slot.push.serverId,
+        cancel, done: Promise.resolve(), settled: false };
+      this.renders.set(render.id, render);
+      render.done = this.runRender(render, cancelled);
+      await render.done;
+    }));
+    if (this.suspended) return;
+    this.assertActive();
+    for (const subject of selected) {
+      const slot = this.projection.subjects.get(subject)?.slot;
+      if (!slot || slot.notices || slot.push.audience !== audience || !this.available(slot.push)) continue;
+      const target = { slot: slot.push.params.eventId };
+      if (this.authorized(slot.push)) this.commit({ kind: 'prepared', subject, target, push: slot.push, source: slot.push.params.coalesce?.deferred ? 'fallback' : 'plain' });
+      else this.commit({ kind: 'discarded', subject, target, reason: 'authority' });
+      this.cancelWake(subject, true);
+    }
+    this.deliver(audience, publish);
+  }
+
+  private async runRender(render: RunningRender, cancelled: Promise<'cancelled'>): Promise<void> {
+    const { subject, id } = render;
+    const slot = structuredClone(this.projection.subjects.get(subject)!.rendering!.slot);
+    const push = slot.push;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    let finished = false;
-    const count = this.activeRenders.get(push.serverId) ?? 0;
-    this.activeRenders.set(push.serverId, count + 1);
     try {
-      if (!this.options.authorized(push)) return;
-      const params: PushRenderParams = { featureSet: push.params.featureSet, ...(coalescingChannel(push) ? { channelId: coalescingChannel(push) } : {}), key: push.params.coalesce!.key,
-        eventId: push.params.eventId, notices: r.slot.notices!, dropped: r.slot.dropped };
-      const request = Promise.resolve().then(() => this.options.render(push, structuredClone(params)))
-        .then(result => {
-          if (!this.suspended && (finished || r.cancelled)) this.options.audit({ kind: 'late-render', subject: key, result });
-          return { result };
-        }, error => ({ error: String(error) }));
+      const params: PushRenderParams = { featureSet: push.params.featureSet,
+        ...(coalescingChannel(push) ? { channelId: coalescingChannel(push) } : {}), key: push.params.coalesce!.key,
+        eventId: push.params.eventId, notices: slot.notices!, dropped: slot.dropped };
+      const request = Promise.resolve().then(() => this.options.render(structuredClone(push), params)).then(result => {
+        const detail = { kind: render.settled || !this.isCurrentRender(subject, id) ? 'late-render' : 'render-response',
+          subject, renderId: id, result };
+        if (this.options.observeLate) this.options.observeLate(detail);
+        else this.observe(detail);
+        return { result };
+      }, error => ({ error: String(error) }));
       const response = await Promise.race([request, cancelled,
         new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), this.options.timeoutMs ?? 5000); })]);
-      finished = true;
-      if (r.cancelled || response === 'cancelled') return;
-      if (!this.options.authorized(push)) { this.options.audit({ kind: 'revoked', subject: key, push }); return; }
+      render.settled = true;
+      if (this.suspended || response === 'cancelled' || !this.isCurrentRender(subject, id)) return;
+      this.assertActive();
+      const target = { render: id };
+      if (!this.authorized(push)) {
+        this.commit({ kind: 'discarded', subject, target, reason: 'authority', observation: response });
+        return;
+      }
       let content = push.params.payload.content;
       let timestamp = push.params.timestamp;
+      let source: 'render' | 'fallback' = 'fallback';
       if (typeof response === 'object' && 'result' in response) {
         try {
           validateCoalescedContent(response.result.content, this.options.maxContentBytes);
           content = response.result.content;
           timestamp = typeof response.result.timestamp === 'string' ? response.result.timestamp : new Date().toISOString();
-        } catch { /* Invalid render content uses the admitted fallback. */ }
+          source = 'render';
+        } catch { /* The admitted fallback remains the bounded fail-open content. */ }
       }
-      this.options.audit({ kind: 'rendered', subject: key, response, fallback: push.params.payload.content, content });
-      if (!content.length) return;
-      const materialized = { ...push, params: { ...push.params, timestamp, payload: { content: structuredClone(content) } } };
-      // Publication and consumption are one synchronous assembly step. A newer
-      // pending batch is untouched and remains for the next assembly.
-      publish(materialized);
-      s.history = 'some';
-      s.consumedEventId = push.params.eventId;
-      this.options.audit({ kind: 'consumed', subject: key, eventId: push.params.eventId });
+      if (!content.length) this.commit({ kind: 'discarded', subject, target, reason: 'empty-render', observation: response });
+      else this.commit({ kind: 'prepared', subject, target,
+        push: { ...push, params: { ...push.params, timestamp, payload: { content } } }, source, observation: response });
     } finally {
-      finished = true;
+      render.settled = true;
       clearTimeout(timer);
-      const remaining = (this.activeRenders.get(push.serverId) ?? 1) - 1;
-      if (remaining > 0) this.activeRenders.set(push.serverId, remaining);
-      else this.activeRenders.delete(push.serverId);
-      if (s.rendering === r) s.rendering = undefined;
-      this.save();
+      this.renders.delete(id);
     }
   }
 
-  private cancelRender(s: Subject): void {
-    if (s.rendering) {
-      if (!this.suspended) this.options.audit({ kind: 'render-cancelled', push: s.rendering.slot.push });
-      s.rendering.cancelled = true;
-      s.rendering.cancel();
-      s.rendering = undefined;
-    }
-  }
-  private save(): void {
-    if (this.suspended) return;
-    const pending: CoalescedPush[] = [];
-    for (const s of this.subjects.values()) {
-      if (s.rendering) pending.push(s.rendering.slot.push);
-      if (s.slot) pending.push(s.slot.push);
-    }
-    this.options.save({ version: 2, receipt: this.lastReceipt, pending: structuredClone(pending), history: [...this.subjects].map(([key, s]) => ({key, history: s.history, consumedEventId: s.consumedEventId, identity: s.identity})) });
-  }
-
-  /** Transport loss cancels rendering but preserves acknowledged unread work. The
-   * next initialized connection must reauthorize it before delivery or replacement. */
   disconnect(serverId: string): void {
     if (this.suspended) return;
-    for (const [key, s] of this.subjects) {
-      const slot = s.slot ?? s.rendering?.slot;
-      if (slot?.push.serverId !== serverId) continue;
-      this.options.audit({ kind: 'disconnected', subject: key, push: slot.push });
-      this.cancelRender(s);
-      s.slot = { push: { ...slot.push, recovered: true }, dropped: 0 };
-      s.wakeQueued = false;
-      this.options.cancelWake(key);
+    this.commit({ kind: 'disconnected', serverId });
+    for (const subject of this.projection.subjects.keys()) {
+      if (this.pendingValue(subject)?.serverId === serverId) this.cancelWake(subject);
     }
-    this.save();
   }
 
-  /** Clean shutdown preserves the same pending fallbacks as a crash snapshot. */
+  /** Stopping only cancels process-local effects. The next controller replays the
+   * unchanged log and appends a recovery decision for unfinished work. */
   suspend(): void {
-    this.save();
     this.suspended = true;
-    for (const [key, s] of this.subjects) {
-      this.cancelRender(s);
-      this.options.cancelWake(key);
-    }
+    for (const render of this.renders.values()) render.cancel();
+    for (const subject of this.projection.subjects.keys()) this.cancelWake(subject);
   }
 }

@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, type CoalescedPush, type CoalescerOptions, type CoalescingSnapshot, type PushRenderResult } from '../src/mcpl/push-coalescer.js';
+import { PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, type CoalescedPush, type CoalescerOptions, type PushRenderResult } from '../src/mcpl/push-coalescer.js';
+
+import { MemoryCoalescingJournal, journalRecords } from './helpers/coalescing-journal.js';
 
 function push(id: string, text = id, flags: Record<string, unknown> = {}, override: Partial<CoalescedPush> = {}): CoalescedPush {
   return { serverId: 'server', epoch: 'epoch', audience: 'agent', params: {
@@ -15,20 +17,20 @@ function pending<T>() {
   return { promise, resolve, reject };
 }
 function setup(overrides: Partial<CoalescerOptions> = {}) {
-  const audit: Record<string, unknown>[] = [], deliveries: CoalescedPush[] = [], wakes: string[] = [];
-  const calls: unknown[] = [];
-  let snapshot: CoalescingSnapshot = { version: 1, pending: [] };
+  const deliveries: CoalescedPush[] = [], wakes: string[] = [], calls: unknown[] = [];
+  const journal = overrides.journal ?? new MemoryCoalescingJournal();
   const c = new PushCoalescer({
-    authorized: () => true,
+    journal, authorized: () => true,
     render: async (_push, params) => { calls.push(params); return { content: [{ type: 'text', text: 'rendered' }] }; },
-    audit: record => audit.push(structuredClone(record)), save: state => { snapshot = state; },
     wake: (_push, key) => { wakes.push(key); return true; }, cancelWake: () => {},
     ...overrides,
   });
-  return { c, audit, deliveries, wakes, calls, snapshot: () => snapshot,
-    assemble: () => c.assemble('agent', p => deliveries.push(structuredClone(p))),
+  return { c, journal, deliveries, wakes, calls,
+    get operations() { return journalRecords(journal).map(record => record.operation); },
+    assemble: () => c.assemble('agent', p => { deliveries.push(structuredClone(p)); }),
     texts: () => deliveries.map(p => p.params.payload.content.map(b => b.type === 'text' ? b.text : '').join('')) };
 }
+
 const result = (s: ReturnType<typeof setup>, p: CoalescedPush) => s.c.accept(p).coalesce!.outcome;
 const rendered = (text: string): PushRenderResult => ({ content: [{ type: 'text', text }] });
 
@@ -47,7 +49,7 @@ test('vectors 1–6: replace until assembly, then append forever (including comp
 });
 
 test('vectors 7/31/32: uncertain history never suppresses a deletion', async () => {
-  const s = setup({ historyUnknown: true });
+  const s = setup(); s.c.forgetHistory();
   assert.equal(result(s,push('edit')), 'appended');
   assert.equal(result(s,push('delete','deleted',{retract:true})), 'noted');
   await s.assemble();
@@ -62,7 +64,7 @@ test('vectors 9/35: namespace isolation and retries return the original receipt'
   const receipt=s.c.accept(one);
   s.c.accept(push('same','other',{},{serverId:'other'}));
   assert.deepEqual(s.c.accept(one),receipt);
-  assert.equal(s.audit.filter(r=>r.kind==='received').length,2);
+  assert.equal(s.operations.filter(r=>r.kind==='accepted').length,2);
   await s.assemble();
   assert.deepEqual(s.texts(),['same','other']);
 });
@@ -77,7 +79,7 @@ test('feature-set and key isolate subjects; transport epochs do not', async () =
 
 test('vector 12: replacing a subject cannot widen its audience', async () => {
   const s=setup(); s.c.accept(push('1')); s.c.accept(push('2','2',{},{audience:'other'}));
-  await s.assemble(); await s.c.assemble('other',p=>s.deliveries.push(p));
+  await s.assemble(); await s.c.assemble('other',p=>{s.deliveries.push(p);});
   assert.deepEqual(s.texts(),[]);
 });
 
@@ -93,14 +95,14 @@ test('vectors 16–20: notices render once, carry private data and never expose 
   await s.assemble(); assert.equal(s.calls.length,2);
   const empty=setup({render:async()=>({content:[]})});
   empty.c.accept(push('1','fallback',{deferred:true})); await empty.assemble();
-  assert.deepEqual(empty.texts(),[]); assert.deepEqual(empty.snapshot().pending,[]);
+  assert.deepEqual(empty.texts(),[]); assert.deepEqual(empty.c.pendingPushes(),[]);
 });
 
 test('vectors 21/23: timeout consumes fallback; late render cannot rewrite it', async () => {
   const r=pending<PushRenderResult>(); const s=setup({timeoutMs:5,render:()=>r.promise});
   s.c.accept(push('1','fallback',{deferred:true})); await s.assemble();
   assert.deepEqual(s.texts(),['fallback']); r.resolve(rendered('late')); await Promise.resolve(); await Promise.resolve();
-  assert.deepEqual(s.texts(),['fallback']); assert(s.audit.some(r=>r.kind==='late-render'));
+  assert.deepEqual(s.texts(),['fallback']); assert(s.operations.some(r=>r.kind==='observed' && r.detail.kind==='late-render'));
 });
 
 for(const kind of ['error','malformed','oversized'] as const) test(`vector 21: ${kind} render uses bounded admitted fallback`,async()=>{
@@ -120,7 +122,7 @@ test('vectors 22/25: concurrent assemblies share a frozen render; later notices 
   assert.equal(result(s,push('2','f2',{deferred:true})),'first');
   await Promise.resolve(); assert.equal(calls,1);
   r.resolve(rendered('r1')); await Promise.all([a,b]);
-  assert.deepEqual(s.texts(),['r1']); assert.equal(s.snapshot().pending[0].params.eventId,'2');
+  assert.deepEqual(s.texts(),['r1']); assert.equal(s.c.pendingPushes()[0].params.eventId,'2');
   await s.assemble(); assert.equal(calls,2); assert.deepEqual(s.texts(),['r1','r1']);
 });
 
@@ -144,7 +146,7 @@ for(const operation of ['retract','plain'] as const) for(const completion of ['r
     if(completion==='result') r.resolve(rendered('old'));
     await work; await s.assemble();
     assert.deepEqual(s.texts(),operation==='plain'?['snapshot']:[]);
-    assert.equal(calls,1); assert.deepEqual(s.snapshot().pending,[]);
+    assert.equal(calls,1); assert.deepEqual(s.c.pendingPushes(),[]);
   });
 
 test('vector 27i: deferred notice replaces unread plain content; consumed plain survives', async()=>{
@@ -183,13 +185,13 @@ for(const flags of [{key:''},{key:'é'.repeat(129)},{deferred:true,retract:true}
     await s.assemble(); assert.deepEqual(s.texts(),['good']);
   });
 
-test('receipts and snapshots cannot be mutated by callers; audit keeps private notice data',async()=>{
+test('receipts and projection queries cannot be mutated by callers; journal keeps private notice data',async()=>{
   const s=setup(); const p=push('one','fallback',{deferred:true,data:{private:'notice'}});
   const receipt=s.c.accept(p); receipt.coalesce!.outcome='consumed';
   p.params.payload.content[0]={type:'text',text:'mutated'};
   assert.equal(s.c.accept(p).coalesce!.outcome,'first');
-  assert.equal(s.snapshot().pending[0].params.payload.content[0].type,'text');
-  assert(JSON.stringify(s.audit).includes('notice'));
+  assert.equal(s.c.pendingPushes()[0].params.payload.content[0].type,'text');
+  assert(JSON.stringify(s.operations).includes('notice'));
   await s.assemble(); assert(!JSON.stringify(s.deliveries.map(d=>d.params.payload)).includes('notice'));
 });
 
@@ -198,7 +200,7 @@ test('disconnect preserves acknowledged fallback; reconnect retry has no second 
   const s=setup({available:()=>available,render:()=>r.promise});
   const first=s.c.accept(push('one','fallback',{deferred:true})); const work=s.assemble();
   available=false; s.c.disconnect('server'); r.resolve(rendered('old')); await work;
-  assert.deepEqual(s.texts(),[]); assert.equal(s.snapshot().pending.length,1);
+  assert.deepEqual(s.texts(),[]); assert.equal(s.c.pendingPushes().length,1);
   available=true;
   assert.deepEqual(s.c.accept(push('one','fallback',{deferred:true},{epoch:'next'})),first);
   await s.assemble(); assert.deepEqual(s.texts(),['fallback']);
@@ -214,23 +216,24 @@ test('resource limit rejects new pending subject without evicting admitted conte
 
 test('restored pending subject keeps identity and unread history across transport epochs',async()=>{
   const before=setup();before.c.accept(push('c','pending'));
-  const after=setup();after.c.restore(before.snapshot());
+  const after=setup({journal:before.journal});after.c.recover();
   assert.equal(result(after,push('d','deleted',{retract:true},{epoch:'new'})),'retracted');
   await after.assemble();assert.deepEqual(after.texts(),[]);
 });
 
-test('receipt eviction in memory cannot duplicate an occurrence stored in the durable index',()=>{
-  const receipts=new Map();const s=setup({lookupReceipt:key=>receipts.get(key),recordReceipt:(key,value)=>receipts.set(key,structuredClone(value))});
-  const first=s.c.accept(push('original'));
+test('old receipts are rebuilt from journal positions without a persisted receipt index',()=>{
+  const s=setup();const first=s.c.accept(push('original'));
   for(let i=0;i<4100;i++)s.c.accept(push(`update-${i}`));
-  const count=s.audit.length;
-  assert.deepEqual(s.c.accept(push('original')),first);assert.equal(s.audit.length,count);
+  const rebuilt=setup({journal:s.journal});const length=s.journal.length();
+  assert.deepEqual(rebuilt.c.accept(push('original')),first);assert.equal(s.journal.length(),length);
 });
 
-test('snapshot bridges a crash between pending-state persistence and receipt-index persistence',async()=>{
-  let crash=true;const before=setup({recordReceipt:()=>{if(crash)throw Error('crash');}});
-  assert.throws(()=>before.c.accept(push('once')),/crash/);crash=false;
-  const after=setup();after.c.restore(before.snapshot());
+test('an acceptance appended before a crash recovers with its receipt and pending work',async()=>{
+  const journal=new MemoryCoalescingJournal();
+  journal.afterAppend=record=>{if(record.operation.kind==='accepted')throw Error('crash after append');};
+  const before=setup({journal});assert.throws(()=>before.c.accept(push('once')),/crash/);
+  journal.afterAppend=undefined;
+  const after=setup({journal});after.c.recover();
   assert.equal(result(after,push('once','once',{},{epoch:'reconnected'})),'first');
   await after.assemble();assert.deepEqual(after.texts(),['once']);
 });

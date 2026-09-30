@@ -68,7 +68,8 @@ import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './m
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { PushHandler, convertBlock as convertPushBlock, type McplPushEvent } from './mcpl/push-handler.js';
-import { PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, coalescingChannel, coalescingSubject, type CoalescedPush, type CoalescingSnapshot } from './mcpl/push-coalescer.js';
+import { PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, coalescingChannel, coalescingSubject, type CoalescedPush } from './mcpl/push-coalescer.js';
+import { ChronicleCoalescingJournal } from './mcpl/chronicle-coalescing-journal.js';
 import { COALESCING_SUBJECT } from './gate/event-gate.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
@@ -447,9 +448,6 @@ function isTurnContinuation(reason: string): boolean {
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
-const COALESCING_AUDIT_ID = 'mcpl/coalescing-audit';
-const COALESCING_PENDING_ID = 'mcpl/coalescing-pending';
-const COALESCING_RECEIPTS_ID = 'mcpl/coalescing-receipts';
 const TURN_CHECKPOINTS_ID = 'framework/turn-checkpoints'; // legacy single-map layout, read-only fallback
 const TURN_CHECKPOINTS_TREE_ID = 'framework/turn-checkpoints/tree';
 
@@ -7401,7 +7399,8 @@ export class AgentFramework {
           if (!this.agents.has(target)) await this.createConversationAgent(target, channel);
           router.bind(channel, target, generation);
         } else if (!channel) {
-          await this.resolveCoalescedRoute(push);
+          const derived = this.derivePushEventChannel(push.params.origin);
+          if (derived) this.channelRegistry?.ensureChannelRegistered(push.serverId, derived.channelId, derived.label, derived.metadata);
         }
       }
       this.pushCoalescer!.wakeRecovered();
@@ -7410,13 +7409,14 @@ export class AgentFramework {
     await work;
   }
 
-  private materializeCoalescedPush(push: CoalescedPush, agent: Agent, consumer = agent.name): void {
+  private materializeCoalescedPush(push: CoalescedPush, agent: Agent, consumer = agent.name): boolean {
     const shared = push.audience === this.coalescingAudience();
-    if ((!shared && push.audience !== this.coalescingAudience(agent.name)) || this.agents.get(agent.name) !== agent) return;
-    const deliveryId = JSON.stringify([push.serverId, push.binding ?? '', push.params.eventId, push.audience]);
+    if ((!shared && push.audience !== this.coalescingAudience(agent.name)) || this.agents.get(agent.name) !== agent) return false;
+    const deliveryId = push.publicationId ?? JSON.stringify([push.serverId, push.binding ?? '', push.params.eventId, push.audience]);
+    const prototypeId = JSON.stringify([push.serverId, push.binding ?? '', push.params.eventId, push.audience]);
     const legacyId = JSON.stringify([push.serverId, push.epoch, push.params.eventId, push.audience]);
     if (push.recovered && agent.getContextManager().getAllMessages().some(m =>
-      m.metadata?.coalescingDeliveryId === deliveryId || m.metadata?.coalescingDeliveryId === legacyId)) return;
+      m.metadata?.coalescingDeliveryId === deliveryId || m.metadata?.coalescingDeliveryId === legacyId || m.metadata?.coalescingDeliveryId === prototypeId)) return true;
     const routing = push.routing;
     const metadata: Record<string, unknown> = {
       ...push.params.origin, ...routing?.metadata,
@@ -7438,19 +7438,16 @@ export class AgentFramework {
     for (const cooldown of this.providerAccelerationCooldowns.values()) {
       cooldown.heldRequests = cooldown.heldRequests.filter(r => !consumedWake(r));
     }
+    return true;
   }
 
   private initializePushCoalescer(triggerFilter?: (content: string, metadata: Record<string, unknown>) => boolean): void {
     const branch = this.store.currentBranch().name;
     this.coalescingBranch = branch;
     this.coalescingTriggerFilter = triggerFilter;
-    for (const [id, strategy] of [[COALESCING_AUDIT_ID, 'append_log'], [COALESCING_PENDING_ID, 'snapshot'], [COALESCING_RECEIPTS_ID, 'tree']] as const) {
-      if (!this.store.listStates().some(s => s.id === id)) this.store.registerState({ id, strategy });
-    }
-    const restored = this.store.getStateJson(COALESCING_PENDING_ID) as CoalescingSnapshot | null;
-    const receiptKey = (key: string) => createHash('sha256').update(key).digest('hex');
+    const journal = new ChronicleCoalescingJournal(this.store, branch);
     this.pushCoalescer = new PushCoalescer({
-      historyUnknown: !!restored,
+      journal,
       available: push => {
         const server = this.mcplServerRegistry?.getServer(push.serverId);
         const channel = coalescingChannel(push);
@@ -7459,15 +7456,6 @@ export class AgentFramework {
       authorized: push => {
         if (this.store.currentBranch().name !== branch) return false;
         try { this.authorizeCoalesced(push); return true; } catch { return false; }
-      },
-      lookupReceipt: key => {
-        const entry = this.store.treeGet(COALESCING_RECEIPTS_ID, receiptKey(key));
-        const bytes = entry && this.store.getBlob(entry.blobHash);
-        return bytes ? JSON.parse(bytes.toString()) as PushEventResult : undefined;
-      },
-      recordReceipt: (key, result) => {
-        const bytes = Buffer.from(JSON.stringify(result));
-        this.store.treeSet(COALESCING_RECEIPTS_ID, receiptKey(key), { blobHash: this.store.storeBlob(bytes, 'application/json'), size: bytes.length, mode: 0o644 });
       },
       render: (push, params) => this.mcplServerRegistry!.getServer(push.serverId)!.sendPushRender(params),
       wake: (push, subject) => {
@@ -7487,14 +7475,9 @@ export class AgentFramework {
         return this.queueCoalescedWake(subject);
       },
       cancelWake: (subject, consumed) => { this.eventGate?.cancelCoalesced(subject); if (!consumed) this.cancelCoalescedRequest(subject); },
-      audit: record => this.store.appendToStateJson(COALESCING_AUDIT_ID, { ...record, timestamp: Date.now() }),
-      save: snapshot => {
-        if (this.store.currentBranch().name === branch) this.store.setStateJson(COALESCING_PENDING_ID, snapshot);
-      },
+      observeLate: detail => this.pushCoalescer?.observe(detail),
     });
-    if (restored) this.pushCoalescer.restore({ ...restored,
-      pending: restored.pending.filter(push => JSON.parse(push.audience || '[]')[0] === branch) });
-    else this.store.setStateJson(COALESCING_PENDING_ID, { version: 2, pending: [], history: [] });
+    this.pushCoalescer.recover(branch);
   }
 
   private ensureCoalescingBranch(): void {
@@ -13190,9 +13173,7 @@ export class AgentFramework {
   private wireMcplEvents(connection: McplServerConnection): void {
     (this.coalescingEpochs ??= new Map()).set(connection.id, randomUUID());
     connection.on('orphaned-render-response', (response: Record<string, unknown>) => {
-      this.store.appendToStateJson(COALESCING_AUDIT_ID, {
-        kind: 'late-render', serverId: connection.id, ...response, timestamp: Date.now(),
-      });
+      this.pushCoalescer?.observe({ kind: 'late-render', serverId: connection.id, ...response });
     });
     // Forward subprocess stderr lines as trace events so consumers (conhost,
     // log sinks, TUI badges) can persist and surface them.

@@ -259,16 +259,26 @@ routing, and channel provenance survive mixed-lane updates.
 
 Pending events stay outside context managers until activation assembly. Shared-context
 publication waits for the other residents' live turns to finish; isolated conversation
-forks receive their own events. Consumed history is never rewritten. Pending snapshots,
-subject history, and occurrence receipts survive restart and reconnect; recovery waits for
+forks receive their own events. Consumed history is never rewritten. Pending work,
+subject history, and occurrence receipts are reconstructed from the journal; recovery waits for
 a fresh grant and channel registration, and does not repeat old source-backed renders.
 Changing a configured endpoint/command creates a separate server-binding namespace. Use a
 different server ID if credentials switch to another principal at the same endpoint.
 
-`mcpl/coalescing-audit` records receipts, replacements, and render outcomes;
-`mcpl/coalescing-pending` stores recovery state; `mcpl/coalescing-receipts` is a durable
-idempotency index. Rendering times out after five seconds. The host retains 64 notices per
-batch, caps notice data at 4 KiB and content at 1 MiB, and tracks up to 128 active subjects.
+`mcpl/coalescing-journal` is the authoritative append-only operation log. Acceptance,
+replacement, retraction, render decisions, and delivery receipts are durable appends.
+A pure reducer rebuilds pending work and the occurrence index; replay itself performs no
+RPCs, context writes, or wakes. Assembly appends a publication intent before writing
+context, then appends completion. The intent seals that occurrence against replacement;
+a journal-owned delivery ID makes an interrupted publication safe to retry.
+
+Older experimental pending/receipt stores are imported once into the journal. Their
+uncertain pending deliveries are sealed conservatively and checked against legacy context
+markers before publication; subsequent recovery never consults those old stores. Startup
+currently replays the full journal and keeps receipt positions in memory, so recovery cost
+and index memory grow with journal history. Rendering times out after five seconds. The
+host retains 64 notices per batch, caps notice data at 4 KiB and content at 1 MiB, and
+tracks up to 128 active subjects.
 Excess pending subjects are rejected rather than silently dropped. Coalesced debounce
 uses its own fixed deadline and does not change unrelated events' quiet periods.
 

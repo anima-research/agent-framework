@@ -182,7 +182,7 @@ test('a render arriving after the RPC deadline is audit-only and cannot replace 
   assert(request.includes('bounded_fallback'));assert(!request.includes('wire_late_payload'));
   await new Promise(resolve=>setTimeout(resolve,300));
   const store=(f.framework as unknown as {store:{getStateJson(id:string):unknown}}).store;
-  const audit=JSON.stringify(store.getStateJson('mcpl/coalescing-audit'));
+  const audit=JSON.stringify(store.getStateJson('mcpl/coalescing-journal'));
   assert(audit.includes('late-render'));assert(audit.includes('wire_late_payload'));
   assert(!f.context().includes('wire_late_payload'));
 });
@@ -381,4 +381,38 @@ test('an isolated agent name cannot alias the shared coalescing audience',async 
   const f=await fixture();t.after(f.close);
   const host=f.framework as unknown as {coalescingAudience(agentName?:string):string};
   assert.notEqual(host.coalescingAudience(),host.coalescingAudience('shared-messages'));
+});
+
+test('journal alone remains authoritative after restart despite contradictory prototype state',async t=>{
+  const f=await fixture();t.after(f.close);
+  const receipt=await f.send('push/event',f.params('journal-original','journal_original'));
+  const store=(f.framework as any).store as import('@animalabs/chronicle').JsStore;
+  assert.deepEqual(store.listStates().filter(s=>s.id.startsWith('mcpl/coalescing')).map(s=>s.id),['mcpl/coalescing-journal']);
+  store.registerState({id:'mcpl/coalescing-pending',strategy:'snapshot'});
+  store.setStateJson('mcpl/coalescing-pending',{version:999,pending:[{invalid:true}]});
+  await f.framework.stop();await f.create();
+  assert.deepEqual((await f.send('push/event',f.params('journal-original','journal_original'))).result,receipt.result);
+  const edit=await f.send('push/event',f.params('journal-edit','journal_latest'));
+  assert.equal(edit.result.coalesce.outcome,'replaced');await f.framework.runUntilIdle();
+  assert(f.context().includes('journal_latest'));assert(!f.context().includes('journal_original'));
+});
+
+test('context append without completion receipt retries the same publication once after restart',async t=>{
+  const f=await fixture();t.after(f.close);
+  await f.send('push/event',f.params('crash-event','crash_window_content'));
+  const host=f.framework as any;
+  const coalescer=host.pushCoalescer as import('../src/mcpl/push-coalescer.js').PushCoalescer;
+  const audience=coalescer.pendingPushes()[0].audience;
+  await assert.rejects(coalescer.assemble(audience,p=>{
+    assert.equal(host.materializeCoalescedPush(p,f.framework.getAgent('agent')!),true);
+    // Persist exactly the crash window: intent and context, no completion record.
+    host.store.sync();throw Error('crash after context append');
+  }),/crash after context append/);
+  const messages=()=>f.framework.getAgent('agent')!.getContextManager().getAllMessages().filter(m=>m.metadata?.eventId==='crash-event');
+  assert.equal(messages().length,1);const deliveryId=messages()[0].metadata!.coalescingDeliveryId;
+  await f.framework.stop();await f.create();await f.framework.runUntilIdle();
+  assert.equal(messages().length,1);assert.equal(messages()[0].metadata!.coalescingDeliveryId,deliveryId);
+  const restored=(f.framework as any).pushCoalescer as import('../src/mcpl/push-coalescer.js').PushCoalescer;
+  assert.equal(restored.inspect().publications.length,0);
+  assert.equal(f.membrane.calls.length,1);
 });
