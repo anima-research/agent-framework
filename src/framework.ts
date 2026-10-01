@@ -1569,16 +1569,35 @@ export class AgentFramework {
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
-            // as TELEMETRY fields — the host's stamp reads them; the turn's
-            // speech locus (channelId / addressed) is deliberately NOT set
-            // here, so a batched wake routes exactly as it did before.
+            // as TELEMETRY fields — the host's stamp reads them.
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
+            // A batch that contains an ADDRESSED message (mention / reply /
+            // DM) routes like the direct path does: the reply goes to that
+            // message's channel. Without it the turn froze on the
+            // process-global most-recent-inbound channel, which an ambient
+            // message elsewhere could retarget between the DM's arrival and
+            // the debounce firing (2026-09-30). Ambient-only batches set no
+            // locus and keep the legacy fallback.
+            ...(provenance?.routeChannelId
+              ? { channelId: provenance.routeChannelId, addressed: true }
+              : {}),
           });
         },
         getAgentNames: () => [...framework.agents.keys()].filter(
           (n) => n !== framework.subconsciousAgentName),
+        // Push events reach the gate with the adapter's raw channel id; map
+        // them to the registered composite id the same way ingestion does
+        // (handleMcplPushEvent registers that channel on arrival, before any
+        // debounce can fire).
+        resolveRouteChannel: (info) => {
+          if (info.eventType === 'mcpl:channel-incoming') return info.channelId || undefined;
+          if (info.eventType === 'mcpl:push-event') {
+            return framework.derivePushEventChannel(info.metadata)?.channelId;
+          }
+          return undefined;
+        },
       });
     }
 
