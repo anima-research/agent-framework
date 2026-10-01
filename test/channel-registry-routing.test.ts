@@ -77,14 +77,15 @@ function makeRegistry(
   };
 }
 
-function incoming(channelId: string, text: string, channelName?: string) {
+function incoming(channelId: string, text: string, channelName?: string, tags?: string[]) {
   return {
     messages: [{
       channelId,
-      messageId: 'm1',
+      messageId: tags ? `marker-${channelId}` : 'm1',
       author: { id: 'u1', name: 'Antra' },
       timestamp: '2026-05-30T00:00:00.000Z',
       content: [{ type: 'text' as const, text }],
+      tags,
       metadata: channelName ? { channelName } : undefined,
     }],
   };
@@ -525,4 +526,33 @@ test('DM prose targets resolve people-first: @name, prefix-lenient names, and <@
   const missing = registry.resolveProseTarget('@nobody');
   assert.ok('error' in missing && /send_dm/.test(missing.error), 'no-match points at send_dm');
   assert.ok('error' in missing && (missing.candidates?.length ?? 0) === 2, 'lists known DMs by name');
+});
+
+test('non-conversational markers do not retarget the default publish locus (#157)', async () => {
+  // A reaction/edit/delete marker (RFC-001 tags) is ABOUT a message, not one
+  // the agent replies to: arriving on chanB it must not flip the
+  // process-global defaultPublishChannel away from the real conversation on
+  // chanA, and must not become context.incoming's reply anchor.
+  const { registry } = makeRegistry(undefined);
+  seedRegistered(registry, 'discord', 'chanA');
+  seedRegistered(registry, 'discord', 'chanB');
+  registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
+
+  for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:edited', 'chat:deleted']) {
+    registry.handleIncoming('discord', incoming('chanB', `[${tag}] marker`, undefined, [tag]));
+    assert.equal(registry.getDefaultPublishChannel(), 'chanA',
+      `a ${tag} marker on chanB must not steal the default publish locus`);
+  }
+
+  // A real message still retargets — the skip is tag-scoped, not a freeze.
+  registry.handleIncoming('discord', incoming('chanB', 'real message on B'));
+  assert.equal(registry.getDefaultPublishChannel(), 'chanB');
+});
+
+test('a marker on a NEVER-conversed channel leaves the locus null, not marker-anchored (#157)', async () => {
+  const { registry } = makeRegistry(undefined);
+  seedRegistered(registry, 'discord', 'chanB');
+  registry.handleIncoming('discord', incoming('chanB', '[edited] marker', undefined, ['chat:edited']));
+  assert.equal(registry.getDefaultPublishChannel(), null,
+    'an edit marker alone must not establish a publish locus');
 });
