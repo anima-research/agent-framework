@@ -1754,6 +1754,10 @@ export class AgentFramework {
         },
         isForkRouted: () => framework.conversationRouter !== null,
         onFocusChanged: (state) => {
+          // Routing first (no gate dependency): while focused, plain speech
+          // lands in the focus channel and held inbound stops moving the
+          // fallback locus.
+          registry.setFocusLocus(state ? { serverId: state.serverId, channelId: state.channelId } : null);
           const gate = framework.eventGate;
           if (!gate) return;
           if (!state) {
@@ -6561,11 +6565,19 @@ export class AgentFramework {
             //    Reactions and system markers are already excluded by
             //    isConversationalInjection, and the engaged-this-turn scope
             //    keeps unrelated channels from moving the pin.
+            //
+            // Focus: a held message (stored, excluded from every view) never
+            // qualifies, and while focused only the focus channel can take
+            // the pin — the resident chose where their words go for this
+            // window; an injection from elsewhere can't overrule that.
             const engaged = this.turnEngagedChannels.get(agent.name);
+            const focusChannel = this.channelRegistry?.getFocusLocus()?.channelId;
             const lastQualifying = [...midTurnInjections].reverse().find((inj) => {
               const m = inj.metadata as Record<string, unknown> | undefined;
               if (!isConversationalInjection(inj.metadata)) return false;
               if (typeof m?.channelId !== 'string') return false;
+              if (m.focusHeld) return false;
+              if (focusChannel !== undefined && m.channelId !== focusChannel) return false;
               const tags = m.tags as string[] | undefined;
               if (isAddressedMessage(tags, m)) return true;
               return engaged?.has(m.channelId as string) === true;
@@ -11099,9 +11111,34 @@ export class AgentFramework {
     if (enrichedCall.name === FOCUS_TOOL_NAME && this.focusCoordinator) {
       // Focus is a property of the primary resident's attention; a fork or
       // side-agent calling it would narrow someone else's window.
-      const result = agentName === this.primaryAgentName
-        ? this.focusCoordinator.handleTool(enrichedCall.input as Record<string, unknown>)
-        : { success: false, isError: false, error: 'focus is available to the primary resident only' };
+      let result: { success: boolean; data?: unknown; error?: string; isError?: boolean } =
+        agentName === this.primaryAgentName
+          ? this.focusCoordinator.handleTool(enrichedCall.input as Record<string, unknown>)
+          : { success: false, isError: false, error: 'focus is available to the primary resident only' };
+      // A successful enter (or re-target) moves THIS turn's prose pin to the
+      // focus channel, same as channel_open: choosing the channel is the
+      // strongest "my next words go here" signal there is, and prose written
+      // after the call must not land in the stale pre-focus channel. The
+      // announcement rides the tool result. Later turns get the focus
+      // channel from resolveLocus (the registry's focus locus).
+      const focused = result.success
+        ? (result.data as { focused?: unknown } | undefined)?.focused
+        : undefined;
+      if (typeof focused === 'string') {
+        const focusAgent = this.agents.get(agentName);
+        if (focusAgent && (focusAgent.proseRouting === 'locus' || focusAgent.proseRouting === 'hybrid')) {
+          this.turnLocusPins.set(agentName, focused);
+          this.lastAnnouncedLocus.set(agentName, focused);
+          result = {
+            ...result,
+            data: {
+              ...(result.data as Record<string, unknown>),
+              routing: 'Your plain speech lands in the focus channel until focus ends. Other channels need an explicit send tool.',
+            },
+          };
+          console.error(`[routing] ${agentName}: focus -> pin moved to ${focused} (announced in tool result)`);
+        }
+      }
       this.queue.push({
         type: 'tool-result',
         callId: enrichedCall.id,

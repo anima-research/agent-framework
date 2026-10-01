@@ -10,3 +10,8 @@
   the resident's actual history/backscroll tools for the rest. `mode:
   "check"` reports held counts (and peeks one channel) without ending;
   `enter` while focused re-targets, delivering the new channel's backlog.
+- While focused, plain speech lands in the focus channel: it outranks the
+  trigger channel and the global most-recent-inbound fallback for every
+  turn, a successful `enter` moves the current turn's prose there too
+  (announced in the tool result), and held inbound neither retargets the
+  fallback locus nor qualifies for the mid-turn addressed re-pin.

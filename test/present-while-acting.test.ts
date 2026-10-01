@@ -391,6 +391,67 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it('under focus, an addressed mid-turn injection from another channel cannot take the pin', async () => {
+    // Focus: the resident chose the channel their words go to. An addressed
+    // message from elsewhere (normally a re-pin) must not overrule that.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'In the focus room.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Still in the focus room.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    (registry as { getFocusLocus?: unknown }).getFocusLocus = () => ({ serverId: 'disc', channelId: 'chan-live-1' });
+    module.toolDelayMs = 25;
+    module.interjection = 'over here!';
+    module.interjectionMetadata = { channelId: 'discord:guild:general', tags: ['chat:addressed'] };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'In the focus room.', locus: 'chan-live-1' },
+      { text: 'Still in the focus room.', locus: 'chan-live-1' },
+    ]);
+    await framework.stop();
+  });
+
+  it('a focus-held injection never re-pins, even when focus is no longer active', async () => {
+    // A held message is stored but excluded from every view; it cannot be
+    // the reason prose moves (focus may have ended mid-turn, so the
+    // focus-channel restriction alone doesn't cover it).
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Round one.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Round two.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    module.toolDelayMs = 25;
+    module.interjection = 'held while focused';
+    module.interjectionMetadata = {
+      channelId: 'discord:dm:someone',
+      tags: ['chat:addressed'],
+      focusHeld: { epochId: 'e1' },
+    };
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'Round one.', locus: 'chan-live-1' },
+      { text: 'Round two.', locus: 'chan-live-1' },
+    ]);
+    await framework.stop();
+  });
+
   it('a follow-up in a channel the agent explicitly engaged this turn re-pins', async () => {
     // 2026-07-31 n=7 (q's #portables reply): the agent explicitly sent into
     // a channel this turn; someone replies there WITHOUT a mention (ambient

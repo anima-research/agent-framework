@@ -648,6 +648,16 @@ export class ChannelRegistry {
   private defaultPublishMessageId: string | null = null;
   private defaultPublishThreadId: string | undefined = undefined;
 
+  /**
+   * The focus channel while the host is in focus mode, installed by the
+   * framework's focus coordinator (NOT read from the durable focus record:
+   * a replayed epoch with no live coordinator must not pin anything). While
+   * set it outranks the trigger channel and the global default in locus
+   * resolution, and inbound from any other channel stops retargeting the
+   * global default — a held message must not move outbound speech.
+   */
+  private focusLocus: { serverId: string; channelId: string } | null = null;
+
   /** Per-channel typing indicator timers. */
   private typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
@@ -928,9 +938,16 @@ export class ChannelRegistry {
       // deliberately after §14.5 validation: a rejected message from an
       // unregistered channel must not retarget outbound speech (the locus is
       // exactly the authority a self-attested channel would be stealing).
-      this.defaultPublishChannel = message.channelId;
-      this.defaultPublishMessageId = message.messageId;
-      this.defaultPublishThreadId = message.threadId;
+      // Under focus, only the focus channel's traffic counts: everything
+      // else is held, and a message the resident can't see must not decide
+      // where the resident's next words go (2026-09-30: an ambient channel
+      // message arriving one second after a DM pulled the DM reply into
+      // that channel).
+      if (this.admitsAsDefault(serverId, message.channelId)) {
+        this.defaultPublishChannel = message.channelId;
+        this.defaultPublishMessageId = message.messageId;
+        this.defaultPublishThreadId = message.threadId;
+      }
       {
         // A server sending channels/incoming is authoritative evidence that
         // the transport is actually open. This repairs transient status only;
@@ -1307,7 +1324,7 @@ export class ChannelRegistry {
     // agent was told the wrong channel under concurrency.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
     const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.defaultPublishChannel;
+    const outgoing = home ?? this.focusLocus?.channelId ?? active ?? this.defaultPublishChannel;
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -1928,6 +1945,26 @@ export class ChannelRegistry {
   /** The active focus epoch, or null. */
   getFocus(): FocusParams | null {
     return this.focusState;
+  }
+
+  /**
+   * Install (target) or clear (null) the focus routing locus. Called by the
+   * framework whenever the focus coordinator's state changes; see
+   * `focusLocus` for what it governs.
+   */
+  setFocusLocus(target: { serverId: string; channelId: string } | null): void {
+    this.focusLocus = target ? { serverId: target.serverId, channelId: target.channelId } : null;
+  }
+
+  /** The installed focus routing locus, or null when not focused. */
+  getFocusLocus(): { serverId: string; channelId: string } | null {
+    return this.focusLocus;
+  }
+
+  /** May inbound on (serverId, channelId) retarget the global default locus? */
+  private admitsAsDefault(serverId: string, channelId: string): boolean {
+    const focus = this.focusLocus;
+    return focus === null || (focus.serverId === serverId && focus.channelId === channelId);
   }
 
   /** Human label of a registered channel, when known. */
@@ -2897,7 +2934,11 @@ export class ChannelRegistry {
 
   resolveLocus(conversationId: string): string | null {
     const home = this.homeChannelResolver?.(conversationId);
-    return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;
+    return home
+      ?? this.focusLocus?.channelId
+      ?? this.activeChannelResolver?.(conversationId)
+      ?? this.defaultPublishChannel
+      ?? null;
   }
 
   async routeSpeech(
