@@ -147,16 +147,20 @@ export function buildChildEnv(
 
   // Windows spawn folds environment names case-insensitively and may choose
   // an earlier host spelling over a differently cased declared override.
-  // Merge the sources separately so every declared value (including '') wins,
-  // leaving exactly one spelling for each Windows variable.
+  // Select Node's first lexicographic spelling within each source, then layer
+  // declared values (including '') over host values. Source precedence and
+  // duplicate-name resolution are separate decisions.
   const merged: NodeJS.ProcessEnv = {};
   const spellings = new Map<string, string>();
   for (const source of [env, config.env ?? {}]) {
-    for (const [key, value] of Object.entries(source)) {
+    const seen = new Set<string>();
+    for (const key of Object.keys(source).sort()) {
       const canonical = key.toUpperCase();
+      if (seen.has(canonical)) continue;
+      seen.add(canonical);
       const previous = spellings.get(canonical);
       if (previous !== undefined && previous !== key) delete merged[previous];
-      merged[key] = value;
+      merged[key] = source[key];
       spellings.set(canonical, key);
     }
   }

@@ -149,11 +149,19 @@ test('win32: operating allowlist matches native mixed-case spellings', () => {
   });
 });
 
-test('win32: later declared spellings replace earlier ones without duplicate names', () => {
-  const env = buildChildEnv({ env: { HTTPS_PROXY: 'http://first.example', https_proxy: '' } }, {
-    HTTPS_PROXY: 'http://host.example', https_proxy: 'http://other-host.example',
-  }, 'win32');
-  assert.deepEqual(env, { https_proxy: '' });
+test('win32: sorted-first spelling wins within each source regardless of insertion order', () => {
+  for (const reverse of [false, true]) {
+    const hostEntries = [['https_proxy', 'http://lower-host.example'], ['HTTPS_PROXY', 'http://upper-host.example']];
+    const declaredEntries = [['https_proxy', 'http://lower-declared.example'], ['HTTPS_PROXY', '']];
+    const host = Object.fromEntries(reverse ? hostEntries.reverse() : hostEntries);
+    const declared = Object.fromEntries(reverse ? declaredEntries.reverse() : declaredEntries);
+    for (const inheritEnv of [false, true]) {
+      assert.deepEqual(buildChildEnv({ inheritEnv }, host, 'win32'), { HTTPS_PROXY: 'http://upper-host.example' });
+      assert.deepEqual(buildChildEnv({ inheritEnv, env: declared }, host, 'win32'), { HTTPS_PROXY: '' });
+      assert.deepEqual(buildChildEnv({ inheritEnv, env: { https_proxy: '' } }, host, 'win32'), { https_proxy: '' },
+        'declared source still outranks every host spelling');
+    }
+  }
 });
 
 test('posix: differently cased host and declared keys remain distinct', () => {
