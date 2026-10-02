@@ -77,12 +77,24 @@ const DEFAULT_SCRIPT_TIMEOUT_MS = 600_000;
 const DEFAULT_IDLE_RECLAIM_MS = 300_000;
 const CANCEL_GRACE_MS = 10_000;
 
+/** The longest delay Node's timers honour (~24.8 days); a longer one fires after ~1 ms. */
+export const MAX_TIMER_MS = 2_147_483_647;
+
+/** A time limit for a message: "45s", "10 min", "2.5 h". */
+export function formatLimit(ms: number): string {
+  if (ms < 120_000) return `${Math.round(ms / 1000)}s`;
+  if (ms < 7_200_000) return `${Math.round(ms / 6_000) / 10} min`;
+  return `${Math.round(ms / 360_000) / 10} h`;
+}
+
 interface PendingExec {
   id: string;
   resolve: (result: ExecResult) => void;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
   killTimer: ReturnType<typeof setTimeout> | null;
   settled: boolean;
+  /** Set once the deadline fired: the result then says the script ran out of time. */
+  deadlineMs: number | null;
 }
 
 export class PyRunner {
@@ -125,8 +137,16 @@ export class PyRunner {
    * log file, wake_agent() is available in-script, and the deadline is the
    * background lifetime. A background runner should be DEDICATED to that one
    * script (the framework creates one per background script).
+   *
+   * `opts.deadlineMs` replaces the runner's scriptTimeoutMs for this exec (a
+   * per-call time limit); a background exec uses its `lifetimeMs` instead.
    */
-  async exec(code: string, tools: InjectedTool[], background?: BackgroundExecOptions): Promise<ExecResult> {
+  async exec(
+    code: string,
+    tools: InjectedTool[],
+    background?: BackgroundExecOptions,
+    opts?: { deadlineMs?: number },
+  ): Promise<ExecResult> {
     if (this.disposed) {
       return { stdout: '', stderr: 'code_execution runner disposed', returnCode: 1, aborted: true };
     }
@@ -154,7 +174,8 @@ export class PyRunner {
     }
 
     const execId = `e${++this.execCounter}`;
-    const deadlineMs = background?.lifetimeMs ?? this.scriptTimeoutMs;
+    // Clamped: a deadline past Node's timer range would fire at once instead of never.
+    const deadlineMs = Math.min(MAX_TIMER_MS, background?.lifetimeMs ?? opts?.deadlineMs ?? this.scriptTimeoutMs);
     this.onWake = background?.onWake ?? null;
     const result = await new Promise<ExecResult>((resolve) => {
       const pending: PendingExec = {
@@ -163,14 +184,17 @@ export class PyRunner {
         deadlineTimer: null,
         killTimer: null,
         settled: false,
+        deadlineMs: null,
       };
       this.pending = pending;
 
       pending.deadlineTimer = setTimeout(() => {
+        pending.deadlineMs = deadlineMs;
         // Deadline: ask politely first (script sees CancelledError and its
         // exec_result still flows back), then kill on unresponsiveness.
         this.send({ op: 'cancel', id: execId, reason: 'deadline' });
         pending.killTimer = setTimeout(() => {
+          pending.deadlineMs = null; // this message already says why
           this.settlePending({
             stdout: '',
             stderr: `script killed after exceeding ${Math.round(deadlineMs / 1000)}s deadline`,
@@ -380,6 +404,14 @@ export class PyRunner {
     const pending = this.pending;
     if (!pending || pending.settled) return;
     pending.settled = true;
+    // Say why the script stopped: the in-script cancellation only reads "cancelled by host".
+    // Only a script that ended unsuccessfully was stopped: one that caught the cancellation
+    // and finished its work returns 0, and must not read as stopped.
+    if (pending.deadlineMs !== null && result.returnCode !== 0) {
+      const note = `script stopped: it reached its ${formatLimit(pending.deadlineMs)} time limit\n`;
+      // A background script reports its output tail, so the note goes there too.
+      result = { ...result, stderr: result.stderr + note, ...(result.tail !== undefined ? { tail: result.tail + note } : {}) };
+    }
     if (pending.deadlineTimer) clearTimeout(pending.deadlineTimer);
     if (pending.killTimer) clearTimeout(pending.killTimer);
     this.pending = null;

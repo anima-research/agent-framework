@@ -53,6 +53,12 @@ export interface CodeExecutionConfig {
   /** Whole-script deadline: cancel → grace → SIGKILL (default 600_000 ms). */
   scriptTimeoutMs?: number;
   /**
+   * Longest deadline an agent may ask for on one call with `time_limit_ms`
+   * (default: `scriptTimeoutMs`, so agents can only shorten it until this is
+   * raised). Longer requests are capped, and the result says so.
+   */
+  maxScriptTimeoutMs?: number;
+  /**
    * Idle interpreter reclaim — script globals are lost after this much
    * inactivity (default 300_000 ms, mirroring ~5-minute container reclaim).
    * 0 disables reclaim.
