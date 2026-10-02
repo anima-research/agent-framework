@@ -485,13 +485,12 @@ interface ChannelRegistryOptions {
     textLen: number;
   }) => void;
   /**
-   * Called when channels were opened WITHOUT the agent asking (subscription
-   * policy admitting a newly discovered channel, or delivery into a closed
-   * locus). The host wires this to drop a durable notice into the agent's
-   * window — the agent must always learn that new traffic will start
-   * flowing, and that `channel_close` opts out (their decision outranks
-   * policy). Fires ONCE per channel ever: the desired-state decision is
-   * durable, so reboots do not re-announce. Must not trigger inference.
+   * Announces either a durable subscription-policy admission (before its
+   * transport RPC; not an open confirmation), or a confirmed delivery-forced
+   * closed-to-open transition. The host records a durable, non-waking notice.
+   * Policy admissions fire once per channel: the persisted desired-state
+   * decision prevents re-announcement on retry or reboot. channel_close
+   * supersedes policy; a fresh delivery into a closed locus engages it again.
    */
   onChannelAutoOpened?: (info: {
     /** Agent whose action caused the open (delivery); absent for policy opens. */
@@ -2083,12 +2082,14 @@ export class ChannelRegistry {
   private applyDesiredChannelState(
     serverId: string,
     channelId: string,
-    history?: ChannelHistoryRequest,
-  ): Promise<{ open: boolean; result?: ChannelsOpenResult }> {
+    options?: { history?: ChannelHistoryRequest; onlyIfClosed?: boolean },
+  ): Promise<{ open: boolean; opened: boolean; result?: ChannelsOpenResult }> {
     const lifecycleKey = this.lifecycleKey(serverId, channelId);
     const channelKey = `${serverId}:${channelId}`;
     const previous = this.channelLifecycleTails.get(lifecycleKey) ?? Promise.resolve();
     const operation = previous.then(async () => {
+      let issued = false;
+      let opened = false;
       for (;;) {
         const entry = this.channels.get(channelKey);
         if (!entry) throw new Error(`Channel is no longer registered: ${channelId}`);
@@ -2100,31 +2101,33 @@ export class ChannelRegistry {
         const descriptor = entry.descriptor;
         const desired = this.getDesiredState(serverId, channelId);
         const open = desired === 'open' || desired === 'tuned-out';
-        let result: ChannelsOpenResult | undefined;
-        try {
-          if (open) {
-            result = await server.sendChannelsOpen({
-              channelId, type: descriptor.type, address: descriptor.address,
-              ...(history ? { history } : {}),
-            });
-          } else {
-            await server.sendChannelsClose({ channelId });
-          }
-        } catch (error) {
-          if (open && this.channels.get(channelKey) === entry &&
-              this.serverRegistry.getServer(serverId) === server) entry.open = false;
-          throw error;
+        if (!issued && options?.onlyIfClosed && open && entry.open) {
+          return { open: true, opened: false };
         }
+        issued = true;
+        let result: ChannelsOpenResult | undefined;
+        if (open) {
+          result = await server.sendChannelsOpen({
+            channelId, type: descriptor.type, address: descriptor.address,
+            ...(options?.history ? { history: options.history } : {}),
+          });
+        } else {
+          await server.sendChannelsClose({ channelId });
+        }
+        // Failure is not a confirmed transition. In particular, a failed
+        // backscroll request must not erase an already-live subscription.
         // Never apply a receipt to a removed entry or a replacement connection.
         // Reconcile their current state before releasing this channel's queue.
         if (this.channels.get(channelKey) !== entry ||
             this.serverRegistry.getServer(serverId) !== server) continue;
+        if (open && !entry.open) opened = true;
+        if (!open) opened = false;
         entry.open = open;
         const now = this.getDesiredState(serverId, channelId);
         const targetChanged = entry.descriptor.type !== descriptor.type ||
           !isDeepStrictEqual(entry.descriptor.address, descriptor.address);
         if (targetChanged || open !== (now === 'open' || now === 'tuned-out')) continue;
-        return { open, result };
+        return { open, opened, result };
       }
     });
     const tail = operation.then(() => {}, () => {});
@@ -2135,6 +2138,26 @@ export class ChannelRegistry {
       }
     });
     return operation;
+  }
+
+  /**
+   * Join work on an already-open channel without recording new intent.
+   * A close that settles during the wait remains authoritative; waiting for
+   * it is not an instruction to open the channel again.
+   */
+  private async waitForOpenChannel(entry: ChannelEntry): Promise<ChannelEntry> {
+    const lifecycleKey = this.lifecycleKey(entry.serverId, entry.descriptor.id);
+    for (;;) {
+      const pending = this.channelLifecycleTails.get(lifecycleKey);
+      if (!pending) break;
+      await pending;
+    }
+    const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
+    if (!current) throw new Error('Channel registration was removed while delivery waited');
+    if (!current.open || this.getDesiredState(current.serverId, current.descriptor.id) === 'closed') {
+      throw new Error('Channel was closed or selected for closure while delivery waited');
+    }
+    return current;
   }
 
   private async reconcileChannels(
@@ -2170,6 +2193,28 @@ export class ChannelRegistry {
         policyOpened.push({ channelId: channel.id, label: entry.descriptor.label });
       }
     }
+
+    // Announce the durable admission decision before awaiting transport.
+    // This is intent, not confirmation that an open RPC succeeded. It stays
+    // truthful if the first attempt fails, and a retry needs no new admission.
+    // channel_close supersedes policy; use current entries at this boundary.
+    const currentAdmissions = policyOpened.flatMap(({ channelId }) => {
+      const entry = this.channels.get(`${serverId}:${channelId}`);
+      if (!entry || this.getDesiredState(serverId, channelId) !== 'open') return [];
+      return [{ channelId, label: entry.descriptor.label }];
+    });
+    if (currentAdmissions.length > 0) {
+      try {
+        this.onChannelAutoOpened?.({
+          serverId,
+          source: 'subscription-policy',
+          channels: currentAdmissions,
+        });
+      } catch (err) {
+        console.error('onChannelAutoOpened (policy) failed:', err);
+      }
+    }
+
     for (const channel of channels) {
       if (!this.channels.has(`${serverId}:${channel.id}`)) continue;
       try {
@@ -2184,21 +2229,6 @@ export class ChannelRegistry {
           desired: this.getDesiredState(serverId, channel.id),
           error: (err as Error).message,
         });
-      }
-    }
-
-    // Announce policy admissions to the agent — nothing may start flowing
-    // traffic into their window without them being told, and told how to
-    // opt out (channel_close; their decision outranks policy).
-    if (policyOpened.length > 0) {
-      try {
-        this.onChannelAutoOpened?.({
-          serverId,
-          source: 'subscription-policy',
-          channels: policyOpened,
-        });
-      } catch (err) {
-        console.error('onChannelAutoOpened (policy) failed:', err);
       }
     }
   }
@@ -2336,17 +2366,17 @@ export class ChannelRegistry {
     entry: ChannelEntry,
     source: 'agent-tool' | 'opened-by-reply' | 'opened-by-delivery',
     history?: ChannelHistoryRequest,
-  ): Promise<ChannelsOpenResult> {
+  ): Promise<{ result: ChannelsOpenResult; opened: boolean }> {
     const transportOnly = source !== 'agent-tool';
     if (!transportOnly || this.getDesiredState(entry.serverId, entry.descriptor.id) !== 'tuned-out') {
       this.setDesiredState(entry.serverId, entry.descriptor.id, 'open', source);
     }
-    const applied = await this.applyDesiredChannelState(entry.serverId, entry.descriptor.id, history);
+    const applied = await this.applyDesiredChannelState(entry.serverId, entry.descriptor.id, { history, onlyIfClosed: transportOnly });
     const desired = this.getDesiredState(entry.serverId, entry.descriptor.id);
     if (!applied.open || (desired !== 'open' && !(transportOnly && desired === 'tuned-out'))) {
       throw new Error('Channel open was superseded by a newer lifecycle decision');
     }
-    return applied.result!;
+    return { result: applied.result!, opened: applied.opened };
   }
 
   /**
@@ -2519,19 +2549,25 @@ export class ChannelRegistry {
     }
     if (matches.length === 0) return { status: 'unknown-channel' };
     if (matches.length > 1) return { status: 'ambiguous' };
-    const entry = matches[0]!;
-    const resolved = { channelId: entry.descriptor.id, label: entry.descriptor.label };
-    if (entry.open && this.getDesiredState(entry.serverId, entry.descriptor.id) === 'open' && !this.hasPendingLifecycle(entry)) {
-      return { status: 'already-open', ...resolved };
-    }
+    let entry = matches[0]!;
     try {
-      await this.openChannelNow(entry, 'opened-by-reply');
-      this.emitTraceFn({
-        type: 'mcpl:channel-opened-by-send',
-        serverId: entry.serverId,
-        channelId: entry.descriptor.id,
-      });
-      return { status: 'opened', ...resolved };
+      if (entry.open && this.hasPendingLifecycle(entry)) {
+        entry = await this.waitForOpenChannel(entry);
+      }
+      const desired = this.getDesiredState(entry.serverId, entry.descriptor.id);
+      if (entry.open && (desired === 'open' || desired === 'tuned-out')) {
+        return { status: 'already-open', channelId: entry.descriptor.id, label: entry.descriptor.label };
+      }
+      const { opened } = await this.openChannelNow(entry, 'opened-by-reply');
+      entry = await this.waitForOpenChannel(entry);
+      if (opened) {
+        this.emitTraceFn({
+          type: 'mcpl:channel-opened-by-send',
+          serverId: entry.serverId,
+          channelId: entry.descriptor.id,
+        });
+      }
+      return { status: opened ? 'opened' : 'already-open', channelId: entry.descriptor.id, label: entry.descriptor.label };
     } catch (err) {
       this.emitTraceFn({
         type: 'mcpl:channel-open-failed',
@@ -2539,7 +2575,9 @@ export class ChannelRegistry {
         channelId: entry.descriptor.id,
         error: (err as Error).message,
       });
-      return { status: 'open-failed', ...resolved };
+      const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
+      return { status: 'open-failed', channelId: entry.descriptor.id,
+        ...(current ? { label: current.descriptor.label } : {}) };
     }
   }
 
@@ -2590,7 +2628,7 @@ export class ChannelRegistry {
             ...(input.beforeMessageId ? { beforeMessageId: input.beforeMessageId } : {}),
           }
         : undefined;
-      const result = await this.openChannelNow(entry, 'agent-tool', history);
+      const { result } = await this.openChannelNow(entry, 'agent-tool', history);
       return {
         success: true,
         data: {
@@ -2992,9 +3030,16 @@ export class ChannelRegistry {
       return fail(null, 'turn has no locus (no home/trigger channel; nothing to deliver into)');
     }
 
-    const entry = this.findChannelEntry(channelId);
+    let entry = this.findChannelEntry(channelId);
     if (!entry) {
       return fail(channelId, `no registered channel for locus "${channelId}"`);
+    }
+    if (entry.open && this.hasPendingLifecycle(entry)) {
+      try {
+        entry = await this.waitForOpenChannel(entry);
+      } catch (err) {
+        return fail(channelId, `lifecycle work prevented delivery: ${(err as Error).message}`);
+      }
     }
 
     // INVARIANT: it is not possible to send into a closed channel. Speech
@@ -3003,26 +3048,29 @@ export class ChannelRegistry {
     // so typing indicators, reaction machinery, and inbound forwarding come
     // alive with the reply. If the open fails, the speech does NOT go out:
     // a half-alive delivery is worse than a loud marker.
-    if (!entry.open || this.hasPendingLifecycle(entry)) {
+    if (!entry.open) {
       try {
-        await this.openChannelNow(entry, 'opened-by-delivery');
-        console.error(
-          `[routeSpeech] ${conversationId}: locus ${channelId} was closed — opened by delivery (speech implies engagement)`,
-        );
-        this.emitTraceFn({
-          type: 'mcpl:channel-opened-by-send',
-          serverId: entry.serverId,
-          channelId,
-        });
-        try {
-          this.onChannelAutoOpened?.({
-            conversationId,
+        const { opened } = await this.openChannelNow(entry, 'opened-by-delivery');
+        entry = await this.waitForOpenChannel(entry);
+        if (opened) {
+          console.error(
+            `[routeSpeech] ${conversationId}: locus ${channelId} was closed — opened by delivery (speech implies engagement)`,
+          );
+          this.emitTraceFn({
+            type: 'mcpl:channel-opened-by-send',
             serverId: entry.serverId,
-            source: 'opened-by-delivery',
-            channels: [{ channelId, label: entry.descriptor.label }],
+            channelId,
           });
-        } catch (err) {
-          console.error('onChannelAutoOpened (delivery) failed:', err);
+          try {
+            this.onChannelAutoOpened?.({
+              conversationId,
+              serverId: entry.serverId,
+              source: 'opened-by-delivery',
+              channels: [{ channelId, label: entry.descriptor.label }],
+            });
+          } catch (err) {
+            console.error('onChannelAutoOpened (delivery) failed:', err);
+          }
         }
       } catch (err) {
         return fail(channelId, `locus channel is closed and open failed: ${(err as Error).message}`);

@@ -8324,15 +8324,14 @@ export class AgentFramework {
       .map((c) => (c.label && c.label !== c.channelId ? `${c.label} (${c.channelId})` : c.channelId))
       .join(', ');
     const plural = channels.length > 1;
-    const causeText =
-      cause === 'subscription-policy'
-        ? 'your subscription policy just admitted ' + (plural ? 'them' : 'it')
-        : 'your own message into the closed channel engaged it';
-    const text =
-      `[channels] Now open: ${shown} — ${causeText}. Ongoing traffic from ` +
-      (plural ? 'these channels' : 'this channel') +
-      ` will reach you. If you don't want ${plural ? 'one of them' : 'it'}, use channel_close — ` +
-      'your choice sticks; neither policy nor a later send will silently reopen it.';
+    const text = (cause === 'subscription-policy'
+      ? `[channels] Selected for opening by subscription policy: ${shown}. ` +
+        'This records the admission decision; channel_list shows current transport state. ' +
+        'When open, ' + (plural ? 'their' : 'its') + ' ongoing traffic will reach you. '
+      : `[channels] Now open: ${shown} — your own message into the closed channel engaged it. ` +
+        'Ongoing traffic from ' + (plural ? 'these channels' : 'this channel') + ' will reach you. ') +
+      `If you don't want ${plural ? 'one of them' : 'it'}, use channel_close; your choice outranks policy. ` +
+      'A fresh message into a closed channel engages it again.';
     try {
       // Through framework.addMessage for mid-turn safety (deferral +
       // hear-while-acting injection) — a delivery-forced open happens inside
