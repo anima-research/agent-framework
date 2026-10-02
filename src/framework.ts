@@ -6890,6 +6890,11 @@ export class AgentFramework {
       if (this.conversationRouter && this.conversationAgentHomes.has(target.name)) {
         metadata.triggered = event.triggerInference ?? false;
         const id = target.getContextManager().addMessage('user', event.content, metadata);
+        // A correction may target an older engagement. Refresh only the
+        // binding whose agent actually received the message.
+        if (this.conversationRouter.getBinding(event.channelId)?.agentName === target.name) {
+          this.conversationRouter.touch(event.channelId);
+        }
         this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
         if (event.triggerInference) {
           this.pendingRequests.push({
@@ -7069,6 +7074,7 @@ export class AgentFramework {
     messageMetadata.triggered = trigger;
 
     const id = agent.getContextManager().addMessage('user', event.content, messageMetadata);
+    router.touch(event.channelId);
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
     if (trigger) {

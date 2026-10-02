@@ -95,8 +95,6 @@ export interface IncomingMessageFacts {
   mentioned: boolean;
   /** Channel classification (see classifyChannel). */
   kind: ChannelKind;
-  /** Clock injection for tests; defaults to Date.now(). */
-  now?: number;
 }
 
 export type RoutingDecision =
@@ -149,17 +147,15 @@ export class ConversationRouter {
   }
 
   /**
-   * Decide where an incoming message goes. Pure read except for refreshing
-   * lastActivity on an existing binding — a 'spawn' decision does NOT create
-   * the binding; the framework calls bind() after the fork agent actually
-   * exists, so a failed spawn doesn't leave a dangling route.
+   * Decide where an incoming message goes without changing router state.
+   * The framework calls bind() after a fork exists and touch() after a
+   * message is delivered. Queries and failed deliveries leave idle clocks
+   * unchanged; a failed spawn doesn't leave a dangling route.
    */
   route(facts: IncomingMessageFacts): RoutingDecision {
-    const now = facts.now ?? Date.now();
     const existing = this.bindings.get(facts.channelId);
 
     if (existing) {
-      existing.lastActivity = now;
       return {
         kind: 'existing',
         agentName: existing.agentName,
@@ -200,6 +196,14 @@ export class ConversationRouter {
     };
     this.bindings.set(channelId, binding);
     return binding;
+  }
+
+  /** Record delivered activity on an existing binding. Does not bind a
+   * channel or advance its generation. Call after successful delivery, not
+   * when previewing a route. The optional clock supports deterministic use. */
+  touch(channelId: string, now = Date.now()): void {
+    const binding = this.bindings.get(channelId);
+    if (binding) binding.lastActivity = now;
   }
 
   unbind(channelId: string): void {
