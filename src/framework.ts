@@ -9,6 +9,7 @@ import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverB
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
+import { isResidentVisibleMessage } from './tune-out/visibility.js';
 import type {
   MessageId,
   MessageMetadata,
@@ -1579,6 +1580,26 @@ export class AgentFramework {
         },
         getAgentNames: () => [...framework.agents.keys()].filter(
           (n) => n !== framework.subconsciousAgentName),
+        prepareDeferredWake: (info) => {
+          if (!framework.subconsciousAgentName || info.eventType !== 'mcpl:channel-incoming') return;
+          const { serverId, channelId } = info;
+          const epochAtArrival = framework.channelRegistry?.getTuneOutState(serverId, channelId)?.params.epochId;
+          const messageId = typeof info.metadata?.messageId === 'string' ? info.metadata.messageId : '';
+          const author = info.metadata?.author as { id?: string } | undefined;
+          const authorId = author?.id;
+          const tags = info.tags ? [...info.tags] : undefined;
+          return () => {
+            const coordinator = framework.tuneOutCoordinator;
+            if (!coordinator) return false;
+            // An already-diverted event stays consumed after cancellation.
+            // A previously ordinary event also respects a newly entered epoch.
+            const epochId = epochAtArrival
+              ?? framework.channelRegistry?.getTuneOutState(serverId, channelId)?.params.epochId;
+            if (!epochId) return false;
+            coordinator.onDeferredWake(serverId, channelId, epochId, messageId, tags, authorId);
+            return true;
+          };
+        },
       });
     }
 
@@ -1717,10 +1738,15 @@ export class AgentFramework {
           },
           subconsciousName: () => framework.subconsciousAgentName,
           primaryName: () => framework.primaryAgentName,
-          getStoredMessages: () => {
+          getBacklogMessages: () => {
             const primary = framework.primaryAgentName
               ? framework.agents.get(framework.primaryAgentName) : undefined;
-            return primary ? primary.getContextManager().getAllMessages() : [];
+            const stored = primary ? primary.getContextManager().getAllMessages() : [];
+            const storedWriteIds = new Set(stored.map(m => m.metadata?.deferredWriteId));
+            const pending = framework.deferredMessages.filter(m =>
+              (m.forAgent ?? framework.primaryAgentName) === framework.primaryAgentName
+              && !storedWriteIds.has(m.id));
+            return [...stored, ...pending];
           },
           currentSequence: () => framework.store.currentSequence(),
           setSubconsciousAnchor: (sequence) =>
@@ -6170,7 +6196,7 @@ export class AgentFramework {
       // the timeline (KV-prefix-stable delivery). The stored originals
       // remain in the shared slot for the subconscious's merged view,
       // fetch_history, and audit.
-      viewFilter: (message) => !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut,
+      viewFilter: isResidentVisibleMessage,
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
@@ -6241,10 +6267,9 @@ export class AgentFramework {
       model: cfg.model ?? primaryConfig.model,
       systemPrompt: cfg.systemPrompt,
       strategy: undefined, // its CM owns the windowed strategy instance
-      // Prose is never auto-routed: a cadence-triggered turn carries no
-      // locus, and bare prose must not fall through to the default channel.
-      // Speech happens only via speak_in_channel (its own marked voice).
-      proseRouting: 'explicit',
+      // All prose, including >> envelopes, stays private. Only the guarded
+      // speak_in_channel tool may publish, even when channel speech is enabled.
+      proseRouting: 'disabled',
       allowedTools: [...SUBCONSCIOUS_TOOL_NAMES, 'think', 'skip_reply', 'end_turn'],
     };
     const agent = new Agent(agentConfig, contextManager, this.membrane);
@@ -6411,7 +6436,8 @@ export class AgentFramework {
                 const hasToolBlocks = msg.content.some(
                   (b) => b.type === 'tool_use' || b.type === 'tool_result'
                 );
-                if (!hasToolBlocks && msg.participant !== agent.name) {
+                if (!hasToolBlocks && msg.participant !== agent.name
+                  && (agent.name === this.subconsciousAgentName || isResidentVisibleMessage(msg))) {
                   midTurnInjections.push({
                     participant: msg.participant,
                     content: msg.content,
@@ -11302,12 +11328,19 @@ export class AgentFramework {
     const midToolCycle = opts?.forAgent
       ? this.pendingAssistantBlocks.has(agent.name)
       : this.pendingAssistantBlocks.size > 0;
+    // Diverted originals never enter the resident's compiled/live view, so
+    // storing them cannot disturb its provider prefix or tool adjacency.
+    // Store promptly so the subconscious and cancellation can see them even
+    // while the resident is busy. Quiesce and store surgery still freeze
+    // ALL context writes, including hidden originals.
+    const residentHidden = agent.name !== this.subconsciousAgentName
+      && !isResidentVisibleMessage({ metadata });
     if (
       !hasToolResult &&
-      (this.quiesced ||
-        midToolCycle ||
-        this.activeTurnTokens.has(agent.name) ||
-        this.activeStreams.has(agent.name))
+      (this.quiesced || this.surgeryHold ||
+        (!residentHidden && (midToolCycle ||
+          this.activeTurnTokens.has(agent.name) ||
+          this.activeStreams.has(agent.name))))
     ) {
       // A re-deferral of a drained entry keeps its id and leaves the un-acked
       // set: one logical message, one durable identity — never two entries.

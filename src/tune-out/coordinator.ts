@@ -47,8 +47,8 @@ export interface TuneOutFrameworkHooks {
   subconsciousName: () => string | null;
   /** The primary resident's registry name. */
   primaryName: () => string | null;
-  /** Read the primary's stored messages (shared slot, unfiltered). */
-  getStoredMessages: () => StoredMessage[];
+  /** Read accepted primary messages, including writes still deferred by quiesce. */
+  getBacklogMessages: () => Array<Pick<StoredMessage, 'participant' | 'content' | 'metadata'>>;
   /** Current chronicle head sequence (window anchor for new epochs). */
   currentSequence: () => number;
   /** Move the subconscious window anchor (never forward past active epochs). */
@@ -116,14 +116,9 @@ export class TuneOutCoordinator {
   }
 
   private listActive(): Array<{ serverId: string; channelId: string; params: TuneOutParams }> {
-    const active: Array<{ serverId: string; channelId: string; params: TuneOutParams }> = [];
-    for (const entry of this.channelRegistry.listChannelsRaw()) {
-      const state = this.channelRegistry.getTuneOutState(entry.serverId, entry.descriptor.id);
-      if (state) {
-        active.push({ serverId: entry.serverId, channelId: entry.descriptor.id, params: state.params });
-      }
-    }
-    return active;
+    // Registration is transient: a slow/disconnected connector must not hide
+    // a durable epoch from deadline recovery or subconscious cancellation.
+    return this.channelRegistry.listActiveTuneOuts();
   }
 
   // ==========================================================================
@@ -205,7 +200,7 @@ export class TuneOutCoordinator {
 
     // Backlog: every message stamped with this epoch, oldest first.
     const epochId = ended.params.epochId;
-    const backlog = this.hooks.getStoredMessages().filter(
+    const backlog = this.hooks.getBacklogMessages().filter(
       (m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === epochId,
     );
     const cap = ended.params.backlogCap;
@@ -300,9 +295,36 @@ export class TuneOutCoordinator {
     // the subconscious either; it diverts silently into the backlog and
     // surfaces in cadence summaries. On top of the gate: addressed
     // mentions and gate-privileged authors wake, per the issue.
+    if (gatePass) this.handleAdmittedWake(serverId, channelId, messageId, tags, authorId);
+    return { epochId: state.params.epochId };
+  }
+
+  /** A debounce has now admitted this event. Its original ingestion already
+   * counted/stored it; only the wake and acknowledgement remain. An ended
+   * epoch's delayed wake is consumed, never forwarded to the resident or a
+   * newer epoch on the same channel. */
+  onDeferredWake(
+    serverId: string,
+    channelId: string,
+    epochId: string,
+    messageId: string,
+    tags: string[] | undefined,
+    authorId?: string,
+  ): void {
+    if (this.channelRegistry.getTuneOutState(serverId, channelId)?.params.epochId !== epochId) return;
+    this.handleAdmittedWake(serverId, channelId, messageId, tags, authorId);
+  }
+
+  private handleAdmittedWake(
+    serverId: string,
+    channelId: string,
+    messageId: string,
+    tags: string[] | undefined,
+    authorId?: string,
+  ): void {
     const addressed = Array.isArray(tags) && tags.includes('chat:addressed');
     const privileged = this.hooks.isPrivilegedAuthor(authorId);
-    if (gatePass && addressed) {
+    if (addressed && messageId) {
       // The mention-er always gets a deterministic signal, independent of
       // what the subconscious later decides (grant-gated; decline
       // precedent). Gate-suppressed mentions get NO reaction: main would
@@ -310,10 +332,9 @@ export class TuneOutCoordinator {
       // standing mute to its subject.
       void this.acknowledgeSuppressed(serverId, channelId, messageId);
     }
-    if (gatePass && (addressed || privileged)) {
+    if (addressed || privileged) {
       this.scheduleWakeInvocation(serverId, channelId);
     }
-    return { epochId: state.params.epochId };
   }
 
   private async acknowledgeSuppressed(serverId: string, channelId: string, messageId: string): Promise<void> {

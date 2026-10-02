@@ -11,6 +11,8 @@ import { createInterface } from 'node:readline';
 
 const statusPath = process.env.STATUS_PATH;
 const commandPath = process.env.COMMAND_PATH;
+const registerDelayMs = Number(process.env.REGISTER_DELAY_MS ?? 0);
+let registerTimer;
 
 const log = (event, extra = {}) => {
   if (!statusPath) return;
@@ -59,6 +61,7 @@ const rl = createInterface({ input: process.stdin });
 // alive past teardown.
 rl.on('close', () => {
   clearInterval(pollTimer);
+  clearTimeout(registerTimer);
   process.exit(0);
 });
 rl.on('line', (line) => {
@@ -98,7 +101,7 @@ rl.on('line', (line) => {
     return;
   }
   if (msg.method === 'notifications/initialized') {
-    send({
+    const register = () => send({
       jsonrpc: '2.0',
       id: 400,
       method: 'channels/register',
@@ -109,9 +112,14 @@ rl.on('line', (line) => {
           label: 'noisy',
           direction: 'bidirectional',
           initiallyOpen: true,
-        }],
+        }, ...(process.env.EXTRA_CHANNEL ? [{
+          id: process.env.EXTRA_CHANNEL,
+          type: 'disc', label: 'other', direction: 'bidirectional', initiallyOpen: true,
+        }] : [])],
       },
     });
+    if (registerDelayMs > 0) registerTimer = setTimeout(register, registerDelayMs);
+    else register();
     return;
   }
   if (msg.method === 'channels/open') {
