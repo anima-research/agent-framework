@@ -385,6 +385,7 @@ import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
+import { McplResponseSerializationError } from './mcpl/errors.js';
 import type {
   McplServerConfig,
   McplHostCapabilities,
@@ -13557,19 +13558,22 @@ export class AgentFramework {
     ): void => {
       connection.on(event, (params: T, responder?: Responder) => {
         let responseAttempted = false;
-        let writeFailure: { error: unknown } | undefined;
+        let responseFailure: { error: unknown; responseAttempted: boolean } | undefined;
         const writeResponse = (write: () => void): void => {
           if (responseAttempted) {
             // Inner handler catches can try to answer a failed result with
             // an error. Preserve the first failure and refuse the second write.
-            throw writeFailure ? writeFailure.error : new Error('MCPL response already attempted');
+            throw responseFailure ? responseFailure.error : new Error('MCPL response already attempted');
           }
           // A throwing transport write may have partially sent the reply.
           responseAttempted = true;
           try {
             write();
           } catch (error) {
-            writeFailure = { error };
+            // Only the encoder can establish that no write was attempted.
+            // Transport exceptions stay outcome-unknown and cannot be retried.
+            if (error instanceof McplResponseSerializationError) responseAttempted = false;
+            responseFailure = { error, responseAttempted };
             throw error;
           }
         };
@@ -13580,9 +13584,9 @@ export class AgentFramework {
             writeResponse(() => responder.respondError(code, message, data)),
         };
         const failed = (error: unknown): void => {
-          if (writeFailure) error = writeFailure.error;
+          if (responseFailure) error = responseFailure.error;
           const message = error instanceof Error ? error.message : String(error);
-          const attemptedBeforeFailure = responseAttempted;
+          const attemptedBeforeFailure = responseFailure?.responseAttempted ?? responseAttempted;
           let responseError: string | undefined;
           if (tracked && !responseAttempted) {
             try {
@@ -13591,6 +13595,8 @@ export class AgentFramework {
               responseError = sendError instanceof Error ? sendError.message : String(sendError);
             }
           }
+          // Keep headless hosts diagnosable even without a trace subscriber.
+          console.error(`[mcpl] ${connection.id} ${event} handler failed:`, error);
           this.emitTrace({
             type: 'mcpl:request-handler-error',
             serverId: connection.id,
@@ -13605,8 +13611,8 @@ export class AgentFramework {
           // Invoke immediately: control-plane responses must retain their
           // ACK-before-reconcile ordering and data-plane barrier semantics.
           const succeeded = (): void => {
-            // A handler may swallow a transport failure without rethrowing.
-            if (writeFailure) failed(writeFailure.error);
+            // A handler may swallow an encoding/transport failure without rethrowing.
+            if (responseFailure) failed(responseFailure.error);
           };
           const result = handler(params, tracked);
           if (result) void result.then(succeeded, failed);

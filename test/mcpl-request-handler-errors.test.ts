@@ -5,11 +5,12 @@ import { EventEmitter } from 'node:events';
 import { AgentFramework } from '../src/framework.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { InferenceRouter } from '../src/mcpl/inference-router.js';
+import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { McplTransport } from '../src/mcpl/transport.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 
-function harness() {
+function harness(connection = Object.assign(new EventEmitter(), { id: 'srv' })) {
   const traces: any[] = [];
-  const connection = Object.assign(new EventEmitter(), { id: 'srv' });
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.traceListeners = [(event: unknown) => traces.push(event)];
   framework.wireMcplEvents(connection);
@@ -237,4 +238,114 @@ test('host command response-write failure is traced without a second reply', asy
   await settle();
   assert.equal(reply.errors.length, 0);
   assert.match(failureTraces(traces)[0].error, /host response failed/);
+});
+
+class ResponseTransport extends McplTransport {
+  constructor() { super(); }
+  readonly kind = 'stdio' as const;
+  readonly lines: string[] = [];
+  failWrite = false;
+  writeLine(line: string): void {
+    this.lines.push(line);
+    if (this.failWrite) throw new TypeError('transport failed after a partial write');
+  }
+  async close(): Promise<void> {}
+}
+
+function wireHarness() {
+  const transport = new ResponseTransport();
+  // Use real connection routing and response encoding without launching a server.
+  const connection = new (McplServerConnection as any)('srv', null, transport) as McplServerConnection;
+  (connection as any).allowHostCommands = true;
+  connection.establishGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []));
+  const h = harness(connection);
+  connection.ready();
+  const request = (method = 'host/command') => transport.emit('line', JSON.stringify({
+    jsonrpc: '2.0', id: 17, method, params: { command: 'maintain' },
+  }));
+  return { ...h, transport, request };
+}
+
+for (const kind of ['bigint', 'circular', 'throwing toJSON'] as const) {
+  test('host-command ' + kind + ' serialization failure receives one internal-error response', async () => {
+    const { framework, traces, transport, request } = wireHarness();
+    let calls = 0;
+    const circular: any = {};
+    circular.self = circular;
+    const progress = kind === 'bigint' ? { count: 1n } : kind === 'circular' ? circular : {
+      toJSON() { calls++; throw new Error('snapshot serialization failed'); },
+    };
+    framework.handleHostCommand = async () => ({ progress });
+    request();
+    await settle();
+    assert.equal(transport.lines.length, 1, 'encoding failed before any result bytes were written');
+    const reply = JSON.parse(transport.lines[0]!);
+    assert.equal(reply.id, 17);
+    assert.equal(reply.error.code, -32603);
+    assert.equal(reply.result, undefined);
+    const failures = failureTraces(traces);
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].responseAttempted, false);
+    if (kind === 'throwing toJSON') assert.equal(calls, 1, 'results are encoded only once');
+  });
+}
+
+test('unserializable error data also permits one encodable error response', async () => {
+  const { framework, traces, transport, request } = wireHarness();
+  framework.channelRegistry = {
+    async handleRegister(_server: string, _params: unknown, reply: any) {
+      reply.respondError(-32602, 'bad input', { count: 1n });
+    },
+  };
+  request('channels/register');
+  await settle();
+  assert.equal(transport.lines.length, 1);
+  assert.equal(JSON.parse(transport.lines[0]!).error.code, -32603);
+  assert.equal(failureTraces(traces)[0].responseAttempted, false);
+});
+
+test('a swallowed pre-write encoding failure still receives a fallback response', async () => {
+  const { framework, traces, transport, request } = wireHarness();
+  framework.channelRegistry = {
+    async handleRegister(_server: string, _params: unknown, reply: any) {
+      try { reply.respond({ count: 1n }); } catch { /* handler swallowed the error */ }
+    },
+  };
+  request('channels/register');
+  await settle();
+  assert.equal(transport.lines.length, 1);
+  assert.equal(JSON.parse(transport.lines[0]!).error.code, -32603);
+  assert.equal(failureTraces(traces)[0].responseAttempted, false);
+});
+
+test('a real transport write failure remains single-attempt after serialization', async () => {
+  const { framework, traces, transport, request } = wireHarness();
+  framework.handleHostCommand = async () => ({ maintained: true });
+  transport.failWrite = true;
+  request();
+  await settle();
+  assert.equal(transport.lines.length, 1, 'a possibly partial write must not get a second reply');
+  assert.deepEqual(JSON.parse(transport.lines[0]!).result, { maintained: true });
+  assert.equal(failureTraces(traces)[0].responseAttempted, true);
+});
+
+test('post-response failures reach stderr when no trace subscriber is attached', async (t) => {
+  const { framework, connection } = harness();
+  framework.traceListeners = [];
+  framework.channelRegistry = {
+    async handleRegister(_server: string, _params: unknown, reply: any) {
+      reply.respond({ registered: [] });
+      throw new Error('headless reconciliation failed');
+    },
+  };
+  const errors: unknown[][] = [];
+  t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args); });
+  const reply = responder();
+  connection.emit('channels-register', {}, reply);
+  await settle();
+  assert.equal(reply.results.length, 1);
+  assert.equal(reply.errors.length, 0);
+  assert.equal(errors.length, 1);
+  assert.match(String(errors[0]?.[0]), /srv.*channels-register/);
+  assert.match(String(errors[0]?.[1]), /headless reconciliation failed/);
 });
