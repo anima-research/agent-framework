@@ -68,7 +68,7 @@ import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './m
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
 import { ToolLifecycleEmitter, parseToolObserveParams } from './mcpl/tool-lifecycle.js';
-import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type ToolClass } from './mcpl/tool-classes.js';
+import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type EffectiveToolClass, type ToolClass, type ToolClassSource } from './mcpl/tool-classes.js';
 import { PushHandler, convertBlock as convertPushBlock, type McplPushEvent } from './mcpl/push-handler.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
@@ -1339,6 +1339,9 @@ export class AgentFramework {
   private mcplToolRefreshPending = false;
   /** Maps tool prefix → serverId for dispatch routing. */
   private mcplPrefixMap: Map<string, string> = new Map();
+  /** Namespaced tool name → the server whose tools/list produced it. Prefixes
+   *  can nest (`foo`, `foo--bar`), so a prefix match alone can name two. */
+  private mcplToolServers: Map<string, string> = new Map();
   /** Maps serverId → McplServerConfig for prefix lookup. */
   private mcplServerConfigs: Map<string, import('./mcpl/types.js').McplServerConfig> = new Map();
   /** Host capabilities advertised during the MCP handshake — stored so servers
@@ -2648,6 +2651,22 @@ export class AgentFramework {
       }
       return tool;
     });
+  }
+
+  /**
+   * The tools one agent is shown at inference: its surface (the subconscious
+   * has its own), less what its permissions deny, plus — for explicit-mode
+   * agents — the on-demand routing reference (teach-by-bounce: the grammar
+   * is never injected, only served when asked). Inference and the RFC-008
+   * listing both use this, so the listing cannot drift from the model's view.
+   */
+  private agentToolSurface(
+    agent: Agent,
+    snapshot?: InferenceToolSnapshot,
+  ): import('./types/index.js').ToolDefinition[] {
+    const tools = this.getToolsForAgent(agent.name, snapshot).filter((t) => agent.canUseTool(t.name));
+    if (agent.proseRouting === 'explicit') tools.push(PROSE_HELP_TOOL);
+    return tools;
   }
 
   getAgentRuntimeSettings(agentName: string): AgentRuntimeSettingsSnapshot {
@@ -8901,11 +8920,7 @@ export class AgentFramework {
 
     try {
       const requestSnapshot = this.captureInferenceToolSnapshot(agent);
-      const allTools = this.getToolsForAgent(agent.name, requestSnapshot);
-      const tools = allTools.filter((t) => agent.canUseTool(t.name));
-      // Explicit-mode agents get the on-demand routing reference (teach-by-
-      // bounce: the grammar is never injected, only served when asked).
-      if (agent.proseRouting === 'explicit') tools.push(PROSE_HELP_TOOL);
+      const tools = this.agentToolSurface(agent, requestSnapshot);
 
       // Gather context from modules (pull-based) and MCPL hooks (push-based)
       // Both produce ContextInjection[] that get merged before inference.
@@ -11598,32 +11613,71 @@ export class AgentFramework {
    */
   private describeToolForLifecycle(tool: string): { class: ToolClass[]; serverId?: string; serverTool?: string } {
     const mcpl = this.resolveMcplTool(tool);
-    if (mcpl) {
-      const [serverId, prefix] = mcpl;
-      const { classes } = resolveToolClass(tool, this.mcplToolClasses.get(tool), {
-        overrides: this.toolClassOverrides,
-        host: [],
-      });
-      return { class: classes, serverId, serverTool: tool.slice(prefix.length + 2) };
-    }
-    const { classes } = resolveToolClass(tool, undefined, {
-      overrides: this.toolClassOverrides,
-      host: this.hostToolClasses,
-    });
+    const { classes } = this.effectiveToolClass(tool, mcpl !== null);
+    if (mcpl) return { class: classes, serverId: mcpl[0], serverTool: tool.slice(mcpl[1].length + 2) };
     return { class: classes };
   }
 
   /**
-   * Find the MCPL server for a tool call by checking against the prefix map.
-   * Returns [serverId, prefix] if found, null otherwise.
+   * RFC-008 §5.1: a tool's effective class and the source that decided it.
+   * Operator overrides first; then host knowledge, for tools the host
+   * implements (never for MCPL tools); then an MCPL tool's own declaration.
+   * Tolerates partially-constructed frameworks (tests use Object.create).
+   */
+  private effectiveToolClass(tool: string, isMcpl: boolean): EffectiveToolClass {
+    return resolveToolClass(tool, isMcpl ? this.mcplToolClasses?.get(tool) : undefined, {
+      overrides: this.toolClassOverrides ?? [],
+      host: isMcpl ? [] : (this.hostToolClasses ?? []),
+    });
+  }
+
+  /**
+   * RFC-008 §6: tools with their effective class and where that class came
+   * from (`override`, `host`, `server`, or `none` for an unclassed tool,
+   * which policy treats as most restrictive). For operators: a surprising
+   * class should be visible before it matters.
+   *
+   * With `agentName`, exactly the tools that agent is shown. Without, every
+   * tool the framework offers to anyone: the shared board plus each agent's
+   * own (the subconscious's surface, `prose_help`), each listed once.
+   */
+  listToolClasses(agentName?: string): Array<{ tool: string; class: ToolClass[]; source: ToolClassSource; serverId?: string }> {
+    let tools: import('./types/index.js').ToolDefinition[];
+    if (agentName !== undefined) {
+      const agent = this.agents.get(agentName);
+      if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+      tools = this.agentToolSurface(agent);
+    } else {
+      tools = [this.getAllTools(), ...[...this.agents.values()].map((a) => this.agentToolSurface(a))].flat();
+    }
+    const seen = new Set<string>();
+    const listed: Array<{ tool: string; class: ToolClass[]; source: ToolClassSource; serverId?: string }> = [];
+    for (const t of tools) {
+      if (seen.has(t.name)) continue;
+      seen.add(t.name);
+      const mcpl = this.resolveMcplTool(t.name);
+      const { classes, source } = this.effectiveToolClass(t.name, mcpl !== null);
+      listed.push({ tool: t.name, class: classes, source, ...(mcpl ? { serverId: mcpl[0] } : {}) });
+    }
+    return listed;
+  }
+
+  /**
+   * Find the MCPL server for a tool: [serverId, prefix], or null.
+   * Prefixes can nest (`foo` and `foo--bar`), so `foo--bar--x` can match
+   * both. The server whose tools/list produced the name decides; a name no
+   * live server listed (stale, or invented by the model) goes to the longest
+   * matching prefix. Never prefix-map insertion order.
    */
   private resolveMcplTool(toolName: string): [string, string] | null {
-    for (const [prefix, serverId] of this.mcplPrefixMap) {
-      if (toolName.startsWith(prefix + '--')) {
-        return [serverId, prefix];
-      }
+    const listedBy = this.mcplToolServers?.get(toolName);
+    let best: [string, string] | null = null;
+    for (const [prefix, serverId] of this.mcplPrefixMap ?? []) {
+      if (!toolName.startsWith(prefix + '--')) continue;
+      if (serverId === listedBy) return [serverId, prefix];
+      if (!best || prefix.length > best[1].length) best = [serverId, prefix];
     }
-    return null;
+    return best;
   }
 
   private dispatchToolCall(agentName: string, call: ToolCall): void {
@@ -13516,6 +13570,13 @@ export class AgentFramework {
      */
     toolObserveFilter: import('./mcpl/tool-lifecycle.js').ToolObserveRule[] | null;
     /**
+     * RFC-008 §6: each of this server's tools with its effective class and
+     * the source that decided it — `override` (operator), `server` (its own
+     * `_meta["mcpl/class"]`), or `none` (unclassed: observers never see its
+     * arguments). Shown next to the grant so a surprising class is visible.
+     */
+    toolClasses: Array<{ tool: string; serverTool: string; class: ToolClass[]; source: ToolClassSource }>;
+    /**
      * Per-transport §17 facts about the last manifest this host fetched and
      * acted on. The revision is server-authored and equality-only; these are
      * not the server's manifestChanged announcements.
@@ -13534,6 +13595,7 @@ export class AgentFramework {
       effectiveGrant: string[]; maskedCapabilities: string[];
       deniedCapabilities: string[]; allowHostCommands: boolean;
       toolObserveFilter: import('./mcpl/tool-lifecycle.js').ToolObserveRule[] | null;
+      toolClasses: Array<{ tool: string; serverTool: string; class: ToolClass[]; source: ToolClassSource }>;
       manifestState: {
         lastValidatedRevision: string | null;
         lastFetchedAt: number | null;
@@ -13545,18 +13607,28 @@ export class AgentFramework {
       const prefix = config.toolPrefix ?? `mcpl--${id}`;
       const connection = this.mcplServerRegistry?.getServer(id) ?? null;
       const connected = connection?.isConnected ?? false;
+      // Attribute through the dispatch resolver: a bare prefix match would
+      // also count a nested prefix's tools (`foo` vs `foo--bar`) as ours.
+      const ownTools = (this.mcplTools ?? []).flatMap((t) => {
+        const hit = this.resolveMcplTool(t.name);
+        return hit && hit[0] === id ? [{ tool: t.name, serverTool: t.name.slice(hit[1].length + 2) }] : [];
+      });
       result.push({
         id,
         connected,
         retrying: !connected && (connection?.willReconnect ?? false),
         toolPrefix: prefix,
-        toolCount: this.mcplTools.filter(t => t.name.startsWith(`${prefix}--`)).length,
+        toolCount: ownTools.length,
         policyEstablished: connection?.policyEstablished ?? false,
         effectiveGrant: connection?.grant.effectiveList() ?? [],
         maskedCapabilities: [...(connection?.droppedCapabilities ?? [])].sort(),
         deniedCapabilities: [...(connection?.grant.deniedPaths ?? [])].sort(),
         allowHostCommands: config.allowHostCommands === true,
         toolObserveFilter: connection?.toolObserveFilter ?? null,
+        toolClasses: ownTools.map(({ tool, serverTool }) => {
+          const { classes, source } = this.effectiveToolClass(tool, true);
+          return { tool, serverTool, class: classes, source };
+        }),
         manifestState: connection
           ? { ...connection.manifestState }
           : { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null },
@@ -13886,6 +13958,7 @@ export class AgentFramework {
     const tools: import('./types/index.js').ToolDefinition[] = [];
     const toolFeatureSets = new Map<string, string>();
     const toolClasses = new Map<string, ToolClass[]>();
+    const toolServers = new Map<string, string>();
 
     for (const server of this.mcplServerRegistry.getAllServers()) {
       const config = this.mcplServerConfigs.get(server.id);
@@ -13895,6 +13968,7 @@ export class AgentFramework {
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
           const namespacedName = `${prefix}--${tool.name}`;
+          toolServers.set(namespacedName, server.id);
           const attributedTool = tool as typeof tool & {
             featureSet?: unknown;
             _meta?: { featureSet?: unknown; [key: string]: unknown };
@@ -13927,6 +14001,7 @@ export class AgentFramework {
     this.mcplTools = tools;
     this.mcplToolFeatureSets = toolFeatureSets;
     this.mcplToolClasses = toolClasses;
+    this.mcplToolServers = toolServers;
   }
 
   /**

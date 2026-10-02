@@ -99,6 +99,7 @@ export type { McplHostCapabilities } from './mcpl/index.js';
 export { TOOL_CLASSES, DEFAULT_INPUT_CLASSES, globMatch } from './mcpl/index.js';
 export type {
   ToolClass,
+  ToolClassSource,
   ToolLifecycleConfig,
   ToolLifecycleNarrowing,
   ToolLifecycleParams,
