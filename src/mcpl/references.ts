@@ -56,12 +56,20 @@ function isRecord(x: unknown): x is Record<string, unknown> {
 
 function takeString(
   raw: unknown, field: keyof typeof REFERENCE_LIMITS & string,
-  out: { rejected: string[]; truncated: string[] },
+  out: { rejected: string[] },
 ): string | undefined {
   if (raw === undefined) return undefined;
   if (typeof raw !== 'string') { out.rejected.push(field); return undefined; }
-  const limit = REFERENCE_LIMITS[field];
-  if (raw.length > limit) { out.truncated.push(field); return raw.slice(0, limit); }
+  // JSON Schema maxLength counts Unicode code points, not UTF-16 units.
+  // Stop as soon as the optional field is invalid, without allocating a copy
+  // of an arbitrarily large server string. Display truncation happens later.
+  let length = 0;
+  for (const _codePoint of raw) {
+    if (++length > REFERENCE_LIMITS[field]) {
+      out.rejected.push(field);
+      return undefined;
+    }
+  }
   return raw;
 }
 
