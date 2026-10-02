@@ -520,6 +520,14 @@ export class EventGate {
 
   // Debounce state
   private debounceTimers = new Map<string, DebounceState>();
+  // Message quiet period (GateOptions.messageQuietPeriod): a message-driven
+  // wake is held until no further message has arrived for quietMs (capped at
+  // maxWaitMs from the first held one), then fires once.
+  private readonly quietMs: number;
+  private readonly quietMaxWaitMs: number;
+  private quietTimer: ReturnType<typeof setTimeout> | null = null;
+  private quietEvents: PendingEvent[] = [];
+  private quietFirstAt = 0;
 
   // Rate-limit state — policy name → key → bucket.
   private rateLimitBuckets = new Map<string, Map<string, RateBucket>>();
@@ -608,7 +616,11 @@ export class EventGate {
     now?: () => number;
     /** Per-event timeout (ms) for the optional gate.js script. Default 50. */
     scriptTimeoutMs?: number;
+    /** See GateOptions.messageQuietPeriod. */
+    messageQuietPeriod?: { quietMs: number; maxWaitMs?: number };
   }) {
+    this.quietMs = Math.max(0, opts.messageQuietPeriod?.quietMs ?? 0);
+    this.quietMaxWaitMs = Math.max(this.quietMs, opts.messageQuietPeriod?.maxWaitMs ?? 30_000);
     this.configPath = opts.configPath;
     this.privilegedUsersPath = opts.privilegedUsersPath;
     this.emitTrace = opts.emitTrace;
@@ -1067,6 +1079,14 @@ export class EventGate {
       this.defaultByEventType.set(info.eventType, bucket);
     }
     if (observed.length > 0) decision.observed = observed;
+    if (
+      decision.trigger &&
+      this.quietMs > 0 &&
+      (info.eventType === 'mcpl:channel-incoming' || info.eventType === 'mcpl:push-event')
+    ) {
+      this.holdForQuietPeriod(info);
+      decision = { ...decision, trigger: false, quietHeld: true };
+    }
 
     this.emitTrace({
       type: 'gate:decision',
@@ -1431,6 +1451,44 @@ export class EventGate {
   // =========================================================================
   // Debounce
   // =========================================================================
+
+  /** Hold a message-driven wake until the senders go quiet. The message
+   *  itself is already in context (stored at arrival); only the WAKE waits,
+   *  so a caption and its images, or a reply split into several Discord
+   *  messages, reach the agent as one turn instead of several. */
+  private holdForQuietPeriod(info: GateEventInfo): void {
+    const now = this.now();
+    if (this.quietEvents.length === 0) this.quietFirstAt = now;
+    this.quietEvents.push({
+      policyName: 'quiet-period',
+      content: '',
+      eventType: info.eventType,
+      timestamp: now,
+      inContext: true,
+      channelId: info.channelId || undefined,
+      authorId: this.extractAuthorId(info.metadata) ?? undefined,
+      serverId: info.serverId || undefined,
+      addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
+    });
+    if (this.quietTimer) clearTimeout(this.quietTimer);
+    const wait = Math.max(0, Math.min(this.quietMs, this.quietFirstAt + this.quietMaxWaitMs - now));
+    this.quietTimer = setTimeout(() => this.fireQuietPeriod(), wait);
+    (this.quietTimer as { unref?: () => void }).unref?.();
+  }
+
+  private fireQuietPeriod(): void {
+    this.quietTimer = null;
+    const events = this.quietEvents;
+    this.quietEvents = [];
+    if (events.length === 0) return;
+    const provenance = wakeProvenance(events);
+    for (const agentName of this.getAgentNamesFn()) {
+      // An agent already mid-turn received these messages as mid-turn input;
+      // waking it again afterwards would spend a redundant turn.
+      if (this.inferring.has(agentName)) continue;
+      this.requestInferenceFn(agentName, 'gate:quiet-period', 'gate', provenance);
+    }
+  }
 
   private handleDebounce(policy: GatePolicy, info: GateEventInfo): void {
     const debounceMs = (policy.behavior as { debounce: number }).debounce;
