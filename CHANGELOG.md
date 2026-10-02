@@ -12,6 +12,10 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+### Fixed
+
+- Channel lifecycle operations now run in order per channel and reconcile the latest desired state and registration after an in-flight operation completes. Concurrent registration, open, and close requests can no longer leave the server in an older state; a superseded tool request reports that its requested state no longer applies.
+
 ## 0.19.0 — 2026-09-28
 
 ### Added

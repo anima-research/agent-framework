@@ -16,6 +16,7 @@
 import type { ContentBlock } from '@animalabs/membrane';
 import { INLINE_WITHHELD_TEXT, isInlineContradiction, referenceStubOrNull } from './references.js';
 import type { JsStore } from '@animalabs/chronicle';
+import { isDeepStrictEqual } from 'node:util';
 
 import type {
   ChannelDescriptor,
@@ -656,6 +657,15 @@ export class ChannelRegistry {
   /** One-time migration inputs from the retired recipe auto-open policy. */
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
   private migratedLegacyPolicies = new Set<string>();
+
+  // Keep one transport operation in flight per logical channel, including
+  // across descriptor replacement. Settled tails release themselves; a
+  // failed operation must not poison later decisions.
+  private channelLifecycleTails = new Map<string, Promise<void>>();
+
+  private hasPendingLifecycle(entry: ChannelEntry): boolean {
+    return this.channelLifecycleTails.has(this.lifecycleKey(entry.serverId, entry.descriptor.id));
+  }
   private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
 
   constructor(
@@ -2065,6 +2075,68 @@ export class ChannelRegistry {
     return channel.initiallyOpen !== true && byPolicy;
   }
 
+  /**
+   * Apply current durable intent, serializing the transport rather than the
+   * server's registration ACK. Re-read after every await: registration,
+   * descriptor updates, or a newer decision may have replaced our snapshot.
+   */
+  private applyDesiredChannelState(
+    serverId: string,
+    channelId: string,
+    history?: ChannelHistoryRequest,
+  ): Promise<{ open: boolean; result?: ChannelsOpenResult }> {
+    const lifecycleKey = this.lifecycleKey(serverId, channelId);
+    const channelKey = `${serverId}:${channelId}`;
+    const previous = this.channelLifecycleTails.get(lifecycleKey) ?? Promise.resolve();
+    const operation = previous.then(async () => {
+      for (;;) {
+        const entry = this.channels.get(channelKey);
+        if (!entry) throw new Error(`Channel is no longer registered: ${channelId}`);
+        const server = this.serverRegistry.getServer(serverId);
+        if (!server) throw new Error(`Server not found: ${serverId}`);
+        if (!CapabilityGrant.of(server).has('channels.lifecycle')) {
+          throw new Error(`channels.lifecycle not in "${serverId}"'s effective grant (§14.1)`);
+        }
+        const descriptor = entry.descriptor;
+        const desired = this.getDesiredState(serverId, channelId);
+        const open = desired === 'open' || desired === 'tuned-out';
+        let result: ChannelsOpenResult | undefined;
+        try {
+          if (open) {
+            result = await server.sendChannelsOpen({
+              channelId, type: descriptor.type, address: descriptor.address,
+              ...(history ? { history } : {}),
+            });
+          } else {
+            await server.sendChannelsClose({ channelId });
+          }
+        } catch (error) {
+          if (open && this.channels.get(channelKey) === entry &&
+              this.serverRegistry.getServer(serverId) === server) entry.open = false;
+          throw error;
+        }
+        // Never apply a receipt to a removed entry or a replacement connection.
+        // Reconcile their current state before releasing this channel's queue.
+        if (this.channels.get(channelKey) !== entry ||
+            this.serverRegistry.getServer(serverId) !== server) continue;
+        entry.open = open;
+        const now = this.getDesiredState(serverId, channelId);
+        const targetChanged = entry.descriptor.type !== descriptor.type ||
+          !isDeepStrictEqual(entry.descriptor.address, descriptor.address);
+        if (targetChanged || open !== (now === 'open' || now === 'tuned-out')) continue;
+        return { open, result };
+      }
+    });
+    const tail = operation.then(() => {}, () => {});
+    this.channelLifecycleTails.set(lifecycleKey, tail);
+    void tail.then(() => {
+      if (this.channelLifecycleTails.get(lifecycleKey) === tail) {
+        this.channelLifecycleTails.delete(lifecycleKey);
+      }
+    });
+    return operation;
+  }
+
   private async reconcileChannels(
     serverId: string,
     channels: ChannelDescriptor[],
@@ -2090,46 +2162,26 @@ export class ChannelRegistry {
     // first boot on a new policy doesn't produce one notice per channel.
     const policyOpened: Array<{ channelId: string; label?: string }> = [];
 
+    // Record all admissions before waiting on any channel. A slow first RPC
+    // must not delay intent for the rest of this registration batch.
     for (const channel of channels) {
-      if (this.ensureInitialDesiredState(serverId, channel)) {
-        policyOpened.push({ channelId: channel.id, label: channel.label });
+      const entry = this.channels.get(`${serverId}:${channel.id}`);
+      if (entry && this.ensureInitialDesiredState(serverId, entry.descriptor)) {
+        policyOpened.push({ channelId: channel.id, label: entry.descriptor.label });
       }
-      const key = `${serverId}:${channel.id}`;
-      const desired = this.getDesiredState(serverId, channel.id);
-      const entry = this.channels.get(key);
-      // Tuned-out sits on the OPEN side of reconcile: traffic must keep
-      // arriving (the subconscious reads it); only main's wake/visibility
-      // is diverted, downstream at ingestion.
-      if (desired !== 'open' && desired !== 'tuned-out') {
-        try {
-          await server.sendChannelsClose({ channelId: channel.id });
-          if (entry) entry.open = false;
-        } catch (err) {
-          this.emitTraceFn({
-            type: 'mcpl:channel-reconcile-failed',
-            serverId,
-            channelId: channel.id,
-            desired,
-            error: (err as Error).message,
-          });
-        }
-        continue;
-      }
-
+    }
+    for (const channel of channels) {
+      if (!this.channels.has(`${serverId}:${channel.id}`)) continue;
       try {
-        await server.sendChannelsOpen({
-          channelId: channel.id,
-          type: channel.type,
-          address: channel.address,
-        });
-        if (entry) entry.open = true;
+        await this.applyDesiredChannelState(serverId, channel.id);
       } catch (err) {
-        if (entry) entry.open = false;
+        // Removal while queued is cancellation, not a failed subscription.
+        if (!this.channels.has(`${serverId}:${channel.id}`)) continue;
         this.emitTraceFn({
           type: 'mcpl:channel-reconcile-failed',
           serverId,
           channelId: channel.id,
-          desired,
+          desired: this.getDesiredState(serverId, channel.id),
           error: (err as Error).message,
         });
       }
@@ -2284,23 +2336,11 @@ export class ChannelRegistry {
     history?: ChannelHistoryRequest,
   ): Promise<ChannelsOpenResult> {
     this.setDesiredState(entry.serverId, entry.descriptor.id, 'open', source);
-    const server = this.serverRegistry.getServer(entry.serverId);
-    if (!server) {
-      throw new Error(`Server not found: ${entry.serverId}`);
+    const applied = await this.applyDesiredChannelState(entry.serverId, entry.descriptor.id, history);
+    if (!applied.open || this.getDesiredState(entry.serverId, entry.descriptor.id) !== 'open') {
+      throw new Error('Channel open was superseded by a newer lifecycle decision');
     }
-    if (!CapabilityGrant.of(server).has('channels.lifecycle')) {
-      // Desired state is already recorded — intent sticks; reconciliation
-      // will retry if the grant later widens (§6.7 expansion-on-receipt).
-      throw new Error(`channels.lifecycle not in "${entry.serverId}"'s effective grant (§14.1)`);
-    }
-    const result: ChannelsOpenResult = await server.sendChannelsOpen({
-      channelId: entry.descriptor.id,
-      type: entry.descriptor.type,
-      address: entry.descriptor.address,
-      ...(history ? { history } : {}),
-    });
-    entry.open = true;
-    return result;
+    return applied.result!;
   }
 
   /**
@@ -2475,7 +2515,7 @@ export class ChannelRegistry {
     if (matches.length > 1) return { status: 'ambiguous' };
     const entry = matches[0]!;
     const resolved = { channelId: entry.descriptor.id, label: entry.descriptor.label };
-    if (entry.open && this.getDesiredState(entry.serverId, entry.descriptor.id) === 'open') {
+    if (entry.open && this.getDesiredState(entry.serverId, entry.descriptor.id) === 'open' && !this.hasPendingLifecycle(entry)) {
       return { status: 'already-open', ...resolved };
     }
     try {
@@ -2530,7 +2570,7 @@ export class ChannelRegistry {
     }
 
     const alreadyDesiredOpen = this.getDesiredState(entry.serverId, input.channelId) === 'open';
-    if (entry.open && alreadyDesiredOpen && !input.backscroll) {
+    if (entry.open && alreadyDesiredOpen && !input.backscroll && !this.hasPendingLifecycle(entry)) {
       return {
         success: true,
         data: { channelId: input.channelId, status: 'already open' },
@@ -2593,7 +2633,7 @@ export class ChannelRegistry {
     }
 
     const alreadyDesiredClosed = this.getDesiredState(entry.serverId, input.channelId) === 'closed';
-    if (!entry.open && alreadyDesiredClosed) {
+    if (!entry.open && alreadyDesiredClosed && !this.hasPendingLifecycle(entry)) {
       return {
         success: true,
         data: { channelId: input.channelId, status: 'already closed' },
@@ -2662,8 +2702,10 @@ export class ChannelRegistry {
           isError: true,
         };
       }
-      await server.sendChannelsClose({ channelId: input.channelId });
-      entry.open = false;
+      const applied = await this.applyDesiredChannelState(entry.serverId, input.channelId);
+      if (applied.open || this.getDesiredState(entry.serverId, input.channelId) !== 'closed') {
+        throw new Error('Channel close was superseded by a newer lifecycle decision');
+      }
       return {
         success: true,
         data: { channelId: input.channelId, status: 'closed' },
@@ -2955,7 +2997,7 @@ export class ChannelRegistry {
     // so typing indicators, reaction machinery, and inbound forwarding come
     // alive with the reply. If the open fails, the speech does NOT go out:
     // a half-alive delivery is worse than a loud marker.
-    if (!entry.open) {
+    if (!entry.open || this.hasPendingLifecycle(entry)) {
       try {
         await this.openChannelNow(entry, 'opened-by-delivery');
         console.error(
