@@ -7174,6 +7174,18 @@ export class AgentFramework {
    * forever. The fork's context stays in Chronicle for investigation.
    */
   private disposeConversationAgent(agentName: string): void {
+    // A closure can finish while writes are still deferred (e.g. quiesce),
+    // or while a successor owns the turn token. Keep the target registered
+    // until those writes land; the fallback reaper can dispose it afterward.
+    const belongsToAgent = (msg: { forAgent?: string }) =>
+      (msg.forAgent ?? this.primaryAgentName) === agentName;
+    if (
+      this.activeTurnTokens.has(agentName) ||
+      this.activeStreams.has(agentName) ||
+      this.pendingAssistantBlocks.has(agentName) ||
+      this.deferredMessages.some(belongsToAgent) ||
+      this.unackedDeferredWrites.some(belongsToAgent)
+    ) return;
     this.closingConversationAgents.delete(agentName);
     const channelId = this.conversationAgentHomes.get(agentName);
     const agent = this.agents.get(agentName);
@@ -10371,12 +10383,6 @@ export class AgentFramework {
         this.pendingAssistantBlocks.delete(agent.name);
       }
 
-      // A conversation fork whose TTL closure turn just finished is done for
-      // good — dispose it so the agent map doesn't grow monotonically.
-      if (ownsPhysicalStream && this.closingConversationAgents.has(agent.name)) {
-        this.disposeConversationAgent(agent.name);
-      }
-
       // The turn is torn down — release the turn-alive marker BEFORE the
       // deferred flush below, so the flush appends at the settled tail.
       // Token-matched: if a successor turn already owns the agent (endTurn
@@ -10393,7 +10399,7 @@ export class AgentFramework {
       // pending). Only THIS agent's messages: other targets' entries wait
       // for their own boundaries (re-adding via addMessage re-defers if the
       // target has meanwhile started a turn).
-      if (frameReachedTerminal && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
+      if (frameReachedTerminal && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
         const deferred = this.drainDeferredFor(agent.name);
         for (const msg of deferred) {
           this.addMessage(msg.participant, msg.content, msg.metadata, {
@@ -10402,6 +10408,13 @@ export class AgentFramework {
           });
         }
         this.ackDeferredWrites();
+      }
+
+      // Flush the closure turn's notices while its owner is still registered.
+      // If quiesce or a successor re-deferred them, disposal waits for the
+      // fallback reaper after their eventual safe write boundary.
+      if (frameReachedTerminal && ownsPhysicalStream && this.closingConversationAgents.has(agent.name)) {
+        this.disposeConversationAgent(agent.name);
       }
     }
   }
@@ -12571,7 +12584,7 @@ export class AgentFramework {
         // addMessage() alone does not request inference, so this never wakes
         // her (matching the `discord-send-failed-skip` gate intent: context
         // yes, wake no).
-        onRouteFailure: ({ channelId, reason, textLen }) => {
+        onRouteFailure: ({ conversationId, channelId, reason, textLen }) => {
           try {
             // Render a human-readable channel name when we can — a bare
             // snowflake in the marker is unresolvable for the agent (the
@@ -12593,6 +12606,9 @@ export class AgentFramework {
                 text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
               }],
               { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason },
+              // Keep the notice with its speaker, including mid-turn deferral.
+              // Unknown conversation IDs retain the primary-agent fallback.
+              this.agents.has(conversationId) ? { forAgent: conversationId } : undefined,
             );
           } catch (err) {
             console.error('onRouteFailure: failed to record send-failure marker:', err);

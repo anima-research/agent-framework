@@ -12,6 +12,10 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+### Fixed
+
+- Speech-route failure notices now target the speaking agent, including conversation forks, and respect that agent's mid-turn deferral. Unregistered conversation IDs retain the primary-agent fallback; notices remain context-only and do not trigger inference. A fork's final closure notice is flushed before disposal, and deferred writes retain their target through quiesce until they can be stored (#188).
+
 ## 0.19.0 — 2026-09-28
 
 ### Added
