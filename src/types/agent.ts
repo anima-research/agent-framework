@@ -339,4 +339,10 @@ export interface InferenceRequest {
   wakeChannelId?: string;
   /** Timestamp of the event the wake provenance was taken from (ms). */
   wakeAt?: number;
+  /** Suppress every automatic plain-prose delivery for this logical turn.
+   * Explicit tool calls remain available. Used by authenticated silent wakes. */
+  suppressProse?: boolean;
+  /** Ephemeral system-position prompt for this turn only. Never written to
+   * Chronicle; callers must supply bounded non-secret control text. */
+  ephemeralSystemPrompt?: string;
 }

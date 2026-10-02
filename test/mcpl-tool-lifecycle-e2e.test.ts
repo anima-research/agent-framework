@@ -126,6 +126,17 @@ describe('tool lifecycle end to end (RFC-007)', () => {
     if (tempDir) rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it('lists every tool with its effective class, source, and server (RFC-008 §6)', () => {
+    const byTool = new Map(framework.listToolClasses().map((e) => [e.tool, e]));
+    assert.deepEqual(byTool.get('prov--click'), { tool: 'prov--click', class: ['computer'], source: 'server', serverId: 'prov' });
+    assert.deepEqual(byTool.get('prov--run'), { tool: 'prov--run', class: [], source: 'none', serverId: 'prov' });
+    assert.deepEqual(byTool.get('obs--ping'), { tool: 'obs--ping', class: ['body'], source: 'server', serverId: 'obs' });
+    const prov = framework.listMcplServers().find((s) => s.id === 'prov')!;
+    assert.deepEqual(prov.toolClasses.map((t) => `${t.serverTool}:${t.class.join('+') || '-'}:${t.source}`), [
+      'click:computer:server', 'run:-:none',
+    ]);
+  });
+
   it('reports other servers\' calls with requested fields only, never results', async () => {
     const policy = readLog(obsLog).find((e) => e.event === 'policy');
     assert.ok(

@@ -9,15 +9,20 @@
  */
 
 import type { ToolDefinition } from '../types/index.js';
+import { formatLimit, MAX_TIMER_MS } from './py-runner.js';
 
 export const CODE_EXECUTION_TOOL_NAME = 'code_execution';
 
 export function buildCodeExecutionToolDefinition(opts?: {
   idleReclaimMs?: number;
   toolCallTimeoutMs?: number;
+  scriptTimeoutMs?: number;
+  maxScriptTimeoutMs?: number;
+  backgroundMaxLifetimeMs?: number;
 }): ToolDefinition {
   const idleMinutes = Math.max(1, Math.round((opts?.idleReclaimMs ?? 300_000) / 60_000));
   const callTimeoutSeconds = Math.round((opts?.toolCallTimeoutMs ?? 270_000) / 1000);
+  const limits = scriptTimeLimits(opts);
   return {
     name: CODE_EXECUTION_TOOL_NAME,
     description:
@@ -36,6 +41,9 @@ export function buildCodeExecutionToolDefinition(opts?: {
       'what you need. Interpreter state (variables, imports) persists across code_execution ' +
       `calls but is reclaimed after ~${idleMinutes} minutes idle. A tool call that receives no ` +
       `response within ~${callTimeoutSeconds}s raises TimeoutError inside the script. ` +
+      `A foreground script is stopped after ${formatLimit(limits.defaultMs)}; pass time_limit_ms to set this call's limit ` +
+      `(at most ${formatLimit(limits.maxMs)}; a background script runs up to ${formatLimit(limits.backgroundMaxMs)}). ` +
+      'Stopping a script does not stop tools it already called. ' +
       'Use this when fanning out across many items, looping over tool calls, or when tool ' +
       'results are large and you only need a slice or summary. Call tools directly (not via ' +
       'code) when a single call answers the question or when you need to reason about each ' +
@@ -72,8 +80,46 @@ export function buildCodeExecutionToolDefinition(opts?: {
           type: 'string',
           description: 'Background script id (for action: cancel).',
         },
+        time_limit_ms: {
+          type: 'integer',
+          description:
+            `Time limit for this script in milliseconds; it is stopped when the limit is reached. ` +
+            `Default ${limits.defaultMs}, at most ${limits.maxMs}; a background script defaults to and is capped at ` +
+            `its ${formatLimit(limits.backgroundMaxMs)} lifetime.`,
+        },
       },
       required: [],
     },
   };
+}
+
+/**
+ * A script's time limits: the default, the most an agent may ask for with
+ * `time_limit_ms`, and the background lifetime (default and ceiling at once).
+ */
+export function scriptTimeLimits(opts?: {
+  scriptTimeoutMs?: number;
+  maxScriptTimeoutMs?: number;
+  backgroundMaxLifetimeMs?: number;
+}): { defaultMs: number; maxMs: number; backgroundMaxMs: number } {
+  // Every limit fits Node's timer range (MAX_TIMER_MS, ~24.8 days).
+  const defaultMs = Math.min(MAX_TIMER_MS, opts?.scriptTimeoutMs ?? 600_000);
+  return {
+    defaultMs,
+    // A ceiling below the default is refused when the framework is created
+    // (validateCodeExecutionConfig); never below the default here either.
+    maxMs: Math.min(MAX_TIMER_MS, Math.max(defaultMs, opts?.maxScriptTimeoutMs ?? defaultMs)),
+    backgroundMaxMs: Math.min(MAX_TIMER_MS, opts?.backgroundMaxLifetimeMs ?? 86_400_000),
+  };
+}
+
+/** Refuse a configuration whose time limits contradict each other. */
+export function validateCodeExecutionConfig(cfg: { scriptTimeoutMs?: number; maxScriptTimeoutMs?: number }): void {
+  const defaultMs = cfg.scriptTimeoutMs ?? 600_000;
+  if (cfg.maxScriptTimeoutMs !== undefined && !(cfg.maxScriptTimeoutMs >= defaultMs)) {
+    throw new Error(
+      `codeExecution.maxScriptTimeoutMs (${cfg.maxScriptTimeoutMs}) must be at least scriptTimeoutMs (${defaultMs}): ` +
+        'it is the most an agent may ask for, and the default is always allowed',
+    );
+  }
 }
