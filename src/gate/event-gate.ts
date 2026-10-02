@@ -63,6 +63,9 @@ const DEFAULT_CONFIG: GateConfig = {
 // ---------------------------------------------------------------------------
 
 interface PendingEvent {
+  /** Host routing captured at arrival; true consumes this wake outside the
+   * resident batch. Invoked only when the debounce/buffer is delivered. */
+  deliverWake?: () => boolean;
   policyName: string;
   content: string;
   eventType: string;
@@ -587,6 +590,7 @@ export class EventGate {
   ) => unknown;
   private requestInferenceFn: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
   private getAgentNamesFn: () => string[];
+  private prepareDeferredWake?: (info: GateEventInfo) => (() => boolean) | undefined;
   /** Clock injection — keeps the new rate_limit / passive_sample paths
    *  testable without monkey-patching Date.now globally. */
   private now: () => number;
@@ -604,6 +608,11 @@ export class EventGate {
     ) => unknown;
     requestInference: (agentName: string, reason: string, source: string, provenance?: WakeProvenance) => void;
     getAgentNames: () => string[];
+    /** Capture host routing before an event is batched. At delivery, return
+     * true to consume it (including its notice), false for normal delivery.
+     * Capturing at arrival lets the host retain an attention epoch even if
+     * that epoch ends before the debounce or inference buffer is flushed. */
+    prepareDeferredWake?: (info: GateEventInfo) => (() => boolean) | undefined;
     /** Optional clock — defaults to Date.now. Tests inject for deterministic time. */
     now?: () => number;
     /** Per-event timeout (ms) for the optional gate.js script. Default 50. */
@@ -615,6 +624,7 @@ export class EventGate {
     this.addMessageFn = opts.addMessage;
     this.requestInferenceFn = opts.requestInference;
     this.getAgentNamesFn = opts.getAgentNames;
+    this.prepareDeferredWake = opts.prepareDeferredWake;
     this.now = opts.now ?? (() => Date.now());
     this.loadPrivileged();
 
@@ -1436,6 +1446,7 @@ export class EventGate {
     const debounceMs = (policy.behavior as { debounce: number }).debounce;
 
     const event: PendingEvent = {
+      deliverWake: this.prepareDeferredWake?.(info),
       policyName: policy.name,
       content: info.content.length > MAX_CONTENT_SNIPPET
         ? info.content.slice(0, MAX_CONTENT_SNIPPET) + '...'
@@ -1498,6 +1509,10 @@ export class EventGate {
   // =========================================================================
 
   private deliverEvents(events: PendingEvent[]): void {
+    // Route each event before building the notice or choosing provenance:
+    // a mixed batch must preserve ordinary wakes without leaking diverted
+    // channels into the resident's reference notice.
+    events = events.filter(event => !event.deliverWake?.());
     if (events.length === 0) return;
 
     const policyNames = [...new Set(events.map(e => e.policyName))];

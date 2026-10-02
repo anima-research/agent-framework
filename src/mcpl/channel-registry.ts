@@ -1868,7 +1868,22 @@ export class ChannelRegistry {
     return { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
   }
 
-  /** Registered channel entries (read-only iteration for the coordinator). */
+  /** Active epochs from durable desired state, including unregistered channels. */
+  listActiveTuneOuts(): Array<{ serverId: string; channelId: string; params: TuneOutParams }> {
+    const active: Array<{ serverId: string; channelId: string; params: TuneOutParams }> = [];
+    for (const [key, state] of this.desiredStates) {
+      if (state.state !== 'tuned-out' || !state.tuneOut) continue;
+      const separator = key.indexOf('\u0000');
+      active.push({
+        serverId: key.slice(0, separator),
+        channelId: key.slice(separator + 1),
+        params: state.tuneOut,
+      });
+    }
+    return active;
+  }
+
+  /** Registered channel entries (read-only iteration). */
   listChannelsRaw(): Array<{ serverId: string; descriptor: ChannelDescriptor }> {
     return [...this.channels.values()].map((e) => ({
       serverId: e.serverId,

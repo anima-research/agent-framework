@@ -6,7 +6,7 @@
  * Names and results carry no credential/config vocabulary; everything it
  * says to the resident is its own text (never host-templated), delivered
  * under its own participant name. Prose is never auto-routed
- * (proseRouting: 'explicit' on its AgentConfig): speaking into a channel
+ * (proseRouting: 'disabled' on its AgentConfig): speaking into a channel
  * happens only through speak_in_channel, so a timer-triggered turn can
  * never leak bare prose to the default locus.
  */
