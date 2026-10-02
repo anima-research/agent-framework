@@ -402,7 +402,7 @@ export interface InferenceLogEntry {
     cacheCreation?: number;
     cacheRead?: number;
   };
-  /** Stop reason from the model */
+  /** Stop reason from the model, or 'turn_ended' for a tool-ended stream. */
   stopReason?: string;
 }
 
