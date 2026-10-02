@@ -7559,20 +7559,20 @@ export class AgentFramework {
           ? { id: str(origin.authorId)!, name: str(origin.authorName) ?? str(origin.authorId)! }
           : inheritedIdentity?.author ?? { id: '', name: str(origin.authorName) ?? 'Someone' },
       } : undefined;
-      if (identity) {
-        // Resolve identity and evaluate trigger policy under the same admission
-        // serialization. An earlier callback could schedule a gate wake before
-        // a preceding occurrence has supplied the subject's self author.
+      const prepare = identity ? () => {
+        // Identity is frozen under admission serialization, and effectful
+        // trigger policy runs only after the coalescer rules out receipt
+        // replay. A retry cannot reinterpret an old self event as a newer author.
         const text = event.content
           .filter((b): b is ContentBlock & { type: 'text'; text: string } => b.type === 'text')
           .map(b => b.text).join('\n');
-        event = { ...event, triggerInference: triggerFilter(text, {
+        event.triggerInference = triggerFilter(text, {
           ...origin, serverId, featureSet: params.featureSet, eventId: params.eventId,
           eventType: 'mcpl:push-event', coalesceChannelId: c.channelId,
           authorId: identity.author.id,
           ...(event.tags ? { tags: event.tags } : {}),
-        }) };
-      }
+        });
+      } : undefined;
       return this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
@@ -7589,7 +7589,7 @@ export class AgentFramework {
         content: params.payload.content,
         ...(identity ? { identity } : {}),
         event: { lane: 'push', event },
-      });
+      }, prepare);
     });
   }
 

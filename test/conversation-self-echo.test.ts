@@ -371,3 +371,29 @@ for (const delivery of ['serial', 'concurrent'] as const) {
     assert.equal(f.membrane.calls.length, 1);
   });
 }
+
+test('a receipted self update never re-evaluates trigger policy using a newer subject author', async (t) => {
+  let filterCalls = 0;
+  const f = await setup(t, { server: { shouldTriggerInference: () => { filterCalls++; return true; } } });
+  await f.send('push/event', {
+    ...f.params('first-self', 'self', { channelId: 'chat', key: 'same-author', deferred: true }),
+    origin: { authorId: 'self', botUserId: 'self' },
+  });
+  const selfUpdate = {
+    ...f.params('next-self', 'self update', { channelId: 'chat', key: 'same-author', deferred: true }),
+    origin: { botUserId: 'self' },
+  };
+  const accepted = await f.send('push/event', selfUpdate);
+  assert.equal(filterCalls, 0);
+  await f.send('push/event', {
+    ...f.params('other', 'other bot update', { channelId: 'chat', key: 'same-author', deferred: true }),
+    origin: { authorId: 'other-bot', botUserId: 'self' },
+  });
+  await f.framework.runUntilIdle();
+  assert.equal(filterCalls, 1);
+  const replayed = await f.send('push/event', selfUpdate);
+  assert.deepEqual(replayed.result, accepted.result);
+  assert.equal(filterCalls, 1, 'receipt replay is not a new admission or a new identity decision');
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, 1);
+});

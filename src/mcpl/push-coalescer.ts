@@ -355,13 +355,15 @@ export class PushCoalescer<E = unknown> {
    * Admit an occurrence that has already passed the lane's ordinary checks and
    * the coalesce-member validation. Returns the wire result, performing the
    * host effects (replace / remove / deliver) synchronously so a create, edit
-   * and delete cannot overtake one another.
+   * and delete cannot overtake one another. The optional prepare callback
+   * computes host effect flags only after receipt replay is ruled out; it
+   * must leave the occurrence's subject and receipt identity unchanged.
    */
-  accept(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {
-    return this.locked(() => this.admit(occurrence));
+  accept(occurrence: CoalescedOccurrence<E>, prepare?: () => void): Promise<PushEventResult> {
+    return this.locked(() => this.admit(occurrence, prepare));
   }
 
-  private async admit(occurrence: CoalescedOccurrence<E>): Promise<PushEventResult> {
+  private async admit(occurrence: CoalescedOccurrence<E>, prepare?: () => void): Promise<PushEventResult> {
     if (this.suspended) throw new CoalesceError('serverId', 'host is stopping', -32000);
     const subject = coalescingSubjectKey(occurrence.serverId, occurrence.binding, occurrence.scope, occurrence.key);
     const duplicate = this.receiptEntry(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId));
@@ -372,6 +374,9 @@ export class PushCoalescer<E = unknown> {
       if (state?.batch && !state.rendering) { this.disarmRecovery(subject); await this.wakeBatch(state.batch); }
       return this.acknowledge(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId), duplicate, subject, occurrence.eventId);
     }
+    // Effectful host policy (for example an EventGate callback) belongs to
+    // new admission, never receipt replay against a newer subject identity.
+    prepare?.();
     const born = this.subjects.has(subject) ? undefined : (occurrence.initial && !occurrence.retract ? 'none' as const : 'unknown' as const);
     const state = this.subjectFor(subject, occurrence);
     const occupantUnread = this.refreshOccupant(state);
