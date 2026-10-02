@@ -6,12 +6,14 @@ import type { McplServerConfig } from '../src/mcpl/types.js';
 const KEY = 'DISCORD_SUPPRESSED_REACTIONS_BASELINE';
 
 /** Exercise the real default-injection boundary, intercepting immediately
- * before connection/spawn. The platform override is synchronous and restored
- * before awaiting anything, so no asynchronous work sees the simulated OS. */
+ * before connection/spawn. Platform/env overrides are synchronous and restored
+ * before awaiting anything, so asynchronous work sees the real process state. */
 async function connectionEnv(
   platform: NodeJS.Platform,
   env: Record<string, string>,
   inheritEnv = false,
+  parentEnv?: NodeJS.ProcessEnv,
+  transportConfig: Pick<McplServerConfig, 'url' | 'transport'> = {},
 ): Promise<Record<string, string>> {
   let captured: McplServerConfig | undefined;
   const stopBeforeSpawn = new Error('captured before spawn');
@@ -30,15 +32,18 @@ async function connectionEnv(
     },
   }) as AgentFramework;
   const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  const originalParentEnv = Object.getOwnPropertyDescriptor(process, 'env')!;
   const originalEnv = { ...env };
   let connection: Promise<void>;
   try {
     Object.defineProperty(process, 'platform', { ...originalPlatform, value: platform });
+    if (parentEnv) Object.defineProperty(process, 'env', { ...originalParentEnv, value: parentEnv });
     connection = (framework as unknown as {
       connectMcplServerInternal(config: McplServerConfig): Promise<void>;
-    }).connectMcplServerInternal({ id: 'probe', command: 'unused', env, inheritEnv });
+    }).connectMcplServerInternal({ id: 'probe', command: 'unused', env, inheritEnv, ...transportConfig });
   } finally {
     Object.defineProperty(process, 'platform', originalPlatform);
+    Object.defineProperty(process, 'env', originalParentEnv);
   }
   await assert.rejects(connection!, (error) => error === stopBeforeSpawn);
   assert.deepEqual(env, originalEnv, 'connection composition must not mutate the caller env');
@@ -65,6 +70,36 @@ for (const inheritEnv of [false, true]) {
     }
   });
 }
+
+test('Windows inherited-only baseline lookup handles case-sensitive worker env copies', async () => {
+  for (const value of ['', '🟪']) {
+    const parents: NodeJS.ProcessEnv[] = [
+      { [KEY.toLowerCase()]: value },
+      { Discord_Suppressed_Reactions_Baseline: value },
+      { [KEY]: 'first', [KEY.toLowerCase()]: value },
+      { [KEY.toLowerCase()]: 'first', [KEY]: value },
+    ];
+    for (const parent of parents) {
+      const composed = await connectionEnv('win32', {}, true, parent);
+      assert.equal(composed[KEY], value);
+    }
+  }
+});
+
+test('inherited-only baseline lookup remains opt-in and POSIX case-sensitive', async () => {
+  for (const [platform, inheritEnv] of [['win32', false], ['linux', true]] as const) {
+    const composed = await connectionEnv(platform, {}, inheritEnv, { [KEY.toLowerCase()]: '' });
+    assert.ok(composed[KEY]!.split(',').includes('💤'));
+  }
+  const explicitPosix = await connectionEnv('linux', {}, true, { [KEY]: '' });
+  assert.equal(explicitPosix[KEY], '');
+});
+
+test('explicit WebSocket selection leaves its env alone even when a command is also present', async () => {
+  const env = { EXTRA: 'value' };
+  const composed = await connectionEnv('linux', env, false, undefined, { transport: 'websocket', url: 'ws://unused' });
+  assert.deepEqual(composed, env);
+});
 
 test('POSIX reaction baseline keeps differently cased env names distinct', async () => {
   const composed = await connectionEnv('linux', { [KEY.toLowerCase()]: '' });

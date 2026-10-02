@@ -385,6 +385,7 @@ import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
+import { isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
   McplHostCapabilities,
@@ -13038,21 +13039,22 @@ export class AgentFramework {
     // and retained awareness ledger. Keep the caller's config unchanged so
     // a later runtime restart derives a fresh default, not a stale override.
     // WebSocket servers own their environment outside this process.
-    // Windows variable names are case-insensitive. Resolve the last declared
-    // spelling before defaulting, so a generated uppercase key cannot defeat
-    // a mixed/lowercase override at the later environment merge or spawn.
-    const declaredBaseline = process.platform === 'win32'
-      ? Object.entries(config.env ?? {})
+    // Match Windows names in both sources: Workers expose a case-sensitive
+    // process.env copy. Resolve the last spelling before defaulting so a
+    // generated uppercase key cannot defeat a mixed/lowercase choice at
+    // the later environment merge or spawn.
+    const baselineValue = (env: NodeJS.ProcessEnv | undefined) => process.platform === 'win32'
+      ? Object.entries(env ?? {})
         .filter(([key]) => key.toUpperCase() === 'DISCORD_SUPPRESSED_REACTIONS_BASELINE')
         .at(-1)?.[1]
-      : config.env?.DISCORD_SUPPRESSED_REACTIONS_BASELINE;
-    const connectionConfig = config.url ? config : {
+      : env?.DISCORD_SUPPRESSED_REACTIONS_BASELINE;
+    const connectionConfig = isWebSocketTransport(config) ? config : {
       ...config,
       env: {
         ...config.env,
         DISCORD_SUPPRESSED_REACTIONS_BASELINE:
-          declaredBaseline
-          ?? (config.inheritEnv ? process.env.DISCORD_SUPPRESSED_REACTIONS_BASELINE : undefined)
+          baselineValue(config.env)
+          ?? (config.inheritEnv ? baselineValue(process.env) : undefined)
           ?? this.getPlacedReactionBaseline().join(','),
       },
     };

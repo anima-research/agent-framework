@@ -106,6 +106,14 @@ describe('placed-reaction baseline', () => {
     assert.deepEqual(config.env, { BASELINE_TEST_EXTRA: 'preserved' }, 'caller config stays unchanged');
   });
 
+  for (const transport of [undefined, 'stdio'] as const) {
+    it('injects the baseline with command + URL and ' + (transport ?? 'implicit') + ' transport', async () => {
+      const fw = await create('🔕', [server({ url: 'ws://127.0.0.1:1', transport })]);
+      const env = await childEnv(fw);
+      assert.deepEqual(new Set(env.baseline?.split(',')), new Set([...REFUSAL_REACTION_BASELINE, '💤', '🔕']));
+    });
+  }
+
   it('derives the default on runtime connect, including newly retained ledger markers', async () => {
     const fw = await create('🔕');
     retain('🫥');
