@@ -12541,7 +12541,7 @@ export class AgentFramework {
         // addMessage() alone does not request inference, so this never wakes
         // her (matching the `discord-send-failed-skip` gate intent: context
         // yes, wake no).
-        onRouteFailure: ({ channelId, reason, textLen }) => {
+        onRouteFailure: ({ conversationId, channelId, reason, textLen }) => {
           try {
             // Render a human-readable channel name when we can — a bare
             // snowflake in the marker is unresolvable for the agent (the
@@ -12563,6 +12563,9 @@ export class AgentFramework {
                 text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
               }],
               { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason },
+              // Keep the notice with its speaker, including mid-turn deferral.
+              // Unknown conversation IDs retain the primary-agent fallback.
+              this.agents.has(conversationId) ? { forAgent: conversationId } : undefined,
             );
           } catch (err) {
             console.error('onRouteFailure: failed to record send-failure marker:', err);
