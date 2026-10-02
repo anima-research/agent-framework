@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 
 import { AgentFramework } from '../src/framework.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { InferenceRouter } from '../src/mcpl/inference-router.js';
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 
 function harness() {
@@ -160,6 +161,71 @@ test('inference responders retain request IDs and successful handling stays sync
   await settle();
   assert.equal(reply.errors.length, 0);
   assert.equal(failureTraces(traces).length, 0);
+});
+
+test('real inference handler cannot turn a failed result write into a second response', async () => {
+  const { framework, connection, traces } = harness();
+  framework.inferenceRouter = new InferenceRouter(
+    {
+      async complete() {
+        return {
+          content: [{ type: 'text', text: 'done' }],
+          stopReason: 'end_turn',
+          usage: { inputTokens: 1, outputTokens: 1 },
+        };
+      },
+    } as never,
+    { isInHook: false } as never,
+    { validateInbound() {} } as never,
+    null,
+    (event) => traces.push(event),
+  );
+  const reply = responder();
+  let resultWrites = 0;
+  reply.respond = () => { resultWrites++; throw new Error('partially written result'); };
+  connection.emit('inference-request', {
+    featureSet: 'test', messages: [{ role: 'user', content: 'hello' }],
+  }, reply);
+  await settle();
+  assert.equal(resultWrites, 1);
+  assert.equal(reply.errors.length, 0, 'the inner inference catch must not send another reply');
+  const failures = failureTraces(traces);
+  assert.equal(failures.length, 1);
+  assert.match(failures[0].error, /partially written result/);
+  assert.equal(failures[0].responseAttempted, true);
+});
+
+test('a swallowed response-write failure still produces a diagnostic', async () => {
+  const { framework, connection, traces } = harness();
+  framework.channelRegistry = {
+    async handleRegister(_server: string, _params: unknown, reply: any) {
+      try { reply.respond({}); } catch { /* Simulate a handler swallowing a transport error. */ }
+    },
+  };
+  const reply = responder();
+  reply.respond = () => { throw new Error('swallowed write failure'); };
+  connection.emit('channels-register', {}, reply);
+  await settle();
+  assert.equal(reply.errors.length, 0);
+  assert.equal(failureTraces(traces).length, 1);
+  assert.match(failureTraces(traces)[0].error, /swallowed write failure/);
+});
+
+test('an error response followed by a handler rejection is not answered again', async () => {
+  const { framework, connection, traces } = harness();
+  framework.channelRegistry = {
+    async handleRegister(_server: string, _params: unknown, reply: any) {
+      reply.respondError(-32602, 'bad params');
+      throw new Error('after error response');
+    },
+  };
+  const reply = responder();
+  connection.emit('channels-register', {}, reply);
+  await settle();
+  assert.equal(reply.errors.length, 1);
+  assert.equal(failureTraces(traces).length, 1);
+  assert.match(failureTraces(traces)[0].error, /after error response/);
+  assert.equal(failureTraces(traces)[0].responseAttempted, true);
 });
 
 test('host command response-write failure is traced without a second reply', async () => {

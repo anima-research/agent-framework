@@ -13557,20 +13557,30 @@ export class AgentFramework {
     ): void => {
       connection.on(event, (params: T, responder?: Responder) => {
         let responseAttempted = false;
+        let writeFailure: { error: unknown } | undefined;
+        const writeResponse = (write: () => void): void => {
+          if (responseAttempted) {
+            // Inner handler catches can try to answer a failed result with
+            // an error. Preserve the first failure and refuse the second write.
+            throw writeFailure ? writeFailure.error : new Error('MCPL response already attempted');
+          }
+          // A throwing transport write may have partially sent the reply.
+          responseAttempted = true;
+          try {
+            write();
+          } catch (error) {
+            writeFailure = { error };
+            throw error;
+          }
+        };
         const tracked = responder && {
           ...responder,
-          respond: (result: unknown) => {
-            // A throwing transport write may have partially sent the reply.
-            // Mark before writing so recovery never sends a second response.
-            responseAttempted = true;
-            responder.respond(result);
-          },
-          respondError: (code: number, message: string, data?: unknown) => {
-            responseAttempted = true;
-            responder.respondError(code, message, data);
-          },
+          respond: (result: unknown) => writeResponse(() => responder.respond(result)),
+          respondError: (code: number, message: string, data?: unknown) =>
+            writeResponse(() => responder.respondError(code, message, data)),
         };
         const failed = (error: unknown): void => {
+          if (writeFailure) error = writeFailure.error;
           const message = error instanceof Error ? error.message : String(error);
           const attemptedBeforeFailure = responseAttempted;
           let responseError: string | undefined;
@@ -13594,8 +13604,13 @@ export class AgentFramework {
         try {
           // Invoke immediately: control-plane responses must retain their
           // ACK-before-reconcile ordering and data-plane barrier semantics.
+          const succeeded = (): void => {
+            // A handler may swallow a transport failure without rethrowing.
+            if (writeFailure) failed(writeFailure.error);
+          };
           const result = handler(params, tracked);
-          if (result) void result.catch(failed);
+          if (result) void result.then(succeeded, failed);
+          else succeeded();
         } catch (error) {
           failed(error);
         }
