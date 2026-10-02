@@ -126,18 +126,41 @@ export const CHILD_ENV_ALLOWLIST = [
 ];
 
 /** Environment for a stdio child: allowlisted host vars (+ LC_*), then the
- *  server's declared `env` on top. `inheritEnv: true` restores full inheritance. */
+ *  server's declared `env` on top. Windows names merge case-insensitively;
+ *  POSIX names remain case-sensitive. `inheritEnv: true` restores full inheritance. */
 export function buildChildEnv(
   config: Pick<McplServerConfig, 'env' | 'inheritEnv'>,
   hostEnv: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): NodeJS.ProcessEnv {
-  if (config.inheritEnv) return { ...hostEnv, ...config.env };
-  const env: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(hostEnv)) {
-    if (value === undefined) continue;
-    if (CHILD_ENV_ALLOWLIST.includes(key) || key.startsWith('LC_')) env[key] = value;
+  const win = platform === 'win32';
+  const env: NodeJS.ProcessEnv = config.inheritEnv ? { ...hostEnv } : {};
+  if (!config.inheritEnv) {
+    for (const [key, value] of Object.entries(hostEnv)) {
+      if (value === undefined) continue;
+      // Windows commonly enumerates Path/SystemRoot rather than PATH/SYSTEMROOT.
+      const probe = win ? key.toUpperCase() : key;
+      if (CHILD_ENV_ALLOWLIST.includes(probe) || probe.startsWith('LC_')) env[key] = value;
+    }
   }
-  return { ...env, ...config.env };
+  if (!win) return { ...env, ...config.env };
+
+  // Windows spawn folds environment names case-insensitively and may choose
+  // an earlier host spelling over a differently cased declared override.
+  // Merge the sources separately so every declared value (including '') wins,
+  // leaving exactly one spelling for each Windows variable.
+  const merged: NodeJS.ProcessEnv = {};
+  const spellings = new Map<string, string>();
+  for (const source of [env, config.env ?? {}]) {
+    for (const [key, value] of Object.entries(source)) {
+      const canonical = key.toUpperCase();
+      const previous = spellings.get(canonical);
+      if (previous !== undefined && previous !== key) delete merged[previous];
+      merged[key] = value;
+      spellings.set(canonical, key);
+    }
+  }
+  return merged;
 }
 
 export class StdioTransport extends McplTransport {

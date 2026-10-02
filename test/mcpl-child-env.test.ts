@@ -41,7 +41,7 @@ test('keeps CA bundles and uppercase/lowercase proxy configuration', () => {
     https_proxy: 'http://lowercase.example:8443',
     no_proxy: 'localhost,.lowercase.internal',
   };
-  const env = buildChildEnv({}, { ...HOST_ENV, ...networkEnv });
+  const env = buildChildEnv({}, { ...HOST_ENV, ...networkEnv }, 'linux');
   for (const [key, value] of Object.entries(networkEnv)) {
     assert.equal(env[key], value, key);
   }
@@ -113,5 +113,57 @@ test('a real spawned stdio child sees only allowlist + declared env', async () =
     else process.env.REQUESTS_CA_BUNDLE = previousCaBundle;
     if (previousProxy === undefined) delete process.env.HTTPS_PROXY;
     else process.env.HTTPS_PROXY = previousProxy;
+  }
+});
+
+for (const inheritEnv of [false, true]) {
+  test(`win32: declared proxy/CA overrides win across case variants (inheritEnv=${inheritEnv})`, () => {
+    for (const name of ['HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE']) {
+      for (const [hostKey, declaredKey] of [[name, name.toLowerCase()], [name.toLowerCase(), name]]) {
+        const env = buildChildEnv(
+          { inheritEnv, env: { [declaredKey!]: '' } },
+          { [hostKey!]: 'http://user:password@host-proxy.example', OPENAI_API_KEY: 'host-secret' },
+          'win32',
+        );
+        assert.deepEqual(
+          Object.keys(env).filter((key) => key.toUpperCase() === name),
+          [declaredKey],
+          'only the declared spelling may reach Windows spawn',
+        );
+        assert.equal(env[declaredKey!], '', name + ' must remain explicitly disabled');
+        assert.equal(env.OPENAI_API_KEY, inheritEnv ? 'host-secret' : undefined);
+      }
+    }
+  });
+}
+
+test('win32: operating allowlist matches native mixed-case spellings', () => {
+  const env = buildChildEnv({}, {
+    Path: 'C:\\Windows', SystemRoot: 'C:\\Windows', ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+    Https_Proxy: 'http://proxy.example', Requests_CA_Bundle: 'C:\\internal.pem',
+    lc_ctype: 'UTF-8', OpenAI_Api_Key: 'host-secret',
+  }, 'win32');
+  assert.deepEqual(env, {
+    Path: 'C:\\Windows', SystemRoot: 'C:\\Windows', ComSpec: 'C:\\Windows\\System32\\cmd.exe',
+    Https_Proxy: 'http://proxy.example', Requests_CA_Bundle: 'C:\\internal.pem', lc_ctype: 'UTF-8',
+  });
+});
+
+test('win32: later declared spellings replace earlier ones without duplicate names', () => {
+  const env = buildChildEnv({ env: { HTTPS_PROXY: 'http://first.example', https_proxy: '' } }, {
+    HTTPS_PROXY: 'http://host.example', https_proxy: 'http://other-host.example',
+  }, 'win32');
+  assert.deepEqual(env, { https_proxy: '' });
+});
+
+test('posix: differently cased host and declared keys remain distinct', () => {
+  for (const inheritEnv of [false, true]) {
+    const env = buildChildEnv({ inheritEnv, env: { https_proxy: '' } }, {
+      HTTPS_PROXY: 'http://host.example', Path: '/mixed-case', PATH: '/usr/bin',
+    }, 'linux');
+    assert.equal(env.HTTPS_PROXY, 'http://host.example');
+    assert.equal(env.https_proxy, '');
+    assert.equal(env.PATH, '/usr/bin');
+    assert.equal(env.Path, inheritEnv ? '/mixed-case' : undefined);
   }
 });
