@@ -219,7 +219,7 @@ it with `discordAwarenessDeadlineMs` (default 10000ms, clamped to 50..60000ms).
 Configure the online marker with `discordAwarenessEmoji`; the offline CLI
 accepts `--emoji`.
 
-For stdio MCPL children, the framework defaults `DISCORD_SUPPRESSED_REACTIONS_BASELINE` to its refusal markers, the Discord adapter's default awareness marker, the configured awareness marker, and every retained outbox emoji. This covers later removals and replays after a configuration change. Explicit server env values and baseline values intentionally inherited with `inheritEnv: true` take precedence, including empty strings; the adapter's filters-file and legacy operator-env precedence remain unchanged.
+For stdio MCPL children, the framework defaults `DISCORD_SUPPRESSED_REACTIONS_BASELINE` to its refusal markers, the Discord adapter's default awareness marker, the configured awareness marker, and every retained outbox emoji. This covers later removals and replays after a configuration change. Explicit server env values (case-insensitive on Windows) and baseline values intentionally inherited with `inheritEnv: true` take precedence, including empty strings; the adapter's filters-file and legacy operator-env precedence remain unchanged.
 
 `framework.getPlacedReactionBaseline()` returns a fresh snapshot for other embeddings, including separately managed WebSocket adapters. An unreadable awareness ledger throws instead of producing a partial snapshot. Hosts that previously supplied a refusal-only default must stop supplying it to adopt this framework-derived default; an explicit operator choice should remain intact.
 
