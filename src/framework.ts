@@ -59,7 +59,7 @@ import type {
   SameRoundThinkTextPolicy,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
-import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reactions.js';
+import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent } from './agent.js';
 import { ModuleRegistry, isStateExistsError } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -13034,7 +13034,21 @@ export class AgentFramework {
       );
     }
 
-    const connection = await this.mcplServerRegistry.addServer(config, this.mcplHostCapabilities);
+    // Derive the default here, after the framework has its effective config
+    // and retained awareness ledger. Keep the caller's config unchanged so
+    // a later runtime restart derives a fresh default, not a stale override.
+    // WebSocket servers own their environment outside this process.
+    const connectionConfig = config.url ? config : {
+      ...config,
+      env: {
+        ...config.env,
+        DISCORD_SUPPRESSED_REACTIONS_BASELINE:
+          config.env?.DISCORD_SUPPRESSED_REACTIONS_BASELINE
+          ?? (config.inheritEnv ? process.env.DISCORD_SUPPRESSED_REACTIONS_BASELINE : undefined)
+          ?? this.getPlacedReactionBaseline().join(','),
+      },
+    };
+    const connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities);
 
     // Wire listeners before either startup staging or the runtime global gate
     // releases control traffic needed for registration and marker service.
@@ -13371,6 +13385,29 @@ export class AgentFramework {
   // ==========================================================================
   // Runtime MCPL server lifecycle (agent-facing hot deploy/restart/unload)
   // ==========================================================================
+
+  /**
+   * Snapshot the protective Discord reaction default for this deployment.
+   * Includes refusal markers, the adapter's own default awareness marker,
+   * the configured awareness marker, and retained outbox markers (including
+   * offline recovery choices and marks that can later be removed/replayed).
+   * Explicit adapter/operator suppression settings still take precedence.
+   * Throws on an unreadable ledger rather than reporting a partial baseline.
+   */
+  getPlacedReactionBaseline(): readonly string[] {
+    let retained: string[];
+    try {
+      retained = this.discordAwarenessOutbox?.batches().map((batch) => batch.emoji) ?? [];
+    } catch (error) {
+      throw new DiscordAwarenessAccountingError('reaction-baseline ledger read', error);
+    }
+    return [...new Set([
+      ...REFUSAL_REACTION_BASELINE,
+      DEFAULT_DISCORD_AWARENESS_EMOJI,
+      this.discordAwarenessEmoji,
+      ...retained,
+    ])].filter((emoji) => emoji.length > 0);
+  }
 
   /**
    * Connect a new MCPL server at runtime. Refreshes the tool list and

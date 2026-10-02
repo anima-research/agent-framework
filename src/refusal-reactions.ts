@@ -27,11 +27,10 @@ export const REFUSAL_REACTIONS: Readonly<Record<string, string>> = {
 /** Marker used when the refusal category has no dedicated emoji. */
 export const REFUSAL_REACTION_FALLBACK = '🛑';
 
-/** Every marker the framework can emit — the category map plus the
- *  fallback, deduplicated, in stable declaration order. This IS the
- *  protective baseline: host composition serializes it (comma-joined) into
- *  `DISCORD_SUPPRESSED_REACTIONS_BASELINE` for adapters that render
- *  reactions. */
+/** Every refusal marker the framework can emit: the category map plus the
+ *  fallback, deduplicated in stable declaration order. For the deployment's
+ *  complete protective default, including awareness markers, use
+ *  AgentFramework.getPlacedReactionBaseline(). */
 export const REFUSAL_REACTION_BASELINE: readonly string[] = [
   ...new Set([...Object.values(REFUSAL_REACTIONS), REFUSAL_REACTION_FALLBACK]),
 ];
