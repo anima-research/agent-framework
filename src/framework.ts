@@ -267,7 +267,9 @@ const isAddressedMessage = (
   _metadata?: Record<string, unknown>,
 ): boolean => Array.isArray(tags) && tags.includes('chat:addressed');
 
-/** Identity, not automation: another bot is still a counterpart. */
+/** Identity, not automation: another bot is still a counterpart. These
+ * server-supplied fields classify traffic the admitted server already owns;
+ * they neither grant capabilities nor authenticate a separate principal. */
 const isSelfAuthoredMessage = (
   tags: unknown,
   authorId: unknown,
@@ -7051,8 +7053,9 @@ export class AgentFramework {
   ): Promise<CoalescingPlacement | undefined> {
     const router = this.conversationRouter!;
     const self = isSelfAuthoredMessage(event.tags, event.author.id, event.metadata);
-    // Echoes can update an existing engagement's context, but cannot start one.
-    if (self && !router.getBinding(event.channelId)) return;
+    // A self-only echo cannot start an engagement. A rendered mixed batch
+    // may still carry genuine counterpart activation after its binding expired.
+    if (self && !event.conversationActivity && !router.getBinding(event.channelId)) return;
     const descriptor = this.channelRegistry?.getDescriptor(event.channelId);
 
     const decision = router.route({

@@ -31,6 +31,10 @@ function harness(published = new Set<string>()) {
   let started!: () => void;
   const rendering = new Promise<void>(resolve => { started = resolve; });
   let hold = false;
+  let holdCommit = false;
+  let releaseCommit!: () => void;
+  let commitStarted!: () => void;
+  const committing = new Promise<void>(resolve => { commitStarted = resolve; });
   const coalescer = new PushCoalescer<Event>({
     isUnread: () => false,
     remove: () => false,
@@ -62,7 +66,11 @@ function harness(published = new Set<string>()) {
     save: () => {},
     saveNow: snapshot => { saved = structuredClone(snapshot); receipts.length = 0; },
     recordReceipt: receipt => { receipts.push(structuredClone(receipt)); },
-    commit: async () => {},
+    commit: async () => {
+      if (!holdCommit) return;
+      commitStarted();
+      await new Promise<void>(resolve => { releaseCommit = resolve; });
+    },
     wasPublished: (_subject, id) => published.has(id),
   });
   return {
@@ -70,6 +78,9 @@ function harness(published = new Set<string>()) {
     hold: () => { hold = true; },
     release: () => { hold = false; release!({ content: [{ type: 'text', text: 'completed active render' }] }); },
     saved: () => structuredClone(saved!),
+    holdCommit: () => { holdCommit = true; },
+    committing,
+    releaseCommit: () => { holdCommit = false; releaseCommit(); },
   };
 }
 
@@ -247,3 +258,37 @@ test('authority becoming unknown during render retains fallback until readiness 
   assert.equal(f.delivered.length, 1);
   assert(f.delivered[0]!.body.includes('fallback:active'), 'do not repeat the interrupted render');
 });
+
+for (const secondCrash of ['before recovery assembly', 'during recovery commit'] as const) {
+  test('receipt-restored pending fallback keeps its role and order across a second crash ' + secondCrash, async () => {
+    const live = harness();
+    await live.coalescer.accept(occurrence('r1'));
+    live.hold();
+    const run = live.coalescer.assemble('agent');
+    await live.rendering;
+    await live.coalescer.accept(occurrence('r2'));
+    const firstSnapshot = live.saved();
+    const firstReceipts = structuredClone(live.receipts);
+    live.coalescer.suspend(); live.release(); await run;
+
+    const middle = harness();
+    middle.coalescer.restore(firstSnapshot);
+    middle.coalescer.restoreReceipts(firstReceipts);
+    let secondSnapshot: CoalescingSnapshot;
+    if (secondCrash === 'during recovery commit') {
+      middle.holdCommit();
+      const recovering = middle.coalescer.assemble('agent');
+      await middle.committing;
+      secondSnapshot = middle.saved();
+      middle.coalescer.suspend(); middle.releaseCommit(); await recovering;
+    } else {
+      secondSnapshot = structuredClone(middle.coalescer.snapshot());
+    }
+    const final = harness();
+    final.coalescer.restore(secondSnapshot);
+    await final.coalescer.assemble('agent');
+    assert.deepEqual(final.delivered.map(d => d.id), ['r1', 'r2'], 'fallback-only policy must not promote newer pending content ahead of older frozen work');
+    assert.deepEqual(final.delivered.map(d => d.body), [JSON.stringify(occurrence('r1').content), JSON.stringify(occurrence('r2').content)]);
+    assert.equal(final.coalescer.pendingBatches(), 0);
+  });
+}

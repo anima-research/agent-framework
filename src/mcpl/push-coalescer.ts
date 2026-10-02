@@ -107,7 +107,10 @@ interface StoredDeferredBatch {
   activation?: CoalescedOccurrence<unknown> | null;
   notices: DeferredNotice[];
   dropped: number;
+  /** Role: this was frozen, not merely awaiting fallback-only delivery. */
   rendering?: boolean;
+  /** Delivery policy independent of role/order: never repeat a possible render. */
+  fallback?: boolean;
   publicationAgent?: string;
 }
 
@@ -588,16 +591,17 @@ export class PushCoalescer<E = unknown> {
     return [...(state.rendering ? [state.rendering.batch] : []), ...(state.recovered ?? [])];
   }
 
-  private storeBatch(batch: DeferredBatch<E>, rendering = !!batch.noRender): StoredDeferredBatch {
+  private storeBatch(batch: DeferredBatch<E>, rendering = false): StoredDeferredBatch {
     return {
       latest: batch.latest as CoalescedOccurrence<unknown>, notices: batch.notices, dropped: batch.dropped,
       ...(batch.activation !== undefined ? { activation: batch.activation as CoalescedOccurrence<unknown> | null } : {}),
       ...(batch.publicationAgent ? { publicationAgent: batch.publicationAgent } : {}),
+      ...(batch.noRender ? { fallback: true } : {}),
       ...(rendering ? { rendering: true } : {}),
     };
   }
 
-  private restoreBatch(batch: StoredDeferredBatch, noRender = !!batch.rendering): DeferredBatch<E> {
+  private restoreBatch(batch: StoredDeferredBatch, noRender = !!(batch.rendering || batch.fallback)): DeferredBatch<E> {
     return {
       latest: batch.latest as CoalescedOccurrence<E>, notices: batch.notices, dropped: batch.dropped,
       ...(batch.activation !== undefined ? { activation: batch.activation as CoalescedOccurrence<E> | null } : {}),

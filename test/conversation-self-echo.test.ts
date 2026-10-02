@@ -628,3 +628,28 @@ test('a transient recovered spawn failure is retried by backoff without another 
   assert(f.context(binding.agentName).includes('document_diff'));
   assert.equal(f.membrane.calls.length, 1);
 });
+
+test('a mixed batch retains counterpart delivery when its binding disappears during render', async (t) => {
+  const f = await setup(t);
+  const router = f.framework.getConversationRouter()!;
+  await f.send('push/event', {
+    ...f.params('counterpart', 'fresh counterpart', { channelId: 'chat', key: 'lost-binding', deferred: true }),
+    tags: ['chat:from-human'], origin: { authorId: 'human' },
+  });
+  const first = router.getBinding('chat')!;
+  assert(first);
+  await f.send('push/event', {
+    ...f.params('echo', 'self addition', { channelId: 'chat', key: 'lost-binding', deferred: true }),
+    tags: ['chat:from-self'], origin: { authorId: 'self' },
+  });
+  f.renderer(async () => {
+    router.unbind('chat');
+    return { content: [{ type: 'text', text: 'rendered counterpart and echo' }] };
+  });
+  await f.framework.runUntilIdle();
+  const replacement = router.getBinding('chat');
+  assert(replacement, 'retained counterpart activity permits routing even though the latest content is an echo');
+  assert.equal(replacement.generation, first.generation + 1);
+  assert(f.context(replacement.agentName).includes('rendered counterpart and echo'));
+  assert.equal(f.renders.length, 1);
+});
