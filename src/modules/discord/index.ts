@@ -153,7 +153,7 @@ export class DiscordModule implements Module {
       this.unsubscribeTrace = ctx.onTrace((event: TraceEvent) => {
         const agentName = (event as { agentName?: string }).agentName;
         if (!agentName) return;
-        if (event.type === 'inference:started') {
+        if (event.type === 'inference:started' && !event.silent) {
           this.startTypingLoop(agentName);
         } else if (TURN_TERMINAL_TRACES.has(event.type)) {
           this.stopTypingLoop(agentName);
