@@ -12,10 +12,6 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
-### Breaking
-
-- **Direct ConversationRouter callers:** `route()` is now a pure query and no longer refreshes idle activity (#46). After successfully delivering a message to the bound fork, call `touch(channelId)`; deterministic clocks move from `route({ now })` to `touch(channelId, now)`. Framework-managed delivery performs this step automatically, including ambient messages and coalesced fixed-audience delivery to the current binding. Queries, failed writes, and delivery to an older engagement leave the current binding's clock unchanged. Bind rules, trigger rules, generation counters, and fork names are unchanged. No store migration or sibling dependency upgrade is required.
-
 ## 0.19.0 — 2026-09-28
 
 ### Added
