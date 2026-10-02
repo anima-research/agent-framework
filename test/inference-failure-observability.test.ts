@@ -83,3 +83,24 @@ test('per-agent isolation: one agent failing does not flag another', () => {
   assert.equal(fw.consecutiveInferenceFailures.get('cairn'), 2);
   assert.equal(fw.consecutiveInferenceFailures.get('lena') ?? 0, 0);
 });
+
+test('failureNotices: room notice on failure 1 and every 5th; off by default', async () => {
+  const { fw, restore } = makeHarness();
+  const posted: Array<{ text: string; locus: string | null }> = [];
+  fw.channelRegistry = {
+    resolveLocus: () => 'discord:g:salon',
+    routeSpeech: async (_agent: string, text: string, locus: string | null) => { posted.push({ text, locus }); return { delivered: true }; },
+  };
+  const addMessage = () => {};
+  fw.agents.set('cairn', { failureNotices: true, getContextManager: () => ({ addMessage }) });
+  fw.agents.set('quiet', { failureNotices: false, getContextManager: () => ({ addMessage }) });
+  try {
+    for (let i = 0; i < 5; i++) fw.noteInferenceExhausted('cairn', '400 image/webp label but PNG bytes');
+    fw.noteInferenceExhausted('quiet', 'boom');
+  } finally { restore(); }
+  await new Promise((r) => setImmediate(r));
+  assert.equal(posted.length, 2, 'failure 1 and failure 5 only');
+  assert.equal(posted[0].locus, 'discord:g:salon');
+  assert.match(posted[0].text, /^⚠️ \[automatic notice\] cairn's reply failed to generate: 400 image\/webp/);
+  assert.match(posted[1].text, /\(5 in a row\)/);
+});
