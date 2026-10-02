@@ -308,4 +308,8 @@ export interface InferenceRequest {
    * not capture the agent's voice just by being newest.
    */
   addressed?: boolean;
+  /** Suppress every automatic plain-prose delivery for this logical turn. */
+  suppressProse?: boolean;
+  /** Ephemeral system-position prompt for this turn only; never stored. */
+  ephemeralSystemPrompt?: string;
 }

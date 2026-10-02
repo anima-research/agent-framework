@@ -786,6 +786,7 @@ export class AgentFramework {
   // (KV bust). Invariant: nothing enters the window between a turn's dequeue
   // and its settle except that turn's own blocks.
   private activeTurnTokens: Map<string, number> = new Map();
+  private activeTurnTriggers: Map<string, InferenceRequest | undefined> = new Map();
   private nextTurnToken = 1;
 
   // Undo/redo state
@@ -4102,6 +4103,8 @@ export class AgentFramework {
               reason: 'context_budget_restart',
               source: 'framework',
               timestamp: Date.now(),
+              suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
+              ephemeralSystemPrompt: this.activeTurnTriggers.get(agent.name)?.ephemeralSystemPrompt,
             });
           } else if (currentState.stream) {
             // Streaming path: convert results and resume the stream.
@@ -4743,8 +4746,13 @@ export class AgentFramework {
       }
     }
 
-    const id = this.addMessage('user', content, metadata);
-    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
+    const silentHeartbeat =
+      event.serverId === 'heartbeat' && event.featureSet === 'heartbeat' &&
+      event.origin?.source === 'heartbeat' && event.origin?.silent === true && content.length === 0;
+    if (!silentHeartbeat) {
+      const id = this.addMessage('user', content, metadata);
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
+    } else { console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${event.eventId}`); }
 
     if (event.triggerInference) {
       // Default broadcast excludes conversation forks (channel-driven).
@@ -4761,6 +4769,11 @@ export class AgentFramework {
           // they must outrank ambient chatter in a batched wake's locus
           // selection just like their channels/incoming counterparts.
           addressed: isAddressedMessage(event.tags, event.origin),
+          ...(silentHeartbeat ? {
+            suppressProse: true,
+            ephemeralSystemPrompt: '[silent heartbeat] Scheduled private self-check. Review pending matters privately. ' +
+              'Do not narrate or publish plain prose; use an explicit send tool only if you deliberately choose to contact someone.',
+          } : {}),
         });
       }
     }
@@ -4947,8 +4960,11 @@ export class AgentFramework {
       }
       const triggerChannel = addressedChannel ?? ambientChannel;
       const triggerAddressed = addressedChannel !== undefined;
+      const silentOnly = requests.every((r) => r.suppressProse === true);
       await this.startAgentStream(agent, {
         ...trigger,
+        suppressProse: silentOnly ? trigger?.suppressProse : undefined,
+        ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         channelId: triggerChannel,
         addressed: triggerAddressed,
       });
@@ -5410,12 +5426,14 @@ export class AgentFramework {
     // no-ops instead of clobbering a successor's marker.
     const turnToken = this.nextTurnToken++;
     this.activeTurnTokens.set(agent.name, turnToken);
+    this.activeTurnTriggers.set(agent.name, trigger);
     let tokenHandedOff = false;
     try {
       tokenHandedOff = await this.beginAgentTurn(agent, trigger, attempt, turnToken);
     } finally {
       if (!tokenHandedOff && this.activeTurnTokens.get(agent.name) === turnToken) {
         this.activeTurnTokens.delete(agent.name);
+        this.activeTurnTriggers.delete(agent.name);
       }
     }
   }
@@ -5431,6 +5449,7 @@ export class AgentFramework {
     attempt: number,
     turnToken: number,
   ): Promise<boolean> {
+    const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     // Flush messages deferred during the PREVIOUS turn — before the
     // checkpoint, the locus announcement, and the compile — so a turn started
     // by a queued wake actually CONTAINS the message that woke it. (2026-07-31
@@ -5519,9 +5538,9 @@ export class AgentFramework {
       this.turnProseDeliveries.delete(agent.name);
       this.turnProseSuppressed.delete(agent.name);
       this.proseHybridSuppressed.delete(agent.name);
-      if (agent.proseRouting === 'hybrid') this.proseTargetPins.delete(agent.name);
-      if (agent.proseRouting === 'explicit') {
-        // Explicit prose routing: there is no locus. The model names every
+      if (turnProseRouting === 'hybrid') this.proseTargetPins.delete(agent.name);
+      if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') {
+        // Explicit/disabled prose routing: there is no locus. The model names every
         // destination in-band (`>>` prefixes); the only turn state is the
         // sticky target, reset for each fresh turn. No freeze, no announce.
         this.proseTargetPins.delete(agent.name);
@@ -5537,6 +5556,11 @@ export class AgentFramework {
       }
     }
 
+    if (trigger?.suppressProse) {
+      this.turnLocusPins.delete(agent.name);
+      this.proseTargetPins.delete(agent.name);
+      this.proseContinuations.delete(agent.name);
+    }
     this.touchEphemeralRun(agent.name, true);
     this.emitTrace({
       type: 'inference:started',
@@ -5544,6 +5568,7 @@ export class AgentFramework {
       // The turn-frozen locus was pinned just above (kept across a
       // context-budget restart, which skips the re-pin but re-emits this).
       channelId: this.turnLocusPins.get(agent.name),
+      ...(trigger?.suppressProse ? { silent: true } : {}),
     });
     this.eventGate?.onInferenceStarted(agent.name);
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
@@ -5558,9 +5583,11 @@ export class AgentFramework {
     // idempotent per channel, and owns the 7s refresh); the catch below stops
     // it on the no-driveStream failure paths (e.g. a compile refusal).
     const earlyTypingChannel =
-      agent.proseRouting === 'explicit'
-        ? trigger?.channelId ?? null
-        : this.turnLocusPins.get(agent.name) ?? null;
+      turnProseRouting === 'disabled'
+        ? null
+        : turnProseRouting === 'explicit'
+          ? trigger?.channelId ?? null
+          : this.turnLocusPins.get(agent.name) ?? null;
     if (earlyTypingChannel) this.channelRegistry?.startTyping(earlyTypingChannel);
 
     try {
@@ -5569,7 +5596,7 @@ export class AgentFramework {
       const tools = allTools.filter((t) => agent.canUseTool(t.name));
       // Explicit-mode agents get the on-demand routing reference (teach-by-
       // bounce: the grammar is never injected, only served when asked).
-      if (agent.proseRouting === 'explicit') tools.push(PROSE_HELP_TOOL);
+      if (turnProseRouting === 'explicit') tools.push(PROSE_HELP_TOOL);
 
       // Gather context from modules (pull-based) and MCPL hooks (push-based)
       // Both produce ContextInjection[] that get merged before inference.
@@ -5608,6 +5635,10 @@ export class AgentFramework {
         }
       }
 
+      if (trigger?.ephemeralSystemPrompt) {
+        const silentInjection: ContextInjection = { namespace: 'framework:silent-heartbeat', position: 'system', content: [{ type: 'text', text: trigger.ephemeralSystemPrompt }] };
+        injections = injections ? [...injections, silentInjection] : [silentInjection];
+      }
       const { stream, request: compiledRequest } = await agent.startStreamWithInjections(tools, injections);
 
       const handle = this.driveStream(
@@ -5691,6 +5722,7 @@ export class AgentFramework {
     attempt = 0,
     compiledRequest?: NormalizedRequest
   ): Promise<void> {
+    const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
@@ -5731,7 +5763,7 @@ export class AgentFramework {
     // Sticky explicit-send suppression: prose after send_message stays quiet
     // to prevent a redundant "sent it" postscript. Fresh injected input
     // clears it, because the following prose is a reply to a new message.
-    let turnSilenced = false;
+    let turnSilenced = trigger?.suppressProse === true;
 
     // Live routing is only trusted when the membrane provides verbatim
     // round-scoped blocks (roundContent, native tool mode, membrane ≥0.5.64).
@@ -5754,9 +5786,11 @@ export class AgentFramework {
     //     sent here", which is true regardless of where the reply goes.
     //     Heartbeat/no-trigger explicit turns show no indicator.
     const typingChannel =
-      agent.proseRouting === 'explicit'
-        ? trigger?.channelId ?? null
-        : resolveTurnLocus();
+      turnProseRouting === 'disabled'
+        ? null
+        : turnProseRouting === 'explicit'
+          ? trigger?.channelId ?? null
+          : resolveTurnLocus();
     if (typingChannel) this.channelRegistry!.startTyping(typingChannel);
 
     // MCPL Spec 14.3 outgoing streaming: route text deltas to their
@@ -5786,9 +5820,9 @@ export class AgentFramework {
       turnIndex: 0,
       phase: 'started',
     });
-    const proseStream = this.channelRegistry
+    const proseStream = this.channelRegistry && turnProseRouting !== 'disabled'
       ? new ProseStreamRouter({
-          mode: agent.proseRouting === 'explicit' ? 'explicit' : agent.proseRouting === 'hybrid' ? 'hybrid' : 'locus',
+          mode: turnProseRouting === 'explicit' ? 'explicit' : turnProseRouting === 'hybrid' ? 'hybrid' : 'locus',
           initialTarget: typingChannel,
           resolve: (spec) => {
             const r = this.channelRegistry!.resolveProseTarget(spec);
@@ -5811,7 +5845,7 @@ export class AgentFramework {
       // A new conversational message, not merely a tool result, means any
       // earlier explicit delivery has completed its conversational job.
       // Routing is NOT touched: the turn locus stays frozen.
-      turnSilenced = false;
+      turnSilenced = trigger?.suppressProse === true;
     };
 
     try {
@@ -5970,7 +6004,7 @@ export class AgentFramework {
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
               if (roundToolNames.some((n) =>
                 SILENCING_TOOLS.has(bareToolName(n)) ||
-                (agent.proseRouting === 'hybrid' && HYBRID_PUBLICATION_TOOLS.has(bareToolName(n)))
+                (turnProseRouting === 'hybrid' && HYBRID_PUBLICATION_TOOLS.has(bareToolName(n)))
               )) {
                 turnSilenced = true;
               }
@@ -5978,7 +6012,9 @@ export class AgentFramework {
                 liveProseRouting = true;
                 const roundSegments = splitProseSegments(assistantBlocks);
                 if (roundSegments.length > 0) {
-                  if (agent.proseRouting === 'hybrid') {
+                  if (turnProseRouting === 'disabled') {
+                    this.recordProseSuppression(agent.name, roundSegments.length);
+                  } else if (turnProseRouting === 'hybrid') {
                     if (turnSilenced) {
                       this.recordProseSuppression(agent.name, roundSegments.length);
                     } else if (!hasSameRoundPrivateThink) {
@@ -5989,7 +6025,7 @@ export class AgentFramework {
                           .catch((err) => console.error('mid-turn hybrid prose delivery failed:', err));
                       }
                     }
-                  } else if (agent.proseRouting === 'explicit') {
+                  } else if (turnProseRouting === 'explicit') {
                     // Explicit mode: every segment through the prose gateway.
                     // Silencing does not apply — unprefixed prose bounces and
                     // prefixed prose is deliberate; think-privacy still holds.
@@ -6288,7 +6324,7 @@ export class AgentFramework {
             }
 
             // Dispatch speech (and thoughts if any)
-            if (speechContent.length > 0 || thoughts.length > 0) {
+            if (!trigger?.suppressProse && (speechContent.length > 0 || thoughts.length > 0)) {
               const speechContext: SpeechContext = {
                 turnComplete: true,
                 trigger: trigger ?? {
@@ -6319,7 +6355,9 @@ export class AgentFramework {
                 .join('\n')
                 .trim();
               if (speechText) {
-                if (agent.proseRouting === 'hybrid') {
+                if (turnProseRouting === 'disabled') {
+                  this.recordProseSuppression(agent.name, 1);
+                } else if (turnProseRouting === 'hybrid') {
                   const locus = resolveTurnLocus();
                   console.error(`[prose] ${agent.name}: text-only turn -> hybrid prose gateway`);
                   try {
@@ -6327,7 +6365,7 @@ export class AgentFramework {
                   } catch (err) {
                     console.error('text-only hybrid prose delivery failed:', err);
                   }
-                } else if (agent.proseRouting === 'explicit') {
+                } else if (turnProseRouting === 'explicit') {
                   console.error(`[prose] ${agent.name}: text-only turn -> prose gateway`);
                   try {
                     await this.deliverProse(agent, speechText);
@@ -6376,7 +6414,7 @@ export class AgentFramework {
                 ? turnSilenced
                 : turnSilenced || toolNames.some((n) =>
                   SILENCING_TOOLS.has(bareToolName(n)) ||
-                  (agent.proseRouting === 'hybrid' && HYBRID_PUBLICATION_TOOLS.has(bareToolName(n)))
+                  (turnProseRouting === 'hybrid' && HYBRID_PUBLICATION_TOOLS.has(bareToolName(n)))
                 );
 
               const segments = splitProseSegments(liveProseRouting ? terminalContent : response.content);
@@ -6386,7 +6424,9 @@ export class AgentFramework {
               // the chain may still be flushing earlier rounds' posts.
               await turnSpeechChain;
 
-              if (agent.proseRouting === 'hybrid') {
+              if (turnProseRouting === 'disabled') {
+                if (segments.length > 0) this.recordProseSuppression(agent.name, segments.length);
+              } else if (turnProseRouting === 'hybrid') {
                 if (silenced && segments.length > 0) {
                   this.recordProseSuppression(agent.name, segments.length);
                 } else if (segments.length > 0) {
@@ -6399,7 +6439,7 @@ export class AgentFramework {
                     }
                   }
                 }
-              } else if (agent.proseRouting === 'explicit') {
+              } else if (turnProseRouting === 'explicit') {
                 if (segments.length > 0) {
                   console.error(
                     `[prose] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> ${segments.length} trailing segment(s) via prose gateway`,
@@ -6452,7 +6492,7 @@ export class AgentFramework {
             // awaited before trailing dispatch, and trailing/text-only
             // segments were awaited in-loop. Locus mode only; explicit-mode
             // envelopes acknowledge themselves through the prose gateway.
-            if (agent.proseRouting !== 'explicit') {
+            if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
               this.appendProseDeliveryReceipt(agent);
             }
 
@@ -6550,7 +6590,7 @@ export class AgentFramework {
                 // deliveries map persists (cleared only at fresh turn
                 // start) and the continuation stream's end writes ONE
                 // receipt for the whole turn.
-                if (cancelKind === 'turn_ended' && agent.proseRouting !== 'explicit') {
+                if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
                   await turnSpeechChain;
                   this.appendProseDeliveryReceipt(agent);
                 }
@@ -6730,6 +6770,7 @@ export class AgentFramework {
       // injection / teardown delivers the messages at a correct position.
       if (myTurnToken !== undefined && this.activeTurnTokens.get(agent.name) === myTurnToken) {
         this.activeTurnTokens.delete(agent.name);
+        this.activeTurnTriggers.delete(agent.name);
       }
 
       // Flush any deferred messages (e.g. if stream failed while tools were pending)
@@ -10293,7 +10334,10 @@ export class AgentFramework {
     if (announce && this.channelRegistry) {
       const text = input.message ?? `💤 Going quiet for ${human}. I'll still see messages, but won't respond until I wake.`;
       const agent = this.agents.get(agentName);
-      if (agent?.proseRouting === 'explicit') {
+      const silentTurn = this.activeTurnTriggers.get(agentName)?.suppressProse === true;
+      if (silentTurn) {
+        console.error(`[sleep] ${agentName}: silent wake — sleep announcement not posted`);
+      } else if (agent?.proseRouting === 'explicit') {
         // Explicit mode: announce to the turn's sticky prose target if the
         // model has set one; otherwise stay quiet — never guess a channel.
         const target = this.proseTargetPins.get(agentName);
