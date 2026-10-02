@@ -104,10 +104,12 @@ export abstract class McplTransport extends EventEmitter {
 /**
  * Host variables a stdio child gets by default: just enough for an ordinary
  * process to run (find binaries, a home dir, temp dir, locale, TLS roots,
- * a display for GUI helpers). Everything else in the host env — notably API
+ * network proxies, a display for GUI helpers). Everything else in the host env — notably API
  * keys and bot tokens — is NOT passed on; a server that needs a variable must
  * declare it in its `env` (recipes can `${VAR}`-substitute from .env), or set
- * `inheritEnv: true` to get the whole host env as before.
+ * `inheritEnv: true` to get the whole host env as before. Proxy URLs may include
+ * credentials. This limits accidental inheritance, not access by a hostile
+ * same-user child process; it is not a process isolation boundary.
  */
 export const CHILD_ENV_ALLOWLIST = [
   'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'LANG', 'TZ',
@@ -115,6 +117,9 @@ export const CHILD_ENV_ALLOWLIST = [
   'DISPLAY', 'WAYLAND_DISPLAY',
   'XDG_RUNTIME_DIR', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
   'SSL_CERT_FILE', 'SSL_CERT_DIR', 'NODE_EXTRA_CA_CERTS',
+  'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+  'http_proxy', 'https_proxy', 'no_proxy',
   '__CF_USER_TEXT_ENCODING',
   // Windows equivalents, harmless elsewhere.
   'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE',

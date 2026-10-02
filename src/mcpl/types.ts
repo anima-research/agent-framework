@@ -229,7 +229,9 @@ export interface McplServerConfig {
   /**
    * Environment variables for the child process. Stdio children do NOT inherit
    * the host environment wholesale: they get a small allowlist (PATH, HOME,
-   * LANG, LC_*, TMPDIR, ... — see CHILD_ENV_ALLOWLIST) plus exactly these.
+   * LANG, LC_*, TMPDIR, TLS CA bundles, and HTTP(S) proxy settings — see
+   * CHILD_ENV_ALLOWLIST) plus exactly these. Proxy URLs can contain credentials.
+   * This limits accidental inheritance; it does not isolate a hostile child.
    */
   env?: Record<string, string>;
 
