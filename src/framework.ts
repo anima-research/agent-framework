@@ -3,7 +3,7 @@ import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceRe
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
@@ -1002,6 +1002,10 @@ export class AgentFramework {
   private processLoggingPersist: boolean;
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
+  // Tool results settle outside driveStream. Key accounting by the physical
+  // stream so an endTurn result can finalize it before cancellation teardown
+  // or ephemeral disposal, without touching a successor's usage.
+  private streamCompletionAccounting = new WeakMap<YieldingStream, () => void>();
 
   /** Per-agent output locus FROZEN for the CURRENT logical turn. Resolved
    *  eagerly in startAgentStream (home → addressed trigger → global default)
@@ -6635,6 +6639,9 @@ export class AgentFramework {
             // driveStream's finally is the backstop.)
             this.eventGate?.onInferenceEnded(agent.name);
             this.settleAgent(agent.name, { stopReason: 'turn_ended', speech: '' });
+            if (currentState.stream) {
+              this.streamCompletionAccounting.get(currentState.stream)?.();
+            }
             this.emitTrace({ type: 'inference:turn_ended', agentName: agent.name });
           } else if (overBudget || overPhysical) {
             // Context budget exceeded: break the stream, let compile() compress.
@@ -9072,6 +9079,31 @@ export class AgentFramework {
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
+    let latestUsage: DetailedUsage | undefined;
+    let completionAccounted = false;
+    const completeAccounting = (usage: DetailedUsage | undefined): void => {
+      if (completionAccounted) return;
+      completionAccounted = true;
+      this.streamCompletionAccounting.delete(stream);
+      this.emitTrace({
+        type: 'inference:completed',
+        agentName: agent.name,
+        durationMs: Date.now() - startTime,
+        tokenUsage: usage ? {
+          input: usage.inputTokens,
+          output: usage.outputTokens,
+          cacheCreation: usage.cacheCreationTokens,
+          cacheRead: usage.cacheReadTokens,
+        } : undefined,
+      });
+      if (usage) {
+        this.usageTracker.onInferenceCompleted(agent.name, usage, usage.estimatedCost
+          ? { total: usage.estimatedCost.total, currency: usage.estimatedCost.currency }
+          : undefined);
+        this.persistUsageState();
+      }
+    };
+    this.streamCompletionAccounting.set(stream, () => completeAccounting(latestUsage));
     // Membrane usage events are cumulative across the native/XML tool loop.
     // Keep the previous cumulative sample so consumers that operate at the
     // physical provider-call boundary (estimator calibration and kv receipt
@@ -9609,22 +9641,7 @@ export class AgentFramework {
                     .join('\n'),
             });
 
-            this.emitTrace({
-              type: 'inference:completed',
-              agentName: agent.name,
-              durationMs,
-              tokenUsage,
-            });
-
-            if (du) {
-              this.usageTracker.onInferenceCompleted(agent.name, {
-                inputTokens: du.inputTokens,
-                outputTokens: du.outputTokens,
-                cacheCreationTokens: du.cacheCreationTokens,
-                cacheReadTokens: du.cacheReadTokens,
-              }, du.estimatedCost ? { total: du.estimatedCost.total, currency: du.estimatedCost.currency } : undefined);
-              this.persistUsageState();
-            }
+            completeAccounting(du);
 
             // Log inference
             this.logInference({
@@ -10144,6 +10161,12 @@ export class AgentFramework {
           }
 
           case 'usage': {
+            // Already cumulative across rounds: replace, rather than sum, and
+            // retain Membrane's cost at the rates that served those rounds.
+            latestUsage = {
+              ...event.usage,
+              estimatedCost: event.usage.estimatedCost ? { ...event.usage.estimatedCost } : undefined,
+            };
             agent.lastStreamInputTokens = event.usage.inputTokens;
             agent.lastStreamRealInputTokens =
               (event.usage.inputTokens ?? 0) +
@@ -10361,6 +10384,7 @@ export class AgentFramework {
         }
       }
       this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`);
+      this.streamCompletionAccounting.delete(stream);
       if (ownsPhysicalStream) {
         this.activeStreams.delete(agent.name);
         this.pendingAssistantBlocks.delete(agent.name);
