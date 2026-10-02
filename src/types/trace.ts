@@ -48,6 +48,8 @@ export type TraceEvent =
        * activation with its channel without re-deriving routing.
        */
       channelId?: string;
+      /** True for a control-plane wake that must not surface typing/prose. */
+      silent?: boolean;
     })
   | (TraceEventBase & {
       type: 'inference:completed';

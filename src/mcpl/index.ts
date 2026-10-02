@@ -142,6 +142,8 @@ export {
   resolveToolClass,
   isToolClass,
   type ToolClass,
+  type ToolClassSource,
+  type EffectiveToolClass,
 } from './tool-classes.js';
 export { globMatch } from './tool-glob.js';
 
