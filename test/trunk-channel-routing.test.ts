@@ -29,6 +29,7 @@ import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 function internals(framework: AgentFramework) {
   return framework as unknown as {
     activeTriggerChannels: Map<string, string>;
+    turnLocusPins: Map<string, string>;
     pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number; channelId?: string }>;
     derivePushEventChannel(
       origin: Record<string, unknown> | undefined,
@@ -287,6 +288,111 @@ describe('Trunk channel routing (item-3 redux)', () => {
       'discord:dm:42',
       'the map must reflect the CURRENT turn’s channel, not chanA',
     );
+    await framework.stop();
+  });
+
+  it('a WebUI turn after Discord traffic pins null and routes with no guess', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'private WebUI reply' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    let resolveCalls = 0;
+    const routedLoci: Array<string | null> = [];
+    i.channelRegistry = {
+      resolveLocus: () => { resolveCalls++; return 'discord:guild:last-room'; },
+      routeSpeech: async (_agent: string, _text: string, locus: string | null) => {
+        routedLoci.push(locus);
+        return null;
+      },
+      getDescriptor: () => undefined,
+      sendOutgoingChunk: () => {}, sendOutgoingComplete: () => {}, sendOutgoingLifecycle: () => {},
+      startTyping: () => {}, stopTyping: () => {}, stopAll: () => {}, getChannelTools: () => [],
+    };
+
+    const scout = framework.getAgent('scout')!;
+    await (framework as unknown as { startAgentStream(agent: unknown, trigger?: unknown): Promise<void> })
+      .startAgentStream(scout, {
+        agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
+      });
+    await framework.runUntilIdle();
+
+    assert.equal(resolveCalls, 0, 'non-channel origin must bypass global last-inbound');
+    assert.equal(i.turnLocusPins.has('scout'), false, 'WebUI turn must freeze no Discord locus');
+    assert.deepEqual(routedLoci, [], 'private prose is retained without calling routeSpeech');
+    const texts = scout.getContextManager().getAllMessages().flatMap((m) => m.content)
+      .filter((b): b is { type: 'text'; text: string } => b.type === 'text').map((b) => b.text);
+    assert.ok(texts.some((t) => t.includes('[delivered] nothing') && t.includes('kept private')));
+    await framework.stop();
+  });
+
+  it('a WebUI turn overrides even a resident home channel', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'private resident reply' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    let resolveCalls = 0;
+    i.channelRegistry = {
+      resolveLocus: () => { resolveCalls++; return 'discord:guild:resident-home'; },
+      routeSpeech: async () => null,
+      getDescriptor: () => undefined,
+      sendOutgoingChunk: () => {}, sendOutgoingComplete: () => {}, sendOutgoingLifecycle: () => {},
+      startTyping: () => {}, stopTyping: () => {}, stopAll: () => {}, getChannelTools: () => [],
+    };
+
+    const scout = framework.getAgent('scout')!;
+    await (framework as unknown as { startAgentStream(agent: unknown, trigger?: unknown): Promise<void> })
+      .startAgentStream(scout, {
+        agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
+      });
+    await framework.runUntilIdle();
+
+    assert.equal(resolveCalls, 0, 'non-channel origin must bypass home and active resolvers too');
+    assert.equal(i.turnLocusPins.has('scout'), false);
+    await framework.stop();
+  });
+
+  it('a channel-triggered turn still pins its channel', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'channel reply' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    i.channelRegistry = {
+      resolveLocus: () => i.activeTriggerChannels.get('scout') ?? null,
+      routeSpeech: async () => null,
+      getDescriptor: () => undefined,
+      sendOutgoingChunk: () => {}, sendOutgoingComplete: () => {}, sendOutgoingLifecycle: () => {},
+      startTyping: () => {}, stopTyping: () => {}, stopAll: () => {}, getChannelTools: () => [],
+    };
+
+    const scout = framework.getAgent('scout')!;
+    await (framework as unknown as { startAgentStream(agent: unknown, trigger?: unknown): Promise<void> })
+      .startAgentStream(scout, {
+        agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(),
+        channelId: 'discord:guild:chanA',
+      });
+    await framework.runUntilIdle();
+
+    assert.equal(i.turnLocusPins.get('scout'), 'discord:guild:chanA');
+    await framework.stop();
+  });
+
+  it('a heartbeat turn still uses the global fallback', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'heartbeat reply' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    i.channelRegistry = {
+      resolveLocus: () => 'discord:guild:last-room',
+      routeSpeech: async () => null,
+      getDescriptor: () => undefined,
+      sendOutgoingChunk: () => {}, sendOutgoingComplete: () => {}, sendOutgoingLifecycle: () => {},
+      startTyping: () => {}, stopTyping: () => {}, stopAll: () => {}, getChannelTools: () => [],
+    };
+
+    const scout = framework.getAgent('scout')!;
+    await (framework as unknown as { startAgentStream(agent: unknown, trigger?: unknown): Promise<void> })
+      .startAgentStream(scout, {
+        agentName: 'scout', reason: 'heartbeat', source: 'timer', timestamp: Date.now(),
+      });
+    await framework.runUntilIdle();
+
+    assert.equal(i.turnLocusPins.get('scout'), 'discord:guild:last-room');
     await framework.stop();
   });
 

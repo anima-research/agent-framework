@@ -731,6 +731,26 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it('channel_open deliberately lifts private-turn routing into the opened channel', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c-private', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public after deliberate open.' }] as ContentBlock[]));
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall = async () =>
+      ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
+    const agent = framework.getAgent('assistant')!;
+    await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
+      .startAgentStream(agent, {
+        agentName: 'assistant', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
+      });
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, [{ text: 'Public after deliberate open.', locus: 'discord:guild:observatory' }]);
+    await framework.stop();
+  });
+
   it('reactions and system markers injected mid-turn do not clear send suppression', async () => {
     // A reaction (`chat:reaction` tag) or a `system: true` marker is not
     // conversational input: prose following an explicit send stays suppressed,

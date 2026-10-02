@@ -345,4 +345,6 @@ export interface InferenceRequest {
   /** Ephemeral system-position prompt for this turn only. Never written to
    * Chronicle; callers must supply bounded non-secret control text. */
   ephemeralSystemPrompt?: string;
+  /** True when a private non-channel surface requested this inference. */
+  nonChannelOrigin?: boolean;
 }
