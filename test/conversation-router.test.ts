@@ -10,6 +10,60 @@ function makeRouter(overrides: Partial<ConstructorParameters<typeof Conversation
 }
 
 // ---------------------------------------------------------------------------
+// Fork namespace identity
+// ---------------------------------------------------------------------------
+
+function proposedName(channelId: string, router = makeRouter()): string {
+  const decision = router.route({ channelId, mentioned: true, kind: 'channel', now: T0 });
+  assert.equal(decision.kind, 'spawn');
+  if (decision.kind !== 'spawn') assert.fail('expected spawn');
+  return decision.agentName;
+}
+
+test('fork names distinguish raw channel IDs, including escape-like and Unicode IDs', () => {
+  const channelIds = [
+    'slack:C1', 'slack/C1', 'slack C1', 'slack-C1', 'slack::C1',
+    'slack~003aC1', 'slack%3AC1', 'slack_C1', 'slack\\C1',
+    '', '-', '/', '.', '..', '~', '\0', '\n',
+    'café', 'cafe\u0301', '频道', '😀', '\ud800', '\ud801', '\ufffd',
+    'slack:C1-g1', 'slack:C1-g2',
+  ];
+  const names = channelIds.map((channelId) => proposedName(channelId));
+  assert.equal(new Set(names).size, channelIds.length, 'every raw ID needs a distinct namespace');
+  for (let i = 0; i < channelIds.length; i++) {
+    assert.equal(proposedName(channelIds[i]!), names[i], 'naming is deterministic across routers');
+    assert.doesNotMatch(names[i]!, /[/\\\s\0]/, 'channel IDs cannot introduce namespace path separators');
+  }
+});
+
+test('new fork names cannot reuse a legacy sanitized namespace, even for safe IDs', () => {
+  const router = makeRouter({ agentPrefix: 'support' });
+  const names = ['slack:C1', 'slack-C1', '', 'slack~003aC1'].map(
+    (channelId) => proposedName(channelId, router),
+  );
+  for (const name of names) {
+    assert.ok(name.startsWith('support'), 'custom prefix is retained');
+    assert.ok(
+      !/^support-[A-Za-z0-9_-]*-g1$/.test(name),
+      'every new name must be outside the legacy sanitizer output, not just unsafe IDs',
+    );
+  }
+});
+
+test('legacy generation counters remain keyed by raw channel ID with the new naming', () => {
+  const router = makeRouter();
+  router.hydrateGenerations({ 'slack:C1': 3, 'slack/C1': 1 });
+  const colonName = proposedName('slack:C1', router);
+  const slashName = proposedName('slack/C1', router);
+  const safeName = proposedName('slack-C1', router);
+  assert.match(colonName, /-g4$/);
+  assert.match(slashName, /-g2$/);
+  assert.match(safeName, /-g1$/);
+  assert.notEqual(safeName, 'conversation-slack-C1-g1', 'a new channel must not inherit legacy history');
+  assert.deepEqual(router.exportGenerations(), { 'slack:C1': 3, 'slack/C1': 1 });
+});
+
+// ---------------------------------------------------------------------------
 // Bind policy
 // ---------------------------------------------------------------------------
 
@@ -19,7 +73,7 @@ test('DM message binds without a mention (default dm bind: always)', () => {
   assert.equal(decision.kind, 'spawn');
   if (decision.kind === 'spawn') {
     assert.equal(decision.generation, 1);
-    assert.match(decision.agentName, /^conversation-slack-D1-g1$/);
+    assert.equal(decision.agentName, 'conversation~slack~003aD1-g1');
     assert.equal(decision.trigger, true);
   }
 });

@@ -67,7 +67,8 @@ export interface ConversationRouterConfig {
   /** Final system-initiated user message sent to a fork on expiry. */
   closurePrompt?: string;
 
-  /** Prefix for generated fork agent names. Default 'conversation'. */
+  /** Prefix for generated fork agent names. Default 'conversation'.
+   * Read the generated name from the binding rather than constructing it. */
   agentPrefix?: string;
 
   /**
@@ -274,11 +275,16 @@ export class ConversationRouter {
     return rule === 'always' || facts.mentioned;
   }
 
-  /** `conversation-slack-C123-g2` — agent names double as Chronicle
-   * namespace components, so the channel id is sanitized. */
+  /** Agent names double as Chronicle namespace components. Escape each
+   * unsafe UTF-16 code unit (including '~') to preserve every distinct JS
+   * string, even lone surrogates, without introducing path separators.
+   * The '~' after the prefix keeps ALL new names outside the old lossy
+   * sanitizer's output for that prefix, including already-safe channel IDs.
+   * Example: `conversation~slack~003aC123-g2`. */
   private forkAgentName(channelId: string, generation: number): string {
     const prefix = this.config.agentPrefix ?? 'conversation';
-    const safe = channelId.replace(/[^A-Za-z0-9_-]+/g, '-');
-    return `${prefix}-${safe}-g${generation}`;
+    const safe = channelId.replace(/[^A-Za-z0-9_-]/g, (unit) =>
+      `~${unit.charCodeAt(0).toString(16).padStart(4, '0')}`);
+    return `${prefix}~${safe}-g${generation}`;
   }
 }

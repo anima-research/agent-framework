@@ -12,6 +12,10 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+### Breaking
+
+- **Hosts using conversation forks:** Generated agent names now escape channel IDs losslessly, so distinct channels cannot share a fork name or Chronicle namespace (#44). Names use a new separator, for example `conversation~slack~003aC1-g1`, including for IDs that needed no escaping. Integrations that construct names must instead read `ConversationRouter.getBinding(channelId).agentName` after binding. Existing Chronicle history remains under its original names, and persisted per-channel generation counters continue unchanged; fresh engagements use the new names and never alias the legacy sanitizer's output for the same configured prefix. No store migration or sibling dependency upgrade is required.
+
 ## 0.19.0 — 2026-09-28
 
 ### Added
