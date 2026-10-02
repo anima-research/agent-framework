@@ -16,6 +16,7 @@ function fixture() {
   const calls: Array<{ kind: 'open' | 'close'; id: string; address?: unknown }> = [];
   const pending: Array<{ finish: () => void; fail: () => void }> = [];
   const held = new Set<string>();
+  const publishedWhileOpen: boolean[] = [];
   const serve = (kind: 'open' | 'close', params: { channelId?: string; address?: unknown }) => {
     const id = params.channelId!;
     calls.push({ kind, id, address: params.address });
@@ -32,6 +33,10 @@ function fixture() {
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
     sendChannelsOpen: (params: { channelId?: string; address?: unknown }) => serve('open', params) as Promise<ChannelsOpenResult>,
     sendChannelsClose: (params: { channelId: string }) => serve('close', params),
+    sendChannelsPublish: async (params: { channelId: string }) => {
+      publishedWhileOpen.push(actual.get(params.channelId) === true);
+      return { delivered: true };
+    },
   };
   const traces: Array<{ type: string; [key: string]: unknown }> = [];
   const registry = new ChannelRegistry(
@@ -52,7 +57,7 @@ function fixture() {
     assert.equal(settled, true, 'lifecycle operations must settle');
     await result;
   };
-  return { registry, actual, calls, pending, held, traces, isOpen, tool, drain };
+  return { registry, actual, calls, pending, held, traces, isOpen, tool, drain, publishedWhileOpen };
 }
 
 test('remove/re-add during reconcile converges on the replacement desired state, with ACK first (#185)', async () => {
@@ -175,6 +180,46 @@ test('descriptor updates during an open refresh its target, but labels alone do 
     assert.deepEqual(f.calls.at(-1)?.address, { value: changesAddress ? 'new-target' : 'original' });
     assert.equal(f.isOpen(), true);
   }
+});
+
+for (const delivery of ['speech', 'reply'] as const) {
+  test(delivery + ' during pending transport work preserves the newer tune-out epoch', async () => {
+    // Felix's review reproduction: merely waiting for transport must not
+    // turn a delivery into a decision to cancel attention diversion.
+    const f = fixture();
+    await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+    f.held.add('x');
+    const close = f.tool('close');
+    await tick();
+    f.registry.enterTuneOut('test', 'x', {
+      epochId: 'new-epoch', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+    }, 'agent-tool');
+    const sent = delivery === 'speech'
+      ? f.registry.routeSpeech('resident', 'hello', 'x').then((result) => result?.delivered === true)
+      : f.registry.openIfClosedForSend('x', 'test').then((result) => result.status === 'opened');
+    await f.drain(close, sent);
+    assert.equal(await sent, true);
+    assert.equal(f.registry.getTuneOutState('test', 'x')?.params.epochId, 'new-epoch');
+    assert.equal(f.actual.get('x'), true);
+    if (delivery === 'speech') assert.deepEqual(f.publishedWhileOpen, [true]);
+    assert.equal((await f.tool('open')).success, false, 'explicit channel_open still requires tune-out cancellation');
+    assert.equal(f.registry.getTuneOutState('test', 'x')?.params.epochId, 'new-epoch');
+  });
+}
+
+test('automatic opening accepts a newer tune-out established during its RPC without clearing it', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor()] });
+  f.held.add('x');
+  const speech = f.registry.routeSpeech('resident', 'hello', 'x');
+  await tick();
+  f.registry.enterTuneOut('test', 'x', {
+    epochId: 'mid-open-epoch', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+  }, 'agent-tool');
+  await f.drain(speech);
+  assert.equal((await speech)?.delivered, true);
+  assert.equal(f.registry.getTuneOutState('test', 'x')?.params.epochId, 'mid-open-epoch');
+  assert.deepEqual(f.publishedWhileOpen, [true]);
 });
 
 test('a newer tune-out decision keeps transport open when an older close completes', async () => {

@@ -2329,15 +2329,21 @@ export class ChannelRegistry {
    * events, desired state, and live state can never diverge by path.
    * Desired state is recorded BEFORE the server round-trip: intent sticks
    * even if the subscribe fails, and reconciliation retries later.
+   * Automatic delivery needs open transport, not a change of attention:
+   * preserve tune-out epochs both before and during the round-trip.
    */
   private async openChannelNow(
     entry: ChannelEntry,
-    source: string,
+    source: 'agent-tool' | 'opened-by-reply' | 'opened-by-delivery',
     history?: ChannelHistoryRequest,
   ): Promise<ChannelsOpenResult> {
-    this.setDesiredState(entry.serverId, entry.descriptor.id, 'open', source);
+    const transportOnly = source !== 'agent-tool';
+    if (!transportOnly || this.getDesiredState(entry.serverId, entry.descriptor.id) !== 'tuned-out') {
+      this.setDesiredState(entry.serverId, entry.descriptor.id, 'open', source);
+    }
     const applied = await this.applyDesiredChannelState(entry.serverId, entry.descriptor.id, history);
-    if (!applied.open || this.getDesiredState(entry.serverId, entry.descriptor.id) !== 'open') {
+    const desired = this.getDesiredState(entry.serverId, entry.descriptor.id);
+    if (!applied.open || (desired !== 'open' && !(transportOnly && desired === 'tuned-out'))) {
       throw new Error('Channel open was superseded by a newer lifecycle decision');
     }
     return applied.result!;
