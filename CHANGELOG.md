@@ -12,10 +12,6 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
-### Fixed
-
-- MCPL request and notification handlers contain synchronous throws and async rejections (#186), including channel reconciliation failures after an acknowledgement. Failures emit `mcpl:request-handler-error`; requests receive JSON-RPC `-32603` only when no response write has been attempted. Pre-write JSON encoding failures can receive an internal-error reply; possibly partial transport writes remain single-attempt. Failed error-response writes are included in the trace, failures also reach stderr for headless hosts, and notifications receive no response.
-
 ## 0.19.0 — 2026-09-28
 
 ### Added

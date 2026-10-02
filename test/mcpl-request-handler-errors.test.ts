@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import { AgentFramework } from '../src/framework.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
@@ -349,3 +351,51 @@ test('post-response failures reach stderr when no trace subscriber is attached',
   assert.match(String(errors[0]?.[0]), /srv.*channels-register/);
   assert.match(String(errors[0]?.[1]), /headless reconciliation failed/);
 });
+
+for (const mode of ['handshake', 'connected', 'throwing-listener']) {
+  test('separate stdio host survives inbound ' + mode + ' faults and processes later messages', () => {
+    const probe = spawnSync(process.execPath, [
+      '--import', 'tsx', fileURLToPath(new URL('./fixtures/mcpl-inbound-host-probe.mjs', import.meta.url)), mode,
+    ], { encoding: 'utf8', timeout: 5000 });
+    assert.equal(probe.error, undefined);
+    assert.equal(probe.status, 0, probe.stderr);
+    assert.match(probe.stdout, /continued/);
+  });
+}
+
+for (const value of [null, 42, 'hi', true, []]) {
+  test('non-object inbound ' + JSON.stringify(value) + ' leaves the next notification deliverable', () => {
+    const { connection, transport } = wireHarness();
+    let received = false;
+    connection.removeAllListeners('tools-list-changed');
+    connection.on('tools-list-changed', () => { received = true; });
+    assert.doesNotThrow(() => transport.emit('line', JSON.stringify(value)));
+    transport.emit('line', JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }));
+    assert.equal(received, true);
+  });
+}
+
+for (const release of ['live', 'ready', 'readyControlPlane'] as const) {
+  test('synchronous notification failure is contained during ' + release + ' dispatch and traced', (t) => {
+    const transport = new ResponseTransport();
+    const connection = new (McplServerConnection as any)('srv', null, transport) as McplServerConnection;
+    const { traces } = harness(connection);
+    const errors: unknown[][] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args); });
+    const seen: number[] = [];
+    connection.removeAllListeners('tools-list-changed');
+    connection.on('tools-list-changed', (params: { sequence: number }) => {
+      if (params.sequence === 1) throw new Error('raw notification failed');
+      seen.push(params.sequence);
+    });
+    if (release === 'live') connection.ready();
+    const send = (sequence: number) => transport.emit('line', JSON.stringify({
+      jsonrpc: '2.0', method: 'notifications/tools/list_changed', params: { sequence },
+    }));
+    assert.doesNotThrow(() => { send(1); send(2); });
+    if (release !== 'live') assert.doesNotThrow(() => connection[release]());
+    assert.deepEqual(seen, [2]);
+    assert.equal(traces.filter((e) => e.type === 'mcpl:server-error').length, 1);
+    assert.equal(errors.length, 1);
+  });
+}
