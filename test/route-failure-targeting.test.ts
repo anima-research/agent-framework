@@ -4,6 +4,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
+import { ContextManager, PassthroughStrategy } from '@animalabs/context-manager';
+import { CapabilityGrant } from '../src/mcpl/capability-grant.js';
+import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { ProcessEvent } from '../src/index.js';
 import type { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -15,6 +18,12 @@ function internals(framework: AgentFramework) {
     activeTurnTokens: Map<string, number>;
     deferredMessages: Array<{ forAgent?: string; metadata?: Record<string, unknown> }>;
     pendingRequests: unknown[];
+    pendingAssistantBlocks: Map<string, unknown[]>;
+    mcplServerRegistry: McplServerRegistry;
+    lastConversationSweep: number;
+    sweepExpiredConversations(): void;
+    quiesced: boolean;
+    flushDeferredWrites(label: string): Promise<void>;
   };
 }
 
@@ -42,6 +51,8 @@ describe('speech route failure notice targeting', () => {
 
   afterEach(async () => {
     internals(framework).activeTurnTokens.clear();
+    internals(framework).pendingAssistantBlocks.clear();
+    internals(framework).quiesced = false;
     await framework.stop();
     rmSync(tempDir, { recursive: true, force: true });
   });
@@ -106,6 +117,81 @@ describe('speech route failure notice targeting', () => {
     assert.equal(state.deferredMessages[0]!.metadata?.kind, 'discord-send-failed');
     assert.equal(state.pendingRequests.length, 0);
   });
+
+  for (const condition of ['ordinary', 'other-tool-cycle', 'quiesced'] as const) {
+    it('retains a failed TTL-closure reply notice before disposal: ' + condition, async (t) => {
+      const state = internals(framework);
+      const channelId = 'closure-channel';
+      let failPublishing = false;
+      const publisher = {
+        grant: new CapabilityGrant(new Set(['channels.publish']), []),
+        sendChannelsTyping() {},
+        async sendChannelsPublish() {
+          if (failPublishing && condition === 'quiesced') state.quiesced = true;
+          return { delivered: !failPublishing };
+        },
+      };
+      t.mock.method(state.mcplServerRegistry, 'getServer', () => publisher as never);
+      (state.channelRegistry as unknown as { channels: Map<string, unknown> }).channels.set('srv:' + channelId, {
+        serverId: 'srv', descriptor: { id: channelId, type: 'srv', label: 'closure test' }, open: true,
+      });
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Initial reply.' }]));
+      framework.pushEvent({
+        type: 'mcpl:channel-incoming', serverId: 'srv', channelId, messageId: 'closure-incoming',
+        author: { id: 'user', name: 'User' },
+        content: [{ type: 'text', text: 'Please help.' }],
+        timestamp: new Date().toISOString(),
+        metadata: { mentioned: true },
+        triggerInference: true,
+      } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+      const binding = framework.getConversationRouter()!.getBinding(channelId)!;
+      assert.ok(binding);
+      const fork = framework.getAgent(binding.agentName)!;
+
+      failPublishing = true;
+      const finalReply = 'Final reply that the server cannot deliver.';
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: finalReply }]));
+      if (condition === 'other-tool-cycle') state.pendingAssistantBlocks.set('secondary', []);
+      binding.lastActivity = 0;
+      state.lastConversationSweep = 0;
+      state.sweepExpiredConversations();
+      await framework.runUntilIdle();
+      state.pendingAssistantBlocks.clear();
+
+      if (condition === 'quiesced') {
+        assert.ok(framework.getAgent(fork.name) === fork, 'a deferred write keeps its owner registered while quiesced');
+        assert.equal(state.deferredMessages.length, 1);
+        state.lastConversationSweep = 0;
+        state.sweepExpiredConversations();
+        assert.ok(framework.getAgent(fork.name) === fork, 'the fallback reaper must also retain the pending write target');
+        state.quiesced = false;
+        await state.flushDeferredWrites('closure test resume');
+        state.lastConversationSweep = 0;
+        state.sweepExpiredConversations();
+      }
+
+      assert.equal(framework.getAgent(fork.name), null, 'the settled fork is eventually disposed');
+      assert.equal(state.deferredMessages.length, 0);
+      // Open a fresh manager over the retained fork namespace, rather than
+      // relying only on the disposed Agent's in-memory context manager.
+      const archive = await ContextManager.open({
+        store: framework.getStore(), namespace: 'conversations/' + fork.name,
+        isolate: true, strategy: new PassthroughStrategy(),
+      });
+      const { messages } = await archive.compile();
+      const noticeIndex = messages.findIndex((m) => JSON.stringify(m.content).includes('[discord-send-failed]'));
+      const replyIndex = messages.findIndex((m) => m.participant === fork.name && JSON.stringify(m.content).includes(finalReply));
+      assert.ok(replyIndex >= 0, 'the failed closure reply remains archived');
+      assert.ok(noticeIndex > replyIndex, 'the archived failure notice follows the closure reply');
+      assert.equal(messages.filter((m) => JSON.stringify(m.content).includes('[discord-send-failed]')).length, 1);
+      assert.match(JSON.stringify(messages[noticeIndex]!.content), /delivered:false/);
+      const primary = await framework.getAgent('primary')!.getContextManager().compile();
+      assert.ok(!primary.messages.some((m) => JSON.stringify(m.content).includes('[discord-send-failed]')));
+      assert.equal(membrane.calls.length, 2, 'only the initial and closure turns ran');
+      assert.equal(state.pendingRequests.length, 0, 'a failed closure reply does not wake another turn');
+    });
+  }
 
   it('delivers a failed fork reply notice to the fork after its turn, without waking it again', async () => {
     const reply = 'Reply from the fork.';
