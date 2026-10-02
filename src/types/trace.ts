@@ -429,6 +429,20 @@ export type TraceEvent =
       error: string;
     })
   | (TraceEventBase & {
+      /** An inbound RPC request/notification handler threw or rejected. */
+      type: 'mcpl:request-handler-error';
+      serverId: string;
+      /** Connection event name, e.g. channels-register or push-event. */
+      event: string;
+      /** Absent for notifications. */
+      requestId?: string | number;
+      /** True if a response write was attempted before the handler failed. */
+      responseAttempted: boolean;
+      error: string;
+      /** Failure while trying to send an internal-error response. */
+      responseError?: string;
+    })
+  | (TraceEventBase & {
       type: 'mcpl:orphaned-response';
       serverId: string;
       /** The JSON-RPC id of the late response whose pending request already timed out. */
