@@ -1075,9 +1075,27 @@ export class WorkspaceModule implements Module {
   // Tool Dispatch
   // ==========================================================================
 
+  private generatedTextFiles = new Map<string, {read: () => string; agentName: string}>();
+
+  /** Generated files bypass stored blobs so every read reflects current definitions. */
+  registerGeneratedTextFile(path: string, read: () => string, agentName: string): void {
+    const [mount, ...parts] = path.split('/');
+    if (!this.config.mounts.some(m => m.name === mount) || !parts.length
+      || parts.some(p => !p || p === '.' || p === '..') || this.generatedTextFiles.has(path))
+      throw new Error(`Duplicate/invalid generated path: ${path}`);
+    this.generatedTextFiles.set(path, {read, agentName});
+  }
+
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     try {
       const input = call.input as Record<string, unknown>;
+      const generated = typeof input?.path === 'string' ? this.generatedTextFiles.get(input.path) : undefined;
+      if (generated) {
+        if (call.callerAgentName !== generated.agentName) return {success:false,isError:true,error:'Generated file belongs to another agent'};
+        if (call.name !== 'read') return {success:false,isError:true,error:'Generated file is read-only; edit the presentation configuration instead'};
+        return await this.handleRead(input as unknown as ReadInput, generated.read());
+      }
+
       switch (call.name) {
         case 'read': return await this.handleRead(input as unknown as ReadInput);
         case 'read_image': return await this.handleReadImage(input as unknown as ReadImageInput);
@@ -1746,7 +1764,7 @@ export class WorkspaceModule implements Module {
   // Tool Handlers
   // ==========================================================================
 
-  private async handleRead(input: ReadInput): Promise<ToolResult> {
+  private async handleRead(input: ReadInput, generatedContent?: string): Promise<ToolResult> {
     const characterPaging = input.offsetChars !== undefined || input.limitChars !== undefined;
     const offsetChars = input.offsetChars ?? 0;
     const limitChars = input.limitChars ?? 2000;
@@ -1760,6 +1778,8 @@ export class WorkspaceModule implements Module {
         return { success: false, isError: true, error: 'offsetChars must be a non-negative safe integer and limitChars a positive safe integer.' };
       }
     }
+    let content = generatedContent;
+    if (content === undefined) {
     const { mount, relativePath } = this.parsePath(input.path);
     const store = this.getStore();
 
@@ -1775,7 +1795,8 @@ export class WorkspaceModule implements Module {
       return { success: false, error: `Blob not found for: ${input.path}`, isError: true };
     }
 
-    const content = blob.toString('utf-8');
+    content = blob.toString('utf-8');
+    }
     if (characterPaging) {
       const start = Math.min(offsetChars, content.length);
       const splitsPair = (at: number): boolean =>
