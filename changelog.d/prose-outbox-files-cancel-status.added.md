@@ -1,0 +1,4 @@
+- Prose outbox, for Sol's requirements (2026-09-26):
+  - A queued send keeps exact copies of its files (`proseOutbox.fileArgs`, default `["files"]`), hash-checked before each retry. A changed or missing copy is given up visibly; a call whose files can't be kept isn't queued and returns an error. Nothing is ever sent text-only in place of a message with files.
+  - `outbox_cancel` / `outbox_status` tools whenever the outbox is enabled, plus `AgentFramework.cancelOutboxEntry` / `getOutboxStatus` for operators. Delivery notes carry each entry's short id; an in-flight retry can't be withdrawn.
+  - The queue's directories are 0700.
