@@ -48,9 +48,11 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore) {
       return { delivered: true };
     },
   };
+  let currentServer = server;
+  const replaceServer = () => { currentServer = { ...server }; };
   const traces: Array<{ type: string; [key: string]: unknown }> = [];
   const registry = new ChannelRegistry(
-    { getServer: () => server } as unknown as McplServerRegistry,
+    { getServer: () => currentServer } as unknown as McplServerRegistry,
     {} as FeatureSetManager, () => {}, (event) => traces.push(event),
     { store, onRouteFailure: (info) => routeFailures.push(info),
       onChannelAutoOpened: (info) => { notices.push(info); onNotice?.(info); } },
@@ -69,7 +71,7 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore) {
     assert.equal(settled, true, 'lifecycle operations must settle');
     await result;
   };
-  return { registry, actual, calls, pending, held, traces, isOpen, tool, drain, publishedWhileOpen, notices, routeFailures };
+  return { registry, actual, calls, pending, held, traces, isOpen, tool, drain, publishedWhileOpen, notices, routeFailures, replaceServer };
 }
 
 test('remove/re-add during reconcile converges on the replacement desired state, with ACK first (#185)', async () => {
@@ -406,6 +408,53 @@ test('failed policy opening records intent once, with truthful resident text thr
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+for (const change of ['address', 'type'] as const) {
+  test('failed corrective open does not reuse the old ' + change + ' confirmation', async () => {
+    const f = fixture();
+    await f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+    f.calls.length = 0;
+    f.held.add('x');
+    const backscroll = f.registry.handleChannelToolCall('channel_open', {
+      serverId: 'test', channelId: 'x', backscroll: 5,
+    });
+    await tick();
+    const speech = f.registry.routeSpeech('resident', 'waiting reply', 'x');
+    const updated = change === 'address'
+      ? descriptor('x', true, 'B')
+      : { ...descriptor('x', true, 'A'), type: 'new-type' };
+    await f.registry.handleChanged('test', { updated: [updated] });
+    assert.equal(f.isOpen(), false, 'old target confirmation is invalid after retargeting');
+    f.pending.shift()!.finish(); // successful receipt for A
+    await tick();
+    f.pending.shift()!.fail(); // corrective open for the new target fails
+    await f.drain(backscroll, speech);
+    assert.equal((await backscroll).success, false);
+    assert.equal(await speech, null);
+    assert.equal(f.isOpen(), false);
+    assert.deepEqual(f.publishedWhileOpen, []);
+    assert.equal(f.routeFailures.length, 1);
+  });
+}
+
+test('a failed RPC from a replaced connection cannot preserve its old open confirmation', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  f.held.add('x');
+  const backscroll = f.registry.handleChannelToolCall('channel_open', {
+    serverId: 'test', channelId: 'x', backscroll: 5,
+  });
+  await tick();
+  const speech = f.registry.routeSpeech('resident', 'waiting reply', 'x');
+  f.replaceServer();
+  f.pending.shift()!.fail();
+  await f.drain(backscroll, speech);
+  assert.equal((await backscroll).success, false);
+  assert.equal(await speech, null);
+  assert.equal(f.isOpen(), false);
+  assert.deepEqual(f.publishedWhileOpen, []);
+  assert.equal(f.routeFailures.length, 1);
 });
 
 test('descriptor churn exhausts convergence and fails the tool plus joined deliveries instead of hanging', async () => {

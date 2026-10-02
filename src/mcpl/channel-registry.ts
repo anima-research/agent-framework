@@ -212,7 +212,12 @@ function shallowEqualRecord(
 interface ChannelEntry {
   serverId: string;
   descriptor: ChannelDescriptor;
+  /** Last confirmed state for this entry's current transport target. */
   open: boolean;
+}
+
+function sameChannelTarget(a: ChannelDescriptor, b: ChannelDescriptor): boolean {
+  return a.type === b.type && isDeepStrictEqual(a.address, b.address);
 }
 
 /** Minimal responder interface for sending JSON-RPC results back. */
@@ -813,6 +818,9 @@ export class ChannelRegistry {
           this.emitTraceFn({ type: 'mcpl:channel-descriptor-rejected', serverId, channelId: channel.id, reason: 'update for unregistered channel' });
           continue;
         }
+        // A live subscription to the old target does not confirm the new
+        // type/address. Label-only updates preserve that confirmation.
+        if (!sameChannelTarget(existing.descriptor, channel)) existing.open = false;
         existing.descriptor = channel;
         this.appendLabelSighting(channel.id, channel.label, extractDmMeta(channel.metadata));
         addedResults.push({ id: channel.id, accepted: true });
@@ -2125,28 +2133,36 @@ export class ChannelRegistry {
           throw error;
         }
         attempts++;
+        const sameTarget = () => this.serverRegistry.getServer(serverId) === server &&
+          sameChannelTarget(entry.descriptor, descriptor);
         let result: ChannelsOpenResult | undefined;
-        if (open) {
-          result = await server.sendChannelsOpen({
-            channelId, type: descriptor.type, address: descriptor.address,
-            ...(options?.history ? { history: options.history } : {}),
-          });
-        } else {
-          await server.sendChannelsClose({ channelId });
+        try {
+          if (open) {
+            result = await server.sendChannelsOpen({
+              channelId, type: descriptor.type, address: descriptor.address,
+              ...(options?.history ? { history: options.history } : {}),
+            });
+          } else {
+            await server.sendChannelsClose({ channelId });
+          }
+        } catch (error) {
+          // A failed same-target backscroll can retain its known-open state.
+          // A receipt/failure from an older connection or target cannot.
+          if (this.channels.get(channelKey) === entry && !sameTarget()) entry.open = false;
+          throw error;
         }
-        // Failure is not a confirmed transition. In particular, a failed
-        // backscroll request must not erase an already-live subscription.
-        // Never apply a receipt to a removed entry or a replacement connection.
-        // Reconcile their current state before releasing this channel's queue.
-        if (this.channels.get(channelKey) !== entry ||
-            this.serverRegistry.getServer(serverId) !== server) continue;
+        // Never apply an old receipt to the current target, even transiently:
+        // a corrective open might fail before that stale bit is replaced.
+        if (this.channels.get(channelKey) !== entry) continue;
+        if (!sameTarget()) {
+          entry.open = false;
+          continue;
+        }
         if (open && !entry.open) opened = true;
         if (!open) opened = false;
         entry.open = open;
         const now = this.getDesiredState(serverId, channelId);
-        const targetChanged = entry.descriptor.type !== descriptor.type ||
-          !isDeepStrictEqual(entry.descriptor.address, descriptor.address);
-        if (targetChanged || open !== (now === 'open' || now === 'tuned-out')) continue;
+        if (open !== (now === 'open' || now === 'tuned-out')) continue;
         return { open, opened, result };
       }
     });
@@ -2185,7 +2201,7 @@ export class ChannelRegistry {
     const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
     if (!current) throw new Error('Channel registration was removed while delivery waited');
     if (!current.open || this.getDesiredState(current.serverId, current.descriptor.id) === 'closed') {
-      throw new Error('Channel was closed or selected for closure while delivery waited');
+      throw new Error('Channel is not confirmed open for delivery, or was selected for closure while delivery waited');
     }
     return current;
   }
