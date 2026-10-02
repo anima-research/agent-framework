@@ -21,6 +21,8 @@ function occurrence(id: string, self = false, wake = !self): Occurrence {
 function harness(published = new Set<string>()) {
   const delivered: Array<{ id: string; body: string; activation: string | null }> = [];
   const wakes = new Set<string>();
+  const audiences = new Map<string, string[]>();
+  const unauthorized = new Set<string>();
   let saved: CoalescingSnapshot | undefined;
   const receipts: CoalescingReceiptRecord[] = [];
   let release: ((value: { content: Array<{ type: 'text'; text: string }> }) => void) | undefined;
@@ -44,8 +46,8 @@ function harness(published = new Set<string>()) {
       if (o.event.wake && !o.event.self) wakes.add(o.eventId);
     },
     cancelWake: () => { wakes.clear(); },
-    authorized: () => true,
-    audience: async () => ['agent'],
+    authorized: o => !unauthorized.has(o.eventId),
+    audience: async o => audiences.get(o.eventId) ?? [o.deliverTo ?? 'agent'],
     render: async (o) => {
       if (!hold) return { content: [{ type: 'text', text: 'render:' + o.eventId }] };
       started();
@@ -59,7 +61,7 @@ function harness(published = new Set<string>()) {
     wasPublished: (_subject, id) => published.has(id),
   });
   return {
-    coalescer, delivered, wakes, published, receipts, rendering,
+    coalescer, delivered, wakes, published, receipts, rendering, audiences, unauthorized,
     hold: () => { hold = true; },
     release: () => { hold = false; release!({ content: [{ type: 'text', text: 'completed active render' }] }); },
     saved: () => structuredClone(saved!),
@@ -164,3 +166,34 @@ test('a second interruption preserves frozen and pending batches with their sepa
   assert.deepEqual(twice.delivered.map(d => d.id), ['active', 'new-quiet']);
   assert.deepEqual(twice.delivered.map(d => d.activation), ['active', 'new-quiet']);
 });
+
+for (const olderAudience of ['gone', 'other-live', 'unauthorized'] as const) {
+  test('a frozen batch for ' + olderAudience + ' cannot block a newer batch for this recipient', async () => {
+    const live = harness();
+    await live.coalescer.accept({ ...occurrence('old'), deliverTo: 'old-fork' });
+    live.hold();
+    const run = live.coalescer.assemble('old-fork');
+    await live.rendering;
+    await live.coalescer.accept(occurrence('new'));
+    const snapshot = structuredClone(live.coalescer.snapshot());
+    live.coalescer.suspend(); live.release(); await run;
+
+    const restored = harness();
+    restored.audiences.set('old', olderAudience === 'gone' ? [] : ['old-fork']);
+    restored.audiences.set('new', ['new-fork']);
+    if (olderAudience === 'unauthorized') restored.unauthorized.add('old');
+    restored.coalescer.restore(snapshot);
+    await restored.coalescer.assemble('new-fork');
+    assert.deepEqual(restored.delivered.map(d => d.id), ['new'], 'later eligible work is not head-of-line blocked');
+    if (olderAudience === 'other-live') {
+      assert.deepEqual(restored.coalescer.pendingBatchOccurrences().map(o => o.eventId), ['old']);
+      assert(restored.wakes.has('old'), 'consuming the newer batch preserves the other recipient cause');
+      await restored.coalescer.assemble('old-fork');
+      assert.deepEqual(restored.delivered.map(d => d.id), ['new', 'old']);
+    } else {
+      assert.deepEqual(restored.coalescer.pendingBatchOccurrences(), [], 'unreachable frozen work is settled without widening audience');
+      await restored.coalescer.assemble('old-fork');
+      assert.deepEqual(restored.delivered.map(d => d.id), ['new']);
+    }
+  });
+}

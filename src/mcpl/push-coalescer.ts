@@ -678,16 +678,46 @@ export class PushCoalescer<E = unknown> {
       return (await this.host.audience(this.activationFor(rendering.batch) ?? rendering.batch.latest)).includes(agentName) && state.rendering === rendering
         ? { done: rendering.done, recovered: !!rendering.recovered } : undefined;
     }
-    const recovered = !!state.recovered?.length;
-    const batch = recovered ? state.recovered![0] : state.batch;
-    if (!batch) return undefined;
-    const audience = await this.host.audience(this.activationFor(batch) ?? batch.latest);
-    if (!audience.includes(agentName) || (recovered ? state.recovered?.[0] !== batch : state.batch !== batch) || state.rendering) return undefined;
-    if (recovered) state.recovered!.shift();
-    else state.batch = undefined;
+    let recovered = false;
+    let batch: DeferredBatch<E> | undefined;
+    let pruned = false;
+    // Preserve order within this recipient's recovered work, not a global
+    // head-of-line dependency on another (or vanished) recipient's batch.
+    for (let i = 0; i < (state.recovered?.length ?? 0);) {
+      const candidate = state.recovered![i]!;
+      const authorized = this.host.authorized(candidate.latest);
+      const audience = authorized
+        ? await this.host.audience(this.activationFor(candidate) ?? candidate.latest) : [];
+      if (!authorized || audience.length === 0) {
+        this.host.audit({ kind: authorized ? 'audience-gone' : 'revoked', subject, eventId: candidate.latest.eventId });
+        state.recovered!.splice(i, 1);
+        pruned = true;
+        continue;
+      }
+      if (audience.includes(agentName)) {
+        batch = candidate;
+        state.recovered!.splice(i, 1);
+        recovered = true;
+        break;
+      }
+      i++;
+    }
+    if (!batch && state.batch) {
+      const candidate = state.batch;
+      const audience = await this.host.audience(this.activationFor(candidate) ?? candidate.latest);
+      if (audience.includes(agentName) && state.batch === candidate && !state.rendering) {
+        batch = candidate;
+        state.batch = undefined;
+      }
+    }
+    if (!batch) {
+      if (pruned) await this.wakeSubject(subject, state);
+      return undefined;
+    }
     this.host.cancelWake(subject);
     if (!this.host.authorized(batch.latest)) {
       this.host.audit({ kind: 'revoked', subject, eventId: batch.latest.eventId });
+      await this.wakeSubject(subject, state);
       return { done: Promise.resolve(), recovered };
     }
     batch.publicationAgent = agentName;
@@ -695,7 +725,7 @@ export class PushCoalescer<E = unknown> {
     state.rendering = rendering;
     const putBack = () => {
       state.rendering = undefined;
-      if (recovered) (state.recovered ??= []).unshift(batch);
+      if (recovered) (state.recovered ??= []).unshift(batch!);
       else state.batch = batch;
     };
     try {
@@ -713,6 +743,7 @@ export class PushCoalescer<E = unknown> {
     if (!this.host.authorized(batch.latest)) {
       this.host.audit({ kind: 'revoked', subject, eventId: batch.latest.eventId });
       state.rendering = undefined;
+      await this.wakeSubject(subject, state);
       return { done: Promise.resolve(), recovered };
     }
     rendering.done = this.render(subject, state, rendering, agentName);
@@ -771,7 +802,12 @@ export class PushCoalescer<E = unknown> {
         state.occupant = undefined;
         if (placement) state.audienceAgent = placement.agent;
       } finally {
-        if (state.rendering === rendering) state.rendering = undefined;
+        if (state.rendering === rendering) {
+          state.rendering = undefined;
+          // This materialization consumed only its own cause. Other live
+          // recipients and newer pending batches still own their wakes.
+          if (!this.suspended) await this.wakeSubject(subject, state);
+        }
       }
     });
   }
