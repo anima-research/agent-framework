@@ -2,7 +2,7 @@ import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { FrameworkConfig } from '../src/types/framework.js';
-import { fixture, crash } from './helpers/coalescing-fixture.js';
+import { fixture, crash, eventually } from './helpers/coalescing-fixture.js';
 
 const conversations = {
   templateAgent: 'agent',
@@ -224,6 +224,7 @@ for (const recovery of ['snapshot', 'receipt bridge'] as const) {
     else await crash(f);
     await f.create();
     await f.register();
+    await eventually(() => !!f.framework.getConversationRouter()!.getBinding('chat'), 'mixed-batch recovery after registration');
     await f.framework.runUntilIdle();
     assert.equal(f.membrane.calls.length, calls + 1, 'restart recovers the counterpart cause, not the last self verdict');
     assert(f.framework.getConversationRouter()!.getBinding('chat'));
@@ -501,3 +502,129 @@ for (const lane of ['plain', 'deferred'] as const) {
     }
   });
 }
+
+for (const denial of ['push grant', 'channel grant', 'binding'] as const) {
+  test('recovered counterpart work cannot spawn or wake before current ' + denial + ' authorization', async (t) => {
+    const f = await setup(t);
+    const params = {
+      ...f.params('active', 'authorized original', { channelId: 'chat', key: 'recovery-authority', deferred: true }),
+      tags: ['chat:from-human'], origin: { authorId: 'human' },
+    };
+    await f.send('push/event', params);
+    await f.framework.stop();
+    const calls = f.membrane.calls.length;
+    if (denial === 'push grant') await f.create(false);
+    else {
+      // A restored snapshot bound to a different peer must not transfer its wake.
+      if (denial === 'binding') {
+        const { JsStore } = await import('@animalabs/chronicle');
+        const { join } = await import('node:path');
+        const store = JsStore.openOrCreate({ path: join(f.dir, 'store') });
+        const snapshot = store.getStateJson('mcpl/coalescing') as { subjects: Array<{ batch?: { latest: { binding: string } } }> };
+        for (const s of snapshot.subjects) if (s.batch) s.batch.latest.binding = 'a different peer';
+        store.setStateJson('mcpl/coalescing', snapshot);
+        store.close();
+      }
+      await f.create();
+    }
+    if (denial === 'channel grant') {
+      const { CapabilityGrant } = await import('../src/mcpl/capability-grant.js');
+      const connection = (f.framework as unknown as { mcplServerRegistry: { getServer(id: string): { establishGrant(grant: unknown): void } } }).mcplServerRegistry.getServer('editor');
+      connection.establishGrant(new CapabilityGrant(new Set(['pushEvents']), []));
+    }
+    assert.equal(f.framework.getConversationRouter()!.getBinding('chat'), undefined, 'current authority must precede audience creation');
+    await f.framework.runUntilIdle();
+    assert.equal(f.membrane.calls.length, calls, 'unapproved content cannot cause even an empty turn');
+    assert.equal(f.renders.length, 0);
+  });
+}
+
+test('valid recovered work waits for channel registration, then wakes once', async (t) => {
+  const f = await setup(t);
+  await f.send('push/event', {
+    ...f.params('active', 'wait for registration', { channelId: 'chat', key: 'recovery-authority', deferred: true }),
+    tags: ['chat:from-human'], origin: { authorId: 'human' },
+  });
+  await f.framework.stop();
+  await f.create();
+  assert.equal(f.framework.getConversationRouter()!.getBinding('chat'), undefined);
+  f.framework.nudgeAgent('agent', 'unrelated startup work');
+  await f.framework.runUntilIdle();
+  assert.equal(f.framework.getConversationRouter()!.getBinding('chat'), undefined, 'unrelated assembly cannot spawn or discard unready work');
+  await f.register();
+  await eventually(() => !!f.framework.getConversationRouter()!.getBinding('chat'), 'registration recovery wake');
+  await f.framework.runUntilIdle();
+  const binding = f.framework.getConversationRouter()!.getBinding('chat');
+  assert(binding, 'registration resumes the still-pending work');
+  assert(f.context(binding.agentName).includes('document_diff'));
+  assert.equal(f.renders.length, 1);
+  const calls = f.membrane.calls.length;
+  await f.register();
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, calls, 'repeated readiness creates no duplicate turn');
+});
+
+test('a transient fork creation failure preserves acknowledged recovered work for retry', async (t) => {
+  const f = await setup(t);
+  await f.send('push/event', {
+    ...f.params('active', 'recoverable fallback', { channelId: 'chat', key: 'spawn-failure', deferred: true }),
+    tags: ['chat:from-human'], origin: { authorId: 'human' },
+  });
+  await f.framework.stop();
+  await f.create();
+  const router = f.framework.getConversationRouter()!;
+  // The unfixed recovery may already have spawned; isolate the subsequent
+  // audience-resolution attempt rather than relying on that separate defect.
+  router.unbind('chat');
+  const internals = f.framework as unknown as {
+    createConversationAgent(name: string, channelId: string): Promise<unknown>;
+    pushCoalescer: { snapshot(): unknown; restore(snapshot: unknown): void; pendingBatches(): number; options: { recoveryBackoffMs?: number } };
+    pendingRequests: unknown[];
+  };
+  internals.pendingRequests.length = 0;
+  const snapshot = internals.pushCoalescer.snapshot() as { subjects: Array<{ batch?: { rendering?: boolean } }> };
+  for (const s of snapshot.subjects) if (s.batch) s.batch.rendering = true;
+  internals.pushCoalescer.restore(snapshot);
+  internals.pushCoalescer.options.recoveryBackoffMs = 60_000;
+  const original = internals.createConversationAgent;
+  internals.createConversationAgent = async () => { throw new Error('transient spawn failure'); };
+  await f.register();
+  f.framework.nudgeAgent('agent', 'unrelated turn');
+  await f.framework.runUntilIdle();
+  assert(internals.pushCoalescer.pendingBatches() > 0, 'failed creation is not permanent audience disappearance');
+  internals.createConversationAgent = original;
+  await f.register();
+  await eventually(() => !!router.getBinding('chat'), 'retried audience resolution');
+  await f.framework.runUntilIdle();
+  const binding = router.getBinding('chat');
+  assert(binding);
+  assert(f.context(binding.agentName).includes('recoverable fallback'));
+});
+
+test('a transient recovered spawn failure is retried by backoff without another message', async (t) => {
+  const f = await setup(t);
+  await f.send('push/event', {
+    ...f.params('active', 'retry fallback', { channelId: 'chat', key: 'spawn-retry', deferred: true }),
+    tags: ['chat:from-human'], origin: { authorId: 'human' },
+  });
+  await f.framework.stop();
+  await f.create();
+  const internals = f.framework as unknown as {
+    createConversationAgent(name: string, channelId: string): Promise<unknown>;
+    pushCoalescer: { options: { recoveryBackoffMs?: number } };
+  };
+  const original = internals.createConversationAgent;
+  let attempts = 0;
+  internals.createConversationAgent = async function (name, channel) {
+    if (++attempts === 1) throw new Error('one transient creation failure');
+    return original.call(this, name, channel);
+  };
+  internals.pushCoalescer.options.recoveryBackoffMs = 20;
+  await f.register();
+  await eventually(() => !!f.framework.getConversationRouter()!.getBinding('chat'), 'autonomous audience retry');
+  await f.framework.runUntilIdle();
+  assert(attempts >= 2);
+  const binding = f.framework.getConversationRouter()!.getBinding('chat')!;
+  assert(f.context(binding.agentName).includes('document_diff'));
+  assert.equal(f.membrane.calls.length, 1);
+});

@@ -21,7 +21,9 @@ function occurrence(id: string, self = false, wake = !self): Occurrence {
 function harness(published = new Set<string>()) {
   const delivered: Array<{ id: string; body: string; activation: string | null }> = [];
   const wakes = new Set<string>();
-  const audiences = new Map<string, string[]>();
+  const audiences = new Map<string, string[] | null>();
+  const waitingAuthority = new Set<string>();
+  const audienceCalls: string[] = [];
   const unauthorized = new Set<string>();
   let saved: CoalescingSnapshot | undefined;
   const receipts: CoalescingReceiptRecord[] = [];
@@ -46,8 +48,11 @@ function harness(published = new Set<string>()) {
       if (o.event.wake && !o.event.self) wakes.add(o.eventId);
     },
     cancelWake: () => { wakes.clear(); },
-    authorized: o => !unauthorized.has(o.eventId),
-    audience: async o => audiences.get(o.eventId) ?? [o.deliverTo ?? 'agent'],
+    authorized: o => waitingAuthority.has(o.eventId) ? undefined : !unauthorized.has(o.eventId),
+    audience: async o => {
+      audienceCalls.push(o.eventId);
+      return audiences.has(o.eventId) ? audiences.get(o.eventId)! : [o.deliverTo ?? 'agent'];
+    },
     render: async (o) => {
       if (!hold) return { content: [{ type: 'text', text: 'render:' + o.eventId }] };
       started();
@@ -61,7 +66,7 @@ function harness(published = new Set<string>()) {
     wasPublished: (_subject, id) => published.has(id),
   });
   return {
-    coalescer, delivered, wakes, published, receipts, rendering, audiences, unauthorized,
+    coalescer, delivered, wakes, published, receipts, rendering, audiences, unauthorized, waitingAuthority, audienceCalls,
     hold: () => { hold = true; },
     release: () => { hold = false; release!({ content: [{ type: 'text', text: 'completed active render' }] }); },
     saved: () => structuredClone(saved!),
@@ -197,3 +202,48 @@ for (const olderAudience of ['gone', 'other-live', 'unauthorized'] as const) {
     }
   });
 }
+
+for (const obstruction of ['temporary audience', 'authority not ready'] as const) {
+  test(obstruction + ' preserves frozen work while a different recipient progresses', async (t) => {
+    const live = harness();
+    await live.coalescer.accept({ ...occurrence('old'), deliverTo: 'old-fork' });
+    live.hold();
+    const run = live.coalescer.assemble('old-fork');
+    await live.rendering;
+    await live.coalescer.accept({ ...occurrence('new'), deliverTo: 'new-fork' });
+    const snapshot = structuredClone(live.coalescer.snapshot());
+    live.coalescer.suspend(); live.release(); await run;
+    const restored = harness();
+    t.after(() => restored.coalescer.suspend());
+    restored.coalescer.restore(snapshot);
+    if (obstruction === 'temporary audience') restored.audiences.set('old', null);
+    else restored.waitingAuthority.add('old');
+    await restored.coalescer.assemble('new-fork');
+    assert.deepEqual(restored.delivered.map(d => d.id), ['new']);
+    assert.deepEqual(restored.coalescer.pendingBatchOccurrences().map(o => o.eventId), ['old']);
+    if (obstruction === 'authority not ready') assert(!restored.audienceCalls.includes('old'), 'no audience effects before current authority');
+    restored.audiences.delete('old');
+    restored.waitingAuthority.delete('old');
+    await restored.coalescer.assemble('old-fork');
+    assert.deepEqual(restored.delivered.map(d => d.id), ['new', 'old']);
+  });
+}
+
+test('authority becoming unknown during render retains fallback until readiness returns', async (t) => {
+  const f = harness();
+  t.after(() => f.coalescer.suspend());
+  await f.coalescer.accept(occurrence('active'));
+  f.hold();
+  const run = f.coalescer.assemble('agent');
+  await f.rendering;
+  f.waitingAuthority.add('active');
+  f.release(); await run;
+  assert.equal(f.delivered.length, 0, 'unready authority cannot publish');
+  assert.equal(f.coalescer.pendingBatches(), 1, 'temporary readiness loss is not revocation');
+  f.waitingAuthority.delete('active');
+  await f.coalescer.resumePending();
+  assert(f.wakes.has('active'));
+  await f.coalescer.assemble('agent');
+  assert.equal(f.delivered.length, 1);
+  assert(f.delivered[0]!.body.includes('fallback:active'), 'do not repeat the interrupted render');
+});

@@ -7476,9 +7476,11 @@ export class AgentFramework {
     // Restore independent batch causes in order. An older frozen counterpart
     // cannot be cancelled by a newer quiet batch on the same subject, and two
     // causes must not race to create the same conversation fork.
-    void this.admitCoalesced(async () => {
-      for (const occ of coalescer.pendingBatchOccurrences()) await this.wakeForCoalescedBatch(occ, true);
-    }).catch(err => console.error('[coalescing] could not restore pending wakes:', err));
+    this.resumeCoalescedWork();
+  }
+
+  private resumeCoalescedWork(): void {
+    void this.pushCoalescer?.resumePending().catch(err => console.error('[coalescing] could not resume pending work:', err));
   }
 
   /**
@@ -7634,13 +7636,13 @@ export class AgentFramework {
     }
   }
 
-  private coalescedAuthorized(occ: CoalescedOccurrence<CoalescedDelivery>): boolean {
+  private coalescedAuthorized(occ: CoalescedOccurrence<CoalescedDelivery>): boolean | undefined {
+    // No current peer identity means this obligation cannot be transferred.
+    if (!this.mcplServerConfigs.has(occ.serverId) || occ.binding !== this.coalescingBinding(occ.serverId)) return false;
     const server = this.mcplServerRegistry?.getServer(occ.serverId);
-    if (!server?.isConnected || !server.policyEstablished) return false;
-    // §3.2: work admitted under another binding (the id since reassigned to a
-    // different endpoint) never acquires the replacement peer's authority —
-    // and its private notice data is never sent to that peer.
-    if (occ.binding !== this.coalescingBinding(occ.serverId)) return false;
+    // Startup/reconnect is not revocation. Keep work until current authority
+    // is known, and re-evaluate at readiness/registration boundaries.
+    if (!server?.isConnected || !server.policyEstablished || this.discordAwarenessBarrier) return undefined;
     if (occ.event.lane === 'push') {
       if (!server.grant.has('pushEvents')) return false;
       try { this.featureSetManager?.validateInbound(occ.serverId, occ.event.event.featureSet); } catch { return false; }
@@ -7648,8 +7650,9 @@ export class AgentFramework {
     if (occ.scope.kind === 'channel' || occ.event.lane === 'channel') {
       // §3.2 / §5.4 rule 4: the channel's CURRENT authority, whichever lane.
       if (!server.grant.has('channels.incoming')) return false;
-      if (occ.event.lane === 'push') return this.channelRegistry?.isDeclaredChannel(occ.serverId, occ.scope.id) ?? false;
-      return !!this.channelRegistry?.getDescriptor(occ.scope.id);
+      // A channel can register after policy establishment. Its absence is
+      // not authority to wake and not proof acknowledged work was revoked.
+      return this.channelRegistry?.isDeclaredChannel(occ.serverId, occ.scope.id) ? true : undefined;
     }
     return true;
   }
@@ -7662,7 +7665,7 @@ export class AgentFramework {
     return isSelfAuthoredMessage(occ.tags, authorId, metadata);
   }
 
-  private async coalescedAudience(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<string[]> {
+  private async coalescedAudience(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<string[] | null> {
     if (occ.deliverTo) return this.agents.has(occ.deliverTo) ? [occ.deliverTo] : [];
     const explicit = occ.event.event.targetAgents;
     if (explicit) return explicit.filter((n) => this.agents.has(n));
@@ -7687,7 +7690,7 @@ export class AgentFramework {
         return [decision.agentName];
       } catch (err) {
         console.error(`[coalescing] could not spawn a conversation agent for ${occ.scope.id}:`, err);
-        return [];
+        return null; // temporary resolution failure, not a vanished fixed audience
       }
     }
     return [...this.agents.keys()].filter((n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName);
@@ -7760,17 +7763,21 @@ export class AgentFramework {
     return placement;
   }
 
-  private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>, preserveExisting = false): Promise<void> {
+  private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>, preserveExisting = false): Promise<void | boolean> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     if (!preserveExisting) this.cancelCoalescedWakes(subject);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
+    if (this.coalescedAuthorized(occ) !== true) return;
     if (this.conversationRouter && occ.scope.kind === 'channel' && this.isSelfConversationOccurrence(occ)) return;
     const origin = occ.event.event.origin;
     // The wake carries the batch's channel so the turn freezes its reply
     // locus there (the materialized delivery at assembly wakes nobody).
     const channelId = occ.scope.kind === 'channel' ? occ.scope.id : this.derivePushEventChannel(origin)?.channelId;
     const authorId = occ.identity?.author?.id ?? (typeof origin?.authorId === 'string' ? origin.authorId : undefined);
-    for (const agentName of await this.coalescedAudience(occ)) {
+    const audience = await this.coalescedAudience(occ);
+    if (audience === null) return false;
+    if (this.coalescedAuthorized(occ) !== true) return;
+    for (const agentName of audience) {
       this.pendingRequests.push({
         agentName,
         reason: 'mcpl:push-event',
@@ -13086,6 +13093,7 @@ export class AgentFramework {
       }
       connection.ready();
     }
+    if (this.discordAwarenessBarrier === null) this.resumeCoalescedWork();
     return this.discordAwarenessBarrier === null;
   }
 
@@ -13361,6 +13369,7 @@ export class AgentFramework {
         impacts,
       });
       this.handleToolsListChanged(connection.id);
+      this.resumeCoalescedWork();
     } finally {
       st.inFlight = false;
       st.lastCompletedAt = Date.now();
@@ -13704,7 +13713,8 @@ export class AgentFramework {
       params: ChannelsRegisterParams,
       responder?: { respond: (result: unknown) => void },
     ) => {
-      await this.channelRegistry?.handleRegister(connection.id, params, responder as never);
+      try { await this.channelRegistry?.handleRegister(connection.id, params, responder as never); }
+      finally { this.resumeCoalescedWork(); }
     });
 
     // Handle channel changes (Step 7) — §14.5 dual-mode: the responder is
@@ -13715,7 +13725,8 @@ export class AgentFramework {
       params: ChannelsChangedParams,
       responder?: { respond: (result: unknown) => void },
     ) => {
-      await this.channelRegistry?.handleChanged(connection.id, params, responder as never);
+      try { await this.channelRegistry?.handleChanged(connection.id, params, responder as never); }
+      finally { this.resumeCoalescedWork(); }
     });
 
     // §6.6/§12: requests that previously had no handler and hung forever

@@ -183,13 +183,16 @@ export interface CoalescerHost<E> {
    * pending activity/wake cause. Re-evaluated for restored legacy batches. */
   isPassive?(occurrence: CoalescedOccurrence<E>): boolean;
   /** Queue a wake for a batch that has no model-visible content yet. */
-  wakeForBatch(occurrence: CoalescedOccurrence<E>, preserveExisting?: boolean): Promise<void>;
+  /** false means a temporary audience failure; keep work and retry with backoff. */
+  wakeForBatch(occurrence: CoalescedOccurrence<E>, preserveExisting?: boolean): Promise<void | boolean>;
   /** Withdraw unstarted wakes whose sole cause is this subject. */
   cancelWake(subject: string): void;
-  /** The batch's audience still holds the authority it was admitted under. */
-  authorized(occurrence: CoalescedOccurrence<E>): boolean;
-  /** Agents that read this occurrence's delivery target (may spawn a fork). */
-  audience(occurrence: CoalescedOccurrence<E>): Promise<string[]>;
+  /** true: currently authorized; false: denied/reassigned; undefined: current
+   * authority is not yet known (connection, policy, or registration pending). */
+  authorized(occurrence: CoalescedOccurrence<E>): boolean | undefined;
+  /** [] means no recipient exists; null means resolution failed temporarily.
+   * May spawn a fork, so call only after current authorization succeeds. */
+  audience(occurrence: CoalescedOccurrence<E>): Promise<string[] | null>;
   render(occurrence: CoalescedOccurrence<E>, params: PushRenderParams): Promise<PushRenderResult>;
   audit(record: Record<string, unknown>): void;
   /** Persist (throttled by the host); the thunk builds the snapshot lazily. */
@@ -475,9 +478,12 @@ export class PushCoalescer<E = unknown> {
       if (this.recovery.get(subject) === entry) entry.timer = undefined;
       if (this.suspended || this.subjects.get(subject) !== state || (!state.batch && !state.recovered?.length) || state.rendering) return;
       // Authority and wake policy are the host's, re-evaluated at fire time.
-      if (!this.workBatches(state).some(b => this.host.authorized(b.latest))) return;
+      if (!this.workBatches(state).some(b => this.host.authorized(b.latest) === true)) return;
       this.host.audit({ kind: 'recovery-wake', subject, eventId: this.workBatches(state)[0]?.latest.eventId, attempt, delayMs: delay });
-      void this.wakeSubject(subject, state).catch(() => { /* audited by the host */ });
+      void this.locked(async () => {
+        if (this.suspended || this.subjects.get(subject) !== state) return;
+        await this.wakeSubject(subject, state);
+      }).catch(() => { /* audited by the host */ });
     }, delay);
     (entry.timer as { unref?: () => void }).unref?.();
     this.recovery.set(subject, entry);
@@ -600,13 +606,41 @@ export class PushCoalescer<E = unknown> {
     };
   }
 
+  /** Re-evaluate retained work when current transport/policy/channel state changes. */
+  resumePending(): Promise<void> {
+    return this.locked(async () => {
+      if (this.suspended) return;
+      for (const [subject, state] of this.subjects) {
+        if (this.workBatches(state).length) await this.wakeSubject(subject, state);
+      }
+    });
+  }
+
+  private async resolveAudience(subject: string, state: SubjectState<E>, batch: DeferredBatch<E>): Promise<string[] | null> {
+    try {
+      const audience = await this.host.audience(this.activationFor(batch) ?? batch.latest);
+      if (audience !== null) return audience;
+    } catch (error) {
+      this.host.audit({ kind: 'audience-unavailable', subject, eventId: batch.latest.eventId, error: String(error) });
+    }
+    this.scheduleRecovery(subject, state);
+    return null;
+  }
+
   private async wakeSubject(subject: string, state: SubjectState<E>): Promise<void> {
     this.host.cancelWake(subject);
     for (const batch of this.workBatches(state)) {
       const activation = this.activationFor(batch);
       // Different frozen/pending batches have independent causes. A quiet
       // newer batch must not cancel an older, still-unconsumed obligation.
-      if (activation) await this.host.wakeForBatch(activation, true);
+      if (!activation || this.host.authorized(batch.latest) !== true
+        || this.host.authorized(activation) !== true) continue;
+      try {
+        if (await this.host.wakeForBatch(activation, true) === false) this.scheduleRecovery(subject, state);
+      } catch (error) {
+        this.host.audit({ kind: 'audience-unavailable', subject, eventId: batch.latest.eventId, error: String(error) });
+        this.scheduleRecovery(subject, state);
+      }
     }
   }
 
@@ -675,7 +709,8 @@ export class PushCoalescer<E = unknown> {
     if (!state || this.suspended) return undefined;
     if (state.rendering) {
       const rendering = state.rendering;
-      return (await this.host.audience(this.activationFor(rendering.batch) ?? rendering.batch.latest)).includes(agentName) && state.rendering === rendering
+      if (this.host.authorized(rendering.batch.latest) !== true) return undefined;
+      return (await this.resolveAudience(subject, state, rendering.batch))?.includes(agentName) && state.rendering === rendering
         ? { done: rendering.done, recovered: !!rendering.recovered } : undefined;
     }
     let recovered = false;
@@ -686,9 +721,10 @@ export class PushCoalescer<E = unknown> {
     for (let i = 0; i < (state.recovered?.length ?? 0);) {
       const candidate = state.recovered![i]!;
       const authorized = this.host.authorized(candidate.latest);
-      const audience = authorized
-        ? await this.host.audience(this.activationFor(candidate) ?? candidate.latest) : [];
-      if (!authorized || audience.length === 0) {
+      if (authorized === undefined) { i++; continue; }
+      const audience = authorized ? await this.resolveAudience(subject, state, candidate) : [];
+      if (audience === null) { i++; continue; }
+      if (authorized === false || audience.length === 0) {
         this.host.audit({ kind: authorized ? 'audience-gone' : 'revoked', subject, eventId: candidate.latest.eventId });
         state.recovered!.splice(i, 1);
         pruned = true;
@@ -704,10 +740,17 @@ export class PushCoalescer<E = unknown> {
     }
     if (!batch && state.batch) {
       const candidate = state.batch;
-      const audience = await this.host.audience(this.activationFor(candidate) ?? candidate.latest);
-      if (audience.includes(agentName) && state.batch === candidate && !state.rendering) {
-        batch = candidate;
+      const authorized = this.host.authorized(candidate.latest);
+      if (authorized === false) {
+        this.host.audit({ kind: 'revoked', subject, eventId: candidate.latest.eventId });
         state.batch = undefined;
+        pruned = true;
+      } else if (authorized === true) {
+        const audience = await this.resolveAudience(subject, state, candidate);
+        if (audience?.includes(agentName) && state.batch === candidate && !state.rendering) {
+          batch = candidate;
+          state.batch = undefined;
+        }
       }
     }
     if (!batch) {
@@ -715,7 +758,13 @@ export class PushCoalescer<E = unknown> {
       return undefined;
     }
     this.host.cancelWake(subject);
-    if (!this.host.authorized(batch.latest)) {
+    const authority = this.host.authorized(batch.latest);
+    if (authority === undefined) {
+      if (recovered) (state.recovered ??= []).unshift(batch);
+      else state.batch = batch;
+      return undefined;
+    }
+    if (authority === false) {
       this.host.audit({ kind: 'revoked', subject, eventId: batch.latest.eventId });
       await this.wakeSubject(subject, state);
       return { done: Promise.resolve(), recovered };
@@ -740,7 +789,9 @@ export class PushCoalescer<E = unknown> {
     }
     this.clearRecovery(subject);
     if (this.suspended) { putBack(); return undefined; }
-    if (!this.host.authorized(batch.latest)) {
+    const dispatchAuthority = this.host.authorized(batch.latest);
+    if (dispatchAuthority === undefined) { putBack(); return undefined; }
+    if (dispatchAuthority === false) {
       this.host.audit({ kind: 'revoked', subject, eventId: batch.latest.eventId });
       state.rendering = undefined;
       await this.wakeSubject(subject, state);
@@ -785,7 +836,15 @@ export class PushCoalescer<E = unknown> {
       try {
         if (rendering.cancelled || state.rendering !== rendering || this.suspended) return;
         // Rule 4: authority is re-checked at response.
-        if (!this.host.authorized(occurrence)) { this.host.audit({ kind: 'revoked', subject, eventId: occurrence.eventId }); return; }
+        const authority = this.host.authorized(occurrence);
+        if (authority === undefined) {
+          // Transport/policy readiness may return. Keep the accepted fallback
+          // as interrupted work; never repeat a render that may have executed.
+          batch.noRender = true;
+          (state.recovered ??= []).unshift(batch);
+          return;
+        }
+        if (authority === false) { this.host.audit({ kind: 'revoked', subject, eventId: occurrence.eventId }); return; }
         this.host.audit({ kind: 'rendered', subject, eventId: occurrence.eventId, source, empty: content.length === 0 });
         if (!content.length) return; // §5.2: nothing happened
         const placement = await this.host.deliver({ ...occurrence, timestamp, content }, content, assemblingFor, this.activationFor(batch));
