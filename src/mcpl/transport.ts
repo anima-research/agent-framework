@@ -125,12 +125,19 @@ export const CHILD_ENV_ALLOWLIST = [
 export function buildChildEnv(
   config: Pick<McplServerConfig, 'env' | 'inheritEnv'>,
   hostEnv: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): NodeJS.ProcessEnv {
   if (config.inheritEnv) return { ...hostEnv, ...config.env };
   const env: NodeJS.ProcessEnv = {};
+  // Windows env var names are case-insensitive and enumerate in arbitrary
+  // spellings (`Path`, `SystemRoot`, `ComSpec`); match the allowlist by
+  // upper-cased name there and keep the original spelling. POSIX names are
+  // case-sensitive, so `Path` staying excluded there is correct.
+  const win = platform === 'win32';
   for (const [key, value] of Object.entries(hostEnv)) {
     if (value === undefined) continue;
-    if (CHILD_ENV_ALLOWLIST.includes(key) || key.startsWith('LC_')) env[key] = value;
+    const probe = win ? key.toUpperCase() : key;
+    if (CHILD_ENV_ALLOWLIST.includes(probe) || probe.startsWith('LC_')) env[key] = value;
   }
   return { ...env, ...config.env };
 }

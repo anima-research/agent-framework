@@ -10897,6 +10897,8 @@ export class AgentFramework {
       toolCallTimeoutMs: cfg?.toolCallTimeoutMs,
       scriptTimeoutMs: cfg?.scriptTimeoutMs,
       idleReclaimMs: 0, // dedicated runner; lifetime is the exec deadline
+      env: cfg?.env,
+      inheritEnv: cfg?.inheritEnv,
       label: `${agentName}:${scriptId}`,
       onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args),
     });
@@ -11221,6 +11223,8 @@ export class AgentFramework {
         toolCallTimeoutMs: cfg?.toolCallTimeoutMs,
         scriptTimeoutMs: cfg?.scriptTimeoutMs,
         idleReclaimMs: cfg?.idleReclaimMs,
+        env: cfg?.env,
+        inheritEnv: cfg?.inheritEnv,
         label: agentName,
         onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args),
       });
