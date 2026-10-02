@@ -12,16 +12,6 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
-### Breaking (direct ChannelRegistry consumers)
-
-- `onChannelAutoOpened` with `source: 'subscription-policy'` now reports a durable admission decision before transport reconciliation. Treat it as intent; await the registration call and inspect `getOpenChannels()` when confirmed live state is needed. `opened-by-delivery` still reports a confirmed transition. The built-in host notice now distinguishes selected-for-opening from currently open.
-
-### Fixed
-
-- Failed backscroll requests preserve the registry's known-open state rather than claiming a close. Automatic delivery joins pending lifecycle work without reopening a channel closed during the wait, and reports only actual delivery-forced opens using the current registration label.
-
-- Channel lifecycle operations now run in order per channel and reconcile the latest desired state and registration after an in-flight operation completes. Concurrent registration, open, and close requests can no longer leave the server in an older state; a superseded tool request reports that its requested state no longer applies. Automatic delivery preserves active tune-out attention state while opening or awaiting transport.
-
 ## 0.19.0 — 2026-09-28
 
 ### Added

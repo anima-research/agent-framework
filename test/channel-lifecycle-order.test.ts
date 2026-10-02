@@ -26,6 +26,7 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore) {
   const held = new Set<string>();
   const publishedWhileOpen: boolean[] = [];
   const notices: Array<{ source: string; channels: Array<{ channelId: string; label?: string }> }> = [];
+  const routeFailures: Array<{ reason: string }> = [];
   const serve = (kind: 'open' | 'close', params: { channelId?: string; address?: unknown }) => {
     const id = params.channelId!;
     calls.push({ kind, id, address: params.address });
@@ -51,7 +52,8 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore) {
   const registry = new ChannelRegistry(
     { getServer: () => server } as unknown as McplServerRegistry,
     {} as FeatureSetManager, () => {}, (event) => traces.push(event),
-    { store, onChannelAutoOpened: (info) => { notices.push(info); onNotice?.(info); } },
+    { store, onRouteFailure: (info) => routeFailures.push(info),
+      onChannelAutoOpened: (info) => { notices.push(info); onNotice?.(info); } },
   );
   const isOpen = (id = 'x') => registry.getOpenChannels().some((e) => e.descriptor.id === id);
   const tool = (kind: 'open' | 'close') => registry.handleChannelToolCall('channel_' + kind, { serverId: 'test', channelId: 'x' });
@@ -67,7 +69,7 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore) {
     assert.equal(settled, true, 'lifecycle operations must settle');
     await result;
   };
-  return { registry, actual, calls, pending, held, traces, isOpen, tool, drain, publishedWhileOpen, notices };
+  return { registry, actual, calls, pending, held, traces, isOpen, tool, drain, publishedWhileOpen, notices, routeFailures };
 }
 
 test('remove/re-add during reconcile converges on the replacement desired state, with ACK first (#185)', async () => {
@@ -404,6 +406,95 @@ test('failed policy opening records intent once, with truthful resident text thr
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('descriptor churn exhausts convergence and fails the tool plus joined deliveries instead of hanging', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  f.calls.length = 0;
+  f.held.add('x');
+  let toolSettled = false, speechSettled = false, replySettled = false;
+  const opening = f.registry.handleChannelToolCall('channel_open', {
+    serverId: 'test', channelId: 'x', backscroll: 5,
+  }).then((result) => { toolSettled = true; return result; });
+  await tick();
+  const speech = f.registry.routeSpeech('resident', 'waiting reply', 'x')
+    .then((result) => { speechSettled = true; return result; });
+  const reply = f.registry.openIfClosedForSend('x', 'test')
+    .then((result) => { replySettled = true; return result; });
+  try {
+    // Every RPC succeeds promptly, but its target is superseded before the
+    // receipt arrives. Bound the test itself without a hanging provider.
+    for (let i = 0; i < 12 && !toolSettled; i++) {
+      await f.registry.handleChanged('test', { updated: [descriptor('x', true, 'churn-' + i)] });
+      f.pending.shift()?.finish();
+      await tick();
+    }
+    assert.equal(toolSettled, true, 'the whole convergence operation must be bounded');
+    assert.equal(speechSettled, true, 'joined speech must receive a terminal result');
+    assert.equal(replySettled, true, 'reply preparation must receive a terminal result');
+    assert.equal(f.calls.length, 5, 'at most five transport attempts per operation');
+    assert.equal((await opening).success, false);
+    assert.match((await opening).error!, /did not converge/);
+    assert.equal(await speech, null);
+    assert.equal((await reply).status, 'open-failed');
+    assert.equal(f.isOpen(), false, 'an unconfirmed current target is not reported open');
+    assert.deepEqual(f.publishedWhileOpen, []);
+    assert.equal(f.routeFailures.length, 1);
+    assert.match(f.routeFailures[0].reason, /did not converge/);
+    assert.ok(f.traces.some((e) => e.type === 'mcpl:channel-reconcile-failed' &&
+      String(e.error).includes('did not converge')));
+  } finally {
+    // Original code needs one stable receipt to release its unbounded loop.
+    await f.drain(opening, speech, reply);
+  }
+  f.held.delete('x');
+  const retry = await f.registry.routeSpeech('resident', 'a later stable retry', 'x');
+  assert.equal(retry?.delivered, true);
+  assert.equal(f.calls.length, 6, 'later delivery reconfirms the latest target before publishing');
+  assert.equal((await f.tool('close')).success, true, 'exhaustion releases the queue');
+  assert.equal((await f.tool('open')).success, true, 'a later stable decision gets a fresh retry budget');
+});
+
+test('background reconciliation reports supersession exhaustion and still permits other channels', async () => {
+  const f = fixture();
+  f.held.add('x');
+  let settled = false;
+  const reconcile = f.registry.handleChanged('test', { added: [descriptor('x', true)] })
+    .then(() => { settled = true; });
+  await tick();
+  try {
+    await f.registry.handleChanged('test', { added: [descriptor('y', true)] });
+    assert.equal(f.actual.get('y'), true);
+    for (let i = 0; i < 12 && !settled; i++) {
+      await f.registry.handleChanged('test', { updated: [descriptor('x', true, 'churn-' + i)] });
+      f.pending.shift()?.finish();
+      await tick();
+    }
+    assert.equal(settled, true);
+    assert.equal(f.calls.filter((call) => call.id === 'x').length, 5);
+    const failures = f.traces.filter((e) => e.type === 'mcpl:channel-reconcile-failed');
+    assert.equal(failures.length, 1);
+    assert.match(String(failures[0].error), /did not converge/);
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'open', 'failure does not erase desired intent');
+  } finally { await f.drain(reconcile); }
+});
+
+test('finite descriptor supersession can converge on its fifth transport attempt', async () => {
+  const f = fixture();
+  f.held.add('x');
+  const reconcile = f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  await tick();
+  for (let i = 0; i < 4; i++) {
+    await f.registry.handleChanged('test', { updated: [descriptor('x', true, 'target-' + i)] });
+    f.pending.shift()!.finish();
+    await tick();
+  }
+  await f.drain(reconcile);
+  assert.equal(f.calls.length, 5);
+  assert.equal(f.isOpen(), true);
+  assert.deepEqual(f.calls.at(-1)?.address, { value: 'target-3' });
+  assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-reconcile-failed').length, 0);
 });
 
 test('a newer tune-out decision keeps transport open when an older close completes', async () => {

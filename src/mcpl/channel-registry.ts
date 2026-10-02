@@ -46,6 +46,10 @@ import { CapabilityGrant } from './capability-grant.js';
 // ============================================================================
 
 const TYPING_INTERVAL_MS = 7_000;
+const MAX_CHANNEL_LIFECYCLE_ATTEMPTS = 5;
+
+/** A successful RPC can still fail to establish the latest channel target. */
+class ChannelLifecycleConvergenceError extends Error {}
 const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
 
 /**
@@ -2087,8 +2091,8 @@ export class ChannelRegistry {
     const lifecycleKey = this.lifecycleKey(serverId, channelId);
     const channelKey = `${serverId}:${channelId}`;
     const previous = this.channelLifecycleTails.get(lifecycleKey) ?? Promise.resolve();
-    const operation = previous.then(async () => {
-      let issued = false;
+    const operation = previous.catch(() => {}).then(async () => {
+      let attempts = 0;
       let opened = false;
       for (;;) {
         const entry = this.channels.get(channelKey);
@@ -2101,10 +2105,26 @@ export class ChannelRegistry {
         const descriptor = entry.descriptor;
         const desired = this.getDesiredState(serverId, channelId);
         const open = desired === 'open' || desired === 'tuned-out';
-        if (!issued && options?.onlyIfClosed && open && entry.open) {
+        if (attempts === 0 && options?.onlyIfClosed && open && entry.open) {
           return { open: true, opened: false };
         }
-        issued = true;
+        // Per-RPC timeouts do not bound a stream of promptly successful but
+        // continually superseded receipts. Bound this whole operation, then
+        // release its queue slot and surface the failure to delivery joiners.
+        if (attempts >= MAX_CHANNEL_LIFECYCLE_ATTEMPTS) {
+          // No receipt confirmed the current target/intent. A later delivery
+          // must reconcile it rather than reuse an earlier target's open flag.
+          entry.open = false;
+          const error = new ChannelLifecycleConvergenceError(
+            `Channel ${channelId} did not converge after ${attempts} lifecycle attempts; its target or desired state kept changing`,
+          );
+          this.emitTraceFn({
+            type: 'mcpl:channel-reconcile-failed',
+            serverId, channelId, desired, attempts, error: error.message,
+          });
+          throw error;
+        }
+        attempts++;
         let result: ChannelsOpenResult | undefined;
         if (open) {
           result = await server.sendChannelsOpen({
@@ -2130,13 +2150,16 @@ export class ChannelRegistry {
         return { open, opened, result };
       }
     });
-    const tail = operation.then(() => {}, () => {});
+    // Keep the rejection visible to existing joiners, while observing it
+    // immediately and letting each queued successor start after either result.
+    const tail = operation.then(() => {});
     this.channelLifecycleTails.set(lifecycleKey, tail);
-    void tail.then(() => {
+    const cleanup = () => {
       if (this.channelLifecycleTails.get(lifecycleKey) === tail) {
         this.channelLifecycleTails.delete(lifecycleKey);
       }
-    });
+    };
+    void tail.then(cleanup, cleanup);
     return operation;
   }
 
@@ -2150,7 +2173,14 @@ export class ChannelRegistry {
     for (;;) {
       const pending = this.channelLifecycleTails.get(lifecycleKey);
       if (!pending) break;
-      await pending;
+      try {
+        await pending;
+      } catch (error) {
+        // A redundant backscroll failure can leave a known-open channel
+        // usable. Exhausted convergence is different: it never established
+        // the current target, so joined delivery must fail visibly.
+        if (error instanceof ChannelLifecycleConvergenceError) throw error;
+      }
     }
     const current = this.channels.get(`${entry.serverId}:${entry.descriptor.id}`);
     if (!current) throw new Error('Channel registration was removed while delivery waited');
@@ -2221,7 +2251,9 @@ export class ChannelRegistry {
         await this.applyDesiredChannelState(serverId, channel.id);
       } catch (err) {
         // Removal while queued is cancellation, not a failed subscription.
-        if (!this.channels.has(`${serverId}:${channel.id}`)) continue;
+        // Exhausted convergence already emitted its diagnostic at the bound.
+        if (!this.channels.has(`${serverId}:${channel.id}`) ||
+            err instanceof ChannelLifecycleConvergenceError) continue;
         this.emitTraceFn({
           type: 'mcpl:channel-reconcile-failed',
           serverId,
