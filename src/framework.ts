@@ -81,7 +81,7 @@ import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
-import { ConversationRouter } from './mcpl/conversation-router.js';
+import { ConversationRouter, type IncomingMessageFacts } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import {
@@ -6902,6 +6902,7 @@ export class AgentFramework {
     deliverTo?: string;
     /** Host-owned deferred batch attribution, separate from rendered content. */
     conversationActivity?: boolean;
+    conversationBinding?: Pick<IncomingMessageFacts, 'mentioned' | 'kind'>;
   }): Promise<CoalescingPlacement | undefined> {
     const metadata: Record<string, unknown> = {
       ...event.metadata,
@@ -7048,6 +7049,7 @@ export class AgentFramework {
       triggerInference?: boolean;
       coalescingSubject?: string;
       conversationActivity?: boolean;
+      conversationBinding?: Pick<IncomingMessageFacts, 'mentioned' | 'kind'>;
     },
     messageMetadata: Record<string, unknown>,
   ): Promise<CoalescingPlacement | undefined> {
@@ -7060,8 +7062,8 @@ export class AgentFramework {
 
     const decision = router.route({
       channelId: event.channelId,
-      mentioned: event.metadata?.mentioned === true,
-      kind: ConversationRouter.classifyChannel(descriptor, event.metadata),
+      mentioned: event.conversationBinding?.mentioned ?? (event.metadata?.mentioned === true),
+      kind: event.conversationBinding?.kind ?? ConversationRouter.classifyChannel(descriptor, event.metadata),
     });
 
     if (decision.kind === 'unbound') {
@@ -7737,7 +7739,17 @@ export class AgentFramework {
     // A rendered batch's latest content may be self-authored while a fresh
     // counterpart occurrence still supplies its pending activity. Never infer
     // activity from text the renderer happens to include from older history.
-    const activity = activation === undefined ? {} : { conversationActivity: activation !== null };
+    // Rebinding must use the cause's mention/channel-kind facts too; the
+    // latest self echo may omit the very facts that qualified its counterpart.
+    const activationMetadata = activation?.event.lane === 'channel'
+      ? activation.event.event.metadata : activation?.event.event.origin;
+    const activity = activation === undefined ? {} : {
+      conversationActivity: activation !== null,
+      ...(activation ? { conversationBinding: {
+        mentioned: activationMetadata?.mentioned === true,
+        kind: ConversationRouter.classifyChannel(this.channelRegistry?.getDescriptor(occ.scope.id), activationMetadata),
+      } } : {}),
+    };
     if (occ.event.lane === 'channel') {
       const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...activity, ...(assemblingFor ? { assemblingFor } : {}) };
       const placement = await this.handleMcplChannelIncoming(event);

@@ -629,12 +629,13 @@ test('a transient recovered spawn failure is retried by backoff without another 
   assert.equal(f.membrane.calls.length, 1);
 });
 
-test('a mixed batch retains counterpart delivery when its binding disappears during render', async (t) => {
-  const f = await setup(t);
+for (const bind of ['always', 'mention', 'dm'] as const) {
+test('a mixed batch retains counterpart delivery under ' + bind + ' binding when its binding disappears during render', async (t) => {
+  const f = await setup(t, { framework: { conversations: { ...conversations, bind: { channel: bind === 'dm' ? 'never' : bind } } } });
   const router = f.framework.getConversationRouter()!;
   await f.send('push/event', {
     ...f.params('counterpart', 'fresh counterpart', { channelId: 'chat', key: 'lost-binding', deferred: true }),
-    tags: ['chat:from-human'], origin: { authorId: 'human' },
+    tags: ['chat:from-human'], origin: { authorId: 'human', mentioned: bind !== 'dm', ...(bind === 'dm' ? { channel_type: 'im' } : {}) },
   });
   const first = router.getBinding('chat')!;
   assert(first);
@@ -653,3 +654,5 @@ test('a mixed batch retains counterpart delivery when its binding disappears dur
   assert(f.context(replacement.agentName).includes('rendered counterpart and echo'));
   assert.equal(f.renders.length, 1);
 });
+
+}
