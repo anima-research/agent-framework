@@ -9,7 +9,6 @@
   - `tools/observe` (server → host request) sets an ordered first-match
     filter on which calls are reported and which argument fields are sent;
     it only narrows what the grant allows.
-  - `tools/observe` rejects explicit null params and non-object `_meta`, preserving the previous filter on invalid requests. Omitted params and `rules: null` clear the filter; `rules: []` pauses observation. Pattern and field-path limits count Unicode code points, accepting up to 256 code points each, including astral characters.
   - Both paths are denied by default. Grant them with a
     `McplServerConfig.toolLifecycle` policy block (`observe`, `inputs` with a
     `tools`/`classes`/`conversations` narrowing; `classes: 'default'` admits
