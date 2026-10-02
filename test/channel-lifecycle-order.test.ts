@@ -410,6 +410,34 @@ test('failed policy opening records intent once, with truthful resident text thr
   }
 });
 
+for (const kind of ['speech', 'reply'] as const) {
+  test(kind + ' joins a pending close even after retargeting clears open confirmation', async () => {
+    const f = fixture();
+    await f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+    f.calls.length = 0;
+    f.held.add('x');
+    const closing = f.tool('close');
+    await tick();
+    await f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+    assert.equal(f.isOpen(), false);
+    const delivery = kind === 'speech'
+      ? f.registry.routeSpeech('resident', 'waiting reply', 'x')
+      : f.registry.openIfClosedForSend('x', 'test');
+    await f.drain(closing, delivery);
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'closed');
+    assert.equal((await closing).success, true);
+    assert.equal(f.isOpen(), false);
+    assert.deepEqual(f.publishedWhileOpen, []);
+    assert.equal(f.calls.every((call) => call.kind === 'close'), true);
+    if (kind === 'speech') {
+      assert.equal(await delivery, null);
+      assert.equal(f.routeFailures.length, 1);
+    } else {
+      assert.equal((await delivery as { status: string }).status, 'open-failed');
+    }
+  });
+}
+
 for (const change of ['address', 'type'] as const) {
   test('failed corrective open does not reuse the old ' + change + ' confirmation', async () => {
     const f = fixture();

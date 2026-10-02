@@ -2180,7 +2180,8 @@ export class ChannelRegistry {
   }
 
   /**
-   * Join work on an already-open channel without recording new intent.
+   * Join outstanding lifecycle work without recording new intent. Retargeting
+   * may have invalidated open confirmation while the decision remains pending.
    * A close that settles during the wait remains authoritative; waiting for
    * it is not an instruction to open the channel again.
    */
@@ -2599,7 +2600,7 @@ export class ChannelRegistry {
     if (matches.length > 1) return { status: 'ambiguous' };
     let entry = matches[0]!;
     try {
-      if (entry.open && this.hasPendingLifecycle(entry)) {
+      if (this.hasPendingLifecycle(entry)) {
         entry = await this.waitForOpenChannel(entry);
       }
       const desired = this.getDesiredState(entry.serverId, entry.descriptor.id);
@@ -3082,7 +3083,7 @@ export class ChannelRegistry {
     if (!entry) {
       return fail(channelId, `no registered channel for locus "${channelId}"`);
     }
-    if (entry.open && this.hasPendingLifecycle(entry)) {
+    if (this.hasPendingLifecycle(entry)) {
       try {
         entry = await this.waitForOpenChannel(entry);
       } catch (err) {
