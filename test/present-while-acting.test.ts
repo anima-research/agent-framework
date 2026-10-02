@@ -174,12 +174,17 @@ describe('present while acting', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  async function createFramework(): Promise<AgentFramework> {
+  async function createFramework(extra: Record<string, unknown> = {}): Promise<AgentFramework> {
     const framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
       agents: [
-        { name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.' },
+        {
+          name: 'assistant',
+          model: 'test-model',
+          systemPrompt: 'You are a robot pilot.',
+          ...extra,
+        },
       ],
       modules: [module],
     });
@@ -274,6 +279,62 @@ describe('present while acting', () => {
       'explicit send in round 1 silences the turn from that round onward',
     );
 
+    await framework.stop();
+  });
+
+  it('a round whose send FAILED releases its held prose and lifts the silence', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'sending it directly' },
+      { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'hi' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Narrating round two.' },
+      { type: 'tool_use', id: 'c2', name: 'robot--move', input: { dir: 'up' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    const origHandle = module.handleToolCall.bind(module);
+    module.handleToolCall = async (call) =>
+      call.name === 'send_message'
+        ? { success: false, error: 'connection closed', isError: true }
+        : origHandle(call);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(
+      routed.map((r) => r.text),
+      ['sending it directly', 'Narrating round two.'],
+      'the failed send did not speak, so its round\'s prose and later prose are delivered',
+    );
+    await framework.stop();
+  });
+
+  it("proseSilencing 'round': an early send silences only its own round", async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'private planning' },
+      { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'hi' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Narrating round two.' },
+      { type: 'tool_use', id: 'c2', name: 'robot--move', input: { dir: 'up' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'The long closing answer.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework({ proseSilencing: 'round' });
+    const routed = stubChannelRegistry(framework);
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    assert.deepEqual(
+      routed.map((r) => r.text),
+      ['Narrating round two.', 'The long closing answer.'],
+    );
     await framework.stop();
   });
 
