@@ -212,7 +212,7 @@ function shallowEqualRecord(
 interface ChannelEntry {
   serverId: string;
   descriptor: ChannelDescriptor;
-  /** Last confirmed state for this entry's current transport target. */
+  /** Whether the current target is confirmed open; false can be unconfirmed. */
   open: boolean;
 }
 
@@ -670,6 +670,14 @@ export class ChannelRegistry {
   // across descriptor replacement. Settled tails release themselves; a
   // failed operation must not poison later decisions.
   private channelLifecycleTails = new Map<string, Promise<void>>();
+  // Losing an open receipt does not confirm closure. Keep that distinction
+  // private while preserving the public open:boolean availability projection.
+  private unconfirmedChannelTargets = new WeakSet<ChannelEntry>();
+
+  private invalidateTransportConfirmation(entry: ChannelEntry): void {
+    entry.open = false;
+    this.unconfirmedChannelTargets.add(entry);
+  }
 
   private hasPendingLifecycle(entry: ChannelEntry): boolean {
     return this.channelLifecycleTails.has(this.lifecycleKey(entry.serverId, entry.descriptor.id));
@@ -820,7 +828,7 @@ export class ChannelRegistry {
         }
         // A live subscription to the old target does not confirm the new
         // type/address. Label-only updates preserve that confirmation.
-        if (!sameChannelTarget(existing.descriptor, channel)) existing.open = false;
+        if (!sameChannelTarget(existing.descriptor, channel)) this.invalidateTransportConfirmation(existing);
         existing.descriptor = channel;
         this.appendLabelSighting(channel.id, channel.label, extractDmMeta(channel.metadata));
         addedResults.push({ id: channel.id, accepted: true });
@@ -963,7 +971,9 @@ export class ChannelRegistry {
         // the transport is actually open. This repairs transient status only;
         // durable desired state still changes exclusively through lifecycle
         // operations.
-        this.channels.get(incomingKey)!.open = true;
+        const incomingEntry = this.channels.get(incomingKey)!;
+        incomingEntry.open = true;
+        this.unconfirmedChannelTargets.delete(incomingEntry);
       };
       if (!coalesced) markAccepted();
 
@@ -2122,7 +2132,7 @@ export class ChannelRegistry {
         if (attempts >= MAX_CHANNEL_LIFECYCLE_ATTEMPTS) {
           // No receipt confirmed the current target/intent. A later delivery
           // must reconcile it rather than reuse an earlier target's open flag.
-          entry.open = false;
+          this.invalidateTransportConfirmation(entry);
           const error = new ChannelLifecycleConvergenceError(
             `Channel ${channelId} did not converge after ${attempts} lifecycle attempts; its target or desired state kept changing`,
           );
@@ -2148,19 +2158,20 @@ export class ChannelRegistry {
         } catch (error) {
           // A failed same-target backscroll can retain its known-open state.
           // A receipt/failure from an older connection or target cannot.
-          if (this.channels.get(channelKey) === entry && !sameTarget()) entry.open = false;
+          if (this.channels.get(channelKey) === entry && !sameTarget()) this.invalidateTransportConfirmation(entry);
           throw error;
         }
         // Never apply an old receipt to the current target, even transiently:
         // a corrective open might fail before that stale bit is replaced.
         if (this.channels.get(channelKey) !== entry) continue;
         if (!sameTarget()) {
-          entry.open = false;
+          this.invalidateTransportConfirmation(entry);
           continue;
         }
         if (open && !entry.open) opened = true;
         if (!open) opened = false;
         entry.open = open;
+        this.unconfirmedChannelTargets.delete(entry);
         const now = this.getDesiredState(serverId, channelId);
         if (open !== (now === 'open' || now === 'tuned-out')) continue;
         return { open, opened, result };
@@ -2726,7 +2737,8 @@ export class ChannelRegistry {
     }
 
     const alreadyDesiredClosed = this.getDesiredState(entry.serverId, input.channelId) === 'closed';
-    if (!entry.open && alreadyDesiredClosed && !this.hasPendingLifecycle(entry)) {
+    if (!entry.open && alreadyDesiredClosed && !this.hasPendingLifecycle(entry) &&
+        !this.unconfirmedChannelTargets.has(entry)) {
       return {
         success: true,
         data: { channelId: input.channelId, status: 'already closed' },

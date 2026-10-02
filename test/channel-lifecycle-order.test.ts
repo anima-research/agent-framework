@@ -410,6 +410,26 @@ test('failed policy opening records intent once, with truthful resident text thr
   }
 });
 
+test('an unconfirmed target retries explicit close instead of claiming already closed', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+  f.calls.length = 0;
+  f.held.add('x');
+  const closing = f.tool('close');
+  await tick();
+  await f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+  f.pending.shift()!.fail();
+  assert.equal((await closing).success, false);
+  assert.equal(f.isOpen(), false);
+  assert.equal(f.actual.get('x'), true, 'failed close did not change the server state');
+  f.held.delete('x');
+  assert.equal((await f.tool('close')).success, true);
+  assert.equal(f.actual.get('x'), false, 'explicit retry must actually close the channel');
+  assert.equal(f.calls.length, 2, 'unconfirmed is different from confirmed closed');
+  assert.equal((await f.tool('close')).success, true);
+  assert.equal(f.calls.length, 2, 'the confirmed-closed fast path remains available');
+});
+
 for (const kind of ['speech', 'reply'] as const) {
   test(kind + ' joins a pending close even after retargeting clears open confirmation', async () => {
     const f = fixture();
