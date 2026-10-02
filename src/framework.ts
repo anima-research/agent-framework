@@ -7532,7 +7532,10 @@ export class AgentFramework {
     });
   }
 
-  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent): Promise<PushEventResult> {
+  private handleCoalescedPush(
+    serverId: string, params: PushEventParams, event: McplPushEvent,
+    triggerFilter: (content: string, metadata: Record<string, unknown>) => boolean,
+  ): Promise<PushEventResult> {
     return this.admitCoalesced(async () => {
       if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
       validateCoalesceMember(params.coalesce, 'push');
@@ -7546,6 +7549,30 @@ export class AgentFramework {
       const inheritedIdentity = c.channelId ? this.pushCoalescer.identity(coalescingSubjectKey(
         serverId, this.coalescingBinding(serverId), { kind: 'channel', id: c.channelId }, c.key,
       )) : undefined;
+      const identity = c.channelId ? {
+        ...inheritedIdentity,
+        ...(str(origin.messageId) ? { messageId: str(origin.messageId) } : {}),
+        ...(str(origin.threadId) ? { threadId: str(origin.threadId) } : {}),
+        // Freeze even an unknown author now. A later self update must not
+        // retroactively change the identity of this pending activation.
+        author: str(origin.authorId)
+          ? { id: str(origin.authorId)!, name: str(origin.authorName) ?? str(origin.authorId)! }
+          : inheritedIdentity?.author ?? { id: '', name: str(origin.authorName) ?? 'Someone' },
+      } : undefined;
+      if (identity) {
+        // Resolve identity and evaluate trigger policy under the same admission
+        // serialization. An earlier callback could schedule a gate wake before
+        // a preceding occurrence has supplied the subject's self author.
+        const text = event.content
+          .filter((b): b is ContentBlock & { type: 'text'; text: string } => b.type === 'text')
+          .map(b => b.text).join('\n');
+        event = { ...event, triggerInference: triggerFilter(text, {
+          ...origin, serverId, featureSet: params.featureSet, eventId: params.eventId,
+          eventType: 'mcpl:push-event', coalesceChannelId: c.channelId,
+          authorId: identity.author.id,
+          ...(event.tags ? { tags: event.tags } : {}),
+        }) };
+      }
       return this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
@@ -7560,18 +7587,7 @@ export class AgentFramework {
         data: c.data,
         tags: event.tags,
         content: params.payload.content,
-        ...(c.channelId ? {
-          identity: {
-            ...inheritedIdentity,
-            ...(str(origin.messageId) ? { messageId: str(origin.messageId) } : {}),
-            ...(str(origin.threadId) ? { threadId: str(origin.threadId) } : {}),
-            // Freeze even an unknown author now. A later self update must not
-            // retroactively change the identity of this pending activation.
-            author: str(origin.authorId)
-              ? { id: str(origin.authorId)!, name: str(origin.authorName) ?? str(origin.authorId)! }
-              : inheritedIdentity?.author ?? { id: '', name: str(origin.authorName) ?? 'Someone' },
-          },
-        } : {}),
+        ...(identity ? { identity } : {}),
         event: { lane: 'push', event },
       });
     });
@@ -12540,8 +12556,11 @@ export class AgentFramework {
       this.featureSetManager,
       (event) => this.pushEvent(event as unknown as ProcessEvent),
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
-      triggerFilter,
-      (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
+      // Channel-scoped coalesced pushes evaluate this inside serialized
+      // admission, once inherited author identity has been resolved.
+      (content, metadata) => typeof metadata.coalesceChannelId === 'string'
+        ? false : triggerFilter(content, metadata),
+      (serverId, params, event) => this.handleCoalescedPush(serverId, params, event, triggerFilter),
     );
 
     // Server-initiated inference router (Step 6)

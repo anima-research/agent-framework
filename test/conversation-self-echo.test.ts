@@ -341,3 +341,33 @@ test('without conversation routing, self channel messages keep existing behavior
   assert(f.context().includes('ordinary primary self echo'));
   assert.equal(f.membrane.calls.length, 1);
 });
+
+for (const delivery of ['serial', 'concurrent'] as const) {
+  test('inherited self identity vetoes the trigger callback during ' + delivery + ' admission', async (t) => {
+    let filterCalls = 0;
+    const f = await setup(t, { server: { shouldTriggerInference: () => { filterCalls++; return true; } } });
+    const first = {
+      ...f.params('first-self', 'self', { channelId: 'chat', key: 'same-author', deferred: true }),
+      origin: { authorId: 'self', botUserId: 'self' },
+    };
+    const next = {
+      ...f.params('next-self', 'self update', { channelId: 'chat', key: 'same-author', deferred: true }),
+      origin: { botUserId: 'self' },
+    };
+    if (delivery === 'serial') {
+      await f.send('push/event', first);
+      await f.send('push/event', next);
+    } else {
+      await Promise.all([f.send('push/event', first), f.send('push/event', next)]);
+    }
+    assert.equal(filterCalls, 0, 'the trigger boundary must use the admitted, inherited self author');
+    assert.equal(f.framework.getConversationRouter()!.getBinding('chat'), undefined);
+    await f.send('push/event', {
+      ...f.params('other', 'other bot update', { channelId: 'chat', key: 'same-author', deferred: true }),
+      origin: { authorId: 'other-bot', botUserId: 'self' },
+    });
+    assert.equal(filterCalls, 1, 'a genuine counterpart still reaches the configured trigger policy');
+    await f.framework.runUntilIdle();
+    assert.equal(f.membrane.calls.length, 1);
+  });
+}

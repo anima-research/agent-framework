@@ -267,7 +267,7 @@ export class PushHandler {
         eventType: 'mcpl:push-event',
         ...(params.origin ?? {}),
         // Channel scope can be declared by coalesce without any origin fields.
-        ...(params.coalesce?.channelId ? { coalesceChannelId: params.coalesce.channelId } : {}),
+        coalesceChannelId: params.coalesce?.channelId,
         ...(params.tags ? { tags: params.tags } : {}),
       };
       triggerInference = this.shouldTriggerInference(textContent, metadata);
