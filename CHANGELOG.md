@@ -12,10 +12,6 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
-### Fixed
-
-- RFC-005 references now drop overlong optional `name`, `mimeType`, and `expiresAt` fields instead of retaining truncated testimony. Their schema limits count Unicode code points. Reference blocks and subtractive disposition remain valid; admitted display labels retain independent sanitization and truncation.
-
 ## 0.19.0 — 2026-09-28
 
 ### Added
