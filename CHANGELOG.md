@@ -14,7 +14,7 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ### Fixed
 
-- Tool-ended turns now emit `inference:completed` and record cumulative token, cache, and estimated-cost usage exactly once, including turns ended by `skip_reply` or other `endTurn` tools.
+- Tool-ended turns now emit `inference:completed`, record a successful inference-log entry, and record cumulative token, cache, and estimated-cost usage exactly once, including turns ended by `skip_reply` or other `endTurn` tools. Log-backed health totals now include these turns.
 
 ## 0.19.0 — 2026-09-28
 

@@ -3,7 +3,7 @@ import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceRe
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
-import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
+import type { Membrane, ContentBlock, NormalizedRequest, NormalizedResponse, YieldingStream, DetailedUsage, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
@@ -9081,20 +9081,25 @@ export class AgentFramework {
     const myStreamId = agent.streamId;
     let latestUsage: DetailedUsage | undefined;
     let completionAccounted = false;
-    const completeAccounting = (usage: DetailedUsage | undefined): void => {
+    const completeAccounting = (
+      usage: DetailedUsage | undefined,
+      response?: NormalizedResponse,
+      durationMs = Date.now() - startTime,
+    ): void => {
       if (completionAccounted) return;
       completionAccounted = true;
       this.streamCompletionAccounting.delete(stream);
+      const tokenUsage = usage ? {
+        input: usage.inputTokens,
+        output: usage.outputTokens,
+        cacheCreation: usage.cacheCreationTokens,
+        cacheRead: usage.cacheReadTokens,
+      } : undefined;
       this.emitTrace({
         type: 'inference:completed',
         agentName: agent.name,
-        durationMs: Date.now() - startTime,
-        tokenUsage: usage ? {
-          input: usage.inputTokens,
-          output: usage.outputTokens,
-          cacheCreation: usage.cacheCreationTokens,
-          cacheRead: usage.cacheReadTokens,
-        } : undefined,
+        durationMs,
+        tokenUsage,
       });
       if (usage) {
         this.usageTracker.onInferenceCompleted(agent.name, usage, usage.estimatedCost
@@ -9102,6 +9107,20 @@ export class AgentFramework {
           : undefined);
         this.persistUsageState();
       }
+      // Health snapshots and log queries read this same terminal accounting.
+      // A tool-ended stream has no final provider response; record that fact
+      // rather than fabricating response content or waiting for cancellation.
+      this.logInference({
+        timestamp: startTime,
+        agentName: agent.name,
+        requestId,
+        success: true,
+        request: compiledRequest ?? { note: 'streaming request' },
+        response: response?.raw ?? { note: response ? 'streaming response' : 'stream ended by tool result' },
+        durationMs,
+        tokenUsage,
+        stopReason: response?.stopReason ?? 'turn_ended',
+      });
     };
     this.streamCompletionAccounting.set(stream, () => completeAccounting(latestUsage));
     // Membrane usage events are cumulative across the native/XML tool loop.
@@ -9641,20 +9660,7 @@ export class AgentFramework {
                     .join('\n'),
             });
 
-            completeAccounting(du);
-
-            // Log inference
-            this.logInference({
-              timestamp: startTime,
-              agentName: agent.name,
-              requestId,
-              success: true,
-              request: compiledRequest ?? { note: 'streaming request' },
-              response: response.raw ?? { note: 'streaming response' },
-              durationMs,
-              tokenUsage,
-              stopReason: response.stopReason,
-            });
+            completeAccounting(du, response, durationMs);
 
             // Surface refusals instead of going silently mute: stderr line
             // (headless inference failures are otherwise under-logged) + an

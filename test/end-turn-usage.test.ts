@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DetailedUsage, NormalizedResponse } from '@animalabs/membrane';
 import { AgentFramework } from '../src/index.js';
+import { HealthModule } from '../src/modules/health/index.js';
 import type { Module, ToolCall, TraceEvent } from '../src/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
@@ -108,6 +109,13 @@ describe('tool-ended turn usage accounting', () => {
         assert.equal(completed[0].agentName, 'worker');
         assert.deepEqual(completed[0].tokenUsage, expectedTokens(totalUsage));
         assert.ok(completed[0].durationMs >= 0);
+        const logs = f.framework.queryInferenceLogs({ agentName: 'worker' });
+        assert.equal(logs.total, 1);
+        assert.equal(logs.entries[0].entry.success, true);
+        assert.equal(logs.entries[0].entry.stopReason, 'turn_ended');
+        assert.deepEqual(logs.entries[0].entry.tokenUsage, expectedTokens(totalUsage));
+        assert.deepEqual(logs.entries[0].entry.response, { note: 'stream ended by tool result' });
+        assert.equal(logs.entries[0].entry.durationMs, completed[0].durationMs);
         assert.equal(f.traces.filter((e) => e.type === 'inference:turn_ended').length, 1);
         assert.equal(f.traces.filter((e) => e.type === 'usage:updated').length, 1);
         assert.equal(f.traces.filter((e) => e.type === 'inference:exhausted').length, 0);
@@ -141,6 +149,10 @@ describe('tool-ended turn usage accounting', () => {
       assert.equal(f.traces.filter((e) => e.type === 'inference:turn_ended').length, 0);
       assert.equal(f.framework.getSessionUsage().inferenceCount, 1);
       assert.deepEqual(f.framework.getSessionUsage().totals, expectedTotals(totalUsage));
+      const logs = f.framework.queryInferenceLogs({ agentName: 'ordinary' });
+      assert.equal(logs.total, 1, 'natural completion logs exactly once');
+      assert.equal(logs.entries[0].entry.stopReason, 'end_turn');
+      assert.deepEqual(logs.entries[0].entry.tokenUsage, expectedTokens(totalUsage));
     } finally {
       await f.framework.stop();
       rmSync(f.dir, { recursive: true, force: true });
@@ -162,6 +174,10 @@ describe('tool-ended turn usage accounting', () => {
         { agentName: 'bob', usage: expectedTotals(totalUsage), inferenceCount: 1 },
       ]);
       assert.deepEqual(f.traces.filter((e) => e.type === 'usage:updated').map((e) => e.agentName), ['alice', 'bob']);
+      const logs = f.framework.queryInferenceLogs();
+      assert.equal(logs.total, 2);
+      assert.equal(new Set(logs.entries.map((e) => e.entry.requestId)).size, 2);
+      assert.deepEqual(logs.entries.map((e) => e.entry.agentName).sort(), ['alice', 'bob']);
       await f.framework.stop();
       stopped = true;
       const reopened = await AgentFramework.create({
@@ -169,11 +185,40 @@ describe('tool-ended turn usage accounting', () => {
       });
       try {
         assert.deepEqual(reopened.getSessionUsage(), snapshot);
+        assert.deepEqual(reopened.queryInferenceLogs(), logs);
       } finally {
         await reopened.stop();
       }
     } finally {
       if (!stopped) await f.framework.stop();
+      rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('includes tool-ended turns in the log-backed health snapshot', async () => {
+    const f = await fixture();
+    try {
+      f.membrane.pushResponse(toolResponse('echo', 'echo-1', firstUsage));
+      f.membrane.pushResponse(toolResponse('finish', 'finish-1', totalUsage));
+      await run(f.framework, 'worker');
+      const health = new HealthModule({ timeZone: 'UTC' });
+      health.bind(f.framework, f.framework.getStore());
+      const result = await health.handleToolCall({
+        id: 'health-snapshot', name: 'snapshot', input: { includeSubagents: false },
+      });
+      assert.equal(result.success, true);
+      const data = result.data as {
+        inferences: { successCount: number; errorCount: number };
+        tokenTotalsByAgent: Record<string, { input: number; output: number; cacheRead: number; inferences: number }>;
+      };
+      assert.equal(data.inferences.successCount, 1);
+      assert.equal(data.inferences.errorCount, 0);
+      assert.deepEqual(data.tokenTotalsByAgent.worker, {
+        input: totalUsage.inputTokens, output: totalUsage.outputTokens,
+        cacheRead: totalUsage.cacheReadTokens, inferences: 1,
+      });
+    } finally {
+      await f.framework.stop();
       rmSync(f.dir, { recursive: true, force: true });
     }
   });
@@ -188,6 +233,10 @@ describe('tool-ended turn usage accounting', () => {
       assert.equal(completed[0].tokenUsage, undefined);
       assert.equal(f.traces.filter((e) => e.type === 'usage:updated').length, 0);
       assert.equal(f.framework.getSessionUsage().inferenceCount, 0);
+      const logs = f.framework.queryInferenceLogs({ agentName: 'unknown-usage' });
+      assert.equal(logs.total, 1);
+      assert.equal(logs.entries[0].entry.success, true);
+      assert.equal(logs.entries[0].entry.tokenUsage, undefined);
     } finally {
       await f.framework.stop();
       rmSync(f.dir, { recursive: true, force: true });
