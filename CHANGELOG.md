@@ -12,6 +12,10 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+### Fixed
+
+- `tools/observe` now rejects explicit null params and non-object `_meta` before changing the existing filter. Omitted params and `rules: null` still clear the filter. Pattern and field-path limits count Unicode code points, matching the RFC-007 schema and accepting valid 256-code-point astral strings; rule and path-count limits are unchanged.
+
 ## 0.19.0 — 2026-09-28
 
 ### Added

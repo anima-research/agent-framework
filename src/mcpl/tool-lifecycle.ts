@@ -106,7 +106,7 @@ export interface ToolLifecycleConfig {
 export const DEFAULT_MAX_INPUT_BYTES = 16 * 1024;
 
 /** Accepted sizes for a `tools/observe` request (RFC-007 §6.6 asks hosts to
- *  accept at least 64 rules, 64 paths per rule, 256-character strings). */
+ *  accept at least 64 rules, 64 paths per rule, 256-code-point strings). */
 export const TOOL_OBSERVE_LIMITS = {
   rules: 256,
   pathsPerRule: 256,
@@ -128,6 +128,16 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** JSON Schema maxLength counts code points, not UTF-16 code units.
+ *  Stop at the limit rather than allocating a copy of an oversized input. */
+function exceedsCodePointLimit(value: string, limit: number): boolean {
+  let count = 0;
+  for (const _point of value) {
+    if (++count > limit) return true;
+  }
+  return false;
+}
+
 /**
  * Validate `tools/observe` params. `rules` absent or null clears the filter
  * (`{ok, rules: null}`); `[]` is a valid filter that reports nothing. Unknown
@@ -135,7 +145,9 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * make a rule match more than its author wrote.
  */
 export function parseToolObserveParams(params: unknown): ToolObserveParseResult {
-  if (params === undefined || params === null) return { ok: true, rules: null };
+  // Omitted transport params normalize to {}, but explicit JSON null is
+  // not an object and must not clear an existing restrictive filter.
+  if (params === undefined) return { ok: true, rules: null };
   if (!isPlainObject(params)) return { ok: false, message: 'tools/observe params must be an object' };
   // Unknown members are rejected here too (MCP's own `_meta` excepted): a
   // misspelled `rules` must not read as "no rules" and silently clear a
@@ -144,6 +156,9 @@ export function parseToolObserveParams(params: unknown): ToolObserveParseResult 
     if (key !== 'rules' && key !== '_meta') {
       return { ok: false, message: `tools/observe: unknown params member "${key}"` };
     }
+  }
+  if (params._meta !== undefined && !isPlainObject(params._meta)) {
+    return { ok: false, message: 'tools/observe: _meta must be an object' };
   }
   const raw = params.rules;
   if (raw === undefined || raw === null) return { ok: true, rules: null };
@@ -173,7 +188,7 @@ export function parseToolObserveParams(params: unknown): ToolObserveParseResult 
         continue;
       }
       if (typeof value !== 'string') return { ok: false, message: `tools/observe: ${at}.match.${key} must be a string` };
-      if (value.length > TOOL_OBSERVE_LIMITS.stringLength) {
+      if (exceedsCodePointLimit(value, TOOL_OBSERVE_LIMITS.stringLength)) {
         return { ok: false, message: `tools/observe: ${at}.match.${key} is too long`, data: { limit: 'stringLength' } };
       }
       (match as Record<string, string>)[key] = value;
@@ -196,7 +211,7 @@ export function parseToolObserveParams(params: unknown): ToolObserveParseResult 
           if (typeof path !== 'string' || path.length === 0) {
             return { ok: false, message: `tools/observe: ${at}.input must hold non-empty strings` };
           }
-          if (path.length > TOOL_OBSERVE_LIMITS.stringLength) {
+          if (exceedsCodePointLimit(path, TOOL_OBSERVE_LIMITS.stringLength)) {
             return { ok: false, message: `tools/observe: ${at}.input path is too long`, data: { limit: 'stringLength' } };
           }
           paths.push(path);
