@@ -13173,14 +13173,15 @@ export class AgentFramework {
     // a later runtime restart derives a fresh default, not a stale override.
     // WebSocket servers own their environment outside this process.
     // Match Windows names in both sources: Workers expose a case-sensitive
-    // process.env copy. Resolve the last spelling before defaulting so a
-    // generated uppercase key cannot defeat a mixed/lowercase choice at
-    // the later environment merge or spawn.
-    const baselineValue = (env: NodeJS.ProcessEnv | undefined) => process.platform === 'win32'
-      ? Object.entries(env ?? {})
-        .filter(([key]) => key.toUpperCase() === 'DISCORD_SUPPRESSED_REACTIONS_BASELINE')
-        .at(-1)?.[1]
-      : env?.DISCORD_SUPPRESSED_REACTIONS_BASELINE;
+    // process.env copy. Within one source, Node's spawn keeps the first
+    // lexicographically sorted spelling. Resolve each source that way,
+    // then keep the declared source's precedence over inherited values.
+    const baselineValue = (env: NodeJS.ProcessEnv | undefined) => {
+      if (process.platform !== 'win32') return env?.DISCORD_SUPPRESSED_REACTIONS_BASELINE;
+      const key = Object.keys(env ?? {}).sort()
+        .find((name) => name.toUpperCase() === 'DISCORD_SUPPRESSED_REACTIONS_BASELINE');
+      return key === undefined ? undefined : env?.[key];
+    };
     const connectionConfig = isWebSocketTransport(config) ? config : {
       ...config,
       env: {
@@ -13534,6 +13535,8 @@ export class AgentFramework {
    * Includes refusal markers, the adapter's own default awareness marker,
    * the configured awareness marker, and retained outbox markers (including
    * offline recovery choices and marks that can later be removed/replayed).
+   * Composite custom-emote markers become bare IDs for Discord's suppression
+   * matcher; stored markers and the actual add/remove payloads stay unchanged.
    * Explicit adapter/operator suppression settings still take precedence.
    * Throws on an unreadable ledger rather than reporting a partial baseline.
    */
@@ -13544,12 +13547,19 @@ export class AgentFramework {
     } catch (error) {
       throw new DiscordAwarenessAccountingError('reaction-baseline ledger read', error);
     }
+    // Discord events carry the custom emoji's name and ID separately. Full
+    // marker forms belong in add/remove calls, but suppression matches their
+    // stable ID (including after a rename), rather than the composite token.
+    const suppressionToken = (emoji: string): string => {
+      const custom = /^(?:<a?:\w+:(\d{17,20})>|(?:a:)?\w+:(\d{17,20}))$/.exec(emoji.trim());
+      return custom?.[1] ?? custom?.[2] ?? emoji;
+    };
     return [...new Set([
       ...REFUSAL_REACTION_BASELINE,
       DEFAULT_DISCORD_AWARENESS_EMOJI,
       this.discordAwarenessEmoji,
       ...retained,
-    ])].filter((emoji) => emoji.length > 0);
+    ].map(suppressionToken))].filter((emoji) => emoji.length > 0);
   }
 
   /**

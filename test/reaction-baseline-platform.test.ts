@@ -53,14 +53,15 @@ async function connectionEnv(
 
 for (const inheritEnv of [false, true]) {
   test('Windows reaction baseline honors declared case variants, inheritEnv=' + inheritEnv, async () => {
-    const cases: Array<Record<string, string>> = [
-      { [KEY.toLowerCase()]: '' },
-      { Discord_Suppressed_Reactions_Baseline: '🟪' },
-      { [KEY]: 'first', [KEY.toLowerCase()]: '' },
-      { [KEY.toLowerCase()]: 'first', [KEY]: 'last' },
+    const cases: Array<{ env: Record<string, string>; expected: string }> = [
+      { env: { [KEY.toLowerCase()]: '' }, expected: '' },
+      { env: { Discord_Suppressed_Reactions_Baseline: '🟪' }, expected: '🟪' },
+      { env: { [KEY]: 'upper', [KEY.toLowerCase()]: '' }, expected: 'upper' },
+      { env: { [KEY.toLowerCase()]: '', [KEY]: 'upper' }, expected: 'upper' },
+      { env: { [KEY]: '', [KEY.toLowerCase()]: 'lower' }, expected: '' },
+      { env: { [KEY.toLowerCase()]: 'lower', [KEY]: '' }, expected: '' },
     ];
-    for (const env of cases) {
-      const expected = Object.values(env).at(-1);
+    for (const { env, expected } of cases) {
       const composed = await connectionEnv('win32', env, inheritEnv);
       // Node's Windows spawn sorts and keeps the first spelling of a folded
       // name. The chosen value must survive that step as well as #205's merge.
@@ -73,17 +74,27 @@ for (const inheritEnv of [false, true]) {
 
 test('Windows inherited-only baseline lookup handles case-sensitive worker env copies', async () => {
   for (const value of ['', '🟪']) {
-    const parents: NodeJS.ProcessEnv[] = [
-      { [KEY.toLowerCase()]: value },
-      { Discord_Suppressed_Reactions_Baseline: value },
-      { [KEY]: 'first', [KEY.toLowerCase()]: value },
-      { [KEY.toLowerCase()]: 'first', [KEY]: value },
+    const cases: Array<{ parent: NodeJS.ProcessEnv; expected: string }> = [
+      { parent: { [KEY.toLowerCase()]: value }, expected: value },
+      { parent: { Discord_Suppressed_Reactions_Baseline: value }, expected: value },
+      { parent: { [KEY]: 'upper', [KEY.toLowerCase()]: value }, expected: 'upper' },
+      { parent: { [KEY.toLowerCase()]: value, [KEY]: 'upper' }, expected: 'upper' },
+      { parent: { [KEY]: value, [KEY.toLowerCase()]: 'lower' }, expected: value },
+      { parent: { [KEY.toLowerCase()]: 'lower', [KEY]: value }, expected: value },
     ];
-    for (const parent of parents) {
+    for (const { parent, expected } of cases) {
       const composed = await connectionEnv('win32', {}, true, parent);
-      assert.equal(composed[KEY], value);
+      assert.equal(composed[KEY], expected);
     }
   }
+});
+
+test('Windows chooses duplicate spellings within each source, then declared over inherited', async () => {
+  const parent = { [KEY]: 'host-upper', [KEY.toLowerCase()]: 'host-lower' };
+  const composed = await connectionEnv('win32', { [KEY.toLowerCase()]: '', [KEY]: 'declared-upper' }, true, parent);
+  assert.equal(composed[KEY], 'declared-upper');
+  const singleDeclared = await connectionEnv('win32', { [KEY.toLowerCase()]: '' }, true, parent);
+  assert.equal(singleDeclared[KEY], '', 'declared lowercase empty defeats inherited uppercase');
 });
 
 test('inherited-only baseline lookup remains opt-in and POSIX case-sensitive', async () => {

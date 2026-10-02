@@ -91,6 +91,33 @@ describe('placed-reaction baseline', () => {
     assert.equal(baseline(fw).length, new Set(baseline(fw)).size);
   });
 
+  for (const emoji of ['<:mark:123456789012345678>', '<a:mark:123456789012345678>', 'mark:123456789012345678', 'a:mark:123456789012345678']) {
+    it('injects a stable custom-emote ID for configured marker ' + emoji, async () => {
+      const fw = await create(emoji, [server()]);
+      const expected = [...REFUSAL_REACTION_BASELINE, '💤', '123456789012345678'];
+      assert.deepEqual(baseline(fw), expected);
+      assert.equal((await childEnv(fw)).baseline, expected.join(','));
+    });
+  }
+
+  it('canonicalizes retained custom markers before deduplication without changing the ledger', async () => {
+    const first = retain('<:old_name:123456789012345678>');
+    retain('new_name:123456789012345678');
+    retain('<a:another:123456789012345679>');
+    const fw = await create('123456789012345678');
+    assert.deepEqual(baseline(fw), [...REFUSAL_REACTION_BASELINE, '💤', '123456789012345678', '123456789012345679']);
+    const stored = new DiscordAwarenessOutbox(outboxPath).batches();
+    assert.equal(stored.find((batch) => batch.id === first.id)?.emoji, '<:old_name:123456789012345678>');
+  });
+
+  it('preserves Unicode and name tokens while accepting padded full custom markers', async () => {
+    retain('👩‍💻');
+    retain(':name_only:');
+    retain('not:a:custom');
+    const fw = await create('  <:mark:123456789012345678>  ');
+    assert.deepEqual(baseline(fw), [...REFUSAL_REACTION_BASELINE, '💤', '123456789012345678', '👩‍💻', ':name_only:', 'not:a:custom']);
+  });
+
   it('deduplicates a configured marker already used for refusals', async () => {
     const fw = await create(REFUSAL_REACTION_BASELINE[0]);
     assert.deepEqual(baseline(fw), [...REFUSAL_REACTION_BASELINE, '💤']);
@@ -125,7 +152,7 @@ describe('placed-reaction baseline', () => {
     assert.ok((await childEnv(fw)).baseline?.split(',').includes('👁️'), 'restart recomputes a default rather than retaining it as an explicit override');
   });
 
-  for (const value of ['🟪', '']) {
+  for (const value of ['🟪', '', '<:operator_choice:123456789012345678>']) {
     it('preserves an explicit server baseline ' + JSON.stringify(value), async () => {
       const fw = await create(undefined, [server({ env: { [ENV_KEY]: value } })]);
       assert.equal((await childEnv(fw)).baseline, value);

@@ -12,10 +12,6 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
-### Fixed
-
-- Discord reaction suppression defaults now include refusal markers, default/configured awareness markers, and retained recovery-outbox emojis. `AgentFramework.getPlacedReactionBaseline()` exposes that snapshot; stdio MCPL startup and runtime connections inject it by default. Explicit server env (case-insensitive on Windows) and intentionally inherited baseline values, including empty strings, retain precedence. Hosts that inject the old refusal-only default must remove that default to adopt the framework-derived one; remote WebSocket adapters still need their own environment configuration (#95).
-
 ## 0.19.0 — 2026-09-28
 
 ### Added
