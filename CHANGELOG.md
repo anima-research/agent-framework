@@ -16,6 +16,11 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 - **Direct ConversationRouter callers:** `route()` is now a pure query and no longer refreshes idle activity (#46). After successfully delivering a message to the bound fork, call `touch(channelId)`; deterministic clocks move from `route({ now })` to `touch(channelId, now)`. Framework-managed delivery performs this step automatically, including ambient messages and coalesced fixed-audience delivery to the current binding. Queries, failed writes, and delivery to an older engagement leave the current binding's clock unchanged. Bind rules, trigger rules, generation counters, and fork names are unchanged. No store migration or sibling dependency upgrade is required.
 
+### Fixed
+
+- **Hosts using conversation forks:** Self-authored channel echoes continue updating an existing fork's context, but cannot create a fork, request inference, or refresh its idle clock (#47). Self identity comes from `chat:from-self` or a nonempty author ID matching the message's `botUserId`; other bots and unknown identities keep normal routing. The veto precedes trigger callbacks so echoes cannot schedule delayed gate wakes. Non-channel pushes and deployments without conversation routing keep their existing behavior.
+- Deferred channel batches retain the latest counterpart activation separately from their latest content. A self update preserves a pending counterpart cause; a later counterpart update replaces it, including a no-wake verdict. Consumption, retraction, and plain replacement clear the batch and cause together. Snapshots and receipt recovery preserve the cause, so fresh counterpart activity still counts in mixed batches while historical rendered text cannot renew a self-only batch. Legacy snapshots have only their recorded latest occurrence; an earlier overwritten cause cannot be reconstructed.
+
 ## 0.19.0 — 2026-09-28
 
 ### Added

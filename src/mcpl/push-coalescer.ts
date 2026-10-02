@@ -90,6 +90,10 @@ export interface PushRenderResult { content: McplContentBlock[]; timestamp?: str
 interface DeferredBatch<E> {
   /** Latest notice; its content is the fallback, its tags/event drive delivery. */
   latest: CoalescedOccurrence<E>;
+  /** Undefined: latest drives activity/wake policy (also the legacy format).
+   * Null: this batch contains only passive updates. Otherwise retain the
+   * latest active occurrence when a passive update changes the content. */
+  activation?: CoalescedOccurrence<E> | null;
   notices: DeferredNotice[];
   dropped: number;
   /** Set on a batch restored from a snapshot whose render may have started. */
@@ -124,7 +128,7 @@ export interface CoalescingSnapshot {
     identity?: CoalescedOccurrence['identity'];
     occupant?: { eventId: string; placement: CoalescingPlacement };
     audienceAgent?: string;
-    batch?: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number; rendering?: boolean };
+    batch?: { latest: CoalescedOccurrence<unknown>; activation?: CoalescedOccurrence<unknown> | null; notices: DeferredNotice[]; dropped: number; rendering?: boolean };
   }>;
 }
 /** One receipt, written synchronously at acceptance (bridges the snapshot throttle). */
@@ -140,7 +144,7 @@ export interface CoalescingReceiptRecord {
    *  the receipt that suppresses its retry), or `null` when the acceptance
    *  left no batch — a retraction or plain replacement must be recoverable
    *  too. Records replay in order, so the last one per subject wins. */
-  batch: { latest: CoalescedOccurrence<unknown>; notices: DeferredNotice[]; dropped: number } | null;
+  batch: { latest: CoalescedOccurrence<unknown>; activation?: CoalescedOccurrence<unknown> | null; notices: DeferredNotice[]; dropped: number } | null;
 }
 
 export interface CoalescerHost<E> {
@@ -150,8 +154,13 @@ export interface CoalescerHost<E> {
   remove(placement: CoalescingPlacement): boolean;
   /** Ordinary delivery of the event; undefined when routing delivered nowhere.
    *  A replacement is delivered as a fresh message after the unread prior was
-   *  removed: it lands where a fresh event lands (§4.1 allows either place). */
-  deliver(occurrence: CoalescedOccurrence<E>, materialized?: McplContentBlock[], assemblingFor?: string): Promise<CoalescingPlacement | undefined>;
+   *  removed: it lands where a fresh event lands (§4.1 allows either place).
+   *  For deferred materialization, activation names the pending activity
+   *  cause, or null for a passive-only batch; content retains its own identity. */
+  deliver(occurrence: CoalescedOccurrence<E>, materialized?: McplContentBlock[], assemblingFor?: string, activation?: CoalescedOccurrence<E> | null): Promise<CoalescingPlacement | undefined>;
+  /** A passive deferred update changes content but cannot replace the batch's
+   * pending activity/wake cause. Re-evaluated for restored legacy batches. */
+  isPassive?(occurrence: CoalescedOccurrence<E>): boolean;
   /** Queue a wake for a batch that has no model-visible content yet. */
   wakeForBatch(occurrence: CoalescedOccurrence<E>): Promise<void>;
   /** Withdraw unstarted wakes whose sole cause is this subject. */
@@ -360,7 +369,7 @@ export class PushCoalescer<E = unknown> {
       // A producer retrying acknowledged work is also a chance to notice a
       // batch left asleep by a failed freeze: wake it now, without effects.
       const state = this.subjects.get(subject);
-      if (state?.batch && !state.rendering) { this.disarmRecovery(subject); await this.host.wakeForBatch(state.batch.latest); }
+      if (state?.batch && !state.rendering) { this.disarmRecovery(subject); await this.wakeBatch(state.batch); }
       return this.acknowledge(coalescingReceiptKey(occurrence.serverId, occurrence.binding, occurrence.eventId), duplicate, subject, occurrence.eventId);
     }
     const born = this.subjects.has(subject) ? undefined : (occurrence.initial && !occurrence.retract ? 'none' as const : 'unknown' as const);
@@ -387,7 +396,7 @@ export class PushCoalescer<E = unknown> {
     try {
       this.host.recordReceipt?.({
         key: receiptKey, result: entry.result, at: entry.at, subject, ...(born ? { born } : {}),
-        batch: state.batch ? structuredClone({ latest: state.batch.latest as CoalescedOccurrence<unknown>, notices: state.batch.notices, dropped: state.batch.dropped }) : null,
+        batch: state.batch ? structuredClone({ latest: state.batch.latest as CoalescedOccurrence<unknown>, ...(state.batch.activation !== undefined ? { activation: state.batch.activation as CoalescedOccurrence<unknown> | null } : {}), notices: state.batch.notices, dropped: state.batch.dropped }) : null,
       });
     } catch (error) {
       // Not acknowledged: the work would be lost while its receipt suppressed
@@ -440,7 +449,7 @@ export class PushCoalescer<E = unknown> {
       // Authority and wake policy are the host's, re-evaluated at fire time.
       if (!this.host.authorized(state.batch.latest)) return;
       this.host.audit({ kind: 'recovery-wake', subject, eventId: state.batch.latest.eventId, attempt, delayMs: delay });
-      void this.host.wakeForBatch(state.batch.latest).catch(() => { /* audited by the host */ });
+      void this.wakeBatch(state.batch).catch(() => { /* audited by the host */ });
     }, delay);
     (entry.timer as { unref?: () => void }).unref?.();
     this.recovery.set(subject, entry);
@@ -525,6 +534,22 @@ export class PushCoalescer<E = unknown> {
     return state.consumedEventId || state.history !== 'none' ? 'appended' : 'first';
   }
 
+  /** Keep content identity separate from the pending activity/wake cause.
+   * A later active occurrence replaces the cause, even when it vetoes waking. */
+  private activationFor(batch: DeferredBatch<E>): CoalescedOccurrence<E> | null {
+    const activation = batch.activation === undefined ? batch.latest : batch.activation;
+    return activation && !this.host.isPassive?.(activation) ? activation : null;
+  }
+
+  private async wakeBatch(batch: DeferredBatch<E>): Promise<void> {
+    const activation = this.activationFor(batch);
+    if (activation) await this.host.wakeForBatch(activation);
+    else {
+      const o = batch.latest;
+      this.host.cancelWake(coalescingSubjectKey(o.serverId, o.binding, o.scope, o.key));
+    }
+  }
+
   private async acceptDeferred(subject: string, state: SubjectState<E>, occurrence: CoalescedOccurrence<E>, occupantUnread: boolean): Promise<CoalesceOutcome> {
     let outcome: CoalesceOutcome = 'first';
     if (occupantUnread && state.occupant) {
@@ -541,17 +566,20 @@ export class PushCoalescer<E = unknown> {
       // Later notices stay in the batch's audience.
       occurrence = { ...occurrence, deliverTo: state.batch.latest.deliverTo };
     }
+    const passive = this.host.isPassive?.(occurrence) ?? false;
+    const activation = passive ? (state.batch ? this.activationFor(state.batch) : null) : undefined;
     const notice: DeferredNotice = { eventId: occurrence.eventId, timestamp: occurrence.timestamp, ...(occurrence.data !== undefined ? { data: structuredClone(occurrence.data) } : {}) };
     if (state.batch) {
       state.batch.notices.push(notice);
       if (state.batch.notices.length > this.maxNotices) { state.batch.notices.shift(); state.batch.dropped++; }
       state.batch.latest = occurrence;
+      state.batch.activation = activation;
       outcome = 'replaced';
     } else {
       // Rule 1: a notice during a render opens a NEW batch ("first").
-      state.batch = { latest: occurrence, notices: [notice], dropped: 0 };
+      state.batch = { latest: occurrence, ...(activation !== undefined ? { activation } : {}), notices: [notice], dropped: 0 };
     }
-    await this.host.wakeForBatch(occurrence);
+    await this.wakeBatch(state.batch);
     return outcome;
   }
 
@@ -591,13 +619,13 @@ export class PushCoalescer<E = unknown> {
     if (state.rendering) {
       // Another assembly froze this batch; share its outcome (vector 25).
       const rendering = state.rendering;
-      return (await this.host.audience(rendering.batch.latest)).includes(agentName) && state.rendering === rendering ? { done: rendering.done } : undefined;
+      return (await this.host.audience(this.activationFor(rendering.batch) ?? rendering.batch.latest)).includes(agentName) && state.rendering === rendering ? { done: rendering.done } : undefined;
     }
     const batch = state.batch;
     if (!batch) return undefined;
     // The audience lookup may spawn a fork. Under the lock no admission can
     // move the subject on meanwhile; the identity check guards the host.
-    const audience = await this.host.audience(batch.latest);
+    const audience = await this.host.audience(this.activationFor(batch) ?? batch.latest);
     if (!audience.includes(agentName) || state.batch !== batch || state.rendering) return undefined;
     state.batch = undefined;
     this.host.cancelWake(subject);
@@ -675,7 +703,7 @@ export class PushCoalescer<E = unknown> {
         if (!this.host.authorized(occurrence)) { this.host.audit({ kind: 'revoked', subject, eventId: occurrence.eventId }); return; }
         this.host.audit({ kind: 'rendered', subject, eventId: occurrence.eventId, source, empty: content.length === 0 });
         if (!content.length) return; // §5.2: nothing happened
-        const placement = await this.host.deliver({ ...occurrence, timestamp, content }, content, assemblingFor);
+        const placement = await this.host.deliver({ ...occurrence, timestamp, content }, content, assemblingFor, this.activationFor(batch));
         if (placement?.deferredId) {
           // Landed in another agent's deferred queue (its turn is alive): still
           // unread there, so it stays replaceable and withdrawable.
@@ -718,7 +746,7 @@ export class PushCoalescer<E = unknown> {
         // An interrupted render is not replayed (§3.2): a batch that was
         // RENDERING keeps its fallback; a batch that was only pending renders
         // normally at the next assembly.
-        state.batch = { latest: s.batch.latest as CoalescedOccurrence<E>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.rendering ? { noRender: true } : {}) };
+        state.batch = { latest: s.batch.latest as CoalescedOccurrence<E>, ...(s.batch.activation !== undefined ? { activation: s.batch.activation as CoalescedOccurrence<E> | null } : {}), notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.rendering ? { noRender: true } : {}) };
       }
       this.subjects.set(s.subject, state);
     }
@@ -770,7 +798,7 @@ export class PushCoalescer<E = unknown> {
       // afterwards: take the fallback.
       const state = this.subjects.get(r.subject) ?? { history: 'unknown' as const, touchedAt: now };
       state.batch = r.batch
-        ? { latest: r.batch.latest as CoalescedOccurrence<E>, notices: r.batch.notices, dropped: r.batch.dropped, noRender: true }
+        ? { latest: r.batch.latest as CoalescedOccurrence<E>, ...(r.batch.activation !== undefined ? { activation: r.batch.activation as CoalescedOccurrence<E> | null } : {}), notices: r.batch.notices, dropped: r.batch.dropped, noRender: true }
         : undefined;
       this.subjects.set(r.subject, state);
     }
@@ -785,8 +813,8 @@ export class PushCoalescer<E = unknown> {
         subject, history: s.history, consumedEventId: s.consumedEventId, identity: s.identity,
         ...(s.audienceAgent ? { audienceAgent: s.audienceAgent } : {}),
         ...(s.occupant ? { occupant: s.occupant } : {}),
-        ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.noRender ? { rendering: true } : {}) } }
-          : s.rendering ? { batch: { latest: s.rendering.batch.latest as CoalescedOccurrence<unknown>, notices: s.rendering.batch.notices, dropped: s.rendering.batch.dropped, rendering: true } }
+        ...(s.batch ? { batch: { latest: s.batch.latest as CoalescedOccurrence<unknown>, ...(s.batch.activation !== undefined ? { activation: s.batch.activation as CoalescedOccurrence<unknown> | null } : {}), notices: s.batch.notices, dropped: s.batch.dropped, ...(s.batch.noRender ? { rendering: true } : {}) } }
+          : s.rendering ? { batch: { latest: s.rendering.batch.latest as CoalescedOccurrence<unknown>, ...(s.rendering.batch.activation !== undefined ? { activation: s.rendering.batch.activation as CoalescedOccurrence<unknown> | null } : {}), notices: s.rendering.batch.notices, dropped: s.rendering.batch.dropped, rendering: true } }
           : {}),
       })),
     };
@@ -794,7 +822,10 @@ export class PushCoalescer<E = unknown> {
 
   /** Batches whose wake should be re-queued after a restart (their fallback is pending). */
   pendingBatchOccurrences(): CoalescedOccurrence<E>[] {
-    return [...this.subjects.values()].flatMap(s => s.batch ? [s.batch.latest] : []);
+    return [...this.subjects.values()].flatMap(s => {
+      const activation = s.batch ? this.activationFor(s.batch) : null;
+      return activation ? [activation] : [];
+    });
   }
 
   suspend(): void {
