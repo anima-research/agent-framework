@@ -461,3 +461,43 @@ test('a published frozen fork batch is settled from its old namespace before sel
   assert.equal(f.membrane.calls.length, calls, 'an already-published counterpart cause cannot wake a new fork');
   assert.equal(f.framework.getConversationRouter()!.getBinding('chat'), undefined);
 });
+
+for (const lane of ['plain', 'deferred'] as const) {
+  test('a ' + lane + ' self update preserves a genuine counterpart debounce timer and its deadline', async (t) => {
+    const f = await setup(t, { framework: { gate: { config: {
+      default: 'skip', policies: [{ name: 'counterpart', match: { tagsAny: ['probe:wake'] }, behavior: { debounce: 5000 } }],
+    } } } });
+    // Establish a fork without a pending wake.
+    await sendPlain(f, 'start', 'initial counterpart', { tags: [] });
+    const binding = f.framework.getConversationRouter()!.getBinding('chat')!;
+    const counterpart = {
+      ...f.params('counterpart', 'genuine counterpart', { channelId: 'chat', key: 'same', deferred: lane === 'deferred' }),
+      tags: ['probe:wake'], origin: { authorId: 'human' },
+    };
+    await f.send('push/event', counterpart);
+    const gate = (f.framework as unknown as { eventGate: {
+      debounceTimers: Map<string, { timer: ReturnType<typeof setTimeout>; events: unknown[] }>;
+      fireDebounce(name: string): void;
+    } }).eventGate;
+    const pending = gate.debounceTimers.get('counterpart')!;
+    assert(pending, 'the counterpart arms a delayed wake');
+    const timer = pending.timer;
+    const events = [...pending.events];
+    await f.send('push/event', {
+      ...f.params('self', 'self addition', { channelId: 'chat', key: 'same', deferred: lane === 'deferred' }),
+      tags: ['chat:from-self', 'probe:wake'], origin: { authorId: 'self' },
+    });
+    assert.equal(gate.debounceTimers.get('counterpart')?.timer, timer, 'self cannot cancel or extend the original timer');
+    assert.deepEqual(pending.events, events, 'self creates no delayed gate cause');
+    clearTimeout(timer);
+    gate.fireDebounce('counterpart');
+    await f.framework.runUntilIdle();
+    assert(f.membrane.calls.length > 0, 'the genuine counterpart wake is preserved');
+    if (lane === 'deferred') {
+      assert.equal(f.renders.length, 1);
+      assert(f.context(binding.agentName).includes('document_diff'));
+    } else {
+      assert(f.context(binding.agentName).includes('self addition'));
+    }
+  });
+}
