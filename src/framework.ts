@@ -387,6 +387,7 @@ import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
+import { McplResponseSerializationError } from './mcpl/errors.js';
 import type {
   McplServerConfig,
   McplHostCapabilities,
@@ -13693,6 +13694,86 @@ export class AgentFramework {
    * Push events and inference requests are deferred to Steps 6/7.
    */
   private wireMcplEvents(connection: McplServerConnection): void {
+    type Responder = {
+      id: string | number;
+      respond: (result: unknown) => void;
+      respondError: (code: number, message: string, data?: unknown) => void;
+    };
+
+    // EventEmitter does not consume promises returned by listeners. Keep
+    // each RPC handler's rejection at this boundary, including failures after
+    // channels/register or channels/changed has acknowledged the request.
+    const onRequest = <T>(
+      event: string,
+      handler: (params: T, responder?: Responder) => void | Promise<void>,
+    ): void => {
+      connection.on(event, (params: T, responder?: Responder) => {
+        let responseAttempted = false;
+        let responseFailure: { error: unknown; responseAttempted: boolean } | undefined;
+        const writeResponse = (write: () => void): void => {
+          if (responseAttempted) {
+            // Inner handler catches can try to answer a failed result with
+            // an error. Preserve the first failure and refuse the second write.
+            throw responseFailure ? responseFailure.error : new Error('MCPL response already attempted');
+          }
+          // A throwing transport write may have partially sent the reply.
+          responseAttempted = true;
+          try {
+            write();
+          } catch (error) {
+            // Only the encoder can establish that no write was attempted.
+            // Transport exceptions stay outcome-unknown and cannot be retried.
+            if (error instanceof McplResponseSerializationError) responseAttempted = false;
+            responseFailure = { error, responseAttempted };
+            throw error;
+          }
+        };
+        const tracked = responder && {
+          ...responder,
+          respond: (result: unknown) => writeResponse(() => responder.respond(result)),
+          respondError: (code: number, message: string, data?: unknown) =>
+            writeResponse(() => responder.respondError(code, message, data)),
+        };
+        const failed = (error: unknown): void => {
+          if (responseFailure) error = responseFailure.error;
+          const message = error instanceof Error ? error.message : String(error);
+          const attemptedBeforeFailure = responseFailure?.responseAttempted ?? responseAttempted;
+          let responseError: string | undefined;
+          if (tracked && !responseAttempted) {
+            try {
+              tracked.respondError(-32603, message);
+            } catch (sendError) {
+              responseError = sendError instanceof Error ? sendError.message : String(sendError);
+            }
+          }
+          // Keep headless hosts diagnosable even without a trace subscriber.
+          console.error(`[mcpl] ${connection.id} ${event} handler failed:`, error);
+          this.emitTrace({
+            type: 'mcpl:request-handler-error',
+            serverId: connection.id,
+            event,
+            requestId: responder?.id,
+            responseAttempted: attemptedBeforeFailure,
+            error: message,
+            ...(responseError === undefined ? {} : { responseError }),
+          });
+        };
+        try {
+          // Invoke immediately: control-plane responses must retain their
+          // ACK-before-reconcile ordering and data-plane barrier semantics.
+          const succeeded = (): void => {
+            // A handler may swallow an encoding/transport failure without rethrowing.
+            if (responseFailure) failed(responseFailure.error);
+          };
+          const result = handler(params, tracked);
+          if (result) void result.then(succeeded, failed);
+          else succeeded();
+        } catch (error) {
+          failed(error);
+        }
+      });
+    };
+
     // Forward subprocess stderr lines as trace events so consumers (conhost,
     // log sinks, TUI badges) can persist and surface them.
     connection.on('stderr', (params: { line: string }) => {
@@ -13710,7 +13791,7 @@ export class AgentFramework {
     // framework; the ScopeManager and config `scopes` wiring went with it.
 
     // Handle push events (Step 6)
-    connection.on('push-event', async (
+    onRequest('push-event', async (
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
@@ -13720,7 +13801,7 @@ export class AgentFramework {
     });
 
     // Handle server-initiated inference requests (Step 6)
-    connection.on('inference-request', async (
+    onRequest('inference-request', async (
       params: McplInferenceRequestParams,
       responder?: { id: string | number; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
@@ -13741,7 +13822,7 @@ export class AgentFramework {
     });
 
     // Handle channel registration (Step 7)
-    connection.on('channels-register', async (
+    onRequest('channels-register', async (
       params: ChannelsRegisterParams,
       responder?: { respond: (result: unknown) => void },
     ) => {
@@ -13752,7 +13833,7 @@ export class AgentFramework {
     // present for the Request form and carries itemized added-descriptor
     // results; absent for Notifications, where rejection is itemwise
     // filtering plus a diagnostic trace.
-    connection.on('channels-changed', async (
+    onRequest('channels-changed', async (
       params: ChannelsChangedParams,
       responder?: { respond: (result: unknown) => void },
     ) => {
@@ -13770,7 +13851,7 @@ export class AgentFramework {
       });
     });
 
-    connection.on('channels-list', (
+    onRequest('channels-list', (
       _params: unknown,
       responder?: { respond: (result: unknown) => void },
     ) => {
@@ -13782,7 +13863,7 @@ export class AgentFramework {
     // RFC-007 §6: the server's filter over tools/lifecycle. Admission already
     // required toolLifecycle.observe (-32002 otherwise). Validation failures
     // leave the previous filter in force (§6.6).
-    connection.on('tools-observe', (
+    onRequest('tools-observe', (
       params: unknown,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void },
     ) => {
@@ -13796,7 +13877,7 @@ export class AgentFramework {
       responder?.respond({});
     });
 
-    connection.on('model-info', (
+    onRequest('model-info', (
       _params: unknown,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void },
     ) => {
@@ -13813,7 +13894,7 @@ export class AgentFramework {
     });
 
     // Handle incoming channel messages (Step 7)
-    connection.on('channels-incoming', async (
+    onRequest('channels-incoming', async (
       params: ChannelsIncomingParams,
       responder?: { respond: (result: unknown) => void },
     ) => {
@@ -13823,20 +13904,15 @@ export class AgentFramework {
     });
 
     // Handle host-level admin commands from a surface (e.g. Discord /undo)
-    connection.on('host-command', async (
+    onRequest('host-command', async (
       params: HostCommandParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
       if (!responder) return;
-      try {
-        const barrier = this.discordAwarenessBarrier;
-        if (barrier) await barrier.promise;
-        const result = await this.handleHostCommand(connection.id, params ?? {});
-        responder.respond(result);
-      } catch (error) {
-        const err = error instanceof Error ? error : new Error(String(error));
-        responder.respondError(-32603, err.message);
-      }
+      const barrier = this.discordAwarenessBarrier;
+      if (barrier) await barrier.promise;
+      const result = await this.handleHostCommand(connection.id, params ?? {});
+      responder.respond(result);
     });
 
     // Handle dynamic tool list changes (notifications/tools/list_changed)

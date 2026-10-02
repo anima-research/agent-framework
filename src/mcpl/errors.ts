@@ -40,6 +40,14 @@ export const CHANNEL_OPEN_FAILED = -32024;
 // Error Factories
 // ============================================================================
 
+/** Response encoding failed before the transport was given any bytes. */
+export class McplResponseSerializationError extends Error {
+  constructor(cause: unknown) {
+    super('MCPL response could not be serialized', { cause });
+    this.name = 'McplResponseSerializationError';
+  }
+}
+
 /**
  * Create a "feature set not enabled" error.
  * Returned when a server sends a message tagged with a feature set
