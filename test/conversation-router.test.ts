@@ -14,7 +14,7 @@ function makeRouter(overrides: Partial<ConstructorParameters<typeof Conversation
 // ---------------------------------------------------------------------------
 
 function proposedName(channelId: string, router = makeRouter()): string {
-  const decision = router.route({ channelId, mentioned: true, kind: 'channel', now: T0 });
+  const decision = router.route({ channelId, mentioned: true, kind: 'channel' });
   assert.equal(decision.kind, 'spawn');
   if (decision.kind !== 'spawn') assert.fail('expected spawn');
   return decision.agentName;
