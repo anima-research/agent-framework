@@ -397,3 +397,67 @@ test('a receipted self update never re-evaluates trigger policy using a newer su
   await f.framework.runUntilIdle();
   assert.equal(f.membrane.calls.length, 1);
 });
+
+for (const recovery of ['snapshot', 'receipt bridge'] as const) {
+  for (const deferred of [false, true]) {
+  test('inherited self author survives ' + recovery + ' for deferred=' + deferred, async (t) => {
+    let filterCalls = 0;
+    const f = await setup(t, { server: { shouldTriggerInference: () => { filterCalls++; return true; } } });
+    await f.send('push/event', {
+      ...f.params('first-self', 'self', { channelId: 'chat', key: 'same-author', deferred }),
+      origin: { authorId: 'self', botUserId: 'self' },
+    });
+    if (recovery === 'snapshot') await f.framework.stop();
+    else await crash(f);
+    await f.create();
+    await f.register();
+    await f.send('push/event', {
+      ...f.params('next-self', 'self update', { channelId: 'chat', key: 'same-author', deferred }),
+      origin: { botUserId: 'self' },
+    });
+    assert.equal(filterCalls, 0, 'recovery must preserve the author used by inherited identity');
+    await f.framework.runUntilIdle();
+    assert.equal(f.framework.getConversationRouter()!.getBinding('chat'), undefined);
+    assert.equal(f.membrane.calls.length, 0);
+  });
+}
+}
+
+test('a published frozen fork batch is settled from its old namespace before self-only recovery can wake', async (t) => {
+  const f = await setup(t);
+  await sendPlain(f, 'start', 'initial counterpart');
+  const originalFork = f.framework.getConversationRouter()!.getBinding('chat')!.agentName;
+  let release!: (value: unknown) => void;
+  const started = new Promise<void>(resolve => {
+    f.renderer(() => { resolve(); return new Promise(r => { release = r; }); });
+  });
+  await f.send('push/event', {
+    ...f.params('active', 'older active fallback', { channelId: 'chat', key: 'overlap', deferred: true }),
+    tags: ['chat:from-human'], origin: { authorId: 'human' },
+  });
+  const run = f.framework.runUntilIdle();
+  await started;
+  await f.send('push/event', {
+    ...f.params('self-during-render', 'self fallback', { channelId: 'chat', key: 'overlap', deferred: true }),
+    tags: ['chat:from-self'], origin: { authorId: 'self' },
+  });
+  // Retain the pre-publication snapshot/receipts, as a crash in the checkpoint
+  // window would. Context publication itself still goes to the real store.
+  const internals = f.framework as unknown as {
+    flushCoalescingSnapshot(): void;
+    coalescingSaveTimer: ReturnType<typeof setTimeout> | null;
+  };
+  if (internals.coalescingSaveTimer) clearTimeout(internals.coalescingSaveTimer);
+  internals.coalescingSaveTimer = null;
+  internals.flushCoalescingSnapshot = () => {};
+  release({ content: [{ type: 'text', text: 'completed active render' }] });
+  await run;
+  assert(f.context(originalFork).includes('completed active render'));
+  const calls = f.membrane.calls.length;
+  await crash(f);
+  await f.create();
+  await f.register();
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, calls, 'an already-published counterpart cause cannot wake a new fork');
+  assert.equal(f.framework.getConversationRouter()!.getBinding('chat'), undefined);
+});

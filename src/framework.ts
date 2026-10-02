@@ -5,7 +5,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeF
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
+import { ContextManager, MessageStore, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
@@ -7390,12 +7390,15 @@ export class AgentFramework {
   }
 
   private initializePushCoalescer(): void {
+    // Boot-only metadata cache for frozen batches published into forks that
+    // are no longer registered after restart. Avoid reading their blob bodies.
+    const publishedForks = new Map<string, Set<string>>();
     const coalescer = new PushCoalescer<CoalescedDelivery>({
       isUnread: (p) => this.isUnreadPlacement(p),
       remove: (p) => this.removePlacement(p),
       deliver: (occ, materialized, assemblingFor, activation) => this.deliverCoalesced(occ, materialized, assemblingFor, activation),
       isPassive: (occ) => !!this.conversationRouter && occ.scope.kind === 'channel' && this.isSelfConversationOccurrence(occ),
-      wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
+      wakeForBatch: (occ, preserveExisting) => this.wakeForCoalescedBatch(occ, preserveExisting),
       cancelWake: (subject) => this.cancelCoalescedWakes(subject),
       authorized: (occ) => this.coalescedAuthorized(occ),
       audience: (occ) => this.coalescedAudience(occ),
@@ -7413,7 +7416,7 @@ export class AgentFramework {
         this.coalescingRecentReceipts.push(record);
         this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
       },
-      wasPublished: (subject, eventId) => {
+      wasPublished: (subject, eventId, publicationAgent) => {
         // Boot-time only: the occurrence's durable delivery identity
         // (subject + eventId in message metadata) in any agent's context.
         for (const agent of this.agents.values()) {
@@ -7421,6 +7424,28 @@ export class AgentFramework {
             if (agent.getContextManager().getAllMessages().some((m) =>
               m.metadata?.coalescingSubject === subject && m.metadata?.eventId === eventId)) return true;
           } catch { /* a context that cannot be read cannot prove publication */ }
+        }
+        if (publicationAgent && !this.agents.has(publicationAgent)) {
+          let published = publishedForks.get(publicationAgent);
+          if (!published) {
+            published = new Set<string>();
+            try {
+              const messages = new MessageStore(this.store, { namespace: `conversations/${publicationAgent}` });
+              for (let offset = 0; ;) {
+                const page = messages.getWindow(offset, 256, { resolveBlobs: false });
+                for (const message of page.messages) {
+                  const m = message.metadata;
+                  if (typeof m?.coalescingSubject === 'string' && typeof m?.eventId === 'string') {
+                    published.add(JSON.stringify([m.coalescingSubject, m.eventId]));
+                  }
+                }
+                offset = page.startIndex + page.messages.length;
+                if (offset >= page.totalCount || !page.messages.length) break;
+              }
+            } catch { /* unavailable history cannot establish publication */ }
+            publishedForks.set(publicationAgent, published);
+          }
+          return published.has(JSON.stringify([subject, eventId]));
         }
         return false;
       },
@@ -7446,9 +7471,14 @@ export class AgentFramework {
     } catch (err) {
       console.error('[coalescing] could not restore coalescing state; starting with unknown history:', err);
     }
+    publishedForks.clear();
     this.pushCoalescer = coalescer;
-    // Batches restored from a snapshot still owe the agent a wake (§14 v41).
-    for (const occ of coalescer.pendingBatchOccurrences()) void this.wakeForCoalescedBatch(occ);
+    // Restore independent batch causes in order. An older frozen counterpart
+    // cannot be cancelled by a newer quiet batch on the same subject, and two
+    // causes must not race to create the same conversation fork.
+    void this.admitCoalesced(async () => {
+      for (const occ of coalescer.pendingBatchOccurrences()) await this.wakeForCoalescedBatch(occ, true);
+    }).catch(err => console.error('[coalescing] could not restore pending wakes:', err));
   }
 
   /**
@@ -7730,9 +7760,9 @@ export class AgentFramework {
     return placement;
   }
 
-  private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
+  private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>, preserveExisting = false): Promise<void> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
-    this.cancelCoalescedWakes(subject);
+    if (!preserveExisting) this.cancelCoalescedWakes(subject);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
     if (this.conversationRouter && occ.scope.kind === 'channel' && this.isSelfConversationOccurrence(occ)) return;
     const origin = occ.event.event.origin;
