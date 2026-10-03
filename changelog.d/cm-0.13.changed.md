@@ -1,0 +1,1 @@
+Depend on `@animalabs/context-manager` ^0.13.0: optional compression-hold timeouts, branch-ID cache keys, Bedrock summarizer recognition, tool pairing before pruning in both renderers, and fuller refusal diagnostics.
