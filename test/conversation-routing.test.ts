@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { ContextManager } from '@animalabs/context-manager';
 import { AgentFramework } from '../src/index.js';
 import type { ProcessEvent, ConversationRouterConfig, TraceEvent } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -95,7 +96,7 @@ describe('Conversation routing', () => {
     }));
     await framework.runUntilIdle();
 
-    const fork = framework.getAgent('conversation-slack-D1-g1');
+    const fork = framework.getAgent('conversation~slack~003aD1-g1');
     assert.ok(fork, 'fork agent should exist');
 
     // Message landed in the fork's context, not the trunk's.
@@ -116,9 +117,110 @@ describe('Conversation routing', () => {
 
     // Binding is live.
     const router = framework.getConversationRouter()!;
-    assert.equal(router.getBinding('slack:D1')?.agentName, 'conversation-slack-D1-g1');
+    assert.equal(router.getBinding('slack:D1')?.agentName, 'conversation~slack~003aD1-g1');
 
     await framework.stop();
+  });
+
+  it('colliding channel spellings spawn distinct forks with isolated persisted history', async () => {
+    const channelIds = ['slack:C1', 'slack/C1', 'slack C1', 'slack-C1', 'slack~003aC1'];
+    const framework = await makeFramework();
+    const names: string[] = [];
+    try {
+      for (const [i, channelId] of channelIds.entries()) {
+        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ack' }]));
+        framework.pushEvent(incomingEvent({ channelId, text: `PRIVATE-CASE-${i}`, mentioned: true }));
+        await framework.runUntilIdle();
+      }
+      const router = framework.getConversationRouter()!;
+      for (const [i, channelId] of channelIds.entries()) {
+        const binding = router.getBinding(channelId);
+        assert.ok(binding, `${channelId} needs its own live binding`);
+        names.push(binding.agentName);
+        const fork = framework.getAgent(binding.agentName);
+        assert.ok(fork);
+        assert.equal(router.channelForAgent(fork.name), channelId);
+        const { messages } = await fork.getContextManager().compile();
+        const text = JSON.stringify(messages);
+        for (let j = 0; j < channelIds.length; j++) {
+          assert.equal(text.includes(`PRIVATE-CASE-${j}`), i === j, 'only this channel enters its fork');
+        }
+      }
+      assert.equal(new Set(names).size, channelIds.length);
+    } finally {
+      await framework.stop();
+    }
+
+    // Verify the isolation in Chronicle itself, not just live Agent objects.
+    const reopened = await makeFramework();
+    try {
+      for (const [i, name] of names.entries()) {
+        const context = await ContextManager.open({
+          store: reopened.getStore(), namespace: `conversations/${name}`, isolate: true,
+        });
+        try {
+          const { messages } = await context.compile();
+          const text = JSON.stringify(messages);
+          for (let j = 0; j < channelIds.length; j++) {
+            assert.equal(text.includes(`PRIVATE-CASE-${j}`), i === j, 'persisted histories stay isolated');
+          }
+        } finally {
+          context.close();
+        }
+      }
+    } finally {
+      await reopened.stop();
+    }
+  });
+
+  it('upgrade preserves legacy history and counters without lending that history to a new channel', async () => {
+    const legacyName = 'conversation-slack-C1-g1';
+    const legacy = await makeFramework();
+    try {
+      // Fixture from the old sanitizer: slack:C1 had generation 1 in this namespace.
+      const context = await ContextManager.open({
+        store: legacy.getStore(), namespace: `conversations/${legacyName}`, isolate: true,
+      });
+      context.addMessage('user', [{ type: 'text', text: 'LEGACY-PRIVATE-CASE' }]);
+      context.close();
+      legacy.getStore().setStateJson('framework/conversation-router', {
+        generations: { 'slack:C1': 1 },
+      });
+    } finally {
+      await legacy.stop();
+    }
+
+    const framework = await makeFramework();
+    try {
+      for (const channelId of ['slack-C1', 'slack:C1']) {
+        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ack' }]));
+        framework.pushEvent(incomingEvent({ channelId, text: 'new engagement', mentioned: true }));
+        await framework.runUntilIdle();
+      }
+      const router = framework.getConversationRouter()!;
+      for (const channelId of ['slack-C1', 'slack:C1']) {
+        const binding = router.getBinding(channelId);
+        assert.ok(binding);
+        assert.equal(binding.generation, channelId === 'slack:C1' ? 2 : 1);
+        const fork = framework.getAgent(binding.agentName)!;
+        const { messages } = await fork.getContextManager().compile();
+        assert.ok(!JSON.stringify(messages).includes('LEGACY-PRIVATE-CASE'), 'old history must stay with its original namespace');
+        assert.notEqual(binding.agentName, legacyName);
+      }
+
+      const oldContext = await ContextManager.open({
+        store: framework.getStore(), namespace: `conversations/${legacyName}`, isolate: true,
+      });
+      try {
+        const { messages } = await oldContext.compile();
+        assert.ok(JSON.stringify(messages).includes('LEGACY-PRIVATE-CASE'), 'legacy history remains readable');
+        assert.ok(!JSON.stringify(messages).includes('new engagement'), 'legacy history remains unchanged');
+      } finally {
+        oldContext.close();
+      }
+    } finally {
+      await framework.stop();
+    }
   });
 
   it('channel message without mention is dropped; mention spawns', async () => {
@@ -127,12 +229,12 @@ describe('Conversation routing', () => {
 
     framework.pushEvent(incomingEvent({ channelId: 'slack:C1', text: 'just chatting' }));
     await framework.runUntilIdle();
-    assert.equal(framework.getAgent('conversation-slack-C1-g1'), null, 'no fork without mention');
+    assert.equal(framework.getAgent('conversation~slack~003aC1-g1'), null, 'no fork without mention');
     assert.equal(membrane.calls.length, 0, 'no inference for unrouted messages');
 
     framework.pushEvent(incomingEvent({ channelId: 'slack:C1', text: 'bot, help', mentioned: true }));
     await framework.runUntilIdle();
-    assert.ok(framework.getAgent('conversation-slack-C1-g1'), 'mention spawns fork');
+    assert.ok(framework.getAgent('conversation~slack~003aC1-g1'), 'mention spawns fork');
 
     await framework.stop();
   });
@@ -148,7 +250,7 @@ describe('Conversation routing', () => {
     framework.pushEvent(incomingEvent({ channelId: 'slack:C1', text: 'ambient detail' }));
     await framework.runUntilIdle();
 
-    const fork = framework.getAgent('conversation-slack-C1-g1')!;
+    const fork = framework.getAgent('conversation~slack~003aC1-g1')!;
     const { messages } = await fork.getContextManager().compile();
     assert.ok(
       messages.some((m) => JSON.stringify(m.content).includes('ambient detail')),
@@ -171,7 +273,7 @@ describe('Conversation routing', () => {
     framework.pushEvent(incomingEvent({ channelId: 'slack:D2', text: 'hi', channelType: 'im' }));
     await framework.runUntilIdle();
 
-    const fork = framework.getAgent('conversation-slack-D2-g1')!;
+    const fork = framework.getAgent('conversation~slack~003aD2-g1')!;
     const { messages } = await fork.getContextManager().compile();
     assert.ok(
       messages.some((m) => JSON.stringify(m.content).includes('HANDBOOK')),
@@ -283,7 +385,7 @@ describe('Conversation routing', () => {
     await framework.runUntilIdle();
     const router = framework.getConversationRouter()!;
     assert.ok(router.getBinding('slack:D3'), 'spawn should leave a live binding');
-    const g1 = framework.getAgent('conversation-slack-D3-g1');
+    const g1 = framework.getAgent('conversation~slack~003aD3-g1');
     assert.ok(g1, 'g1 fork should exist after spawn');
 
     // Force expiry deterministically and provide the closure-turn response.
@@ -301,7 +403,7 @@ describe('Conversation routing', () => {
       'closure prompt should be in the fork context',
     );
     assert.equal(
-      framework.getAgent('conversation-slack-D3-g1'), null,
+      framework.getAgent('conversation~slack~003aD3-g1'), null,
       'closed fork should be disposed once its closure turn finished',
     );
 
@@ -309,7 +411,7 @@ describe('Conversation routing', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi again' }]));
     framework.pushEvent(incomingEvent({ channelId: 'slack:D3', text: 'back again', channelType: 'im' }));
     await framework.runUntilIdle();
-    assert.ok(framework.getAgent('conversation-slack-D3-g2'), 'rebind spawns generation 2');
+    assert.ok(framework.getAgent('conversation~slack~003aD3-g2'), 'rebind spawns generation 2');
 
     await framework.stop();
   });
@@ -323,7 +425,7 @@ describe('Conversation routing', () => {
 
     fw1.pushEvent(incomingEvent({ channelId: 'slack:D9', text: 'case one', channelType: 'im' }));
     await fw1.runUntilIdle();
-    assert.ok(fw1.getAgent('conversation-slack-D9-g1'), 'first engagement spawns g1');
+    assert.ok(fw1.getAgent('conversation~slack~003aD9-g1'), 'first engagement spawns g1');
     await fw1.stop();
 
     // Restart: same store, fresh framework. The generation counter must come
@@ -333,8 +435,8 @@ describe('Conversation routing', () => {
     fw2.pushEvent(incomingEvent({ channelId: 'slack:D9', text: 'case two', channelType: 'im' }));
     await fw2.runUntilIdle();
 
-    assert.equal(fw2.getAgent('conversation-slack-D9-g1'), null, 'g1 must not be resurrected');
-    const g2 = fw2.getAgent('conversation-slack-D9-g2');
+    assert.equal(fw2.getAgent('conversation~slack~003aD9-g1'), null, 'g1 must not be resurrected');
+    const g2 = fw2.getAgent('conversation~slack~003aD9-g2');
     assert.ok(g2, 'restart spawns the next generation, not generation 1 again');
 
     const { messages } = await g2!.getContextManager().compile();
@@ -355,7 +457,7 @@ describe('Conversation routing', () => {
     const framework = await makeFramework();
     framework.pushEvent(incomingEvent({ channelId: 'slack:C7', text: 'bot, help', mentioned: true }));
     await framework.runUntilIdle();
-    const forkName = 'conversation-slack-C7-g1';
+    const forkName = 'conversation~slack~003aC7-g1';
     assert.ok(framework.getAgent(forkName), 'fork should exist');
 
     const failures: Array<{ tool: string; error: string }> = [];
@@ -383,7 +485,7 @@ describe('Conversation routing', () => {
     const framework = await makeFramework();
     framework.pushEvent(incomingEvent({ channelId: 'slack:C7', text: 'bot, help', mentioned: true }));
     await framework.runUntilIdle();
-    const forkName = 'conversation-slack-C7-g1';
+    const forkName = 'conversation~slack~003aC7-g1';
     assert.ok(framework.getAgent(forkName), 'fork should exist');
 
     // tool:started is emitted AFTER the fence with the (possibly rewritten)
