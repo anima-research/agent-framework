@@ -2446,6 +2446,44 @@ export class ChannelRegistry {
   }
 
   /**
+   * The `>>` target to show an agent for a channel: one whitespace-free token
+   * that `resolveProseTarget()` maps back to this same channel. The prefix
+   * grammar takes the target as the first non-whitespace run, so a label with
+   * a space can't be quoted verbatim: `>>#DM: alice` parses as target `#DM:`
+   * plus body `alice …`, and `>>#fable (antra's server)` delivers
+   * `(antra's server)` as text. Tried in order: `@name` for a DM, `#label`,
+   * `#name` (label without its server suffix), the descriptor id.
+   *
+   * Undefined when there is no safe token: the channel isn't registered (on
+   * `serverId`, when given), no candidate is whitespace-free and resolves back,
+   * or the id is registered by more than one server. A resolved target names a
+   * channel by id alone, and ids are unique only within a connection, so a
+   * shared id could route the reply through the wrong server.
+   */
+  proseTargetFor(channelId: string, serverId?: string): string | undefined {
+    const sameId = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
+    const entry = serverId ? sameId.find((e) => e.serverId === serverId) : sameId[0];
+    if (!entry || sameId.length > 1) return undefined;
+    const d = entry.descriptor;
+    const label = d.label ?? '';
+    const meta = d.metadata as { channelType?: string; recipientName?: string } | undefined;
+    const isDm = meta?.channelType === 'dm' || label.toLowerCase().startsWith('dm: ') || d.id.includes(':dm:');
+    const dmName = meta?.recipientName ?? (label.toLowerCase().startsWith('dm: ') ? label.slice(4) : undefined);
+    const bare = label.replace(/^#/, '');
+    const candidates = [
+      ...(isDm && dmName ? [`@${dmName}`] : []),
+      ...(bare ? [`#${bare}`, `#${bare.replace(/\s*\([^)]*\)\s*$/, '')}`] : []),
+      d.id,
+    ];
+    for (const c of candidates) {
+      if (/\s/.test(c) || c === '#') continue;
+      const r = this.resolveProseTarget(c);
+      if ('channelId' in r && r.channelId === d.id) return c;
+    }
+    return undefined;
+  }
+
+  /**
    * Open a channel because something was DELIVERED into it (explicit send
    * tool or routed speech). Sending into a closed channel is not a thing:
    * engaging a channel opens it, so typing indicators, reaction machinery,
