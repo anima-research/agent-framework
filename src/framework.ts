@@ -1951,7 +1951,12 @@ export class AgentFramework {
     if (this.mcplServerRegistry) {
       shutdownPromises.push(this.mcplServerRegistry.closeAll());
     }
-    await Promise.all(shutdownPromises);
+    // A failed teardown must not skip storage cleanup or let it race another
+    // teardown which is still writing. Registries also settle their members.
+    const shutdownErrors: unknown[] = [];
+    for (const result of await Promise.allSettled(shutdownPromises)) {
+      if (result.status === 'rejected') shutdownErrors.push(result.reason);
+    }
 
     // Streams may queue storage repairs while being cancelled above. Retry
     // after their teardown, while the store is still open, before final sync.
@@ -1960,6 +1965,7 @@ export class AgentFramework {
         agent.toolResultGuard.flushUnrecorded();
       } catch (error) {
         console.error(`[tool-result-guard] agent=${agent.name} could not finish queued storage work at stop:`, error);
+        shutdownErrors.push(error);
       }
     }
 
@@ -1968,11 +1974,18 @@ export class AgentFramework {
       this.store.sync();
     } catch (error) {
       console.error('Final sync error:', error);
+      shutdownErrors.push(error);
     }
 
     if (this.ownsStore) {
-      this.store.close();
+      try {
+        this.store.close();
+      } catch (error) {
+        shutdownErrors.push(error);
+      }
     }
+    if (shutdownErrors.length === 1) throw shutdownErrors[0];
+    if (shutdownErrors.length > 1) throw new AggregateError(shutdownErrors, 'Framework shutdown failed');
   }
 
   /**

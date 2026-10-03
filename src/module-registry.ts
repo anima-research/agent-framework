@@ -309,11 +309,15 @@ export class ModuleRegistry {
    * Stop all modules.
    */
   async stopAll(): Promise<void> {
-    const stopPromises = Array.from(this.modules.values()).map((m) => m.stop());
-    await Promise.all(stopPromises);
+    const results = await Promise.allSettled(
+      Array.from(this.modules.values()).map(async (m) => m.stop()),
+    );
     this.modules.clear();
     this.moduleContexts.clear();
     this.speechHandlers = [];
+    const errors = results.flatMap(result => result.status === 'rejected' ? [result.reason] : []);
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, 'Module shutdown failed');
   }
 
   /**

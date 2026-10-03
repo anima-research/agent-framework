@@ -1,0 +1,1 @@
+- Shutdown now waits for all module and MCPL teardown attempts before final storage work, closes owned stores even when final sync fails, and rejects with teardown, storage-repair, sync or close failures instead of reporting success.
