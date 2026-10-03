@@ -53,6 +53,12 @@ export interface CodeExecutionConfig {
   /** Whole-script deadline: cancel → grace → SIGKILL (default 600_000 ms). */
   scriptTimeoutMs?: number;
   /**
+   * Longest deadline an agent may ask for on one call with `time_limit_ms`
+   * (default: `scriptTimeoutMs`, so agents can only shorten it until this is
+   * raised). Longer requests are capped, and the result says so.
+   */
+  maxScriptTimeoutMs?: number;
+  /**
    * Idle interpreter reclaim — script globals are lost after this much
    * inactivity (default 300_000 ms, mirroring ~5-minute container reclaim).
    * 0 disables reclaim.
@@ -231,6 +237,23 @@ export interface FrameworkConfig {
    * with the clamp reported via agent_settings get.
    */
   toolResultInlineMaxChars?: number;
+
+  /**
+   * MCPL RFC-008 operator class overrides: RFC-007 §6.2 patterns over the
+   * model-facing tool name → classes. Highest-precedence source of a tool's
+   * effective class (first matching pattern wins); replaces, never merges
+   * with, what the providing server declared. Use it to correct or tighten a
+   * misclassed tool.
+   */
+  toolClassOverrides?: Record<string, string[]>;
+
+  /**
+   * MCPL RFC-008 host knowledge for tools the EMBEDDING host implements (its
+   * own modules), same shape as toolClassOverrides. Consulted before the
+   * framework's built-in table and never for MCPL-provided tools, whose
+   * class comes from an override or their server's `_meta["mcpl/class"]`.
+   */
+  hostToolClasses?: Record<string, string[]>;
 
   /** Inference routing policy for server-initiated inference (optional). */
   inferenceRouting?: InferenceRoutingPolicy;

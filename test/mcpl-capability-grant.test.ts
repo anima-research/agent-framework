@@ -25,7 +25,7 @@ const caps = (o: Record<string, unknown>): McplCapabilities =>
 
 // ── §6.2 vocabulary ─────────────────────────────────────────────────────────
 
-test('vocabulary is exactly the 17 §6.2 paths', () => {
+test('vocabulary is exactly the 19 §6.2 paths (17 + RFC-007\'s two toolLifecycle leaves)', () => {
   assert.deepEqual([...ALL_CAPABILITY_PATHS].sort(), [
     'channels.acknowledge',
     'channels.incoming',
@@ -43,6 +43,8 @@ test('vocabulary is exactly the 17 §6.2 paths', () => {
     'inferenceRequest.streaming',
     'modelInfo',
     'pushEvents',
+    'toolLifecycle.inputs',
+    'toolLifecycle.observe',
     'tools',
   ]);
   assert.equal(isKnownCapabilityPath('channels'), false); // namespace, not a path

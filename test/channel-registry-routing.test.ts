@@ -2,6 +2,7 @@ import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-gr
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { parseProsePrefix } from '../src/mcpl/prose-grammar.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 
@@ -582,4 +583,67 @@ test('focus locus: same channel id on another server does not retarget the defau
   });
   assert.equal(registry.buildChannelContext('trunk')?.incoming?.messageId, 'm1',
     'the other server\'s chanA is not the focus channel');
+});
+
+test('proseTargetFor: one whitespace-free token per channel that resolves back to it', async () => {
+  const { registry } = makeRegistry({ delivered: true });
+  await registry.handleChanged('discord', {
+    added: [
+      { id: 'discord:dm:555', type: 'discord', label: 'DM: antra', direction: 'bidirectional',
+        metadata: { channelType: 'dm', recipientName: 'antra', recipientId: '134390790938951680' } },
+      // A DM known only by its label (no metadata): still "@name".
+      { id: 'discord:dm:557', type: 'discord', label: 'DM: _reim0n', direction: 'bidirectional' },
+      { id: 'discord:g1:100', type: 'discord', label: "#fable (antra's server)", direction: 'bidirectional' },
+      { id: 'discord:g1:101', type: 'discord', label: '#ops', direction: 'bidirectional' },
+      // Same name in two guilds: "#lobby" is ambiguous, the full labels have spaces → the id.
+      { id: 'discord:g1:102', type: 'discord', label: '#lobby (antra\'s server)', direction: 'bidirectional' },
+      { id: 'discord:g2:200', type: 'discord', label: '#lobby (Connectome)', direction: 'bidirectional' },
+    ],
+  } as never);
+
+  const expected: Record<string, string> = {
+    'discord:dm:555': '@antra',
+    'discord:dm:557': '@_reim0n',
+    'discord:g1:100': '#fable',
+    'discord:g1:101': '#ops',
+    'discord:g1:102': 'discord:g1:102',
+    'discord:g2:200': 'discord:g2:200',
+  };
+  for (const [id, want] of Object.entries(expected)) {
+    const t = registry.proseTargetFor(id);
+    assert.equal(t, want, `target for ${id}`);
+    // The property that matters: the grammar reads it whole, and it routes back here.
+    assert.equal(parseProsePrefix(`>>${t} hello`).target, t, `${t} parses as one target`);
+    const r = registry.resolveProseTarget(t!);
+    assert.ok('channelId' in r && r.channelId === id, `${t} resolves to ${id}`);
+  }
+  assert.equal(registry.proseTargetFor('discord:nowhere'), undefined, 'unregistered → undefined');
+});
+
+test('proseTargetFor: no token when none is safe (shared id across servers, whitespace-only options)', async () => {
+  const { registry } = makeRegistry({ delivered: true });
+  // The same channel id registered by two connections: a resolved target names a
+  // channel by id alone, so either server's reply could leave through the other.
+  await registry.handleChanged('discord-a', {
+    added: [{ id: 'chan:7', type: 'discord', label: '#shared-a', direction: 'bidirectional' }],
+  } as never);
+  await registry.handleChanged('discord-b', {
+    added: [{ id: 'chan:7', type: 'discord', label: '#shared-b', direction: 'bidirectional' }],
+  } as never);
+  assert.equal(registry.proseTargetFor('chan:7', 'discord-a'), undefined);
+  assert.equal(registry.proseTargetFor('chan:7', 'discord-b'), undefined);
+  assert.equal(registry.proseTargetFor('chan:7'), undefined);
+
+  // An id with whitespace and a label with whitespace: nothing parses as one target.
+  await registry.handleChanged('discord-a', {
+    added: [{ id: 'thread 42', type: 'discord', label: 'thread 42', direction: 'bidirectional' }],
+  } as never);
+  assert.equal(registry.proseTargetFor('thread 42', 'discord-a'), undefined);
+
+  // serverId is honoured: a channel registered only on discord-a isn't named for discord-b.
+  await registry.handleChanged('discord-a', {
+    added: [{ id: 'chan:8', type: 'discord', label: '#only-a', direction: 'bidirectional' }],
+  } as never);
+  assert.equal(registry.proseTargetFor('chan:8', 'discord-a'), '#only-a');
+  assert.equal(registry.proseTargetFor('chan:8', 'discord-b'), undefined);
 });

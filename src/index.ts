@@ -93,6 +93,19 @@ export type { McplServerConfig } from './mcpl/index.js';
 export { McplServerConnection } from './mcpl/index.js';
 export type { McplHostCapabilities } from './mcpl/index.js';
 
+// MCPL tool lifecycle (RFC-007) and tool classes (RFC-008): the types a host
+// needs to write McplServerConfig.toolLifecycle policy and class tables, and
+// the portable pattern matcher both use.
+export { TOOL_CLASSES, DEFAULT_INPUT_CLASSES, globMatch } from './mcpl/index.js';
+export type {
+  ToolClass,
+  ToolClassSource,
+  ToolLifecycleConfig,
+  ToolLifecycleNarrowing,
+  ToolLifecycleParams,
+  ToolObserveRule,
+} from './mcpl/index.js';
+
 // Per-channel conversation routing
 export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './mcpl/index.js';
 export type {

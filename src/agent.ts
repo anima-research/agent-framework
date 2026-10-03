@@ -522,8 +522,50 @@ export class Agent {
     this.updateHotContextSettings({ preparedWindowTokens: null });
   }
 
+  /**
+   * RFC-006 consumed watermark: the newest stored message at the last compile
+   * of a model request, per branch. Everything above it has never been in a
+   * request and may still be replaced or withdrawn in place by its sender.
+   */
+  private consumedWatermark: { branch: string; sequence: number } | null = null;
+
+  getConsumedWatermark(): { branch: string; sequence: number } | null {
+    return this.consumedWatermark;
+  }
+
+  /** Mark everything currently stored as consumed (boot, branch switch). */
+  markContextConsumed(): void {
+    // Tolerates partial context-manager doubles (tests build Agents over
+    // stubs): without a watermark nothing is ever treated as unread.
+    this.consumedWatermark = this.pendingWatermark();
+  }
+
+  /** The watermark a successful compile will establish (taken before, applied after). */
+  private pendingWatermark(): { branch: string; sequence: number } | null {
+    const cm = this.contextManager as Partial<ContextManager>;
+    try {
+      if (typeof cm.currentBranch !== 'function' || typeof cm.getAllMessages !== 'function') return null;
+      // The chronicle head, not this slot's last message: a compile reads
+      // everything stored on the branch so far, including messages merged in
+      // from another slot (the subconscious reads the residents' shared slot).
+      const store = typeof cm.getStore === 'function' ? cm.getStore() as { currentSequence?: () => number } : undefined;
+      let sequence = typeof store?.currentSequence === 'function' ? store.currentSequence() : undefined;
+      if (sequence === undefined) {
+        const count = typeof cm.getMessageCount === 'function' ? cm.getMessageCount() : cm.getAllMessages().length;
+        sequence = count > 0 ? cm.getAllMessages().at(-1)?.sequence ?? 0 : 0;
+      }
+      return { branch: cm.currentBranch().name, sequence };
+    } catch {
+      return null;
+    }
+  }
+
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
+    // RFC-006 §3.3: consumption is determined at assembly — a compile that
+    // fails assembled nothing, so the watermark moves only on success.
+    const watermark = this.pendingWatermark();
     const result = await this.contextManager.compile(this.resolveBudget(budget));
+    if (watermark) this.consumedWatermark = watermark;
     if (!budget) this.settleRuntimeSettingsTransition();
     return result;
   }
@@ -538,9 +580,11 @@ export class Agent {
     injections?: ContextInjection[],
     opts?: { kvUnifiedImmutablePrefixHash?: string },
   ): Promise<CompileResult> {
+    const watermark = this.pendingWatermark();
     const result = await this.contextManager.compile(
       this.resolveBudget(budget), injections, opts as never,
     );
+    if (watermark) this.consumedWatermark = watermark;
     if (!budget) this.settleRuntimeSettingsTransition();
     return result;
   }

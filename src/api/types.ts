@@ -369,6 +369,8 @@ export type ApiEventType =
   | 'module:added'
   | 'module:removed'
   | 'message:added'
+  | 'message:removed'
+  | 'mcpl:coalescing'
   // Server-specific events
   | 'connected'
   | 'speech'

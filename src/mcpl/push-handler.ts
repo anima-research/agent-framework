@@ -18,6 +18,7 @@ import type {
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import { expandCoreTags } from './tags.js';
+import { validateCoalescedContent } from './push-coalescer.js';
 
 // ============================================================================
 // McplPushEvent (the ProcessEvent shape pushed to the queue)
@@ -42,6 +43,10 @@ export interface McplPushEvent {
   inferenceId: string;
   triggerInference?: boolean;
   targetAgents?: string[];
+  /** RFC-006: set when the coalescer delivers; rides the wake it queues. */
+  coalescingSubject?: string;
+  /** RFC-006 assembly: materialized for this agent's turn (store directly). */
+  assemblingFor?: string;
 }
 
 // ============================================================================
@@ -171,6 +176,7 @@ export class PushHandler {
     pushEventFn: (event: McplPushEvent) => void,
     emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
     shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean,
+    private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent) => Promise<PushEventResult>,
   ) {
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -189,11 +195,11 @@ export class PushHandler {
    * 6. Emit trace
    * 7. Respond with accepted + inferenceId
    */
-  handlePushEvent(
+  async handlePushEvent(
     serverId: string,
     params: PushEventParams,
     responder?: Responder,
-  ): void {
+  ): Promise<void> {
     // §16.3: expand the normative chat:* core closure once, at entry, so
     // every downstream consumer (wake matching, metadata, the queued event)
     // sees the closed set. Producer `implies` edges are NOT consumed —
@@ -223,8 +229,22 @@ export class PushHandler {
       return;
     }
 
-    // 2. Deduplicate by eventId
-    if (this.dedup.checkAndAdd(params.eventId)) {
+    // 2. Deduplicate by eventId. A coalesced occurrence is deduplicated by the
+    // coalescer's receipts instead (RFC-006 §3.1: a retry within the window
+    // gets its original result, which this set could not return).
+    const coalesced = params.coalesce !== undefined && !!this.handleCoalesced;
+    if (coalesced) {
+      // RFC-006 §13: malformed content is a -32602, checked before conversion.
+      try {
+        validateCoalescedContent(params.payload?.content);
+      } catch (error) {
+        const err = error as Error & { code?: number; field?: string };
+        if (responder?.respondError) responder.respondError(err.code ?? -32602, err.message, { field: err.field });
+        else responder?.respond({ accepted: false, reason: err.message });
+        return;
+      }
+    }
+    if (!coalesced && this.dedup.checkAndAdd(params.eventId)) {
       console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=duplicate`);
       responder?.respond({ accepted: false, reason: 'duplicate' });
       return;
@@ -267,6 +287,22 @@ export class PushHandler {
       inferenceId,
       triggerInference,
     };
+    if (coalesced) {
+      // RFC-006: the coalescer decides whether this occurrence replaces an
+      // unread one, appends, or withdraws; it delivers through the same event
+      // the ordinary path would have queued.
+      try {
+        const result = await this.handleCoalesced!(serverId, params, pushEvent);
+        this.emitTraceFn({ type: 'mcpl:push_event', serverId, eventId: params.eventId, featureSet: params.featureSet, coalesce: result.coalesce });
+        responder?.respond(result);
+      } catch (error) {
+        const err = error as Error & { code?: number; field?: string };
+        console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=${err.message}`);
+        if (responder?.respondError) responder.respondError(typeof err.code === 'number' ? err.code : -32603, err.message, { field: err.field });
+        else responder?.respond({ accepted: false, reason: err.message });
+      }
+      return;
+    }
     this.pushEventFn(pushEvent);
 
     // 7. Emit trace

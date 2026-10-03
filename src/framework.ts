@@ -68,7 +68,15 @@ import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
-import { PushHandler, type McplPushEvent } from './mcpl/push-handler.js';
+import { ToolLifecycleEmitter, parseToolObserveParams } from './mcpl/tool-lifecycle.js';
+import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type EffectiveToolClass, type ToolClass, type ToolClassSource } from './mcpl/tool-classes.js';
+import { PushHandler, convertBlock as convertPushBlock, type McplPushEvent } from './mcpl/push-handler.js';
+import {
+  PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
+  coalescingSubjectKey, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
+  type CoalescingReceiptRecord,
+} from './mcpl/push-coalescer.js';
+import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, PushEventResult } from './mcpl/types.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
@@ -91,11 +99,13 @@ import {
   splitPreservingImageSlots,
   type ParsedImagePlaceholder,
 } from './tool-image-ledger.js';
-import { randomUUID } from 'node:crypto';
-import { PyRunner, buildInjectedTools } from './code-execution/py-runner.js';
+import { randomUUID, createHash } from 'node:crypto';
+import { PyRunner, buildInjectedTools, formatLimit } from './code-execution/py-runner.js';
 import {
   buildCodeExecutionToolDefinition,
   CODE_EXECUTION_TOOL_NAME,
+  scriptTimeLimits,
+  validateCodeExecutionConfig,
 } from './code-execution/tool-definition.js';
 import { splitProseSegments } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
@@ -410,6 +420,35 @@ import {
 const FRAMEWORK_STATE_ID = 'framework/state';
 /** Snapshot slot mirroring context writes deferred while quiesced (#122). */
 const DEFERRED_WRITES_ID = 'framework/deferred-writes';
+/** The event a coalesced occurrence delivers through — one per lane. */
+interface CoalescedChannelEvent {
+  type: 'mcpl:channel-incoming';
+  serverId: string;
+  channelId: string;
+  messageId: string;
+  threadId?: string;
+  author: { id: string; name: string };
+  content: ContentBlock[];
+  timestamp: string;
+  metadata?: Record<string, unknown>;
+  tags?: string[];
+  triggerInference?: boolean;
+  targetAgents?: string[];
+  coalescingSubject?: string;
+  /** Occurrence id (RFC-006 §3.1); channel messages carry it only when coalesced. */
+  eventId?: string;
+  /** RFC-006 assembly: materialized for this agent's turn (store directly). */
+  assemblingFor?: string;
+  /** RFC-006 §3.2: deliver into this agent only (replacement / notice audience). */
+  deliverTo?: string;
+}
+type CoalescedDelivery =
+  | { lane: 'channel'; event: CoalescedChannelEvent }
+  | { lane: 'push'; event: McplPushEvent };
+/** RFC-006 coalescing bookkeeping: receipts (retry window) + subject history. */
+const COALESCING_STATE_ID = 'mcpl/coalescing';
+/** Receipts written since the last snapshot flush (bridges the throttle window). */
+const COALESCING_RECENT_ID = 'mcpl/coalescing-recent';
 /** Above this serialized size the deferred-write mirror is skipped (kept in
  *  memory only) rather than rewriting a multi-MB snapshot per deferral. */
 const DEFERRED_WRITES_PERSIST_CAP_BYTES = 4 * 1024 * 1024;
@@ -1216,7 +1255,36 @@ export class AgentFramework {
   private mcplServerRegistry: McplServerRegistry | null = null;
   private featureSetManager: FeatureSetManager | null = null;
   private hookOrchestrator: HookOrchestrator | null = null;
+  /** MCPL RFC-007: `tools/lifecycle` to observing servers. Created with the
+   *  MCPL subsystem; inert (no tracking) while no connection holds
+   *  `toolLifecycle.observe`. */
+  private toolLifecycleEmitter: ToolLifecycleEmitter | null = null;
+  /** MCPL RFC-008 class sources, normalized: operator overrides, then host
+   *  knowledge (embedding host's table ahead of the built-in one). */
+  private toolClassOverrides: Array<[string, ToolClass[]]> = [];
+  private hostToolClasses: Array<[string, ToolClass[]]> = normalizeClassTable(
+    BUILTIN_TOOL_CLASSES as Record<string, readonly string[]>,
+    'BUILTIN_TOOL_CLASSES',
+  );
   private pushHandler: PushHandler | null = null;
+  /** RFC-006 coalescing (see mcpl/push-coalescer.ts for the design). */
+  private pushCoalescer: PushCoalescer<CoalescedDelivery> | null = null;
+  /** Both lanes are admitted in arrival order: a create, edit and delete of
+   *  one subject must not overtake one another while routing awaits. */
+  private coalescingAdmission: Promise<unknown> = Promise.resolve();
+  private coalescingSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private coalescingSnapshotDirty: (() => CoalescingSnapshot) | null = null;
+  private coalescingRecentReceipts: CoalescingReceiptRecord[] = [];
+  /**
+   * Agents that read the residents' shared un-namespaced message slot: every
+   * ordinary resident (their context managers are not isolated) and the
+   * subconscious (isolated, but merging that slot read-only). A message in
+   * that slot is unread only if NONE of them has compiled past it. Forks and
+   * ephemeral agents have isolated slots and are their own only readers.
+   */
+  private readonly sharedSlotAgents = new Set<Agent>();
+  /** Group commit: one fsync per event-loop turn, shared by every waiter. */
+  private coalescingCommit: Promise<void> | null = null;
   private inferenceRouter: InferenceRouter | null = null;
   private channelRegistry: ChannelRegistry | null = null;
   private checkpointManager: CheckpointManager | null = null;
@@ -1269,10 +1337,15 @@ export class AgentFramework {
   private mcplTools: import('./types/index.js').ToolDefinition[] = [];
   /** Namespaced tool name → stateful feature-set attribution from tools/list. */
   private mcplToolFeatureSets: Map<string, string> = new Map();
+  /** Namespaced tool name → the server's RFC-008 `_meta["mcpl/class"]`. */
+  private mcplToolClasses: Map<string, ToolClass[]> = new Map();
   private mcplToolRefreshInFlight = false;
   private mcplToolRefreshPending = false;
   /** Maps tool prefix → serverId for dispatch routing. */
   private mcplPrefixMap: Map<string, string> = new Map();
+  /** Namespaced tool name → the server whose tools/list produced it. Prefixes
+   *  can nest (`foo`, `foo--bar`), so a prefix match alone can name two. */
+  private mcplToolServers: Map<string, string> = new Map();
   /** Maps serverId → McplServerConfig for prefix lookup. */
   private mcplServerConfigs: Map<string, import('./mcpl/types.js').McplServerConfig> = new Map();
   /** Host capabilities advertised during the MCP handshake — stored so servers
@@ -1368,6 +1441,9 @@ export class AgentFramework {
    * Create and start the framework.
    */
   static async create(config: FrameworkConfig): Promise<AgentFramework> {
+    // Before anything opens or starts: a refused config must leave nothing behind.
+    if (config.codeExecution?.enabled) validateCodeExecutionConfig(config.codeExecution);
+
     // Create or use existing store
     let store: JsStore;
     let ownsStore: boolean;
@@ -1392,6 +1468,13 @@ export class AgentFramework {
       store.registerState({ id: DEFERRED_WRITES_ID, strategy: 'snapshot' });
     } catch {
       // Already registered
+    }
+    for (const id of [COALESCING_STATE_ID, COALESCING_RECENT_ID]) {
+      try {
+        store.registerState({ id, strategy: 'snapshot' });
+      } catch {
+        // Already registered
+      }
     }
 
     try {
@@ -1591,6 +1674,12 @@ export class AgentFramework {
     // Client-side programmatic tool calling (code_execution). Config is only
     // retained when enabled — everything downstream gates on the field.
     framework.codeExecutionConfig = config.codeExecution?.enabled ? config.codeExecution : null;
+
+    framework.toolClassOverrides = normalizeClassTable(config.toolClassOverrides, 'toolClassOverrides');
+    framework.hostToolClasses = [
+      ...normalizeClassTable(config.hostToolClasses, 'hostToolClasses'),
+      ...normalizeClassTable(BUILTIN_TOOL_CLASSES as Record<string, readonly string[]>, 'BUILTIN_TOOL_CLASSES'),
+    ];
 
     if (config.toolResultInlineMaxChars !== undefined) {
       const cap = config.toolResultInlineMaxChars;
@@ -1848,6 +1937,8 @@ export class AgentFramework {
    * Stop the event loop.
    */
   async stop(): Promise<void> {
+    this.pushCoalescer?.suspend();
+    this.flushCoalescingSnapshot();
     this.running = false;
     // Flushed-but-unsynced deferred writes: sync and ack now, while the
     // store is still open, rather than leaving them to a reboot replay.
@@ -2631,6 +2722,22 @@ export class AgentFramework {
       }
       return tool;
     });
+  }
+
+  /**
+   * The tools one agent is shown at inference: its surface (the subconscious
+   * has its own), less what its permissions deny, plus — for explicit-mode
+   * agents — the on-demand routing reference (teach-by-bounce: the grammar
+   * is never injected, only served when asked). Inference and the RFC-008
+   * listing both use this, so the listing cannot drift from the model's view.
+   */
+  private agentToolSurface(
+    agent: Agent,
+    snapshot?: InferenceToolSnapshot,
+  ): import('./types/index.js').ToolDefinition[] {
+    const tools = this.getToolsForAgent(agent.name, snapshot).filter((t) => agent.canUseTool(t.name));
+    if (agent.proseRouting === 'explicit') tools.push(PROSE_HELP_TOOL);
+    return tools;
   }
 
   getAgentRuntimeSettings(agentName: string): AgentRuntimeSettingsSnapshot {
@@ -3920,6 +4027,8 @@ export class AgentFramework {
       });
 
       const agent = new Agent(config, contextManager, this.membrane);
+    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+      agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, contextManager);
 
       const cleanup = () => {
@@ -6229,6 +6338,8 @@ export class AgentFramework {
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
+    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+    this.sharedSlotAgents.add(agent);
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
     if (restoredSettings) {
       agent.restoreRuntimeSettings(
@@ -6303,6 +6414,8 @@ export class AgentFramework {
       allowedTools: [...SUBCONSCIOUS_TOOL_NAMES, 'think', 'skip_reply', 'end_turn'],
     };
     const agent = new Agent(agentConfig, contextManager, this.membrane);
+    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+    this.sharedSlotAgents.add(agent); // reads the shared slot through its merged view
     this.agents.set(name, agent);
     this.agentConfigs.set(name, agentConfig);
     this.subconsciousAgentName = name;
@@ -6374,6 +6487,10 @@ export class AgentFramework {
         scriptWaiter(event.result);
         return;
       }
+
+      // RFC-007: the call's terminal (completed / failed) — the result
+      // itself is never sent, only whether it was an error.
+      this.toolLifecycleEmitter?.onResult(event.agentName, event.callId, event.result);
 
       const agent = this.agents.get(event.agentName);
       if (agent) {
@@ -6664,6 +6781,8 @@ export class AgentFramework {
               reason: 'context_budget_restart',
               source: 'framework',
               timestamp: Date.now(),
+              suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
+              ephemeralSystemPrompt: this.activeTurnTriggers.get(agent.name)?.ephemeralSystemPrompt,
             });
           } else if (currentState.stream) {
             // Streaming path: convert results and resume the stream.
@@ -6716,6 +6835,17 @@ export class AgentFramework {
       this.handleMcplPushEvent(event as unknown as McplPushEvent);
     }
 
+    await this.dispatchProcessEventToModules(event, startTime);
+  }
+
+  /**
+   * The module half of handleProcessEvent: every module's onProcess, their
+   * responses, the tool-call dispatch, the completion trace and the process
+   * log. Shared with RFC-006 coalesced deliveries, which bypass the queue
+   * (the coalescer needs the placement synchronously) but must still reach
+   * modules exactly like the ordinary deliveries do.
+   */
+  private async dispatchProcessEventToModules(event: ProcessEvent, startTime = Date.now()): Promise<void> {
     // Dispatch to all modules, tracking responses with module names
     const responses: ModuleProcessResponse[] = [];
     for (const module of this.moduleRegistry.getAllModules()) {
@@ -6839,9 +6969,16 @@ export class AgentFramework {
     tags?: string[];
     triggerInference?: boolean;
     targetAgents?: string[];
-  }): Promise<void> {
+    /** RFC-006: set when the coalescer delivers; rides the wake it queues. */
+    coalescingSubject?: string;
+    eventId?: string;
+    assemblingFor?: string;
+    deliverTo?: string;
+  }): Promise<CoalescingPlacement | undefined> {
     const metadata: Record<string, unknown> = {
       ...event.metadata,
+      ...(event.eventId ? { eventId: event.eventId } : {}),
+      ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       channelId: event.channelId,
       messageId: event.messageId,
       author: event.author,
@@ -6854,9 +6991,31 @@ export class AgentFramework {
     // Per-channel conversation routing: messages go to the channel's fork
     // agent (spawned from the template on first qualifying message), never
     // to the primary conversation.
-    if (this.conversationRouter) {
-      await this.routeConversationIncoming(event, metadata);
-      return;
+    // RFC-006 §3.2: a replacement or deletion notice follows the delivery it
+    // corrects — into the agent that holds (or read) the prior occurrence,
+    // never a context fresh routing would pick. Gone agent → delivered nowhere.
+    if (event.deliverTo) {
+      const target = this.agents.get(event.deliverTo);
+      if (!target) return undefined;
+      if (this.conversationRouter && this.conversationAgentHomes.has(target.name)) {
+        metadata.triggered = event.triggerInference ?? false;
+        const id = target.getContextManager().addMessage('user', event.content, metadata);
+        this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
+        if (event.triggerInference) {
+          this.pendingRequests.push({
+            agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
+            channelId: event.channelId,
+            counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
+            addressed: isAddressedMessage(event.tags, event.metadata),
+            ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
+          });
+        }
+        return { agent: target.name, messageId: id };
+      }
+      if (this.conversationRouter) return undefined; // the trunk never holds channel traffic
+      event = { ...event, targetAgents: [target.name] };
+    } else if (this.conversationRouter) {
+      return this.routeConversationIncoming(event, metadata);
     }
 
     // Tune-out divert (issue #77): stamped, stored, no resident wake. The
@@ -6914,7 +7073,8 @@ export class AgentFramework {
       }
     }
 
-    const id = this.addMessage('user', incomingContent, metadata);
+    const placement: CoalescingPlacement = { agent: '' };
+    const id = this.addMessage('user', incomingContent, metadata, { placement, bypassDeferralFor: event.assemblingFor });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
     if (event.triggerInference && !divert && !held) {
@@ -6940,9 +7100,11 @@ export class AgentFramework {
           // Addressed messages outrank ambient chatter when a batched wake
           // picks the turn's frozen speech locus.
           addressed,
+          ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
         });
       }
     }
+    return placement.agent ? placement : undefined;
   }
 
   /**
@@ -6961,9 +7123,10 @@ export class AgentFramework {
       metadata?: Record<string, unknown>;
       tags?: string[];
       triggerInference?: boolean;
+      coalescingSubject?: string;
     },
     messageMetadata: Record<string, unknown>,
-  ): Promise<void> {
+  ): Promise<CoalescingPlacement | undefined> {
     const router = this.conversationRouter!;
     const descriptor = this.channelRegistry?.getDescriptor(event.channelId);
 
@@ -7040,8 +7203,10 @@ export class AgentFramework {
         channelId: event.channelId,
         counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
         addressed: isAddressedMessage(event.tags, event.metadata),
+        ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       });
     }
+    return { agent: agent.name, messageId: id };
   }
 
   /**
@@ -7094,6 +7259,8 @@ export class AgentFramework {
 
       const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
       const agent = new Agent(config, contextManager, this.membrane);
+    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+      agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.agents.set(name, agent);
       this.agentConfigs.set(name, config);
       this.conversationAgentHomes.set(name, channelId);
@@ -7272,6 +7439,19 @@ export class AgentFramework {
     const label = opts.channelLabel ?? descriptor?.label;
     const channelLabel = label ? `#${label}` : `"${opts.channelId}"`;
     const place = opts.guildName ? `${channelLabel} in "${opts.guildName}"` : channelLabel;
+    // The label is for reading; the prefix must be ONE token that resolves back
+    // here, on this server (a DM label "DM: alice" quoted verbatim parses as
+    // target "#DM:"). A registry that can name targets is authoritative: no safe
+    // token means no prefix option. A stand-in without proseTargetFor gets a
+    // whitespace-free guess, never a label with spaces.
+    const namer = this.channelRegistry as { proseTargetFor?: (id: string, serverId?: string) => string | undefined };
+    const target = typeof namer.proseTargetFor === 'function'
+      ? namer.proseTargetFor(opts.channelId, opts.serverId)
+      : [label ? `#${label}` : undefined, opts.channelId].find((t): t is string => !!t && !/\s/.test(t));
+    const replyOption = target
+      ? `1. Reply without joining — write your reply this turn prefixed with ">>${target}"; it will be delivered there. ` +
+        `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`
+      : `1. Reply without joining isn't available here: no single-word target reaches this channel unambiguously. Join it (option 2) to reply.\n`;
     const missedCount = opts.missedMessages ?? 0;
     const missedNote =
       missedCount > 0
@@ -7287,8 +7467,7 @@ export class AgentFramework {
         `a reply to one of your messages) reach you from it; the rest of its traffic is invisible to you. ` +
         missedNote +
         `Your options:\n` +
-        `1. Reply without joining — write your reply this turn prefixed with ">>${channelLabel}"; it will be delivered there. ` +
-        `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n` +
+        replyOption +
         `2. Join the channel — call channel_open with channelId "${opts.channelId}" and serverId "${opts.serverId}"` +
         (maxBackscroll > 0
           ? `; to also read recent history, add backscroll (a number up to ${maxBackscroll}) and beforeMessageId "${opts.messageId}".\n`
@@ -7308,10 +7487,454 @@ export class AgentFramework {
     };
   }
 
+  // ==========================================================================
+  // RFC-006 event coalescing (see mcpl/push-coalescer.ts for the design)
+  // ==========================================================================
+
+  /**
+   * RFC-006 §3.2 binding identity: the configured server id bound to its
+   * endpoint/command. Survives reconnects to the same peer; changes when the
+   * id is reassigned to another endpoint (restartMcplServer with a new config).
+   */
+  private coalescingBinding(serverId: string): string {
+    const config = this.mcplServerConfigs.get(serverId);
+    return createHash('sha256').update(JSON.stringify([serverId, config?.url ?? null, config?.command ?? null, config?.args ?? null])).digest('hex').slice(0, 16);
+  }
+
+  private initializePushCoalescer(): void {
+    const coalescer = new PushCoalescer<CoalescedDelivery>({
+      isUnread: (p) => this.isUnreadPlacement(p),
+      remove: (p) => this.removePlacement(p),
+      deliver: (occ, materialized, assemblingFor) => this.deliverCoalesced(occ, materialized, assemblingFor),
+      wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
+      cancelWake: (subject) => this.cancelCoalescedWakes(subject),
+      authorized: (occ) => this.coalescedAuthorized(occ),
+      audience: (occ) => this.coalescedAudience(occ),
+      render: (occ, params) => {
+        const server = this.mcplServerRegistry?.getServer(occ.serverId);
+        if (!server?.isConnected) throw new Error('server disconnected');
+        return server.sendPushRender(params);
+      },
+      audit: (record) => this.emitTrace({ type: 'mcpl:coalescing', ...record }),
+      save: (snapshot) => this.scheduleCoalescingSnapshot(snapshot),
+      recordReceipt: (record) => {
+        // Written now, not at the throttled flush: an acknowledged acceptance
+        // must not lose its receipt, the subject's birth, or (deferred) the
+        // accepted work itself to a crash. A failure here fails the acceptance.
+        this.coalescingRecentReceipts.push(record);
+        this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
+      },
+      wasPublished: (subject, eventId) => {
+        // Boot-time only: the occurrence's durable delivery identity
+        // (subject + eventId in message metadata) in any agent's context.
+        for (const agent of this.agents.values()) {
+          try {
+            if (agent.getContextManager().getAllMessages().some((m) =>
+              m.metadata?.coalescingSubject === subject && m.metadata?.eventId === eventId)) return true;
+          } catch { /* a context that cannot be read cannot prove publication */ }
+        }
+        return false;
+      },
+      commit: () => this.commitCoalescingDurable(),
+      saveNow: (snapshot) => {
+        if (this.coalescingSaveTimer) { clearTimeout(this.coalescingSaveTimer); this.coalescingSaveTimer = null; }
+        this.coalescingSnapshotDirty = null;
+        this.store.setStateJson(COALESCING_STATE_ID, snapshot);
+        this.coalescingRecentReceipts = [];
+        this.store.setStateJson(COALESCING_RECENT_ID, []);
+      },
+    });
+    try {
+      coalescer.restore(this.store.getStateJson(COALESCING_STATE_ID) as CoalescingSnapshot | null);
+      const recent = this.store.getStateJson(COALESCING_RECENT_ID) as CoalescingReceiptRecord[] | null;
+      if (Array.isArray(recent)) {
+        coalescer.restoreReceipts(recent);
+        // Until the next snapshot flush checkpoints the recovered state, these
+        // records are its only durable form: keep them in the writable buffer
+        // so the next acceptance appends to them instead of replacing them.
+        this.coalescingRecentReceipts = recent;
+      }
+    } catch (err) {
+      console.error('[coalescing] could not restore coalescing state; starting with unknown history:', err);
+    }
+    this.pushCoalescer = coalescer;
+    // Batches restored from a snapshot still owe the agent a wake (§14 v41).
+    for (const occ of coalescer.pendingBatchOccurrences()) void this.wakeForCoalescedBatch(occ);
+  }
+
+  /**
+   * Durability barrier for coalescing (RFC-006 §3.1/§3.2): everything
+   * written so far is fsynced before the caller proceeds. Group-committed —
+   * all acceptances that arrive in one event-loop turn share one
+   * `store.sync()` — so throughput is bounded by fsync rate per batch, not
+   * per message.
+   */
+  private commitCoalescingDurable(): Promise<void> {
+    if (!this.coalescingCommit) {
+      this.coalescingCommit = new Promise<void>((resolve, reject) => {
+        setImmediate(() => {
+          this.coalescingCommit = null;
+          try { this.store.sync(); resolve(); } catch (err) { reject(err); }
+        });
+      });
+    }
+    return this.coalescingCommit;
+  }
+
+  private scheduleCoalescingSnapshot(snapshot: () => CoalescingSnapshot): void {
+    this.coalescingSnapshotDirty = snapshot;
+    if (this.coalescingSaveTimer) return;
+    const timer = setTimeout(() => this.flushCoalescingSnapshot(), 2_000);
+    timer.unref?.();
+    this.coalescingSaveTimer = timer;
+  }
+
+  private flushCoalescingSnapshot(): void {
+    if (this.coalescingSaveTimer) { clearTimeout(this.coalescingSaveTimer); this.coalescingSaveTimer = null; }
+    const snapshot = this.coalescingSnapshotDirty;
+    this.coalescingSnapshotDirty = null;
+    if (!snapshot) return;
+    try {
+      this.store.setStateJson(COALESCING_STATE_ID, snapshot());
+      this.coalescingRecentReceipts = [];
+      this.store.setStateJson(COALESCING_RECENT_ID, []);
+    } catch (err) {
+      console.error('[coalescing] could not persist coalescing state:', err);
+    }
+  }
+
+  /** Serialize both lanes' admissions: create, edit and delete of one subject stay ordered. */
+  private admitCoalesced<T>(work: () => Promise<T>): Promise<T> {
+    const run = this.coalescingAdmission.then(work, work);
+    this.coalescingAdmission = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private handleCoalescedIncoming(
+    serverId: string,
+    message: ChannelIncomingMessage,
+    event: CoalescedChannelEvent,
+  ): Promise<ChannelIncomingMessageResult> {
+    return this.admitCoalesced(async () => {
+      if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
+      validateCoalesceMember(message.coalesce, 'channel');
+      if (typeof message.eventId !== 'string' || !message.eventId) {
+        throw new CoalesceError('eventId', 'eventId is required with coalesce');
+      }
+      if (typeof message.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
+      validateCoalescedContent(message.content);
+      const c = message.coalesce;
+      const result = await this.pushCoalescer.accept({
+        serverId,
+        binding: this.coalescingBinding(serverId),
+        scope: { kind: 'channel', id: message.channelId },
+        key: c.key,
+        eventId: message.eventId,
+        timestamp: message.timestamp,
+        retract: !!c.retract,
+        deferred: false,
+        initial: !!c.initial,
+        tags: event.tags,
+        content: message.content,
+        identity: { messageId: message.messageId, author: message.author, threadId: message.threadId },
+        event: { lane: 'channel', event: { ...event, eventId: message.eventId } },
+      });
+      return { messageId: message.messageId, accepted: true, coalesce: result.coalesce };
+    });
+  }
+
+  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent): Promise<PushEventResult> {
+    return this.admitCoalesced(async () => {
+      if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
+      validateCoalesceMember(params.coalesce, 'push');
+      if (typeof params.eventId !== 'string' || !params.eventId) throw new CoalesceError('eventId', 'eventId is required');
+      if (typeof params.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
+      validateCoalescedContent(params.payload?.content);
+      const c = params.coalesce;
+      if (c.channelId) this.assertChannelScopedPush(serverId, c.channelId);
+      const origin = params.origin ?? {};
+      const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+      return this.pushCoalescer.accept({
+        serverId,
+        binding: this.coalescingBinding(serverId),
+        featureSet: params.featureSet,
+        scope: c.channelId ? { kind: 'channel', id: c.channelId } : { kind: 'featureSet', id: params.featureSet },
+        key: c.key,
+        eventId: params.eventId,
+        timestamp: params.timestamp,
+        retract: !!c.retract,
+        deferred: !!c.deferred,
+        initial: !!c.initial,
+        data: c.data,
+        tags: event.tags,
+        content: params.payload.content,
+        ...(c.channelId ? {
+          identity: {
+            ...(str(origin.messageId) ? { messageId: str(origin.messageId) } : {}),
+            ...(str(origin.threadId) ? { threadId: str(origin.threadId) } : {}),
+            ...(str(origin.authorId) ? { author: { id: str(origin.authorId)!, name: str(origin.authorName) ?? str(origin.authorId)! } } : {}),
+          },
+        } : {}),
+        event: { lane: 'push', event },
+      });
+    });
+  }
+
+  /** §3.2: a channel-scoped push needs what a channels/incoming message needs. */
+  private assertChannelScopedPush(serverId: string, channelId: string): void {
+    const server = this.mcplServerRegistry?.getServer(serverId);
+    if (!server?.policyEstablished || !server.grant.has('channels.incoming')) {
+      throw new CoalesceError('coalesce.channelId', 'Channel not permitted', -32017);
+    }
+    if (!this.channelRegistry?.isDeclaredChannel(serverId, channelId)) {
+      throw new CoalesceError('coalesce.channelId', 'Unknown channel', -32023);
+    }
+  }
+
+  private coalescedAuthorized(occ: CoalescedOccurrence<CoalescedDelivery>): boolean {
+    const server = this.mcplServerRegistry?.getServer(occ.serverId);
+    if (!server?.isConnected || !server.policyEstablished) return false;
+    // §3.2: work admitted under another binding (the id since reassigned to a
+    // different endpoint) never acquires the replacement peer's authority —
+    // and its private notice data is never sent to that peer.
+    if (occ.binding !== this.coalescingBinding(occ.serverId)) return false;
+    if (occ.event.lane === 'push') {
+      if (!server.grant.has('pushEvents')) return false;
+      try { this.featureSetManager?.validateInbound(occ.serverId, occ.event.event.featureSet); } catch { return false; }
+    }
+    if (occ.scope.kind === 'channel' || occ.event.lane === 'channel') {
+      // §3.2 / §5.4 rule 4: the channel's CURRENT authority, whichever lane.
+      if (!server.grant.has('channels.incoming')) return false;
+      if (occ.event.lane === 'push') return this.channelRegistry?.isDeclaredChannel(occ.serverId, occ.scope.id) ?? false;
+      return !!this.channelRegistry?.getDescriptor(occ.scope.id);
+    }
+    return true;
+  }
+
+  private async coalescedAudience(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<string[]> {
+    if (occ.deliverTo) return this.agents.has(occ.deliverTo) ? [occ.deliverTo] : [];
+    const explicit = occ.event.event.targetAgents;
+    if (explicit) return explicit.filter((n) => this.agents.has(n));
+    if (occ.scope.kind === 'channel' && this.conversationRouter) {
+      const router = this.conversationRouter;
+      const bound = router.getBinding(occ.scope.id)?.agentName;
+      if (bound) return this.agents.has(bound) ? [bound] : [];
+      // No fork yet: the same bind decision an incoming message would get. A
+      // batch that qualifies spawns its fork now so it has someone to wake.
+      const metadata = (occ.event.lane === 'channel' ? occ.event.event.metadata : occ.event.event.origin) ?? {};
+      const decision = router.route({
+        channelId: occ.scope.id,
+        mentioned: metadata.mentioned === true,
+        kind: ConversationRouter.classifyChannel(this.channelRegistry?.getDescriptor(occ.scope.id), metadata),
+      });
+      if (decision.kind !== 'spawn') return decision.kind === 'unbound' ? [] : (this.agents.has(decision.agentName) ? [decision.agentName] : []);
+      try {
+        await this.createConversationAgent(decision.agentName, occ.scope.id);
+        router.bind(occ.scope.id, decision.agentName, decision.generation);
+        this.persistConversationRouterState();
+        return [decision.agentName];
+      } catch (err) {
+        console.error(`[coalescing] could not spawn a conversation agent for ${occ.scope.id}:`, err);
+        return [];
+      }
+    }
+    return [...this.agents.keys()].filter((n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName);
+  }
+
+  /** Deliver through the lane's ordinary path; report where it landed. */
+  private async deliverCoalesced(
+    occ: CoalescedOccurrence<CoalescedDelivery>,
+    materialized?: McplContentBlock[],
+    assemblingFor?: string,
+  ): Promise<CoalescingPlacement | undefined> {
+    const coalescingSubject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
+    const narrowing = occ.deliverTo ? { deliverTo: occ.deliverTo } : {};
+    if (occ.event.lane === 'channel') {
+      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...(assemblingFor ? { assemblingFor } : {}) };
+      const placement = await this.handleMcplChannelIncoming(event);
+      await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+      return placement;
+    }
+    if (occ.scope.kind === 'channel') {
+      // §3.2: a channel-scoped push addresses the channel's subject namespace,
+      // so it is delivered as a message OF that channel — same routing
+      // (conversation forks, tune-out, closed-channel invitation), same reply
+      // locus, and the subject's stable platform identity (§3.1, vector 43).
+      const push = occ.event.event;
+      const identity = { ...this.pushCoalescer?.identity(coalescingSubject), ...occ.identity };
+      const origin = push.origin ?? {};
+      const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+      const event: CoalescedChannelEvent = {
+        type: 'mcpl:channel-incoming',
+        serverId: occ.serverId,
+        channelId: occ.scope.id,
+        messageId: identity.messageId ?? str(origin.messageId) ?? occ.eventId,
+        threadId: identity.threadId ?? str(origin.threadId),
+        author: identity.author ?? { id: str(origin.authorId) ?? '', name: str(origin.authorName) ?? str(origin.authorId) ?? 'Someone' },
+        content: materialized ? materialized.map(convertPushBlock) : push.content,
+        timestamp: occ.timestamp,
+        metadata: origin,
+        tags: push.tags,
+        triggerInference: assemblingFor ? false : push.triggerInference,
+        targetAgents: push.targetAgents,
+        coalescingSubject,
+        eventId: occ.eventId,
+        ...narrowing,
+        ...(assemblingFor ? { assemblingFor } : {}),
+      };
+      const placement = await this.handleMcplChannelIncoming(event);
+      await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+      return placement;
+    }
+    const event: McplPushEvent = {
+      ...occ.event.event,
+      eventId: occ.eventId,
+      timestamp: occ.timestamp,
+      ...(materialized ? { content: materialized.map(convertPushBlock) } : {}),
+      coalescingSubject,
+      // §5.2: the materialized occurrence is consumed by the request being
+      // assembled; the wake that started it is not repeated.
+      ...(assemblingFor ? { assemblingFor, triggerInference: false } : {}),
+      ...(occ.deliverTo ? { targetAgents: [occ.deliverTo] } : {}),
+    };
+    const placement = this.handleMcplPushEvent(event);
+    await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
+    return placement;
+  }
+
+  private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
+    const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
+    this.cancelCoalescedWakes(subject);
+    if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
+    const origin = occ.event.event.origin;
+    // The wake carries the batch's channel so the turn freezes its reply
+    // locus there (the materialized delivery at assembly wakes nobody).
+    const channelId = occ.scope.kind === 'channel' ? occ.scope.id : this.derivePushEventChannel(origin)?.channelId;
+    const authorId = occ.identity?.author?.id ?? (typeof origin?.authorId === 'string' ? origin.authorId : undefined);
+    for (const agentName of await this.coalescedAudience(occ)) {
+      this.pendingRequests.push({
+        agentName,
+        reason: 'mcpl:push-event',
+        source: occ.serverId,
+        timestamp: Date.now(),
+        channelId,
+        counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
+        addressed: isAddressedMessage(occ.tags, origin),
+        coalescingSubject: subject,
+      });
+    }
+  }
+
+  /** Withdraw unstarted wakes whose sole cause is this subject (§4.2). */
+  private cancelCoalescedWakes(subject: string): void {
+    this.pendingRequests = this.pendingRequests.filter((r) => r.coalescingSubject !== subject);
+    for (const cooldown of this.providerAccelerationCooldowns.values()) {
+      cooldown.heldRequests = cooldown.heldRequests.filter((r) => r.coalescingSubject !== subject);
+    }
+  }
+
+  /**
+   * A placement in the deferred queue is upgraded in place once the flush has
+   * stored it: the stored copy carries `metadata.deferredWriteId`, found by
+   * scanning the unread tail (above the watermark) — never below it.
+   */
+  private resolvePlacement(p: CoalescingPlacement): void {
+    if (!p.deferredId || this.deferredMessages.some((m) => m.id === p.deferredId)) return;
+    const agent = this.agents.get(p.agent);
+    if (!agent) return;
+    const cm = agent.getContextManager();
+    const watermark = agent.getConsumedWatermark();
+    const floor = watermark && watermark.branch === cm.currentBranch().name ? watermark.sequence : Number.POSITIVE_INFINITY;
+    const all = cm.getAllMessages();
+    for (let i = all.length - 1; i >= 0 && all[i].sequence > floor; i--) {
+      if (all[i].metadata?.deferredWriteId === p.deferredId) {
+        p.messageId = all[i].id;
+        delete p.deferredId;
+        return;
+      }
+    }
+  }
+
+  private isUnreadPlacement(p: CoalescingPlacement): boolean {
+    this.resolvePlacement(p);
+    if (p.deferredId) return this.deferredMessages.some((m) => m.id === p.deferredId);
+    if (!p.messageId) return false;
+    const agent = this.agents.get(p.agent);
+    return !!agent && this.isUnreadStoredMessage(agent, p.messageId);
+  }
+
+  /**
+   * Unread = stored, above the agent's consumed watermark on the current
+   * branch, not a body-group shard (immutable), and not folded into any
+   * summary (compression is consumption, §3.3). Conservative on every doubt.
+   */
+  private isUnreadStoredMessage(agent: Agent, messageId: MessageId): boolean {
+    const cm = agent.getContextManager();
+    let message: ReturnType<ContextManager['getMessage']>;
+    try { message = cm.getMessage(messageId); } catch { return false; }
+    if (!message || message.bodyGroupId) return false;
+    // Every agent that can read this message must not have compiled past it.
+    // Residents share one message slot, so a message one of them read is
+    // history for all of them (the never-rewrite rule is about the message,
+    // not the agent that happened to be asked). A tune-out-diverted message
+    // never enters a resident's compiled view; only the subconscious reads
+    // it through its merged view — no subconscious, nobody reads it.
+    let readers: Agent[];
+    if ((message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) {
+      const subconscious = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
+      if (!subconscious) return true;
+      readers = [subconscious];
+    } else {
+      readers = this.sharedSlotAgents.has(agent)
+        ? [...this.sharedSlotAgents].filter((a) => this.agents.get(a.name) === a)
+        : [agent];
+    }
+    const branch = cm.currentBranch().name;
+    const ts = message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp);
+    for (const reader of readers) {
+      const watermark = reader.getConsumedWatermark();
+      if (!watermark || watermark.branch !== branch || message.sequence <= watermark.sequence) return false;
+      // Compression is consumption (§3.3): folded into any reader's summary.
+      try {
+        const rcm = reader.getContextManager();
+        const strategy = rcm.getStrategy() as { getSummary?: (id: string) => { sourceIds?: string[]; sourceLevel?: number } | null };
+        for (const summary of rcm.getSummariesInRange({ fromMs: ts, toMs: ts })) {
+          const entry = strategy.getSummary?.(summary.id);
+          if (!entry || (entry.sourceLevel ?? 0) > 0 || entry.sourceIds?.includes(messageId)) return false;
+        }
+      } catch {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private removePlacement(p: CoalescingPlacement): boolean {
+    this.resolvePlacement(p);
+    if (p.deferredId) {
+      const before = this.deferredMessages.length;
+      this.deferredMessages = this.deferredMessages.filter((m) => m.id !== p.deferredId);
+      if (this.deferredMessages.length === before) return false;
+      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+      return true;
+    }
+    if (!p.messageId) return false;
+    const agent = this.agents.get(p.agent);
+    if (!agent) return false;
+    try {
+      agent.getContextManager().removeMessage(p.messageId);
+      this.emitTrace({ type: 'message:removed', messageId: p.messageId, source: 'mcpl:coalescing' });
+      return true;
+    } catch (err) {
+      console.error(`[coalescing] could not remove unread message ${p.messageId} for ${agent.name}:`, err);
+      return false;
+    }
+  }
+
   /**
    * Convert an MCPL push event to a context message.
    */
-  private handleMcplPushEvent(event: McplPushEvent): void {
+  private handleMcplPushEvent(event: McplPushEvent): CoalescingPlacement | undefined {
     const triggerChannel = this.derivePushEventChannel(event.origin);
     if (triggerChannel && this.channelRegistry) {
       this.channelRegistry.ensureChannelRegistered(
@@ -7329,6 +7952,7 @@ export class AgentFramework {
       eventId: event.eventId,
       triggered: event.triggerInference ?? false,
       ...(event.tags ? { tags: event.tags } : {}),
+      ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
     };
     // `origin.channelId` is the server-internal raw id (a bare Discord
     // snowflake) — unroutable as a locus and unresolvable by the agent. Store
@@ -7381,8 +8005,24 @@ export class AgentFramework {
       }
     }
 
-    const id = this.addMessage('user', content, metadata);
-    this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
+    // Silent heartbeat ticks are control-plane wakes, not autobiography.
+    // Accept the no-message path only for the heartbeat feature's own exact
+    // marker with an empty payload — arbitrary MCPL servers cannot hide
+    // content merely by setting `origin.silent`.
+    const silentHeartbeat =
+      event.serverId === 'heartbeat' &&
+      event.featureSet === 'heartbeat' &&
+      event.origin?.source === 'heartbeat' &&
+      event.origin?.silent === true &&
+      content.length === 0;
+
+    const placement: CoalescingPlacement = { agent: '' };
+    if (!silentHeartbeat) {
+      const id = this.addMessage('user', content, metadata, { placement, bypassDeferralFor: event.assemblingFor });
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
+    } else {
+      console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${event.eventId}`);
+    }
 
     if (event.triggerInference && !held) {
       // Default broadcast excludes conversation forks (channel-driven).
@@ -7400,9 +8040,17 @@ export class AgentFramework {
           // they must outrank ambient chatter in a batched wake's locus
           // selection just like their channels/incoming counterparts.
           addressed: isAddressedMessage(event.tags, event.origin),
+          ...(silentHeartbeat ? {
+            suppressProse: true,
+            ephemeralSystemPrompt:
+              '[silent heartbeat] Scheduled private self-check. Review pending matters privately. ' +
+              'Do not narrate or publish plain prose; use an explicit send tool only if you deliberately choose to contact someone.',
+          } : {}),
+          ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
         });
       }
     }
+    return placement.agent ? placement : undefined;
   }
 
   /**
@@ -7560,7 +8208,9 @@ export class AgentFramework {
         // route the resumed turn into the wrong channel.
         const newestByKey = new Map<string, InferenceRequest>();
         for (const request of parked) {
-          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}`;
+          // A coalesced wake is withdrawable by its subject (RFC-006 §4.2); it
+          // must not absorb an unrelated wake that would vanish with it.
+          const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}`;
           const prev = newestByKey.get(key);
           if (!prev || request.timestamp >= prev.timestamp) {
             newestByKey.set(key, request);
@@ -7689,8 +8339,13 @@ export class AgentFramework {
           if (!provReq || (r.wakeAt ?? r.timestamp) >= (provReq.wakeAt ?? provReq.timestamp)) provReq = r;
         }
       }
+      // A silent tick never suppresses a genuine coalesced wake. If any
+      // ordinary request shares this batch, the ordinary turn semantics win.
+      const silentOnly = requests.every((r) => r.suppressProse === true);
       await this.startAgentStream(agent, {
         ...trigger,
+        suppressProse: silentOnly ? trigger?.suppressProse : undefined,
+        ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         channelId: channelReq?.channelId,
         addressed: addressedReq !== undefined,
         // A context-budget restart continues the same logical turn: it keeps
@@ -8255,6 +8910,7 @@ export class AgentFramework {
     turnToken: number,
     ownsProviderGate: boolean,
   ): Promise<boolean> {
+    const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     // Flush messages deferred during the PREVIOUS turn — before the
     // checkpoint, the locus announcement, and the compile — so a turn started
     // by a queued wake actually CONTAINS the message that woke it. (2026-07-31
@@ -8294,6 +8950,18 @@ export class AgentFramework {
           }
         }
         this.ackDeferredWrites();
+      }
+    }
+
+    // RFC-006 §5: deferred batches for this agent render now, at the assembly
+    // boundary — after the deferred flush (same window: turn alive, compile
+    // not yet run) and before the checkpoint (they are the turn's inputs).
+    // Not on a context-budget restart: that continues the same logical turn.
+    if (attempt === 0 && trigger?.reason !== 'context_budget_restart' && this.pushCoalescer?.pendingBatches()) {
+      try {
+        await this.pushCoalescer.assemble(agent.name);
+      } catch (err) {
+        console.error(`[coalescing] assembly for ${agent.name} failed:`, err);
       }
     }
 
@@ -8358,8 +9026,8 @@ export class AgentFramework {
       this.turnProseDeliveries.delete(agent.name);
       this.turnProseSuppressed.delete(agent.name);
       this.proseHybridSuppressed.delete(agent.name);
-      if (agent.proseRouting === 'hybrid') this.proseTargetPins.delete(agent.name);
-      if (agent.proseRouting === 'explicit' || agent.proseRouting === 'disabled') {
+      if (turnProseRouting === 'hybrid') this.proseTargetPins.delete(agent.name);
+      if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') {
         // Explicit and disabled prose routing have no inferred locus.
         // Explicit mode uses a turn-scoped `>>` target; disabled mode has no
         // prose target at all. Neither mode freezes or announces a locus.
@@ -8376,6 +9044,15 @@ export class AgentFramework {
       }
     }
 
+    // A context-budget restart normally preserves the turn locus, but a
+    // silent control-plane wake must remain locusless even if an explicit tool
+    // opened/pinned a channel mid-turn.
+    if (trigger?.suppressProse) {
+      this.turnLocusPins.delete(agent.name);
+      this.proseTargetPins.delete(agent.name);
+      this.proseContinuations.delete(agent.name);
+    }
+
     this.touchEphemeralRun(agent.name, true);
     this.emitTrace({
       type: 'inference:started',
@@ -8383,6 +9060,7 @@ export class AgentFramework {
       // The turn-frozen locus was pinned just above (kept across a
       // context-budget restart, which skips the re-pin but re-emits this).
       channelId: this.turnLocusPins.get(agent.name),
+      ...(trigger?.suppressProse ? { silent: true } : {}),
     });
     // A budget restart continues the same logical inference window. The
     // predecessor keeps EventGate liveness until its successor terminates.
@@ -8401,18 +9079,14 @@ export class AgentFramework {
     // idempotent per channel, and owns the 7s refresh); the catch below stops
     // it on the no-driveStream failure paths (e.g. a compile refusal).
     const earlyTypingChannel =
-      agent.proseRouting === 'explicit'
+      turnProseRouting === 'explicit'
         ? trigger?.channelId ?? null
         : this.turnLocusPins.get(agent.name) ?? null;
     if (earlyTypingChannel) this.channelRegistry?.startTyping(earlyTypingChannel);
 
     try {
       const requestSnapshot = this.captureInferenceToolSnapshot(agent);
-      const allTools = this.getToolsForAgent(agent.name, requestSnapshot);
-      const tools = allTools.filter((t) => agent.canUseTool(t.name));
-      // Explicit-mode agents get the on-demand routing reference (teach-by-
-      // bounce: the grammar is never injected, only served when asked).
-      if (agent.proseRouting === 'explicit') tools.push(PROSE_HELP_TOOL);
+      const tools = this.agentToolSurface(agent, requestSnapshot);
 
       // Gather context from modules (pull-based) and MCPL hooks (push-based)
       // Both produce ContextInjection[] that get merged before inference.
@@ -8449,6 +9123,15 @@ export class AgentFramework {
         } catch (error) {
           console.error('beforeInference hook error:', error);
         }
+      }
+
+      if (trigger?.ephemeralSystemPrompt) {
+        const silentInjection: ContextInjection = {
+          namespace: 'framework:silent-heartbeat',
+          position: 'system',
+          content: [{ type: 'text', text: trigger.ephemeralSystemPrompt }],
+        };
+        injections = injections ? [...injections, silentInjection] : [silentInjection];
       }
 
       // An ephemeral watchdog may dispose this Agent while hooks/compile await.
@@ -8581,6 +9264,7 @@ export class AgentFramework {
     drainKvSubmissionIds?: () => string[],
     knownToolNames: ReadonlySet<string> = new Set(),
   ): Promise<void> {
+    const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     const startTime = Date.now();
     const requestId = `${agent.name}-${startTime}-${Math.random().toString(36).slice(2, 8)}`;
     const myStreamId = agent.streamId;
@@ -8638,7 +9322,7 @@ export class AgentFramework {
     // Sticky explicit-send suppression: prose after send_message stays quiet
     // to prevent a redundant "sent it" postscript. Fresh injected input
     // clears it, because the following prose is a reply to a new message.
-    let turnSilenced = false;
+    let turnSilenced = trigger?.suppressProse === true;
 
     // Live routing is only trusted when the membrane provides verbatim
     // round-scoped blocks (roundContent, native tool mode, membrane ≥0.5.64).
@@ -8661,9 +9345,9 @@ export class AgentFramework {
     //     sent here", which is true regardless of where the reply goes.
     //     Heartbeat/no-trigger explicit turns show no indicator.
     const typingChannel =
-      agent.proseRouting === 'disabled'
+      turnProseRouting === 'disabled'
         ? null
-        : agent.proseRouting === 'explicit'
+        : turnProseRouting === 'explicit'
           ? trigger?.channelId ?? null
           : resolveTurnLocus();
     if (typingChannel) this.channelRegistry!.startTyping(typingChannel);
@@ -8681,6 +9365,9 @@ export class AgentFramework {
     // id makes the discarded attempt's chunk buffer orphaned (never
     // finalized) instead of being appended to — see the 'retrying' case.
     let outgoingInferenceId = newOutgoingInferenceId();
+    // RFC-007: every inference id THIS stream mints, so the stream's end
+    // aborts only its own open tool calls — never a successor's.
+    const lifecycleInferenceIds = new Set<string>([outgoingInferenceId]);
     let outgoingIndex = 0;
 
     // §10.5 inference/lifecycle: `started` now, exactly one terminal in the
@@ -8701,10 +9388,10 @@ export class AgentFramework {
     // turns until completion: otherwise speculative outgoing chunks could
     // expose the wrapper before the fail-closed classifier runs.
     const proseStream = this.channelRegistry &&
-      agent.proseRouting !== 'disabled' &&
+      turnProseRouting !== 'disabled' &&
       !agent.toolWrapperProseGuard
       ? new ProseStreamRouter({
-          mode: agent.proseRouting === 'explicit' ? 'explicit' : agent.proseRouting === 'hybrid' ? 'hybrid' : 'locus',
+          mode: turnProseRouting === 'explicit' ? 'explicit' : turnProseRouting === 'hybrid' ? 'hybrid' : 'locus',
           initialTarget: typingChannel,
           resolve: (spec) => {
             const r = this.channelRegistry!.resolveProseTarget(spec);
@@ -8727,7 +9414,7 @@ export class AgentFramework {
       // A new conversational message, not merely a tool result, means any
       // earlier explicit delivery has completed its conversational job.
       // Routing is NOT touched: the turn locus stays frozen.
-      turnSilenced = false;
+      turnSilenced = trigger?.suppressProse === true;
     };
 
     try {
@@ -8778,6 +9465,7 @@ export class AgentFramework {
                 ' — discarding the refused attempt',
             );
             outgoingInferenceId = newOutgoingInferenceId();
+            lifecycleInferenceIds.add(outgoingInferenceId);
             outgoingIndex = 0;
             proseStream?.reset();
             this.emitTrace({
@@ -8876,7 +9564,14 @@ export class AgentFramework {
             agent.enterWaitingForTools(event.calls, stream);
 
             for (const call of event.calls) {
+              // RFC-007: register at the one dispatch point for model-issued
+              // calls, keyed by (agent, call id) with this inference's id;
+              // `started` goes out once dispatch returns. Refusal sites inside
+              // dispatch run synchronously and call refuse() first, so a call
+              // the host refuses produces no events.
+              this.toolLifecycleEmitter?.register(agent.name, outgoingInferenceId, call);
               this.dispatchToolCall(agent.name, call);
+              this.toolLifecycleEmitter?.open(agent.name, call.id);
             }
 
             // Speak-while-acting: route THIS round's prose to the locus NOW
@@ -8902,12 +9597,12 @@ export class AgentFramework {
                 liveProseRouting = true;
                 const roundSegments = splitProseSegments(assistantBlocks);
                 if (roundSegments.length > 0) {
-                  if (agent.proseRouting === 'disabled') {
+                  if (turnProseRouting === 'disabled') {
                     console.error(
                       `[routing] ${agent.name}: mid-turn prose NOT routed (proseRouting=disabled)`,
                     );
                     this.recordProseSuppression(agent.name, roundSegments.length);
-                  } else if (agent.proseRouting === 'hybrid') {
+                  } else if (turnProseRouting === 'hybrid') {
                     if (turnSilenced) {
                       this.recordProseSuppression(agent.name, roundSegments.length);
                     } else if (!hasSameRoundPrivateThink) {
@@ -8918,7 +9613,7 @@ export class AgentFramework {
                           .catch((err) => console.error('mid-turn hybrid prose delivery failed:', err));
                       }
                     }
-                  } else if (agent.proseRouting === 'explicit') {
+                  } else if (turnProseRouting === 'explicit') {
                     // Explicit mode: every segment through the prose gateway.
                     // Silencing does not apply — unprefixed prose bounces and
                     // prefixed prose is deliberate; think-privacy still holds.
@@ -9260,7 +9955,7 @@ export class AgentFramework {
             }
 
             // Dispatch speech (and thoughts if any)
-            if (speechContent.length > 0 || thoughts.length > 0) {
+            if (!trigger?.suppressProse && (speechContent.length > 0 || thoughts.length > 0)) {
               const speechContext: SpeechContext = {
                 turnComplete: true,
                 trigger: trigger ?? {
@@ -9291,10 +9986,10 @@ export class AgentFramework {
                 .join('\n')
                 .trim();
               if (speechText) {
-                if (agent.proseRouting === 'disabled') {
+                if (turnProseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
                   this.recordProseSuppression(agent.name, 1);
-                } else if (agent.proseRouting === 'hybrid') {
+                } else if (turnProseRouting === 'hybrid') {
                   const locus = resolveTurnLocus();
                   console.error(`[prose] ${agent.name}: text-only turn -> hybrid prose gateway`);
                   try {
@@ -9302,7 +9997,7 @@ export class AgentFramework {
                   } catch (err) {
                     console.error('text-only hybrid prose delivery failed:', err);
                   }
-                } else if (agent.proseRouting === 'explicit') {
+                } else if (turnProseRouting === 'explicit') {
                   console.error(`[prose] ${agent.name}: text-only turn -> prose gateway`);
                   try {
                     await this.deliverProse(agent, speechText);
@@ -9358,14 +10053,14 @@ export class AgentFramework {
               // the chain may still be flushing earlier rounds' posts.
               await turnSpeechChain;
 
-              if (agent.proseRouting === 'disabled') {
+              if (turnProseRouting === 'disabled') {
                 if (segments.length > 0) {
                   console.error(
                     `[routing] ${agent.name}: tool-call trailing prose NOT routed (proseRouting=disabled)`,
                   );
                   this.recordProseSuppression(agent.name, segments.length);
                 }
-              } else if (agent.proseRouting === 'hybrid') {
+              } else if (turnProseRouting === 'hybrid') {
                 if (silenced && segments.length > 0) {
                   this.recordProseSuppression(agent.name, segments.length);
                 } else if (segments.length > 0) {
@@ -9378,7 +10073,7 @@ export class AgentFramework {
                     }
                   }
                 }
-              } else if (agent.proseRouting === 'explicit') {
+              } else if (turnProseRouting === 'explicit') {
                 if (segments.length > 0) {
                   console.error(
                     `[prose] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> ${segments.length} trailing segment(s) via prose gateway`,
@@ -9431,7 +10126,7 @@ export class AgentFramework {
             // awaited before trailing dispatch, and trailing/text-only
             // segments were awaited in-loop. Locus mode only; explicit-mode
             // envelopes acknowledge themselves through the prose gateway.
-            if (agent.proseRouting !== 'explicit') {
+            if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
               this.appendProseDeliveryReceipt(agent);
             }
 
@@ -9600,7 +10295,7 @@ export class AgentFramework {
                 // deliveries map persists (cleared only at fresh turn
                 // start) and the continuation stream's end writes ONE
                 // receipt for the whole turn.
-                if (cancelKind === 'turn_ended' && agent.proseRouting !== 'explicit') {
+                if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
                   await turnSpeechChain;
                   this.appendProseDeliveryReceipt(agent);
                 }
@@ -9820,6 +10515,13 @@ export class AgentFramework {
       // completed; catch → failed; framework-cancel → aborted). A host
       // crash emits nothing — that is the documented best-effort limit, and
       // why consumers keep their safety timeout.
+      //
+      // RFC-007 §7.3: a tool call still open when its turn's stream ends was
+      // cancelled before a result — its terminal is `aborted`. (A normal turn
+      // has none: the stream waits for every result before continuing.)
+      // Scoped to this stream's own inference ids: a budget-restart successor
+      // may already be running for the same agent.
+      this.toolLifecycleEmitter?.abortOpen(agent.name, lifecycleInferenceIds);
       this.hookOrchestrator?.emitLifecycle({
         inferenceId: outgoingInferenceId,
         conversationId: agent.name,
@@ -10176,6 +10878,7 @@ export class AgentFramework {
     const startTime = Date.now();
     this.runCodeExecution(agentName, call)
       .catch((error): ToolResult => {
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         // runCodeExecution is designed not to reject; this is the last-resort
         // guard so a bug here can never strand the agent in waiting_for_tools.
         const err = error instanceof Error ? error : new Error(String(error));
@@ -10225,6 +10928,7 @@ export class AgentFramework {
       background?: unknown;
       action?: unknown;
       script_id?: unknown;
+      time_limit_ms?: unknown;
     };
 
     // Management surface: the agent's own daemon fleet is inspectable and
@@ -10273,6 +10977,18 @@ export class AgentFramework {
       };
     }
 
+    // A per-call time limit, capped by the deployment's ceiling (the result says when it was capped).
+    if (input.time_limit_ms !== undefined && (typeof input.time_limit_ms !== 'number' || !Number.isFinite(input.time_limit_ms) || input.time_limit_ms < 1000)) {
+      return { success: false, error: '`time_limit_ms` must be a number of milliseconds, at least 1000', isError: true };
+    }
+    const limits = scriptTimeLimits(this.codeExecutionConfig ?? undefined);
+    const ceilingMs = input.background === true ? limits.backgroundMaxMs : limits.maxMs;
+    const requestedMs = input.time_limit_ms === undefined ? undefined : Math.floor(input.time_limit_ms);
+    const timeLimitMs = requestedMs === undefined ? undefined : Math.min(requestedMs, ceilingMs);
+    const capNote = requestedMs !== undefined && requestedMs > ceilingMs
+      ? `time_limit_ms ${requestedMs} was capped at ${ceilingMs}, this deployment's maximum`
+      : undefined;
+
     const agent = this.agents.get(agentName);
     const surface = agent
       ? this.getToolsForAgent(agentName).filter((t) => agent.canUseTool(t.name))
@@ -10282,17 +10998,26 @@ export class AgentFramework {
     );
 
     if (input.background === true) {
-      return this.startBackgroundScript(agentName, input.code, injected);
+      const started = this.startBackgroundScript(agentName, input.code, injected, timeLimitMs);
+      if (capNote && started.success && started.data && typeof started.data === 'object') {
+        (started.data as Record<string, unknown>).time_limit_note = capNote;
+      }
+      return started;
     }
 
     const runner = this.getOrCreateScriptRunner(agentName);
     this.scriptDeferredEndTurn.delete(agentName);
-    const exec = await runner.exec(input.code, injected);
+    const exec = await runner.exec(input.code, injected, undefined, timeLimitMs !== undefined ? { deadlineMs: timeLimitMs } : undefined);
     const endTurn = this.scriptDeferredEndTurn.delete(agentName);
 
     return {
       success: true,
-      data: { stdout: exec.stdout, stderr: exec.stderr, return_code: exec.returnCode },
+      data: {
+        stdout: exec.stdout,
+        stderr: exec.stderr,
+        return_code: exec.returnCode,
+        ...(capNote ? { time_limit_note: capNote } : {}),
+      },
       isError: false,
       ...(endTurn ? { endTurn: true } : {}),
     };
@@ -10314,6 +11039,7 @@ export class AgentFramework {
     agentName: string,
     code: string,
     injected: import('./code-execution/py-runner.js').InjectedTool[],
+    timeLimitMs?: number,
   ): ToolResult {
     // v1: primary-agent-only. A conversation fork's or ephemeral's daemon
     // would outlive its owner and its wake would land in the primary
@@ -10339,7 +11065,8 @@ export class AgentFramework {
     }
 
     const scriptId = `bg-${++this.backgroundScriptCounter}`;
-    const lifetimeMs = cfg?.backgroundMaxLifetimeMs ?? 86_400_000;
+    // The agent's time_limit_ms (already capped) shortens the lifetime; it never extends it.
+    const lifetimeMs = timeLimitMs ?? cfg?.backgroundMaxLifetimeMs ?? 86_400_000;
 
     // Journal: a file under the agent's first read-write workspace mount so
     // their existing read/grep/shell tools work on it. Python appends
@@ -10405,6 +11132,7 @@ export class AgentFramework {
         script_id: scriptId,
         log: logPath ?? 'no writable workspace mount — output is not retrievable; only wake_agent() reaches you',
         lifetime_hours: Math.round(lifetimeMs / 3_600_000 * 10) / 10,
+        lifetime: formatLimit(lifetimeMs), // exact for short limits, which lifetime_hours rounds to 0
         note: 'The script dies if the host process restarts. Manage with code_execution {"action": "list"|"cancel"}.',
       },
     };
@@ -11041,17 +11769,91 @@ export class AgentFramework {
     this.store.appendToStateJson(PROCESS_LOG_ID, entryToStore);
   }
 
+  /** Forget one server's RFC-008 class declarations (see the close handler). */
+  private dropMcplToolClasses(serverId: string): void {
+    // Tolerate partially-constructed frameworks (tests build them with
+    // Object.create): nothing cached means nothing to forget.
+    if (!this.mcplToolClasses?.size) return;
+    const prefix = this.mcplServerConfigs?.get(serverId)?.toolPrefix ?? `mcpl--${serverId}`;
+    for (const name of [...this.mcplToolClasses.keys()]) {
+      if (name.startsWith(`${prefix}--`)) this.mcplToolClasses.delete(name);
+    }
+  }
+
   /**
-   * Find the MCPL server for a tool call by checking against the prefix map.
-   * Returns [serverId, prefix] if found, null otherwise.
+   * RFC-007/RFC-008: what tools/lifecycle says about a model-facing tool —
+   * its effective class, and for MCPL tools the providing connection and
+   * the server's own tool name. Host knowledge (built-in table, embedding
+   * host's table) applies only to tools the host implements; an MCPL tool's
+   * class comes from an operator override or its server's declaration.
+   */
+  private describeToolForLifecycle(tool: string): { class: ToolClass[]; serverId?: string; serverTool?: string } {
+    const mcpl = this.resolveMcplTool(tool);
+    const { classes } = this.effectiveToolClass(tool, mcpl !== null);
+    if (mcpl) return { class: classes, serverId: mcpl[0], serverTool: tool.slice(mcpl[1].length + 2) };
+    return { class: classes };
+  }
+
+  /**
+   * RFC-008 §5.1: a tool's effective class and the source that decided it.
+   * Operator overrides first; then host knowledge, for tools the host
+   * implements (never for MCPL tools); then an MCPL tool's own declaration.
+   * Tolerates partially-constructed frameworks (tests use Object.create).
+   */
+  private effectiveToolClass(tool: string, isMcpl: boolean): EffectiveToolClass {
+    return resolveToolClass(tool, isMcpl ? this.mcplToolClasses?.get(tool) : undefined, {
+      overrides: this.toolClassOverrides ?? [],
+      host: isMcpl ? [] : (this.hostToolClasses ?? []),
+    });
+  }
+
+  /**
+   * RFC-008 §6: tools with their effective class and where that class came
+   * from (`override`, `host`, `server`, or `none` for an unclassed tool,
+   * which policy treats as most restrictive). For operators: a surprising
+   * class should be visible before it matters.
+   *
+   * With `agentName`, exactly the tools that agent is shown. Without, every
+   * tool the framework offers to anyone: the shared board plus each agent's
+   * own (the subconscious's surface, `prose_help`), each listed once.
+   */
+  listToolClasses(agentName?: string): Array<{ tool: string; class: ToolClass[]; source: ToolClassSource; serverId?: string }> {
+    let tools: import('./types/index.js').ToolDefinition[];
+    if (agentName !== undefined) {
+      const agent = this.agents.get(agentName);
+      if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+      tools = this.agentToolSurface(agent);
+    } else {
+      tools = [this.getAllTools(), ...[...this.agents.values()].map((a) => this.agentToolSurface(a))].flat();
+    }
+    const seen = new Set<string>();
+    const listed: Array<{ tool: string; class: ToolClass[]; source: ToolClassSource; serverId?: string }> = [];
+    for (const t of tools) {
+      if (seen.has(t.name)) continue;
+      seen.add(t.name);
+      const mcpl = this.resolveMcplTool(t.name);
+      const { classes, source } = this.effectiveToolClass(t.name, mcpl !== null);
+      listed.push({ tool: t.name, class: classes, source, ...(mcpl ? { serverId: mcpl[0] } : {}) });
+    }
+    return listed;
+  }
+
+  /**
+   * Find the MCPL server for a tool: [serverId, prefix], or null.
+   * Prefixes can nest (`foo` and `foo--bar`), so `foo--bar--x` can match
+   * both. The server whose tools/list produced the name decides; a name no
+   * live server listed (stale, or invented by the model) goes to the longest
+   * matching prefix. Never prefix-map insertion order.
    */
   private resolveMcplTool(toolName: string): [string, string] | null {
-    for (const [prefix, serverId] of this.mcplPrefixMap) {
-      if (toolName.startsWith(prefix + '--')) {
-        return [serverId, prefix];
-      }
+    const listedBy = this.mcplToolServers?.get(toolName);
+    let best: [string, string] | null = null;
+    for (const [prefix, serverId] of this.mcplPrefixMap ?? []) {
+      if (!toolName.startsWith(prefix + '--')) continue;
+      if (serverId === listedBy) return [serverId, prefix];
+      if (!best || prefix.length > best[1].length) best = [serverId, prefix];
     }
-    return null;
+    return best;
   }
 
   private dispatchToolCall(agentName: string, call: ToolCall): void {
@@ -11285,6 +12087,8 @@ export class AgentFramework {
       })
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
+        // RFC-007: the module threw — the host could not obtain a result.
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         this.emitTrace({
           type: 'tool:failed',
           module: moduleName,
@@ -11329,6 +12133,14 @@ export class AgentFramework {
        * minting a second, independently replayable one.
        */
       deferredWriteId?: string;
+      /** Out-param: where the message landed (RFC-006 needs to find it again). */
+      placement?: { agent?: string; messageId?: MessageId; deferredId?: string };
+      /**
+       * RFC-006 assembly: the named agent's turn is alive but its compile has
+       * not run yet (the same window the turn-start deferred flush writes
+       * in). A message for THAT agent is stored directly instead of deferred.
+       */
+      bypassDeferralFor?: string;
     }
   ): MessageId {
     // Route to the named agent, else the primary (not ephemeral subagents).
@@ -11378,6 +12190,7 @@ export class AgentFramework {
       : this.pendingAssistantBlocks.size > 0;
     if (
       !hasToolResult &&
+      opts?.bypassDeferralFor !== agent.name &&
       (this.quiesced ||
         midToolCycle ||
         this.activeTurnTokens.has(agent.name) ||
@@ -11394,14 +12207,17 @@ export class AgentFramework {
       }
       this.deferredMessages.push({ id, seq: seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent });
       if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
+      if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.deferredId = id; }
       return '' as MessageId; // Deferred — flushed at the target's next boundary
     }
 
-    return agent.getContextManager().addMessage(
+    const stored = agent.getContextManager().addMessage(
       participant,
       content,
       opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
     );
+    if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
+    return stored;
   }
 
   /**
@@ -11939,6 +12755,11 @@ export class AgentFramework {
     this.mcplServerRegistry = new McplServerRegistry();
     this.featureSetManager = new FeatureSetManager();
     this.hookOrchestrator = new HookOrchestrator(this.mcplServerRegistry, this.featureSetManager);
+    this.toolLifecycleEmitter = new ToolLifecycleEmitter({
+      observers: () => this.mcplServerRegistry?.getAllServers() ?? [],
+      configFor: (serverId) => this.mcplServerConfigs.get(serverId)?.toolLifecycle,
+      describe: (tool) => this.describeToolForLifecycle(tool),
+    });
 
     // Build prefix map and store configs for tool routing
     for (const config of serverConfigs) {
@@ -11953,11 +12774,13 @@ export class AgentFramework {
       ?? (this.eventGate ? this.eventGate.asShouldTriggerCallback() : undefined);
 
     // Push events handler (Step 6)
+    this.initializePushCoalescer();
     this.pushHandler = new PushHandler(
       this.featureSetManager,
       (event) => this.pushEvent(event as unknown as ProcessEvent),
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       triggerFilter,
+      (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
     );
 
     // Server-initiated inference router (Step 6)
@@ -11987,6 +12810,8 @@ export class AgentFramework {
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       {
         store: this.store,
+        handleCoalescedIncoming: (serverId, message, event) =>
+          this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent),
         sendTypingFn: (serverId, channelId, metadata, op) => {
           const server = this.mcplServerRegistry!.getServer(serverId);
           if (server) {
@@ -12061,11 +12886,17 @@ export class AgentFramework {
     // implemented for years — are declared (AUDIT-001/issue #76 item 12).
     this.mcplHostCapabilities = {
       version: '0.5',
+      // RFC-006 (mcpl PR #5, revision 7): both lanes, deferred rendering,
+      // channel-scoped pushes, one-hour retry window.
+      eventCoalescing: { ...PUSH_COALESCING_SUPPORT },
       pushEvents: true,
       contextHooks: {
         beforeInference: true,
       },
       inferenceLifecycle: true,
+      // RFC-007: tools/lifecycle (metadata, and requested argument fields
+      // under their own grant) plus the tools/observe filter.
+      toolLifecycle: { observe: true, inputs: true },
       // modelInfo is NOT advertised: §12.2's result requires all four of
       // {id, vendor, contextWindow, capabilities} and the host has no
       // truthful source for contextWindow/capabilities (grep: none exists).
@@ -12948,6 +13779,20 @@ export class AgentFramework {
     /** Host-owned authority; deliberately separate from the portable grant. */
     allowHostCommands: boolean;
     /**
+     * RFC-007 §10: the server's current tools/observe filter — its own
+     * statement of which calls and argument fields it uses, shown next to
+     * the grant so an operator can narrow toolLifecycle.inputs to match. It
+     * confers nothing. Null = no filter (granted calls, metadata only).
+     */
+    toolObserveFilter: import('./mcpl/tool-lifecycle.js').ToolObserveRule[] | null;
+    /**
+     * RFC-008 §6: each of this server's tools with its effective class and
+     * the source that decided it — `override` (operator), `server` (its own
+     * `_meta["mcpl/class"]`), or `none` (unclassed: observers never see its
+     * arguments). Shown next to the grant so a surprising class is visible.
+     */
+    toolClasses: Array<{ tool: string; serverTool: string; class: ToolClass[]; source: ToolClassSource }>;
+    /**
      * Per-transport §17 facts about the last manifest this host fetched and
      * acted on. The revision is server-authored and equality-only; these are
      * not the server's manifestChanged announcements.
@@ -12965,6 +13810,8 @@ export class AgentFramework {
       toolPrefix: string; toolCount: number; policyEstablished: boolean;
       effectiveGrant: string[]; maskedCapabilities: string[];
       deniedCapabilities: string[]; allowHostCommands: boolean;
+      toolObserveFilter: import('./mcpl/tool-lifecycle.js').ToolObserveRule[] | null;
+      toolClasses: Array<{ tool: string; serverTool: string; class: ToolClass[]; source: ToolClassSource }>;
       manifestState: {
         lastValidatedRevision: string | null;
         lastFetchedAt: number | null;
@@ -12976,17 +13823,28 @@ export class AgentFramework {
       const prefix = config.toolPrefix ?? `mcpl--${id}`;
       const connection = this.mcplServerRegistry?.getServer(id) ?? null;
       const connected = connection?.isConnected ?? false;
+      // Attribute through the dispatch resolver: a bare prefix match would
+      // also count a nested prefix's tools (`foo` vs `foo--bar`) as ours.
+      const ownTools = (this.mcplTools ?? []).flatMap((t) => {
+        const hit = this.resolveMcplTool(t.name);
+        return hit && hit[0] === id ? [{ tool: t.name, serverTool: t.name.slice(hit[1].length + 2) }] : [];
+      });
       result.push({
         id,
         connected,
         retrying: !connected && (connection?.willReconnect ?? false),
         toolPrefix: prefix,
-        toolCount: this.mcplTools.filter(t => t.name.startsWith(`${prefix}--`)).length,
+        toolCount: ownTools.length,
         policyEstablished: connection?.policyEstablished ?? false,
         effectiveGrant: connection?.grant.effectiveList() ?? [],
         maskedCapabilities: [...(connection?.droppedCapabilities ?? [])].sort(),
         deniedCapabilities: [...(connection?.grant.deniedPaths ?? [])].sort(),
         allowHostCommands: config.allowHostCommands === true,
+        toolObserveFilter: connection?.toolObserveFilter ?? null,
+        toolClasses: ownTools.map(({ tool, serverTool }) => {
+          const { classes, source } = this.effectiveToolClass(tool, true);
+          return { tool, serverTool, class: classes, source };
+        }),
         manifestState: connection
           ? { ...connection.manifestState }
           : { lastValidatedRevision: null, lastFetchedAt: null, lastNegotiatedAt: null },
@@ -13025,7 +13883,7 @@ export class AgentFramework {
     ) => {
       const barrier = this.discordAwarenessBarrier;
       if (barrier) await barrier.promise;
-      this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+      await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
     });
 
     // Handle server-initiated inference requests (Step 6)
@@ -13033,6 +13891,11 @@ export class AgentFramework {
       params: McplInferenceRequestParams,
       responder?: { id: string | number; respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
+      // RFC-006 §5.3 / SPEC §10.7: no inference from inside a render.
+      if (this.pushCoalescer?.isRendering(connection.id)) {
+        responder?.respondError(-32600, 'Cannot request inference while push/render is in progress');
+        return;
+      }
       if (this.inferenceRouter && responder) {
         const barrier = this.discordAwarenessBarrier;
         if (barrier) await barrier.promise;
@@ -13083,6 +13946,23 @@ export class AgentFramework {
       });
     });
 
+    // RFC-007 §6: the server's filter over tools/lifecycle. Admission already
+    // required toolLifecycle.observe (-32002 otherwise). Validation failures
+    // leave the previous filter in force (§6.6).
+    connection.on('tools-observe', (
+      params: unknown,
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void },
+    ) => {
+      const parsed = parseToolObserveParams(params);
+      if (!parsed.ok) {
+        if (responder?.respondError) responder.respondError(-32602, parsed.message, parsed.data);
+        else console.error(`[mcpl] ${connection.id}: tools/observe rejected — ${parsed.message}`);
+        return;
+      }
+      connection.toolObserveFilter = parsed.rules;
+      responder?.respond({});
+    });
+
     connection.on('model-info', (
       _params: unknown,
       responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void },
@@ -13106,7 +13986,7 @@ export class AgentFramework {
     ) => {
       const barrier = this.discordAwarenessBarrier;
       if (barrier) await barrier.promise;
-      this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
+      await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
     });
 
     // Handle host-level admin commands from a surface (e.g. Discord /undo)
@@ -13269,6 +14149,10 @@ export class AgentFramework {
     // disconnectMcplServer, which deletes the trees explicitly.
     connection.on('close', (code?: number | null, signal?: string | null) => {
       this.featureSetManager?.removeServer(connection.id);
+      // RFC-008: a closed provider's class hints are stale — on reconnect it
+      // may class its tools differently. Until the next tools/list its tools
+      // are unclassed, the restrictive answer (RFC-007 §4.3).
+      this.dropMcplToolClasses(connection.id);
       this.emitTrace({
         type: 'mcpl:server-closed',
         serverId: connection.id,
@@ -13289,6 +14173,8 @@ export class AgentFramework {
 
     const tools: import('./types/index.js').ToolDefinition[] = [];
     const toolFeatureSets = new Map<string, string>();
+    const toolClasses = new Map<string, ToolClass[]>();
+    const toolServers = new Map<string, string>();
 
     for (const server of this.mcplServerRegistry.getAllServers()) {
       const config = this.mcplServerConfigs.get(server.id);
@@ -13298,10 +14184,15 @@ export class AgentFramework {
         for (const tool of result.tools) {
           if (!isToolAllowed(tool.name, config)) continue;
           const namespacedName = `${prefix}--${tool.name}`;
+          toolServers.set(namespacedName, server.id);
           const attributedTool = tool as typeof tool & {
             featureSet?: unknown;
-            _meta?: { featureSet?: unknown };
+            _meta?: { featureSet?: unknown; [key: string]: unknown };
           };
+          // RFC-008: the server's class hint for this tool. Never shown to
+          // the model (the definition below is unchanged by it).
+          const declaredClasses = parseDeclaredClasses(attributedTool._meta, namespacedName);
+          if (declaredClasses) toolClasses.set(namespacedName, declaredClasses);
           const featureSet = typeof attributedTool.featureSet === 'string'
             ? attributedTool.featureSet
             : typeof attributedTool._meta?.featureSet === 'string'
@@ -13325,6 +14216,8 @@ export class AgentFramework {
 
     this.mcplTools = tools;
     this.mcplToolFeatureSets = toolFeatureSets;
+    this.mcplToolClasses = toolClasses;
+    this.mcplToolServers = toolServers;
   }
 
   /**
@@ -13390,6 +14283,8 @@ export class AgentFramework {
     const server = this.mcplServerRegistry!.getServer(serverId);
 
     if (!server) {
+      // RFC-007: refused before executing — no lifecycle events.
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
@@ -13402,6 +14297,7 @@ export class AgentFramework {
 
     const config = this.mcplServerConfigs.get(serverId);
     if (!isToolAllowed(toolName, config)) {
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
       this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: 'denied by tool policy' });
       this.pushEvent({
         type: 'tool-result',
@@ -13578,6 +14474,8 @@ export class AgentFramework {
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
         this.emitTrace({ type: 'tool:failed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, error: err.message, stack: err.stack });
+        // RFC-007: transport error, closed connection or timeout — no result.
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
 
         this.pushEvent({
           type: 'tool-result',
@@ -13604,6 +14502,8 @@ export class AgentFramework {
     const home = this.conversationAgentHomes.get(agentName);
     if (home) {
       const reject = (error: string): void => {
+        // RFC-007: the guard refuses before the tool runs — no lifecycle events.
+        this.toolLifecycleEmitter?.refuse(agentName, call.id);
         this.emitTrace({
           type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id,
           error: `conversation agent ${agentName}: ${error}`,
@@ -13687,6 +14587,7 @@ export class AgentFramework {
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
         this.emitTrace({ type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id, error: err.message });
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
@@ -13925,7 +14826,8 @@ export class AgentFramework {
     if (announce && this.channelRegistry) {
       const text = input.message ?? `💤 Going quiet for ${human}. I'll still see messages, but won't respond until I wake.`;
       const agent = this.agents.get(agentName);
-      if (agent?.proseRouting === 'disabled') {
+      const silentTurn = this.activeTurnTriggers.get(agentName)?.suppressProse === true;
+      if (silentTurn || agent?.proseRouting === 'disabled') {
         console.error(`[sleep] ${agentName}: proseRouting=disabled — sleep announcement not posted`);
       } else if (agent?.proseRouting === 'explicit') {
         // Explicit mode: announce to the turn's sticky prose target if the
@@ -14769,6 +15671,7 @@ export class AgentFramework {
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: err.message });
+      this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
       result = { success: false, error: err.message, isError: true };
     }
     this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
@@ -14793,6 +15696,7 @@ export class AgentFramework {
       .catch((error) => {
         const err = error instanceof Error ? error : new Error(String(error));
         this.emitTrace({ type: 'tool:failed', module: 'gate', tool: call.name, callId: call.id, error: err.message });
+        this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,

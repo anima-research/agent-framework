@@ -118,6 +118,35 @@ export { ScopeManager, type ElevationHandler } from './scope-manager.js';
 // Hook orchestration (beforeInference/afterInference fan-out)
 export { HookOrchestrator } from './hook-orchestrator.js';
 
+export {
+  ToolLifecycleEmitter,
+  parseToolObserveParams,
+  selectFields,
+  boundInput,
+  openingFor,
+  DEFAULT_MAX_INPUT_BYTES,
+  TOOL_OBSERVE_LIMITS,
+  type ToolPhase,
+  type ToolLifecycleParams,
+  type ToolObserveRule,
+  type ToolObserveMatch,
+  type ToolLifecycleConfig,
+  type ToolLifecycleNarrowing,
+} from './tool-lifecycle.js';
+export {
+  TOOL_CLASSES,
+  TOOL_CLASS_META_KEY,
+  DEFAULT_INPUT_CLASSES,
+  BUILTIN_TOOL_CLASSES,
+  parseDeclaredClasses,
+  resolveToolClass,
+  isToolClass,
+  type ToolClass,
+  type ToolClassSource,
+  type EffectiveToolClass,
+} from './tool-classes.js';
+export { globMatch } from './tool-glob.js';
+
 // Push events (Section 9)
 export { PushHandler } from './push-handler.js';
 export type { McplPushEvent } from './push-handler.js';
