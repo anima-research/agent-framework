@@ -5,7 +5,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeF
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
+import { ContextManager, MessageStore, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
@@ -81,7 +81,7 @@ import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
-import { ConversationRouter } from './mcpl/conversation-router.js';
+import { ConversationRouter, type IncomingMessageFacts } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import {
@@ -266,6 +266,16 @@ const isAddressedMessage = (
   tags?: string[],
   _metadata?: Record<string, unknown>,
 ): boolean => Array.isArray(tags) && tags.includes('chat:addressed');
+
+/** Identity, not automation: another bot is still a counterpart. These
+ * server-supplied fields classify traffic the admitted server already owns;
+ * they neither grant capabilities nor authenticate a separate principal. */
+const isSelfAuthoredMessage = (
+  tags: unknown,
+  authorId: unknown,
+  metadata?: Record<string, unknown>,
+): boolean => (Array.isArray(tags) && tags.includes('chat:from-self'))
+  || (typeof authorId === 'string' && authorId.length > 0 && authorId === metadata?.botUserId);
 
 // parseProsePrefix moved to ./mcpl/prose-grammar.ts — ONE grammar shared with
 // the outgoing-stream router (Spec 14.3), so streamed chunks and delivered
@@ -6968,6 +6978,9 @@ export class AgentFramework {
     eventId?: string;
     assemblingFor?: string;
     deliverTo?: string;
+    /** Host-owned deferred batch attribution, separate from rendered content. */
+    conversationActivity?: boolean;
+    conversationBinding?: Pick<IncomingMessageFacts, 'mentioned' | 'kind'>;
   }): Promise<CoalescingPlacement | undefined> {
     const metadata: Record<string, unknown> = {
       ...event.metadata,
@@ -6992,15 +7005,16 @@ export class AgentFramework {
       const target = this.agents.get(event.deliverTo);
       if (!target) return undefined;
       if (this.conversationRouter && this.conversationAgentHomes.has(target.name)) {
-        metadata.triggered = event.triggerInference ?? false;
+        const self = isSelfAuthoredMessage(event.tags, event.author.id, event.metadata);
+        metadata.triggered = !self && (event.triggerInference ?? false);
         const id = target.getContextManager().addMessage('user', event.content, metadata);
         // A correction may target an older engagement. Refresh only the
         // binding whose agent actually received the message.
-        if (this.conversationRouter.getBinding(event.channelId)?.agentName === target.name) {
+        if ((event.conversationActivity ?? !self) && this.conversationRouter.getBinding(event.channelId)?.agentName === target.name) {
           this.conversationRouter.touch(event.channelId);
         }
         this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
-        if (event.triggerInference) {
+        if (!self && event.triggerInference) {
           this.pendingRequests.push({
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
             channelId: event.channelId,
@@ -7112,16 +7126,22 @@ export class AgentFramework {
       tags?: string[];
       triggerInference?: boolean;
       coalescingSubject?: string;
+      conversationActivity?: boolean;
+      conversationBinding?: Pick<IncomingMessageFacts, 'mentioned' | 'kind'>;
     },
     messageMetadata: Record<string, unknown>,
   ): Promise<CoalescingPlacement | undefined> {
     const router = this.conversationRouter!;
+    const self = isSelfAuthoredMessage(event.tags, event.author.id, event.metadata);
+    // A self-only echo cannot start an engagement. A rendered mixed batch
+    // may still carry genuine counterpart activation after its binding expired.
+    if (self && !event.conversationActivity && !router.getBinding(event.channelId)) return;
     const descriptor = this.channelRegistry?.getDescriptor(event.channelId);
 
     const decision = router.route({
       channelId: event.channelId,
-      mentioned: event.metadata?.mentioned === true,
-      kind: ConversationRouter.classifyChannel(descriptor, event.metadata),
+      mentioned: event.conversationBinding?.mentioned ?? (event.metadata?.mentioned === true),
+      kind: event.conversationBinding?.kind ?? ConversationRouter.classifyChannel(descriptor, event.metadata),
     });
 
     if (decision.kind === 'unbound') {
@@ -7174,11 +7194,11 @@ export class AgentFramework {
 
     // Respect an explicit server-config-level veto (shouldTriggerInference)
     // on top of the router's own trigger policy.
-    const trigger = decision.trigger && event.triggerInference !== false;
+    const trigger = !self && decision.trigger && event.triggerInference !== false;
     messageMetadata.triggered = trigger;
 
     const id = agent.getContextManager().addMessage('user', event.content, messageMetadata);
-    router.touch(event.channelId);
+    if (event.conversationActivity ?? !self) router.touch(event.channelId);
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
     if (trigger) {
@@ -7491,11 +7511,15 @@ export class AgentFramework {
   }
 
   private initializePushCoalescer(): void {
+    // Boot-only metadata cache for frozen batches published into forks that
+    // are no longer registered after restart. Avoid reading their blob bodies.
+    const publishedForks = new Map<string, Set<string>>();
     const coalescer = new PushCoalescer<CoalescedDelivery>({
       isUnread: (p) => this.isUnreadPlacement(p),
       remove: (p) => this.removePlacement(p),
-      deliver: (occ, materialized, assemblingFor) => this.deliverCoalesced(occ, materialized, assemblingFor),
-      wakeForBatch: (occ) => this.wakeForCoalescedBatch(occ),
+      deliver: (occ, materialized, assemblingFor, activation) => this.deliverCoalesced(occ, materialized, assemblingFor, activation),
+      isPassive: (occ) => !!this.conversationRouter && occ.scope.kind === 'channel' && this.isSelfConversationOccurrence(occ),
+      wakeForBatch: (occ, preserveExisting) => this.wakeForCoalescedBatch(occ, preserveExisting),
       cancelWake: (subject) => this.cancelCoalescedWakes(subject),
       authorized: (occ) => this.coalescedAuthorized(occ),
       audience: (occ) => this.coalescedAudience(occ),
@@ -7513,7 +7537,7 @@ export class AgentFramework {
         this.coalescingRecentReceipts.push(record);
         this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
       },
-      wasPublished: (subject, eventId) => {
+      wasPublished: (subject, eventId, publicationAgent) => {
         // Boot-time only: the occurrence's durable delivery identity
         // (subject + eventId in message metadata) in any agent's context.
         for (const agent of this.agents.values()) {
@@ -7521,6 +7545,28 @@ export class AgentFramework {
             if (agent.getContextManager().getAllMessages().some((m) =>
               m.metadata?.coalescingSubject === subject && m.metadata?.eventId === eventId)) return true;
           } catch { /* a context that cannot be read cannot prove publication */ }
+        }
+        if (publicationAgent && !this.agents.has(publicationAgent)) {
+          let published = publishedForks.get(publicationAgent);
+          if (!published) {
+            published = new Set<string>();
+            try {
+              const messages = new MessageStore(this.store, { namespace: `conversations/${publicationAgent}` });
+              for (let offset = 0; ;) {
+                const page = messages.getWindow(offset, 256, { resolveBlobs: false });
+                for (const message of page.messages) {
+                  const m = message.metadata;
+                  if (typeof m?.coalescingSubject === 'string' && typeof m?.eventId === 'string') {
+                    published.add(JSON.stringify([m.coalescingSubject, m.eventId]));
+                  }
+                }
+                offset = page.startIndex + page.messages.length;
+                if (offset >= page.totalCount || !page.messages.length) break;
+              }
+            } catch { /* unavailable history cannot establish publication */ }
+            publishedForks.set(publicationAgent, published);
+          }
+          return published.has(JSON.stringify([subject, eventId]));
         }
         return false;
       },
@@ -7546,9 +7592,16 @@ export class AgentFramework {
     } catch (err) {
       console.error('[coalescing] could not restore coalescing state; starting with unknown history:', err);
     }
+    publishedForks.clear();
     this.pushCoalescer = coalescer;
-    // Batches restored from a snapshot still owe the agent a wake (§14 v41).
-    for (const occ of coalescer.pendingBatchOccurrences()) void this.wakeForCoalescedBatch(occ);
+    // Restore independent batch causes in order. An older frozen counterpart
+    // cannot be cancelled by a newer quiet batch on the same subject, and two
+    // causes must not race to create the same conversation fork.
+    this.resumeCoalescedWork();
+  }
+
+  private resumeCoalescedWork(): void {
+    void this.pushCoalescer?.resumePending().catch(err => console.error('[coalescing] could not resume pending work:', err));
   }
 
   /**
@@ -7632,7 +7685,10 @@ export class AgentFramework {
     });
   }
 
-  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent): Promise<PushEventResult> {
+  private handleCoalescedPush(
+    serverId: string, params: PushEventParams, event: McplPushEvent,
+    triggerFilter: (content: string, metadata: Record<string, unknown>) => boolean,
+  ): Promise<PushEventResult> {
     return this.admitCoalesced(async () => {
       if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
       validateCoalesceMember(params.coalesce, 'push');
@@ -7643,6 +7699,33 @@ export class AgentFramework {
       if (c.channelId) this.assertChannelScopedPush(serverId, c.channelId);
       const origin = params.origin ?? {};
       const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+      const inheritedIdentity = c.channelId ? this.pushCoalescer.identity(coalescingSubjectKey(
+        serverId, this.coalescingBinding(serverId), { kind: 'channel', id: c.channelId }, c.key,
+      )) : undefined;
+      const identity = c.channelId ? {
+        ...inheritedIdentity,
+        ...(str(origin.messageId) ? { messageId: str(origin.messageId) } : {}),
+        ...(str(origin.threadId) ? { threadId: str(origin.threadId) } : {}),
+        // Freeze even an unknown author now. A later self update must not
+        // retroactively change the identity of this pending activation.
+        author: str(origin.authorId)
+          ? { id: str(origin.authorId)!, name: str(origin.authorName) ?? str(origin.authorId)! }
+          : inheritedIdentity?.author ?? { id: '', name: str(origin.authorName) ?? 'Someone' },
+      } : undefined;
+      const prepare = identity ? () => {
+        // Identity is frozen under admission serialization, and effectful
+        // trigger policy runs only after the coalescer rules out receipt
+        // replay. A retry cannot reinterpret an old self event as a newer author.
+        const text = event.content
+          .filter((b): b is ContentBlock & { type: 'text'; text: string } => b.type === 'text')
+          .map(b => b.text).join('\n');
+        event.triggerInference = triggerFilter(text, {
+          ...origin, serverId, featureSet: params.featureSet, eventId: params.eventId,
+          eventType: 'mcpl:push-event', coalesceChannelId: c.channelId,
+          authorId: identity.author.id,
+          ...(event.tags ? { tags: event.tags } : {}),
+        });
+      } : undefined;
       return this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
@@ -7657,15 +7740,9 @@ export class AgentFramework {
         data: c.data,
         tags: event.tags,
         content: params.payload.content,
-        ...(c.channelId ? {
-          identity: {
-            ...(str(origin.messageId) ? { messageId: str(origin.messageId) } : {}),
-            ...(str(origin.threadId) ? { threadId: str(origin.threadId) } : {}),
-            ...(str(origin.authorId) ? { author: { id: str(origin.authorId)!, name: str(origin.authorName) ?? str(origin.authorId)! } } : {}),
-          },
-        } : {}),
+        ...(identity ? { identity } : {}),
         event: { lane: 'push', event },
-      });
+      }, prepare);
     });
   }
 
@@ -7680,13 +7757,13 @@ export class AgentFramework {
     }
   }
 
-  private coalescedAuthorized(occ: CoalescedOccurrence<CoalescedDelivery>): boolean {
+  private coalescedAuthorized(occ: CoalescedOccurrence<CoalescedDelivery>): boolean | undefined {
+    // No current peer identity means this obligation cannot be transferred.
+    if (!this.mcplServerConfigs.has(occ.serverId) || occ.binding !== this.coalescingBinding(occ.serverId)) return false;
     const server = this.mcplServerRegistry?.getServer(occ.serverId);
-    if (!server?.isConnected || !server.policyEstablished) return false;
-    // §3.2: work admitted under another binding (the id since reassigned to a
-    // different endpoint) never acquires the replacement peer's authority —
-    // and its private notice data is never sent to that peer.
-    if (occ.binding !== this.coalescingBinding(occ.serverId)) return false;
+    // Startup/reconnect is not revocation. Keep work until current authority
+    // is known, and re-evaluate at readiness/registration boundaries.
+    if (!server?.isConnected || !server.policyEstablished || this.discordAwarenessBarrier) return undefined;
     if (occ.event.lane === 'push') {
       if (!server.grant.has('pushEvents')) return false;
       try { this.featureSetManager?.validateInbound(occ.serverId, occ.event.event.featureSet); } catch { return false; }
@@ -7694,13 +7771,22 @@ export class AgentFramework {
     if (occ.scope.kind === 'channel' || occ.event.lane === 'channel') {
       // §3.2 / §5.4 rule 4: the channel's CURRENT authority, whichever lane.
       if (!server.grant.has('channels.incoming')) return false;
-      if (occ.event.lane === 'push') return this.channelRegistry?.isDeclaredChannel(occ.serverId, occ.scope.id) ?? false;
-      return !!this.channelRegistry?.getDescriptor(occ.scope.id);
+      // A channel can register after policy establishment. Its absence is
+      // not authority to wake and not proof acknowledged work was revoked.
+      return this.channelRegistry?.isDeclaredChannel(occ.serverId, occ.scope.id) ? true : undefined;
     }
     return true;
   }
 
-  private async coalescedAudience(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<string[]> {
+  private isSelfConversationOccurrence(occ: CoalescedOccurrence<CoalescedDelivery>): boolean {
+    const metadata = occ.event.lane === 'channel' ? occ.event.event.metadata : occ.event.event.origin;
+    const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
+    const identity = { ...this.pushCoalescer?.identity(subject), ...occ.identity };
+    const authorId = identity.author?.id ?? (occ.event.lane === 'channel' ? occ.event.event.author.id : metadata?.authorId);
+    return isSelfAuthoredMessage(occ.tags, authorId, metadata);
+  }
+
+  private async coalescedAudience(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<string[] | null> {
     if (occ.deliverTo) return this.agents.has(occ.deliverTo) ? [occ.deliverTo] : [];
     const explicit = occ.event.event.targetAgents;
     if (explicit) return explicit.filter((n) => this.agents.has(n));
@@ -7708,6 +7794,7 @@ export class AgentFramework {
       const router = this.conversationRouter;
       const bound = router.getBinding(occ.scope.id)?.agentName;
       if (bound) return this.agents.has(bound) ? [bound] : [];
+      if (this.isSelfConversationOccurrence(occ)) return [];
       // No fork yet: the same bind decision an incoming message would get. A
       // batch that qualifies spawns its fork now so it has someone to wake.
       const metadata = (occ.event.lane === 'channel' ? occ.event.event.metadata : occ.event.event.origin) ?? {};
@@ -7724,7 +7811,7 @@ export class AgentFramework {
         return [decision.agentName];
       } catch (err) {
         console.error(`[coalescing] could not spawn a conversation agent for ${occ.scope.id}:`, err);
-        return [];
+        return null; // temporary resolution failure, not a vanished fixed audience
       }
     }
     return [...this.agents.keys()].filter((n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName);
@@ -7735,11 +7822,26 @@ export class AgentFramework {
     occ: CoalescedOccurrence<CoalescedDelivery>,
     materialized?: McplContentBlock[],
     assemblingFor?: string,
+    activation?: CoalescedOccurrence<CoalescedDelivery> | null,
   ): Promise<CoalescingPlacement | undefined> {
     const coalescingSubject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     const narrowing = occ.deliverTo ? { deliverTo: occ.deliverTo } : {};
+    // A rendered batch's latest content may be self-authored while a fresh
+    // counterpart occurrence still supplies its pending activity. Never infer
+    // activity from text the renderer happens to include from older history.
+    // Rebinding must use the cause's mention/channel-kind facts too; the
+    // latest self echo may omit the very facts that qualified its counterpart.
+    const activationMetadata = activation?.event.lane === 'channel'
+      ? activation.event.event.metadata : activation?.event.event.origin;
+    const activity = activation === undefined ? {} : {
+      conversationActivity: activation !== null,
+      ...(activation ? { conversationBinding: {
+        mentioned: activationMetadata?.mentioned === true,
+        kind: ConversationRouter.classifyChannel(this.channelRegistry?.getDescriptor(occ.scope.id), activationMetadata),
+      } } : {}),
+    };
     if (occ.event.lane === 'channel') {
-      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...(assemblingFor ? { assemblingFor } : {}) };
+      const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...activity, ...(assemblingFor ? { assemblingFor } : {}) };
       const placement = await this.handleMcplChannelIncoming(event);
       await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
       return placement;
@@ -7769,6 +7871,7 @@ export class AgentFramework {
         coalescingSubject,
         eventId: occ.eventId,
         ...narrowing,
+        ...activity,
         ...(assemblingFor ? { assemblingFor } : {}),
       };
       const placement = await this.handleMcplChannelIncoming(event);
@@ -7791,16 +7894,21 @@ export class AgentFramework {
     return placement;
   }
 
-  private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
+  private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>, preserveExisting = false): Promise<void | boolean> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
-    this.cancelCoalescedWakes(subject);
+    if (!preserveExisting) this.cancelCoalescedWakes(subject);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
+    if (this.coalescedAuthorized(occ) !== true) return;
+    if (this.conversationRouter && occ.scope.kind === 'channel' && this.isSelfConversationOccurrence(occ)) return;
     const origin = occ.event.event.origin;
     // The wake carries the batch's channel so the turn freezes its reply
     // locus there (the materialized delivery at assembly wakes nobody).
     const channelId = occ.scope.kind === 'channel' ? occ.scope.id : this.derivePushEventChannel(origin)?.channelId;
     const authorId = occ.identity?.author?.id ?? (typeof origin?.authorId === 'string' ? origin.authorId : undefined);
-    for (const agentName of await this.coalescedAudience(occ)) {
+    const audience = await this.coalescedAudience(occ);
+    if (audience === null) return false;
+    if (this.coalescedAuthorized(occ) !== true) return;
+    for (const agentName of audience) {
       this.pendingRequests.push({
         agentName,
         reason: 'mcpl:push-event',
@@ -7925,6 +8033,8 @@ export class AgentFramework {
    */
   private handleMcplPushEvent(event: McplPushEvent): CoalescingPlacement | undefined {
     const triggerChannel = this.derivePushEventChannel(event.origin);
+    const self = !!this.conversationRouter && !!triggerChannel
+      && isSelfAuthoredMessage(event.tags, event.origin?.authorId, event.origin);
     if (triggerChannel && this.channelRegistry) {
       this.channelRegistry.ensureChannelRegistered(
         event.serverId,
@@ -7939,7 +8049,7 @@ export class AgentFramework {
       serverId: event.serverId,
       featureSet: event.featureSet,
       eventId: event.eventId,
-      triggered: event.triggerInference ?? false,
+      triggered: !self && (event.triggerInference ?? false),
       ...(event.tags ? { tags: event.tags } : {}),
       ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
     };
@@ -7993,7 +8103,7 @@ export class AgentFramework {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${event.eventId}`);
     }
 
-    if (event.triggerInference) {
+    if (!self && event.triggerInference) {
       // Default broadcast excludes conversation forks (channel-driven).
       const targetAgents = event.targetAgents
         ?? [...this.agents.keys()].filter(
@@ -12838,8 +12948,21 @@ export class AgentFramework {
 
     // Find shouldTriggerInference callback:
     // Per-server callback takes precedence; fall back to EventGate; fall back to no filter.
-    const triggerFilter = serverConfigs.find(c => c.shouldTriggerInference)?.shouldTriggerInference
+    const configuredTriggerFilter = serverConfigs.find(c => c.shouldTriggerInference)?.shouldTriggerInference
       ?? (this.eventGate ? this.eventGate.asShouldTriggerCallback() : undefined);
+    const triggerFilter = (content: string, metadata: Record<string, unknown>): boolean => {
+      const channelEvent = metadata.eventType === 'mcpl:channel-incoming';
+      const channelPush = metadata.eventType === 'mcpl:push-event'
+        && (typeof metadata.coalesceChannelId === 'string' || !!this.derivePushEventChannel(metadata));
+      const authorId = channelEvent
+        ? (metadata.author as { id?: unknown } | undefined)?.id
+        : metadata.authorId;
+      // The callback may arm a delayed gate wake, so delivery-time suppression
+      // alone is too late. Non-channel pushes keep their existing policy.
+      if (this.conversationRouter && (channelEvent || channelPush)
+        && isSelfAuthoredMessage(metadata.tags, authorId, metadata)) return false;
+      return configuredTriggerFilter ? configuredTriggerFilter(content, metadata) : true;
+    };
 
     // Push events handler (Step 6)
     this.initializePushCoalescer();
@@ -12847,8 +12970,11 @@ export class AgentFramework {
       this.featureSetManager,
       (event) => this.pushEvent(event as unknown as ProcessEvent),
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
-      triggerFilter,
-      (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
+      // Channel-scoped coalesced pushes evaluate this inside serialized
+      // admission, once inherited author identity has been resolved.
+      (content, metadata) => typeof metadata.coalesceChannelId === 'string'
+        ? false : triggerFilter(content, metadata),
+      (serverId, params, event) => this.handleCoalescedPush(serverId, params, event, triggerFilter),
     );
 
     // Server-initiated inference router (Step 6)
@@ -13344,6 +13470,7 @@ export class AgentFramework {
       }
       connection.ready();
     }
+    if (this.discordAwarenessBarrier === null) this.resumeCoalescedWork();
     return this.discordAwarenessBarrier === null;
   }
 
@@ -13619,6 +13746,7 @@ export class AgentFramework {
         impacts,
       });
       this.handleToolsListChanged(connection.id);
+      this.resumeCoalescedWork();
     } finally {
       st.inFlight = false;
       st.lastCompletedAt = Date.now();
@@ -13980,7 +14108,8 @@ export class AgentFramework {
       params: ChannelsRegisterParams,
       responder?: { respond: (result: unknown) => void },
     ) => {
-      await this.channelRegistry?.handleRegister(connection.id, params, responder as never);
+      try { await this.channelRegistry?.handleRegister(connection.id, params, responder as never); }
+      finally { this.resumeCoalescedWork(); }
     });
 
     // Handle channel changes (Step 7) — §14.5 dual-mode: the responder is
@@ -13991,7 +14120,8 @@ export class AgentFramework {
       params: ChannelsChangedParams,
       responder?: { respond: (result: unknown) => void },
     ) => {
-      await this.channelRegistry?.handleChanged(connection.id, params, responder as never);
+      try { await this.channelRegistry?.handleChanged(connection.id, params, responder as never); }
+      finally { this.resumeCoalescedWork(); }
     });
 
     // §6.6/§12: requests that previously had no handler and hung forever
