@@ -528,6 +528,63 @@ test('DM prose targets resolve people-first: @name, prefix-lenient names, and <@
   assert.ok('error' in missing && (missing.candidates?.length ?? 0) === 2, 'lists known DMs by name');
 });
 
+test('focus locus: held inbound does not retarget the default; the focus channel outranks trigger and default', async () => {
+  // 2026-09-30: an ambient channel message arriving one second after a DM
+  // retargeted the process-global default, and the DM's batched (channel-
+  // less) wake delivered the DM reply into that channel. Under focus, only
+  // the focus channel's traffic may move the default, and the focus channel
+  // is the locus regardless of trigger/default.
+  let active: string | undefined;
+  const { registry, publishCalls } = makeRegistry({ delivered: true }, undefined, () => active);
+  seedRegistered(registry, 'discord', 'chanA', 'chanB');
+
+  registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
+  assert.equal(registry.getDefaultPublishChannel(), 'chanA');
+
+  registry.setFocusLocus({ serverId: 'discord', channelId: 'chanA' });
+  registry.handleIncoming('discord', incoming('chanB', 'held chatter from B'));
+  assert.equal(registry.getDefaultPublishChannel(), 'chanA', 'held inbound must not retarget the default');
+  assert.equal(registry.buildChannelContext('trunk')?.incoming?.channelId, 'chanA',
+    'refusal reactions / typing target the admitted inbound, not the held one');
+
+  active = 'chanB'; // even a trigger that slipped past the hold
+  assert.equal(registry.resolveLocus('trunk'), 'chanA', 'focus channel outranks the trigger channel');
+  assert.equal(registry.buildChannelContext('trunk')?.defaultOutgoing?.channelId, 'chanA',
+    'advertised outgoing matches where speech lands');
+  const res = await registry.routeSpeech('trunk', 'reply', registry.resolveLocus('trunk'));
+  assert.deepEqual(res, { delivered: true, channelId: 'chanA' });
+  assert.equal(publishCalls.at(-1)?.channelId, 'chanA');
+
+  // Focus inbound on the focus channel still counts.
+  registry.handleIncoming('discord', incoming('chanA', 'more from A'));
+  assert.equal(registry.getDefaultPublishChannel(), 'chanA');
+
+  // Unfocused: normal resolution resumes; the held message never became the default.
+  registry.setFocusLocus(null);
+  assert.equal(registry.resolveLocus('trunk'), 'chanB', 'trigger channel wins again once unfocused');
+  active = undefined;
+  assert.equal(registry.resolveLocus('trunk'), 'chanA', 'default is the last ADMITTED inbound');
+  registry.handleIncoming('discord', incoming('chanB', 'after focus'));
+  assert.equal(registry.getDefaultPublishChannel(), 'chanB', 'inbound retargets normally after focus');
+});
+
+test('focus locus: same channel id on another server does not retarget the default', () => {
+  const { registry } = makeRegistry({ delivered: true });
+  seedRegistered(registry, 'discord', 'chanA');
+  seedRegistered(registry, 'slack', 'chanA', 'chanZ');
+  registry.handleIncoming('discord', incoming('chanA', 'hi'));
+  registry.setFocusLocus({ serverId: 'discord', channelId: 'chanA' });
+  registry.handleIncoming('slack', {
+    messages: [{ ...incoming('chanZ', 'z').messages[0], messageId: 'mz' }],
+  });
+  assert.equal(registry.getDefaultPublishChannel(), 'chanA');
+  registry.handleIncoming('slack', {
+    messages: [{ ...incoming('chanA', 'same id, other server').messages[0], messageId: 'm-slack' }],
+  });
+  assert.equal(registry.buildChannelContext('trunk')?.incoming?.messageId, 'm1',
+    'the other server\'s chanA is not the focus channel');
+});
+
 test('proseTargetFor: one whitespace-free token per channel that resolves back to it', async () => {
   const { registry } = makeRegistry({ delivered: true });
   await registry.handleChanged('discord', {

@@ -88,6 +88,12 @@ interface PendingEvent {
    *  newer ambient chatter when a batched wake picks its provenance — the same
    *  rule the framework applies to the turn's speech locus. */
   addressed: boolean;
+  /** The gate metadata the event was evaluated with, kept so a hold predicate
+   *  installed LATER (focus entry) can re-derive the event's channel exactly
+   *  as the live evaluation does — a push event's channel rides in its origin
+   *  fields, not in `channelId`. */
+  metadata?: Record<string, unknown>;
+  tags?: string[];
 }
 
 /**
@@ -534,6 +540,8 @@ export class EventGate {
   private inferenceBuffer: PendingEvent[] = [];
   /** Host quiesce suppression — see setQuiesced. */
   private quiesced = false;
+  /** Focus hold — see setHoldPredicate. */
+  private holdPredicate: ((info: GateEventInfo) => boolean) | null = null;
   /** Lifetime count of buffer-cap evictions (see bufferForInference). */
   private droppedBufferedEvents = 0;
 
@@ -997,6 +1005,25 @@ export class EventGate {
   evaluate(info: GateEventInfo): GateDecision {
     this.reloadIfChanged();
 
+    // Focus hold (strict — nothing breaks through): a held event must not
+    // reach ANY policy. In particular a debounce policy would otherwise queue
+    // it here and later deliver a "[Gate: N events]" wake for traffic the
+    // framework is holding out of the window.
+    if (this.holdPredicate?.(info)) {
+      this.totalEvaluations++;
+      this.emitTrace({
+        type: 'gate:decision',
+        eventType: info.eventType,
+        serverId: info.serverId || undefined,
+        channelId: info.channelId || undefined,
+        matchedPolicy: 'focus-held',
+        trigger: false,
+        behavior: 'skip',
+        timestamp: this.now(),
+      });
+      return { trigger: false, policyName: 'focus-held', behavior: 'skip' };
+    }
+
     // Sleep suppression: while asleep, drop EXTERNAL wakes. Two things still
     // rouse the agent — its own heartbeat (an internal clock, not an outside
     // interruption: each tick lets the agent reconsider and optionally `wake`)
@@ -1451,6 +1478,8 @@ export class EventGate {
       authorId: this.extractAuthorId(info.metadata) ?? undefined,
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
+      ...(info.metadata ? { metadata: info.metadata } : {}),
+      ...(info.tags ? { tags: info.tags } : {}),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1498,6 +1527,10 @@ export class EventGate {
   // =========================================================================
 
   private deliverEvents(events: PendingEvent[]): void {
+    // Delivery-time re-check of the hold: a queued event the predicate now
+    // holds (focus entered after it was queued, purge notwithstanding) must
+    // not wake the agent inside the window it is holding.
+    if (this.holdPredicate) events = events.filter((e) => !this.isHeldPending(e));
     if (events.length === 0) return;
 
     const policyNames = [...new Set(events.map(e => e.policyName))];
@@ -1586,6 +1619,48 @@ export class EventGate {
     if (this.quiesced === quiesced) return;
     this.quiesced = quiesced;
     if (!quiesced) this.flushInferenceBufferIfClear();
+  }
+
+  /**
+   * Install (or clear with null) the focus hold: events the predicate
+   * accepts are dropped before policy evaluation (no trigger, no debounce
+   * queueing). Installing also purges already-queued debounce/buffered
+   * events the predicate would hold, so a wake queued seconds before focus
+   * began cannot land inside it.
+   */
+  setHoldPredicate(predicate: ((info: GateEventInfo) => boolean) | null): number {
+    this.holdPredicate = predicate;
+    if (!predicate) return 0;
+    const held = (e: PendingEvent): boolean => this.isHeldPending(e);
+    let purged = 0;
+    for (const [name, state] of this.debounceTimers) {
+      const before = state.events.length;
+      state.events = state.events.filter((e) => !held(e));
+      purged += before - state.events.length;
+      if (state.events.length === 0) {
+        clearTimeout(state.timer);
+        this.debounceTimers.delete(name);
+      }
+    }
+    const beforeBuffer = this.inferenceBuffer.length;
+    this.inferenceBuffer = this.inferenceBuffer.filter((e) => !held(e));
+    purged += beforeBuffer - this.inferenceBuffer.length;
+    return purged;
+  }
+
+  /** The hold predicate applied to a queued event, with the SAME inputs the
+   *  live evaluation had (metadata + tags), so purge, delivery re-check and
+   *  live evaluation cannot disagree about one event. */
+  private isHeldPending(e: PendingEvent): boolean {
+    if (!this.holdPredicate) return false;
+    return this.holdPredicate({
+      content: e.content,
+      eventType: e.eventType,
+      serverId: e.serverId ?? '',
+      channelId: e.channelId ?? '',
+      metadata: e.metadata ?? (e.channelId ? { channelId: e.channelId } : undefined),
+      ...(e.tags ? { tags: e.tags } : {}),
+    });
   }
 
   private flushInferenceBufferIfClear(): void {

@@ -89,18 +89,46 @@ export interface TuneOutParams {
   expiresAtMs?: number;
 }
 
+/**
+ * Parameters of the active focus epoch (per resident, not per channel):
+ * only `channelId` reaches the resident; everything else is held with
+ * `metadata.focusHeld = { epochId }` (permanent main-view exclusion) until
+ * the epoch ends. Durable in the lifecycle log as a `focus` record
+ * (null = ended), last-record-wins on replay.
+ */
+export interface FocusParams {
+  epochId: string;
+  /** The one channel that stays live. */
+  serverId: string;
+  channelId: string;
+  startedAtMs: number;
+  /** Chronicle sequence when focus began (audit bound). */
+  startedAtSequence: number;
+  /** Absolute deadline; the epoch ends itself here. */
+  expiresAtMs: number;
+  /** Newest raw messages delivered PER CHANNEL at unfocus. */
+  backlogCap: number;
+  /** Re-target release points: held messages of `channelId` with
+   *  sequence <= value were already delivered (a re-target dumps the new
+   *  focus channel's backlog early). Stamps are never mutated. */
+  released?: Record<string, number>;
+}
+
 interface ChannelLifecycleEvent {
   kind:
     | 'desired-state'
     | 'legacy-policy-migrated'
     | 'invitation-declined'
-    | 'tune-out-wake';
+    | 'tune-out-wake'
+    | 'focus';
   serverId: string;
   timestamp: string;
   channelId?: string;
   desired?: DesiredChannelState;
   /** Present when desired === 'tuned-out'. */
   tuneOut?: TuneOutParams;
+  /** kind 'focus': the active epoch, or null when focus ended. */
+  focus?: FocusParams | null;
   /** kind 'tune-out-wake': durable running wake count for an epoch.
    *  Lives in the lifecycle log (not gate stats) because gate runtime
    *  state dies with the process and max-wakes must not reset on restart. */
@@ -633,6 +661,16 @@ export class ChannelRegistry {
   private defaultPublishMessageId: string | null = null;
   private defaultPublishThreadId: string | undefined = undefined;
 
+  /**
+   * The focus channel while the host is in focus mode, installed by the
+   * framework's focus coordinator (NOT read from the durable focus record:
+   * a replayed epoch with no live coordinator must not pin anything). While
+   * set it outranks the trigger channel and the global default in locus
+   * resolution, and inbound from any other channel stops retargeting the
+   * global default — a held message must not move outbound speech.
+   */
+  private focusLocus: { serverId: string; channelId: string } | null = null;
+
   /** Per-channel typing indicator timers. */
   private typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
@@ -652,6 +690,9 @@ export class ChannelRegistry {
      *  'tune-out-wake' lifecycle records; see recordTuneOutWake). */
     wakeCount?: number;
   }>();
+
+  /** Chronicle-projected focus epoch (one per resident), or null. */
+  private focusState: FocusParams | null = null;
 
   /** One-time migration inputs from the retired recipe auto-open policy. */
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
@@ -932,12 +973,19 @@ export class ChannelRegistry {
       // deliberately after §14.5 validation: a rejected message from an
       // unregistered channel must not retarget outbound speech (the locus is
       // exactly the authority a self-attested channel would be stealing).
+      // Under focus, only the focus channel's traffic counts: everything
+      // else is held, and a message the resident can't see must not decide
+      // where the resident's next words go (2026-09-30: an ambient channel
+      // message arriving one second after a DM pulled the DM reply into
+      // that channel).
       // A coalesced item is "accepted" only once the coalescer admits it, so
       // for those this runs after the hook (below).
       const markAccepted = () => {
-        this.defaultPublishChannel = message.channelId;
-        this.defaultPublishMessageId = message.messageId;
-        this.defaultPublishThreadId = message.threadId;
+        if (this.admitsAsDefault(serverId, message.channelId)) {
+          this.defaultPublishChannel = message.channelId;
+          this.defaultPublishMessageId = message.messageId;
+          this.defaultPublishThreadId = message.threadId;
+        }
         // A server sending channels/incoming is authoritative evidence that
         // the transport is actually open. This repairs transient status only;
         // durable desired state still changes exclusively through lifecycle
@@ -1346,7 +1394,7 @@ export class ChannelRegistry {
     // agent was told the wrong channel under concurrency.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
     const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.defaultPublishChannel;
+    const outgoing = home ?? this.focusLocus?.channelId ?? active ?? this.defaultPublishChannel;
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -1478,6 +1526,28 @@ export class ChannelRegistry {
         }
       } else if (event.kind === 'legacy-policy-migrated') {
         this.migratedLegacyPolicies.add(event.serverId);
+      } else if (event.kind === 'focus') {
+        // Last record wins; a malformed epoch (no id / channel) reads as
+        // ended rather than crashing boot on a corrupt log.
+        const f = event.focus;
+        if (
+          f && typeof f === 'object' && typeof f.epochId === 'string' &&
+          typeof f.channelId === 'string' && typeof f.serverId === 'string' &&
+          typeof f.expiresAtMs === 'number' && Number.isFinite(f.expiresAtMs)
+        ) {
+          // Optional fields fall back to sane values rather than failing the
+          // epoch: a record missing backlogCap must still dump a backlog.
+          this.focusState = {
+            ...f,
+            backlogCap: typeof f.backlogCap === 'number' && Number.isFinite(f.backlogCap)
+              ? Math.max(0, Math.floor(f.backlogCap)) : 20,
+            startedAtMs: typeof f.startedAtMs === 'number' && Number.isFinite(f.startedAtMs)
+              ? f.startedAtMs : f.expiresAtMs,
+            startedAtSequence: typeof f.startedAtSequence === 'number' ? f.startedAtSequence : 0,
+          };
+        } else {
+          this.focusState = null;
+        }
       }
     }
   }
@@ -1938,6 +2008,89 @@ export class ChannelRegistry {
     return { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
   }
 
+  /**
+   * Durably set (params) or end (null) the resident's focus epoch. The
+   * focus coordinator owns the hold/dump flow; this is only the state flip.
+   */
+  setFocus(params: FocusParams | null, source: string): void {
+    const serverId = params?.serverId ?? this.focusState?.serverId ?? 'host';
+    this.focusState = params;
+    this.appendLifecycleEvent({
+      kind: 'focus',
+      serverId,
+      ...(params ? { channelId: params.channelId } : {}),
+      focus: params,
+      source,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  /** The active focus epoch, or null. */
+  getFocus(): FocusParams | null {
+    return this.focusState;
+  }
+
+  /**
+   * Install (target) or clear (null) the focus routing locus. Called by the
+   * framework whenever the focus coordinator's state changes; see
+   * `focusLocus` for what it governs.
+   */
+  setFocusLocus(target: { serverId: string; channelId: string } | null): void {
+    this.focusLocus = target ? { serverId: target.serverId, channelId: target.channelId } : null;
+  }
+
+  /** The installed focus routing locus, or null when not focused. */
+  getFocusLocus(): { serverId: string; channelId: string } | null {
+    return this.focusLocus;
+  }
+
+  /** May inbound on (serverId, channelId) retarget the global default locus? */
+  private admitsAsDefault(serverId: string, channelId: string): boolean {
+    const focus = this.focusLocus;
+    return focus === null || (focus.serverId === serverId && focus.channelId === channelId);
+  }
+
+  /**
+   * Resolve a channel the way the channel tools do: by id, optionally
+   * server-qualified, with an explicit error when the bare id is registered
+   * by more than one server (identity is (serverId, channelId)).
+   */
+  resolveChannel(
+    channelId: string,
+    serverId?: string,
+  ): { entry?: { serverId: string; channelId: string; label?: string }; error?: string } {
+    const r = this.resolveToolChannelEntry(channelId, serverId);
+    if (!r.entry) return { error: r.error };
+    return {
+      entry: {
+        serverId: r.entry.serverId,
+        channelId: r.entry.descriptor.id,
+        ...(typeof r.entry.descriptor.label === 'string' && r.entry.descriptor.label
+          ? { label: r.entry.descriptor.label } : {}),
+      },
+    };
+  }
+
+  /**
+   * May the host post into this channel on the resident's behalf (focus
+   * autoreply)? Channels the resident is open in, and DMs (which carry no
+   * open/closed decision of the resident's). A channel the resident declined
+   * or never joined is off limits: the host must not speak in a room the
+   * resident chose to stay out of.
+   */
+  canAutoReplyInto(serverId: string, channelId: string): boolean {
+    const entry = this.channels.get(`${serverId}:${channelId}`);
+    if (!entry) return false;
+    if (extractDmMeta(entry.descriptor.metadata).isDm) return true;
+    return this.getDesiredState(serverId, channelId) === 'open';
+  }
+
+  /** Human label of a registered channel, when known. */
+  channelLabel(serverId: string, channelId: string): string | undefined {
+    const label = this.channels.get(`${serverId}:${channelId}`)?.descriptor.label;
+    return typeof label === 'string' && label ? label : undefined;
+  }
+
   /** Registered channel entries (read-only iteration for the coordinator). */
   listChannelsRaw(): Array<{ serverId: string; descriptor: ChannelDescriptor }> {
     return [...this.channels.values()].map((e) => ({
@@ -1976,9 +2129,10 @@ export class ChannelRegistry {
     channelId: string,
     text: string,
     agentName: string,
+    serverId?: string,
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
     this.emitTraceFn({ type: 'mcpl:speech-routed', conversationId: agentName, channelId, text });
-    return this.handleToolPublish({ channelId, content: text });
+    return this.handleToolPublish({ channelId, content: text, ...(serverId ? { serverId } : {}) });
   }
 
   /**
@@ -2937,7 +3091,11 @@ export class ChannelRegistry {
 
   resolveLocus(conversationId: string): string | null {
     const home = this.homeChannelResolver?.(conversationId);
-    return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;
+    return home
+      ?? this.focusLocus?.channelId
+      ?? this.activeChannelResolver?.(conversationId)
+      ?? this.defaultPublishChannel
+      ?? null;
   }
 
   async routeSpeech(
@@ -3065,7 +3223,12 @@ export class ChannelRegistry {
     return { delivered, channelId, ...(messageId !== undefined ? { messageId } : {}) };
   }
 
-  private async handleToolPublish(input: { channelId?: string; content?: string; text?: string }): Promise<ToolResult> {
+  private async handleToolPublish(input: {
+    channelId?: string; content?: string; text?: string;
+    /** Server-qualify the channel (identity is (serverId, channelId)); an
+     *  unqualified id that two servers registered is first-match. */
+    serverId?: string;
+  }): Promise<ToolResult> {
     // Resolve content: accept both `content` and `text` (backward compat)
     const messageText = input.content ?? input.text;
     if (!messageText) {
@@ -3086,11 +3249,15 @@ export class ChannelRegistry {
       };
     }
 
-    const entry = this.findChannelEntry(channelId);
+    const entry = input.serverId
+      ? this.resolveToolChannelEntry(channelId, input.serverId).entry
+      : this.findChannelEntry(channelId);
     if (!entry) {
       return {
         success: false,
-        error: `Channel not found: ${channelId}`,
+        error: input.serverId
+          ? `Channel not found: ${channelId} on server ${input.serverId}`
+          : `Channel not found: ${channelId}`,
         isError: true,
       };
     }
