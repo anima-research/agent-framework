@@ -6,6 +6,7 @@
 
 import type { McplServerConfig, McplHostCapabilities } from './types.js';
 import { McplServerConnection } from './server-connection.js';
+import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from '../shutdown.js';
 
 /**
  * Capability keys that can be queried via `getServersWithCapability`.
@@ -25,6 +26,7 @@ export type McplCapabilityQuery =
  */
 export class McplServerRegistry {
   private servers = new Map<string, McplServerConnection>();
+  private closing = new Map<McplServerConnection, Promise<void>>();
 
   /**
    * Connect to an MCPL server and register it.
@@ -70,8 +72,7 @@ export class McplServerRegistry {
     if (!connection) {
       return;
     }
-    this.servers.delete(id);
-    await connection.close();
+    await this.closeServer(id, connection);
   }
 
   /**
@@ -137,12 +138,24 @@ export class McplServerRegistry {
   /**
    * Close all server connections and clear the registry.
    */
-  async closeAll(): Promise<void> {
-    const connections = Array.from(this.servers.values());
-    this.servers.clear();
-    const results = await Promise.allSettled(connections.map(async (c) => c.close()));
-    const errors = results.flatMap(result => result.status === 'rejected' ? [result.reason] : []);
-    if (errors.length === 1) throw errors[0];
-    if (errors.length > 1) throw new AggregateError(errors, 'MCPL shutdown failed');
+  async closeAll(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
+    validateShutdownTimeout(timeoutMs);
+    await waitForShutdown(Array.from(this.servers, ([id, connection]) => ({
+      label: `mcpl:${id}`, promise: this.closeServer(id, connection),
+    })), timeoutMs);
+  }
+
+  private closeServer(id: string, connection: McplServerConnection): Promise<void> {
+    const existing = this.closing.get(connection);
+    if (existing) return existing;
+    const attempt = Promise.resolve().then(() => connection.close()).then(() => {
+      if (this.servers.get(id) === connection) this.servers.delete(id);
+      this.closing.delete(connection);
+    }, error => {
+      this.closing.delete(connection);
+      throw error;
+    });
+    this.closing.set(connection, attempt);
+    return attempt;
   }
 }

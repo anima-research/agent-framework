@@ -59,6 +59,7 @@ import type {
   SameRoundThinkTextPolicy,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
+import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reactions.js';
 import { Agent } from './agent.js';
 import { ModuleRegistry, isStateExistsError } from './module-registry.js';
@@ -951,6 +952,8 @@ function truncateReason(reason: string, max = 160): string {
 export class AgentFramework {
   private store: JsStore;
   private ownsStore: boolean;
+  private stopPromise: Promise<void> | null = null;
+  private ownedStoreClosed = false;
   private membrane: Membrane;
   private queue: ProcessQueueImpl;
   private agents: Map<string, Agent> = new Map();
@@ -1870,9 +1873,26 @@ export class AgentFramework {
   }
 
   /**
-   * Stop the event loop.
+   * Stop the event loop. Failed module/MCPL cleanup can be retried with its
+   * original context; storage stays open until that cleanup succeeds.
+   * @param teardownTimeoutMs Module/MCPL wait budget (default 5000 ms). This
+   * does not bound earlier stream or event-loop quiescence, or cancel cleanup.
    */
-  async stop(): Promise<void> {
+  stop(teardownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
+    try { validateShutdownTimeout(teardownTimeoutMs); }
+    catch (error) { return Promise.reject(error); }
+    if (this.stopPromise) return this.stopPromise;
+    const attempt = this.stopOwned(teardownTimeoutMs);
+    this.stopPromise = attempt;
+    // Failed cleanup can be retried while its original store is open. A
+    // terminal storage failure after successful close must remain a failure.
+    void attempt.catch(() => {
+      if (!this.ownedStoreClosed && this.stopPromise === attempt) this.stopPromise = null;
+    });
+    return attempt;
+  }
+
+  private async stopOwned(teardownTimeoutMs: number): Promise<void> {
     this.pushCoalescer?.suspend();
     this.flushCoalescingSnapshot();
     this.running = false;
@@ -1947,16 +1967,19 @@ export class AgentFramework {
     this.livenessWatchdog?.stop();
 
     // Stop modules and MCPL servers in parallel
-    const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll()];
+    const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll(teardownTimeoutMs)];
     if (this.mcplServerRegistry) {
-      shutdownPromises.push(this.mcplServerRegistry.closeAll());
+      shutdownPromises.push(this.mcplServerRegistry.closeAll(teardownTimeoutMs));
     }
-    // A failed teardown must not skip storage cleanup or let it race another
-    // teardown which is still writing. Registries also settle their members.
+    // Timed-out or failed teardown retains its context and may still write.
+    // Keep storage open and skip final work until an explicit retry succeeds.
     const shutdownErrors: unknown[] = [];
     for (const result of await Promise.allSettled(shutdownPromises)) {
       if (result.status === 'rejected') shutdownErrors.push(result.reason);
     }
+
+    if (shutdownErrors.length === 1) throw shutdownErrors[0];
+    if (shutdownErrors.length > 1) throw new AggregateError(shutdownErrors, 'Framework teardown failed');
 
     // Streams may queue storage repairs while being cancelled above. Retry
     // after their teardown, while the store is still open, before final sync.
@@ -1980,6 +2003,7 @@ export class AgentFramework {
     if (this.ownsStore) {
       try {
         this.store.close();
+        this.ownedStoreClosed = true;
       } catch (error) {
         shutdownErrors.push(error);
       }
