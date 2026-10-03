@@ -42,6 +42,8 @@ export interface Module {
    * default (15s) when omitted. Declare a larger budget when gatherContext
    * does real work — e.g. sequential LLM calls with provider backoff — so the
    * injection isn't silently dropped every turn.
+   *
+   * @deprecated Only meaningful for the deprecated `gatherContext` hook.
    */
   readonly contextTimeoutMs?: number;
 
@@ -106,6 +108,15 @@ export interface Module {
    * that should be injected into the compiled context.
    * Complementary to MCPL push-based hooks — modules pull via gatherContext.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
+   *
+   * @deprecated Context injection is deprecated (agent-framework#171).
+   * Injections are per-compile overlays — never stored, re-anchored to the
+   * latest user message on every compile — so they break prompt-cache
+   * prefixes across activations (head-only hits on OpenAI lanes) and can
+   * land between a tool call and its result. Do not add new implementations:
+   * put durable content in the system prompt and deliver changing state as
+   * conversation content (events, tool results). Still called for now; the
+   * framework logs one `[deprecated]` line per module that injects.
    */
   gatherContext?(agentName: string): Promise<ContextInjection[]>;
 
