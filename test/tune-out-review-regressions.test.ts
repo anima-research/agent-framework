@@ -8,6 +8,7 @@ import type { StoredMessage } from '@animalabs/context-manager';
 import type { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import type { TuneOutCoordinator } from '../src/tune-out/coordinator.js';
 import type { EventGate } from '../src/gate/event-gate.js';
+import type { ConversationRouterConfig } from '../src/mcpl/conversation-router.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 type QueuedMessage = Pick<StoredMessage, 'participant' | 'content' | 'metadata'> & {
@@ -31,6 +32,7 @@ interface FrameworkInternals {
   store: { sync(): void };
   handleMcplChannelIncoming(event: IncomingEvent): Promise<void>;
   reserveStoreForSurgery(verb: string, agentName: string): () => void;
+  flushDeferredWrites(label: string): Promise<void>;
 }
 const internals = (f: AgentFramework) => f as unknown as FrameworkInternals;
 const OTHER_CHANNEL = 'disc:guild:other';
@@ -48,7 +50,8 @@ async function waitFor(cond: () => boolean, label: string) {
     await new Promise(r => setTimeout(r, 10));
   }
 }
-async function setup(t: TestContext, modules: Module[] = [], gateConfig?: GateConfig, allowChannelSpeech = false) {
+async function setup(t: TestContext, modules: Module[] = [], gateConfig?: GateConfig, allowChannelSpeech = false,
+  conversations?: ConversationRouterConfig) {
   const dir = mkdtempSync(join(tmpdir(), 'tuneout-review-'));
   const status = join(dir, 'status.jsonl');
   const membrane = new MockMembrane();
@@ -56,6 +59,7 @@ async function setup(t: TestContext, modules: Module[] = [], gateConfig?: GateCo
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(), modules,
     agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'Resident.', proseRouting: 'disabled' }],
     subconscious: { enabled: true, systemPrompt: 'Observe and report.', allowChannelSpeech },
+    conversations,
     ...(gateConfig ? { gate: { configPath: join(dir, 'gate.json'), config: gateConfig } } : {}),
     mcplServers: [{ id: 'disc', command: process.execPath, args: [FIXTURE], env: { STATUS_PATH: status, EXTRA_CHANNEL: OTHER_CHANNEL } }],
   });
@@ -287,11 +291,63 @@ test(`cancel/re-enter consumes the old epoch's delayed wake (buffered=${buffered
 });
 }
 
-test('a previously queued ordinary wake respects tuneout entered before delivery', async t => {
-  const { framework, f } = await setup(t, [], DEBOUNCE_CONFIG);
-  gatedIncoming(f);
+for (const addressed of [false, true]) {
+test(`a previously queued ordinary wake keeps its original recipient (addressed=${addressed})`, async t => {
+  const { framework, f, status } = await setup(t, [], DEBOUNCE_CONFIG);
+  gatedIncoming(f, CHANNEL, addressed);
   await framework.runUntilIdle();
+  const original = f.agents.get('resident')!.getContextManager().getAllMessages().find(m => m.metadata?.messageId === `message-${CHANNEL}`);
+  assert.ok(original && !original.metadata?.tuneOut, 'the message was ordinary resident input');
   f.tuneOutCoordinator.enter('disc', CHANNEL, {}, 'agent-tool');
   await new Promise(r => setTimeout(r, 150));
-  assert.equal(f.pendingRequests.length, 0);
+  assert.deepEqual(f.pendingRequests.map(r => r.agentName), ['resident']);
+  assert.equal(f.tuneOutCoordinator.pendingWakes.size, 0);
+  assert.equal(f.channelRegistry.getTuneOutState('disc', CHANNEL)?.wakeCount, 0);
+  assert.ok(!readFileSync(status, 'utf8').includes('suppressed-tuned-out'));
 });
+}
+
+test('a newly bound fork keeps its debounced wake even when the channel has a tuneout epoch', async t => {
+  const { framework, f, status } = await setup(t, [], DEBOUNCE_CONFIG, false, {
+    templateAgent: 'resident', bind: { channel: 'always' }, trigger: { channel: 'always' },
+  });
+  assert.ok(f.tuneOutCoordinator.enter('disc', CHANNEL, {}, 'agent-tool').ok);
+  gatedIncoming(f, CHANNEL, true);
+  await framework.runUntilIdle();
+  const binding = framework.getConversationRouter()!.getBinding(CHANNEL);
+  assert.ok(binding, 'incoming traffic binds a fork');
+  const fork = f.agents.get(binding.agentName)!;
+  const original = fork.getContextManager().getAllMessages().find(m => m.metadata?.messageId === `message-${CHANNEL}`);
+  assert.ok(original && !original.metadata?.tuneOut, 'fork routing bypassed diversion');
+  await new Promise(r => setTimeout(r, 150));
+  assert.ok(f.pendingRequests.some(r => r.agentName === binding.agentName), 'the fork must receive the delayed wake');
+  assert.equal(f.tuneOutCoordinator.pendingWakes.size, 0);
+  assert.ok(!readFileSync(status, 'utf8').includes('suppressed-tuned-out'));
+});
+
+for (const flush of [false, true]) {
+for (const cap of [1, 10]) {
+test(`backlog keeps receipt order across resume (flushed=${flush}, cap=${cap})`, async t => {
+  const { framework, f, incoming } = await setup(t);
+  f.tuneOutCoordinator.enter('disc', CHANNEL, { backlogCap: cap }, 'agent-tool');
+  f.activeTurnTokens.set('resident', 1);
+  await framework.quiesce({ timeoutMs: 1 });
+  await incoming('OLDER_DIVERTED');
+  await framework.resume();
+  assert.ok(f.deferredMessages.some(m => JSON.stringify(m.content).includes('OLDER_DIVERTED')),
+    'the resident is still busy at resume');
+  await incoming('NEWER_DIVERTED');
+  if (flush) {
+    f.activeTurnTokens.delete('resident');
+    await f.flushDeferredWrites('review');
+  }
+  f.tuneOutCoordinator.cancel('disc', CHANNEL, 'agent-tool', 'review');
+  f.activeTurnTokens.delete('resident');
+  const messages = [...f.agents.get('resident')!.getContextManager().getAllMessages(), ...f.deferredMessages];
+  const dump = JSON.stringify(messages.find(m => m.metadata?.kind === 'tune-out-cancel')?.content);
+  assert.ok(dump.includes('NEWER_DIVERTED'), 'the newest message must survive the cap');
+  if (cap === 1) assert.ok(!dump.includes('OLDER_DIVERTED'));
+  else assert.ok(dump.indexOf('OLDER_DIVERTED') < dump.indexOf('NEWER_DIVERTED'));
+});
+}
+}

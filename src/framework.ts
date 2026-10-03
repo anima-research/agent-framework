@@ -1581,9 +1581,17 @@ export class AgentFramework {
         getAgentNames: () => [...framework.agents.keys()].filter(
           (n) => n !== framework.subconsciousAgentName),
         prepareDeferredWake: (info) => {
-          if (!framework.subconsciousAgentName || info.eventType !== 'mcpl:channel-incoming') return;
+          // Conversation routing takes precedence over diversion at ingestion,
+          // including messages that create a fork. Its wakes must follow the
+          // same route even when an unbound channel already has an epoch.
+          if (!framework.subconsciousAgentName || framework.conversationRouter
+            || info.eventType !== 'mcpl:channel-incoming') return;
           const { serverId, channelId } = info;
           const epochAtArrival = framework.channelRegistry?.getTuneOutState(serverId, channelId)?.params.epochId;
+          // Ordinary input remains resident-visible. A later tune-out must
+          // not retroactively claim its wake, acknowledge it as suppressed,
+          // or debit the new epoch's budget.
+          if (!epochAtArrival) return;
           const messageId = typeof info.metadata?.messageId === 'string' ? info.metadata.messageId : '';
           const author = info.metadata?.author as { id?: string } | undefined;
           const authorId = author?.id;
@@ -1591,12 +1599,9 @@ export class AgentFramework {
           return () => {
             const coordinator = framework.tuneOutCoordinator;
             if (!coordinator) return false;
-            // An already-diverted event stays consumed after cancellation.
-            // A previously ordinary event also respects a newly entered epoch.
-            const epochId = epochAtArrival
-              ?? framework.channelRegistry?.getTuneOutState(serverId, channelId)?.params.epochId;
-            if (!epochId) return false;
-            coordinator.onDeferredWake(serverId, channelId, epochId, messageId, tags, authorId);
+            // An already-diverted event stays consumed after cancellation,
+            // without being reassigned to a newer epoch on this channel.
+            coordinator.onDeferredWake(serverId, channelId, epochAtArrival, messageId, tags, authorId);
             return true;
           };
         },
@@ -11335,9 +11340,14 @@ export class AgentFramework {
     // ALL context writes, including hidden originals.
     const residentHidden = agent.name !== this.subconsciousAgentName
       && !isResidentVisibleMessage({ metadata });
+    // A resume can leave older writes queued behind a still-alive turn.
+    // Never let a newer diverted original overtake one: both pending and
+    // stored backlog must stay in receipt order, including after a flush.
+    const pendingDiversion = residentHidden && this.deferredMessages.some(msg =>
+      (msg.forAgent ?? this.primaryAgentName) === agent.name && !isResidentVisibleMessage(msg));
     if (
       !hasToolResult &&
-      (this.quiesced || this.surgeryHold ||
+      (this.quiesced || this.surgeryHold || pendingDiversion ||
         (!residentHidden && (midToolCycle ||
           this.activeTurnTokens.has(agent.name) ||
           this.activeStreams.has(agent.name))))
