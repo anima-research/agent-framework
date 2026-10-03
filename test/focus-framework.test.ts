@@ -38,7 +38,7 @@ function internals(framework: AgentFramework) {
   };
 }
 
-async function waitFor(cond: () => boolean | Promise<boolean>, what: string, timeoutMs = 15_000): Promise<void> {
+async function waitFor(cond: () => boolean | Promise<boolean>, what: string, timeoutMs = 60_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await cond()) return;
@@ -69,9 +69,17 @@ describe('focus through the framework', () => {
       focus: { enabled: true, defaultBacklogCap: 2 },
       gate: {
         config: {
+          // Debounce windows far beyond any run of this file: a queued wake
+          // that SURVIVES the purge (the focus channel's own, asserted below)
+          // must never fire mid-test — it would wake scout with no mock
+          // response queued, and the harness then spins silently (a wake
+          // with no MockMembrane response restart-loops on microtasks and
+          // starves the TAP reporter — cf. the harness note atop
+          // channel-incoming-targeting.test.ts). A 60 s window hung a slow
+          // CI runner exactly that way.
           policies: [
-            { name: 'batch-other', match: { channel: OTHER }, behavior: { debounce: 60_000 } },
-            { name: 'batch-push', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 60_000 } },
+            { name: 'batch-other', match: { channel: OTHER }, behavior: { debounce: 3_600_000 } },
+            { name: 'batch-push', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 3_600_000 } },
           ],
           default: 'always',
         },
