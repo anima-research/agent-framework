@@ -78,3 +78,45 @@ test('focus records do not disturb per-channel desired state', () => {
   registry.setFocus(PARAMS, 'agent-tool');
   assert.equal(registry.getDesiredState('discord', 'discord:g:work'), undefined);
 });
+
+test('replay tolerates a record missing optional fields (backlogCap → 20) but needs serverId', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'focus-lifecycle-partial-'));
+  try {
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    makeRegistry(store);
+    store.appendToStateJson('mcpl/channel-lifecycle', {
+      kind: 'focus', serverId: 'discord', timestamp: 'now',
+      focus: { epochId: 'p', serverId: 'discord', channelId: 'discord:g:work', expiresAtMs: 2_000_000_000_000 },
+    });
+    const partial = makeRegistry(store);
+    assert.equal(partial.getFocus()?.backlogCap, 20);
+    assert.equal(partial.getFocus()?.startedAtMs, 2_000_000_000_000);
+
+    store.appendToStateJson('mcpl/channel-lifecycle', {
+      kind: 'focus', serverId: 'discord', timestamp: 'now',
+      focus: { epochId: 'q', channelId: 'discord:g:work', expiresAtMs: 2_000_000_000_000, backlogCap: 5 },
+    });
+    assert.equal(makeRegistry(store).getFocus(), null, 'no serverId → identity unknown → not focused');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('resolveChannel is server-qualified and refuses ambiguity; canAutoReplyInto admits open channels and DMs only', async () => {
+  const registry = makeRegistry();
+  // handleChanged, not ensureChannelRegistered: the latter is id-only and
+  // treats a second server's same-id channel as already registered.
+  await registry.handleChanged('a', { added: [
+    { id: 'shared', type: 'x', label: 'a-shared', direction: 'bidirectional' },
+    { id: 'dm-1', type: 'x', label: 'DM: x', direction: 'bidirectional', metadata: { channelType: 'dm' } },
+  ] } as never);
+  await registry.handleChanged('b', { added: [
+    { id: 'shared', type: 'x', label: 'b-shared', direction: 'bidirectional' },
+  ] } as never);
+  assert.match(registry.resolveChannel('shared').error ?? '', /ambiguous/);
+  assert.deepEqual(registry.resolveChannel('shared', 'b').entry, { serverId: 'b', channelId: 'shared', label: 'b-shared' });
+  assert.match(registry.resolveChannel('nope').error ?? '', /not found/);
+  assert.equal(registry.canAutoReplyInto('a', 'shared'), false, 'registered but not open');
+  assert.equal(registry.canAutoReplyInto('a', 'dm-1'), true, 'DM');
+  assert.equal(registry.canAutoReplyInto('zzz', 'shared'), false, 'unknown server');
+});

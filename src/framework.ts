@@ -473,6 +473,18 @@ const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
 /** Stamp a deferred write's durable id into the metadata it is stored with
  *  (boot recovery dedups replays by it). Idempotent for an already-stamped
  *  message. */
+/**
+ * Stored-but-not-for-the-resident: tune-out-diverted (#77) and focus-held
+ * messages. ONE predicate for every surface that puts stored messages in
+ * front of the resident — the compile viewFilter AND the mid-turn live
+ * injection of deferred messages — so a held message cannot reach a live
+ * turn through a path the filter does not cover.
+ */
+function isHeldFromResidentView(metadata: MessageMetadata | Record<string, unknown> | undefined): boolean {
+  const md = metadata as { tuneOut?: unknown; focusHeld?: unknown } | undefined;
+  return !!(md?.tuneOut || md?.focusHeld);
+}
+
 function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string): MessageMetadata {
   return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
 }
@@ -1809,13 +1821,32 @@ export class AgentFramework {
     }
 
     // Focus coordinator: per-resident single-channel attention. Needs only
-    // the channel subsystem (no subconscious).
-    if (config.focus?.enabled && framework.channelRegistry) {
+    // the channel subsystem (no subconscious). Built whenever channels exist
+    // — not only when enabled — so a persisted epoch from before the switch
+    // was turned off (or before conversation routing was configured) still
+    // ends and delivers its backlog at boot. The tool is offered only when
+    // enabled and no router is present (`enter` could never succeed under
+    // per-channel routing).
+    if (framework.channelRegistry) {
       const registry = framework.channelRegistry;
-      framework.focusConfig = config.focus;
-      framework.focusCoordinator = new FocusCoordinator(registry, config.focus, {
-        addMessage: (participant, content, metadata) =>
-          framework.addMessage(participant, content, metadata as MessageMetadata),
+      const focusConfig: FocusConfig = config.focus ?? { enabled: false };
+      framework.focusConfig = focusConfig;
+      framework.focusCoordinator = new FocusCoordinator(registry, focusConfig, {
+        addMessage: (participant, content, metadata) => {
+          const placement: { agent?: string; messageId?: MessageId; deferredId?: string } = {};
+          const id = framework.addMessage(participant, content, metadata as MessageMetadata, { placement });
+          if (placement.deferredId) {
+            // A deferred focus dump is the ONLY delivery of the messages it
+            // carries (their originals stay behind the view filter). The
+            // deferred queue is persisted only during/after quiesce by
+            // default — turn persistence on now so a crash before the flush
+            // replays the dump instead of losing the backlog.
+            framework.deferredWritesPersisted = true;
+            framework.persistDeferredWrites();
+            return { id: placement.deferredId, deferred: true };
+          }
+          return { id, deferred: false };
+        },
         requestInference: (agentName, reason, source) => {
           framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
         },
@@ -1825,13 +1856,27 @@ export class AgentFramework {
             ? framework.agents.get(framework.primaryAgentName) : undefined;
           return primary ? primary.getContextManager().getAllMessages() : [];
         },
+        getDeferredMessages: () => {
+          const primary = framework.primaryAgentName;
+          return framework.deferredMessages
+            .filter((m) => (m.forAgent ?? primary) === primary)
+            .map((m) => ({
+              participant: m.participant, content: m.content,
+              ...(m.metadata ? { metadata: m.metadata as Record<string, unknown> } : {}),
+            }));
+        },
         currentSequence: () => framework.store.currentSequence(),
         channelLabel: (serverId, channelId) => registry.channelLabel(serverId, channelId),
-        publish: async (channelId, text) => {
+        publish: async (serverId, channelId, text) => {
           const r = await registry.publishForAgent(
-            channelId, text, `${framework.primaryAgentName ?? 'agent'}/focus-autoreply`);
+            channelId, text, `${framework.primaryAgentName ?? 'agent'}/focus-autoreply`, serverId);
+          // A server answering `delivered: false` did not post the reply.
+          const delivered = (r.data as { delivered?: unknown } | undefined)?.delivered;
+          if (r.success && delivered === false) return { success: false, error: 'server reported delivered: false' };
           return { success: r.success, ...(r.error ? { error: r.error } : {}) };
         },
+        canAutoReplyInto: (serverId, channelId) => registry.canAutoReplyInto(serverId, channelId),
+        isTunedOut: (serverId, channelId) => registry.getTuneOutState(serverId, channelId) !== null,
         timeZone: () => framework.timeZone,
         availableToolNames: () => {
           const primary = framework.primaryAgentName
@@ -1855,12 +1900,21 @@ export class AgentFramework {
           }
           const purged = gate.setHoldPredicate((info) => {
             if (info.eventType !== 'mcpl:channel-incoming' && info.eventType !== 'mcpl:push-event') return false;
+            const serverId = info.serverId
+              || (typeof info.metadata?.serverId === 'string' ? info.metadata.serverId : '');
             const channelId = info.eventType === 'mcpl:push-event'
               ? framework.derivePushEventChannel(info.metadata)?.channelId ?? info.channelId
               : info.channelId;
             // Events with no channel (heartbeats, non-chat pushes) are not held.
             if (!channelId) return false;
-            return channelId !== state.channelId;
+            // Identity is (serverId, channelId): a same-named channel on
+            // another server is not the focus channel.
+            if (serverId === state.serverId && channelId === state.channelId) return false;
+            // Tuned-out channels stay with the subconscious: tune-out's own
+            // classification (suppressed-mention ack, subconscious wake)
+            // composes with the gate verdict and must keep seeing it.
+            if (registry.getTuneOutState(serverId, channelId)) return false;
+            return true;
           });
           if (purged > 0) {
             framework.emitTrace({ type: 'focus:purged-queued-wakes', count: purged } as never);
@@ -2447,7 +2501,7 @@ export class AgentFramework {
     if (this.tuneOutCoordinator) {
       channelTools.push(AgentFramework.TUNE_OUT_TOOL);
     }
-    if (this.focusCoordinator && this.focusConfig) {
+    if (this.focusCoordinator && this.focusConfig?.enabled && !this.conversationRouter) {
       channelTools.push(buildFocusToolDefinition(this.focusConfig));
     }
     const gateTools = this.eventGate
@@ -6331,10 +6385,7 @@ export class AgentFramework {
       // fetch_history, and audit.
       // Focus-held messages (`metadata.focusHeld`) are excluded the same way;
       // the <focus-backlog> dump at unfocus is the delivery.
-      viewFilter: (message) => {
-        const md = message.metadata as { tuneOut?: unknown; focusHeld?: unknown } | undefined;
-        return !md?.tuneOut && !md?.focusHeld;
-      },
+      viewFilter: (message) => !isHeldFromResidentView(message.metadata),
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
@@ -6579,7 +6630,9 @@ export class AgentFramework {
                 const hasToolBlocks = msg.content.some(
                   (b) => b.type === 'tool_use' || b.type === 'tool_result'
                 );
-                if (!hasToolBlocks && msg.participant !== agent.name) {
+                // A tune-out-diverted or focus-held message is stored for
+                // the backlog only — it must not reach the live turn either.
+                if (!hasToolBlocks && msg.participant !== agent.name && !isHeldFromResidentView(msg.metadata)) {
                   midTurnInjections.push({
                     participant: msg.participant,
                     content: msg.content,
@@ -7037,7 +7090,9 @@ export class AgentFramework {
     }
     // Focus hold: every channel but the focus channel is stored-not-shown
     // and wakes nobody; addressed messages get the automatic reply.
-    const held = !divert
+    // An event explicitly targeted away from the primary is someone else's
+    // traffic: focus narrows the primary's attention, not a side agent's.
+    const held = !divert && this.targetsPrimary(event.targetAgents)
       ? this.focusCoordinator?.onIncoming(
           event.serverId, event.channelId, event.messageId, event.tags, event.author) ?? null
       : null;
@@ -7967,7 +8022,7 @@ export class AgentFramework {
     // Focus hold — DMs and addressed-while-closed messages arrive here, so
     // this path must hold too or they leak around the focus.
     let held: { epochId: string } | null = null;
-    if (triggerChannel && this.focusCoordinator) {
+    if (triggerChannel && this.focusCoordinator && this.targetsPrimary(event.targetAgents)) {
       const origin = (event.origin ?? {}) as Record<string, unknown>;
       held = this.focusCoordinator.onIncoming(
         event.serverId,
@@ -8069,6 +8124,13 @@ export class AgentFramework {
    * Returns undefined for push events with no channel provenance (heartbeats,
    * timers), which correctly keep the global fallback.
    */
+  /** Untargeted events broadcast (so they reach the primary); a targeted
+   *  one reaches the primary only if named. */
+  private targetsPrimary(targetAgents: string[] | undefined): boolean {
+    if (!targetAgents) return true;
+    return this.primaryAgentName !== null && targetAgents.includes(this.primaryAgentName);
+  }
+
   private derivePushEventChannel(
     origin: Record<string, unknown> | undefined,
   ): { channelId: string; label?: string; metadata?: Record<string, unknown> } | undefined {

@@ -18,7 +18,8 @@ import type { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/tune-out-mcpl-server.mjs');
 const FOCUS = 'disc:guild:noisy';   // registered by the fixture
-const OTHER = 'disc:guild:other';   // registered here, same server
+const OTHER = 'disc:guild:other';   // registered here, same server, opened
+const LURK = 'disc:guild:lurk';     // registered here, never opened
 
 type Stored = { participant: string; content: Array<{ type: string; text?: string }>; metadata?: Record<string, unknown> };
 
@@ -68,7 +69,10 @@ describe('focus through the framework', () => {
       focus: { enabled: true, defaultBacklogCap: 2 },
       gate: {
         config: {
-          policies: [{ name: 'batch-other', match: { channel: OTHER }, behavior: { debounce: 60_000 } }],
+          policies: [
+            { name: 'batch-other', match: { channel: OTHER }, behavior: { debounce: 60_000 } },
+            { name: 'batch-push', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 60_000 } },
+          ],
           default: 'always',
         },
       },
@@ -85,7 +89,14 @@ describe('focus through the framework', () => {
       () => (internals(framework).channelRegistry?.listChannelsRaw().length ?? 0) > 0,
       'channel registration',
     );
-    internals(framework).channelRegistry!.ensureChannelRegistered('disc', OTHER, 'other');
+    const registry = internals(framework).channelRegistry!;
+    registry.ensureChannelRegistered('disc', OTHER, 'other');
+    registry.ensureChannelRegistered('disc', LURK, 'lurk');
+    // A second server whose channel id STRING equals the focus channel's id.
+    registry.ensureChannelRegistered('disc2', FOCUS, 'imposter');
+    // The resident is open in OTHER (autoreply may speak there) and not in LURK.
+    const opened = await registry.handleChannelToolCall('channel_open', { channelId: OTHER, serverId: 'disc' });
+    assert.equal(opened.success, true, JSON.stringify(opened));
   });
 
   after(async () => {
@@ -132,11 +143,27 @@ describe('focus through the framework', () => {
     assert.equal(gate.getStatus().policies.find((p) => p.name === 'batch-other')?.debounceState?.pendingCount, 1);
 
     // ---- enter ---------------------------------------------------------
-    const entered = coordinator.handleTool({ mode: 'enter', channelId: FOCUS, durationSeconds: 120 });
+    // …and a queued mcpl-native PUSH wake for a held channel (channel rides in
+    // origin.mcplChannelId, no top-level channelId — the shape the purge used
+    // to miss; slimepriestess's probe 1).
+    const pushMeta = { serverId: 'disc', featureSet: 'chat', eventId: 'e-pre-1', eventType: 'mcpl:push-event', mcplChannelId: OTHER, tags: ['chat:message'] };
+    assert.equal(gate.evaluate({ content: 'queued before focus', eventType: 'mcpl:push-event', serverId: 'disc', channelId: '', metadata: pushMeta, tags: ['chat:message'] }).policyName, 'batch-push');
+    // …and a queued push wake for the FOCUS channel itself, which must survive.
+    const focusPushMeta = { ...pushMeta, eventId: 'e-pre-2', mcplChannelId: FOCUS };
+    gate.evaluate({ content: 'focus channel, queued before focus', eventType: 'mcpl:push-event', serverId: 'disc', channelId: '', metadata: focusPushMeta, tags: ['chat:message'] });
+    assert.equal(gate.getStatus().policies.find((p) => p.name === 'batch-push')?.debounceState?.pendingCount, 2);
+
+    const entered = coordinator.handleTool({ mode: 'enter', channelId: FOCUS, serverId: 'disc', durationSeconds: 120 });
     assert.equal(entered.success, true, JSON.stringify(entered));
 
     // …is purged on enter, and new OTHER events are held at the gate.
     assert.equal(gate.getStatus().policies.find((p) => p.name === 'batch-other')?.debounceState?.pendingCount ?? 0, 0);
+    assert.equal(gate.getStatus().policies.find((p) => p.name === 'batch-push')?.debounceState?.pendingCount ?? 0, 1,
+      'the held channel\'s push wake is purged; the focus channel\'s survives');
+    assert.equal(gate.evaluate({ content: 'same shape after focus', eventType: 'mcpl:push-event', serverId: 'disc', channelId: '', metadata: { ...pushMeta, eventId: 'e-pre-3' }, tags: ['chat:message'] }).policyName,
+      'focus-held', 'live evaluation and purge share one derivation');
+    // Same id string on another server is NOT the focus channel (probe 2).
+    assert.equal(gate.evaluate({ content: 'x', eventType: 'mcpl:channel-incoming', serverId: 'disc2', channelId: FOCUS, metadata: {} }).policyName, 'focus-held');
     const heldDecision = gate.evaluate({ content: 'x', eventType: 'mcpl:channel-incoming', serverId: 'disc', channelId: OTHER, metadata: {} });
     assert.deepEqual([heldDecision.trigger, heldDecision.policyName], [false, 'focus-held']);
     const liveDecision = gate.evaluate({ content: 'x', eventType: 'mcpl:channel-incoming', serverId: 'disc', channelId: FOCUS, metadata: {} });
@@ -148,13 +175,17 @@ describe('focus through the framework', () => {
     });
     assert.equal(dmDecision.policyName, 'focus-held');
     const beat = gate.evaluate({ content: 'tick', eventType: 'mcpl:push-event', serverId: 'heartbeat', channelId: '', metadata: { source: 'heartbeat' } });
-    assert.equal(beat.trigger, true);
+    assert.notEqual(beat.policyName, 'focus-held', 'a channel-less push is not held (it falls to the ordinary policies)');
 
     // ---- ingestion: channels/incoming --------------------------------
     i.pendingRequests.length = 0;
     await i.handleMcplChannelIncoming(incoming(OTHER, 'other 1'));
     await i.handleMcplChannelIncoming(incoming(OTHER, '@scout other 2', { addressed: true, authorId: 'A' }));
     await i.handleMcplChannelIncoming(incoming(OTHER, '@scout other 3', { addressed: true, authorId: 'A' }));
+    // A mention in a channel the resident never joined: held, counted, no reply.
+    await i.handleMcplChannelIncoming(incoming(LURK, '@scout from lurk', { addressed: true, authorId: 'C' }));
+    // Cross-server collision: same id string as the focus channel, other server.
+    await i.handleMcplChannelIncoming({ ...incoming(FOCUS, 'hello from the imposter channel', { authorId: 'U9' }), serverId: 'disc2' });
     assert.equal(i.pendingRequests.length, 0, 'held traffic wakes nobody');
 
     // ---- ingestion: push/event (DM) ----------------------------------
@@ -170,16 +201,17 @@ describe('focus through the framework', () => {
     const cm = i.agents.get('scout')!.getContextManager();
     const stored = cm.getAllMessages();
     const heldStored = stored.filter((m) => (m.metadata as { focusHeld?: unknown })?.focusHeld);
-    assert.equal(heldStored.length, 4, 'all four held messages are stored');
+    assert.equal(heldStored.length, 6, 'all six held messages are stored (incl. lurk + imposter)');
+    assert.ok(heldStored.some((m) => textOf(m).includes('imposter channel')), 'the other server\'s same-id channel is held');
     assert.ok(heldStored.every((m) => (m.metadata as { focusHeld: { epochId: string } }).focusHeld.epochId));
     const compiled = await cm.compile();
-    assert.ok(!compiled.messages.some((m) => /other \d|psst/.test(textOf(m))), 'held messages never compile');
+    assert.ok(!compiled.messages.some((m) => /other \d|psst|lurk|imposter/.test(textOf(m))), 'held messages never compile');
 
     // ---- autoreply: once per (channel, author), over the real child --
     await waitFor(() => publishes().length >= 2, 'autoreply publishes');
     await new Promise((r) => setTimeout(r, 200));
     assert.deepEqual(publishes().sort(), [OTHER, 'discord:dm:999'].sort(),
-      'one reply per channel+author despite two addressed messages from A');
+      'one reply per channel+author despite two addressed messages from A; none into the never-joined channel');
 
     // ---- the focus channel still wakes --------------------------------
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'on it' }]));
@@ -190,10 +222,10 @@ describe('focus through the framework', () => {
     i.pendingRequests.length = 0;
     // ---- check ---------------------------------------------------------
     const check = coordinator.handleTool({ mode: 'check' });
-    const data = check.data as { focused: boolean; held: Array<{ channelId: string; messages: number; addressed: number }> };
+    const data = check.data as { focused: boolean; held: Array<{ serverId: string; channelId: string; messages: number; addressed: number }> };
     assert.equal(data.focused, true);
-    assert.deepEqual(data.held.map((h) => [h.channelId, h.messages, h.addressed]).sort(),
-      [[OTHER, 3, 2], ['discord:dm:999', 1, 1]].sort());
+    assert.deepEqual(data.held.map((h) => [h.serverId, h.channelId, h.messages, h.addressed]).sort(),
+      [['disc', OTHER, 3, 2], ['disc', LURK, 1, 1], ['disc2', FOCUS, 1, 0], ['disc', 'discord:dm:999', 1, 1]].sort());
     // ---- end -----------------------------------------------------------
     // The end-of-focus wake runs a real scout turn; MockMembrane needs a
     // response queued or the harness restart-loops the turn.
@@ -203,14 +235,14 @@ describe('focus through the framework', () => {
     // framework mid-turn and the harness microtask-spins, starving the TAP
     // reporter — so the failure would be invisible. Log it synchronously.
     try {
-    assert.deepEqual(ended, { success: true, data: { ended: true, held: 4 } });
+    assert.deepEqual(ended, { success: true, data: { ended: true, held: 6 } });
     assert.deepEqual(i.pendingRequests.map((r) => [r.agentName, r.reason]), [['scout', 'focus ended (ended by you)']]);
     // The dump goes through addMessage, which defers under the turn-alive
     // guard and flushes at the next turn boundary — the wake queued above.
     let dump: Stored | undefined;
     await waitFor(() => Boolean(dump = cm.getAllMessages().find((m) => m.metadata?.kind === 'focus-end')), 'dump delivered');
     const text = textOf(dump!);
-    assert.match(text, /4 messages held across 2 channels; 3 addressed you/);
+    assert.match(text, /6 messages held across 4 channels; 4 addressed you \(2 got the automatic reply\)/);
     assert.match(text, /<focus-backlog channel="#other \(disc:guild:other\)" messages=3 tz="[^"]+" truncated=1 \(oldest, not shown\)>/);
     assert.doesNotMatch(text, /other 1\n/);
     assert.match(text, /other 2\n.*other 3\n<\/focus-backlog>/);

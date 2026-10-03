@@ -15,3 +15,17 @@
   turn, a successful `enter` moves the current turn's prose there too
   (announced in the tool result), and held inbound neither retargets the
   fallback locus nor qualifies for the mid-turn addressed re-pin.
+- Review hardening: channel identity is `(serverId, channelId)` throughout
+  (hold, gate, `enter` with an optional `serverId`, server-qualified
+  autoreply publish); the gate keeps each queued event's metadata so the
+  focus-entry purge, delivery-time re-check and live evaluation derive a
+  push event's channel identically; a held message never reaches a live
+  turn through the mid-turn deferred injection; held messages still deferred
+  behind the current turn are part of the unfocus backlog, and a deferred
+  focus dump makes the deferred queue durable so a crash cannot lose it; the
+  autoreply speaks only in channels the resident is open in and in DMs, and
+  a failed publish releases the per-author allowance; channels under
+  tune-out are left to the subconscious (and cannot be focused); the tool is
+  not offered under per-channel conversation routing; a persisted epoch
+  still ends at boot after `focus.enabled` is turned off; configured maxima
+  are floored/capped integers; media blocks are named in the dump.

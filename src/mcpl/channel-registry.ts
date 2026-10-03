@@ -1530,11 +1530,24 @@ export class ChannelRegistry {
         // Last record wins; a malformed epoch (no id / channel) reads as
         // ended rather than crashing boot on a corrupt log.
         const f = event.focus;
-        this.focusState =
+        if (
           f && typeof f === 'object' && typeof f.epochId === 'string' &&
-          typeof f.channelId === 'string' && typeof f.expiresAtMs === 'number'
-            ? f
-            : null;
+          typeof f.channelId === 'string' && typeof f.serverId === 'string' &&
+          typeof f.expiresAtMs === 'number' && Number.isFinite(f.expiresAtMs)
+        ) {
+          // Optional fields fall back to sane values rather than failing the
+          // epoch: a record missing backlogCap must still dump a backlog.
+          this.focusState = {
+            ...f,
+            backlogCap: typeof f.backlogCap === 'number' && Number.isFinite(f.backlogCap)
+              ? Math.max(0, Math.floor(f.backlogCap)) : 20,
+            startedAtMs: typeof f.startedAtMs === 'number' && Number.isFinite(f.startedAtMs)
+              ? f.startedAtMs : f.expiresAtMs,
+            startedAtSequence: typeof f.startedAtSequence === 'number' ? f.startedAtSequence : 0,
+          };
+        } else {
+          this.focusState = null;
+        }
       }
     }
   }
@@ -2037,6 +2050,41 @@ export class ChannelRegistry {
     return focus === null || (focus.serverId === serverId && focus.channelId === channelId);
   }
 
+  /**
+   * Resolve a channel the way the channel tools do: by id, optionally
+   * server-qualified, with an explicit error when the bare id is registered
+   * by more than one server (identity is (serverId, channelId)).
+   */
+  resolveChannel(
+    channelId: string,
+    serverId?: string,
+  ): { entry?: { serverId: string; channelId: string; label?: string }; error?: string } {
+    const r = this.resolveToolChannelEntry(channelId, serverId);
+    if (!r.entry) return { error: r.error };
+    return {
+      entry: {
+        serverId: r.entry.serverId,
+        channelId: r.entry.descriptor.id,
+        ...(typeof r.entry.descriptor.label === 'string' && r.entry.descriptor.label
+          ? { label: r.entry.descriptor.label } : {}),
+      },
+    };
+  }
+
+  /**
+   * May the host post into this channel on the resident's behalf (focus
+   * autoreply)? Channels the resident is open in, and DMs (which carry no
+   * open/closed decision of the resident's). A channel the resident declined
+   * or never joined is off limits: the host must not speak in a room the
+   * resident chose to stay out of.
+   */
+  canAutoReplyInto(serverId: string, channelId: string): boolean {
+    const entry = this.channels.get(`${serverId}:${channelId}`);
+    if (!entry) return false;
+    if (extractDmMeta(entry.descriptor.metadata).isDm) return true;
+    return this.getDesiredState(serverId, channelId) === 'open';
+  }
+
   /** Human label of a registered channel, when known. */
   channelLabel(serverId: string, channelId: string): string | undefined {
     const label = this.channels.get(`${serverId}:${channelId}`)?.descriptor.label;
@@ -2081,9 +2129,10 @@ export class ChannelRegistry {
     channelId: string,
     text: string,
     agentName: string,
+    serverId?: string,
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
     this.emitTraceFn({ type: 'mcpl:speech-routed', conversationId: agentName, channelId, text });
-    return this.handleToolPublish({ channelId, content: text });
+    return this.handleToolPublish({ channelId, content: text, ...(serverId ? { serverId } : {}) });
   }
 
   /**
@@ -3174,7 +3223,12 @@ export class ChannelRegistry {
     return { delivered, channelId, ...(messageId !== undefined ? { messageId } : {}) };
   }
 
-  private async handleToolPublish(input: { channelId?: string; content?: string; text?: string }): Promise<ToolResult> {
+  private async handleToolPublish(input: {
+    channelId?: string; content?: string; text?: string;
+    /** Server-qualify the channel (identity is (serverId, channelId)); an
+     *  unqualified id that two servers registered is first-match. */
+    serverId?: string;
+  }): Promise<ToolResult> {
     // Resolve content: accept both `content` and `text` (backward compat)
     const messageText = input.content ?? input.text;
     if (!messageText) {
@@ -3195,11 +3249,15 @@ export class ChannelRegistry {
       };
     }
 
-    const entry = this.findChannelEntry(channelId);
+    const entry = input.serverId
+      ? this.resolveToolChannelEntry(channelId, input.serverId).entry
+      : this.findChannelEntry(channelId);
     if (!entry) {
       return {
         success: false,
-        error: `Channel not found: ${channelId}`,
+        error: input.serverId
+          ? `Channel not found: ${channelId} on server ${input.serverId}`
+          : `Channel not found: ${channelId}`,
         isError: true,
       };
     }
