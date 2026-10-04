@@ -1892,6 +1892,26 @@ export class AgentFramework {
           // lands in the focus channel and held inbound stops moving the
           // fallback locus.
           registry.setFocusLocus(state ? { serverId: state.serverId, channelId: state.channelId } : null);
+          if (state) {
+            // Wakes already queued for channels that are held from now on
+            // (a channel message that arrived a moment before `enter`, a
+            // coalesced push batch) must not run a turn inside the focus —
+            // the gate purge below covers its own queues, this covers the
+            // framework's. Their messages predate the epoch and stay visible.
+            const primary = framework.primaryAgentName;
+            const staleWake = (r: InferenceRequest): boolean =>
+              r.agentName === primary && !!r.channelId
+              && (r.reason === 'mcpl:channel-incoming' || r.reason === 'mcpl:push-event')
+              && !(r.source === state.serverId && r.channelId === state.channelId)
+              && !registry.getTuneOutState(r.source, r.channelId);
+            const before = framework.pendingRequests.length;
+            framework.pendingRequests = framework.pendingRequests.filter((r) => !staleWake(r));
+            for (const cooldown of framework.providerAccelerationCooldowns.values()) {
+              cooldown.heldRequests = cooldown.heldRequests.filter((r) => !staleWake(r));
+            }
+            const dropped = before - framework.pendingRequests.length;
+            if (dropped > 0) framework.emitTrace({ type: 'focus:purged-pending-wakes', count: dropped } as never);
+          }
           const gate = framework.eventGate;
           if (!gate) return;
           if (!state) {
@@ -7090,9 +7110,11 @@ export class AgentFramework {
     }
     // Focus hold: every channel but the focus channel is stored-not-shown
     // and wakes nobody; addressed messages get the automatic reply.
-    // An event explicitly targeted away from the primary is someone else's
-    // traffic: focus narrows the primary's attention, not a side agent's.
-    const held = !divert && this.targetsPrimary(event.targetAgents)
+    // Host-wide by design: residents share one message slot, so an event
+    // targeted at a side agent still lands in the window the primary reads —
+    // exempting it from the hold would show the primary traffic it asked not
+    // to see. Held regardless of `targetAgents`.
+    const held = !divert
       ? this.focusCoordinator?.onIncoming(
           event.serverId, event.channelId, event.messageId, event.tags, event.author) ?? null
       : null;
@@ -7934,6 +7956,13 @@ export class AgentFramework {
     // not the agent that happened to be asked). A tune-out-diverted message
     // never enters a resident's compiled view; only the subconscious reads
     // it through its merged view — no subconscious, nobody reads it.
+    // A focus-held message awaiting its unfocus dump has been read by nobody
+    // (the view filter hides it; the dump is its delivery): unread, whatever
+    // the watermark says — an edit or retraction must replace it in place so
+    // the dump renders the final text. After its epoch ended the dump has
+    // consumed it and the ordinary watermark rule applies (a later edit is
+    // new traffic, appended where the resident will see it).
+    if (this.focusCoordinator?.isAwaitingDelivery(message)) return true;
     let readers: Agent[];
     if ((message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut) {
       const subconscious = this.subconsciousAgentName ? this.agents.get(this.subconsciousAgentName) : undefined;
@@ -8022,7 +8051,7 @@ export class AgentFramework {
     // Focus hold — DMs and addressed-while-closed messages arrive here, so
     // this path must hold too or they leak around the focus.
     let held: { epochId: string } | null = null;
-    if (triggerChannel && this.focusCoordinator && this.targetsPrimary(event.targetAgents)) {
+    if (triggerChannel && this.focusCoordinator) {
       const origin = (event.origin ?? {}) as Record<string, unknown>;
       held = this.focusCoordinator.onIncoming(
         event.serverId,
@@ -8124,13 +8153,6 @@ export class AgentFramework {
    * Returns undefined for push events with no channel provenance (heartbeats,
    * timers), which correctly keep the global fallback.
    */
-  /** Untargeted events broadcast (so they reach the primary); a targeted
-   *  one reaches the primary only if named. */
-  private targetsPrimary(targetAgents: string[] | undefined): boolean {
-    if (!targetAgents) return true;
-    return this.primaryAgentName !== null && targetAgents.includes(this.primaryAgentName);
-  }
-
   private derivePushEventChannel(
     origin: Record<string, unknown> | undefined,
   ): { channelId: string; label?: string; metadata?: Record<string, unknown> } | undefined {

@@ -120,7 +120,8 @@ interface ChannelLifecycleEvent {
     | 'legacy-policy-migrated'
     | 'invitation-declined'
     | 'tune-out-wake'
-    | 'focus';
+    | 'focus'
+    | 'focus-autoreply';
   serverId: string;
   timestamp: string;
   channelId?: string;
@@ -129,6 +130,11 @@ interface ChannelLifecycleEvent {
   tuneOut?: TuneOutParams;
   /** kind 'focus': the active epoch, or null when focus ended. */
   focus?: FocusParams | null;
+  /** kind 'focus-autoreply': an automatic reply that actually published,
+   *  for (serverId, channelId, authorId) under `epochId`. Durable so the
+   *  once-per-author rule survives a restart without trusting an optimistic
+   *  stamp written before the publish settled. */
+  authorId?: string;
   /** kind 'tune-out-wake': durable running wake count for an epoch.
    *  Lives in the lifecycle log (not gate stats) because gate runtime
    *  state dies with the process and max-wakes must not reset on restart. */
@@ -693,6 +699,9 @@ export class ChannelRegistry {
 
   /** Chronicle-projected focus epoch (one per resident), or null. */
   private focusState: FocusParams | null = null;
+  /** Autoreplies published under the ACTIVE focus epoch
+   *  (`serverId\0channelId\0authorId`); cleared when the epoch changes. */
+  private focusAutoReplies = new Set<string>();
 
   /** One-time migration inputs from the retired recipe auto-open policy. */
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
@@ -1537,6 +1546,7 @@ export class ChannelRegistry {
         ) {
           // Optional fields fall back to sane values rather than failing the
           // epoch: a record missing backlogCap must still dump a backlog.
+          if (this.focusState?.epochId !== f.epochId) this.focusAutoReplies.clear();
           this.focusState = {
             ...f,
             backlogCap: typeof f.backlogCap === 'number' && Number.isFinite(f.backlogCap)
@@ -1547,6 +1557,15 @@ export class ChannelRegistry {
           };
         } else {
           this.focusState = null;
+          this.focusAutoReplies.clear();
+        }
+      } else if (
+        event.kind === 'focus-autoreply' &&
+        typeof event.channelId === 'string' && typeof event.epochId === 'string'
+      ) {
+        // Only while the epoch that recorded it is still the active one.
+        if (this.focusState?.epochId === event.epochId) {
+          this.focusAutoReplies.add(this.autoReplyKey(event.serverId, event.channelId, event.authorId));
         }
       }
     }
@@ -2014,6 +2033,7 @@ export class ChannelRegistry {
    */
   setFocus(params: FocusParams | null, source: string): void {
     const serverId = params?.serverId ?? this.focusState?.serverId ?? 'host';
+    if (this.focusState?.epochId !== params?.epochId) this.focusAutoReplies.clear();
     this.focusState = params;
     this.appendLifecycleEvent({
       kind: 'focus',
@@ -2028,6 +2048,38 @@ export class ChannelRegistry {
   /** The active focus epoch, or null. */
   getFocus(): FocusParams | null {
     return this.focusState;
+  }
+
+  private autoReplyKey(serverId: string, channelId: string, authorId: string | undefined): string {
+    return `${serverId}\u0000${channelId}\u0000${authorId ?? ''}`;
+  }
+
+  /** Durably record that an automatic reply PUBLISHED under the active
+   *  epoch. No-op (false) if `epochId` is no longer the active epoch — a
+   *  publish that settles after its epoch ended must not mark the next one. */
+  recordFocusAutoReply(epochId: string, serverId: string, channelId: string, authorId: string | undefined): boolean {
+    if (this.focusState?.epochId !== epochId) return false;
+    this.focusAutoReplies.add(this.autoReplyKey(serverId, channelId, authorId));
+    this.appendLifecycleEvent({
+      kind: 'focus-autoreply',
+      serverId,
+      channelId,
+      epochId,
+      ...(authorId !== undefined ? { authorId } : {}),
+      timestamp: new Date().toISOString(),
+    });
+    return true;
+  }
+
+  /** Has an automatic reply already published for this (channel, author)
+   *  under the active epoch? */
+  hasFocusAutoReply(serverId: string, channelId: string, authorId: string | undefined): boolean {
+    return this.focusAutoReplies.has(this.autoReplyKey(serverId, channelId, authorId));
+  }
+
+  /** Number of automatic replies published under the active epoch. */
+  focusAutoReplyCount(): number {
+    return this.focusAutoReplies.size;
   }
 
   /**
@@ -3140,7 +3192,12 @@ export class ChannelRegistry {
       return fail(null, 'turn has no locus (no home/trigger channel; nothing to deliver into)');
     }
 
-    const entry = this.findChannelEntry(channelId);
+    // Under focus the locus IS the focus channel, whose identity is
+    // (serverId, channelId): resolve it server-qualified so a same-id channel
+    // registered by another server cannot receive the resident's words.
+    const entry = (this.focusLocus && this.focusLocus.channelId === channelId
+      ? this.channels.get(`${this.focusLocus.serverId}:${channelId}`)
+      : undefined) ?? this.findChannelEntry(channelId);
     if (!entry) {
       return fail(channelId, `no registered channel for locus "${channelId}"`);
     }

@@ -647,3 +647,17 @@ test('proseTargetFor: no token when none is safe (shared id across servers, whit
   assert.equal(registry.proseTargetFor('chan:8', 'discord-a'), '#only-a');
   assert.equal(registry.proseTargetFor('chan:8', 'discord-b'), undefined);
 });
+
+test('focus locus: speech goes to the focused SERVER\'s channel when another server registered the same id first', async () => {
+  const { registry, traces } = makeRegistry({ delivered: true });
+  seedRegistered(registry, 'discord', 'chanA'); // registered first → an id-only lookup finds this one
+  seedRegistered(registry, 'slack', 'chanA');
+  registry.setFocusLocus({ serverId: 'slack', channelId: 'chanA' });
+  const res = await registry.routeSpeech('trunk', 'for the slack room', registry.resolveLocus('trunk'));
+  assert.deepEqual(res, { delivered: true, channelId: 'chanA' });
+  const routed = traces.filter((t) => t.type === 'mcpl:speech-routed' || t.type === 'mcpl:channel-opened-by-send');
+  assert.ok(routed.length > 0, 'speech was routed');
+  assert.ok(routed.every((t) => t.serverId === undefined || t.serverId === 'slack'),
+    `routed through the focused server, not the first-registered one: ${JSON.stringify(routed)}`);
+  assert.ok(routed.some((t) => t.serverId === 'slack'));
+});

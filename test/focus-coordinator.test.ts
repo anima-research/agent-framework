@@ -46,10 +46,21 @@ function harness(opts?: {
   const gateStates: Array<FocusParams | null> = [];
   let seq = 0;
   let publishFails = opts?.publishFails ?? false;
+  /** When set, publishes wait on it — lets a test settle one late. */
+  let publishGate: Promise<void> | null = null;
 
+  const replies = new Set<string>();
+  const rk = (s: string, c: string, a?: string) => `${s}|${c}|${a ?? ''}`;
   const registry = {
     getFocus: () => focus,
-    setFocus: (p: FocusParams | null) => { focus = p; },
+    setFocus: (p: FocusParams | null) => { if (focus?.epochId !== p?.epochId) replies.clear(); focus = p; },
+    hasFocusAutoReply: (s: string, c: string, a?: string) => replies.has(rk(s, c, a)),
+    recordFocusAutoReply: (epochId: string, s: string, c: string, a?: string) => {
+      if (focus?.epochId !== epochId) return false;
+      replies.add(rk(s, c, a));
+      return true;
+    },
+    focusAutoReplyCount: () => replies.size,
     resolveChannel: (channelId: string, serverId?: string) => {
       const matches = CHANNELS.filter((c) => c.id === channelId && (!serverId || c.serverId === serverId));
       if (matches.length === 0) return { error: `Channel not found: ${channelId}` };
@@ -72,6 +83,7 @@ function harness(opts?: {
     currentSequence: () => seq,
     channelLabel: (s, c) => CHANNELS.find((x) => x.serverId === s && x.id === c)?.label,
     publish: async (serverId, channelId, text) => {
+      if (publishGate) await publishGate;
       if (publishFails) return { success: false, error: 'boom' };
       published.push({ serverId, channelId, text });
       return { success: true };
@@ -122,8 +134,11 @@ function harness(opts?: {
 
   return {
     coordinator, incoming, incomingDeferred, delivered, published, wakes, gateStates, stored, deferredQueue,
-    getFocus: () => focus, setFocus: (p: FocusParams | null) => { focus = p; },
+    getFocus: () => focus, setFocus: (p: FocusParams | null) => { if (focus?.epochId !== p?.epochId) replies.clear(); focus = p; },
     setPublishFails: (v: boolean) => { publishFails = v; },
+    setPublishGate: (g: Promise<void> | null) => { publishGate = g; },
+    recordReply: (s: string, c: string, a?: string) => { replies.add(rk(s, c, a)); },
+    replyCount: () => replies.size,
   };
 }
 
@@ -199,17 +214,16 @@ describe('focus: autoreply', () => {
     const h = harness();
     h.coordinator.enter('discord:g:work', { serverId: 'discord' }, 'agent-tool');
     h.incoming('discord:g:chat', 'ambient', { authorId: 'A' });
-    const first = h.incoming('discord:g:chat', '@scout?', { addressed: true, authorId: 'A' });
-    const second = h.incoming('discord:g:chat', '@scout??', { addressed: true, authorId: 'A' });
-    const other = h.incoming('discord:g:chat', '@scout', { addressed: true, authorId: 'B' });
-    const elsewhere = h.incoming('discord:dm:antra', 'dm', { addressed: true, authorId: 'A' });
+    h.incoming('discord:g:chat', '@scout?', { addressed: true, authorId: 'A' });
+    h.incoming('discord:g:chat', '@scout??', { addressed: true, authorId: 'A' });   // same tick: in-flight dedupe
+    h.incoming('discord:g:chat', '@scout', { addressed: true, authorId: 'B' });
+    h.incoming('discord:dm:antra', 'dm', { addressed: true, authorId: 'A' });
+    await settle();
+    h.incoming('discord:g:chat', '@scout???', { addressed: true, authorId: 'A' });  // later: durable dedupe
     await settle();
     assert.deepEqual(h.published.map((p) => [p.serverId, p.channelId]),
       [['discord', 'discord:g:chat'], ['discord', 'discord:g:chat'], ['discord', 'discord:dm:antra']]);
-    assert.equal(first?.autoReplied, true);
-    assert.equal(second?.autoReplied, undefined);
-    assert.equal(other?.autoReplied, true);
-    assert.equal(elsewhere?.autoReplied, true);
+    assert.equal(h.replyCount(), 3, 'each published reply is recorded durably');
     assert.match(h.published[0]!.text, /scout is in focus mode/);
     assert.match(h.published[0]!.text, /^\[Automatic reply\]/);
   });
@@ -220,11 +234,10 @@ describe('focus: autoreply', () => {
     const lurk = h.incoming('discord:g:lurk', '@scout from a room you never joined', { addressed: true });
     const dm = h.incoming('discord:dm:antra', 'dm', { addressed: true });
     await settle();
-    assert.ok(lurk && !lurk.autoReplied, 'held, counted, reply-less');
-    assert.equal(dm?.autoReplied, true);
-    assert.deepEqual(h.published.map((p) => p.channelId), ['discord:dm:antra']);
+    assert.ok(lurk && dm, 'both held');
+    assert.deepEqual(h.published.map((p) => p.channelId), ['discord:dm:antra'], 'held, counted, reply-less in the never-joined room');
     h.coordinator.end('t', 'x');
-    assert.match(h.delivered[0]!.text, /2 addressed you \(1 got the automatic reply\)/);
+    assert.match(h.delivered[0]!.text, /2 addressed you \(1 automatic reply was sent\)/);
   });
 
   it('a failed publish releases the (channel, author) allowance so the next mention retries', async () => {
@@ -233,6 +246,7 @@ describe('focus: autoreply', () => {
     h.incoming('discord:g:chat', '@scout 1', { addressed: true, authorId: 'A' });
     await settle();
     assert.equal(h.published.length, 0);
+    assert.equal(h.replyCount(), 0, 'a failed publish records nothing durable — a restart retries too');
     h.setPublishFails(false);
     h.incoming('discord:g:chat', '@scout 2', { addressed: true, authorId: 'A' });
     await settle();
@@ -240,6 +254,25 @@ describe('focus: autoreply', () => {
     h.incoming('discord:g:chat', '@scout 3', { addressed: true, authorId: 'A' });
     await settle();
     assert.equal(h.published.length, 1, 'and then once is once');
+  });
+
+  it('a publish that settles after its epoch ended does not touch the next epoch', async () => {
+    const h = harness();
+    let release!: () => void;
+    h.setPublishGate(new Promise<void>((r) => { release = r; }));
+    h.coordinator.enter('discord:g:work', { serverId: 'discord' }, 'agent-tool');
+    h.incoming('discord:g:chat', '@scout', { addressed: true, authorId: 'A' });   // publish parked
+    h.coordinator.end('t', 'x');
+    h.coordinator.enter('discord:g:work', { serverId: 'discord' }, 'agent-tool'); // new epoch
+    h.setPublishGate(null);
+    release();
+    await settle(); await settle();
+    assert.equal(h.replyCount(), 0, 'the late success is not counted in the new epoch');
+    // …and did not consume the new epoch's allowance for that author.
+    h.incoming('discord:g:chat', '@scout again', { addressed: true, authorId: 'A' });
+    await settle();
+    assert.equal(h.replyCount(), 1);
+    assert.equal(h.published.length, 2);
   });
 
   it('autoReply: false suppresses the reply but still holds; the end notice says so', async () => {
@@ -301,6 +334,23 @@ describe('focus: end + backlog', () => {
     const r = h.coordinator.end('t', 'x');
     assert.ok(r.ok && r.held === 2);
     assert.match(h.delivered[0]!.text, /messages=2 tz="UTC">\n\[\d\d:\d\d\] someone: stored one\n\[arrived mid-turn\] someone: arrived mid-turn\n<\/focus-backlog>/);
+  });
+
+  it('isAwaitingDelivery: true only for the active epoch\'s unreleased held messages', () => {
+    const h = harness();
+    h.coordinator.enter('discord:g:work', { serverId: 'discord' }, 'agent-tool');
+    h.incoming('discord:g:chat', 'held');
+    h.incoming('discord:g:work', 'live');
+    const [held, live] = h.stored;
+    assert.equal(h.coordinator.isAwaitingDelivery(held!), true);
+    assert.equal(h.coordinator.isAwaitingDelivery(live!), false, 'not stamped');
+    h.coordinator.enter('discord:g:chat', {}, 'agent-tool');           // re-target releases it
+    assert.equal(h.coordinator.isAwaitingDelivery(held!), false, 'released by the re-target dump');
+    h.incoming('discord:g:work', 'now held');
+    const nowHeld = h.stored.at(-1)!;
+    assert.equal(h.coordinator.isAwaitingDelivery(nowHeld), true);
+    h.coordinator.end('t', 'x');
+    assert.equal(h.coordinator.isAwaitingDelivery(nowHeld), false, 'the dump consumed it');
   });
 
   it('media blocks are named, not dropped', () => {
@@ -462,7 +512,7 @@ describe('focus: resume', () => {
     assert.deepEqual(h.wakes, ['scout']);
   });
 
-  it('a live deadline re-arms and rebuilds the autoreply memory from stamps', async () => {
+  it('a live deadline re-arms; the once-per-author rule holds across the restart via the durable record', async () => {
     const h = harness();
     const params: FocusParams = {
       epochId: 'live', serverId: 'discord', channelId: 'discord:g:work',
@@ -474,10 +524,11 @@ describe('focus: resume', () => {
       content: [{ type: 'text', text: '@scout' }],
       metadata: {
         channelId: 'discord:g:chat', serverId: 'discord', author: { id: 'A', name: 'a' },
-        tags: ['chat:addressed'], focusHeld: { epochId: 'live', autoReplied: true },
+        tags: ['chat:addressed'], focusHeld: { epochId: 'live' },
       } as StoredMessage['metadata'],
     });
     h.setFocus(params);
+    h.recordReply('discord', 'discord:g:chat', 'A'); // replayed from the lifecycle log
     h.coordinator.resume();
     assert.equal(h.getFocus()?.epochId, 'live');
     assert.deepEqual(h.gateStates.at(-1)?.epochId, 'live');

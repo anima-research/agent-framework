@@ -29,3 +29,10 @@
   not offered under per-channel conversation routing; a persisted epoch
   still ends at boot after `focus.enabled` is turned off; configured maxima
   are floored/capped integers; media blocks are named in the dump.
+  Speech under focus is routed server-qualified (a same-id channel on
+  another server cannot receive it); automatic replies that published are
+  recorded in the lifecycle log, so once-per-author survives a restart and
+  a failed publish is retried, and a publish settling after its epoch ended
+  touches nothing; a held message awaiting its dump counts as unread for
+  event coalescing (an edit replaces it in place); wakes already queued for
+  a channel are dropped when that channel becomes held.

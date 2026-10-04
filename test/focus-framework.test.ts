@@ -21,14 +21,15 @@ const FOCUS = 'disc:guild:noisy';   // registered by the fixture
 const OTHER = 'disc:guild:other';   // registered here, same server, opened
 const LURK = 'disc:guild:lurk';     // registered here, never opened
 
-type Stored = { participant: string; content: Array<{ type: string; text?: string }>; metadata?: Record<string, unknown> };
+type Stored = { id?: string; participant: string; content: Array<{ type: string; text?: string }>; metadata?: Record<string, unknown> };
 
 function internals(framework: AgentFramework) {
   return framework as unknown as {
     focusCoordinator: FocusCoordinator | null;
     eventGate: EventGate | null;
     channelRegistry: ChannelRegistry | null;
-    pendingRequests: Array<{ agentName: string; reason: string }>;
+    pendingRequests: Array<{ agentName: string; reason: string; source?: string; channelId?: string; timestamp?: number }>;
+    isUnreadStoredMessage(agent: unknown, messageId: string): boolean;
     handleMcplChannelIncoming(event: Record<string, unknown>): Promise<void>;
     handleMcplPushEvent(event: Record<string, unknown>): void;
     agents: Map<string, { state: { status: string }; getContextManager(): {
@@ -161,8 +162,14 @@ describe('focus through the framework', () => {
     gate.evaluate({ content: 'focus channel, queued before focus', eventType: 'mcpl:push-event', serverId: 'disc', channelId: '', metadata: focusPushMeta, tags: ['chat:message'] });
     assert.equal(gate.getStatus().policies.find((p) => p.name === 'batch-push')?.debounceState?.pendingCount, 2);
 
+    // …and a framework-level wake already queued for a channel that is about
+    // to be held (a message that arrived a moment before `enter`). Pushed and
+    // purged within one tick, so the loop never sees it.
+    i.pendingRequests.push({ agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'disc', channelId: OTHER, timestamp: Date.now() });
+
     const entered = coordinator.handleTool({ mode: 'enter', channelId: FOCUS, serverId: 'disc', durationSeconds: 120 });
     assert.equal(entered.success, true, JSON.stringify(entered));
+    assert.ok(!i.pendingRequests.some((r) => r.channelId === OTHER), 'a queued wake for a now-held channel does not run inside focus');
 
     // …is purged on enter, and new OTHER events are held at the gate.
     assert.equal(gate.getStatus().policies.find((p) => p.name === 'batch-other')?.debounceState?.pendingCount ?? 0, 0);
@@ -228,6 +235,13 @@ describe('focus through the framework', () => {
     await waitFor(() => membrane.calls.length >= 1, 'scout turn on the focus channel');
     await waitFor(() => i.agents.get('scout')!.state.status === 'idle', 'scout idle');
     i.pendingRequests.length = 0;
+
+    // The focus-channel turn advanced the watermark past the held messages,
+    // but nobody has read them: the coalescer must still treat them as
+    // unread (an edit replaces in place, so the dump shows the final text).
+    const heldOne = cm.getAllMessages().find((m) => textOf(m) === 'other 1')!;
+    assert.equal(i.isUnreadStoredMessage(i.agents.get('scout'), heldOne.id!), true, 'held = unread while awaiting the dump');
+
     // ---- check ---------------------------------------------------------
     const check = coordinator.handleTool({ mode: 'check' });
     const data = check.data as { focused: boolean; held: Array<{ serverId: string; channelId: string; messages: number; addressed: number }> };
@@ -250,7 +264,7 @@ describe('focus through the framework', () => {
     let dump: Stored | undefined;
     await waitFor(() => Boolean(dump = cm.getAllMessages().find((m) => m.metadata?.kind === 'focus-end')), 'dump delivered');
     const text = textOf(dump!);
-    assert.match(text, /6 messages held across 4 channels; 4 addressed you \(2 got the automatic reply\)/);
+    assert.match(text, /6 messages held across 4 channels; 4 addressed you \(2 automatic replies were sent\)/);
     assert.match(text, /<focus-backlog channel="#other \(disc:guild:other\)" messages=3 tz="[^"]+" truncated=1 \(oldest, not shown\)>/);
     assert.doesNotMatch(text, /other 1\n/);
     assert.match(text, /other 2\n.*other 3\n<\/focus-backlog>/);
@@ -270,5 +284,6 @@ describe('focus through the framework', () => {
     }
     await waitFor(() => membrane.calls.length >= 2, 'scout turn after focus ended');
     await waitFor(() => i.agents.get('scout')!.state.status === 'idle', 'scout idle after end');
+    assert.equal(i.isUnreadStoredMessage(i.agents.get('scout'), heldOne.id!), false, 'once dumped, the ordinary watermark rule applies');
   });
 });

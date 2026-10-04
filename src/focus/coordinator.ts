@@ -211,10 +211,6 @@ export interface FocusFrameworkHooks {
 
 interface HeldStamp {
   epochId: string;
-  /** Set on the message whose arrival triggered an autoreply attempt for
-   *  its (channel, author). Optimistic: recorded at send time, so after a
-   *  restart a reply that failed to publish is not retried for that pair. */
-  autoReplied?: true;
 }
 
 /** A held message as the dump sees it: stored, or still deferred. */
@@ -231,13 +227,13 @@ const DUMP_KINDS = new Set(['focus-end', 'focus-retarget']);
 
 export class FocusCoordinator {
   private expiryTimer: ReturnType<typeof setTimeout> | null = null;
-  /** (channelId\0authorId) pairs already auto-replied in the active epoch. */
-  private autoReplied = new Set<string>();
+  /** (server, channel, author) autoreplies currently being published — the
+   *  in-process half of once-per-author; the durable half (replies that DID
+   *  publish) lives in the lifecycle log via the registry. */
+  private inFlightReplies = new Set<string>();
   /** Held-message tallies for the active epoch (rebuilt from the store at resume). */
   private heldCount = 0;
   private addressedCount = 0;
-  /** Autoreplies that actually published in the active epoch. */
-  private repliedCount = 0;
 
   constructor(
     private readonly channelRegistry: ChannelRegistry,
@@ -299,22 +295,31 @@ export class FocusCoordinator {
   }
 
   private rebuildTallies(state: FocusParams): void {
-    this.autoReplied.clear();
+    this.inFlightReplies.clear();
     this.heldCount = 0;
     this.addressedCount = 0;
-    this.repliedCount = 0;
     for (const m of this.heldMessages(state.epochId)) {
       this.heldCount++;
-      const md = m.metadata;
-      const tags = md?.tags;
+      const tags = m.metadata?.tags;
       if (Array.isArray(tags) && tags.includes('chat:addressed')) this.addressedCount++;
-      const stamp = md?.focusHeld as HeldStamp | undefined;
-      if (stamp?.autoReplied) {
-        this.repliedCount++;
-        const key = this.replyKey(String(md?.channelId ?? ''), authorIdOf(md));
-        if (key) this.autoReplied.add(key);
-      }
     }
+  }
+
+  /**
+   * Is this stored message held for a delivery that has not happened yet —
+   * stamped with the ACTIVE epoch and not released by a re-target? Until the
+   * unfocus dump renders it, nobody has read it, so an edit or retraction
+   * must replace it in place (the dump then shows the final text). Once its
+   * epoch ended the dump has consumed it, and a later edit is new traffic.
+   */
+  isAwaitingDelivery(message: { sequence: number; metadata?: unknown }): boolean {
+    const state = this.getState();
+    if (!state) return false;
+    const md = message.metadata as Record<string, unknown> | undefined;
+    if ((md?.focusHeld as HeldStamp | undefined)?.epochId !== state.epochId) return false;
+    return !this.isReleased(state, {
+      sequence: message.sequence, participant: '', content: [], metadata: md, timestamp: new Date(0), deferred: false,
+    });
   }
 
   private armExpiry(state: FocusParams): void {
@@ -425,10 +430,9 @@ export class FocusCoordinator {
       backlogCap: Math.min(limits.maxCap, Math.max(0, Math.floor(requestedCap))),
     };
     this.channelRegistry.setFocus(params, source);
-    this.autoReplied.clear();
+    this.inFlightReplies.clear();
     this.heldCount = 0;
     this.addressedCount = 0;
-    this.repliedCount = 0;
     this.armExpiry(params);
     this.hooks.onFocusChanged(params);
     this.hooks.emitTrace({ type: 'focus:entered', serverId: target.serverId, channelId: target.channelId, epochId: params.epochId, expiresAtMs: params.expiresAtMs });
@@ -444,6 +448,8 @@ export class FocusCoordinator {
   end(source: string, reason: string): { ok: true; held: number } | { ok: false; error: string } {
     const state = this.getState();
     if (!state) return { ok: false, error: 'not in focus mode' };
+    // Read before the flip: the registry's reply record is per active epoch.
+    const repliedCount = this.channelRegistry.focusAutoReplyCount();
     this.channelRegistry.setFocus(null, source);
     this.clearExpiry();
     this.hooks.onFocusChanged(null);
@@ -466,8 +472,8 @@ export class FocusCoordinator {
     const addressedNote = this.addressedCount === 0
       ? ''
       : `; ${this.addressedCount} addressed you` +
-        (this.repliedCount > 0
-          ? ` (${this.repliedCount === this.addressedCount ? 'all' : this.repliedCount} got the automatic reply)`
+        (repliedCount > 0
+          ? ` (${repliedCount} automatic repl${repliedCount === 1 ? 'y was' : 'ies were'} sent)`
           : ' (no automatic reply was sent)');
     const header =
       `[Focus ended — ${reason}. You were focused on ${focusLabel} for ~${minutes}m. ` +
@@ -498,12 +504,11 @@ export class FocusCoordinator {
     }
     this.hooks.emitTrace({
       type: 'focus:ended', epochId: state.epochId, channelId: state.channelId, reason, held,
-      addressed: this.addressedCount, replied: this.repliedCount,
+      addressed: this.addressedCount, replied: repliedCount,
     });
-    this.autoReplied.clear();
+    this.inFlightReplies.clear();
     this.heldCount = 0;
     this.addressedCount = 0;
-    this.repliedCount = 0;
     return { ok: true, held };
   }
 
@@ -541,21 +546,19 @@ export class FocusCoordinator {
     // reply-less — before focus it produced an invitation the resident
     // decided on; the host must not answer in a room they chose not to join.
     if (!this.hooks.canAutoReplyInto(serverId, channelId)) return stamp;
-    const key = this.replyKey(channelId, author?.id);
-    if (key && this.autoReplied.has(key)) return stamp;
-    if (key) this.autoReplied.add(key);
-    stamp.autoReplied = true;
-    void this.sendAutoReply(state, serverId, channelId, messageId, key);
+    // Once per (server, channel, author) per epoch: the durable record says a
+    // reply PUBLISHED; the in-flight set covers the publish still settling.
+    if (this.channelRegistry.hasFocusAutoReply(serverId, channelId, author?.id)) return stamp;
+    const key = `${serverId}\u0000${channelId}\u0000${author?.id ?? ''}`;
+    if (this.inFlightReplies.has(key)) return stamp;
+    this.inFlightReplies.add(key);
+    void this.sendAutoReply(state, serverId, channelId, messageId, author?.id, key);
     return stamp;
   }
 
-  private replyKey(channelId: string, authorId: string | undefined | null): string | null {
-    if (!channelId) return null;
-    return `${channelId}\0${authorId ?? ''}`;
-  }
-
   private async sendAutoReply(
-    state: FocusParams, serverId: string, channelId: string, messageId: string, key: string | null,
+    state: FocusParams, serverId: string, channelId: string, messageId: string,
+    authorId: string | undefined, key: string,
   ): Promise<void> {
     const template = this.config.autoReplyTemplate ?? DEFAULT_AUTOREPLY;
     const remainingMin = Math.max(1, Math.round((state.expiresAtMs - Date.now()) / 60_000));
@@ -571,14 +574,18 @@ export class FocusCoordinator {
     } catch (err) {
       failure = (err as Error).message;
     }
+    // A publish that settles after its epoch ended (or was replaced by a new
+    // one) belongs to that epoch: it must neither release an allowance nor
+    // count a reply in the epoch that is active now.
+    const sameEpoch = this.getState()?.epochId === state.epochId;
+    if (sameEpoch) this.inFlightReplies.delete(key);
     if (failure !== undefined) {
-      // Release the (channel, author) allowance so the next addressed
-      // message from them retries rather than staying silent all epoch.
-      if (key) this.autoReplied.delete(key);
+      // Nothing recorded: the next addressed message from this author retries
+      // (also after a restart — only replies that published are durable).
       this.hooks.emitTrace({ type: 'focus:autoreply-failed', serverId, channelId, messageId, error: failure });
       return;
     }
-    this.repliedCount++;
+    if (sameEpoch) this.channelRegistry.recordFocusAutoReply(state.epochId, serverId, channelId, authorId);
     this.hooks.emitTrace({ type: 'focus:autoreply', serverId, channelId, messageId });
   }
 
@@ -811,13 +818,6 @@ function channelIdOf(m: HeldMessage): string | undefined {
 function serverIdOf(m: HeldMessage | undefined): string | undefined {
   const v = m?.metadata?.serverId;
   return typeof v === 'string' && v ? v : undefined;
-}
-
-function authorIdOf(md: Record<string, unknown> | undefined): string | undefined {
-  const author = md?.author as { id?: unknown } | undefined;
-  if (author && author.id != null) return String(author.id);
-  if (md?.authorId != null) return String(md.authorId);
-  return undefined;
 }
 
 function numberOrUndefined(v: unknown): number | undefined {
