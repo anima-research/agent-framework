@@ -9050,9 +9050,11 @@ export class AgentFramework {
     // idempotent per channel, and owns the 7s refresh); the catch below stops
     // it on the no-driveStream failure paths (e.g. a compile refusal).
     const earlyTypingChannel =
-      turnProseRouting === 'explicit'
-        ? trigger?.channelId ?? null
-        : this.turnLocusPins.get(agent.name) ?? null;
+      turnProseRouting === 'disabled'
+        ? (trigger?.suppressProse ? null : trigger?.channelId ?? trigger?.wakeChannelId ?? null)
+        : turnProseRouting === 'explicit'
+          ? trigger?.channelId ?? null
+          : this.turnLocusPins.get(agent.name) ?? null;
     if (earlyTypingChannel) this.channelRegistry?.startTyping(earlyTypingChannel);
 
     try {
@@ -9318,9 +9320,13 @@ export class AgentFramework {
     //     this doesn't violate never-guess: it says "attending to what you
     //     sent here", which is true regardless of where the reply goes.
     //     Heartbeat/no-trigger explicit turns show no indicator.
+    //   - disabled mode: like explicit, the trigger channel; a batched gate
+    //     wake names no channelId, only where it came from (wakeChannelId),
+    //     so typing goes there. A silent wake (suppressProse, which also runs
+    //     as disabled) stays private and shows no indicator.
     const typingChannel =
       turnProseRouting === 'disabled'
-        ? null
+        ? (trigger?.suppressProse ? null : trigger?.channelId ?? trigger?.wakeChannelId ?? null)
         : turnProseRouting === 'explicit'
           ? trigger?.channelId ?? null
           : resolveTurnLocus();
