@@ -8868,6 +8868,25 @@ export class AgentFramework {
   }
 
   /**
+   * Where a `proseRouting: 'disabled'` turn shows typing: the trigger
+   * channel, as in explicit mode, else where a batched gate wake came from
+   * (`wakeChannelId`; the gate deliberately names no `channelId`). Not a
+   * tuned-out channel: its ambient traffic can reach the gate before tune-out
+   * diverts it, and typing there would show attendance the agent turned
+   * off. A silent wake (`suppressProse`, which also runs as disabled) shows
+   * none.
+   */
+  private disabledTypingChannel(trigger: InferenceRequest | undefined): string | null {
+    if (!trigger || trigger.suppressProse) return null;
+    if (trigger.channelId) return trigger.channelId;
+    const wake = trigger.wakeChannelId;
+    if (!wake) return null;
+    const serverId = this.channelRegistry?.getChannelServerId(wake);
+    if (serverId && this.channelRegistry?.getTuneOutState(serverId, wake)) return null;
+    return wake;
+  }
+
+  /**
    * Body of startAgentStream, split out so the caller's try/finally owns the
    * turn token unconditionally. Returns true iff the token was handed off to
    * driveStream (whose finally then owns clearing it).
@@ -9051,7 +9070,7 @@ export class AgentFramework {
     // it on the no-driveStream failure paths (e.g. a compile refusal).
     const earlyTypingChannel =
       turnProseRouting === 'disabled'
-        ? (trigger?.suppressProse ? null : trigger?.channelId ?? trigger?.wakeChannelId ?? null)
+        ? this.disabledTypingChannel(trigger)
         : turnProseRouting === 'explicit'
           ? trigger?.channelId ?? null
           : this.turnLocusPins.get(agent.name) ?? null;
@@ -9320,13 +9339,10 @@ export class AgentFramework {
     //     this doesn't violate never-guess: it says "attending to what you
     //     sent here", which is true regardless of where the reply goes.
     //     Heartbeat/no-trigger explicit turns show no indicator.
-    //   - disabled mode: like explicit, the trigger channel; a batched gate
-    //     wake names no channelId, only where it came from (wakeChannelId),
-    //     so typing goes there. A silent wake (suppressProse, which also runs
-    //     as disabled) stays private and shows no indicator.
+    //   - disabled mode: see disabledTypingChannel.
     const typingChannel =
       turnProseRouting === 'disabled'
-        ? (trigger?.suppressProse ? null : trigger?.channelId ?? trigger?.wakeChannelId ?? null)
+        ? this.disabledTypingChannel(trigger)
         : turnProseRouting === 'explicit'
           ? trigger?.channelId ?? null
           : resolveTurnLocus();
