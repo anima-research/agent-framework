@@ -1176,9 +1176,7 @@ export class ChannelRegistry {
         // global-clear branch's semantics, and keeps defensive stopTyping(ch)
         // calls from spamming stops at a server that never saw a start.
         const entry = this.findChannelEntry(channelId);
-        if (entry && this.sendTypingFn) {
-          this.sendTypingFn(entry.serverId, channelId, this.typingMetadata.get(channelId), 'stop');
-        }
+        if (entry) this.sendTypingStop(entry.serverId, channelId);
       }
       this.typingMetadata.delete(channelId);
     } else {
@@ -1188,11 +1186,9 @@ export class ChannelRegistry {
         clearInterval(interval);
       }
       this.typingIntervals.clear();
-      if (this.sendTypingFn) {
-        for (const id of channels) {
-          const entry = this.findChannelEntry(id);
-          if (entry) this.sendTypingFn(entry.serverId, id, this.typingMetadata.get(id), 'stop');
-        }
+      for (const id of channels) {
+        const entry = this.findChannelEntry(id);
+        if (entry) this.sendTypingStop(entry.serverId, id);
       }
       this.typingMetadata.clear();
     }
@@ -2157,6 +2153,16 @@ export class ChannelRegistry {
   // ==========================================================================
   // Private: Typing notification
   // ==========================================================================
+
+  /**
+   * Send a typing 'stop'. The same §14.1 grant gate as the start: a timer can
+   * exist for a server whose start was skipped for lack of `channels.typing`,
+   * and it must not receive an unpaired stop either.
+   */
+  private sendTypingStop(serverId: string, channelId: string): void {
+    if (!CapabilityGrant.of(this.serverRegistry.getServer(serverId)).has('channels.typing')) return;
+    this.sendTypingFn?.(serverId, channelId, this.typingMetadata.get(channelId), 'stop');
+  }
 
   /**
    * Send a typing notification for a channel.

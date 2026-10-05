@@ -33,8 +33,13 @@ async function make(proseRouting: 'disabled' | 'explicit') {
   return { dir, framework, typed: () => [...new Set(typing)] };
 }
 
-async function wake(proseRouting: 'disabled' | 'explicit', request: Record<string, unknown> | 'silent') {
+async function wake(
+  proseRouting: 'disabled' | 'explicit',
+  request: Record<string, unknown> | Record<string, unknown>[] | 'silent',
+  homes: Record<string, string> = {},
+) {
   const x = await make(proseRouting);
+  for (const [agent, home] of Object.entries(homes)) (x.framework as any).conversationAgentHomes.set(agent, home);
   try {
     if (request === 'silent') {
       (x.framework as any).handleMcplPushEvent({
@@ -44,7 +49,10 @@ async function wake(proseRouting: 'disabled' | 'explicit', request: Record<strin
         inferenceId: 'inf-1', triggerInference: true,
       });
     } else {
-      (x.framework as any).pendingRequests.push({ agentName: 'assistant', timestamp: Date.now(), ...request });
+      const now = Date.now();
+      for (const [i, r] of (Array.isArray(request) ? request : [request]).entries()) {
+        (x.framework as any).pendingRequests.push({ agentName: 'assistant', timestamp: now + i, ...r });
+      }
     }
     await x.framework.runUntilIdle();
     return x.typed();
@@ -68,6 +76,25 @@ describe('typing with proseRouting disabled', () => {
 
   it('shows no typing for a wake that names no channel', async () => {
     assert.deepEqual(await wake('disabled', { reason: 'heartbeat', source: 'heartbeat' }), []);
+  });
+
+  it('a silent request batched with ordinary ones does not pick the turn\'s channel', async () => {
+    const silent = { reason: 'heartbeat', source: 'heartbeat', suppressProse: true, channelId: 'zulip:private', wakeChannelId: 'zulip:private' };
+    assert.deepEqual(await wake('disabled', [silent, { reason: 'heartbeat', source: 'heartbeat' }]), []);
+    assert.deepEqual(
+      await wake('disabled', [silent, { reason: 'channel-message', source: 'zulip', channelId: 'zulip:support' }]),
+      ['zulip:support'],
+    );
+  });
+
+  it('a gate wake types only where the channel\'s messages reach this agent', async () => {
+    const gate = (ch: string) => ({ reason: 'gate', source: 'gate', wakeChannelId: ch });
+    // This agent is the fork bound to zulip:b: only its home channel.
+    assert.deepEqual(await wake('disabled', gate('zulip:a'), { assistant: 'zulip:b' }), []);
+    assert.deepEqual(await wake('disabled', gate('zulip:b'), { assistant: 'zulip:b' }), ['zulip:b']);
+    // Another fork owns zulip:a: not this agent's channel.
+    assert.deepEqual(await wake('disabled', gate('zulip:a'), { 'fork-1': 'zulip:a' }), []);
+    assert.deepEqual(await wake('disabled', gate('zulip:c'), { 'fork-1': 'zulip:a' }), ['zulip:c']);
   });
 
   it('leaves explicit mode unchanged: a batched gate wake shows no typing', async () => {

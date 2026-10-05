@@ -8289,9 +8289,14 @@ export class AgentFramework {
       // and counterparty must come from the same message, or a batch of
       // "ambient from A, then addressed from B" would report B's channel
       // with A's author (review finding on the provenance change).
+      // A silent tick never suppresses a genuine coalesced wake. If any
+      // ordinary request shares this batch, the ordinary turn semantics win,
+      // including where the turn is: a silent request names no channel then.
+      const silentOnly = requests.every((r) => r.suppressProse === true);
+      const routable = silentOnly ? requests : requests.filter((r) => r.suppressProse !== true);
       let ambientReq: InferenceRequest | undefined;
       let addressedReq: InferenceRequest | undefined;
-      for (const r of requests) {
+      for (const r of routable) {
         if (!r.channelId) continue;
         ambientReq = r;
         if (r.addressed) addressedReq = r;
@@ -8303,14 +8308,11 @@ export class AgentFramework {
       // ordered by the event's own time (wakeAt) rather than flush order.
       let provReq: InferenceRequest | undefined = channelReq?.counterparty || channelReq?.wakeChannelId ? channelReq : undefined;
       if (!provReq) {
-        for (const r of requests) {
+        for (const r of routable) {
           if (!r.counterparty && !r.wakeChannelId) continue;
           if (!provReq || (r.wakeAt ?? r.timestamp) >= (provReq.wakeAt ?? provReq.timestamp)) provReq = r;
         }
       }
-      // A silent tick never suppresses a genuine coalesced wake. If any
-      // ordinary request shares this batch, the ordinary turn semantics win.
-      const silentOnly = requests.every((r) => r.suppressProse === true);
       await this.startAgentStream(agent, {
         ...trigger,
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
@@ -8870,16 +8872,27 @@ export class AgentFramework {
   /**
    * Where a `proseRouting: 'disabled'` turn shows typing: the trigger
    * channel, as in explicit mode, else where a batched gate wake came from
-   * (`wakeChannelId`; the gate deliberately names no `channelId`). Never a
+   * (`wakeChannelId`; the gate deliberately names no `channelId`) when that
+   * channel's messages reach this agent. Never a
    * tuned-out channel: its incoming traffic, addressed included, is diverted
    * away from the resident, yet an ambient push or a gate wake can still name
    * the channel, and typing there would show attendance the agent turned off
    * (`enterTuneOut` also stops typing already running there). A silent wake
    * (`suppressProse`, which also runs as disabled) shows none.
    */
-  private disabledTypingChannel(trigger: InferenceRequest | undefined): string | null {
+  private disabledTypingChannel(agentName: string, trigger: InferenceRequest | undefined): string | null {
     if (!trigger || trigger.suppressProse) return null;
-    const channelId = trigger.channelId ?? trigger.wakeChannelId;
+    let channelId = trigger.channelId;
+    if (!channelId && trigger.wakeChannelId) {
+      // The gate wakes every agent, but with conversation routing a channel's
+      // messages reach only the fork bound to it: a fork types only on its
+      // home channel, and no other agent types on a fork-bound channel.
+      const home = this.conversationAgentHomes.get(agentName);
+      const reachesAgent = home !== undefined
+        ? trigger.wakeChannelId === home
+        : ![...this.conversationAgentHomes.values()].includes(trigger.wakeChannelId);
+      if (reachesAgent) channelId = trigger.wakeChannelId;
+    }
     if (!channelId) return null;
     const serverId = this.channelRegistry?.getChannelServerId(channelId);
     if (serverId && this.channelRegistry?.getTuneOutState(serverId, channelId)) return null;
@@ -9070,7 +9083,7 @@ export class AgentFramework {
     // it on the no-driveStream failure paths (e.g. a compile refusal).
     const earlyTypingChannel =
       turnProseRouting === 'disabled'
-        ? this.disabledTypingChannel(trigger)
+        ? this.disabledTypingChannel(agent.name, trigger)
         : turnProseRouting === 'explicit'
           ? trigger?.channelId ?? null
           : this.turnLocusPins.get(agent.name) ?? null;
@@ -9342,7 +9355,7 @@ export class AgentFramework {
     //   - disabled mode: see disabledTypingChannel.
     const typingChannel =
       turnProseRouting === 'disabled'
-        ? this.disabledTypingChannel(trigger)
+        ? this.disabledTypingChannel(agent.name, trigger)
         : turnProseRouting === 'explicit'
           ? trigger?.channelId ?? null
           : resolveTurnLocus();

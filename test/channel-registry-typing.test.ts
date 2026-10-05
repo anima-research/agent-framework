@@ -140,3 +140,24 @@ test('stopTyping() global branch only dispatches stops for channels with interva
   assert.equal(stops.length, 1);
   assert.equal(stops[0].channelId, 'ch1');
 });
+
+test('a server without the channels.typing grant gets no stop, from either stopTyping branch', () => {
+  const calls: TypingCall[] = [];
+  const registry = new ChannelRegistry(
+    { getServer: () => ({ grant: new CapabilityGrant(new Set(), []) }) } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+    { sendTypingFn: (serverId, channelId, metadata, op) => { calls.push({ serverId, channelId, metadata, op }); } },
+  );
+  (registry as unknown as {
+    channels: Map<string, { serverId: string; descriptor: { id: string }; open: boolean }>;
+  }).channels.set('srv:ch1', { serverId: 'srv', descriptor: { id: 'ch1' }, open: true });
+
+  registry.startTyping('ch1'); // the timer exists; the start was skipped for lack of the grant
+  registry.stopTyping('ch1');
+  registry.startTyping('ch1');
+  registry.stopTyping();
+
+  assert.deepEqual(calls, [], 'an ungranted server receives neither start nor stop');
+});

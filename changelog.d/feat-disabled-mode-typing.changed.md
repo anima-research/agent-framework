@@ -11,3 +11,11 @@
   there. Before, its 7 s refresh continued until the turn ended. A
   disabled-mode turn does not restart it; an explicit or locus turn can still
   restart it at stream start or on a retry, as before.
+- With conversation routing, a disabled-mode gate wake shows typing only
+  where the channel's messages reach the agent: a fork on its home channel,
+  any other agent never on a fork-bound channel.
+- A silent request batched with ordinary ones no longer picks the turn's
+  channel or wake provenance; the ordinary requests decide, in every
+  prose-routing mode. A batch of only silent requests is unchanged.
+- A typing `stop` now honors the server's `channels.typing` grant, like the
+  start: a server without the grant no longer receives an unpaired stop.
