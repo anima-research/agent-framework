@@ -3,10 +3,11 @@
   batched gate wake names no `channelId`, so its `wakeChannelId` is used
   instead. Before, disabled-mode turns showed no indicator at all, so a
   resident that answers only through send tools looked idle while it worked.
-  Never on a tuned-out channel: tune-out diverts even addressed traffic away
-  from the resident, but an ambient push or a gate wake can still name the
-  channel. Silent wakes (`suppressProse`, such as a silent heartbeat) still
-  show none. Explicit and locus modes pick their typing channel as before.
+  Never on a tuned-out channel: the agent turned its attention off there, yet
+  an ambient push or a gate wake can still name the channel. Silent wakes
+  (`suppressProse`, such as a silent heartbeat) still show none. Explicit and
+  locus modes pick their typing channel as before.
 - Entering tune-out on a channel now stops a typing indicator already running
-  there, in every prose-routing mode. Before, its 7 s refresh continued until
-  the turn ended.
+  there. Before, its 7 s refresh continued until the turn ended. A
+  disabled-mode turn does not restart it; an explicit or locus turn can still
+  restart it at stream start or on a retry, as before.

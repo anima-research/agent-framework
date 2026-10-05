@@ -8871,9 +8871,9 @@ export class AgentFramework {
    * Where a `proseRouting: 'disabled'` turn shows typing: the trigger
    * channel, as in explicit mode, else where a batched gate wake came from
    * (`wakeChannelId`; the gate deliberately names no `channelId`). Never a
-   * tuned-out channel: tune-out diverts even addressed traffic away from the
-   * resident, yet an ambient push or a gate wake can still name the channel,
-   * and typing there would show attendance the agent turned off
+   * tuned-out channel: its incoming traffic, addressed included, is diverted
+   * away from the resident, yet an ambient push or a gate wake can still name
+   * the channel, and typing there would show attendance the agent turned off
    * (`enterTuneOut` also stops typing already running there). A silent wake
    * (`suppressProse`, which also runs as disabled) shows none.
    */

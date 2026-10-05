@@ -1863,9 +1863,6 @@ export class ChannelRegistry {
       tuneOut: params,
       wakeCount: 0,
     });
-    // A tuned-out channel shows no attendance: stop a typing run already
-    // going there, or its 7s refresh would continue until the turn ends.
-    this.stopTyping(channelId);
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -1875,6 +1872,9 @@ export class ChannelRegistry {
       source,
       timestamp: new Date().toISOString(),
     });
+    // A tuned-out channel shows no attendance: stop a typing run already
+    // going there, or its 7s refresh would continue until the turn ends.
+    this.stopTyping(channelId);
   }
 
   /**

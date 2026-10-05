@@ -176,7 +176,7 @@ describe('typing with proseRouting disabled, through the real gate and registry'
     }
   });
 
-  it('tune-out entered mid-turn stops the typing already running there', async () => {
+  it('tune-out entered mid-turn, before the stream starts, stops the typing already running there', async () => {
     let intervalsAfterTuneOut = -1;
     const x = await makeRealPath({
       onStream: (registry) => {
