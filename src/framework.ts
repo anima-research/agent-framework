@@ -8870,20 +8870,20 @@ export class AgentFramework {
   /**
    * Where a `proseRouting: 'disabled'` turn shows typing: the trigger
    * channel, as in explicit mode, else where a batched gate wake came from
-   * (`wakeChannelId`; the gate deliberately names no `channelId`). Not a
-   * tuned-out channel: its ambient traffic can reach the gate before tune-out
-   * diverts it, and typing there would show attendance the agent turned
-   * off. A silent wake (`suppressProse`, which also runs as disabled) shows
-   * none.
+   * (`wakeChannelId`; the gate deliberately names no `channelId`). Never a
+   * tuned-out channel: tune-out diverts even addressed traffic away from the
+   * resident, yet an ambient push or a gate wake can still name the channel,
+   * and typing there would show attendance the agent turned off
+   * (`enterTuneOut` also stops typing already running there). A silent wake
+   * (`suppressProse`, which also runs as disabled) shows none.
    */
   private disabledTypingChannel(trigger: InferenceRequest | undefined): string | null {
     if (!trigger || trigger.suppressProse) return null;
-    if (trigger.channelId) return trigger.channelId;
-    const wake = trigger.wakeChannelId;
-    if (!wake) return null;
-    const serverId = this.channelRegistry?.getChannelServerId(wake);
-    if (serverId && this.channelRegistry?.getTuneOutState(serverId, wake)) return null;
-    return wake;
+    const channelId = trigger.channelId ?? trigger.wakeChannelId;
+    if (!channelId) return null;
+    const serverId = this.channelRegistry?.getChannelServerId(channelId);
+    if (serverId && this.channelRegistry?.getTuneOutState(serverId, channelId)) return null;
+    return channelId;
   }
 
   /**

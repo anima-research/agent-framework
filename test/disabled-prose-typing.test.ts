@@ -80,24 +80,27 @@ describe('typing with proseRouting disabled', () => {
 });
 
 /**
- * The real path: an incoming channel message goes through the ChannelRegistry,
- * a debounced EventGate wake (which carries only wakeChannelId), and the
- * tune-out coordinator; typing is recorded at the registry's sendTypingFn.
+ * The real path: typing is recorded at the ChannelRegistry's sendTypingFn,
+ * with the real EventGate (debounce) and TuneOutCoordinator in place.
  */
-async function makeRealPath(tunedOut: boolean) {
+async function makeRealPath(opts: { tunedOut?: boolean; onStream?: (registry: ChannelRegistry) => void } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'disabled-typing-real-'));
-  const membrane = { streamYielding: () => new MockYieldingStream([createMockResponse([])]) };
+  let streams = 0;
+  let registry!: ChannelRegistry;
+  const membrane = {
+    streamYielding: () => { streams++; opts.onStream?.(registry); return new MockYieldingStream([createMockResponse([])]); },
+  };
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane as any,
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'test', proseRouting: 'disabled' }],
     modules: [],
-    gate: { config: { default: 'always', policies: [{ name: 'batch', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 50 } }] } },
+    gate: { config: { default: 'always', policies: [{ name: 'batch', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } }] } },
   } as any);
   const typing: { channelId: string; op: string }[] = [];
   const server = { grant: new CapabilityGrant(new Set(['channels.typing']), []) };
   const servers = { getServer: () => server } as any;
   const f = framework as any;
-  const registry = new ChannelRegistry(servers, {} as any, (e: any) => f.pushEvent(e), () => {}, {
+  registry = new ChannelRegistry(servers, {} as any, (e: any) => f.pushEvent(e), () => {}, {
     store: f.store,
     shouldTriggerInference: f.eventGate.asShouldTriggerCallback(),
     sendTypingFn: (_s: string, channelId: string, _m: unknown, op?: string) => { typing.push({ channelId, op: op ?? 'start' }); },
@@ -116,33 +119,85 @@ async function makeRealPath(tunedOut: boolean) {
     isForkBound: () => false, isPrivilegedAuthor: () => false, allowChannelSpeech: () => false,
     emitTrace: () => {},
   } as any);
-  if (tunedOut) {
-    registry.enterTuneOut('zulip', 'zulip:support', {
-      epochId: 'epoch-1', cadenceSeconds: 3600, backlogCap: 20, maxWakes: 5, startedAtSequence: f.store.currentSequence(),
-    } as any, 'agent-tool' as any);
-  }
-  registry.handleIncoming('zulip', { messages: [{
-    channelId: 'zulip:support', messageId: 'm1', author: { id: 'u1', name: 'Human' },
-    timestamp: new Date().toISOString(), content: [{ type: 'text', text: 'ambient traffic' }],
-    tags: ['chat:ambient', 'chat:from-human'],
-  }] } as any);
-  await framework.runUntilIdle();
-  await new Promise((r) => setTimeout(r, 120)); // let the debounce fire
-  await framework.runUntilIdle();
-  const result = { typing, intervals: (registry as any).typingIntervals.size as number };
-  await framework.stop(); rmSync(dir, { recursive: true, force: true });
-  return result;
+  const tuneOut = () => registry.enterTuneOut('zulip', 'zulip:support', {
+    epochId: 'epoch-1', cadenceSeconds: 3600, backlogCap: 20, maxWakes: 5, startedAtSequence: f.store.currentSequence(),
+  } as any, 'agent-tool' as any);
+  if (opts.tunedOut) tuneOut();
+  return {
+    framework, registry, typing, tuneOut,
+    streams: () => streams,
+    starts: () => typing.filter((t) => t.op === 'start').map((t) => t.channelId),
+    async ambient() {
+      registry.handleIncoming('zulip', { messages: [{
+        channelId: 'zulip:support', messageId: 'm1', author: { id: 'u1', name: 'Human' },
+        timestamp: new Date().toISOString(), content: [{ type: 'text', text: 'ambient traffic' }],
+        tags: ['chat:ambient', 'chat:from-human'],
+      }] } as any);
+      await framework.runUntilIdle();
+      await new Promise((r) => setTimeout(r, 300)); // past the 100 ms debounce
+      await framework.runUntilIdle();
+    },
+    async request(r: Record<string, unknown>) {
+      f.pendingRequests.push({ agentName: 'assistant', timestamp: Date.now(), ...r });
+      await framework.runUntilIdle();
+    },
+    async close() { await framework.stop(); rmSync(dir, { recursive: true, force: true }); },
+  };
 }
 
 describe('typing with proseRouting disabled, through the real gate and registry', () => {
   it('a debounced ambient wake types where it came from, then stops', async () => {
-    const { typing, intervals } = await makeRealPath(false);
-    assert.deepEqual(typing, [{ channelId: 'zulip:support', op: 'start' }, { channelId: 'zulip:support', op: 'stop' }]);
-    assert.equal(intervals, 0);
+    const x = await makeRealPath();
+    try {
+      await x.ambient();
+      assert.equal(x.streams(), 1, 'the gate wake ran a turn');
+      assert.deepEqual(x.typing, [{ channelId: 'zulip:support', op: 'start' }, { channelId: 'zulip:support', op: 'stop' }]);
+      assert.equal((x.registry as any).typingIntervals.size, 0);
+    } finally { await x.close(); }
   });
 
-  it('a tuned-out channel shows no typing, even when its traffic reaches the gate', async () => {
-    const { typing } = await makeRealPath(true);
-    assert.deepEqual(typing, []);
+  it('a tuned-out channel shows no typing when its traffic still reaches the gate', async () => {
+    const x = await makeRealPath({ tunedOut: true });
+    try {
+      await x.ambient();
+      assert.equal(x.streams(), 1, 'the gate wake ran a turn');
+      assert.deepEqual(x.starts(), []);
+    } finally { await x.close(); }
+  });
+
+  it('a tuned-out channel shows no typing for a push that names it, ambient or addressed', async () => {
+    for (const addressed of [false, true]) {
+      const x = await makeRealPath({ tunedOut: true });
+      try {
+        await x.request({ reason: 'mcpl:push-event', source: 'zulip', channelId: 'zulip:support', addressed });
+        assert.equal(x.streams(), 1, 'the push ran a turn');
+        assert.deepEqual(x.starts(), [], `addressed=${addressed}`);
+      } finally { await x.close(); }
+    }
+  });
+
+  it('tune-out entered mid-turn stops the typing already running there', async () => {
+    let intervalsAfterTuneOut = -1;
+    const x = await makeRealPath({
+      onStream: (registry) => {
+        x.tuneOut();
+        intervalsAfterTuneOut = (registry as any).typingIntervals.size;
+      },
+    });
+    try {
+      await x.request({ reason: 'mcpl:push-event', source: 'zulip', channelId: 'zulip:support', addressed: true });
+      assert.equal(x.streams(), 1);
+      assert.equal(intervalsAfterTuneOut, 0, 'no refresh keeps running after tune-out');
+      assert.deepEqual(x.typing, [{ channelId: 'zulip:support', op: 'start' }, { channelId: 'zulip:support', op: 'stop' }]);
+    } finally { await x.close(); }
+  });
+
+  it('a silent wake that names channels still shows no typing', async () => {
+    const x = await makeRealPath();
+    try {
+      await x.request({ reason: 'heartbeat', source: 'heartbeat', suppressProse: true, channelId: 'zulip:support', wakeChannelId: 'zulip:support' });
+      assert.equal(x.streams(), 1);
+      assert.deepEqual(x.starts(), []);
+    } finally { await x.close(); }
   });
 });
