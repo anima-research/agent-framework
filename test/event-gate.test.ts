@@ -547,6 +547,27 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests[0].counterparty, undefined, 'no author on the chosen event, none borrowed from the chatter');
   });
 
+  it('a newer AMBIENT route-only push does not hide an earlier event\'s channel and author', async () => {
+    const path = writeConfig('debounce-route-only-ambient.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const resolveRouteChannel = (info: GateEventInfo) =>
+      typeof info.metadata?.mcplChannelId === 'string' ? info.metadata.mcplChannelId : info.channelId || undefined;
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'surface', channelId: 'surface:room:general',
+      content: 'chatter', metadata: { authorId: '7' } }));
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'surface', content: 'status ping',
+      metadata: { mcplChannelId: 'surface:room:feed' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].channelId, 'surface:room:general', 'telemetry keeps the attributable event');
+    assert.strictEqual(inferenceRequests[0].counterparty, 'surface:user:7');
+    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined, 'ambient batches never route');
+  });
+
   it('a throwing route resolver never breaks gating', async () => {
     const path = writeConfig('debounce-route-throw.json', {
       policies: [
