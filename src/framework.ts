@@ -1315,10 +1315,12 @@ export class AgentFramework {
   private codeExecutionConfig: import('./types/index.js').CodeExecutionConfig | null = null;
   private codeExecutionRunners: Map<string, PyRunner> = new Map();
   private scriptToolWaiters: Map<string, (result: ToolResult) => void> = new Map();
-  /** Agents whose running script hit an endTurn-carrying inner result —
-   *  deferred and applied to the final code_execution result instead of
-   *  cancelling the stream mid-script (which would wedge the turn). */
-  private scriptDeferredEndTurn: Set<string> = new Set();
+  /** Per agent, the foreground script now running. An endTurn-carrying inner
+   *  result marks the script that made the call, and is applied to that
+   *  script's code_execution result instead of cancelling the stream
+   *  mid-script (which would wedge the turn). A stopped script's late result
+   *  marks only that script, never the agent's next one. */
+  private scriptDeferredEndTurn: Map<string, { endTurn: boolean }> = new Map();
   /** Background (daemon) scripts: model-authored watchers that outlive their
    *  spawning turn. Each gets a DEDICATED PyRunner; wake_agent() injects a
    *  provenance envelope + payload and requests inference. Keyed by script id. */
@@ -11188,9 +11190,12 @@ export class AgentFramework {
     }
 
     const runner = this.getOrCreateScriptRunner(agentName);
-    this.scriptDeferredEndTurn.delete(agentName);
+    // A busy runner refuses this exec; the running script keeps its mark.
+    const script = { endTurn: false };
+    if (!runner.busy) this.scriptDeferredEndTurn.set(agentName, script);
     const exec = await runner.exec(input.code, injected, undefined, timeLimitMs !== undefined ? { deadlineMs: timeLimitMs } : undefined);
-    const endTurn = this.scriptDeferredEndTurn.delete(agentName);
+    if (this.scriptDeferredEndTurn.get(agentName) === script) this.scriptDeferredEndTurn.delete(agentName);
+    const endTurn = script.endTurn;
 
     return {
       success: true,
@@ -11595,7 +11600,9 @@ export class AgentFramework {
         scriptTimeoutMs: cfg?.scriptTimeoutMs,
         idleReclaimMs: cfg?.idleReclaimMs,
         label: agentName,
-        onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args),
+        // The script that made the call is the one running when it arrives.
+        onToolCall: (toolName, args) =>
+          this.handleScriptToolCall(agentName, toolName, args, this.scriptDeferredEndTurn.get(agentName)),
       });
       this.codeExecutionRunners.set(agentName, runner);
     }
@@ -11615,16 +11622,18 @@ export class AgentFramework {
     agentName: string,
     toolName: string,
     args: Record<string, unknown>,
+    /** The foreground script that made the call; none for a background script. */
+    script?: { endTurn: boolean },
   ): Promise<string> {
     if (toolName === CODE_EXECUTION_TOOL_NAME) {
       return 'Error: code_execution cannot be called from within a script';
     }
     const result = await this.dispatchScriptToolCall(agentName, toolName, args);
-    if (result.endTurn) {
+    if (result.endTurn && script) {
       // Deferred: applied to the final code_execution result (see
       // scriptDeferredEndTurn) — ending the turn mid-script would cancel the
       // stream while the script still runs and wedge the tool round.
-      this.scriptDeferredEndTurn.add(agentName);
+      script.endTurn = true;
     }
     if (result.isError) {
       return `Error: ${result.error ?? 'tool call failed'}`;

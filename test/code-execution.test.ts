@@ -535,6 +535,44 @@ describe('framework code_execution integration (real python3)', () => {
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  it("a stopped script's late end-turn request does not end the next script's turn", async () => {
+    let releaseFinish: () => void = () => {};
+    const finishReleased = new Promise<void>((resolve) => { releaseFinish = resolve; });
+    let finishStarted = false;
+    class SlowFinishModule extends ScriptToolModule {
+      override async handleToolCall(call: ToolCall): Promise<ToolResult> {
+        if (call.name.endsWith('finish')) {
+          finishStarted = true;
+          await finishReleased;
+        }
+        return super.handleToolCall(call);
+      }
+    }
+    const { tempDir, storePath } = tempStorePath('pytc-stale-endturn-');
+    const framework = await createFrameworkWithCodeExecution(storePath, new MockMembrane(), new SlowFinishModule());
+    const run = (input: Record<string, unknown>) =>
+      framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input });
+    framework.start();
+    try {
+      // The first script is stopped at its time limit while its call that ends the turn is running.
+      const stopped = await run({ code: 'await test__finish({})', time_limit_ms: 1000 });
+      assert.ok(finishStarted);
+      assert.match((stopped.data as { stderr: string }).stderr, /reached its 1s time limit/);
+      assert.ok(!stopped.endTurn);
+
+      // The call finishes while the next script runs; its request belonged to the stopped script.
+      const next = run({ code: 'import asyncio\nawait asyncio.sleep(1)\nprint("next done")' });
+      await new Promise((r) => setTimeout(r, 300));
+      releaseFinish();
+      const result = await next;
+      assert.strictEqual((result.data as { stdout: string }).stdout, 'next done\n');
+      assert.ok(!result.endTurn, "the stopped script's request ended the next script's turn");
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
