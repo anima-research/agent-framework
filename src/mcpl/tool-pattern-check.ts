@@ -53,7 +53,8 @@ export function checkToolPattern(
   toolNames: Iterable<string>,
   servers: readonly PatternServer[],
 ): ToolPatternVerdict {
-  for (const name of toolNames) {
+  const names = [...toolNames];
+  for (const name of names) {
     if (globMatch(pattern, name)) return { kind: 'matched' };
   }
   const pending = servers.filter((s) => !s.listed && couldMatchUnderPrefix(pattern, s.prefix));
@@ -61,11 +62,20 @@ export function checkToolPattern(
 
   // Written against the wrong namespace for a known server: the bare id
   // (`<id>--…`) where the effective prefix differs, or the default form
-  // (`mcpl--<id>--…`) for a server that set its own toolPrefix.
+  // (`mcpl--<id>--…`) for a server that set its own toolPrefix. Never when
+  // the namespace as written is real — another server's toolPrefix or a
+  // module's tools — since the pattern then names that, not a mistake.
+  const inRealNamespace = (ns: string) =>
+    servers.some((o) => o.prefix === ns) || names.some((n) => n.startsWith(`${ns}--`));
   for (const s of servers) {
     let rest: string | undefined;
-    if (s.prefix !== s.id && pattern.startsWith(`${s.id}--`)) rest = pattern.slice(s.id.length + 2);
-    else if (s.prefix !== `mcpl--${s.id}` && pattern.startsWith(`mcpl--${s.id}--`)) rest = pattern.slice(s.id.length + 8);
+    if (s.prefix !== s.id && pattern.startsWith(`${s.id}--`) && !inRealNamespace(s.id)) {
+      rest = pattern.slice(s.id.length + 2);
+    } else if (
+      s.prefix !== `mcpl--${s.id}` && pattern.startsWith(`mcpl--${s.id}--`) && !inRealNamespace(`mcpl--${s.id}`)
+    ) {
+      rest = pattern.slice(s.id.length + 8);
+    }
     if (rest === undefined) continue;
     const why = s.prefix === `mcpl--${s.id}` ? ' (no toolPrefix set; the default is "mcpl--<serverId>")' : '';
     return {

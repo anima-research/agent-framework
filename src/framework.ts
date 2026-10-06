@@ -13557,6 +13557,22 @@ export class AgentFramework {
   private static readonly MANIFEST_FETCH_FLOOR_MS = 5_000;
 
   /**
+   * The `mcpl:policy-refused` fields from a refusal receipt, as the host
+   * acts on them: the receipt is server-supplied, so `fallback` is the
+   * branch actually taken (anything but `close` is treated as `mcp-only`)
+   * and a non-string `reason` is dropped.
+   */
+  private static policyRefusalFields(receipt: { fallback?: unknown; reason?: unknown }): {
+    fallback: 'close' | 'mcp-only';
+    reason: string | null;
+  } {
+    return {
+      fallback: receipt.fallback === 'close' ? 'close' : 'mcp-only',
+      reason: typeof receipt.reason === 'string' ? receipt.reason : null,
+    };
+  }
+
+  /**
    * §17.5 host processing: fetch the complete manifest, validate exactly as
    * at initialize, diff, apply §6.7 consequences (removals eagerly even
    * when other declarations are invalid; additions only through
@@ -13675,8 +13691,7 @@ export class AgentFramework {
             type: 'mcpl:policy-refused',
             serverId: connection.id,
             phase: 'manifest-change',
-            reason: receipt.reason ?? null,
-            fallback,
+            ...AgentFramework.policyRefusalFields(receipt),
           });
           if (fallback === 'close') {
             await connection.close();
@@ -13794,8 +13809,7 @@ export class AgentFramework {
           type: 'mcpl:policy-refused',
           serverId: config.id,
           phase: 'initial',
-          reason: receipt.reason ?? null,
-          fallback,
+          ...AgentFramework.policyRefusalFields(receipt),
         });
         if (fallback === 'close') {
           await connection.close();
@@ -14393,7 +14407,12 @@ export class AgentFramework {
           }
         }
       } catch {
-        // Server may not support tools/list — skip silently
+        // Server may not support tools/list — skip silently. A live server
+        // whose handshake advertised no MCP `tools` has, in effect, listed
+        // nothing; count it as listed so tool-pattern checks do not wait on
+        // it forever. (A server that advertised tools but failed to list
+        // them stays unknown.)
+        if (server.isConnected && !server.mcpToolsAdvertised) listedServers.add(server.id);
       }
     }
 
