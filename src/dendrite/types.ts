@@ -194,6 +194,13 @@ export interface ContextInheritance {
 export interface AgentSpec {
   name: AgentName;
   kind: AgentKind;
+  /**
+   * The model the agent runs on — "whose weights", next to `inherit.from`
+   * for "whose context". Together they are what a consent decision about a
+   * derived agent is made on. Filled by the framework from the agent's
+   * configuration.
+   */
+  model?: string;
   roles: AgentRoles;
   lifetime: AgentLifetime;
   activation?: ActivationBounds;
@@ -263,6 +270,7 @@ export interface ActivationRecord {
 export interface AgentRecord {
   name: AgentName;
   kind: AgentKind;
+  model?: string;
   /**
    * Bumped every time this identity is instantiated: a persistent agent
    * restored at boot is a new incarnation of the same identity.

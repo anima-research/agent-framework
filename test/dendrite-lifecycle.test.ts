@@ -131,6 +131,10 @@ describe('Dendrite lifecycle', () => {
     const created = traces.find((t) => t.type === 'dendrite:agent-created' && t.agentName === 'worker-1');
     assert.ok(created, 'creation is announced');
     assert.deepEqual((created as { lifetime: unknown }).lifetime, record.lifetime);
+    // Whose weights, next to whose context: what a consent decision is made on.
+    assert.equal((created as { model?: string }).model, 'test-model');
+    assert.equal(record.model, 'test-model');
+    assert.equal(byName.get('mira')!.model, 'test-model');
 
     gates.release('g1');
     const result = await worker.settled;
@@ -267,11 +271,14 @@ describe('Dendrite lifecycle', () => {
     assert.equal(landed.length, 1);
     assert.equal(landed[0]!.participant, 'fork-1', 'the result is the child\'s own words under its own name');
     assert.equal(landed[0]!.text, 'the answer is 42');
-    assert.deepEqual(landed[0]!.metadata.dendrite, {
+    const stamp = landed[0]!.metadata.dendrite as Record<string, unknown>;
+    assert.equal(typeof stamp.producedAt, 'number', 'when it was produced, apart from when it is read');
+    assert.deepEqual({ ...stamp, producedAt: undefined }, {
       mailId: delivery.mailId,
       kind: 'result',
       from: { agent: 'fork-1', incarnation: 1 },
       causedBy: ['task-7'],
+      producedAt: undefined,
     });
     assert.deepEqual(framework.listHeldMail(), [], 'a delivered result is no longer held');
     // (Co-residents share one message slot today, so mira can read it too;
@@ -545,9 +552,16 @@ describe('Dendrite restart', () => {
     });
     await until(() => gates1.entered.has('mira-busy'), 'mira to be mid-turn');
 
+    const traces: TraceEvent[] = [];
+    first.onTrace((event) => traces.push(event));
     const delivery = first.deliverAgentResult('job', [{ type: 'text', text: 'survives the crash' }]);
     assert.equal(delivery.delivered, true, 'queued for mira');
     assert.equal(first.listHeldMail().length, 1, 'still held: the message has not entered the store');
+    // Published is not delivered: queued for a boundary is a deferral.
+    assert.deepEqual(
+      traces.filter((t) => t.type.startsWith('dendrite:mail-')).map((t) => t.type),
+      ['dendrite:mail-deferred'],
+    );
     assert.equal(
       textsIn(first, 'mira').some((m) => m.metadata.kind === 'agent-result'),
       false,

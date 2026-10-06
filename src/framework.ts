@@ -4287,12 +4287,13 @@ export class AgentFramework {
           ? {
               ...spec,
               name: config.name,
+              model: config.model,
               // A shared fork's context lives under its parent's namespace,
               // on the fork's own branch — not in a namespace of its own.
               namespace: inherit?.mode === 'shared' ? namespace : spec.namespace ?? namespace,
               ...(inherit ? { inherit } : {}),
             }
-          : workerSpec(config.name, { namespace }),
+          : { ...workerSpec(config.name, { namespace }), model: config.model },
       });
 
       const cleanup = () => {
@@ -4492,6 +4493,7 @@ export class AgentFramework {
       spec: {
         name,
         kind: record.kind,
+        model: fullConfig.model,
         roles: record.roles,
         lifetime: record.lifetime,
         ...(record.activation ? { activation: record.activation } : {}),
@@ -4867,6 +4869,7 @@ export class AgentFramework {
       });
       return false;
     }
+    const placement: { agent?: string; messageId?: MessageId; deferredId?: string } = {};
     this.addMessage(
       // The sender's own name: its words stay its own.
       mail.from.agent,
@@ -4877,18 +4880,27 @@ export class AgentFramework {
           mailId: mail.id,
           kind: mail.kind,
           from: mail.from,
+          // When the sender produced it — distinct from when it is read. A
+          // result held across a restart arrives later than it was made,
+          // and the reader should be able to tell.
+          producedAt: mail.createdAt,
           ...(mail.causedBy?.length ? { causedBy: mail.causedBy } : {}),
         },
       } as MessageMetadata,
-      { forAgent: mail.to },
+      { forAgent: mail.to, placement },
     );
-    this.emitTrace({
-      type: 'dendrite:mail-delivered',
-      mailId: mail.id,
-      kind: mail.kind,
-      from: mail.from.agent,
-      to: mail.to,
-    });
+    if (!placement.messageId) {
+      // Queued for the recipient's next boundary. `mail-delivered` fires
+      // when the message actually enters its store (releaseLandedMail):
+      // published is not delivered.
+      this.emitTrace({
+        type: 'dendrite:mail-deferred',
+        mailId: mail.id,
+        kind: mail.kind,
+        from: mail.from.agent,
+        to: mail.to,
+      });
+    }
     if (wake) {
       this.pendingRequests.push({
         agentName: mail.to,
@@ -4920,6 +4932,7 @@ export class AgentFramework {
       type: 'dendrite:agent-created',
       agentName: record.name,
       kind: record.kind,
+      ...(record.model ? { model: record.model } : {}),
       incarnation: record.incarnation,
       lifetime: record.lifetime,
       ...(record.relationships.spawnedBy
@@ -7433,7 +7446,7 @@ export class AgentFramework {
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     // The first resident declared owns default delivery.
     this.announceAgentCreated(
-      this.registry.register(residentSpec(config.name, { primary: !this.primaryAgentName })),
+      this.registry.register({ ...residentSpec(config.name, { primary: !this.primaryAgentName }), model: config.model }),
     );
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
     if (restoredSettings) {
@@ -7514,7 +7527,9 @@ export class AgentFramework {
     // An attention tenant of the resident it serves: reads the shared slot
     // through its merged view (held traffic included), never a broadcast
     // recipient, and outlives policy epochs.
-    this.announceAgentCreated(this.registry.register(subconsciousSpec(name, primaryName)));
+    this.announceAgentCreated(
+      this.registry.register({ ...subconsciousSpec(name, primaryName), model: agentConfig.model }),
+    );
     this.agents.set(name, agent);
     this.agentConfigs.set(name, agentConfig);
     this.subconsciousAgentName = name;
@@ -7673,7 +7688,7 @@ export class AgentFramework {
             if (deferred.length > 0) {
               for (const msg of deferred) {
                 agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
-                this.releaseLandedMail(msg.metadata);
+                this.releaseLandedMail(msg.metadata, agent.name);
                 // Injection guards: tool blocks would corrupt the tool-cycle
                 // structure the membrane enforces, and a message named as the
                 // agent itself would render as an ASSISTANT turn on the wire
@@ -8350,11 +8365,14 @@ export class AgentFramework {
       const agent = new Agent(config, contextManager, this.membrane);
       this.restoreToolResultGuardSetting(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-      this.announceAgentCreated(this.registry.register(conversationForkSpec(name, {
-        template: router.templateAgent,
-        channelId,
-        idleTtlMs: router.idleTtlMs,
-      })));
+      this.announceAgentCreated(this.registry.register({
+        ...conversationForkSpec(name, {
+          template: router.templateAgent,
+          channelId,
+          idleTtlMs: router.idleTtlMs,
+        }),
+        model: config.model,
+      }));
       this.agents.set(name, agent);
       this.agentConfigs.set(name, config);
       return agent;
@@ -10014,7 +10032,7 @@ export class AgentFramework {
             const id = agent.getContextManager().addMessage(
               msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id),
             );
-            this.releaseLandedMail(msg.metadata);
+            this.releaseLandedMail(msg.metadata, agent.name);
             this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
           } catch (err) {
             console.error(
@@ -13417,7 +13435,7 @@ export class AgentFramework {
       opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
     );
     if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
-    this.releaseLandedMail(metadata);
+    this.releaseLandedMail(metadata, agent.name);
     return stored;
   }
 
@@ -13428,9 +13446,17 @@ export class AgentFramework {
    * deferred-write flushes (turn start, tool boundary). Both writes reach
    * disk in the same sync, so a crash keeps either both or neither.
    */
-  private releaseLandedMail(metadata: MessageMetadata | undefined): void {
-    const mailId = (metadata as { dendrite?: { mailId?: unknown } } | undefined)?.dendrite?.mailId;
-    if (typeof mailId === 'string') this.registry.releaseMail(mailId);
+  private releaseLandedMail(metadata: MessageMetadata | undefined, recipient: string): void {
+    const stamp = (metadata as { dendrite?: { mailId?: unknown; kind?: unknown; from?: { agent?: unknown } } } | undefined)?.dendrite;
+    if (typeof stamp?.mailId !== 'string') return;
+    this.registry.releaseMail(stamp.mailId);
+    this.emitTrace({
+      type: 'dendrite:mail-delivered',
+      mailId: stamp.mailId,
+      kind: String(stamp.kind ?? 'message'),
+      from: String(stamp.from?.agent ?? ''),
+      to: recipient,
+    });
   }
 
   /**

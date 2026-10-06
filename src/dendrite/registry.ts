@@ -104,6 +104,7 @@ export class AgentRegistry {
     const record: AgentRecord = {
       name: spec.name,
       kind: spec.kind,
+      ...(spec.model ? { model: spec.model } : {}),
       incarnation,
       roles: { ...spec.roles },
       lifetime: { ...spec.lifetime },

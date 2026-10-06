@@ -494,6 +494,8 @@ export type TraceEvent =
       type: 'dendrite:agent-created';
       agentName: string;
       kind: string;
+      /** Whose weights; `inherit.from` is whose context. */
+      model?: string;
       incarnation: number;
       lifetime: import('../dendrite/types.js').AgentLifetime;
       spawnedBy?: string;
@@ -529,8 +531,17 @@ export type TraceEvent =
       by?: string;
       reason?: string;
     })
+  /** The message entered the recipient's store (not merely queued for it). */
   | (TraceEventBase & {
       type: 'dendrite:mail-delivered';
+      mailId: string;
+      kind: string;
+      from: string;
+      to: string;
+    })
+  /** Queued for the recipient's next boundary; `mail-delivered` follows when it lands. */
+  | (TraceEventBase & {
+      type: 'dendrite:mail-deferred';
       mailId: string;
       kind: string;
       from: string;

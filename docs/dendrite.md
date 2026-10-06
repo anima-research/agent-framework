@@ -96,7 +96,7 @@ Each agent declares `onParentEnd`:
 
 `reparentAgent` clears the orphan state. If the orphan's result recipient is gone, the route moves to the new parent and results already held are delivered there.
 
-The `dendrite:agent-created` trace names the kind, the lifetime and the `onParentEnd` policy at creation.
+The `dendrite:agent-created` trace names the kind, the model (whose weights), the context source (whose context), the lifetime and the `onParentEnd` policy at creation. It is the event a consent decision about a derived agent can be made on; the consent flow itself belongs to the host.
 
 ### After a restart
 
@@ -112,7 +112,9 @@ framework.sendAgentMessage('oren', 'mira', [{ type: 'text', text: 'the build is 
 framework.deliverAgentResult('fork-1', [{ type: 'text', text: result.speech }], { causedBy: ['task-7'] });
 ```
 
-Both put the sender's content in the recipient's context **under the sender's own name**. `metadata.dendrite` carries the sender's name and incarnation, the mail id and the causal chain. Nothing is inserted into the recipient's own voice.
+Both put the sender's content in the recipient's context **under the sender's own name**. `metadata.dendrite` carries the sender's name and incarnation, the mail id, the causal chain, and `producedAt`, when the sender produced it, so a result that arrives late reads as mail from then rather than as the present. Nothing is inserted into the recipient's own voice.
+
+Published is not delivered. `dendrite:mail-deferred` fires when a message is queued for a recipient's next boundary; `dendrite:mail-delivered` fires only when it has entered the recipient's store. Neither says the model has seen it; that is a separate event the framework does not yet record.
 
 A result is written to the registry and synced to disk before delivery is attempted. It is released only when its message has entered the recipient's store. Consequences:
 
@@ -275,8 +277,8 @@ The framework detects these at run time. The registry, lifecycle, attributed mai
 The proposal left these open. Each is a decision of this implementation and can be revisited.
 
 1. **A fork is a Chronicle branch read through a branch-bound handle.** The alternative, an overlay in the context manager, would have re-implemented copy-on-write for eleven strategy states with in-place edits.
-2. **A fork inherits the states its parent's context manager owns** (message slot, auxiliary slots, context log, strategy states, the mint-preimage index) and nothing else in the store.
-3. **Queues, locks and refusal records are inherited as persisted state.** Compression holds and compression work in flight are not; the child rebuilds its queue from what is persisted, as after a restart.
+2. **A fork inherits the states its parent's context manager owns** (message slot, auxiliary slots, context log, the strategy's declared manifest, the mint-preimage index) and nothing else in the store.
+3. **The inherited-state manifest is the strategy's to declare.** The autobiographical strategy inherits summaries, chunk records, the id counter, pins, resolutions, locks, calibration, the kv-unified receipt and the merge quarantine; it leaves the merge queue (rebuilt from inherited memory on initialize) and its compression-refusal ledger empty on the child's branch. That is the list Linn quoted from the earlier design doc's §7 in the architecture channel. Compression holds and compression work in flight are not inherited either.
 4. **Running bounded jobs no longer receive untargeted broadcasts or gate wakes.**
 5. **Orphans keep running by default**, and the adoption offer is a notice to the nearest live ancestor, then the primary.
 6. **The default-delivery owner cannot be stopped.**

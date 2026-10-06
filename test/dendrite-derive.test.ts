@@ -327,12 +327,18 @@ describe('Dendrite deriveAgent', () => {
       resultTo: { to: 'mira', as: 'message' },
       framing: [{ participant: 'user', content: [{ type: 'text', text: FRAMING }] }],
     });
+    const mailTraces: string[] = [];
+    framework.onTrace((event) => {
+      if (event.type.startsWith('dendrite:mail-')) mailTraces.push(event.type);
+    });
     const delivery = framework.deliverAgentResult('fork-1', [{ type: 'text', text: result.speech }]);
     assert.equal(delivery.delivered, true);
     // mira is mid-turn: the result waits for her tool boundary, never lost.
     assert.equal(framework.listHeldMail().length, 1);
+    assert.deepEqual(mailTraces, ['dendrite:mail-deferred'], 'queued is not delivered');
     gates.release('g-mira');
     await until(() => framework.listHeldMail().length === 0, 'the result to enter mira\'s context');
+    assert.deepEqual(mailTraces, ['dendrite:mail-deferred', 'dendrite:mail-delivered'], 'delivered when it entered the store');
     const landed = framework.getAgent('mira')!.getContextManager().getAllMessages()
       .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'agent-result');
     assert.equal(landed.length, 1);
