@@ -271,6 +271,7 @@ The framework detects these at run time. The registry, lifecycle, attributed mai
 - **Per-activation bounds** (`maxTurns`, `maxInputTokens`) are recorded and not enforced.
 - **Model-facing tools** for any of this. The framework provides the API; tools belong to the host.
 - **Resource accounting and write-conflict handling** between agents that share external state.
+- **A loud miss for off-branch sequences in Chronicle.** `iterFrom`/`query` on a handle still scan the log from the start when the branch has no record at the requested sequence. Nothing in the fork path reads records by sequence, so a fork cannot reach it, but a direct caller on a view can.
 
 ## Choices made here
 
