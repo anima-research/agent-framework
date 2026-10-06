@@ -268,6 +268,10 @@ unread backlog is simply its unread backlog. Receipts and subject history are
 kept in the `mcpl/coalescing` state (retry window 1 h); audit lines are
 `mcpl:coalescing` trace events.
 
+#### Per-channel conversation routing (deprecated)
+
+> **Deprecated: `FrameworkConfig.conversations` (`ConversationRouter`).** Per-channel conversation routing sends each channel's traffic to its own fork agent, spawned from a template agent and closed after an idle TTL. It is being retired ([#235](https://github.com/anima-research/agent-framework/issues/235)). Its `'mention'` bind/trigger rule, the default for channels, reads `metadata.mentioned`, which discord-mcpl does not set, so on Discord channels an @-mention never binds a fork or triggers a bound one. Don't adopt it in new hosts. Existing configurations still route exactly as before, and the framework logs one `[deprecated]` line when it is created with `conversations` set. Removal is a follow-up.
+
 ### Streaming Lifecycle
 
 1. **Start**: Framework calls `agent.startStreamWithInjections()` → `YieldingStream`

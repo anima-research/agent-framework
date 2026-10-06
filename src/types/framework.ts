@@ -274,6 +274,13 @@ export interface FrameworkConfig {
    * messages route to per-channel fork agents spawned from the template
    * agent instead of the primary conversation. If omitted, behavior is
    * unchanged (all messages go to the primary agent).
+   *
+   * @deprecated Per-channel conversation routing is deprecated and will be
+   * removed (anima-research/agent-framework#235). Its 'mention' bind/trigger
+   * rule reads `metadata.mentioned`, which not every channel server sets
+   * (discord-mcpl does not), so on those channels an @-mention neither binds
+   * a fork nor triggers a bound one. Routing still works for now; the
+   * framework logs one `[deprecated]` line at creation when this is set.
    */
   conversations?: ConversationRouterConfig;
 }
