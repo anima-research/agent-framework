@@ -83,9 +83,11 @@ export interface ConversationRouterConfig {
   /**
    * Idle time before a binding expires and the fork is closed. Default 12h.
    *
-   * Expiry is checked at most about once a minute, so the effective
-   * granularity is ~60s: a short TTL can close its fork up to ~60s after it
-   * elapses.
+   * Expiry is checked at most about once a minute, so the sweep usually
+   * notices an expired binding up to ~60s after the TTL elapses. That is the
+   * usual extra delay, not a deadline for closing the fork: the closure turn
+   * can be delayed further (e.g. while the host is quiesced, it stays queued
+   * until resume).
    */
   idleTtlMs?: number;
 
