@@ -6592,8 +6592,9 @@ export class AgentFramework {
         if (currentState.status === 'ready') {
           // Flush pending assistant blocks (tool_use + preamble text) to context
           const pendingBlocks = this.pendingAssistantBlocks.get(agent.name);
+          const turnRowMetadata = this.silentTurnRowMetadata(agent.name);
           if (pendingBlocks) {
-            agent.addAssistantResponse(pendingBlocks);
+            agent.addAssistantResponse(pendingBlocks, turnRowMetadata);
             this.pendingAssistantBlocks.delete(agent.name);
           }
 
@@ -6612,7 +6613,7 @@ export class AgentFramework {
           const membraneResults = currentState.toolResults.map(tc =>
             this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
           );
-          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults);
+          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata);
 
           // Flush any messages that were deferred while this turn was in
           // flight. Route to the PRIMARY agent — deferred messages are
@@ -6849,6 +6850,7 @@ export class AgentFramework {
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               ephemeralSystemPrompt: this.activeTurnTriggers.get(agent.name)?.ephemeralSystemPrompt,
+              silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
             });
           } else if (currentState.stream) {
             // Streaming path: convert results and resume the stream.
@@ -8083,6 +8085,7 @@ export class AgentFramework {
             ephemeralSystemPrompt:
               '[silent heartbeat] Scheduled private self-check. Review pending matters privately. ' +
               'Do not narrate or publish plain prose; use an explicit send tool only if you deliberately choose to contact someone.',
+            silentHeartbeat: { eventId: event.eventId, serverId: event.serverId },
           } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
         });
@@ -8384,6 +8387,7 @@ export class AgentFramework {
         ...trigger,
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
+        silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
         channelId: channelReq?.channelId,
         addressed: addressedReq !== undefined,
         // A context-budget restart continues the same logical turn: it keeps
@@ -8395,6 +8399,18 @@ export class AgentFramework {
         wakeAt: budgetRestart ? undefined : provReq?.wakeAt,
       });
     }
+  }
+
+  /**
+   * Metadata for rows the agent's current turn stores: a silent heartbeat
+   * tick stamps each of them (assistant responses, tool_result rows) so they
+   * stay identifiable after the turn — request builds key the tick separator
+   * on it, and a later retention policy can find or collapse them. Undefined
+   * for ordinary turns, whose rows are stored exactly as before.
+   */
+  private silentTurnRowMetadata(agentName: string): MessageMetadata | undefined {
+    const tick = this.activeTurnTriggers.get(agentName)?.silentHeartbeat;
+    return tick ? { silentHeartbeat: { eventId: tick.eventId, serverId: tick.serverId } } : undefined;
   }
 
   /** Record prose segments suppressed by explicit-send silencing. */
@@ -9202,7 +9218,9 @@ export class AgentFramework {
         request: compiledRequest,
         takeKvSubmission,
         drainKvSubmissionIds,
-      } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools);
+      } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
+        silentHeartbeat: trigger?.silentHeartbeat,
+      });
       if (this.agents.get(agent.name) !== agent) {
         stream.cancel();
         agent.cancelStream();
@@ -9831,7 +9849,7 @@ export class AgentFramework {
               // Flush pending assistant blocks
               const pending = this.pendingAssistantBlocks.get(agent.name);
               if (pending) {
-                agent.addAssistantResponse(pending);
+                agent.addAssistantResponse(pending, this.silentTurnRowMetadata(agent.name));
                 this.pendingAssistantBlocks.delete(agent.name);
               }
               // Store tool results — same bounded spill policy as the
@@ -9846,7 +9864,8 @@ export class AgentFramework {
                   cap,
                 );
                 agent.toolResultGuard.storeResults(toolResultContent, readyState.toolResults.map((tc) =>
-                  this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id))), readyState.toolResults);
+                  this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id))), readyState.toolResults,
+                  this.silentTurnRowMetadata(agent.name));
                 // The response is already complete: this batch is never
                 // submitted in this turn, so it cannot be refused. Admit it.
                 agent.toolResultGuard.settleTurnEnded();
@@ -9890,16 +9909,17 @@ export class AgentFramework {
                 system: true,
                 kind: 'tool-wrapper-prose-contained',
                 toolName: guardedWrapperTool,
+                ...this.silentTurnRowMetadata(agent.name),
               });
               console.error(
                 `[tool-boundary] ${agent.name}: contained whole-response prose wrapper for registered tool ${guardedWrapperTool}; no tool called`,
               );
             } else if (lastToolIdx >= 0) {
               if (terminalContent.length > 0) {
-                agent.addAssistantResponse(terminalContent);
+                agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
               }
             } else {
-              agent.addAssistantResponse(terminalContent);
+              agent.addAssistantResponse(terminalContent, this.silentTurnRowMetadata(agent.name));
             }
 
             // Bind the cooldown receipt to this fresh, successful request —
