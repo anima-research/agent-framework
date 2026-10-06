@@ -18,6 +18,7 @@
  * bookkeeping and is unit-tested without a framework.
  */
 import type { McplContentBlock, PushEventResult } from './types.js';
+import { isVisiblyEmptyContent } from './visible-content.js';
 
 export const PUSH_COALESCING_SUPPORT = {
   pushEvents: true, channelsIncoming: true, deferred: true, channelScopedPush: true,
@@ -33,6 +34,15 @@ export class CoalesceError extends Error {
   constructor(readonly field: string, message: string, readonly code = -32602) {
     super(message);
     this.name = 'CoalesceError';
+  }
+}
+
+/** Content with nothing model-visible (see visible-content.ts): -32602. */
+export class EmptyContentError extends CoalesceError {
+  readonly reason = 'empty-content';
+  constructor(field = 'payload.content') {
+    super(field, 'content has no visible content: send at least one non-text block or non-whitespace text');
+    this.name = 'EmptyContentError';
   }
 }
 
@@ -207,8 +217,20 @@ function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOc
   return out;
 }
 
-/** Validate wire content before it is stored, rendered or converted. */
-export function validateCoalescedContent(content: unknown, maxBytes = 1024 * 1024): asserts content is McplContentBlock[] {
+/**
+ * Validate wire content before it is stored, rendered or converted.
+ *
+ * Visibly-empty content is refused unless `allowEmpty`: an admitted
+ * occurrence with nothing to show would wake the model with no visible cause.
+ * Empty is legitimate only where the RFC gives it a meaning — a retraction
+ * with nothing to announce (§6) and a render result that says nothing
+ * happened (§5.2) — and for the silent-heartbeat marker.
+ */
+export function validateCoalescedContent(
+  content: unknown,
+  maxBytes = 1024 * 1024,
+  options: { allowEmpty?: boolean } = {},
+): asserts content is McplContentBlock[] {
   if (!Array.isArray(content)) throw new CoalesceError('payload.content', 'content must be an array');
   for (const b of content as Array<Record<string, unknown>>) {
     if (!b || typeof b !== 'object' || Array.isArray(b)) throw new CoalesceError('payload.content', 'invalid content block');
@@ -219,6 +241,7 @@ export function validateCoalescedContent(content: unknown, maxBytes = 1024 * 102
     throw new CoalesceError('payload.content', 'invalid content block');
   }
   if (Buffer.byteLength(JSON.stringify(content)) > maxBytes) throw new CoalesceError('payload.content', 'content exceeds host byte limit');
+  if (!options.allowEmpty && isVisiblyEmptyContent(content)) throw new EmptyContentError();
 }
 
 /** Validate the `coalesce` member of either lane (§13). */
@@ -486,7 +509,9 @@ export class PushCoalescer<E = unknown> {
     this.host.cancelWake(subject);
     state.consumedEventId = undefined;
     if (state.history === 'none') return 'retracted';
-    if (!occurrence.content.length) return 'consumed';
+    // An empty notice — or one with only blank text, which would reach the
+    // model as an empty message — is pure withdrawal: append nothing.
+    if (isVisiblyEmptyContent(occurrence.content)) return 'consumed';
     // The notice is an ordinary occurrence: it rides the normal delivery path
     // (tags → gate policy → wake) and is consumed like any message — in the
     // context that read a version, never a new one (§3.2).
@@ -654,7 +679,8 @@ export class PushCoalescer<E = unknown> {
       try {
         const result = await this.host.render(occurrence, params);
         if (rendering.cancelled) { this.host.audit({ kind: 'late-render', subject, eventId: occurrence.eventId, discarded: true }); }
-        else validateCoalescedContent(result?.content, this.options.maxContentBytes);
+        // §5.2: an empty result is legitimate ("nothing happened").
+        else validateCoalescedContent(result?.content, this.options.maxContentBytes, { allowEmpty: true });
         if (rendering.cancelled) throw new CancelledRender();
         content = result.content;
         timestamp = typeof result.timestamp === 'string' ? result.timestamp : new Date().toISOString();
@@ -673,8 +699,9 @@ export class PushCoalescer<E = unknown> {
         if (rendering.cancelled || state.rendering !== rendering || this.suspended) return;
         // Rule 4: authority is re-checked at response.
         if (!this.host.authorized(occurrence)) { this.host.audit({ kind: 'revoked', subject, eventId: occurrence.eventId }); return; }
-        this.host.audit({ kind: 'rendered', subject, eventId: occurrence.eventId, source, empty: content.length === 0 });
-        if (!content.length) return; // §5.2: nothing happened
+        const empty = isVisiblyEmptyContent(content);
+        this.host.audit({ kind: 'rendered', subject, eventId: occurrence.eventId, source, empty });
+        if (empty) return; // §5.2: nothing happened (blank text included)
         const placement = await this.host.deliver({ ...occurrence, timestamp, content }, content, assemblingFor);
         if (placement?.deferredId) {
           // Landed in another agent's deferred queue (its turn is alive): still

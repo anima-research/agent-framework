@@ -217,6 +217,16 @@ export type TraceEvent =
       messageId: string;
       source: string;
     })
+  /** MCPL content with nothing model-visible reached the store/wake site
+   *  (module-emitted or coalescer-delivered) and was dropped: no row, no wake. */
+  | (TraceEventBase & {
+      type: 'mcpl:empty-content-dropped';
+      lane: 'push' | 'channel';
+      serverId: string;
+      eventId?: string;
+      channelId?: string;
+      messageId?: string;
+    })
   /** RFC-006 coalescing decision record (received / displaced / removed /
    *  rendered / revoked / render-cancelled / late-render / render-failed). */
   | (TraceEventBase & {
