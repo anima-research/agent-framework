@@ -299,7 +299,7 @@ export class PyRunner {
     });
 
     this.reader = createInterface({ input: child.stdout });
-    this.reader.on('line', (line) => this.handleLine(line));
+    this.reader.on('line', (line) => this.handleLine(line, child));
 
     this.childReady = new Promise<void>((resolve, reject) => {
       const onReady = () => {
@@ -333,7 +333,7 @@ export class PyRunner {
 
   private readyResolver: (() => void) | null = null;
 
-  private handleLine(line: string): void {
+  private handleLine(line: string, child: ChildProcessWithoutNullStreams): void {
     let msg: { op?: string; id?: string; name?: string; args?: unknown; stdout?: string; stderr?: string; return_code?: number };
     try {
       msg = JSON.parse(line);
@@ -358,7 +358,7 @@ export class PyRunner {
         this.onToolCall(toolName, args)
           .catch((err) => `Error: ${err instanceof Error ? err.message : String(err)}`)
           .then((result) => {
-            this.send({ op: 'tool_result', id: callId, result });
+            this.reply(child, { op: 'tool_result', id: callId, result }, `result of ${toolName} call ${callId}`);
           });
         return;
       }
@@ -376,7 +376,7 @@ export class PyRunner {
               `wake handler failed: ${err instanceof Error ? err.message : String(err)}`)
           : Promise.resolve('this script is not allowed to wake the agent');
         void refuse.then((error) => {
-          this.send({ op: 'wake_ack', id: wakeId, ...(error ? { error } : {}) });
+          this.reply(child, { op: 'wake_ack', id: wakeId, ...(error ? { error } : {}) }, `ack of wake ${wakeId}`);
         });
         return;
       }
@@ -416,6 +416,20 @@ export class PyRunner {
     if (pending.killTimer) clearTimeout(pending.killTimer);
     this.pending = null;
     pending.resolve(result);
+  }
+
+  /**
+   * Answer the interpreter that asked. Call and wake ids restart in every
+   * interpreter, so an answer that outlives its interpreter (the script was
+   * aborted, killed or crashed, or the interpreter reclaimed) would resolve
+   * the same id in the one that replaced it, inside another script: drop it.
+   */
+  private reply(child: ChildProcessWithoutNullStreams, msg: unknown, what: string): void {
+    if (child !== this.child) {
+      console.error(`[pytc:${this.label}] dropped late ${what}: the interpreter that asked for it is gone`);
+      return;
+    }
+    this.send(msg);
   }
 
   private send(obj: unknown): void {
