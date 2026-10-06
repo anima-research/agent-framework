@@ -3,7 +3,8 @@
 // ROLE=provider: offers two tools — `click`, classed `computer` via
 //   _meta["mcpl/class"] (RFC-008), and `run`, unclassed. `run` returns an
 //   error result. Every result carries RESULT-MARKER, which must never reach
-//   an observer (tool results are never carried).
+//   an observer (tool results are never carried). A call whose arguments
+//   carry `delay_ms` is answered that much later.
 // ROLE=observer: advertises toolLifecycle {observe, inputs}, offers its own
 //   tool `ping` (its own calls must not be reported to it), and once the §5.3
 //   policy exchange is done sends `tools/observe` with the rules in FILTER
@@ -115,10 +116,13 @@ rl.on('line', (line) => {
   if (msg.method === 'tools/call') {
     const name = msg.params?.name;
     log('tools-call', { name });
-    reply(msg.id, {
+    const answer = () => reply(msg.id, {
       content: [{ type: 'text', text: `RESULT-MARKER from ${name}` }],
       isError: name === 'run',
     });
+    const delayMs = Number(msg.params?.arguments?.delay_ms ?? 0);
+    if (delayMs > 0) setTimeout(answer, delayMs);
+    else answer();
     return;
   }
   if (msg.method === 'tools/lifecycle') {

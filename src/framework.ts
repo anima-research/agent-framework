@@ -68,7 +68,7 @@ import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
 import { maskNegotiatedCapabilities } from './mcpl/capability-mask.js';
 import { HookOrchestrator } from './mcpl/hook-orchestrator.js';
-import { ToolLifecycleEmitter, parseToolObserveParams } from './mcpl/tool-lifecycle.js';
+import { ToolLifecycleEmitter, parseToolObserveParams, type ScriptCallOrigin } from './mcpl/tool-lifecycle.js';
 import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolveToolClass, type EffectiveToolClass, type ToolClass, type ToolClassSource } from './mcpl/tool-classes.js';
 import { PushHandler, convertBlock as convertPushBlock, type McplPushEvent } from './mcpl/push-handler.js';
 import {
@@ -1319,6 +1319,10 @@ export class AgentFramework {
    *  deferred and applied to the final code_execution result instead of
    *  cancelling the stream mid-script (which would wedge the turn). */
   private scriptDeferredEndTurn: Set<string> = new Set();
+  /** RFC-007: per agent, the origin of the foreground script its runner is
+   *  executing, handed to that script's inner calls (scripts run one at a
+   *  time per runner). Background runners capture theirs in the closure. */
+  private foregroundScriptOrigins: Map<string, ScriptCallOrigin> = new Map();
   /** Background (daemon) scripts: model-authored watchers that outlive their
    *  spawning turn. Each gets a DEDICATED PyRunner; wake_agent() injects a
    *  provenance envelope + payload and requests inference. Keyed by script id. */
@@ -6552,6 +6556,10 @@ export class AgentFramework {
       const scriptWaiter = this.scriptToolWaiters.get(event.callId);
       if (scriptWaiter) {
         this.scriptToolWaiters.delete(event.callId);
+        // RFC-007: the inner call's terminal. Also reached when the script
+        // was killed while the call ran: the result reaches no one, but the
+        // call did finish.
+        this.toolLifecycleEmitter?.onResult(event.agentName, event.callId, event.result);
         scriptWaiter(event.result);
         return;
       }
@@ -11105,6 +11113,11 @@ export class AgentFramework {
    * results reach the running script and never the model context.
    */
   private async runCodeExecution(agentName: string, call: ToolCall): Promise<ToolResult> {
+    // RFC-007: what the script's own tool calls are attributed to. Read
+    // before the first await: it is only known while this call is being
+    // dispatched. Undefined off the model dispatch path (ephemeral callers),
+    // whose code_execution call is not reported either.
+    const origin = this.toolLifecycleEmitter?.scriptOrigin(agentName, call.id);
     const input = (call.input ?? {}) as {
       code?: unknown;
       background?: unknown;
@@ -11180,7 +11193,7 @@ export class AgentFramework {
     );
 
     if (input.background === true) {
-      const started = this.startBackgroundScript(agentName, input.code, injected, timeLimitMs);
+      const started = this.startBackgroundScript(agentName, input.code, injected, timeLimitMs, origin);
       if (capNote && started.success && started.data && typeof started.data === 'object') {
         (started.data as Record<string, unknown>).time_limit_note = capNote;
       }
@@ -11189,7 +11202,17 @@ export class AgentFramework {
 
     const runner = this.getOrCreateScriptRunner(agentName);
     this.scriptDeferredEndTurn.delete(agentName);
-    const exec = await runner.exec(input.code, injected, undefined, timeLimitMs !== undefined ? { deadlineMs: timeLimitMs } : undefined);
+    // A busy runner refuses this exec; the running script keeps its origin.
+    const ownsOrigin = origin !== undefined && !runner.busy;
+    if (ownsOrigin) this.foregroundScriptOrigins.set(agentName, origin);
+    let exec: import('./code-execution/py-runner.js').ExecResult;
+    try {
+      exec = await runner.exec(input.code, injected, undefined, timeLimitMs !== undefined ? { deadlineMs: timeLimitMs } : undefined);
+    } finally {
+      if (ownsOrigin && this.foregroundScriptOrigins.get(agentName) === origin) {
+        this.foregroundScriptOrigins.delete(agentName);
+      }
+    }
     const endTurn = this.scriptDeferredEndTurn.delete(agentName);
 
     return {
@@ -11222,6 +11245,7 @@ export class AgentFramework {
     code: string,
     injected: import('./code-execution/py-runner.js').InjectedTool[],
     timeLimitMs?: number,
+    origin?: ScriptCallOrigin,
   ): ToolResult {
     // v1: primary-agent-only. A conversation fork's or ephemeral's daemon
     // would outlive its owner and its wake would land in the primary
@@ -11271,7 +11295,7 @@ export class AgentFramework {
       scriptTimeoutMs: cfg?.scriptTimeoutMs,
       idleReclaimMs: 0, // dedicated runner; lifetime is the exec deadline
       label: `${agentName}:${scriptId}`,
-      onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args),
+      onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args, origin),
     });
 
     const record: BackgroundScriptRecord = {
@@ -11595,7 +11619,8 @@ export class AgentFramework {
         scriptTimeoutMs: cfg?.scriptTimeoutMs,
         idleReclaimMs: cfg?.idleReclaimMs,
         label: agentName,
-        onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args),
+        onToolCall: (toolName, args) =>
+          this.handleScriptToolCall(agentName, toolName, args, this.foregroundScriptOrigins.get(agentName)),
       });
       this.codeExecutionRunners.set(agentName, runner);
     }
@@ -11615,11 +11640,12 @@ export class AgentFramework {
     agentName: string,
     toolName: string,
     args: Record<string, unknown>,
+    origin?: ScriptCallOrigin,
   ): Promise<string> {
     if (toolName === CODE_EXECUTION_TOOL_NAME) {
       return 'Error: code_execution cannot be called from within a script';
     }
-    const result = await this.dispatchScriptToolCall(agentName, toolName, args);
+    const result = await this.dispatchScriptToolCall(agentName, toolName, args, origin);
     if (result.endTurn) {
       // Deferred: applied to the final code_execution result (see
       // scriptDeferredEndTurn) — ending the turn mid-script would cancel the
@@ -11656,11 +11682,16 @@ export class AgentFramework {
    * resolve with its result. The waiter intercept in handleProcessEvent
    * (keyed by the pytc- call ID) routes the tool-result event here instead
    * of into the agent's pending tool round.
+   *
+   * RFC-007: with an `origin`, observers see the call as they see a model
+   * call (register, dispatch with its refusal sites, open; the terminal at
+   * the waiter intercept), under the inner tool's own name and class.
    */
   private dispatchScriptToolCall(
     agentName: string,
     toolName: string,
     args: Record<string, unknown>,
+    origin?: ScriptCallOrigin,
   ): Promise<ToolResult> {
     return new Promise<ToolResult>((resolve) => {
       const callId = `pytc-${randomUUID()}`;
@@ -11670,6 +11701,9 @@ export class AgentFramework {
       const safetyMs = (this.codeExecutionConfig?.toolCallTimeoutMs ?? 270_000) + 30_000;
       const safety = setTimeout(() => {
         if (this.scriptToolWaiters.delete(callId)) {
+          // RFC-007: no result reached the host — the call failed.
+          this.toolLifecycleEmitter?.markDispatchFailure(agentName, callId);
+          this.toolLifecycleEmitter?.onResult(agentName, callId, undefined);
           resolve({
             success: false,
             error: `tool '${toolName}' produced no result within ${Math.round(safetyMs / 1000)}s`,
@@ -11684,15 +11718,21 @@ export class AgentFramework {
         resolve(result);
       });
 
+      const call = { id: callId, name: toolName, input: args };
+      if (origin) this.toolLifecycleEmitter?.registerScriptCall(agentName, origin, call);
       try {
-        this.dispatchToolCall(agentName, { id: callId, name: toolName, input: args });
+        this.dispatchToolCall(agentName, call);
       } catch (error) {
+        // Never started: nothing was sent, so nothing is owed.
+        this.toolLifecycleEmitter?.refuse(agentName, callId);
         if (this.scriptToolWaiters.delete(callId)) {
           clearTimeout(safety);
           const err = error instanceof Error ? error : new Error(String(error));
           resolve({ success: false, error: err.message, isError: true });
         }
+        return;
       }
+      if (origin) this.toolLifecycleEmitter?.open(agentName, callId);
     });
   }
 
