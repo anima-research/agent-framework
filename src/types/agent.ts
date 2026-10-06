@@ -330,8 +330,10 @@ export interface InferenceRequest {
    * Where the wake came from, for telemetry ONLY — never a speech locus.
    * Set by the EventGate for batched wakes (composite channel id of the
    * chosen event when the event carried one; push-event raw ids are not
-   * used). Routing keeps reading `channelId`, which only the direct channel
-   * paths set from normalized ids — a gate wake leaves it unset, as before.
+   * used). Routing keeps reading `channelId`, set from registered ids: by
+   * the direct channel paths, and by a gate wake only when its chosen event
+   * addressed the agent and the host resolved that event's registered
+   * channel (ambient-only batches leave it unset).
    */
   wakeChannelId?: string;
   /** Timestamp of the event the wake provenance was taken from (ms). */

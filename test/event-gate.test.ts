@@ -526,6 +526,27 @@ describe('debounce', () => {
       'the DM is the newest addressed event; replying to the older mention would answer the wrong person');
   });
 
+  it('an addressed push that names only its registered channel (no raw id, no author) still routes', async () => {
+    const path = writeConfig('debounce-route-only.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const resolveRouteChannel = (info: GateEventInfo) =>
+      typeof info.metadata?.mcplChannelId === 'string' ? info.metadata.mcplChannelId : undefined;
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'surface', channelId: 'surface:room:general',
+      content: 'chatter', metadata: { authorId: '7' } }));
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'surface', content: 'dm',
+      tags: ['chat:dm', 'chat:addressed'], metadata: { mcplChannelId: 'surface:dm:42' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].routeChannelId, 'surface:dm:42');
+    assert.strictEqual(inferenceRequests[0].addressed, true);
+    assert.strictEqual(inferenceRequests[0].counterparty, undefined, 'no author on the chosen event, none borrowed from the chatter');
+  });
+
   it('a throwing route resolver never breaks gating', async () => {
     const path = writeConfig('debounce-route-throw.json', {
       policies: [

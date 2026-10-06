@@ -8,3 +8,10 @@
   composite channel id via a new `EventGate` option `resolveRouteChannel`
   (the framework supplies it); batched-wake lines now show that id instead
   of the adapter's raw one. Ambient-only batches keep the legacy fallback.
+- When a batch holds several addressed wakes, the newest addressed EVENT now
+  decides the turn's channel, not the most recently queued request. A gate
+  wake flushed after a busy turn no longer outranks a newer mention's direct
+  wake. A conversation fork takes a batched wake's route only for its home
+  channel, so a fork bound elsewhere shows no typing in the addressed
+  channel. An addressed wake with no author no longer borrows another
+  request's author for its turn telemetry.

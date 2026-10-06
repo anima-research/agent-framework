@@ -204,7 +204,11 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
   let newest: PendingEvent | undefined;
   let newestAddressed: PendingEvent | undefined;
   for (const e of events) {
-    if (!e.channelId && !e.authorId) continue;
+    // A resolved route counts as naming a channel: a push whose origin
+    // declares only `mcplChannelId` (no raw channel id, no author) is still a
+    // routable addressed message, and skipping it here would leave its wake
+    // on the legacy most-recent-inbound fallback.
+    if (!e.channelId && !e.authorId && !e.routeChannelId) continue;
     if (!newest || e.timestamp >= newest.timestamp) newest = e;
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }

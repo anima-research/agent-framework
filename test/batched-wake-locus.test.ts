@@ -129,3 +129,55 @@ describe('batched wake routing', () => {
     assert.deepEqual(publishes(), [GENERAL]);
   });
 });
+
+describe('batched wake routing with conversation forks', () => {
+  let tempDir: string;
+  let framework: AgentFramework;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'wake-locus-fork-'));
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [
+        { name: 'trunk', model: 'test-model', systemPrompt: 'You are trunk.' },
+        { name: 'fork-room', model: 'test-model', systemPrompt: 'You are a fork.' },
+        { name: 'fork-other', model: 'test-model', systemPrompt: 'You are a fork.' },
+      ],
+      gate: {
+        config: {
+          policies: [{ name: 'batch', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 50 } }],
+          default: 'skip',
+        },
+      },
+      modules: [],
+    });
+  });
+
+  afterEach(async () => {
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('the addressed route applies only to the fork homed there; other forks and the trunk get none', async () => {
+    const internals = framework as unknown as {
+      conversationAgentHomes: Map<string, string>;
+      pendingRequests: Array<{ agentName: string; channelId?: string; addressed?: boolean; counterparty?: string }>;
+      eventGate: { evaluate(info: unknown): unknown };
+    };
+    internals.conversationAgentHomes.set('fork-room', ROOM);
+    internals.conversationAgentHomes.set('fork-other', GENERAL);
+    internals.eventGate.evaluate({
+      content: '@agent hi', eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM,
+      tags: ['chat:addressed'], metadata: { authorId: '5' },
+    });
+    await waitFor(() => internals.pendingRequests.some((r) => r.agentName === 'fork-other'), 'gate wake broadcast');
+    const byAgent = new Map(internals.pendingRequests.map((r) => [r.agentName, r]));
+    assert.equal(byAgent.get('fork-room')?.channelId, ROOM, 'the fork that owns the channel takes the route');
+    assert.equal(byAgent.get('fork-room')?.addressed, true);
+    assert.equal(byAgent.get('fork-other')?.channelId, undefined, 'a fork bound elsewhere gets no locus');
+    assert.equal(byAgent.get('trunk')?.channelId, undefined, 'the trunk never takes a fork-bound channel');
+    // Telemetry provenance still reaches every agent.
+    assert.equal(byAgent.get('fork-other')?.counterparty, 'discord:user:5');
+  });
+});
