@@ -78,7 +78,8 @@ export interface ToolObserveRule {
  * RFC-007 §6.2 grammar.
  */
 export interface ToolLifecycleNarrowing {
-  /** Patterns over the model-facing tool name (`computer--*`). */
+  /** Patterns over the model-facing tool name (`computer--*`): for an MCPL
+   *  tool `<toolPrefix>--<tool>`, toolPrefix defaulting to `mcpl--<serverId>`. */
   tools?: string[];
   /** The tool's effective class must intersect this set. `'default'` is
    *  DEFAULT_INPUT_CLASSES (computer, shell, files, web, media, body). */
