@@ -985,6 +985,7 @@ interface DerivingContextManager {
     strategy: ContextStrategy;
     membrane?: Membrane;
     solve?: 'reuse' | 'fresh';
+    inherit?: { refusals?: boolean };
     atSequence?: number;
     debugLogContext?: boolean;
   }): Promise<ContextManager>;
@@ -1020,6 +1021,12 @@ export interface DeriveAgentOptions {
   mode?: 'shared' | 'copy';
   /** `'shared'` only. Default `'reuse'`. */
   solve?: 'reuse' | 'fresh';
+  /**
+   * `'shared'` only. Also inherit the parent's refusal ledger (what it
+   * declined to compress). Default false; set for a fork that stands in
+   * for the parent's attention. Recorded as `inherit.refusals`.
+   */
+  inheritRefusals?: boolean;
   /**
    * A fresh strategy instance for the child. Strategy instances hold state
    * and are never shared; to reuse the parent's rendering it must be the
@@ -4388,7 +4395,11 @@ export class AgentFramework {
       ...(options.idleTimeoutMs !== undefined ? { idleTimeoutMs: options.idleTimeoutMs } : {}),
       ...(options.maxTurns !== undefined ? { maxTurns: options.maxTurns } : {}),
       ...(options.metadata ? { metadata: options.metadata } : {}),
-      inherit: { mode, ...(options.solve ? { solve: options.solve } : {}) },
+      inherit: {
+        mode,
+        ...(options.solve ? { solve: options.solve } : {}),
+        ...(options.inheritRefusals !== undefined ? { refusals: options.inheritRefusals } : {}),
+      },
     });
     const { name: _name, ...specBody } = {
       ...spec,
@@ -4617,6 +4628,7 @@ export class AgentFramework {
       strategy: config.strategy ?? new PassthroughStrategy(),
       membrane: this.membrane,
       solve: inherit.solve ?? 'reuse',
+      inherit: { refusals: inherit.refusals === true },
       ...(inherit.atSequence !== undefined ? { atSequence: inherit.atSequence } : {}),
       debugLogContext: !!process.env.DEBUG_CONTEXT,
     });
@@ -4626,6 +4638,7 @@ export class AgentFramework {
       inherit: {
         ...inherit,
         solve: inherit.solve ?? 'reuse',
+        refusals: inherit.refusals === true,
         ownBranch,
         ...(derivation
           ? { branch: derivation.parentBranch, atSequence: derivation.atSequence, derivation }

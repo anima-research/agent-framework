@@ -172,6 +172,7 @@ describe('Dendrite deriveAgent', () => {
       from: 'mira',
       mode: 'shared',
       solve: 'reuse',
+      refusals: false,
       ownBranch: 'dendrite/fork-1',
       branch: 'main',
       atSequence: record.inherit!.atSequence,
@@ -279,6 +280,37 @@ describe('Dendrite deriveAgent', () => {
     // Still the parent's identity and still a valid request.
     assert.equal(forkRequest.system, parentRequest.system);
     assert.ok(fork.includes('[FORK-FRAMING]'));
+  });
+
+  it('inherits the parent\'s refusal ledger only when asked, and says so in the record', { skip }, async () => {
+    await miraMidTurn();
+    const ledger = 'agents/mira/autobio:compression-refusal-quarantine-events';
+    framework.getStore().appendToStateJson(ledger, { kind: 'checkpoint', at: 1, note: 'mira declined this' });
+
+    membrane.script('fork-1', say('done'));
+    const without = await runFork({
+      name: 'fork-1',
+      from: 'mira',
+      strategy: folding(),
+      framing: [{ participant: 'user', content: [{ type: 'text', text: FRAMING }] }],
+    });
+    assert.equal(framework.getAgentRecord('fork-1')!.inherit!.refusals, false);
+    assert.equal(without.contextManager.getStore().getStateLen(ledger) ?? 0, 0, 'a task fork is free of its parent\'s refusals');
+
+    membrane.identify = (request) => (JSON.stringify(request.messages).includes('[READER-FRAMING]') ? 'reader-1' : request.assistantParticipant ?? '');
+    membrane.script('reader-1', say('done'));
+    const withRefusals = await runFork({
+      name: 'reader-1',
+      from: 'mira',
+      kind: 'subconscious-fork',
+      inheritRefusals: true,
+      strategy: folding(),
+      framing: [{ participant: 'user', content: [{ type: 'text', text: '[READER-FRAMING] you stand in for mira\'s attention' }] }],
+    });
+    const record = framework.getAgentRecord('reader-1')!;
+    assert.equal(record.inherit!.refusals, true, 'the creation record says "with my refusals"');
+    assert.equal(withRefusals.contextManager.getStore().getStateLen(ledger), 1, 'and the child knows what mira declined');
+    assert.equal(framework.getStore().getStateLen(ledger), 1, 'mira\'s own ledger is untouched');
   });
 
   it('a running fork can itself be derived from, and each sees only its own line', { skip }, async () => {

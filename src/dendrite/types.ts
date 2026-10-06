@@ -177,6 +177,14 @@ export interface ContextInheritance {
    */
   derivation?: unknown;
   /**
+   * `'shared'` only: whether the parent's refusal ledger — what it declined
+   * to compress, and why — comes along. Default false: a task fork is free
+   * of its parent's refusals. A fork that stands in for the parent's
+   * attention is created with it, so it is not asked the thing the parent
+   * said no to without knowing. Named in the creation event either way.
+   */
+  refusals?: boolean;
+  /**
    * - `'reuse'` (default): keep the parent's rendering frontier — prefix,
    *   cache markers and solver state — for fast startup.
    * - `'fresh'`: deliberately pay for a new solve, e.g. at another budget;

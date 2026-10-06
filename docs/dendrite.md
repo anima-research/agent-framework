@@ -155,6 +155,10 @@ Shared inheritance is refused with a clear error when the installed packages can
 
 The child's writes go to a Chronicle branch of its own (`dendrite/<name>`). That branch outlives the child. The store's branch cursor does not move.
 
+### The refusal ledger
+
+By default a fork does not inherit its parent's compression-refusal ledger (what the parent declined to compress, and why): a task fork is free of its parent's refusals. `inheritRefusals: true` brings it along, for a fork that stands in for the parent's attention and must not be asked the thing the parent said no to without knowing. Either way the creation record and event state it (`inherit.refusals`), so nobody discovers the difference by being asked. Inherited entries are the parent's; the child's own refusals append after them on its branch.
+
 ### Reusing or redoing the solve
 
 - `solve: 'reuse'` (default): the child keeps the parent's rendering. Fold state arrives through the store. The part that lives only in memory (the previous compile's cache identities, an in-flight budget transition, a hot-tuned tail) is handed from the parent's strategy to the child's.
@@ -209,6 +213,8 @@ const left = await framework.inspectAgentContext('fork-1');
 - `inspectAgentContext` on an ended agent returns the context it left. This is the real context: treat it as read-only unless you intend to change what a resume starts from.
 
 **External effects are not replayed and not undone.** A tool that ran before an agent ended has had its effect. A call that never received its result may be made again by the model after a resume.
+
+**On record for when replay exists:** a child's stored turns, if ever read back by its parent — merged, replayed or mailed — arrive as the child's, under its name and incarnation. Mail already does this; replay must too.
 
 ## Cost
 
