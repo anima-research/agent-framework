@@ -50,6 +50,8 @@ export interface CodeExecutionConfig {
    * script (default 270_000 ms, mirroring the managed runtime's message).
    */
   toolCallTimeoutMs?: number;
+  /** Default observation budget; then return a running script_id (default 10_000, max 60_000 ms). */
+  foregroundWaitMs?: number;
   /** Whole-script deadline: cancel → grace → SIGKILL (default 600_000 ms). */
   scriptTimeoutMs?: number;
   /**

@@ -303,6 +303,8 @@ export interface CompletedToolCall {
  * Inference request for an agent.
  */
 export interface InferenceRequest {
+  /** Host-generated identity of a script notification; withdrawn if delivered mid-turn. */
+  scriptWakeId?: string;
   /** Host-owned identity for withdrawal of an unconsumed coalesced wake. */
   coalescingSubject?: string;
   coalescingEventId?: string;

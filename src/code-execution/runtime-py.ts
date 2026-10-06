@@ -196,7 +196,7 @@ def _make_tool_fn(tool_name, py_name):
         except asyncio.TimeoutError:
             raise TimeoutError(
                 "Calling tool ['" + tool_name + "'] timed out (no response after "
-                + str(int(CALL_TIMEOUT_S)) + "s)."
+                + str(CALL_TIMEOUT_S) + "s)."
             )
         finally:
             _pending_tool_futures.pop(call_id, None)
