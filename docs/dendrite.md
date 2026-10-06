@@ -223,7 +223,26 @@ Measured with `bench/derive/derive-bench.mjs` in context-manager, on one synthet
 
 Creating a child does not get slower as the history grows. Its first full read does, linearly, at the same rate the parent already pays on each of its own turns: both walk the message list once.
 
-Creating a child copies one array of references to the parent's message objects, at about 8 bytes per message. The messages themselves, their resolved media and their caller-facing views are shared. That is why memory per child is about 2% of what one more copy of the history would cost.
+Creating a child copies one array of references to the parent's message objects, at about 8 bytes per message. The messages themselves, their resolved media and their caller-facing views are shared.
+
+The store-level costs underneath, from `cargo run --release --example fork_bench` in chronicle. The store has one message-like state of N items of about 500 bytes and 1,000 small states. The 0.4.0 column is the same store on the published build.
+
+| | 20,000 items | 20,000 on 0.4.0 | 200,000 items | 200,000 on 0.4.0 |
+|---|---|---|---|---|
+| Fork at the head, inheriting 12 states | 3.9 µs | not available | 3.3 µs | not available |
+| Fork at the head, inheriting all 1,001 states | 212 µs | 408 µs | 219 µs | 613 µs |
+| Child's first read, parent warm | 2.8 µs | 33 ms | 2.8 µs | 343 ms |
+| Resident memory per child that has read | 4.8 KB | 23.9 MB | 6.4 KB | 113 MB |
+| Child's first append | 42 µs | 1.0 ms | 41 µs | 47 ms |
+| Read right after that append | 2.4 µs | 32 ms | 2.5 µs | 372 ms |
+
+All figures in this section are single runs on a machine that was also running builds. Treat them as orders of magnitude.
+
+Store-level costs that still grow with the size of the state:
+
+- A fork at an *earlier* point (`atSequence`) when a full snapshot has been written since: about 10 ms at 20,000 items and 110 to 140 ms at 200,000.
+- The first read on such a historical branch: one materialization, about 25 ms and 240 ms. Forks at the head avoid both.
+- A field index built for a child that has already written: about 160 ms at 200,000 items. A child that never queries history by time or channel never builds one.
 
 Two costs are not removed:
 
