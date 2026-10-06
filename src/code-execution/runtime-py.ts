@@ -37,6 +37,10 @@
  *                {op:"wake", id, exec_id, line, payload}
  *                {op:"exec_result", id, stdout, stderr, return_code, tail?}
  *
+ * At a deadline the host sends cancel and then SIGINT (not on Windows): the
+ * cancel stops a script waiting on an await, the signal one stuck in blocking
+ * code (see _on_sigint).
+ *
  * IMPORTANT: the python source below must not contain backticks or the
  * sequence dollar+brace (TS template literal syntax). String.raw preserves
  * backslashes, so \n inside python string literals is fine.
@@ -49,6 +53,7 @@ import inspect
 import io
 import json
 import os
+import signal
 import sys
 import threading
 import traceback
@@ -169,6 +174,11 @@ _next_wake_id = 0
 _current_exec_id = None
 _current_exec_task = None
 
+# SIGINT handling (see _on_sigint): armed while a script runs; the interrupt
+# it raised, so _run_script can tell it from the script's own exceptions.
+_interrupt_armed = False
+_host_interrupt = None
+
 
 def _make_tool_fn(tool_name, py_name):
     async def tool_fn(args=None):
@@ -280,7 +290,7 @@ def handle_init(msg):
 
 
 async def _run_script(exec_id, code):
-    global _current_exec_id, _current_exec_task
+    global _current_exec_id, _current_exec_task, _interrupt_armed, _host_interrupt
     if BACKGROUND:
         out = LogTee(LOG_PATH, TAIL_CHARS)
         err = out  # interleave, terminal-style; tail is shared
@@ -293,17 +303,32 @@ async def _run_script(exec_id, code):
     return_code = 0
     try:
         compiled = compile(code, "<script>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
-        result = eval(compiled, SCRIPT_GLOBALS)
-        if inspect.iscoroutine(result):
-            await result
+        _interrupt_armed = True
+        try:
+            result = eval(compiled, SCRIPT_GLOBALS)
+            if inspect.iscoroutine(result):
+                await result
+        finally:
+            _interrupt_armed = False
     except asyncio.CancelledError:
         err.write("\nKeyboardInterrupt: script cancelled by host\n")
         return_code = 1
-    except BaseException:
-        traceback.print_exc(file=err)
+    except BaseException as exc:
+        if exc is _host_interrupt:
+            # Where the script was when it was stopped, without the runtime's frames.
+            frames = [
+                f for f in traceback.extract_tb(exc.__traceback__)
+                if f.filename != _RUN_SCRIPT_CODE.co_filename
+            ]
+            err.write("Traceback (most recent call last):\n")
+            err.write("".join(traceback.format_list(frames)))
+            err.write("KeyboardInterrupt: script interrupted by host\n")
+        else:
+            traceback.print_exc(file=err)
         return_code = 1
     finally:
         sys.stdout, sys.stderr, sys.stdin = old_out, old_err, old_in
+        _host_interrupt = None
         _current_exec_id = None
         _current_exec_task = None
         for fut in list(_pending_tool_futures.values()):
@@ -353,7 +378,17 @@ async def main():
             loop.call_soon_threadsafe(queue.put_nowait, raw_line)
         loop.call_soon_threadsafe(queue.put_nowait, None)
 
-    threading.Thread(target=reader, daemon=True).start()
+    # The reader thread blocks SIGINT (it inherits the mask while it starts),
+    # so the signal reaches the main thread, where a blocking call in the
+    # script is waiting to be interrupted.
+    masked = hasattr(signal, "pthread_sigmask") and hasattr(signal, "SIGINT")
+    if masked:
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+    try:
+        threading.Thread(target=reader, daemon=True).start()
+    finally:
+        if masked:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
     send({"op": "ready"})
 
     while True:
@@ -409,6 +444,44 @@ async def main():
             pass
 
 
+# At the deadline the host sends a cancel op, which lands only when the script
+# awaits: a script blocked in time.sleep(), a busy loop or a blocking read
+# never gives the event loop control back. So the host also sends SIGINT, and
+# this turns it into KeyboardInterrupt in the running script, where
+# _run_script catches it: the output so far and the interpreter's globals
+# survive. It raises at most once per script, and only with _run_script's
+# frame on the stack -- checking the current task is not enough, as asyncio
+# runs its own code for the task between steps, and an exception raised there
+# escapes the event loop and ends the interpreter. Anywhere else it does
+# nothing: between scripts, while the script waits on an await (the cancel op
+# covers that), in the protocol loop, and mid-way through a protocol write,
+# which an exception would leave torn.
+_RUN_SCRIPT_CODE = _run_script.__code__
+_SEND_CODE = send.__code__
+
+
+def _on_sigint(signum, frame):
+    global _interrupt_armed, _host_interrupt
+    if not _interrupt_armed:
+        return
+    while frame is not None:
+        code = frame.f_code
+        if code is _SEND_CODE:
+            return
+        if code is _RUN_SCRIPT_CODE:
+            _interrupt_armed = False
+            _host_interrupt = KeyboardInterrupt("script interrupted by host")
+            raise _host_interrupt
+        frame = frame.f_back
+
+
 if __name__ == "__main__":
+    # A handler of our own also keeps asyncio.run from installing one that
+    # would cancel main() and end the interpreter.
+    if hasattr(signal, "SIGINT"):
+        try:
+            signal.signal(signal.SIGINT, _on_sigint)
+        except (ValueError, OSError):
+            pass
     asyncio.run(main())
 `;

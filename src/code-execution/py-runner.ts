@@ -10,7 +10,7 @@
  * This is a ROBUSTNESS boundary, not a security sandbox — same doctrine as
  * GateScript: the agent already has broader host access through its tools.
  * What this class guarantees is liveness: a wedged or runaway script cannot
- * hang the agent turn (cancel -> grace -> SIGKILL -> respawn) and a crashed
+ * hang the agent turn (cancel + SIGINT -> grace -> SIGKILL -> respawn) and a crashed
  * interpreter surfaces as a tool result, never as an unhandled rejection.
  */
 
@@ -193,11 +193,17 @@ export class PyRunner {
         // Deadline: ask politely first (script sees CancelledError and its
         // exec_result still flows back), then kill on unresponsiveness.
         this.send({ op: 'cancel', id: execId, reason: 'deadline' });
+        // The cancel lands only when the script awaits. Blocking code (time.sleep, a
+        // busy loop, a blocking read) never does, so interrupt it as well: the runtime
+        // raises KeyboardInterrupt in the script's own code and ignores SIGINT elsewhere.
+        this.interruptChild();
         pending.killTimer = setTimeout(() => {
           pending.deadlineMs = null; // this message already says why
           this.settlePending({
             stdout: '',
-            stderr: `script killed after exceeding ${Math.round(deadlineMs / 1000)}s deadline`,
+            stderr:
+              `script stopped: it reached its ${formatLimit(deadlineMs)} time limit and did not respond, ` +
+              'so it was killed and the interpreter restarted (variables from earlier scripts are gone)',
             returnCode: 1,
             aborted: true,
           });
@@ -427,6 +433,25 @@ export class PyRunner {
       console.error(
         `[pytc:${this.label}] protocol write failed: ${err instanceof Error ? err.message : String(err)}`,
       );
+    }
+  }
+
+  /**
+   * SIGINT the interpreter: blocking code in the running script raises
+   * KeyboardInterrupt. Not on Windows, where Node's kill() ends the process
+   * outright; there the cancel op and the kill grace remain.
+   * process.kill rather than child.kill, which would mark the child `killed`:
+   * a killed child gets no more protocol messages and is respawned on the
+   * next exec, losing the interpreter state this keeps.
+   */
+  private interruptChild(): void {
+    const child = this.child;
+    if (process.platform === 'win32' || !child || child.exitCode !== null || child.killed) return;
+    if (child.pid === undefined) return;
+    try {
+      process.kill(child.pid, 'SIGINT');
+    } catch {
+      // already gone: the exit handler settles the exec
     }
   }
 
