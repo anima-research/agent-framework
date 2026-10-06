@@ -93,6 +93,21 @@ export type ProviderHoldHook = (
 
 export interface FrameworkConfig {
   /**
+   * Dendrite agent lifecycle options.
+   */
+  dendrite?: {
+    /**
+     * When an agent ends while task work it spawned is still running, the
+     * orphan is always told. With this on (the default), the first agent
+     * that could adopt it — its nearest live ancestor, else the primary —
+     * also receives a factual notice, which is what makes the reparenting
+     * offer visible to a model. Turn it off when the host makes adoption
+     * decisions itself from the `dendrite:agent-orphaned` trace.
+     */
+    announceOrphans?: boolean;
+  };
+
+  /**
    * The subconscious resident (issue #77): a persistent side-agent that
    * receives diverted traffic from tuned-out channels and reports to the
    * resident in its own voice. See src/tune-out/tools.ts.

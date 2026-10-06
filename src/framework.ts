@@ -83,6 +83,23 @@ import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
 import { ConversationRouter } from './mcpl/conversation-router.js';
+import {
+  AgentRegistry,
+  conversationForkSpec,
+  residentSpec,
+  subconsciousSpec,
+  workerSpec,
+} from './dendrite/index.js';
+import type {
+  ActivationRecord,
+  AgentEndReason,
+  AgentRecord,
+  AgentSpec,
+  EndOutcome,
+  HeldMail,
+  PolicyEpoch,
+  RegistrySnapshot,
+} from './dendrite/index.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import {
@@ -418,6 +435,12 @@ import {
 } from './operator-log.js';
 
 const FRAMEWORK_STATE_ID = 'framework/state';
+/** Dendrite agent registry: live records, incarnation counters, held mail. */
+const AGENT_REGISTRY_STATE_ID = 'framework/dendrite';
+/** Dendrite agent registry: append-only history of ended agent records. */
+const AGENT_REGISTRY_ENDED_ID = 'framework/dendrite/ended';
+/** How many ended agent records are reloaded for inspection at boot. */
+const AGENT_REGISTRY_ENDED_RELOAD = 256;
 /** Snapshot slot mirroring context writes deferred while quiesced (#122). */
 const DEFERRED_WRITES_ID = 'framework/deferred-writes';
 /** The event a coalesced occurrence delivers through — one per lane. */
@@ -940,6 +963,26 @@ interface EphemeralRun {
   inferenceStarted: boolean;
   lastActivity: number;
   toolCallsCount: number;
+  /** Why the run ended, for the registry record. Unset = it failed. */
+  endReason?: AgentEndReason;
+  /** Who ended it, when it was stopped from outside. */
+  endedBy?: string;
+}
+
+/** Rejection delivered to the caller awaiting a bounded run that was ended from outside. */
+export class AgentStoppedError extends Error {
+  constructor(
+    readonly agentName: string,
+    readonly reason: AgentEndReason,
+    readonly by?: string,
+    detail?: string,
+  ) {
+    super(
+      `Agent "${agentName}" was ended (${reason}${by ? ` by ${by}` : ''})` +
+        (detail ? `: ${detail}` : ''),
+    );
+    this.name = 'AgentStoppedError';
+  }
 }
 
 /** Cap an API error message for inline use in a rewind marker: keep enough to
@@ -1101,7 +1144,7 @@ export class AgentFramework {
    * liveness/settlement state cross generations. */
   private usedEphemeralAgentNames: Set<string> = new Set();
   /** One-shot generation tickets minted by createEphemeralAgent. */
-  private ephemeralCandidates: WeakMap<Agent, ContextManager> = new WeakMap();
+  private ephemeralCandidates: WeakMap<Agent, { contextManager: ContextManager; spec: AgentSpec }> = new WeakMap();
   /** Physical ephemeral frames deliberately disposed by their run watchdog/caller.
    * The name is single-generation, so these frames still own their terminal
    * typing/outgoing close even after runEphemeralToCompletion deregisters them. */
@@ -1280,13 +1323,18 @@ export class AgentFramework {
   private coalescingSnapshotDirty: (() => CoalescingSnapshot) | null = null;
   private coalescingRecentReceipts: CoalescingReceiptRecord[] = [];
   /**
-   * Agents that read the residents' shared un-namespaced message slot: every
-   * ordinary resident (their context managers are not isolated) and the
-   * subconscious (isolated, but merging that slot read-only). A message in
-   * that slot is unread only if NONE of them has compiled past it. Forks and
-   * ephemeral agents have isolated slots and are their own only readers.
+   * Dendrite agent registry — every agent this framework runs, with its
+   * roles, lifetime and relationships. `agents` stays the map of live Agent
+   * OBJECTS (the generation identity streams are checked against); the
+   * registry is what says what each of them is for. Selection sites read
+   * roles from here instead of excluding kinds by hand.
    */
-  private readonly sharedSlotAgents = new Set<Agent>();
+  private readonly registry: AgentRegistry = new AgentRegistry({
+    persist: (snapshot) => this.persistAgentRegistry(snapshot),
+    appendEnded: (record) => this.appendEndedAgentRecord(record),
+  });
+  /** Tell the first adoption candidate when task work is orphaned (config.dendrite.announceOrphans). */
+  private announceOrphans = true;
   /** Group commit: one fsync per event-loop turn, shared by every waiter. */
   private coalescingCommit: Promise<void> | null = null;
   private inferenceRouter: InferenceRouter | null = null;
@@ -1296,17 +1344,15 @@ export class AgentFramework {
   private conversationRouter: ConversationRouter | null = null;
   /** Agent configs by name — fork agents are built from the template's config. */
   private agentConfigs: Map<string, AgentConfig> = new Map();
-  /**
-   * Fork agent → its home channel. Permanent (unlike router bindings, which
-   * expire): publish/injection scoping must survive unbinding so the closure
-   * turn still lands in the right channel.
-   */
-  private conversationAgentHomes: Map<string, string> = new Map();
+  // A fork agent's home channel is its registry record's `homeChannel`.
+  // Permanent (unlike router bindings, which expire): publish/injection
+  // scoping must survive unbinding so the closure turn still lands in the
+  // right channel.
   /** Last idle-TTL sweep timestamp. */
   private lastConversationSweep = 0;
 
   /** Forks whose TTL closure turn has been queued — disposed (removed from
-   * agents/agentConfigs/conversationAgentHomes) when their stream ends. */
+   * agents/agentConfigs and ended in the registry) when their stream ends. */
   private closingConversationAgents: Set<string> = new Set();
   // Client-side programmatic tool calling (`code_execution`). Null unless
   // config.codeExecution.enabled. One PyRunner per agent (interpreter state
@@ -1475,12 +1521,22 @@ export class AgentFramework {
     } catch {
       // Already registered
     }
-    for (const id of [COALESCING_STATE_ID, COALESCING_RECENT_ID]) {
+    for (const id of [COALESCING_STATE_ID, COALESCING_RECENT_ID, AGENT_REGISTRY_STATE_ID]) {
       try {
         store.registerState({ id, strategy: 'snapshot' });
       } catch {
         // Already registered
       }
+    }
+    try {
+      store.registerState({
+        id: AGENT_REGISTRY_ENDED_ID,
+        strategy: 'append_log',
+        deltaSnapshotEvery: 100,
+        fullSnapshotEvery: 20,
+      });
+    } catch {
+      // Already registered
     }
 
     try {
@@ -1581,6 +1637,13 @@ export class AgentFramework {
     // Restore persisted usage data (if any) from prior session
     framework.restoreUsageState();
 
+    framework.announceOrphans = config.dendrite?.announceOrphans ?? true;
+
+    // What the previous process left in the agent registry. Read before any
+    // agent is declared so a restored persistent agent becomes a new
+    // incarnation of the same identity rather than a stranger.
+    const interruptedAgents = framework.restoreAgentRegistry();
+
     // Create agents
     for (const agentConfig of config.agents) {
       await framework.createAgent(agentConfig);
@@ -1593,6 +1656,11 @@ export class AgentFramework {
     if (config.subconscious?.enabled) {
       await framework.createSubconsciousAgent(config.subconscious);
     }
+
+    // Configuration has now declared its agents: settle what the previous
+    // process left unfinished (interrupted bounded work, persistent agents
+    // no longer configured, results still held for delivery).
+    framework.reconcileAgentRegistry(interruptedAgents);
 
     // Finish any branch-local suppression interrupted after Chronicle switched
     // branches. This runs before modules, MCPL connections, or inbound traffic.
@@ -1667,8 +1735,7 @@ export class AgentFramework {
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
           });
         },
-        getAgentNames: () => [...framework.agents.keys()].filter(
-          (n) => n !== framework.subconsciousAgentName),
+        getAgentNames: () => framework.registry.gateRecipients(),
       });
     }
 
@@ -1816,7 +1883,7 @@ export class AgentFramework {
           setSubconsciousAnchor: (sequence) =>
             framework.subconsciousStrategy?.setAnchor(sequence),
           isForkBound: (channelId) =>
-            [...framework.conversationAgentHomes.values()].includes(channelId),
+            framework.registry.list().some((record) => record.homeChannel === channelId),
           isPrivilegedAuthor: (authorId) =>
             framework.eventGate?.isPrivilegedUser(authorId) ?? false,
           allowChannelSpeech: () => !!framework.subconsciousConfig?.allowChannelSpeech,
@@ -2111,7 +2178,7 @@ export class AgentFramework {
     return true;
   }
   private holdProviderAcceleration(agent: Agent, error: Error, trigger?: InferenceRequest, auxiliary = false): boolean {
-    if (this.ephemeralRuns.has(agent.name) || this.conversationAgentHomes.has(agent.name)) return false;
+    if (!this.registry.ownsProviderScheduling(agent.name)) return false;
     // The host knows more than the message wording does: ask it first. An
     // auxiliary failure arms host holds only — the built-in acceleration
     // cooldown stays a primary-path mechanism.
@@ -4073,7 +4140,18 @@ export class AgentFramework {
    * Data persists after cleanup for investigation and cross-revert.
    * Call cleanup() when done to release the ContextManager.
    */
-  async createEphemeralAgent(config: AgentConfig): Promise<{
+  async createEphemeralAgent(
+    config: AgentConfig,
+    /**
+     * How the registry should describe this agent. Omitted: an independent
+     * fresh worker with no spawner and no result route, which is what every
+     * caller of this method got before the registry existed. Supplying a
+     * spec (see the presets in `dendrite/`) declares who spawned it, where
+     * its result goes and what it inherited, so lifecycle rules — orphan
+     * notice, reparenting, held results — apply to it.
+     */
+    spec?: Omit<AgentSpec, 'name'>,
+  ): Promise<{
     agent: Agent;
     contextManager: ContextManager;
     cleanup: () => void;
@@ -4100,7 +4178,12 @@ export class AgentFramework {
       const agent = new Agent(config, contextManager, this.membrane);
       this.restoreToolResultGuardSetting(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-      this.ephemeralCandidates.set(agent, contextManager);
+      this.ephemeralCandidates.set(agent, {
+        contextManager,
+        spec: spec
+          ? { ...spec, name: config.name, namespace: spec.namespace ?? namespace }
+          : workerSpec(config.name, { namespace }),
+      });
 
       const cleanup = () => {
         // Don't close the store — it's shared. Just release the CM.
@@ -4111,6 +4194,480 @@ export class AgentFramework {
     } catch (error) {
       this.usedEphemeralAgentNames.delete(config.name);
       throw error;
+    }
+  }
+
+  // ==========================================================================
+  // Dendrite: agent registry, lifecycle and attributed communication
+  // ==========================================================================
+  //
+  // One trust domain: there is no permission check on any of this. Any
+  // caller may list, cancel, stop or reparent any agent. Context isolation
+  // between agents is not process or filesystem isolation — agents sharing
+  // tools, a shell or a workspace can affect the same external state.
+
+  /** Flat list of registered agents with their roles, lifetime and relationships. */
+  listAgents(options: { includeEnded?: boolean } = {}): AgentRecord[] {
+    return structuredClone(this.registry.list(options));
+  }
+
+  /** One agent's record: the live one, else its most recent ended one. */
+  getAgentRecord(name: string): AgentRecord | null {
+    const record = this.registry.inspect(name);
+    return record ? structuredClone(record) : null;
+  }
+
+  /** The agent that owns default delivery, or null before any is declared. */
+  getPrimaryAgentName(): string | null {
+    return this.registry.primary();
+  }
+
+  /**
+   * Activations in flight, each with the agent that owns the work. Derived
+   * from the live turn state, so it cannot disagree with what is running.
+   */
+  listActivations(): ActivationRecord[] {
+    const activations: ActivationRecord[] = [];
+    for (const [name, token] of this.activeTurnTokens) {
+      const record = this.registry.get(name);
+      if (!record) continue;
+      const trigger = this.activeTurnTriggers.get(name);
+      activations.push({
+        id: `${name}#${record.incarnation}:${token}`,
+        owner: { agent: name, incarnation: record.incarnation },
+        ...(trigger?.timestamp !== undefined ? { requestedAt: trigger.timestamp } : {}),
+        ...(trigger?.reason ? { reason: trigger.reason } : {}),
+        ...(trigger?.source ? { source: trigger.source } : {}),
+        ...(trigger?.channelId ? { channelId: trigger.channelId } : {}),
+      });
+    }
+    return activations;
+  }
+
+  /**
+   * Policy epochs currently in force (tune-out holds), read from the
+   * coordinator's own durable state — not mirrored. An epoch is neither an
+   * agent nor a task: ending one leaves both running.
+   */
+  listPolicyEpochs(): PolicyEpoch[] {
+    if (!this.channelRegistry) return [];
+    const owner = this.registry.primary();
+    const epochs: PolicyEpoch[] = [];
+    for (const entry of this.channelRegistry.listChannelsRaw()) {
+      const state = this.channelRegistry.getTuneOutState(entry.serverId, entry.descriptor.id);
+      if (!state) continue;
+      epochs.push({
+        id: state.params.epochId,
+        kind: 'tune-out',
+        scope: { serverId: entry.serverId, channelId: entry.descriptor.id },
+        ...(owner ? { owner } : {}),
+        ...(this.subconsciousAgentName ? { reader: this.subconsciousAgentName } : {}),
+        startedAtSequence: state.params.startedAtSequence,
+        ...(state.params.expiresAtMs !== undefined ? { expiresAtMs: state.params.expiresAtMs } : {}),
+      });
+    }
+    return epochs;
+  }
+
+  /**
+   * Cancel an agent's activation in flight, leaving the agent registered.
+   * For a bounded job, whose lifetime is that one run, this ends the job.
+   * Returns false when nothing was running.
+   */
+  cancelActivation(name: string, options: { by?: string; reason?: string } = {}): boolean {
+    if (!this.registry.has(name)) throw new Error(`cancelActivation: "${name}" is not a registered agent`);
+    const run = this.ephemeralRuns.get(name);
+    if (run) {
+      run.endReason ??= 'stopped';
+      run.endedBy ??= options.by;
+    }
+    const cancelled = this.abortInference(name, options.reason ?? 'cancelled');
+    if (run && !cancelled) {
+      // Nothing in flight to abort (startup, or between rounds): settle the
+      // awaiting caller directly so the job still ends.
+      run.settle.reject(new AgentStoppedError(name, 'stopped', options.by, options.reason));
+    }
+    if (cancelled || run) {
+      this.emitTrace({
+        type: 'dendrite:activation-cancelled',
+        agentName: name,
+        ...(options.by ? { by: options.by } : {}),
+        ...(options.reason ? { reason: options.reason } : {}),
+      });
+    }
+    return cancelled || run !== undefined;
+  }
+
+  /**
+   * End an agent: cancel its run, remove it from the framework, and settle
+   * what it spawned — attention tenants end with it; task work is orphaned,
+   * notified and offered for reparenting, and keeps running.
+   *
+   * The default-delivery owner cannot be stopped (the framework needs
+   * exactly one); cancel its activation instead. A persistent agent stopped
+   * here is declared by configuration and returns at the next boot.
+   */
+  stopAgent(name: string, options: { by?: string; reason?: string } = {}): EndOutcome {
+    const record = this.registry.get(name);
+    if (!record) throw new Error(`stopAgent: "${name}" is not a registered agent`);
+    if (record.roles.defaultDelivery) {
+      throw new Error(
+        `stopAgent: "${name}" owns default delivery and cannot be stopped; use cancelActivation to end its current run`,
+      );
+    }
+    const outcome = this.registry.end(name, 'stopped', options.by)!;
+    this.teardownEndedAgent(outcome.ended, options.reason);
+    this.settleEndedAgent(outcome);
+    return structuredClone(outcome);
+  }
+
+  /**
+   * Give an agent a new parent. Clears its orphan state; a result route
+   * whose recipient is gone follows the new parent, and results it already
+   * produced for the lost recipient are delivered to the new one.
+   */
+  reparentAgent(name: string, newParent: string, options: { by?: string } = {}): AgentRecord {
+    const { record, deliverable } = this.registry.reparent(name, newParent);
+    this.emitTrace({
+      type: 'dendrite:agent-reparented',
+      agentName: name,
+      parent: newParent,
+      ...(options.by ? { by: options.by } : {}),
+    });
+    this.lifecycleNotice(
+      name,
+      `[Agent lifecycle: ${newParent} is now your parent` +
+        (record.relationships.resultTo?.to === newParent ? ' and will receive your result' : '') +
+        '.]',
+      { event: 'reparented', parent: newParent },
+    );
+    for (const mail of deliverable) this.attemptMailDelivery(mail);
+    return structuredClone(record);
+  }
+
+  /**
+   * An explicit message from one agent to another: the sender's verbatim
+   * content, in the recipient's context under the SENDER's name, with the
+   * sender's identity and incarnation and the causal chain in metadata.
+   * Never an unmarked insertion into the recipient's own voice.
+   */
+  sendAgentMessage(
+    from: string,
+    to: string,
+    content: ContentBlock[],
+    options: { causedBy?: string[]; wake?: boolean } = {},
+  ): { mailId: string; delivered: boolean } {
+    if (!this.registry.inspect(from)) throw new Error(`sendAgentMessage: sender "${from}" is not a known agent`);
+    if (!this.registry.inspect(to)) throw new Error(`sendAgentMessage: recipient "${to}" is not a known agent`);
+    this.registry.noteMessagePath(from, to);
+    const mail = this.registry.holdMail({
+      kind: 'message',
+      from: this.registry.ref(from),
+      to,
+      content,
+      ...(options.causedBy?.length ? { causedBy: options.causedBy } : {}),
+    });
+    return { mailId: mail.id, delivered: this.attemptMailDelivery(mail, options.wake ?? true) };
+  }
+
+  /**
+   * Return a bounded job's result along the agent's declared result route.
+   * The result is recorded durably before delivery is attempted, so it is
+   * neither lost nor delivered twice across a restart; if the recipient is
+   * gone it is held as attributed mail until the agent is reparented.
+   *
+   * May be called after the agent's run has ended — its record stays
+   * inspectable. Refused for a `tool-result` route: there the awaiting
+   * caller already holds the result and delivers it itself.
+   */
+  deliverAgentResult(
+    from: string,
+    content: ContentBlock[],
+    options: { causedBy?: string[] } = {},
+  ): { mailId: string; delivered: boolean; to: string } {
+    const record = this.registry.inspect(from);
+    if (!record) throw new Error(`deliverAgentResult: "${from}" is not a known agent`);
+    const route = record.relationships.resultTo;
+    if (!route) throw new Error(`deliverAgentResult: "${from}" has no result route`);
+    if (route.as !== 'message') {
+      throw new Error(
+        `deliverAgentResult: "${from}" returns its result as a ${route.as}; the caller awaiting the run delivers it`,
+      );
+    }
+    const mail = this.registry.holdMail({
+      kind: 'result',
+      from: { agent: from, incarnation: record.incarnation },
+      to: route.to,
+      content,
+      ...(options.causedBy?.length ? { causedBy: options.causedBy } : {}),
+    });
+    // A finished job's output must survive a hard exit from here on.
+    try { this.store.sync(); } catch (error) { console.error('[dendrite] sync after holding a result failed:', error); }
+    return { mailId: mail.id, delivered: this.attemptMailDelivery(mail), to: route.to };
+  }
+
+  /** Communications not yet handed to their recipient, and why. */
+  listHeldMail(filter: { to?: string; from?: string } = {}): HeldMail[] {
+    return structuredClone(this.registry.listMail(filter));
+  }
+
+  /**
+   * Try to hand one held item to its recipient. True when the message is in
+   * (or queued for) the recipient's context; false when it stays held
+   * because nobody can receive it. The held copy is released by
+   * `addMessage` at the moment the message enters the store.
+   */
+  private attemptMailDelivery(mail: HeldMail, wake = true): boolean {
+    const recipient = this.registry.has(mail.to) ? this.agents.get(mail.to) : undefined;
+    if (!recipient) {
+      this.registry.markMailHeld(mail.id, 'recipient-gone');
+      this.emitTrace({
+        type: 'dendrite:mail-held',
+        mailId: mail.id,
+        kind: mail.kind,
+        from: mail.from.agent,
+        to: mail.to,
+        reason: 'recipient-gone',
+      });
+      return false;
+    }
+    this.addMessage(
+      // The sender's own name: its words stay its own.
+      mail.from.agent,
+      mail.content as ContentBlock[],
+      {
+        kind: `agent-${mail.kind}`,
+        dendrite: {
+          mailId: mail.id,
+          kind: mail.kind,
+          from: mail.from,
+          ...(mail.causedBy?.length ? { causedBy: mail.causedBy } : {}),
+        },
+      } as MessageMetadata,
+      { forAgent: mail.to },
+    );
+    this.emitTrace({
+      type: 'dendrite:mail-delivered',
+      mailId: mail.id,
+      kind: mail.kind,
+      from: mail.from.agent,
+      to: mail.to,
+    });
+    if (wake) {
+      this.pendingRequests.push({
+        agentName: mail.to,
+        reason: `agent-${mail.kind}:${mail.from.agent}`,
+        source: 'dendrite',
+        timestamp: Date.now(),
+      });
+    }
+    return true;
+  }
+
+  /** A host-framed lifecycle fact in an agent's context. Never voiced as anyone. */
+  private lifecycleNotice(agentName: string, text: string, detail: Record<string, unknown>): void {
+    if (!this.agents.has(agentName)) return;
+    this.addMessage(
+      'user',
+      [{ type: 'text', text }],
+      { system: true, kind: 'agent-lifecycle', dendrite: detail } as MessageMetadata,
+      { forAgent: agentName },
+    );
+  }
+
+  /**
+   * The creation ("consent") event: names what kind of agent this is, what
+   * ends it and what happens to it when its spawner ends.
+   */
+  private announceAgentCreated(record: AgentRecord): void {
+    this.emitTrace({
+      type: 'dendrite:agent-created',
+      agentName: record.name,
+      kind: record.kind,
+      incarnation: record.incarnation,
+      lifetime: record.lifetime,
+      ...(record.relationships.spawnedBy
+        ? { spawnedBy: record.relationships.spawnedBy, onParentEnd: record.onParentEnd }
+        : {}),
+      ...(record.relationships.resultTo ? { resultTo: record.relationships.resultTo } : {}),
+      ...(record.inherit ? { inherit: record.inherit } : {}),
+    });
+  }
+
+  /**
+   * Remove an ended agent's live object from the framework. A bounded run
+   * is ended through its awaiting caller (whose teardown owns the
+   * name-keyed state); any other agent is torn down here.
+   */
+  private teardownEndedAgent(record: AgentRecord, detail?: string): void {
+    const name = record.name;
+    const reason = record.ended?.reason ?? 'stopped';
+    const run = this.ephemeralRuns.get(name);
+    if (run) {
+      run.endReason = reason;
+      run.endedBy = record.ended?.by;
+      run.settle.reject(new AgentStoppedError(name, reason, record.ended?.by, detail));
+      return;
+    }
+    const agent = this.agents.get(name);
+    if (!agent) return;
+    if (record.homeChannel && this.conversationRouter?.getBinding(record.homeChannel)?.agentName === name) {
+      this.conversationRouter.unbind(record.homeChannel);
+    }
+    this.closingConversationAgents.delete(name);
+    // Cancel before deregistration: a late stream event is discarded by
+    // driveStream's Agent-identity check once the name no longer maps to it.
+    agent.cancelStream();
+    this.activeStreams.delete(name);
+    this.pendingAssistantBlocks.delete(name);
+    this.eventGate?.onInferenceEnded(name);
+    this.agents.delete(name);
+    this.agentConfigs.delete(name);
+    this.toolImageLedgers.delete(name);
+    this.evictTurnCheckpoints(name);
+    this.activeTurnTokens.delete(name);
+    this.activeTurnTriggers.delete(name);
+    this.logicalTurnToolCalls.delete(agent);
+    this.pendingRequests = this.pendingRequests.filter((request) => request.agentName !== name);
+    if (name === this.subconsciousAgentName) {
+      this.tuneOutCoordinator?.stop();
+      this.subconsciousAgentName = null;
+    }
+  }
+
+  /**
+   * Carry out what the registry decided when an agent ended: tear down the
+   * attention tenants that end with it, and tell each orphan — and the
+   * first agent that could adopt it — what happened.
+   */
+  private settleEndedAgent(outcome: EndOutcome | null): void {
+    if (!outcome) return;
+    for (const record of [...outcome.cascaded, outcome.ended]) {
+      this.emitTrace({
+        type: 'dendrite:agent-ended',
+        agentName: record.name,
+        kind: record.kind,
+        incarnation: record.incarnation,
+        reason: record.ended?.reason ?? 'stopped',
+        ...(record.ended?.by ? { by: record.ended.by } : {}),
+      });
+    }
+    for (const record of outcome.cascaded) this.teardownEndedAgent(record);
+
+    const parent = outcome.ended;
+    for (const { record, candidates } of outcome.orphaned) {
+      const former = record.orphaned?.formerParent.agent ?? parent.name;
+      const reason = record.orphaned?.reason ?? parent.ended?.reason ?? 'stopped';
+      this.emitTrace({
+        type: 'dendrite:agent-orphaned',
+        agentName: record.name,
+        formerParent: former,
+        reason,
+        candidates,
+      });
+      const route = record.relationships.resultTo;
+      const resultHeld = route?.as === 'message' && !this.registry.has(route.to);
+      this.lifecycleNotice(
+        record.name,
+        `[Agent lifecycle: ${former}, the agent that started you, has ended (${reason}). ` +
+          'Your own work is not cancelled.' +
+          (resultHeld ? ' Your result will be held until another agent becomes its recipient.' : '') +
+          ']',
+        { event: 'orphaned', formerParent: record.orphaned?.formerParent, reason, candidates },
+      );
+      const candidate = candidates[0];
+      if (candidate && this.announceOrphans) {
+        this.lifecycleNotice(
+          candidate,
+          `[Agent lifecycle: ${former} has ended (${reason}) while its ${record.kind} agent ` +
+            `"${record.name}" was still running. "${record.name}" now has no parent` +
+            (resultHeld ? ' and nowhere to return its result' : '') +
+            '; it can be reparented to you.]',
+          { event: 'adoption-offered', agent: record.name, formerParent: record.orphaned?.formerParent, reason },
+        );
+      }
+    }
+  }
+
+  private persistAgentRegistry(snapshot: RegistrySnapshot): void {
+    this.store.setStateJson(AGENT_REGISTRY_STATE_ID, snapshot);
+  }
+
+  private appendEndedAgentRecord(record: AgentRecord): void {
+    this.store.appendToStateJson(AGENT_REGISTRY_ENDED_ID, record);
+  }
+
+  /** Load the previous process's registry. Returns the bounded work it interrupted. */
+  private restoreAgentRegistry(): AgentRecord[] {
+    let snapshot: RegistrySnapshot | null = null;
+    let ended: AgentRecord[] = [];
+    try {
+      snapshot = this.store.getStateJson(AGENT_REGISTRY_STATE_ID) as RegistrySnapshot | null;
+    } catch {
+      // No persisted registry yet
+    }
+    try {
+      const tail = this.store.getStateTail(AGENT_REGISTRY_ENDED_ID, AGENT_REGISTRY_ENDED_RELOAD);
+      if (tail) ended = JSON.parse(tail.toString('utf8')) as AgentRecord[];
+    } catch {
+      // No ended history yet
+    }
+    return this.registry.restore(snapshot, Array.isArray(ended) ? ended : []).interrupted;
+  }
+
+  /**
+   * Boot reconciliation, once configuration has declared its agents.
+   * Restart behaviour follows from lifetime: persistent agents were just
+   * re-created; everything else that was live was interrupted, and the
+   * recipient of an interrupted job's result is told so. Results held from
+   * before the restart are delivered now, exactly once.
+   */
+  private reconcileAgentRegistry(interrupted: AgentRecord[]): void {
+    for (const outcome of this.registry.reconcile().unconfigured) this.settleEndedAgent(outcome);
+
+    const byRecipient = new Map<string, AgentRecord[]>();
+    for (const record of interrupted) {
+      this.emitTrace({
+        type: 'dendrite:agent-ended',
+        agentName: record.name,
+        kind: record.kind,
+        incarnation: record.incarnation,
+        reason: 'host-restart',
+      });
+      const route = record.relationships.resultTo;
+      if (route?.as !== 'message' || !this.agents.has(route.to)) continue;
+      // A result it had already handed over needs no apology.
+      if (this.registry.listMail({ from: record.name }).some((mail) => mail.kind === 'result')) continue;
+      byRecipient.set(route.to, [...(byRecipient.get(route.to) ?? []), record]);
+    }
+    for (const [recipient, records] of byRecipient) {
+      const names = records.map((record) => `"${record.name}"`).join(', ');
+      this.lifecycleNotice(
+        recipient,
+        `[Agent lifecycle: the host restarted while ${names} ${records.length === 1 ? 'was' : 'were'} ` +
+          `still working for you. ${records.length === 1 ? 'It was' : 'They were'} ended without a result.]`,
+        { event: 'interrupted', agents: records.map((record) => record.name), reason: 'host-restart' },
+      );
+      this.pendingRequests.push({
+        agentName: recipient,
+        reason: 'agent-interrupted',
+        source: 'dendrite',
+        timestamp: Date.now(),
+      });
+    }
+
+    for (const mail of this.registry.listMail()) {
+      const recipient = this.agents.get(mail.to);
+      if (recipient) {
+        // The message may have reached the store in the same sync that the
+        // release missed; never deliver it a second time.
+        const already = recipient.getContextManager().queryMessages({ metadata: { 'dendrite.mailId': mail.id } });
+        if (already.messages.length > 0) {
+          this.registry.releaseMail(mail.id);
+          continue;
+        }
+      }
+      this.attemptMailDelivery(mail);
     }
   }
 
@@ -4203,7 +4760,8 @@ export class AgentFramework {
     // Only a fresh object returned by createEphemeralAgent may enter this path.
     // Never overwrite a resident/conversation owner or a concurrent run: their
     // cleanup is name-keyed and could cancel/deregister the legitimate owner.
-    if (this.ephemeralCandidates.get(agent) !== contextManager) {
+    const candidate = this.ephemeralCandidates.get(agent);
+    if (!candidate || candidate.contextManager !== contextManager) {
       throw new Error(`Ephemeral agent "${agent.name}" has no fresh generation ticket from this framework`);
     }
     // A live surgery holds the whole store: an agent admitted now would
@@ -4221,6 +4779,9 @@ export class AgentFramework {
     if (this.agents.has(agent.name) || this.ephemeralRuns.has(agent.name)) {
       throw new Error(`Ephemeral agent "${agent.name}" is already registered or running`);
     }
+    // Admit it to the registry first: a spec the registry refuses (spawner
+    // or result recipient gone since creation) must not leave a live agent.
+    this.announceAgentCreated(this.registry.register(candidate.spec));
     // Register temporarily so the event loop can drive it
     this.agents.set(agent.name, agent);
     const run: EphemeralRun = {
@@ -4231,15 +4792,31 @@ export class AgentFramework {
     };
     this.ephemeralRuns.set(agent.name, run);
 
+    const lifetime = candidate.spec.lifetime;
     const STARTUP_TIMEOUT_MS = watchdogs?.startupTimeoutMs ?? 30_000;
     // After inference has started, give it 15 minutes of activity-bounded
     // life. The stream driver refreshes the deadline as it makes progress;
-    // sustained silence trips it.
-    const COMPLETION_IDLE_TIMEOUT_MS = watchdogs?.idleTimeoutMs ?? 15 * 60_000;
+    // sustained silence trips it. An explicit watchdog wins; otherwise the
+    // spec's task lifetime is the bound.
+    const COMPLETION_IDLE_TIMEOUT_MS = watchdogs?.idleTimeoutMs
+      ?? (lifetime.kind === 'task' ? lifetime.idleTimeoutMs : undefined)
+      ?? 15 * 60_000;
     const IDLE_POLL_MS = watchdogs?.idlePollMs ?? 30_000;
 
     let startupWatchdog: ReturnType<typeof setTimeout> | null = null;
     let completionWatchdog: ReturnType<typeof setInterval> | null = null;
+    let deadlineWatchdog: ReturnType<typeof setTimeout> | null = null;
+
+    // A task lifetime's wall-clock deadline: the identity must end, however
+    // lively its stream is.
+    const deadline = new Promise<never>((_, reject) => {
+      if (lifetime.kind !== 'task' || lifetime.deadlineMs === undefined) return;
+      deadlineWatchdog = setTimeout(() => {
+        run.endReason = 'deadline';
+        reject(new AgentStoppedError(agent.name, 'deadline', undefined, `${lifetime.deadlineMs}ms elapsed`));
+      }, lifetime.deadlineMs);
+      deadlineWatchdog.unref?.();
+    });
 
     const startupTimeout = new Promise<never>((_, reject) => {
       startupWatchdog = setTimeout(() => {
@@ -4281,11 +4858,14 @@ export class AgentFramework {
         run.settle.promise,
         startupTimeout,
         completionIdleTimeout,
+        deadline,
       ]);
+      run.endReason ??= 'completed';
       return { speech: result.speech, toolCallsCount: result.toolCallsCount };
     } finally {
       if (startupWatchdog) clearTimeout(startupWatchdog);
       if (completionWatchdog) clearInterval(completionWatchdog);
+      if (deadlineWatchdog) clearTimeout(deadlineWatchdog);
       // Mark before cancellation: an adapter may synchronously settle its
       // iterator, and this physical frame still owns terminal typing/outgoing
       // closure even though the ephemeral name is about to be deregistered.
@@ -4318,6 +4898,9 @@ export class AgentFramework {
       this.activeTurnTokens.delete(agent.name);
       this.activeTurnTriggers.delete(agent.name);
       this.logicalTurnToolCalls.delete(agent);
+      // The identity ends with its run. Whatever it spawned is settled by
+      // the registry's rules (attention tenants end, task work is orphaned).
+      this.settleEndedAgent(this.registry.end(agent.name, run.endReason ?? 'failed', run.endedBy));
     }
   }
 
@@ -6406,7 +6989,10 @@ export class AgentFramework {
     const agent = new Agent(config, contextManager, this.membrane);
     this.restoreToolResultGuardSetting(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-    this.sharedSlotAgents.add(agent);
+    // The first resident declared owns default delivery.
+    this.announceAgentCreated(
+      this.registry.register(residentSpec(config.name, { primary: !this.primaryAgentName })),
+    );
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
     if (restoredSettings) {
       agent.restoreRuntimeSettings(
@@ -6483,7 +7069,10 @@ export class AgentFramework {
     const agent = new Agent(agentConfig, contextManager, this.membrane);
     this.restoreToolResultGuardSetting(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
-    this.sharedSlotAgents.add(agent); // reads the shared slot through its merged view
+    // An attention tenant of the resident it serves: reads the shared slot
+    // through its merged view (held traffic included), never a broadcast
+    // recipient, and outlives policy epochs.
+    this.announceAgentCreated(this.registry.register(subconsciousSpec(name, primaryName)));
     this.agents.set(name, agent);
     this.agentConfigs.set(name, agentConfig);
     this.subconsciousAgentName = name;
@@ -6989,12 +7578,12 @@ export class AgentFramework {
         if (!decision.trigger) return;
       }
 
-      // Broadcast requests exclude conversation forks — they are driven by
-      // their own channel's messages, not by framework-wide events.
+      // A broadcast request reaches the agents whose role says they take
+      // untargeted inbound; channel-bound and bounded-job agents are driven
+      // by their own channel or task, not by framework-wide events.
       const targetAgents =
         response.requestInference === true
-          ? Array.from(this.agents.keys()).filter(
-              (n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName)
+          ? this.registry.untargetedRecipients()
           : response.requestInference;
 
       for (const agentName of targetAgents) {
@@ -7060,7 +7649,7 @@ export class AgentFramework {
     if (event.deliverTo) {
       const target = this.agents.get(event.deliverTo);
       if (!target) return undefined;
-      if (this.conversationRouter && this.conversationAgentHomes.has(target.name)) {
+      if (this.conversationRouter && this.registry.homeChannel(target.name) !== undefined) {
         metadata.triggered = event.triggerInference ?? false;
         const id = target.getContextManager().addMessage('user', event.content, metadata);
         // A correction may target an older engagement. Refresh only the
@@ -7141,8 +7730,7 @@ export class AgentFramework {
       // keeps the historical broadcast. (targetAgents was declared on
       // McplChannelIncomingEvent from the start but never honored here —
       // tune-out's wake routing is the first setter.)
-      const targetAgents = event.targetAgents
-        ?? [...this.agents.keys()].filter((n) => n !== this.subconsciousAgentName);
+      const targetAgents = event.targetAgents ?? this.registry.untargetedRecipients();
       for (const agentName of targetAgents) {
         if (!this.agents.has(agentName)) continue;
         this.pendingRequests.push({
@@ -7319,9 +7907,13 @@ export class AgentFramework {
       const agent = new Agent(config, contextManager, this.membrane);
       this.restoreToolResultGuardSetting(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+      this.announceAgentCreated(this.registry.register(conversationForkSpec(name, {
+        template: router.templateAgent,
+        channelId,
+        idleTtlMs: router.idleTtlMs,
+      })));
       this.agents.set(name, agent);
       this.agentConfigs.set(name, config);
-      this.conversationAgentHomes.set(name, channelId);
       return agent;
     } catch (error) {
       this.usedEphemeralAgentNames.delete(name);
@@ -7349,12 +7941,12 @@ export class AgentFramework {
    */
   private disposeConversationAgent(agentName: string): void {
     this.closingConversationAgents.delete(agentName);
-    const channelId = this.conversationAgentHomes.get(agentName);
+    const channelId = this.registry.homeChannel(agentName);
     const agent = this.agents.get(agentName);
     this.agents.delete(agentName);
     this.toolImageLedgers.delete(agentName);
     this.agentConfigs.delete(agentName);
-    this.conversationAgentHomes.delete(agentName);
+    this.settleEndedAgent(this.registry.end(agentName, 'idle-ttl', 'framework'));
     this.evictTurnCheckpoints(agentName);
     if (agent) this.logicalTurnToolCalls.delete(agent);
     this.emitTrace({
@@ -7374,7 +7966,7 @@ export class AgentFramework {
     agentName: string,
     injections: ContextInjection[],
   ): ContextInjection[] {
-    const home = this.conversationAgentHomes.get(agentName);
+    const home = this.registry.homeChannel(agentName);
     if (!home || !this.channelRegistry || injections.length === 0) {
       return injections;
     }
@@ -7415,7 +8007,7 @@ export class AgentFramework {
         // Agent vanished (external reset) — nothing to close, just make sure
         // its bookkeeping doesn't linger.
         this.agentConfigs.delete(binding.agentName);
-        this.conversationAgentHomes.delete(binding.agentName);
+        this.settleEndedAgent(this.registry.end(binding.agentName, 'idle-ttl', 'framework'));
         continue;
       }
       agent.getContextManager().addMessage(
@@ -7796,7 +8388,7 @@ export class AgentFramework {
         return [];
       }
     }
-    return [...this.agents.keys()].filter((n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName);
+    return this.registry.untargetedRecipients();
   }
 
   /** Deliver through the lane's ordinary path; report where it landed. */
@@ -7943,8 +8535,10 @@ export class AgentFramework {
       if (!subconscious) return true;
       readers = [subconscious];
     } else {
-      readers = this.sharedSlotAgents.has(agent)
-        ? [...this.sharedSlotAgents].filter((a) => this.agents.get(a.name) === a)
+      readers = this.registry.readsSharedSlot(agent.name)
+        ? this.registry.sharedSlotReaders()
+            .map((name) => this.agents.get(name))
+            .filter((reader): reader is Agent => reader !== undefined)
         : [agent];
     }
     const branch = cm.currentBranch().name;
@@ -8063,10 +8657,8 @@ export class AgentFramework {
     }
 
     if (event.triggerInference) {
-      // Default broadcast excludes conversation forks (channel-driven).
-      const targetAgents = event.targetAgents
-        ?? [...this.agents.keys()].filter(
-          (n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName);
+      // Default broadcast: the registry's untargeted recipients.
+      const targetAgents = event.targetAgents ?? this.registry.untargetedRecipients();
       for (const agentName of targetAgents) {
         this.pendingRequests.push({
           agentName,
@@ -8848,8 +9440,7 @@ export class AgentFramework {
     attempt = 0,
     providerGateAlreadyHeld = false,
   ): Promise<void> {
-    const ownsProviderGate =
-      !this.ephemeralRuns.has(agent.name) && !this.conversationAgentHomes.has(agent.name);
+    const ownsProviderGate = this.registry.ownsProviderScheduling(agent.name);
     if (ownsProviderGate && !providerGateAlreadyHeld) {
       this.acquirePrimaryProviderGate(agent.name);
       const gate = this.providerGate(agent.name);
@@ -12365,6 +12956,11 @@ export class AgentFramework {
       opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
     );
     if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
+    // Held agent mail is released only here, where its message has actually
+    // entered the recipient's store — never on a deferral. Both writes reach
+    // disk in the same sync, so a crash keeps either both or neither.
+    const mailId = (metadata as { dendrite?: { mailId?: unknown } } | undefined)?.dendrite?.mailId;
+    if (typeof mailId === 'string') this.registry.releaseMail(mailId);
     return stored;
   }
 
@@ -12970,11 +13566,11 @@ export class AgentFramework {
         // Route a conversation fork's plain-text speech to its HOME channel, not
         // the process-global most-recent-inbound locus (item 3). The trunk agent
         // has no home entry, so this returns undefined and routeSpeech falls back
-        // to defaultPublishChannel. `conversationAgentHomes` is the permanent
+        // to defaultPublishChannel. The registry's `homeChannel` is the permanent
         // spawn-time binding; `channelForAgent` is the router's live binding as a
         // belt-and-suspenders fallback.
         homeChannelResolver: (agentName) =>
-          this.conversationAgentHomes.get(agentName)
+          this.registry.homeChannel(agentName)
           ?? this.conversationRouter?.channelForAgent(agentName),
         // Route a single TRUNK agent's plain-text speech to the channel that
         // triggered its CURRENT turn (item-3 redux). connectome-host runs every
@@ -14647,7 +15243,7 @@ export class AgentFramework {
     // ones; channel_open is rejected outright — opening channels mutates
     // framework-global state (the open-channel set every agent's injections
     // are scoped against), which is not a fork's call to make.
-    const home = this.conversationAgentHomes.get(agentName);
+    const home = this.registry.homeChannel(agentName);
     if (home) {
       const reject = (error: string): void => {
         // RFC-007: the guard refuses before the tool runs — no lifecycle events.

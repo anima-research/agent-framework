@@ -2,7 +2,7 @@
 export * from './types/index.js';
 
 // Core classes
-export { AgentFramework, BudgetPreflightError, ResumeBlockedError } from './framework.js';
+export { AgentFramework, AgentStoppedError, BudgetPreflightError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus } from './framework.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';
@@ -10,6 +10,9 @@ export { ProcessQueueImpl } from './queue.js';
 export { ModuleRegistry } from './module-registry.js';
 export { formatZonedDateTime, formatZonedTime, isValidTimeZone, resolveTimeZone } from './timezone.js';
 export { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
+
+// Dendrite: agent registry, lifecycle and presets
+export * from './dendrite/index.js';
 
 // Built-in modules
 export * from './modules/index.js';
