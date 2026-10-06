@@ -343,7 +343,7 @@ describe('Dendrite deriveAgent', () => {
     );
   });
 
-  it('denies a tool at dispatch without removing it from the request', { skip }, async () => {
+  it('denies a tool at dispatch without removing it from the request', async () => {
     const { parentRequest } = await miraMidTurn();
     const refused: Array<{ tool?: unknown; error?: unknown }> = [];
     framework.onTrace((event) => {
@@ -354,10 +354,11 @@ describe('Dendrite deriveAgent', () => {
       createMockResponse([{ type: 'tool_use', id: 'call-denied', name: 'test--wait', input: { gate: 'never' } }], 'tool_use'),
       say('could not wait'),
     );
+    // Copy inheritance: the deny does not depend on how context is inherited.
     const { result, contextManager } = await runFork({
       name: 'fork-1',
       from: 'mira',
-      strategy: folding(),
+      mode: 'copy',
       config: { denyToolsAtDispatch: ['test--wait'] },
       framing: [{ participant: 'user', content: [{ type: 'text', text: FRAMING }] }],
     });
