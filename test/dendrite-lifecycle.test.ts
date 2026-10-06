@@ -10,7 +10,6 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
-import type { NormalizedRequest, NormalizedResponse, YieldingStream } from '@animalabs/membrane';
 import {
   AgentFramework,
   AgentSpecError,
@@ -20,98 +19,10 @@ import {
 } from '../src/index.js';
 import type {
   AgentSpec,
-  EventResponse,
-  Module,
-  ModuleContext,
   ProcessEvent,
-  ProcessState,
-  ToolCall,
-  ToolDefinition,
-  ToolResult,
   TraceEvent,
 } from '../src/index.js';
-import { createMockResponse, MockYieldingStream } from './helpers/mock-membrane.js';
-
-/** A membrane that scripts each agent separately: one response list per activation. */
-class RoutedMembrane {
-  readonly calls: NormalizedRequest[] = [];
-  private readonly scripts = new Map<string, NormalizedResponse[][]>();
-
-  script(agent: string, ...activation: NormalizedResponse[]): void {
-    this.scripts.set(agent, [...(this.scripts.get(agent) ?? []), activation]);
-  }
-
-  callsFor(agent: string): NormalizedRequest[] {
-    return this.calls.filter((call) => call.assistantParticipant === agent);
-  }
-
-  streamYielding(request: NormalizedRequest): YieldingStream {
-    this.calls.push(request);
-    const queue = this.scripts.get(request.assistantParticipant ?? '') ?? [];
-    const activation = queue.shift() ?? [createMockResponse([{ type: 'text', text: 'ok' }])];
-    return new MockYieldingStream(activation);
-  }
-
-  async complete(request: NormalizedRequest): Promise<NormalizedResponse> {
-    this.calls.push(request);
-    return createMockResponse([{ type: 'text', text: 'ok' }]);
-  }
-
-  asMembrane(): import('@animalabs/membrane').Membrane {
-    return this as unknown as import('@animalabs/membrane').Membrane;
-  }
-}
-
-/** `test--wait` blocks its caller until the test releases the named gate. */
-class GateModule implements Module {
-  readonly name = 'test';
-  readonly entered = new Set<string>();
-  private readonly gates = new Map<string, () => void>();
-  broadcastOn: string | null = null;
-
-  async start(_ctx: ModuleContext): Promise<void> {}
-  // Gates still closed at shutdown stay closed: releasing them would hand a
-  // tool result to a framework that has already stopped.
-  async stop(): Promise<void> {}
-
-  getTools(): ToolDefinition[] {
-    return [{
-      name: 'wait',
-      description: 'Block until released',
-      inputSchema: { type: 'object', properties: { gate: { type: 'string' } } },
-    }];
-  }
-
-  async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    const gate = String((call.input as { gate?: string }).gate ?? 'default');
-    this.entered.add(gate);
-    await new Promise<void>((resolve) => this.gates.set(gate, resolve));
-    return { success: true, data: { released: gate } };
-  }
-
-  release(gate: string): void {
-    this.gates.get(gate)?.();
-  }
-
-  async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
-    if (this.broadcastOn && (event as { type: string }).type === this.broadcastOn) {
-      return { requestInference: true };
-    }
-    return {};
-  }
-}
-
-const waitCall = (gate: string) =>
-  createMockResponse([{ type: 'tool_use', id: `call-${gate}`, name: 'test--wait', input: { gate } }], 'tool_use');
-const say = (text: string) => createMockResponse([{ type: 'text', text }]);
-
-async function until(condition: () => boolean, what: string, timeoutMs = 5_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!condition()) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
+import { GateModule, RoutedMembrane, say, until, waitCall } from './helpers/dendrite.js';
 
 function textsIn(framework: AgentFramework, agent: string): Array<{ participant: string; text: string; metadata: Record<string, unknown> }> {
   return framework.getAgent(agent)!.getContextManager().getAllMessages().map((message) => ({
@@ -585,6 +496,39 @@ describe('Dendrite restart', () => {
     const third = await process(new GateModule());
     assert.equal(third.getAgentRecord('mira')!.incarnation, 3);
     assert.equal(textsIn(third, 'mira').filter((m) => m.metadata.kind === 'agent-lifecycle').length, 1);
+  });
+
+  it('a job interrupted by a restart resumes on its own context and still returns its result', async () => {
+    const gates1 = new GateModule();
+    const first = await process(gates1);
+    first.start();
+    await blockedJob(first, gates1, 'job', workerSpec('job', { spawnedBy: 'mira', resultTo: { to: 'mira', as: 'message' } }));
+
+    const second = await process(new GateModule());
+    second.start();
+    assert.equal(second.getAgentRecord('job')?.ended?.reason, 'host-restart');
+
+    membrane.script('job', say('finished after the restart'));
+    const resumed = await second.resumeAgent('job', {
+      model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+    });
+    assert.deepEqual(
+      resumed.contextManager.getAllMessages().map((m) => (m.content[0] as { text: string }).text),
+      ['Go.'],
+      'the round that was in flight was never stored; it starts from the task',
+    );
+    const result = await second.runEphemeralToCompletion(resumed.agent, resumed.contextManager);
+    assert.equal(result.speech, 'finished after the restart');
+
+    const record = second.getAgentRecord('job')!;
+    assert.equal(record.incarnation, 2);
+    assert.equal(record.relationships.spawnedBy, 'mira');
+    const delivery = second.deliverAgentResult('job', [{ type: 'text', text: result.speech }]);
+    assert.equal(delivery.delivered, true);
+    await second.runUntilIdle();
+    const landed = textsIn(second, 'mira').filter((m) => m.metadata.kind === 'agent-result');
+    assert.deepEqual(landed.map((m) => [m.participant, m.text]), [['job', 'finished after the restart']]);
+    assert.deepEqual((landed[0]!.metadata.dendrite as { from: unknown }).from, { agent: 'job', incarnation: 2 });
   });
 
   it('delivers a result held across a crash exactly once', async () => {

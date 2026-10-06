@@ -88,9 +88,13 @@ export class AgentRegistry {
    * Admit an agent. Refuses a spec that breaks a registry invariant — an
    * unbounded task, a second default-delivery owner, a relationship that
    * names nobody — so a malformed agent fails at load, not mid-run.
+   *
+   * `resume` admits a new incarnation of an identity that ended: where its
+   * context came from is then history, so the context source no longer has
+   * to be live. Who it reports to still does.
    */
-  register(spec: AgentSpec): AgentRecord {
-    this.validate(spec);
+  register(spec: AgentSpec, options: { resume?: boolean } = {}): AgentRecord {
+    this.validate(spec, options.resume === true);
     const previous = this.awaiting.get(spec.name);
     this.awaiting.delete(spec.name);
 
@@ -112,8 +116,9 @@ export class AgentRegistry {
         messagePeers: previous ? [...previous.relationships.messagePeers] : [],
         ...(spec.resultTo ? { resultTo: { ...spec.resultTo } } : {}),
       },
-      ...(spec.inherit ? { inherit: { ...spec.inherit } } : {}),
+      ...(spec.inherit ? { inherit: clone(spec.inherit) } : {}),
       ...(spec.selfParticipants?.length ? { selfParticipants: [...spec.selfParticipants] } : {}),
+      ...(spec.presentAs ? { presentAs: spec.presentAs } : {}),
       ...(spec.homeChannel ? { homeChannel: spec.homeChannel } : {}),
       readsSharedSlot: spec.readsSharedSlot ?? false,
       ...(spec.namespace ? { namespace: spec.namespace } : {}),
@@ -125,7 +130,7 @@ export class AgentRegistry {
     return record;
   }
 
-  private validate(spec: AgentSpec): void {
+  private validate(spec: AgentSpec, resume = false): void {
     const fail = (problem: string): never => {
       throw new AgentSpecError(spec.name || '(unnamed)', problem);
     };
@@ -156,7 +161,7 @@ export class AgentRegistry {
     if (spec.resultTo && !this.live.has(spec.resultTo.to)) {
       fail(`result recipient "${spec.resultTo.to}" is not a registered agent`);
     }
-    if (spec.inherit && !this.live.has(spec.inherit.from)) {
+    if (spec.inherit && !resume && !this.live.has(spec.inherit.from)) {
       fail(`context source "${spec.inherit.from}" is not a registered agent`);
     }
     for (const edge of spec.observes ?? []) {

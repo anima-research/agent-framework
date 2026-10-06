@@ -193,6 +193,34 @@ export interface AgentConfig {
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
 
   /**
+   * Stored participants that are this agent's own voice, in addition to its
+   * name: their turns are presented to the model as this agent's assistant
+   * turns. A derived agent sets this to the agent it inherited from, so the
+   * parent's turns read as its own history. Model-facing role assignment
+   * only, applied at request assembly — stored authorship is never rewritten.
+   */
+  selfParticipants?: string[];
+
+  /**
+   * The participant name this agent's own turns are presented under at
+   * request assembly. Defaults to `name`. A derived agent that should share
+   * its parent's provider prefix sets the parent's name, so the two
+   * requests are identical in formatters that render participant names as
+   * well as in those that only assign roles. New turns are still STORED
+   * under the agent's own name.
+   */
+  presentAs?: string;
+
+  /**
+   * Tools refused when this agent calls them, although they stay advertised.
+   * Restricts a derived agent without changing the tool block at the front
+   * of its request — removing a tool from `allowedTools` instead would
+   * change those bytes and forfeit the provider prefix it shares with its
+   * parent.
+   */
+  denyToolsAtDispatch?: string[];
+
+  /**
    * Fail-closed containment for a text response whose entire visible prose is
    * an invocation-shaped wrapper naming a tool registered on that exact turn.
    * The wrapper is neither executed nor stored as assistant continuity; a

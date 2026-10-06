@@ -165,6 +165,18 @@ export interface ContextInheritance {
   /** The parent branch the checkpoint is on. Filled at creation. */
   branch?: string;
   /**
+   * `'shared'` only: the Chronicle branch that holds everything the child
+   * writes. It outlives the child and is what inspection or a later resume
+   * opens. Filled at creation.
+   */
+  ownBranch?: string;
+  /**
+   * `'shared'` only: the context manager's own record of the derivation
+   * (plain data). Kept so the child's context can be reopened after it
+   * ended or after a restart — to resume it or to inspect it.
+   */
+  derivation?: unknown;
+  /**
    * - `'reuse'` (default): keep the parent's rendering frontier — prefix,
    *   cache markers and solver state — for fast startup.
    * - `'fresh'`: deliberately pay for a new solve, e.g. at another budget;
@@ -197,6 +209,8 @@ export interface AgentSpec {
    * model-facing role assignment only.
    */
   selfParticipants?: string[];
+  /** The participant name its turns are presented under, when not its own name. */
+  presentAs?: string;
   /** A channel this agent is bound to (its speech home and inbound scope). */
   homeChannel?: string;
   /**
@@ -261,6 +275,7 @@ export interface AgentRecord {
   relationships: AgentRelationships;
   inherit?: ContextInheritance;
   selfParticipants?: string[];
+  presentAs?: string;
   homeChannel?: string;
   readsSharedSlot: boolean;
   namespace?: string;

@@ -88,6 +88,7 @@ import {
   conversationForkSpec,
   residentSpec,
   subconsciousSpec,
+  taskForkSpec,
   workerSpec,
 } from './dendrite/index.js';
 import type {
@@ -416,7 +417,7 @@ import type {
   ChannelsChangedParams,
   ChannelsIncomingParams,
 } from './mcpl/types.js';
-import type { ContextInjection } from '@animalabs/context-manager';
+import type { ContextInjection, ContextStrategy } from '@animalabs/context-manager';
 import { formatZonedDateTime, resolveTimeZone } from './timezone.js';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
@@ -969,6 +970,80 @@ interface EphemeralRun {
   endedBy?: string;
 }
 
+/**
+ * What a reader of the residents' shared message slot does not see:
+ * messages stamped at ingestion as diverted by a tune-out. Used by every
+ * resident, and by a context derived from one when it is reopened.
+ */
+const RESIDENT_VIEW_FILTER = (message: StoredMessage): boolean =>
+  !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut;
+
+/** The context-manager surface shared inheritance needs; absent on versions without derivation. */
+interface DerivingContextManager {
+  derive(options: {
+    branch: string;
+    strategy: ContextStrategy;
+    membrane?: Membrane;
+    solve?: 'reuse' | 'fresh';
+    atSequence?: number;
+    debugLogContext?: boolean;
+  }): Promise<ContextManager>;
+  getDerivation(): ContextDerivationRecord | null;
+}
+
+/** context-manager's plain-data record of a derivation (see its ContextDerivation). */
+interface ContextDerivationRecord {
+  parentBranch: string;
+  branch: string;
+  atSequence: number;
+  solve: 'reuse' | 'fresh';
+  slots?: { messageNamespace: string | null; contextNamespace: string | null };
+}
+
+/** `ContextManager.reopenDerived`, absent on versions without derivation. */
+type ReopenDerived = (options: {
+  store: JsStore;
+  derivation: ContextDerivationRecord;
+  strategy?: ContextStrategy;
+  membrane?: Membrane;
+  viewFilter?: (message: StoredMessage) => boolean;
+  debugLogContext?: boolean;
+}) => Promise<ContextManager>;
+
+/** Options for {@link AgentFramework.deriveAgent}. */
+export interface DeriveAgentOptions {
+  /** The new agent's name. Single-use within this framework's lifetime. */
+  name: string;
+  /** The live agent whose context and configuration are inherited. */
+  from: string;
+  /** How context is inherited. Default `'shared'`. */
+  mode?: 'shared' | 'copy';
+  /** `'shared'` only. Default `'reuse'`. */
+  solve?: 'reuse' | 'fresh';
+  /**
+   * A fresh strategy instance for the child. Strategy instances hold state
+   * and are never shared; to reuse the parent's rendering it must be the
+   * same class with compatible configuration. Default: passthrough.
+   */
+  strategy?: ContextStrategy;
+  /** Identity and settings overrides. Everything not named is the parent's. */
+  config?: Partial<Omit<AgentConfig, 'name' | 'strategy'>>;
+  /** Ordinary messages appended to the child before it runs. */
+  framing?: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }>;
+  /** Who spawned it. Default: `from`. */
+  spawnedBy?: string;
+  /** Where its completion returns. */
+  resultTo?: import('./dendrite/index.js').ResultRoute;
+  /** What happens to it when its spawner ends. Default `'orphan'`. */
+  onParentEnd?: import('./dendrite/index.js').ParentEndPolicy;
+  deadlineMs?: number;
+  idleTimeoutMs?: number;
+  maxTurns?: number;
+  /** Preset label for discovery. Default `'task-fork'`. */
+  kind?: string;
+  metadata?: Record<string, unknown>;
+}
+
 /** Rejection delivered to the caller awaiting a bounded run that was ended from outside. */
 export class AgentStoppedError extends Error {
   constructor(
@@ -1144,7 +1219,20 @@ export class AgentFramework {
    * liveness/settlement state cross generations. */
   private usedEphemeralAgentNames: Set<string> = new Set();
   /** One-shot generation tickets minted by createEphemeralAgent. */
-  private ephemeralCandidates: WeakMap<Agent, { contextManager: ContextManager; spec: AgentSpec }> = new WeakMap();
+  private ephemeralCandidates: WeakMap<Agent, {
+    contextManager: ContextManager;
+    config: AgentConfig;
+    spec: AgentSpec;
+    /** A new incarnation of an identity that ended (see resumeAgent). */
+    resume?: boolean;
+  }> = new WeakMap();
+  /**
+   * Derived agent → the agent whose tool presentation it shows. A derived
+   * agent that inherits its parent's tools must advertise the identical
+   * tool block (it is the front of the shared request prefix), including
+   * the parent's resident-edited visibility and descriptions.
+   */
+  private toolSurfaceOwners: Map<string, string> = new Map();
   /** Physical ephemeral frames deliberately disposed by their run watchdog/caller.
    * The name is single-generation, so these frames still own their terminal
    * typing/outgoing close even after runEphemeralToCompletion deregisters them. */
@@ -2801,7 +2889,8 @@ export class AgentFramework {
           : t);
       return [...SUBCONSCIOUS_TOOLS, ...basics];
     }
-    return [...this.getAllTools(), ...(this.toolPresentations.has(agentName) ? presentationTools(this.toolPresentations.get(agentName)!.config.cataloguePath) : [])].map((tool) => {
+    const surfaceOwner = this.toolSurfaceOwners.get(agentName) ?? agentName;
+    return [...this.getAllTools(), ...(this.toolPresentations.has(surfaceOwner) ? presentationTools(this.toolPresentations.get(surfaceOwner)!.config.cataloguePath) : [])].map((tool) => {
       if (tool.name === 'think') {
         return this.buildThinkTool(
           snapshot?.sameRoundThinkTextPolicy
@@ -2822,7 +2911,9 @@ export class AgentFramework {
   }
 
   inspectToolPresentation(agentName: string, snapshot?: InferenceToolSnapshot): PresentationSnapshot | null {
-    const presentation = this.toolPresentations.get(agentName);
+    // A derived agent shows its parent's presentation (see toolSurfaceOwners);
+    // only the owner can edit it (editToolPresentation looks up by own name).
+    const presentation = this.toolPresentations.get(this.toolSurfaceOwners.get(agentName) ?? agentName);
     if (!presentation) return null;
     const tools = this.availableToolsForPresentation(agentName, snapshot);
     const sources = new Map<string, string>();
@@ -4164,24 +4255,43 @@ export class AgentFramework {
     }
     this.usedEphemeralAgentNames.add(config.name);
     try {
-      const namespace = `subagent/${config.name}`;
+      let namespace = `subagent/${config.name}`;
+      let contextManager: ContextManager;
+      let inherit = spec?.inherit;
 
-      const contextManager = await ContextManager.open({
-        store: this.store,
-        namespace,
-        isolate: true,
-        strategy: config.strategy ?? new PassthroughStrategy(),
-        membrane: this.membrane,
-        debugLogContext: !!process.env.DEBUG_CONTEXT,
-      });
+      if (inherit?.mode === 'shared') {
+        // Shared reads, separate writes: the child's context is the parent's
+        // at a checkpoint, on a branch of its own. Nothing is copied.
+        const derived = await this.deriveSharedContext(config, inherit);
+        contextManager = derived.contextManager;
+        inherit = derived.inherit;
+        namespace = derived.namespace;
+      } else {
+        contextManager = await ContextManager.open({
+          store: this.store,
+          namespace,
+          isolate: true,
+          strategy: config.strategy ?? new PassthroughStrategy(),
+          membrane: this.membrane,
+          debugLogContext: !!process.env.DEBUG_CONTEXT,
+        });
+      }
 
       const agent = new Agent(config, contextManager, this.membrane);
       this.restoreToolResultGuardSetting(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, {
         contextManager,
+        config,
         spec: spec
-          ? { ...spec, name: config.name, namespace: spec.namespace ?? namespace }
+          ? {
+              ...spec,
+              name: config.name,
+              // A shared fork's context lives under its parent's namespace,
+              // on the fork's own branch — not in a namespace of its own.
+              namespace: inherit?.mode === 'shared' ? namespace : spec.namespace ?? namespace,
+              ...(inherit ? { inherit } : {}),
+            }
           : workerSpec(config.name, { namespace }),
       });
 
@@ -4195,6 +4305,332 @@ export class AgentFramework {
       this.usedEphemeralAgentNames.delete(config.name);
       throw error;
     }
+  }
+
+  /**
+   * Derive a new agent from a live one: the parent's context at a
+   * checkpoint, a private continuation, and — unless overridden — the
+   * parent's whole configuration (model, thinking, cache TTL, provider
+   * params, prompt, tools). The parent keeps running.
+   *
+   * The returned agent is a bounded job, driven with
+   * `runEphemeralToCompletion` exactly like one from `createEphemeralAgent`.
+   *
+   * **Inheritance.** `mode: 'shared'` (the default) gives the child the
+   * parent's messages and fold state through shared storage: nothing is
+   * copied, the child folds with the parent's memory tree, and neither can
+   * alter what the other reads. It needs branch-bound store handles and is
+   * refused, not silently downgraded, where they are missing. `mode: 'copy'`
+   * is the historical mechanism — the parent's compiled context re-added as
+   * the child's own messages — and works everywhere.
+   *
+   * **Rendering.** With `solve: 'reuse'` (the default) and nothing
+   * overridden, the child's first request is the parent's request plus the
+   * child's framing: the same system prompt and tool block, the parent's
+   * turns presented as the child's own, and a cache marker on the end of
+   * the parent's request so the prefix it wrote is read back. `solve:
+   * 'fresh'` deliberately re-solves, e.g. at another budget; so does any
+   * override that changes what is rendered. Those are operating choices —
+   * the presentation changes and the provider cache misses.
+   *
+   * **Framing** is ordinary messages appended to the child before it runs:
+   * the task, and whatever tells it which stream it is. The parent's turn
+   * in flight is not in its store yet (see `getPendingAssistantRound`), so
+   * a fork made from inside a tool call starts from the message before the
+   * turn that made it.
+   *
+   * Context isolation is not process or filesystem isolation: parent and
+   * child share tools, any shell and the workspace.
+   */
+  async deriveAgent(options: DeriveAgentOptions): Promise<{
+    agent: Agent;
+    contextManager: ContextManager;
+    cleanup: () => void;
+  }> {
+    const parent = this.agents.get(options.from);
+    const parentConfig = this.agentConfigs.get(options.from);
+    if (!parent || !parentConfig) {
+      throw new Error(`deriveAgent: "${options.from}" is not a registered agent`);
+    }
+    const mode = options.mode ?? 'shared';
+    const shared = mode === 'shared';
+
+    const config: AgentConfig = {
+      ...parentConfig,
+      // The parent's LIVE settings, not just its recipe: a runtime budget or
+      // think-policy override changes what it renders.
+      ...(parent.contextBudgetTokens !== undefined ? { contextBudgetTokens: parent.contextBudgetTokens } : {}),
+      sameRoundThinkTextPolicy: parent.getEffectiveSameRoundThinkTextPolicy(),
+      ...options.config,
+      name: options.name,
+      strategy: options.strategy,
+      // A shared inheritance has no copy step to rename the parent's turns,
+      // so the mapping is declared: the parent's voice is the child's own,
+      // presented under the name the parent's own requests use.
+      ...(shared
+        ? {
+            selfParticipants: [...new Set([
+              parent.name,
+              ...(parentConfig.selfParticipants ?? []),
+              ...(options.config?.selfParticipants ?? []),
+            ])],
+            presentAs: options.config?.presentAs ?? parent.presentAs,
+          }
+        : { selfParticipants: options.config?.selfParticipants, presentAs: options.config?.presentAs }),
+    };
+
+    const spec = taskForkSpec(options.name, {
+      parent: options.from,
+      spawnedBy: options.spawnedBy ?? options.from,
+      ...(options.resultTo ? { resultTo: options.resultTo } : {}),
+      ...(options.deadlineMs !== undefined ? { deadlineMs: options.deadlineMs } : {}),
+      ...(options.idleTimeoutMs !== undefined ? { idleTimeoutMs: options.idleTimeoutMs } : {}),
+      ...(options.maxTurns !== undefined ? { maxTurns: options.maxTurns } : {}),
+      ...(options.metadata ? { metadata: options.metadata } : {}),
+      inherit: { mode, ...(options.solve ? { solve: options.solve } : {}) },
+    });
+    const { name: _name, ...specBody } = {
+      ...spec,
+      // The record states the mapping the agent's requests actually use.
+      ...(config.selfParticipants?.length ? { selfParticipants: config.selfParticipants } : {}),
+      ...(config.presentAs && config.presentAs !== config.name ? { presentAs: config.presentAs } : {}),
+      ...(options.kind ? { kind: options.kind } : {}),
+      ...(options.onParentEnd ? { onParentEnd: options.onParentEnd } : {}),
+    };
+
+    const created = await this.createEphemeralAgent(config, specBody);
+    if (options.config?.allowedTools === undefined) {
+      this.toolSurfaceOwners.set(options.name, this.toolSurfaceOwners.get(options.from) ?? options.from);
+    }
+
+    if (!shared) {
+      // The historical copy: the parent's compiled view, its turns renamed
+      // so the child reads its inheritance as its own history.
+      const { messages } = await parent.getContextManager().compile();
+      for (const message of messages) {
+        created.contextManager.addMessage(
+          parent.isOwnParticipant(message.participant) ? options.name : message.participant,
+          message.content,
+        );
+      }
+      created.agent.markContextConsumed();
+    }
+    for (const message of options.framing ?? []) {
+      created.contextManager.addMessage(message.participant, message.content, message.metadata);
+    }
+    return created;
+  }
+
+  /**
+   * The assistant turn an agent has produced but not yet stored: its tool
+   * calls and any text before them, held until every tool result is in so
+   * the pair lands adjacently. A host deriving an agent from inside one of
+   * those tool calls can reproduce the turn in the child's framing.
+   */
+  getPendingAssistantRound(agentName: string): ContentBlock[] | undefined {
+    const blocks = this.pendingAssistantBlocks.get(agentName);
+    return blocks ? structuredClone(blocks) : undefined;
+  }
+
+  /**
+   * Bring an ended bounded job back as a new incarnation of the same
+   * identity, on the context it left: an isolated agent's own namespace, or
+   * a derived agent's own branch. Nothing is re-derived and nothing is
+   * re-seeded — the agent continues from its last stored message, which is
+   * the end of its last complete round (a round whose tool results never
+   * all arrived was never stored).
+   *
+   * Use it for a job that was stopped, failed, or was interrupted by a
+   * restart. Configuration is not persisted with an agent, so the caller
+   * supplies it again; the role mapping a derived agent used is restored
+   * from its record unless the config sets one. Relationships are kept
+   * where the other agent still exists; a job whose spawner or result
+   * recipient is gone resumes without that edge and can be reparented.
+   *
+   * External effects are not replayed and not undone: a tool the previous
+   * incarnation ran before it ended has had its effect, and a call it never
+   * received a result for may be made again by the model. Drive the result
+   * with `runEphemeralToCompletion`.
+   */
+  async resumeAgent(name: string, config: Omit<AgentConfig, 'name'>): Promise<{
+    agent: Agent;
+    contextManager: ContextManager;
+    cleanup: () => void;
+  }> {
+    if (this.registry.has(name) || this.agents.has(name) || this.ephemeralRuns.has(name)) {
+      throw new Error(`resumeAgent: "${name}" is still registered; only an ended agent resumes`);
+    }
+    const record = this.registry.inspect(name);
+    if (!record?.ended) throw new Error(`resumeAgent: "${name}" is not a known ended agent`);
+    if (record.lifetime.kind !== 'task') {
+      throw new Error(
+        `resumeAgent: "${name}" has a ${record.lifetime.kind} lifetime; only bounded jobs resume this way`,
+      );
+    }
+    const fullConfig: AgentConfig = {
+      ...config,
+      name,
+      ...(config.selfParticipants === undefined && record.selfParticipants
+        ? { selfParticipants: record.selfParticipants }
+        : {}),
+      ...(config.presentAs === undefined && record.presentAs ? { presentAs: record.presentAs } : {}),
+    };
+    const contextManager = await this.reopenAgentContext(record, config.strategy);
+
+    const agent = new Agent(fullConfig, contextManager, this.membrane);
+    this.restoreToolResultGuardSetting(agent);
+    agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
+
+    const spawnedBy = record.relationships.spawnedBy;
+    const resultTo = record.relationships.resultTo;
+    const keepSpawner = spawnedBy !== undefined && this.registry.has(spawnedBy);
+    this.usedEphemeralAgentNames.add(name);
+    this.ephemeralCandidates.set(agent, {
+      contextManager,
+      config: fullConfig,
+      resume: true,
+      spec: {
+        name,
+        kind: record.kind,
+        roles: record.roles,
+        lifetime: record.lifetime,
+        ...(record.activation ? { activation: record.activation } : {}),
+        ...(keepSpawner ? { spawnedBy, onParentEnd: record.onParentEnd } : {}),
+        ...(resultTo && this.registry.has(resultTo.to) ? { resultTo } : {}),
+        ...(record.inherit ? { inherit: record.inherit } : {}),
+        ...(fullConfig.selfParticipants?.length ? { selfParticipants: fullConfig.selfParticipants } : {}),
+        ...(fullConfig.presentAs && fullConfig.presentAs !== name ? { presentAs: fullConfig.presentAs } : {}),
+        ...(record.namespace ? { namespace: record.namespace } : {}),
+        ...(record.metadata ? { metadata: record.metadata } : {}),
+      },
+    });
+    return { agent, contextManager, cleanup: () => {} };
+  }
+
+  /**
+   * A context to read an agent's history from, without changing the live
+   * system.
+   *
+   * - A live agent: a snapshot derived from its context — at the head, or
+   *   at `atSequence` for an earlier state. The snapshot is its own branch;
+   *   the agent keeps running and is not affected by anything done to it.
+   * - An ended agent: the context it left, reopened where it lives.
+   *
+   * The returned manager uses a passthrough strategy: it shows what is
+   * stored, raw. An ended agent's context is the real one — treat it as
+   * read-only unless you mean to change what a later resume starts from.
+   */
+  async inspectAgentContext(name: string, options: { atSequence?: number } = {}): Promise<ContextManager> {
+    const live = this.registry.has(name) ? this.agents.get(name) : undefined;
+    if (live) {
+      const source = live.getContextManager() as ContextManager & Partial<DerivingContextManager>;
+      if (typeof source.derive !== 'function') {
+        throw new Error(
+          'inspectAgentContext: a snapshot of a live agent needs a @animalabs/context-manager that provides ContextManager.derive',
+        );
+      }
+      const taken = new Set(this.store.listBranches().map((branch) => branch.name));
+      let n = 1;
+      while (taken.has(`dendrite/inspect/${name}/${n}`)) n++;
+      return source.derive({
+        branch: `dendrite/inspect/${name}/${n}`,
+        strategy: new PassthroughStrategy(),
+        membrane: this.membrane,
+        solve: 'fresh',
+        ...(options.atSequence !== undefined ? { atSequence: options.atSequence } : {}),
+      });
+    }
+    const record = this.registry.inspect(name);
+    if (!record) throw new Error(`inspectAgentContext: "${name}" is not a known agent`);
+    if (options.atSequence !== undefined) {
+      throw new Error('inspectAgentContext: atSequence applies to a live agent; an ended agent is read as it was left');
+    }
+    return this.reopenAgentContext(record, new PassthroughStrategy());
+  }
+
+  /** Open the context an ended agent left, wherever it lives. */
+  private async reopenAgentContext(record: AgentRecord, strategy?: ContextStrategy): Promise<ContextManager> {
+    if (record.inherit?.mode === 'shared') {
+      const derivation = record.inherit.derivation as ContextDerivationRecord | undefined;
+      const reopen = (ContextManager as unknown as { reopenDerived?: ReopenDerived }).reopenDerived;
+      if (!derivation || typeof reopen !== 'function') {
+        throw new Error(
+          `Agent "${record.name}": its context is a derived branch, which this ` +
+            '@animalabs/context-manager cannot reopen (ContextManager.reopenDerived)',
+        );
+      }
+      return reopen.call(ContextManager, {
+        store: this.store,
+        derivation,
+        strategy: strategy ?? new PassthroughStrategy(),
+        membrane: this.membrane,
+        // A context derived from a reader of the shared slot keeps that reader's view.
+        ...(derivation.slots?.messageNamespace === null ? { viewFilter: RESIDENT_VIEW_FILTER } : {}),
+        debugLogContext: !!process.env.DEBUG_CONTEXT,
+      });
+    }
+    if (!record.namespace) {
+      throw new Error(`Agent "${record.name}": its record names no context to reopen`);
+    }
+    return ContextManager.open({
+      store: this.store,
+      namespace: record.namespace,
+      isolate: true,
+      strategy: strategy ?? new PassthroughStrategy(),
+      membrane: this.membrane,
+      debugLogContext: !!process.env.DEBUG_CONTEXT,
+    });
+  }
+
+  /** Open a derived agent's context on a branch of its own (see deriveAgent). */
+  private async deriveSharedContext(
+    config: AgentConfig,
+    inherit: NonNullable<AgentSpec['inherit']>,
+  ): Promise<{ contextManager: ContextManager; inherit: NonNullable<AgentSpec['inherit']>; namespace: string }> {
+    const parent = this.agents.get(inherit.from);
+    if (!parent) {
+      throw new Error(`Agent "${config.name}": context source "${inherit.from}" is not a registered agent`);
+    }
+    if (this.surgeryHold) {
+      throw new Error(
+        `Agent "${config.name}" refused: the store is under live ${this.surgeryHold.verb} ` +
+          `for ${this.surgeryHold.agentName} — retry when it completes`,
+      );
+    }
+    const source = parent.getContextManager() as ContextManager & Partial<DerivingContextManager>;
+    if (typeof source.derive !== 'function') {
+      throw new Error(
+        `Agent "${config.name}": shared context inheritance needs a @animalabs/context-manager ` +
+          'that provides ContextManager.derive; use inherit.mode "copy" with this version',
+      );
+    }
+    // The branch is the child's durable state and outlives it. Names from an
+    // earlier process may still own a branch of the same name.
+    const taken = new Set(this.store.listBranches().map((branch) => branch.name));
+    let ownBranch = `dendrite/${config.name}`;
+    for (let n = 2; taken.has(ownBranch); n++) ownBranch = `dendrite/${config.name}~${n}`;
+
+    const contextManager = await source.derive({
+      branch: ownBranch,
+      strategy: config.strategy ?? new PassthroughStrategy(),
+      membrane: this.membrane,
+      solve: inherit.solve ?? 'reuse',
+      ...(inherit.atSequence !== undefined ? { atSequence: inherit.atSequence } : {}),
+      debugLogContext: !!process.env.DEBUG_CONTEXT,
+    });
+    const derivation = (contextManager as ContextManager & Partial<DerivingContextManager>).getDerivation?.();
+    return {
+      contextManager,
+      inherit: {
+        ...inherit,
+        solve: inherit.solve ?? 'reuse',
+        ownBranch,
+        ...(derivation
+          ? { branch: derivation.parentBranch, atSequence: derivation.atSequence, derivation }
+          : {}),
+      },
+      namespace: this.registry.get(inherit.from)?.namespace ?? `subagent/${config.name}`,
+    };
   }
 
   // ==========================================================================
@@ -4781,9 +5217,13 @@ export class AgentFramework {
     }
     // Admit it to the registry first: a spec the registry refuses (spawner
     // or result recipient gone since creation) must not leave a live agent.
-    this.announceAgentCreated(this.registry.register(candidate.spec));
+    this.announceAgentCreated(
+      this.registry.register(candidate.spec, { resume: candidate.resume === true }),
+    );
     // Register temporarily so the event loop can drive it
     this.agents.set(agent.name, agent);
+    // Kept while the run is live so the agent can itself be derived from.
+    this.agentConfigs.set(agent.name, candidate.config);
     const run: EphemeralRun = {
       settle: this.createDeferred<AgentSettleResult>(),
       inferenceStarted: false,
@@ -4886,6 +5326,8 @@ export class AgentFramework {
         this.agents.delete(agent.name);
       }
       this.toolImageLedgers.delete(agent.name);
+      if (this.agentConfigs.get(agent.name) === candidate.config) this.agentConfigs.delete(agent.name);
+      this.toolSurfaceOwners.delete(agent.name);
       // Spawn-and-dispose bookkeeping (main, d453165/fee96a7): without this,
       // ephemeral agents leave checkpoint-tree keys and diagnostics map
       // entries behind for the life of the store/session.
@@ -6983,7 +7425,7 @@ export class AgentFramework {
       // the timeline (KV-prefix-stable delivery). The stored originals
       // remain in the shared slot for the subconscious's merged view,
       // fetch_history, and audit.
-      viewFilter: (message) => !(message.metadata as { tuneOut?: unknown } | undefined)?.tuneOut,
+      viewFilter: RESIDENT_VIEW_FILTER,
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
@@ -7231,6 +7673,7 @@ export class AgentFramework {
             if (deferred.length > 0) {
               for (const msg of deferred) {
                 agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
+                this.releaseLandedMail(msg.metadata);
                 // Injection guards: tool blocks would corrupt the tool-cycle
                 // structure the membrane enforces, and a message named as the
                 // agent itself would render as an ASSISTANT turn on the wire
@@ -7239,7 +7682,7 @@ export class AgentFramework {
                 const hasToolBlocks = msg.content.some(
                   (b) => b.type === 'tool_use' || b.type === 'tool_result'
                 );
-                if (!hasToolBlocks && msg.participant !== agent.name) {
+                if (!hasToolBlocks && !agent.isOwnParticipant(msg.participant)) {
                   midTurnInjections.push({
                     participant: msg.participant,
                     content: msg.content,
@@ -9571,6 +10014,7 @@ export class AgentFramework {
             const id = agent.getContextManager().addMessage(
               msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id),
             );
+            this.releaseLandedMail(msg.metadata);
             this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
           } catch (err) {
             console.error(
@@ -12632,6 +13076,23 @@ export class AgentFramework {
   private dispatchToolCall(agentName: string, call: ToolCall): void {
     // Enrich call with caller identity so modules can resolve the calling agent
     const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
+    // Dispatch-time deny (AgentConfig.denyToolsAtDispatch): the tool stays
+    // advertised so the agent's request prefix is unchanged; the call is
+    // refused here, before anything runs.
+    if (this.agents.get(agentName)?.deniesAtDispatch(call.name)) {
+      const error = `${call.name} is not available to ${agentName}`;
+      // RFC-007: refused before the tool runs — no lifecycle events.
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
+      this.emitTrace({ type: 'tool:failed', module: 'dendrite', tool: call.name, callId: call.id, error });
+      this.pushEvent({
+        type: 'tool-result',
+        callId: call.id,
+        agentName,
+        moduleName: 'dendrite',
+        result: { success: false, error, isError: true },
+      });
+      return;
+    }
     if (isPresentationTool(call.name)) {
       const result = this.editToolPresentation(agentName, enrichedCall);
       this.pushEvent({type:'tool-result',callId:call.id,agentName,moduleName:'tool-presentation',result});
@@ -12956,12 +13417,20 @@ export class AgentFramework {
       opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
     );
     if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
-    // Held agent mail is released only here, where its message has actually
-    // entered the recipient's store — never on a deferral. Both writes reach
-    // disk in the same sync, so a crash keeps either both or neither.
+    this.releaseLandedMail(metadata);
+    return stored;
+  }
+
+  /**
+   * Held agent mail is released only when its message has actually entered
+   * the recipient's store — never on a deferral. Called at every site that
+   * writes a message into a context: the direct path above and the two
+   * deferred-write flushes (turn start, tool boundary). Both writes reach
+   * disk in the same sync, so a crash keeps either both or neither.
+   */
+  private releaseLandedMail(metadata: MessageMetadata | undefined): void {
     const mailId = (metadata as { dendrite?: { mailId?: unknown } } | undefined)?.dendrite?.mailId;
     if (typeof mailId === 'string') this.registry.releaseMail(mailId);
-    return stored;
   }
 
   /**
