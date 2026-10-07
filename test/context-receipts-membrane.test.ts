@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+  AnthropicAdapter,
   Membrane,
   NativeFormatter,
   type ProviderAdapter,
@@ -83,6 +84,34 @@ class ScriptedAdapter implements ProviderAdapter {
   }
 }
 
+/**
+ * The real Anthropic request builder and cleanup; only the network response
+ * is scripted. It shows what the shipped adapter reports.
+ */
+class ScriptedAnthropic extends AnthropicAdapter {
+  turns: Turn[] = [];
+  requests: ProviderRequest[] = [];
+  sent: Array<{ messages: unknown[] }> = [];
+  constructor() { super({ apiKey: 'test', cacheKeepalive: { enabled: false } }); }
+  override async stream(request: ProviderRequest, callbacks: StreamCallbacks, options?: ProviderRequestOptions): Promise<ProviderResponse> {
+    this.requests.push(request);
+    const wire = (this as unknown as { buildRequest(r: ProviderRequest, cb?: (b?: unknown) => void): { messages: unknown[] } })
+      .buildRequest(request, options?.onContentAltered);
+    this.sent.push(JSON.parse(JSON.stringify(wire)));
+    options?.onRequest?.(wire);
+    const turn = this.turns.shift() ?? 'text';
+    const usage = { inputTokens: 40, outputTokens: 3 };
+    if (turn === 'tool') {
+      return {
+        content: [{ type: 'tool_use', id: `call-${this.requests.length}`, name: 'probe--wait', input: {} }],
+        stopReason: 'tool_use', usage, model: request.model, rawRequest: wire, raw: {},
+      };
+    }
+    callbacks.onChunk('heard you');
+    return { content: [{ type: 'text', text: 'heard you' }], stopReason: 'end_turn', usage, model: request.model, rawRequest: wire, raw: {} };
+  }
+}
+
 /** A tool that holds the turn open until the test lets it finish. */
 class ProbeModule implements Module {
   readonly name = 'probe';
@@ -103,7 +132,7 @@ class ProbeModule implements Module {
 
 interface Harness {
   framework: AgentFramework;
-  adapter: ScriptedAdapter;
+  adapter: ScriptedAdapter | ScriptedAnthropic;
   probe: ProbeModule;
   command: (c: Record<string, unknown>) => void;
   tempDir: string;
@@ -111,12 +140,12 @@ interface Harness {
 
 let harness: Harness | null = null;
 
-async function open(mode: 'native' | 'xml'): Promise<Harness> {
+async function open(mode: 'native' | 'xml' | 'anthropic'): Promise<Harness> {
   const tempDir = mkdtempSync(join(tmpdir(), 'receipts-membrane-'));
   const commandPath = join(tempDir, 'commands.jsonl');
   writeFileSync(commandPath, '');
-  const adapter = new ScriptedAdapter(mode);
-  const membrane = mode === 'native' ? new Membrane(adapter, { formatter: new NativeFormatter() }) : new Membrane(adapter);
+  const adapter = mode === 'anthropic' ? new ScriptedAnthropic() : new ScriptedAdapter(mode);
+  const membrane = mode === 'xml' ? new Membrane(adapter) : new Membrane(adapter, { formatter: new NativeFormatter() });
   const probe = new ProbeModule();
   const history = new HistoryModule();
   const framework = await AgentFramework.create({
@@ -258,5 +287,28 @@ describe('receipts from the real membrane producer', () => {
     await waitFor(() => h.adapter.requests.length >= 3, 'next turn');
     await waitFor(p.idle, 'next turn settles');
     assert.equal(p.versionState('x-mid').delivered, true, 'the next compile carried it');
+  });
+
+  it('the real Anthropic cleanup: an injected body losing a whitespace block is partial, as preparation would make a compiled one', async () => {
+    const h = await open('anthropic');
+    const p = probes(h);
+    h.adapter.turns = ['tool', 'text'];
+    h.command({ op: 'incoming', channelId: ROOM, messageId: 'a-start', mode: 'addressed', text: 'do the thing' });
+    await waitFor(() => h.probe.entered, 'tool running');
+    h.command({
+      op: 'incoming', channelId: ROOM, messageId: 'a-mid', mode: 'addressed',
+      content: [{ type: 'text', text: 'also this' }, { type: 'text', text: '   ' }],
+    });
+    await waitFor(() => !!(h.framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length, 'deferred while the turn is alive');
+    h.probe.release!();
+    await waitFor(p.idle, 'turn settles');
+    const sent = (h.adapter as ScriptedAnthropic).sent;
+    assert.equal(sent.length, 2);
+    assert.ok(JSON.stringify(sent[1]!.messages).includes('also this'), 'the injection was carried');
+    assert.ok(!JSON.stringify(sent[1]!.messages).includes('"   "'), 'its whitespace block was cleaned away');
+    const clocks = await p.roomClocks();
+    assert.equal(clocks.partial?.messageId, 'a-mid');
+    assert.deepEqual(clocks.partial?.missing, ['wire-alteration']);
+    assert.notEqual(clocks.delivered?.messageId, 'a-mid');
   });
 });
