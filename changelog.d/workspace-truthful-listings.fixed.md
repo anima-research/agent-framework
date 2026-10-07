@@ -34,3 +34,6 @@
   `workspace:agent-action-scan-incomplete` event.
 - Disk text is stored as its raw bytes rather than through a UTF-8 round trip, so a file in
   another encoding no longer differs from its own stored copy.
+- `materialize` and `autoMaterialize` never write or unlink through a symlink the mount doesn't
+  follow, or through a directory that resolves outside the mount, even with `force`; such a path
+  is listed as skipped with the reason.

@@ -38,6 +38,7 @@ import type { BranchIntent, BranchIntents, ConflictKind, ConflictRecord, DiskCou
 import {
   type MountView,
   type Walk,
+  effectStaysInMount,
   fingerprintVouches,
   looksBinary,
   observePath,
@@ -209,12 +210,6 @@ interface Verdict {
 function keepStoreSide(hasStore: boolean, bi: BranchIntent | null): EntryState {
   if (hasStore) return 'workspace-draft';
   return bi?.tombstone ? 'workspace-deleted' : 'not-in-branch';
-}
-
-function withoutConflict(bi: BranchIntent | null, extra: Partial<BranchIntent> = {}): BranchIntent {
-  const next: BranchIntent = { ...(bi ?? {}), ...extra };
-  delete next.conflict;
-  return next;
 }
 
 /**
@@ -585,16 +580,25 @@ export async function pushPaths(
   const result: PushResult = { written: [], unchanged: [], deleted: [], skipped: [], pendingDeletions: [] };
   if (mount.readOnly) return result;
 
-  // Observe disk.
+  type Plan = { path: string; kind: 'write' | 'unlink'; blob: Buffer; hash: string; prior: Agreed | null } | { path: string; kind: 'unlink'; blob: null; hash: null; prior: Agreed | null };
+  const plans: Plan[] = [];
+
+  // Observe disk, and where a write or unlink would land.
   const facts = new Map<string, DiskFact>();
+  const targets = new Map<string, true | string>();
   for (const path of paths) {
     const p = agreement.get(mount.name, path);
     facts.set(path, await learnDisk(mount, path, { p, hasStore: true, hasIntent: true }, {}));
+    targets.set(path, await effectStaysInMount(mount.view, mount.rootReal, path));
   }
+  // Not even force writes or unlinks outside the mount.
+  const plan = (next: Plan): void => {
+    const target = targets.get(next.path)!;
+    if (target === true) plans.push(next);
+    else result.skipped.push({ path: next.path, reason: `not ${next.kind === 'write' ? 'written' : 'unlinked'}: ${target}` });
+  };
 
   // Decide synchronously what to push.
-  type Plan = { path: string; kind: 'write' | 'unlink'; blob: Buffer; hash: string; prior: Agreed | null } | { path: string; kind: 'unlink'; blob: null; hash: null; prior: Agreed | null };
-  const plans: Plan[] = [];
   const branchId = store.currentBranch().id;
   for (const [path, d] of facts) {
     const entry = store.treeGet(mount.treeStateId, path);
@@ -617,7 +621,7 @@ export async function pushPaths(
       }
       const priorP = p && (p.kind === 'absent' || p.kind === 'content') ? p : null;
       const blob = store.getBlob(s.hash);
-      if (blob) plans.push({ path, kind: 'write', blob, hash: s.hash, prior: priorP });
+      if (blob) plan({ path, kind: 'write', blob, hash: s.hash, prior: priorP });
       continue;
     }
     // Whatever the verdict learned about disk (an agreement, a resolved
@@ -659,7 +663,7 @@ export async function pushPaths(
         continue;
       }
       if (d.kind === 'absent') continue;
-      plans.push({ path, kind: 'unlink', blob: null, hash: null, prior });
+      plan({ path, kind: 'unlink', blob: null, hash: null, prior });
       continue;
     }
     const blob = store.getBlob(s.hash);
@@ -667,27 +671,27 @@ export async function pushPaths(
       result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
       continue;
     }
-    plans.push({ path, kind: 'write', blob, hash: s.hash, prior });
+    plan({ path, kind: 'write', blob, hash: s.hash, prior });
   }
 
   // 1. Durable intents before any disk effect.
-  plans.forEach((plan, i) => {
-    agreement.intend(mount.name, plan.path, {
+  plans.forEach((step, i) => {
+    agreement.intend(mount.name, step.path, {
       effect: 'disk',
-      prior: plan.prior,
-      expect: plan.kind === 'write' ? { kind: 'content', hash: plan.hash! } : ABSENT,
+      prior: step.prior,
+      expect: step.kind === 'write' ? { kind: 'content', hash: step.hash! } : ABSENT,
       branchId,
     }, { durable: i === plans.length - 1 });
   });
 
   // 2. Effects, each made durable before its completion.
-  for (const plan of plans) {
-    const absolute = join(mount.view.root, plan.path);
-    opts.beforeEffect?.(plan.path);
+  for (const step of plans) {
+    const absolute = join(mount.view.root, step.path);
+    opts.beforeEffect?.(step.path);
     try {
-      if (plan.kind === 'write') {
+      if (step.kind === 'write') {
         await mkdir(dirname(absolute), { recursive: true });
-        await writeFile(absolute, plan.blob!);
+        await writeFile(absolute, step.blob!);
         await fsyncPath(absolute, 'r+');
         await fsyncPath(dirname(absolute));
       } else {
@@ -696,22 +700,22 @@ export async function pushPaths(
       }
     } catch (err) {
       // The intent stays pending; the next observation resolves it.
-      result.skipped.push({ path: plan.path, reason: `disk ${plan.kind} failed: ${err instanceof Error ? err.message : String(err)}` });
+      result.skipped.push({ path: step.path, reason: `disk ${step.kind} failed: ${err instanceof Error ? err.message : String(err)}` });
       continue;
     }
     // 3. Completion, and the branch intent it settles.
-    if (plan.kind === 'write') {
-      const seen = await readPath(mount.view, mount.rootReal, plan.path, mount.view.maxFileSize);
-      const value: Agreed = seen.kind === 'read' && seen.hash === plan.hash
-        ? { kind: 'content', hash: plan.hash!, size: seen.size, fp: seen.fp }
-        : { kind: 'content', hash: plan.hash!, size: plan.blob!.byteLength };
-      agreement.set(mount.name, plan.path, value);
-      mount.intents.update(plan.path, (cur) => { const next = { ...cur }; delete next.conflict; delete next.origin; return next; });
-      result.written.push(plan.path);
+    if (step.kind === 'write') {
+      const seen = await readPath(mount.view, mount.rootReal, step.path, mount.view.maxFileSize);
+      const value: Agreed = seen.kind === 'read' && seen.hash === step.hash
+        ? { kind: 'content', hash: step.hash!, size: seen.size, fp: seen.fp }
+        : { kind: 'content', hash: step.hash!, size: step.blob!.byteLength };
+      agreement.set(mount.name, step.path, value);
+      mount.intents.update(step.path, (cur) => { const next = { ...cur }; delete next.conflict; delete next.origin; return next; });
+      result.written.push(step.path);
     } else {
-      agreement.set(mount.name, plan.path, { kind: 'absent' });
-      mount.intents.put(plan.path, null);
-      result.deleted.push(plan.path);
+      agreement.set(mount.name, step.path, { kind: 'absent' });
+      mount.intents.put(step.path, null);
+      result.deleted.push(step.path);
     }
   }
   agreement.maybeCheckpoint();

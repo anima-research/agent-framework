@@ -12,7 +12,7 @@
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -680,6 +680,42 @@ describe('incomplete walks', () => {
     assert.equal(pass.reports.get('c.txt')?.state, 'unverified');
     assert.ok(pass.incomplete.some((r: { reason: string }) => /file cap/.test(r.reason)));
     assert.notEqual(env.store.treeGet(TREE, 'c.txt'), null);
+  });
+});
+
+describe('the mount boundary', () => {
+  test('not even a forced materialize writes through a symlink or a symlinked directory out of the mount', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    const outside = join(env.root, 'outside.txt');
+    writeFileSync(outside, 'outside, untouched');
+    mkdirSync(join(env.root, 'outdir'));
+    await call(m, 'write', { path: 'work/link.txt', content: 'from the workspace' });
+    await call(m, 'write', { path: 'work/linkdir/inner.txt', content: 'from the workspace' });
+    symlinkSync(outside, env.disk('link.txt'));
+    symlinkSync(join(env.root, 'outdir'), env.disk('linkdir'));
+
+    const res = await call(m, 'materialize', { force: true });
+    const reasons = ((res.skipped ?? []) as Array<{ reason: string }>).map((s) => s.reason).join('\n');
+    assert.match(reasons, /link\.txt: not written: a symlink, which this mount does not follow/);
+    assert.match(reasons, /linkdir\/inner\.txt: not written: a parent directory resolves outside the mount/);
+    assert.equal(readFileSync(outside, 'utf8'), 'outside, untouched');
+    assert.throws(() => readFileSync(join(env.root, 'outdir', 'inner.txt')), /ENOENT/);
+  });
+
+  test('a missing mount root is unavailable, not a deletion of everything in it', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'v1');
+    renameSync(env.dir, `${env.dir}.away`);
+    try {
+      assert.equal(await stateOf(m, 'a.txt'), 'unverified');
+      await call(m, 'sync', {});
+      assert.notEqual(env.store.treeGet(TREE, 'a.txt'), null, 'nothing was removed');
+    } finally {
+      renameSync(`${env.dir}.away`, env.dir);
+    }
+    assert.equal(await stateOf(m, 'a.txt'), 'synced');
   });
 });
 

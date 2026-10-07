@@ -18,7 +18,7 @@
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { lstat, open, readdir, realpath, stat, statfs } from 'node:fs/promises';
-import { join, sep } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import type { Fingerprint } from './disk-agreement.js';
 
 export interface MountView {
@@ -60,6 +60,31 @@ function errno(err: unknown): string | undefined {
 
 function contained(rootReal: string, candidate: string): boolean {
   return candidate === rootReal || candidate.startsWith(rootReal.endsWith(sep) ? rootReal : rootReal + sep);
+}
+
+/**
+ * Whether a write or unlink at a mount-relative path stays inside the mount:
+ * the nearest existing ancestor resolves inside the canonical root, and a
+ * symlink at the path itself is acted through only when the mount follows
+ * symlinks and it resolves inside. Returns true, or why not.
+ */
+export async function effectStaysInMount(view: MountView, rootReal: string, relativePath: string): Promise<true | string> {
+  const absolute = join(view.root, relativePath);
+  for (let dir = dirname(absolute); ; dir = dirname(dir)) {
+    const real = await realpath(dir).catch(() => null);
+    if (real !== null) {
+      if (!contained(rootReal, real)) return 'a parent directory resolves outside the mount';
+      break;
+    }
+    if (dirname(dir) === dir) break;
+  }
+  const info = await lstat(absolute).catch(() => null);
+  if (info?.isSymbolicLink()) {
+    if (!view.followSymlinks) return 'a symlink, which this mount does not follow';
+    const real = await realpath(absolute).catch(() => null);
+    if (real === null || !contained(rootReal, real)) return 'a symlink that leaves the mount';
+  }
+  return true;
 }
 
 function statFingerprint(st: { size: bigint; mtimeNs: bigint; ctimeNs: bigint; ino: bigint; dev: bigint }): StatFingerprint {

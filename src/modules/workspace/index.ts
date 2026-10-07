@@ -7,8 +7,8 @@
 
 import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
-import { open, readFile, stat, access, writeFile, unlink, mkdir, lstat, realpath } from 'node:fs/promises';
-import { join, resolve, relative, dirname, sep } from 'node:path';
+import { open, readFile, stat, lstat, realpath } from 'node:fs/promises';
+import { join, resolve, relative, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
@@ -35,7 +35,7 @@ import type {
 } from './types.js';
 import { WORKSPACE_FS_EVENT_TYPES, opToEventType } from './types.js';
 import { MountWatcher, type FsChange } from './watcher.js';
-import { hashContent, isBinary, DEFAULT_MAX_FILE_SIZE } from './sync.js';
+import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
 import { filesystemTrustsCtime } from './observe.js';
