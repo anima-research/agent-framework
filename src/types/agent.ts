@@ -1,6 +1,7 @@
 import type { ContentBlock, YieldingStream } from '@animalabs/membrane';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ToolCallId, ToolResult, ToolCall } from './events.js';
+import type { SilentHeartbeatTick } from '../silent-heartbeat.js';
 
 export type SameRoundThinkTextPolicy = 'public' | 'private';
 export type SameRoundThinkTextPolicySource =
@@ -362,4 +363,8 @@ export interface InferenceRequest {
   /** Ephemeral system-position prompt for this turn only. Never written to
    * Chronicle; callers must supply bounded non-secret control text. */
   ephemeralSystemPrompt?: string;
+  /** The authenticated silent heartbeat tick this turn answers. Every row the
+   * turn stores is stamped `metadata.silentHeartbeat` with it, and request
+   * builds render a request-only separator before the tick's first row. */
+  silentHeartbeat?: SilentHeartbeatTick;
 }
