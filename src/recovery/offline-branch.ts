@@ -4,6 +4,7 @@ import { ContextManager } from '@animalabs/context-manager';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   DiscordAwarenessOutbox,
+  boundDiscordAwarenessText,
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
   selectDiscordAwarenessRefs,
@@ -233,13 +234,37 @@ export async function createOfflineRecoveryBranch(
       }
     } catch (error) {
       // A partially suppressed branch is not safe to boot into. Preserve it
-      // for diagnosis, but leave Chronicle on the untouched source branch and
-      // keep the explicit batch prepared: it is the unfinished body's record
-      // (startup holds its marks, and resumes the body only on its branch).
-      if (store.currentBranch().name === createdBranch) {
-        await contextManager.switchBranch(sourceBranch);
+      // for diagnosis, but put Chronicle back on the untouched source branch.
+      // Once the source is confirmed, the batch is retired (after the
+      // restored state is synced): its surgery never happened. If it can't
+      // be confirmed, the batch stays prepared as the unfinished body's
+      // record (startup holds its marks, and resumes the body only on its
+      // branch). The error says which.
+      const failure = error instanceof Error ? error.message : String(error);
+      let restore = '';
+      try {
+        if (store.currentBranch().name !== sourceBranch) await contextManager.switchBranch(sourceBranch);
+      } catch (restoreError) {
+        restore = `; restoring ${sourceBranch} failed: ${boundDiscordAwarenessText(
+          restoreError instanceof Error ? restoreError.message : String(restoreError),
+        )}`;
       }
-      throw error;
+      let retire = '';
+      if (batch) {
+        if (store.currentBranch().name !== sourceBranch) {
+          retire = `; awareness batch ${batch.id} kept, since the source branch could not be confirmed`;
+        } else {
+          try {
+            outbox.discard(batch.id);
+          } catch (discardError) {
+            retire = `; awareness batch ${batch.id} could not be retired (${boundDiscordAwarenessText(
+              discardError instanceof Error ? discardError.message : String(discardError),
+            )}); startup will hold it`;
+          }
+        }
+      }
+      if (!restore && !retire) throw error;
+      throw new Error(`${failure}${restore}${retire}`, { cause: error });
     }
 
     // The body change landed. Marker bookkeeping is reported apart from it

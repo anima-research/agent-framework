@@ -21,7 +21,7 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -462,6 +462,45 @@ describe('surgery and awareness marks', () => {
     assert.equal(after.suppressionComplete, true);
     assert.equal(after.status, 'active');
     assert.equal(outbox().operations().filter((op) => op.action === 'add').length, 1, 'only the release queued marks');
+  });
+
+  it('an imported active suppression is verified on its target at startup: the old ledger does not prove its body', async () => {
+    await start(false);
+    const { removed } = seed(3);
+    const live = cm();
+    const sourceBranch = live.currentBranch().name;
+    // The old ledger's window: its batch says active, but the fork still
+    // carries the message its suppression was to remove.
+    await live.fork('partial');
+    const [target] = live.getAllMessages().filter((m) => String(m.id) === removed[1]);
+    await framework.stop();
+    mkdirSync(join(storePath, 'recovery'), { recursive: true });
+    writeFileSync(join(storePath, 'recovery', 'discord-awareness-outbox.json'), JSON.stringify({
+      version: 2,
+      batches: [{
+        id: 'legacy-sup', status: 'active', agentName: 'resident', sourceBranch, targetBranch: 'partial',
+        emoji: '💤', createdAt: 1, activationPolicy: 'explicit',
+        suppressionIntervals: [{ fromId: String(target.id), toId: String(target.id) }],
+        refs: [{
+          serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'amb-1',
+          desired: true, markerPresent: true, deliveryStatus: 'applied', attempts: 1, lastAction: 'add',
+        }],
+      }],
+    }));
+
+    await start(false); // on 'partial'
+    assert.equal(cm().currentBranch().name, 'partial');
+    assert.ok(!cm().getAllMessages().some((m) => String(m.id) === removed[1]), 'the interval was resumed');
+    const [batch] = outbox().batches();
+    assert.equal(batch.suppressionComplete, true);
+    assert.equal(batch.status, 'active');
+    assert.equal(outbox().operations().length, 0, 'its marks stay history: nothing is sent');
+
+    // Idempotent: a later startup on the target changes nothing.
+    await framework.stop();
+    await start(false);
+    assert.equal(outbox().batches()[0].suppressionComplete, true);
+    assert.equal(outbox().operations().length, 0);
   });
 
   it('a surgery that removes nothing addressable schedules no marks even when marks are chosen', async () => {

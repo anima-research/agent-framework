@@ -372,3 +372,62 @@ test('offline recovery reports a marker bookkeeping failure apart from the body,
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('a failed offline suppression retires its batch once the source is confirmed, and keeps it when it is not', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-fail-'));
+  const storePath = join(dir, 'agent.chronicle');
+  const seed = async () => {
+    rmSync(storePath, { recursive: true, force: true });
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'keep' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-keep' });
+    cm.addMessage('user', [{ type: 'text', text: 'hide me' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-a' });
+    cm.addMessage('user', [{ type: 'text', text: 'anchor' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current' });
+    cm.close();
+    store.close();
+  };
+  const inspect = () => {
+    const store = JsStore.openOrCreate({ path: storePath });
+    try {
+      const outbox = new DiscordAwarenessOutbox(store);
+      return { branch: store.currentBranch().name, statuses: outbox.batches().map((b) => b.status), due: outbox.pendingDispatches().length };
+    } finally {
+      store.close();
+    }
+  };
+  const removeMessage = ContextManager.prototype.removeMessage;
+  const switchBranch = ContextManager.prototype.switchBranch;
+  try {
+    ContextManager.prototype.removeMessage = function () { throw new Error('injected redaction failure'); };
+
+    // The source comes back: the batch is retired; nothing will ever resume or mark.
+    await seed();
+    await assert.rejects(
+      createOfflineRecoveryBranch({
+        storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
+        marks: { scope: 'all' }, branchName: 'recovery/cairn/fail',
+      }),
+      (error: Error) => /injected redaction failure/.test(error.message) && !/kept/.test(error.message),
+    );
+    assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded'], due: 0 });
+
+    // The source can't be confirmed: the batch stays as the unfinished body's record.
+    await seed();
+    ContextManager.prototype.switchBranch = async function (this: ContextManager, name: string) {
+      if (name === 'main') throw new Error('injected restore failure');
+      return switchBranch.call(this, name);
+    };
+    await assert.rejects(
+      createOfflineRecoveryBranch({
+        storePath, agentName: 'cairn', messageId: 'm-current', suppressMessageIds: ['m-a'],
+        marks: { scope: 'all' }, branchName: 'recovery/cairn/fail2',
+      }),
+      /injected redaction failure; restoring main failed: injected restore failure; awareness batch .* kept, since the source branch could not be confirmed/,
+    );
+    assert.deepEqual(inspect(), { branch: 'recovery/cairn/fail2', statuses: ['prepared'], due: 0 });
+  } finally {
+    ContextManager.prototype.removeMessage = removeMessage;
+    ContextManager.prototype.switchBranch = switchBranch;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

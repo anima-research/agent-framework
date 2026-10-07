@@ -5422,44 +5422,62 @@ export class AgentFramework {
     const turnMarks: DiscordAwarenessMarks = params.marks === 'addressed' || params.marks === 'all'
       ? { scope: params.marks }
       : 'none';
-    // What the undone turns remove from this agent's context is whatever is
-    // in it now and not after: addressing metadata only, never content.
-    const before = this.addressingSnapshot(agentName);
-    let undone = 0;
+    // Each undone turn switches the whole store: hold it, like every surgery,
+    // for the whole act, so no agent sharing it can start a turn between the
+    // address snapshots and the switches they bracket.
+    let release: () => void;
     try {
-      for (let i = 0; i < requested; i++) {
-        const r = this.undoLastTurn(agentName, hostCommandRequester(serverId, params));
-        if (!r.undone) break;
-        undone++;
-      }
+      release = this.reserveStoreForSurgery('undo turns', agentName);
     } catch (error) {
-      // e.g. "Cannot undo while agent is streaming" — report what happened,
-      // including any turns already undone before the failure.
-      const msg = error instanceof Error ? error.message : String(error);
-      if (undone === 0) return { ok: false, error: msg };
-      console.error(`[host-command] undo partially failed after ${undone}/${requested}: ${msg}`);
-    }
-
-    console.error(
-      `[host-command] undo agent=${agentName} requested=${requested} undone=${undone}` +
-        ` by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
-    );
-
-    if (undone === 0) {
       return {
-        ok: true,
-        undone: 0,
-        requested,
-        markers: { scope: marksScope(turnMarks) as SurgeryMarkerReceipt['scope'], unmarked: 0, notRemoved: 0, status: 'none', queued: 0 },
-        lastVisible: null,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        ...(error instanceof OperatorActionError ? { code: error.code } : {}),
       };
     }
+    let undone = 0;
+    let markers: SurgeryMarkerReceipt;
+    try {
+      // What the undone turns remove from this agent's context is whatever is
+      // in it now and not after: addressing metadata only, never content.
+      const before = this.addressingSnapshot(agentName);
+      try {
+        for (let i = 0; i < requested; i++) {
+          const r = this.undoLastTurn(agentName, hostCommandRequester(serverId, params));
+          if (!r.undone) break;
+          undone++;
+        }
+      } catch (error) {
+        // e.g. "Cannot undo while agent is streaming" — report what happened,
+        // including any turns already undone before the failure.
+        const msg = error instanceof Error ? error.message : String(error);
+        if (undone === 0) return { ok: false, error: msg };
+        console.error(`[host-command] undo partially failed after ${undone}/${requested}: ${msg}`);
+      }
 
-    // Marks are a one-shot choice about the messages these turns removed;
-    // the branch move itself never adds or removes any.
-    const after = new Set(this.addressingSnapshot(agentName).keys());
-    const removed = [...before].filter(([id]) => !after.has(id)).map(([, carrier]) => carrier);
-    const markers = this.scheduleAppliedMarks('undo', agentName, serverId, removed, turnMarks);
+      console.error(
+        `[host-command] undo agent=${agentName} requested=${requested} undone=${undone}` +
+          ` by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
+      );
+
+      if (undone === 0) {
+        return {
+          ok: true,
+          undone: 0,
+          requested,
+          markers: { scope: marksScope(turnMarks) as SurgeryMarkerReceipt['scope'], unmarked: 0, notRemoved: 0, status: 'none', queued: 0 },
+          lastVisible: null,
+        };
+      }
+
+      // Marks are a one-shot choice about the messages these turns removed;
+      // the branch move itself never adds or removes any.
+      const after = new Set(this.addressingSnapshot(agentName).keys());
+      const removed = [...before].filter(([id]) => !after.has(id)).map(([, carrier]) => carrier);
+      markers = this.scheduleAppliedMarks('undo', agentName, serverId, removed, turnMarks);
+    } finally {
+      release();
+    }
     return { ok: true, undone, requested, markers, lastVisible: await this.lastVisiblePreview(agentName) };
   }
 

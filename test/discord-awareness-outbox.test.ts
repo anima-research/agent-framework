@@ -329,6 +329,92 @@ test('a newer opposite intent retires the old request\'s retries even when it wa
   assert.ok(!due.includes('add:m1') && !due.includes('add:m2') && !due.includes('remove:m3'), due.join(','));
 }));
 
+test('authorization order: a retract after a surgery\'s choice wins over that choice\'s later activation', withJournal((outbox, h) => {
+  const due = (o: DiscordAwarenessOutbox) => o.pendingDispatches('discord').map((d) => `${d.action}:${d.key.messageId}`).sort();
+  const prepare = (target: string, refs: DiscordAwarenessRef[], extra: Record<string, unknown> = {}) => outbox.prepare({
+    agentName: 'cairn', sourceBranch: 'main', targetBranch: target, refs, scope: 'all', ...extra,
+  })!;
+
+  // prepare -> retract -> activate: the remove goes, the add never does.
+  const a = prepare('t/a', [ref('m1')]);
+  outbox.retract(a.id);
+  assert.equal(outbox.activate(a.id), 0, 'nothing queued');
+  assert.deepEqual(outbox.settleActivation(a.id), { status: 'queued', queued: 0 });
+  assert.deepEqual(due(outbox), ['remove:m1']);
+
+  // Overlapping prepared batches: a retract of one decides the shared key
+  // for the other, which was chosen earlier; its other key is unaffected.
+  const b = prepare('t/b', [ref('m2')]);
+  const c = prepare('t/c', [ref('m2'), ref('m3')]);
+  outbox.retract(b.id);
+  assert.equal(outbox.activate(c.id), 1);
+  assert.equal(outbox.activate(b.id), 0);
+  assert.deepEqual(due(outbox), ['add:m3', 'remove:m1', 'remove:m2']);
+
+  // retract('all') covers batches not yet activated.
+  const d = prepare('t/d', [ref('m4')]);
+  const all = outbox.retract('all');
+  assert.ok(all.removalsQueued >= 4);
+  assert.equal(outbox.activate(d.id), 0);
+  assert.ok(!due(outbox).includes('add:m4'));
+
+  // Cancelling the retract stops it without reviving the choice it overrode.
+  const e = prepare('t/e', [ref('m5')]);
+  const { requestId } = outbox.retract(e.id);
+  outbox.cancel(requestId);
+  assert.equal(outbox.activate(e.id), 0);
+  assert.ok(!due(outbox).some((d) => d.endsWith(':m5')), 'neither the add nor the cancelled remove');
+
+  // A later choice wins over an earlier retract.
+  const f = prepare('t/f', [ref('m1')]);
+  assert.equal(outbox.activate(f.id), 1);
+  assert.ok(due(outbox).includes('add:m1') && !due(outbox).includes('remove:m1'));
+
+  // A release is a new act: it wins over a retract made while the batch was held.
+  const g = prepare('t/g', [ref('m6')]);
+  h.reopen().recoverAtStartup('elsewhere'); // holds g (and nothing else is prepared)
+  const held = h.reopen();
+  held.retract(g.id);
+  assert.equal(held.release(g.id).addsQueued, 1);
+  assert.ok(due(held).includes('add:m6') && !due(held).includes('remove:m6'));
+
+  // The body's obligation is not the marks': a suppression whose marks were
+  // retracted before activation still records its body complete.
+  const sup = held.prepare({
+    agentName: 'cairn', sourceBranch: 'main', targetBranch: 't/s', refs: [ref('m7')], scope: 'all',
+    activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i1', toId: 'i1' }],
+  })!;
+  held.retract(sup.id);
+  assert.equal(held.activate(sup.id), 0);
+  const settled = held.batches().find((x) => x.id === sup.id)!;
+  assert.equal(settled.status, 'active');
+  assert.equal(settled.suppressionComplete, true);
+  assert.deepEqual(held.preparedSuppressionsForBranch('t/s'), []);
+
+  // Everything above holds across a restart.
+  assert.deepEqual(due(h.reopen()), due(held));
+}));
+
+test('startup records a crash-completion activation only after syncing the store, and nothing when the sync fails', withJournal((outbox, h) => {
+  const batch = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', refs: [ref('m1')], scope: 'all' })!;
+  const restarted = h.reopen();
+  const sync = h.store.sync.bind(h.store);
+  const calls: string[] = [];
+  const append = h.store.appendJson.bind(h.store);
+  (h.store as any).appendJson = (type: string, payload: unknown) => { calls.push('append'); return append(type, payload); };
+  (h.store as any).sync = () => { calls.push('sync'); throw new Error('injected sync failure'); };
+  try {
+    assert.throws(() => restarted.recoverAtStartup('rollback/cairn/1'), /injected sync failure/);
+  } finally {
+    (h.store as any).sync = sync;
+    (h.store as any).appendJson = append;
+  }
+  assert.deepEqual(calls, ['sync'], 'the sync came first, and nothing was appended');
+  assert.equal(h.reopen().batches().find((b) => b.id === batch.id)?.status, 'prepared');
+  // With a working store, the next startup completes it.
+  assert.deepEqual(h.reopen().recoverAtStartup('rollback/cairn/1').activated, [batch.id]);
+}));
+
 test('a retract request can be cancelled by the id its receipt returned, even after a restart', withJournal((outbox, h) => {
   const batch = activeBatch(outbox, [ref('m1'), ref('m2'), ref('m3')]);
   for (const id of ['m1', 'm2', 'm3']) answer(outbox, id, 'confirmed');
@@ -480,6 +566,24 @@ test('v2 import keeps what the old ledger recorded as evidence, holds pending wo
   assert.equal(again.batches().filter((b) => b.id === 'dd34b043').length, 1);
   assert.equal(batches(again).find((v) => v.id === 'dd34b043')!.legacy!.entries, 5);
   assert.equal(existsSync(h.legacyPath), false);
+}));
+
+test('an imported active suppression is not proof its body completed: startup still verifies its intervals', withJournal((_outbox, h) => {
+  mkdirSync(join(h.dir, 'recovery'), { recursive: true });
+  writeFileSync(h.legacyPath, JSON.stringify({
+    version: 2,
+    batches: [{
+      id: 'legacy-sup', status: 'active', agentName: 'cairn', sourceBranch: 'main', targetBranch: 'partial',
+      emoji: '💤', createdAt: 1, activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 'i1', toId: 'i1' }],
+      refs: [{ ...ref('m1'), desired: true, markerPresent: true, deliveryStatus: 'applied', attempts: 1, lastAction: 'add' }],
+    }],
+  }));
+  const outbox = h.reopen();
+  const [batch] = outbox.batches();
+  assert.equal(batch.status, 'active', 'its marks were active: history');
+  assert.equal(batch.suppressionComplete, undefined, 'its body is not certified by the old ledger');
+  assert.deepEqual(outbox.preparedSuppressionsForBranch('partial').map((b) => b.id), ['legacy-sup']);
+  assert.equal(outbox.pendingDispatches('discord').length, 0);
 }));
 
 // ---------------------------------------------------------------------------
@@ -706,7 +810,16 @@ test('turn-based host/command undo honours the marks choice for the messages its
       return { undone: true };
     };
     await muted(async () => {
+      // Another agent sharing the store is mid-turn: refused, nothing undone.
+      framework.activeTurnTokens.set('other', 99);
+      const busy = await framework.handleHostCommand('discord', { command: 'undo', agentName: 'cairn', turns: 2, marks: 'addressed' });
+      assert.equal(busy.ok, false);
+      assert.equal(busy.code, 'agent-busy');
+      assert.equal(turns, 1);
+      framework.activeTurnTokens.delete('other');
+
       const result = await framework.handleHostCommand('discord', { command: 'undo', agentName: 'cairn', turns: 2, marks: 'addressed' });
+      assert.equal(framework.surgeryHold, null, 'the reservation was released');
       assert.equal(result.ok, true);
       assert.equal(result.undone, 1);
       assert.equal(result.markers.status, 'queued');
