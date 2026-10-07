@@ -673,6 +673,7 @@ export class WorkspaceModule implements Module {
         initialSyncDone: false,
         lastMaterializedBranchId: null,
         materializedHashes: new Map(),
+        refusedPaths: new Set(),
         watcherReadyAt: null,
         watcherError: null,
       };
@@ -712,6 +713,12 @@ export class WorkspaceModule implements Module {
       if (mount) {
         mount.lastMaterializedSeq = meta.lastMaterializedSeq;
         mount.lastMaterializedBranchId = meta.lastMaterializedBranchId ?? null;
+        // Freshness-guard baselines: without them the first materialize after
+        // a restart can't tell a shell edit from our own last write (#109).
+        for (const [path, hash] of Object.entries(meta.materializedHashes ?? {})) {
+          if (!mount.materializedHashes.has(path)) mount.materializedHashes.set(path, hash);
+        }
+        for (const path of meta.refusedPaths ?? []) mount.refusedPaths.add(path);
         // watcherReadyAt intentionally not restored — each session must
         // observe its own watcher attach, otherwise a stale timestamp
         // would hide a new-session attach failure.
@@ -900,6 +907,8 @@ export class WorkspaceModule implements Module {
         state.mounts[name] = {
           lastMaterializedSeq: mount.lastMaterializedSeq,
           lastMaterializedBranchId: mount.lastMaterializedBranchId ?? undefined,
+          materializedHashes: Object.fromEntries(mount.materializedHashes),
+          refusedPaths: [...mount.refusedPaths],
           watcherReadyAt: mount.watcherReadyAt,
           watcherError: mount.watcherError,
         };
@@ -1053,7 +1062,7 @@ export class WorkspaceModule implements Module {
           properties: {
             path: { type: 'string', description: 'Specific path to materialize (optional — defaults to all changed)' },
             mount: { type: 'string', description: 'Specific mount (optional)' },
-            force: { type: 'boolean', description: 'Materialize even if the current branch has diverged from the branch last written to disk (default false). Only needed for genuine divergence — descendant branches pass automatically.' },
+            force: { type: 'boolean', description: 'Overwrite files whose disk copy changed since the last materialize (another writer), and materialize even if the current branch has diverged from the branch last written to disk (default false). Without it, divergent files are skipped and listed.' },
           },
         },
       },
@@ -2271,6 +2280,8 @@ export class WorkspaceModule implements Module {
       const changes = mount.lastMaterializedSeq > 0
         ? store.treeDiff(mount.treeStateId, mount.lastMaterializedSeq, currentSeq)
         : [];
+      // Refused paths (#109) are pending too, past the watermark or not.
+      const pending = new Set([...changes.map((c) => c.path), ...mount.refusedPaths]);
 
       const currentBranch = store.currentBranch();
       status[name] = {
@@ -2280,7 +2291,7 @@ export class WorkspaceModule implements Module {
         fileCount: entries.length,
         lastMaterializedSeq: mount.lastMaterializedSeq,
         currentSeq,
-        pendingChanges: changes.length,
+        pendingChanges: pending.size,
         initialSyncDone: mount.initialSyncDone,
         currentBranch: currentBranch.name,
         lastMaterializedBranch: mount.lastMaterializedBranchId,
@@ -2349,19 +2360,25 @@ export class WorkspaceModule implements Module {
 
       // Suppress watcher for paths we're about to write
       const watcher = this.watchers.get(name);
-      const written = await materializeToFs(store, mount, paths);
+      const { written, unchanged, skipped } = await materializeToFs(store, mount, paths, { force: input.force });
 
       for (const p of written) {
         watcher?.suppress(p);
         allWritten.push({ mount: name, path: p });
+      }
+      // Freshness-guard refusals (#109) ride the same skipped list as branch
+      // blocks: divergence must be visible, not resolved silently either way.
+      for (const s of skipped) {
+        blocked.push({ mount: name, reason: `${s.path}: ${s.reason}` });
       }
 
       // Track which branch we materialized on. Re-pin on a clean empty
       // materialize too (previously-pinned mount, nothing pending): disk
       // already reflects the current branch's tree, and leaving the old pin
       // would keep force required forever after a cross-branch materialize
-      // that happened to write nothing.
-      if (written.length > 0 || mount.lastMaterializedBranchId !== null) {
+      // that happened to write nothing. A first materialize that found every
+      // file already in place pins too: disk holds this branch's tree.
+      if (written.length > 0 || unchanged.length > 0 || mount.lastMaterializedBranchId !== null) {
         mount.lastMaterializedBranchId = store.currentBranch().id;
       }
     }
@@ -2391,11 +2408,14 @@ export class WorkspaceModule implements Module {
     mount.lastMaterializedSeq = 0;
 
     const watcher = this.watchers.get(mountName);
-    const written = await materializeToFs(store, mount);
+    // force: this path only runs after a deliberate undo/redo/branch switch
+    // on the framework's own _config mount — restoring disk to the branch
+    // state IS the operator intent, so the freshness guard yields.
+    const { written, unchanged } = await materializeToFs(store, mount, undefined, { force: true });
     for (const p of written) {
       watcher?.suppress(p);
     }
-    if (written.length > 0) {
+    if (written.length > 0 || unchanged.length > 0) {
       mount.lastMaterializedBranchId = store.currentBranch().id;
     }
     return written;
