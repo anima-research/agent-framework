@@ -14559,13 +14559,12 @@ export class AgentFramework {
     // preserved across the transient close are resumed by idempotent
     // registration. Then refresh tools (server may have different tools).
     connection.on('reconnect', (info?: { attempts?: number }) => {
-      // The connection paused its data plane before wiring the fresh
-      // transport. Let control traffic through for registration, then
-      // re-establish the grant: the §5.3 policy Request must be answered
-      // before this connection's data plane opens, otherwise the first
-      // post-reconnect events land while the grant is still empty and are
-      // rejected fail-closed instead of delivered.
-      connection.readyControlPlane();
+      // The connection closed both planes before wiring the fresh transport,
+      // as at initial connect. Re-establish the grant first: the §5.3 policy
+      // Request (whose response is never buffered) must be answered before
+      // any plane opens, otherwise the first post-reconnect traffic, control
+      // included (the server's channels/register), lands while the grant is
+      // still empty and is rejected fail-closed instead of delivered.
       void (async () => {
         try {
           const config = this.mcplServerConfigs.get(connection.id);

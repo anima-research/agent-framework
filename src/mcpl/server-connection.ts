@@ -354,8 +354,8 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * Close the data plane synchronously while leaving an already-released
-   * control plane live. Used before reconnect adoption, so no data event can
-   * arrive before the server's grant is re-established, and by quiesce.
+   * control plane live: quiesce holds wakes this way while operator traffic
+   * (host/command) still flows. A reconnect closes both planes instead.
    */
   pauseDataPlane(): void {
     this.dataPlaneReady = false;
@@ -953,11 +953,15 @@ export class McplServerConnection extends EventEmitter {
         this.hostCapabilities,
       );
 
-      // Close the data plane before the new transport can emit. The reconnect
-      // lifecycle event bypasses buffering; its framework listener releases
-      // the control traffic needed to re-establish the server's grant while
-      // data stays held until the grant is in place.
-      this.pauseDataPlane();
+      // Close both planes before the new transport can emit, as at initial
+      // connect: its traffic is admitted against the grant, which this
+      // boundary resets, so control traffic too (a server's channels/register
+      // right after initialize) must wait for the new grant rather than be
+      // refused against the empty one. The reconnect lifecycle event bypasses
+      // buffering; its framework listener re-establishes the grant (§5.3
+      // policy responses are never buffered) and then opens the planes.
+      this.controlPlaneReady = false;
+      this.dataPlaneReady = false;
       this.resetPolicyForTransportBoundary();
       this.transport = transport;
       this.capabilities = capabilities;

@@ -170,4 +170,25 @@ describe('McplServerConnection — reconnect lifecycle events', () => {
       grant: [],
     });
   });
+
+  it('holds a reconnected transport\'s control traffic, not only its data, until the host opens the planes', async () => {
+    writeFileSync(FLAG_FILE, '');
+    connection = await McplServerConnection.connect(makeConfig(), HOST_CAPS);
+    const controlEvents: string[] = [];
+    connection.on('tools-list-changed', () => controlEvents.push('tools-list-changed'));
+    let reconnected = false;
+    connection.on('reconnect', () => { reconnected = true; });
+    connection.ready();
+    connection.emit('tools-list-changed');
+    assert.deepStrictEqual(controlEvents, ['tools-list-changed'], 'an open control plane delivers');
+
+    connection.sendToolsList().catch(() => {});
+    await waitFor(() => reconnected, 5000, 'reconnect after crash');
+    // What the fresh transport sends is admitted against a grant the host
+    // has not re-established yet: it waits, as at initial connect.
+    connection.emit('tools-list-changed');
+    assert.deepStrictEqual(controlEvents, ['tools-list-changed'], 'control traffic is held after the boundary');
+    connection.ready();
+    assert.deepStrictEqual(controlEvents, ['tools-list-changed', 'tools-list-changed'], 'and released when the planes open');
+  });
 });
