@@ -348,7 +348,9 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
       'be checked for such edits, so its delivery stays unconfirmed. Each delivery names ' +
       'its basis. Every delivered version is ' +
       'remembered, so one counts when it first reaches you, however long ago it was accepted. ' +
-      'receiptClocks.gaps lists intervals in which observations may be missing. A ' +
+      'receiptClocks.gaps lists intervals in which observations may be missing; one still ' +
+      'open ends "(ongoing)" and sets receiptClocks.degraded. Until the receipt ledger has ' +
+      'been read in this host\'s run, channels carry no clocks at all. A ' +
       'missing inbound item is not evidence of upstream inactivity: a connector or ' +
       'allowlist can keep it from reaching the host at all.',
     inputSchema: { type: 'object' as const, properties: {} },

@@ -34,6 +34,11 @@
     the resident at any age, and never again. `receiptClocks` names the scope
     (store id, agent), `trackingSince` and coverage gaps: an unclean previous
     run, or a ledger write that failed, which never blocks delivery.
+  - A ledger that can't be read never blocks startup or delivery. Until a
+    whole read succeeds, nothing is written to it, `channel_list` reports the
+    open gap (and no clocks until the ledger has been read once), and the
+    read is retried. Tracking then resumes from the whole ledger, with the
+    unreadable interval recorded as a gap.
   - Request preparation captures immutable evidence of the bodies each request
     carries (`Agent.prepareActivationRequest`; `StartStreamResult.evidence`).
 - `history--folds {since?, limit?, branch?}`: the calling agent's fold record,

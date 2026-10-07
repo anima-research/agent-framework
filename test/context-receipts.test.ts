@@ -251,6 +251,142 @@ describe('ChannelClockLedger', () => {
     assert.equal(clocks(l, 'r').received?.messageId, 'm6');
     assert.equal(l.delivered('r', CH, src('m6', 1_006), real, BRANCH), false);
   });
+
+  /**
+   * The store with faults switched on by the test: reads that fail, one
+   * record read back damaged (a well-formed entry missing its fields), and
+   * an append that lands but reports failure.
+   */
+  const faulty = () => {
+    const faults = { failReads: false, damaged: null as string | null, landThenThrow: null as string | null };
+    const view = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === 'getRecordIdsByType' && faults.failReads) return () => { throw new Error('read failed'); };
+        if (prop === 'getRecord') {
+          return (id: string) => {
+            const record = target.getRecord(id);
+            return record && id === faults.damaged ? { ...record, payload: Buffer.from('{"k":"dlv","at":3000}') } : record;
+          };
+        }
+        if (prop === 'appendJson') {
+          return (type: string, payload: unknown) => {
+            const written = target.appendJson(type, payload);
+            if (faults.landThenThrow !== null && (payload as { k?: string }).k === faults.landThenThrow) {
+              faults.landThenThrow = null;
+              throw new Error('write reported failure after landing');
+            }
+            return written;
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as JsStore;
+    return { view, faults };
+  };
+  /** Every record the ledger has written, entries and checkpoints. */
+  const recordCount = () => store.getRecordIdsByType(CLOCK_RECORD).length + store.getRecordIdsByType(`${CLOCK_RECORD}/checkpoint`).length;
+  const entries = () => store.getRecordIdsByType(CLOCK_RECORD)
+    .map((id) => JSON.parse(store.getRecord(id)!.payload.toString('utf8')) as { k: string; at: number; from?: number; to?: number; reason?: string });
+
+  it('stops nothing when its journal cannot be read at start, and resumes from the whole journal with the unread interval as a gap', () => {
+    let l = open();
+    l.received(CH, src('m1', 1_100), 'channels/incoming');
+    clock = 2_000;
+    l.delivered('r', CH, src('m1', 1_100), ver('e1'), BRANCH);
+    clock = 3_000;
+    l.stop();
+
+    const { view, faults } = faulty();
+    faults.failReads = true;
+    clock = 5_000;
+    l = new ChannelClockLedger(view, 'store-1', now);
+    l.start(); // returns: the host opens
+    const before = recordCount();
+    assert.deepEqual(l.scope('r').gaps, [{ from: 5_000, to: 5_000, reason: 'ledger-unreadable (ongoing)' }]);
+    assert.equal(l.scope('r').degraded, true);
+    assert.equal(l.clocksFor('r', [CH]).size, 0, 'no clocks: an unread journal is not an empty one');
+    l.received(CH, src('m2', 5_100), 'channels/incoming');
+    assert.equal(l.delivered('r', CH, src('m2', 5_100), ver('e2'), BRANCH), false);
+    faults.failReads = false;
+    clock = 20_000;
+    assert.equal(l.delivered('r', CH, src('m2', 5_100), ver('e2'), BRANCH), false, 'the next read waits until it is due');
+    assert.equal(recordCount(), before, 'nothing appended or checkpointed while unread');
+
+    clock = 35_000;
+    l.received(CH, src('m3', 35_000), 'channels/incoming'); // the due read succeeds
+    const scope = l.scope('r');
+    assert.equal(scope.degraded, false);
+    assert.equal(scope.trackingSince, 1_000, 'coverage read back');
+    assert.deepEqual(scope.gaps, [{ from: 5_000, to: 35_000, reason: 'ledger-unreadable' }]);
+    assert.equal(l.delivered('r', CH, src('m1', 1_100), ver('e1'), BRANCH), false, 'dedup read back');
+    assert.equal(clocks(l, 'r').lastDeliveredAt, 2_000);
+    assert.equal(clocks(l, 'r').received?.messageId, 'm3');
+    assert.equal(l.delivered('r', CH, src('m2', 5_100), ver('e2'), BRANCH), true, 'a version unconfirmed while unread counts when it next arrives');
+    assert.deepEqual(entries().filter((e) => e.at >= 5_000).map((e) => e.k), ['gap', 'start', 'recv', 'dlv'], 'the gap, then the run\'s start before its entries');
+
+    l.stop();
+    clock = 40_000;
+    l = open();
+    assert.deepEqual(l.scope('r').gaps, [{ from: 5_000, to: 35_000, reason: 'ledger-unreadable' }], 'stopped cleanly after recovering: no unclean gap');
+  });
+
+  it('keeps what memory held when a read fails part-way, and writes nothing until a whole read succeeds', () => {
+    const { view, faults } = faulty();
+    const l = new ChannelClockLedger(view, 'store-1', now);
+    l.start();
+    clock = 2_000;
+    l.delivered('r', CH, src('m1', 1_100), ver('e1'), BRANCH);
+    const delivery = store.getRecordIdsByType(CLOCK_RECORD).at(-1)!;
+    // An append lands but reports failure, so the next write reads the journal first...
+    faults.landThenThrow = 'recv';
+    clock = 3_000;
+    l.received(CH, src('m2', 3_000), 'channels/incoming');
+    // ...and that read meets a damaged entry after reducing the one before it.
+    faults.damaged = delivery;
+    const before = recordCount();
+    clock = 4_000;
+    assert.equal(l.delivered('r', CH, src('m3', 4_000), ver('e3'), BRANCH), false);
+    assert.equal(recordCount(), before, 'no append, and no checkpoint over entries never reduced');
+    assert.equal(clocks(l, 'r').lastDeliveredAt, 2_000, 'memory as it was, not a partial reduction');
+    assert.equal(l.isDelivered('r', ver('e1')), true, 'dedup as it was');
+    assert.equal(clocks(l, 'r').received, undefined);
+    assert.equal(l.scope('r').degraded, true);
+
+    faults.damaged = null;
+    clock = 34_000;
+    assert.equal(l.delivered('r', CH, src('m3', 4_000), ver('e3'), BRANCH), true, 'a whole read, then the write');
+    assert.equal(clocks(l, 'r').received?.messageId, 'm2', 'the entry that landed was read back');
+    assert.equal(l.delivered('r', CH, src('m1', 1_100), ver('e1'), BRANCH), false);
+    assert.equal(l.scope('r').degraded, false);
+    assert.deepEqual(l.scope('r').gaps, [{ from: 3_000, to: 34_000, reason: 'ledger-write-failed' }]);
+  });
+
+  it('recovers through a gap write that lands but reports failure: the gap once, the start before the run\'s entries', () => {
+    let l = open();
+    clock = 2_000;
+    l.stop();
+    const { view, faults } = faulty();
+    faults.failReads = true;
+    clock = 5_000;
+    l = new ChannelClockLedger(view, 'store-1', now);
+    l.start();
+    faults.failReads = false;
+    faults.landThenThrow = 'gap';
+    clock = 35_000;
+    l.received(CH, src('m1', 35_000), 'channels/incoming'); // recovers; the gap's write lands but reports failure
+    clock = 36_000;
+    l.received(CH, src('m2', 36_000), 'channels/incoming');
+    assert.deepEqual(
+      entries().filter((e) => e.at >= 5_000).map((e) => e.k === 'gap' ? `gap ${e.from}-${e.to} ${e.reason}` : `${e.k} ${e.at}`),
+      ['gap 5000-35000 ledger-unreadable', 'start 35000', 'recv 35000', 'recv 36000'],
+    );
+    assert.equal(l.scope('r').degraded, false);
+    l.stop();
+    clock = 40_000;
+    l = open();
+    assert.deepEqual(l.scope('r').gaps, [{ from: 5_000, to: 35_000, reason: 'ledger-unreadable' }]);
+  });
 });
 
 describe('ContextReceipts', () => {

@@ -32,6 +32,19 @@
  * counts when it first does, at any age. Checkpoints grow with the sets, so
  * their interval grows too (a quarter of the remembered keys, at least 4000
  * entries), which keeps total checkpoint storage linear in deliveries.
+ *
+ * A journal that can't be read (a failed or damaged read, at start or while
+ * reconciling) stops neither the host nor delivery: the ledger becomes
+ * unreadable. A read is all or nothing, and nothing is written or
+ * checkpointed until a whole read succeeds, so no partial or empty state can
+ * cover entries that weren't read. Meanwhile channel_list reports the open
+ * gap, and no clocks at all until the journal has been read once. The read
+ * is retried on use, at most every 30 s, and once more at stop. When it
+ * succeeds, tracking resumes from the whole journal, dedup sets and coverage
+ * included, and the unreadable interval is recorded as a gap. A run whose
+ * journal never becomes readable writes nothing, so a later run can't show
+ * that interval as a gap: recording it would mean appending to a journal no
+ * one could read.
  */
 
 import { createHash } from 'node:crypto';
@@ -42,6 +55,8 @@ export const CLOCK_RECORD = 'agent-framework/channel-clocks';
 
 /** Minimum entries between checkpoints. */
 const CHECKPOINT_EVERY = 4000;
+/** How long an unreadable journal waits before the next read attempt. */
+const READ_RETRY_MS = 30_000;
 /** Coverage gaps listed with the clocks (most recent). */
 const GAPS_KEPT = 20;
 
@@ -157,7 +172,7 @@ export interface ClockScope {
   trackingSince: number | null;
   /** Recent intervals in which observations may be missing. */
   gaps: Array<{ from: number; to: number; reason: string }>;
-  /** True while a ledger write failure is unresolved. */
+  /** True while a gap is still open: a ledger write failed, or the journal can't be read. */
   degraded: boolean;
 }
 
@@ -198,9 +213,20 @@ function emptySnapshot(): Snapshot {
 export class ChannelClockLedger {
   private readonly journal: RecordJournal<ClockEntry, Snapshot>;
   private state: Snapshot = emptySnapshot();
-  /** Set while a write failure is unresolved: when it began and why. */
+  /** Set while a gap is open (a write failed, or the journal can't be read): when it began and why. */
   private pendingGap: { from: number; reason: string } | null = null;
+  /** Between start() and stop(). */
   private started = false;
+  /** When start() was called: where this run begins. */
+  private runStartedAt = 0;
+  /** This run's start has been recorded (or attempted): the journal was read after start(). */
+  private runBegun = false;
+  /** This run's start marker, until it is known to be recorded: it precedes the run's other entries. */
+  private pendingStart: number | null = null;
+  /** The journal has been read whole at least once, so memory holds its clocks. */
+  private hasRead = false;
+  /** Set while the journal can't be read: when the next attempt is due. Nothing is written meanwhile. */
+  private unreadable: { retryAt: number } | null = null;
   /** Inside batch(): the store has been synced for this batch's writes. */
   private batch: { synced: boolean } | null = null;
 
@@ -219,25 +245,30 @@ export class ChannelClockLedger {
     this.checkpointEvery = limits.checkpointEvery ?? CHECKPOINT_EVERY;
   }
 
-  /** Load, report an unclean previous run, and record this run's start. */
+  /**
+   * Begin this run: read the journal, report an unclean previous run, and
+   * record this run's start. Never throws: a journal that can't be read
+   * leaves tracking unavailable, and the run begins when a retried read
+   * succeeds (readable()).
+   */
   start(): void {
-    this.reload();
-    const at = this.now();
-    if (this.state.openRun !== null) {
-      this.writeGap({ from: this.state.lastAt ?? this.state.openRun, to: at, reason: 'unclean-stop' });
-    }
-    this.write({ k: 'start', at });
     this.started = true;
+    this.runStartedAt = this.now();
+    if (this.read()) this.beginRun();
   }
 
   /**
    * Record a clean stop: any outstanding gap first, then the stop marker,
    * then a checkpoint. If the gap can't be written, no stop marker is
-   * written either, so the next start reports the interval as unclean.
+   * written either, so the next start reports the interval as unclean. A
+   * journal still unreadable after one last attempt gets nothing written.
    */
   stop(): void {
     if (!this.started) return;
+    if (this.unreadable) this.unreadable.retryAt = this.now();
+    const readable = this.readable();
     this.started = false;
+    if (!readable) return;
     const at = this.now();
     if (this.pendingGap) {
       if (!this.flushPendingGap(at)) return;
@@ -275,16 +306,16 @@ export class ChannelClockLedger {
    * true when it was a first delivery (the clock moved).
    */
   delivered(agent: string, ch: ChannelRef, src: SourceRef, ver: VersionRef, branch: BranchStamp, at = this.now()): boolean {
-    // Eligibility is decided on reconciled state: an earlier append that
-    // failed after landing may already hold this very delivery.
-    if (!this.reconcile()) return false;
+    // Eligibility is decided on state read whole and reconciled: an earlier
+    // append that failed after landing may already hold this very delivery.
+    if (!this.readable() || !this.reconcile()) return false;
     if (this.deliveredSets.get(agent)?.has(versionDigest(ver))) return false;
     return this.write({ k: 'dlv', at, agent, ch, src, ver, branch });
   }
 
   /** A partial copy of `ver` reached `agent` before any complete one. */
   partial(agent: string, ch: ChannelRef, src: SourceRef, ver: VersionRef, branch: BranchStamp, why: string[], at = this.now()): boolean {
-    if (!this.reconcile()) return false;
+    if (!this.readable() || !this.reconcile()) return false;
     const digest = versionDigest(ver);
     if (this.deliveredSets.get(agent)?.has(digest) || this.partialSets.get(agent)?.has(digest)) return false;
     return this.write({ k: 'part', at, agent, ch, src, ver, branch, why });
@@ -295,10 +326,15 @@ export class ChannelClockLedger {
     return this.deliveredSets.get(agent)?.has(versionDigest(ver)) ?? false;
   }
 
-  /** The clocks of the given channels for one resident. */
+  /**
+   * The clocks of the given channels for one resident; none at all until the
+   * journal has been read (the scope's open gap says why).
+   */
   clocksFor(agent: string, channels: Array<Pick<ChannelRef, 'binding' | 'channelId'>>): Map<string, ChannelClocks> {
-    const a = this.state.agents[agent];
+    this.readable();
     const out = new Map<string, ChannelClocks>();
+    if (!this.hasRead) return out;
+    const a = this.state.agents[agent];
     for (const ch of channels) {
       const key = channelKey(ch);
       const recv = this.state.channels[key]?.received;
@@ -317,6 +353,7 @@ export class ChannelClockLedger {
   }
 
   scope(agent: string): ClockScope {
+    this.readable();
     return {
       storeId: this.storeId,
       agent,
@@ -335,27 +372,87 @@ export class ChannelClockLedger {
    * nothing, and the open coverage gap covers it.
    */
   private reconcile(): boolean {
-    if (!this.journal.needsReconcile) return true;
-    try {
-      this.reload();
-      return true;
-    } catch (err) {
-      console.error('[receipts] clock ledger could not reconcile after a failed write:', err);
-      return false;
-    }
+    return !this.journal.needsReconcile || this.read();
   }
 
-  private reload(): void {
-    const { snapshot, entries } = this.journal.load();
-    this.state = snapshot && snapshot.v === 2 ? snapshot : emptySnapshot();
-    this.deliveredSets = new Map();
-    this.partialSets = new Map();
-    for (const [agent, sets] of Object.entries(this.state.seen ?? {})) {
-      this.deliveredSets.set(agent, unpack(sets.delivered));
-      this.partialSets.set(agent, unpack(sets.partial));
+  /**
+   * Read the whole journal into memory, all or nothing. On failure memory
+   * keeps what it held, the ledger becomes unreadable (nothing is written or
+   * checkpointed until a later read succeeds, though the journal may already
+   * have advanced past entries never reduced), and a coverage gap opens.
+   */
+  private read(): boolean {
+    const held = { state: this.state, delivered: this.deliveredSets, partial: this.partialSets };
+    try {
+      const { snapshot, entries } = this.journal.load();
+      this.state = snapshot && snapshot.v === 2 ? snapshot : emptySnapshot();
+      this.deliveredSets = new Map();
+      this.partialSets = new Map();
+      for (const [agent, sets] of Object.entries(this.state.seen ?? {})) {
+        this.deliveredSets.set(agent, unpack(sets.delivered));
+        this.partialSets.set(agent, unpack(sets.partial));
+      }
+      this.state.seen = {};
+      for (const { entry } of entries) this.reduce(entry);
+    } catch (err) {
+      this.state = held.state;
+      this.deliveredSets = held.delivered;
+      this.partialSets = held.partial;
+      const at = this.now();
+      console.error(`[receipts] channel clock ledger could not be read; retrying in ${READ_RETRY_MS / 1000} s:`, err);
+      this.unreadable = { retryAt: at + READ_RETRY_MS };
+      if (!this.pendingGap) this.pendingGap = { from: at, reason: 'ledger-unreadable' };
+      return false;
     }
-    this.state.seen = {};
-    for (const { entry } of entries) this.reduce(entry);
+    this.unreadable = null;
+    this.hasRead = true;
+    return true;
+  }
+
+  /**
+   * Whether memory holds the journal as read whole. While it can't be read,
+   * a due attempt (on use, at most every READ_RETRY_MS) reads it again, and
+   * a run whose start waited on the read begins once it succeeds.
+   */
+  private readable(): boolean {
+    if (!this.unreadable) return true;
+    if (this.now() < this.unreadable.retryAt) return false;
+    if (!this.read()) return false;
+    if (this.started && !this.runBegun) this.beginRun();
+    return true;
+  }
+
+  /**
+   * This run's start, once the journal has been read: an unclean previous
+   * run's interval as a gap, up to where this run began, then the start
+   * marker. A read that only succeeded after start() left its interval open
+   * as a pending gap, which the marker's write records first; before
+   * tracking ever began there was nothing to miss. A gap that can't be
+   * written yet widens the one left open, and a marker that can't be written
+   * yet is retried before the run's next entry, so neither interval is lost.
+   */
+  private beginRun(): void {
+    this.runBegun = true;
+    if (this.state.openRun !== null) {
+      const from = this.state.lastAt ?? this.state.openRun;
+      if (!this.writeGap({ from, to: this.runStartedAt, reason: 'unclean-stop' }) && this.pendingGap) {
+        this.pendingGap.from = Math.min(this.pendingGap.from, from);
+      }
+    }
+    if (this.state.trackingSince === null && this.pendingGap?.reason === 'ledger-unreadable') this.pendingGap = null;
+    this.pendingStart = this.now();
+    this.recordStart();
+  }
+
+  /**
+   * Write the pending start marker. If an earlier attempt landed but
+   * reported failure, the journal holds the same marker twice, which reduces
+   * the same as once.
+   */
+  private recordStart(): boolean {
+    if (!this.write({ k: 'start', at: this.pendingStart! })) return false;
+    this.pendingStart = null;
+    return true;
   }
 
   /** The reduced state with the dedup sets packed in, for a checkpoint. */
@@ -379,10 +476,15 @@ export class ChannelClockLedger {
    * Append one entry and reduce it. A failure opens a coverage gap that
    * channel_list reports and the next successful write records; it never
    * reaches the caller, because delivery must not depend on bookkeeping.
+   * Nothing is appended while the journal can't be read.
    */
   private write(entry: ClockEntry): boolean {
+    if (!this.readable()) return false;
     if (this.pendingGap && entry.k !== 'gap') {
       if (!this.flushPendingGap(this.now())) return false;
+    }
+    if (this.pendingStart !== null && entry.k !== 'gap' && entry.k !== 'start') {
+      if (!this.recordStart()) return false;
     }
     const assertsState = entry.k === 'dlv' || entry.k === 'part';
     // Tracking markers and gaps decide what the next start may claim about
@@ -419,11 +521,23 @@ export class ChannelClockLedger {
     if (!this.pendingGap) this.pendingGap = { from: this.now(), reason: 'ledger-write-failed' };
   }
 
-  /** Reconcile after a failure, then record the gap. */
+  /**
+   * Reconcile after a failure, then record the gap. An earlier attempt that
+   * landed but reported failure is in the reconciled journal already, so
+   * only the time since it is recorded.
+   */
   private flushPendingGap(to: number): boolean {
     const gap = this.pendingGap!;
+    if (!this.reconcile()) return false;
+    const landed = this.state.gaps.at(-1);
+    if (landed && landed.reason === gap.reason && landed.from === gap.from) {
+      if (landed.to >= to) {
+        this.pendingGap = null;
+        return true;
+      }
+      gap.from = landed.to;
+    }
     try {
-      if (this.journal.needsReconcile) this.reload();
       this.journal.append({ k: 'gap', at: to, from: gap.from, to, reason: gap.reason }, { durable: true });
     } catch (err) {
       console.error('[receipts] coverage gap could not be recorded:', err);
@@ -434,8 +548,8 @@ export class ChannelClockLedger {
     return true;
   }
 
-  private writeGap(gap: { from: number; to: number; reason: string }): void {
-    this.write({ k: 'gap', at: gap.to, ...gap });
+  private writeGap(gap: { from: number; to: number; reason: string }): boolean {
+    return this.write({ k: 'gap', at: gap.to, ...gap });
   }
 
   private agent(name: string): AgentState {
