@@ -128,15 +128,24 @@ test('a small unclassified reason produces exactly the marker it did before', ()
 });
 
 test('no excerpt splits a surrogate pair, at any cut position', () => {
-  for (const at of [599, 600, 601, 1_000, MEGA - 100, MEGA - 101]) {
+  // A pair at every position of a reason longer than both bounds, so that
+  // wherever the cuts fall, some position straddles each of them.
+  const length = 2_500;
+  const omission = new RegExp(` …\\[(\\d+) of ${length} characters omitted\\]… `);
+  for (let at = 0; at <= length - 2; at++) {
     const { fw, markers, logged, restore } = makeHarness();
-    const reason = `${'x'.repeat(at)}😀${'x'.repeat(MEGA - at)}`;
     try {
-      fw.noteInferenceExhausted('cairn', reason, false, 'invalid_request');
+      fw.noteInferenceExhausted('cairn', `${'x'.repeat(at)}😀${'x'.repeat(length - 2 - at)}`, false, 'invalid_request');
     } finally { restore(); }
-    assert.equal(loneSurrogate.test(markers[0].meta.reason), false);
-    assert.equal(loneSurrogate.test(logged[0].reason as string), false);
-    assert.ok(markers[0].meta.reason.length <= 600);
+    for (const [excerpt, max] of [[markers[0].meta.reason as string, 600], [logged[0].reason as string, 2_000]] as const) {
+      const where = `pair at ${at}, ${max}-character excerpt`;
+      assert.equal(loneSurrogate.test(excerpt), false, `${where}: a lone surrogate`);
+      assert.ok(excerpt.length <= max, `${where}: ${excerpt.length} characters`);
+      // A cut moved off a pair omits one more character, and says so.
+      const stated = omission.exec(excerpt);
+      assert.ok(stated, `${where}: no omission marker`);
+      assert.equal(excerpt.length - stated[0].length + Number(stated[1]), length, `${where}: the stated omission`);
+    }
   }
 });
 
