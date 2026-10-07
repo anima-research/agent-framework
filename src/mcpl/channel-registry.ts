@@ -525,6 +525,17 @@ interface ChannelRegistryOptions {
    * wins), BEFORE `defaultPublishChannel`.
    */
   activeChannelResolver?: (agentName: string) => string | undefined;
+  /**
+   * Configured HOME channel for turns with no channel provenance (heartbeats,
+   * timers). Without it, such a turn's plain-text speech falls through to
+   * `defaultPublishChannel` — the most-recent inbound across ALL channels — so
+   * a heartbeat check-in lands in whatever channel last had activity,
+   * including public ones. Consulted AFTER `homeChannelResolver` and
+   * `activeChannelResolver` (a fork's home / a real triggering channel always
+   * wins), BEFORE `defaultPublishChannel`. Channel descriptor id form, e.g.
+   * `discord:{guildId}:{channelId}`.
+   */
+  homeChannel?: string;
 }
 
 // ============================================================================
@@ -572,6 +583,7 @@ export class ChannelRegistry {
   }) => void;
   private homeChannelResolver?: (agentName: string) => string | undefined;
   private activeChannelResolver?: (agentName: string) => string | undefined;
+  private homeChannel?: string;
   private store?: JsStore;
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
@@ -684,6 +696,7 @@ export class ChannelRegistry {
     this.onChannelAutoOpened = options?.onChannelAutoOpened;
     this.homeChannelResolver = options?.homeChannelResolver;
     this.activeChannelResolver = options?.activeChannelResolver;
+    this.homeChannel = options?.homeChannel;
     this.store = options?.store;
     this.initializeLifecycleStore();
     this.initializeLabelHistoryStore();
@@ -1367,7 +1380,7 @@ export class ChannelRegistry {
     // agent was told the wrong channel under concurrency.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
     const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.defaultPublishChannel;
+    const outgoing = home ?? active ?? this.homeChannel ?? this.defaultPublishChannel;
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -2958,7 +2971,11 @@ export class ChannelRegistry {
 
   resolveLocus(conversationId: string): string | null {
     const home = this.homeChannelResolver?.(conversationId);
-    return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;
+    return home
+      ?? this.activeChannelResolver?.(conversationId)
+      ?? this.homeChannel
+      ?? this.defaultPublishChannel
+      ?? null;
   }
 
   async routeSpeech(

@@ -1374,6 +1374,9 @@ export class AgentFramework {
    *  subsystem can be lazily initialized by connectMcplServer when the
    *  framework started with zero configured servers. */
   private mcplInferenceRoutingConfig: import('./mcpl/types.js').InferenceRoutingPolicy | null = null;
+  /** Configured home channel for no-trigger turns (heartbeats, timers) — see
+   *  ChannelRegistryOptions.homeChannel. */
+  private mcplHomeChannel: string | null = null;
   /** Durable, non-Chronicle projection queue for messages removed by a branch. */
   private discordAwarenessOutbox: DiscordAwarenessOutbox | null = null;
   private discordAwarenessEmoji = DEFAULT_DISCORD_AWARENESS_EMOJI;
@@ -1731,6 +1734,7 @@ export class AgentFramework {
     // Stored for lazy MCPL initialization (connectMcplServer on a framework
     // that started with zero configured servers).
     framework.mcplInferenceRoutingConfig = config.inferenceRouting ?? null;
+    framework.mcplHomeChannel = config.homeChannel ?? null;
 
     // Client-side programmatic tool calling (code_execution). Config is only
     // retained when enabled — everything downstream gates on the field.
@@ -13155,6 +13159,9 @@ export class AgentFramework {
         // a concurrent message in another channel hijacks it. Empty for
         // heartbeat / no-trigger turns → correct global fallback.
         activeChannelResolver: (agentName) => this.activeTriggerChannels.get(agentName),
+        // Configured home channel: where a no-trigger turn's speech goes
+        // instead of the last-active channel (heartbeat containment).
+        homeChannel: this.mcplHomeChannel ?? undefined,
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
         // agent sees, on her next turn, that her reply never reached the human.
