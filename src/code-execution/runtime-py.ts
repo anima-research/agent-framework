@@ -215,6 +215,9 @@ _current_exec_task = None
 #  10. cancel op or repeated signal after delivery -> nothing
 #  11. script finished, reporting its result -> nothing
 #  12. between scripts -> nothing
+#  13. a previous script installed an eager task factory -> no effect: the
+#      runtime builds its script task directly, and the state is in place
+#      before the script's first step
 _PENDING = "pending"
 _REQUESTED = "requested"
 _DELIVERED = "delivered"
@@ -466,13 +469,19 @@ def _dispatch(msg):
                 "return_code": 1,
             })
             return True
+        # Everything _on_sigint reads is in place before the script can run
+        # (row 13). The task is built directly, not through the loop's task
+        # factory: a script may have installed one (interpreter state
+        # persists), and an eager one would run the next script inside this
+        # call, before the assignments below.
         st = _ScriptStop()
+        _stop = st
         _current_exec_id = msg.get("id")
-        _current_exec_task = asyncio.ensure_future(
-            _run_script(msg.get("id"), msg.get("code") or "", st)
+        _current_exec_task = asyncio.Task(
+            _run_script(msg.get("id"), msg.get("code") or "", st),
+            loop=asyncio.get_running_loop(),
         )
         st.task = _current_exec_task
-        _stop = st
     elif op == "tool_result":
         _resolve(_pending_tool_futures.get(msg.get("id")), str(msg.get("result", "")))
     elif op == "wake_ack":

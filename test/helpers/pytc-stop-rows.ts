@@ -124,6 +124,11 @@ ROWS = {
     "11 reporting": lambda: run("print('done')", hook=('"exec_result"', sigint_here)),
     "12 between scripts": lambda: run("print('ok')", before_exec=sigint_here),
 }
+if sys.version_info >= (3, 12):  # last: the factory stays installed on the loop
+    ROWS["13 eager task factory installed"] = lambda: run(
+        "import asyncio\nasyncio.get_running_loop().set_task_factory(asyncio.eager_task_factory)\nprint('installed')")
+    ROWS["13 next script blocks"] = lambda: run(
+        "import time\nprint('a')\ntime.sleep(5)\nprint('b')", steps=lambda: signal_after(0.2))
 
 
 async def main():

@@ -1148,8 +1148,37 @@ describe('code_execution time limit vs blocking code (real python3)', { skip: pr
       finished('10 after delivery', ['cleaned']);
       finished('11 reporting', ['done']);
       finished('12 between scripts', ['ok']);
+      if (rows['13 next script blocks']) {
+        // Python 3.12+: an eager task factory left installed by an earlier script.
+        finished('13 eager task factory installed', ['installed']);
+        stopped('13 next script blocks', interrupted, ['a'], ['b']);
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an eager task factory installed by an earlier script does not hide the next one from the deadline', async (t) => {
+    const runner = new PyRunner({ onToolCall: async () => '', cancelGraceMs: 3000 });
+    try {
+      const install = await runner.exec(
+        'import asyncio, sys\nif sys.version_info >= (3, 12):\n    asyncio.get_running_loop().set_task_factory(asyncio.eager_task_factory)\n    print("installed")',
+        [],
+      );
+      assert.strictEqual(install.returnCode, 0, install.stderr);
+      if (install.stdout !== 'installed\n') {
+        t.skip('asyncio.eager_task_factory needs Python 3.12+');
+        return;
+      }
+      const started = Date.now();
+      const result = await runner.exec('import time\nprint("before")\ntime.sleep(30)', [], undefined, { deadlineMs: 1000 });
+      assert.strictEqual(result.aborted, undefined, 'interrupted, not killed');
+      assert.strictEqual(result.stdout, 'before\n');
+      assert.match(result.stderr, /KeyboardInterrupt: script interrupted by host/);
+      assert.match(result.stderr, /script stopped: it reached its 1s time limit/);
+      assert.ok(Date.now() - started < 2500, `stopped at the limit (${Date.now() - started}ms)`);
+    } finally {
+      runner.dispose();
     }
   });
 
