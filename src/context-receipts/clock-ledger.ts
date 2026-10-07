@@ -24,8 +24,9 @@
  *
  * Deduplication is exact and persistent. A version is delivered at most
  * once per resident, however long ago it was accepted. Every delivered (and
- * partially exposed) version is remembered as a 64-bit digest of its key,
- * and the full sets ride in each checkpoint as one packed base64 string.
+ * partially exposed) version is remembered by the SHA-256 of its canonical
+ * identity ([basis, key]), and the full sets ride in each checkpoint as one
+ * packed base64 string.
  * Re-presenting a delivered version (an unfold, a replay, every later round)
  * never moves a clock, and a version that has never reached the resident
  * counts when it first does, at any age. Checkpoints grow with the sets, so
@@ -112,7 +113,7 @@ interface AgentState {
   partial: Record<string, PartialStamp>;
 }
 
-/** A resident's persisted dedup sets: packed 8-byte version digests, base64. */
+/** A resident's persisted dedup sets: packed 32-byte version digests, base64. */
 interface PackedSets {
   delivered: string;
   partial: string;
@@ -161,9 +162,9 @@ export function channelKey(ch: Pick<ChannelRef, 'binding' | 'channelId'>): strin
 }
 
 
-/** A version's 64-bit digest, as 16 hex characters. */
+/** A version's identity: the SHA-256 of [basis, key], as 64 hex characters. */
 function versionDigest(ver: VersionRef): string {
-  return createHash('sha256').update(JSON.stringify([ver.basis, ver.key])).digest('hex').slice(0, 16);
+  return createHash('sha256').update(JSON.stringify([ver.basis, ver.key])).digest('hex');
 }
 
 function pack(set: ReadonlySet<string>): string {
@@ -174,7 +175,7 @@ function unpack(packed: string | undefined): Set<string> {
   const out = new Set<string>();
   if (!packed) return out;
   const hex = Buffer.from(packed, 'base64').toString('hex');
-  for (let i = 0; i + 16 <= hex.length; i += 16) out.add(hex.slice(i, i + 16));
+  for (let i = 0; i + 64 <= hex.length; i += 64) out.add(hex.slice(i, i + 64));
   return out;
 }
 
@@ -355,6 +356,9 @@ export class ChannelClockLedger {
       if (!this.flushPendingGap(this.now())) return false;
     }
     const assertsState = entry.k === 'dlv' || entry.k === 'part';
+    // Tracking markers and gaps decide what the next start may claim about
+    // this run, so they're on stable storage before the run goes on.
+    const durable = entry.k === 'start' || entry.k === 'stop' || entry.k === 'gap';
     try {
       if (assertsState && this.batch) {
         if (!this.batch.synced) {
@@ -363,7 +367,7 @@ export class ChannelClockLedger {
         }
         this.journal.append(entry);
       } else {
-        this.journal.append(entry, assertsState ? { afterCommittedState: true } : {});
+        this.journal.append(entry, { ...(assertsState ? { afterCommittedState: true } : {}), ...(durable ? { durable: true } : {}) });
       }
     } catch (err) {
       this.noteFailure(err);
@@ -391,7 +395,7 @@ export class ChannelClockLedger {
     const gap = this.pendingGap!;
     try {
       if (this.journal.needsReconcile) this.reload();
-      this.journal.append({ k: 'gap', at: to, from: gap.from, to, reason: gap.reason });
+      this.journal.append({ k: 'gap', at: to, from: gap.from, to, reason: gap.reason }, { durable: true });
     } catch (err) {
       console.error('[receipts] coverage gap could not be recorded:', err);
       return false;

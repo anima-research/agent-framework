@@ -897,20 +897,26 @@ export class Agent {
     return { request, evidence: this.receiptEvidence(compiled, requestIndexOf) };
   }
 
-  /** Evidence of the channel bodies a compiled request carries. */
+  /**
+   * Evidence of the channel bodies a compiled request carries, resolved from
+   * the compile's own view (`rawSources`): that covers bodies merged in from
+   * auxiliary slots, which `getMessage` cannot see, and binds the evidence to
+   * what this compile held rather than to a later edit.
+   */
   private receiptEvidence(compiled: CompileResult, requestIndexOf: number[]): RequestEvidence {
     const cm = this.contextManager as ContextManager & { getStoreId?: () => string };
+    const sources = compiled.rawSources;
     let groups: Map<string, StoredMessage[]> | null = null;
     return requestEvidence({
       agent: this.name,
       storeId: cm.getStoreId?.() ?? 'unknown',
       provenance: compiled.provenance ?? null,
       requestIndexOf,
-      getMessage: (id) => cm.getMessage(id),
+      getMessage: (id) => sources?.get(id) ?? null,
       groupMembers: (head) => {
         if (!groups) {
           groups = new Map();
-          for (const m of cm.getAllMessages()) {
+          for (const m of sources?.values() ?? []) {
             if (!m.bodyGroupId) continue;
             const list = groups.get(m.bodyGroupId) ?? [];
             list.push(m);

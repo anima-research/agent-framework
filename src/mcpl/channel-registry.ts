@@ -328,8 +328,10 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
       'carried a new raw body from the channel to you, complete: every part present, ' +
       'nothing truncated, no image or block removed on the way. Summaries that mention a ' +
       'message do not count, and showing an already-delivered version again never moves ' +
-      'the clock. lastPartialAt: a body that reached you only partially and has not ' +
-      'arrived whole since. Null means no observation since receiptClocks.trackingSince, ' +
+      'the clock. lastPartialAt: the most recent time a body from the channel first reached ' +
+      'you only partially (cut, or altered on the way); it is history, and a later complete ' +
+      'arrival of that body shows in lastDeliveredAt, not here. Null means no observation ' +
+      'since receiptClocks.trackingSince, ' +
       'not silence before it. The clocks cover one store and one resident ' +
       '(receiptClocks.storeId, agent): a session switch starts a separate history. ' +
       'Versions are identified by the producer event id where its lane guarantees one, ' +

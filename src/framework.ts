@@ -1433,7 +1433,7 @@ export class AgentFramework {
     this.ownsStore = ownsStore;
     this.clockLedger = new ChannelClockLedger(store, storeIdentity(store));
     this.contextReceipts = new ContextReceipts(this.clockLedger, {
-      acceptRound: (agentName, provenance, usage, at) => {
+      acceptRound: (agentName, provenance, usage, at, presentation) => {
         this.agents.get(agentName)?.getContextManager().acceptRound({
           provenance,
           acceptedAt: at,
@@ -1442,6 +1442,7 @@ export class AgentFramework {
             cacheReadTokens: usage.cacheReadTokens,
             cacheCreationTokens: usage.cacheCreationTokens,
           },
+          presentation,
         });
       },
     });
@@ -6936,7 +6937,7 @@ export class AgentFramework {
             // messages (membrane ≥0.5.72) — appended after the tool_result
             // envelope so the next round of THIS turn hears them.
             if (midTurnInjections.length > 0) {
-              this.contextReceipts.injectedBatch(agent.name, agent.streamId, injectedBodies);
+              this.contextReceipts.injectedBatch(agent.name, agent.streamId, midTurnInjections.length, injectedBodies);
             }
             currentState.stream.provideToolResults(
               agent.toolResultGuard.submissionResults(membraneResults),

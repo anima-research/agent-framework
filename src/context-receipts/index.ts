@@ -44,16 +44,34 @@ export interface RoundReport {
   fidelity?: 'established' | 'unknown';
 }
 
+interface InjectedBatch {
+  /** Every message of the batch, bodies or not: the producer's coordinates. */
+  size: number;
+  /** Evidence for the channel bodies among them, at their batch indices. */
+  bodies: BodyEvidence[];
+  /** How much of the batch, as an ordered prefix, a round has carried. */
+  applied: number;
+}
+
 interface StreamState {
   evidence: RequestEvidence | undefined;
-  batches: BodyEvidence[][];
-  applied: number[];
+  batches: InjectedBatch[];
   accepted: boolean;
 }
 
+/** How a round carried the compile, for fold receipts. */
+export type Presentation = 'verbatim' | 'altered' | 'unknown';
+
 export interface ContextReceiptHooks {
-  /** Accept a compile for fold receipts (ContextManager.acceptRound). */
-  acceptRound(agent: string, provenance: CompileProvenance, usage: RoundReport['usage'], at: number): void;
+  /** Accept a compile for fold receipts (ContextManager.acceptRound). Throws when the write fails. */
+  acceptRound(agent: string, provenance: CompileProvenance, usage: RoundReport['usage'], at: number, presentation: Presentation): void;
+}
+
+/** One source version and every request fragment that carries it in a round. */
+interface VersionCarriage {
+  body: BodyEvidence;
+  complete: boolean;
+  missing: Set<string>;
 }
 
 export class ContextReceipts {
@@ -73,15 +91,18 @@ export class ContextReceipts {
   }
 
   beginStream(agent: string, streamId: number, evidence: RequestEvidence | undefined): void {
-    this.streams.set(key(agent, streamId), { evidence, batches: [], applied: [], accepted: false });
+    this.streams.set(key(agent, streamId), { evidence, batches: [], accepted: false });
   }
 
-  /** A batch of mid-turn injected messages handed to the stream; returns its batch number. */
-  injectedBatch(agent: string, streamId: number, bodies: BodyEvidence[]): number {
+  /**
+   * A batch of mid-turn injected messages handed to the stream: `size` is
+   * the whole batch's length (the producer's coordinate space), `bodies` the
+   * evidence for its channel bodies. Returns the batch number.
+   */
+  injectedBatch(agent: string, streamId: number, size: number, bodies: BodyEvidence[]): number {
     const state = this.streams.get(key(agent, streamId));
     if (!state) return -1;
-    state.batches.push(bodies);
-    state.applied.push(0);
+    state.batches.push({ size, bodies, applied: 0 });
     return state.batches.length - 1;
   }
 
@@ -98,36 +119,58 @@ export class ContextReceipts {
 
     if (round.injectedBatch) {
       const { batch, applied } = round.injectedBatch;
-      if (batch >= 0 && batch < state.applied.length) {
-        state.applied[batch] = Math.max(state.applied[batch]!, Math.min(applied, state.batches[batch]!.length));
-      }
+      const target = state.batches[batch];
+      if (target) target.applied = Math.max(target.applied, Math.min(applied, target.size));
     }
 
     const evidence = state.evidence;
     const established = round.fidelity === 'established';
+    const alteredMessages = new Set(round.altered?.messages ?? []);
     if (established && evidence) {
       const branch = branchOf(evidence);
-      const alteredMessages = new Set(round.altered?.messages ?? []);
       const alteredInjected = new Set((round.altered?.injected ?? []).map(([b, i]) => `${b}:${i}`));
-      this.ledger.withCommittedState(() => {
-        for (const body of evidence.bodies) {
-          this.evaluate(agent, body, alteredMessages.has(body.index), branch, at);
+      // A body can reach the request in several fragments (a split message,
+      // a sharded body, the same version compiled and injected). It is
+      // delivered complete only when every fragment carrying it in this
+      // round arrived complete and unaltered.
+      const carried = new Map<string, VersionCarriage>();
+      const carry = (body: BodyEvidence, altered: boolean) => {
+        const id = JSON.stringify([body.ver.basis, body.ver.key]);
+        const entry = carried.get(id) ?? { body, complete: true, missing: new Set<string>() };
+        if (!body.complete) {
+          entry.complete = false;
+          for (const why of body.missing ?? []) entry.missing.add(why);
         }
-        state.batches.forEach((bodies, batch) => {
-          const applied = state.applied[batch] ?? 0;
-          for (const body of bodies) {
-            if (body.index < applied) this.evaluate(agent, body, alteredInjected.has(`${batch}:${body.index}`), branch, at);
-          }
-        });
+        if (altered) {
+          entry.complete = false;
+          entry.missing.add('wire-alteration');
+        }
+        carried.set(id, entry);
+      };
+      for (const body of evidence.bodies) carry(body, alteredMessages.has(body.index));
+      state.batches.forEach((batch, n) => {
+        for (const body of batch.bodies) {
+          if (body.index < batch.applied) carry(body, alteredInjected.has(`${n}:${body.index}`));
+        }
+      });
+      this.ledger.withCommittedState(() => {
+        for (const entry of carried.values()) {
+          if (entry.complete) this.ledger.delivered(agent, entry.body.ch, entry.body.src, entry.body.ver, branch, at);
+          else this.ledger.partial(agent, entry.body.ch, entry.body.src, entry.body.ver, branch, [...entry.missing], at);
+        }
       });
     }
 
     if (!state.accepted && evidence?.provenance) {
-      state.accepted = true;
+      const presentation: Presentation = !established ? 'unknown' : alteredMessages.size > 0 ? 'altered' : 'verbatim';
       try {
-        this.hooks.acceptRound(agent, evidence.provenance, round.usage, at);
+        this.hooks.acceptRound(agent, evidence.provenance, round.usage, at, presentation);
+        // Only a completed acceptance closes this compile's acceptance: a
+        // failed or uncertain write is retried at the stream's next round
+        // (the context manager finds it already accepted if it landed).
+        state.accepted = true;
       } catch (err) {
-        console.error(`[receipts] ${agent}: fold acceptance failed:`, err);
+        console.error(`[receipts] ${agent}: fold acceptance failed (retried at the next round):`, err);
       }
     }
   }
@@ -136,14 +179,6 @@ export class ContextReceipts {
     this.streams.delete(key(agent, streamId));
   }
 
-  private evaluate(agent: string, body: BodyEvidence, altered: boolean, branch: BranchStamp, at: number): void {
-    if (body.complete && !altered) {
-      this.ledger.delivered(agent, body.ch, body.src, body.ver, branch, at);
-      return;
-    }
-    const why = [...(body.missing ?? []), ...(altered ? ['wire-alteration'] : [])];
-    this.ledger.partial(agent, body.ch, body.src, body.ver, branch, why, at);
-  }
 }
 
 function key(agent: string, streamId: number): string {

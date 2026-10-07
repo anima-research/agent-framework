@@ -222,7 +222,8 @@ describe('ContextReceipts', () => {
   let dir: string;
   let store: JsStore;
   let ledger: ChannelClockLedger;
-  let accepted: Array<{ agent: string; usage: RoundReport['usage'] }>;
+  let accepted: Array<{ agent: string; usage: RoundReport['usage']; presentation: string }>;
+  let acceptFailures = 0;
   let receipts: ContextReceipts;
 
   const body = (index: number, id: string, extra: Partial<BodyEvidence> = {}): BodyEvidence => ({
@@ -258,7 +259,16 @@ describe('ContextReceipts', () => {
     ledger = new ChannelClockLedger(store, 'store-1');
     ledger.start();
     accepted = [];
-    receipts = new ContextReceipts(ledger, { acceptRound: (agent, _p, usage) => accepted.push({ agent, usage }) });
+    acceptFailures = 0;
+    receipts = new ContextReceipts(ledger, {
+      acceptRound: (agent, _p, usage, _at, presentation) => {
+        if (acceptFailures > 0) {
+          acceptFailures--;
+          throw new Error('journal write failed');
+        }
+        accepted.push({ agent, usage, presentation });
+      },
+    });
   });
   afterEach(() => {
     store.close();
@@ -273,6 +283,29 @@ describe('ContextReceipts', () => {
     receipts.usage('r', 1, round({ index: 1 }));
     assert.equal(accepted.length, 1);
     assert.deepEqual(accepted[0]!.usage, { inputTokens: 10 });
+    assert.equal(accepted[0]!.presentation, 'verbatim');
+  });
+
+  it('retries a failed acceptance at the next round, and records how the round presented the compile', () => {
+    acceptFailures = 1;
+    receipts.beginStream('r', 1, evidence([body(0, 'm1')]));
+    receipts.usage('r', 1, round());
+    assert.equal(accepted.length, 0, 'the first attempt failed');
+    receipts.usage('r', 1, round({ index: 1, altered: { messages: [0], injected: [] } }));
+    assert.deepEqual(accepted.map((a) => a.presentation), ['altered']);
+    receipts.beginStream('r', 2, evidence([body(0, 'm2')]));
+    receipts.usage('r', 2, round({ fidelity: 'unknown' }));
+    assert.deepEqual(accepted.map((a) => a.presentation), ['altered', 'unknown']);
+  });
+
+  it('delivers a body only when every fragment carrying it arrived whole', () => {
+    // One version compiled into two request messages (a split message); the
+    // producer altered the second fragment.
+    receipts.beginStream('r', 1, evidence([body(0, 'm1'), body(1, 'm1-part2', { ver: ver('m1'), src: src('m1', 1_000) })]));
+    receipts.usage('r', 1, round({ altered: { messages: [1], injected: [] } }));
+    const c = ledger.clocksFor('r', [CH]).get(channelKey(CH))!;
+    assert.equal(c.lastDeliveredAt, null, 'not delivered: one fragment was altered');
+    assert.ok(c.partial?.missing.includes('wire-alteration'));
   });
 
   it('confirms nothing for a refused round, a stream that never reports, or unknown fidelity', () => {
@@ -295,9 +328,17 @@ describe('ContextReceipts', () => {
     assert.ok(c.partial?.missing.includes('content') || c.partial?.missing.includes('wire-alteration'));
   });
 
+  it('keeps the whole batch\'s coordinates when some injected messages are not bodies', () => {
+    receipts.beginStream('r', 1, evidence([]));
+    // Index 0 is a routing notice (no evidence); index 1 is the channel body.
+    receipts.injectedBatch('r', 1, 2, [body(1, 'i1')]);
+    receipts.usage('r', 1, round({ injectedBatch: { batch: 0, applied: 2 } }));
+    assert.ok(delivered('i1'));
+  });
+
   it('delivers injected bodies only once a round carried them', () => {
     receipts.beginStream('r', 1, evidence([]));
-    const batch = receipts.injectedBatch('r', 1, [body(0, 'i0'), body(1, 'i1')]);
+    const batch = receipts.injectedBatch('r', 1, 2, [body(0, 'i0'), body(1, 'i1')]);
     assert.equal(batch, 0);
     receipts.usage('r', 1, round({ injectedBatch: { batch: 0, applied: 1 } }));
     assert.ok(delivered('i0'));
@@ -367,6 +408,42 @@ describe('receipt evidence', () => {
 });
 
 describe('request-owned evidence', () => {
+  it('names a body the reader compiled from an auxiliary slot, and delivers it to that reader only', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'evidence-aux-'));
+    try {
+      const main = await ContextManager.open({ path: join(dir, 'store'), strategy: new PassthroughStrategy() });
+      const reader = await ContextManager.open({
+        store: main.getStore(), namespace: 'subconscious/reader', isolate: true,
+        strategy: new PassthroughStrategy(), auxiliaryMessageViews: [{}],
+      });
+      const source = {
+        kind: 'channel', lane: 'push/event', serverId: 'discord', binding: 'b1',
+        channelId: 'discord:g:room', eventId: 'ev-aux', messageId: 'p-aux', acceptedAt: 7,
+      };
+      main.addMessage('alice', [{ type: 'text', text: 'heard by the reader' }], { inboundSource: source } as never);
+      const agent = new Agent({ name: 'reader', model: 'test', systemPrompt: 's' }, reader, {} as Membrane);
+      const { evidence } = await agent.prepareActivationRequest([]);
+      assert.equal(evidence.bodies.length, 1, 'the auxiliary body is in the evidence');
+      assert.equal(evidence.bodies[0]!.ver.basis, 'event');
+
+      const store = main.getStore();
+      const ledger = new ChannelClockLedger(store, reader.getStoreId());
+      ledger.start();
+      const receipts = new ContextReceipts(ledger, { acceptRound: () => {} });
+      receipts.beginStream('reader', 1, evidence);
+      receipts.usage('reader', 1, { index: 0, stopReason: 'end_turn', usage: {}, fidelity: 'established' });
+      const key = channelKey({ binding: 'b1', channelId: 'discord:g:room' });
+      const ref = [{ binding: 'b1', channelId: 'discord:g:room' }];
+      assert.equal(ledger.clocksFor('reader', ref).get(key)!.delivered?.messageId, 'p-aux');
+      assert.equal(ledger.clocksFor('main', ref).get(key)!.lastDeliveredAt, null, 'not the main resident');
+      ledger.stop();
+      reader.close();
+      main.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('names the body as prepared, even if it is edited before the round is confirmed', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'evidence-edit-'));
     try {
