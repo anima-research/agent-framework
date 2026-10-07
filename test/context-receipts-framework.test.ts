@@ -24,7 +24,7 @@ import {
   type ToolResult,
 } from '../src/index.js';
 import { HistoryModule } from '../src/modules/history/index.js';
-import { recordedBodyDigest, versionOf, type ChannelClockLedger } from '../src/context-receipts/index.js';
+import { copyFacts, versionOf, type ChannelClockLedger } from '../src/context-receipts/index.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs');
@@ -89,9 +89,12 @@ class ScriptedStream implements YieldingStream {
 class ScriptedMembrane {
   scripts: Script[] = [];
   requests: NormalizedRequest[] = [];
+  /** When each request reached the provider. */
+  startedAt: number[] = [];
   streams: ScriptedStream[] = [];
   streamYielding(request: NormalizedRequest): YieldingStream {
     this.requests.push(request);
+    this.startedAt.push(Date.now());
     const script = this.scripts.shift() ?? 'ok';
     let stream: ScriptedStream;
     if (script === 'fail') {
@@ -209,7 +212,7 @@ describe('receipt clocks through the framework', () => {
     const source = readInboundSource(message.metadata)!;
     assert.equal(source.kind, 'channel');
     if (source.kind !== 'channel') return false;
-    const ver = versionOf(source, [message.content], ledger().storeId, message.id, recordedBodyDigest(message.metadata));
+    const ver = versionOf(source, [message.content], ledger().storeId, message.id, copyFacts(message));
     return ledger().isDelivered('scout', ver);
   };
   const idle = () => framework.getAgent('scout')!.state.status === 'idle';
@@ -316,10 +319,17 @@ describe('receipt clocks through the framework', () => {
     await waitFor(() => !!(framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length, 'deferred');
     probe.release!();
     await waitFor(idle, 'turn settles');
-    assert.ok(!deliveredItem((m) => m.messageId === 'x-mid'), 'not carried, so not delivered');
+    assert.deepEqual(membrane.streams[0]!.injected, [1], 'the framework supplied it to the stream');
+    // Whether the framework wakes again for it or the next item does, a later
+    // request carries it; the round that carried none of it never delivers it.
     command({ op: 'incoming', channelId: ROOM, messageId: 'x-next', mode: 'addressed', text: 'and?' });
-    await waitFor(() => membrane.requests.length >= 2, 'next turn');
-    await waitFor(idle, 'next turn settles');
-    assert.ok(deliveredItem((m) => m.messageId === 'x-mid'), 'the next compile carried it');
+    await waitFor(() => deliveredItem((m) => m.messageId === 'x-mid') && idle(), 'a later compile carries it');
+    const store = framework.getStore();
+    const deliveries = store.getRecordIdsByType('agent-framework/channel-clocks')
+      .map((rid) => JSON.parse(store.getRecord(rid)!.payload.toString('utf8')) as { k: string; at: number; src?: { messageId?: string } })
+      .filter((e) => e.k === 'dlv' && e.src?.messageId === 'x-mid');
+    assert.equal(deliveries.length, 1);
+    assert.ok(membrane.startedAt.length >= 2);
+    assert.ok(deliveries[0]!.at >= membrane.startedAt[1]!, 'delivered by a later request, not by the round that carried none of it');
   });
 });

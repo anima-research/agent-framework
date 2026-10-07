@@ -101,13 +101,43 @@ export function sourceBodyDigest(blocks: readonly ContentBlock[]): string {
   return createHash('sha256').update(canonicalJson([blocks])).digest('hex');
 }
 
+function digestField(metadata: unknown, field: 'sourceBodyDigest' | 'storedBodyDigest'): string | undefined {
+  const value = (metadata as Record<string, unknown> | null | undefined)?.[field];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
 /**
  * The body digest ingestion recorded for an item, before any decoration or
  * reshaping (`metadata.sourceBodyDigest`), if it recorded one.
  */
 export function recordedBodyDigest(metadata: unknown): string | undefined {
-  const value = (metadata as { sourceBodyDigest?: unknown } | null | undefined)?.sourceBodyDigest;
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
+  return digestField(metadata, 'sourceBodyDigest');
+}
+
+/** What a stored copy's own record says about its body (see versionOf). */
+export interface CopyFacts {
+  /** The body is stored in shards: its head has a bodyGroupId. */
+  sharded: boolean;
+  /** `metadata.sourceBodyDigest`: the delivered body's digest, recorded at ingestion. */
+  sourceDigest?: string;
+  /**
+   * `metadata.storedBodyDigest`: the digest of the blocks ingestion handed to
+   * storage (decorated, before any sharding), recorded with sourceDigest. It
+   * binds the record to the stored representation, so an edit after
+   * ingestion can't inherit the delivered body's version.
+   */
+  storedDigest?: string;
+}
+
+/** A stored copy's facts, from its head (the first shard, or the message itself). */
+export function copyFacts(head: { metadata?: unknown; bodyGroupId?: string }): CopyFacts {
+  const sourceDigest = digestField(head.metadata, 'sourceBodyDigest');
+  const storedDigest = digestField(head.metadata, 'storedBodyDigest');
+  return {
+    sharded: Boolean(head.bodyGroupId),
+    ...(sourceDigest ? { sourceDigest } : {}),
+    ...(storedDigest ? { storedDigest } : {}),
+  };
 }
 
 /**
@@ -116,30 +146,45 @@ export function recordedBodyDigest(metadata: unknown): string | undefined {
  * coalesced admission; else platform message id plus a digest of the body;
  * else the stored copy itself.
  *
- * The body digest is the one ingestion recorded for the delivery
- * (`recorded`), before decoration or sharding, so a stored header, sharding,
- * injection and compilation all carry one version. An item stored without
- * one predates both decoration and the record: unsharded, its stored blocks
- * are the delivered body and hash to the same digest; sharded, its source
- * digest can't be recovered from the shards, so it falls back to the stored
- * copy (a replay of it is then not recognizable).
+ * The body digest is the one ingestion recorded for the delivery, before
+ * decoration or sharding, so a stored header, sharding, injection and
+ * compilation all carry one version. It applies while the copy is still what
+ * ingestion stored: an unsharded copy must still hash to its recorded stored
+ * digest (an edit after ingestion breaks that), and shards can't be edited at
+ * all. A copy stored without a record predates decoration: unsharded, its
+ * stored blocks are the delivered body; sharded (by its own sharding facts,
+ * not by how many shards a view returned), the source digest can't be
+ * recovered. A copy whose body can't be recovered falls back to the stored
+ * copy: a replay of it is then not recognizable.
  */
 export function versionOf(
   source: InboundChannelSource,
   contents: ReadonlyArray<readonly ContentBlock[]>,
   storeId: string,
   storeMessageId: string,
-  recorded?: string,
+  facts: CopyFacts = { sharded: false },
 ): VersionRef {
   const eventGuaranteed = source.eventId !== undefined && (source.lane === 'push/event' || source.coalesced === true);
   if (eventGuaranteed) {
     return { basis: 'event', key: JSON.stringify([source.binding, source.eventId]) };
   }
-  const digest = recorded ?? (contents.length === 1 ? sourceBodyDigest(contents[0]!) : undefined);
+  const digest = recoverableDigest(contents, facts);
   if (source.messageId && digest) {
     return { basis: 'message-digest', key: JSON.stringify([source.binding, source.channelId, source.messageId, digest]) };
   }
   return { basis: 'stored-copy', key: JSON.stringify([storeId, storeMessageId]) };
+}
+
+/** The delivered body's digest, when this copy can still vouch for it. */
+function recoverableDigest(contents: ReadonlyArray<readonly ContentBlock[]>, facts: CopyFacts): string | undefined {
+  const whole = !facts.sharded && contents.length === 1 ? contents[0]! : undefined;
+  if (facts.sourceDigest) {
+    if (facts.sharded) return facts.sourceDigest;
+    return whole && facts.storedDigest !== undefined && sourceBodyDigest(whole) === facts.storedDigest
+      ? facts.sourceDigest
+      : undefined;
+  }
+  return whole ? sourceBodyDigest(whole) : undefined;
 }
 
 /** Tags that make an item a notice about a body rather than a body. */
@@ -197,7 +242,7 @@ export function requestEvidence(inputs: EvidenceInputs): RequestEvidence {
           ...(missing.length > 0 ? { missing } : {}),
           ch: channelOf(source),
           src: sourceRefOf(source, stored.id),
-          ver: versionOf(source, members.map((m) => m.content), inputs.storeId, stored.id, recordedBodyDigest(stored.metadata)),
+          ver: versionOf(source, members.map((m) => m.content), inputs.storeId, stored.id, copyFacts(stored)),
         }));
       }
     });
@@ -211,12 +256,18 @@ export function requestEvidence(inputs: EvidenceInputs): RequestEvidence {
   });
 }
 
-/** Evidence for one mid-turn injected message (index within its batch). */
+/**
+ * Evidence for one mid-turn injected message (index within its batch). The
+ * injected content is the whole body as handed to storage; `stored` is the
+ * stored copy (its head), whose sharding facts decide legacy recoverability
+ * just as they do for the compiled copy.
+ */
 export function injectedEvidence(
   index: number,
   storeMessageId: string,
   message: { content: readonly ContentBlock[]; metadata?: unknown },
   storeId: string,
+  stored?: { metadata?: unknown; bodyGroupId?: string } | null,
 ): BodyEvidence | null {
   const source = readInboundSource(message.metadata);
   if (!source || source.kind !== 'channel' || !isBody({ metadata: message.metadata as StoredMessage['metadata'] }, source)) return null;
@@ -226,6 +277,9 @@ export function injectedEvidence(
     complete: true,
     ch: channelOf(source),
     src: sourceRefOf(source, storeMessageId),
-    ver: versionOf(source, [message.content], storeId, storeMessageId, recordedBodyDigest(message.metadata)),
+    ver: versionOf(source, [message.content], storeId, storeMessageId, {
+      ...copyFacts({ metadata: message.metadata }),
+      sharded: Boolean(stored?.bodyGroupId),
+    }),
   });
 }

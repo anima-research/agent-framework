@@ -6729,7 +6729,10 @@ export class AgentFramework {
                   (b) => b.type === 'tool_use' || b.type === 'tool_result'
                 );
                 if (!hasToolBlocks && msg.participant !== agent.name) {
-                  const evidence = injectedEvidence(midTurnInjections.length, storedId, msg, this.clockLedger.storeId);
+                  const evidence = injectedEvidence(
+                    midTurnInjections.length, storedId, msg, this.clockLedger.storeId,
+                    agent.getContextManager().getMessage(storedId),
+                  );
                   if (evidence) injectedBodies.push(evidence);
                   midTurnInjections.push({
                     participant: msg.participant,

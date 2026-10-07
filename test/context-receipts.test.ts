@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { ContextManager, PassthroughStrategy, type CompileProvenance } from '@animalabs/context-manager';
-import type { Membrane } from '@animalabs/membrane';
+import type { ContentBlock, Membrane } from '@animalabs/membrane';
 import { Agent } from '../src/agent.js';
 import {
   ChannelClockLedger,
@@ -428,34 +428,54 @@ describe('receipt evidence', () => {
     assert.equal(versionOf(base, text, 's', 'm').basis, 'stored-copy');
   });
 
-  it('keeps one source-body version through decoration and sharding', () => {
+  it('keeps one source-body version through decoration and sharding, while the copy is what ingestion stored', () => {
     const src = { ...base, messageId: 'p1' };
     const body = { type: 'text' as const, text: 'unchanged body' };
     const header = (label: string) => ({ type: 'text' as const, text: `[source: discord / discord:g:room · ${label}]` });
-    // Recorded at ingestion, before decoration: the stored header (here, a
-    // label changed by a rename between two acceptances) does not matter.
-    const before = versionOf(src, [[header('Old room'), body]], 's', 'copy-1', 'digest-of-body');
-    const after = versionOf(src, [[header('New room'), body]], 's', 'copy-2', 'digest-of-body');
+    const stamped = (stored: ContentBlock[]) => ({ sharded: false, sourceDigest: sourceBodyDigest([body]), storedDigest: sourceBodyDigest(stored) });
+    // A rename between two acceptances changes the stored header, not the version.
+    const oldCopy = [header('Old room'), body];
+    const newCopy = [header('New room'), body];
+    const before = versionOf(src, [oldCopy], 's', 'copy-1', stamped(oldCopy));
+    const after = versionOf(src, [newCopy], 's', 'copy-2', stamped(newCopy));
+    assert.equal(before.basis, 'message-digest');
     assert.equal(before.key, after.key);
-    assert.notEqual(before.key, versionOf(src, [[header('New room'), body]], 's', 'copy-2', 'digest-of-another-body').key);
-    // The recorded digest is the shared source-body digest, so a stamped copy
-    // matches an undecorated, unsharded copy stored before the record.
-    const stamped = versionOf(src, [[header('New room'), body]], 's', 'copy-3', sourceBodyDigest([body]));
-    const legacy = versionOf(src, [[body]], 's', 'legacy');
-    assert.equal(stamped.key, legacy.key);
-    // A sharded copy stored without a record can't recover its source digest.
-    const legacySharded = versionOf(src, [[{ type: 'text', text: 'unchanged' }], [{ type: 'text', text: ' body' }]], 's', 'head');
-    assert.equal(legacySharded.basis, 'stored-copy');
+    // A stamped copy matches an undecorated, unsharded copy stored before the record.
+    assert.equal(before.key, versionOf(src, [[body]], 's', 'legacy').key);
+    // An edit after ingestion keeps the stamp but not the stored digest: the
+    // changed text can't count as the delivered body.
+    const edited = versionOf(src, [[header('Old room'), { type: 'text', text: 'edited body' }]], 's', 'copy-1', stamped(oldCopy));
+    assert.equal(edited.basis, 'stored-copy');
+    // Shards can't be edited, so a stamped sharded copy keeps its version.
+    const shardedStamped = versionOf(src, [[header('Old room')], [body]], 's', 'head', { sharded: true, sourceDigest: sourceBodyDigest([body]) });
+    assert.equal(shardedStamped.key, before.key);
+    // Unstamped and sharded, by the copy's own sharding facts, even when only
+    // one shard is at hand: the source digest can't be recovered.
+    assert.equal(versionOf(src, [[header('Old room'), body]], 's', 'head', { sharded: true }).basis, 'stored-copy');
     assert.equal(recordedBodyDigest({ sourceBodyDigest: 'abc' }), 'abc');
     assert.equal(recordedBodyDigest({ sourceBodyDigest: '' }), undefined);
     assert.equal(recordedBodyDigest(undefined), undefined);
   });
 
+  it('a legacy sharded head with one shard available is a stored copy (Hugo #47005 control)', () => {
+    const source = { ...base, messageId: 'p8' };
+    const head = { id: 'h8', sequence: 8, participant: 'u', content: [{ type: 'text', text: 'first half' }], metadata: { inboundSource: source }, bodyGroupId: 'g8', shardIndex: 0 };
+    const ev = requestEvidence({
+      agent: 'r', storeId: 'store',
+      provenance: { messages: [{ kind: 'raw', bodies: [{ messageId: 'h8', sequence: 8, complete: false, missing: ['shards'] }] }] } as unknown as CompileProvenance,
+      requestIndexOf: [0],
+      getMessage: (id) => (id === 'h8' ? head as never : null),
+      groupMembers: () => [head] as never,
+    });
+    assert.equal(ev.bodies[0]!.ver.basis, 'stored-copy');
+    assert.equal(ev.bodies[0]!.complete, false);
+  });
+
   it('injected and compiled copies share the recorded version', () => {
     const source = { ...base, messageId: 'p9' };
     const metadata = { inboundSource: source, sourceBodyDigest: 'recorded' };
-    const injected = injectedEvidence(0, 's9', { content: [{ type: 'text', text: '[source: x]' }, { type: 'text', text: 'body' }], metadata }, 'store')!;
     const head = { id: 's9', sequence: 9, participant: 'u', content: [{ type: 'text', text: '[source: x]' }], metadata, bodyGroupId: 'g', shardIndex: 0 };
+    const injected = injectedEvidence(0, 's9', { content: [{ type: 'text', text: '[source: x]' }, { type: 'text', text: 'body' }], metadata }, 'store', head)!;
     const tail = { id: 's10', sequence: 10, participant: 'u', content: [{ type: 'text', text: 'body' }], metadata, bodyGroupId: 'g', shardIndex: 1 };
     const compiled = requestEvidence({
       agent: 'r', storeId: 'store',

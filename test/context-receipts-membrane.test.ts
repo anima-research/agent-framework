@@ -37,7 +37,7 @@ import {
   type ToolResult,
 } from '../src/index.js';
 import { HistoryModule } from '../src/modules/history/index.js';
-import { recordedBodyDigest, versionOf, type ChannelClockLedger } from '../src/context-receipts/index.js';
+import { copyFacts, versionOf, type ChannelClockLedger } from '../src/context-receipts/index.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs');
 const ROOM = 'discord:g1:room';
@@ -201,7 +201,7 @@ function probes(h: Harness) {
     const source = readInboundSource(message.metadata)!;
     assert.equal(source.kind, 'channel');
     if (source.kind !== 'channel') throw new Error('not a channel body');
-    const ver = versionOf(source, [message.content], ledger().storeId, message.id, recordedBodyDigest(message.metadata));
+    const ver = versionOf(source, [message.content], ledger().storeId, message.id, copyFacts(message));
     return { delivered: ledger().isDelivered('scout', ver) };
   };
   const roomClocks = async () => {

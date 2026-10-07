@@ -69,11 +69,16 @@ export interface SourceRef {
  * The identity of one source version, and the basis it rests on:
  *  - `event`: the producer's eventId, where the lane guarantees stable
  *    retries and distinct versions (MCPL push/event, RFC-006 coalescing);
- *  - `message-digest`: platform message id plus a digest of the stored body.
- *    A revision restoring earlier bytes of the same message counts as that
- *    earlier version;
- *  - `stored-copy`: the stored message itself. Identity unknown: a replay of
- *    the same source item can't be recognized.
+ *  - `message-digest`: platform message id plus the digest of the source body
+ *    as it was delivered, recorded at ingestion before any decoration or
+ *    sharding (for an unsharded copy stored before that record, its stored
+ *    body). A revision restoring earlier bytes of the same message counts as
+ *    that earlier version;
+ *  - `stored-copy`: the stored message itself, when its source body can't be
+ *    recovered: no platform message id, a copy edited after ingestion, or a
+ *    body stored in shards before ingestion recorded digests, even with a
+ *    platform message id. Identity unknown: a replay of the same source item
+ *    can't be recognized.
  */
 export interface VersionRef {
   basis: 'event' | 'message-digest' | 'stored-copy';
