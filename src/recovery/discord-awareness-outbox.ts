@@ -493,7 +493,17 @@ interface JournalEntryGroup {
   records: JournalRecord[];
 }
 
-/** The reduced state as a checkpoint stores it. */
+/**
+ * The reduced state as a checkpoint stores it. This journal writes no
+ * checkpoints. Its reduced state keeps every request and every attempt,
+ * because receipts, `operations()` and authorization order read that
+ * history, so a snapshot of it copies all of it, and copying it every N
+ * entries grows the store quadratically with the marks ever requested.
+ * Rather than keep a separate summary of that history, opening replays every
+ * entry. A journal an earlier build of this journal checkpointed is still
+ * read from its latest checkpoint, which is where RecordJournal.load()
+ * starts.
+ */
 interface JournalSnapshot {
   batches: DiscordAwarenessBatch[];
   ops: DiscordAwarenessOp[];
@@ -504,8 +514,6 @@ interface JournalSnapshot {
 }
 
 export const DISCORD_AWARENESS_RECORD_TYPE = 'af:discord-awareness';
-/** Replay at open is bounded by a checkpoint every this many entries. */
-const CHECKPOINT_EVERY = 256;
 
 interface JournalState {
   batches: Map<string, DiscordAwarenessBatch>;
@@ -539,7 +547,6 @@ interface RetractRequest {
 export class DiscordAwarenessOutbox {
   private readonly journal: RecordJournal<JournalEntryGroup, JournalSnapshot>;
   private readonly legacyPath?: string;
-  private readonly checkpointEvery: number;
   /** Reduced state; rebuilt from the journal when null. */
   private state: JournalState | null = null;
   /** Operations dispatched by this process and still awaiting an outcome. */
@@ -548,12 +555,10 @@ export class DiscordAwarenessOutbox {
   /**
    * @param store the Chronicle store the journal lives in.
    * @param opts.legacyPath a pre-journal JSON ledger to import once, if present.
-   * @param opts.checkpointEvery entries between checkpoints (default 256).
    */
-  constructor(store: JsStore, opts: { legacyPath?: string; checkpointEvery?: number } = {}) {
+  constructor(store: JsStore, opts: { legacyPath?: string } = {}) {
     this.journal = new RecordJournal(store, { type: DISCORD_AWARENESS_RECORD_TYPE });
     if (opts.legacyPath) this.legacyPath = opts.legacyPath;
-    this.checkpointEvery = Math.max(1, Math.floor(opts.checkpointEvery ?? CHECKPOINT_EVERY));
   }
 
   // -- surgery side -----------------------------------------------------------
@@ -1270,8 +1275,9 @@ export class DiscordAwarenessOutbox {
   /**
    * The reduced state, rebuilt from the journal when there is none yet or an
    * earlier write left the journal unreconciled (RecordJournal then requires
-   * a reload before writing again). The first load also imports a
-   * pre-journal ledger, once.
+   * a reload before writing again): every entry is replayed, after an
+   * earlier build's checkpoint if there is one (see JournalSnapshot). The
+   * first load also imports a pre-journal ledger, once.
    */
   private load(): JournalState {
     if (this.state && !this.journal.needsReconcile) return this.state;
@@ -1338,17 +1344,6 @@ export class DiscordAwarenessOutbox {
       throw error;
     }
     applyRecords(state, records);
-    if (this.journal.entriesSinceCheckpoint >= this.checkpointEvery) {
-      try {
-        this.journal.checkpoint(snapshotState(state));
-      } catch (error) {
-        // Replay just stays longer; the journal reloads before its next write.
-        this.state = null;
-        console.error(
-          `[discord-awareness] checkpoint failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-    }
   }
 }
 
@@ -1366,17 +1361,7 @@ function liveRequests(records: JournalRecord[]): number {
   return records.filter((record) => record.t === 'requested' && !cancelled.has(record.opId)).length;
 }
 
-function snapshotState(state: JournalState): JournalSnapshot {
-  return {
-    batches: [...state.batches.values()].map((batch) => structuredClone(batch)),
-    ops: [...state.ops.values()].map((op) => structuredClone(op)),
-    legacy: [...state.legacy.values()].flat().map((evidence) => structuredClone(evidence)),
-    retracts: [...state.retracts.values()].map((retract) => structuredClone(retract)),
-    importedSources: [...state.importedSources],
-    position: state.position,
-  };
-}
-
+/** The state an earlier build's checkpoint recorded (see JournalSnapshot). */
 function restoreState(snapshot: JournalSnapshot): JournalState {
   const state: JournalState = {
     batches: new Map(snapshot.batches.map((batch) => [batch.id, structuredClone(batch)])),

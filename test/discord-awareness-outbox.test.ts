@@ -29,6 +29,7 @@ import {
 import { AgentFramework } from '../src/framework.js';
 import { McplRequestError } from '../src/mcpl/server-connection.js';
 import { OperatorLog } from '../src/operator-log.js';
+import { RecordJournal } from '../src/record-journal.js';
 
 const ref = (messageId: string, channel = 'c1'): DiscordAwarenessRef =>
   ({ serverId: 'discord', channelId: `discord:g1:${channel}`, messageId });
@@ -511,22 +512,54 @@ test('a corrupt journal entry stops the reader rather than being skipped', withJ
   assert.throws(() => h.reopen().batches(), /Corrupt Discord awareness journal entry/);
 }));
 
-test('checkpoints bound replay and reproduce the reduced state', withJournal((_outbox, h) => {
-  const outbox = new DiscordAwarenessOutbox(h.store, { checkpointEvery: 8 });
-  const batch = activeBatch(outbox, Array.from({ length: 5 }, (_, i) => ref(`m${i}`)));
-  for (let round = 0; round < 3; round++) {
-    for (let i = 0; i < 5; i++) {
-      const claimed = outbox.claimDispatch('discord', (d) => d.key.messageId !== `m${i}`);
-      if (claimed) outbox.recordOutcome(claimed.attempts, round === 2 ? 'confirmed' : 'failed', { error: 'Discord 503' });
-    }
+test('the journal writes no checkpoints: a long history is replayed whole', withJournal((_outbox, h) => {
+  // Every reduction needs the whole history, so a checkpoint would copy all
+  // of it, and copying it every N entries grows the store quadratically.
+  // (Durability is not under test here: skip the per-entry fsync.)
+  const unsynced = new Proxy(h.store, {
+    get(target, prop) {
+      if (prop === 'sync') return () => {};
+      const value = Reflect.get(target, prop);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const outbox = new DiscordAwarenessOutbox(unsynced);
+  const batch = activeBatch(outbox, Array.from({ length: 150 }, (_, i) => ref(`m${i}`)));
+  for (let claimed = outbox.claimDispatch('discord'); claimed; claimed = outbox.claimDispatch('discord')) {
+    outbox.recordOutcome(claimed.attempts, 'confirmed');
   }
   outbox.retract(batch.id);
-  assert.ok(h.store.getRecordIdsByType(`${DISCORD_AWARENESS_RECORD_TYPE}/checkpoint`).length >= 2, 'checkpoints were written');
-  const reread = new DiscordAwarenessOutbox(h.store, { checkpointEvery: 8 });
+  const entries = h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length;
+  assert.ok(entries > 256, `${entries} entries: more than an earlier build wrote between checkpoints`);
+  assert.equal(h.store.getRecordIdsByType(`${DISCORD_AWARENESS_RECORD_TYPE}/checkpoint`).length, 0);
+  const reread = h.reopen();
   assert.deepEqual(reread.view(), outbox.view());
   assert.deepEqual(reread.operations(), outbox.operations());
-  assert.equal(batches(reread).find((v) => v.id === batch.id)!.adds.confirmed, 5);
-  assert.equal(retracts(reread).length, 1);
+}));
+
+test('a journal an earlier build checkpointed is read from that checkpoint and continues the same', withJournal((outbox, h) => {
+  const batch = activeBatch(outbox, [ref('m1'), ref('m2'), ref('m3')]);
+  answer(outbox, 'm1', 'confirmed');
+  answer(outbox, 'm2', 'unknown');
+  // An earlier build checkpointed its reduced state here, with the journal
+  // position its next record would follow.
+  const earlier = new RecordJournal<{ records: unknown[] }, unknown>(h.store, { type: DISCORD_AWARENESS_RECORD_TYPE });
+  const { entries } = earlier.load();
+  earlier.checkpoint({
+    batches: outbox.batches(),
+    ops: outbox.operations(),
+    legacy: [],
+    retracts: [],
+    importedSources: [],
+    position: entries.reduce((sum, { entry }) => sum + entry.records.length, 0),
+  });
+  // History continues past it: a retract, whose removals' authorization is
+  // its position after the checkpointed ones.
+  outbox.retract(batch.id);
+  answer(outbox, 'm3', 'confirmed');
+  const reread = h.reopen();
+  assert.deepEqual(reread.view(), outbox.view());
+  assert.deepEqual(reread.operations(), outbox.operations());
 }));
 
 test('v2 import keeps what the old ledger recorded as evidence, holds pending work, and happens once', withJournal((_outbox, h) => {
