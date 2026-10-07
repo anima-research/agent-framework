@@ -8,28 +8,33 @@
   - **Who needs to act:** a surface that should keep offering marks passes the
     operator's choice: `marks: { scope: 'addressed' | 'all', refs? }` on
     `rollbackToMessage`/`suppressMessages`, `marks: 'addressed' | 'all'` on
-    `host/command` `undo` and `hide`, and `--marks addressed|all` on the CLI.
-    `addressed` covers messages tagged `chat:addressed` (mentions, replies to
-    the bot, DMs). Show `previewSurgeryMarks()` before the choice, and pass a
-    scope's `refs` back to bind the choice to exactly the previewed messages.
-    Any other `host/command` `marks` value is refused rather than guessed.
+    `host/command` `undo` (by messages or by turns) and `hide`, and
+    `--marks addressed|all` on the CLI. `addressed` covers messages tagged
+    `chat:addressed` (mentions, replies to the bot, DMs). Show
+    `previewSurgeryMarks()` before the choice, and pass a scope's `refs` back
+    to bind the choice to exactly the previewed messages. Any other
+    `host/command` `marks` value is refused rather than guessed. A surface
+    that reacted to `hide`'s `hiddenRefs` itself should stop when the result
+    carries `markers`: the framework marked through its journal.
   - **Unchanged:** the body change itself (fork, switch, redaction), the
     receipt's `status` values, the emoji (`discordAwarenessEmoji`) and the
     reaction deadline (`discordAwarenessDeadlineMs`). Marks already on Discord
     are left alone; nothing is removed automatically.
   - Receipts (`markers`) now also carry `scope`, `unmarked` and `notRemoved`.
-    Marks that were chosen but can't be recorded, because there is no journal
-    (no `storePath` or `discordAwarenessOutboxPath`), are reported as
-    `not-scheduled` rather than `none`.
+  - `host/command` `hide` now holds the store like every surgery, so it is
+    refused (`agent-busy`) while any agent sharing the store is mid-turn.
   - No sibling version is required: a host that ignores the new option simply
     places no marks. The connectome-host and discord-mcpl companions add the
     choice to their surfaces.
 - **Code using `DiscordAwarenessOutbox` directly:** the awareness ledger is now
-  an append-only journal of requests and attempts,
-  `<store>/recovery/discord-awareness-journal.jsonl`. `pending()` and
-  `reconcileForBranch()` are gone. Use `pendingDispatches()`,
-  `recordDispatching()`/`recordOutcome()`, `view()`, and
-  `cancel()`/`retract()`/`release()`. A previous `discord-awareness-outbox.json`
-  is imported once on first use: its recorded outcomes are kept, its undelivered
-  work is held for an explicit release, and the file is renamed
-  `.migrated-v2`.
+  an append-only journal of typed records in the Chronicle store
+  (`af:discord-awareness`, on the shared `RecordJournal`), so the constructor
+  takes the store: `new DiscordAwarenessOutbox(store, { legacyPath? })`.
+  `pending()` and `reconcileForBranch()` are gone. Use `claimDispatch()` (or
+  `pendingDispatches()` and `recordDispatching()`), `recordOutcome()`,
+  `view()`, `cancel()`, `retract()`, `release()` and `settleActivation()`.
+  `discordAwarenessOutboxPath` now only names a previous JSON ledger to
+  import. Such a file (by default `<store>/recovery/discord-awareness-outbox.json`)
+  is imported once on first use and renamed `.migrated-v2`. What it recorded
+  is kept as evidence, never as synthesized attempts, and its undelivered
+  work is held for an explicit release.

@@ -408,8 +408,9 @@ import {
   extractDiscordAwarenessRefs,
   selectDiscordAwarenessRefs,
   boundDiscordAwarenessText,
+  isPermanentDiscordReactionFailure,
   type DiscordAwarenessBatch,
-  type DiscordAwarenessBatchView,
+  type DiscordAwarenessView,
   type DiscordAwarenessCancelReceipt,
   type DiscordAwarenessMarks,
   type DiscordAwarenessReleaseReceipt,
@@ -754,10 +755,6 @@ function hostCommandRequester(serverId: string, params: HostCommandParams): Oper
   };
 }
 
-function isPermanentDiscordReactionFailure(message: string): boolean {
-  return /unknown message|unknown channel|missing access|missing permissions|missing permission|cannot access|channel .* not found|message .* not found/i
-    .test(message);
-}
 
 /**
  * Default error policy - retry with exponential backoff.
@@ -904,8 +901,9 @@ interface HostCommandParams {
   marks?: string;
   /** For the `marks` command: `list`, `cancel`, `retract` or `release`. */
   action?: string;
-  /** For the `marks` command: the batch to act on (`all` for retract). */
-  batchId?: string;
+  /** For the `marks` command: a batch id; for cancel also a retract request
+   *  id; for retract also `all`. */
+  target?: string;
   /** For the `hide` command: Discord message id of the (first) message to
    *  remove. With `toMessageId`, removes the inclusive range between them. */
   fromMessageId?: string;
@@ -1550,11 +1548,12 @@ export class AgentFramework {
       }
     }
 
-    const discordAwarenessOutboxPath = config.discordAwarenessOutboxPath
-      ?? (config.storePath ? defaultDiscordAwarenessOutboxPath(config.storePath) : undefined);
-    const discordAwarenessOutbox = discordAwarenessOutboxPath
-      ? new DiscordAwarenessOutbox(discordAwarenessOutboxPath)
-      : null;
+    // The awareness journal lives in the store (typed records); a
+    // pre-journal JSON ledger, if one is found, is imported once.
+    const discordAwarenessOutbox = new DiscordAwarenessOutbox(store, {
+      legacyPath: config.discordAwarenessOutboxPath
+        ?? (config.storePath ? defaultDiscordAwarenessOutboxPath(config.storePath) : undefined),
+    });
 
     const operatorLogPath = config.operatorLogPath === false
       ? undefined
@@ -5088,7 +5087,7 @@ export class AgentFramework {
     /** For the `marks` command: the journal's batches (`list`) or the
      *  action's receipt. */
     awareness?:
-      | DiscordAwarenessBatchView[]
+      | DiscordAwarenessView[]
       | DiscordAwarenessCancelReceipt
       | DiscordAwarenessRetractReceipt
       | DiscordAwarenessReleaseReceipt;
@@ -5135,20 +5134,20 @@ export class AgentFramework {
       // The awareness journal's operator controls, for surfaces that act
       // through host/command (the web UI calls the framework methods).
       const by = { requester: hostCommandRequester(serverId, params) };
-      const batchId = params.batchId;
+      const target = params.target;
       try {
         switch (params.action) {
           case 'list':
             return { ok: true, awareness: this.listDiscordAwareness() };
           case 'cancel':
-            if (!batchId) return { ok: false, error: 'marks cancel needs batchId' };
-            return { ok: true, awareness: this.cancelDiscordAwareness(batchId, by) };
+            if (!target) return { ok: false, error: 'marks cancel needs target (a batch or retract request id)' };
+            return { ok: true, awareness: this.cancelDiscordAwareness(target, by) };
           case 'retract':
-            if (!batchId) return { ok: false, error: 'marks retract needs batchId (or all)' };
-            return { ok: true, awareness: this.retractDiscordAwareness(batchId, by) };
+            if (!target) return { ok: false, error: 'marks retract needs target (a batch id, or all)' };
+            return { ok: true, awareness: this.retractDiscordAwareness(target, by) };
           case 'release':
-            if (!batchId) return { ok: false, error: 'marks release needs batchId' };
-            return { ok: true, awareness: this.releaseDiscordAwareness(batchId, by) };
+            if (!target) return { ok: false, error: 'marks release needs target (a held batch id)' };
+            return { ok: true, awareness: this.releaseDiscordAwareness(target, by) };
           default:
             return { ok: false, error: 'marks needs action list, cancel, retract or release' };
         }
@@ -5287,6 +5286,18 @@ export class AgentFramework {
         };
       }
 
+      // Like every surgery, a redaction holds the whole store: no turn (of
+      // any agent sharing it) may start while messages are being removed.
+      let release: () => void;
+      try {
+        release = this.reserveStoreForSurgery('hide', agentName);
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+          ...(error instanceof OperatorActionError ? { code: error.code } : {}),
+        };
+      }
       try {
         if (params.toMessageId) {
           const toIdx = byDiscordId(params.toMessageId);
@@ -5297,7 +5308,7 @@ export class AgentFramework {
           const refs = refsIn(lo, hi);
           const rangeIds = all.slice(lo, hi + 1).map((m) => String(m.id));
           cm.removeMessages(all[lo].id, all[hi].id);
-          const markers = this.scheduleHideMarks(agentName, serverId, all.slice(lo, hi + 1), hideMarks);
+          const markers = this.scheduleAppliedMarks('hide', agentName, serverId, all.slice(lo, hi + 1), hideMarks);
           console.error(
             `[host-command] hide agent=${agentName} range removed=${hi - lo + 1} ` +
               `(${params.fromMessageId}..${params.toMessageId}) by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -5331,7 +5342,7 @@ export class AgentFramework {
         const refs = refsIn(fromIdx, fromIdx);
         const hiddenId = String(all[fromIdx].id);
         cm.removeMessage(all[fromIdx].id);
-        const markers = this.scheduleHideMarks(agentName, serverId, [all[fromIdx]], hideMarks);
+        const markers = this.scheduleAppliedMarks('hide', agentName, serverId, [all[fromIdx]], hideMarks);
         console.error(
           `[host-command] hide agent=${agentName} removed=1 (${params.fromMessageId}) ` +
             `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -5352,6 +5363,8 @@ export class AgentFramework {
         };
       } catch (error) {
         return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      } finally {
+        release();
       }
     }
 
@@ -5402,6 +5415,12 @@ export class AgentFramework {
     }
 
     const requested = Math.max(1, Math.min(20, Math.floor(params.turns ?? 1)));
+    const turnMarks: DiscordAwarenessMarks = params.marks === 'addressed' || params.marks === 'all'
+      ? { scope: params.marks }
+      : 'none';
+    // What the undone turns remove from this agent's context is whatever is
+    // in it now and not after: addressing metadata only, never content.
+    const before = this.addressingSnapshot(agentName);
     let undone = 0;
     try {
       for (let i = 0; i < requested; i++) {
@@ -5423,12 +5442,48 @@ export class AgentFramework {
     );
 
     if (undone === 0) {
-      return { ok: true, undone: 0, requested, lastVisible: null };
+      return {
+        ok: true,
+        undone: 0,
+        requested,
+        markers: { scope: marksScope(turnMarks) as SurgeryMarkerReceipt['scope'], unmarked: 0, notRemoved: 0, status: 'none', queued: 0 },
+        lastVisible: null,
+      };
     }
 
-    // Turn undo is a branch move: awareness marks are one-shot and never
-    // follow branch state, so there is nothing to reconcile here.
-    return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
+    // Marks are a one-shot choice about the messages these turns removed;
+    // the branch move itself never adds or removes any.
+    const after = new Set(this.addressingSnapshot(agentName).keys());
+    const removed = [...before].filter(([id]) => !after.has(id)).map(([, carrier]) => carrier);
+    const markers = this.scheduleAppliedMarks('undo', agentName, serverId, removed, turnMarks);
+    return { ok: true, undone, requested, markers, lastVisible: await this.lastVisiblePreview(agentName) };
+  }
+
+  /**
+   * The addressing metadata of every message in an agent's context, by
+   * message id, read in bounded windows without resolving blobs: the Discord
+   * address and MCPL tags only, never content.
+   */
+  private addressingSnapshot(agentName: string): Map<string, { metadata: Record<string, unknown> }> {
+    const snapshot = new Map<string, { metadata: Record<string, unknown> }>();
+    const cm = this.agents.get(agentName)?.getContextManager();
+    if (!cm) return snapshot;
+    const total = cm.getMessageCount();
+    for (let offset = 0; offset < total; offset += 500) {
+      const { messages } = cm.getMessageWindow(offset, Math.min(500, total - offset), { resolveBlobs: false });
+      for (const message of messages) {
+        const metadata = (message.metadata ?? {}) as Record<string, unknown>;
+        snapshot.set(String(message.id), {
+          metadata: {
+            serverId: metadata.serverId,
+            channelId: metadata.channelId,
+            messageId: metadata.messageId,
+            tags: metadata.tags,
+          },
+        });
+      }
+    }
+    return snapshot;
   }
 
   /**
@@ -5991,6 +6046,37 @@ export class AgentFramework {
   }
 
   /**
+   * After a failed surgery has put the source back: retire its prepared
+   * awareness batch, but only when the store is confirmed on the source. If
+   * it isn't, the batch stays prepared as the evidence of an unfinished body
+   * (startup resumes or holds it). Never throws: the caller is already
+   * reporting the surgery's failure; returns a clause to append to it.
+   */
+  private retireAfterRestore(
+    batch: DiscordAwarenessBatch | null,
+    sourceBranch: string,
+    agentName: string,
+  ): string {
+    if (!batch || !this.discordAwarenessOutbox) return '';
+    if (this.store.currentBranch().name !== sourceBranch) {
+      return `; awareness batch ${batch.id} kept, since the source branch could not be confirmed`;
+    }
+    try {
+      this.discordAwarenessOutbox.discard(batch.id);
+      return '';
+    } catch (error) {
+      const detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
+      this.opsAlert(
+        'discord-awareness-unresolved',
+        agentName,
+        `A failed surgery's awareness batch ${batch.id} could not be retired; startup will hold it: ${detail}`,
+        { data: { batchId: batch.id } },
+      );
+      return `; awareness batch ${batch.id} could not be retired (${detail})`;
+    }
+  }
+
+  /**
    * After a failed switch or redaction: put the store back on `sourceBranch`
    * if it moved, and return a sentence saying what actually happened. Never
    * throws — the caller reports the original failure with this appended.
@@ -6107,11 +6193,11 @@ export class AgentFramework {
           // initialization, so a rejection here can leave the store on the
           // new branch with an uninitialized strategy. Retire the batch and
           // go back to the source; keep the branch for diagnosis.
-          if (markerBatch) this.discordAwarenessOutbox!.discard(markerBatch.id);
           const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
+          const retired = this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
-            `Rollback failed; ${restored}: ${error instanceof Error ? error.message : String(error)}`,
+            `Rollback failed; ${restored}${retired}: ${error instanceof Error ? error.message : String(error)}`,
             { cause: error },
           );
         }
@@ -6122,7 +6208,7 @@ export class AgentFramework {
           scope: marksScope(opts.marks) as SurgeryMarkerReceipt['scope'],
           unmarked: selection.unmarked,
           notRemoved: selection.notRemoved,
-        }, selection.refs.length);
+        });
         // Starts delivery without awaiting it (the first reaction request may
         // already be on the wire when this returns); it never gates traffic.
         this.deliverDiscordAwarenessInBackground('rollback', agentName);
@@ -6242,25 +6328,24 @@ export class AgentFramework {
           activationPolicy: 'explicit',
           suppressionIntervals: ordered.map((iv) => ({ fromId: iv.fromId, toId: iv.toId })),
         }) ?? null;
-        // Anything short of activation retires the batch: a prepared explicit
-        // batch is resumed at startup whenever its exact target branch is
-        // active — e.g. after an operator opens the failed fork to look — and
-        // an un-completable resume there aborts framework start.
-        const retireBatch = (): void => {
-          if (markerBatch) this.discordAwarenessOutbox!.discard(markerBatch.id);
-        };
+        // A failure short of activation puts the source back first, and only
+        // then retires the batch: a prepared explicit batch is resumed at
+        // startup whenever its exact target branch is active (e.g. after an
+        // operator opens the failed fork to look), and an un-completable
+        // resume there aborts framework start. If the source can't be
+        // confirmed, the batch stays as the unfinished body's evidence.
 
         try {
           createdBranch = await cm.fork(targetBranch);
         } catch (error) {
           // fork() switches the chronicle branch before awaiting strategy
           // initialization; a rejection can leave the store on the new
-          // branch. Retire the batch and go back to the source.
-          retireBatch();
+          // branch. Go back to the source, then retire the batch.
           const restored = await this.restoreSourceBranch(cm, sourceBranch, targetBranch, agentName);
+          const retired = this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
-            `Suppression failed creating ${targetBranch}; ${restored}: ${error instanceof Error ? error.message : String(error)}`,
+            `Suppression failed creating ${targetBranch}; ${restored}${retired}: ${error instanceof Error ? error.message : String(error)}`,
             { cause: error },
           );
         }
@@ -6273,11 +6358,11 @@ export class AgentFramework {
           // A partially suppressed branch is not safe to serve from. Keep it
           // for diagnosis, put the agent back on the untouched source — and
           // say honestly whether that restore happened.
-          retireBatch();
           const restored = await this.restoreSourceBranch(cm, sourceBranch, createdBranch, agentName);
+          const retired = this.retireAfterRestore(markerBatch, sourceBranch, agentName);
           throw new OperatorActionError(
             'failed',
-            `Suppression failed on ${createdBranch}; ${restored}: ${error instanceof Error ? error.message : String(error)}`,
+            `Suppression failed on ${createdBranch}; ${restored}${retired}: ${error instanceof Error ? error.message : String(error)}`,
             { cause: error },
           );
         }
@@ -6291,7 +6376,7 @@ export class AgentFramework {
           scope: marksScope(opts.marks) as SurgeryMarkerReceipt['scope'],
           unmarked: selection.unmarked,
           notRemoved: selection.notRemoved,
-        }, selection.refs.length);
+        });
         // Starts delivery without awaiting it (the first reaction request may
         // already be on the wire when this returns); it never gates traffic.
         this.deliverDiscordAwarenessInBackground('suppress', agentName);
@@ -6427,22 +6512,23 @@ export class AgentFramework {
     };
   }
 
-  /** The awareness journal's batches, for operator surfaces. */
-  listDiscordAwareness(): DiscordAwarenessBatchView[] {
+  /** The awareness journal's batches and retract requests, for operator surfaces. */
+  listDiscordAwareness(): DiscordAwarenessView[] {
     return this.discordAwarenessOutbox?.view() ?? [];
   }
 
   /**
-   * Stop a batch's awareness marks that have not been sent. Never removes a
-   * reaction: requests already on the wire, or whose outcome is unknown, are
-   * reported and may still land; retract explicitly to remove them.
+   * Stop all further sends and retries of a batch's marks, or of a retract
+   * request's removals (by its request id). Never removes a reaction and
+   * never undoes one: requests already on the wire, or whose outcome is
+   * unknown, are reported and may still land.
    */
   cancelDiscordAwareness(
-    batchId: string,
+    target: string,
     opts: { requester?: OperatorRequester; note?: string } = {},
   ): DiscordAwarenessCancelReceipt {
-    return this.awarenessOperatorAction('awareness-cancel', { batchId }, opts, () =>
-      this.requireDiscordAwarenessOutbox().cancel(batchId, describeRequester(opts.requester)));
+    return this.awarenessOperatorAction('awareness-cancel', { target }, opts, () =>
+      this.requireDiscordAwarenessOutbox().cancel(target, describeRequester(opts.requester)));
   }
 
   /**
@@ -6519,72 +6605,48 @@ export class AgentFramework {
    */
   private activateSurgeryMarkers(
     batch: DiscordAwarenessBatch | null,
-    verb: 'rollback' | 'suppress' | 'hide',
+    verb: 'rollback' | 'suppress' | 'hide' | 'undo',
     agentName: string,
     facts: SurgeryMarkerFacts,
-    selected: number,
   ): SurgeryMarkerReceipt {
-    if (!batch) {
-      if (selected > 0 && !this.discordAwarenessOutbox) {
-        // Chosen and in scope, but there is nowhere to record them: say so
-        // rather than report that none were wanted.
-        console.error(
-          `[discord-awareness] ${verb} agent=${agentName}: ${selected} mark(s) chosen, but no awareness journal is configured`,
-        );
-        return {
-          ...facts,
-          status: 'not-scheduled',
-          queued: 0,
-          error: 'no awareness journal is configured (no storePath or discordAwarenessOutboxPath)',
-        };
-      }
-      return { ...facts, status: 'none', queued: 0 };
-    }
-    try {
-      this.discordAwarenessOutbox!.activate(batch.id);
-    } catch (error) {
-      const detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
-      let retired = false;
-      let retireDetail = '';
-      try {
-        retired = this.discordAwarenessOutbox!.discard(batch.id);
-      } catch (discardError) {
-        retireDetail = boundDiscordAwarenessText(
-          discardError instanceof Error ? discardError.message : String(discardError),
-        );
-      }
-      console.error(
-        `[discord-awareness] ${verb} agent=${agentName}: body applied, but marker batch ${batch.id} ` +
-          `could not be activated (${detail}); ` +
-          (retired ? 'batch retired' : `batch left prepared${retireDetail ? ` (retire failed: ${retireDetail})` : ''}`),
-      );
-      if (batch.refs.length === 0) return { ...facts, status: 'none', queued: 0 };
-      this.opsAlert(
-        retired ? 'discord-awareness-not-scheduled' : 'discord-awareness-unresolved',
-        agentName,
-        retired
-          ? `${verb} applied, but its ${batch.refs.length} awareness mark(s) were not scheduled ` +
-            `(batch ${batch.id} retired): ${detail}`
-          : `${verb} applied, but awareness batch ${batch.id} (${batch.refs.length} mark(s)) could be ` +
-            `neither activated nor retired; it may still be delivered: ${detail}`,
-        { data: { batchId: batch.id, retired } },
-      );
-      return retired
-        ? { ...facts, status: 'not-scheduled', queued: 0, error: detail }
-        : { ...facts, status: 'unresolved', queued: 0, batchId: batch.id, error: detail };
-    }
+    if (!batch || !this.discordAwarenessOutbox) return { ...facts, status: 'none', queued: 0 };
+    const settled = this.discordAwarenessOutbox.settleActivation(batch.id);
+    // A suppression-only batch carries no marks: its activation records the
+    // body complete, and the receipt has nothing to report.
     if (batch.refs.length === 0) return { ...facts, status: 'none', queued: 0 };
-    return { ...facts, status: 'queued', queued: batch.refs.length, batchId: batch.id };
+    if (settled.status === 'queued') {
+      return { ...facts, status: 'queued', queued: settled.queued, batchId: batch.id };
+    }
+    const retired = settled.status === 'not-scheduled';
+    console.error(
+      `[discord-awareness] ${verb} agent=${agentName}: body applied, but marker batch ${batch.id} ` +
+        `could not be activated (${settled.error}); ${retired ? 'batch retired' : 'batch left prepared'}`,
+    );
+    this.opsAlert(
+      retired ? 'discord-awareness-not-scheduled' : 'discord-awareness-unresolved',
+      agentName,
+      retired
+        ? `${verb} applied, but its ${batch.refs.length} awareness mark(s) were not scheduled ` +
+          `(batch ${batch.id} retired): ${settled.error}`
+        : `${verb} applied, but awareness batch ${batch.id} (${batch.refs.length} mark(s)) could be ` +
+          `neither activated nor retired; it may still be delivered: ${settled.error}`,
+      { data: { batchId: batch.id, retired } },
+    );
+    return retired
+      ? { ...facts, status: 'not-scheduled', queued: 0, error: settled.error }
+      : { ...facts, status: 'unresolved', queued: 0, batchId: batch.id, error: settled.error };
   }
 
   /**
-   * Marks for an in-place `hide`, scheduled after its redaction committed.
-   * The batch targets the current branch and is explicit (activated here);
-   * a crash between its two journal records leaves it prepared for exactly
-   * this branch, which startup completes. Old records without a serverId are
+   * Marks for a change already applied in place (an in-place `hide`, or a
+   * turn undo), scheduled after it. The batch targets the current branch and
+   * is explicit (activated here, after the change is synced); a crash
+   * between its two journal records leaves it prepared for exactly this
+   * branch, which startup completes. Old records without a serverId are
    * routed through the server that issued the command.
    */
-  private scheduleHideMarks(
+  private scheduleAppliedMarks(
+    verb: 'hide' | 'undo',
     agentName: string,
     serverId: string,
     removed: Array<{ metadata?: Record<string, unknown> }>,
@@ -6619,12 +6681,12 @@ export class AgentFramework {
       this.opsAlert(
         'discord-awareness-not-scheduled',
         agentName,
-        `hide applied, but its ${selection.refs.length} awareness mark(s) were not scheduled: ${detail}`,
+        `${verb} applied, but its ${selection.refs.length} awareness mark(s) were not scheduled: ${detail}`,
       );
       return { ...facts, status: 'not-scheduled', queued: 0, error: detail };
     }
-    const receipt = this.activateSurgeryMarkers(batch, 'hide', agentName, facts, selection.refs.length);
-    if (receipt.status === 'queued') this.deliverDiscordAwarenessInBackground('hide', agentName);
+    const receipt = this.activateSurgeryMarkers(batch, verb, agentName, facts);
+    if (receipt.status === 'queued') this.deliverDiscordAwarenessInBackground(verb, agentName);
     return receipt;
   }
 
@@ -6636,7 +6698,7 @@ export class AgentFramework {
    * the queued work stays in the journal for the next pass.
    */
   private deliverDiscordAwarenessInBackground(
-    occasion: 'rollback' | 'suppress' | 'hide' | 'retract' | 'release' | 'startup' | 'connect' | 'list-change' | 'reconnect',
+    occasion: 'rollback' | 'suppress' | 'hide' | 'undo' | 'retract' | 'release' | 'startup' | 'connect' | 'list-change' | 'reconnect',
     agentName: string,
   ): void {
     if (!this.discordAwarenessOutbox) return;
@@ -13600,15 +13662,16 @@ export class AgentFramework {
         if (interval.fromId === interval.toId) cm.removeMessage(from.id);
         else cm.removeMessages(from.id, to.id);
       }
-      if (batch.status === 'held' || batch.cancelled) {
-        // Body integrity only: its marks were held at an earlier startup (and
-        // are released explicitly, never by a branch becoming active), or an
-        // operator cancelled them.
-        this.discordAwarenessOutbox.recordSuppressionComplete(batch.id);
-        console.error(`[discord-awareness] completed held suppression ${batch.id} (marks stay held)`);
-      } else {
+      if (batch.status === 'prepared' && !batch.cancelled) {
+        // Crash completion of the surgery itself: body, then its marks.
         this.discordAwarenessOutbox.activate(batch.id);
         console.error(`[discord-awareness] resumed suppression batch ${batch.id}`);
+      } else {
+        // Body integrity only. Its marks are the operator's: held at an
+        // earlier startup, released, or cancelled; a branch becoming active
+        // never changes them.
+        this.discordAwarenessOutbox.recordSuppressionComplete(batch.id);
+        console.error(`[discord-awareness] completed suppression body ${batch.id} (marks ${batch.status})`);
       }
     }
   }
@@ -13648,33 +13711,32 @@ export class AgentFramework {
       let delivered = 0;
       let failed = 0;
       const attempted = new Set<string>();
+      const signature = (dispatch: { opIds: string[]; action: string }) =>
+        `${dispatch.opIds.join(',')}\0${dispatch.action}`;
       let announced = false;
       while (true) {
-        const dispatches = this.readDiscordAwarenessDispatches(serverId).filter((dispatch) => {
-          const key = `${dispatch.opIds.join(',')}\0${dispatch.action}`;
-          if (attempted.has(key)) return false;
-          attempted.add(key);
-          return true;
-        });
-        if (dispatches.length === 0) break;
+        // One dispatch at a time, chosen and written ahead in one step from
+        // the journal as it is now: a cancel or retract made while the
+        // previous request was on the wire takes effect here.
+        let claimed: ReturnType<DiscordAwarenessOutbox['claimDispatch']>;
+        try {
+          claimed = outbox.claimDispatch(serverId, (dispatch) => attempted.has(signature(dispatch)));
+        } catch (error) {
+          throw new DiscordAwarenessAccountingError('dispatch write-ahead', error);
+        }
+        if (!claimed) break;
+        const { dispatch, attempts } = claimed;
+        attempted.add(signature(dispatch));
         if (!announced) {
           announced = true;
-          console.error(
-            `[discord-awareness] ${serverId}: delivering ${dispatches.length} queued mark operation(s)`,
-          );
+          console.error(`[discord-awareness] ${serverId}: delivering queued mark operations`);
         }
-        for (const dispatch of dispatches) {
+        {
           const ref = dispatch.key;
           const channelId = ref.channelId.startsWith('discord:')
             ? ref.channelId.split(':').at(-1)!
             : ref.channelId;
           const tool = dispatch.action === 'add' ? 'add_reaction' : 'remove_reaction';
-          let attempts: Array<{ opId: string; attempt: number }>;
-          try {
-            attempts = outbox.recordDispatching(dispatch);
-          } catch (error) {
-            throw new DiscordAwarenessAccountingError('dispatch write-ahead', error);
-          }
           let outcome: 'confirmed' | 'failed' | 'not-sent' | 'unknown';
           let detail: string | undefined;
           try {

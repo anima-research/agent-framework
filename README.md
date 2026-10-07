@@ -169,9 +169,11 @@ messages that mentioned or replied to the bot, and DMs) or `--marks all`
 (every removed Discord message). The output counts what will be marked and
 what stays unmarked, and `--dry-run` shows exactly which addresses each choice
 covers. Only `{serverId, channelId, messageId}` metadata is written, to the
-awareness journal `<store>/recovery/discord-awareness-journal.jsonl`, and the
-marks are delivered when the host and that agent's `discord-mcpl` bot next
-connect (see [Live surgery and Discord awareness marks](#live-surgery-and-discord-awareness-marks)).
+awareness journal kept in the store itself, and the marks are delivered when
+the host and that agent's `discord-mcpl` bot next connect (see
+[Live surgery and Discord awareness marks](#live-surgery-and-discord-awareness-marks)).
+If the branch is made but the marks can't be recorded, the output's `markers`
+says so and the branch stands.
 Portal and other non-Discord records are ignored.
 
 When the safe point is an assistant/tool-side record rather than a Discord
@@ -216,7 +218,7 @@ normal agent host must be stopped while this command has the Chronicle store
 open.
 
 With the host stopped, the same command inspects and controls the awareness
-journal: `--awareness list`, `--awareness cancel <batch>`,
+journal: `--awareness list`, `--awareness cancel <batch|retract-request>`,
 `--awareness retract <batch|all>` and `--awareness release <batch>` behave as
 the live controls described below.
 
@@ -345,15 +347,13 @@ const result = await framework.rollbackToMessage('cairn', {
   never marked. The choice is recorded in the operator log.
 - **The surgery returns once marks are scheduled**, never after Discord has
   accepted them. `result.markers` says whether they were scheduled (`queued`
-  with a count and batch id), not chosen or not in scope (`none`), chosen but
-  never to be delivered (`not-scheduled`: the framework has no awareness
-  journal, having neither `storePath` nor `discordAwarenessOutboxPath`, or
-  recording the batch failed after the body change and the batch was retired;
-  `error` says which), or
-  `unresolved` (neither activation nor retirement could be recorded; it names
-  a batch that may still be delivered). Every receipt also counts the removed
-  messages left unmarked. Marker bookkeeping never fails or undoes an applied
-  rollback or suppression.
+  with a count and batch id), not chosen or not in scope (`none`), not to be
+  delivered because recording the batch failed after the body change and it
+  was retired (`not-scheduled`), or `unresolved` (neither activation nor
+  retirement could be recorded; it names a batch that may still be
+  delivered). Every receipt also counts the removed messages left unmarked.
+  Marker bookkeeping never fails or undoes an applied rollback or
+  suppression.
 - **Delivery runs in the background** and never holds MCPL traffic or turns.
   A route that is not connected keeps its work queued until it connects.
   Each reaction call has a mandatory deadline independent of
@@ -362,28 +362,45 @@ const result = await framework.rollbackToMessage('cairn', {
   (offline: `--emoji`).
 - **Marks are one-shot.** Switching branches, undo/redo and restarts never add
   or remove a mark. The journal is an append-only history of requests and
-  their attempts, written ahead of each dispatch. A request written and never
-  answered is recorded as `unknown` and is never resolved by a later
-  confirmation of a different attempt. A batch whose surgery was interrupted
-  before its branch switch was recorded is held at startup until an operator
-  releases it.
-- **Operator controls:** `listDiscordAwareness()`;
-  `cancelDiscordAwareness(batch)` stops a batch's further sends and retries
-  and never removes a reaction (its receipt counts requests in flight or
-  unknown, which may still land); `retractDiscordAwareness(batch | 'all')`
-  removes this bot's reaction, through each address's configured MCPL route,
-  from a batch's messages or from every message an add was ever sent for, and
-  its receipt discloses earlier adds whose outcome is unknown, any of which
-  may land after the removal; `releaseDiscordAwareness(batch)` queues a held
-  batch. Each is recorded in the operator log.
-- **Over `host/command`** (servers granted `allowHostCommands`): message-granular
-  `undo` takes `marks: 'none' | 'addressed' | 'all'` (default `none`; any
-  other value is refused), and the `marks` verb takes `action: 'list' |
-  'cancel' | 'retract' | 'release'` with a `batchId` (`all` for retract).
+  their attempts, kept as typed records in the Chronicle store: it survives
+  rollbacks, branch deletion and a killed process, and lives with its store.
+  Each request is written ahead of its dispatch, and a dispatch is admitted
+  from the journal as it is at that moment, so a cancel takes effect even
+  while an earlier request is on the wire. A request written and never
+  answered is recorded as `unknown`, and a later confirmation of a different
+  attempt never resolves it. A record that certifies a body change (an
+  activation, a completed suppression, a retirement) is written only after
+  that change is synced. A batch whose surgery was interrupted before its
+  branch switch was recorded is held at startup until an operator releases
+  it; an interrupted suppression's redactions are resumed whenever its branch
+  is active at startup, whatever its marks' state.
+- **Operator controls,** each recorded in the operator log:
+  - `listDiscordAwareness()` lists batches and retract requests;
+  - `cancelDiscordAwareness(batch | retractRequest)` stops all further sends
+    and retries of a batch's marks or a retract's removals, and never removes
+    or undoes anything. Its receipt counts requests in flight or unknown,
+    including earlier attempts later answered, any of which may still land;
+  - `retractDiscordAwareness(batch | 'all')` queues removal of this bot's
+    reaction, through each address's configured MCPL route, for every message
+    of the batch (or every message any batch or imported ledger recorded an
+    add for), whatever history says: removing an absent reaction does
+    nothing. It supersedes adds not yet sent, and its receipt discloses
+    earlier requests whose outcome is unknown and imported history that
+    leaves outcomes unrecorded;
+  - `releaseDiscordAwareness(batch)` queues a held batch.
+- **Over `host/command`** (servers granted `allowHostCommands`): `undo` (by
+  messages or by turns) and `hide` take `marks: 'none' | 'addressed' | 'all'`
+  (default `none`; any other value is refused) and return `markers`. `hide`
+  holds the store like every surgery. The `marks` verb takes `action: 'list'
+  | 'cancel' | 'retract' | 'release'` with a `target` (a batch id; for cancel
+  also a retract request id; for retract also `all`).
 
-A pre-journal awareness ledger (`discord-awareness-outbox.json`) is imported
-once on first use: its recorded outcomes are kept, its undelivered work is
-held for an explicit release, and the old file is renamed `.migrated-v2`.
+A pre-journal awareness ledger (`discord-awareness-outbox.json` under the
+store, or `discordAwarenessOutboxPath`) is imported once on first use and the
+file renamed `.migrated-v2`. What it recorded about each message is kept as
+evidence (attempt count, last action, status and error, and how many attempt
+outcomes it leaves unrecorded), never as a claim about what is on Discord.
+Its undelivered work is held for an explicit release.
 
 ## Observability
 

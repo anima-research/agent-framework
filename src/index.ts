@@ -132,6 +132,7 @@ export {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
+  isPermanentDiscordReactionFailure,
   selectDiscordAwarenessRefs,
 } from './recovery/discord-awareness-outbox.js';
 export type {
@@ -140,6 +141,9 @@ export type {
   DiscordAwarenessBatch,
   DiscordAwarenessBatchRecord,
   DiscordAwarenessBatchView,
+  DiscordAwarenessLegacyEvidence,
+  DiscordAwarenessRetractView,
+  DiscordAwarenessView,
   DiscordAwarenessCancelReceipt,
   DiscordAwarenessDispatch,
   DiscordAwarenessMarks,

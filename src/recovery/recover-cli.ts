@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { JsStore } from '@animalabs/chronicle';
 import { createOfflineRecoveryBranch } from './offline-branch.js';
 import {
   DiscordAwarenessOutbox,
@@ -29,6 +30,7 @@ function usage(): string {
   return `Usage:
   agent-framework-recover --store <path> --agent <name> <anchor> [options]
   agent-framework-recover --store <path> --awareness <list|cancel ID|retract ID|all|release ID>
+                              (cancel takes a batch id or a retract request id)
 
 Creates and activates a Chronicle recovery branch while the normal host is
 down. The recovery is local to the resident: by default no Discord reaction is
@@ -49,14 +51,16 @@ Options:
                               Awareness marks on removed Discord messages
                               (default none; addressed = mentions, replies to
                               the bot and DMs; all = every addressable message)
-  --outbox <path>             Override the awareness journal path
+  --outbox <path>             A pre-journal awareness ledger to import
+                              (default: <store>/recovery/discord-awareness-outbox.json)
   --emoji <emoji>             Marker reaction (default: 💤)
   --dry-run                   Inspect counts/addresses without writing
   --help                      Show this help
 
 Awareness journal (host stopped):
   --awareness list            Each batch: scope, counts by status, holds
-  --awareness cancel <ID>     Stop a batch's unsent marks (never removes any)
+  --awareness cancel <ID>     Stop further sends of a batch's marks, or of a
+                              retract's removals (never undoes anything)
   --awareness retract <ID|all>
                               Queue removal of this bot's marks (through each
                               ref's configured MCPL route) on a batch's refs,
@@ -135,26 +139,33 @@ function parseArgs(args: string[]): CliOptions {
 }
 
 function awareness(options: CliOptions): void {
-  const outbox = new DiscordAwarenessOutbox(
-    options.outboxPath ?? defaultDiscordAwarenessOutboxPath(options.storePath!),
-  );
-  const { verb, target } = options.awareness!;
-  const by = 'agent-framework-recover';
-  let result: unknown;
-  switch (verb) {
-    case 'list': result = { journal: outbox.path, batches: outbox.view() }; break;
-    case 'cancel': result = outbox.cancel(target!, by); break;
-    case 'retract': result = outbox.retract(target!, by); break;
-    case 'release': result = outbox.release(target!, by); break;
+  // The journal lives in the store; with the host stopped, this process is
+  // its only writer.
+  const store = JsStore.openOrCreate({ path: options.storePath! });
+  try {
+    const outbox = new DiscordAwarenessOutbox(store, {
+      legacyPath: options.outboxPath ?? defaultDiscordAwarenessOutboxPath(options.storePath!),
+    });
+    const { verb, target } = options.awareness!;
+    const by = 'agent-framework-recover';
+    let result: unknown;
+    switch (verb) {
+      case 'list': result = { store: options.storePath, batches: outbox.view() }; break;
+      case 'cancel': result = outbox.cancel(target!, by); break;
+      case 'retract': result = outbox.retract(target!, by); break;
+      case 'release': result = outbox.release(target!, by); break;
+    }
+    console.log(JSON.stringify(result, null, 2));
+  } finally {
+    store.close();
   }
-  console.log(JSON.stringify(result, null, 2));
 }
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
   if (options.awareness) {
-    if (!options.storePath && !options.outboxPath) {
-      throw new Error(`--awareness needs --store (or --outbox)\n\n${usage()}`);
+    if (!options.storePath) {
+      throw new Error(`--awareness needs --store\n\n${usage()}`);
     }
     awareness(options);
     return;

@@ -1,4 +1,5 @@
 import { JsStore } from '@animalabs/chronicle';
+import type { SurgeryMarkerReceipt } from '../operator-log.js';
 import { ContextManager } from '@animalabs/context-manager';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
@@ -29,6 +30,7 @@ export interface OfflineRecoveryBranchOptions {
   namespace?: string;
   /** Use for old message records that do not carry metadata.serverId. */
   discordServerId?: string;
+  /** A pre-journal awareness ledger to import (default: under the store). */
   outboxPath?: string;
   emoji?: string;
   /**
@@ -49,15 +51,17 @@ export interface OfflineRecoveryBranchResult {
   discordAddressable: number;
   /** The publication scope recorded for this recovery. */
   marksScope: 'none' | 'addressed' | 'all';
-  /** Marks requested (queued once the branch is activated); not delivered. */
+  /** Marks queued for delivery (planned, for a dry run); not delivered. */
   discordMarkersQueued: number;
+  /** What became of the marks once the branch was made (absent on a dry
+   *  run): scheduling only, never Discord acceptance. */
+  markers?: SurgeryMarkerReceipt;
   /** The refs that will be marked (empty unless marks were chosen). */
   refs: DiscordAwarenessRef[];
   /** Removed addressable messages left unmarked. */
   unmarked: number;
   /** Authorized refs (marks.refs) this recovery does not remove. */
   notRemoved: number;
-  outboxPath: string;
 }
 
 /**
@@ -176,8 +180,6 @@ export async function createOfflineRecoveryBranch(
     if (targetBranch === sourceBranch) {
       throw new Error('Recovery branch name must differ from the active source branch');
     }
-    const outboxPath = options.outboxPath
-      ?? defaultDiscordAwarenessOutboxPath(options.storePath);
 
     const result: OfflineRecoveryBranchResult = {
       dryRun: options.dryRun === true,
@@ -191,11 +193,14 @@ export async function createOfflineRecoveryBranch(
       refs,
       unmarked: selection.unmarked,
       notRemoved: selection.notRemoved,
-      outboxPath,
     };
     if (options.dryRun) return result;
 
-    const outbox = new DiscordAwarenessOutbox(outboxPath);
+    // The journal lives in this store; the host is stopped, so this process
+    // is its only writer.
+    const outbox = new DiscordAwarenessOutbox(store, {
+      legacyPath: options.outboxPath ?? defaultDiscordAwarenessOutboxPath(options.storePath),
+    });
     const batch = outbox.prepare({
       agentName: options.agentName,
       sourceBranch,
@@ -226,18 +231,36 @@ export async function createOfflineRecoveryBranch(
         if (interval.fromId === interval.toId) contextManager.removeMessage(interval.fromId);
         else contextManager.removeMessages(interval.fromId, interval.toId);
       }
-      if (batch) outbox.activate(batch.id);
     } catch (error) {
       // A partially suppressed branch is not safe to boot into. Preserve it
       // for diagnosis, but leave Chronicle on the untouched source branch and
-      // keep the explicit outbox batch non-deliverable.
+      // keep the explicit batch prepared: it is the unfinished body's record
+      // (startup holds its marks, and resumes the body only on its branch).
       if (store.currentBranch().name === createdBranch) {
         await contextManager.switchBranch(sourceBranch);
       }
       throw error;
     }
 
-    return result;
+    // The body change landed. Marker bookkeeping is reported apart from it
+    // and never undoes it.
+    const facts = {
+      scope: (marks === 'none' ? 'none' : marks.scope) as SurgeryMarkerReceipt['scope'],
+      unmarked: selection.unmarked,
+      notRemoved: selection.notRemoved,
+    };
+    let markers: SurgeryMarkerReceipt = { ...facts, status: 'none', queued: 0 };
+    if (batch) {
+      const settled = outbox.settleActivation(batch.id);
+      if (batch.refs.length > 0) {
+        markers = settled.status === 'queued'
+          ? { ...facts, status: 'queued', queued: settled.queued, batchId: batch.id }
+          : settled.status === 'not-scheduled'
+            ? { ...facts, status: 'not-scheduled', queued: 0, error: settled.error }
+            : { ...facts, status: 'unresolved', queued: 0, batchId: batch.id, error: settled.error };
+      }
+    }
+    return { ...result, discordMarkersQueued: markers.queued, markers };
   } finally {
     contextManager?.close();
     store.close();

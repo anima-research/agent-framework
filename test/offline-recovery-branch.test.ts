@@ -7,9 +7,19 @@ import { JsStore } from '@animalabs/chronicle';
 import { ContextManager } from '@animalabs/context-manager';
 import { createOfflineRecoveryBranch } from '../src/recovery/offline-branch.js';
 import {
+  DISCORD_AWARENESS_RECORD_TYPE,
   DiscordAwarenessOutbox,
-  defaultDiscordAwarenessOutboxPath,
 } from '../src/recovery/discord-awareness-outbox.js';
+
+/** Read the store's awareness journal with the host (and CLI) stopped. */
+function readJournal<T>(storePath: string, read: (outbox: DiscordAwarenessOutbox, store: JsStore) => T): T {
+  const store = JsStore.openOrCreate({ path: storePath });
+  try {
+    return read(new DiscordAwarenessOutbox(store), store);
+  } finally {
+    store.close();
+  }
+}
 
 test('offline recovery branches without compiling and queues discarded Discord refs', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-'));
@@ -53,17 +63,17 @@ test('offline recovery branches without compiling and queues discarded Discord r
     recoveredCm.close();
     recoveredStore.close();
 
-    const batches = new DiscordAwarenessOutbox(
-      defaultDiscordAwarenessOutboxPath(storePath),
-    ).pendingDispatches('discord');
+    const batches = readJournal(storePath, (outbox) => outbox.pendingDispatches('discord'));
     assert.equal(batches.length, 2);
     assert.deepEqual(batches.map((dispatch) => dispatch.key.messageId), ['m-toxic-1', 'm-toxic-2']);
 
     // The outbox is metadata-only: quarantined text must never leak to it.
-    const rawOutbox = await import('node:fs').then(({ readFileSync }) =>
-      readFileSync(defaultDiscordAwarenessOutboxPath(storePath), 'utf8'));
-    assert.ok(!rawOutbox.includes('never echo this one'));
-    assert.ok(!rawOutbox.includes('or this one'));
+    const rawJournal = readJournal(storePath, (_outbox, store) => store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE)
+      .map((id) => Buffer.from(store.getRecord(id)!.payload).toString('utf-8'))
+      .join('\n'));
+    assert.ok(rawJournal.length > 0);
+    assert.ok(!rawJournal.includes('never echo this one'));
+    assert.ok(!rawJournal.includes('or this one'));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -180,9 +190,7 @@ test('offline recovery suppresses inclusive ranges in context order', async () =
     recoveredCm.close();
     recoveredStore.close();
 
-    const batches = new DiscordAwarenessOutbox(
-      defaultDiscordAwarenessOutboxPath(storePath),
-    ).pendingDispatches('discord');
+    const batches = readJournal(storePath, (outbox) => outbox.pendingDispatches('discord'));
     assert.equal(batches.length, 3);
     assert.deepEqual(
       batches.map((dispatch) => dispatch.key.messageId),
@@ -300,9 +308,11 @@ test('offline recovery is local by default; addressed marks only messages that a
     assert.equal(local.discordAddressable, 2);
     assert.equal(local.discordMarkersQueued, 0);
     assert.equal(local.unmarked, 2);
-    const outbox = new DiscordAwarenessOutbox(defaultDiscordAwarenessOutboxPath(storePath));
-    assert.equal(outbox.pendingDispatches('discord').length, 0, 'nothing is queued for Discord');
-    assert.equal(outbox.batches().length, 0);
+    assert.deepEqual(local.markers, { scope: 'none', unmarked: 2, notRemoved: 0, status: 'none', queued: 0 });
+    readJournal(storePath, (outbox) => {
+      assert.equal(outbox.pendingDispatches('discord').length, 0, 'nothing is queued for Discord');
+      assert.equal(outbox.batches().length, 0);
+    });
 
     // A dry run with addressed shows exactly what would be marked.
     rmSync(storePath, { recursive: true, force: true });
@@ -316,11 +326,48 @@ test('offline recovery is local by default; addressed marks only messages that a
     });
     assert.equal(marked.discordMarkersQueued, 1);
     assert.equal(marked.unmarked, 1);
+    assert.equal(marked.markers?.status, 'queued');
     assert.deepEqual(
-      new DiscordAwarenessOutbox(defaultDiscordAwarenessOutboxPath(storePath)).pendingDispatches('discord')
-        .map((dispatch) => dispatch.key.messageId),
+      readJournal(storePath, (outbox) => outbox.pendingDispatches('discord').map((dispatch) => dispatch.key.messageId)),
       ['m-addressed'],
     );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('offline recovery reports a marker bookkeeping failure apart from the body, which stands', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-settle-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'safe' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-safe' });
+    cm.addMessage('user', [{ type: 'text', text: 'hey' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-gone', tags: ['chat:addressed'] });
+    cm.close();
+    store.close();
+    const original = DiscordAwarenessOutbox.prototype.activate;
+    DiscordAwarenessOutbox.prototype.activate = function () { throw new Error('injected activation failure'); };
+    let result: Awaited<ReturnType<typeof createOfflineRecoveryBranch>>;
+    try {
+      result = await createOfflineRecoveryBranch({
+        storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'all' }, branchName: 'recovery/cairn/settle',
+      });
+    } finally {
+      DiscordAwarenessOutbox.prototype.activate = original;
+    }
+    assert.equal(result.markers?.status, 'not-scheduled');
+    assert.match(result.markers?.status === 'not-scheduled' ? result.markers.error : '', /injected activation failure/);
+    assert.equal(result.discordMarkersQueued, 0);
+    const reopened = JsStore.openOrCreate({ path: storePath });
+    try {
+      assert.equal(reopened.currentBranch().name, 'recovery/cairn/settle', 'the recovery branch stands');
+      const outbox = new DiscordAwarenessOutbox(reopened);
+      assert.equal(outbox.batches()[0].status, 'discarded');
+      assert.equal(outbox.pendingDispatches('discord').length, 0);
+    } finally {
+      reopened.close();
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

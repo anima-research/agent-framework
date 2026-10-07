@@ -14,11 +14,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework } from '../src/framework.js';
-import { DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
+import { DISCORD_AWARENESS_RECORD_TYPE, DiscordAwarenessOutbox } from '../src/recovery/discord-awareness-outbox.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
 
 const FIXTURE = fileURLToPath(new URL('./fixtures/surgery-marks-mcpl-server.mjs', import.meta.url));
@@ -40,35 +41,39 @@ async function waitFor(description: string, predicate: () => boolean, timeoutMs 
 function setup() {
   const dir = mkdtempSync(join(tmpdir(), 'awareness-delivery-'));
   const storePath = join(dir, 'store');
-  // Outside the store: the store directory must not exist before Chronicle
-  // creates it, and these tests seed the journal before the first start.
-  const journal = join(dir, 'awareness', 'discord-awareness-journal.jsonl');
   const paths = {
     calls: join(dir, 'calls.jsonl'),
     events: join(dir, 'events.jsonl'),
     hold: join(dir, 'release'),
     probe: join(dir, 'probe'),
   };
+  /** Queue marks in the store's journal while no host has it open. */
   const queueMarks = (messageIds: string[]) => {
-    const outbox = new DiscordAwarenessOutbox(journal);
-    const batch = outbox.prepare({
-      agentName: 'resident',
-      sourceBranch: 'source',
-      targetBranch: 'main',
-      refs: messageIds.map((messageId) => ({ serverId: 'discord', channelId: 'discord:g1:c1', messageId })),
-      scope: 'all',
-      activationPolicy: 'explicit',
-    })!;
-    outbox.activate(batch.id);
-    return outbox;
+    const store = JsStore.openOrCreate({ path: storePath });
+    try {
+      const outbox = new DiscordAwarenessOutbox(store);
+      const batch = outbox.prepare({
+        agentName: 'resident',
+        sourceBranch: 'source',
+        targetBranch: 'main',
+        refs: messageIds.map((messageId) => ({ serverId: 'discord', channelId: 'discord:g1:c1', messageId })),
+        scope: 'all',
+        activationPolicy: 'explicit',
+      })!;
+      outbox.activate(batch.id);
+    } finally {
+      store.close();
+    }
   };
+  /** The running framework's own journal instance. */
+  const journal = (framework: AgentFramework): DiscordAwarenessOutbox =>
+    (framework as unknown as { discordAwarenessOutbox: DiscordAwarenessOutbox }).discordAwarenessOutbox;
   const config = (opts: { discord?: boolean; requestTimeoutMs?: number; awarenessDeadlineMs?: number } = {}) => ({
     storePath,
     membrane: new MockMembrane().asMembrane(),
     agents: [{ name: 'resident', model: 'test', systemPrompt: 'test' }],
     modules: [],
     maintenanceIntervalMs: 0,
-    discordAwarenessOutboxPath: journal,
     ...(opts.awarenessDeadlineMs ? { discordAwarenessDeadlineMs: opts.awarenessDeadlineMs } : {}),
     ...(opts.discord === false ? {} : {
       mcplServers: [{
@@ -101,7 +106,7 @@ test('startup does not wait for queued marks, and channel traffic flows while th
     );
     writeFileSync(paths.hold, '1');
     await waitFor('both adds confirmed', () => {
-      const outbox = new DiscordAwarenessOutbox(journal);
+      const outbox = journal(framework!);
       return outbox.operations().filter((op) => outbox.operationStatus(op) === 'confirmed').length === 2;
     });
   } finally {
@@ -117,12 +122,9 @@ test('the mandatory awareness deadline still bounds a hung reaction with request
   try {
     queueMarks(['m1']);
     framework = await AgentFramework.create(config({ requestTimeoutMs: 0, awarenessDeadlineMs: 150 }));
-    // Another reader sees an unanswered dispatch as unknown at once; wait
-    // for the drain's own outcome record.
     await waitFor('the hung add to be recorded unknown', () =>
-      new DiscordAwarenessOutbox(journal).operations().some((op) => op.attempts[0]?.outcome === 'unknown'));
-    const outbox = new DiscordAwarenessOutbox(journal);
-    const [op] = outbox.operations();
+      journal(framework!).operations().some((op) => op.attempts[0]?.outcome === 'unknown'));
+    const [op] = journal(framework).operations();
     assert.equal(op.attempts[0].outcome, 'unknown');
     assert.match(op.attempts[0].error ?? '', /did not respond/);
   } finally {
@@ -137,17 +139,17 @@ test('a route that is not connected leaves marks queued; they go out once it is'
   let framework: AgentFramework | undefined;
   try {
     queueMarks(['m1']);
-    const before = readFileSync(journal, 'utf8');
     framework = await AgentFramework.create(config({ discord: false }));
+    const before = JSON.stringify(journal(framework).operations());
     await framework.syncDiscordAwarenessMarkers();
-    assert.equal(readFileSync(journal, 'utf8'), before, 'nothing recorded for a route that is down');
+    assert.equal(JSON.stringify(journal(framework).operations()), before, 'nothing recorded for a route that is down');
     await framework.stop();
     framework = undefined;
 
     writeFileSync(paths.hold, '1');
     framework = await AgentFramework.create(config());
     await waitFor('the queued add confirmed', () => {
-      const outbox = new DiscordAwarenessOutbox(journal);
+      const outbox = journal(framework!);
       return outbox.operations().every((op) => outbox.operationStatus(op) === 'confirmed');
     });
     assert.deepEqual(jsonl(paths.calls).map((call) => call.name), ['add_reaction']);
@@ -159,13 +161,14 @@ test('a route that is not connected leaves marks queued; they go out once it is'
 });
 
 test('a corrupt journal stops startup, since it may hold a suppression the body needs resumed', async () => {
-  const { dir, journal, config } = setup();
+  const { dir, storePath, config } = setup();
   try {
-    mkdirSync(join(journal, '..'), { recursive: true });
-    writeFileSync(journal, '{"t":"batch",\nnot json at all\n{"t":"commit","at":1,"txn":"x"}\n');
+    const store = JsStore.openOrCreate({ path: storePath });
+    store.appendJson(DISCORD_AWARENESS_RECORD_TYPE, { records: 'not a record group' });
+    store.close();
     await assert.rejects(
       AgentFramework.create(config({ discord: false })),
-      /Discord awareness accounting failed during startup reconciliation: Corrupt Discord awareness journal/,
+      /Discord awareness accounting failed during startup reconciliation: Corrupt Discord awareness journal entry/,
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -188,7 +191,7 @@ test('a branch switch neither adds nor removes marks', async () => {
     });
     const result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'addressed' } });
     await waitFor('the add confirmed', () =>
-      new DiscordAwarenessOutbox(journal).operations().some((op) => op.attempts[0]?.outcome === 'confirmed'));
+      journal(framework!).operations().some((op) => op.attempts[0]?.outcome === 'confirmed'));
     // Switch back to the source and forward again: nothing is sent.
     await cm.switchBranch(result.sourceBranch);
     await framework.syncDiscordAwarenessMarkers();
@@ -198,7 +201,7 @@ test('a branch switch neither adds nor removes marks', async () => {
     framework = await AgentFramework.create(config());
     await framework.syncDiscordAwarenessMarkers();
     assert.deepEqual(jsonl(paths.calls).map((call) => call.name), ['add_reaction']);
-    assert.equal(new DiscordAwarenessOutbox(journal).operations().length, 1);
+    assert.equal(journal(framework).operations().length, 1);
   } finally {
     writeFileSync(paths.hold, '1');
     await framework?.stop();

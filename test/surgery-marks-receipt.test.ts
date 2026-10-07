@@ -70,7 +70,8 @@ describe('surgery and awareness marks', () => {
   let framework: AgentFramework;
 
   const cm = () => framework.getAgent('resident')!.getContextManager();
-  const outbox = () => new DiscordAwarenessOutbox(join(storePath, 'recovery', 'discord-awareness-journal.jsonl'));
+  /** The running framework's own journal instance (the journal's one writer). */
+  const outbox = () => (framework as unknown as { discordAwarenessOutbox: DiscordAwarenessOutbox }).discordAwarenessOutbox;
   const answered = () => jsonl(eventsPath).filter((e) => e.event === 'reaction-answered').length;
   const calls = () => jsonl<{ name: string; args: { messageId: string; emoji: string } }>(callsPath);
 
@@ -347,8 +348,7 @@ describe('surgery and awareness marks', () => {
     assert.ok(kinds.includes('awareness-cancel') && kinds.includes('awareness-retract'));
   });
 
-  it('marks chosen where no awareness journal exists are reported as not scheduled, not as unwanted', async () => {
-    // A caller-supplied store and no storePath: no default journal location.
+  it('a caller-supplied store keeps its awareness journal in the store too', async () => {
     framework = await AgentFramework.create({
       store: JsStore.openOrCreate({ path: storePath }),
       membrane: new MockMembrane().asMembrane(),
@@ -359,12 +359,109 @@ describe('surgery and awareness marks', () => {
     });
     const { tail } = seed(2, [0]);
     const result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'addressed' } });
-    assert.equal(result.messagesRemoved, 2);
-    assert.equal(result.markers.status, 'not-scheduled');
-    assert.match(result.markers.status === 'not-scheduled' ? result.markers.error : '', /no awareness journal/);
+    assert.equal(result.markers.status, 'queued');
+    assert.equal(result.markers.queued, 1);
     assert.equal(result.markers.unmarked, 1);
-    const local = await framework.rollbackToMessage('resident', { messageId: String(cm().getAllMessages()[0].id) });
-    assert.equal(local.markers.status, 'none', 'nothing chosen is still none');
+  });
+
+  it('cancel during delivery stops the marks not yet sent: exactly one request reaches the server', async () => {
+    await start(true);
+    const { tail } = seed(3);
+    const result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } });
+    const batchId = result.markers.status === 'queued' ? result.markers.batchId : '';
+    await waitFor('the first add on the wire', () => calls().length === 1);
+    const receipt = framework.cancelDiscordAwareness(batchId);
+    assert.deepEqual({ cancelled: receipt.cancelled, inFlight: receipt.inFlight }, { cancelled: 2, inFlight: 1 });
+    writeFileSync(holdPath, '1');
+    await waitFor('the held add answered and recorded', () =>
+      outbox().operations().some((op) => op.attempts[0]?.outcome === 'confirmed'));
+    await framework.syncDiscordAwarenessMarkers();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(calls().length, 1, 'the cancelled marks were never sent');
+  });
+
+  it('a failed rollback keeps its batch when the source cannot be confirmed, and says so', async () => {
+    await start(false);
+    const { tail } = seed(2);
+    const live = cm();
+    const realSwitch = live.switchBranch.bind(live);
+    // The switch lands, then fails; the restore does nothing: the store is
+    // left on the fork, so the batch is the unfinished change's record.
+    live.switchBranch = async (name: string) => { await realSwitch(name); throw new Error('injected switch failure'); };
+    const realRestore = (framework as any).restoreSourceBranch;
+    (framework as any).restoreSourceBranch = async () => 'source not restored (injected)';
+    try {
+      await assert.rejects(
+        framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } }),
+        /awareness batch .* kept, since the source branch could not be confirmed/,
+      );
+    } finally {
+      live.switchBranch = realSwitch;
+      (framework as any).restoreSourceBranch = realRestore;
+    }
+    const [batch] = outbox().batches();
+    assert.equal(batch.status, 'prepared', 'not retired while the store sits on the fork');
+  });
+
+  it('a failed suppression retires its batch only after the source is back, and reports a failed retire', async () => {
+    await start(false);
+    const { removed } = seed(3);
+    const live = cm();
+    const realFork = live.fork.bind(live);
+    live.fork = async () => { throw new Error('injected fork failure'); };
+    const discard = DiscordAwarenessOutbox.prototype.discard;
+    DiscordAwarenessOutbox.prototype.discard = function () { throw new Error('injected retire failure'); };
+    try {
+      await assert.rejects(
+        framework.suppressMessages('resident', { messageIds: [removed[0]], marks: { scope: 'all' } }),
+        /could not be retired \(injected retire failure\)/,
+      );
+    } finally {
+      live.fork = realFork;
+      DiscordAwarenessOutbox.prototype.discard = discard;
+    }
+    assert.equal(outbox().batches()[0].status, 'prepared');
+    // With retirement working, the same failure retires it (source confirmed).
+    live.fork = async () => { throw new Error('injected fork failure'); };
+    try {
+      await assert.rejects(framework.suppressMessages('resident', { messageIds: [removed[1]], marks: { scope: 'all' } }));
+    } finally {
+      live.fork = realFork;
+    }
+    assert.equal(outbox().batches().at(-1)!.status, 'discarded');
+  });
+
+  it('an interrupted suppression: held at startup, its marks released, then its body resumed on its branch', async () => {
+    await start(false);
+    const { removed } = seed(3);
+    const live = cm();
+    const sourceBranch = live.currentBranch().name;
+    // An interrupted suppression: the fork exists, nothing was redacted yet.
+    await live.fork('partial');
+    const [target] = live.getAllMessages().filter((m) => String(m.id) === removed[1]);
+    const batch = outbox().prepare({
+      agentName: 'resident', sourceBranch, targetBranch: 'partial',
+      refs: [{ serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'amb-1' }], scope: 'all',
+      activationPolicy: 'explicit', suppressionIntervals: [{ fromId: String(target.id), toId: String(target.id) }],
+    })!;
+    await live.switchBranch(sourceBranch);
+    await framework.stop();
+
+    await start(false); // on the source branch: the batch is held
+    assert.equal(outbox().batches()[0].status, 'held');
+    const released = framework.releaseDiscordAwareness(batch.id);
+    assert.equal(released.addsQueued, 1);
+    await framework.stop();
+
+    const store = JsStore.openOrCreate({ path: storePath });
+    store.switchBranch('partial');
+    store.close();
+    await start(false); // on the target: the body is completed, the marks untouched
+    assert.ok(!cm().getAllMessages().some((m) => String(m.id) === removed[1]), 'the saved redaction landed');
+    const [after] = outbox().batches();
+    assert.equal(after.suppressionComplete, true);
+    assert.equal(after.status, 'active');
+    assert.equal(outbox().operations().filter((op) => op.action === 'add').length, 1, 'only the release queued marks');
   });
 
   it('a surgery that removes nothing addressable schedules no marks even when marks are chosen', async () => {

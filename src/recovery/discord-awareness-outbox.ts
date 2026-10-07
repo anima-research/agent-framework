@@ -1,16 +1,8 @@
-import {
-  closeSync,
-  existsSync,
-  fsyncSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  renameSync,
-  truncateSync,
-  writeSync,
-} from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { existsSync, readFileSync, renameSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import type { JsStore } from '@animalabs/chronicle';
+import { RecordJournal, type AppendOptions } from '../record-journal.js';
 
 /**
  * Discord awareness marks: a reaction (💤 by default) that an operator may
@@ -34,16 +26,22 @@ import { createHash, randomUUID } from 'node:crypto';
  * server id is the configured route to a bot, not the bot's identity: if the
  * route is re-pointed at another bot, retained operations act as that bot,
  * and nothing here can detect it.
+ *
+ * The journal lives in the Chronicle store as typed records (RecordJournal):
+ * it survives branch switches, rollbacks, `deleteBranch` and a killed
+ * process, and lives and dies with its store. Each append is one record
+ * holding a group of journal records that apply together. A record that
+ * asserts a branch change (an activation after a switch or redaction) is
+ * appended only after that state is synced, so it can never outlive it.
  */
 
 export const DEFAULT_DISCORD_AWARENESS_EMOJI = '💤';
 
-/** The journal file under a store, next to the other recovery state. */
 /**
  * Bound text that came from elsewhere (a Discord error body, a filesystem
  * error) before it is journaled, logged or returned in a receipt: the journal
- * is re-read on every operation, and a server's error text has no length
- * limit of its own. Head and tail are kept, with the omitted length stated;
+ * is kept for the store's life, and a server's error text has no length limit
+ * of its own. Head and tail are kept, with the omitted length stated;
  * a cut never splits a surrogate pair.
  */
 export function boundDiscordAwarenessText(text: string, max = 500): string {
@@ -56,8 +54,24 @@ export function boundDiscordAwarenessText(text: string, max = 500): string {
   return `${head} … [${text.length - head.length - tail.length} chars omitted] … ${tail}`;
 }
 
+/**
+ * Where a pre-journal awareness ledger (the JSON file earlier releases kept
+ * under a store) is found, to import once.
+ */
+/**
+ * A Discord answer that the reaction can never succeed: the message or
+ * channel is gone or inaccessible. Retrying cannot help.
+ */
+export function isPermanentDiscordReactionFailure(message: string): boolean {
+  return /unknown message|unknown channel|missing access|missing permissions|missing permission|cannot access|channel .* not found|message .* not found/i
+    .test(message);
+}
+
+/** AF's own refusal to write a request on a closed connection. */
+const PRE_WRITE_REFUSAL = /^Cannot send request:/;
+
 export function defaultDiscordAwarenessOutboxPath(storePath: string): string {
-  return join(storePath, 'recovery', 'discord-awareness-journal.jsonl');
+  return join(storePath, 'recovery', LEGACY_LEDGER_NAME);
 }
 
 /** The pre-journal (version 1 and 2) ledger file name, imported once. */
@@ -129,7 +143,8 @@ export type DiscordAwarenessBatchStatus = 'prepared' | 'active' | 'held' | 'disc
 
 export interface DiscordAwarenessBatch extends DiscordAwarenessBatchRecord {
   status: DiscordAwarenessBatchStatus;
-  /** A held suppression whose body was completed at a later startup. */
+  /** A suppression whose body is recorded complete (by its activation, or by
+   *  a later startup's resume). */
   suppressionComplete?: boolean;
   held?: { reason: string; at: number; releaseActions: DiscordAwarenessReleaseAction[] };
   cancelled?: { at: number; by?: string };
@@ -172,7 +187,7 @@ export interface DiscordAwarenessOp {
   cause: DiscordAwarenessOpCause;
   requestedAt: number;
   attempts: DiscordAwarenessAttempt[];
-  cancelled?: { at: number; reason: 'batch-cancelled' | 'superseded' };
+  cancelled?: { at: number; reason: 'batch-cancelled' | 'request-cancelled' | 'superseded' | 'imported' };
 }
 
 /** One dispatch: the head operation for a reaction key, plus any consecutive
@@ -185,7 +200,9 @@ export interface DiscordAwarenessDispatch {
 
 /** Receipt for cancel(). Nothing is ever removed from Discord by a cancel. */
 export interface DiscordAwarenessCancelReceipt {
-  batchId: string;
+  /** The batch id or retract request id that was cancelled. */
+  target: string;
+  kind: 'batch' | 'retract';
   /** Requests that will now never be sent (for a batch not yet activated,
    *  every mark it would have requested). */
   cancelled: number;
@@ -197,12 +214,19 @@ export interface DiscordAwarenessCancelReceipt {
   unknown: number;
   /** Operations Discord already confirmed (cancel does not undo them). */
   confirmed: number;
+  /** Requests of this batch or retract whose outcome is unresolved (on the
+   *  wire or unknown), counted per request sent and including earlier
+   *  attempts of operations whose last attempt was answered: any may land. */
+  unresolvedAttempts: number;
+  /** Imported (pre-journal) attempts on this batch whose outcome the old
+   *  ledger does not establish: any may have landed. */
+  legacyOutcomesUnrecorded: number;
 }
 
 /** Receipt for retract(). */
 export interface DiscordAwarenessRetractReceipt {
   requestId: string;
-  /** Removals queued (one per reaction key). */
+  /** Removals queued: one per selected reaction key, whatever history says. */
   removalsQueued: number;
   /** Add requests for those keys that had not been sent, now superseded. */
   addsSuperseded: number;
@@ -212,6 +236,32 @@ export interface DiscordAwarenessRetractReceipt {
   /** Unresolved earlier add requests on those keys (one per request sent,
    *  however many batches' operations it carried). */
   unresolvedAddAttempts: number;
+  /** Keys whose imported (pre-journal) history leaves attempt outcomes
+   *  unrecorded: any of those may have had an effect. */
+  keysWithLegacyUncertainty: number;
+}
+
+/**
+ * What a pre-journal ledger recorded about one batch ref, kept as facts. It
+ * is evidence for operators and receipts, never a claim about what is on
+ * Discord now, and it never causes a dispatch.
+ */
+export interface DiscordAwarenessLegacyEvidence {
+  batchId: string;
+  key: DiscordAwarenessRef & { emoji: string };
+  /** Attempts the old ledger counted (it kept only the last one's details). */
+  attempts: number;
+  lastAction: DiscordAwarenessAction;
+  /** The old ledger's status after the last attempt. */
+  lastStatus: 'pending' | 'applied' | 'permanent-failure';
+  lastError?: string;
+  /** What the last error was: AF's refusal before writing a request, a
+   *  Discord answer (message/channel gone or inaccessible), or anything else. */
+  lastErrorKind?: 'pre-write-refusal' | 'discord-answer' | 'other';
+  /** Recorded attempts whose outcome the old ledger does not establish:
+   *  every attempt before the last, and the last unless it was applied,
+   *  refused before writing, or answered by Discord. */
+  outcomesUnrecorded: number;
 }
 
 export interface DiscordAwarenessReleaseReceipt {
@@ -222,6 +272,7 @@ export interface DiscordAwarenessReleaseReceipt {
 
 /** Per-batch view for operators: what was asked and what is known. */
 export interface DiscordAwarenessBatchView {
+  kind: 'batch';
   id: string;
   status: DiscordAwarenessBatchStatus;
   scope: DiscordAwarenessBatchRecord['scope'];
@@ -240,9 +291,36 @@ export interface DiscordAwarenessBatchView {
   adds: Record<DiscordAwarenessOpStatus, number>;
   /** Removals requested (by any retract) on this batch's refs, by status. */
   removals: Record<DiscordAwarenessOpStatus, number>;
-  /** Attempts on this batch's refs whose outcome is unknown or on the wire. */
+  /** Requests on this batch's refs whose outcome is unknown or on the wire. */
+  unresolvedAttempts: number;
+  /** What a pre-journal ledger recorded about this batch's refs, if imported. */
+  legacy?: {
+    entries: number;
+    /** Refs whose last recorded action was an add the old ledger saw applied. */
+    lastAddConfirmed: number;
+    /** Refs whose last recorded action was a removal it saw applied. */
+    lastRemoveConfirmed: number;
+    /** Recorded attempts whose outcome the old ledger does not establish. */
+    outcomesUnrecorded: number;
+  };
+}
+
+/** One retract request: the removals it queued and what became of them. */
+export interface DiscordAwarenessRetractView {
+  kind: 'retract';
+  /** The retract's request id (what cancel takes). */
+  id: string;
+  /** The batch it retracted, or `all`. */
+  target: string;
+  at: number;
+  by?: string;
+  cancelled?: { at: number; by?: string };
+  removals: Record<DiscordAwarenessOpStatus, number>;
+  /** Removal requests whose outcome is unknown or on the wire. */
   unresolvedAttempts: number;
 }
+
+export type DiscordAwarenessView = DiscordAwarenessBatchView | DiscordAwarenessRetractView;
 
 /** Extract Discord addressing metadata without reading message content. */
 export interface DiscordMessageMetadataCarrier {
@@ -334,7 +412,7 @@ type JournalRecord =
       action: DiscordAwarenessAction;
       cause: DiscordAwarenessOpCause;
     }
-  | { t: 'op-cancelled'; at: number; opId: string; reason: 'batch-cancelled' | 'superseded' }
+  | { t: 'op-cancelled'; at: number; opId: string; reason: 'batch-cancelled' | 'request-cancelled' | 'superseded' | 'imported' }
   | { t: 'dispatching'; at: number; opId: string; attempt: number; dispatchId?: string }
   | {
       t: 'outcome';
@@ -346,49 +424,72 @@ type JournalRecord =
       error?: string;
     }
   | { t: 'retract'; at: number; requestId: string; target: string; by?: string }
+  | { t: 'request-cancelled'; at: number; requestId: string; by?: string }
   | { t: 'suppression-complete'; at: number; batchId: string }
-  | { t: 'import-complete'; at: number; source: 'v2'; sha256: string }
-  | { t: 'commit'; at: number; txn: string };
+  | { t: 'legacy-evidence'; at: number; evidence: DiscordAwarenessLegacyEvidence }
+  | { t: 'import-complete'; at: number; source: 'v2'; sha256: string };
 
-/**
- * Every multi-record append is one transaction: its records carry a `txn`
- * id and only take effect when the closing `commit` record is present. A
- * torn append (disk full, crash mid-write) therefore applies none of its
- * records, never a prefix, so an activation can't half-queue its marks and a
- * retract can't supersede adds without queuing its removals.
- */
-type StoredRecord = JournalRecord & { txn?: string };
+/** One journal entry (one Chronicle record): records that apply together. */
+interface JournalEntryGroup {
+  records: JournalRecord[];
+}
+
+/** The reduced state as a checkpoint stores it. */
+interface JournalSnapshot {
+  batches: DiscordAwarenessBatch[];
+  ops: DiscordAwarenessOp[];
+  legacy: DiscordAwarenessLegacyEvidence[];
+  retracts?: RetractRequest[];
+  importedSources: string[];
+}
+
+export const DISCORD_AWARENESS_RECORD_TYPE = 'af:discord-awareness';
+/** Replay at open is bounded by a checkpoint every this many entries. */
+const CHECKPOINT_EVERY = 256;
 
 interface JournalState {
   batches: Map<string, DiscordAwarenessBatch>;
   /** Operations in request order. */
   ops: Map<string, DiscordAwarenessOp>;
+  /** Imported pre-journal evidence, by reaction key. */
+  legacy: Map<string, DiscordAwarenessLegacyEvidence[]>;
+  /** Retract requests, by request id. */
+  retracts: Map<string, RetractRequest>;
   importedSources: Set<string>;
 }
 
+interface RetractRequest {
+  requestId: string;
+  target: string;
+  at: number;
+  by?: string;
+  cancelled?: { at: number; by?: string };
+}
+
 /**
- * The durable awareness-mark ledger: an append-only journal (one JSON record
- * per line, each append fsynced) and the operations derived from it.
+ * The durable awareness-mark ledger: an append-only journal of typed records
+ * in the store, and the operations reduced from it. One instance per store is
+ * the journal's only writer (RecordJournal's single-writer rule): the running
+ * framework, or the offline CLI while the host is stopped.
  */
 export class DiscordAwarenessOutbox {
-  readonly path: string;
-  private readonly legacyPath: string;
+  private readonly journal: RecordJournal<JournalEntryGroup, JournalSnapshot>;
+  private readonly legacyPath?: string;
+  private readonly checkpointEvery: number;
+  /** Reduced state; rebuilt from the journal when null. */
+  private state: JournalState | null = null;
   /** Operations dispatched by this process and still awaiting an outcome. */
   private readonly inFlight = new Set<string>();
 
   /**
-   * @param path the journal file. A path ending in `.json` names a pre-journal
-   * ledger (as an older `discordAwarenessOutboxPath` would): the journal then
-   * lives beside it as `<name>.journal.jsonl` and the file itself is imported.
+   * @param store the Chronicle store the journal lives in.
+   * @param opts.legacyPath a pre-journal JSON ledger to import once, if present.
+   * @param opts.checkpointEvery entries between checkpoints (default 256).
    */
-  constructor(path: string) {
-    if (path.endsWith('.json')) {
-      this.legacyPath = path;
-      this.path = `${path.slice(0, -'.json'.length)}.journal.jsonl`;
-    } else {
-      this.path = path;
-      this.legacyPath = join(dirname(path), LEGACY_LEDGER_NAME);
-    }
+  constructor(store: JsStore, opts: { legacyPath?: string; checkpointEvery?: number } = {}) {
+    this.journal = new RecordJournal(store, { type: DISCORD_AWARENESS_RECORD_TYPE });
+    if (opts.legacyPath) this.legacyPath = opts.legacyPath;
+    this.checkpointEvery = Math.max(1, Math.floor(opts.checkpointEvery ?? CHECKPOINT_EVERY));
   }
 
   // -- surgery side -----------------------------------------------------------
@@ -428,7 +529,8 @@ export class DiscordAwarenessOutbox {
         ? { suppressionIntervals: input.suppressionIntervals.map((interval) => ({ ...interval })) }
         : {}),
     };
-    this.append([{ t: 'batch', at: batch.createdAt, batch }]);
+    // Durable before the surgery's switch, so startup can crash-complete it.
+    this.append([{ t: 'batch', at: batch.createdAt, batch }], { durable: true });
     return { ...structuredClone(batch), status: 'prepared' };
   }
 
@@ -454,8 +556,43 @@ export class DiscordAwarenessOutbox {
       kind: 'batch',
       batchId,
     }, at));
-    this.append(records);
+    // The activation asserts the body change just committed (the switch, or
+    // the last redaction): sync that first, so a crash can never leave marks
+    // active for a change the store lost.
+    this.append(records, { afterCommittedState: true, durable: true });
     return batch.refs.length;
+  }
+
+  /**
+   * Activate a batch after its body change landed, and if that cannot be
+   * recorded, retire it instead, so that what the caller reports is what
+   * the journal will do:
+   * - `queued`: the batch is active (including when the activation landed
+   *   but its durability barrier failed: startup would crash-complete it);
+   * - `not-scheduled`: it was retired; none of its marks will be sent;
+   * - `unresolved`: neither could be recorded; a later startup that can read
+   *   the batch may activate it.
+   * Never throws.
+   */
+  settleActivation(batchId: string):
+    | { status: 'queued'; queued: number }
+    | { status: 'not-scheduled'; error: string }
+    | { status: 'unresolved'; error: string } {
+    let detail: string;
+    try {
+      this.activate(batchId);
+      return { status: 'queued', queued: this.load().batches.get(batchId)?.refs.length ?? 0 };
+    } catch (error) {
+      detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
+    }
+    try {
+      const current = this.load().batches.get(batchId);
+      if (current?.status === 'active') return { status: 'queued', queued: current.refs.length };
+      if (this.discard(batchId)) return { status: 'not-scheduled', error: detail };
+    } catch (error) {
+      detail += `; retiring it also failed: ${boundDiscordAwarenessText(error instanceof Error ? error.message : String(error))}`;
+    }
+    return { status: 'unresolved', error: detail };
   }
 
   /**
@@ -465,20 +602,26 @@ export class DiscordAwarenessOutbox {
   discard(batchId: string): boolean {
     const batch = this.load().batches.get(batchId);
     if (!batch || batch.status !== 'prepared') return false;
-    this.append([{ t: 'discarded', at: Date.now(), batchId }]);
+    // Retiring a batch retires its obligations (marks and any body resume):
+    // the branch state its surgery left (a restored source, or a completed
+    // body) is synced first, and the record is durable, so a crash can never
+    // keep the retirement while losing the state it relies on.
+    this.append([{ t: 'discarded', at: Date.now(), batchId }], { afterCommittedState: true, durable: true });
     return true;
   }
 
   /**
    * Suppressions whose body may still need resuming on the active branch:
-   * explicit batches with intervals whose target is exactly that branch,
-   * prepared (crash completion: resume, then activate) or held at an earlier
-   * startup (resume the body only; marks stay held). Branch ancestry is never
-   * consulted.
+   * explicit batches with intervals whose target is exactly that branch and
+   * whose body was never recorded complete. Body recovery is independent of
+   * the marks: a prepared batch is crash-completed (resume, then activate);
+   * any other, held, released or cancelled, has only its body resumed.
+   * A batch its own surgery retired (discarded) is not resumed. Branch
+   * ancestry is never consulted.
    */
   preparedSuppressionsForBranch(branchName: string): DiscordAwarenessBatch[] {
     return [...this.load().batches.values()]
-      .filter((batch) => (batch.status === 'prepared' || batch.status === 'held')
+      .filter((batch) => batch.status !== 'discarded'
         && !batch.suppressionComplete
         && batch.activationPolicy === 'explicit'
         && !!batch.suppressionIntervals?.length
@@ -486,9 +629,11 @@ export class DiscordAwarenessOutbox {
       .map((batch) => structuredClone(batch));
   }
 
-  /** Record that a held suppression's body was completed (its marks stay held). */
+  /** Record that a suppression's body was completed by a resume that did not
+   *  activate its marks (they were held, released or cancelled). */
   recordSuppressionComplete(batchId: string): void {
-    this.append([{ t: 'suppression-complete', at: Date.now(), batchId }]);
+    // Certifies the redactions just made: only after they are synced.
+    this.append([{ t: 'suppression-complete', at: Date.now(), batchId }], { afterCommittedState: true, durable: true });
   }
 
   /**
@@ -552,7 +697,7 @@ export class DiscordAwarenessOutbox {
         held.push(batch.id);
       }
     }
-    if (records.length > 0) this.append(records);
+    if (records.length > 0) this.append(records, { durable: true });
     return { activated, held, unknownAttempts };
   }
 
@@ -565,12 +710,15 @@ export class DiscordAwarenessOutbox {
    * dropped. Nothing is ever removed from Discord by a cancel: the receipt
    * reports what may already have landed, and retract removes it.
    */
-  cancel(batchId: string, by?: string): DiscordAwarenessCancelReceipt {
+  cancel(target: string, by?: string): DiscordAwarenessCancelReceipt {
     const state = this.load();
+    if (state.retracts.has(target)) return this.cancelRetract(state, target, by);
+    const batchId = target;
     const batch = state.batches.get(batchId);
-    if (!batch) throw new Error(`Discord awareness batch not found: ${batchId}`);
+    if (!batch) throw new Error(`Discord awareness batch or retract request not found: ${target}`);
     const receipt: DiscordAwarenessCancelReceipt = {
-      batchId,
+      target: batchId,
+      kind: 'batch',
       // A prepared batch (its surgery still running, or its bookkeeping
       // unresolved) has no requests yet: every one of its marks is stopped.
       cancelled: batch.status === 'prepared' && !batch.cancelled ? batch.refs.length : 0,
@@ -578,6 +726,13 @@ export class DiscordAwarenessOutbox {
       inFlight: 0,
       unknown: 0,
       confirmed: 0,
+      unresolvedAttempts: unresolvedDispatches(
+        [...state.ops.values()].filter((op) => op.cause.batchId === batchId && op.action === 'add'),
+        (op, attempt) => this.attemptUnresolved(op, attempt),
+      ),
+      legacyOutcomesUnrecorded: [...state.legacy.values()].flat()
+        .filter((evidence) => evidence.batchId === batchId)
+        .reduce((sum, evidence) => sum + evidence.outcomesUnrecorded, 0),
     };
     if (batch.cancelled) return receipt;
     const at = Date.now();
@@ -595,27 +750,67 @@ export class DiscordAwarenessOutbox {
       else continue; // failed or already cancelled
       records.push({ t: 'op-cancelled', at, opId: op.opId, reason: 'batch-cancelled' });
     }
-    this.append(records);
+    this.append(records, { durable: true });
+    return receipt;
+  }
+
+  /** Stop a retract's removals that are still due; nothing sent is undone. */
+  private cancelRetract(state: JournalState, requestId: string, by?: string): DiscordAwarenessCancelReceipt {
+    const retract = state.retracts.get(requestId)!;
+    const ops = [...state.ops.values()].filter((op) => op.cause.requestId === requestId);
+    const receipt: DiscordAwarenessCancelReceipt = {
+      target: requestId,
+      kind: 'retract',
+      cancelled: 0,
+      heldDropped: 0,
+      inFlight: 0,
+      unknown: 0,
+      confirmed: 0,
+      unresolvedAttempts: unresolvedDispatches(ops, (op, attempt) => this.attemptUnresolved(op, attempt)),
+      legacyOutcomesUnrecorded: 0,
+    };
+    if (retract.cancelled) return receipt;
+    const at = Date.now();
+    const records: JournalRecord[] = [{ t: 'request-cancelled', at, requestId, ...(by ? { by } : {}) }];
+    for (const op of ops) {
+      const status = this.opStatus(op);
+      if (status === 'confirmed') {
+        receipt.confirmed++;
+        continue;
+      }
+      if (status === 'requested') receipt.cancelled++;
+      else if (status === 'dispatching') receipt.inFlight++;
+      else if (status === 'unknown') receipt.unknown++;
+      else continue;
+      records.push({ t: 'op-cancelled', at, opId: op.opId, reason: 'request-cancelled' });
+    }
+    this.append(records, { durable: true });
     return receipt;
   }
 
   /**
    * Remove this bot's mark (through the configured route) from a batch's refs,
-   * or from every ref any batch ever sent an add for. Acts across batches: a
-   * reaction is one per (route, message, emoji), whichever batches asked for
-   * it. Keys where no add attempt ever left the host are skipped. Add
-   * requests not yet sent for those keys are superseded. The removal is
-   * always sent, whatever earlier outcomes say.
+   * or from every key any batch requested or an imported ledger recorded an
+   * add for (`all`). A reaction is one per (route, message, emoji), whichever
+   * batches asked for it, so this acts across batches. A removal is queued for
+   * every selected key, whatever history says: history can't establish what
+   * is on Discord now, and removing an absent reaction does nothing. Add
+   * requests not yet sent for those keys are superseded. The receipt reports
+   * history only: requests whose outcome is unresolved, and imported history
+   * that leaves outcomes unrecorded, any of which may land or have landed.
    */
   retract(target: string | 'all', by?: string): DiscordAwarenessRetractReceipt {
     const state = this.load();
     let candidateKeys: Array<DiscordAwarenessRef & { emoji: string }>;
     if (target === 'all') {
-      candidateKeys = uniqueKeys([...state.ops.values()].filter((op) => op.action === 'add').map((op) => op.key));
+      candidateKeys = uniqueKeys([
+        ...[...state.ops.values()].filter((op) => op.action === 'add').map((op) => op.key),
+        ...[...state.legacy.values()].flat().map((evidence) => evidence.key),
+      ]);
     } else {
       const batch = state.batches.get(target);
       if (!batch) throw new Error(`Discord awareness batch not found: ${target}`);
-      candidateKeys = batch.refs.map((ref) => ({ ...ref, emoji: batch.emoji }));
+      candidateKeys = uniqueKeys(batch.refs.map((ref) => ({ ...ref, emoji: batch.emoji })));
     }
     const requestId = randomUUID();
     const at = Date.now();
@@ -625,34 +820,27 @@ export class DiscordAwarenessOutbox {
       addsSuperseded: 0,
       keysWithUnresolvedAdds: 0,
       unresolvedAddAttempts: 0,
+      keysWithLegacyUncertainty: 0,
     };
-    const toRemove: Array<DiscordAwarenessRef & { emoji: string; action: DiscordAwarenessAction }> = [];
     const records: JournalRecord[] = [{ t: 'retract', at, requestId, target, ...(by ? { by } : {}) }];
+    const toRemove: Array<DiscordAwarenessRef & { emoji: string; action: DiscordAwarenessAction }> = [];
     for (const key of candidateKeys) {
       const adds = this.opsForKey(state, key).filter((op) => op.action === 'add');
-      const left = adds.some((op) => op.attempts.some((attempt) => attempt.outcome !== 'not-sent'));
-      if (!left) {
-        // Nothing was ever sent for this key: stop its unsent adds, and
-        // there is no reaction of ours to remove.
-        for (const op of adds) {
-          if (this.opStatus(op) !== 'requested') continue;
-          records.push({ t: 'op-cancelled', at, opId: op.opId, reason: 'superseded' });
-          receipt.addsSuperseded++;
-        }
-        continue;
-      }
       const unresolved = unresolvedDispatches(adds, (op, attempt) => this.attemptUnresolved(op, attempt));
       if (unresolved > 0) {
         receipt.keysWithUnresolvedAdds++;
         receipt.unresolvedAddAttempts += unresolved;
       }
+      if ((state.legacy.get(markKey(key)) ?? []).some((evidence) => evidence.outcomesUnrecorded > 0)) {
+        receipt.keysWithLegacyUncertainty++;
+      }
       toRemove.push({ ...key, action: 'remove' });
     }
     const requested = this.requestRecords(state, toRemove, undefined, { kind: 'retract', requestId }, at);
-    receipt.addsSuperseded += requested.filter((record) => record.t === 'op-cancelled').length;
+    receipt.addsSuperseded = requested.filter((record) => record.t === 'op-cancelled').length;
     receipt.removalsQueued = requested.filter((record) => record.t === 'requested').length;
     records.push(...requested);
-    this.append(records);
+    this.append(records, { durable: true });
     return receipt;
   }
 
@@ -671,7 +859,7 @@ export class DiscordAwarenessOutbox {
       kind: 'release',
       batchId,
     }, at));
-    this.append(records);
+    this.append(records, { durable: true });
     return {
       batchId,
       addsQueued: actions.filter((action) => action.action === 'add').length,
@@ -700,47 +888,79 @@ export class DiscordAwarenessOutbox {
     }
     const dispatches: Array<DiscordAwarenessDispatch & { order: number }> = [];
     for (const ops of byKey.values()) {
-      // One request per reaction key on the wire at a time, including a
-      // cancelled one still awaiting its outcome: opposite actions must not
-      // overtake each other.
-      if (ops.some((op) => op.attempts.at(-1)?.outcome === undefined && op.attempts.length > 0
-        && this.inFlight.has(op.opId))) continue;
-      const live = ops.filter((op) => !op.cancelled);
-      let head: DiscordAwarenessOp | undefined;
-      for (let index = 0; index < live.length; index++) {
-        const op = live[index];
-        const status = this.opStatus(op);
-        if (status === 'requested') { head = op; break; }
-        if (status === 'unknown' && index === live.length - 1) { head = op; break; }
-      }
-      if (!head) continue;
-      const opIds = [head.opId];
-      const start = live.indexOf(head);
-      for (let index = start + 1; index < live.length; index++) {
-        const next = live[index];
-        if (next.action !== head.action || this.opStatus(next) !== 'requested') break;
-        opIds.push(next.opId);
-      }
-      dispatches.push({ key: head.key, action: head.action, opIds, order: head.requestedAt });
+      const head = this.headDispatch(ops);
+      if (head) dispatches.push(head);
     }
     return dispatches
       .sort((a, b) => a.order - b.order)
       .map(({ order: _order, ...dispatch }) => dispatch);
   }
 
-  /** Write-ahead: record that a dispatch is about to leave the host. */
+  /**
+   * Choose a server's next due dispatch and write it ahead, in one step:
+   * eligibility is computed from the journal as it is now, so a cancel or
+   * retract made while an earlier request was on the wire is never
+   * overridden by an older list. `skip` excludes dispatches already tried
+   * in this pass. Returns null when nothing is due.
+   */
+  claimDispatch(
+    serverId: string,
+    skip: (dispatch: DiscordAwarenessDispatch) => boolean = () => false,
+  ): { dispatch: DiscordAwarenessDispatch; attempts: Array<{ opId: string; attempt: number }> } | null {
+    for (const dispatch of this.pendingDispatches(serverId)) {
+      if (skip(dispatch)) continue;
+      const attempts = this.recordDispatching(dispatch);
+      if (attempts.length > 0) return { dispatch, attempts };
+    }
+    return null;
+  }
+
+  /**
+   * Write-ahead: record that a dispatch is about to leave the host. A
+   * dispatch computed earlier is narrowed to the operations still due for its
+   * key now; when none remain, nothing is written and no attempts are
+   * returned (do not send).
+   */
   recordDispatching(dispatch: DiscordAwarenessDispatch): Array<{ opId: string; attempt: number }> {
     const state = this.load();
+    const current = this.headDispatch(this.opsForKey(state, dispatch.key));
+    if (!current || current.action !== dispatch.action) return [];
+    const opIds = dispatch.opIds.filter((opId) => current.opIds.includes(opId));
+    if (opIds.length === 0) return [];
     const at = Date.now();
     const dispatchId = randomUUID();
-    const attempts = dispatch.opIds.map((opId) => {
-      const op = state.ops.get(opId);
-      if (!op) throw new Error(`Discord awareness operation not found: ${opId}`);
-      return { opId, attempt: op.attempts.length + 1 };
-    });
-    this.append(attempts.map(({ opId, attempt }) => ({ t: 'dispatching' as const, at, opId, attempt, dispatchId })));
+    const attempts = opIds.map((opId) => ({ opId, attempt: state.ops.get(opId)!.attempts.length + 1 }));
+    this.append(
+      attempts.map(({ opId, attempt }) => ({ t: 'dispatching' as const, at, opId, attempt, dispatchId })),
+      { durable: true },
+    );
     for (const { opId } of attempts) this.inFlight.add(opId);
     return attempts;
+  }
+
+  /** The due dispatch for one key's operations (in request order), if any. */
+  private headDispatch(ops: DiscordAwarenessOp[]): (DiscordAwarenessDispatch & { order: number }) | null {
+    // One request per reaction key on the wire at a time, including a
+    // cancelled one still awaiting its outcome: opposite actions must not
+    // overtake each other.
+    if (ops.some((op) => op.attempts.length > 0 && op.attempts.at(-1)!.outcome === undefined
+      && this.inFlight.has(op.opId))) return null;
+    const live = ops.filter((op) => !op.cancelled);
+    let head: DiscordAwarenessOp | undefined;
+    for (let index = 0; index < live.length; index++) {
+      const op = live[index];
+      const status = this.opStatus(op);
+      if (status === 'requested') { head = op; break; }
+      if (status === 'unknown' && index === live.length - 1) { head = op; break; }
+    }
+    if (!head) return null;
+    const opIds = [head.opId];
+    for (let index = live.indexOf(head) + 1; index < live.length; index++) {
+      const next = live[index];
+      if (next.action !== head.action || this.opStatus(next) !== 'requested') break;
+      opIds.push(next.opId);
+    }
+    return { key: { ...head.key }, action: head.action, opIds, order: head.requestedAt };
   }
 
   /** Record the outcome of a dispatch's attempts. */
@@ -782,9 +1002,9 @@ export class DiscordAwarenessOutbox {
     return this.opStatus(op);
   }
 
-  view(): DiscordAwarenessBatchView[] {
+  view(): DiscordAwarenessView[] {
     const state = this.load();
-    const views: DiscordAwarenessBatchView[] = [];
+    const views: DiscordAwarenessView[] = [];
     for (const batch of state.batches.values()) {
       if (batch.status === 'discarded') continue;
       const keys = new Set(batch.refs.map((ref) => markKey({ ...ref, emoji: batch.emoji })));
@@ -798,7 +1018,9 @@ export class DiscordAwarenessOutbox {
         if (op.action === 'remove') removals[this.opStatus(op)]++;
       }
       const unresolvedAttempts = unresolvedDispatches(onKeys, (op, attempt) => this.attemptUnresolved(op, attempt));
+      const evidence = [...state.legacy.values()].flat().filter((entry) => entry.batchId === batch.id);
       views.push({
+        kind: 'batch',
         id: batch.id,
         status: batch.status,
         scope: batch.scope,
@@ -818,6 +1040,31 @@ export class DiscordAwarenessOutbox {
         adds,
         removals,
         unresolvedAttempts,
+        ...(evidence.length > 0
+          ? {
+              legacy: {
+                entries: evidence.length,
+                lastAddConfirmed: evidence.filter((entry) => entry.lastAction === 'add' && entry.lastStatus === 'applied').length,
+                lastRemoveConfirmed: evidence.filter((entry) => entry.lastAction === 'remove' && entry.lastStatus === 'applied').length,
+                outcomesUnrecorded: evidence.reduce((sum, entry) => sum + entry.outcomesUnrecorded, 0),
+              },
+            }
+          : {}),
+      });
+    }
+    for (const retract of state.retracts.values()) {
+      const ops = [...state.ops.values()].filter((op) => op.cause.requestId === retract.requestId);
+      const removals = emptyCounts();
+      for (const op of ops) removals[this.opStatus(op)]++;
+      views.push({
+        kind: 'retract',
+        id: retract.requestId,
+        target: retract.target,
+        at: retract.at,
+        ...(retract.by ? { by: retract.by } : {}),
+        ...(retract.cancelled ? { cancelled: retract.cancelled } : {}),
+        removals,
+        unresolvedAttempts: unresolvedDispatches(ops, (op, attempt) => this.attemptUnresolved(op, attempt)),
       });
     }
     return views;
@@ -853,10 +1100,11 @@ export class DiscordAwarenessOutbox {
   }
 
   /**
-   * Records for new requests. A request supersedes requests for the same
-   * key with the opposite action that were never sent (the newest explicit
-   * intent wins without churning the reaction); operations already sent are
-   * never touched.
+   * Records for new requests. A request supersedes the future of every
+   * request for the same key with the opposite action that is still due
+   * (never sent, refused before writing, or failed retryably): the newest
+   * explicit intent wins. Their attempts stay as history, and a request on
+   * the wire still settles before anything else for that key is sent.
    */
   private requestRecords(
     state: JournalState,
@@ -876,7 +1124,7 @@ export class DiscordAwarenessOutbox {
       };
       for (const op of this.opsForKey(state, key)) {
         if (op.action === request.action || superseded.has(op.opId)) continue;
-        if (this.opStatus(op) !== 'requested' || op.attempts.some((attempt) => attempt.outcome !== 'not-sent')) continue;
+        if (this.opStatus(op) !== 'requested') continue;
         records.push({ t: 'op-cancelled', at, opId: op.opId, reason: 'superseded' });
         superseded.add(op.opId);
       }
@@ -885,120 +1133,87 @@ export class DiscordAwarenessOutbox {
     return records;
   }
 
+  /**
+   * The reduced state, rebuilt from the journal when there is none yet or an
+   * earlier write left the journal unreconciled (RecordJournal then requires
+   * a reload before writing again). The first load also imports a
+   * pre-journal ledger, once.
+   */
   private load(): JournalState {
-    const { records } = this.readJournal();
-    const state = fold(records);
-    const legacy = this.pendingLegacyImport(state);
-    if (legacy?.records.length) return fold([...records, ...legacy.records]);
+    if (this.state && !this.journal.needsReconcile) return this.state;
+    const { snapshot, entries } = this.journal.load();
+    const state = snapshot ? restoreState(snapshot) : emptyState();
+    for (const { id, entry } of entries) {
+      if (!entry || !Array.isArray(entry.records)) {
+        throw new Error(`Corrupt Discord awareness journal entry ${id}`);
+      }
+      applyRecords(state, entry.records);
+    }
+    this.state = state;
+    this.importLegacyLedger(state);
     return state;
   }
 
-  /**
-   * The journal's records, and how to repair an unterminated final line
-   * before the next append: a torn fragment (never applied) is truncated
-   * away; a complete record that only lost its newline is terminated.
-   * Without the repair, the next append would share that line and turn a
-   * harmless torn tail into corruption.
-   */
-  private readJournal(): { records: StoredRecord[]; repair?: { truncateTo: number } | { terminate: true } } {
-    let raw: Buffer;
-    try {
-      raw = readFileSync(this.path);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { records: [] };
-      throw new Error(
-        `Could not read Discord awareness journal ${this.path}: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-    const terminated = raw.length === 0 || raw[raw.length - 1] === 0x0a;
-    const lastNewline = raw.lastIndexOf(0x0a);
-    const body = terminated ? raw : raw.subarray(0, lastNewline + 1);
-    const lines = body.toString('utf8').split('\n');
-    const records: StoredRecord[] = [];
-    for (let index = 0; index < lines.length; index++) {
-      const line = lines[index];
-      if (!line.trim()) continue;
-      try {
-        records.push(JSON.parse(line) as StoredRecord);
-      } catch {
-        throw new Error(`Corrupt Discord awareness journal ${this.path} at line ${index + 1}`);
-      }
-    }
-    if (terminated) return { records };
-    const tail = raw.subarray(lastNewline + 1).toString('utf8');
-    try {
-      records.push(JSON.parse(tail) as StoredRecord);
-      return { records, repair: { terminate: true } };
-    } catch {
-      // A torn append: none of it ever applied.
-      return { records, repair: { truncateTo: lastNewline + 1 } };
-    }
-  }
-
-  /**
-   * A pre-journal ledger beside the journal: null when there is none;
-   * otherwise its import records, empty when its hash is already imported
-   * (a crash between the import and the rename), so the file is only renamed.
-   */
-  private pendingLegacyImport(state: JournalState): { records: JournalRecord[]; sha256: string } | null {
+  /** Import a pre-journal ledger beside the store once (by hash), then rename it. */
+  private importLegacyLedger(state: JournalState): void {
+    if (!this.legacyPath) return;
     let raw: string;
     try {
       raw = readFileSync(this.legacyPath, 'utf8');
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
       throw new Error(
         `Could not read Discord awareness ledger ${this.legacyPath}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
     const sha256 = createHash('sha256').update(raw).digest('hex');
-    if (state.importedSources.has(sha256)) return { records: [], sha256 };
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      throw new Error(`Invalid Discord awareness ledger ${this.legacyPath}`);
+    if (!state.importedSources.has(sha256)) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        throw new Error(`Invalid Discord awareness ledger ${this.legacyPath}`);
+      }
+      this.append(importLegacy(parsed, this.legacyPath, sha256), { durable: true });
     }
-    return { records: importLegacy(parsed, this.legacyPath, sha256), sha256 };
-  }
-
-  private append(records: JournalRecord[]): void {
-    if (records.length === 0) return;
-    const journal = this.readJournal();
-    const state = fold(journal.records);
-    const legacy = this.pendingLegacyImport(state);
-    const all: StoredRecord[] = legacy ? [...legacy.records, ...records] : records;
-    let lines: StoredRecord[] = all;
-    if (all.length > 1) {
-      const txn = randomUUID();
-      lines = [
-        ...all.map((record) => ({ ...record, txn })),
-        { t: 'commit', at: Date.now(), txn },
-      ];
-    }
-    mkdirSync(dirname(this.path), { recursive: true });
-    if (journal.repair && 'truncateTo' in journal.repair) truncateSync(this.path, journal.repair.truncateTo);
-    const prefix = journal.repair && 'terminate' in journal.repair ? '\n' : '';
-    const fd = openSync(this.path, 'a', 0o600);
-    try {
-      writeSync(fd, prefix + lines.map((record) => JSON.stringify(record)).join('\n') + '\n');
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    if (legacy) this.retireLegacyFile();
-  }
-
-  private retireLegacyFile(): void {
+    // Imported (now or by an earlier process that stopped before renaming):
+    // the file is inert; move it out of the way.
     if (!existsSync(this.legacyPath)) return;
     try {
       renameSync(this.legacyPath, `${this.legacyPath}.migrated-v2`);
     } catch (error) {
-      // The import is already recorded (by hash), so the file is inert; the
-      // next write retries the rename.
       console.error(
         `[discord-awareness] imported ${basename(this.legacyPath)} but could not rename it: ` +
           `${error instanceof Error ? error.message : String(error)}`,
       );
+    }
+  }
+
+  /**
+   * Append one group of records as one journal entry and apply it. A failed
+   * append leaves the state to be rebuilt from the journal: whether it was
+   * written is unknown, and the next operation reloads before writing.
+   */
+  private append(records: JournalRecord[], opts: AppendOptions = {}): void {
+    if (records.length === 0) return;
+    const state = this.load();
+    try {
+      this.journal.append({ records }, opts);
+    } catch (error) {
+      this.state = null;
+      throw error;
+    }
+    applyRecords(state, records);
+    if (this.journal.entriesSinceCheckpoint >= this.checkpointEvery) {
+      try {
+        this.journal.checkpoint(snapshotState(state));
+      } catch (error) {
+        // Replay just stays longer; the journal reloads before its next write.
+        this.state = null;
+        console.error(
+          `[discord-awareness] checkpoint failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
   }
 }
@@ -1007,24 +1222,41 @@ export class DiscordAwarenessOutbox {
 // Fold and legacy import
 // ---------------------------------------------------------------------------
 
-function fold(stored: StoredRecord[]): JournalState {
-  const state: JournalState = { batches: new Map(), ops: new Map(), importedSources: new Set() };
-  // Records of a transaction apply, in order, at its commit; an uncommitted
-  // transaction (a torn or interrupted append) never applies.
-  const open = new Map<string, JournalRecord[]>();
-  const records: JournalRecord[] = [];
-  for (const record of stored) {
-    if (record.t === 'commit') {
-      records.push(...(open.get(record.txn) ?? []));
-      open.delete(record.txn);
-    } else if (record.txn) {
-      const buffered = open.get(record.txn);
-      if (buffered) buffered.push(record);
-      else open.set(record.txn, [record]);
-    } else {
-      records.push(record);
-    }
-  }
+function emptyState(): JournalState {
+  return { batches: new Map(), ops: new Map(), legacy: new Map(), retracts: new Map(), importedSources: new Set() };
+}
+
+function snapshotState(state: JournalState): JournalSnapshot {
+  return {
+    batches: [...state.batches.values()].map((batch) => structuredClone(batch)),
+    ops: [...state.ops.values()].map((op) => structuredClone(op)),
+    legacy: [...state.legacy.values()].flat().map((evidence) => structuredClone(evidence)),
+    retracts: [...state.retracts.values()].map((retract) => structuredClone(retract)),
+    importedSources: [...state.importedSources],
+  };
+}
+
+function restoreState(snapshot: JournalSnapshot): JournalState {
+  const state: JournalState = {
+    batches: new Map(snapshot.batches.map((batch) => [batch.id, structuredClone(batch)])),
+    ops: new Map(snapshot.ops.map((op) => [op.opId, structuredClone(op)])),
+    legacy: new Map(),
+    retracts: new Map((snapshot.retracts ?? []).map((retract) => [retract.requestId, structuredClone(retract)])),
+    importedSources: new Set(snapshot.importedSources),
+  };
+  for (const evidence of snapshot.legacy ?? []) addLegacyEvidence(state, structuredClone(evidence));
+  return state;
+}
+
+function addLegacyEvidence(state: JournalState, evidence: DiscordAwarenessLegacyEvidence): void {
+  const key = markKey(evidence.key);
+  const list = state.legacy.get(key);
+  if (list) list.push(evidence);
+  else state.legacy.set(key, [evidence]);
+}
+
+/** Apply one entry's records, in order, to the reduced state. */
+function applyRecords(state: JournalState, records: JournalRecord[]): void {
   for (const record of records) {
     switch (record.t) {
       case 'batch':
@@ -1034,7 +1266,13 @@ function fold(stored: StoredRecord[]): JournalState {
         break;
       case 'activated': {
         const batch = state.batches.get(record.batchId);
-        if (batch && batch.status !== 'discarded') batch.status = 'active';
+        if (batch && batch.status !== 'discarded') {
+          batch.status = 'active';
+          // Only a surgery (or its resume) activates a suppression, after its
+          // last redaction: activation records the body complete. Release
+          // does not.
+          if (batch.suppressionIntervals?.length) batch.suppressionComplete = true;
+        }
         break;
       }
       case 'discarded': {
@@ -1114,6 +1352,26 @@ function fold(stored: StoredRecord[]): JournalState {
         if (batch) batch.suppressionComplete = true;
         break;
       }
+      case 'legacy-evidence':
+        addLegacyEvidence(state, structuredClone(record.evidence));
+        break;
+      case 'retract':
+        if (!state.retracts.has(record.requestId)) {
+          state.retracts.set(record.requestId, {
+            requestId: record.requestId,
+            target: record.target,
+            at: record.at,
+            ...(record.by ? { by: record.by } : {}),
+          });
+        }
+        break;
+      case 'request-cancelled': {
+        const retract = state.retracts.get(record.requestId);
+        if (retract && !retract.cancelled) {
+          retract.cancelled = { at: record.at, ...(record.by ? { by: record.by } : {}) };
+        }
+        break;
+      }
       case 'import-complete':
         state.importedSources.add(record.sha256);
         break;
@@ -1121,7 +1379,6 @@ function fold(stored: StoredRecord[]): JournalState {
         break;
     }
   }
-  return state;
 }
 
 interface LegacyEntry extends DiscordAwarenessRef {
@@ -1148,11 +1405,13 @@ interface LegacyBatch {
 }
 
 /**
- * Translate a version 1 or 2 ledger into journal records with deterministic
- * identities, ending with an `import-complete` record carrying the file's
- * hash. What the old ledger recorded is kept as it was recorded; nothing is
- * inferred about Discord. Pending work, and batches still prepared, are held
- * for an operator: they were queued before marks were an explicit choice.
+ * Translate a version 1 or 2 ledger into journal records, ending with an
+ * `import-complete` record carrying the file's hash. Batches keep their ids.
+ * What the old ledger recorded about each ref is kept as legacy evidence:
+ * facts (attempt count, last action, status and error), never synthesized
+ * attempts and never a judgment about what is on Discord. Pending work, and
+ * batches still prepared, are held for an operator: they were queued before
+ * marks were an explicit choice. Nothing imported is ever dispatched.
  */
 function importLegacy(parsed: unknown, path: string, sha256: string): JournalRecord[] {
   const document = parsed as { version?: unknown; batches?: unknown };
@@ -1187,6 +1446,8 @@ function importLegacy(parsed: unknown, path: string, sha256: string): JournalRec
         ...(raw.suppressionIntervals?.length ? { suppressionIntervals: raw.suppressionIntervals } : {}),
       },
     });
+    // An active batch was activated by its surgery, after its body (an
+    // earlier release activated suppressions only after the last redaction).
     if (legacyActive) records.push({ t: 'activated', at: raw.createdAt, batchId: raw.id });
     const releaseActions: DiscordAwarenessReleaseAction[] = [];
     for (const entry of raw.refs) {
@@ -1200,27 +1461,13 @@ function importLegacy(parsed: unknown, path: string, sha256: string): JournalRec
             ...key,
             action: desired || !legacyActive ? 'add' : 'remove',
             ...(entry.attempts ? { priorAttempts: entry.attempts } : {}),
-            ...(entry.lastError ? { priorError: entry.lastError } : {}),
+            ...(entry.lastError ? { priorError: boundDiscordAwarenessText(entry.lastError) } : {}),
           });
         }
-        continue;
       }
-      if (!entry.attempts || !entry.lastAction) continue;
-      const opId = `v2:${raw.id}:${markKey(key)}`;
-      const attemptAt = entry.lastAttemptAt ?? raw.createdAt;
-      records.push({ t: 'requested', at: raw.createdAt, opId, key, action: entry.lastAction, cause: { kind: 'import', batchId: raw.id } });
-      records.push({ t: 'dispatching', at: attemptAt, opId, attempt: 1 });
-      records.push(status === 'applied'
-        ? { t: 'outcome', at: attemptAt, opId, attempt: 1, outcome: 'confirmed' }
-        : {
-            t: 'outcome',
-            at: attemptAt,
-            opId,
-            attempt: 1,
-            outcome: 'failed',
-            permanent: true,
-            ...(entry.lastError ? { error: `recorded by an earlier ledger: ${entry.lastError}` } : {}),
-          });
+      if (entry.attempts && entry.attempts > 0 && entry.lastAction) {
+        records.push({ t: 'legacy-evidence', at, evidence: legacyEvidence(raw.id, key, entry, status) });
+      }
     }
     if (releaseActions.length > 0) {
       records.push({
@@ -1236,6 +1483,37 @@ function importLegacy(parsed: unknown, path: string, sha256: string): JournalRec
   }
   records.push({ t: 'import-complete', at, source: 'v2', sha256 });
   return records;
+}
+
+/** The facts a v2 entry recorded about its attempts, and what they leave open. */
+function legacyEvidence(
+  batchId: string,
+  key: DiscordAwarenessRef & { emoji: string },
+  entry: LegacyEntry,
+  status: 'pending' | 'applied' | 'permanent-failure',
+): DiscordAwarenessLegacyEvidence {
+  const attempts = entry.attempts!;
+  const lastError = entry.lastError;
+  const lastErrorKind = lastError === undefined ? undefined
+    : PRE_WRITE_REFUSAL.test(lastError) ? 'pre-write-refusal'
+    : isPermanentDiscordReactionFailure(lastError) ? 'discord-answer'
+    : 'other';
+  // The last attempt's outcome is established when the ledger saw it
+  // applied, or its error proves it was refused before writing or answered
+  // by Discord. Earlier attempts' details were never kept.
+  const lastEstablished = status === 'applied'
+    || lastErrorKind === 'pre-write-refusal'
+    || (status === 'permanent-failure' && lastErrorKind === 'discord-answer');
+  return {
+    batchId,
+    key: { ...key },
+    attempts,
+    lastAction: entry.lastAction!,
+    lastStatus: status,
+    ...(lastError !== undefined ? { lastError: boundDiscordAwarenessText(lastError) } : {}),
+    ...(lastErrorKind ? { lastErrorKind } : {}),
+    outcomesUnrecorded: (attempts - 1) + (lastEstablished ? 0 : 1),
+  };
 }
 
 // ---------------------------------------------------------------------------
