@@ -248,6 +248,17 @@ export class ModuleRegistry {
    * out of the model-facing tool list and surfaced through the framework's
    * `utils` meta-tool; dispatch goes through the same handleToolCall.
    */
+  /** Every module's getSubconsciousTools(), prefixed `module--name`. */
+  getAllSubconsciousTools(): ToolDefinition[] {
+    const tools: ToolDefinition[] = [];
+    for (const module of this.modules.values()) {
+      for (const tool of module.getSubconsciousTools?.() ?? []) {
+        tools.push({ ...tool, name: `${module.name}--${tool.name}` });
+      }
+    }
+    return tools;
+  }
+
   getAllUtilities(): ToolDefinition[] {
     const utilities: ToolDefinition[] = [];
     for (const module of this.modules.values()) {

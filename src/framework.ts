@@ -1219,6 +1219,8 @@ export class AgentFramework {
   // tool_use → tool_result adjacency required by the Anthropic API).
   /** The subconscious resident's registry name (issue #77), or null. */
   private subconsciousAgentName: string | null = null;
+  /** The subconscious Agent's allowedTools, kept current by syncSubconsciousTools. */
+  private readonly subconsciousAllowedTools: string[] = [];
   /** Its windowed strategy — the coordinator moves the anchor on tune-out entry. */
   private subconsciousStrategy: WindowedPassthroughStrategy | null = null;
   /** Its config (speak_in_channel gate, voice block provenance). */
@@ -2463,6 +2465,7 @@ export class AgentFramework {
    */
   async addModule(module: Module): Promise<void> {
     await this.moduleRegistry.addModule(module);
+    this.syncSubconsciousTools();
     this.emitTrace({ type: 'module:added', moduleName: module.name });
   }
 
@@ -2471,7 +2474,27 @@ export class AgentFramework {
    */
   async removeModule(name: string): Promise<void> {
     await this.moduleRegistry.removeModule(name);
+    this.syncSubconsciousTools();
     this.emitTrace({ type: 'module:removed', moduleName: name });
+  }
+
+  /**
+   * The subconscious's allowed tools are its fixed surface plus whatever
+   * modules offer it now (Module.getSubconsciousTools). It is created
+   * before modules are added, so the list its Agent holds is rewritten in
+   * place whenever modules change.
+   */
+  private syncSubconsciousTools(): void {
+    const allowed = this.subconsciousAllowedTools;
+    allowed.splice(
+      0,
+      allowed.length,
+      ...SUBCONSCIOUS_TOOL_NAMES,
+      'think',
+      'skip_reply',
+      'end_turn',
+      ...this.moduleRegistry.getAllSubconsciousTools().map((t) => t.name),
+    );
   }
 
   /**
@@ -2845,7 +2868,9 @@ export class AgentFramework {
                 ?? this.getAgentRuntimeSettings(agentName).sameRoundThinkTextPolicy,
             )
           : t);
-      return [...SUBCONSCIOUS_TOOLS, ...basics];
+      // Plus what modules offer it (Module.getSubconsciousTools), allowed by
+      // syncSubconsciousTools.
+      return [...SUBCONSCIOUS_TOOLS, ...this.moduleRegistry.getAllSubconsciousTools(), ...basics];
     }
     return [...this.getAllTools(), ...(this.toolPresentations.has(agentName) ? presentationTools(this.toolPresentations.get(agentName)!.config.cataloguePath) : [])].map((tool) => {
       if (tool.name === 'think') {
@@ -7227,8 +7252,10 @@ export class AgentFramework {
       // locus, and bare prose must not fall through to the default channel.
       // Speech happens only via speak_in_channel (its own marked voice).
       proseRouting: 'explicit',
-      allowedTools: [...SUBCONSCIOUS_TOOL_NAMES, 'think', 'skip_reply', 'end_turn'],
+      // Rewritten in place by syncSubconsciousTools as modules come and go.
+      allowedTools: this.subconsciousAllowedTools,
     };
+    this.syncSubconsciousTools();
     const agent = new Agent(agentConfig, contextManager, this.membrane);
     this.restoreToolResultGuardSetting(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable

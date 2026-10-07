@@ -76,6 +76,19 @@ export interface Module {
   getUtilities?(): ToolDefinition[];
 
   /**
+   * Tools this module offers the subconscious resident (tune-out), whose
+   * surface is otherwise its own small set: no residents' tool board and no
+   * `utils`. Same ToolDefinition shape and un-prefixed names as getTools();
+   * each appears there as `module--name`, and a call arrives at this
+   * module's handleToolCall with callerAgentName naming the subconscious.
+   * For tools every addressee must be able to call, such as an agent's
+   * answer to a host that asks it directly; residents reach the same tools
+   * through getTools() or getUtilities(). Optional; omitting it offers the
+   * subconscious nothing.
+   */
+  getSubconsciousTools?(): ToolDefinition[];
+
+  /**
    * Handle a tool call.
    * Tool name is without module prefix.
    */
