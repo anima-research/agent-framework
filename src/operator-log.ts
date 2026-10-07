@@ -118,6 +118,27 @@ export function capIds(ids: string[]): { ids: string[]; count: number; truncated
     : { ids, count: ids.length };
 }
 
+/**
+ * What a live surgery did about Discord awareness marks, reported apart from
+ * the body change itself. A surgery that returns has applied its body change;
+ * this says only whether marks were scheduled:
+ *
+ * - `none` — the change removed no addressable Discord message.
+ * - `queued` — the outbox batch is durably active and its delivery has been
+ *   handed to the background drain. It is not a delivery claim: per-message
+ *   outcomes stay in the outbox ledger.
+ * - `not-scheduled` — the body change landed, but recording the batch as
+ *   active failed, so no mark will be delivered for it: the batch is retired
+ *   from the ledger. Only if retiring it failed as well is `batchId` present:
+ *   that batch stays prepared, and a later reconciliation (or, for a
+ *   suppression, the next startup) that can write the ledger may still
+ *   promote it.
+ */
+export type SurgeryMarkerReceipt =
+  | { status: 'none'; queued: 0 }
+  | { status: 'queued'; queued: number; batchId: string }
+  | { status: 'not-scheduled'; queued: 0; error: string; batchId?: string };
+
 /** Thrown by live surgery methods when a request cannot be honored. `code`
  *  lets surfaces distinguish "agent busy — quiesce first" from bad input. */
 export class OperatorActionError extends Error {

@@ -406,12 +406,14 @@ import {
   DiscordAwarenessOutbox,
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
+  type DiscordAwarenessBatch,
 } from './recovery/discord-awareness-outbox.js';
 import {
   OperatorActionError,
   OperatorLog,
   capIds,
   defaultOperatorLogPath,
+  type SurgeryMarkerReceipt,
   type OperatorLogEntry,
   type OperatorLogInput,
   type OperatorRequester,
@@ -715,6 +717,14 @@ function bodyGroupRun(
     toId: String(win.messages[win.messages.length - 1].id),
     group: win.messages[0].bodyGroupId !== undefined,
   };
+}
+
+function describeMarkers(m: SurgeryMarkerReceipt): string {
+  if (m.status === 'queued') return `queued:${m.queued}`;
+  if (m.status === 'not-scheduled') {
+    return m.batchId ? `not-scheduled(batch ${m.batchId} left prepared)` : 'not-scheduled(batch retired)';
+  }
+  return 'none';
 }
 
 function describeRequester(r: OperatorRequester | undefined): string {
@@ -5068,6 +5078,9 @@ export class AgentFramework {
     /** Discord addresses removed by message-granular undo. The durable outbox
      *  owns eventual delivery; this is also returned for immediate surfaces. */
     removedRefs?: Array<{ serverId: string; channelId: string; messageId: string }>;
+    /** For message-granular undo: whether awareness marks were scheduled
+     *  (not whether Discord has accepted them). */
+    markers?: SurgeryMarkerReceipt;
     hidden?: number;
     /** For `hide`: the Discord (channelId, messageId) of each removed message
      *  that carried one — so the surface can mark them with a reaction. */
@@ -5311,6 +5324,7 @@ export class AgentFramework {
           ok: true,
           messagesRemoved: r.messagesRemoved,
           removedRefs: r.removedRefs,
+          markers: r.markers,
           lastVisible: r.lastVisible,
         };
       } catch (error) {
@@ -5942,6 +5956,11 @@ export class AgentFramework {
    * Discord messages that left the live context get awareness markers via the
    * durable outbox, exactly as message-granular `undo` does.
    *
+   * Returns once the switch has landed and the marker batch is durably active
+   * (`markers`), without waiting for Discord to accept the reactions: delivery
+   * runs after the store reservation is released, behind the MCPL data-plane
+   * gate, and its per-message outcomes stay in the outbox ledger.
+   *
    * Throws `OperatorActionError` (`agent-busy`, `unknown-message`, …) — the
    * agent must be idle; nothing is queued.
    */
@@ -5964,6 +5983,8 @@ export class AgentFramework {
      *  the group's last shard so the sharded message stays whole. */
     tailMessageId: string;
     removedRefs: Array<{ serverId: string; channelId: string; messageId: string }>;
+    /** Whether awareness marks were scheduled; never a delivery claim. */
+    markers: SurgeryMarkerReceipt;
     lastVisible: { participant?: string; role?: string; preview?: string } | null;
   }> {
     const logBase: OperatorLogInput = {
@@ -6001,9 +6022,11 @@ export class AgentFramework {
       }
 
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
-      // until the switch has landed or been rolled back.
+      // until the switch has landed and its marker batch is durably active,
+      // or the switch has been rolled back. Remote delivery is not waited on.
       const release = this.reserveStoreForSurgery('roll back', agentName);
       let branchName: string;
+      let markers: SurgeryMarkerReceipt;
       try {
         // Prepare the external side effect before switching Chronicle. If the
         // process dies after the switch but before activate(), startup
@@ -6034,8 +6057,13 @@ export class AgentFramework {
             { cause: error },
           );
         }
-        if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
-        await this.syncDiscordAwarenessMarkers();
+        // The body change has landed. Nothing after this point turns the
+        // rollback into a failure: marks are an outbox outcome, reported
+        // apart from the body (`markers`).
+        markers = this.activateSurgeryMarkers(markerBatch, 'rollback', agentName);
+        // Installs the MCPL data-plane gate synchronously, before the store is
+        // released; the drain itself runs after this call returns.
+        this.deliverDiscordAwarenessInBackground('rollback', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -6044,7 +6072,8 @@ export class AgentFramework {
       console.error(
         `[operator] rollback agent=${agentName} to=${tailMessageId}` +
           `${tailMessageId !== opts.messageId ? ` (requested ${opts.messageId}, snapped to end of body group)` : ''}` +
-          ` removed=${messagesRemoved} branch=${branchName} by=${describeRequester(opts.requester)}`,
+          ` removed=${messagesRemoved} branch=${branchName} marks=${describeMarkers(markers)}` +
+          ` by=${describeRequester(opts.requester)}`,
       );
       this.recordOperatorAction({
         ...logBase,
@@ -6054,6 +6083,7 @@ export class AgentFramework {
           tailMessageId,
           messagesRemoved,
           discordRefs: removedRefs.length,
+          markers,
         },
       });
       return {
@@ -6063,6 +6093,7 @@ export class AgentFramework {
         messagesRemoved,
         tailMessageId,
         removedRefs,
+        markers,
         lastVisible: await this.lastVisiblePreview(agentName),
       };
     } catch (error) {
@@ -6078,6 +6109,8 @@ export class AgentFramework {
    * removed together. Discord originals get awareness markers via the outbox;
    * the batch is `explicit`-activated only after every removal succeeded, and
    * a crash mid-way is finished at next boot (resumePreparedDiscordSuppressions).
+   * Like rollbackToMessage, it returns once the body change and the batch's
+   * activation are durable (`markers`); delivery runs in the background.
    *
    * Not retroactive over derived state: a message already folded into an
    * autobiographical summary stays in that summary — roll back to before it
@@ -6099,6 +6132,8 @@ export class AgentFramework {
     messagesRemoved: number;
     removedIds: string[];
     removedRefs: Array<{ serverId: string; channelId: string; messageId: string }>;
+    /** Whether awareness marks were scheduled; never a delivery claim. */
+    markers: SurgeryMarkerReceipt;
     lastVisible: { participant?: string; role?: string; preview?: string } | null;
   }> {
     const requestedIds = [...new Set(opts.messageIds.map(String))];
@@ -6151,9 +6186,11 @@ export class AgentFramework {
         throw new OperatorActionError('invalid', 'Suppression branch name must differ from the active branch');
       }
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
-      // until the fork is fully redacted or the source is restored.
+      // until the fork is fully redacted and its marker batch durably
+      // active, or the source is restored. Remote delivery is not waited on.
       const release = this.reserveStoreForSurgery('suppress', agentName);
       let createdBranch: string;
+      let markers: SurgeryMarkerReceipt;
       try {
         const markerBatch = this.discordAwarenessOutbox?.prepare({
           agentName,
@@ -6194,7 +6231,6 @@ export class AgentFramework {
             if (iv.group || iv.fromId !== iv.toId) cm.removeMessages(iv.fromId as MessageId, iv.toId as MessageId);
             else cm.removeMessage(iv.fromId as MessageId);
           }
-          if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
         } catch (error) {
           // A partially suppressed branch is not safe to serve from. Keep it
           // for diagnosis, put the agent back on the untouched source — and
@@ -6207,7 +6243,16 @@ export class AgentFramework {
             { cause: error },
           );
         }
-        await this.syncDiscordAwarenessMarkers();
+        // Every redaction committed: the body change has landed and the fork
+        // is safe to serve from. Activating the marker batch is bookkeeping
+        // about a world-side effect; if it fails, the suppression still
+        // stands and the receipt says the marks were not scheduled. (No
+        // interval needs resuming any more, so retiring the batch there
+        // loses nothing.)
+        markers = this.activateSurgeryMarkers(markerBatch, 'suppress', agentName);
+        // Installs the MCPL data-plane gate synchronously, before the store is
+        // released; the drain itself runs after this call returns.
+        this.deliverDiscordAwarenessInBackground('suppress', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -6215,7 +6260,7 @@ export class AgentFramework {
 
       console.error(
         `[operator] suppress agent=${agentName} removed=${messagesRemoved} branch=${createdBranch} ` +
-          `by=${describeRequester(opts.requester)}`,
+          `marks=${describeMarkers(markers)} by=${describeRequester(opts.requester)}`,
       );
       const loggedIds = capIds(removedIds);
       this.recordOperatorAction({
@@ -6227,6 +6272,7 @@ export class AgentFramework {
           removedIds: loggedIds.ids,
           ...(loggedIds.truncated ? { removedIdsTruncated: true } : {}),
           discordRefs: removedRefs.length,
+          markers,
         },
       });
       return {
@@ -6236,12 +6282,83 @@ export class AgentFramework {
         messagesRemoved,
         removedIds,
         removedRefs,
+        markers,
         lastVisible: await this.lastVisiblePreview(agentName),
       };
     } catch (error) {
       this.recordOperatorAction({ ...logBase, error: error instanceof Error ? error.message : String(error) });
       throw error;
     }
+  }
+
+  /**
+   * Record a surgery's prepared marker batch as active once its body change
+   * has landed, and say what happened. Never throws: the body is already
+   * applied, so a ledger failure here is reported as `not-scheduled` rather
+   * than as a failed surgery an operator might retry. A batch that could not
+   * be activated is retired, so that the reconciliation which delivery runs
+   * next cannot promote it behind a receipt saying it was not scheduled; only
+   * when retiring fails too does it stay prepared (named by `batchId`). A
+   * batch with no refs (a suppression journal with nothing addressable) is
+   * still activated, which closes its resume journal; it schedules no marks.
+   */
+  private activateSurgeryMarkers(
+    batch: DiscordAwarenessBatch | null,
+    verb: 'rollback' | 'suppress',
+    agentName: string,
+  ): SurgeryMarkerReceipt {
+    if (!batch) return { status: 'none', queued: 0 };
+    try {
+      this.discordAwarenessOutbox!.activate(batch.id);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      let retired = false;
+      let retireDetail = '';
+      try {
+        retired = this.discordAwarenessOutbox!.discard(batch.id);
+      } catch (discardError) {
+        retireDetail = discardError instanceof Error ? discardError.message : String(discardError);
+      }
+      console.error(
+        `[discord-awareness] ${verb} agent=${agentName}: body applied, but marker batch ${batch.id} ` +
+          `could not be activated (${detail}); ` +
+          (retired ? 'batch retired' : `batch left prepared${retireDetail ? ` (retire failed: ${retireDetail})` : ''}`),
+      );
+      if (batch.refs.length === 0) return { status: 'none', queued: 0 };
+      this.opsAlert(
+        'discord-awareness-not-scheduled',
+        agentName,
+        `${verb} applied, but its ${batch.refs.length} awareness mark(s) were not scheduled: ${detail}`,
+        { data: { batchId: batch.id, retired } },
+      );
+      return retired
+        ? { status: 'not-scheduled', queued: 0, error: detail }
+        : { status: 'not-scheduled', queued: 0, error: detail, batchId: batch.id };
+    }
+    if (batch.refs.length === 0) return { status: 'none', queued: 0 };
+    return { status: 'queued', queued: batch.refs.length, batchId: batch.id };
+  }
+
+  /**
+   * Hand awareness delivery to the background, without holding the caller.
+   * `syncDiscordAwarenessMarkers` installs the MCPL data-plane gate
+   * synchronously, before its first await, so calling this while a surgery
+   * still holds the store keeps MCPL-borne wakes behind the gate exactly as
+   * before. Only the surgery's response and its store reservation stop
+   * waiting on remote reactions. A failure is accounted by the gate itself
+   * (connections recycled); here it is logged and raised as an ops alert.
+   */
+  private deliverDiscordAwarenessInBackground(verb: 'rollback' | 'suppress', agentName: string): void {
+    if (!this.discordAwarenessOutbox) return;
+    this.syncDiscordAwarenessMarkers().catch((error) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[discord-awareness] delivery after ${verb} agent=${agentName} failed: ${detail}`);
+      this.opsAlert(
+        'discord-awareness-delivery',
+        agentName,
+        `Awareness mark delivery after ${verb} failed: ${detail}`,
+      );
+    });
   }
 
   /** Re-materialize config files from the (new) active branch — fire and
