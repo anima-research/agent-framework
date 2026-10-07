@@ -154,6 +154,22 @@ export interface AgentSettingsExtension {
   /** Restore the listed keys (or all when omitted) to defaults and return the
    *  new values. Optional — extensions without reset semantics are skipped. */
   reset?(agentName: string, keys?: string[]): Record<string, unknown>;
+  /**
+   * The values this extension's keys would have after an update (`patch`
+   * holds only its keys) or a reset (`keys`, or all when omitted), computed
+   * without changing anything: normalized as update would store them, and a
+   * reset's concrete defaults. Throw for input update would reject.
+   *
+   * An operator-gated change (FrameworkConfig.operatorChangeGate) approves
+   * these values, and the framework refuses to apply it once they no longer
+   * hold. Without preview, an operator or module change to these keys can't
+   * be resolved and is refused while a gate is configured; the agent's own
+   * calls are unaffected.
+   */
+  preview?(
+    agentName: string,
+    change: { action: 'update'; patch: Record<string, unknown> } | { action: 'reset'; keys?: string[] },
+  ): Record<string, unknown>;
 }
 
 /**

@@ -53,6 +53,8 @@ export class ToolResultGuard {
   get enabled(): boolean { return this.override ?? this.configured; }
   setOverride(value: boolean | undefined): void { this.override = value; }
   get settingOverride(): boolean | undefined { return this.override; }
+  /** The recipe's value: what a reset of the setting restores. */
+  get configuredEnabled(): boolean { return this.configured; }
   get hasPending(): boolean { return this.pending !== undefined; }
   /** True only once the pending batch's originals were actually put on the
    * wire. Guard effects (retry suppression, refusal claim, prose buffering)

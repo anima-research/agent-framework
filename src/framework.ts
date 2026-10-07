@@ -9,7 +9,7 @@ import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
-import { callProvenance } from './call-provenance.js';
+import { callProvenance, leaseScope } from './call-provenance.js';
 import {
   selfChangeKind,
   sameValue,
@@ -18,6 +18,7 @@ import {
   type ResolvedOperatorChange,
   type ResolvedPresentationChange,
   type ResolvedSettingsChange,
+  type ResolvedUndoTurnsChange,
   type RuntimeSettingsValues,
 } from './operator-change.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
@@ -502,6 +503,88 @@ const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
 /** Stamp a deferred write's durable id into the metadata it is stored with
  *  (boot recovery dedups replays by it). Idempotent for an already-stamped
  *  message. */
+/** agent_settings input, parsed once for the handler and for operator-change
+ *  resolution alike, so the two can never disagree about what it changes. */
+type ParsedAgentSettings =
+  | { action: 'get' }
+  | { action: 'cancel' }
+  | {
+      action: 'update';
+      /** Core keys, coerced as the handler always has (Number(...)), plus `immediate`. */
+      patch: AgentRuntimeSettingsPatch;
+      /** Each extension's slice of the input (only its keys). */
+      extUpdates: Map<AgentSettingsExtension, Record<string, unknown>>;
+    }
+  | {
+      action: 'reset';
+      /** Core keys to reset; undefined with resetsAll, or when only extension keys are named. */
+      keys?: Array<keyof AgentRuntimeSettingsPatch>;
+      resetsAll: boolean;
+      /** Extensions to reset, each with its keys (undefined: all of them, on reset-all). */
+      extResets: Map<AgentSettingsExtension, string[] | undefined>;
+    };
+
+const AGENT_SETTINGS_CORE_NAMES: Record<string, keyof AgentRuntimeSettingsPatch> = {
+  context_budget_tokens: 'contextBudgetTokens',
+  tail_tokens: 'tailTokens',
+  transition_pace_tokens: 'transitionPaceTokens',
+  same_round_think_text_policy: 'sameRoundThinkTextPolicy',
+};
+
+function parseAgentSettingsInput(input: Record<string, unknown>, extensions: AgentSettingsExtension[]): ParsedAgentSettings {
+  switch (input.action) {
+    case 'get':
+      return { action: 'get' };
+    case 'cancel':
+      return { action: 'cancel' };
+    case 'update': {
+      const patch: AgentRuntimeSettingsPatch = {};
+      if (input.context_budget_tokens !== undefined) patch.contextBudgetTokens = Number(input.context_budget_tokens);
+      if (input.tail_tokens !== undefined) patch.tailTokens = Number(input.tail_tokens);
+      if (input.transition_pace_tokens !== undefined) patch.transitionPaceTokens = Number(input.transition_pace_tokens);
+      if (input.same_round_think_text_policy !== undefined) {
+        patch.sameRoundThinkTextPolicy = input.same_round_think_text_policy as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
+      }
+      // Immediate budget decrease: skip the paced descent; the next compile
+      // plans straight at the new budget (one-shot fold-down).
+      if (input.immediate !== undefined) patch.immediate = Boolean(input.immediate);
+      const extUpdates = new Map<AgentSettingsExtension, Record<string, unknown>>();
+      for (const ext of extensions) {
+        const slice: Record<string, unknown> = {};
+        for (const key of ext.keys) if (input[key] !== undefined) slice[key] = input[key];
+        if (Object.keys(slice).length > 0) extUpdates.set(ext, slice);
+      }
+      return { action: 'update', patch, extUpdates };
+    }
+    case 'reset': {
+      const extResets = new Map<AgentSettingsExtension, string[] | undefined>();
+      if (input.settings === undefined) {
+        // Reset-all covers every extension that can reset.
+        for (const ext of extensions) if (ext.reset) extResets.set(ext, undefined);
+        return { action: 'reset', resetsAll: true, extResets };
+      }
+      if (!Array.isArray(input.settings)) throw new Error('reset `settings` must be an array');
+      const keys: Array<keyof AgentRuntimeSettingsPatch> = [];
+      for (const name of input.settings) {
+        if (typeof name === 'string' && AGENT_SETTINGS_CORE_NAMES[name]) {
+          keys.push(AGENT_SETTINGS_CORE_NAMES[name]);
+          continue;
+        }
+        const owner = extensions.find((ext) => typeof name === 'string' && ext.keys.includes(name));
+        if (!owner) throw new Error(`Unknown reset setting: ${String(name)}`);
+        // An extension without reset semantics is skipped, as reset-all skips it.
+        if (!owner.reset) continue;
+        const list = extResets.get(owner) ?? [];
+        list.push(name as string);
+        extResets.set(owner, list);
+      }
+      return { action: 'reset', ...(keys.length > 0 ? { keys } : {}), resetsAll: false, extResets };
+    }
+    default:
+      throw new Error('agent_settings: action must be get, update, reset, or cancel');
+  }
+}
+
 function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string): MessageMetadata {
   return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
 }
@@ -680,7 +763,11 @@ export class ResumeBlockedError extends Error {
 
 interface RedoEntry {
   branchName: string;
-  checkpoint: TurnCheckpoint;
+  /** Checkpoints redo re-adds after switching back, oldest first. A single
+   *  undo saved its source without the checkpoint, so redo re-adds it; an
+   *  admitted multi-turn cut writes nothing on its source, whose tip still
+   *  holds them all, so it re-adds none. */
+  checkpoints: TurnCheckpoint[];
 }
 
 interface InferenceToolSnapshot {
@@ -2778,6 +2865,20 @@ export class AgentFramework {
         }
         return { tool_result_inline_max_chars: null };
       },
+      preview: (agentName: string, change) => {
+        if (change.action === 'reset') {
+          return {
+            tool_result_inline_max_chars: !change.keys || change.keys.includes('tool_result_inline_max_chars')
+              ? null
+              : this.toolResultInlineMaxCharsOverride.get(agentName) ?? null,
+          };
+        }
+        const n = Number(change.patch.tool_result_inline_max_chars);
+        if (!Number.isFinite(n) || n < 1000) {
+          throw new Error('tool_result_inline_max_chars must be a number >= 1000');
+        }
+        return { tool_result_inline_max_chars: Math.floor(n) };
+      },
     };
   }
 
@@ -2824,6 +2925,13 @@ export class AgentFramework {
         return set(name, patch.tool_result_guard);
       },
       reset: (name) => set(name, undefined),
+      preview: (name, change) => {
+        const guard = this.agents.get(name)?.toolResultGuard;
+        if (!guard) throw new Error(`Unknown agent: ${name}`);
+        if (change.action === 'reset') return { tool_result_guard: guard.configuredEnabled };
+        if (typeof change.patch.tool_result_guard !== 'boolean') throw new Error('tool_result_guard must be a boolean');
+        return { tool_result_guard: change.patch.tool_result_guard };
+      },
     };
   }
 
@@ -5276,8 +5384,12 @@ export class AgentFramework {
   ): Promise<{
     ok: boolean;
     error?: string;
-    /** Refusal code from live surgery (e.g. 'agent-busy'), when applicable. */
+    /** Refusal code from live surgery (e.g. 'agent-busy'), when applicable;
+     *  'staged' when the operator-change gate staged the change, with its
+     *  receipt text as `error`; 'gate-failed' when the gate refused it. */
     code?: string;
+    /** For a staged change: the host's receipt id. */
+    staged?: { id: string };
     undone?: number;
     requested?: number;
     /** For quiesce/resume/maintain/host-status: the host mode snapshot. */
@@ -5622,6 +5734,9 @@ export class AgentFramework {
     }
 
     const requested = Math.max(1, Math.min(20, Math.floor(params.turns ?? 1)));
+    if (this.operatorChangeGate) {
+      return this.gatedUndoTurns(agentName, requested, hostCommandRequester(serverId, params));
+    }
     const turnMarks: DiscordAwarenessMarks = params.marks === 'addressed' || params.marks === 'all'
       ? { scope: params.marks }
       : 'none';
@@ -6073,7 +6188,7 @@ export class AgentFramework {
       redoStack = [];
       this.redoStacks.set(agentName, redoStack);
     }
-    redoStack.push({ branchName: currentBranch.name, checkpoint });
+    redoStack.push({ branchName: currentBranch.name, checkpoints: [checkpoint] });
 
     this.emitTrace({
       type: 'undo:completed',
@@ -6122,7 +6237,7 @@ export class AgentFramework {
       return { redone: false };
     }
 
-    const { branchName, checkpoint } = redoStack.pop()!;
+    const { branchName, checkpoints: restored } = redoStack.pop()!;
     const currentBranch = this.store.currentBranch();
 
     this.store.switchBranch(branchName);
@@ -6133,9 +6248,9 @@ export class AgentFramework {
       (wsRedo as any).materializeMount('_config').catch(() => {});
     }
 
-    // Restore the checkpoint
+    // Restore the checkpoints the undo removed
     const checkpoints = this.getTurnCheckpoints(agentName);
-    checkpoints.push(checkpoint);
+    checkpoints.push(...restored);
     this.saveTurnCheckpoints(agentName, checkpoints);
 
     this.emitTrace({
@@ -6373,7 +6488,8 @@ export class AgentFramework {
       `${opts.requester ? `, for ${opts.requester.name ?? opts.requester.id ?? 'operator'} via ${opts.requester.via}` : ''})`,
     );
     try {
-      return await fn(held.lease);
+      // The callback, and the work it starts, runs inside this lease's scope.
+      return await leaseScope.run(held.lease, () => fn(held.lease));
     } finally {
       held.release();
       console.log(`[safe-boundary] ${held.lease.verb}: released after ${Date.now() - held.lease.since}ms`);
@@ -6525,76 +6641,73 @@ export class AgentFramework {
   ): ResolvedSettingsChange | ResolvedPresentationChange | null {
     if (!admission) return null;
     const change = this.activeAdmissions?.get(admission.id);
-    if (!change || change.agent !== agentName) return null;
+    if (!change || change.agent !== agentName || change.kind === 'undo-turns') return null;
     const changeTool = change.kind === 'agent-settings' ? 'agent_settings' : change.tool;
     return tool === changeTool && sameValue(change.input, input) ? change : null;
   }
 
-  /** The core patch / reset keys and extension keys an agent_settings input touches. */
-  private parseSettingsChange(input: Record<string, unknown>): {
-    action: { action: 'update'; patch: AgentRuntimeSettingsPatch } | { action: 'reset'; keys?: Array<keyof AgentRuntimeSettingsPatch> } | { action: 'cancel' };
-    extensionKeys: string[];
+  /**
+   * What an agent_settings change would do, resolved without changing
+   * anything: the touched core settings now (`from`) and after (`target`),
+   * and the touched extension keys the same way, from each owner's preview.
+   * Shares the handler's parser, so it reads the input exactly as the
+   * handler would. Throws when the change can't be resolved: input the
+   * handler would reject, an extension that can't preview, a failing reader.
+   */
+  private resolveSettingsEffect(agentName: string, input: Record<string, unknown>): {
+    from: RuntimeSettingsValues;
+    target: RuntimeSettingsValues;
+    extensions?: { from: Record<string, unknown>; target: Record<string, unknown> };
   } {
-    const extensions = [...this.collectAgentSettingsExtensions().values()];
-    const extKeyOwner = (key: string) => extensions.find((ext) => ext.keys.includes(key));
-    const core: Record<string, keyof AgentRuntimeSettingsPatch> = {
-      context_budget_tokens: 'contextBudgetTokens',
-      tail_tokens: 'tailTokens',
-      transition_pace_tokens: 'transitionPaceTokens',
-      same_round_think_text_policy: 'sameRoundThinkTextPolicy',
-    };
-    if (input.action === 'cancel') return { action: { action: 'cancel' }, extensionKeys: [] };
-    if (input.action === 'update') {
-      const patch: AgentRuntimeSettingsPatch = {};
-      const extensionKeys: string[] = [];
-      for (const [key, value] of Object.entries(input)) {
-        if (key === 'action' || key === 'immediate' || value === undefined) continue;
-        const coreKey = core[key];
-        if (coreKey === 'sameRoundThinkTextPolicy') {
-          if (typeof value !== 'string') throw new Error(`${key} must be a string`);
-          patch.sameRoundThinkTextPolicy = value as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
-        } else if (coreKey) {
-          if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${key} must be a number`);
-          (patch as Record<string, unknown>)[coreKey] = value;
-        } else if (extKeyOwner(key)) extensionKeys.push(key);
-        else throw new Error(`Unknown setting: ${key}`);
+    const agent = this.agents.get(agentName);
+    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    const parsed = parseAgentSettingsInput(input, [...this.collectAgentSettingsExtensions().values()]);
+    if (parsed.action === 'get') throw new Error('agent_settings get changes nothing');
+    let coreAction: Parameters<Agent['previewRuntimeSettingsTarget']>[0] | null = null;
+    if (parsed.action === 'cancel') coreAction = { action: 'cancel' };
+    else if (parsed.action === 'update') {
+      if (Object.keys(parsed.patch).length > 0) {
+        agent.checkRuntimeSettingsPatch(parsed.patch);
+        coreAction = { action: 'update', patch: parsed.patch };
       }
-      return { action: { action: 'update', patch }, extensionKeys };
+    } else if (parsed.resetsAll || parsed.keys) {
+      coreAction = { action: 'reset', ...(parsed.keys ? { keys: parsed.keys } : {}) };
     }
-    if (input.action === 'reset') {
-      if (input.settings === undefined) {
-        return { action: { action: 'reset' }, extensionKeys: extensions.flatMap((ext) => (ext.reset ? ext.keys : [])) };
-      }
-      if (!Array.isArray(input.settings)) throw new Error('reset `settings` must be an array');
-      const keys: Array<keyof AgentRuntimeSettingsPatch> = [];
-      const extensionKeys: string[] = [];
-      for (const name of input.settings) {
-        if (typeof name === 'string' && core[name]) keys.push(core[name]);
-        else if (typeof name === 'string' && extKeyOwner(name)) extensionKeys.push(name);
-        else throw new Error(`Unknown reset setting: ${String(name)}`);
-      }
-      return { action: keys.length > 0 ? { action: 'reset', keys } : { action: 'reset', keys: [] }, extensionKeys };
-    }
-    throw new Error('agent_settings: action must be get, update, reset, or cancel');
-  }
+    const target = coreAction ? agent.previewRuntimeSettingsTarget(coreAction) : {};
+    const snapshot = agent.getRuntimeSettings() as unknown as Record<string, unknown>;
+    const from: Record<string, unknown> = {};
+    for (const key of Object.keys(target)) from[key] = snapshot[key] ?? null;
 
-  /** The current values of the given settings: core keys from the snapshot
-   *  (unset reads null), extension keys from their owners. */
-  private currentSettingsValues(agentName: string, coreKeys: string[], extensionKeys: string[]): {
-    core: RuntimeSettingsValues;
-    extensions: Record<string, unknown>;
-  } {
-    const snapshot = this.getAgentRuntimeSettings(agentName) as unknown as Record<string, unknown>;
-    const core: Record<string, unknown> = {};
-    for (const key of coreKeys) core[key] = snapshot[key] ?? null;
-    const extensions: Record<string, unknown> = {};
-    if (extensionKeys.length > 0) {
-      for (const ext of this.collectAgentSettingsExtensions().values()) {
-        const values = ext.get(agentName);
-        for (const key of extensionKeys) if (ext.keys.includes(key)) extensions[key] = values[key] ?? null;
+    const extFrom: Record<string, unknown> = {};
+    const extTarget: Record<string, unknown> = {};
+    const visit = (
+      ext: AgentSettingsExtension,
+      change: { action: 'update'; patch: Record<string, unknown> } | { action: 'reset'; keys?: string[] },
+      keys: string[],
+    ) => {
+      if (!ext.preview) {
+        throw new Error(
+          `${keys.join(', ')} ${keys.length === 1 ? 'is' : 'are'} managed by a settings extension that ` +
+          `can't preview a change, so an operator change to ${keys.length === 1 ? 'it' : 'them'} can't be resolved`,
+        );
       }
+      const now = ext.get(agentName);
+      const next = ext.preview(agentName, change);
+      for (const key of keys) {
+        extFrom[key] = now[key] ?? null;
+        extTarget[key] = next[key] ?? null;
+      }
+    };
+    if (parsed.action === 'update') {
+      for (const [ext, slice] of parsed.extUpdates) visit(ext, { action: 'update', patch: slice }, Object.keys(slice));
+    } else if (parsed.action === 'reset') {
+      for (const [ext, keys] of parsed.extResets) visit(ext, { action: 'reset', ...(keys ? { keys } : {}) }, keys ?? ext.keys);
     }
-    return { core: core as RuntimeSettingsValues, extensions };
+    return {
+      from: from as RuntimeSettingsValues,
+      target,
+      ...(Object.keys(extTarget).length > 0 ? { extensions: { from: extFrom, target: extTarget } } : {}),
+    };
   }
 
   /** Resolve an operator's or module's mutating self-change call to the
@@ -6617,17 +6730,7 @@ export class AgentFramework {
       sourceBranch: this.store.currentBranch().name,
     };
     if (tool === 'agent_settings') {
-      const { action, extensionKeys } = this.parseSettingsChange(input);
-      const target = agent.previewRuntimeSettingsTarget(action);
-      const current = this.currentSettingsValues(agentName, Object.keys(target), extensionKeys);
-      return {
-        ...base,
-        kind: 'agent-settings',
-        input: structuredClone(input),
-        from: current.core,
-        target,
-        ...(extensionKeys.length > 0 ? { extensions: current.extensions } : {}),
-      };
+      return { ...base, kind: 'agent-settings', input: structuredClone(input), ...this.resolveSettingsEffect(agentName, input) };
     }
     const name = (input as { name?: unknown }).name;
     const entry = typeof name === 'string'
@@ -6649,18 +6752,27 @@ export class AgentFramework {
       throw new OperatorActionError('stale', `Change ${change.id} for ${change.agent} no longer holds: ${what}`);
     };
     if (!this.agents.has(change.agent)) throw new OperatorActionError('unknown-agent', `Unknown agent: ${change.agent}`);
+    const branch = this.store.currentBranch().name;
+    if (branch !== change.sourceBranch) stale(`the active branch moved from ${change.sourceBranch} to ${branch}`);
     if (change.kind === 'agent-settings') {
-      const { action, extensionKeys } = this.parseSettingsChange(change.input);
-      const current = this.currentSettingsValues(change.agent, Object.keys(change.from), extensionKeys);
-      if (!sameValue(current.core, change.from)) {
-        stale(`its settings moved from ${JSON.stringify(change.from)} to ${JSON.stringify(current.core)}`);
+      let now: ReturnType<AgentFramework['resolveSettingsEffect']>;
+      try {
+        now = this.resolveSettingsEffect(change.agent, change.input);
+      } catch (error) {
+        stale(`it can no longer be resolved (${error instanceof Error ? error.message : String(error)})`);
       }
-      if (change.extensions && !sameValue(current.extensions, change.extensions)) {
-        stale(`its host-managed settings moved from ${JSON.stringify(change.extensions)} to ${JSON.stringify(current.extensions)}`);
+      if (!sameValue(now!.from, change.from)) {
+        stale(`its settings moved from ${JSON.stringify(change.from)} to ${JSON.stringify(now!.from)}`);
       }
-      const target = this.agents.get(change.agent)!.previewRuntimeSettingsTarget(action);
-      if (!sameValue(target, change.target)) {
-        stale(`it would now set ${JSON.stringify(target)}, not the approved ${JSON.stringify(change.target)}`);
+      if (!sameValue(now!.target, change.target)) {
+        stale(`it would now set ${JSON.stringify(now!.target)}, not the approved ${JSON.stringify(change.target)}`);
+      }
+      if (!sameValue(now!.extensions ?? null, change.extensions ?? null)) {
+        stale(
+          `its host-managed settings would now go from ${JSON.stringify(now!.extensions?.from ?? {})} ` +
+          `to ${JSON.stringify(now!.extensions?.target ?? {})}, not the approved ` +
+          `${JSON.stringify(change.extensions?.from ?? {})} to ${JSON.stringify(change.extensions?.target ?? {})}`,
+        );
       }
       return;
     }
@@ -6683,35 +6795,242 @@ export class AgentFramework {
     if (!this.operatorChangeGate || call.origin === undefined) return run();
     if (!selfChangeKind(call.name, call.input)) return run();
     const input = (call.input ?? {}) as Record<string, unknown>;
+    const refused = (error: string): ToolResult => ({ success: false, isError: true, error });
     const admitted = this.admittedChange(call.admission, agentName, call.name, input);
-    if (admitted) {
-      // The last check before the change runs, with no await in between.
-      try {
-        this.revalidateSelfChange(admitted);
-      } catch (error) {
-        return { success: false, isError: true, error: error instanceof Error ? error.message : String(error) };
-      }
-      return run();
-    }
     let change: ResolvedSettingsChange | ResolvedPresentationChange;
-    try {
-      change = this.resolveSelfChange(agentName, call.name, input, call.origin);
-    } catch {
-      return run(); // invalid input: the handler reports its own error
+    if (admitted) {
+      change = admitted;
+    } else {
+      // A change that can't be resolved is refused, never run ungated: the
+      // resolver shares the handler's parser, so whatever it can't resolve
+      // the gate could not have decided.
+      try {
+        change = this.resolveSelfChange(agentName, call.name, input, call.origin);
+      } catch (error) {
+        return refused(`Operator change refused: it couldn't be resolved (${error instanceof Error ? error.message : String(error)})`);
+      }
+      const answer = await this.askOperatorChangeGate(change);
+      if (answer.outcome === 'staged') {
+        return { success: false, isError: true, error: answer.receipt.text, data: { staged: answer.receipt } };
+      }
+      if (answer.outcome === 'gate-failed') return refused(`Operator change refused: ${answer.error}`);
     }
-    const answer = await this.askOperatorChangeGate(change);
-    if (answer.outcome === 'staged') {
-      return { success: false, isError: true, error: answer.receipt.text, data: { staged: answer.receipt } };
-    }
-    if (answer.outcome === 'gate-failed') {
-      return { success: false, isError: true, error: `Operator change refused: ${answer.error}` };
-    }
+    // Permission to apply isn't a safe boundary: while the store is held by
+    // a reservation this call isn't running under, refuse rather than wait
+    // (the holder may be waiting for this very call's turn).
+    const held = this.storeHoldAgainstCaller();
+    if (held) return refused(`Operator change refused: the store is held by ${held}; retry when it completes`);
+    // The last check before the change runs, with no await in between.
     try {
       this.revalidateSelfChange(change);
     } catch (error) {
-      return { success: false, isError: true, error: error instanceof Error ? error.message : String(error) };
+      return refused(error instanceof Error ? error.message : String(error));
     }
     return run();
+  }
+
+  /** The store hold this work isn't running under, described; null when the
+   *  store is free, or held by the lease whose callback this work runs in. */
+  private storeHoldAgainstCaller(): string | null {
+    if (!this.surgeryHold) return null;
+    const scoped = leaseScope.getStore();
+    if (scoped && this.heldLease?.lease === scoped) return null;
+    return `${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`;
+  }
+
+  /**
+   * host/command undo by turns when the host has an operator-change gate:
+   * resolve the exact checkpoints, ask, and either return the receipt
+   * (staged, nothing changed) or apply exactly that change now as one cut,
+   * under a store reservation. Without a gate, host/command keeps its
+   * per-turn loop.
+   */
+  private async gatedUndoTurns(agentName: string, requested: number, requester: OperatorRequester): Promise<{
+    ok: boolean;
+    error?: string;
+    code?: string;
+    staged?: { id: string };
+    undone?: number;
+    requested?: number;
+    lastVisible?: { participant?: string; role?: string; preview?: string } | null;
+  }> {
+    const agent = this.agents.get(agentName)!;
+    if (agent.state.status !== 'idle') {
+      return { ok: false, error: `Cannot undo while agent is ${agent.state.status}` };
+    }
+    const change = this.resolveUndoTurns(agentName, requested, requester);
+    if (!change) return { ok: true, undone: 0, requested, lastVisible: null };
+    const answer = await this.askOperatorChangeGate(change);
+    if (answer.outcome === 'staged') {
+      return { ok: false, code: 'staged', error: answer.receipt.text, staged: { id: answer.receipt.id }, requested };
+    }
+    if (answer.outcome === 'gate-failed') {
+      return { ok: false, code: 'gate-failed', error: `Operator change refused: ${answer.error}`, requested };
+    }
+    let applied: ReturnType<AgentFramework['applyUndoTurns']>;
+    try {
+      const release = this.reserveStoreForSurgery('undo', agentName);
+      try {
+        applied = this.applyUndoTurns(change);
+      } finally {
+        release();
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        ...(error instanceof OperatorActionError ? { code: error.code } : {}),
+        requested,
+      };
+    }
+    console.error(
+      `[host-command] undo agent=${agentName} requested=${requested} undone=${applied.undone} ` +
+        `as one cut (${change.id}) by=${requester.name ?? requester.id ?? requester.via}`,
+    );
+    await this.syncDiscordAwarenessMarkers();
+    return { ok: true, undone: applied.undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
+  }
+
+  /** Resolve host/command undo by turns to the exact checkpoints it would
+   *  undo, newest first; null when there is nothing to undo. */
+  private resolveUndoTurns(agentName: string, requested: number, requester?: OperatorRequester): ResolvedUndoTurnsChange | null {
+    const checkpoints = this.getTurnCheckpoints(agentName);
+    if (checkpoints.length === 0) return null;
+    const taken = checkpoints.slice(-requested).reverse();
+    return {
+      id: randomUUID(),
+      agent: agentName,
+      surface: 'host-command',
+      ...(requester ? { requester } : {}),
+      resolvedAt: Date.now(),
+      sourceBranch: this.store.currentBranch().name,
+      kind: 'undo-turns',
+      requestedTurns: requested,
+      checkpoints: taken.map((c) => ({ turnIndex: c.turnIndex, sequenceBefore: c.sequenceBefore, branchName: c.branchName })),
+    };
+  }
+
+  /** The branch an admitted undo-turns change cuts to: named for the change,
+   *  so a recovering host can recognize a cut that already happened. */
+  private undoTurnsDestination(change: ResolvedUndoTurnsChange): string {
+    return `undo/${change.agent}/op-${change.id}`;
+  }
+
+  /**
+   * Apply a resolved undo-turns change as one absolute cut. The caller holds
+   * the store (a lease, or a surgery reservation). Revalidates against
+   * stable identity: the active branch must still be the source branch, and
+   * every staged checkpoint must still be in the agent's list (appending a
+   * notice or an answer changes neither). Then it branches at the oldest
+   * staged checkpoint's sequenceBefore, which drops the staged turns and
+   * everything after them, and removes those checkpoints and any newer
+   * ones. One redo entry restores the source tip and all of them. If the
+   * active branch is already this change's destination, the cut happened
+   * before (a host retrying after a crash) and nothing changes.
+   */
+  private applyUndoTurns(change: ResolvedUndoTurnsChange, admission?: OperatorAdmission): {
+    requested: number;
+    undone: number;
+    fromBranch: string;
+    toBranch: string;
+    alreadyApplied?: true;
+  } {
+    const stale = (what: string): never => {
+      throw new OperatorActionError('stale', `Undo ${change.id} for ${change.agent} no longer holds: ${what}`);
+    };
+    if (!this.agents.has(change.agent)) throw new OperatorActionError('unknown-agent', `Unknown agent: ${change.agent}`);
+    const destination = this.undoTurnsDestination(change);
+    const undone = change.checkpoints.length;
+    const current = this.store.currentBranch().name;
+    if (current === destination) {
+      return { requested: change.requestedTurns, undone, fromBranch: change.sourceBranch, toBranch: destination, alreadyApplied: true };
+    }
+    // The destination exists if an earlier attempt got as far as creating
+    // it. Never written to (its head still at its branch point), that
+    // attempt was interrupted before switching, and this one finishes it.
+    // Written to, the cut was applied and the active branch has left it
+    // since (a redo, a later undo): refused, never re-applied.
+    const dest = this.store.listBranches().find((b) => b.name === destination);
+    const created = dest !== undefined;
+    if (dest && dest.head !== (dest.branchPoint ?? dest.head)) {
+      stale(`its cut was already applied as ${destination}, and the active branch has moved since to ${current}`);
+    }
+    if (current !== change.sourceBranch) stale(`the active branch moved from ${change.sourceBranch} to ${current}`);
+    const list = this.getTurnCheckpoints(change.agent);
+    const at = (c: ResolvedUndoTurnsChange['checkpoints'][number]) => list.findIndex((k) =>
+      k.turnIndex === c.turnIndex && k.sequenceBefore === c.sequenceBefore && k.branchName === c.branchName);
+    for (const c of change.checkpoints) {
+      if (at(c) < 0) stale(`turn ${c.turnIndex} is no longer an undoable checkpoint`);
+    }
+    const oldest = change.checkpoints[change.checkpoints.length - 1]!;
+    const cutAt = at(oldest);
+    const removed = list.slice(cutAt);
+
+    // Checkpoint lists are branch-scoped state, and nothing is written on the
+    // source: the destination, cut before the oldest staged turn recorded
+    // itself, inherits the older checkpoints (saved there explicitly), and
+    // the source tip keeps every checkpoint for redo to return to. So each
+    // step is idempotent and a retry after a crash finishes the cut.
+    const kept = list.slice(0, cutAt);
+    if (!created) this.store.createBranchAt(destination, change.sourceBranch, oldest.sequenceBefore);
+    this.store.switchBranch(destination);
+    // Mark the destination as used, naming the change that made it: this
+    // write is what moves its head off its branch point (see above), so a
+    // later retry can tell a completed cut from an interrupted one.
+    const framework = this.store.getStateJson(FRAMEWORK_STATE_ID);
+    this.store.setStateJson(FRAMEWORK_STATE_ID, {
+      ...(framework && typeof framework === 'object' ? framework as Record<string, unknown> : {}),
+      operatorCut: { changeId: change.id, at: Date.now() },
+    });
+    this.saveTurnCheckpoints(change.agent, kept);
+    const ws = this.moduleRegistry.getModule('workspace');
+    if (ws && 'materializeMount' in ws) {
+      (ws as unknown as { materializeMount(name: string): Promise<unknown> }).materializeMount('_config').catch(() => {});
+    }
+    let redoStack = this.redoStacks.get(change.agent);
+    if (!redoStack) {
+      redoStack = [];
+      this.redoStacks.set(change.agent, redoStack);
+    }
+    // The source tip still holds the removed checkpoints: redo re-adds none.
+    redoStack.push({ branchName: change.sourceBranch, checkpoints: [] });
+
+    this.emitTrace({
+      type: 'undo:completed',
+      agentName: change.agent,
+      turnIndex: oldest.turnIndex,
+      fromBranch: change.sourceBranch,
+      toBranch: destination,
+      turns: undone,
+    });
+    this.recordOperatorAction({
+      kind: 'undo-turns',
+      agent: change.agent,
+      ...(change.requester ? { requester: change.requester } : {}),
+      params: {
+        changeId: change.id,
+        requested: change.requestedTurns,
+        resolved: undone,
+        turnIndexes: change.checkpoints.map((c) => c.turnIndex),
+        ...(admission ? { admission: admission.id } : {}),
+      },
+      result: { sourceBranch: change.sourceBranch, targetBranch: destination, checkpointsRemoved: removed.length },
+    });
+    return { requested: change.requestedTurns, undone, fromBranch: change.sourceBranch, toBranch: destination };
+  }
+
+  /** After an admitted undo: reconcile awareness markers as host/command
+   *  undo always has. The cut stands either way; the durable outbox owns
+   *  eventual delivery, so a sync failure is logged, not thrown. */
+  private async syncAwarenessAfterUndo(agentName: string): Promise<void> {
+    try {
+      await this.syncDiscordAwarenessMarkers();
+    } catch (error) {
+      console.error(
+        `[operator-change] awareness sync after undo for ${agentName} failed; the outbox retries: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   /**
@@ -6729,6 +7048,11 @@ export class AgentFramework {
     opts: { lease: SafeBoundaryLease; admission: OperatorAdmission },
   ): Promise<AppliedOperatorChange> {
     this.heldLeaseTokens(opts.lease, `apply ${change.kind} for ${change.agent}`);
+    if (change.kind === 'undo-turns') {
+      const applied = this.applyUndoTurns(change, opts.admission);
+      if (!applied.alreadyApplied) await this.syncAwarenessAfterUndo(change.agent);
+      return { kind: 'undo-turns', ...applied };
+    }
     this.revalidateSelfChange(change);
     const tool = change.kind === 'agent-settings' ? 'agent_settings' : change.tool;
     this.activeAdmissions.set(opts.admission.id, change);
@@ -12149,32 +12473,40 @@ export class AgentFramework {
       selfChangeKind(toolName, input) &&
       !this.admittedChange(opts?.admission, agentName, toolName, input)
     ) {
-      let change: ResolvedSettingsChange | ResolvedPresentationChange | undefined;
+      let change: ResolvedSettingsChange | ResolvedPresentationChange;
       try {
         change = this.resolveSelfChange(agentName, toolName, input, 'puppet', opts?.requester);
-      } catch {
-        change = undefined; // invalid input: the tool refuses it itself, as before
+      } catch (error) {
+        // Refused, never run ungated, and no pair: the tool didn't run.
+        return {
+          toolUseId: null,
+          result: {
+            success: false,
+            isError: true,
+            error: `Operator change refused: it couldn't be resolved (${error instanceof Error ? error.message : String(error)})`,
+          },
+        };
       }
-      if (change) {
-        const answer = await this.askOperatorChangeGate(change);
-        if (answer.outcome === 'staged') {
-          return {
-            toolUseId: null,
-            result: { success: false, isError: true, error: answer.receipt.text },
-            staged: answer.receipt,
-          };
-        }
-        if (answer.outcome === 'gate-failed') {
-          throw new Error(`puppet refused: the operator-change gate failed (${answer.error})`);
-        }
-        this.revalidateSelfChange(change);
-        const admission: OperatorAdmission = { id: change.id };
-        this.activeAdmissions.set(admission.id, change);
-        try {
-          return await this.puppetToolCallUngated(agentName, toolName, input, { ...opts, admission });
-        } finally {
-          this.activeAdmissions.delete(admission.id);
-        }
+      const answer = await this.askOperatorChangeGate(change);
+      if (answer.outcome === 'staged') {
+        return {
+          toolUseId: null,
+          result: { success: false, isError: true, error: answer.receipt.text },
+          staged: answer.receipt,
+        };
+      }
+      if (answer.outcome === 'gate-failed') {
+        throw new Error(`puppet refused: the operator-change gate failed (${answer.error})`);
+      }
+      // Revalidated here and again where the change runs (gatedSelfChange's
+      // admitted path), right before the handler, with no await between.
+      this.revalidateSelfChange(change);
+      const admission: OperatorAdmission = { id: change.id };
+      this.activeAdmissions.set(admission.id, change);
+      try {
+        return await this.puppetToolCallUngated(agentName, toolName, input, { ...opts, admission });
+      } finally {
+        this.activeAdmissions.delete(admission.id);
       }
     }
     return this.puppetToolCallUngated(agentName, toolName, input, opts);
@@ -16905,15 +17237,7 @@ export class AgentFramework {
     });
     let result: ToolResult;
     try {
-      const input = (call.input ?? {}) as {
-        action?: unknown;
-        context_budget_tokens?: unknown;
-        tail_tokens?: unknown;
-        transition_pace_tokens?: unknown;
-        same_round_think_text_policy?: unknown;
-        immediate?: unknown;
-        settings?: unknown;
-      } & Record<string, unknown>;
+      const input = (call.input ?? {}) as Record<string, unknown>;
       const extensions = this.collectAgentSettingsExtensions();
       /** Extension values merged flat alongside the core snapshot. */
       const extGet = (): Record<string, unknown> => {
@@ -16921,7 +17245,8 @@ export class AgentFramework {
         for (const ext of extensions.values()) Object.assign(out, ext.get(agentName));
         return out;
       };
-      switch (input.action) {
+      const parsed = parseAgentSettingsInput(input, [...extensions.values()]);
+      switch (parsed.action) {
         case 'get':
           result = {
             success: true,
@@ -16932,32 +17257,13 @@ export class AgentFramework {
           result = { success: true, data: this.cancelAgentRuntimeSettingsTransition(agentName) };
           break;
         case 'update': {
-          const patch: AgentRuntimeSettingsPatch = {};
-          if (input.context_budget_tokens !== undefined) {
-            patch.contextBudgetTokens = Number(input.context_budget_tokens);
-          }
-          if (input.tail_tokens !== undefined) patch.tailTokens = Number(input.tail_tokens);
-          if (input.transition_pace_tokens !== undefined) {
-            patch.transitionPaceTokens = Number(input.transition_pace_tokens);
-          }
-          if (input.same_round_think_text_policy !== undefined) {
-            patch.sameRoundThinkTextPolicy = input.same_round_think_text_policy as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
-          }
-          // Immediate budget decrease: skip the paced descent; the next
-          // compile plans straight at the new budget (one-shot fold-down).
-          if (input.immediate !== undefined) patch.immediate = Boolean(input.immediate);
+          const { patch } = parsed;
           // Route extension-owned keys to their modules; apply the core patch
           // only when it touches core keys (an extension-only update must not
           // disturb a converging budget transition).
           const extResults: Record<string, unknown> = {};
-          for (const ext of extensions.values()) {
-            const slice: Record<string, unknown> = {};
-            for (const key of ext.keys) {
-              if (input[key] !== undefined) slice[key] = input[key];
-            }
-            if (Object.keys(slice).length > 0) {
-              Object.assign(extResults, ext.update(agentName, slice));
-            }
+          for (const [ext, slice] of parsed.extUpdates) {
+            Object.assign(extResults, ext.update(agentName, slice));
           }
           const coreTouched = Object.keys(patch).length > 0;
           const core = coreTouched
@@ -16980,47 +17286,14 @@ export class AgentFramework {
           break;
         }
         case 'reset': {
-          let keys: Array<keyof AgentRuntimeSettingsPatch> | undefined;
-          const extResetKeys = new Map<AgentSettingsExtension, string[]>();
-          const resetsAllSettings = input.settings === undefined;
-          if (input.settings !== undefined) {
-            if (!Array.isArray(input.settings)) throw new Error('reset `settings` must be an array');
-            const names: Record<string, keyof AgentRuntimeSettingsPatch> = {
-              context_budget_tokens: 'contextBudgetTokens',
-              tail_tokens: 'tailTokens',
-              transition_pace_tokens: 'transitionPaceTokens',
-              same_round_think_text_policy: 'sameRoundThinkTextPolicy',
-            };
-            keys = [];
-            for (const name of input.settings) {
-              if (typeof name === 'string' && names[name]) {
-                keys.push(names[name]);
-                continue;
-              }
-              const owner = [...extensions.values()].find(
-                (ext) => typeof name === 'string' && ext.keys.includes(name),
-              );
-              if (!owner) throw new Error(`Unknown reset setting: ${String(name)}`);
-              const list = extResetKeys.get(owner) ?? [];
-              list.push(name as string);
-              extResetKeys.set(owner, list);
-            }
-            if (keys.length === 0) keys = undefined;
-          }
+          const { keys, resetsAll } = parsed;
           const touchedSameRoundThinkTextPolicy =
-            resetsAllSettings || keys?.includes('sameRoundThinkTextPolicy') === true;
+            resetsAll || keys?.includes('sameRoundThinkTextPolicy') === true;
           const extResults: Record<string, unknown> = {};
-          if (input.settings === undefined) {
-            // Reset-all covers extensions too.
-            for (const ext of extensions.values()) {
-              if (ext.reset) Object.assign(extResults, ext.reset(agentName));
-            }
-          } else {
-            for (const [ext, list] of extResetKeys) {
-              if (ext.reset) Object.assign(extResults, ext.reset(agentName, list));
-            }
+          for (const [ext, list] of parsed.extResets) {
+            Object.assign(extResults, list === undefined ? ext.reset!(agentName) : ext.reset!(agentName, list));
           }
-          const coreTouched = input.settings === undefined || keys !== undefined;
+          const coreTouched = resetsAll || keys !== undefined;
           const core = coreTouched
             ? this.resetAgentRuntimeSettings(agentName, keys)
             : this.getAgentRuntimeSettings(agentName);
@@ -17040,8 +17313,6 @@ export class AgentFramework {
           };
           break;
         }
-        default:
-          throw new Error('agent_settings: action must be get, update, reset, or cancel');
       }
     } catch (error) {
       result = {

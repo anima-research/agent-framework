@@ -54,9 +54,10 @@ export interface ResolvedSettingsChange extends ResolvedOperatorChangeBase {
   /** The concrete values the action leaves them at (Agent.previewRuntimeSettingsTarget).
    *  Application applies the action only if it still produces exactly these. */
   target: RuntimeSettingsValues;
-  /** Host-managed (extension) keys the input touches, with their values when
-   *  resolved. Their owners apply them; application checks they haven't moved. */
-  extensions?: Record<string, unknown>;
+  /** Host-managed (extension) keys the input touches: their values when
+   *  resolved, and the values the change leaves them at, from each owner's
+   *  preview (AgentSettingsExtension.preview). Application checks both. */
+  extensions?: { from: Record<string, unknown>; target: Record<string, unknown> };
 }
 
 /** set_tool_visibility / set_tool_description, from an operator or a module. */
@@ -68,14 +69,35 @@ export interface ResolvedPresentationChange extends ResolvedOperatorChangeBase {
   from: { name: string; visible: boolean; description: string };
 }
 
+/** host/command undo by turns: the exact turn checkpoints it undoes. */
+export interface ResolvedUndoTurnsChange extends ResolvedOperatorChangeBase {
+  kind: 'undo-turns';
+  /** Turns asked for. `checkpoints` holds fewer when history is shorter. */
+  requestedTurns: number;
+  /** The checkpoints it undoes, newest first. Application makes one cut at
+   *  the oldest one's sequenceBefore, onto a branch named for this change. */
+  checkpoints: Array<{ turnIndex: number; sequenceBefore: number; branchName: string }>;
+}
+
 export type ResolvedOperatorChange =
   | ResolvedSettingsChange
-  | ResolvedPresentationChange;
+  | ResolvedPresentationChange
+  | ResolvedUndoTurnsChange;
 
 /** What applyResolvedOperatorChange did. */
 export type AppliedOperatorChange =
   | { kind: 'agent-settings'; result: unknown }
-  | { kind: 'tool-presentation'; result: unknown };
+  | { kind: 'tool-presentation'; result: unknown }
+  | {
+      kind: 'undo-turns';
+      requested: number;
+      undone: number;
+      fromBranch: string;
+      toBranch: string;
+      /** The cut had already been applied (the active branch is its
+       *  destination): nothing changed this time. */
+      alreadyApplied?: true;
+    };
 
 /** The self-change kind a tool call is, when it mutates the agent's own body:
  *  agent_settings update/reset/cancel, or a tool-presentation edit. */

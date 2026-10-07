@@ -272,9 +272,12 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'undo:completed';
       agentName: string;
+      /** The (oldest) turn undone. */
       turnIndex: number;
       fromBranch: string;
       toBranch: string;
+      /** Turns undone by one cut (an admitted multi-turn undo); absent for one. */
+      turns?: number;
     })
   | (TraceEventBase & {
       type: 'redo:completed';

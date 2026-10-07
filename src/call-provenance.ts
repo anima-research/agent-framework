@@ -17,3 +17,11 @@ import type { ToolCall } from './types/index.js';
 export type CallProvenance = Pick<ToolCall, 'origin' | 'admission'>;
 
 export const callProvenance = new AsyncLocalStorage<CallProvenance>();
+
+/**
+ * The lease whose callback (runAtSafeBoundary) the current work runs
+ * inside, carried across its asynchronous work. A module's own timer or an
+ * unrelated caller is outside it even while that lease holds the store, so
+ * a mutation can tell the lease holder's work from everyone else's.
+ */
+export const leaseScope = new AsyncLocalStorage<object>();

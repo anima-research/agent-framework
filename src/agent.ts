@@ -564,6 +564,11 @@ export class Agent {
     return target;
   }
 
+  /** Throw if updateRuntimeSettings would reject this patch; changes nothing. */
+  checkRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
+    this.validateRuntimeSettingsPatch(patch);
+  }
+
   private validateRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
     if (Object.keys(patch).length === 0) throw new Error('At least one setting is required');
     if (patch.contextBudgetTokens !== undefined) {
