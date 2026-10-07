@@ -37,9 +37,9 @@
  *                {op:"wake", id, exec_id, line, payload}
  *                {op:"exec_result", id, stdout, stderr, return_code, tail?}
  *
- * At a deadline the host sends cancel and then SIGINT (not on Windows): the
- * cancel stops a script waiting on an await, the signal also one stuck in
- * blocking code (see _on_sigint).
+ * At a deadline the host sends cancel and then SIGINT, repeated until the
+ * script reports (not on Windows): the cancel stops a script waiting on an
+ * await, the signal also one stuck in blocking code (see _on_sigint).
  *
  * IMPORTANT: the python source below must not contain backticks or the
  * sequence dollar+brace (TS template literal syntax). String.raw preserves
@@ -178,18 +178,36 @@ _current_exec_task = None
 # it raised, so _run_script can tell it from the script's own exceptions.
 _interrupt_armed = False
 _host_interrupt = None
-# Whether the running script was cancelled (cancel op or SIGINT): only once.
+# The running script is cancelled once (cancel op or SIGINT), and a SIGINT
+# schedules that at most once.
 _script_cancelled = False
+_cancel_scheduled = False
 
 
-def _cancel_script():
-    global _script_cancelled
-    task = _current_exec_task
-    if task is None or task.done() or _script_cancelled:
-        return False
+def _cancel_script(task=None):
+    # Runs on the loop (main()'s dispatch, or a callback the SIGINT handler
+    # scheduled), never from inside the handler: cancelling there could land
+    # between main()'s check of a future the script awaits and its
+    # set_result. A scheduled call is bound to its script's task.
+    global _script_cancelled, _interrupt_armed
+    current = _current_exec_task
+    if current is None or current.done() or _script_cancelled:
+        return
+    if task is not None and task is not current:
+        return
     _script_cancelled = True
-    task.cancel()
-    return True
+    # Delivered: the script may catch it and finish (it then returns 0).
+    _interrupt_armed = False
+    current.cancel()
+
+
+def _resolve(fut, value):
+    # Defense in depth: the script may have been cancelled since the lookup.
+    if fut is not None and not fut.done():
+        try:
+            fut.set_result(value)
+        except asyncio.InvalidStateError:
+            pass
 
 
 def _make_tool_fn(tool_name, py_name):
@@ -381,7 +399,7 @@ async def _run_script(exec_id, code):
 
 
 async def main():
-    global _current_exec_id, _current_exec_task, _script_cancelled
+    global _current_exec_id, _current_exec_task, _script_cancelled, _cancel_scheduled
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
 
@@ -431,17 +449,14 @@ async def main():
                 continue
             _current_exec_id = msg.get("id")
             _script_cancelled = False
+            _cancel_scheduled = False
             _current_exec_task = asyncio.ensure_future(
                 _run_script(msg.get("id"), msg.get("code") or "")
             )
         elif op == "tool_result":
-            fut = _pending_tool_futures.get(msg.get("id"))
-            if fut is not None and not fut.done():
-                fut.set_result(str(msg.get("result", "")))
+            _resolve(_pending_tool_futures.get(msg.get("id")), str(msg.get("result", "")))
         elif op == "wake_ack":
-            fut = _pending_wake_futures.get(msg.get("id"))
-            if fut is not None and not fut.done():
-                fut.set_result(msg.get("error") or None)
+            _resolve(_pending_wake_futures.get(msg.get("id")), msg.get("error") or None)
         elif op == "cancel":
             _cancel_script()
         elif op == "exit":
@@ -458,39 +473,44 @@ async def main():
 
 # At the deadline the host sends a cancel op, which lands only when the script
 # awaits: a script blocked in time.sleep(), a busy loop or a blocking read
-# never gives the event loop control back. So the host also sends SIGINT,
-# which stops the running script once, whatever it is doing:
+# never gives the event loop control back. So the host also sends SIGINT
+# (repeated until the script reports), which stops the running script once:
 #   - In its own code, it raises KeyboardInterrupt there; _run_script catches
 #     it, so the output so far and the interpreter's globals survive. Only
 #     with _run_script's frame on the stack: checking the current task is not
 #     enough, as asyncio runs its own code for the task between steps, and an
 #     exception raised there escapes the event loop and ends the interpreter.
 #   - Anywhere else (waiting on an await, or mid-way through a protocol write,
-#     which an exception would leave torn) it cancels the script, as the
-#     cancel op would. Not waiting for that op matters: the script may resume
-#     into blocking code before the op is read.
-# Between scripts it does nothing.
+#     which an exception would leave torn) it schedules the script's
+#     cancellation on the loop, as the cancel op would, without waiting for
+#     that op to be read. Should the script resume into blocking code before
+#     the cancellation runs, it is still armed, and the next SIGINT lands
+#     there.
+# Between scripts, and once the script was interrupted or cancelled, it does
+# nothing.
 _RUN_SCRIPT_CODE = _run_script.__code__
 _SEND_CODE = send.__code__
 
 
 def _on_sigint(signum, frame):
-    global _interrupt_armed, _host_interrupt
+    global _interrupt_armed, _host_interrupt, _cancel_scheduled
     if not _interrupt_armed:
         return
-    _interrupt_armed = False
     while frame is not None:
         code = frame.f_code
         if code is _SEND_CODE:
             break
         if code is _RUN_SCRIPT_CODE:
+            _interrupt_armed = False
             _host_interrupt = KeyboardInterrupt("script interrupted by host")
             raise _host_interrupt
         frame = frame.f_back
-    if _cancel_script():
-        # select() resumes its wait after a signal; wake it so the
-        # cancellation runs now (as asyncio.run's own SIGINT handler does).
-        _current_exec_task.get_loop().call_soon_threadsafe(lambda: None)
+    task = _current_exec_task
+    if not _cancel_scheduled and task is not None and not task.done():
+        _cancel_scheduled = True
+        # Thread-safe scheduling also wakes select(), which otherwise resumes
+        # its wait after a signal.
+        task.get_loop().call_soon_threadsafe(_cancel_script, task)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,8 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -23,7 +24,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { AgentFramework, PyRunner, buildInjectedTools } from '../src/index.js';
+import { AgentFramework, PYTHON_RUNTIME_SOURCE, PyRunner, buildInjectedTools } from '../src/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
 const ECHO_TOOLS: { pyName: string; toolName: string }[] = [
@@ -1096,6 +1097,69 @@ describe('code_execution time limit vs blocking code (real python3)', { skip: pr
       }
     } finally {
       runner.dispose();
+    }
+  });
+
+  // Drives the runtime's own functions to land the signal at exact points of main()'s dispatch.
+  const SIGNAL_TIMING_DRIVER = [
+    'import asyncio, importlib.util, io, json, signal, sys, threading',
+    'spec = importlib.util.spec_from_file_location("pytc_runtime", sys.argv[1])',
+    'rt = importlib.util.module_from_spec(spec)',
+    'spec.loader.exec_module(rt)',
+    'rt.PROTO_OUT = io.StringIO()',
+    'signal.signal(signal.SIGINT, rt._on_sigint)',
+    'async def main():',
+    '    rt.handle_init({"tools": [], "background": True})',
+    '    rt._current_exec_id = "e1"',
+    '    code = "import time\\nawait wake_agent({})\\nprint(\'woke\')\\ntime.sleep(5)\\nprint(\'slept\')"',
+    '    rt._current_exec_task = asyncio.ensure_future(rt._run_script("e1", code))',
+    '    while "w1" not in rt._pending_wake_futures:',
+    '        await asyncio.sleep(0.01)',
+    '    fut = rt._pending_wake_futures["w1"]',
+    '    if sys.argv[2] == "mid-resolve":',
+    '        # between the check of a future the script awaits and its set_result',
+    '        if not fut.done():',
+    '            rt._on_sigint(signal.SIGINT, sys._getframe())',
+    '            fut.set_result(None)',
+    '    else:',
+    '        # the script\'s wakeup is queued ahead of the cancellation the signal schedules',
+    '        fut.set_result(None)',
+    '        rt._on_sigint(signal.SIGINT, sys._getframe())',
+    '        threading.Timer(0.5, signal.pthread_kill, (threading.main_thread().ident, signal.SIGINT)).start()',
+    '    for _ in range(1000):',
+    '        if rt._current_exec_task is None:',
+    '            break',
+    '        await asyncio.sleep(0.01)',
+    '    lines = [json.loads(l) for l in rt.PROTO_OUT.getvalue().splitlines()]',
+    '    result = [m for m in lines if m["op"] == "exec_result"][0]',
+    '    print(json.dumps({"return_code": result["return_code"], "tail": result["tail"]}))',
+    'asyncio.run(main())',
+  ].join('\n');
+
+  it('a SIGINT never cancels a script inside main()\'s dispatch; one it cannot stop at once stays armed', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pytc-signal-timing-'));
+    try {
+      writeFileSync(join(dir, 'runtime.py'), PYTHON_RUNTIME_SOURCE);
+      writeFileSync(join(dir, 'driver.py'), SIGNAL_TIMING_DRIVER);
+      const drive = (scenario: string) =>
+        JSON.parse(execFileSync('python3', [join(dir, 'driver.py'), join(dir, 'runtime.py'), scenario], { encoding: 'utf8', timeout: 20_000 })) as { return_code: number; tail: string };
+
+      // Cancelling from inside the handler here cancelled the future under main(), whose
+      // set_result then raised InvalidStateError and ended the interpreter.
+      const midResolve = drive('mid-resolve');
+      assert.strictEqual(midResolve.return_code, 1);
+      assert.match(midResolve.tail, /KeyboardInterrupt: script cancelled by host/);
+      assert.doesNotMatch(midResolve.tail, /woke/);
+
+      // The script resumes into blocking code before the scheduled cancellation runs: the next
+      // signal (the host repeats it) interrupts it there.
+      const resumed = drive('resumed');
+      assert.strictEqual(resumed.return_code, 1);
+      assert.match(resumed.tail, /woke/);
+      assert.match(resumed.tail, /KeyboardInterrupt: script interrupted by host/);
+      assert.doesNotMatch(resumed.tail, /slept/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

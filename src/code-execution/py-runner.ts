@@ -78,6 +78,8 @@ const DEFAULT_TOOL_CALL_TIMEOUT_MS = 270_000;
 const DEFAULT_SCRIPT_TIMEOUT_MS = 600_000;
 const DEFAULT_IDLE_RECLAIM_MS = 300_000;
 const CANCEL_GRACE_MS = 10_000;
+/** After the deadline, SIGINT is repeated at this interval until the script reports or is killed. */
+const INTERRUPT_REPEAT_MS = 200;
 
 /** The longest delay Node's timers honour (~24.8 days); a longer one fires after ~1 ms. */
 export const MAX_TIMER_MS = 2_147_483_647;
@@ -94,6 +96,8 @@ interface PendingExec {
   resolve: (result: ExecResult) => void;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
   killTimer: ReturnType<typeof setTimeout> | null;
+  /** Repeats the deadline SIGINT (see interruptChild). */
+  interruptTimer?: ReturnType<typeof setInterval>;
   settled: boolean;
   /** Set once the deadline fired: the result then says the script ran out of time. */
   deadlineMs: number | null;
@@ -199,9 +203,12 @@ export class PyRunner {
         this.send({ op: 'cancel', id: execId, reason: 'deadline' });
         // The cancel lands only when the script awaits. Blocking code (time.sleep, a
         // busy loop, a blocking read) never does, so interrupt it as well: the runtime
-        // raises KeyboardInterrupt in the script's own code, or cancels a script that
-        // is waiting (it may resume into blocking code before the cancel op is read).
+        // raises KeyboardInterrupt in the script's own code, or schedules the
+        // cancellation of a script that is waiting. Repeated, because a waiting script
+        // can resume into blocking code before that cancellation runs; the runtime
+        // ignores the repeats once the script was interrupted or cancelled.
         this.interruptChild();
+        pending.interruptTimer = setInterval(() => this.interruptChild(), INTERRUPT_REPEAT_MS);
         pending.killTimer = setTimeout(() => {
           pending.deadlineMs = null; // this message already says why
           this.settlePending({
@@ -425,6 +432,7 @@ export class PyRunner {
     }
     if (pending.deadlineTimer) clearTimeout(pending.deadlineTimer);
     if (pending.killTimer) clearTimeout(pending.killTimer);
+    if (pending.interruptTimer) clearInterval(pending.interruptTimer);
     this.pending = null;
     pending.resolve(result);
   }
