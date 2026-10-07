@@ -443,6 +443,138 @@ test('startup records a crash-completion activation only after syncing the store
   assert.deepEqual(h.reopen().recoverAtStartup('rollback/cairn/1').activated, [batch.id]);
 }));
 
+test('a staged choice: authorized at staging, never dispatched or touched at startup, activated by its change after the body', withJournal((outbox, h) => {
+  const due = (o: DiscordAwarenessOutbox) => o.pendingDispatches('discord').map((d) => `${d.action}:${d.key.messageId}`).sort();
+  const stage = (id: string, refs: DiscordAwarenessRef[]) => outbox.prepare({
+    id, staged: true, agentName: 'cairn', sourceBranch: 'main', targetBranch: `undo/cairn/${id}`, refs, scope: 'addressed',
+  })!;
+
+  const a = stage('op-a', [ref('m1'), ref('m2'), ref('m3')]);
+  assert.equal(a.status, 'staged');
+  assert.equal(outbox.pendingDispatches('discord').length, 0);
+  assert.deepEqual(h.reopen().recoverAtStartup('undo/cairn/op-a'), { activated: [], held: [], unknownAttempts: 0 });
+  assert.equal(outbox.view().find((v) => v.id === 'op-a')!.kind, 'batch');
+  // Its body is its change's: even a staged suppression is never offered
+  // for the outbox's body resume.
+  outbox.prepare({
+    id: 'op-s', staged: true, agentName: 'cairn', sourceBranch: 'main', targetBranch: 'main', refs: [ref('s1')], scope: 'addressed',
+    activationPolicy: 'explicit', suppressionIntervals: [{ fromId: 's1', toId: 's1' }],
+  });
+  assert.deepEqual(outbox.preparedSuppressionsForBranch('main'), []);
+  outbox.discard('op-s');
+
+  // The change commits its body: the facts narrow the audience (m4 was
+  // never chosen, m3 was not cut) and count the late arrival unmarked.
+  const settled = outbox.activateStaged('op-a', { targetBranch: 'undo/cairn/op-a', refs: [ref('m1'), ref('m2'), ref('m4')], unmarked: 1, notRemoved: 1 });
+  assert.equal(settled.status, 'queued');
+  assert.equal(settled.status === 'queued' && settled.queued, 2);
+  const recorded = settled.status === 'queued' ? settled.batch : null;
+  assert.deepEqual(recorded!.refs.map((r) => r.messageId), ['m1', 'm2']);
+  assert.deepEqual({ unmarked: recorded!.unmarked, notRemoved: recorded!.notRemoved, status: recorded!.status }, { unmarked: 1, notRemoved: 1, status: 'active' });
+  assert.deepEqual(due(outbox), ['add:m1', 'add:m2']);
+
+  // A retry replays the recorded facts and count, even after the operator
+  // cancelled in between; it writes nothing and recounts nothing.
+  outbox.cancel('op-a');
+  const records = h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length;
+  const retry = outbox.activateStaged('op-a', { targetBranch: 'elsewhere', refs: [ref('m9')], unmarked: 7 });
+  assert.equal(retry.status === 'queued' && retry.queued, 2);
+  assert.deepEqual(retry.status === 'queued' && retry.batch.refs.map((r) => r.messageId), ['m1', 'm2']);
+  assert.deepEqual(outbox.settleActivation('op-a'), { status: 'queued', queued: 2 });
+  assert.equal(h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length, records);
+}));
+
+test('a staged choice keeps its staging-time authority: a retract while it waits wins, and cancelling it never revives', withJournal((outbox, h) => {
+  const due = (o: DiscordAwarenessOutbox) => o.pendingDispatches('discord').map((d) => `${d.action}:${d.key.messageId}`).sort();
+  const stage = (id: string, refs: DiscordAwarenessRef[]) => outbox.prepare({
+    id, staged: true, agentName: 'cairn', sourceBranch: 'main', targetBranch: `undo/cairn/${id}`, refs, scope: 'all',
+  })!;
+  // retract('all') covers staged choices; retracting by the staged id works too.
+  stage('op-b', [ref('m1'), ref('m2')]);
+  stage('op-c', [ref('m3')]);
+  const all = outbox.retract('all');
+  assert.equal(all.removalsQueued, 3);
+  // A choice staged after the retract is a later authorization.
+  stage('op-d', [ref('m4')]);
+  const restarted = h.reopen(); // the authority survives a restart
+  const { requestId } = restarted.retract('op-d');
+  restarted.cancel(requestId); // stopping the retract revives nothing
+  const b = restarted.activateStaged('op-b', { targetBranch: 'undo/cairn/op-b', refs: [ref('m1'), ref('m2')] });
+  const c = restarted.activateStaged('op-c', { targetBranch: 'undo/cairn/op-c', refs: [ref('m3')] });
+  const d = restarted.activateStaged('op-d', { targetBranch: 'undo/cairn/op-d', refs: [ref('m4')] });
+  assert.deepEqual([b, c, d].map((r) => r.status === 'queued' && r.queued), [0, 0, 0]);
+  assert.deepEqual(due(restarted), ['remove:m1', 'remove:m2', 'remove:m3']);
+}));
+
+test('a staged choice cancelled or dropped before its body is never scheduled; a failed write leaves it staged for the retry', withJournal((outbox, h) => {
+  const stage = (id: string) => outbox.prepare({
+    id, staged: true, agentName: 'cairn', sourceBranch: 'main', targetBranch: `undo/cairn/${id}`, refs: [ref(`m-${id}`)], scope: 'all',
+  })!;
+  stage('op-e');
+  assert.equal(outbox.cancel('op-e').cancelled, 1, 'a staged choice counts as stopped');
+  const records = h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length;
+  const cancelled = outbox.activateStaged('op-e', { targetBranch: 'undo/cairn/op-e', refs: [ref('m-op-e')] });
+  assert.equal(cancelled.status, 'not-scheduled');
+  assert.equal(h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length, records, 'nothing written');
+
+  stage('op-f');
+  assert.equal(outbox.discard('op-f'), true);
+  assert.equal(outbox.batches().find((b) => b.id === 'op-f')!.status, 'discarded');
+  assert.equal(outbox.activateStaged('op-f', { targetBranch: 'x', refs: [] }).status, 'not-scheduled');
+
+  stage('op-g');
+  const sync = h.store.sync.bind(h.store);
+  (h.store as any).sync = () => { throw new Error('injected sync failure'); };
+  let failed;
+  try {
+    failed = outbox.activateStaged('op-g', { targetBranch: 'undo/cairn/op-g', refs: [ref('m-op-g')] });
+  } finally {
+    (h.store as any).sync = sync;
+  }
+  assert.equal(failed.status, 'unresolved');
+  assert.equal(outbox.batches().find((b) => b.id === 'op-g')!.status, 'staged');
+  const again = outbox.activateStaged('op-g', { targetBranch: 'undo/cairn/op-g', refs: [ref('m-op-g')] });
+  assert.equal(again.status === 'queued' && again.queued, 1);
+  // A staged batch is not the live surgeries' to settle.
+  stage('op-h');
+  assert.equal(outbox.settleActivation('op-h').status, 'unresolved');
+  assert.equal(outbox.batches().find((b) => b.id === 'op-h')!.status, 'staged');
+}));
+
+test('a batch id is validated, and an existing id is returned as recorded with nothing written', withJournal((outbox, h) => {
+  const input = { agentName: 'cairn', sourceBranch: 'main', targetBranch: 't', refs: [ref('m1')], scope: 'all' as const };
+  const first = outbox.prepare({ ...input, id: 'op-1', staged: true })!;
+  const records = h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length;
+  const again = outbox.prepare({ ...input, id: 'op-1', refs: [ref('m2'), ref('m3')] })!;
+  assert.deepEqual({ status: again.status, refs: again.refs.map((r) => r.messageId) }, { status: 'staged', refs: ['m1'] });
+  assert.equal(again.authorization, first.authorization);
+  assert.equal(h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length, records);
+  // Whatever its status: a discarded id stays discarded.
+  outbox.discard('op-1');
+  assert.equal(outbox.prepare({ ...input, id: 'op-1' })!.status, 'discarded');
+  const { requestId } = outbox.retract('all');
+  for (const bad of ['', 'all', 'x'.repeat(201), requestId]) {
+    assert.throws(() => outbox.prepare({ ...input, id: bad }), /Invalid Discord awareness batch id/);
+  }
+}));
+
+test('live activations record what they queued, and settleActivation replays it after a cancel', withJournal((outbox) => {
+  const batch = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 't', refs: [ref('m1'), ref('m2')], scope: 'all' })!;
+  assert.deepEqual(outbox.settleActivation(batch.id), { status: 'queued', queued: 2 });
+  outbox.cancel(batch.id);
+  assert.deepEqual(outbox.settleActivation(batch.id), { status: 'queued', queued: 2 });
+  assert.equal(outbox.batches()[0].activation!.queued, 2);
+}));
+
+test('an applied change records what its activation queued, and settling it again replays that count', withJournal((outbox) => {
+  const applied = outbox.settleApplied({ agentName: 'cairn', branch: 'main', refs: [ref('m1'), ref('m2')], scope: 'addressed' })!;
+  assert.deepEqual(applied.settled, { status: 'queued', queued: 2 });
+  outbox.cancel(applied.batchId);
+  // The original scheduling fact, not a recount of what still stands.
+  assert.deepEqual(outbox.settleActivation(applied.batchId), { status: 'queued', queued: 2 });
+  assert.equal(outbox.batches()[0].activation!.queued, 2);
+}));
+
 test('a retract request can be cancelled by the id its receipt returned, even after a restart', withJournal((outbox, h) => {
   const batch = activeBatch(outbox, [ref('m1'), ref('m2'), ref('m3')]);
   for (const id of ['m1', 'm2', 'm3']) answer(outbox, id, 'confirmed');

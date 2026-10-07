@@ -138,10 +138,23 @@ export interface DiscordAwarenessBatchRecord {
   activationPolicy?: 'target-branch' | 'explicit';
   /** Idempotent interval operations used to resume an interrupted suppression. */
   suppressionIntervals?: DiscordSuppressionInterval[];
+  /**
+   * A publication choice recorded when an operator change was staged, before
+   * its body change: its record's position is the choice's authorization for
+   * life. A staged batch is never dispatched, crash-completed or held; the
+   * change's own journal activates it (activateStaged) once its body change
+   * is established, or retires it (discard) when the change is dropped.
+   */
+  staged?: boolean;
 }
 
 /** A surgery's request, as it prepares a batch. */
 export interface DiscordAwarenessPrepareInput {
+  /** A caller-chosen identity: an existing batch of this id is returned as
+   *  recorded, in whatever status, and nothing is written. */
+  id?: string;
+  /** Record a staged publication choice (see DiscordAwarenessBatchRecord.staged). */
+  staged?: boolean;
   agentName: string;
   sourceBranch: string;
   targetBranch: string;
@@ -167,7 +180,7 @@ export type DiscordAwarenessSettlement =
   | { status: 'not-scheduled'; error: string }
   | { status: 'unresolved'; error: string };
 
-export type DiscordAwarenessBatchStatus = 'prepared' | 'active' | 'held' | 'discarded';
+export type DiscordAwarenessBatchStatus = 'staged' | 'prepared' | 'active' | 'held' | 'discarded';
 
 export interface DiscordAwarenessBatch extends DiscordAwarenessBatchRecord {
   status: DiscordAwarenessBatchStatus;
@@ -180,6 +193,9 @@ export interface DiscordAwarenessBatch extends DiscordAwarenessBatchRecord {
   /** Journal position of the operator's release: the authorization of the
    *  requests the release queues. */
   releaseAuthorization?: number;
+  /** What the activation recorded: when, and how many adds it requested (the
+   *  original scheduling fact a retry replays, never a recount). */
+  activation?: { at: number; queued: number };
   held?: { reason: string; at: number; releaseActions: DiscordAwarenessReleaseAction[] };
   cancelled?: { at: number; by?: string };
   released?: { at: number; by?: string };
@@ -455,7 +471,15 @@ function isAddressed(message: DiscordMessageMetadataCarrier): boolean {
 
 type JournalRecord =
   | { t: 'batch'; at: number; batch: DiscordAwarenessBatchRecord }
-  | { t: 'activated'; at: number; batchId: string }
+  | {
+      t: 'activated';
+      at: number;
+      batchId: string;
+      /** Adds this activation requested (not born superseded). */
+      queued?: number;
+      /** A staged batch's facts, from the body change that committed. */
+      facts?: { targetBranch: string; refs: DiscordAwarenessRef[]; unmarked?: number; notRemoved?: number };
+    }
   /** An imported ledger's `active`: a historical fact about its marks, never
    *  a certificate that a suppression's body completed. */
   | { t: 'legacy-activated'; at: number; batchId: string }
@@ -569,11 +593,21 @@ export class DiscordAwarenessOutbox {
    * delivers: activate() (or startup's crash completion) does.
    */
   prepare(input: DiscordAwarenessPrepareInput): DiscordAwarenessBatch | null {
+    if (input.id !== undefined) {
+      const state = this.load();
+      if (typeof input.id !== 'string' || input.id.length === 0 || input.id.length > 200
+        || input.id === 'all' || state.retracts.has(input.id)) {
+        throw new Error(`Invalid Discord awareness batch id: ${JSON.stringify(boundDiscordAwarenessText(String(input.id)))}`);
+      }
+      const existing = state.batches.get(input.id);
+      if (existing) return structuredClone(existing);
+    }
     const batch = batchRecord(input);
     if (!batch) return null;
-    // Durable before the surgery's switch, so startup can crash-complete it.
+    // Durable before the surgery's switch, so startup can crash-complete it;
+    // a staged choice, before anything can act on it.
     this.append([{ t: 'batch', at: batch.createdAt, batch }], { durable: true });
-    return { ...structuredClone(batch), status: 'prepared' };
+    return structuredClone(this.load().batches.get(batch.id)!);
   }
 
   /**
@@ -592,7 +626,7 @@ export class DiscordAwarenessOutbox {
    * Never throws.
    */
   settleApplied(
-    input: Omit<DiscordAwarenessPrepareInput, 'sourceBranch' | 'targetBranch' | 'activationPolicy' | 'suppressionIntervals'>
+    input: Omit<DiscordAwarenessPrepareInput, 'id' | 'staged' | 'sourceBranch' | 'targetBranch' | 'activationPolicy' | 'suppressionIntervals'>
       & { branch: string },
   ): { batchId: string; marks: number; settled: DiscordAwarenessSettlement } | null {
     const { branch, ...rest } = input;
@@ -637,6 +671,7 @@ export class DiscordAwarenessOutbox {
     if (!batch) throw new Error(`Discord awareness batch not found: ${batchId}`);
     if (batch.status === 'active') return 0;
     if (batch.status !== 'prepared') {
+      // A staged batch is activated by its change (activateStaged), never here.
       throw new Error(`Discord awareness batch ${batchId} is ${batch.status}, not prepared`);
     }
     if (batch.cancelled) {
@@ -644,12 +679,11 @@ export class DiscordAwarenessOutbox {
       throw new Error(`Discord awareness batch ${batchId} was cancelled before activation`);
     }
     const at = Date.now();
-    const records: JournalRecord[] = [{ t: 'activated', at, batchId }];
     const requested = this.requestRecords(state, batch.refs.map((ref) => ({ ...ref, action: 'add' as const })), batch.emoji, {
       kind: 'batch',
       batchId,
     }, at, batch.authorization);
-    records.push(...requested);
+    const records: JournalRecord[] = [{ t: 'activated', at, batchId, queued: liveRequests(requested) }, ...requested];
     // The activation asserts the body change just committed (the switch, or
     // the last redaction): sync that first, so a crash can never leave marks
     // active for a change the store lost.
@@ -671,18 +705,21 @@ export class DiscordAwarenessOutbox {
   settleActivation(batchId: string): DiscordAwarenessSettlement {
     let detail: string;
     try {
+      const before = this.load().batches.get(batchId);
+      // Already active (a retry): replay what its activation recorded.
+      if (before?.status === 'active') return { status: 'queued', queued: this.recordedQueued(batchId) };
+      if (before?.status === 'staged') {
+        return { status: 'unresolved', error: `Discord awareness batch ${batchId} is staged: its change activates it (activateStaged)` };
+      }
       return { status: 'queued', queued: this.activate(batchId) };
     } catch (error) {
       detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
     }
     try {
-      const state = this.load();
-      const current = state.batches.get(batchId);
+      const current = this.load().batches.get(batchId);
       if (current?.status === 'active') {
         // The activation landed but its barrier failed: report what it queued.
-        const queued = [...state.ops.values()]
-          .filter((op) => op.cause.kind === 'batch' && op.cause.batchId === batchId && !op.cancelled).length;
-        return { status: 'queued', queued };
+        return { status: 'queued', queued: this.recordedQueued(batchId) };
       }
       if (this.discard(batchId)) return { status: 'not-scheduled', error: detail };
     } catch (error) {
@@ -691,13 +728,96 @@ export class DiscordAwarenessOutbox {
     return { status: 'unresolved', error: detail };
   }
 
+  /** The adds an active batch's activation recorded; for an activation
+   *  recorded without the count, its own requests still standing. */
+  private recordedQueued(batchId: string): number {
+    const state = this.load();
+    const batch = state.batches.get(batchId);
+    if (batch?.activation) return batch.activation.queued;
+    return [...state.ops.values()]
+      .filter((op) => op.cause.kind === 'batch' && op.cause.batchId === batchId && !op.cancelled).length;
+  }
+
   /**
-   * Retire a batch whose surgery did not complete. Only a prepared batch can
-   * be discarded; returns false when nothing was retired.
+   * Activate a staged batch once its change has established that the body
+   * change committed. One durable record, written after the body's state is
+   * synced, holds the change's facts (refs narrowed to the staged choice's;
+   * the publication audience only shrinks), the activation and the adds it
+   * requested, under the staging-time authorization: a key retracted since
+   * staging is born superseded. Never throws for the batch's own state:
+   * - `queued`: activated now, or already (a retry), with the facts and
+   *   count its activation recorded, never a recount;
+   * - `not-scheduled`: cancelled while staged, or discarded; nothing written;
+   * - `unresolved`: the record could not be written; the batch stays staged
+   *   and a later call activates it.
+   */
+  activateStaged(
+    batchId: string,
+    facts: { targetBranch: string; refs: DiscordAwarenessRef[]; unmarked?: number; notRemoved?: number },
+  ):
+    | { status: 'queued'; queued: number; batch: DiscordAwarenessBatch }
+    | { status: 'not-scheduled'; error: string }
+    | { status: 'unresolved'; error: string } {
+    const state = this.load();
+    const batch = state.batches.get(batchId);
+    if (!batch) throw new Error(`Discord awareness batch not found: ${batchId}`);
+    if (batch.status === 'active') {
+      return { status: 'queued', queued: this.recordedQueued(batchId), batch: structuredClone(batch) };
+    }
+    if (batch.status === 'discarded') {
+      return { status: 'not-scheduled', error: `Discord awareness batch ${batchId} was discarded` };
+    }
+    if (batch.status !== 'staged') {
+      throw new Error(`Discord awareness batch ${batchId} is ${batch.status}, not staged`);
+    }
+    if (batch.cancelled) {
+      return { status: 'not-scheduled', error: `Discord awareness batch ${batchId} was cancelled while staged` };
+    }
+    const staged = new Set(batch.refs.map(refKey));
+    const refs = dedupeRefs(facts.refs).filter((ref) => staged.has(refKey(ref)));
+    const at = Date.now();
+    const requested = this.requestRecords(state, refs.map((ref) => ({ ...ref, action: 'add' as const })), batch.emoji, {
+      kind: 'batch',
+      batchId,
+    }, at, batch.authorization);
+    const records: JournalRecord[] = [{
+      t: 'activated',
+      at,
+      batchId,
+      queued: liveRequests(requested),
+      facts: {
+        targetBranch: facts.targetBranch,
+        refs,
+        ...(facts.unmarked !== undefined ? { unmarked: facts.unmarked } : {}),
+        ...(facts.notRemoved !== undefined ? { notRemoved: facts.notRemoved } : {}),
+      },
+    }, ...requested];
+    try {
+      this.append(records, { afterCommittedState: true, durable: true });
+    } catch (error) {
+      let current: DiscordAwarenessBatch | undefined;
+      try {
+        current = this.load().batches.get(batchId);
+      } catch (readError) {
+        return { status: 'unresolved', error: `${errorText(error)}; reading the journal back also failed: ${errorText(readError)}` };
+      }
+      if (current?.status === 'active') {
+        return { status: 'queued', queued: this.recordedQueued(batchId), batch: structuredClone(current) };
+      }
+      return { status: 'unresolved', error: errorText(error) };
+    }
+    const after = this.load().batches.get(batchId)!;
+    return { status: 'queued', queued: this.recordedQueued(batchId), batch: structuredClone(after) };
+  }
+
+  /**
+   * Retire a batch whose surgery did not complete, or a staged batch whose
+   * change was dropped. Only a prepared or staged batch can be discarded;
+   * returns false when nothing was retired.
    */
   discard(batchId: string): boolean {
     const batch = this.load().batches.get(batchId);
-    if (!batch || batch.status !== 'prepared') return false;
+    if (!batch || (batch.status !== 'prepared' && batch.status !== 'staged')) return false;
     // Retiring a batch retires its obligations (marks and any body resume):
     // the branch state its surgery left (a restored source, or a completed
     // body) is synced first, and the record is durable, so a crash can never
@@ -712,12 +832,14 @@ export class DiscordAwarenessOutbox {
    * whose body was never recorded complete. Body recovery is independent of
    * the marks: a prepared batch is crash-completed (resume, then activate);
    * any other, held, released or cancelled, has only its body resumed.
-   * A batch its own surgery retired (discarded) is not resumed. Branch
+   * A batch its own surgery retired (discarded) is not resumed, and neither
+   * is a staged one: its change's own journal owns its body. Branch
    * ancestry is never consulted.
    */
   preparedSuppressionsForBranch(branchName: string): DiscordAwarenessBatch[] {
     return [...this.load().batches.values()]
-      .filter((batch) => batch.status !== 'discarded'
+      // A staged batch's body belongs to its change's own journal.
+      .filter((batch) => batch.status !== 'discarded' && batch.status !== 'staged'
         && !batch.suppressionComplete
         && batch.activationPolicy === 'explicit'
         && !!batch.suppressionIntervals?.length
@@ -771,15 +893,15 @@ export class DiscordAwarenessOutbox {
       if (batch.targetBranch === activeBranchName) {
         if (suppression) continue; // resumePreparedDiscordSuppressions completes it
 
-        records.push({ t: 'activated', at, batchId: batch.id });
-        records.push(...this.requestRecords(
+        const requested = this.requestRecords(
           state,
           batch.refs.map((ref) => ({ ...ref, action: 'add' as const })),
           batch.emoji,
           { kind: 'batch', batchId: batch.id },
           at,
           batch.authorization,
-        ));
+        );
+        records.push({ t: 'activated', at, batchId: batch.id, queued: liveRequests(requested) }, ...requested);
         activated.push(batch.id);
       } else {
         records.push({
@@ -822,7 +944,7 @@ export class DiscordAwarenessOutbox {
       kind: 'batch',
       // A prepared batch (its surgery still running, or its bookkeeping
       // unresolved) has no requests yet: every one of its marks is stopped.
-      cancelled: batch.status === 'prepared' && !batch.cancelled ? batch.refs.length : 0,
+      cancelled: (batch.status === 'prepared' || batch.status === 'staged') && !batch.cancelled ? batch.refs.length : 0,
       heldDropped: batch.held?.releaseActions.length ?? 0,
       inFlight: 0,
       unknown: 0,
@@ -1390,13 +1512,24 @@ function applyRecords(state: JournalState, records: JournalRecord[]): void {
     switch (record.t) {
       case 'batch':
         if (!state.batches.has(record.batch.id)) {
-          state.batches.set(record.batch.id, { ...structuredClone(record.batch), status: 'prepared', authorization: position });
+          state.batches.set(record.batch.id, {
+            ...structuredClone(record.batch),
+            status: record.batch.staged ? 'staged' : 'prepared',
+            authorization: position,
+          });
         }
         break;
       case 'activated': {
         const batch = state.batches.get(record.batchId);
         if (batch && batch.status !== 'discarded') {
           batch.status = 'active';
+          if (record.queued !== undefined) batch.activation = { at: record.at, queued: record.queued };
+          if (record.facts) {
+            batch.targetBranch = record.facts.targetBranch;
+            batch.refs = record.facts.refs.map((ref) => ({ ...ref }));
+            if (record.facts.unmarked !== undefined) batch.unmarked = record.facts.unmarked;
+            if (record.facts.notRemoved !== undefined) batch.notRemoved = record.facts.notRemoved;
+          }
           // Only a surgery (or its resume) activates a suppression, after its
           // last redaction synced: activation records the body complete.
           // Release does not, and neither does an imported `active`.
@@ -1411,7 +1544,7 @@ function applyRecords(state: JournalState, records: JournalRecord[]): void {
       }
       case 'discarded': {
         const batch = state.batches.get(record.batchId);
-        if (batch && batch.status === 'prepared') batch.status = 'discarded';
+        if (batch && (batch.status === 'prepared' || batch.status === 'staged')) batch.status = 'discarded';
         break;
       }
       case 'held': {
@@ -1674,7 +1807,7 @@ function batchRecord(input: DiscordAwarenessPrepareInput): DiscordAwarenessBatch
   const refs = dedupeRefs(input.refs);
   if (refs.length === 0 && !input.suppressionIntervals?.length) return null;
   return {
-    id: randomUUID(),
+    id: input.id ?? randomUUID(),
     agentName: input.agentName,
     sourceBranch: input.sourceBranch,
     targetBranch: input.targetBranch,
@@ -1688,6 +1821,7 @@ function batchRecord(input: DiscordAwarenessPrepareInput): DiscordAwarenessBatch
     ...(input.suppressionIntervals?.length
       ? { suppressionIntervals: input.suppressionIntervals.map((interval) => ({ ...interval })) }
       : {}),
+    ...(input.staged ? { staged: true } : {}),
   };
 }
 
