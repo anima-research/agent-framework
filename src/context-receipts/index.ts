@@ -26,8 +26,8 @@ import type { BranchStamp, ChannelClockLedger } from './clock-ledger.js';
 
 export { ChannelClockLedger, channelKey, CLOCK_RECORD } from './clock-ledger.js';
 export type { ChannelClocks, ChannelRef, ClockScope, SourceRef, VersionRef } from './clock-ledger.js';
-export { requestEvidence, injectedEvidence, channelOf, sourceRefOf, versionOf, recordedBodyDigest, sourceBodyDigest, copyFacts, copyIntact, withPreparation } from './evidence.js';
-export type { BodyEvidence, CopyFacts, RequestEvidence } from './evidence.js';
+export { requestEvidence, injectedEvidence, channelOf, sourceRefOf, versionOf, recordedBodyDigest, sourceBodyDigest, copyFacts, copyFidelity, withPreparation } from './evidence.js';
+export type { BodyEvidence, CopyFacts, CopyFidelity, RequestEvidence } from './evidence.js';
 
 /** One provider round's report: membrane's `UsageEvent.round`. */
 export type { RoundReport };
@@ -155,6 +155,9 @@ export class ContextReceipts {
           const first = copies.values().next().value!;
           const missing = new Set<string>();
           for (const c of copies.values()) for (const why of c.missing) missing.add(why);
+          // A copy whose fidelity can't be checked confirms nothing, and on
+          // its own shows no loss either: the version stays unconfirmed.
+          if ([...missing].every((why) => why === 'unverifiable')) continue;
           this.ledger.partial(agent, first.body.ch, first.body.src, first.body.ver, branch, [...missing], at);
         }
       });

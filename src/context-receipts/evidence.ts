@@ -155,7 +155,7 @@ export function copyFacts(head: { metadata?: unknown; bodyGroupId?: string }): C
  * stored copy: a replay of it is then not recognizable.
  *
  * Identity says which source item a copy is of, not that the copy still
- * presents it: see copyIntact, which completeness requires.
+ * presents it: see copyFidelity, which confirmed delivery requires.
  */
 export function versionOf(
   source: InboundChannelSource,
@@ -183,18 +183,23 @@ function recoverableDigest(contents: ReadonlyArray<readonly ContentBlock[]>, fac
 
 /**
  * Whether this copy still presents what ingestion stored for the source item,
- * whatever its version basis (event id or digest). A supported context edit
- * (CM editMessage) replaces an unsharded copy's content and keeps its
- * metadata, stamp included; such a copy no longer presents the source body
- * and can't establish its delivery. Shards can't be edited. A stamped
- * unsharded copy is intact while its blocks hash to its recorded stored
- * digest (a stamp without one can't vouch for the copy). A copy stored
- * before stamping can't be checked, and counts as intact.
+ * whatever its version basis (event id or digest):
+ *  - `intact`: shards (which can't be edited), or an unsharded copy whose
+ *    blocks still hash to its recorded stored digest;
+ *  - `edited`: an unsharded copy whose blocks no longer hash to it. A
+ *    supported context edit (CM editMessage) replaces content and keeps
+ *    metadata, stamp included; the copy no longer presents the source body;
+ *  - `unverifiable`: an unsharded copy with no stored digest to check
+ *    against (stored before ingestion recorded one). Its bytes can be
+ *    hashed, but nothing shows an edit never changed them.
+ * Only an intact copy can confirm delivery.
  */
-export function copyIntact(contents: ReadonlyArray<readonly ContentBlock[]>, facts: CopyFacts): boolean {
-  if (facts.sharded) return true;
-  if (facts.sourceDigest === undefined && facts.storedDigest === undefined) return true;
-  return contents.length === 1 && facts.storedDigest !== undefined && sourceBodyDigest(contents[0]!) === facts.storedDigest;
+export type CopyFidelity = 'intact' | 'edited' | 'unverifiable';
+
+export function copyFidelity(contents: ReadonlyArray<readonly ContentBlock[]>, facts: CopyFacts): CopyFidelity {
+  if (facts.sharded) return 'intact';
+  if (facts.storedDigest === undefined) return 'unverifiable';
+  return contents.length === 1 && sourceBodyDigest(contents[0]!) === facts.storedDigest ? 'intact' : 'edited';
 }
 
 /** Tags that make an item a notice about a body rather than a body. */
@@ -246,12 +251,12 @@ export function requestEvidence(inputs: EvidenceInputs): RequestEvidence {
         const contents = members.map((m) => m.content);
         const facts = copyFacts(stored);
         const lostFragment = droppedFragments.has(body.messageId);
-        const intact = copyIntact(contents, facts);
-        const missing = [...(body.missing ?? []), ...(lostFragment ? ['preparation'] : []), ...(intact ? [] : ['edited'])];
+        const fidelity = copyFidelity(contents, facts);
+        const missing = [...(body.missing ?? []), ...(lostFragment ? ['preparation'] : []), ...(fidelity === 'intact' ? [] : [fidelity])];
         bodies.push(Object.freeze({
           index,
           storeMessageId: stored.id,
-          complete: body.complete && !lostFragment && intact,
+          complete: body.complete && !lostFragment && fidelity === 'intact',
           ...(missing.length > 0 ? { missing } : {}),
           ch: channelOf(source),
           src: sourceRefOf(source, stored.id),
@@ -285,12 +290,13 @@ export function injectedEvidence(
   const source = readInboundSource(message.metadata);
   if (!source || source.kind !== 'channel' || !isBody({ metadata: message.metadata as StoredMessage['metadata'] }, source)) return null;
   const facts = { ...copyFacts({ metadata: message.metadata }), sharded: Boolean(stored?.bodyGroupId) };
-  const intact = copyIntact([message.content], { ...facts, sharded: false });
+  // The injected content is the whole body as handed to storage: checked as one copy.
+  const fidelity = copyFidelity([message.content], { ...facts, sharded: false });
   return Object.freeze({
     index,
     storeMessageId,
-    complete: intact,
-    ...(intact ? {} : { missing: ['edited'] }),
+    complete: fidelity === 'intact',
+    ...(fidelity === 'intact' ? {} : { missing: [fidelity] }),
     ch: channelOf(source),
     src: sourceRefOf(source, storeMessageId),
     ver: versionOf(source, [message.content], storeId, storeMessageId, facts),

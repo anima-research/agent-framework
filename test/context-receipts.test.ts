@@ -21,7 +21,7 @@ import {
   versionOf,
   recordedBodyDigest,
   sourceBodyDigest,
-  copyIntact,
+  copyFidelity,
   type BodyEvidence,
   type RequestEvidence,
   type RoundReport,
@@ -411,6 +411,9 @@ describe('ContextReceipts', () => {
   });
 });
 
+/** The producer's stamps for a body stored exactly as `blocks` (no header). */
+const stamp = (blocks: unknown[]) => ({ sourceBodyDigest: sourceBodyDigest(blocks as never), storedBodyDigest: sourceBodyDigest(blocks as never) });
+
 describe('receipt evidence', () => {
   const base: InboundChannelSource = {
     kind: 'channel', lane: 'channels/incoming', serverId: 'discord', binding: 'b1', channelId: 'discord:g:room', acceptedAt: 5,
@@ -444,14 +447,15 @@ describe('receipt evidence', () => {
     // A stamped copy matches an undecorated, unsharded copy stored before the record.
     assert.equal(before.key, versionOf(src, [[body]], 's', 'legacy').key);
     // An edit after ingestion keeps the copy's identity (it is still a copy of
-    // that item); copyIntact, which completeness requires, says it no longer
-    // presents the body.
+    // that item); copyFidelity, which confirmed delivery requires, says it no
+    // longer presents the body.
     const editedBlocks = [header('Old room'), { type: 'text' as const, text: 'edited body' }];
     assert.equal(versionOf(src, [editedBlocks], 's', 'copy-1', stamped(oldCopy)).key, before.key);
-    assert.equal(copyIntact([editedBlocks], stamped(oldCopy)), false);
-    assert.equal(copyIntact([oldCopy], stamped(oldCopy)), true);
-    assert.equal(copyIntact([oldCopy], { sharded: false, sourceDigest: 'x' }), false, 'a stamp without its stored digest cannot vouch');
-    assert.equal(copyIntact([[body]], { sharded: false }), true, 'stored before stamping: cannot be checked');
+    assert.equal(copyFidelity([editedBlocks], stamped(oldCopy)), 'edited');
+    assert.equal(copyFidelity([oldCopy], stamped(oldCopy)), 'intact');
+    assert.equal(copyFidelity([oldCopy], { sharded: false, sourceDigest: 'x' }), 'unverifiable', 'a stamp without its stored digest cannot vouch');
+    assert.equal(copyFidelity([[body]], { sharded: false }), 'unverifiable', 'stored before stamping: hashable, but not shown unedited');
+    assert.equal(copyFidelity([[header('Old room')], [body]], { sharded: true }), 'intact', 'shards cannot be edited');
     // Shards can't be edited, so a stamped sharded copy keeps its version.
     const shardedStamped = versionOf(src, [[header('Old room')], [body]], 's', 'head', { sharded: true, sourceDigest: sourceBodyDigest([body]) });
     assert.equal(shardedStamped.key, before.key);
@@ -495,7 +499,7 @@ describe('receipt evidence', () => {
 
   it('marks a copy incomplete when preparation dropped one of its fragments', () => {
     const stored = new Map([
-      ['s1', { id: 's1', sequence: 1, participant: 'u', content: [{ type: 'text', text: 'a' }], metadata: { inboundSource: { ...base, messageId: 'p1' } } }],
+      ['s1', { id: 's1', sequence: 1, participant: 'u', content: [{ type: 'text', text: 'a' }], metadata: { inboundSource: { ...base, messageId: 'p1' }, ...stamp([{ type: 'text', text: 'a' }]) } }],
     ]);
     const provenance = {
       messages: [
@@ -521,7 +525,7 @@ describe('receipt evidence', () => {
 
   it('maps compiled bodies to request indices, keeping only channel bodies', () => {
     const stored = new Map([
-      ['s1', { id: 's1', sequence: 1, participant: 'u', content: [{ type: 'text', text: 'a' }], metadata: { inboundSource: { ...base, messageId: 'p1' } } }],
+      ['s1', { id: 's1', sequence: 1, participant: 'u', content: [{ type: 'text', text: 'a' }], metadata: { inboundSource: { ...base, messageId: 'p1' }, ...stamp([{ type: 'text', text: 'a' }]) } }],
       ['s2', { id: 's2', sequence: 2, participant: 'u', content: [{ type: 'text', text: 'b' }], metadata: {} }],
       ['s3', { id: 's3', sequence: 3, participant: 'u', content: [{ type: 'text', text: 'x' }], metadata: { tags: ['chat:deleted'], inboundSource: { ...base, messageId: 'p3' } } }],
     ]);
@@ -594,7 +598,8 @@ describe('request-owned evidence', () => {
         channelId: 'discord:g:room', eventId: 'ev-1', messageId: 'p1', acceptedAt: 5,
       };
       cm.addMessage('someone', [{ type: 'text', text: '   ' }]); // whitespace only: preparation drops it
-      cm.addMessage('someone', [{ type: 'text', text: '  ' }, { type: 'text', text: 'hello' }], { inboundSource: source } as never);
+      const content = [{ type: 'text' as const, text: '  ' }, { type: 'text' as const, text: 'hello' }];
+      cm.addMessage('someone', content, { inboundSource: source, ...stamp(content) } as never);
       const agent = new Agent({ name: 'r', model: 'test', systemPrompt: 's' }, cm, {} as Membrane);
       const { request, evidence } = await agent.prepareActivationRequest([]);
       assert.equal(request.messages.length, 1);
@@ -631,7 +636,8 @@ describe('request-owned evidence', () => {
         kind: 'channel', lane: 'push/event', serverId: 'discord', binding: 'b1',
         channelId: 'discord:g:room', eventId: 'ev-aux', messageId: 'p-aux', acceptedAt: 7,
       };
-      main.addMessage('alice', [{ type: 'text', text: 'heard by the reader' }], { inboundSource: source } as never);
+      const heard = [{ type: 'text' as const, text: 'heard by the reader' }];
+      main.addMessage('alice', heard, { inboundSource: source, ...stamp(heard) } as never);
       const agent = new Agent({ name: 'reader', model: 'test', systemPrompt: 's' }, reader, {} as Membrane);
       const { evidence } = await agent.prepareActivationRequest([]);
       assert.equal(evidence.bodies.length, 1, 'the auxiliary body is in the evidence');
@@ -663,7 +669,8 @@ describe('request-owned evidence', () => {
         kind: 'channel', lane: 'channels/incoming', serverId: 'discord', binding: 'b1',
         channelId: 'discord:g:room', messageId: 'p1', acceptedAt: 5,
       };
-      const id = cm.addMessage('someone', [{ type: 'text', text: 'original words' }], { inboundSource: source } as never);
+      const words = [{ type: 'text' as const, text: 'original words' }];
+      const id = cm.addMessage('someone', words, { inboundSource: source, ...stamp(words) } as never);
       const agent = new Agent({ name: 'r', model: 'test', systemPrompt: 's' }, cm, {} as Membrane);
       const { evidence } = await agent.prepareActivationRequest([]);
       assert.equal(evidence.bodies.length, 1);
@@ -688,5 +695,35 @@ describe('history--folds folding sentence', () => {
     assert.match(foldingSentence('windowed-passthrough', ['raw', 'omitted']), /never summarizes/);
     assert.match(foldingSentence('custom', null), /does not report its rendered layout/);
     assert.match(foldingSentence('autobiographical', ['raw', 'summary', 'omitted']), /folds history into summaries/);
+  });
+});
+
+describe('copies whose fidelity can\'t be checked', () => {
+  it('a body stored before stamping is never confirmed, and on its own records no loss (Hugo #47358)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'evidence-legacy-'));
+    try {
+      const cm = await ContextManager.open({ path: join(dir, 'store'), strategy: new PassthroughStrategy(), namespace: 'agents/r' });
+      const source = {
+        kind: 'channel', lane: 'channels/incoming', serverId: 'discord', binding: 'b1', channelId: 'discord:g:room', messageId: 'p-old', acceptedAt: 5,
+      };
+      cm.addMessage('someone', [{ type: 'text', text: 'stored long ago' }], { inboundSource: source } as never);
+      const agent = new Agent({ name: 'r', model: 'test', systemPrompt: 's' }, cm, {} as Membrane);
+      const { evidence } = await agent.prepareActivationRequest([]);
+      assert.equal(evidence.bodies[0]!.complete, false);
+      assert.deepEqual(evidence.bodies[0]!.missing, ['unverifiable']);
+      assert.equal(evidence.bodies[0]!.ver.basis, 'message-digest', 'its bytes still name a version');
+      const ledger = new ChannelClockLedger(cm.getStore(), cm.getStoreId());
+      ledger.start();
+      const receipts = new ContextReceipts(ledger, { acceptRound: () => {} });
+      receipts.beginStream('r', 1, evidence);
+      receipts.usage('r', 1, { index: 0, stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, altered: { messages: [], injected: [] }, fidelity: 'established' });
+      const clocks = ledger.clocksFor('r', [{ binding: 'b1', channelId: 'discord:g:room' }]).get(channelKey({ binding: 'b1', channelId: 'discord:g:room' }))!;
+      assert.equal(clocks.lastDeliveredAt, null, 'unconfirmed, not delivered');
+      assert.equal(clocks.lastPartialAt, null, 'and no loss is claimed either');
+      ledger.stop();
+      cm.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

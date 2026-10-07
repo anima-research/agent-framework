@@ -79,7 +79,9 @@ export interface SourceRef {
  *    ingestion recorded digests, even with a platform message id. Identity
  *    unknown: a replay of the same source item can't be recognized.
  * Whatever the basis, a copy edited after ingestion keeps its identity but
- * can't establish delivery (evidence copyIntact): it is a partial exposure.
+ * can't establish delivery (evidence copyFidelity): it is a partial exposure.
+ * A copy whose fidelity can't be checked (stored before ingestion recorded
+ * digests) confirms nothing and stays unconfirmed.
  */
 export interface VersionRef {
   basis: 'event' | 'message-digest' | 'stored-copy';

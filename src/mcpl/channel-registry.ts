@@ -340,7 +340,9 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
       'that earlier version), otherwise by the stored copy, so a replay is then not ' +
       'recognizable (that includes a split body stored before body digests were recorded, ' +
       'even with a platform message id). A copy edited after it arrived is a partial ' +
-      'exposure, never a delivery. Each delivery names its basis. Every delivered version is ' +
+      'exposure, never a delivery; an item stored before body digests were recorded can\'t ' +
+      'be checked for such edits, so its delivery stays unconfirmed. Each delivery names ' +
+      'its basis. Every delivered version is ' +
       'remembered, so one counts when it first reaches you, however long ago it was accepted. ' +
       'receiptClocks.gaps lists intervals in which observations may be missing. A ' +
       'missing inbound item is not evidence of upstream inactivity: a connector or ' +
