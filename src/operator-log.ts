@@ -131,9 +131,9 @@ export function capIds(ids: string[]): { ids: string[]; count: number; truncated
  *   active failed, so it was retired from the ledger: none of its marks will
  *   be delivered.
  * - `unresolved` — the ledger could record neither the activation nor the
- *   retirement. The batch (`batchId`) is still in the ledger in its prepared
- *   state, and any later reconciliation or restart that can read it may
- *   promote and deliver it; nothing here promises otherwise.
+ *   retirement. `batchId` names a retained batch whose scheduling outcome is
+ *   unresolved: any later reconciliation or restart that can read it may
+ *   promote and deliver it, and nothing here promises otherwise.
  */
 export type SurgeryMarkerReceipt =
   | { status: 'none'; queued: 0 }

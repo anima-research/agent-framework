@@ -5955,11 +5955,11 @@ export class AgentFramework {
    * Discord messages that left the live context get awareness markers via the
    * durable outbox, exactly as message-granular `undo` does.
    *
-   * Returns once the switch has landed and the marker batch is durably active
-   * (`markers`), without waiting for Discord to accept the reactions: delivery
-   * is started, behind the MCPL data-plane gate, and continues without the
-   * caller or the store reservation waiting on it; its per-message outcomes
-   * stay in the outbox ledger.
+   * Returns once the switch has landed: the body is applied, with a
+   * marker-scheduling receipt (`markers`). It does not wait for Discord to
+   * accept the reactions: delivery is started, behind the MCPL data-plane
+   * gate, and continues without the caller or the store reservation waiting
+   * on it; its per-message outcomes stay in the outbox ledger.
    *
    * Throws `OperatorActionError` (`agent-busy`, `unknown-message`, …) — the
    * agent must be idle; nothing is queued.
@@ -6022,8 +6022,9 @@ export class AgentFramework {
       }
 
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
-      // until the switch has landed and its marker batch is durably active,
-      // or the switch has been rolled back. Remote delivery is not waited on.
+      // until the switch has landed and its marker scheduling has been
+      // recorded or reported, or the switch has been rolled back. Remote
+      // delivery is not waited on.
       const release = this.reserveStoreForSurgery('roll back', agentName);
       let branchName: string;
       let markers: SurgeryMarkerReceipt;
@@ -6110,9 +6111,9 @@ export class AgentFramework {
    * removed together. Discord originals get awareness markers via the outbox;
    * the batch is `explicit`-activated only after every removal succeeded, and
    * a crash mid-way is finished at next boot (resumePreparedDiscordSuppressions).
-   * Like rollbackToMessage, it returns once the body change and the batch's
-   * activation are durable (`markers`); delivery continues without the caller
-   * waiting on it.
+   * Like rollbackToMessage, it returns once the body change has landed, with
+   * a marker-scheduling receipt (`markers`); delivery continues without the
+   * caller waiting on it.
    *
    * Not retroactive over derived state: a message already folded into an
    * autobiographical summary stays in that summary — roll back to before it
@@ -6188,8 +6189,9 @@ export class AgentFramework {
         throw new OperatorActionError('invalid', 'Suppression branch name must differ from the active branch');
       }
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
-      // until the fork is fully redacted and its marker batch durably
-      // active, or the source is restored. Remote delivery is not waited on.
+      // until the fork is fully redacted and its marker scheduling has been
+      // recorded or reported, or the source is restored. Remote delivery is
+      // not waited on.
       const release = this.reserveStoreForSurgery('suppress', agentName);
       let createdBranch: string;
       let markers: SurgeryMarkerReceipt;
