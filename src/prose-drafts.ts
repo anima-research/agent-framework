@@ -105,7 +105,10 @@ export interface InheritedRisk {
 export interface Draft {
   id: string;
   agent: string;
-  /** The held words, byte for byte. */
+  /** The held words, byte for byte as a resend publishes them: a run an
+   *  explicit send suppressed exactly as written; a bounce or a hold with no
+   *  destination, its envelope as routing read it (surrounding whitespace
+   *  trimmed). */
   text: string;
   reason: DraftReason;
   /** Words copied in from a draft that may already have been posted. */

@@ -8980,8 +8980,10 @@ export class AgentFramework {
         `(drafts(action: "resend", draftIds: ["${d.id}"], destination: "#channel", confirmDuplicate: true))`),
     ];
     // Named: residents that share one message slot (#197) share this window.
+    // "Not sent" only when no copied words may already have been posted.
     return (
-      `[drafts] ${agentName}: not sent — ${many ? `${held.length} plain-speech segments` : 'a plain-speech segment'} ` +
+      `[drafts] ${agentName}: ${risky.length > 0 ? '' : 'not sent — '}` +
+      `${many ? `${held.length} plain-speech segments` : 'a plain-speech segment'} ` +
       `held as draft${many ? 's' : ''} ${ids.join(', ')} — ${AgentFramework.DRAFT_REASON_TEXT[reason]}. ` +
       `Nothing publishes drafts but your own resend, and they stay until you act: ${resend.join('; ')}; ` +
       `drafts(action: "dismiss", draftIds: [${quoted(held)}]) sets ${many ? 'them' : 'it'} aside.`
@@ -9135,7 +9137,7 @@ export class AgentFramework {
   private async handleDraftsTool(agentName: string, rawInput: unknown): Promise<ToolResult> {
     const input = (rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput) ? rawInput : {}) as Record<string, unknown>;
     const refuse = (error: string): ToolResult => ({ success: false, error, isError: true });
-    // Plain text, not a JSON-quoted string: draft text must read exactly as written.
+    // Plain text, not a JSON-quoted string: draft text must read exactly as held.
     const ok = (text: string): ToolResult => ({ success: true, data: [{ type: 'text', text }] });
     // null and omission mean the same thing: the field is not in use.
     const present = (v: unknown): boolean => v !== undefined && v !== null;
@@ -9212,7 +9214,7 @@ export class AgentFramework {
             return `  attempt ${this.draftTime(a.at)} → ${AgentFramework.destinationText(a.destination)}: ${status}` +
               (a.confirmedDuplicate ? ' (resent knowing it might duplicate)' : '');
           }),
-          `Text (${d.text.length} chars, exactly as written):`,
+          `Text (${d.text.length} chars, exactly as a resend publishes it):`,
           d.text,
         ];
         return lines.join('\n');

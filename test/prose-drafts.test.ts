@@ -352,7 +352,7 @@ describe('held prose drafts, end to end', () => {
       ]);
       const [list, read, resend] = h.toolResults();
       assert.match(list!, /3 open drafts, newest first/);
-      assert.ok(read!.endsWith(`exactly as written):\n${segments[1]}`), `read shows the text in full: ${read}`);
+      assert.ok(read!.endsWith(`exactly as a resend publishes it):\n${segments[1]}`), `read shows the text in full: ${read}`);
       assert.match(resend!, new RegExp(`${ids[0]}: delivered to #room \\(Guild One\\) \\(${ROOM}\\), message posted-2`));
       const sent = h.publishes().slice(1);
       assert.deepEqual(sent.map((p) => [p.channelId, p.text]), segments.map((s) => [ROOM, s]), 'verbatim, in order');
@@ -1074,6 +1074,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       const notice = h.messages().find((m) => (m.metadata as { kind?: string; draftIds?: string[] } | undefined)?.kind === 'prose-drafts'
         && (m.metadata as { draftIds?: string[] }).draftIds?.includes(copy.id))!;
       const words = notice.content.map((b) => (b as { text?: string }).text ?? '').join('');
+      assert.ok(words.startsWith(`[drafts] scout: 2 plain-speech segments held as drafts ${free.id}, ${copy.id} — `), `no "not sent" over words that may be out: ${words}`);
       assert.ok(words.includes(`drafts(action: "resend", draftIds: ["${free.id}"], destination: "#channel") delivers it unchanged`), words);
       assert.ok(words.includes(`${copy.id} includes the words of ${original.id}, and ${original.id}'s attempt to #room (Guild One) (${ROOM})`), words);
       assert.ok(words.includes(`so check that channel before resending ${copy.id} (drafts(action: "resend", draftIds: ["${copy.id}"], destination: "#channel", confirmDuplicate: true))`), words);
