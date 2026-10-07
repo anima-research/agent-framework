@@ -61,7 +61,7 @@ import type {
   SameRoundThinkTextPolicy,
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
-import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reactions.js';
+import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent } from './agent.js';
 import { ModuleRegistry, isStateExistsError } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
@@ -391,6 +391,7 @@ import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
+import { isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
   McplHostCapabilities,
@@ -13654,7 +13655,31 @@ export class AgentFramework {
       );
     }
 
-    const connection = await this.mcplServerRegistry.addServer(config, this.mcplHostCapabilities);
+    // Derive the default here, after the framework has its effective config
+    // and retained awareness ledger. Keep the caller's config unchanged so
+    // a later runtime restart derives a fresh default, not a stale override.
+    // WebSocket servers own their environment outside this process.
+    // Match Windows names in both sources: Workers expose a case-sensitive
+    // process.env copy. Within one source, Node's spawn keeps the first
+    // lexicographically sorted spelling. Resolve each source that way,
+    // then keep the declared source's precedence over inherited values.
+    const baselineValue = (env: NodeJS.ProcessEnv | undefined) => {
+      if (process.platform !== 'win32') return env?.DISCORD_SUPPRESSED_REACTIONS_BASELINE;
+      const key = Object.keys(env ?? {}).sort()
+        .find((name) => name.toUpperCase() === 'DISCORD_SUPPRESSED_REACTIONS_BASELINE');
+      return key === undefined ? undefined : env?.[key];
+    };
+    const connectionConfig = isWebSocketTransport(config) ? config : {
+      ...config,
+      env: {
+        ...config.env,
+        DISCORD_SUPPRESSED_REACTIONS_BASELINE:
+          baselineValue(config.env)
+          ?? (config.inheritEnv ? baselineValue(process.env) : undefined)
+          ?? this.getPlacedReactionBaseline().join(','),
+      },
+    };
+    const connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities);
 
     // Wire listeners before either startup staging or the runtime global gate
     // releases control traffic needed for registration and marker service.
@@ -14019,6 +14044,38 @@ export class AgentFramework {
   // ==========================================================================
   // Runtime MCPL server lifecycle (agent-facing hot deploy/restart/unload)
   // ==========================================================================
+
+  /**
+   * Snapshot the protective Discord reaction default for this deployment.
+   * Includes refusal markers, the adapter's own default awareness marker,
+   * the configured awareness marker, and retained outbox markers (including
+   * offline recovery choices and marks that can later be removed/replayed).
+   * Composite custom-emote markers become bare IDs for Discord's suppression
+   * matcher; stored markers and the actual add/remove payloads stay unchanged.
+   * Explicit adapter/operator suppression settings still take precedence.
+   * Throws on an unreadable ledger rather than reporting a partial baseline.
+   */
+  getPlacedReactionBaseline(): readonly string[] {
+    let retained: string[];
+    try {
+      retained = this.discordAwarenessOutbox?.batches().map((batch) => batch.emoji) ?? [];
+    } catch (error) {
+      throw new DiscordAwarenessAccountingError('reaction-baseline ledger read', error);
+    }
+    // Discord events carry the custom emoji's name and ID separately. Full
+    // marker forms belong in add/remove calls, but suppression matches their
+    // stable ID (including after a rename), rather than the composite token.
+    const suppressionToken = (emoji: string): string => {
+      const custom = /^(?:<a?:\w+:(\d{17,20})>|(?:a:)?\w+:(\d{17,20}))$/.exec(emoji.trim());
+      return custom?.[1] ?? custom?.[2] ?? emoji;
+    };
+    return [...new Set([
+      ...REFUSAL_REACTION_BASELINE,
+      DEFAULT_DISCORD_AWARENESS_EMOJI,
+      this.discordAwarenessEmoji,
+      ...retained,
+    ].map(suppressionToken))].filter((emoji) => emoji.length > 0);
+  }
 
   /**
    * Connect a new MCPL server at runtime. Refreshes the tool list and
