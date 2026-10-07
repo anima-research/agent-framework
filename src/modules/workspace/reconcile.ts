@@ -232,6 +232,29 @@ function settleAdoption(p: Pending, s: { hash: string; size: number } | null): A
 }
 
 /**
+ * The synchronous precondition of every workspace mutation: an adoption left
+ * pending on the selected branch is settled by the tree before the mutation
+ * changes it, and durably, so the settlement can't be lost while the new
+ * write survives. Afterwards the write can never pass for the adoption's
+ * outcome. Other pending intents never consult the tree, so a write can't
+ * confuse them. Holds whether or not an earlier observation could settle it.
+ */
+export function settleAdoptionBeforeMutation(
+  store: JsStore,
+  agreement: DiskAgreement,
+  mount: { name: string; treeStateId: string },
+  path: string,
+): void {
+  const p = agreement.get(mount.name, path);
+  if (p?.kind !== 'pending' || p.effect !== 'adopt' || p.branchId !== store.currentBranch().id) return;
+  const entry = store.treeGet(mount.treeStateId, path);
+  const settled = settleAdoption(p, entry ? { hash: entry.blobHash, size: entry.size } : null);
+  if (settled === 'forget') agreement.forget(mount.name, path);
+  else agreement.set(mount.name, path, settled, { afterCommittedState: true });
+  agreement.barrier();
+}
+
+/**
  * Resolve a pending intent against what was observed. Returns the evidence
  * the rule should use, and whether that resolution should be recorded.
  */
@@ -406,12 +429,14 @@ interface Gathered {
 const GATHER_ATTEMPTS = 3;
 
 async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRuntime, scope: Scope, opts: PassOptions): Promise<Gathered> {
-  const branchId = store.currentBranch().id;
-  const gathered: Gathered = { branchId, walk: null, facts: new Map(), dirs: [], incomplete: [] };
-
   // A missing mount root is an unavailable mount (an unmounted drive, a root
   // being replaced), not proof that every file in it was deleted.
   const rootAvailable = await lstat(mount.view.root).then((s) => s.isDirectory(), () => false);
+
+  // The branch is labelled where the tracked candidates are read, with no
+  // await between: the decision is checked against this label.
+  const branchId = store.currentBranch().id;
+  const gathered: Gathered = { branchId, walk: null, facts: new Map(), dirs: [], incomplete: [] };
   if (!rootAvailable) {
     // Said whether or not anything is tracked: an unavailable mount must not
     // read as a verified empty directory.
@@ -479,6 +504,9 @@ export async function reconcilePass(
   opts: PassOptions = {},
 ): Promise<PassResult> {
   agreement.ensureReconciled();
+  // Evidence a failed barrier left unsynced is settled before anything is
+  // decided from it; if the barrier fails again, so does the pass.
+  if (agreement.needsBarrier) agreement.barrier();
   const result: PassResult = { ops: [], newConflicts: [], reports: new Map(), incomplete: [], dirs: [] };
 
   // Enumerate on one branch and observe disk (async). The decision below must
@@ -573,7 +601,7 @@ export async function reconcilePass(
   // 5. Durable before returning. An agreement advance (D = S) has no pending
   // intent to recover from, so losing its append would leave an older P that
   // another branch would misread as a disk edit.
-  if (recorded || committed) agreement.barrier();
+  if (recorded || committed || agreement.needsBarrier) agreement.barrier();
   agreement.maybeCheckpoint();
 
   // Reports.
@@ -661,6 +689,7 @@ export async function pushPaths(
   opts: PushOptions = {},
 ): Promise<PushResult> {
   agreement.ensureReconciled();
+  if (agreement.needsBarrier) agreement.barrier(); // as a pass does: nothing decided from unsynced evidence
   const result: PushResult = {
     written: [], unchanged: [], deleted: [], skipped: [], pendingDeletions: [],
     branchId: store.currentBranch().id, sequence: store.currentSequence(),
@@ -841,7 +870,7 @@ export async function pushPaths(
   }
   // Durable before returning, like a pass: agreements recorded here have no
   // pending intent behind them, and completions shouldn't wait for one.
-  if (recorded) agreement.barrier();
+  if (recorded || agreement.needsBarrier) agreement.barrier();
   agreement.maybeCheckpoint();
   return result;
 }

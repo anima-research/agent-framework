@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -167,6 +168,25 @@ async function seedSynced(env: Env, m: WorkspaceModule, path: string, content: s
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Run `fn` with FileHandle.readFile switching branches as `onRead` says. */
+async function withReadHook<T>(onRead: (calls: number) => void, fn: () => Promise<T>): Promise<T> {
+  const probe = await open(join(tmpdir(), `read-hook-${process.pid}`), 'w');
+  const proto = Object.getPrototypeOf(probe) as { readFile: (...args: unknown[]) => Promise<Buffer> };
+  await probe.close();
+  const readFile = proto.readFile;
+  let calls = 0;
+  proto.readFile = async function (this: unknown, ...args: unknown[]) {
+    onRead(++calls);
+    return readFile.apply(this, args);
+  };
+  try {
+    return await fn();
+  } finally {
+    proto.readFile = readFile;
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 
@@ -609,6 +629,52 @@ describe('restarts and faults', () => {
     assert.equal(env.readDisk('a.txt'), 'C');
   });
 
+  test('a write commits only once a pending adoption on its branch is settled, even if the scan could not settle it', async (t) => {
+    const env = new Env(t);
+    const m = await pendingAdoption(env); // pending on main
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('other', main);
+    env.writeDisk('a.txt', 'C');
+    env.store.switchBranch('other'); // the write starts on another branch
+    // Each of the settle pass's three gathers sees the branch change under it,
+    // so it decides nothing and returns incomplete; the write commits on main.
+    await withReadHook((n) => env.store.switchBranch(n % 2 === 1 ? main : 'other'),
+      () => call(m, 'write', { path: 'work/a.txt', content: 'B' }));
+    assert.equal(env.store.currentBranch().name, main);
+    assert.notEqual((m as any).agreement.get('work', 'a.txt').kind, 'pending', 'settled at the commit');
+    const e = await entryOf(m, 'a.txt');
+    assert.equal(e?.state, 'conflict', 'B (the write) and C (disk) both changed since A');
+    assert.equal(await contentOf(m, 'a.txt'), 'B', 'the write survives');
+  });
+
+  test('evidence is read only after an ambiguous append is reconciled', (t) => {
+    const env = new Env(t);
+    let failSync = false;
+    const flaky = new Proxy(env.store, {
+      get(target, prop) {
+        if (prop === 'sync') {
+          return () => {
+            if (failSync) {
+              failSync = false;
+              throw Object.assign(new Error('injected EIO after the append'), { code: 'EIO' });
+            }
+            target.sync();
+          };
+        }
+        const value = (target as unknown as Record<string | symbol, unknown>)[prop];
+        return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    const agreement = new DiskAgreement(flaky as JsStore);
+    agreement.open([{ name: 'work', root: '/srv/work' }]);
+    failSync = true;
+    assert.throws(() => agreement.intend('work', 'a.txt', {
+      effect: 'adopt', prior: null, expect: { kind: 'content', hash: 'h' }, branchId: 'b',
+    }, { durable: true }), /injected EIO/);
+    assert.equal(agreement.get('work', 'a.txt')?.kind, 'pending', 'the append that landed is read back, not the stale view');
+    assert.equal(agreement.needsBarrier, true);
+  });
+
   test('with disk unreadable at the write, the pending adoption settles by the tree', { skip: IS_ROOT ? 'root reads every file' : false }, async (t) => {
     const env = new Env(t);
     const m = await pendingAdoption(env);
@@ -622,6 +688,42 @@ describe('restarts and faults', () => {
     const e = await entryOf(m, 'a.txt');
     assert.equal(e?.state, 'conflict', 'disk C and the write B both changed since A: kept apart');
     assert.equal(await contentOf(m, 'a.txt'), 'B');
+  });
+
+  test('a failed agreement barrier stays owed: the next pass settles it before deciding', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    await call(m, 'write', { path: 'work/a.txt', content: 'B' });
+    env.writeDisk('a.txt', 'B'); // D = S: an agreement, with no intent behind it
+    const set = DiskAgreement.prototype.set;
+    const storeSync = env.store.sync;
+    let armed = false;
+    let syncs = 0;
+    DiskAgreement.prototype.set = function (this: DiskAgreement, ...args: Parameters<typeof set>) {
+      set.apply(this, args);
+      armed = true; // the next sync is the barrier that should make it durable
+    };
+    (env.store as unknown as { sync: () => void }).sync = function () {
+      syncs++;
+      if (armed) {
+        armed = false;
+        throw Object.assign(new Error('injected EIO at the barrier'), { code: 'EIO' });
+      }
+      storeSync.call(env.store);
+    };
+    try {
+      assert.match(await refused(m, 'ls', { path: 'work' }), /injected EIO at the barrier/);
+      assert.equal((m as any).agreement.needsBarrier, true, 'the obligation survives the failed pass');
+      DiskAgreement.prototype.set = set;
+      syncs = 0;
+      await call(m, 'ls', { path: 'work' }); // nothing new to record
+      assert.ok(syncs >= 1, 'the next pass still syncs');
+      assert.equal((m as any).agreement.needsBarrier, false);
+    } finally {
+      DiskAgreement.prototype.set = set;
+      (env.store as unknown as { sync: () => void }).sync = storeSync;
+    }
   });
 
   for (const trigger of ['a scan', 'a materialize'] as const) {
@@ -1003,24 +1105,6 @@ describe('on-agent-action', () => {
     );
   });
 
-  /** Run `fn` with FileHandle.readFile switching branches as `onRead` says. */
-  async function withReadHook<T>(onRead: (calls: number) => void, fn: () => Promise<T>): Promise<T> {
-    const probe = await open(join(tmpdir(), `read-hook-${process.pid}`), 'w');
-    const proto = Object.getPrototypeOf(probe) as { readFile: (...args: unknown[]) => Promise<Buffer> };
-    await probe.close();
-    const readFile = proto.readFile;
-    let calls = 0;
-    proto.readFile = async function (this: unknown, ...args: unknown[]) {
-      onRead(++calls);
-      return readFile.apply(this, args);
-    };
-    try {
-      return await fn();
-    } finally {
-      proto.readFile = readFile;
-    }
-  }
-
   test('a branch switch while a pass reads disk makes it gather again, on the branch it then decides on', async (t) => {
     const env = new Env(t);
     const m = await env.open();
@@ -1052,6 +1136,38 @@ describe('on-agent-action', () => {
       () => call(m, 'ls', { path: 'work', recursive: true }));
     assert.deepEqual(data.entries, []);
     assert.deepEqual(data.incomplete, [{ path: '', reason: 'the selected branch kept changing while the scan ran' }]);
+  });
+
+  test('a branch switched away during the root check and back during a read is decided on the branch enumerated', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('other', main);
+    await call(m, 'write', { path: 'work/only-main.txt', content: 'a draft on main' });
+
+    const fsp = createRequire(import.meta.url)('node:fs/promises') as { lstat: (...args: unknown[]) => Promise<unknown> };
+    const lstat = fsp.lstat;
+    let first = true;
+    fsp.lstat = async function (path: unknown, ...rest: unknown[]) {
+      const result = await lstat(path, ...rest);
+      if (first && path === env.dir) {
+        first = false;
+        env.store.switchBranch('other'); // A -> B before the candidates are read
+      }
+      return result;
+    };
+    syncBuiltinESMExports();
+    try {
+      const data = await withReadHook((n) => { if (n === 1) env.store.switchBranch(main); }, // B -> A during a read
+        () => call(m, 'ls', { path: 'work', recursive: true }));
+      assert.equal(env.store.currentBranch().name, main);
+      const states = new Map((data.entries as Entry[]).map((e) => [e.path, e.state]));
+      assert.equal(states.get('only-main.txt'), 'workspace-draft', "main's draft is in main's listing");
+    } finally {
+      fsp.lstat = lstat;
+      syncBuiltinESMExports();
+    }
   });
 
   test('a push whose selection was made on another branch writes nothing', async (t) => {

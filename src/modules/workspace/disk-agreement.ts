@@ -84,6 +84,12 @@ export class DiskAgreement {
   private readonly journal: RecordJournal<JournalEntry, Snapshot>;
   private readonly mounts = new Map<string, { root: string; paths: Map<string, Physical> }>();
   private configured: Array<{ name: string; root: string }> = [];
+  /**
+   * An append (or a rebuild) not yet made durable. Cleared only by a
+   * barrier that succeeds, so a failed barrier stays owed: a later pass with
+   * nothing new to record still settles it before deciding anything.
+   */
+  private unsynced = false;
 
   constructor(store: JsStore) {
     this.store = store;
@@ -102,7 +108,15 @@ export class DiskAgreement {
 
   /** Re-read the journal when an earlier write left it unreconciled. */
   ensureReconciled(): void {
-    if (this.journal.needsReconcile) this.rebuild();
+    if (this.journal.needsReconcile) {
+      this.rebuild();
+      this.unsynced = true; // what was read back may not all be durable
+    }
+  }
+
+  /** Whether evidence recorded so far still awaits a barrier. */
+  get needsBarrier(): boolean {
+    return this.unsynced;
   }
 
   private rebuild(): void {
@@ -130,16 +144,19 @@ export class DiskAgreement {
       } else {
         this.mounts.set(name, { root, paths: new Map() });
         this.journal.append({ t: 'mount', mount: name, root });
+        this.unsynced = true;
       }
     }
   }
 
   get(mount: string, path: string): Physical | undefined {
+    this.ensureReconciled(); // an ambiguous append may have landed: read it back first
     return this.mounts.get(mount)?.paths.get(path);
   }
 
   /** Every path with evidence under a prefix ('' for the whole mount). */
   paths(mount: string, prefix = ''): Array<[string, Physical]> {
+    this.ensureReconciled();
     const paths = this.mounts.get(mount)?.paths;
     if (!paths) return [];
     const out: Array<[string, Physical]> = [];
@@ -173,7 +190,9 @@ export class DiskAgreement {
 
   private write(entry: JournalEntry, opts: { durable?: boolean; afterCommittedState?: boolean }): void {
     this.ensureReconciled();
+    this.unsynced = true; // until proven durable: a failed append may still have landed
     this.journal.append(entry, opts);
+    if (opts.durable) this.unsynced = false; // synced after this append, and so everything before it
     const mount = this.mounts.get((entry as { mount: string }).mount);
     if (!mount) return;
     if (entry.t === 'set') mount.paths.set(entry.path, entry.value);
@@ -192,8 +211,9 @@ export class DiskAgreement {
     this.journal.checkpoint(snapshot);
   }
 
-  /** Make every append so far stable (the barrier before a batch's effects). */
+  /** Make every append so far stable. Throws, and stays owed, if the sync fails. */
   barrier(): void {
     this.store.sync();
+    this.unsynced = false;
   }
 }

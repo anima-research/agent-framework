@@ -50,6 +50,7 @@ import {
   type TreeOp,
   pushPaths,
   reconcilePass,
+  settleAdoptionBeforeMutation,
 } from './reconcile.js';
 
 /** Default for how long the after-batch scan may hold the agent's next inference. */
@@ -1844,6 +1845,9 @@ export class WorkspaceModule implements Module {
   ): Promise<string | null> {
     const store = this.getStore();
     const intents = this.intents.get(mount.config.name)!;
+    // The mutation's precondition, enforced here, synchronously with the
+    // commit: whatever settleBeforeMutation's pass could or couldn't settle.
+    settleAdoptionBeforeMutation(store, this.agreementOrThrow(), { name: mount.config.name, treeStateId: mount.treeStateId }, relativePath);
     const known = this.agreementOrThrow().get(mount.config.name, relativePath) !== undefined;
     if (change.kind === 'set') {
       store.treeSet(mount.treeStateId, relativePath, { blobHash: change.blobHash, size: change.size, mode: change.mode ?? 0o644 });
@@ -1886,12 +1890,13 @@ export class WorkspaceModule implements Module {
   // ==========================================================================
 
   /**
-   * The mutation boundary: before a tool reads or changes a path's workspace
-   * entry, a pending intent on that path is settled by a pass over it. An
-   * adoption on this branch resolves by the tree's content, so once a new
-   * write had changed the tree, the write could pass for the old adoption's
-   * outcome and a real disk change would then overwrite it. The caller holds
-   * the mount's turn.
+   * Before a tool reads or changes a path's workspace entry, a pending intent
+   * on that path is settled by a pass over it, so the tool works from what
+   * disk now holds (an edit sees a disk change the settled adoption took in).
+   * The pass may not settle it (a branch that keeps changing, an unreadable
+   * disk copy); the precondition that matters is enforced again,
+   * synchronously, where the change commits (commitToolChange). The caller
+   * holds the mount's turn.
    */
   private async settleBeforeMutation(mount: MountState, relativePath: string): Promise<void> {
     if (this.agreementOrThrow().get(mount.config.name, relativePath)?.kind !== 'pending') return;
