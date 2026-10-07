@@ -5,7 +5,6 @@ export * from './types/index.js';
 export { AgentFramework, BudgetPreflightError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus, SafeBoundaryLease, SafeBoundaryOptions } from './framework.js';
 export type {
-  OperatorChangeDecision,
   OperatorChangeReceipt,
   ResolvedOperatorChange,
   ResolvedSettingsChange,
@@ -13,6 +12,11 @@ export type {
   RuntimeSettingsValues,
   AppliedOperatorChange,
   ResolvedUndoTurnsChange,
+  ResolvedUnstickChange,
+  UnstickOperationRecord,
+  UnstickStepRecord,
+  UnstickAttemptRecord,
+  UnstickAttemptOutcome,
 } from './operator-change.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';

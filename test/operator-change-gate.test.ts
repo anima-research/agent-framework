@@ -21,7 +21,7 @@ import type {
   InferenceRequest,
   Module,
   ModuleContext,
-  OperatorChangeDecision,
+  OperatorChangeReceipt,
   ResolvedOperatorChange,
   ToolCall,
   ToolDefinition,
@@ -103,11 +103,11 @@ describe('operator-change gate: self-change tools', () => {
   let mover: Mover;
   let knobs: Knobs;
   let asked: ResolvedOperatorChange[];
-  let decide: (change: ResolvedOperatorChange) => Promise<OperatorChangeDecision>;
+  let decide: (change: ResolvedOperatorChange) => Promise<OperatorChangeReceipt>;
   let quiet: typeof console.log;
 
-  const staged = async (change: ResolvedOperatorChange): Promise<OperatorChangeDecision> =>
-    ({ decision: 'staged', receipt: { id: `rev-${asked.length}`, text: `staged ${change.kind} as rev-${asked.length}; waiting for scout` } });
+  const staged = async (change: ResolvedOperatorChange): Promise<OperatorChangeReceipt> =>
+    ({ id: `rev-${asked.length}`, text: `staged ${change.kind} as rev-${asked.length}; waiting for scout` });
 
   beforeEach(async () => {
     tempDir = mkdtempSync(join(tmpdir(), 'operator-gate-'));
@@ -153,17 +153,6 @@ describe('operator-change gate: self-change tools', () => {
     assert.deepEqual(change.kind === 'agent-settings' && { from: change.from, target: change.target },
       { from: { contextBudgetTokens: before }, target: { contextBudgetTokens: 120_000 } });
     assert.ok(framework.getOperatorLog().some((e) => e.kind === 'operator-change-staged'));
-  });
-
-  it('applies at once on apply, asking only once even though the call goes through two checks', async () => {
-    decide = async () => ({ decision: 'apply' });
-    const out = await framework.puppetToolCall('scout', 'agent_settings', { action: 'update', context_budget_tokens: 120_000 });
-    assert.equal(out.result.success, true, String(out.result.error));
-    assert.equal(typeof out.toolUseId, 'string');
-    assert.equal(budget(), 120_000);
-    assert.equal(pairs(), 1);
-    assert.equal(asked.length, 1);
-    assert.equal((framework as unknown as Internals).activeAdmissions.size, 0, 'the admission ended with the call');
   });
 
   it('refuses when the gate fails, applying nothing', async () => {
@@ -274,58 +263,14 @@ describe('operator-change gate: self-change tools', () => {
     );
   });
 
-  it("refuses to apply while the store is held by a lease it isn't running under, and applies inside one", async () => {
-    decide = async () => ({ decision: 'apply' });
+  it('stages a delegated change made after its puppet call returned, never running it', async () => {
     const before = budget();
-    let releaseLease!: () => void;
-    const holding = new Promise<void>((r) => { releaseLease = r; });
-    let granted!: () => void;
-    const isGranted = new Promise<void>((r) => { granted = r; });
-    const leased = framework.runAtSafeBoundary({ verb: 'held elsewhere' }, async () => { granted(); await holding; });
-    await isGranted;
-    const outside = await mover.ctx.callTool!({ id: 'own', name: 'agent_settings', input: { action: 'update', context_budget_tokens: 150_000 }, callerAgentName: 'scout' });
-    assert.match(String(outside.error), /the store is held by held elsewhere/);
-    assert.equal(budget(), before, 'permission to apply is not a safe boundary');
-    releaseLease();
-    await leased;
-
-    await framework.runAtSafeBoundary({ verb: 'mine' }, async () => {
-      const inside = await mover.ctx.callTool!({ id: 'own2', name: 'agent_settings', input: { action: 'update', context_budget_tokens: 150_000 }, callerAgentName: 'scout' });
-      assert.equal(inside.success, true, String(inside.error));
-    });
-    assert.equal(budget(), 150_000, 'the lease holder can apply under its own lease');
-  });
-
-  it("refuses to apply while another call owns the agent's live turn", async () => {
-    decide = async () => ({ decision: 'apply' });
-    const before = budget();
-    const entered = new Promise<void>((resolve) => { mover.entered = resolve; });
-    const holding = framework.puppetToolCall('scout', 'mover--hold', {});
-    await entered; // the puppet now owns scout's turn token
-    const outside = await mover.ctx.callTool!({ id: 'own', name: 'agent_settings', input: { action: 'update', context_budget_tokens: 150_000 }, callerAgentName: 'scout' });
-    assert.match(String(outside.error), /scout has a live turn that isn't this call's/);
+    await framework.puppetToolCall('scout', 'mover--set_budget_later', {}); // a module tool: runs, schedules the change
+    (mover as unknown as { fireLater: () => void }).fireLater();
+    const late = await mover.later!;
+    assert.match(String(late.error), /staged agent-settings/, 'it keeps its actor, so it is gated, and only staged');
+    assert.equal(asked.at(-1)!.surface, 'puppet');
     assert.equal(budget(), before);
-    mover.release!();
-    await holding;
-  });
-
-  it("applies a puppet's own delegated change during its turn, but not from a late callback in a later turn", async () => {
-    decide = async () => ({ decision: 'apply' });
-    const own = await framework.puppetToolCall('scout', 'mover--set_budget', {});
-    assert.equal(own.result.success, true, String(own.result.error));
-    assert.equal(budget(), 130_000, 'the puppet owns its turn');
-
-    await framework.puppetToolCall('scout', 'mover--set_budget_later', {}); // returns; the change is still to come
-    const tokens = (framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens;
-    tokens.set('scout', 987_654); // a later turn is alive when the callback fires
-    try {
-      (mover as unknown as { fireLater: () => void }).fireLater();
-      const late = await mover.later!;
-      assert.match(String(late.error), /live turn that isn't this call's/, 'provenance kept, permission not');
-      assert.equal(budget(), 130_000, 'unchanged by the late callback');
-    } finally {
-      tokens.delete('scout');
-    }
   });
 
   it('admits only the exact call its admission was registered for, and revalidates it as it runs', async () => {
@@ -444,7 +389,7 @@ describe('operator-change gate: tool presentation', () => {
       modules: [workspace],
       operatorChangeGate: async (change) => {
         asked.push(structuredClone(change));
-        return { decision: 'staged', receipt: { id: 'rev-p', text: 'staged' } };
+        return { id: 'rev-p', text: 'staged' };
       },
     });
     const quiet = console.log;
@@ -485,7 +430,7 @@ describe('operator-change gate: host/command undo by turns', () => {
   let membrane: MockMembrane;
   let framework: AgentFramework;
   let asked: ResolvedOperatorChange[];
-  let decide: (change: ResolvedOperatorChange) => Promise<OperatorChangeDecision>;
+  let decide: (change: ResolvedOperatorChange) => Promise<OperatorChangeReceipt>;
   let quiet: { log: typeof console.log; error: typeof console.error };
   type HostInternals = {
     pendingRequests: InferenceRequest[];
@@ -501,7 +446,7 @@ describe('operator-change gate: host/command undo by turns', () => {
     tempDir = mkdtempSync(join(tmpdir(), 'operator-gate-undo-'));
     membrane = new MockMembrane();
     asked = [];
-    decide = async (change) => ({ decision: 'staged', receipt: { id: 'rev-u', text: `staged ${change.kind}` } });
+    decide = async (change) => ({ id: 'rev-u', text: `staged ${change.kind}` });
     framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
       membrane: membrane.asMembrane(),
@@ -546,14 +491,16 @@ describe('operator-change gate: host/command undo by turns', () => {
     assert.equal(change.sourceBranch, before.branch);
   });
 
-  it('applies an admitted multi-turn undo as one cut with one redo entry', async () => {
-    decide = async () => ({ decision: 'apply' });
+  it('applies a staged multi-turn undo as one cut with one redo entry', async () => {
     await turn('one'); await turn('two'); await turn('three');
     const source = branch();
     const r = await undo(2);
-    assert.equal(r.ok, true, String(r.error));
-    assert.deepEqual([r.undone, r.requested], [2, 2]);
-    assert.equal(branch(), `undo/scout/op-${asked[0]!.id}`, 'the destination is named for the change');
+    assert.deepEqual([r.ok, r.code], [false, 'staged'], 'host/command only stages');
+    const change = asked[0]!;
+    const applied = await framework.runAtSafeBoundary({ verb: 'apply' }, (lease) =>
+      framework.applyResolvedOperatorChange(change, { lease, admission: { id: 'rev-u' } }));
+    assert.deepEqual(applied.kind === 'undo-turns' && [applied.undone, applied.requested], [2, 2]);
+    assert.equal(branch(), `undo/scout/op-${change.id}`, 'the destination is named for the change');
     // A turn's checkpoint is taken after its input landed, so undoing turns
     // keeps the oldest undone turn's input, exactly as the per-turn loop does.
     assert.deepEqual(texts(), ['one', 'reply to one', 'two'], 'turns two and three are undone');
@@ -627,37 +574,49 @@ describe('operator-change gate: host/command undo by turns', () => {
     );
   });
 
-  for (const seam of ['marker', 'checkpoints', 'log'] as const) {
-    it(`finishes the cut's bookkeeping on retry after a failure at the ${seam} write, redo included`, async () => {
+  for (const [seam, later] of (['marker', 'log', 'completion', 'completion sync'] as const).flatMap((x) => [[x, false], [x, true]] as const)) {
+    it(`finishes the cut's bookkeeping on retry after a failure at the ${seam} write${later ? ', keeping later work' : ', redo included'}`, async () => {
       await turn('one'); await turn('two'); await turn('three');
       const source = branch();
       await undo(2);
       const change = asked[0]!;
-      const fw = framework as unknown as {
-        saveTurnCheckpoints: (agent: string, list: unknown[]) => void;
-        recordOperatorAction: (entry: { kind: string }) => void;
-      };
-      const store = framework.getStore() as unknown as { setStateJson: (id: string, v: unknown) => void };
-      const real = { setState: store.setStateJson.bind(store), save: fw.saveTurnCheckpoints.bind(fw), record: fw.recordOperatorAction.bind(fw) };
+      const fw = framework as unknown as { recordOperatorAction: (entry: { kind: string }) => void };
+      const store = framework.getStore() as unknown as { setStateJson: (id: string, v: unknown) => void; sync: () => void };
+      const real = { setState: store.setStateJson.bind(store), record: fw.recordOperatorAction.bind(fw), sync: store.sync.bind(store) };
       let armed = true;
       const fail = () => { armed = false; throw new Error(`injected ${seam} failure`); };
-      if (seam === 'marker') store.setStateJson = (id, v) => (armed && (v as { operatorCut?: unknown })?.operatorCut ? fail() : real.setState(id, v));
-      if (seam === 'checkpoints') fw.saveTurnCheckpoints = (agent, list) => (armed ? fail() : real.save(agent, list));
+      const cut = (v: unknown) => (v as { operatorCut?: { completed?: boolean } })?.operatorCut;
+      if (seam === 'marker') store.setStateJson = (id, v) => (armed && cut(v) && !cut(v)!.completed ? fail() : real.setState(id, v));
+      if (seam === 'completion') store.setStateJson = (id, v) => (armed && cut(v)?.completed ? fail() : real.setState(id, v));
       if (seam === 'log') fw.recordOperatorAction = (entry) => (armed && entry.kind === 'undo-turns' ? fail() : real.record(entry));
+      if (seam === 'completion sync') {
+        // The sync right after the completion marker is the barrier that
+        // makes completion durable: fail it once.
+        let marked = false;
+        store.setStateJson = (id, v) => { if (cut(v)?.completed) marked = true; return real.setState(id, v); };
+        store.sync = () => (armed && marked ? fail() : real.sync());
+      }
       const apply = () => framework.runAtSafeBoundary({ verb: 'apply' }, (lease) =>
         framework.applyResolvedOperatorChange(change, { lease, admission: { id: 'rev-u' } }));
       try {
         await assert.rejects(apply(), new RegExp(`injected ${seam} failure`));
       } finally {
         store.setStateJson = real.setState;
-        fw.saveTurnCheckpoints = real.save;
         fw.recordOperatorAction = real.record;
+        store.sync = real.sync;
       }
       assert.equal(branch(), `undo/scout/op-${change.id}`, 'the cut landed before the failure');
+      if (later) await turn('after the failure'); // legitimate work on the destination before the retry
       const retried = await apply();
       assert.equal(retried.kind === 'undo-turns' && retried.alreadyApplied, true, 'not cut again');
-      assert.equal(host().getTurnCheckpoints('scout').length, 1);
       assert.equal(framework.getOperatorLog().filter((e) => e.kind === 'undo-turns').length, 1, 'logged once');
+      if (later) {
+        assert.equal(host().getTurnCheckpoints('scout').length, 2, 'the older turn and the later one: repair kept later work');
+        assert.equal(texts().at(-1), 'reply to after the failure');
+        assert.equal(host().redoStacks.get('scout')?.length ?? 0, 0, 'the later work invalidated redo, and repair did not restore it');
+        return;
+      }
+      assert.equal(host().getTurnCheckpoints('scout').length, 1);
       assert.equal(host().redoStacks.get('scout')!.length, 1, 'one redo entry, not one per attempt');
       const redone = framework.redo('scout');
       assert.deepEqual([redone.redone, redone.toBranch], [true, source], 'the promised one-step redo exists');
@@ -665,22 +624,55 @@ describe('operator-change gate: host/command undo by turns', () => {
     });
   }
 
-  it('never awaits awareness delivery, and never reports its failure as the undo\'s', async () => {
-    decide = async () => ({ decision: 'apply' });
+  it('leaves a completed cut alone on retry after further work, in process and after reopen', async () => {
+    await turn('one'); await turn('two'); await turn('three');
+    await undo(1);
+    const change = asked[0]!;
+    const apply = () => framework.runAtSafeBoundary({ verb: 'apply' }, (lease) =>
+      framework.applyResolvedOperatorChange(change, { lease, admission: { id: 'rev-u' } }));
+    await apply();
+    await turn('after the cut'); // real work on the destination: a new turn and its checkpoint
+    const now = () => ({
+      checkpoints: host().getTurnCheckpoints('scout').map((c) => c.turnIndex),
+      texts: texts(),
+      redo: host().redoStacks.get('scout')?.length ?? 0,
+    });
+    const settled = now();
+    assert.equal(settled.checkpoints.length, 3, 'two older turns and the one after the cut');
+    const again = await apply();
+    assert.equal(again.kind === 'undo-turns' && again.alreadyApplied, true);
+    assert.deepEqual(now(), settled, 'nothing touched in process');
+    await framework.stop();
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', maxTokens: 1000 }],
+      modules: [],
+      operatorChangeGate: async (c) => { asked.push(structuredClone(c)); return decide(c); },
+    });
+    const logged = () => framework.getOperatorLog().filter((e) => e.kind === 'undo-turns').length;
+    const before = logged();
+    const reopened = await apply();
+    assert.equal(reopened.kind === 'undo-turns' && reopened.alreadyApplied, true);
+    assert.deepEqual(now(), { ...settled, redo: 0 }, 'nor after reopen, and no redo entry conjured');
+    assert.equal(logged(), before, 'and no second record of the cut');
+  });
+
+
+  it("never awaits awareness delivery inside the lease, and never reports its failure as the undo's", async () => {
     const fw = framework as unknown as { discordAwarenessOutbox: unknown; syncDiscordAwarenessMarkers: () => Promise<void> };
     fw.discordAwarenessOutbox = {}; // so delivery is attempted
     let calls = 0;
     fw.syncDiscordAwarenessMarkers = () => { calls++; return calls === 1 ? Promise.reject(new Error('delivery down')) : new Promise<void>(() => {}); };
     try {
       await turn('one'); await turn('two'); await turn('three');
-      const now = await undo(1);
-      assert.equal(now.ok, true, 'a delivery failure is not the undo\'s');
-      decide = async (change) => ({ decision: 'staged', receipt: { id: 'rev-d', text: `staged ${change.kind}` } });
-      await undo(1);
-      const staged = asked.at(-1)!;
-      const applied = await framework.runAtSafeBoundary({ verb: 'apply' }, (lease) =>
-        framework.applyResolvedOperatorChange(staged, { lease, admission: { id: 'rev-d' } }));
-      assert.equal(applied.kind, 'undo-turns', 'returned while delivery is still pending');
+      for (const id of ['rev-a', 'rev-b']) {
+        await undo(1);
+        const staged = asked.at(-1)!;
+        const applied = await framework.runAtSafeBoundary({ verb: 'apply' }, (lease) =>
+          framework.applyResolvedOperatorChange(staged, { lease, admission: { id } }));
+        assert.equal(applied.kind, 'undo-turns', 'returned whether delivery failed or is still pending');
+      }
       assert.equal(calls, 2, 'delivery started both times');
     } finally {
       fw.discordAwarenessOutbox = null;
@@ -700,11 +692,14 @@ describe('operator-change gate: host/command undo by turns', () => {
   });
 
   it('resolves fewer turns than requested when history is shorter, and reports both', async () => {
-    decide = async () => ({ decision: 'apply' });
     await turn('only');
     const r = await undo(3);
-    assert.deepEqual([r.ok, r.undone, r.requested], [true, 1, 3]);
-    assert.equal(asked[0]!.kind === 'undo-turns' && asked[0]!.checkpoints.length, 1);
+    assert.deepEqual([r.code, r.requested], ['staged', 3]);
+    const change = asked[0]!;
+    assert.equal(change.kind === 'undo-turns' && change.checkpoints.length, 1);
+    const applied = await framework.runAtSafeBoundary({ verb: 'apply' }, (lease) =>
+      framework.applyResolvedOperatorChange(change, { lease, admission: { id: 'rev-u' } }));
+    assert.deepEqual(applied.kind === 'undo-turns' && [applied.undone, applied.requested], [1, 3]);
   });
 
   it('refuses when the gate fails, and asks nothing when there is nothing to undo', async () => {
@@ -716,5 +711,199 @@ describe('operator-change gate: host/command undo by turns', () => {
     const r = await undo(1);
     assert.deepEqual([r.ok, r.code], [false, 'gate-failed']);
     assert.equal(host().getTurnCheckpoints('scout').length, 1, 'nothing undone');
+  });
+});
+
+describe('operator-change gate: host/command unstick, planned at staging', () => {
+  let tempDir: string;
+  let membrane: MockMembrane;
+  let framework: AgentFramework;
+  let asked: ResolvedOperatorChange[];
+  let decide: (change: ResolvedOperatorChange) => Promise<OperatorChangeReceipt>;
+  let quiet: { log: typeof console.log; error: typeof console.error };
+  type UnstickInternals = {
+    pendingRequests: InferenceRequest[];
+    unstickJournalState: unknown;
+    unstickAttemptWaiters: Map<string, unknown>;
+    handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+    addMessage(participant: string, content: unknown[]): string;
+  };
+  const host = () => framework as unknown as UnstickInternals;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'operator-gate-unstick-'));
+    membrane = new MockMembrane();
+    asked = [];
+    decide = async (change) => ({ id: 'rev-s', text: `staged ${change.kind}` });
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', maxTokens: 1000 }],
+      modules: [],
+      operatorChangeGate: async (change) => { asked.push(structuredClone(change)); return decide(change); },
+    });
+    quiet = { log: console.log, error: console.error };
+    console.log = () => {};
+    console.error = () => {};
+    // History: two answered turns, then a message the agent keeps refusing
+    // (a refusal stores nothing, so the culprit is the newest message).
+    for (const text of ['one', 'two']) {
+      host().addMessage('user', [{ type: 'text', text }]);
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `reply to ${text}` }]));
+      host().pendingRequests.push({ agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'test', timestamp: Date.now() } as InferenceRequest);
+      await framework.runUntilIdle();
+    }
+    host().addMessage('user', [{ type: 'text', text: 'culprit' }]);
+  });
+  afterEach(async () => {
+    console.log = quiet.log;
+    console.error = quiet.error;
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const cm = () => framework.getAgent('scout')!.getContextManager();
+  const texts = () => (cm().getAllMessages() as Array<{ content: Array<{ text?: string }>; metadata?: { system?: unknown } }>)
+    .filter((m) => !m.metadata?.system).map((m) => m.content[0]?.text ?? '');
+  const textOf = (id: string) => (cm().getAllMessages() as Array<{ id: string; content: Array<{ text?: string }> }>)
+    .find((m) => String(m.id) === id)?.content[0]?.text;
+  const unstick = (maxRewinds = 3) => host().handleHostCommand('discord', { command: 'unstick', agentName: 'scout', maxRewinds, requesterName: 'nissa' });
+  const refusal = () => createMockResponse([{ type: 'thinking', thinking: '', signature: 'sig' } as never], 'refusal');
+  const step = (change: ResolvedOperatorChange, n: number) => framework.runAtSafeBoundary({ verb: `step ${n}` }, (lease) =>
+    framework.applyResolvedOperatorChange(change, { lease, admission: { id: 'rev-s' }, step: n }));
+  const rerun = async (change: ResolvedOperatorChange, n: number) => {
+    const outcome = framework.rerunUnstick(change as never, { step: n });
+    await framework.runUntilIdle();
+    return outcome;
+  };
+
+  it('stages the whole plan, newest exchange first, with exact ids and changes nothing', async () => {
+    const before = texts();
+    const r = await unstick(3);
+    assert.deepEqual([r.ok, r.code, r.cap], [false, 'staged', 3]);
+    const change = asked[0]!;
+    assert.equal(change.kind, 'unstick');
+    const plan = change.kind === 'unstick' ? change.plan : [];
+    assert.deepEqual(plan.map((p) => p.messageIds.map(textOf)), [['culprit'], ['reply to two'], ['two']], 'the known range at risk');
+    assert.ok(plan.every((p) => p.fingerprints.length === p.messageIds.length));
+    assert.deepEqual(texts(), before);
+  });
+
+  it('applies planned steps under leases and re-runs between them, never shedding a later arrival', async () => {
+    await unstick(3);
+    const change = asked[0]!;
+    host().addMessage('user', [{ type: 'text', text: 'later arrival' }]); // e.g. the notice's answer
+    assert.deepEqual((await step(change, 1)).kind === 'unstick' && (await step(change, 1)), { kind: 'unstick', step: 1, shedIds: (change as { plan: Array<{ messageIds: string[] }> }).plan[0]!.messageIds, alreadyApplied: true });
+    assert.deepEqual(texts(), ['one', 'reply to one', 'two', 'reply to two', 'later arrival']);
+    membrane.pushResponse(refusal());
+    assert.deepEqual(await rerun(change, 1), { step: 1, status: 'completed', outcome: 'refused', category: 'unknown' });
+    await step(change, 2);
+    assert.deepEqual(texts(), ['one', 'reply to one', 'two', 'later arrival'], 'step 2 took its planned exchange, not the later arrival');
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'back' }]));
+    const second = await rerun(change, 2);
+    assert.equal(second.status === 'completed' && second.outcome, 'responded');
+    const op = framework.getUnstickOperation(change.id)!;
+    assert.deepEqual(op.steps.map((s) => [s.step, s.status]), [[1, 'shed'], [2, 'shed']]);
+    assert.deepEqual(op.attempts.map((a) => [a.step, a.outcome]), [[1, 'refused'], [2, 'responded']]);
+  });
+
+  it('takes steps only in order, after a refused re-run, and only within the plan', async () => {
+    await unstick(2);
+    const change = asked[0]!;
+    await assert.rejects(step(change, 2), /follows only a refused re-run after step 1/);
+    await step(change, 1);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'fine now' }]));
+    await rerun(change, 1);
+    await assert.rejects(step(change, 2), /follows only a refused re-run/, 'it responded: nothing more is authorized');
+    await assert.rejects(step(change, 3), /plans 2 step\(s\); there is no step 3/);
+  });
+
+  it('refuses a step whose planned message was edited in place, or whose branch moved', async () => {
+    await unstick(2);
+    const change = asked[0]!;
+    await step(change, 1);
+    membrane.pushResponse(refusal());
+    await rerun(change, 1);
+    const planned = (change as { plan: Array<{ messageIds: string[] }> }).plan[1]!.messageIds[0]!;
+    cm().editMessage(planned as never, [{ type: 'text', text: 'reply to two, edited' }]);
+    await assert.rejects(step(change, 2), (e: Error & { code?: string }) => e.code === 'stale' && /changed since it was approved/.test(e.message));
+    const store = framework.getStore();
+    store.createBranch('elsewhere');
+    store.switchBranch('elsewhere');
+    await assert.rejects(step(change, 2), (e: Error & { code?: string }) => e.code === 'stale' && /active branch moved/.test(e.message));
+  });
+
+  it('finishes an interrupted step on its planned exchange, never another', async () => {
+    await unstick(2);
+    const change = asked[0]!;
+    const manager = cm() as unknown as { removeMessage: (id: string) => void };
+    const realRemove = manager.removeMessage.bind(manager);
+    manager.removeMessage = () => { throw new Error('injected crash mid-shed'); };
+    try {
+      await assert.rejects(step(change, 1), /injected crash mid-shed/);
+    } finally {
+      manager.removeMessage = realRemove;
+    }
+    assert.equal(framework.getUnstickOperation(change.id)!.steps[0]!.status, 'intent', 'the intent was journaled first');
+    const finished = await step(change, 1);
+    assert.equal(finished.kind === 'unstick' && finished.alreadyApplied, undefined, 'finished now');
+    assert.deepEqual(texts(), ['one', 'reply to one', 'two', 'reply to two'], 'exactly the culprit, nothing older');
+    assert.equal(framework.getUnstickOperation(change.id)!.steps[0]!.status, 'shed');
+  });
+
+  it('launches each re-run at most once, and reports an orphaned one as interrupted', async () => {
+    await unstick(2);
+    const change = asked[0]!;
+    await step(change, 1);
+    const first = framework.rerunUnstick(change as never, { step: 1 });
+    const again = framework.rerunUnstick(change as never, { step: 1 });
+    assert.equal(host().pendingRequests.filter((r) => r.reason === 'unstick-attempt').length, 1, 'one inference queued');
+    // As if the process died before the queued re-run ran.
+    host().pendingRequests.length = 0;
+    host().unstickAttemptWaiters.clear();
+    host().unstickJournalState = null;
+    assert.deepEqual(await framework.rerunUnstick(change as never, { step: 1 }), { step: 1, status: 'interrupted' });
+    assert.equal(host().pendingRequests.length, 0, 'never relaunched');
+    void first; void again;
+  });
+
+  it('keeps its record when the branch moves, since the journal is the store\'s, not the branch\'s', async () => {
+    await unstick(2);
+    const change = asked[0]!;
+    await step(change, 1);
+    const store = framework.getStore();
+    store.createBranch('moved');
+    store.switchBranch('moved');
+    host().unstickJournalState = null; // reload from the store
+    assert.equal(framework.getUnstickOperation(change.id)!.steps[0]!.status, 'shed');
+  });
+
+  it('runs back to back as a host would: each step after the previous re-run has fully settled', async () => {
+    await unstick(3);
+    const change = asked[0]!;
+    // One response per re-run, queued as it starts: the mock hands a stream
+    // every queued response (later ones resume tool rounds).
+    const responses = [refusal(), refusal(), createMockResponse([{ type: 'text', text: 'back' }])];
+    let done = false;
+    const pump = (async () => { while (!done) { await framework.runUntilIdle(); await new Promise((r) => setTimeout(r, 5)); } })();
+    const outcomes: string[] = [];
+    try {
+      for (const { step: n } of (change as { plan: Array<{ step: number }> }).plan) {
+        await step(change, n); // takes the lease as soon as the previous re-run has settled
+        membrane.pushResponse(responses[n - 1]!);
+        const attempt = await framework.rerunUnstick(change as never, { step: n });
+        // Resolved only once the turn has fully settled: no live turn left.
+        assert.equal((framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens.has('scout'), false);
+        assert.equal(framework.getAgent('scout')!.state.status, 'idle');
+        outcomes.push(attempt.status === 'completed' ? attempt.outcome : attempt.status);
+        if (attempt.status !== 'completed' || attempt.outcome !== 'refused') break;
+      }
+    } finally {
+      done = true;
+      await pump;
+    }
+    assert.deepEqual(outcomes, ['refused', 'refused', 'responded']);
+    assert.deepEqual(framework.getUnstickOperation(change.id)!.steps.map((x) => x.status), ['shed', 'shed', 'shed']);
+    assert.deepEqual(texts(), ['one', 'reply to one', 'back'], 'exactly the planned range went, then the agent answered');
   });
 });

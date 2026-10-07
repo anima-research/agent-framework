@@ -9,7 +9,7 @@ import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
-import { callProvenance, leaseScope, turnScope } from './call-provenance.js';
+import { callProvenance } from './call-provenance.js';
 import {
   selfChangeKind,
   sameValue,
@@ -19,8 +19,12 @@ import {
   type ResolvedPresentationChange,
   type ResolvedSettingsChange,
   type ResolvedUndoTurnsChange,
+  type ResolvedUnstickChange,
   type RuntimeSettingsValues,
+  type UnstickAttemptOutcome,
+  type UnstickOperationRecord,
 } from './operator-change.js';
+import { RecordJournal } from './record-journal.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
 import type {
   MessageId,
@@ -583,6 +587,46 @@ function parseAgentSettingsInput(input: Record<string, unknown>, extensions: Age
     default:
       throw new Error('agent_settings: action must be get, update, reset, or cancel');
   }
+}
+
+/** One entry of the unstick journal (operator/unstick). */
+type UnstickJournalEntry =
+  | { kind: 'step-intent'; operationId: string; agent: string; step: number; messageIds: string[] }
+  | { kind: 'step-done'; operationId: string; step: number }
+  | { kind: 'attempt-launched'; operationId: string; agent: string; step: number }
+  | { kind: 'attempt-done'; operationId: string; step: number; outcome: 'responded' | 'refused' | 'failed'; category?: string; error?: string };
+type UnstickJournalSnapshot = Record<string, UnstickOperationRecord>;
+
+function reduceUnstickEntry(ops: Map<string, UnstickOperationRecord>, entry: UnstickJournalEntry): void {
+  const op = ops.get(entry.operationId)
+    ?? { operationId: entry.operationId, agent: 'agent' in entry ? entry.agent : '', steps: [], attempts: [] };
+  if ('agent' in entry && !op.agent) op.agent = entry.agent;
+  switch (entry.kind) {
+    case 'step-intent':
+      if (!op.steps.some((s) => s.step === entry.step)) {
+        op.steps.push({ step: entry.step, status: 'intent', messageIds: [...entry.messageIds] });
+      }
+      break;
+    case 'step-done': {
+      const step = op.steps.find((s) => s.step === entry.step);
+      if (step) step.status = 'shed';
+      break;
+    }
+    case 'attempt-launched':
+      if (!op.attempts.some((a) => a.step === entry.step)) op.attempts.push({ step: entry.step, status: 'launched' });
+      break;
+    case 'attempt-done': {
+      const attempt = op.attempts.find((a) => a.step === entry.step);
+      if (attempt && attempt.status !== 'completed') {
+        attempt.status = 'completed';
+        attempt.outcome = entry.outcome;
+        if (entry.category) attempt.category = entry.category;
+        if (entry.error) attempt.error = entry.error;
+      }
+      break;
+    }
+  }
+  ops.set(entry.operationId, op);
 }
 
 function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string): MessageMetadata {
@@ -1580,6 +1624,16 @@ export class AgentFramework {
   private activeAdmissions: Map<string, ResolvedOperatorChange> = new Map();
   /** Admitted undo cuts whose bookkeeping finished in this process. */
   private completedOperatorCuts: Set<string> = new Set();
+  /** The unstick journal and its reduced operations (unstickLedger). */
+  private unstickJournalState: {
+    journal: RecordJournal<UnstickJournalEntry, UnstickJournalSnapshot>;
+    ops: Map<string, UnstickOperationRecord>;
+  } | null = null;
+  /** Unstick re-runs this process launched and hasn't settled, by operation#step. */
+  private unstickAttemptWaiters: Map<string, { promise: Promise<UnstickAttemptOutcome>; resolve: (outcome: UnstickAttemptOutcome) => void }> = new Map();
+  /** Outcomes recorded but not yet released to their waiters (the turn is
+   *  still tearing down), by operation#step. */
+  private unstickSettled: Map<string, UnstickAttemptOutcome> = new Map();
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
   /** Framework-global inference gate; older generations cannot release it. */
@@ -3765,9 +3819,11 @@ export class AgentFramework {
    * still memory-only: they flush within the turn, as before.
    */
   /**
-   * Returns true when the durable queue is on disk as it now stands (written,
-   * or cleared because nothing is left), false when it is kept in memory
-   * only: not in persisted mode, over its size cap, or the write failed.
+   * Returns true when the queue as it now stands would survive a killed
+   * process: written to (or cleared from) the recovery file, or, with no
+   * recovery path, kept in branch state and synced by a forced persist.
+   * False otherwise: kept in memory only (not in persisted mode, over its
+   * size cap, or the write failed), or kept in branch state not yet synced.
    * `opts.force` enters persisted mode outside quiesce, for a module message
    * that asked to be durable (ModuleMessageOptions.durable); the mode ends,
    * as it does after quiesce, once the queue drains.
@@ -3794,13 +3850,24 @@ export class AgentFramework {
           return false;
         }
         if (this.deferredWritesPath) {
+          // A written-and-renamed file survives a killed process.
           this.writeRecoveryFile(this.deferredWritesPath, { version: 2, pending: durable, scanFrom });
-        } else {
-          this.warnRecoveryFallbackOnce();
-          this.store.setStateJson(DEFERRED_WRITES_ID, { version: 2, pending: durable, scanFrom });
+          this.deferredWritesPersisted = true;
+          return true;
         }
+        this.warnRecoveryFallbackOnce();
+        this.store.setStateJson(DEFERRED_WRITES_ID, { version: 2, pending: durable, scanFrom });
         this.deferredWritesPersisted = true;
-        return true;
+        // Branch state persists only on sync(): the queue is durable now only
+        // when a persist asked for durability (force) and its sync succeeded.
+        if (!opts?.force) return false;
+        try {
+          this.store.sync();
+          return true;
+        } catch (err) {
+          console.error('[host-mode] deferred-write queue kept in branch state, but its sync failed:', err);
+          return false;
+        }
       } else if (this.deferredWritesPersisted) {
         if (this.deferredWritesPath) {
           this.writeRecoveryFile(this.deferredWritesPath, { version: 1, pending: [] });
@@ -5563,6 +5630,9 @@ export class AgentFramework {
       }
       const cap = Math.max(1, Math.min(10,
         Math.floor(params.maxRewinds ?? agent.refusalHandling?.maxRewinds ?? 3)));
+      if (this.operatorChangeGate) {
+        return this.gatedUnstick(agentName, cap, hostCommandRequester(serverId, params));
+      }
       this.forcedRewind.set(agentName, {
         remaining: cap,
         removed: [],
@@ -6515,8 +6585,7 @@ export class AgentFramework {
       `${opts.requester ? `, for ${opts.requester.name ?? opts.requester.id ?? 'operator'} via ${opts.requester.via}` : ''})`,
     );
     try {
-      // The callback, and the work it starts, runs inside this lease's scope.
-      return await leaseScope.run(held.lease, () => fn(held.lease));
+      return await fn(held.lease);
     } finally {
       held.release();
       console.log(`[safe-boundary] ${held.lease.verb}: released after ${Date.now() - held.lease.since}ms`);
@@ -6622,44 +6691,38 @@ export class AgentFramework {
   // Operator-change admission (FrameworkConfig.operatorChangeGate)
   // ---------------------------------------------------------------------------
 
-  /** Ask the host's gate about one resolved change. Without a gate the answer
-   *  is apply, today's behaviour; a gate that throws or answers nonsense
-   *  refuses the change (fails closed). Staging and refusals are logged. */
+  /** Hand one resolved change to the host's gate, which stages it and
+   *  answers with its receipt. A gate that throws, or answers without a
+   *  receipt, refuses the change (fails closed). Both are logged. */
   private async askOperatorChangeGate(change: ResolvedOperatorChange): Promise<
-    | { outcome: 'apply' }
     | { outcome: 'staged'; receipt: OperatorChangeReceipt }
     | { outcome: 'gate-failed'; error: string }
   > {
-    const gate = this.operatorChangeGate;
-    if (!gate) return { outcome: 'apply' };
-    let answer: { outcome: 'apply' } | { outcome: 'staged'; receipt: OperatorChangeReceipt } | { outcome: 'gate-failed'; error: string };
+    let answer: { outcome: 'staged'; receipt: OperatorChangeReceipt } | { outcome: 'gate-failed'; error: string };
     try {
-      const decision = await gate(change);
-      if (decision?.decision === 'apply') answer = { outcome: 'apply' };
-      else if (decision?.decision === 'staged'
-        && typeof decision.receipt?.id === 'string' && typeof decision.receipt?.text === 'string') {
-        answer = { outcome: 'staged', receipt: { id: decision.receipt.id, text: decision.receipt.text } };
-      } else answer = { outcome: 'gate-failed', error: 'the operator-change gate returned no valid decision' };
+      const receipt = await this.operatorChangeGate!(change);
+      answer = typeof receipt?.id === 'string' && typeof receipt?.text === 'string'
+        ? { outcome: 'staged', receipt: { id: receipt.id, text: receipt.text } }
+        : { outcome: 'gate-failed', error: 'the operator-change gate returned no receipt' };
     } catch (error) {
       answer = { outcome: 'gate-failed', error: error instanceof Error ? error.message : String(error) };
     }
-    if (answer.outcome !== 'apply') {
-      this.recordOperatorAction({
-        kind: answer.outcome === 'staged' ? 'operator-change-staged' : 'operator-change-refused',
-        agent: change.agent,
-        ...(change.requester ? { requester: change.requester } : {}),
-        params: { changeId: change.id, change: change.kind, surface: change.surface },
-        ...(answer.outcome === 'staged'
-          ? { result: { receipt: answer.receipt.id } }
-          : { error: `gate failed: ${answer.error}` }),
-      });
-    }
+    this.recordOperatorAction({
+      kind: answer.outcome === 'staged' ? 'operator-change-staged' : 'operator-change-refused',
+      agent: change.agent,
+      ...(change.requester ? { requester: change.requester } : {}),
+      params: { changeId: change.id, change: change.kind, surface: change.surface },
+      ...(answer.outcome === 'staged'
+        ? { result: { receipt: answer.receipt.id } }
+        : { error: `gate failed: ${answer.error}` }),
+    });
     return answer;
   }
 
-  /** The change `admission` was registered for (applyResolvedOperatorChange,
-   *  or an applied puppet call), when it is exactly this agent, tool and
-   *  input. Any other admission covers nothing. */
+  /** The change `admission` was registered for, when it is exactly this
+   *  agent, tool and input. Admissions exist only while
+   *  applyResolvedOperatorChange applies their change under a held lease;
+   *  any other admission covers nothing. */
   private admittedChange(
     admission: OperatorAdmission | undefined,
     agentName: string,
@@ -6668,7 +6731,7 @@ export class AgentFramework {
   ): ResolvedSettingsChange | ResolvedPresentationChange | null {
     if (!admission) return null;
     const change = this.activeAdmissions?.get(admission.id);
-    if (!change || change.agent !== agentName || change.kind === 'undo-turns') return null;
+    if (!change || change.agent !== agentName || (change.kind !== 'agent-settings' && change.kind !== 'tool-presentation')) return null;
     const changeTool = change.kind === 'agent-settings' ? 'agent_settings' : change.tool;
     return tool === changeTool && sameValue(change.input, input) ? change : null;
   }
@@ -6813,10 +6876,11 @@ export class AgentFramework {
   /**
    * Run a self-change tool call (agent_settings, tool presentation) through
    * the gate when an operator or a module made it. The agent's own model
-   * calls (no origin), reads, and calls carrying an admission registered for
-   * exactly this change run as before. Otherwise the call is resolved and
-   * the gate decides: staged returns its receipt as the call's error; apply
-   * revalidates and runs exactly that call; a failed gate refuses it.
+   * calls (no origin) and reads run as before. A call admitted for exactly
+   * this change (applyResolvedOperatorChange, under its lease) is revalidated
+   * and runs. Anything else is resolved and staged: the receipt comes back
+   * as the call's error and nothing runs. A change that can't be resolved,
+   * or a failed gate, is refused.
    */
   private async gatedSelfChange(agentName: string, call: ToolCall, run: () => ToolResult): Promise<ToolResult> {
     if (!this.operatorChangeGate || call.origin === undefined) return run();
@@ -6824,66 +6888,36 @@ export class AgentFramework {
     const input = (call.input ?? {}) as Record<string, unknown>;
     const refused = (error: string): ToolResult => ({ success: false, isError: true, error });
     const admitted = this.admittedChange(call.admission, agentName, call.name, input);
-    let change: ResolvedSettingsChange | ResolvedPresentationChange;
     if (admitted) {
-      change = admitted;
-    } else {
-      // A change that can't be resolved is refused, never run ungated: the
-      // resolver shares the handler's parser, so whatever it can't resolve
-      // the gate could not have decided.
+      // The last check before the change runs, with no await in between.
       try {
-        change = this.resolveSelfChange(agentName, call.name, input, call.origin);
+        this.revalidateSelfChange(admitted);
       } catch (error) {
-        return refused(`Operator change refused: it couldn't be resolved (${error instanceof Error ? error.message : String(error)})`);
+        return refused(error instanceof Error ? error.message : String(error));
       }
-      const answer = await this.askOperatorChangeGate(change);
-      if (answer.outcome === 'staged') {
-        return { success: false, isError: true, error: answer.receipt.text, data: { staged: answer.receipt } };
-      }
-      if (answer.outcome === 'gate-failed') return refused(`Operator change refused: ${answer.error}`);
+      return run();
     }
-    // Permission to apply isn't a safe boundary: while the store is held by
-    // a reservation this call isn't running under, or the agent has a live
-    // turn that isn't this call's own, refuse rather than wait (the holder
-    // may be waiting for this very call's turn).
-    const busy = this.applyBoundaryAgainstCaller(agentName);
-    if (busy) return refused(`Operator change refused: ${busy}; retry when it completes`);
-    // The last check before the change runs, with no await in between.
+    // A change that can't be resolved is refused, never run ungated: the
+    // resolver shares the handler's parser, so whatever it can't resolve the
+    // gate could not have staged.
+    let change: ResolvedSettingsChange | ResolvedPresentationChange;
     try {
-      this.revalidateSelfChange(change);
+      change = this.resolveSelfChange(agentName, call.name, input, call.origin);
     } catch (error) {
-      return refused(error instanceof Error ? error.message : String(error));
+      return refused(`Operator change refused: it couldn't be resolved (${error instanceof Error ? error.message : String(error)})`);
     }
-    return run();
+    const answer = await this.askOperatorChangeGate(change);
+    if (answer.outcome === 'gate-failed') return refused(`Operator change refused: ${answer.error}`);
+    return { success: false, isError: true, error: answer.receipt.text, data: { staged: answer.receipt } };
   }
 
-  /**
-   * Why a gated change to `agentName` can't apply now from this caller, or
-   * null when it can. The store must not be held by a reservation this work
-   * isn't running under (only the lease whose callback this is), and the
-   * agent must have no live turn other than the caller's own: the turn a
-   * puppet call runs as (turnScope), or the lease's reservation of it.
-   */
-  private applyBoundaryAgainstCaller(agentName: string): string | null {
-    const scoped = leaseScope.getStore();
-    const inHeldLease = scoped !== undefined && this.heldLease?.lease === scoped;
-    if (this.surgeryHold && !inHeldLease) {
-      return `the store is held by ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`;
-    }
-    const token = this.activeTurnTokens.get(agentName);
-    if (token === undefined) return null;
-    const own = turnScope.getStore();
-    if (own && own.agent === agentName && own.token === token) return null;
-    if (inHeldLease && this.heldLease!.tokens.get(agentName) === token) return null;
-    return `${agentName} has a live turn that isn't this call's`;
-  }
 
   /**
    * host/command undo by turns when the host has an operator-change gate:
-   * resolve the exact checkpoints, ask, and either return the receipt
-   * (staged, nothing changed) or apply exactly that change now as one cut,
-   * under a store reservation. Without a gate, host/command keeps its
-   * per-turn loop.
+   * resolve the exact checkpoints and stage them, returning the receipt.
+   * Nothing changes now; the host applies the change through
+   * applyResolvedOperatorChange under a lease. Without a gate, host/command
+   * keeps its per-turn loop.
    */
   private async gatedUndoTurns(agentName: string, requested: number, requester: OperatorRequester): Promise<{
     ok: boolean;
@@ -6901,36 +6935,294 @@ export class AgentFramework {
     const change = this.resolveUndoTurns(agentName, requested, requester);
     if (!change) return { ok: true, undone: 0, requested, lastVisible: null };
     const answer = await this.askOperatorChangeGate(change);
-    if (answer.outcome === 'staged') {
-      return { ok: false, code: 'staged', error: answer.receipt.text, staged: { id: answer.receipt.id }, requested };
-    }
     if (answer.outcome === 'gate-failed') {
       return { ok: false, code: 'gate-failed', error: `Operator change refused: ${answer.error}`, requested };
     }
-    let applied: ReturnType<AgentFramework['applyUndoTurns']>;
-    try {
-      const release = this.reserveStoreForSurgery('undo', agentName);
-      try {
-        applied = this.applyUndoTurns(change);
-        // Gate installed before release; delivery drains in the background
-        // and a failure there is never reported as this undo's.
-        this.deliverDiscordAwarenessInBackground('undo', agentName);
-      } finally {
-        release();
-      }
-    } catch (error) {
-      return {
-        ok: false,
-        error: error instanceof Error ? error.message : String(error),
-        ...(error instanceof OperatorActionError ? { code: error.code } : {}),
-        requested,
-      };
+    return { ok: false, code: 'staged', error: answer.receipt.text, staged: { id: answer.receipt.id }, requested };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Admitted unstick (ResolvedUnstickChange): planned steps, re-runs, journal
+  // ---------------------------------------------------------------------------
+
+  /** The unstick journal, loaded and reduced on first use. Store-bound and
+   *  branch-independent (RecordJournal): an operation's intents and outcomes
+   *  don't rewind with an undo, and they die with this store. */
+  private unstickLedger(): {
+    journal: RecordJournal<UnstickJournalEntry, UnstickJournalSnapshot>;
+    ops: Map<string, UnstickOperationRecord>;
+  } {
+    if (!this.unstickJournalState) {
+      const journal = new RecordJournal<UnstickJournalEntry, UnstickJournalSnapshot>(this.store, { type: 'operator/unstick' });
+      this.unstickJournalState = { journal, ops: new Map() };
+      this.reloadUnstickJournal();
     }
-    console.error(
-      `[host-command] undo agent=${agentName} requested=${requested} undone=${applied.undone} ` +
-        `as one cut (${change.id}) by=${requester.name ?? requester.id ?? requester.via}`,
-    );
-    return { ok: true, undone: applied.undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
+    return this.unstickJournalState;
+  }
+
+  /** Rebuild the reduced operations from exactly what the journal holds: at
+   *  first use, and to reconcile after an ambiguous write. */
+  private reloadUnstickJournal(): void {
+    const state = this.unstickJournalState!;
+    const { snapshot, entries } = state.journal.load();
+    state.ops = new Map(Object.entries(snapshot ?? {}).map(([id, op]) => [id, structuredClone(op)]));
+    for (const { entry } of entries) reduceUnstickEntry(state.ops, entry);
+  }
+
+  /** Append one journal entry and reduce it. A failure after the entry may
+   *  have reached the store reconciles the reduced state before rethrowing. */
+  private journalUnstick(entry: UnstickJournalEntry, opts: { durable?: boolean; afterCommittedState?: boolean }): void {
+    const ledger = this.unstickLedger();
+    try {
+      ledger.journal.append(entry, opts);
+    } catch (error) {
+      if (ledger.journal.needsReconcile) this.reloadUnstickJournal();
+      throw error;
+    }
+    reduceUnstickEntry(ledger.ops, entry);
+    if (ledger.journal.entriesSinceCheckpoint >= 64) {
+      // Keep the newest operations; older ones are long finished.
+      const kept = [...ledger.ops.entries()].slice(-32);
+      try {
+        ledger.journal.checkpoint(Object.fromEntries(kept));
+        ledger.ops = new Map(kept);
+      } catch (error) {
+        console.error('[unstick] journal checkpoint failed (replay stays longer):', error instanceof Error ? error.message : error);
+        if (ledger.journal.needsReconcile) this.reloadUnstickJournal();
+      }
+    }
+  }
+
+  /** The durable record of an unstick operation, or null if it never ran a step. */
+  getUnstickOperation(operationId: string): UnstickOperationRecord | null {
+    const op = this.unstickLedger().ops.get(operationId);
+    return op ? structuredClone(op) : null;
+  }
+
+  /** Content-only fingerprint of a message: an edit in place changes it. */
+  private messageFingerprint(message: { participant?: unknown; content?: unknown }): string {
+    return createHash('sha256').update(JSON.stringify([message.participant ?? null, message.content ?? null])).digest('hex').slice(0, 32);
+  }
+
+  /**
+   * Plan host/command unstick at staging: walk back from the tail as it
+   * stands now, one complete exchange per step (planShedExchange), through
+   * the cap or until nothing is left. Null when there is nothing to shed.
+   */
+  private resolveUnstick(agentName: string, cap: number, requester?: OperatorRequester): ResolvedUnstickChange | null {
+    const agent = this.agents.get(agentName)!;
+    const cm = agent.getContextManager();
+    const byId = new Map(cm.getAllMessages().map((m) => [String(m.id), m]));
+    const plan: ResolvedUnstickChange['plan'] = [];
+    let anchor: MessageId | null | undefined;
+    for (let step = 1; step <= cap; step++) {
+      if (anchor === null) break;
+      const next = this.planShedExchange(agent, anchor);
+      if (!next || next === 'anchor-missing') break;
+      const messageIds = next.removedIds.map(String);
+      plan.push({ step, messageIds, fingerprints: messageIds.map((id) => this.messageFingerprint(byId.get(id)!)) });
+      anchor = next.anchor;
+    }
+    if (plan.length === 0) return null;
+    return {
+      id: randomUUID(),
+      agent: agentName,
+      surface: 'host-command',
+      ...(requester ? { requester } : {}),
+      resolvedAt: Date.now(),
+      sourceBranch: this.store.currentBranch().name,
+      kind: 'unstick',
+      cap,
+      plan,
+    };
+  }
+
+  /**
+   * Apply step `step` of a planned unstick. The caller holds the store (the
+   * host's lease, or the self-driven form's). Step k > 1 follows only a
+   * refused re-run after step k-1. The step's intent, naming exactly the
+   * planned exchange, is journaled durably before anything is removed, and
+   * its completion after the removal is committed. A step journaled as shed
+   * reports alreadyApplied; one journaled only as an intent (interrupted)
+   * finishes exactly its planned exchange, never another.
+   */
+  private applyUnstickStep(change: ResolvedUnstickChange, step: number, admission?: OperatorAdmission): {
+    step: number;
+    shedIds: string[];
+    alreadyApplied?: true;
+  } {
+    const stale = (what: string): never => {
+      throw new OperatorActionError('stale', `Unstick ${change.id} for ${change.agent} no longer holds: ${what}`);
+    };
+    if (!Number.isInteger(step) || step < 1 || step > change.plan.length) {
+      throw new OperatorActionError('invalid', `Unstick ${change.id} plans ${change.plan.length} step(s); there is no step ${step}`);
+    }
+    const agent = this.agents.get(change.agent);
+    if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${change.agent}`);
+    const op = this.unstickLedger().ops.get(change.id);
+    const journaled = op?.steps.find((s) => s.step === step);
+    if (journaled?.status === 'shed') return { step, shedIds: journaled.messageIds, alreadyApplied: true };
+    if (step > 1) {
+      const previous = op?.attempts.find((a) => a.step === step - 1);
+      if (previous?.status !== 'completed' || previous.outcome !== 'refused') {
+        throw new OperatorActionError(
+          'invalid',
+          `Unstick ${change.id}: step ${step} follows only a refused re-run after step ${step - 1}`,
+        );
+      }
+    }
+    const branch = this.store.currentBranch().name;
+    if (branch !== change.sourceBranch) stale(`the active branch moved from ${change.sourceBranch} to ${branch}`);
+    const planned = change.plan[step - 1]!;
+    const cm = agent.getContextManager();
+    const byId = new Map(cm.getAllMessages().map((m) => [String(m.id), m]));
+    planned.messageIds.forEach((id, i) => {
+      const message = byId.get(id);
+      // An interrupted step may already have removed some of its exchange.
+      if (!message) {
+        if (!journaled) stale(`message ${id}, planned for step ${step}, is gone`);
+        return;
+      }
+      if (this.messageFingerprint(message) !== planned.fingerprints[i]) {
+        stale(`message ${id}, planned for step ${step}, changed since it was approved`);
+      }
+    });
+    if (!journaled) {
+      this.journalUnstick(
+        { kind: 'step-intent', operationId: change.id, agent: change.agent, step, messageIds: planned.messageIds },
+        { durable: true },
+      );
+    }
+    for (const id of planned.messageIds) {
+      if (byId.has(id)) cm.removeMessage(id as MessageId);
+    }
+    const lastRefusal = op?.attempts.filter((a) => a.outcome === 'refused').at(-1)?.category;
+    this.updateRewindMarker(agent, lastRefusal ?? 'unknown');
+    this.journalUnstick({ kind: 'step-done', operationId: change.id, step }, { afterCommittedState: true });
+    this.recordOperatorAction({
+      kind: 'unstick-step',
+      agent: change.agent,
+      ...(change.requester ? { requester: change.requester } : {}),
+      params: { changeId: change.id, step, of: change.plan.length, ...(admission ? { admission: admission.id } : {}) },
+      result: { shedIds: planned.messageIds, ...(journaled ? { finishedInterrupted: true } : {}) },
+    });
+    return { step, shedIds: planned.messageIds };
+  }
+
+  /**
+   * Re-run the agent after step `step` of a planned unstick, outside any
+   * lease. Bound to the operation and step: an attempt already journaled is
+   * reported, never launched again. A new one is journaled `launched`
+   * durably before its one inference is queued, and the promise resolves
+   * with its outcome when the turn ends. An attempt journaled `launched`
+   * that no process is running reports `interrupted`: its outcome is unknown.
+   */
+  async rerunUnstick(change: ResolvedUnstickChange, opts: { step: number }): Promise<UnstickAttemptOutcome> {
+    const step = opts.step;
+    const op = this.unstickLedger().ops.get(change.id);
+    if (op?.steps.find((s) => s.step === step)?.status !== 'shed') {
+      throw new OperatorActionError('invalid', `Unstick ${change.id}: step ${step} hasn't been applied, so there is nothing to re-run`);
+    }
+    const key = `${change.id}#${step}`;
+    const existing = op.attempts.find((a) => a.step === step);
+    if (existing) {
+      if (existing.status === 'completed') {
+        return {
+          step,
+          status: 'completed',
+          outcome: existing.outcome!,
+          ...(existing.category ? { category: existing.category } : {}),
+          ...(existing.error ? { error: existing.error } : {}),
+        };
+      }
+      return this.unstickAttemptWaiters.get(key)?.promise ?? { step, status: 'interrupted' };
+    }
+    this.journalUnstick({ kind: 'attempt-launched', operationId: change.id, agent: change.agent, step }, { durable: true });
+    let resolve!: (outcome: UnstickAttemptOutcome) => void;
+    const promise = new Promise<UnstickAttemptOutcome>((r) => { resolve = r; });
+    this.unstickAttemptWaiters.set(key, { promise, resolve });
+    this.pendingRequests.push({
+      agentName: change.agent,
+      reason: 'unstick-attempt',
+      source: 'framework',
+      timestamp: Date.now(),
+      unstick: { operationId: change.id, step },
+    });
+    this.recordOperatorAction({
+      kind: 'unstick-attempt',
+      agent: change.agent,
+      ...(change.requester ? { requester: change.requester } : {}),
+      params: { changeId: change.id, step },
+      result: { launched: true },
+    });
+    return promise;
+  }
+
+  /** Record an unstick attempt's outcome once, and resolve whoever waits. */
+  private settleUnstickAttempt(
+    binding: { operationId: string; step: number },
+    outcome: 'responded' | 'refused' | 'failed',
+    detail?: { category?: string; error?: string },
+  ): void {
+    const op = this.unstickLedger().ops.get(binding.operationId);
+    const attempt = op?.attempts.find((a) => a.step === binding.step);
+    if (!attempt || attempt.status === 'completed') return;
+    const result: UnstickAttemptOutcome = {
+      step: binding.step,
+      status: 'completed',
+      outcome,
+      ...(detail?.category ? { category: detail.category } : {}),
+      ...(detail?.error ? { error: detail.error } : {}),
+    };
+    try {
+      this.journalUnstick(
+        { kind: 'attempt-done', operationId: binding.operationId, step: binding.step, outcome, ...detail },
+        { afterCommittedState: true },
+      );
+    } catch (error) {
+      // Not journaled: after a restart this attempt reads `interrupted`, an
+      // honest unknown. This process still reports what it saw.
+      console.error(
+        `[unstick] could not journal attempt ${binding.step} of ${binding.operationId}: ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    // Whoever waits hears the outcome only once the turn has fully settled
+    // (releaseUnstickAttempt, at the end of the stream's teardown): a caller
+    // that takes the next lease then finds the agent's turn truly over.
+    this.unstickSettled.set(`${binding.operationId}#${binding.step}`, result);
+  }
+
+  /** Resolve an unstick re-run's waiter with its recorded outcome, at the
+   *  end of its stream's teardown. */
+  private releaseUnstickAttempt(binding: { operationId: string; step: number }): void {
+    const key = `${binding.operationId}#${binding.step}`;
+    const result = this.unstickSettled.get(key);
+    if (!result) return;
+    this.unstickSettled.delete(key);
+    this.unstickAttemptWaiters.get(key)?.resolve(result);
+    this.unstickAttemptWaiters.delete(key);
+  }
+
+  /**
+   * host/command unstick when the host has an operator-change gate: plan it
+   * in full and stage it, returning the receipt. Nothing changes now; the
+   * host drives the plan (applyResolvedOperatorChange per step under a
+   * lease, rerunUnstick between steps). Without a gate, host/command keeps
+   * its in-stream loop.
+   */
+  private async gatedUnstick(
+    agentName: string,
+    cap: number,
+    requester: OperatorRequester,
+  ): Promise<{ ok: boolean; error?: string; code?: string; staged?: { id: string }; cap?: number }> {
+    const change = this.resolveUnstick(agentName, cap, requester);
+    if (!change) return { ok: false, error: `Cannot unstick ${agentName}: nothing to shed` };
+    const answer = await this.askOperatorChangeGate(change);
+    if (answer.outcome === 'gate-failed') {
+      return { ok: false, code: 'gate-failed', error: `Operator change refused: ${answer.error}` };
+    }
+    return { ok: false, code: 'staged', error: answer.receipt.text, staged: { id: answer.receipt.id }, cap: change.plan.length };
   }
 
   /** Resolve host/command undo by turns to the exact checkpoints it would
@@ -7032,15 +7324,29 @@ export class AgentFramework {
   private finishUndoTurnsCut(change: ResolvedUndoTurnsChange, admission?: OperatorAdmission): void {
     const destination = this.undoTurnsDestination(change);
     const oldest = change.checkpoints[change.checkpoints.length - 1]!;
-    const framework = this.store.getStateJson(FRAMEWORK_STATE_ID);
-    const state = (framework && typeof framework === 'object' ? framework : {}) as Record<string, unknown>;
-    if ((state.operatorCut as { changeId?: unknown } | undefined)?.changeId !== change.id) {
-      this.store.setStateJson(FRAMEWORK_STATE_ID, { ...state, operatorCut: { changeId: change.id, at: Date.now() } });
+    const marker = (): { changeId?: unknown; completed?: unknown } | undefined => {
+      const framework = this.store.getStateJson(FRAMEWORK_STATE_ID);
+      return (framework && typeof framework === 'object' ? framework as Record<string, unknown> : {}).operatorCut as
+        { changeId?: unknown; completed?: unknown } | undefined;
+    };
+    const writeMarker = (completed: boolean) => {
+      const framework = this.store.getStateJson(FRAMEWORK_STATE_ID);
+      this.store.setStateJson(FRAMEWORK_STATE_ID, {
+        ...(framework && typeof framework === 'object' ? framework as Record<string, unknown> : {}),
+        operatorCut: { changeId: change.id, at: Date.now(), ...(completed ? { completed: true } : {}) },
+      });
+    };
+    // A completed cut is left exactly as it is, whatever happened since on
+    // its branch (later turns and their checkpoints, a redo stack): only
+    // its durability is confirmed again.
+    if (marker()?.changeId === change.id && marker()?.completed === true) {
+      this.store.sync();
+      return;
     }
-    this.saveTurnCheckpoints(
-      change.agent,
-      this.getTurnCheckpoints(change.agent).filter((c) => c.sequenceBefore < oldest.sequenceBefore),
-    );
+    if (marker()?.changeId !== change.id) writeMarker(false);
+    // Checkpoints need no bookkeeping: the lists are branch-scoped, and the
+    // destination, cut where the oldest staged turn had yet to record
+    // itself, inherits exactly the older ones. Later turns add their own.
     this.materializeConfigMountAfterBranchSwitch();
     let redoStack = this.redoStacks.get(change.agent);
     if (!redoStack) {
@@ -7048,10 +7354,17 @@ export class AgentFramework {
       this.redoStacks.set(change.agent, redoStack);
     }
     // The source tip still holds the removed checkpoints: redo re-adds none.
-    if (!redoStack.some((entry) => entry.changeId === change.id)) {
+    // A turn that already ran on the destination (it recorded a checkpoint
+    // there) invalidated redo, as any new work does, so a repair pushes no
+    // entry then: redoing would discard that work.
+    const laterWork = this.getTurnCheckpoints(change.agent).some((c) => c.branchName === destination);
+    if (!laterWork && !redoStack.some((entry) => entry.changeId === change.id)) {
       redoStack.push({ branchName: change.sourceBranch, checkpoints: [], changeId: change.id });
     }
-    if (this.completedOperatorCuts.has(change.id)) return;
+    if (this.completedOperatorCuts.has(change.id)) {
+      this.completeUndoTurnsCut(change);
+      return;
+    }
     this.emitTrace({
       type: 'undo:completed',
       agentName: change.agent,
@@ -7074,6 +7387,20 @@ export class AgentFramework {
       result: { sourceBranch: change.sourceBranch, targetBranch: destination },
     });
     this.completedOperatorCuts.add(change.id);
+    this.completeUndoTurnsCut(change);
+  }
+
+  /** Mark an admitted undo cut complete on its destination and make that
+   *  durable: branch state persists only on sync(), so completion is
+   *  reported only after the sync succeeds (a failure throws, and a retry
+   *  confirms it again). */
+  private completeUndoTurnsCut(change: ResolvedUndoTurnsChange): void {
+    const framework = this.store.getStateJson(FRAMEWORK_STATE_ID);
+    this.store.setStateJson(FRAMEWORK_STATE_ID, {
+      ...(framework && typeof framework === 'object' ? framework as Record<string, unknown> : {}),
+      operatorCut: { changeId: change.id, at: Date.now(), completed: true },
+    });
+    this.store.sync();
   }
 
   /**
@@ -7088,9 +7415,15 @@ export class AgentFramework {
    */
   async applyResolvedOperatorChange(
     change: ResolvedOperatorChange,
-    opts: { lease: SafeBoundaryLease; admission: OperatorAdmission },
+    opts: { lease: SafeBoundaryLease; admission: OperatorAdmission; step?: number },
   ): Promise<AppliedOperatorChange> {
     this.heldLeaseTokens(opts.lease, `apply ${change.kind} for ${change.agent}`);
+    if (change.kind === 'unstick') {
+      if (opts.step === undefined) {
+        throw new OperatorActionError('invalid', `Applying unstick ${change.id} takes a step (1 to ${change.plan.length})`);
+      }
+      return { kind: 'unstick', ...this.applyUnstickStep(change, opts.step, opts.admission) };
+    }
     if (change.kind === 'undo-turns') {
       const applied = this.applyUndoTurns(change, opts.admission);
       // Installs the MCPL data-plane gate now, under the lease, and drains in
@@ -8461,6 +8794,10 @@ export class AgentFramework {
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               ephemeralSystemPrompt: this.activeTurnTriggers.get(agent.name)?.ephemeralSystemPrompt,
+              // The restart continues an unstick re-run: it keeps the binding.
+              ...(this.activeTurnTriggers.get(agent.name)?.unstick
+                ? { unstick: this.activeTurnTriggers.get(agent.name)!.unstick }
+                : {}),
             });
           } else if (currentState.stream) {
             // Streaming path: convert results and resume the stream.
@@ -10037,8 +10374,12 @@ export class AgentFramework {
       // A silent tick never suppresses a genuine coalesced wake. If any
       // ordinary request shares this batch, the ordinary turn semantics win.
       const silentOnly = requests.every((r) => r.suppressProse === true);
+      // An unstick re-run in the batch binds the turn to its operation and
+      // step, whichever request leads the batch.
+      const unstickReq = requests.find((r) => r.unstick);
       await this.startAgentStream(agent, {
         ...trigger,
+        ...(unstickReq ? { unstick: unstickReq.unstick } : {}),
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         channelId: channelReq?.channelId,
@@ -11676,7 +12017,14 @@ export class AgentFramework {
               // config; both are bounded.
               let handledByRewind = false;
               const rh = agent.refusalHandling;
-              const forced = this.forcedRewind.get(agent.name);
+              // An admitted unstick's re-run never sheds in the stream: it
+              // records the refusal, and the host decides the next step.
+              const unstickRun = trigger?.unstick;
+              if (unstickRun) {
+                this.settleUnstickAttempt(unstickRun, 'refused', { category });
+                handledByRewind = true;
+              }
+              const forced = unstickRun ? undefined : this.forcedRewind.get(agent.name);
 
               // NOTE: plain retries are NOT done here. `refusalHandling.retries`
               // is handed to membrane (see Agent.startActivation), which
@@ -11723,7 +12071,7 @@ export class AgentFramework {
                   },
                   () => this.finishUnstick(agent.name, false, category),
                 );
-              } else if (rh?.autoRewind && !guardRefusal) {
+              } else if (rh?.autoRewind && !guardRefusal && !unstickRun) {
                 const cap = Math.max(1, rh.maxRewinds ?? 3);
                 const used = this.refusalRewinds.get(agent.name) ?? 0;
                 doRewind(
@@ -11760,6 +12108,7 @@ export class AgentFramework {
               // A turn that completed WITHOUT a refusal ends the rewind episode:
               // the model responded. Leave the consolidated marker in place as
               // the durable record; just clear the per-episode counters.
+              if (trigger?.unstick) this.settleUnstickAttempt(trigger.unstick, 'responded');
               if (this.forcedRewind.has(agent.name)) {
                 this.finishUnstick(agent.name, true);
               }
@@ -12302,10 +12651,18 @@ export class AgentFramework {
         durationMs,
       });
       this.abortAgentScript(agent.name, 'stream threw');
+      if (trigger?.unstick) this.settleUnstickAttempt(trigger.unstick, 'failed', { error: err.message });
       lifecyclePhase = 'failed'; // §10.5 — terminal emitted in finally
       agent.reset();
       if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
     } finally {
+      // An unstick re-run that ended without an outcome (aborted, cancelled)
+      // failed, unless a budget restart carries it on.
+      if (trigger?.unstick && !this.pendingRequests.some((r) =>
+        r.agentName === agent.name && r.unstick?.operationId === trigger.unstick!.operationId
+          && r.unstick.step === trigger.unstick!.step)) {
+        this.settleUnstickAttempt(trigger.unstick, 'failed', { error: 'the re-run ended without a response' });
+      }
       const unsettledKvSubmissions = drainKvSubmissionIds?.() ?? [];
       if (unsettledKvSubmissions.length > 0) {
         try {
@@ -12433,6 +12790,8 @@ export class AgentFramework {
         }
         this.ackDeferredWrites();
       }
+      // Last: the turn has settled, so an unstick re-run's caller may act.
+      if (trigger?.unstick) this.releaseUnstickAttempt(trigger.unstick);
     }
   }
 
@@ -12509,11 +12868,11 @@ export class AgentFramework {
   ): Promise<{ toolUseId: string | null; result: ToolResult; staged?: OperatorChangeReceipt }> {
     if (!this.agents.get(agentName)) throw new Error(`Unknown agent: ${agentName}`);
     // An operator's mutating self-change (agent_settings update/reset/cancel,
-    // a tool-presentation edit) goes through the host's gate before anything
-    // runs. Staged: nothing executes and no pair is stored, since a pair
-    // would testify the tool ran; the receipt comes back with toolUseId null.
-    // Apply: the call proceeds as exactly the resolved change, revalidated,
-    // and admitted for its own duration only.
+    // a tool-presentation edit) is staged with the host's gate, not run:
+    // no pair is stored, since a pair would testify the tool ran, and the
+    // receipt comes back with toolUseId null. The change runs only when the
+    // host applies it (applyResolvedOperatorChange under its lease), which
+    // calls back here carrying the admission for exactly this change.
     if (
       this.operatorChangeGate &&
       selfChangeKind(toolName, input) &&
@@ -12534,26 +12893,14 @@ export class AgentFramework {
         };
       }
       const answer = await this.askOperatorChangeGate(change);
-      if (answer.outcome === 'staged') {
-        return {
-          toolUseId: null,
-          result: { success: false, isError: true, error: answer.receipt.text },
-          staged: answer.receipt,
-        };
-      }
       if (answer.outcome === 'gate-failed') {
         throw new Error(`puppet refused: the operator-change gate failed (${answer.error})`);
       }
-      // Revalidated here and again where the change runs (gatedSelfChange's
-      // admitted path), right before the handler, with no await between.
-      this.revalidateSelfChange(change);
-      const admission: OperatorAdmission = { id: change.id };
-      this.activeAdmissions.set(admission.id, change);
-      try {
-        return await this.puppetToolCallUngated(agentName, toolName, input, { ...opts, admission });
-      } finally {
-        this.activeAdmissions.delete(admission.id);
-      }
+      return {
+        toolUseId: null,
+        result: { success: false, isError: true, error: answer.receipt.text },
+        staged: answer.receipt,
+      };
     }
     return this.puppetToolCallUngated(agentName, toolName, input, opts);
   }
@@ -12628,16 +12975,14 @@ export class AgentFramework {
     let ownedToEnd = false;
     try {
       const started = Date.now();
-      // The call, and anything it delegates, runs as this turn: a gated
-      // change it makes to this agent is the caller's own, not a busy agent.
-      const result = await turnScope.run({ agent: agentName, token: turnToken }, () => this.executeToolCall({
+      const result = await this.executeToolCall({
         id: toolUseId,
         name: toolName,
         input,
         callerAgentName: agentName,
         origin: 'puppet',
         ...(opts?.admission ? { admission: opts.admission } : {}),
-      }));
+      });
       const durationMs = Date.now() - started;
 
       // Store the pair through the same shapes the ordinary path uses. Build

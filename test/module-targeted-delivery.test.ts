@@ -231,3 +231,67 @@ describe('ModuleContext.addMessage durable delivery across a hard kill', () => {
     }
   });
 });
+
+describe('ModuleContext.addMessage durable delivery with no recovery path (store only)', () => {
+  const anchor = fileURLToPath(import.meta.url);
+  const index = fileURLToPath(new URL('../src/index.js', import.meta.url));
+  const mock = fileURLToPath(new URL('./helpers/mock-membrane.js', import.meta.url));
+  const childScript = (dir: string) => {
+    const script = join(dir, 'child.mjs');
+    writeFileSync(script, `
+      import { createRequire } from 'node:module';
+      import { AgentFramework } from ${JSON.stringify(index)};
+      import { MockMembrane } from ${JSON.stringify(mock)};
+      import { writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      const { JsStore } = createRequire(${JSON.stringify(anchor)})('@animalabs/chronicle');
+      const [mode, dir] = process.argv.slice(2);
+      const courier = { name: 'courier', async start(c) { this.ctx = c; }, async stop() {}, getTools() { return []; },
+        async handleToolCall() { return { success: true }; }, async onProcess() { return {}; } };
+      console.log = () => {}; console.error = () => {};
+      const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+      const fw = await AgentFramework.create({ store, membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'test' }], modules: [courier] });
+      if (mode === 'check') {
+        const all = JSON.stringify(fw.getAgent('scout').getContextManager().getAllMessages());
+        writeFileSync(join(dir, 'count.json'), JSON.stringify(all.split('STORE_ONLY_NOTICE').length - 1));
+        await fw.stop();
+        process.exit(0);
+      }
+      fw.getStore().sync();
+      if (mode === 'failing-sync') fw.getStore().sync = () => { throw new Error('injected sync failure'); };
+      const placement = {};
+      courier.ctx.addMessage('user', [{ type: 'text', text: 'STORE_ONLY_NOTICE' }], undefined, { forAgent: 'scout', durable: true, placement });
+      writeFileSync(join(dir, 'receipt.json'), JSON.stringify(placement));
+      process.kill(process.pid, 'SIGKILL');
+    `);
+    return script;
+  };
+  const run = (script: string, mode: string, dir: string) => spawnSync(process.execPath, [script, mode, dir], { encoding: 'utf8' });
+
+  it('says durable only after its sync succeeded, and keeps the message through a kill', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'store-only-durable-'));
+    try {
+      const script = childScript(dir);
+      assert.equal(run(script, 'deliver', dir).signal, 'SIGKILL');
+      assert.equal((JSON.parse(readFileSync(join(dir, 'receipt.json'), 'utf8')) as MessagePlacement).durable, true);
+      const check = run(script, 'check', dir);
+      assert.equal(check.status, 0, check.stderr);
+      assert.equal(JSON.parse(readFileSync(join(dir, 'count.json'), 'utf8')), 1, 'present after the kill, exactly once');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a delivery unconfirmed when its sync fails, rather than claiming a buffered queue durable', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'store-only-unconfirmed-'));
+    try {
+      const script = childScript(dir);
+      assert.equal(run(script, 'failing-sync', dir).signal, 'SIGKILL');
+      assert.equal((JSON.parse(readFileSync(join(dir, 'receipt.json'), 'utf8')) as MessagePlacement).durable, false,
+        'neither the queue in branch state nor the message was ever synced');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

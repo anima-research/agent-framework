@@ -17,20 +17,3 @@ import type { ToolCall } from './types/index.js';
 export type CallProvenance = Pick<ToolCall, 'origin' | 'admission'>;
 
 export const callProvenance = new AsyncLocalStorage<CallProvenance>();
-
-/**
- * The lease whose callback (runAtSafeBoundary) the current work runs
- * inside, carried across its asynchronous work. A module's own timer or an
- * unrelated caller is outside it even while that lease holds the store, so
- * a mutation can tell the lease holder's work from everyone else's.
- */
-export const leaseScope = new AsyncLocalStorage<object>();
-
-/**
- * The agent turn the current work runs as, carried across its asynchronous
- * work: puppetToolCall sets it around its execution with the token it holds
- * (its own, or the lease's). A gated change for that agent counts this turn
- * as the caller's own rather than as a busy agent; anyone else's call finds
- * the agent busy.
- */
-export const turnScope = new AsyncLocalStorage<{ agent: string; token: number }>();
