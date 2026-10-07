@@ -232,12 +232,13 @@ function settleAdoption(p: Pending, s: { hash: string; size: number } | null): A
 }
 
 /**
- * The synchronous precondition of every workspace mutation: an adoption left
- * pending on the selected branch is settled by the tree before the mutation
- * changes it, and durably, so the settlement can't be lost while the new
- * write survives. Afterwards the write can never pass for the adoption's
- * outcome. Other pending intents never consult the tree, so a write can't
- * confuse them. Holds whether or not an earlier observation could settle it.
+ * The synchronous precondition of every workspace mutation: evidence owed a
+ * barrier is made durable first, and an adoption left pending on the
+ * selected branch is settled by the tree before the mutation changes it, and
+ * durably, so the settlement can't be lost while the new write survives.
+ * Afterwards the write can never pass for the adoption's outcome. Other
+ * pending intents never consult the tree, so a write can't confuse them.
+ * Holds whether or not an earlier observation could settle it.
  */
 export function settleAdoptionBeforeMutation(
   store: JsStore,
@@ -245,6 +246,9 @@ export function settleAdoptionBeforeMutation(
   mount: { name: string; treeStateId: string },
   path: string,
 ): void {
+  // Evidence still owed a barrier (from a failed one, or read back at open)
+  // is made durable before any new tree mutation is permitted at all.
+  if (agreement.needsBarrier) agreement.barrier();
   const p = agreement.get(mount.name, path);
   if (p?.kind !== 'pending' || p.effect !== 'adopt' || p.branchId !== store.currentBranch().id) return;
   const entry = store.treeGet(mount.treeStateId, path);

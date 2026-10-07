@@ -21,7 +21,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DiskAgreement } from '../src/modules/workspace/disk-agreement.js';
 import { fingerprintVouches, filesystemTrustsCtime } from '../src/modules/workspace/observe.js';
-import { pushPaths } from '../src/modules/workspace/reconcile.js';
+import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent } from '../src/types/events.js';
@@ -645,6 +645,56 @@ describe('restarts and faults', () => {
     const e = await entryOf(m, 'a.txt');
     assert.equal(e?.state, 'conflict', 'B (the write) and C (disk) both changed since A');
     assert.equal(await contentOf(m, 'a.txt'), 'B', 'the write survives');
+  });
+
+  test('a failed barrier at the mutation precondition stays owed, and the next mutation discharges it first', async (t) => {
+    const env = new Env(t);
+    const m = await pendingAdoption(env);
+    const agreement = (m as any).agreement as DiskAgreement;
+    const mount = { name: 'work', treeStateId: TREE };
+    const set = DiskAgreement.prototype.set;
+    const storeSync = env.store.sync;
+    let armed = false;
+    let syncs = 0;
+    DiskAgreement.prototype.set = function (this: DiskAgreement, ...args: Parameters<typeof set>) {
+      set.apply(this, args);
+      armed = true; // the next sync is the barrier after the settlement
+    };
+    (env.store as unknown as { sync: () => void }).sync = function () {
+      syncs++;
+      if (armed) {
+        armed = false;
+        throw Object.assign(new Error('injected EIO at the precondition barrier'), { code: 'EIO' });
+      }
+      storeSync.call(env.store);
+    };
+    try {
+      assert.throws(() => settleAdoptionBeforeMutation(env.store, agreement, mount, 'a.txt'), /precondition barrier/);
+      DiskAgreement.prototype.set = set;
+      assert.equal(agreement.get('work', 'a.txt')?.kind, 'content', 'settled in memory');
+      assert.equal(agreement.needsBarrier, true, 'and still owed a barrier');
+      syncs = 0;
+      settleAdoptionBeforeMutation(env.store, agreement, mount, 'a.txt'); // P no longer looks pending
+      assert.ok(syncs >= 1, 'the retry discharges the barrier before permitting the mutation');
+      assert.equal(agreement.needsBarrier, false);
+    } finally {
+      DiskAgreement.prototype.set = set;
+      (env.store as unknown as { sync: () => void }).sync = storeSync;
+    }
+    await call(m, 'write', { path: 'work/a.txt', content: 'B' });
+  });
+
+  test('evidence loaded at open owes a barrier: reading records back proves nothing about their durability', (t) => {
+    const env = new Env(t);
+    const writer = new DiskAgreement(env.store);
+    writer.open([{ name: 'work', root: '/srv/work' }]);
+    writer.set('work', 'a.txt', { kind: 'content', hash: 'h', size: 1 }); // no barrier after it
+    const reader = new DiskAgreement(env.store);
+    reader.open([{ name: 'work', root: '/srv/work' }]);
+    assert.deepEqual(reader.get('work', 'a.txt'), { kind: 'content', hash: 'h', size: 1 });
+    assert.equal(reader.needsBarrier, true);
+    reader.barrier();
+    assert.equal(reader.needsBarrier, false);
   });
 
   test('evidence is read only after an ambiguous append is reconciled', (t) => {

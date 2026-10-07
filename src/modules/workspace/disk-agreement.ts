@@ -108,10 +108,7 @@ export class DiskAgreement {
 
   /** Re-read the journal when an earlier write left it unreconciled. */
   ensureReconciled(): void {
-    if (this.journal.needsReconcile) {
-      this.rebuild();
-      this.unsynced = true; // what was read back may not all be durable
-    }
+    if (this.journal.needsReconcile) this.rebuild();
   }
 
   /** Whether evidence recorded so far still awaits a barrier. */
@@ -119,7 +116,14 @@ export class DiskAgreement {
     return this.unsynced;
   }
 
+  /**
+   * Replay the journal into memory. Records that read back are not proven
+   * durable — a previous owner may have appended them and died before any
+   * barrier — so evidence rebuilt here owes one, whether at open or after an
+   * ambiguous append.
+   */
   private rebuild(): void {
+    this.unsynced = true;
     const { snapshot, entries } = this.journal.load();
     const replayed = new Map<string, { root: string; paths: Map<string, Physical> }>();
     for (const [name, mount] of Object.entries(snapshot?.mounts ?? {})) {
@@ -144,7 +148,6 @@ export class DiskAgreement {
       } else {
         this.mounts.set(name, { root, paths: new Map() });
         this.journal.append({ t: 'mount', mount: name, root });
-        this.unsynced = true;
       }
     }
   }
