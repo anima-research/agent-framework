@@ -1659,16 +1659,41 @@ export class AgentFramework {
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
-            // as TELEMETRY fields — the host's stamp reads them; the turn's
-            // speech locus (channelId / addressed) is deliberately NOT set
-            // here, so a batched wake routes exactly as it did before.
+            // as TELEMETRY fields — the host's stamp reads them.
             ...(provenance?.channelId ? { wakeChannelId: provenance.channelId } : {}),
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
+            // A batch that contains an ADDRESSED message (mention / reply /
+            // DM) routes like the direct path does: the reply goes to that
+            // message's channel. Without it the turn froze on the
+            // process-global most-recent-inbound channel, which an ambient
+            // message elsewhere could retarget between the DM's arrival and
+            // the debounce firing (2026-09-30). Ambient-only batches set no
+            // locus and keep the legacy fallback.
+            //
+            // The wake is broadcast to every agent, conversation forks
+            // included, and a fork speaks only in its home channel: the
+            // route applies to a fork only when it IS that home, and never to
+            // another agent when a fork owns that channel. Otherwise a fork
+            // bound elsewhere would show typing where it isn't replying.
+            ...(provenance?.routeChannelId && framework.mayTakeGateRoute(agentName, provenance.routeChannelId)
+              ? { channelId: provenance.routeChannelId, addressed: true }
+              : {}),
           });
         },
         getAgentNames: () => [...framework.agents.keys()].filter(
           (n) => n !== framework.subconsciousAgentName),
+        // Push events reach the gate with the adapter's raw channel id; map
+        // them to the registered composite id the same way ingestion does
+        // (handleMcplPushEvent registers that channel on arrival, before any
+        // debounce can fire).
+        resolveRouteChannel: (info) => {
+          if (info.eventType === 'mcpl:channel-incoming') return info.channelId || undefined;
+          if (info.eventType === 'mcpl:push-event') {
+            return framework.derivePushEventChannel(info.metadata)?.channelId;
+          }
+          return undefined;
+        },
       });
     }
 
@@ -8092,6 +8117,21 @@ export class AgentFramework {
   }
 
   /**
+   * Whether a batched gate wake's addressed route may become `agentName`'s
+   * speech locus. The gate broadcasts to every agent, conversation forks
+   * included. A fork speaks only in its home channel, and a channel bound to
+   * a fork is that fork's conversation, so no other agent takes it.
+   */
+  private mayTakeGateRoute(agentName: string, routeChannelId: string): boolean {
+    const home = this.conversationAgentHomes.get(agentName);
+    if (home !== undefined) return home === routeChannelId;
+    for (const boundChannel of this.conversationAgentHomes.values()) {
+      if (boundChannel === routeChannelId) return false;
+    }
+    return true;
+  }
+
+  /**
    * Derive the MCPL composite channel id (the outbound routing locus) for a
    * push event from its server-defined `origin`, if it carries one.
    *
@@ -8358,19 +8398,31 @@ export class AgentFramework {
       // and counterparty must come from the same message, or a batch of
       // "ambient from A, then addressed from B" would report B's channel
       // with A's author (review finding on the provenance change).
+      //
+      // "Most recent" is by the EVENT's time (wakeAt, else the request's own
+      // timestamp), not queue order. A gate wake is queued when its debounce
+      // flushes, which can be long after its event: an addressed message
+      // held in the gate while the agent was busy lands BEHIND a newer
+      // addressed message's direct wake, and queue order would hand the turn
+      // to the older one. Ties keep the later-queued request, as before.
+      const eventAt = (r: InferenceRequest): number => r.wakeAt ?? r.timestamp;
       let ambientReq: InferenceRequest | undefined;
       let addressedReq: InferenceRequest | undefined;
       for (const r of requests) {
         if (!r.channelId) continue;
-        ambientReq = r;
-        if (r.addressed) addressedReq = r;
+        if (!ambientReq || eventAt(r) >= eventAt(ambientReq)) ambientReq = r;
+        if (r.addressed && (!addressedReq || eventAt(r) >= eventAt(addressedReq))) addressedReq = r;
       }
       const channelReq = addressedReq ?? ambientReq;
-      // Telemetry provenance (who/where woke the agent): from the routing
-      // winner when it carries one; else from the most recent request that
-      // does (gate wakes name a counterparty without setting a locus),
-      // ordered by the event's own time (wakeAt) rather than flush order.
-      let provReq: InferenceRequest | undefined = channelReq?.counterparty || channelReq?.wakeChannelId ? channelReq : undefined;
+      // Telemetry provenance (who/where woke the agent). An ADDRESSED winner
+      // is its own provenance, even when it names no author (a push event
+      // can route without an author id): borrowing another request's author
+      // would credit the turn to someone who did not address the agent.
+      // Otherwise from the routing winner when it carries one; else from the
+      // most recent request that does (ambient gate wakes name a counterparty
+      // without setting a locus), ordered by the event's own time.
+      let provReq: InferenceRequest | undefined = addressedReq
+        ?? (channelReq?.counterparty || channelReq?.wakeChannelId ? channelReq : undefined);
       if (!provReq) {
         for (const r of requests) {
           if (!r.counterparty && !r.wakeChannelId) continue;
