@@ -235,7 +235,9 @@ describe('receipts through the ingestion stamps', () => {
     store.append = append;
     const head = p.copies('i-1')[0]!;
     assert.ok(head.bodyGroupId);
-    assert.equal(head.shardCount, 2, 'the stored shard declares the whole group');
+    const written = p.cm().getAllMessages().filter((m) => m.bodyGroupId === head.bodyGroupId);
+    assert.equal(written.length, 1);
+    assert.ok((head.shardCount ?? 0) > written.length, 'the stored shard declares more of the group than was written');
     h.command({ op: 'incoming', channelId: ROOM, messageId: 'i-trigger', mode: 'addressed', text: 'look' });
     await waitFor(() => p.entries('dlv', 'i-trigger').length === 1 && p.idle(), 'the next compile');
     assert.ok(!JSON.stringify(h.adapter.requests.at(-1)!.messages).includes('second half'), 'the second shard was never stored');
