@@ -278,6 +278,64 @@ describe('PyRunner (real python3)', () => {
   });
 });
 
+// Inner-call ids restart in every interpreter: a result that outlives its
+// interpreter must not resolve a call of the one that replaced it.
+describe('code_execution inner-call results after the interpreter is replaced (real python3)', () => {
+  const until = async (cond: () => boolean, what: string) => {
+    const deadline = Date.now() + 10_000;
+    while (!cond()) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  };
+
+  const stops: Record<string, { code: string; stop?: (runner: PyRunner) => void }> = {
+    aborted: { code: 'print(await test__echo({}))', stop: (runner) => runner.abort('turn abandoned') },
+    crashed: {
+      code: 'import asyncio, os\nasyncio.get_running_loop().call_later(0.2, os._exit, 1)\nprint(await test__echo({}))',
+    },
+  };
+
+  for (const [how, { code, stop }] of Object.entries(stops)) {
+    it(`a late result from a script whose interpreter ${how} does not reach the next script`, async () => {
+      const calls: Array<(result: string) => void> = [];
+      const runner = new PyRunner({
+        onToolCall: () => new Promise<string>((resolve) => calls.push(resolve)),
+      });
+      const logged: string[] = [];
+      const consoleError = console.error;
+      console.error = (...args: unknown[]) => {
+        logged.push(args.map(String).join(' '));
+        consoleError(...args);
+      };
+      try {
+        const first = runner.exec(code, ECHO_TOOLS);
+        await until(() => calls.length === 1, 'the first script to call its tool');
+        stop?.(runner);
+        const stopped = await first;
+        assert.strictEqual(stopped.aborted, true, stopped.stderr);
+
+        const second = runner.exec('print(await test__echo({}))', ECHO_TOOLS);
+        await until(() => calls.length === 2, 'the second script to call its tool');
+        // Both calls are the first of their interpreter.
+        calls[0]('stale result of the stopped script');
+        await new Promise((r) => setTimeout(r, 300));
+        calls[1]('result of this script');
+        const result = await second;
+        assert.strictEqual(result.returnCode, 0, result.stderr);
+        assert.strictEqual(result.stdout, 'result of this script\n');
+        assert.ok(
+          logged.some((l) => /dropped late result of test--echo call t1: the interpreter that asked for it is gone/.test(l)),
+          'the dropped result is logged',
+        );
+      } finally {
+        console.error = consoleError;
+        runner.dispose();
+      }
+    });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Framework integration
 // ---------------------------------------------------------------------------
@@ -474,6 +532,44 @@ describe('framework code_execution integration (real python3)', () => {
       const finishCalls = module.calls.filter((c) => c.name.endsWith('--finish') || c.name === 'finish');
       assert.strictEqual(finishCalls.length, 1);
       assert.strictEqual(result.toolCallsCount, 1); // one model-visible call: code_execution
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a stopped script's late end-turn request does not end the next script's turn", async () => {
+    let releaseFinish: () => void = () => {};
+    const finishReleased = new Promise<void>((resolve) => { releaseFinish = resolve; });
+    let finishStarted = false;
+    class SlowFinishModule extends ScriptToolModule {
+      override async handleToolCall(call: ToolCall): Promise<ToolResult> {
+        if (call.name.endsWith('finish')) {
+          finishStarted = true;
+          await finishReleased;
+        }
+        return super.handleToolCall(call);
+      }
+    }
+    const { tempDir, storePath } = tempStorePath('pytc-stale-endturn-');
+    const framework = await createFrameworkWithCodeExecution(storePath, new MockMembrane(), new SlowFinishModule());
+    const run = (input: Record<string, unknown>) =>
+      framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input });
+    framework.start();
+    try {
+      // The first script is stopped at its time limit while its call that ends the turn is running.
+      const stopped = await run({ code: 'await test__finish({})', time_limit_ms: 1000 });
+      assert.ok(finishStarted);
+      assert.match((stopped.data as { stderr: string }).stderr, /reached its 1s time limit/);
+      assert.ok(!stopped.endTurn);
+
+      // The call finishes while the next script runs; its request belonged to the stopped script.
+      const next = run({ code: 'import asyncio\nawait asyncio.sleep(1)\nprint("next done")' });
+      await new Promise((r) => setTimeout(r, 300));
+      releaseFinish();
+      const result = await next;
+      assert.strictEqual((result.data as { stdout: string }).stdout, 'next done\n');
+      assert.ok(!result.endTurn, "the stopped script's request ended the next script's turn");
     } finally {
       await framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
