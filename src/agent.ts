@@ -17,7 +17,7 @@ export interface StartStreamResult {
   takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined;
   drainKvSubmissionIds?: () => string[];
 }
-import { requestEvidence, type RequestEvidence } from './context-receipts/evidence.js';
+import { requestEvidence, withPreparation, type RequestEvidence } from './context-receipts/evidence.js';
 import type {
   ContextManager,
   TokenBudget,
@@ -849,8 +849,12 @@ export class Agent {
     // path entirely; twin of context-manager's stripEmptyTextBlocks on the
     // compression path.)
     // Each compiled message's position in the request (-1 when dropped), so
-    // receipt evidence names request indices.
+    // receipt evidence names request indices; and which messages this
+    // preparation did not carry verbatim (an empty '' block carries nothing,
+    // but whitespace-only text is content).
     const requestIndexOf: number[] = [];
+    const preparedAltered = new Set<number>();
+    let compileAltered = false;
     const sanitized: NormalizedMessage[] = [];
     for (const m of messages) {
       const content = m.content.filter(
@@ -858,10 +862,15 @@ export class Agent {
         // disk can carry a non-string `text` despite what the types claim.
         (b: ContentBlock) => !(b.type === "text" && (typeof b.text !== "string" || b.text.trim() === "")),
       );
+      const removedContent = m.content.some(
+        (b: ContentBlock) => b.type === 'text' && !content.includes(b) && !(typeof b.text === 'string' && b.text === ''),
+      );
       if (content.length === 0) {
         requestIndexOf.push(-1);
+        if (removedContent) compileAltered = true;
         continue;
       }
+      if (removedContent) preparedAltered.add(sanitized.length);
       requestIndexOf.push(sanitized.length);
       sanitized.push({ ...m, content });
     }
@@ -877,8 +886,10 @@ export class Agent {
       }];
     }
 
+    const guarded = this.toolResultGuard.prepareRequest(messages);
+    for (const index of substitutedIndices(messages, guarded)) preparedAltered.add(index);
     const request: NormalizedRequest = {
-      messages: this.toolResultGuard.prepareRequest(messages),
+      messages: guarded,
       system: this.buildSystemPrompt(systemInjections),
       config: {
         model: this.model,
@@ -894,7 +905,10 @@ export class Agent {
       ...(this.providerParams && { providerParams: this.providerParams }),
       assistantParticipant: this.name,
     };
-    return { request, evidence: this.receiptEvidence(compiled, requestIndexOf) };
+    return {
+      request,
+      evidence: withPreparation(this.receiptEvidence(compiled, requestIndexOf), preparedAltered, compileAltered),
+    };
   }
 
   /**
@@ -972,10 +986,14 @@ export class Agent {
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
 
-    const { request, evidence } = await this.prepareActivationRequest(availableTools, injections, budget, compressionTools);
+    const prepared = await this.prepareActivationRequest(availableTools, injections, budget, compressionTools);
+    const { request } = prepared;
     // One-to-one: prepareRequest swaps guarded tool results in place, so
-    // the evidence's request indices still hold.
+    // the evidence's request indices still hold; a swap is a change this
+    // preparation made, so the evidence records it.
+    const beforeGuard = request.messages;
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
+    const evidence = withPreparation(prepared.evidence, new Set(substitutedIndices(beforeGuard, request.messages)), false);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
       .getStrategy?.() as {
@@ -1300,4 +1318,17 @@ export class Agent {
       content,
     }];
   }
+}
+
+/** Indices of messages whose content blocks a request-preparation pass replaced. */
+function substitutedIndices(before: readonly NormalizedMessage[], after: readonly NormalizedMessage[]): number[] {
+  const out: number[] = [];
+  after.forEach((message, i) => {
+    const original = before[i];
+    if (!original || original === message) return;
+    if (original.content.length !== message.content.length || original.content.some((block, j) => block !== message.content[j])) {
+      out.push(i);
+    }
+  });
+  return out;
 }

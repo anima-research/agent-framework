@@ -32,6 +32,30 @@ export interface RequestEvidence {
   provenance: CompileProvenance | null;
   /** Channel bodies among the request's messages. */
   bodies: readonly BodyEvidence[];
+  /**
+   * True when request preparation itself did not carry the compile verbatim:
+   * it dropped or changed a compiled message (whitespace-only text removed,
+   * a guarded tool result substituted). The compile's layout then cannot
+   * have been presented exactly, whatever the producer reports.
+   */
+  preparationAltered: boolean;
+}
+
+/**
+ * The same evidence after request preparation changed some messages: bodies
+ * at those request indices are no longer complete (missing 'preparation'),
+ * and the compile is marked not carried verbatim.
+ */
+export function withPreparation(evidence: RequestEvidence, alteredIndices: ReadonlySet<number>, compileAltered: boolean): RequestEvidence {
+  if (alteredIndices.size === 0 && !compileAltered) return evidence;
+  const bodies = evidence.bodies.map((body) => alteredIndices.has(body.index)
+    ? Object.freeze({ ...body, complete: false, missing: [...new Set([...(body.missing ?? []), 'preparation'])] })
+    : body);
+  return Object.freeze({
+    ...evidence,
+    bodies: Object.freeze(bodies),
+    preparationAltered: evidence.preparationAltered || compileAltered || alteredIndices.size > 0,
+  });
 }
 
 /** Channel of a stored item, from its frozen source envelope. */
@@ -147,6 +171,7 @@ export function requestEvidence(inputs: EvidenceInputs): RequestEvidence {
     storeId: inputs.storeId,
     provenance,
     bodies: Object.freeze(bodies),
+    preparationAltered: false,
   });
 }
 

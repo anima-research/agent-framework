@@ -272,6 +272,7 @@ describe('ContextReceipts', () => {
     storeId: 'store-1',
     provenance: { compileId: 'c1', namespace: 'agents/r', branch: { id: 'br', name: 'main', created: 1 }, messages: [], layout: null, strategy: 'passthrough' } as CompileProvenance,
     bodies,
+    preparationAltered: false,
   });
   const round = (extra: Partial<RoundReport> = {}): RoundReport => ({
     index: 0,
@@ -451,6 +452,40 @@ describe('receipt evidence', () => {
 });
 
 describe('request-owned evidence', () => {
+  it('composes request preparation\'s own changes: a compile it altered is never presented verbatim', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'evidence-prep-'));
+    try {
+      const cm = await ContextManager.open({ path: join(dir, 'store'), strategy: new PassthroughStrategy(), namespace: 'agents/r' });
+      const source = {
+        kind: 'channel', lane: 'push/event', serverId: 'discord', binding: 'b1',
+        channelId: 'discord:g:room', eventId: 'ev-1', messageId: 'p1', acceptedAt: 5,
+      };
+      cm.addMessage('someone', [{ type: 'text', text: '   ' }]); // whitespace only: preparation drops it
+      cm.addMessage('someone', [{ type: 'text', text: '  ' }, { type: 'text', text: 'hello' }], { inboundSource: source } as never);
+      const agent = new Agent({ name: 'r', model: 'test', systemPrompt: 's' }, cm, {} as Membrane);
+      const { request, evidence } = await agent.prepareActivationRequest([]);
+      assert.equal(request.messages.length, 1);
+      assert.equal(evidence.preparationAltered, true);
+      assert.equal(evidence.bodies[0]!.complete, false, 'its whitespace block was not carried');
+      assert.deepEqual(evidence.bodies[0]!.missing, ['preparation']);
+
+      const store = cm.getStore();
+      const ledger = new ChannelClockLedger(store, cm.getStoreId());
+      ledger.start();
+      const presentations: string[] = [];
+      const receipts = new ContextReceipts(ledger, { acceptRound: (_a, _p, _u, _t, presentation) => { presentations.push(presentation); } });
+      receipts.beginStream('r', 1, evidence);
+      receipts.usage('r', 1, { index: 0, stopReason: 'end_turn', usage: {}, altered: { messages: [], injected: [] }, fidelity: 'established' });
+      assert.deepEqual(presentations, ['altered'], 'the producer preserved what it was given, but the compile was already changed');
+      const key = channelKey({ binding: 'b1', channelId: 'discord:g:room' });
+      assert.equal(ledger.clocksFor('r', [{ binding: 'b1', channelId: 'discord:g:room' }]).get(key)!.lastDeliveredAt, null);
+      ledger.stop();
+      cm.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('names a body the reader compiled from an auxiliary slot, and delivers it to that reader only', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'evidence-aux-'));
     try {

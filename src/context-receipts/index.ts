@@ -25,7 +25,7 @@ import type { BranchStamp, ChannelClockLedger } from './clock-ledger.js';
 
 export { ChannelClockLedger, channelKey, CLOCK_RECORD } from './clock-ledger.js';
 export type { ChannelClocks, ChannelRef, ClockScope, SourceRef, VersionRef } from './clock-ledger.js';
-export { requestEvidence, injectedEvidence, channelOf, sourceRefOf, versionOf } from './evidence.js';
+export { requestEvidence, injectedEvidence, channelOf, sourceRefOf, versionOf, withPreparation } from './evidence.js';
 export type { BodyEvidence, RequestEvidence } from './evidence.js';
 
 /** One provider round's report, as membrane emits it on the usage event. */
@@ -173,7 +173,12 @@ export class ContextReceipts {
     }
 
     if (!state.accepted && evidence?.provenance) {
-      const presentation: Presentation = !established ? 'unknown' : alteredMessages.size > 0 ? 'altered' : 'verbatim';
+      // A known alteration (by request preparation, or reported by the
+      // producer) means the compile was not presented verbatim; otherwise
+      // only established fidelity makes it verbatim.
+      const presentation: Presentation = evidence.preparationAltered || alteredMessages.size > 0
+        ? 'altered'
+        : established ? 'verbatim' : 'unknown';
       try {
         this.hooks.acceptRound(agent, evidence.provenance, round.usage, at, presentation);
         // Only a completed acceptance closes this compile's acceptance: a
