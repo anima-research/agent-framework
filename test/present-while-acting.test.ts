@@ -129,21 +129,33 @@ class RobotModule implements Module {
   }
 }
 
-/** Minimal ChannelRegistry stub covering everything driveStream touches. */
-function stubChannelRegistry(framework: AgentFramework) {
+/** Minimal ChannelRegistry stub covering everything driveStream touches.
+ *  By default every agent has a HOME route (a fork-style deliberate route,
+ *  `chan-live-N`); `{ home: false }` leaves routes to the turn's wake. */
+function stubChannelRegistry(framework: AgentFramework, opts: { home?: boolean } = {}) {
   const routed: Array<{ text: string; locus: string | null }> = [];
   let locusCalls = 0;
   const explicit: Record<string, unknown> = {
     resolveLocus: () => {
+      if (opts.home === false) return null;
       locusCalls++;
       return `chan-live-${locusCalls}`;
     },
-    routeSpeech: async (_agent: string, text: string, locus?: string | null) => {
-      routed.push({ text, locus: locus ?? null });
+    routeSpeech: async (_agent: string, text: string, target?: string | null | { channelId: string }) => {
+      const locus = target && typeof target === 'object' ? target.channelId : target ?? null;
+      routed.push({ text, locus });
       // Mirror the real registry's outcome shape (delivery receipts read it).
       return locus ? { delivered: true, channelId: locus } : null;
     },
     getDefaultPublishChannel: () => null,
+    // Hybrid `>>>#name` targets resolve to `chan-name` and deliver through
+    // the registry's outcome-returning form, recorded like routeSpeech.
+    resolveProseTarget: (spec: string) => ({ channelId: spec.startsWith('#') ? `chan-${spec.slice(1)}` : spec, label: spec }),
+    deliverSpeech: async (_agent: string, text: string, target?: string | null | { channelId: string }) => {
+      const locus = target && typeof target === 'object' ? target.channelId : target ?? null;
+      routed.push({ text, locus });
+      return { status: 'delivered', destination: { serverId: 'stub', channelId: locus ?? '' }, at: Date.now() };
+    },
     isChannelOpen: () => true,
     getDescriptor: () => undefined,
     getChannelTools: () => [],
@@ -155,6 +167,31 @@ function stubChannelRegistry(framework: AgentFramework) {
     get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),
   });
   return routed;
+}
+
+/** A channel item's source envelope, as admission stamps it. */
+function envelope(channelId: string, messageId = 'm-arrival'): Record<string, unknown> {
+  return {
+    kind: 'channel', lane: 'channels/incoming', serverId: 'srv', binding: 'srv',
+    channelId, messageId, acceptedAt: Date.now(),
+  };
+}
+
+/** Wake the agent from one conversation: the turn infers its route there. */
+function triggerFromChannel(framework: AgentFramework, channelId = 'chan-A'): void {
+  (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+    agentName: 'assistant', reason: 'mcpl:channel-incoming', source: 'srv', timestamp: Date.now(),
+    channelId, addressed: true,
+    routeCandidates: [{
+      conversation: { kind: 'channel', serverId: 'srv', channelId },
+      addressed: true, messageId: 'm-trigger', at: Date.now(),
+    }],
+  });
+}
+
+function heldDrafts(framework: AgentFramework): Array<{ text: string; reason: string; note?: string }> {
+  return (framework as unknown as { proseDrafts: { open(agent: string): Array<{ text: string; reason: string; note?: string }> } })
+    .proseDrafts.open('assistant');
 }
 
 // ---------------------------------------------------------------------------
@@ -335,15 +372,14 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it('an ADDRESSED mid-turn injection re-pins the locus for subsequent prose', async () => {
-    // 2026-07-31 Mythos misroutes (n=6): someone explicitly addresses the
-    // agent from another channel mid-turn (mention / reply / DM); the
-    // agent's trailing prose answers THEM but the frozen pin delivered it
-    // to the stale locus (the hospital scene into antra's DM, and its
-    // mirror). Addressed conversational injections — the chat:addressed
-    // signal turn-START batching already prefers — now move the pin, with a
-    // one-line [routing] notice riding the same injection batch so window
-    // and wire agree. Ambient injections still cannot (previous test).
+  it('an ADDRESSED mid-turn arrival from another conversation holds an inferred route: later prose becomes a draft', async () => {
+    // 2026-07-31 misroutes (n=6): someone addresses the agent from another
+    // channel mid-turn; the agent's next unaddressed words could answer
+    // either conversation. The old re-pin guessed the newcomer and sent
+    // words still meant for the first conversation into the second
+    // (shelf-355). Now the inferred route is HELD: unaddressed speech becomes
+    // drafts for the rest of the turn, with a one-line [routing] notice
+    // riding the same injection batch so window and wire agree.
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Station four, proceeding.' },
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
@@ -353,10 +389,12 @@ describe('present while acting', () => {
     ] as ContentBlock[]));
 
     const framework = await createFramework();
-    const routed = stubChannelRegistry(framework);
+    const routed = stubChannelRegistry(framework, { home: false });
     module.toolDelayMs = 25;
     module.interjection = 'hey, quick question over here?';
-    module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
+    module.interjectionMetadata = {
+      channelId: 'discord:dm:antra', tags: ['chat:addressed'], inboundSource: envelope('discord:dm:antra'),
+    };
 
     const notices: string[] = [];
     framework.onTrace((event) => {
@@ -364,38 +402,33 @@ describe('present while acting', () => {
       if (e.type === 'message:added' && e.source === 'routing-notice') notices.push(e.source!);
     });
 
-    trigger(framework);
+    triggerFromChannel(framework, 'chan-A');
     await framework.runUntilIdle();
 
-    // Round-1 prose predates the injection and belongs to the old pin;
-    // trailing prose follows the addressed speaker.
-    assert.deepEqual(routed, [
-      { text: 'Station four, proceeding.', locus: 'chan-live-1' },
-      { text: 'Answering the person who addressed me.', locus: 'discord:dm:antra' },
-    ]);
-    // Boot-baseline announcement + the mid-turn re-pin notice.
-    assert.equal(notices.length, 2, 'the re-pin produced exactly one routing notice');
-    // The notice rode the injection batch to the live stream (window == wire).
-    const injectedBatches = membrane.lastStream!.receivedToolResultOptions
-      .map((o) => o?.injectedMessages ?? []);
-    const wired = injectedBatches.flat().map((m) => JSON.stringify(m.content));
+    // Round-1 prose predates the arrival and goes to the turn's route; the
+    // trailing prose is held, never guessed into either conversation.
+    assert.deepEqual(routed, [{ text: 'Station four, proceeding.', locus: 'chan-A' }]);
+    const [held] = heldDrafts(framework);
+    assert.equal(held?.text, 'Answering the person who addressed me.');
+    assert.equal(held?.reason, 'ambiguous');
+    assert.match(held?.note ?? '', /chan-A; discord:dm:antra/);
+    // Turn-start announcement + the mid-turn hold notice.
+    assert.equal(notices.length, 2, 'the hold produced exactly one routing notice');
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .map((o) => o?.injectedMessages ?? []).flat().map((m) => JSON.stringify(m.content));
+    assert.ok(wired.some((t) => t.includes('quick question')), 'the addressed message itself was injected');
     assert.ok(
-      wired.some((s) => s.includes('quick question')),
-      'the addressed message itself was injected',
-    );
-    assert.ok(
-      wired.some((s) => s.includes('[routing] The conversation moved to discord:dm:antra')),
-      'the re-pin notice was injected alongside it',
+      wired.some((t) => t.includes('[routing] discord:dm:antra addressed you mid-turn') && t.includes('instead of going to chan-A')),
+      'the hold notice was injected alongside it',
     );
 
     await framework.stop();
   });
 
-  it('a follow-up in a channel the agent explicitly engaged this turn re-pins', async () => {
-    // 2026-07-31 n=7 (q's #portables reply): the agent explicitly sent into
-    // a channel this turn; someone replies there WITHOUT a mention (ambient
-    // by tag, addressed by context). The engaged-channel leg moves the pin;
-    // trailing prose answering them follows.
+  it('a follow-up in a channel the agent explicitly engaged this turn holds the route', async () => {
+    // 2026-07-31 n=7 (q's #portables reply): the agent explicitly sent into a
+    // channel this turn; someone replies there WITHOUT a mention. Their
+    // follow-up competes for the agent's unaddressed words, so it holds them.
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use'));
@@ -404,12 +437,13 @@ describe('present while acting', () => {
     ] as ContentBlock[]));
 
     const framework = await createFramework();
-    const routed = stubChannelRegistry(framework);
+    const routed = stubChannelRegistry(framework, { home: false });
     module.toolDelayMs = 25;
     module.interjection = 'I need to swap out this eye screen';
     module.interjectionMetadata = {
       channelId: 'discord:guild:portables',
       tags: ['chat:ambient', 'chat:from-human'],
+      inboundSource: envelope('discord:guild:portables'),
     };
     // Simulate an explicit send into #portables earlier in THIS turn (the
     // production record happens on the MCPL send path; the harness module's
@@ -423,22 +457,18 @@ describe('present while acting', () => {
       return origHandle(call);
     };
 
-    trigger(framework);
+    triggerFromChannel(framework, 'chan-A');
     await framework.runUntilIdle();
 
-    assert.deepEqual(routed, [
-      { text: 'Good plan on both counts.', locus: 'discord:guild:portables' },
-    ], 'trailing prose followed the human reply into the engaged channel');
+    assert.deepEqual(routed, [], 'neither conversation is guessed');
+    assert.deepEqual(heldDrafts(framework).map((d) => [d.text, d.reason]), [['Good plan on both counts.', 'ambiguous']]);
 
     await framework.stop();
   });
 
-  it('an agent-resident follow-up in an engaged channel re-pins too (no author-kind filter)', async () => {
+  it('an agent-resident follow-up in an engaged channel holds it too (no author-kind filter)', async () => {
     // Fleet participants include agent-residents — "bot" by Discord flag,
-    // full conversational participants in fact. Their in-flow replies in a
-    // channel the agent just engaged move the pin exactly like anyone
-    // else's (antra, 2026-07-31: the author-kind distinction is fragile and
-    // wrong for this fleet).
+    // full conversational participants in fact (antra, 2026-07-31).
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use'));
@@ -447,12 +477,13 @@ describe('present while acting', () => {
     ] as ContentBlock[]));
 
     const framework = await createFramework();
-    const routed = stubChannelRegistry(framework);
+    const routed = stubChannelRegistry(framework, { home: false });
     module.toolDelayMs = 25;
     module.interjection = '*from the table* one receipt for the case, since I have a dated instance';
     module.interjectionMetadata = {
       channelId: 'discord:guild:hospital',
       tags: ['chat:ambient', 'chat:from-bot'],
+      inboundSource: envelope('discord:guild:hospital'),
     };
     const origHandle = module.handleToolCall.bind(module);
     module.handleToolCall = async (call) => {
@@ -462,19 +493,18 @@ describe('present while acting', () => {
       return origHandle(call);
     };
 
-    trigger(framework);
+    triggerFromChannel(framework, 'chan-A');
     await framework.runUntilIdle();
 
-    assert.deepEqual(routed, [
-      { text: 'Continuing with the colleague.', locus: 'discord:guild:hospital' },
-    ], 'the agent-resident follow-up moved the pin like any participant');
+    assert.deepEqual(routed, []);
+    assert.deepEqual(heldDrafts(framework).map((d) => d.reason), ['ambiguous']);
 
     await framework.stop();
   });
 
-  it('ambient chatter in a channel the agent did NOT engage still cannot move the pin', async () => {
-    // The Cairn-protection boundary, restated for the engaged-channel era:
-    // no mention, no engagement this turn → the pin holds.
+  it('ambient chatter in a channel the agent did NOT engage leaves the route alone', async () => {
+    // The Cairn-protection boundary: no mention, no engagement this turn →
+    // the route holds steady and speech keeps going where it was going.
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use'));
@@ -483,28 +513,27 @@ describe('present while acting', () => {
     ] as ContentBlock[]));
 
     const framework = await createFramework();
-    const routed = stubChannelRegistry(framework);
+    const routed = stubChannelRegistry(framework, { home: false });
     module.toolDelayMs = 25;
     module.interjection = 'unrelated lounge chatter';
     module.interjectionMetadata = {
       channelId: 'discord:guild:lounge',
       tags: ['chat:ambient', 'chat:from-human'],
+      inboundSource: envelope('discord:guild:lounge'),
     };
 
-    trigger(framework);
+    triggerFromChannel(framework, 'chan-A');
     await framework.runUntilIdle();
 
-    assert.deepEqual(routed, [
-      { text: 'Continuing my report.', locus: 'chan-live-1' },
-    ], 'un-engaged ambient left the pin alone');
+    assert.deepEqual(routed, [{ text: 'Continuing my report.', locus: 'chan-A' }], 'un-engaged ambient changed nothing');
+    assert.deepEqual(heldDrafts(framework), []);
 
     await framework.stop();
   });
 
-  it('an addressed injection from the CURRENT locus does not chatter a notice', async () => {
-    // Same-channel addressed input is the ordinary case (the person the
-    // agent is already talking to sends another message mid-turn): the pin
-    // is already right, so no re-pin and — critically for KV — no notice.
+  it('an addressed arrival in the SAME conversation keeps the route and adds no notice', async () => {
+    // The person the agent is already talking to sends another message
+    // mid-turn: nothing competes, so no hold and — for KV — no notice.
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
     ] as ContentBlock[], 'tool_use'));
@@ -513,10 +542,10 @@ describe('present while acting', () => {
     ] as ContentBlock[]));
 
     const framework = await createFramework();
-    const routed = stubChannelRegistry(framework);
+    const routed = stubChannelRegistry(framework, { home: false });
     module.toolDelayMs = 25;
     module.interjection = 'and one more thing';
-    module.interjectionMetadata = { channelId: 'chan-live-1', tags: ['chat:addressed'] };
+    module.interjectionMetadata = { channelId: 'chan-A', tags: ['chat:addressed'], inboundSource: envelope('chan-A') };
 
     const notices: string[] = [];
     framework.onTrace((event) => {
@@ -524,11 +553,75 @@ describe('present while acting', () => {
       if (e.type === 'message:added' && e.source === 'routing-notice') notices.push(e.source!);
     });
 
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'Continuing right here.', locus: 'chan-A' }]);
+    assert.equal(notices.length, 1, 'only the turn-start announcement');
+    // Someone else speaking in the same conversation doesn't move the reply
+    // edge: the route still answers the message that woke the turn.
+    const view = (framework as unknown as { speechRouteView(agent: string): Record<string, unknown> }).speechRouteView('assistant');
+    assert.deepEqual(view, { kind: 'channel', serverId: 'srv', channelId: 'chan-A', replyTo: 'm-trigger' });
+
+    await framework.stop();
+  });
+
+  it('hybrid: a >>> target set this turn survives a hold — deliberate pins are never held', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#alpha Opening note.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'And a follow-up for alpha.' },
+    ] as ContentBlock[]));
+
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'hybrid.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.', proseRouting: 'hybrid' }],
+      modules: [module],
+    });
+    module.framework = framework;
+    const routed = stubChannelRegistry(framework, { home: false });
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, over here?';
+    module.interjectionMetadata = {
+      channelId: 'discord:dm:antra', tags: ['chat:addressed'], inboundSource: envelope('discord:dm:antra'),
+    };
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'Opening note.', locus: 'chan-alpha' },
+      { text: 'And a follow-up for alpha.', locus: 'chan-alpha' },
+    ], 'the sticky >>> target keeps carrying unprefixed prose through the hold');
+    assert.deepEqual(heldDrafts(framework), []);
+
+    await framework.stop();
+  });
+
+  it('a deliberate route (a fork home) is never held by an arrival', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Still answering at home.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework); // home route chan-live-1
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, over here?';
+    module.interjectionMetadata = {
+      channelId: 'discord:dm:antra', tags: ['chat:addressed'], inboundSource: envelope('discord:dm:antra'),
+    };
+
     trigger(framework);
     await framework.runUntilIdle();
 
-    assert.deepEqual(routed, [{ text: 'Continuing right here.', locus: 'chan-live-1' }]);
-    assert.equal(notices.length, 1, 'only the boot-baseline announcement — no re-pin chatter');
+    assert.deepEqual(routed, [{ text: 'Still answering at home.', locus: 'chan-live-1' }]);
+    assert.deepEqual(heldDrafts(framework), []);
 
     await framework.stop();
   });
@@ -563,7 +656,7 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it('a re-pinned turn\'s receipt names both channels in delivery order', async () => {
+  it('a held turn\'s receipt names where its speech landed and the draft it held', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Station four, proceeding.' },
       { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
@@ -573,12 +666,14 @@ describe('present while acting', () => {
     ] as ContentBlock[]));
 
     const framework = await createFramework();
-    stubChannelRegistry(framework);
+    stubChannelRegistry(framework, { home: false });
     module.toolDelayMs = 25;
     module.interjection = 'quick question over here?';
-    module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'] };
+    module.interjectionMetadata = {
+      channelId: 'discord:dm:antra', tags: ['chat:addressed'], inboundSource: envelope('discord:dm:antra'),
+    };
 
-    trigger(framework);
+    triggerFromChannel(framework, 'chan-A');
     await framework.runUntilIdle();
 
     const cm = (framework as unknown as {
@@ -589,7 +684,9 @@ describe('present while acting', () => {
       .filter((b) => b.type === 'text')
       .map((b) => b.text ?? '')
       .filter((t) => t.startsWith('[delivered]'));
-    assert.deepEqual(receipts, ['[delivered] plain speech → chan-live-1 · discord:dm:antra']);
+    assert.equal(receipts.length, 1);
+    assert.match(receipts[0]!, /^\[delivered\] plain speech → chan-A/);
+    assert.match(receipts[0]!, /held as draft d-[a-z2-9]{5}/);
 
     await framework.stop();
   });
@@ -704,13 +801,11 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it('channel_open moves the pin mid-turn and announces in its own tool result', async () => {
+  it('channel_open sets the speech route mid-turn and announces it in its own tool result', async () => {
     // The agent's own deliberate open is the strongest "my next words go
-    // here" signal — stronger than any injection. The original 2026-07-21
-    // Aria fix only set next-turn trigger state; the turn-frozen refactor
-    // silently regressed the reply-right-after-opening case. Now the pin
-    // moves immediately and the announcement rides the tool result itself
-    // (model-requested content: distance zero, safest role).
+    // here" signal: by default (setSpeechTarget) its unaddressed speech goes
+    // to the opened channel for the rest of the turn — replacing an inferred
+    // route, or a hold — and the announcement rides the tool result itself.
     membrane.pushResponse(createMockResponse([
       { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
     ] as ContentBlock[], 'tool_use'));
@@ -719,23 +814,74 @@ describe('present while acting', () => {
     ] as ContentBlock[]));
 
     const framework = await createFramework();
-    const routed = stubChannelRegistry(framework);
+    const routed = stubChannelRegistry(framework, { home: false });
     const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
     (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall =
       async () => ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
 
-    trigger(framework);
+    triggerFromChannel(framework, 'chan-A');
     await framework.runUntilIdle();
 
     assert.deepEqual(routed, [
       { text: 'Hello, observatory.', locus: 'discord:guild:observatory' },
     ], 'prose right after channel_open lands in the opened channel');
-    // The announcement rode the tool result the model saw.
     const results = membrane.lastStream!.receivedToolResults.flat() as Array<{ content?: unknown }>;
     assert.ok(
-      JSON.stringify(results).includes('plain speech now lands in this channel'),
+      JSON.stringify(results).includes('Your unaddressed plain speech now goes to discord:guild:observatory for the rest of this turn'),
       'routing note present in the channel_open tool result',
     );
+
+    await framework.stop();
+  });
+
+  it('channel_open with setSpeechTarget: false opens for reading and leaves the route where it was', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'discord:guild:observatory', setSpeechTarget: false } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Still talking to chan-A.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework, { home: false });
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall =
+      async () => ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'Still talking to chan-A.', locus: 'chan-A' }]);
+    const results = JSON.stringify(membrane.lastStream!.receivedToolResults.flat());
+    assert.ok(results.includes('Opened for reading. Your plain speech still goes to chan-A.'));
+
+    await framework.stop();
+  });
+
+  it('channel_open with setSpeechTarget: false and no route says speech is held as drafts', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'discord:guild:observatory', setSpeechTarget: false } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Thinking out loud.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework, { home: false });
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall =
+      async () => ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
+
+    // A heartbeat-style wake: no conversation, so no route.
+    (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+      agentName: 'assistant', reason: 'heartbeat', source: 'timer', timestamp: Date.now(),
+    });
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, []);
+    assert.deepEqual(heldDrafts(framework).map((d) => [d.text, d.reason]), [['Thinking out loud.', 'no-destination']]);
+    const results = JSON.stringify(membrane.lastStream!.receivedToolResults.flat());
+    assert.ok(results.includes('You have no speech route, so unaddressed plain speech is held as drafts.'));
 
     await framework.stop();
   });
@@ -790,11 +936,12 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
-  it('announces the outbound locus in the window only when it changes', async () => {
-    // Turn 1 (locus chan-live-1, e2e): one durable [routing] notice — the
-    // boot baseline. Then the announce-on-change logic directly (MockMembrane
-    // supports one turn per test): same locus → silence (steady state must
-    // not chatter — KV); new locus → exactly one more notice.
+  it('announces the speech route in the window only when it changes', async () => {
+    // Turn 1 (home route chan-live-1, e2e): one durable [routing] notice —
+    // the boot baseline. Then the announce-on-change logic directly
+    // (MockMembrane supports one turn per test): same route → silence
+    // (steady state must not chatter — KV); a new route, a hold, or no
+    // route → exactly one notice each.
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'one' }] as ContentBlock[]));
 
     const framework = await createFramework();
@@ -810,25 +957,29 @@ describe('present while acting', () => {
 
     trigger(framework);
     await framework.runUntilIdle();
-    assert.equal(notices.length, 1, 'first turn announced the boot-baseline locus');
+    assert.equal(notices.length, 1, 'first turn announced the boot-baseline route');
 
+    type Route = { route: unknown; hold?: unknown };
     const announce = (
-      framework as unknown as {
-        announceLocusIfChanged(agentName: string, locus: string | null): void;
-      }
-    ).announceLocusIfChanged.bind(framework);
+      framework as unknown as { announceRouteIfChanged(agentName: string, turn: Route): void }
+    ).announceRouteIfChanged.bind(framework);
+    const channel = (channelId: string, origin = 'trigger'): Route =>
+      ({ route: { kind: 'channel', serverId: '', channelId, origin } });
 
-    announce('assistant', 'chan-live-1');
-    assert.equal(notices.length, 1, 'unchanged locus announced nothing');
-
-    announce('assistant', 'chan-B');
-    assert.equal(notices.length, 2, 'changed locus announced exactly once');
-
-    announce('assistant', 'chan-B');
-    assert.equal(notices.length, 2, 'steady state on the new locus stays silent');
-
-    announce('assistant', null);
-    assert.equal(notices.length, 3, 'losing the locus is announced too');
+    announce('assistant', channel('chan-live-1', 'home'));
+    assert.equal(notices.length, 1, 'unchanged route announced nothing');
+    announce('assistant', channel('chan-B'));
+    assert.equal(notices.length, 2, 'changed route announced exactly once');
+    announce('assistant', channel('chan-B'));
+    assert.equal(notices.length, 2, 'steady state on the new route stays silent');
+    const held: Route = {
+      route: null,
+      hold: { since: 'turn-start', conversations: [{ kind: 'channel', serverId: '', channelId: 'chan-B' }, { kind: 'surface', surface: 'tui' }] },
+    };
+    announce('assistant', held);
+    assert.equal(notices.length, 3, 'a held turn is announced');
+    announce('assistant', { route: null });
+    assert.equal(notices.length, 4, 'losing the route is announced too');
 
     await framework.stop();
   });

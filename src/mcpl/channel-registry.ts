@@ -341,6 +341,12 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
           type: 'string',
           description: 'Anchor message from the closed-channel notice; it is excluded from backscroll.',
         },
+        setSpeechTarget: {
+          type: 'boolean',
+          description:
+            'Whether your unaddressed plain speech should go to this channel for the rest of this turn ' +
+            '(default true). false opens it for reading only; the result says where your speech goes.',
+        },
       },
       required: ['channelId'],
     },
@@ -379,11 +385,16 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_publish',
-    description: 'Publish a message to a channel. If channelId is omitted, publishes to the most recent incoming channel.',
+    description:
+      'Publish a message to a channel — an explicit send. Without channelId it goes to your current speech ' +
+      'route (the conversation your plain speech is going to this turn); with no route it is refused, never ' +
+      'guessed. The receipt names where it went, and whether delivery was confirmed, failed (nothing posted) ' +
+      'or is unknown (it may have been posted).',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        channelId: { type: 'string', description: 'ID of the channel to publish to (defaults to the most recent incoming channel)' },
+        channelId: { type: 'string', description: 'ID of the channel to publish to (defaults to your current speech route)' },
+        serverId: { type: 'string', description: 'Owning MCPL server; needed only when channelId is registered by more than one.' },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
@@ -458,6 +469,14 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 // ============================================================================
 // Constructor Options
 // ============================================================================
+
+/** An agent's current speech route as the registry needs it. */
+export type SpeechRouteView =
+  | { kind: 'channel'; serverId: string; channelId: string; threadId?: string; replyTo?: string }
+  | { kind: 'surface'; surface: string }
+  /** Competing conversations hold unaddressed speech (usable addresses). */
+  | { kind: 'held'; conversations: string[] }
+  | { kind: 'none' };
 
 /** Where a publish was resolved to go — named by the registry, never by
  *  the caller's spelling. */
@@ -554,27 +573,20 @@ interface ChannelRegistryOptions {
    * Resolve a conversation fork's HOME channel from its agent name. Conversation
    * forks are spawned bound to a single channel (the framework tracks this in
    * `conversationAgentHomes` / `ConversationRouter.channelForAgent`); their
-   * plain-text speech must route THERE. The process-global `defaultPublishChannel`
-   * tracks only the most-recent inbound across ALL channels, so with one fork per
-   * channel running concurrently it misroutes a fork's reply to whichever channel
-   * last spoke (item 3). Returns undefined for the trunk/primary agent, which has
-   * no home and correctly falls back to the global locus (heartbeats, etc.).
+   * plain-text speech must route THERE, whatever else arrives. Returns
+   * undefined for an agent without a home: its route comes from its turn.
    */
   homeChannelResolver?: (agentName: string) => string | undefined;
   /**
-   * Resolve the channel that triggered an agent's CURRENT inference turn, by
-   * agent name. This is the fix for single-TRUNK agents (the only mode
-   * connectome-host runs — it never exposes conversation forks). A trunk agent
-   * has no fork home, so without this its plain-text speech falls back to the
-   * process-global `defaultPublishChannel`, which tracks the most-recent inbound
-   * across ALL channels and misroutes a reply to whichever channel last spoke
-   * under concurrency (item-3 redux). The framework tracks the triggering
-   * channel of the live turn per-agent and exposes it here; resolves to
-   * undefined for a heartbeat / no-trigger turn, which correctly keeps the
-   * global fallback. Consulted AFTER `homeChannelResolver` (a fork's home always
-   * wins), BEFORE `defaultPublishChannel`.
+   * The agent's current speech route (src/speech-routes.ts), as the
+   * framework holds it for the live turn: where its unaddressed plain speech
+   * goes, if anywhere. The same route feeds the beforeInference channel
+   * context (defaultOutgoing, and its reply edge as `incoming`) and is the
+   * destination of a channel_publish that names no channel — so what the
+   * agent is told and where it lands never diverge. There is no
+   * latest-inbound fallback: without a route there is nothing to default to.
    */
-  activeChannelResolver?: (agentName: string) => string | undefined;
+  speechRouteResolver?: (agentName: string) => SpeechRouteView;
 }
 
 // ============================================================================
@@ -616,7 +628,7 @@ export class ChannelRegistry {
     channels: Array<{ channelId: string; label?: string }>;
   }) => void;
   private homeChannelResolver?: (agentName: string) => string | undefined;
-  private activeChannelResolver?: (agentName: string) => string | undefined;
+  private speechRouteResolver?: (agentName: string) => SpeechRouteView;
   private store?: JsStore;
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
@@ -672,13 +684,6 @@ export class ChannelRegistry {
    */
   private dmClassified = new Map<string, true>();
 
-  /** Most recent incoming channel ID — used for speech routing / default publish. */
-  private defaultPublishChannel: string | null = null;
-
-  /** Most recent incoming message metadata, used for buildChannelContext. */
-  private defaultPublishMessageId: string | null = null;
-  private defaultPublishThreadId: string | undefined = undefined;
-
   /** Per-channel typing indicator timers. */
   private typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
@@ -730,7 +735,7 @@ export class ChannelRegistry {
     this.onRouteFailure = options?.onRouteFailure;
     this.onChannelAutoOpened = options?.onChannelAutoOpened;
     this.homeChannelResolver = options?.homeChannelResolver;
-    this.activeChannelResolver = options?.activeChannelResolver;
+    this.speechRouteResolver = options?.speechRouteResolver;
     this.store = options?.store;
     this.initializeLifecycleStore();
     this.initializeLabelHistoryStore();
@@ -976,16 +981,11 @@ export class ChannelRegistry {
       if (message.tags) message.tags = expandCoreTags(message.tags);
       const convertedContent: ContentBlock[] = message.content.map(convertBlock);
 
-      // Track default publish channel (most recent ACCEPTED incoming) —
-      // deliberately after §14.5 validation: a rejected message from an
-      // unregistered channel must not retarget outbound speech (the locus is
-      // exactly the authority a self-attested channel would be stealing).
-      // A coalesced item is "accepted" only once the coalescer admits it, so
-      // for those this runs after the hook (below).
+      // An accepted message never retargets speech: a route comes from a
+      // turn's own wake or a deliberate choice, never from whichever channel
+      // last saw traffic (shelf-355). A coalesced item is "accepted" only
+      // once the coalescer admits it, so for those this runs after the hook.
       const markAccepted = () => {
-        this.defaultPublishChannel = message.channelId;
-        this.defaultPublishMessageId = message.messageId;
-        this.defaultPublishThreadId = message.threadId;
         // A server sending channels/incoming is authoritative evidence that
         // the transport is actually open. This repairs transient status only;
         // durable desired state still changes exclusively through lifecycle
@@ -1258,13 +1258,6 @@ export class ChannelRegistry {
   // ==========================================================================
 
   /**
-   * Get the default publish channel ID (most recent incoming channel).
-   */
-  getDefaultPublishChannel(): string | null {
-    return this.defaultPublishChannel;
-  }
-
-  /**
    * Get the descriptor for a channel by its channelId (first match across
    * servers). Used by the conversation router for DM classification.
    */
@@ -1372,7 +1365,7 @@ export class ChannelRegistry {
         });
 
       case 'channel_publish':
-        return this.handleToolPublish(input as { channelId: string; content: string });
+        return this.handleToolPublish(input as { channelId?: string; serverId?: string; content?: string; text?: string }, origin);
 
       case 'think':
         return this.handleToolThink(input as { content?: string });
@@ -1400,15 +1393,12 @@ export class ChannelRegistry {
   buildChannelContext(agentName?: string): ChannelContext | undefined {
     const openChannels = this.getOpenChannels();
 
-    // Resolve the outbound locus the SAME way routeSpeech does, so the agent is
-    // told the channel its speech will actually land in: a conversation fork's
-    // home channel, else this turn's triggering channel (single trunk agent —
-    // item-3 redux), else the global default (heartbeats). Without this, a fork
-    // was advertised the global locus but published somewhere else; and a trunk
-    // agent was told the wrong channel under concurrency.
-    const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
-    const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
-    const outgoing = home ?? active ?? this.defaultPublishChannel;
+    // The agent's own speech route, the one its plain speech will actually
+    // use: the outgoing channel, and the message it answers as `incoming`.
+    // Without a channel route there is no outgoing channel to advertise —
+    // never a latest-inbound guess.
+    const route = agentName ? this.speechRouteResolver?.(agentName) : undefined;
+    const outgoing = route?.kind === 'channel' ? route.channelId : undefined;
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -1416,18 +1406,14 @@ export class ChannelRegistry {
 
     const context: ChannelContext = {};
 
-    // Incoming: the most-recent inbound message (what the agent is replying to).
-    // Left process-global — per-channel inbound tracking (the right messageId for
-    // a fork's own channel) is a separate concern from the outbound routing fix.
-    if (this.defaultPublishChannel && this.defaultPublishMessageId) {
+    if (route?.kind === 'channel' && route.replyTo) {
       context.incoming = {
-        channelId: this.defaultPublishChannel,
-        messageId: this.defaultPublishMessageId,
-        threadId: this.defaultPublishThreadId,
+        channelId: route.channelId,
+        messageId: route.replyTo,
+        ...(route.threadId ? { threadId: route.threadId } : {}),
       };
     }
 
-    // Default outgoing: the resolved outbound locus (home channel for forks).
     if (outgoing) {
       context.defaultOutgoing = {
         channelId: outgoing,
@@ -1456,11 +1442,6 @@ export class ChannelRegistry {
       if (entry.serverId !== serverId) continue;
       this.channels.delete(key);
       this.stopTyping(entry.descriptor.id);
-      if (this.defaultPublishChannel === entry.descriptor.id) {
-        this.defaultPublishChannel = null;
-        this.defaultPublishMessageId = null;
-        this.defaultPublishThreadId = undefined;
-      }
     }
     // Desired state and migration markers deliberately survive disconnects.
   }
@@ -1477,11 +1458,6 @@ export class ChannelRegistry {
 
     // Clear channels map
     this.channels.clear();
-
-    // Reset default publish tracking
-    this.defaultPublishChannel = null;
-    this.defaultPublishMessageId = null;
-    this.defaultPublishThreadId = undefined;
   }
 
   // ==========================================================================
@@ -2032,7 +2008,8 @@ export class ChannelRegistry {
   /**
    * Publish into a channel on behalf of a named non-resident agent (the
    * subconscious's speak_in_channel). Same delivery path as the
-   * channel_publish tool; the agent name rides the speech-routed trace.
+   * channel_publish tool — the publish executor, with the same receipt —
+   * attributed to that agent; its name also rides the speech-routed trace.
    */
   async publishForAgent(
     channelId: string,
@@ -2040,7 +2017,7 @@ export class ChannelRegistry {
     agentName: string,
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
     this.emitTraceFn({ type: 'mcpl:speech-routed', conversationId: agentName, channelId, text });
-    return this.handleToolPublish({ channelId, content: text });
+    return this.handleToolPublish({ channelId, content: text }, { kind: 'agent', agentName });
   }
 
   /**
@@ -2997,9 +2974,14 @@ export class ChannelRegistry {
     return server;
   }
 
+  /**
+   * An agent's standing HOME channel — a conversation fork's — or null. It is
+   * the only route the registry knows of its own: every other route is the
+   * framework's, decided per turn (shelf-355), and incoming traffic never
+   * makes one.
+   */
   resolveLocus(conversationId: string): string | null {
-    const home = this.homeChannelResolver?.(conversationId);
-    return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;
+    return this.homeChannelResolver?.(conversationId) ?? null;
   }
 
   /**
@@ -3054,9 +3036,8 @@ export class ChannelRegistry {
   /**
    * Publish `text` to one registered channel and report what the attempt
    * established (PublishOutcome). The delivery executor behind plain speech
-   * (deliverSpeech / routeSpeech) and resident resends of held drafts;
-   * channel_publish (and publishForAgent, which shares its handler) moves
-   * onto it with shelf-356 — until then that tool reads its own receipt.
+   * (deliverSpeech / routeSpeech), resident resends of held drafts, and
+   * channel_publish (with publishForAgent, which shares its handler).
    *
    * Resolution is exact (resolveDestination): `serverId` plus `channelId`
    * when the caller has the server, otherwise the channel id must be
@@ -3218,7 +3199,7 @@ export class ChannelRegistry {
      *  stale global default and land the reply in the wrong channel (item-3,
      *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
      *  "this turn is pinned to no locus": fail loudly rather than guess. */
-    locusChannelId: string | null,
+    locusChannelId: string | null | { serverId?: string; channelId: string },
   ): Promise<PublishOutcome> {
     const fail = (channelId: string | null, reason: string, outcome: PublishOutcome): PublishOutcome => {
       const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
@@ -3250,8 +3231,11 @@ export class ChannelRegistry {
       return fail(null, reason, { status: 'failed', reason, at: Date.now() });
     }
 
-    const outcome = await this.publish(conversationId, text, { channelId: locusChannelId });
-    const channelId = outcome.destination?.channelId ?? locusChannelId;
+    // A route that knows its server publishes exactly there: the same
+    // channel id on another server is a different conversation.
+    const target = typeof locusChannelId === 'string' ? { channelId: locusChannelId } : locusChannelId;
+    const outcome = await this.publish(conversationId, text, target);
+    const channelId = outcome.destination?.channelId ?? target.channelId;
     if (outcome.status !== 'delivered') {
       return fail(channelId, outcome.reason ?? 'delivery not confirmed', outcome);
     }
@@ -3277,7 +3261,7 @@ export class ChannelRegistry {
   async routeSpeech(
     conversationId: string,
     text: string,
-    locusChannelId: string | null,
+    locusChannelId: string | null | { serverId?: string; channelId: string },
   ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
     const outcome = await this.deliverSpeech(conversationId, text, locusChannelId);
     if (outcome.status !== 'delivered') return null;
@@ -3288,7 +3272,10 @@ export class ChannelRegistry {
     };
   }
 
-  private async handleToolPublish(input: { channelId?: string; content?: string; text?: string }): Promise<ToolResult> {
+  private async handleToolPublish(
+    input: { channelId?: string; serverId?: string; content?: string; text?: string },
+    origin?: ChannelToolOrigin,
+  ): Promise<ToolResult> {
     // Resolve content: accept both `content` and `text` (backward compat)
     const messageText = input.content ?? input.text;
     if (!messageText) {
@@ -3299,59 +3286,58 @@ export class ChannelRegistry {
       };
     }
 
-    // Resolve channelId: default to most recent incoming channel
-    const channelId = input.channelId ?? this.defaultPublishChannel;
-    if (!channelId) {
-      return {
-        success: false,
-        error: 'No channelId specified and no default channel available',
-        isError: true,
-      };
-    }
-
-    const entry = this.findChannelEntry(channelId);
-    if (!entry) {
-      return {
-        success: false,
-        error: `Channel not found: ${channelId}`,
-        isError: true,
-      };
-    }
-
-    const server = this.serverRegistry.getServer(entry.serverId);
-    if (!server) {
-      return {
-        success: false,
-        error: `Server not found: ${entry.serverId}`,
-        isError: true,
-      };
-    }
-
-    try {
-      if (!CapabilityGrant.of(server).has('channels.publish')) {
+    // The destination: the one named, else the caller's current speech
+    // route — never the most recent inbound channel (shelf-355).
+    let target: { serverId?: string; channelId: string };
+    if (input.channelId) {
+      target = { channelId: input.channelId, ...(input.serverId ? { serverId: input.serverId } : {}) };
+    } else {
+      const route = origin?.kind === 'agent' ? this.speechRouteResolver?.(origin.agentName) : undefined;
+      if (route?.kind !== 'channel') {
+        const why = route?.kind === 'held'
+          ? `your speech route is held between ${route.conversations.join(' and ')}`
+          : route?.kind === 'surface'
+            ? `your speech route is the local surface ${route.surface}, not a channel`
+            : 'you have no current speech route';
         return {
           success: false,
-          error: `channels.publish not in "${server.id}"'s effective grant (§14.1)`,
+          error: `No channelId given, and ${why}: name the channel to publish to. Nothing was sent.`,
           isError: true,
         };
       }
-      const publishParams: ChannelsPublishParams = {
-        conversationId: '', // Framework will fill this when wired
-        channelId,
-        content: [{ type: 'text', text: messageText }],
-      };
+      target = { serverId: route.serverId, channelId: route.channelId };
+    }
 
-      const result = await server.sendChannelsPublish(publishParams);
+    const outcome = await this.publish(
+      origin?.kind === 'agent' ? origin.agentName : '',
+      messageText,
+      target,
+    );
+    const where = outcome.destination
+      ? { serverId: outcome.destination.serverId, channelId: outcome.destination.channelId, ...(outcome.destination.label ? { channelLabel: outcome.destination.label } : {}) }
+      : { channelId: target.channelId, ...(target.serverId ? { serverId: target.serverId } : {}) };
+    if (outcome.status === 'delivered') {
       return {
         success: true,
-        data: result ?? { delivered: true },
-      };
-    } catch (err) {
-      return {
-        success: false,
-        error: `Failed to publish to channel: ${(err as Error).message}`,
-        isError: true,
+        data: {
+          delivered: true,
+          status: 'delivered',
+          ...where,
+          ...(outcome.messageId ? { messageId: outcome.messageId } : {}),
+        },
       };
     }
+    // Not confirmed: say which, and where it was attempted. `unknown` may
+    // already be posted (a partial multi-part send, a timeout): never invite
+    // a blind retry.
+    const shown = `${where.channelId}${'channelLabel' in where && where.channelLabel ? ` (${where.channelLabel})` : ''}`;
+    return {
+      success: false,
+      error: outcome.status === 'unknown'
+        ? `Delivery to ${shown} was not confirmed — it may or may not have been posted: ${outcome.reason ?? 'no valid receipt'}. Check the channel before sending again.`
+        : `Not sent to ${shown}: ${outcome.reason ?? 'refused'}. Nothing was posted.`,
+      isError: true,
+      data: { delivered: false, status: outcome.status, ...where, ...(outcome.messageId ? { messageId: outcome.messageId } : {}) },
+    };
   }
 }

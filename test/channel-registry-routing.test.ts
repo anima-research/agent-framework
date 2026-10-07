@@ -1,7 +1,7 @@
 import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
+import { ChannelRegistry, type SpeechRouteView } from '../src/mcpl/channel-registry.js';
 import { parseProsePrefix } from '../src/mcpl/prose-grammar.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
@@ -15,7 +15,7 @@ type RouteFailure = { conversationId: string; channelId: string | null; reason: 
 function makeRegistry(
   publishResult: { delivered?: boolean } | undefined,
   homeChannelResolver?: (agentName: string) => string | undefined,
-  activeChannelResolver?: (agentName: string) => string | undefined,
+  speechRouteResolver?: (agentName: string) => SpeechRouteView,
   onChannelAutoOpened?: (info: {
     conversationId?: string;
     serverId: string;
@@ -60,7 +60,7 @@ function makeRegistry(
     {
       onRouteFailure: (info) => { failures.push(info); },
       homeChannelResolver,
-      activeChannelResolver,
+      speechRouteResolver,
       onChannelAutoOpened,
     },
   );
@@ -127,7 +127,7 @@ test('routeSpeech surfaces a failure when the server reports delivered:false', a
   seedRegistered(registry, 'discord', 'ch-x');
   registry.handleIncoming('discord', incoming('ch-x', 'hi'));
 
-  const res = await registry.routeSpeech('cairn', 'undeliverable reply', registry.resolveLocus('cairn'));
+  const res = await registry.routeSpeech('cairn', 'undeliverable reply', 'ch-x');
 
   assert.equal(res, null, 'a non-delivered send must not report success');
   assert.equal(failures.length, 1, 'onRouteFailure should fire');
@@ -136,10 +136,9 @@ test('routeSpeech surfaces a failure when the server reports delivered:false', a
   assert.ok(traces.some(t => t.type === 'mcpl:speech-route-failed'));
 });
 
-test('routeSpeech routes a conversation fork to its HOME channel, not the global last-inbound (item 3)', async () => {
-  // Two channels are live. chanA registered first; then a message arrives on
-  // chanB, flipping the process-global defaultPublishChannel to chanB. A fork
-  // bound to chanA must still publish to chanA.
+test('routeSpeech routes a conversation fork to its HOME channel, whatever arrives elsewhere (item 3)', async () => {
+  // Two channels are live and chanB spoke last. A fork bound to chanA must
+  // still publish to chanA.
   const homes: Record<string, string> = { 'conversation-chanA-g1': 'chanA' };
   const { registry, publishCalls } = makeRegistry(
     { delivered: true },
@@ -150,19 +149,18 @@ test('routeSpeech routes a conversation fork to its HOME channel, not the global
   registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
   seedRegistered(registry, 'discord', 'chanB');
   registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
-  // Global locus is now chanB.
-  assert.equal(registry.getDefaultPublishChannel(), 'chanB');
 
   const res = await registry.routeSpeech('conversation-chanA-g1', 'reply for A', registry.resolveLocus('conversation-chanA-g1'));
   assert.deepEqual(res, { delivered: true, channelId: 'chanA' },
-    'fork must route to its home channel, not the global last-inbound');
+    'fork must route to its home channel, not the last inbound');
   assert.equal(publishCalls.at(-1)?.channelId, 'chanA');
 });
 
-test('routeSpeech falls back to the global locus for the trunk agent (no home)', async () => {
-  // The trunk/primary agent has no home entry; it correctly uses the global
-  // most-recent-inbound channel.
-  const { registry, publishCalls } = makeRegistry(
+test('incoming traffic never selects a destination: without a home there is no locus (shelf-355)', async () => {
+  // The old registry tracked the process-global most-recent inbound channel
+  // and routed homeless speech there. Now a route comes only from a turn's
+  // own wake or a deliberate choice, which the framework holds.
+  const { registry, publishCalls, failures } = makeRegistry(
     { delivered: true },
     () => undefined, // no agent has a home
   );
@@ -172,35 +170,70 @@ test('routeSpeech falls back to the global locus for the trunk agent (no home)',
   seedRegistered(registry, 'discord', 'chanB');
   registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
 
+  assert.equal(registry.resolveLocus('trunk'), null);
+  assert.equal(registry.buildChannelContext('trunk')?.defaultOutgoing, undefined,
+    'nothing is advertised as where speech goes');
   const res = await registry.routeSpeech('trunk', 'heartbeat reply', registry.resolveLocus('trunk'));
-  assert.deepEqual(res, { delivered: true, channelId: 'chanB' });
-  assert.equal(publishCalls.at(-1)?.channelId, 'chanB');
+  assert.equal(res, null);
+  assert.equal(publishCalls.length, 0);
+  assert.match(failures.at(-1)!.reason, /no locus/);
 });
 
-test('buildChannelContext advertises the fork home as defaultOutgoing (item 3)', () => {
-  const homes: Record<string, string> = { 'conversation-chanA-g1': 'chanA' };
-  const { registry } = makeRegistry(
-    { delivered: true },
-    (agentName) => homes[agentName],
-  );
-
-  seedRegistered(registry, 'discord', 'chanA');
+test('buildChannelContext advertises the agent\'s own route and its reply edge, and nothing for a held or absent route', () => {
+  const routes: Record<string, SpeechRouteView> = {
+    'conversation-chanA-g1': { kind: 'channel', serverId: 'discord', channelId: 'chanA' },
+    scout: { kind: 'channel', serverId: 'discord', channelId: 'chanB', replyTo: 'm-7', threadId: 't-1' },
+    held: { kind: 'held', conversations: ['#chanA (chanA)', '#chanB (chanB)'] },
+    tui: { kind: 'surface', surface: 'tui' },
+  };
+  const { registry } = makeRegistry({ delivered: true }, () => undefined, (n) => routes[n] ?? { kind: 'none' });
+  seedRegistered(registry, 'discord', 'chanA', 'chanB');
   registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
-  seedRegistered(registry, 'discord', 'chanB');
   registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
 
-  // The fork is told chanA (where its speech actually lands)...
-  const forkCtx = registry.buildChannelContext('conversation-chanA-g1');
-  assert.equal(forkCtx?.defaultOutgoing?.channelId, 'chanA');
+  assert.equal(registry.buildChannelContext('conversation-chanA-g1')?.defaultOutgoing?.channelId, 'chanA');
+  const scout = registry.buildChannelContext('scout');
+  assert.equal(scout?.defaultOutgoing?.channelId, 'chanB');
+  assert.deepEqual(scout?.incoming, { channelId: 'chanB', messageId: 'm-7', threadId: 't-1' },
+    'the reply edge is the route\'s own triggering message');
+  for (const agent of ['held', 'tui', 'nobody']) {
+    const ctx = registry.buildChannelContext(agent);
+    assert.equal(ctx?.defaultOutgoing, undefined, `${agent}: no outgoing channel`);
+    assert.equal(ctx?.incoming, undefined, `${agent}: no reply edge`);
+  }
+});
 
-  // ...while the trunk agent (no home) is told the global default.
-  const trunkCtx = registry.buildChannelContext('trunk');
-  assert.equal(trunkCtx?.defaultOutgoing?.channelId, 'chanB');
+test('a route that names its server publishes there, even when another server registers the same channel id', async () => {
+  const published: Array<{ server: string; channelId?: string }> = [];
+  const server = (id: string) => ({
+    grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
+    sendChannelsPublish: async (params: { channelId?: string }) => {
+      published.push({ server: id, channelId: params.channelId });
+      return { delivered: true, messageId: `${id}-1` };
+    },
+    sendChannelsOpen: async () => ({}),
+  });
+  const servers: Record<string, unknown> = { a: server('a'), b: server('b') };
+  const registry = new ChannelRegistry(
+    { getServer: (id: string) => servers[id] } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+    {},
+  );
+  seedRegistered(registry, 'a', 'shared');
+  seedRegistered(registry, 'b', 'shared');
+
+  const res = await registry.routeSpeech('scout', 'to b', { serverId: 'b', channelId: 'shared' });
+  assert.deepEqual(res, { delivered: true, channelId: 'shared', messageId: 'b-1' });
+  assert.deepEqual(published, [{ server: 'b', channelId: 'shared' }]);
+  // Without the server, the shared id is refused rather than guessed.
+  assert.equal(await registry.routeSpeech('scout', 'which one?', 'shared'), null);
+  assert.equal(published.length, 1);
 });
 
 test('routeSpeech surfaces a failure when there is no locus at all', async () => {
   const { registry, failures } = makeRegistry({ delivered: true });
-  // No handleIncoming → defaultPublishChannel is null.
   const res = await registry.routeSpeech('cairn', 'into the void', registry.resolveLocus('cairn'));
   assert.equal(res, null);
   assert.equal(failures.length, 1);
@@ -208,85 +241,76 @@ test('routeSpeech surfaces a failure when there is no locus at all', async () =>
   assert.match(failures[0].reason, /no locus/);
 });
 
-// ── item-3 redux: single TRUNK agents route to the turn's triggering channel ──
+// ── channel_publish: an explicit send through the publish executor ──
 
-test('routeSpeech routes a TRUNK agent to its ACTIVE triggering channel, not the global last-inbound (item-3 redux)', async () => {
-  // The exact live repro: scout (a single trunk agent) is answering channel A
-  // when a message arrives on channel B, flipping the process-global
-  // defaultPublishChannel to B. The reply must still land in A. Forks (home)
-  // don't exist here — connectome-host never spawns them — so the ONLY thing
-  // keeping A's answer in A is the active-triggering-channel resolver.
-  const active: Record<string, string> = { scout: 'chanA' };
+test('channel_publish without a channel goes to the caller\'s route, and its receipt names the destination', async () => {
   const { registry, publishCalls } = makeRegistry(
-    { delivered: true },
-    () => undefined,               // no fork homes (trunk-only, connectome-host mode)
-    (agentName) => active[agentName],
-  );
-
-  seedRegistered(registry, 'discord', 'chanA');
-  registry.handleIncoming('discord', incoming('chanA', 'A: sleep && date'));
-  seedRegistered(registry, 'discord', 'chanB');
-  registry.handleIncoming('discord', incoming('chanB', 'B: unrelated')); // flips global to chanB
-  assert.equal(registry.getDefaultPublishChannel(), 'chanB');
-
-  const res = await registry.routeSpeech('scout', 'the date is ...', registry.resolveLocus('scout'));
-  assert.deepEqual(res, { delivered: true, channelId: 'chanA' },
-    'trunk reply must go to the channel that triggered the turn, not the global last-inbound');
-  assert.equal(publishCalls.at(-1)?.channelId, 'chanA');
-});
-
-test('routeSpeech precedence: fork HOME wins over the active triggering channel', async () => {
-  // A fork bound to chanA must route home even if its live turn was (somehow)
-  // triggered from chanB — home is the strongest signal and must not regress.
-  const { registry, publishCalls } = makeRegistry(
-    { delivered: true },
-    (n) => (n === 'conversation-chanA-g1' ? 'chanA' : undefined),
-    () => 'chanB',
-  );
-  seedRegistered(registry, 'discord', 'chanA');
-  registry.handleIncoming('discord', incoming('chanA', 'hi'));
-  seedRegistered(registry, 'discord', 'chanB');
-  registry.handleIncoming('discord', incoming('chanB', 'hi'));
-
-  const res = await registry.routeSpeech('conversation-chanA-g1', 'reply', registry.resolveLocus('conversation-chanA-g1'));
-  assert.deepEqual(res, { delivered: true, channelId: 'chanA' });
-  assert.equal(publishCalls.at(-1)?.channelId, 'chanA');
-});
-
-test('buildChannelContext advertises the active triggering channel as defaultOutgoing (item-3 redux)', () => {
-  const active: Record<string, string> = { scout: 'chanA' };
-  const { registry } = makeRegistry(
-    { delivered: true },
+    { delivered: true, messageId: 'p-1' } as { delivered?: boolean },
     () => undefined,
-    (n) => active[n],
+    (n) => (n === 'scout' ? { kind: 'channel', serverId: 'discord', channelId: 'chanA' } : { kind: 'none' }),
   );
-  seedRegistered(registry, 'discord', 'chanA');
-  registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
-  seedRegistered(registry, 'discord', 'chanB');
-  registry.handleIncoming('discord', incoming('chanB', 'hi from B')); // global → chanB
+  seedRegistered(registry, 'discord', 'chanA', 'chanB');
+  registry.handleIncoming('discord', incoming('chanB', 'chanB spoke last'));
 
-  // The trunk is TOLD chanA (where its speech will actually land), matching
-  // what routeSpeech resolves — not the global chanB.
-  const ctx = registry.buildChannelContext('scout');
-  assert.equal(ctx?.defaultOutgoing?.channelId, 'chanA');
+  const res = await registry.handleChannelToolCall('channel_publish', { content: 'hello' }, { kind: 'agent', agentName: 'scout' });
+  assert.equal(res.success, true);
+  assert.deepEqual(res.data, { delivered: true, status: 'delivered', serverId: 'discord', channelId: 'chanA', channelLabel: 'chanA', messageId: 'p-1' });
+  assert.equal(publishCalls.at(-1)?.channelId, 'chanA', 'the route, not the last inbound channel');
+});
+
+test('channel_publish without a channel or a route is refused, never guessed', async () => {
+  const views: Record<string, SpeechRouteView> = {
+    held: { kind: 'held', conversations: ['#chanA (chanA)', '#chanB (chanB)'] },
+    tui: { kind: 'surface', surface: 'tui' },
+  };
+  const { registry, publishCalls } = makeRegistry({ delivered: true }, () => undefined, (n) => views[n] ?? { kind: 'none' });
+  seedRegistered(registry, 'discord', 'chanA', 'chanB');
+  registry.handleIncoming('discord', incoming('chanB', 'chanB spoke last'));
+
+  const none = await registry.handleChannelToolCall('channel_publish', { content: 'x' }, { kind: 'agent', agentName: 'nobody' });
+  assert.equal(none.success, false);
+  assert.match(none.error!, /No channelId given, and you have no current speech route: name the channel to publish to\. Nothing was sent\./);
+  const held = await registry.handleChannelToolCall('channel_publish', { content: 'x' }, { kind: 'agent', agentName: 'held' });
+  assert.match(held.error!, /your speech route is held between #chanA \(chanA\) and #chanB \(chanB\)/);
+  const tui = await registry.handleChannelToolCall('channel_publish', { content: 'x' }, { kind: 'agent', agentName: 'tui' });
+  assert.match(tui.error!, /your speech route is the local surface tui, not a channel/);
+  const module = await registry.handleChannelToolCall('channel_publish', { content: 'x' }, { kind: 'module' });
+  assert.match(module.error!, /you have no current speech route/);
+  assert.equal(publishCalls.length, 0);
+});
+
+test('channel_publish reports failed and unknown outcomes with the attempted destination', async () => {
+  const refused = makeRegistry({ delivered: false });
+  seedRegistered(refused.registry, 'discord', 'chanA');
+  const failed = await refused.registry.handleChannelToolCall('channel_publish', { channelId: 'chanA', content: 'x' }, { kind: 'agent', agentName: 'scout' });
+  assert.equal(failed.success, false);
+  assert.match(failed.error!, /^Not sent to chanA \(chanA\): .*Nothing was posted\.$/);
+  assert.deepEqual(
+    { status: (failed.data as { status: string }).status, serverId: (failed.data as { serverId: string }).serverId, channelId: (failed.data as { channelId: string }).channelId },
+    { status: 'failed', serverId: 'discord', channelId: 'chanA' },
+  );
+
+  const silent = makeRegistry(undefined);
+  seedRegistered(silent.registry, 'discord', 'chanA');
+  const unknown = await silent.registry.handleChannelToolCall('channel_publish', { channelId: 'chanA', content: 'x' }, { kind: 'agent', agentName: 'scout' });
+  assert.equal(unknown.success, false);
+  assert.match(unknown.error!, /^Delivery to chanA \(chanA\) was not confirmed — it may or may not have been posted: .*Check the channel before sending again\.$/);
+  assert.equal((unknown.data as { status: string }).status, 'unknown');
 });
 
 test('ensureChannelRegistered keeps a DM closed while making its one-shot reply routable', async () => {
   // A Discord DM arrives via push/event (channel closed), so it is never
-  // registered and never updates defaultPublishChannel — routeSpeech would drop
-  // the reply. Registering it on inbound makes it a publishable locus; the
-  // active resolver (the woken turn's DM) then targets it.
+  // registered — routeSpeech would drop the reply. Registering it on inbound
+  // makes it a publishable destination; the woken turn's route (its DM)
+  // then targets it.
   const dm = 'discord:dm:42';
-  const active: Record<string, string> = { scout: dm };
   const { registry, publishCalls, lookup, traces } = makeRegistry(
     { delivered: true },
     () => undefined,
-    (n) => active[n],
   );
 
   // No prior handleIncoming for the DM — it only ever came as a push event.
   assert.equal(lookup(dm), undefined);
-  assert.equal(registry.getDefaultPublishChannel(), null);
 
   registry.ensureChannelRegistered('discord', dm, 'DM with Antra');
 
@@ -296,9 +320,9 @@ test('ensureChannelRegistered keeps a DM closed while making its one-shot reply 
   assert.equal(entry!.open, false, 'one-shot reachability is not a subscription');
   assert.ok(traces.some((t) => t.type === 'mcpl:channel-lazy-registered'));
 
-  const res = await registry.routeSpeech('scout', 'replying in the DM', registry.resolveLocus('scout'));
+  const res = await registry.routeSpeech('scout', 'replying in the DM', { serverId: 'discord', channelId: dm });
   assert.deepEqual(res, { delivered: true, channelId: dm },
-    'the DM reply must route back to the DM channel, not the global locus');
+    'the DM reply must route back to the DM channel');
   assert.equal(publishCalls.at(-1)?.channelId, dm);
 });
 

@@ -93,7 +93,29 @@ interface PendingEvent {
    *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
    *  DM) — unroutable. Absent when the host could not resolve one. */
   routeChannelId?: string;
+  /** The triggering message's id, when the metadata carries one: the reply
+   *  edge of a speech route inferred from this event. */
+  messageId?: string;
 }
+
+/** One conversation a batched gate wake carries, for the framework's
+ *  speech-route inference (src/speech-routes.ts). */
+export type GateRouteCandidate =
+  | {
+      kind: 'channel';
+      /** The registered channel; for an unroutable candidate, the raw id
+       *  the event named (or `user:<author>` when it named only an author). */
+      channelId: string;
+      serverId?: string;
+      messageId?: string;
+      addressed: boolean;
+      at: number;
+      /** The host could not resolve the event's registered channel: it still
+       *  competes for the turn (replying to an older conversation instead
+       *  would answer the wrong person), but can never be the route. */
+      unroutable?: true;
+    }
+  | { kind: 'surface'; surface: string; at: number };
 
 /**
  * Where a gate-requested wake came from, handed to the framework alongside the
@@ -123,6 +145,15 @@ export interface WakeProvenance {
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
+  /**
+   * Every conversation in the batch, addressed or not: each event whose
+   * registered channel the host resolved, and each local-surface message
+   * (console/API input, addressed by nature). The framework infers the
+   * turn's speech route from all of them — the addressed ones if any, else
+   * all; one conversation only, else the turn starts held — instead of
+   * trusting a single pick.
+   */
+  routeCandidates?: GateRouteCandidate[];
 }
 
 interface DebounceState {
@@ -215,8 +246,36 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     if (!newest || e.timestamp >= newest.timestamp) newest = e;
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }
+  const routeCandidates: GateRouteCandidate[] = [];
+  for (const e of events) {
+    if (e.routeChannelId) {
+      routeCandidates.push({
+        kind: 'channel',
+        channelId: e.routeChannelId,
+        ...(e.serverId ? { serverId: e.serverId } : {}),
+        ...(e.messageId ? { messageId: e.messageId } : {}),
+        addressed: e.addressed,
+        at: e.timestamp,
+      });
+    } else if (e.eventType === 'external-message' || e.eventType === 'api:message') {
+      routeCandidates.push({
+        kind: 'surface',
+        surface: e.serverId || (e.eventType === 'api:message' ? 'api' : 'external'),
+        at: e.timestamp,
+      });
+    } else if (e.channelId || e.authorId) {
+      routeCandidates.push({
+        kind: 'channel',
+        channelId: e.channelId || `user:${e.authorId}`,
+        ...(e.serverId ? { serverId: e.serverId } : {}),
+        addressed: e.addressed,
+        at: e.timestamp,
+        unroutable: true,
+      });
+    }
+  }
   const pick = newestAddressed ?? newest;
-  if (!pick) return undefined;
+  if (!pick) return routeCandidates.length > 0 ? { routeCandidates } : undefined;
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one
   const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
@@ -227,6 +286,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     ...(pick.addressed ? { addressed: true } : {}),
     ...(pick.addressed && pick.routeChannelId ? { routeChannelId: pick.routeChannelId } : {}),
     at: pick.timestamp,
+    ...(routeCandidates.length > 0 ? { routeCandidates } : {}),
   };
 }
 
@@ -1498,6 +1558,9 @@ export class EventGate {
       serverId: info.serverId || undefined,
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
       routeChannelId: this.routeChannelFor(info),
+      ...(typeof info.metadata?.messageId === 'string' && info.metadata.messageId
+        ? { messageId: info.metadata.messageId as string }
+        : {}),
     };
 
     const existing = this.debounceTimers.get(policy.name);

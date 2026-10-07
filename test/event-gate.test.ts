@@ -33,7 +33,7 @@ function makeGate(configPath: string, opts?: {
 }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string }> = [];
+  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routeCandidates?: Array<Record<string, unknown>> }> = [];
 
   const gate = new EventGate({
     configPath,
@@ -582,6 +582,33 @@ describe('debounce', () => {
     await new Promise(r => setTimeout(r, 150));
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].routeChannelId, undefined);
+  });
+
+  it('a batched wake reports every conversation in its batch as a route candidate (shelf-355)', async () => {
+    const path = writeConfig('debounce-route-candidates.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const resolveRouteChannel = (info: GateEventInfo) =>
+      info.eventType === 'mcpl:channel-incoming' ? info.channelId : undefined;
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: '@agent hi',
+      tags: ['chat:addressed'], metadata: { authorId: '1', messageId: 'm-room' } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:general', content: 'chatter',
+      metadata: { authorId: '7', messageId: 'm-gen' } }));
+    // An addressed push whose channel the host could not resolve still competes.
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'dm',
+      tags: ['chat:dm', 'chat:addressed'], metadata: { authorId: '42', channelId: '1548' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    const candidates = (inferenceRequests[0].routeCandidates ?? []).map(({ at: _at, ...rest }) => rest);
+    assert.deepStrictEqual(candidates, [
+      { kind: 'channel', channelId: 'discord:g:room', serverId: 'discord', messageId: 'm-room', addressed: true },
+      { kind: 'channel', channelId: 'discord:g:general', serverId: 'discord', messageId: 'm-gen', addressed: false },
+      { kind: 'channel', channelId: '1548', serverId: 'discord', addressed: true, unroutable: true },
+    ]);
   });
 
   it('a batched wake with no channel-bearing event carries no provenance', async () => {

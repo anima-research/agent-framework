@@ -348,6 +348,15 @@ export interface InferenceRequest {
   wakeChannelId?: string;
   /** Timestamp of the event the wake provenance was taken from (ms). */
   wakeAt?: number;
+  /**
+   * The conversations this wake carries, as speech-route candidates
+   * (src/speech-routes.ts): the triggering message's channel or local
+   * surface, whether it addressed the agent, and its message id (the reply
+   * edge). A batched gate wake carries its whole batch. At a true new turn
+   * the framework infers the turn's route from every candidate of the
+   * batch: the addressed ones if any, else all; one conversation only.
+   */
+  routeCandidates?: import('../speech-routes.js').RouteCandidate[];
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
   suppressProse?: boolean;

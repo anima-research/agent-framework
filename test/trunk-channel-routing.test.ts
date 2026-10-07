@@ -25,10 +25,10 @@ import { AgentFramework } from '../src/index.js';
 import type { ProcessEvent } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
-/** Reach the private per-turn triggering-channel map + the pure channel-deriver. */
+/** Reach the private per-turn speech routes + the pure channel-deriver. */
 function internals(framework: AgentFramework) {
   return framework as unknown as {
-    activeTriggerChannels: Map<string, string>;
+    turnRoutes: Map<string, { route: { kind: string; channelId?: string; replyTo?: string; origin: string } | null; hold?: unknown }>;
     pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number; channelId?: string }>;
     derivePushEventChannel(
       origin: Record<string, unknown> | undefined,
@@ -310,23 +310,23 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await fw3.stop();
   });
 
-  it('a channel-incoming trunk turn records its triggering channel', async () => {
+  it('a channel-incoming trunk turn takes its triggering conversation as its speech route', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the date is ...' }]));
     const framework = await makeFramework();
 
-    framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: sleep && date'));
+    const event = channelIncoming('discord:guild:chanA', 'A: sleep && date');
+    framework.pushEvent(event);
     await framework.runUntilIdle();
 
     assert.equal(membrane.calls.length, 1, 'the trunk should have run one turn');
-    assert.equal(
-      internals(framework).activeTriggerChannels.get('scout'),
-      'discord:guild:chanA',
-      'the turn must be routed to the channel that triggered it',
-    );
+    const route = internals(framework).turnRoutes.get('scout')?.route;
+    assert.equal(route?.channelId, 'discord:guild:chanA', 'the turn must be routed to the channel that triggered it');
+    assert.equal(route?.replyTo, (event as unknown as { messageId: string }).messageId, 'its message is the reply edge');
+    assert.equal(route?.origin, 'trigger');
     await framework.stop();
   });
 
-  it('a DM push-event turn records the reconstructed DM channel (item-3 redux DM sub-case)', async () => {
+  it('a DM push-event turn takes the reconstructed DM channel as its route (item-3 redux DM sub-case)', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi in the DM' }]));
     const framework = await makeFramework();
 
@@ -335,48 +335,42 @@ describe('Trunk channel routing (item-3 redux)', () => {
 
     assert.equal(membrane.calls.length, 1, 'the trunk should wake for the DM');
     assert.equal(
-      internals(framework).activeTriggerChannels.get('scout'),
+      internals(framework).turnRoutes.get('scout')?.route?.channelId,
       'discord:dm:42',
-      'the DM reply must route to the DM channel, not the global locus',
+      'the DM reply must route to the DM channel',
     );
     await framework.stop();
   });
 
-  it('the triggering channel tracks the CURRENT turn, never a stale one', async () => {
+  it('the route belongs to the CURRENT turn, never a stale one', async () => {
     const framework = await makeFramework();
     const i = internals(framework);
 
-    // A channel-A turn sets the active channel... (push the response right before
-    // each turn: MockMembrane's stream consumes ALL queued responses at once.)
+    // (Push the response right before each turn: MockMembrane's stream
+    // consumes ALL queued responses at once.)
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ans A' }]));
     framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: hi'));
     await framework.runUntilIdle();
-    assert.equal(i.activeTriggerChannels.get('scout'), 'discord:guild:chanA');
+    assert.equal(i.turnRoutes.get('scout')?.route?.channelId, 'discord:guild:chanA');
 
-    // ...then a DM turn OVERWRITES it — the next turn's reply must never inherit
-    // the previous turn's channel (the concurrency hazard this fix removes).
+    // A DM turn decides its own route — never inherits the previous turn's.
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ans DM' }]));
     framework.pushEvent(dmPushEvent('42', 'now in a DM'));
     await framework.runUntilIdle();
     assert.equal(membrane.calls.length, 2, 'both turns should have run');
-    assert.equal(
-      i.activeTriggerChannels.get('scout'),
-      'discord:dm:42',
-      'the map must reflect the CURRENT turn’s channel, not chanA',
-    );
+    assert.equal(i.turnRoutes.get('scout')?.route?.channelId, 'discord:dm:42', 'the CURRENT turn’s channel, not chanA');
     await framework.stop();
   });
 
-  it('startAgentStream clears the triggering channel for a no-channel (heartbeat) turn', async () => {
+  it('a no-trigger (heartbeat) turn has no speech route, whatever the previous turn had', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tick' }]));
     const framework = await makeFramework();
     const i = internals(framework);
 
-    // Simulate a stale channel left by a prior turn, then run a heartbeat/timer
-    // turn (an InferenceRequest with no channelId). startAgentStream must clear
-    // the entry up front so routeSpeech falls back to the global locus rather
-    // than replaying the stale channel.
-    i.activeTriggerChannels.set('scout', 'discord:guild:stale');
+    // A stale route left by a prior turn must not carry over: a turn with no
+    // route candidates (a heartbeat/timer) has no destination, so its plain
+    // speech is held as a draft rather than sent anywhere.
+    i.turnRoutes.set('scout', { route: { kind: 'channel', channelId: 'discord:guild:stale', origin: 'trigger' } });
     const scout = framework.getAgent('scout')!;
     await (framework as unknown as {
       startAgentStream(agent: unknown, trigger?: unknown): Promise<void>;
@@ -385,11 +379,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     });
     await framework.runUntilIdle();
 
-    assert.equal(
-      i.activeTriggerChannels.has('scout'),
-      false,
-      'a no-trigger turn must clear any stale triggering channel',
-    );
+    assert.deepEqual(i.turnRoutes.get('scout'), { route: null }, 'a no-trigger turn has no route');
     await framework.stop();
   });
 });
