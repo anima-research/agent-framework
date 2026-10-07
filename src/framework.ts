@@ -7916,12 +7916,21 @@ export class AgentFramework {
   /**
    * Apply a staged branch cut under the held lease, or recover it.
    * - An established outcome is reported as it was recorded.
-   * - The latest attempt committed if its switch was recorded, its
-   *   destination is active, or its destination was written to since (being
-   *   back on the source proves nothing): its outcome is established from
-   *   its own evidence, and it is never cut again.
-   * - Otherwise this is a fresh attempt: revalidated on the source, its
-   *   evidence recorded before the cut, its switch right after.
+   * - The latest attempt is decided only by a record or by what this process
+   *   saw (cutAttemptDisposition), never by its destination's state, active
+   *   or written to:
+   *   - committed (its switch recorded or seen, or an operator's attestation):
+   *     its outcome is established from its own evidence, and it is never
+   *     cut again;
+   *   - not committed (its failure recorded or seen, or an operator's
+   *     verdict): abandoned, with its source restored if its destination is
+   *     still active, and a fresh attempt follows;
+   *   - unresolved (no switch or failure recorded or seen, and no operator
+   *     verdict): refused as `unresolved` until an operator settles it with
+   *     resolveOperatorChange.
+   * - A fresh attempt cuts onto a destination of its own, never one an
+   *   earlier attempt touched: revalidated on the source, its evidence
+   *   recorded before the cut, its switch right after.
    */
   private async applyCut(
     change: ResolvedUndoTurnsChange | ResolvedUndoMessagesChange,
@@ -8138,9 +8147,10 @@ export class AgentFramework {
 
   /**
    * Apply a staged undo by messages under the held lease: the rollback cut
-   * at its tail, onto the branch named for the change (an existing one an
-   * interrupted attempt created is reused), through the same branching the
-   * ungated rollback uses.
+   * at its tail, through the same branching the ungated rollback uses, onto
+   * the branch named for the change and attempt (applyCut). An interrupted
+   * attempt's destination is never reused: a retry after an abandoned
+   * attempt cuts onto a fresh one.
    */
   private async applyUndoMessages(change: ResolvedUndoMessagesChange, admission?: OperatorAdmission): Promise<{
     requested: number;
@@ -8335,11 +8345,16 @@ export class AgentFramework {
 
   /**
    * At startup, establish the outcome of every gated body change that
-   * committed before a crash recorded it: a cut whose switch was recorded or
-   * whose destination is active or used, and an interrupted hide, finished
-   * on its own branch. This runs before modules, connections or traffic, so
-   * a committed body never waits on its host to settle its marks. Anything
-   * not provably committed is left for the host's retry.
+   * committed before a crash recorded it: a cut whose switch was recorded,
+   * or that an operator attested as committed (resolveOperatorChange, live
+   * or offline), and an interrupted hide, finished on its own branch. A
+   * cut's destination being active or written to proves nothing: a cut with
+   * no recorded switch, failure or operator verdict is unresolved, never
+   * certified, and if its destination is the active body, startup boots
+   * quiesced until an operator settles it. This runs before modules,
+   * connections or traffic, so a committed body never waits on its host to
+   * settle its marks. Anything else not provably committed is left for the
+   * host's retry.
    */
   private async reconcileOperatorChanges(): Promise<void> {
     // Both journals were first read before the agents (an unreadable one
