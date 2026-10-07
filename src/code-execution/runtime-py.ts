@@ -174,31 +174,77 @@ _next_wake_id = 0
 _current_exec_id = None
 _current_exec_task = None
 
-# SIGINT handling (see _on_sigint): armed while a script runs; the interrupt
-# it raised, so _run_script can tell it from the script's own exceptions.
-_interrupt_armed = False
-_host_interrupt = None
-# The running script is cancelled once (cancel op or SIGINT), and a SIGINT
-# schedules that at most once.
-_script_cancelled = False
-_cancel_scheduled = False
+# How the host stops a script (its time limit, or an abort): ONE per-script
+# state, so the script is stopped exactly once, by whichever path gets there
+# first. Every other path then does nothing to that script.
+#   PENDING   -> nothing asked yet.
+#   REQUESTED -> asked while the script was outside its own code (waiting on
+#                an await, writing a protocol line, or not started yet). A
+#                cancellation is queued on the loop, or delivered as the
+#                script starts.
+#   DELIVERED -> KeyboardInterrupt raised in its code, or its task cancelled.
+#                Final: whatever the script does next (except/finally, awaits
+#                in its cleanup) runs to completion or to the host's kill.
+# Transitions happen only in the main thread: in the SIGINT handler (between
+# bytecodes, so it never cancels anything itself -- see _on_sigint) and in
+# loop callbacks. Neither can interleave a transition of the other halfway
+# in a way that matters: the handler only moves PENDING to REQUESTED or, with
+# the script's own frame on the stack, to DELIVERED; a loop callback never
+# runs while the script's frame is on the stack.
+#
+# Where the signal (or the cancel op) can land, and what happens:
+#   1. script's own code, running or blocking -> KeyboardInterrupt there
+#   2. script waiting on an await (loop idle) -> cancellation queued; it wakes
+#      the loop and lands at that await
+#   3. main() mid-dispatch, between the done() check of a future the script
+#      awaits and its set_result (reply behind the cancellation) -> queued;
+#      set_result completes; the script gets CancelledError instead of it
+#   4. the script writing a protocol line (send) -> queued; the line stays
+#      whole; the cancellation lands at the script's next await
+#   5. reply ahead of the queued cancellation, script then awaits -> the
+#      cancellation lands at that await
+#   6. reply ahead, script then blocks -> the next signal (the host repeats
+#      it) raises KeyboardInterrupt there; the queued cancellation then does
+#      nothing, so cleanup that awaits is not cut short
+#   7. reply ahead, script finishes before the queued cancellation runs ->
+#      it does nothing, and never reaches the next script
+#   8. script not started yet (signal, or the cancel op) -> delivered as
+#      CancelledError when it starts, so it still reports
+#   9. cancel op before the signal -> delivered; the signal and its repeats
+#      do nothing, so cleanup after a caught CancelledError runs on
+#  10. cancel op or repeated signal after delivery -> nothing
+#  11. script finished, reporting its result -> nothing
+#  12. between scripts -> nothing
+_PENDING = "pending"
+_REQUESTED = "requested"
+_DELIVERED = "delivered"
 
 
-def _cancel_script(task=None):
-    # Runs on the loop (main()'s dispatch, or a callback the SIGINT handler
-    # scheduled), never from inside the handler: cancelling there could land
-    # between main()'s check of a future the script awaits and its
-    # set_result. A scheduled call is bound to its script's task.
-    global _script_cancelled, _interrupt_armed
-    current = _current_exec_task
-    if current is None or current.done() or _script_cancelled:
+class _ScriptStop:
+    __slots__ = ("task", "running", "state", "interrupt")
+
+    def __init__(self):
+        self.task = None
+        self.running = False  # the script's own code may be on the stack
+        self.state = _PENDING
+        self.interrupt = None  # the KeyboardInterrupt raised in its code
+
+
+_stop = None  # the running script's _ScriptStop; None between scripts
+
+
+def _deliver_cancel(st):
+    # Loop context only: the cancel op in main()'s dispatch, or queued by the
+    # SIGINT handler. Never from inside the handler, where a cancellation
+    # could land between main()'s done() check of a future the script awaits
+    # and its set_result.
+    if st is None or st is not _stop or st.state == _DELIVERED:
         return
-    if task is not None and task is not current:
+    if not st.running:
+        st.state = _REQUESTED  # not started yet: delivered as it starts
         return
-    _script_cancelled = True
-    # Delivered: the script may catch it and finish (it then returns 0).
-    _interrupt_armed = False
-    current.cancel()
+    st.state = _DELIVERED
+    st.task.cancel()
 
 
 def _resolve(fut, value):
@@ -319,8 +365,8 @@ def handle_init(msg):
         SCRIPT_GLOBALS.pop("wake_agent", None)
 
 
-async def _run_script(exec_id, code):
-    global _current_exec_id, _current_exec_task, _interrupt_armed, _host_interrupt
+async def _run_script(exec_id, code, st):
+    global _current_exec_id, _current_exec_task, _stop
     if BACKGROUND:
         out = LogTee(LOG_PATH, TAIL_CHARS)
         err = out  # interleave, terminal-style; tail is shared
@@ -333,18 +379,22 @@ async def _run_script(exec_id, code):
     return_code = 0
     try:
         compiled = compile(code, "<script>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
-        _interrupt_armed = True
+        st.running = True
         try:
+            if st.state == _REQUESTED:
+                # Stopped before it started (row 8).
+                st.state = _DELIVERED
+                raise asyncio.CancelledError()
             result = eval(compiled, SCRIPT_GLOBALS)
             if inspect.iscoroutine(result):
                 await result
         finally:
-            _interrupt_armed = False
+            st.running = False
     except asyncio.CancelledError:
         err.write("\nKeyboardInterrupt: script cancelled by host\n")
         return_code = 1
     except BaseException as exc:
-        if exc is _host_interrupt:
+        if exc is st.interrupt:
             # Where the script was when it was stopped, without the runtime's frames.
             frames = [
                 f for f in traceback.extract_tb(exc.__traceback__)
@@ -358,7 +408,9 @@ async def _run_script(exec_id, code):
         return_code = 1
     finally:
         sys.stdout, sys.stderr, sys.stdin = old_out, old_err, old_in
-        _host_interrupt = None
+        st.interrupt = None
+        if _stop is st:
+            _stop = None
         _current_exec_id = None
         _current_exec_task = None
         for fut in list(_pending_tool_futures.values()):
@@ -398,8 +450,41 @@ async def _run_script(exec_id, code):
     })
 
 
+def _dispatch(msg):
+    """Handle one protocol message from the host; False means stop reading."""
+    global _current_exec_id, _current_exec_task, _stop
+    op = msg.get("op")
+    if op == "init":
+        handle_init(msg)
+    elif op == "exec":
+        if _current_exec_task is not None and not _current_exec_task.done():
+            send({
+                "op": "exec_result",
+                "id": msg.get("id"),
+                "stdout": "",
+                "stderr": "RuntimeError: another script is already running in this interpreter",
+                "return_code": 1,
+            })
+            return True
+        st = _ScriptStop()
+        _current_exec_id = msg.get("id")
+        _current_exec_task = asyncio.ensure_future(
+            _run_script(msg.get("id"), msg.get("code") or "", st)
+        )
+        st.task = _current_exec_task
+        _stop = st
+    elif op == "tool_result":
+        _resolve(_pending_tool_futures.get(msg.get("id")), str(msg.get("result", "")))
+    elif op == "wake_ack":
+        _resolve(_pending_wake_futures.get(msg.get("id")), msg.get("error") or None)
+    elif op == "cancel":
+        _deliver_cancel(_stop)
+    elif op == "exit":
+        return False
+    return True
+
+
 async def main():
-    global _current_exec_id, _current_exec_task, _script_cancelled, _cancel_scheduled
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
 
@@ -434,32 +519,7 @@ async def main():
             REAL_STDERR.write("[pytc-runtime] bad protocol line\n")
             REAL_STDERR.flush()
             continue
-        op = msg.get("op")
-        if op == "init":
-            handle_init(msg)
-        elif op == "exec":
-            if _current_exec_task is not None and not _current_exec_task.done():
-                send({
-                    "op": "exec_result",
-                    "id": msg.get("id"),
-                    "stdout": "",
-                    "stderr": "RuntimeError: another script is already running in this interpreter",
-                    "return_code": 1,
-                })
-                continue
-            _current_exec_id = msg.get("id")
-            _script_cancelled = False
-            _cancel_scheduled = False
-            _current_exec_task = asyncio.ensure_future(
-                _run_script(msg.get("id"), msg.get("code") or "")
-            )
-        elif op == "tool_result":
-            _resolve(_pending_tool_futures.get(msg.get("id")), str(msg.get("result", "")))
-        elif op == "wake_ack":
-            _resolve(_pending_wake_futures.get(msg.get("id")), msg.get("error") or None)
-        elif op == "cancel":
-            _cancel_script()
-        elif op == "exit":
+        if not _dispatch(msg):
             break
 
     # Drain: give a cancelled exec a moment to emit its exec_result.
@@ -473,44 +533,41 @@ async def main():
 
 # At the deadline the host sends a cancel op, which lands only when the script
 # awaits: a script blocked in time.sleep(), a busy loop or a blocking read
-# never gives the event loop control back. So the host also sends SIGINT
-# (repeated until the script reports), which stops the running script once:
-#   - In its own code, it raises KeyboardInterrupt there; _run_script catches
-#     it, so the output so far and the interpreter's globals survive. Only
-#     with _run_script's frame on the stack: checking the current task is not
-#     enough, as asyncio runs its own code for the task between steps, and an
-#     exception raised there escapes the event loop and ends the interpreter.
-#   - Anywhere else (waiting on an await, or mid-way through a protocol write,
-#     which an exception would leave torn) it schedules the script's
-#     cancellation on the loop, as the cancel op would, without waiting for
-#     that op to be read. Should the script resume into blocking code before
-#     the cancellation runs, it is still armed, and the next SIGINT lands
-#     there.
-# Between scripts, and once the script was interrupted or cancelled, it does
-# nothing.
+# never gives the event loop control back. So the host also sends SIGINT,
+# repeated until the script reports, and this stops the script through its
+# _ScriptStop (see the table there):
+#   - With the script's own code on the stack (_run_script's frame, reached
+#     before any send frame), it raises KeyboardInterrupt there; _run_script
+#     catches it, so the output so far and the interpreter's globals survive.
+#     Checking the current task instead is not enough: asyncio runs its own
+#     code for the task between steps, and an exception raised there escapes
+#     the event loop and ends the interpreter.
+#   - Anywhere else it only queues the cancellation on the loop (which also
+#     wakes select(), otherwise resuming its wait after a signal): cancelling
+#     here could cancel a future between main()'s done() check and its
+#     set_result, and an exception mid-send would tear a protocol line.
 _RUN_SCRIPT_CODE = _run_script.__code__
 _SEND_CODE = send.__code__
 
 
 def _on_sigint(signum, frame):
-    global _interrupt_armed, _host_interrupt, _cancel_scheduled
-    if not _interrupt_armed:
+    st = _stop
+    if st is None or st.state == _DELIVERED:
         return
-    while frame is not None:
-        code = frame.f_code
-        if code is _SEND_CODE:
-            break
-        if code is _RUN_SCRIPT_CODE:
-            _interrupt_armed = False
-            _host_interrupt = KeyboardInterrupt("script interrupted by host")
-            raise _host_interrupt
-        frame = frame.f_back
-    task = _current_exec_task
-    if not _cancel_scheduled and task is not None and not task.done():
-        _cancel_scheduled = True
-        # Thread-safe scheduling also wakes select(), which otherwise resumes
-        # its wait after a signal.
-        task.get_loop().call_soon_threadsafe(_cancel_script, task)
+    if st.running:
+        while frame is not None:
+            code = frame.f_code
+            if code is _SEND_CODE:
+                break
+            if code is _RUN_SCRIPT_CODE:
+                st.state = _DELIVERED
+                st.interrupt = KeyboardInterrupt("script interrupted by host")
+                raise st.interrupt
+            frame = frame.f_back
+    if st.state == _PENDING:
+        st.state = _REQUESTED
+        if st.running:
+            st.task.get_loop().call_soon_threadsafe(_deliver_cancel, st)
 
 
 if __name__ == "__main__":

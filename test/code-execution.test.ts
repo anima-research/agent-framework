@@ -26,6 +26,7 @@ import type {
 } from '../src/index.js';
 import { AgentFramework, PYTHON_RUNTIME_SOURCE, PyRunner, buildInjectedTools } from '../src/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
+import { PYTC_STOP_ROWS_DRIVER } from './helpers/pytc-stop-rows.js';
 
 const ECHO_TOOLS: { pyName: string; toolName: string }[] = [
   { pyName: 'test__echo', toolName: 'test--echo' },
@@ -1100,64 +1101,53 @@ describe('code_execution time limit vs blocking code (real python3)', { skip: pr
     }
   });
 
-  // Drives the runtime's own functions to land the signal at exact points of main()'s dispatch.
-  const SIGNAL_TIMING_DRIVER = [
-    'import asyncio, importlib.util, io, json, signal, sys, threading',
-    'spec = importlib.util.spec_from_file_location("pytc_runtime", sys.argv[1])',
-    'rt = importlib.util.module_from_spec(spec)',
-    'spec.loader.exec_module(rt)',
-    'rt.PROTO_OUT = io.StringIO()',
-    'signal.signal(signal.SIGINT, rt._on_sigint)',
-    'async def main():',
-    '    rt.handle_init({"tools": [], "background": True})',
-    '    rt._current_exec_id = "e1"',
-    '    code = "import time\\nawait wake_agent({})\\nprint(\'woke\')\\ntime.sleep(5)\\nprint(\'slept\')"',
-    '    rt._current_exec_task = asyncio.ensure_future(rt._run_script("e1", code))',
-    '    while "w1" not in rt._pending_wake_futures:',
-    '        await asyncio.sleep(0.01)',
-    '    fut = rt._pending_wake_futures["w1"]',
-    '    if sys.argv[2] == "mid-resolve":',
-    '        # between the check of a future the script awaits and its set_result',
-    '        if not fut.done():',
-    '            rt._on_sigint(signal.SIGINT, sys._getframe())',
-    '            fut.set_result(None)',
-    '    else:',
-    '        # the script\'s wakeup is queued ahead of the cancellation the signal schedules',
-    '        fut.set_result(None)',
-    '        rt._on_sigint(signal.SIGINT, sys._getframe())',
-    '        threading.Timer(0.5, signal.pthread_kill, (threading.main_thread().ident, signal.SIGINT)).start()',
-    '    for _ in range(1000):',
-    '        if rt._current_exec_task is None:',
-    '            break',
-    '        await asyncio.sleep(0.01)',
-    '    lines = [json.loads(l) for l in rt.PROTO_OUT.getvalue().splitlines()]',
-    '    result = [m for m in lines if m["op"] == "exec_result"][0]',
-    '    print(json.dumps({"return_code": result["return_code"], "tail": result["tail"]}))',
-    'asyncio.run(main())',
-  ].join('\n');
-
-  it('a SIGINT never cancels a script inside main()\'s dispatch; one it cannot stop at once stays armed', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'pytc-signal-timing-'));
+  it("the runtime's stop table: each place a signal or cancel op can land stops the script once", () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pytc-stop-rows-'));
     try {
       writeFileSync(join(dir, 'runtime.py'), PYTHON_RUNTIME_SOURCE);
-      writeFileSync(join(dir, 'driver.py'), SIGNAL_TIMING_DRIVER);
-      const drive = (scenario: string) =>
-        JSON.parse(execFileSync('python3', [join(dir, 'driver.py'), join(dir, 'runtime.py'), scenario], { encoding: 'utf8', timeout: 20_000 })) as { return_code: number; tail: string };
+      writeFileSync(join(dir, 'driver.py'), PYTC_STOP_ROWS_DRIVER);
+      type Row = { rc: number | null; tail: string; secs: number; ops: string[] };
+      const rows = JSON.parse(
+        execFileSync('python3', [join(dir, 'driver.py'), join(dir, 'runtime.py')], { encoding: 'utf8', timeout: 60_000 }),
+      ) as Record<string, Row>;
+      const printed = (row: Row, line: string) => row.tail.split('\n').includes(line);
+      const interrupted = /KeyboardInterrupt: script interrupted by host/;
+      const cancelled = /KeyboardInterrupt: script cancelled by host/;
+      const stopped = (name: string, how: RegExp, has: string[] = [], hasNot: string[] = []) => {
+        const row = rows[name];
+        assert.ok(row, name);
+        assert.strictEqual(row.rc, 1, `${name}: ${row.tail}`);
+        assert.match(row.tail, how, name);
+        for (const w of has) assert.ok(printed(row, w), `${name}: printed ${w}`);
+        for (const w of hasNot) assert.ok(!printed(row, w), `${name}: did not print ${w}`);
+        assert.ok(row.secs < 2, `${name}: stopped at once (${row.secs}s)`);
+      };
+      const finished = (name: string, has: string[]) => {
+        const row = rows[name];
+        assert.ok(row, name);
+        assert.strictEqual(row.rc, 0, `${name}: ${row.tail}`);
+        for (const w of has) assert.ok(printed(row, w), `${name}: printed ${w}`);
+        assert.doesNotMatch(row.tail, /by host/, `${name}: never stopped (again) by us`);
+      };
 
-      // Cancelling from inside the handler here cancelled the future under main(), whose
-      // set_result then raised InvalidStateError and ended the interpreter.
-      const midResolve = drive('mid-resolve');
-      assert.strictEqual(midResolve.return_code, 1);
-      assert.match(midResolve.tail, /KeyboardInterrupt: script cancelled by host/);
-      assert.doesNotMatch(midResolve.tail, /woke/);
-
-      // The script resumes into blocking code before the scheduled cancellation runs: the next
-      // signal (the host repeats it) interrupts it there.
-      const resumed = drive('resumed');
-      assert.strictEqual(resumed.return_code, 1);
-      assert.match(resumed.tail, /woke/);
-      assert.match(resumed.tail, /KeyboardInterrupt: script interrupted by host/);
-      assert.doesNotMatch(resumed.tail, /slept/);
+      stopped('1 own code', interrupted, ['a'], ['b']);
+      stopped('2 waiting on an await', cancelled, [], ['b']);
+      // Cancelling inside the handler here raised InvalidStateError out of main().
+      stopped('3 mid-dispatch, reply behind', cancelled, [], ['woke']);
+      stopped('4 protocol write', cancelled, [], ['b']);
+      assert.ok(rows['4 protocol write'].ops.includes('tool_call'), 'the protocol line stayed whole');
+      stopped('5 reply ahead, then await', cancelled, ['woke'], ['b']);
+      // Interrupted in its blocking code; the queued cancellation must not cut its cleanup short.
+      finished('6 reply ahead, then block', ['woke', 'cleaned']);
+      finished('7 reply ahead, then finish', ['woke']);
+      finished('7 next script', ['ok']);
+      stopped('8 before start, signal', cancelled, [], ['ran']);
+      // The cancel op before the script started used to leave it reporting nothing.
+      stopped('8 before start, cancel op', cancelled, [], ['ran']);
+      finished('9 cancel op first', ['cleaned']);
+      finished('10 after delivery', ['cleaned']);
+      finished('11 reporting', ['done']);
+      finished('12 between scripts', ['ok']);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
