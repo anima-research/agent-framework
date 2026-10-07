@@ -420,6 +420,22 @@ export class ApiServer {
       case 'host.maintenanceTick':
         this.requireAdminToken(params);
         return this.framework.maintenanceTick();
+      // A provider's stated retry-after is honoured across restarts; this is
+      // the explicit operator override (recorded, so a restart keeps it).
+      case 'host.releaseProviderWait': {
+        this.requireAdminToken(params);
+        const p = (params ?? {}) as { agentName?: unknown; model?: unknown; requester?: unknown };
+        if (typeof p.agentName !== 'string' || p.agentName === '') throw new Error('agentName is required');
+        return {
+          released: this.framework.releaseProviderWait(
+            p.agentName,
+            typeof p.model === 'string' && p.model !== '' ? p.model : undefined,
+            typeof p.requester === 'string' && p.requester !== '' ? p.requester : 'api',
+          ),
+        };
+      }
+      case 'host.providerWaits':
+        return { waits: this.framework.providerWaitSnapshot(typeof params?.agentName === 'string' ? params.agentName : undefined) };
 
       default:
         throw new Error(`Unknown command: ${command}`);

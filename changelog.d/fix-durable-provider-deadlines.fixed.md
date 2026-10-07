@@ -1,0 +1,11 @@
+- A provider's stated `retry-after` is now a lower bound on the next call to that model, for that agent, across restarts and branch switches. When a classified error carries `retryAfterMs`, the framework records a provider wait for (agent, model) and calls that model no earlier:
+  - **Primary turns** are held, not retried and not counted as failures: no `[inference-failed]` marker and no hard-down streak. Wakes that arrive meanwhile join the held turn, and one fresh compile runs when the wait ends, the way an organization-acceleration cooldown already works.
+  - **Auxiliary calls** (context-manager compression through provider admission) to a held model are refused without calling the provider. The refusal is a retryable `rate_limit` `MembraneError` carrying the remaining wait. A different model is not held: a compression model the provider did not limit keeps working, and changing an agent's primary model lets its turns proceed while the old model's wait stays recorded.
+  - **Durability:** waits are kept in typed Chronicle records (RecordJournal), so a restart honours them and a rollback or branch switch does not rewind them.
+  - **No shortening:**
+    - A later, shorter wait never shortens an outstanding longer one.
+    - A wait that cannot be represented as an instant becomes an indefinite wait, held until released.
+    - The organization-acceleration cooldown no longer caps a stated wait at 10 minutes. The cap still applies to the framework's own default wait.
+  - **Visibility:** `healthSnapshot().agents[].providerAdmission.providerWaits` lists the waits that bind now. Each wait, hold and release is logged once (`[provider-wait] …`).
+  - **Operator override:** the `release-provider-wait` host command (`agentName`, optional `model`) and the admin-gated `host.releaseProviderWait` API verb release a wait, and the release is recorded so a restart does not restore it. `host.providerWaits` lists the waits. Only the passing of the wait, or this explicit release, ends one; an ordinary restart does not.
+- Error-policy retry waits no longer fire almost at once when a delay exceeds what one timer holds (about 24.8 days). They wait in steps, and `stop()` ends a wait in progress.
