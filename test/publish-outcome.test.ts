@@ -73,6 +73,42 @@ describe('ChannelRegistry.publish outcomes', () => {
     assert.equal(outcome.status, 'failed');
   });
 
+  for (const [what, messageId] of [['a numeric', 123], ['an empty', ''], ['an object', { id: 'x' }]] as const) {
+    it(`treats delivered:false beside ${what} message id as unknown: a contradictory receipt proves nothing`, async () => {
+      const { registry, seed } = registryWith({ discord: { publish: async () => ({ delivered: false, messageId }) } });
+      seed('discord', 'c', '#c');
+      const outcome = await registry.publish('agent', 'x', { channelId: 'c' });
+      assert.equal(outcome.status, 'unknown');
+      assert.match(outcome.reason ?? '', /contradictory receipt/);
+      assert.equal(outcome.messageId, undefined);
+    });
+  }
+
+  it('treats delivered:false with a null message id as failed (nothing named)', async () => {
+    const { registry, seed } = registryWith({ discord: { publish: async () => ({ delivered: false, messageId: null }) } });
+    seed('discord', 'c', '#c');
+    assert.equal((await registry.publish('agent', 'x', { channelId: 'c' })).status, 'failed');
+  });
+
+  it('refuses a supplied but empty or non-string selector instead of reading it as omitted', async () => {
+    const { registry, published, seed } = registryWith({ discord: { publish: ok } });
+    seed('discord', 'c', '#c');
+    for (const target of [
+      { serverId: '', channelId: 'c' },
+      { serverId: null as unknown as string, channelId: 'c' },
+      { serverId: 7 as unknown as string, channelId: 'c' },
+      { channelId: '' },
+      { channelId: undefined as unknown as string },
+    ]) {
+      const outcome = await registry.publish('agent', 'x', target);
+      assert.equal(outcome.status, 'failed', JSON.stringify(target));
+      assert.equal(outcome.destination, undefined);
+      assert.ok('error' in registry.resolveDestination(target), JSON.stringify(target));
+    }
+    assert.equal(published.length, 0, 'nothing dispatched to the sole matching server');
+    assert.equal((await registry.publish('agent', 'x', { serverId: 'discord', channelId: 'c' })).status, 'delivered', 'the exact selector still works');
+  });
+
   it('treats delivered:false that names a posted message as unknown', async () => {
     const { registry, seed } = registryWith({ discord: { publish: async () => ({ delivered: false, messageId: 'part-1' }) } });
     seed('discord', 'c', '#c');

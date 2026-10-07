@@ -3003,25 +3003,6 @@ export class ChannelRegistry {
   }
 
   /**
-   * Publish `text` to one registered channel and report what the attempt
-   * established (PublishOutcome). The single delivery executor behind plain
-   * speech (routeSpeech), resident resends of held drafts, and channel tools.
-   *
-   * Resolution is exact: `serverId` plus `channelId` when the caller has the
-   * server, otherwise the channel id must be registered by exactly one server
-   * (a shared id is refused, never routed through whichever server came
-   * first). It is not possible to send into a closed channel: a closed but
-   * registered destination is opened first (`openSource` names why), and a
-   * failed open sends nothing.
-   *
-   * Only the connector's `delivered: true` confirms a post. Anything that
-   * stops before the request is written is `failed` (nothing left the host),
-   * as is the connector's own `delivered: false`. Once the request has been
-   * dispatched, an error response, a timeout, a lost connection, or a missing
-   * or malformed receipt is `unknown`: the post may or may not exist, and the
-   * caller must not treat it as safe to retry blindly.
-   */
-  /**
    * Resolve a publish target to exactly one registered channel: `serverId`
    * plus `channelId` when the caller has the server, otherwise a channel id
    * registered by exactly one server. A shared id is refused, never resolved
@@ -3044,6 +3025,14 @@ export class ChannelRegistry {
   private findExactEntry(
     target: { serverId?: string; channelId: string },
   ): { entry: ChannelEntry } | { error: string } {
+    // A supplied selector is checked, never read as omission: an empty or
+    // non-string serverId would otherwise widen to "any server".
+    if (typeof target.channelId !== 'string' || !target.channelId) {
+      return { error: 'the destination names no channel id' };
+    }
+    if (target.serverId !== undefined && (typeof target.serverId !== 'string' || !target.serverId)) {
+      return { error: 'serverId must name a server (omit it to resolve the channel id alone)' };
+    }
     const matches = [...this.channels.values()].filter(
       (e) => e.descriptor.id === target.channelId && (!target.serverId || e.serverId === target.serverId),
     );
@@ -3062,6 +3051,33 @@ export class ChannelRegistry {
     return { entry: matches[0]! };
   }
 
+  /**
+   * Publish `text` to one registered channel and report what the attempt
+   * established (PublishOutcome). The delivery executor behind plain speech
+   * (deliverSpeech / routeSpeech) and resident resends of held drafts;
+   * channel_publish (and publishForAgent, which shares its handler) moves
+   * onto it with shelf-356 — until then that tool reads its own receipt.
+   *
+   * Resolution is exact (resolveDestination): `serverId` plus `channelId`
+   * when the caller has the server, otherwise the channel id must be
+   * registered by exactly one server (a shared id is refused, never routed
+   * through whichever server came first). An omitted `serverId` means "not
+   * in use"; a supplied one must be a non-empty server id, and an empty or
+   * non-string selector is refused rather than read as omission. It is not
+   * possible to send into a closed channel: a closed but registered
+   * destination is opened first (`openSource` names why), and a failed open
+   * sends nothing.
+   *
+   * Only the connector's `delivered: true` confirms a post. `failed` means
+   * nothing was posted: the attempt stopped before the request was written,
+   * or the connector answered `delivered: false` and named no message (no
+   * `messageId`, or null). Everything else is `unknown`: once the request
+   * has been handed to the transport, an error response, a timeout, a lost
+   * connection, or a missing, malformed or contradictory receipt (such as
+   * `delivered: false` beside a message id, valid or not) means the post may
+   * or may not exist, and the caller must not treat it as safe to retry
+   * blindly.
+   */
   async publish(
     conversationId: string,
     text: string,
@@ -3153,21 +3169,26 @@ export class ChannelRegistry {
     }
     if (receipt.delivered === false) {
       // `delivered: false` proves nothing went out only when the receipt
-      // names no posted message; a named one means something did.
-      return messageId
-        ? {
-            status: 'unknown',
-            destination,
-            messageId,
-            reason: `server "${entry.serverId}" reported delivered:false but named posted message ${messageId} (delivery uncertain)`,
-            at: at(),
-          }
-        : {
-            status: 'failed',
-            destination,
-            reason: `server "${entry.serverId}" reported delivered:false`,
-            at: at(),
-          };
+      // names no message at all. A message id beside it — valid or
+      // malformed — contradicts it: something may have been posted.
+      if (receipt.messageId === undefined || receipt.messageId === null) {
+        return {
+          status: 'failed',
+          destination,
+          reason: `server "${entry.serverId}" reported delivered:false`,
+          at: at(),
+        };
+      }
+      return {
+        status: 'unknown',
+        destination,
+        ...(messageId ? { messageId } : {}),
+        reason: messageId
+          ? `server "${entry.serverId}" reported delivered:false but named posted message ${messageId} (delivery uncertain)`
+          : `server "${entry.serverId}" reported delivered:false beside a malformed message id ` +
+            `${JSON.stringify(receipt.messageId)} (contradictory receipt; delivery uncertain)`,
+        at: at(),
+      };
     }
     // Final publish is a request, so success requires an explicit receipt; a
     // missing or malformed one leaves delivery uncertain (anima-research/
