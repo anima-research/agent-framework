@@ -10,11 +10,22 @@
     whole since.
   - Rounds are confirmed from membrane's round report on the `usage` event.
     Without one, nothing is confirmed, and `receiptClocks.roundReports` says
-    so.
+    so. A round whose fidelity isn't established (an adapter that doesn't
+    report what it leaves out, an opaque request hook) confirms neither a
+    delivery nor a partial exposure.
   - Versions are identified by the producer event id where the lane
-    guarantees one, otherwise by platform message id plus a body digest,
-    otherwise by the stored copy. Each delivery names its basis, and
-    re-presenting a delivered version never moves a clock.
+    guarantees one. Otherwise they use platform message id plus the digest
+    ingestion recorded for the body as delivered, before any source header or
+    sharding (`metadata.sourceBodyDigest`). Otherwise they use the stored copy.
+    Each delivery names its basis, and re-presenting a delivered version never
+    moves a clock.
+  - A stored copy confirms delivery only while it still presents what
+    ingestion stored. An unsharded copy must hash to its recorded
+    `storedBodyDigest`, and a shard group must have declared its size
+    (context-manager `shardCount`), with every declared shard carried. A copy
+    edited after it arrived is a partial exposure, never a delivery. A copy
+    whose fidelity can't be checked (stored before these digests or sizes
+    were recorded) stays unconfirmed, neither delivered nor shown lost.
   - The clocks live in a store-scoped, unbranched `RecordJournal`, so a
     delivery survives `/undo`. Deduplication is exact and persistent: every
     delivered version is remembered, so a version counts when it first reaches
@@ -32,5 +43,8 @@
   `HistoryModule.setFoldExportStatus`, and the tool shows it. Nothing is
   injected into context.
 - The first provider round of a compile that stands now calls
-  `ContextManager.acceptRound` with that round's own usage, which writes fold
-  receipts.
+  `ContextManager.acceptRound`, which writes fold receipts. It passes that
+  round's own usage and its presentation. The presentation is `altered` when
+  request preparation or the producer reported an alteration. Otherwise it is
+  `verbatim` when the round's fidelity is established, and `unknown` when it
+  isn't.
