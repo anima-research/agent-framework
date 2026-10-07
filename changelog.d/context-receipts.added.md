@@ -6,8 +6,10 @@
   - `lastDeliveredAt`: when a provider round that stood (not a refusal) last
     carried a new raw body from the channel to the calling resident, complete
     and unaltered.
-  - `lastPartialAt`: a body that arrived only partially and hasn't arrived
-    whole since.
+  - `lastPartialAt`: the most recent time a body from the channel first
+    reached the resident only partially (cut, or altered on the way). It is
+    history: a later complete arrival of that body moves `lastDeliveredAt`,
+    not this clock.
   - Rounds are confirmed from membrane's round report on the `usage` event.
     Without one, nothing is confirmed, and `receiptClocks.roundReports` says
     so. A round whose fidelity isn't established (an adapter that doesn't
