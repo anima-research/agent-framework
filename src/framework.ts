@@ -2028,6 +2028,10 @@ export class AgentFramework {
       shutdownPromises.push(this.mcplServerRegistry.closeAll());
     }
     await Promise.all(shutdownPromises);
+    // An awareness drain still recording the outcome of the request that was
+    // on the wire when its connection closed finishes before the store does;
+    // it claims nothing more once the route is gone.
+    await Promise.allSettled([...this.discordAwarenessDrains.values()]);
 
     // Streams may queue storage repairs while being cancelled above. Retry
     // after their teardown, while the store is still open, before final sync.
@@ -13715,6 +13719,10 @@ export class AgentFramework {
         `${dispatch.opIds.join(',')}\0${dispatch.action}`;
       let announced = false;
       while (true) {
+        // A route that went away (shutdown, or a disconnect that will
+        // reconnect) leaves the rest queued: claiming would only write
+        // attempts that cannot be sent.
+        if (!connection.isConnected) break;
         // One dispatch at a time, chosen and written ahead in one step from
         // the journal as it is now: a cancel or retract made while the
         // previous request was on the wire takes effect here.

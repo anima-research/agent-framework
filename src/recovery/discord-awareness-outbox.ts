@@ -1100,11 +1100,12 @@ export class DiscordAwarenessOutbox {
   }
 
   /**
-   * Records for new requests. A request supersedes the future of every
-   * request for the same key with the opposite action that is still due
-   * (never sent, refused before writing, or failed retryably): the newest
-   * explicit intent wins. Their attempts stay as history, and a request on
-   * the wire still settles before anything else for that key is sent.
+   * Records for new requests. A request retires the future retries of every
+   * request for the same key with the opposite action that has not ended
+   * (due, on the wire, or unknown): the newest explicit intent wins, and
+   * cancelling it later never revives what it superseded. Their attempts
+   * stay as history (an unresolved one is still disclosed), and a request
+   * on the wire still settles before anything else for that key is sent.
    */
   private requestRecords(
     state: JournalState,
@@ -1123,8 +1124,9 @@ export class DiscordAwarenessOutbox {
         emoji: request.emoji ?? emoji ?? DEFAULT_DISCORD_AWARENESS_EMOJI,
       };
       for (const op of this.opsForKey(state, key)) {
-        if (op.action === request.action || superseded.has(op.opId)) continue;
-        if (this.opStatus(op) !== 'requested') continue;
+        if (op.action === request.action || superseded.has(op.opId) || op.cancelled) continue;
+        const status = this.opStatus(op);
+        if (status !== 'requested' && status !== 'dispatching' && status !== 'unknown') continue;
         records.push({ t: 'op-cancelled', at, opId: op.opId, reason: 'superseded' });
         superseded.add(op.opId);
       }

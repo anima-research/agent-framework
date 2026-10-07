@@ -261,7 +261,7 @@ test('retract queues a removal for every selected key, whatever history says, an
 
   const receipt = outbox.retract(a.id, 'operator');
   assert.equal(receipt.removalsQueued, 3, 'm2 too: history does not decide whether the act is carried out');
-  assert.equal(receipt.addsSuperseded, 1, "m2's due add stops");
+  assert.equal(receipt.addsSuperseded, 3, "m2's due add stops, and m1's unknown ones are no longer retried");
   assert.equal(receipt.keysWithUnresolvedAdds, 1);
   assert.equal(receipt.unresolvedAddAttempts, 1, 'one physical request carried both adds');
   assert.equal(receipt.keysWithLegacyUncertainty, 0);
@@ -294,6 +294,39 @@ test('a newer opposite request stops the retries of a retryably failed one, in b
   const next = outbox.claimDispatch('discord')!;
   assert.equal(next.dispatch.action, 'add');
   assert.equal(outbox.operations().find((op) => op.action === 'remove')!.cancelled?.reason, 'superseded');
+}));
+
+test('a newer opposite intent retires the old request\'s retries even when it was on the wire or unknown', withJournal((outbox, h) => {
+  // In flight when the retract arrives, then a retryable failure: remove next.
+  const a = activeBatch(outbox, [ref('m1')]);
+  const onWire = outbox.claimDispatch('discord')!;
+  const retract = outbox.retract(a.id);
+  assert.equal(retract.addsSuperseded, 1);
+  assert.equal(retract.keysWithUnresolvedAdds, 1, 'the request on the wire is disclosed');
+  assert.equal(outbox.claimDispatch('discord'), null, 'the key waits for the request on the wire');
+  outbox.recordOutcome(onWire.attempts, 'failed', { error: 'Discord 503' });
+  assert.equal(outbox.claimDispatch('discord', () => false)!.dispatch.action, 'remove');
+  // Unknown, then retract, then the retract cancelled: nothing is revived.
+  const b = activeBatch(outbox, [ref('m2')]);
+  answer(outbox, 'm2', 'unknown');
+  const { requestId } = outbox.retract(b.id);
+  outbox.cancel(requestId);
+  assert.ok(!outbox.pendingDispatches('discord').some((d) => d.key.messageId === 'm2'));
+  // Mirror: a remove in flight when a new add arrives, then a retryable failure.
+  const c = activeBatch(outbox, [ref('m3')]);
+  answer(outbox, 'm3', 'confirmed');
+  outbox.retract(c.id);
+  const removeOnWire = outbox.claimDispatch('discord', (d) => d.key.messageId !== 'm3')!;
+  activeBatch(outbox, [ref('m3')]);
+  outbox.recordOutcome(removeOnWire.attempts, 'failed', { error: 'Discord 503' });
+  const next = outbox.claimDispatch('discord', (d) => d.key.messageId !== 'm3')!;
+  assert.equal(next.dispatch.action, 'add');
+  outbox.recordOutcome(next.attempts, 'confirmed');
+  // All of it holds across a restart.
+  const restarted = h.reopen();
+  restarted.recoverAtStartup('rollback/cairn/1');
+  const due = restarted.pendingDispatches('discord').map((d) => `${d.action}:${d.key.messageId}`);
+  assert.ok(!due.includes('add:m1') && !due.includes('add:m2') && !due.includes('remove:m3'), due.join(','));
 }));
 
 test('a retract request can be cancelled by the id its receipt returned, even after a restart', withJournal((outbox, h) => {
@@ -514,6 +547,35 @@ test('framework drain classifies outcomes from what reached the server', async (
     calls.length = 0;
     await muted(() => framework.drainDiscordAwarenessOutbox('discord'));
     assert.deepEqual(calls.sort(), ['add_reaction:m3', 'add_reaction:m4']);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('a drain whose route goes away stops claiming: the rest stays queued, with no attempts written', async () => {
+  const h = storeHarness();
+  try {
+    activeBatch(h.outbox, [ref('m1'), ref('m2'), ref('m3')]);
+    let connected = true;
+    const calls: string[] = [];
+    const connection = {
+      get isConnected() { return connected; },
+      sendToolsCallWithDeadline: async (_name: string, args: Record<string, unknown>) => {
+        calls.push(String(args.messageId));
+        connected = false; // the host is shutting down
+        throw new McplRequestError('Connection to MCPL server "discord" closed while awaiting response', 'no-response');
+      },
+    };
+    const framework = Object.create(AgentFramework.prototype) as any;
+    framework.discordAwarenessOutbox = h.outbox;
+    framework.discordAwarenessDrains = new Map();
+    framework.discordAwarenessDeadlineMs = 1000;
+    framework.mcplServerRegistry = { getServer: () => connection };
+    await muted(() => framework.drainDiscordAwarenessOutbox('discord'));
+    assert.equal(calls.length, 1);
+    const attempts = h.outbox.operations().reduce((sum, op) => sum + op.attempts.length, 0);
+    assert.equal(attempts, 1, 'only the request that was on the wire');
+    assert.equal(h.outbox.pendingDispatches('discord').length, 3, 'its unknown and the two unsent stay due');
   } finally {
     h.cleanup();
   }
