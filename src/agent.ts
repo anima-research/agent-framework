@@ -4,10 +4,11 @@ import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard, TOOL_RESULT_GUARD_NOTICE } from './tool-result-guard.js';
 import {
-  indexTickLeadingRows,
+  indexSilentTickRows,
   separateSilentHeartbeatTicks,
   silentHeartbeatSeparatorTurn,
   type SilentHeartbeatTick,
+  type SilentTickIndex,
   type StoredRowLike,
 } from './silent-heartbeat.js';
 import {
@@ -854,14 +855,16 @@ export class Agent {
       .filter((m) => m.content.length > 0);
 
     // Silent heartbeat ticks store no prompt row. Render a request-only
-    // separator before each tick's first stored row so the wire formatter
+    // separator before each tick's first surviving row so the wire formatter
     // cannot merge the tick into the previous assistant message (see
-    // silent-heartbeat.ts). The tick's own first request ends on that same
-    // turn, so the prefix it caches is the one every later compile renders.
+    // silent-heartbeat.ts for what can and cannot be matched). This agent's
+    // own first request for a tick ends on that same turn, so the prefix it
+    // caches is the one every later compile renders. "First" is per agent: a
+    // broadcast tick shares its eventId with every resident.
     const ticks = this.indexSilentHeartbeatTicks();
-    messages = separateSilentHeartbeatTicks(messages, ticks.leading, this.name);
+    messages = separateSilentHeartbeatTicks(messages, ticks.rows, this.name);
     const openingTick = options.silentHeartbeat !== undefined
-      && !ticks.ticks.has(options.silentHeartbeat.eventId);
+      && !ticks.started.has(options.silentHeartbeat.eventId);
 
     if (openingTick) {
       messages = [...messages, silentHeartbeatSeparatorTurn()];
@@ -896,16 +899,16 @@ export class Agent {
 
   /** Stored silent-tick rows, memoized on the store's cached message array
    * (ContextManager returns the same array until the store changes). */
-  private silentTickIndex: { source: readonly unknown[]; index: ReturnType<typeof indexTickLeadingRows> } | null = null;
+  private silentTickIndex: { source: readonly unknown[]; index: SilentTickIndex } | null = null;
 
-  private indexSilentHeartbeatTicks(): ReturnType<typeof indexTickLeadingRows> {
-    const empty = { leading: new Map<string, string>(), ticks: new Set<string>() };
+  private indexSilentHeartbeatTicks(): SilentTickIndex {
+    const empty: SilentTickIndex = { rows: new Map(), started: new Set() };
     const cm = this.contextManager as Partial<ContextManager>;
     if (typeof cm.getAllMessages !== 'function') return empty;
     try {
       const stored = cm.getAllMessages() as unknown as readonly StoredRowLike[];
       if (this.silentTickIndex?.source === stored) return this.silentTickIndex.index;
-      const index = indexTickLeadingRows(stored, this.name);
+      const index = indexSilentTickRows(stored, this.name);
       this.silentTickIndex = { source: stored, index };
       return index;
     } catch (error) {

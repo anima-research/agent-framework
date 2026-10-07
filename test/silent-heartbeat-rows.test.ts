@@ -16,7 +16,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AgentFramework } from '../src/index.js';
-import type { Module, ModuleContext, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import type { AgentConfig, Module, ModuleContext, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import { TOOL_RESULT_GUARD_NOTICE } from '../src/tool-result-guard.js';
+import { PassthroughStrategy } from '@animalabs/context-manager';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedMessage, NormalizedRequest, NormalizedResponse, YieldingStream } from '@animalabs/membrane';
@@ -73,16 +75,33 @@ class QueuedStreamsMembrane extends MockMembrane {
   }
 }
 
-async function make(opts: { deliver?: boolean; membrane?: MockMembrane; physicalWindowTokens?: number } = {}) {
+/** A strategy that leaves every tool exchange out of the compiled window. */
+class OmitToolExchange extends PassthroughStrategy {
+  select(...args: Parameters<PassthroughStrategy['select']>) {
+    return super.select(...args).filter((entry) =>
+      !entry.content.some((block) => block.type === 'tool_use' || block.type === 'tool_result'));
+  }
+}
+
+const refused = () => ({
+  ...createMockResponse([{ type: 'text', text: 'discard-this-partial-output' }], 'refusal'),
+  raw: { request: {}, response: { stop_details: { category: 'test-category' } } },
+}) as NormalizedResponse;
+
+async function make(opts: {
+  deliver?: boolean; membrane?: MockMembrane; physicalWindowTokens?: number;
+  agents?: string[]; agent?: Partial<AgentConfig>;
+} = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'silent-hb-rows-'));
   const membrane = opts.membrane ?? new MockMembrane();
   const mod = new ToolModule();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
-    agents: [{
-      name: 'assistant', model: 'test', systemPrompt: 'test', proseRouting: 'locus', maxTokens: 4_000,
+    agents: (opts.agents ?? ['assistant']).map((name) => ({
+      name, model: 'test', systemPrompt: 'test', proseRouting: 'locus' as const, maxTokens: 4_000,
       ...(opts.physicalWindowTokens ? { physicalWindowTokens: opts.physicalWindowTokens } : {}),
-    }],
+      ...opts.agent,
+    })),
     modules: [mod],
   });
   (framework as any).channelRegistry = new Proxy({
@@ -124,8 +143,8 @@ function textOf(message: NormalizedMessage): string {
   return message.content.filter((b) => b.type === 'text').map((b) => (b as { text: string }).text).join('\n');
 }
 
-function stored(framework: AgentFramework) {
-  return framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{
+function stored(framework: AgentFramework, agent = 'assistant') {
+  return framework.getAgent(agent)!.getContextManager().getAllMessages() as Array<{
     participant: string; content: ContentBlock[]; metadata?: Record<string, any>;
   }>;
 }
@@ -192,8 +211,9 @@ describe('silent heartbeat stored rows', () => {
       assert.deepEqual(tickRows.map((m) => m.participant), ['assistant', 'user', 'assistant'],
         'tool round assistant row, its tool_result row, trailing assistant row — nothing else');
       for (const row of tickRows) {
-        assert.equal(row.metadata?.silentHeartbeat?.eventId, tick.eventId, `row stamped: ${JSON.stringify(row.content)}`);
-        assert.equal(row.metadata?.silentHeartbeat?.serverId, 'heartbeat');
+        assert.deepEqual(row.metadata?.silentHeartbeat,
+          { eventId: tick.eventId, serverId: 'heartbeat', agentName: 'assistant' },
+          `row stamped: ${JSON.stringify(row.content)}`);
       }
       assert.ok(tickRows[1]!.content.every((b) => b.type === 'tool_result'), 'the only user row is the tool_result');
       for (const row of all.slice(0, before)) {
@@ -261,6 +281,143 @@ describe('silent heartbeat stored rows', () => {
       assert.deepEqual(restarted.slice(0, opening.length), opening, 'restart compiles the same prefix');
       assert.equal(restarted.filter((m) => textOf(m) === '[heartbeat tick]').length, 1);
       assert.ok(!restarted.some((m) => textOf(m) === '[Continue]'), 'the restart window ends on the tool_result');
+      assert.match(JSON.stringify(membrane.calls[2]), /Scheduled private self-check/, 'still a silent turn');
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it('separates the first SURVIVING tick row when a strategy drops the tick\'s tool exchange', async () => {
+    const x = await make({ deliver: false, agent: { strategy: new OmitToolExchange() } });
+    try {
+      await wake(x, ordinaryEvent('hello'), signed('sig-ordinary', 'ordinary reply'));
+      await wake(x, silentEvent(), TICK_TOOL_ROUND, signed('sig-tick-final', 'all quiet'));
+      await wake(x, ordinaryEvent('later'), signed('sig-later', 'later reply'));
+      const provider = wire(x.membrane.calls[2]!);
+      for (const message of provider) {
+        assert.ok(signatures(message).length <= 1,
+          `one ${message.role} message carries signed thinking from: ${signatures(message).join(', ')}`);
+      }
+      const later = x.membrane.calls[2]!.messages;
+      assert.ok(!later.some((m) => textOf(m) === 'checking'), 'the strategy dropped the tool round');
+      const finalAt = later.findIndex((m) => textOf(m) === 'all quiet');
+      assert.equal(textOf(later[finalAt - 1]!), '[heartbeat tick]');
+      assert.equal(later.filter((m) => textOf(m) === '[heartbeat tick]').length, 1);
+      assert.deepEqual(later.slice(0, x.membrane.calls[1]!.messages.length), x.membrane.calls[1]!.messages);
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it('never keys separators on reply text: identical replies cannot steal or collapse them', async () => {
+    const x = await make({ deliver: false });
+    try {
+      const quiet = [{ type: 'text', text: 'all quiet' }] as ContentBlock[];
+      await wake(x, ordinaryEvent('hello'), quiet);
+      await wake(x, silentEvent(), quiet);
+      await wake(x, silentEvent(), signed('sig-a', 'all quiet'));
+      await wake(x, silentEvent(), signed('sig-b', 'all quiet'));
+      await wake(x, ordinaryEvent('later'), signed('sig-later', 'later reply'));
+      const later = x.membrane.calls[4]!.messages;
+      const separators = later.flatMap((m, i) => textOf(m) === '[heartbeat tick]' ? [i] : []);
+      // Only the two signed ticks are separated, each directly before its
+      // own reply. The unsigned, tool-free tick has no structural identity
+      // and merges as it did before (no signed thinking, so no 400 risk);
+      // the ordinary reply with the same text is never mistaken for a tick.
+      assert.equal(separators.length, 2, JSON.stringify(later.map(textOf)));
+      for (const [i, sig] of [[separators[0]!, 'sig-a'], [separators[1]!, 'sig-b']] as const) {
+        assert.equal((later[i + 1]!.content[0] as { signature?: string }).signature, sig);
+      }
+      for (const message of wire(x.membrane.calls[4]!)) assert.ok(signatures(message).length <= 1);
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it('matches a signed reply carrying blank text blocks, which request builds strip', async () => {
+    const x = await make({ deliver: false });
+    try {
+      await wake(x, ordinaryEvent('hello'), signed('sig-ordinary', 'ordinary reply'));
+      await wake(x, silentEvent(), [
+        { type: 'text', text: '' } as ContentBlock,
+        ...signed('sig-tick', 'quiet'),
+        { type: 'text', text: '   ' } as ContentBlock,
+      ]);
+      await wake(x, ordinaryEvent('later'), signed('sig-later', 'later reply'));
+      const later = x.membrane.calls[2]!.messages;
+      const tickAt = later.findIndex((m) => textOf(m) === 'quiet');
+      assert.equal(textOf(later[tickAt - 1]!), '[heartbeat tick]');
+      for (const message of wire(x.membrane.calls[2]!)) assert.ok(signatures(message).length <= 1);
+      assert.deepEqual(later.slice(0, x.membrane.calls[1]!.messages.length), x.membrane.calls[1]!.messages);
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it('opens a broadcast tick per resident, not per shared eventId', async () => {
+    // Residents share one message slot. A broadcast tick reaches each with
+    // the same eventId; a resident that was busy runs its copy after another
+    // resident has already stored stamped rows for that tick.
+    const x = await make({ deliver: false, agents: ['alpha', 'beta'] });
+    try {
+      const tick = silentEvent();
+      await wake(x, { ...ordinaryEvent('hello beta'), targetAgents: ['beta'] }, signed('sig-beta', 'beta reply'));
+      await wake(x, { ...tick, targetAgents: ['alpha'] }, signed('sig-alpha-tick', 'alpha tick'));
+      assert.ok(stored(x.framework, 'alpha').some((m) => m.metadata?.silentHeartbeat?.eventId === tick.eventId));
+      await wake(x, { ...tick, targetAgents: ['beta'] }, signed('sig-beta-tick', 'beta tick'));
+      await wake(x, { ...ordinaryEvent('later'), targetAgents: ['beta'] }, signed('sig-beta-later', 'later reply'));
+
+      const betaCalls = x.membrane.calls.filter((c) => c.assistantParticipant === 'beta');
+      assert.equal(betaCalls.length, 3);
+      const [, betaTick, betaLater] = betaCalls;
+      assert.equal(textOf(betaTick!.messages.at(-1)!), '[heartbeat tick]', "beta opens its own tick");
+      assert.deepEqual(betaLater!.messages.slice(0, betaTick!.messages.length), betaTick!.messages,
+        "beta's tick request stays a byte-exact prefix of its next request");
+      const betaTickAt = betaLater!.messages.findIndex((m) => textOf(m) === 'beta tick');
+      assert.equal(textOf(betaLater!.messages[betaTickAt - 1]!), '[heartbeat tick]');
+      const owners = stored(x.framework, 'beta')
+        .filter((m) => m.metadata?.silentHeartbeat?.eventId === tick.eventId)
+        .map((m) => [m.participant, m.metadata!.silentHeartbeat.agentName]);
+      assert.deepEqual(owners, [['alpha', 'alpha'], ['beta', 'beta']]);
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it('stamps guarded tool results through acceptance', async () => {
+    const membrane = new QueuedStreamsMembrane();
+    const x = await make({ membrane, agent: { toolResultGuard: true } });
+    try {
+      membrane.queues.push([createMockResponse(signed('sig-ordinary', 'ordinary reply'))]);
+      await wake(x, ordinaryEvent('hello'));
+      const before = stored(x.framework).length;
+      membrane.queues.push([createMockResponse(TICK_TOOL_ROUND, 'tool_use'), createMockResponse(TICK_TRAILING)]);
+      const tick = silentEvent();
+      await wake(x, tick);
+      assert.equal(x.framework.getAgent('assistant')!.toolResultGuard.enabled, true);
+      const tickRows = stored(x.framework).slice(before);
+      assert.deepEqual(tickRows.map((m) => m.participant), ['assistant', 'user', 'assistant']);
+      for (const row of tickRows) assert.equal(row.metadata?.silentHeartbeat?.eventId, tick.eventId);
+      const result = tickRows[1]!.content[0] as { type: string; content?: unknown };
+      assert.equal(result.type, 'tool_result');
+      assert.notEqual(result.content, TOOL_RESULT_GUARD_NOTICE, 'placeholder was replaced on acceptance');
+    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+  });
+
+  it('stamps guarded tool results through a refusal restart', async () => {
+    const membrane = new QueuedStreamsMembrane();
+    const x = await make({ membrane, agent: { toolResultGuard: true } });
+    try {
+      membrane.queues.push([createMockResponse(signed('sig-ordinary', 'ordinary reply'))]);
+      await wake(x, ordinaryEvent('hello'));
+      const before = stored(x.framework).length;
+      membrane.queues.push(
+        [createMockResponse(TICK_TOOL_ROUND, 'tool_use'), refused()],
+        [createMockResponse(TICK_TRAILING)],
+      );
+      const tick = silentEvent();
+      await wake(x, tick);
+      assert.equal(membrane.calls.length, 3, 'the guard restarted the tick once');
+      const tickRows = stored(x.framework).slice(before);
+      assert.deepEqual(tickRows.map((m) => m.participant), ['assistant', 'user', 'assistant']);
+      for (const row of tickRows) assert.equal(row.metadata?.silentHeartbeat?.eventId, tick.eventId);
+      assert.equal((tickRows[1]!.content[0] as { content?: unknown }).content, TOOL_RESULT_GUARD_NOTICE);
+      assert.doesNotMatch(JSON.stringify(tickRows), /discard-this-partial-output/);
+
+      const opening = membrane.calls[1]!.messages;
+      const retry = membrane.calls[2]!.messages;
+      assert.deepEqual(retry.slice(0, opening.length), opening, 'the retry compiles the same prefix');
+      assert.equal(retry.filter((m) => textOf(m) === '[heartbeat tick]').length, 1);
       assert.match(JSON.stringify(membrane.calls[2]), /Scheduled private self-check/, 'still a silent turn');
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });

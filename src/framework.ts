@@ -8,6 +8,7 @@ import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolRes
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
+import type { SilentHeartbeatStamp } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
 import type {
@@ -8405,12 +8406,17 @@ export class AgentFramework {
    * Metadata for rows the agent's current turn stores: a silent heartbeat
    * tick stamps each of them (assistant responses, tool_result rows) so they
    * stay identifiable after the turn — request builds key the tick separator
-   * on it, and a later retention policy can find or collapse them. Undefined
-   * for ordinary turns, whose rows are stored exactly as before.
+   * on it, and a later retention policy can find or collapse them. The stamp
+   * names the agent: residents share one message slot and a broadcast tick
+   * reaches each of them with the same eventId. Undefined for ordinary
+   * turns, whose rows are stored exactly as before.
    */
   private silentTurnRowMetadata(agentName: string): MessageMetadata | undefined {
     const tick = this.activeTurnTriggers.get(agentName)?.silentHeartbeat;
-    return tick ? { silentHeartbeat: { eventId: tick.eventId, serverId: tick.serverId } } : undefined;
+    const stamp: SilentHeartbeatStamp | undefined = tick
+      ? { eventId: tick.eventId, serverId: tick.serverId, agentName }
+      : undefined;
+    return stamp ? { silentHeartbeat: stamp } : undefined;
   }
 
   /** Record prose segments suppressed by explicit-send silencing. */
