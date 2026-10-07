@@ -82,7 +82,7 @@ import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
-import { ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftReason, type DraftSource, type InheritedRisk } from './prose-drafts.js';
+import { ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftReason, type DraftSource, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import { safeSlice } from './safe-slice.js';
@@ -109,7 +109,7 @@ import {
   scriptTimeLimits,
   validateCodeExecutionConfig,
 } from './code-execution/tool-definition.js';
-import { splitProseSegments } from './prose-segments.js';
+import { splitProseRuns } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 
@@ -8791,7 +8791,10 @@ export class AgentFramework {
   /**
    * Silenced plain speech: an explicit send holds it as resendable drafts; a
    * deliberate silence (skip_reply, a silent turn, a same-round private
-   * think) keeps it private — counted for the receipt, never drafted.
+   * think in a native round, where that policy applies) keeps it private —
+   * counted for the receipt, never drafted. `segments` are the runs exactly
+   * as written (splitProseRuns), so a draft keeps the resident's words byte
+   * for byte.
    */
   private holdSilencedProse(
     agent: Agent,
@@ -8809,24 +8812,71 @@ export class AgentFramework {
       this.holdProseDrafts(agent, segments, 'explicit-send', opts);
       return;
     }
-    // Hybrid prose may carry `>>>` envelopes: a draft holds the words, not
-    // the routing syntax (a resend must not publish the prefix), and the
-    // destination the resident wrote stays with it as a note. A
-    // `>>>skip_reply` envelope was private by the resident's own choice.
+    // Hybrid prose may carry `>>>` envelopes. A send suppresses speech, not
+    // what the envelopes do: they move the router's state exactly as
+    // deliverHybridProse's do. After `>>>skip_reply` the rest stays private
+    // (across segments and later rounds) until a destination is named;
+    // naming one sets the sticky target, or leaves none when it does not
+    // resolve; `>>>skip_reply {{unsent}}` sets the latest bounce aside, and
+    // ` !` asks to continue. Only publication is withheld: a draft holds
+    // what the envelope would have published (`{{unsent}}` under the
+    // re-bounce rule, unsentWords), not its routing syntax, and the
+    // destination the resident wrote stays with it as a note.
     let privateCount = 0;
-    const parts: Array<{ text: string; note?: string }> = [];
+    const parts: Array<{ text: string; note?: string; inheritedRisk?: InheritedRisk }> = [];
+    /** Latest bounces a bare `{{unsent}}` named: still the one draft of those words. */
+    const kept: Draft[] = [];
     for (const segment of segments) {
       for (const envelope of splitHybridEnvelopes(segment)) {
         const parsed = parseHybridProsePrefix(envelope);
-        if (parsed.kind === 'private') privateCount++;
-        else if (parsed.kind === 'target') parts.push({ text: parsed.body, note: `written for >>>${parsed.target}` });
-        else parts.push({ text: envelope });
+        if (parsed.continueTurn) this.proseContinuations.add(agent.name);
+        if (parsed.kind === 'private') {
+          this.proseTargetPins.delete(agent.name);
+          this.proseHybridSuppressed.set(agent.name, 'private');
+          if (parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent);
+          privateCount++;
+        } else if (parsed.kind === 'target') {
+          const resolved = this.channelRegistry?.resolveProseTarget(parsed.target!);
+          if (resolved && !('error' in resolved)) {
+            this.proseTargetPins.set(agent.name, resolved.channelId);
+            this.proseHybridSuppressed.delete(agent.name);
+          } else {
+            this.proseTargetPins.delete(agent.name);
+            this.proseHybridSuppressed.set(agent.name, 'failed');
+          }
+          const words = this.unsentWords(agent, parsed.body);
+          if ('draft' in words) {
+            if (!kept.includes(words.draft)) kept.push(words.draft);
+          } else {
+            parts.push({
+              text: words.text,
+              note: `written for >>>${parsed.target}`,
+              ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}),
+            });
+          }
+        } else if (envelope.startsWith('>>>')) {
+          // Malformed: an attempted destination that names none.
+          this.proseTargetPins.delete(agent.name);
+          this.proseHybridSuppressed.set(agent.name, 'failed');
+          parts.push({ text: envelope });
+        } else if (this.proseHybridSuppressed.get(agent.name) === 'private') {
+          privateCount++;
+        } else {
+          parts.push({ text: envelope });
+        }
       }
     }
     if (privateCount > 0) {
       this.turnProsePrivate.set(agent.name, (this.turnProsePrivate.get(agent.name) ?? 0) + privateCount);
     }
     this.holdProseDrafts(agent, parts, 'explicit-send', opts);
+    if (kept.length > 0) {
+      // The turn's receipt names them by their state at turn end; each was
+      // named when it bounced.
+      const list = this.turnDrafts.get(agent.name) ?? [];
+      for (const draft of kept) if (!list.some((d) => d.id === draft.id)) list.push(draft);
+      this.turnDrafts.set(agent.name, list);
+    }
   }
 
   /**
@@ -9375,12 +9425,35 @@ export class AgentFramework {
       );
     }
     const notes: string[] = [];
-    if (drafts.length > 0) {
-      const ids = drafts.slice(0, 8).map((d) => d.id).join(', ') + (drafts.length > 8 ? `, and ${drafts.length - 8} more` : '');
+    // Each of the turn's drafts as it stands now: a mid-turn notice lets the
+    // resident resend or dismiss one before the turn ends, so "not sent" is
+    // said only of drafts still held.
+    const current = drafts.map((d) => this.proseDrafts.get(agent.name, d.id) ?? d);
+    const inState = (state: DraftState): Draft[] => current.filter((d) => draftState(d) === state);
+    const idList = (ds: Draft[]): string =>
+      ds.slice(0, 8).map((d) => d.id).join(', ') + (ds.length > 8 ? `, and ${ds.length - 8} more` : '');
+    const held = inState('held');
+    if (held.length > 0) {
       notes.push(
-        `${drafts.length} plain-speech segment(s) held as draft${drafts.length === 1 ? '' : 's'} ${ids} ` +
+        `${held.length} plain-speech segment(s) held as draft${held.length === 1 ? '' : 's'} ${idList(held)} ` +
         '(not sent — drafts can resend them unchanged, or dismiss them)',
       );
+    }
+    for (const d of inState('unconfirmed')) {
+      notes.push(`draft ${d.id} is unconfirmed: ${this.riskText(d)} — check that channel before sending it again (resend needs confirmDuplicate: true)`);
+    }
+    const dismissed = inState('dismissed');
+    if (dismissed.length > 0) notes.push(`draft${dismissed.length === 1 ? '' : 's'} ${idList(dismissed)} dismissed by you`);
+    for (const d of inState('delivered')) {
+      const attempt = d.attempts.find((a) => a.outcome?.status === 'delivered')!;
+      const how = attempt.via === 'resend' ? 'by your resend' : 'by your {{unsent}}';
+      // A hybrid `{{unsent}}` envelope is already listed above, as the plain
+      // speech it was; a resend (or explicit mode's envelope) is not.
+      if (attempt.via === 'unsent-token' && seen.has(attempt.destination.channelId)) {
+        notes.push(`draft ${d.id} delivered ${how}`);
+      } else {
+        shown.push(`${AgentFramework.destinationText(attempt.destination)} (draft ${d.id}, ${how})`);
+      }
     }
     if (notHeld) {
       notes.push(
@@ -9784,10 +9857,51 @@ export class AgentFramework {
   private static readonly PROSE_BOUNCE_WAKE_CAP = 2;
 
   /**
+   * Words about to be held that may use `{{unsent}}` (a bounce, or an
+   * envelope an explicit send suppressed), under the one re-bounce rule. A
+   * bare `{{unsent}}` is the latest bounce itself, which stays the one draft
+   * of those words rather than being copied. Otherwise the whole authored
+   * text is kept, the token expanded to the latest bounce's words, nothing
+   * stripped or substituted. When that draft may already have been posted
+   * (unconfirmed, or in flight) the words carry its duplication risk: they
+   * can be resent only with confirmDuplicate, like the draft they copy. The
+   * evidence is the risk's own: the copied draft's uncertain attempt, else
+   * the risk that draft itself inherited, else (truly) that it was in flight
+   * when copied.
+   */
+  private unsentWords(agent: Agent, text: string): { draft: Draft } | { text: string; inheritedRisk?: InheritedRisk } {
+    if (!text.includes('{{unsent}}')) return { text };
+    const name = agent.name;
+    const previous = this.proseDrafts.latestBounce(name);
+    if (previous && text.trim() === '{{unsent}}') return { draft: previous };
+    const expanded = text.replaceAll('{{unsent}}', previous?.text ?? '');
+    if (!previous || !(draftState(previous) === 'unconfirmed' || this.draftsInFlight.has(`${name}\u0000${previous.id}`))) {
+      return { text: expanded };
+    }
+    const risky = uncertainAttempt(previous);
+    const inheritedRisk: InheritedRisk = risky
+      ? {
+          draftId: previous.id,
+          destination: risky.destination,
+          at: risky.at,
+          reason: risky.outcome?.reason ?? 'its outcome was never recorded',
+        }
+      : previous.inheritedRisk
+        ? {
+            draftId: previous.id,
+            sourceDraftId: previous.inheritedRisk.sourceDraftId ?? previous.inheritedRisk.draftId,
+            ...(previous.inheritedRisk.destination ? { destination: previous.inheritedRisk.destination } : {}),
+            ...(previous.inheritedRisk.at !== undefined ? { at: previous.inheritedRisk.at } : {}),
+            reason: previous.inheritedRisk.reason,
+          }
+        : { draftId: previous.id, reason: 'it was being sent when these words were held' };
+    return { text: expanded, inheritedRisk };
+  }
+
+  /**
    * A routing envelope that could not be delivered: its words are held as a
    * draft (the `{{unsent}}` source) and the resident is told, privately.
-   * Bouncing `{{unsent}}` itself again keeps the one draft rather than
-   * minting a copy; a body that adds words around it holds the expanded text.
+   * `{{unsent}}` in it follows the re-bounce rule (unsentWords).
    */
   private bounceProse(
     agent: Agent,
@@ -9798,49 +9912,17 @@ export class AgentFramework {
     hold: { round?: number; notice: 'now' | 'later' } = { notice: 'later' },
   ): void {
     const name = agent.name;
-    const previous = this.proseDrafts.latestBounce(name);
-    // A latest bounce that may already have been posted (unconfirmed, or in
-    // flight) is never copied into a fresh draft: that copy would resend
-    // without the confirmation its own uncertainty requires. It stays held as
-    // itself; only the resident's other words become a new draft.
-    const previousAtRisk = previous !== undefined
-      && (draftState(previous) === 'unconfirmed' || this.draftsInFlight.has(`${name}\u0000${previous.id}`));
+    const words = this.unsentWords(agent, text);
     let draft: Draft | undefined;
     let inherited: InheritedRisk | undefined;
-    if (previous && text.trim() === '{{unsent}}') {
-      draft = previous;
+    if ('draft' in words) {
+      draft = words.draft;
     } else {
-      const usesUnsent = text.includes('{{unsent}}');
-      const expanded = usesUnsent ? text.replaceAll('{{unsent}}', previous?.text ?? '') : text;
-      if (usesUnsent && previous && previousAtRisk) {
-        // The whole authored attempt is kept, words of the risky draft
-        // included, and it carries that draft's duplication risk: it can be
-        // resent only with confirmDuplicate, like the draft it copies. The
-        // evidence is the risk's own: the copied draft's uncertain attempt,
-        // else the risk that draft itself inherited, else (truly) that it
-        // was in flight when copied.
-        const risky = uncertainAttempt(previous);
-        inherited = risky
-          ? {
-              draftId: previous.id,
-              destination: risky.destination,
-              at: risky.at,
-              reason: risky.outcome?.reason ?? 'its outcome was never recorded',
-            }
-          : previous.inheritedRisk
-            ? {
-                draftId: previous.id,
-                sourceDraftId: previous.inheritedRisk.sourceDraftId ?? previous.inheritedRisk.draftId,
-                ...(previous.inheritedRisk.destination ? { destination: previous.inheritedRisk.destination } : {}),
-                ...(previous.inheritedRisk.at !== undefined ? { at: previous.inheritedRisk.at } : {}),
-                reason: previous.inheritedRisk.reason,
-              }
-            : { draftId: previous.id, reason: 'it was being sent when these words were held' };
-      }
+      inherited = words.inheritedRisk;
       // The bounce notice below names the draft, so no separate held notice.
       draft = this.holdProseDrafts(
         agent,
-        [{ text: expanded, ...(inherited ? { inheritedRisk: inherited } : {}) }],
+        [{ text: words.text, ...(inherited ? { inheritedRisk: inherited } : {}) }],
         'bounced',
         { round: hold.round, note: reason, notice: 'later' },
       )[0];
@@ -10793,7 +10875,10 @@ export class AgentFramework {
                 const presentsInjections =
                   (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages ?? true;
                 const holdOpts = { round: draftRound, notice: presentsInjections ? 'now' as const : 'later' as const };
-                const roundSegments = splitProseSegments(assistantBlocks);
+                // Routing publishes trimmed segments; held drafts keep the
+                // runs exactly as written.
+                const roundRuns = splitProseRuns(assistantBlocks);
+                const roundSegments = roundRuns.map((run) => run.trim());
                 if (roundSegments.length > 0) {
                   if (turnProseRouting === 'disabled') {
                     console.error(
@@ -10802,7 +10887,12 @@ export class AgentFramework {
                     this.recordProseSuppression(agent.name, roundSegments.length);
                   } else if (turnProseRouting === 'hybrid') {
                     if (turnSilenced) {
-                      this.holdSilencedProse(agent, roundSegments, silenceCause, hasSameRoundPrivateThink, holdOpts);
+                      // In order behind earlier rounds' envelopes: the router
+                      // state they leave is where this round's starts.
+                      const cause = silenceCause;
+                      turnSpeechChain = turnSpeechChain
+                        .then(() => this.holdSilencedProse(agent, roundRuns, cause, hasSameRoundPrivateThink, holdOpts))
+                        .catch((err) => console.error('mid-turn hybrid prose hold failed:', err));
                     } else if (!hasSameRoundPrivateThink) {
                       const locus = resolveTurnLocus();
                       for (const seg of roundSegments) {
@@ -10831,7 +10921,7 @@ export class AgentFramework {
                     );
                     // Never a silent black hole (n=8: the flying-scene reply):
                     // held as drafts the resident can resend, and named.
-                    this.holdSilencedProse(agent, roundSegments, silenceCause, hasSameRoundPrivateThink, holdOpts);
+                    this.holdSilencedProse(agent, roundRuns, silenceCause, hasSameRoundPrivateThink, holdOpts);
                   } else if (hasSameRoundPrivateThink) {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
@@ -11263,18 +11353,20 @@ export class AgentFramework {
             // they are never routed here — which is precisely how the `think`
             // tool (and any explicit send tool) yields a silent turn.
             if (speechContent.length > 0 && this.channelRegistry) {
-              const speechText = speechContent
+              const speechRun = speechContent
                 .map((b) => (b as ContentBlock & { type: 'text' }).text)
-                .join('\n')
-                .trim();
+                .join('\n');
               // A text-only turn is one message — unless an all-refused XML
               // round (membrane `tool_attempt`, answered in-band with a
               // `tool_notice`) separates its prose: nothing was called, but
               // the words before the attempt and after its notice are two
-              // messages, routed as segments like a tool turn's.
-              const speechSegments = response.content.some((b) => (b.type as string) === 'tool_attempt')
-                ? splitProseSegments(response.content)
-                : speechText ? [speechText] : [];
+              // messages, routed as segments like a tool turn's. Routing
+              // publishes trimmed segments; held drafts keep the runs exactly
+              // as written.
+              const speechRuns = response.content.some((b) => (b.type as string) === 'tool_attempt')
+                ? splitProseRuns(response.content)
+                : speechRun.trim() ? [speechRun] : [];
+              const speechSegments = speechRuns.map((run) => run.trim());
               const textOnlyHold = { round: draftRound + 1, notice: 'later' as const };
               if (speechSegments.length > 0) {
                 if (turnProseRouting === 'disabled') {
@@ -11286,7 +11378,7 @@ export class AgentFramework {
                   // (a fresh text-only turn starts unsilenced). Explicit
                   // mode is exempt, as mid-turn.
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (turn silenced: ${silenceCause})`);
-                  this.holdSilencedProse(agent, speechSegments, silenceCause, false, textOnlyHold);
+                  this.holdSilencedProse(agent, speechRuns, silenceCause, false, textOnlyHold);
                 } else if (turnProseRouting === 'hybrid') {
                   const locus = resolveTurnLocus();
                   console.error(`[prose] ${agent.name}: text-only turn -> hybrid prose gateway`);
@@ -11355,7 +11447,10 @@ export class AgentFramework {
                 silenceCause === 'private' || fallbackCause === 'private' ? 'private' : (silenceCause ?? fallbackCause);
               const trailingHold = { round: draftRound + 1, notice: 'later' as const };
 
-              const segments = splitProseSegments(liveProseRouting ? terminalContent : response.content);
+              // Routing publishes trimmed segments; held drafts keep the runs
+              // exactly as written.
+              const runs = splitProseRuns(liveProseRouting ? terminalContent : response.content);
+              const segments = runs.map((run) => run.trim());
 
               // Preserve in-channel ordering: everything enqueued live must
               // land before the trailing prose. Awaited even when silenced —
@@ -11371,7 +11466,7 @@ export class AgentFramework {
                 }
               } else if (turnProseRouting === 'hybrid') {
                 if (silenced && segments.length > 0) {
-                  this.holdSilencedProse(agent, segments, trailingCause, false, trailingHold);
+                  this.holdSilencedProse(agent, runs, trailingCause, false, trailingHold);
                 } else if (segments.length > 0) {
                   const locus = resolveTurnLocus();
                   for (const seg of segments) {
@@ -11401,7 +11496,7 @@ export class AgentFramework {
                   `(${silenced ? `turn silenced: ${trailingCause}` : 'no trailing prose'})`,
                 );
                 if (silenced && segments.length > 0) {
-                  this.holdSilencedProse(agent, segments, trailingCause, false, trailingHold);
+                  this.holdSilencedProse(agent, runs, trailingCause, false, trailingHold);
                 }
               } else {
                 // Reuse the locus pinned at the turn's first live-routed
