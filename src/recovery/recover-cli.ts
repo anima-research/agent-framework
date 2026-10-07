@@ -301,34 +301,60 @@ function operatorChange(options: CliOptions): void {
     }
     const record = records.get(command.changeId);
     const attempt = record ? held(record) : null;
-    if (!record || !attempt) throw new Error(`Operator change ${command.changeId} has no unresolved attempt to settle`);
-    if (options.attempt !== attempt.n) throw new Error(`--attempt ${options.attempt} is not its unresolved attempt (${attempt.n} is)`);
-    if (!options.verdict) throw new Error('--verdict committed|not-committed is required');
-    if (!options.reason?.trim()) throw new Error('--reason is required');
-    const resolution: OperatorChangeResolution = {
-      verdict: options.verdict,
-      reason: options.reason,
-      requester: { via: 'agent-framework-recover', ...(options.requester ? { name: options.requester } : {}) },
-      at: Date.now(),
-      via: 'offline',
+    // Who settles it: --requester names them; otherwise the CLI's user, as
+    // this CLI's other acts record theirs. The same requester goes in the
+    // attestation and in the operator log.
+    const requester: OperatorRequester = options.requester ? { via: 'cli', name: options.requester } : cliRequester();
+    const logBase: OperatorLogInput = {
+      kind: 'resolve-operator-change',
+      agent: record?.agent ?? '*',
+      requester,
+      params: {
+        changeId: command.changeId,
+        ...(options.attempt !== undefined ? { attempt: options.attempt } : {}),
+        ...(options.verdict ? { verdict: options.verdict } : {}),
+        ...(options.reason ? { reason: options.reason } : {}),
+        via: 'offline',
+      },
     };
-    journal.append({ kind: 'resolved', changeId: record.changeId, n: attempt.n, resolution }, { durable: true });
-    // Nothing in the store's body is touched here: a not-committed attempt
-    // whose destination is the active branch gets its source back at the
-    // next start, before any agent initializes on it.
-    const restoresAtStart = options.verdict === 'not-committed' && active === attempt.evidence.target;
-    const remaining = options.verdict === 'not-committed' && !restoresAtStart && active !== attempt.evidence.source
-      ? `the active branch is ${active}, neither the source ${attempt.evidence.source} nor the attempt's destination`
-      : undefined;
-    const receipt: OperatorChangeResolutionReceipt = {
-      changeId: record.changeId,
-      attempt: attempt.n,
-      recorded: resolution,
-      settlement: options.verdict === 'committed'
-        ? 'at the next start: startup establishes its outcome and activates its staged marks before any traffic'
-        : `abandoned${restoresAtStart ? `; the next start restores ${attempt.evidence.source} before any agent initializes` : ''}; a fresh attempt is the host's decision on its next retry`,
-      ...(remaining ? { remaining } : {}),
-    };
+    let receipt: OperatorChangeResolutionReceipt;
+    try {
+      if (!record || !attempt) throw new Error(`Operator change ${command.changeId} has no unresolved attempt to settle`);
+      if (options.attempt !== attempt.n) throw new Error(`--attempt ${options.attempt} is not its unresolved attempt (${attempt.n} is)`);
+      if (!options.verdict) throw new Error('--verdict committed|not-committed is required');
+      if (!options.reason?.trim()) throw new Error('--reason is required');
+      const resolution: OperatorChangeResolution = {
+        verdict: options.verdict,
+        reason: options.reason,
+        requester,
+        at: Date.now(),
+        via: 'offline',
+      };
+      journal.append({ kind: 'resolved', changeId: record.changeId, n: attempt.n, resolution }, { durable: true });
+      // Nothing in the store's body is touched here: a not-committed attempt
+      // whose destination is the active branch gets its source back at the
+      // next start, before any agent initializes on it.
+      const restoresAtStart = options.verdict === 'not-committed' && active === attempt.evidence.target;
+      const remaining = options.verdict === 'not-committed' && !restoresAtStart && active !== attempt.evidence.source
+        ? `the active branch is ${active}, neither the source ${attempt.evidence.source} nor the attempt's destination`
+        : undefined;
+      receipt = {
+        changeId: record.changeId,
+        attempt: attempt.n,
+        recorded: resolution,
+        settlement: options.verdict === 'committed'
+          ? 'at the next start: startup establishes its outcome and activates its staged marks before any traffic'
+          : `abandoned${restoresAtStart ? `; the next start restores ${attempt.evidence.source} before any agent initializes` : ''}; a fresh attempt is the host's decision on its next retry`,
+        ...(remaining ? { remaining } : {}),
+      };
+    } catch (error) {
+      recordOperatorAction(options.storePath!, { ...logBase, error: errorMessage(error) });
+      throw error;
+    }
+    recordOperatorAction(options.storePath!, {
+      ...logBase,
+      result: { settlement: receipt.settlement, ...(receipt.remaining ? { remaining: receipt.remaining } : {}) },
+    });
     console.log(JSON.stringify(receipt, null, 2));
   } finally {
     store.close();

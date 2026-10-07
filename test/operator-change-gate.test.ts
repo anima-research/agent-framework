@@ -1216,8 +1216,20 @@ describe('operator-change gate: host/command undo by turns', () => {
     const listed = recover('list');
     assert.deepEqual(listed.unresolved.map((u: { changeId: string; attempt: number; targetIsActive: boolean }) => [u.changeId, u.attempt, u.targetIsActive]),
       [[change.id, 1, true]], 'inspected without starting the host');
+    // A wrong attempt is refused, and the refusal is logged like the CLI's other acts.
+    const wrong = spawnSync(process.execPath, [cli, '--store', storePath, '--operator-change', 'resolve', change.id,
+      '--attempt', '2', '--verdict', 'not-committed', '--reason', 'wrong attempt'], { encoding: 'utf8' });
+    assert.equal(wrong.status, 1);
+    assert.match(wrong.stderr, /--attempt 2 is not its unresolved attempt \(1 is\)/);
     const settled = recover('resolve', change.id, '--attempt', '1', '--verdict', 'not-committed', '--reason', 'the cut body cannot start', '--requester', 'nissa');
     assert.deepEqual([settled.recorded.via, settled.recorded.verdict, settled.restored], ['offline', 'not-committed', undefined]);
+    assert.deepEqual(settled.recorded.requester, { via: 'cli', name: 'nissa' });
+    const logged = readFileSync(join(storePath, 'operator-actions.jsonl'), 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+      .filter((entry: { kind: string }) => entry.kind === 'resolve-operator-change');
+    assert.deepEqual(logged.map((entry: { agent: string; params: { attempt: number; via: string }; error?: string; result?: { settlement: string } }) =>
+      [entry.agent, entry.params.attempt, entry.params.via, entry.error !== undefined, entry.result !== undefined]),
+    [['scout', 2, 'offline', true, false], ['scout', 1, 'offline', false, true]], 'the refusal and the resolution, each logged');
+    assert.deepEqual(logged[1].requester, { via: 'cli', name: 'nissa' });
     assert.match(settled.settlement, new RegExp(`abandoned; the next start restores ${change.sourceBranch} before any agent initializes`));
     assert.deepEqual(start(), { started: true, branch: change.sourceBranch, quiesced: false }, 'normal readiness: restored before the agent initialized');
     await reopen().catch(() => {}); // the framework in this process was stopped above
