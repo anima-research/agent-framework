@@ -21,8 +21,9 @@
     reaction deadline (`discordAwarenessDeadlineMs`). Marks already on Discord
     are left alone; nothing is removed automatically.
   - Receipts (`markers`) now also carry `scope`, `unmarked` and `notRemoved`.
-  - `host/command` `hide` now holds the store like every surgery, so it is
-    refused (`agent-busy`) while any agent sharing the store is mid-turn.
+  - `host/command` `hide` and turn-based `undo` now hold the store like
+    every surgery, so they are refused (`agent-busy`) while any agent
+    sharing the store is mid-turn.
   - No sibling version is required: a host that ignores the new option simply
     places no marks. The connectome-host and discord-mcpl companions add the
     choice to their surfaces.
@@ -36,5 +37,6 @@
   `discordAwarenessOutboxPath` now only names a previous JSON ledger to
   import. Such a file (by default `<store>/recovery/discord-awareness-outbox.json`)
   is imported once on first use and renamed `.migrated-v2`. What it recorded
-  is kept as evidence, never as synthesized attempts, and its undelivered
-  work is held for an explicit release.
+  is kept as evidence, never as synthesized attempts or as proof that a
+  suppression's body completed, and its undelivered work is held for an
+  explicit release.

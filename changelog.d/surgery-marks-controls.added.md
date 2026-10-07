@@ -10,9 +10,12 @@
     unknown, including earlier attempts later answered, which may still land.
   - `retractDiscordAwareness(batch | 'all')` queues removal of this bot's
     reaction, through each message's configured MCPL route, for every
-    selected message, whatever history says. It supersedes adds not yet
-    sent, and its receipt discloses requests whose outcome is unknown and
-    imported history that leaves outcomes unrecorded.
+    selected message, whatever history says. As the latest authorization
+    for those messages, it stops adds that haven't ended and any an earlier
+    choice would request later (a prepared surgery's activation), and
+    cancelling it never revives them. Its receipt discloses requests whose
+    outcome is unknown and imported history that leaves outcomes
+    unrecorded.
   - `releaseDiscordAwareness(batch)` queues a held batch.
 
   Each control is recorded in the operator log. The same controls are

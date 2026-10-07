@@ -368,12 +368,16 @@ const result = await framework.rollbackToMessage('cairn', {
   from the journal as it is at that moment, so a cancel takes effect even
   while an earlier request is on the wire. A request written and never
   answered is recorded as `unknown`, and a later confirmation of a different
-  attempt never resolves it. A record that certifies a body change (an
-  activation, a completed suppression, a retirement) is written only after
-  that change is synced. A batch whose surgery was interrupted before its
-  branch switch was recorded is held at startup until an operator releases
-  it; an interrupted suppression's redactions are resumed whenever its branch
-  is active at startup, whatever its marks' state.
+  attempt never resolves it. Between opposite requests for one reaction,
+  the later *authorization* wins, whenever each request was created: a
+  surgery's adds carry the moment of its marks choice, even when activation
+  comes later, so a retract made in between prevails; a release is a new
+  act. A record that certifies a body change (an activation, a completed
+  suppression, a retirement) is written only after that change is synced.
+  A batch whose surgery was interrupted before its branch switch was
+  recorded is held at startup until an operator releases it; an interrupted
+  suppression's redactions are resumed whenever its branch is active at
+  startup, whatever its marks' state.
 - **Operator controls,** each recorded in the operator log:
   - `listDiscordAwareness()` lists batches and retract requests;
   - `cancelDiscordAwareness(batch | retractRequest)` stops all further sends
@@ -382,16 +386,19 @@ const result = await framework.rollbackToMessage('cairn', {
     including earlier attempts later answered, any of which may still land;
   - `retractDiscordAwareness(batch | 'all')` queues removal of this bot's
     reaction, through each address's configured MCPL route, for every message
-    of the batch (or every message any batch or imported ledger recorded an
-    add for), whatever history says: removing an absent reaction does
-    nothing. It supersedes adds not yet sent, and its receipt discloses
-    earlier requests whose outcome is unknown and imported history that
-    leaves outcomes unrecorded;
+    of the batch (or of every batch not retired by its own surgery, prepared,
+    held or active, and every message an imported ledger recorded), whatever
+    history says: removing an absent reaction does nothing. As the latest
+    authorization for those messages, it stops adds that haven't ended and
+    any an earlier choice would request later; cancelling it never revives
+    them. Its receipt discloses earlier requests whose outcome is unknown and
+    imported history that leaves outcomes unrecorded;
   - `releaseDiscordAwareness(batch)` queues a held batch.
 - **Over `host/command`** (servers granted `allowHostCommands`): `undo` (by
   messages or by turns) and `hide` take `marks: 'none' | 'addressed' | 'all'`
-  (default `none`; any other value is refused) and return `markers`. `hide`
-  holds the store like every surgery. The `marks` verb takes `action: 'list'
+  (default `none`; any other value is refused) and return `markers`. Each
+  holds the store like every surgery, so it is refused while any agent
+  sharing the store is mid-turn. The `marks` verb takes `action: 'list'
   | 'cancel' | 'retract' | 'release'` with a `target` (a batch id; for cancel
   also a retract request id; for retract also `all`).
 
@@ -399,8 +406,10 @@ A pre-journal awareness ledger (`discord-awareness-outbox.json` under the
 store, or `discordAwarenessOutboxPath`) is imported once on first use and the
 file renamed `.migrated-v2`. What it recorded about each message is kept as
 evidence (attempt count, last action, status and error, and how many attempt
-outcomes it leaves unrecorded), never as a claim about what is on Discord.
-Its undelivered work is held for an explicit release.
+outcomes it leaves unrecorded), never as a claim about what is on Discord,
+and an imported `active` suppression is not taken as proof that its body
+completed: startup verifies and resumes its intervals on its branch. Its
+undelivered work is held for an explicit release.
 
 ## Observability
 

@@ -4,10 +4,12 @@
   did. Each request is written ahead of its dispatch, and a dispatch is
   admitted from the journal as it is at that moment. A request that went out
   and got no answer is recorded as `unknown`, and a later confirmation of a
-  different attempt never resolves it. A batch whose surgery was interrupted
-  before its branch switch was recorded is held at startup until an operator
-  releases it. An interrupted suppression's redactions are resumed whenever
-  its branch is active at startup, independent of what happened to its marks.
+  different attempt never resolves it. Between opposite requests for one
+  reaction, the later authorization wins, whenever each was created. A batch
+  whose surgery was interrupted before its branch switch was recorded is held
+  at startup until an operator releases it. An interrupted suppression's
+  redactions are resumed whenever its branch is active at startup,
+  independent of what happened to its marks.
 - A journal record that certifies a body change (a marks activation, a
   completed suppression, a retired batch) is now written only after that
   change is synced to the store. Previously a crash could keep marks active
