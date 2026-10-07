@@ -996,8 +996,8 @@ function boundProviderErrorCode(code: unknown): string | undefined {
 }
 
 /**
- * One bounded line describing a failure, for logs that would otherwise print
- * the error object. Printing the object shows every own field, and a
+ * A bounded string describing a failure, for logs that would otherwise print
+ * the error object (one line unless the message itself has newlines). Printing the object shows every own field, and a
  * MembraneError's `rawRequest` is the whole request that failed: a long system
  * prompt at depth one is printed in full. The projection keeps what a reader
  * needs (name, classification, status, provider code, message) and nothing
