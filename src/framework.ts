@@ -9,7 +9,7 @@ import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
-import { callProvenance, leaseScope } from './call-provenance.js';
+import { callProvenance, leaseScope, turnScope } from './call-provenance.js';
 import {
   selfChangeKind,
   sameValue,
@@ -763,6 +763,9 @@ export class ResumeBlockedError extends Error {
 
 interface RedoEntry {
   branchName: string;
+  /** The admitted undo-turns change that pushed it, so a retry that finishes
+   *  that cut's bookkeeping pushes it once. */
+  changeId?: string;
   /** Checkpoints redo re-adds after switching back, oldest first. A single
    *  undo saved its source without the checkpoint, so redo re-adds it; an
    *  admitted multi-turn cut writes nothing on its source, whose tip still
@@ -1575,6 +1578,8 @@ export class AgentFramework {
   /** Admissions applyResolvedOperatorChange is carrying out, by admission id:
    *  each lets exactly its change's tool call through the gate. */
   private activeAdmissions: Map<string, ResolvedOperatorChange> = new Map();
+  /** Admitted undo cuts whose bookkeeping finished in this process. */
+  private completedOperatorCuts: Set<string> = new Set();
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
   /** Framework-global inference gate; older generations cannot release it. */
@@ -5127,8 +5132,29 @@ export class AgentFramework {
    * host command.
    */
   private shedNewestTurn(agent: Agent): RewindRecord | null {
+    const plan = this.planShedExchange(agent);
+    if (!plan || plan === 'anchor-missing') return null;
+    const cm = agent.getContextManager();
+    for (const id of plan.removedIds) cm.removeMessage(id);
+    return { kind: plan.kind, descriptor: plan.descriptor, removedIds: plan.removedIds, discordRef: plan.discordRef };
+  }
+
+  /**
+   * Plan shedNewestTurn's removal without changing anything: the newest
+   * non-system message and its complete exchange, with `anchor`, the id of
+   * the message just before that exchange (null when none). Given `atOrBefore`,
+   * only messages at or before that id are considered, so an operation can
+   * walk back from where it stopped whatever arrived since; 'anchor-missing'
+   * when that id is no longer on the branch. Null when nothing is eligible.
+   */
+  private planShedExchange(agent: Agent, atOrBefore?: MessageId | string): (RewindRecord & { anchor: MessageId | null }) | 'anchor-missing' | null {
     const cm = agent.getContextManager();
     const all = cm.getAllMessages();
+    let start = all.length - 1;
+    if (atOrBefore !== undefined) {
+      start = all.findIndex((m) => m.id === atOrBefore);
+      if (start < 0) return 'anchor-missing';
+    }
     const typeOf = (b: unknown) => (b as { type?: string }).type;
     const hasBlock = (m: { content?: unknown } | undefined, t: string) =>
       Array.isArray(m?.content) && (m!.content as unknown[]).some((b) => typeOf(b) === t);
@@ -5143,7 +5169,7 @@ export class AgentFramework {
     // the latest assistant message cannot be modified"). We do NOT add a marker
     // here; the caller keeps one consolidated marker (updateRewindMarker).
     let idx = -1;
-    for (let i = all.length - 1; i >= 0; i--) {
+    for (let i = start; i >= 0; i--) {
       const meta = (all[i].metadata ?? {}) as { system?: unknown };
       if (meta.system) continue;
       idx = i; break;
@@ -5188,8 +5214,9 @@ export class AgentFramework {
       ? { channelId: String(md.channelId), messageId: String(md.messageId) }
       : undefined;
 
-    for (const id of removedIds) cm.removeMessage(id);
-    return { kind, descriptor, removedIds, discordRef };
+    const first = Math.min(...removedIds.map((id) => all.findIndex((m) => m.id === id)));
+    const anchor = first > 0 ? all[first - 1].id : null;
+    return { kind, descriptor, removedIds, discordRef, anchor };
   }
 
   /**
@@ -6816,10 +6843,11 @@ export class AgentFramework {
       if (answer.outcome === 'gate-failed') return refused(`Operator change refused: ${answer.error}`);
     }
     // Permission to apply isn't a safe boundary: while the store is held by
-    // a reservation this call isn't running under, refuse rather than wait
-    // (the holder may be waiting for this very call's turn).
-    const held = this.storeHoldAgainstCaller();
-    if (held) return refused(`Operator change refused: the store is held by ${held}; retry when it completes`);
+    // a reservation this call isn't running under, or the agent has a live
+    // turn that isn't this call's own, refuse rather than wait (the holder
+    // may be waiting for this very call's turn).
+    const busy = this.applyBoundaryAgainstCaller(agentName);
+    if (busy) return refused(`Operator change refused: ${busy}; retry when it completes`);
     // The last check before the change runs, with no await in between.
     try {
       this.revalidateSelfChange(change);
@@ -6829,13 +6857,25 @@ export class AgentFramework {
     return run();
   }
 
-  /** The store hold this work isn't running under, described; null when the
-   *  store is free, or held by the lease whose callback this work runs in. */
-  private storeHoldAgainstCaller(): string | null {
-    if (!this.surgeryHold) return null;
+  /**
+   * Why a gated change to `agentName` can't apply now from this caller, or
+   * null when it can. The store must not be held by a reservation this work
+   * isn't running under (only the lease whose callback this is), and the
+   * agent must have no live turn other than the caller's own: the turn a
+   * puppet call runs as (turnScope), or the lease's reservation of it.
+   */
+  private applyBoundaryAgainstCaller(agentName: string): string | null {
     const scoped = leaseScope.getStore();
-    if (scoped && this.heldLease?.lease === scoped) return null;
-    return `${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`;
+    const inHeldLease = scoped !== undefined && this.heldLease?.lease === scoped;
+    if (this.surgeryHold && !inHeldLease) {
+      return `the store is held by ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`;
+    }
+    const token = this.activeTurnTokens.get(agentName);
+    if (token === undefined) return null;
+    const own = turnScope.getStore();
+    if (own && own.agent === agentName && own.token === token) return null;
+    if (inHeldLease && this.heldLease!.tokens.get(agentName) === token) return null;
+    return `${agentName} has a live turn that isn't this call's`;
   }
 
   /**
@@ -6872,6 +6912,9 @@ export class AgentFramework {
       const release = this.reserveStoreForSurgery('undo', agentName);
       try {
         applied = this.applyUndoTurns(change);
+        // Gate installed before release; delivery drains in the background
+        // and a failure there is never reported as this undo's.
+        this.deliverDiscordAwarenessInBackground('undo', agentName);
       } finally {
         release();
       }
@@ -6887,7 +6930,6 @@ export class AgentFramework {
       `[host-command] undo agent=${agentName} requested=${requested} undone=${applied.undone} ` +
         `as one cut (${change.id}) by=${requester.name ?? requester.id ?? requester.via}`,
     );
-    await this.syncDiscordAwarenessMarkers();
     return { ok: true, undone: applied.undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
 
@@ -6943,6 +6985,9 @@ export class AgentFramework {
     const undone = change.checkpoints.length;
     const current = this.store.currentBranch().name;
     if (current === destination) {
+      // The cut happened. Finish whatever bookkeeping an interrupted attempt
+      // left undone, without cutting again, and only then report it applied.
+      this.finishUndoTurnsCut(change, admission);
       return { requested: change.requestedTurns, undone, fromBranch: change.sourceBranch, toBranch: destination, alreadyApplied: true };
     }
     // The destination exists if an earlier attempt got as far as creating
@@ -6963,45 +7008,57 @@ export class AgentFramework {
       if (at(c) < 0) stale(`turn ${c.turnIndex} is no longer an undoable checkpoint`);
     }
     const oldest = change.checkpoints[change.checkpoints.length - 1]!;
-    const cutAt = at(oldest);
-    const removed = list.slice(cutAt);
 
     // Checkpoint lists are branch-scoped state, and nothing is written on the
     // source: the destination, cut before the oldest staged turn recorded
-    // itself, inherits the older checkpoints (saved there explicitly), and
-    // the source tip keeps every checkpoint for redo to return to. So each
-    // step is idempotent and a retry after a crash finishes the cut.
-    const kept = list.slice(0, cutAt);
+    // itself, keeps only the older checkpoints, and the source tip keeps
+    // every checkpoint for redo to return to.
     if (!created) this.store.createBranchAt(destination, change.sourceBranch, oldest.sequenceBefore);
     this.store.switchBranch(destination);
-    // Mark the destination as used, naming the change that made it: this
-    // write is what moves its head off its branch point (see above), so a
-    // later retry can tell a completed cut from an interrupted one.
+    this.finishUndoTurnsCut(change, admission);
+    return { requested: change.requestedTurns, undone, fromBranch: change.sourceBranch, toBranch: destination };
+  }
+
+  /**
+   * The bookkeeping after an admitted undo cut, once the destination is
+   * active. Every step is idempotent, so a retry after any failure finishes
+   * exactly what is missing and none twice:
+   * - the marker naming this change on the destination, which moves its head
+   *   off its branch point (how applyUndoTurns tells a used cut);
+   * - the destination's checkpoints: only those older than the cut;
+   * - the one redo entry back to the source tip;
+   * - the trace and the operator-log record, once per process.
+   */
+  private finishUndoTurnsCut(change: ResolvedUndoTurnsChange, admission?: OperatorAdmission): void {
+    const destination = this.undoTurnsDestination(change);
+    const oldest = change.checkpoints[change.checkpoints.length - 1]!;
     const framework = this.store.getStateJson(FRAMEWORK_STATE_ID);
-    this.store.setStateJson(FRAMEWORK_STATE_ID, {
-      ...(framework && typeof framework === 'object' ? framework as Record<string, unknown> : {}),
-      operatorCut: { changeId: change.id, at: Date.now() },
-    });
-    this.saveTurnCheckpoints(change.agent, kept);
-    const ws = this.moduleRegistry.getModule('workspace');
-    if (ws && 'materializeMount' in ws) {
-      (ws as unknown as { materializeMount(name: string): Promise<unknown> }).materializeMount('_config').catch(() => {});
+    const state = (framework && typeof framework === 'object' ? framework : {}) as Record<string, unknown>;
+    if ((state.operatorCut as { changeId?: unknown } | undefined)?.changeId !== change.id) {
+      this.store.setStateJson(FRAMEWORK_STATE_ID, { ...state, operatorCut: { changeId: change.id, at: Date.now() } });
     }
+    this.saveTurnCheckpoints(
+      change.agent,
+      this.getTurnCheckpoints(change.agent).filter((c) => c.sequenceBefore < oldest.sequenceBefore),
+    );
+    this.materializeConfigMountAfterBranchSwitch();
     let redoStack = this.redoStacks.get(change.agent);
     if (!redoStack) {
       redoStack = [];
       this.redoStacks.set(change.agent, redoStack);
     }
     // The source tip still holds the removed checkpoints: redo re-adds none.
-    redoStack.push({ branchName: change.sourceBranch, checkpoints: [] });
-
+    if (!redoStack.some((entry) => entry.changeId === change.id)) {
+      redoStack.push({ branchName: change.sourceBranch, checkpoints: [], changeId: change.id });
+    }
+    if (this.completedOperatorCuts.has(change.id)) return;
     this.emitTrace({
       type: 'undo:completed',
       agentName: change.agent,
       turnIndex: oldest.turnIndex,
       fromBranch: change.sourceBranch,
       toBranch: destination,
-      turns: undone,
+      turns: change.checkpoints.length,
     });
     this.recordOperatorAction({
       kind: 'undo-turns',
@@ -7010,27 +7067,13 @@ export class AgentFramework {
       params: {
         changeId: change.id,
         requested: change.requestedTurns,
-        resolved: undone,
+        resolved: change.checkpoints.length,
         turnIndexes: change.checkpoints.map((c) => c.turnIndex),
         ...(admission ? { admission: admission.id } : {}),
       },
-      result: { sourceBranch: change.sourceBranch, targetBranch: destination, checkpointsRemoved: removed.length },
+      result: { sourceBranch: change.sourceBranch, targetBranch: destination },
     });
-    return { requested: change.requestedTurns, undone, fromBranch: change.sourceBranch, toBranch: destination };
-  }
-
-  /** After an admitted undo: reconcile awareness markers as host/command
-   *  undo always has. The cut stands either way; the durable outbox owns
-   *  eventual delivery, so a sync failure is logged, not thrown. */
-  private async syncAwarenessAfterUndo(agentName: string): Promise<void> {
-    try {
-      await this.syncDiscordAwarenessMarkers();
-    } catch (error) {
-      console.error(
-        `[operator-change] awareness sync after undo for ${agentName} failed; the outbox retries: ` +
-        `${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
+    this.completedOperatorCuts.add(change.id);
   }
 
   /**
@@ -7050,7 +7093,10 @@ export class AgentFramework {
     this.heldLeaseTokens(opts.lease, `apply ${change.kind} for ${change.agent}`);
     if (change.kind === 'undo-turns') {
       const applied = this.applyUndoTurns(change, opts.admission);
-      if (!applied.alreadyApplied) await this.syncAwarenessAfterUndo(change.agent);
+      // Installs the MCPL data-plane gate now, under the lease, and drains in
+      // the background: remote delivery is never awaited inside the lease,
+      // and its failure is never this undo's.
+      if (!applied.alreadyApplied) this.deliverDiscordAwarenessInBackground('undo', change.agent);
       return { kind: 'undo-turns', ...applied };
     }
     this.revalidateSelfChange(change);
@@ -12582,14 +12628,16 @@ export class AgentFramework {
     let ownedToEnd = false;
     try {
       const started = Date.now();
-      const result = await this.executeToolCall({
+      // The call, and anything it delegates, runs as this turn: a gated
+      // change it makes to this agent is the caller's own, not a busy agent.
+      const result = await turnScope.run({ agent: agentName, token: turnToken }, () => this.executeToolCall({
         id: toolUseId,
         name: toolName,
         input,
         callerAgentName: agentName,
         origin: 'puppet',
         ...(opts?.admission ? { admission: opts.admission } : {}),
-      });
+      }));
       const durationMs = Date.now() - started;
 
       // Store the pair through the same shapes the ordinary path uses. Build
@@ -14121,13 +14169,67 @@ export class AgentFramework {
       return '' as MessageId; // Deferred — flushed at the target's next boundary
     }
 
+    if (opts?.durable && !opts.deferredWriteId) {
+      return this.storeDurably(agent, participant, content, metadata, opts.placement);
+    }
     const stored = agent.getContextManager().addMessage(
       participant,
       content,
       opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
     );
     if (opts?.deferredWriteId) this.markDeferredWriteLanded(opts.deferredWriteId);
-    if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; opts.placement.durable = true; }
+    // Stored, but not yet proven durable: Chronicle persists on sync().
+    if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; opts.placement.durable = false; }
+    return stored;
+  }
+
+  /**
+   * Store a message at once with a durable receipt (ModuleMessageOptions
+   * .durable). Chronicle persists only on sync(), so a stored id alone
+   * proves nothing across a hard kill. The write goes through the
+   * crash-recovery queue the deferred path uses: queued and persisted under
+   * a fresh write id, with its boot-scan position, before it is written;
+   * stored stamped with that id; then acknowledged by a sync. If the sync
+   * fails the entry stays queued and a restart replays it once,
+   * deduplicated by the id, so durable means "on disk, or queued for
+   * exactly-once replay". If the queue can't be persisted, a direct sync
+   * decides, and its failure is reported as not durable.
+   */
+  private storeDurably(
+    agent: Agent,
+    participant: string,
+    content: ContentBlock[],
+    metadata: MessageMetadata | undefined,
+    placement?: { agent?: string; messageId?: MessageId; deferredId?: string; durable?: boolean },
+  ): MessageId {
+    const cm = agent.getContextManager();
+    const id = randomUUID();
+    let count = 0;
+    try {
+      const counted = cm as unknown as { getMessageCount?: () => number; getAllMessages: () => unknown[] };
+      count = typeof counted.getMessageCount === 'function' ? counted.getMessageCount() : counted.getAllMessages().length;
+    } catch { count = 0; }
+    const prevScan = this.deferredScanFrom.get(agent.name);
+    this.deferredScanFrom.set(agent.name, prevScan === undefined ? count : Math.min(prevScan, count));
+    this.unackedDeferredWrites.push({
+      id, seq: ++this.deferredSeq, participant, content, metadata, forAgent: agent.name, durable: true,
+    });
+    const queued = this.persistDeferredWrites({ force: true });
+    if (!queued) this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== id);
+    const stored = cm.addMessage(participant, content, withDeferredWriteId(metadata, id));
+    let durable = queued;
+    if (queued) {
+      this.markDeferredWriteLanded(id);
+      this.ackDeferredWrites(); // a failed sync leaves it queued: still durable
+    } else {
+      try {
+        this.store.sync();
+        durable = true;
+      } catch (err) {
+        console.error(`[module-delivery] durable message for ${agent.name} stored but its sync failed:`, err);
+      }
+    }
+    if (placement) { placement.agent = agent.name; placement.messageId = stored; placement.durable = durable; }
     return stored;
   }
 

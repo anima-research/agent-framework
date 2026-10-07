@@ -4,15 +4,18 @@
  * went, and ask for a deferral to survive a restart.
  *
  * Deferral is unchanged: the same guard decides when a message is held and
- * when it lands. `durable` only keeps a held message in the persisted
- * recovery queue (the one quiesce uses) instead of memory, so it replays
- * exactly once after a crash.
+ * when it lands. `durable` keeps a held message in the persisted recovery
+ * queue (the one quiesce uses) instead of memory, and passes a message stored
+ * at once through that queue to a sync, so either replays exactly once after
+ * a crash. Only a delivery proven durable says so.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { AgentFramework } from '../src/index.js';
 import type { MessagePlacement, Module, ModuleContext, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -75,8 +78,33 @@ describe('ModuleContext.addMessage delivery options', () => {
     const placement: MessagePlacement = {};
     const id = courier.ctx.addMessage('user', [{ type: 'text', text: 'for other' }], undefined, { forAgent: 'other', placement });
     assert.ok(id, 'stored, with an id');
-    assert.deepEqual(placement, { agent: 'other', messageId: id, durable: true });
+    assert.deepEqual(placement, { agent: 'other', messageId: id, durable: false }, 'stored, not yet proven durable');
     assert.deepEqual(texts(framework, 'other').map((m) => m.text), ['for other']);
+  });
+
+  it('passes a durable message stored at once through the recovery queue to a sync', async () => {
+    const placement: MessagePlacement = {};
+    const id = courier.ctx.addMessage('user', [{ type: 'text', text: 'proven' }], undefined, { forAgent: 'other', placement, durable: true });
+    assert.deepEqual(placement, { agent: 'other', messageId: id, durable: true });
+    const internals = framework as unknown as { unackedDeferredWrites: unknown[]; deferredMessages: unknown[] };
+    assert.equal(internals.unackedDeferredWrites.length, 0, 'acknowledged by the sync');
+    assert.equal(internals.deferredMessages.length, 0);
+    assert.deepEqual(texts(framework, 'other').map((m) => m.text), ['proven'], 'stored once');
+  });
+
+  it('keeps a durable message stored at once queued when its sync fails, and still says durable', async () => {
+    const store = framework.getStore() as unknown as { sync: () => void };
+    const realSync = store.sync.bind(store);
+    store.sync = () => { throw new Error('injected sync failure'); };
+    const placement: MessagePlacement = {};
+    try {
+      courier.ctx.addMessage('user', [{ type: 'text', text: 'queued' }], undefined, { forAgent: 'other', placement, durable: true });
+    } finally {
+      store.sync = realSync;
+    }
+    assert.equal(placement.durable, true, 'held in the persisted queue for exactly-once replay');
+    const internals = framework as unknown as { unackedDeferredWrites: Array<{ id: string }> };
+    assert.equal(internals.unackedDeferredWrites.length, 1, 'still queued, awaiting a sync');
   });
 
   it("holds a targeted message for the target's turn even when the primary is idle", async () => {
@@ -157,5 +185,49 @@ describe('ModuleContext.addMessage delivery options', () => {
     assert.equal(placement.messageId, undefined, 'no stale message id beside the deferral');
     assert.equal(typeof placement.deferredId, 'string');
     assert.equal(placement.durable, false);
+  });
+});
+
+describe('ModuleContext.addMessage durable delivery across a hard kill', () => {
+  it('keeps a durable message stored at once, exactly once, when the process is killed right after the call', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'module-delivery-kill-'));
+    const index = fileURLToPath(new URL('../src/index.js', import.meta.url));
+    const mock = fileURLToPath(new URL('./helpers/mock-membrane.js', import.meta.url));
+    const script = join(dir, 'child.mjs');
+    writeFileSync(script, `
+      import { AgentFramework } from ${JSON.stringify(index)};
+      import { MockMembrane } from ${JSON.stringify(mock)};
+      import { writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      const [mode, dir] = process.argv.slice(2);
+      const courier = { name: 'courier', async start(c) { this.ctx = c; }, async stop() {}, getTools() { return []; },
+        async handleToolCall() { return { success: true }; }, async onProcess() { return {}; } };
+      console.log = () => {}; console.error = () => {};
+      const fw = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'test' }], modules: [courier] });
+      if (mode === 'deliver') {
+        fw.getStore().sync();
+        const placement = {};
+        courier.ctx.addMessage('user', [{ type: 'text', text: 'DURABLE_IMMEDIATE_NOTICE' }], undefined, { forAgent: 'scout', durable: true, placement });
+        writeFileSync(join(dir, 'receipt.json'), JSON.stringify(placement));
+        process.kill(process.pid, 'SIGKILL');
+      } else {
+        const all = JSON.stringify(fw.getAgent('scout').getContextManager().getAllMessages());
+        writeFileSync(join(dir, 'count.json'), JSON.stringify(all.split('DURABLE_IMMEDIATE_NOTICE').length - 1));
+        await fw.stop();
+        process.exit(0);
+      }
+    `);
+    try {
+      const killed = spawnSync(process.execPath, [script, 'deliver', dir], { encoding: 'utf8' });
+      assert.equal(killed.signal, 'SIGKILL', killed.stderr);
+      const receipt = JSON.parse(readFileSync(join(dir, 'receipt.json'), 'utf8')) as MessagePlacement;
+      assert.equal(receipt.durable, true);
+      const reopened = spawnSync(process.execPath, [script, 'check', dir], { encoding: 'utf8' });
+      assert.equal(reopened.status, 0, reopened.stderr);
+      assert.equal(JSON.parse(readFileSync(join(dir, 'count.json'), 'utf8')), 1, 'present after the kill, exactly once');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

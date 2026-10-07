@@ -186,11 +186,13 @@ export interface ModuleMessageOptions {
   /** Out-param: filled with where the message went. */
   placement?: MessagePlacement;
   /**
-   * If the message has to be deferred, keep it in the persisted
-   * crash-recovery queue (the one quiesce uses) rather than in memory only,
-   * so a restart before its flush replays it once (deduplicated by its
-   * deferred-write id). Deferral itself is unchanged: the same guard decides
-   * when it is held and when it lands.
+   * Make the delivery durable before the receipt says so. Deferred: keep it
+   * in the persisted crash-recovery queue (the one quiesce uses) rather than
+   * in memory only, so a restart before its flush replays it once
+   * (deduplicated by its deferred-write id). Stored at once: pass it through
+   * that queue and acknowledge it with a store sync, so a hard kill right
+   * after the call neither loses nor duplicates it. Deferral itself is
+   * unchanged: the same guard decides when it is held and when it lands.
    */
   durable?: boolean;
 }
@@ -205,9 +207,11 @@ export interface MessagePlacement {
    *  `metadata.deferredWriteId` on the message when it lands. */
   deferredId?: string;
   /**
-   * True when it was stored, or deferred with its queue persisted. False
-   * when it is deferred in memory only: not asked to be durable, or the
-   * persist failed or exceeded its size cap.
+   * True only when the delivery is proven durable: asked for with `durable`,
+   * and either on disk (synced) or held in the persisted recovery queue for
+   * exactly-once replay. False otherwise: stored without asking (it reaches
+   * disk at the next sync), deferred in memory only, or a persist or sync
+   * failed.
    */
   durable?: boolean;
 }

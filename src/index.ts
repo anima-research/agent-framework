@@ -12,6 +12,7 @@ export type {
   ResolvedPresentationChange,
   RuntimeSettingsValues,
   AppliedOperatorChange,
+  ResolvedUndoTurnsChange,
 } from './operator-change.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';

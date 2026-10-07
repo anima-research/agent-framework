@@ -32,15 +32,33 @@ import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 class Mover implements Module {
   readonly name = 'mover';
   ctx!: ModuleContext;
+  /** Resolves `hold` once released. */
+  release?: () => void;
+  entered?: () => void;
+  /** The delegated change `set_budget_later` makes after its call returned. */
+  later?: Promise<ToolResult>;
   async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
-    return [{ name: 'set_budget', description: 'Change the caller budget.', inputSchema: { type: 'object', properties: {} } }];
+    return ['set_budget', 'hold', 'set_budget_later'].map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} } }));
   }
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    return this.ctx.callTool!({
-      id: 'delegated', name: 'agent_settings', input: { action: 'update', context_budget_tokens: 130_000 }, callerAgentName: call.callerAgentName,
+    const change = (id: string, tokens = 130_000) => this.ctx.callTool!({
+      id, name: 'agent_settings', input: { action: 'update', context_budget_tokens: tokens }, callerAgentName: call.callerAgentName,
     });
+    if (call.name === 'hold') {
+      this.entered?.();
+      await new Promise<void>((resolve) => { this.release = resolve; });
+      return { success: true, data: 'held' };
+    }
+    if (call.name === 'set_budget_later') {
+      let fire!: () => void;
+      const fired = new Promise<void>((resolve) => { fire = resolve; });
+      this.later = fired.then(() => change('late', 160_000));
+      (this as { fireLater?: () => void }).fireLater = fire;
+      return { success: true, data: 'scheduled' };
+    }
+    return change('delegated');
   }
   async onProcess(): Promise<Record<string, never>> { return {}; }
 }
@@ -276,6 +294,38 @@ describe('operator-change gate: self-change tools', () => {
       assert.equal(inside.success, true, String(inside.error));
     });
     assert.equal(budget(), 150_000, 'the lease holder can apply under its own lease');
+  });
+
+  it("refuses to apply while another call owns the agent's live turn", async () => {
+    decide = async () => ({ decision: 'apply' });
+    const before = budget();
+    const entered = new Promise<void>((resolve) => { mover.entered = resolve; });
+    const holding = framework.puppetToolCall('scout', 'mover--hold', {});
+    await entered; // the puppet now owns scout's turn token
+    const outside = await mover.ctx.callTool!({ id: 'own', name: 'agent_settings', input: { action: 'update', context_budget_tokens: 150_000 }, callerAgentName: 'scout' });
+    assert.match(String(outside.error), /scout has a live turn that isn't this call's/);
+    assert.equal(budget(), before);
+    mover.release!();
+    await holding;
+  });
+
+  it("applies a puppet's own delegated change during its turn, but not from a late callback in a later turn", async () => {
+    decide = async () => ({ decision: 'apply' });
+    const own = await framework.puppetToolCall('scout', 'mover--set_budget', {});
+    assert.equal(own.result.success, true, String(own.result.error));
+    assert.equal(budget(), 130_000, 'the puppet owns its turn');
+
+    await framework.puppetToolCall('scout', 'mover--set_budget_later', {}); // returns; the change is still to come
+    const tokens = (framework as unknown as { activeTurnTokens: Map<string, number> }).activeTurnTokens;
+    tokens.set('scout', 987_654); // a later turn is alive when the callback fires
+    try {
+      (mover as unknown as { fireLater: () => void }).fireLater();
+      const late = await mover.later!;
+      assert.match(String(late.error), /live turn that isn't this call's/, 'provenance kept, permission not');
+      assert.equal(budget(), 130_000, 'unchanged by the late callback');
+    } finally {
+      tokens.delete('scout');
+    }
   });
 
   it('admits only the exact call its admission was registered for, and revalidates it as it runs', async () => {
@@ -558,6 +608,8 @@ describe('operator-change gate: host/command undo by turns', () => {
     const again = await apply();
     assert.equal(again.kind === 'undo-turns' && again.alreadyApplied, true, 'a retry changes nothing');
     assert.deepEqual({ branch: branch(), texts: texts() }, after);
+    assert.equal(host().redoStacks.get('scout')!.length, 1, 'no second redo entry');
+    assert.equal(framework.getOperatorLog().filter((e) => e.kind === 'undo-turns').length, 1, 'no second log record');
 
     framework.redo('scout'); // the active branch moves away from the destination
     await assert.rejects(apply(), (e: Error & { code?: string }) => e.code === 'stale' && /already applied/.test(e.message));
@@ -573,6 +625,66 @@ describe('operator-change gate: host/command undo by turns', () => {
         framework.applyResolvedOperatorChange(change, { lease, admission: { id: 'rev-u' } })),
       (e: Error & { code?: string }) => e.code === 'stale' && /active branch moved/.test(e.message),
     );
+  });
+
+  for (const seam of ['marker', 'checkpoints', 'log'] as const) {
+    it(`finishes the cut's bookkeeping on retry after a failure at the ${seam} write, redo included`, async () => {
+      await turn('one'); await turn('two'); await turn('three');
+      const source = branch();
+      await undo(2);
+      const change = asked[0]!;
+      const fw = framework as unknown as {
+        saveTurnCheckpoints: (agent: string, list: unknown[]) => void;
+        recordOperatorAction: (entry: { kind: string }) => void;
+      };
+      const store = framework.getStore() as unknown as { setStateJson: (id: string, v: unknown) => void };
+      const real = { setState: store.setStateJson.bind(store), save: fw.saveTurnCheckpoints.bind(fw), record: fw.recordOperatorAction.bind(fw) };
+      let armed = true;
+      const fail = () => { armed = false; throw new Error(`injected ${seam} failure`); };
+      if (seam === 'marker') store.setStateJson = (id, v) => (armed && (v as { operatorCut?: unknown })?.operatorCut ? fail() : real.setState(id, v));
+      if (seam === 'checkpoints') fw.saveTurnCheckpoints = (agent, list) => (armed ? fail() : real.save(agent, list));
+      if (seam === 'log') fw.recordOperatorAction = (entry) => (armed && entry.kind === 'undo-turns' ? fail() : real.record(entry));
+      const apply = () => framework.runAtSafeBoundary({ verb: 'apply' }, (lease) =>
+        framework.applyResolvedOperatorChange(change, { lease, admission: { id: 'rev-u' } }));
+      try {
+        await assert.rejects(apply(), new RegExp(`injected ${seam} failure`));
+      } finally {
+        store.setStateJson = real.setState;
+        fw.saveTurnCheckpoints = real.save;
+        fw.recordOperatorAction = real.record;
+      }
+      assert.equal(branch(), `undo/scout/op-${change.id}`, 'the cut landed before the failure');
+      const retried = await apply();
+      assert.equal(retried.kind === 'undo-turns' && retried.alreadyApplied, true, 'not cut again');
+      assert.equal(host().getTurnCheckpoints('scout').length, 1);
+      assert.equal(framework.getOperatorLog().filter((e) => e.kind === 'undo-turns').length, 1, 'logged once');
+      assert.equal(host().redoStacks.get('scout')!.length, 1, 'one redo entry, not one per attempt');
+      const redone = framework.redo('scout');
+      assert.deepEqual([redone.redone, redone.toBranch], [true, source], 'the promised one-step redo exists');
+      assert.equal(host().getTurnCheckpoints('scout').length, 3);
+    });
+  }
+
+  it('never awaits awareness delivery, and never reports its failure as the undo\'s', async () => {
+    decide = async () => ({ decision: 'apply' });
+    const fw = framework as unknown as { discordAwarenessOutbox: unknown; syncDiscordAwarenessMarkers: () => Promise<void> };
+    fw.discordAwarenessOutbox = {}; // so delivery is attempted
+    let calls = 0;
+    fw.syncDiscordAwarenessMarkers = () => { calls++; return calls === 1 ? Promise.reject(new Error('delivery down')) : new Promise<void>(() => {}); };
+    try {
+      await turn('one'); await turn('two'); await turn('three');
+      const now = await undo(1);
+      assert.equal(now.ok, true, 'a delivery failure is not the undo\'s');
+      decide = async (change) => ({ decision: 'staged', receipt: { id: 'rev-d', text: `staged ${change.kind}` } });
+      await undo(1);
+      const staged = asked.at(-1)!;
+      const applied = await framework.runAtSafeBoundary({ verb: 'apply' }, (lease) =>
+        framework.applyResolvedOperatorChange(staged, { lease, admission: { id: 'rev-d' } }));
+      assert.equal(applied.kind, 'undo-turns', 'returned while delivery is still pending');
+      assert.equal(calls, 2, 'delivery started both times');
+    } finally {
+      fw.discordAwarenessOutbox = null;
+    }
   });
 
   it('refuses a staged undo whose checkpoint is gone though the branch stayed', async () => {
