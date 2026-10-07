@@ -106,31 +106,41 @@ describe('silent heartbeat', () => {
     } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
   });
 
-  it('does not honor silent markers from non-heartbeat feature sets', async () => {
-    const x = await make();
-    try {
-      x.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ordinary output' }] as ContentBlock[]));
-      let pushRows = 0;
-      x.framework.onTrace((e: any) => { if (e.type === 'message:added' && e.source === 'mcpl:push-event') pushRows++; });
-      const ev = silentEvent(); ev.featureSet = 'other';
-      (x.framework as any).handleMcplPushEvent(ev);
-      await x.framework.runUntilIdle();
-      assert.equal(pushRows, 1, 'ordinary push was stored');
-      assert.deepEqual(x.routed, ['ordinary output'], 'ordinary prose routing remained');
-    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
-  });
-  it('does not honor heartbeat-shaped silent markers from another server', async () => {
-    const x = await make();
-    try {
-      x.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ordinary output' }] as ContentBlock[]));
-      let pushRows = 0;
-      x.framework.onTrace((e: any) => { if (e.type === 'message:added' && e.source === 'mcpl:push-event') pushRows++; });
-      const ev = silentEvent(); ev.serverId = 'other';
-      (x.framework as any).handleMcplPushEvent(ev);
-      await x.framework.runUntilIdle();
-      assert.equal(pushRows, 1, 'spoofed marker was stored as ordinary push content');
-      assert.deepEqual(x.routed, ['ordinary output']);
-    } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
-  });
+  // A spoofed marker is not a silent tick. With no content it is not a
+  // message either: it would wake the agent to nothing it could see, so it
+  // stores no row and wakes nobody (agent-framework#235 F2).
+  for (const [label, spoof] of [
+    ['a non-heartbeat feature set', (ev: { featureSet: string }) => { ev.featureSet = 'other'; }],
+    ['another server', (ev: { serverId: string }) => { ev.serverId = 'other'; }],
+  ] as const) {
+    it(`drops an empty heartbeat-shaped marker from ${label}: no row, no wake, no prose`, async () => {
+      const x = await make();
+      try {
+        x.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'invented cause' }] as ContentBlock[]));
+        let pushRows = 0; let starts = 0;
+        x.framework.onTrace((e: any) => { if (e.type === 'message:added' && e.source === 'mcpl:push-event') pushRows++; if (e.type === 'inference:started') starts++; });
+        const ev = silentEvent(); spoof(ev);
+        (x.framework as any).handleMcplPushEvent(ev);
+        await x.framework.runUntilIdle();
+        assert.equal(pushRows, 0, 'no stored row for an empty spoofed marker');
+        assert.equal(starts, 0, 'no uncaused wake');
+        assert.deepEqual(x.routed, []);
+      } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+    });
+
+    it(`stores a marker-bearing push with content from ${label} as ordinary content`, async () => {
+      const x = await make();
+      try {
+        x.membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ordinary output' }] as ContentBlock[]));
+        let pushRows = 0;
+        x.framework.onTrace((e: any) => { if (e.type === 'message:added' && e.source === 'mcpl:push-event') pushRows++; });
+        const ev = { ...silentEvent(), content: [{ type: 'text', text: 'visible tick' }] }; spoof(ev);
+        (x.framework as any).handleMcplPushEvent(ev);
+        await x.framework.runUntilIdle();
+        assert.equal(pushRows, 1, 'marker cannot hide content: stored as ordinary push content');
+        assert.deepEqual(x.routed, ['ordinary output'], 'ordinary prose routing remained');
+      } finally { await x.framework.stop(); rmSync(x.dir, { recursive: true, force: true }); }
+    });
+  }
 
 });

@@ -73,10 +73,11 @@ import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolv
 import { PushHandler, convertBlock as convertPushBlock, type McplPushEvent } from './mcpl/push-handler.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
-  coalescingSubjectKey, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
+  coalescingSubjectKey, type AssemblyResult, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
   type CoalescingReceiptRecord,
 } from './mcpl/push-coalescer.js';
 import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, PushEventResult } from './mcpl/types.js';
+import { isSilentHeartbeatMarker, isVisiblyEmptyContent } from './mcpl/visible-content.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
@@ -7066,6 +7067,16 @@ export class AgentFramework {
     assemblingFor?: string;
     deliverTo?: string;
   }): Promise<CoalescingPlacement | undefined> {
+    // Same backstop as the push lane: no row, no wake, no fork spawned for a
+    // message with nothing visible in it.
+    if (isVisiblyEmptyContent(event.content)) {
+      console.error(`[channel-incoming-dropped] server=${event.serverId} channel=${event.channelId} messageId=${event.messageId} reason=empty-content`);
+      this.emitTrace({
+        type: 'mcpl:empty-content-dropped', lane: 'channel', serverId: event.serverId,
+        channelId: event.channelId, messageId: event.messageId, ...(event.eventId ? { eventId: event.eventId } : {}),
+      });
+      return undefined;
+    }
     const metadata: Record<string, unknown> = {
       ...event.metadata,
       ...(event.eventId ? { eventId: event.eventId } : {}),
@@ -7708,7 +7719,7 @@ export class AgentFramework {
         throw new CoalesceError('eventId', 'eventId is required with coalesce');
       }
       if (typeof message.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
-      validateCoalescedContent(message.content);
+      validateCoalescedContent(message.content, undefined, { allowEmpty: message.coalesce.retract === true });
       const c = message.coalesce;
       const result = await this.pushCoalescer.accept({
         serverId,
@@ -7735,7 +7746,11 @@ export class AgentFramework {
       validateCoalesceMember(params.coalesce, 'push');
       if (typeof params.eventId !== 'string' || !params.eventId) throw new CoalesceError('eventId', 'eventId is required');
       if (typeof params.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
-      validateCoalescedContent(params.payload?.content);
+      validateCoalescedContent(params.payload?.content, undefined, {
+        allowEmpty: params.coalesce.retract === true || isSilentHeartbeatMarker({
+          serverId, featureSet: params.featureSet, origin: params.origin, content: params.payload?.content,
+        }),
+      });
       const c = params.coalesce;
       if (c.channelId) this.assertChannelScopedPush(serverId, c.channelId);
       const origin = params.origin ?? {};
@@ -7907,6 +7922,7 @@ export class AgentFramework {
         counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
         addressed: isAddressedMessage(occ.tags, origin),
         coalescingSubject: subject,
+        coalescingBatch: true,
       });
     }
   }
@@ -8021,6 +8037,16 @@ export class AgentFramework {
    * Convert an MCPL push event to a context message.
    */
   private handleMcplPushEvent(event: McplPushEvent): CoalescingPlacement | undefined {
+    // Backstop for the MCPL boundary's empty-content rejection, covering
+    // events that never crossed it (module-emitted, coalescer deliveries):
+    // content with nothing visible stores no row and queues no wake — the
+    // model would wake to `[Continue]` or an older message re-presented as
+    // the newest, a wake with no visible cause.
+    if (isVisiblyEmptyContent(event.content) && !isSilentHeartbeatMarker(event)) {
+      console.error(`[push-event-dropped] server=${event.serverId} eventId=${event.eventId} reason=empty-content`);
+      this.emitTrace({ type: 'mcpl:empty-content-dropped', lane: 'push', serverId: event.serverId, eventId: event.eventId });
+      return undefined;
+    }
     const triggerChannel = this.derivePushEventChannel(event.origin);
     if (triggerChannel && this.channelRegistry) {
       this.channelRegistry.ensureChannelRegistered(
@@ -8075,12 +8101,7 @@ export class AgentFramework {
     // Accept the no-message path only for the heartbeat feature's own exact
     // marker with an empty payload — arbitrary MCPL servers cannot hide
     // content merely by setting `origin.silent`.
-    const silentHeartbeat =
-      event.serverId === 'heartbeat' &&
-      event.featureSet === 'heartbeat' &&
-      event.origin?.source === 'heartbeat' &&
-      event.origin?.silent === true &&
-      content.length === 0;
+    const silentHeartbeat = isSilentHeartbeatMarker({ ...event, content });
 
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
@@ -8435,8 +8456,16 @@ export class AgentFramework {
       // A silent tick never suppresses a genuine coalesced wake. If any
       // ordinary request shares this batch, the ordinary turn semantics win.
       const silentOnly = requests.every((r) => r.suppressProse === true);
+      // RFC-006 §5: when every cause is a deferred batch, the turn's content
+      // exists only once assembly renders it. Recorded for the whole batch
+      // (not inherited from requests[0]), so a requeued trigger stays honest.
+      const batchOnly = !budgetRestart && requests.every((r) => r.coalescingBatch === true && !!r.coalescingSubject);
       await this.startAgentStream(agent, {
         ...trigger,
+        coalescingBatch: batchOnly || undefined,
+        coalescingBatchSubjects: batchOnly
+          ? [...new Set(requests.flatMap((r) => r.coalescingBatchSubjects ?? [r.coalescingSubject!]))]
+          : undefined,
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         channelId: channelReq?.channelId,
@@ -9052,12 +9081,46 @@ export class AgentFramework {
     // boundary — after the deferred flush (same window: turn alive, compile
     // not yet run) and before the checkpoint (they are the turn's inputs).
     // Not on a context-budget restart: that continues the same logical turn.
+    let assembly: AssemblyResult | undefined;
     if (attempt === 0 && !continuingTurn && this.pushCoalescer?.pendingBatches()) {
       try {
-        await this.pushCoalescer.assemble(agent.name);
+        assembly = await this.pushCoalescer.assemble(agent.name);
       } catch (err) {
         console.error(`[coalescing] assembly for ${agent.name} failed:`, err);
       }
+    }
+
+    // A turn whose only causes were deferred batches, all of which rendered
+    // nothing (empty or blank render, §5.2; cancelled; revoked), has nothing
+    // new to show: running it would wake the model to `[Continue]` or an
+    // older message, an uncaused wake. Stop before the checkpoint, locus,
+    // typing and compile. Any batch this assembly materialized keeps the
+    // turn, including one that was not among its causes (a batch whose wake
+    // the freeze withdrew, or one that never qualified for a wake). A cause
+    // this assembly did not settle (rendered elsewhere, not yet frozen) keeps
+    // the turn, as before.
+    const batchSubjects = trigger?.coalescingBatchSubjects;
+    if (assembly && batchSubjects?.length && assembly.materialized.size === 0
+      && batchSubjects.every((s) => assembly.settled.has(s))) {
+      console.error(`[coalescing] ${agent.name}: deferred render produced nothing; turn not started (no wake cause left)`);
+      this.emitTrace({ type: 'mcpl:coalescing', kind: 'turn-withdrawn', agentName: agent.name, subjects: batchSubjects });
+      // Release the turn and land anything deferred while assembly awaited
+      // the render, as a torn-down turn would.
+      if (this.activeTurnTokens.get(agent.name) === turnToken) {
+        this.activeTurnTokens.delete(agent.name);
+        this.activeTurnTriggers.delete(agent.name);
+      }
+      if (!this.activeTurnTokens.has(agent.name)
+        && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
+        for (const msg of this.drainDeferredFor(agent.name)) {
+          this.addMessage(msg.participant, msg.content, msg.metadata, {
+            deferredWriteId: msg.id,
+            ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+          });
+        }
+        this.ackDeferredWrites();
+      }
+      return false;
     }
 
     // Record turn checkpoint before inference (only on first attempt, not retries)

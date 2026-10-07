@@ -306,6 +306,14 @@ export interface InferenceRequest {
   /** Host-owned identity for withdrawal of an unconsumed coalesced wake. */
   coalescingSubject?: string;
   coalescingEventId?: string;
+  /** Host-owned: this wake's cause is an RFC-006 deferred batch, which has
+   *  no model-visible content until it renders at the turn's assembly. */
+  coalescingBatch?: boolean;
+  /** Host-owned, set on a turn's trigger when EVERY request batched into it
+   *  was a deferred-batch wake: these are their subjects. If assembly settles
+   *  all of them without materializing content, the turn has no cause left
+   *  and does not run. */
+  coalescingBatchSubjects?: string[];
   agentName: string;
   reason: string;
   source: string;
