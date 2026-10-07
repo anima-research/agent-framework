@@ -9,6 +9,7 @@ import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
+import { callProvenance } from './call-provenance.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
 import type {
   MessageId,
@@ -482,6 +483,9 @@ interface DeferredWrite {
   content: ContentBlock[];
   metadata?: MessageMetadata;
   forAgent?: string;
+  /** Delivered durable (ModuleMessageOptions.durable): if a flush fails to
+   *  store it, ackDeferredWrites returns it to pending instead of dropping it. */
+  durable?: boolean;
 }
 const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
 
@@ -1247,6 +1251,9 @@ export class AgentFramework {
    * alone would let a hard exit forget an accepted message.
    */
   private unackedDeferredWrites: DeferredWrite[] = [];
+  /** Ids of handed-off deferred writes that actually reached a context
+   *  manager since the last ack. ackDeferredWrites acknowledges only these. */
+  private landedDeferredWrites: Set<string> = new Set();
   /** Monotonic order stamp for deferred writes: the durable queue is always
    *  written, restored, drained and flushed in `seq` order, whatever the
    *  pending/un-acked split — a re-deferred entry keeps its place. */
@@ -1452,6 +1459,17 @@ export class AgentFramework {
   }> = [];
   /** The lease currently held, and the turn token it reserved per agent. */
   private heldLease: { lease: SafeBoundaryLease; tokens: Map<string, number> } | null = null;
+  /**
+   * Ephemeral creations admitted into the store and not yet running or
+   * released: from createEphemeralAgent's admission until
+   * runEphemeralToCompletion takes the candidate or its cleanup() runs. A
+   * safe-boundary lease waits for every one, so nothing initializes or
+   * starts under it. Requests still held behind a lease are not here.
+   */
+  private ephemeralPending: Set<object> = new Set();
+  private ephemeralPendingByAgent: WeakMap<Agent, object> = new WeakMap();
+  /** Creations held until no lease is waiting or held (admitEphemeralCreation). */
+  private boundaryClearedWaiters: Array<() => void> = [];
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
   /** Framework-global inference gate; older generations cannot release it. */
@@ -1519,7 +1537,19 @@ export class AgentFramework {
       // framework hands to its own module registry. The public
       // executeToolCall() is shared with model/ephemeral callers and always
       // stamps agent origin (see there).
-      callTool: (call) => this.executeToolCallFrom({ ...call, origin: call.origin ?? 'host' }, { kind: 'module' }),
+      // Who asked travels with a delegated call: inside a module tool
+      // handler (or work it started) the initiator of that call; with no
+      // call behind it (a module's own timer or event) the host.
+      callTool: (call) => {
+        const ambient = callProvenance.getStore();
+        const origin = call.origin ?? (ambient ? ambient.origin : 'host');
+        const admission = call.admission ?? ambient?.admission;
+        const { origin: _o, admission: _a, ...rest } = call;
+        return this.executeToolCallFrom(
+          { ...rest, ...(origin ? { origin } : {}), ...(admission ? { admission } : {}) },
+          { kind: 'module' },
+        );
+      },
       notifyOps: (kind, agentName, message, data) => this.notifyOps(kind, agentName, message, data),
     });
   }
@@ -3452,7 +3482,7 @@ export class AgentFramework {
     if (this.unackedDeferredWrites.length === 0) return;
     // Nothing durable to reconcile against unless the queue was persisted.
     if (!this.deferredWritesPersisted && !this.quiesced) {
-      this.unackedDeferredWrites = [];
+      this.settleUnackedDeferredWrites();
       return;
     }
     try {
@@ -3465,9 +3495,33 @@ export class AgentFramework {
       );
       return;
     }
-    this.unackedDeferredWrites = [];
+    this.settleUnackedDeferredWrites();
     this.deferredScanFrom.clear();
     this.persistDeferredWrites();
+  }
+
+  /**
+   * Clear the un-acked set once its landed writes are durable. A sync can
+   * only acknowledge a write that reached a context manager. An entry whose
+   * store write failed never landed: if it was delivered durable it goes
+   * back to pending under its own id and seq, so the next boundary retries
+   * it. Any other keeps the established poison policy (logged where it
+   * failed, then dropped) so one bad write can't wedge the queue behind it.
+   */
+  private settleUnackedDeferredWrites(): void {
+    const failedDurable = this.unackedDeferredWrites.filter(
+      (m) => m.durable && !this.landedDeferredWrites.has(m.id),
+    );
+    this.unackedDeferredWrites = [];
+    this.landedDeferredWrites.clear();
+    if (failedDurable.length > 0) {
+      this.deferredMessages.push(...failedDurable);
+      this.deferredMessages.sort(bySeq);
+      console.error(
+        `[host-mode] ${failedDurable.length} durable deferred write(s) failed to store; ` +
+        `kept pending for the next boundary`,
+      );
+    }
   }
 
   /**
@@ -4207,12 +4261,23 @@ export class AgentFramework {
    *
    * Data persists after cleanup for investigation and cross-revert.
    * Call cleanup() when done to release the ContextManager.
+   *
+   * Safe boundaries (runAtSafeBoundary): an admitted creation, and the
+   * candidate it returns, count as pending until runEphemeralToCompletion
+   * takes the candidate or cleanup() runs, and a lease waits for every
+   * pending one. So call cleanup() for a candidate that will never run.
+   * While a lease waits, a creation proceeds only when `opts.requestedBy`
+   * names a stream the lease is already draining (an agent with its turn
+   * alive, or a running ephemeral stream), which may need the new agent to
+   * finish. Any other creation, and any creation while a lease is held,
+   * waits until the boundary clears.
    */
-  async createEphemeralAgent(config: AgentConfig): Promise<{
+  async createEphemeralAgent(config: AgentConfig, opts?: { requestedBy?: string }): Promise<{
     agent: Agent;
     contextManager: ContextManager;
     cleanup: () => void;
   }> {
+    await this.admitEphemeralCreation(opts?.requestedBy);
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier
     // generation before runEphemeralToCompletion has a chance to reject it.
@@ -4220,6 +4285,10 @@ export class AgentFramework {
       throw new Error(`Ephemeral agent name \"${config.name}\" is already registered or has been used in this framework`);
     }
     this.usedEphemeralAgentNames.add(config.name);
+    // Synchronously after admission: from here until the candidate runs or
+    // is cleaned up, a waiting lease isn't granted.
+    const pending = {};
+    this.ephemeralPending.add(pending);
     try {
       const namespace = `subagent/${config.name}`;
 
@@ -4236,15 +4305,21 @@ export class AgentFramework {
       this.restoreToolResultGuardSetting(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, contextManager);
+      this.ephemeralPendingByAgent.set(agent, pending);
 
       const cleanup = () => {
         // Don't close the store — it's shared. Just release the CM.
         // Data persists in the store under the namespace for investigation.
+        // A candidate that never ran stops holding back safe boundaries.
+        this.ephemeralPending.delete(pending);
+        this.tryGrantSafeBoundary();
       };
 
       return { agent, contextManager, cleanup };
     } catch (error) {
       this.usedEphemeralAgentNames.delete(config.name);
+      this.ephemeralPending.delete(pending);
+      this.tryGrantSafeBoundary();
       throw error;
     }
   }
@@ -4356,7 +4431,11 @@ export class AgentFramework {
     if (this.agents.has(agent.name) || this.ephemeralRuns.has(agent.name)) {
       throw new Error(`Ephemeral agent "${agent.name}" is already registered or running`);
     }
-    // Register temporarily so the event loop can drive it
+    // Register temporarily so the event loop can drive it. In the same
+    // synchronous step the candidate stops being pending and becomes a run,
+    // which a safe-boundary lease waits for in its place.
+    const pendingCreation = this.ephemeralPendingByAgent.get(agent);
+    if (pendingCreation) this.ephemeralPending.delete(pendingCreation);
     this.agents.set(agent.name, agent);
     const run: EphemeralRun = {
       settle: this.createDeferred<AgentSettleResult>(),
@@ -6240,6 +6319,7 @@ export class AgentFramework {
           if (at < 0) return; // already granted
           this.boundaryWaiters.splice(at, 1);
           reject(withdrawn());
+          this.notifyBoundaryCleared();
         };
         opts.signal.addEventListener('abort', onAbort, { once: true });
       }
@@ -6268,7 +6348,8 @@ export class AgentFramework {
     // Optional chaining: prototype-built harnesses leave fields undefined,
     // which must read as "nobody waiting" (see surgeryHeld below).
     if (!this.boundaryWaiters?.length || this.heldLease || this.surgeryHold) return;
-    if (this.ephemeralRuns.size > 0 || this.storeBusyReasons().length > 0) return;
+    if (this.ephemeralRuns.size > 0 || (this.ephemeralPending?.size ?? 0) > 0) return;
+    if (this.storeBusyReasons().length > 0) return;
     const waiter = this.boundaryWaiters.shift()!;
     const { tokens, release } = this.takeStoreReservation(waiter.verb, 'safe-boundary');
     const lease: SafeBoundaryLease = Object.freeze({
@@ -6284,10 +6365,44 @@ export class AgentFramework {
       release: () => {
         if (this.heldLease === entry) this.heldLease = null;
         release();
-        // The next waiter may be grantable at once.
+        // The next waiter may be grantable at once; if none is waiting,
+        // creations held behind the boundary proceed.
         this.tryGrantSafeBoundary();
+        this.notifyBoundaryCleared();
       },
     });
+  }
+
+  /**
+   * Admission for createEphemeralAgent. With no lease waiting or held, a
+   * creation proceeds. While a lease waits, it proceeds only for a stream
+   * whose work the lease is already draining (isDrainingStream): such a
+   * stream may need the new agent to finish, as a sync spawn does. Any other
+   * creation, and every creation while a lease is held, waits until no lease
+   * is waiting or held. A held request doesn't count as pending, so it never
+   * blocks the grant it is waiting for.
+   */
+  private async admitEphemeralCreation(requestedBy?: string): Promise<void> {
+    for (;;) {
+      if (!this.boundaryWaiters?.length && !this.heldLease) return;
+      if (!this.heldLease && requestedBy !== undefined && this.isDrainingStream(requestedBy)) return;
+      await new Promise<void>((resolve) => this.boundaryClearedWaiters.push(resolve));
+    }
+  }
+
+  /** A stream a waiting lease is draining: a registered ephemeral run, or an
+   *  agent with a real turn alive (not a lease's reservation token). */
+  private isDrainingStream(name: string): boolean {
+    if (this.ephemeralRuns.has(name)) return true;
+    const token = this.activeTurnTokens.get(name);
+    return token !== undefined && this.heldLease?.tokens.get(name) !== token;
+  }
+
+  /** Release creations held by admitEphemeralCreation once no lease is
+   *  waiting or held. */
+  private notifyBoundaryCleared(): void {
+    if (this.boundaryWaiters?.length || this.heldLease) return;
+    for (const resume of this.boundaryClearedWaiters.splice(0)) resume();
   }
 
   /** The tokens `lease` holds, or a refusal naming why it can't be used. */
@@ -7428,6 +7543,7 @@ export class AgentFramework {
             if (deferred.length > 0) {
               for (const msg of deferred) {
                 agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
+                this.landedDeferredWrites.add(msg.id);
                 // Injection guards: tool blocks would corrupt the tool-cycle
                 // structure the membrane enforces, and a message named as the
                 // agent itself would render as an ASSISTANT turn on the wire
@@ -9811,6 +9927,7 @@ export class AgentFramework {
             const id = agent.getContextManager().addMessage(
               msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id),
             );
+            this.landedDeferredWrites.add(msg.id);
             this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
           } catch (err) {
             console.error(
@@ -13185,6 +13302,14 @@ export class AgentFramework {
       bypassDeferralFor?: string;
     }
   ): MessageId {
+    // The placement receipt describes this call only: a reused out-param
+    // must not keep an earlier delivery's agent, ids or durability.
+    if (opts?.placement) {
+      delete opts.placement.agent;
+      delete opts.placement.messageId;
+      delete opts.placement.deferredId;
+      delete opts.placement.durable;
+    }
     // Route to the named agent, else the primary (not ephemeral subagents).
     const agent = opts?.forAgent
       ? this.agents.get(opts.forAgent)
@@ -13242,12 +13367,17 @@ export class AgentFramework {
       // set: one logical message, one durable identity — never two entries.
       const id = opts?.deferredWriteId ?? randomUUID();
       let seq: number | undefined;
+      let durable = opts?.durable === true;
       if (opts?.deferredWriteId) {
         const prior = this.unackedDeferredWrites.find((m) => m.id === id);
         seq = prior?.seq;
+        durable ||= prior?.durable === true;
         this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== id);
       }
-      this.deferredMessages.push({ id, seq: seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent });
+      this.deferredMessages.push({
+        id, seq: seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent,
+        ...(durable ? { durable: true } : {}),
+      });
       const persisted = this.quiesced || this.deferredWritesPersisted || opts?.durable
         ? this.persistDeferredWrites({ force: opts?.durable === true })
         : false;
@@ -13264,6 +13394,7 @@ export class AgentFramework {
       content,
       opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
     );
+    if (opts?.deferredWriteId) this.landedDeferredWrites.add(opts.deferredWriteId);
     if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; opts.placement.durable = true; }
     return stored;
   }

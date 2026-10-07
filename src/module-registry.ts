@@ -25,6 +25,7 @@ import type {
   TraceEventListener,
 } from './types/index.js';
 import type { Agent } from './agent.js';
+import { callProvenance } from './call-provenance.js';
 
 const MODULE_STATE_PREFIX = 'modules/';
 
@@ -310,7 +311,15 @@ export class ModuleRegistry {
     };
 
     try {
-      return await module.handleToolCall(moduleCall);
+      // The handler, and any work it starts, runs as this call's initiator,
+      // so a tool it delegates to through ctx.callTool keeps that actor.
+      return await callProvenance.run(
+        {
+          ...(call.origin ? { origin: call.origin } : {}),
+          ...(call.admission ? { admission: call.admission } : {}),
+        },
+        () => module.handleToolCall(moduleCall),
+      );
     } catch (error) {
       return {
         success: false,

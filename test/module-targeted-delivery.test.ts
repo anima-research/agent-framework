@@ -143,4 +143,19 @@ describe('ModuleContext.addMessage delivery options', () => {
     assert.equal(id, '');
     assert.deepEqual(placement, {});
   });
+
+  it('describes only the latest call in a reused placement receipt', async () => {
+    const placement: MessagePlacement = {};
+    courier.ctx.addMessage('user', [{ type: 'text', text: 'one' }], undefined, { forAgent: 'scout', placement });
+    assert.equal(typeof placement.messageId, 'string');
+    courier.ctx.addMessage('user', [{ type: 'text', text: 'lost' }], undefined, { forAgent: 'ghost', placement, durable: true });
+    assert.deepEqual(placement, {}, 'nothing left from the earlier delivery');
+
+    courier.ctx.addMessage('user', [{ type: 'text', text: 'two' }], undefined, { forAgent: 'other', placement });
+    (framework as unknown as Internals).activeTurnTokens.set('other', 77);
+    courier.ctx.addMessage('user', [{ type: 'text', text: 'three' }], undefined, { forAgent: 'other', placement });
+    assert.equal(placement.messageId, undefined, 'no stale message id beside the deferral');
+    assert.equal(typeof placement.deferredId, 'string');
+    assert.equal(placement.durable, false);
+  });
 });

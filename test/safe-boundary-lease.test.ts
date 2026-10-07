@@ -13,8 +13,8 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { AgentFramework } from '../src/index.js';
-import type { InferenceRequest, SafeBoundaryLease } from '../src/index.js';
+import { AgentFramework, PassthroughStrategy } from '../src/index.js';
+import type { InferenceRequest, MessagePlacement, Module, ModuleContext, SafeBoundaryLease, ToolDefinition, ToolResult } from '../src/index.js';
 import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
@@ -30,6 +30,7 @@ type Internals = {
   ephemeralRuns: Map<string, unknown>;
   deferredMessages: unknown[];
   unackedDeferredWrites: unknown[];
+  ephemeralPending: Set<object>;
   addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
 };
 
@@ -247,5 +248,110 @@ describe('runAtSafeBoundary', () => {
     const landed = all.find((m) => m.content[0]?.text === 'arrived during the change');
     assert.ok(landed, 'landed at release');
     assert.equal(typeof landed!.metadata?.deferredWriteId, 'string', 'carries its deferred-write id');
+  });
+
+  it('waits for an ephemeral creation in progress, then for its unrun candidate until cleanup', async () => {
+    let releaseInit!: () => void;
+    let reachedInit!: () => void;
+    const initGate = new Promise<void>((r) => { releaseInit = r; });
+    const initStarted = new Promise<void>((r) => { reachedInit = r; });
+    const strategy = new PassthroughStrategy();
+    (strategy as unknown as { initialize: () => Promise<void> }).initialize = async () => { reachedInit(); await initGate; };
+    const creating = framework.createEphemeralAgent({ name: 'pending', model: 'test-model', systemPrompt: 'test', strategy });
+    await initStarted;
+
+    let granted = false;
+    const leased = framework.runAtSafeBoundary({ verb: 'after creation' }, async () => { granted = true; });
+    await tick();
+    assert.equal(granted, false, 'not granted while the creation initializes');
+    releaseInit();
+    const created = await creating;
+    i.tryGrantSafeBoundary();
+    await tick();
+    assert.equal(granted, false, 'nor while its candidate is unrun');
+    created.cleanup();
+    await leased;
+    assert.equal(granted, true, 'granted once the candidate is released');
+    assert.equal(i.ephemeralPending.size, 0);
+  });
+
+  it('holds a creation nobody it is draining asked for, without letting it block the grant', async () => {
+    i.activeTurnTokens.set('other', 9_999); // a real turn keeps the lease waiting
+    const order: string[] = [];
+    const leased = framework.runAtSafeBoundary({ verb: 'held creation' }, async () => { order.push('lease'); });
+    await tick();
+    const creating = framework.createEphemeralAgent({ name: 'outsider', model: 'test-model', systemPrompt: 'test' })
+      .then((c) => { order.push('created'); return c; });
+    await tick();
+    assert.deepEqual(order, [], 'held behind the waiting lease');
+    assert.equal(i.ephemeralPending.size, 0, 'a held request is not pending');
+
+    i.activeTurnTokens.delete('other');
+    i.tryGrantSafeBoundary();
+    await leased;
+    const created = await creating;
+    assert.deepEqual(order, ['lease', 'created'], 'it proceeds only after the lease');
+    created.cleanup();
+  });
+
+  it("admits a creation for a stream it is draining, and waits for that stream's candidate", async () => {
+    i.activeTurnTokens.set('other', 9_999); // other's real turn is alive: the lease drains it
+    let granted = false;
+    const leased = framework.runAtSafeBoundary({ verb: 'draining' }, async () => { granted = true; });
+    await tick();
+    const created = await framework.createEphemeralAgent(
+      { name: 'helper', model: 'test-model', systemPrompt: 'test' }, { requestedBy: 'other' },
+    );
+    assert.equal(i.ephemeralPending.size, 1, 'admitted while the lease waits');
+    i.activeTurnTokens.delete('other'); // other's turn ends
+    i.tryGrantSafeBoundary();
+    await tick();
+    assert.equal(granted, false, "the lease still waits for other's candidate");
+    created.cleanup();
+    await leased;
+    assert.equal(granted, true);
+  });
+
+  it('keeps a durable deferral whose store write failed pending for the next boundary', async () => {
+    class Courier implements Module {
+      readonly name = 'courier';
+      ctx!: ModuleContext;
+      async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
+      async stop(): Promise<void> {}
+      getTools(): ToolDefinition[] { return []; }
+      async handleToolCall(): Promise<ToolResult> { return { success: true }; }
+      async onProcess(): Promise<Record<string, never>> { return {}; }
+    }
+    const courier = new Courier();
+    await framework.addModule(courier as unknown as Module);
+    const cm = framework.getAgent('scout')!.getContextManager();
+    const realAdd = cm.addMessage.bind(cm);
+    let failing = true;
+    (cm as unknown as { addMessage: typeof cm.addMessage }).addMessage = ((participant, content, metadata, causedBy) => {
+      if (failing && (content[0] as { text?: string }).text === 'durable notice') throw new Error('injected append failure');
+      return realAdd(participant, content, metadata, causedBy);
+    }) as typeof cm.addMessage;
+
+    const placement: MessagePlacement = {};
+    const quietErr = console.error;
+    console.error = () => {};
+    try {
+      await framework.runAtSafeBoundary({ verb: 'deliver' }, async () => {
+        courier.ctx.addMessage('user', [{ type: 'text', text: 'durable notice' }], undefined, { forAgent: 'scout', placement, durable: true });
+      });
+    } finally {
+      console.error = quietErr;
+    }
+    assert.equal(placement.durable, true);
+    const landed = () => (cm.getAllMessages() as Array<{ content: Array<{ text?: string }> }>)
+      .filter((m) => m.content[0]?.text === 'durable notice').length;
+    assert.equal(landed(), 0, 'the write failed');
+    assert.equal(i.deferredMessages.length, 1, 'kept pending, not acknowledged away');
+
+    failing = false;
+    await framework.runAtSafeBoundary({ verb: 'next boundary' }, async () => {});
+    assert.equal(landed(), 1, 'lands at the next boundary, once');
+    assert.equal(i.deferredMessages.length, 0);
+    assert.equal(i.unackedDeferredWrites.length, 0);
   });
 });

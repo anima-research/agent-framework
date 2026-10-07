@@ -24,12 +24,29 @@ class ProbeModule implements Module {
   async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
-    return [{ name: 'record', description: 'Record the call.', inputSchema: { type: 'object', properties: {} } }];
+    return ['record', 'proxy', 'proxy_later'].map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} } }));
+  }
+  /** Delegated work finished after the handler returned. */
+  later?: Promise<unknown>;
+  /** A callback the module schedules on its own, outside any tool call. */
+  independently(callerAgentName: string): Promise<unknown> {
+    return new Promise((resolve) => setImmediate(() => resolve(
+      this.ctx.callTool!({ id: 'independent', name: 'probe--record', input: {}, callerAgentName }),
+    )));
   }
   getUtilities(): ToolDefinition[] {
     return [{ name: 'util_record', description: 'Record the call, as a utility.', inputSchema: { type: 'object', properties: {} } }];
   }
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    if (call.name === 'proxy') {
+      return this.ctx.callTool!({ id: 'nested', name: 'probe--record', input: {}, callerAgentName: call.callerAgentName });
+    }
+    if (call.name === 'proxy_later') {
+      this.later = new Promise((resolve) => setTimeout(() => resolve(
+        this.ctx.callTool!({ id: 'nested-later', name: 'probe--record', input: {}, callerAgentName: call.callerAgentName }),
+      ), 5));
+      return { success: true, data: 'scheduled' };
+    }
     this.calls.push(call);
     return { success: true, data: { recorded: call.name } };
   }
@@ -130,5 +147,29 @@ describe('tool-call origin', () => {
     const hostRun = await probe.ctx.callTool!({ id: 'host-ce', name: 'code_execution', input: { code }, callerAgentName: 'scout' });
     assert.equal(hostRun.success, true, String(hostRun.error));
     assert.deepEqual(provenance(probe.calls[1]!), { origin: 'host', admission: undefined });
+  });
+
+  it("keeps the puppet's authorship when a module delegates to another tool, now or later", async () => {
+    await framework.puppetToolCall('scout', 'probe--proxy', {});
+    await framework.puppetToolCall('scout', 'probe--proxy_later', {});
+    await probe.later;
+    assert.deepEqual(probe.calls.map((c) => ({ id: c.id, origin: c.origin })), [
+      { id: 'nested', origin: 'puppet' },
+      { id: 'nested-later', origin: 'puppet' },
+    ]);
+  });
+
+  it("keeps the model's authorship through delegation, and marks a module's own callback as the host's", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: 'toolu_model_2', name: 'probe--proxy', input: {} }], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+    (framework as unknown as Internals).pendingRequests.push(
+      { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'test', timestamp: Date.now() } as InferenceRequest,
+    );
+    await framework.runUntilIdle();
+    await probe.independently('scout');
+    assert.deepEqual(probe.calls.map((c) => ({ id: c.id, origin: c.origin })), [
+      { id: 'nested', origin: undefined },
+      { id: 'independent', origin: 'host' },
+    ]);
   });
 });
