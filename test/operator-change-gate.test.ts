@@ -1807,6 +1807,52 @@ describe('operator journals that cannot be read', () => {
     });
   }
 
+  const evidence = { target: 'undo/scout/op-x', source: 'main', sourceHead: 1, removed: 1, staged: false,
+    marks: { scope: 'none', refs: [], unmarked: 0, notRemoved: 0 } };
+  const startOn = (store: JsStore) => AgentFramework.create({
+    store,
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', maxTokens: 1000 }],
+    modules: [],
+  });
+  const refusedAs = (type: string) => (e: Error) => e.name === 'OperatorJournalUnreadableError' && e.message.includes(type) && /malformed/.test(e.message);
+
+  it('refuses a checkpoint whose snapshot is null rather than reading the entries it covers as gone', async () => {
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    const pending = store.appendJson('operator/changes', { kind: 'attempt', changeId: 'pending', changeKind: 'undo-turns', agent: 'scout', n: 1, at: 1, evidence });
+    store.appendJson('operator/changes/checkpoint', { through: String(pending.id), snapshot: null });
+    store.sync();
+    await assert.rejects(startOn(store), refusedAs('operator/changes'));
+  });
+
+  it('refuses an entry missing what its kind requires', async () => {
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    store.appendJson('operator/changes', { kind: 'attempt', changeId: 'half' });
+    store.sync();
+    await assert.rejects(startOn(store), refusedAs('operator/changes'));
+  });
+
+  it('refuses a null-snapshot checkpoint in the unstick journal too', async () => {
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    const launched = store.appendJson('operator/unstick', { kind: 'attempt-launched', operationId: 'op', agent: 'scout', step: 1 });
+    store.appendJson('operator/unstick/checkpoint', { through: String(launched.id), snapshot: null });
+    store.sync();
+    await assert.rejects(startOn(store), refusedAs('operator/unstick'));
+  });
+
+  it('refuses a malformed ledger offline as well', () => {
+    const path = join(dir, 'offline');
+    const store = JsStore.openOrCreate({ path });
+    const pending = store.appendJson('operator/changes', { kind: 'attempt', changeId: 'pending', changeKind: 'undo-turns', agent: 'scout', n: 1, at: 1, evidence });
+    store.appendJson('operator/changes/checkpoint', { through: String(pending.id), snapshot: null });
+    store.sync();
+    store.close();
+    const cli = fileURLToPath(new URL('../src/recovery/recover-cli.js', import.meta.url));
+    const run = spawnSync(process.execPath, [cli, '--store', path, '--operator-change', 'list'], { encoding: 'utf8' });
+    assert.equal(run.status, 1);
+    assert.match(run.stderr, /malformed operator\/changes checkpoint/);
+  });
+
   it('fails an operation mid-run when operator/changes becomes unreadable, never answering as if it were empty', async () => {
     const framework = await AgentFramework.create({
       storePath: join(dir, 'live'),

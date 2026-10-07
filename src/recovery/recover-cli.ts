@@ -18,7 +18,7 @@ import { RecordJournal } from '../record-journal.js';
 import {
   cutAttemptDisposition,
   OPERATOR_CHANGES_JOURNAL,
-  reduceOperatorChangesEntry,
+  readOperatorChanges,
   type OperatorChangeRecord,
   type OperatorChangeResolution,
   type OperatorChangeResolutionReceipt,
@@ -269,11 +269,8 @@ function operatorChange(options: CliOptions): void {
   const store = JsStore.openOrCreate({ path: options.storePath! });
   try {
     const journal = new RecordJournal<OperatorChangesEntry, OperatorChangesSnapshot>(store, { type: OPERATOR_CHANGES_JOURNAL });
-    const { snapshot, entries } = journal.load();
-    const records = new Map<string, OperatorChangeRecord>(
-      Object.entries(snapshot ?? {}).map(([id, record]) => [id, structuredClone(record)]),
-    );
-    for (const { entry } of entries) reduceOperatorChangesEntry(records, entry);
+    // A journal that can't be interpreted is refused, never read as empty.
+    const records = readOperatorChanges(journal.load());
     const active = store.currentBranch().name;
     const held = (record: OperatorChangeRecord) => {
       if (record.outcome || record.dropped || (record.kind !== 'undo-turns' && record.kind !== 'undo-messages')) return null;

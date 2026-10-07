@@ -21,6 +21,7 @@ import {
   type FrozenMarks,
   cutAttemptDisposition,
   OPERATOR_CHANGES_JOURNAL,
+  readOperatorChanges,
   reduceOperatorChangesEntry,
   type OperatorChangesEntry,
   type OperatorChangesSnapshot,
@@ -609,6 +610,41 @@ type UnstickJournalEntry =
   | { kind: 'attempt-launched'; operationId: string; agent: string; step: number }
   | { kind: 'attempt-done'; operationId: string; step: number; outcome: 'responded' | 'refused' | 'failed'; category?: string; error?: string };
 type UnstickJournalSnapshot = Record<string, UnstickOperationRecord>;
+
+/**
+ * Read the unstick journal into its operations, refusing anything parseable
+ * that can't be interpreted as this ledger (a null-snapshot checkpoint, or
+ * a record or entry missing what it requires), exactly as unreadable bytes.
+ */
+function readUnstickJournal(load: { snapshot: unknown; entries: Array<{ entry: unknown }>; checkpointed: boolean }): Map<string, UnstickOperationRecord> {
+  const malformed = (what: string): never => { throw new Error(`malformed operator/unstick ${what}`); };
+  const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+  const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+  const ops = new Map<string, UnstickOperationRecord>();
+  if (load.checkpointed) {
+    const snapshot = load.snapshot;
+    if (!isObject(snapshot)) throw new Error('malformed operator/unstick checkpoint: its snapshot is not an operation map');
+    for (const [id, op] of Object.entries(snapshot)) {
+      if (!isObject(op) || op.operationId !== id || typeof op.agent !== 'string' || !Array.isArray(op.steps) || !Array.isArray(op.attempts)
+        || !op.steps.every((x) => isObject(x) && isCount(x.step) && typeof x.status === 'string' && Array.isArray(x.messageIds))
+        || !op.attempts.every((x) => isObject(x) && isCount(x.step) && typeof x.status === 'string')) {
+        malformed(`operation ${id}`);
+      }
+      ops.set(id, structuredClone(op as unknown as UnstickOperationRecord));
+    }
+  }
+  for (const { entry } of load.entries) {
+    const e = entry as Record<string, unknown>;
+    const ok = isObject(e) && typeof e.operationId === 'string' && e.operationId.length > 0 && isCount(e.step) && (
+      (e.kind === 'step-intent' && typeof e.agent === 'string' && Array.isArray(e.messageIds))
+      || e.kind === 'step-done'
+      || (e.kind === 'attempt-launched' && typeof e.agent === 'string')
+      || (e.kind === 'attempt-done' && ['responded', 'refused', 'failed'].includes(e.outcome as string)));
+    if (!ok) malformed(`entry ${isObject(e) ? String(e.kind) : typeof e}`);
+    reduceUnstickEntry(ops, entry as UnstickJournalEntry);
+  }
+  return ops;
+}
 
 function reduceUnstickEntry(ops: Map<string, UnstickOperationRecord>, entry: UnstickJournalEntry): void {
   const op = ops.get(entry.operationId)
@@ -7118,10 +7154,7 @@ export class AgentFramework {
 
   private loadUnstickJournal(journal: RecordJournal<UnstickJournalEntry, UnstickJournalSnapshot>): Map<string, UnstickOperationRecord> {
     try {
-      const { snapshot, entries } = journal.load();
-      const ops = new Map(Object.entries(snapshot ?? {}).map(([id, op]) => [id, structuredClone(op)]));
-      for (const { entry } of entries) reduceUnstickEntry(ops, entry);
-      return ops;
+      return readUnstickJournal(journal.load());
     } catch (error) {
       throw new OperatorJournalUnreadableError('operator/unstick', error);
     }
@@ -7183,10 +7216,7 @@ export class AgentFramework {
 
   private loadChangesJournal(journal: RecordJournal<OperatorChangesEntry, OperatorChangesSnapshot>): Map<string, OperatorChangeRecord> {
     try {
-      const { snapshot, entries } = journal.load();
-      const records = new Map(Object.entries(snapshot ?? {}).map(([id, record]) => [id, structuredClone(record)]));
-      for (const { entry } of entries) reduceOperatorChangesEntry(records, entry);
-      return records;
+      return readOperatorChanges(journal.load());
     } catch (error) {
       throw new OperatorJournalUnreadableError('operator/changes', error);
     }

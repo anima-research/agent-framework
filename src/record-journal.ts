@@ -61,6 +61,10 @@ export interface JournalEntry<Entry> extends JournalRecordRef {
 export interface JournalLoad<Entry, Snapshot> {
   /** The latest checkpoint's snapshot, or null when none was written. */
   snapshot: Snapshot | null;
+  /** Whether a checkpoint was found. A checkpoint whose snapshot is null
+   *  still covers (and skips) its entries, so a consumer must not read a
+   *  null snapshot with `checkpointed` as an empty history. */
+  checkpointed: boolean;
   /** Every entry appended after that checkpoint, in append order. */
   entries: Array<JournalEntry<Entry>>;
 }
@@ -153,7 +157,7 @@ export class RecordJournal<Entry, Snapshot = never> {
     this.lastEntryId = tail.length > 0 ? tail[tail.length - 1]!.value : through;
     this.sinceCheckpoint = entries.length;
     this.unreconciled = null;
-    return { snapshot, entries };
+    return { snapshot, entries, checkpointed: latestCheckpointId !== null };
   }
 
   /** True after an ambiguous write, until load() has replayed it. */

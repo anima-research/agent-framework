@@ -405,3 +405,108 @@ export interface OperatorChangeResolutionReceipt {
   /** Anything this didn't repair. */
   remaining?: string;
 }
+
+const CHANGE_KINDS = new Set(['agent-settings', 'tool-presentation', 'undo-turns', 'unstick', 'hide', 'undo-messages']);
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
+const isText = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+function malformed(what: string): never {
+  throw new Error(`malformed operator/changes ${what}`);
+}
+
+function checkEvidence(e: unknown, where: string): void {
+  if (!isObject(e)) malformed(`${where}: evidence`);
+  if (!isText(e.target) || !isText(e.source) || !isCount(e.sourceHead) || !isCount(e.removed) || typeof e.staged !== 'boolean') {
+    malformed(`${where}: evidence fields`);
+  }
+  const marks = e.marks;
+  if (!isObject(marks) || !['none', 'addressed', 'all'].includes(marks.scope as string) || !Array.isArray(marks.refs)
+    || !isCount(marks.unmarked) || !isCount(marks.notRemoved)) malformed(`${where}: marks facts`);
+  if (e.ids !== undefined && (!Array.isArray(e.ids) || !e.ids.every((i) => isObject(i) && isText(i.id) && isText(i.fingerprint)))) {
+    malformed(`${where}: hide ids`);
+  }
+}
+
+function checkResolution(r: unknown, where: string): void {
+  if (!isObject(r) || (r.verdict !== 'committed' && r.verdict !== 'not-committed') || !isText(r.reason) || !isCount(r.at)
+    || (r.via !== 'live' && r.via !== 'offline')) malformed(`${where}: resolution`);
+}
+
+function checkOutcome(o: unknown, where: string): void {
+  if (!isObject(o) || !isCount(o.n) || !isCount(o.at) || !isCount(o.removed) || !isObject(o.markers) || !isText(o.markers.status)) {
+    malformed(`${where}: outcome`);
+  }
+}
+
+function checkRecord(r: unknown, id: string): asserts r is OperatorChangeRecord {
+  const where = `record ${id}`;
+  if (!isObject(r) || r.changeId !== id || !CHANGE_KINDS.has(r.kind as string) || !isText(r.agent) || !Array.isArray(r.attempts)) {
+    malformed(where);
+  }
+  for (const a of r.attempts) {
+    if (!isObject(a) || !isCount(a.n) || !isCount(a.at)) malformed(`${where}: attempt`);
+    checkEvidence(a.evidence, `${where} attempt ${a.n}`);
+    if (a.failed !== undefined && typeof a.failed !== 'string') malformed(`${where} attempt ${a.n}: failed`);
+    if (a.resolution !== undefined) checkResolution(a.resolution, `${where} attempt ${a.n}`);
+  }
+  if (r.switched !== undefined && !isCount(r.switched)) malformed(`${where}: switched`);
+  if (r.outcome !== undefined) checkOutcome(r.outcome, where);
+  if (r.completed !== undefined && r.completed !== true) malformed(`${where}: completed`);
+  if (r.dropped !== undefined && !(isObject(r.dropped) && isCount(r.dropped.at))) malformed(`${where}: dropped`);
+}
+
+function checkEntry(e: unknown): asserts e is OperatorChangesEntry {
+  if (!isObject(e) || !isText(e.changeId)) malformed('entry');
+  const where = `${String(e.kind)} entry for ${e.changeId}`;
+  switch (e.kind) {
+    case 'attempt':
+      if (!CHANGE_KINDS.has(e.changeKind as string) || !isText(e.agent) || !isCount(e.n) || !isCount(e.at)) malformed(where);
+      checkEvidence(e.evidence, where);
+      return;
+    case 'switched':
+      if (!isCount(e.n)) malformed(where);
+      return;
+    case 'failed':
+      if (!isCount(e.n) || typeof e.error !== 'string') malformed(where);
+      return;
+    case 'resolved':
+      if (!isCount(e.n)) malformed(where);
+      checkResolution(e.resolution, where);
+      return;
+    case 'outcome':
+      checkOutcome(e.outcome, where);
+      return;
+    case 'completed':
+      return;
+    case 'dropped':
+      if (!CHANGE_KINDS.has(e.changeKind as string) || !isText(e.agent) || !isCount(e.at)) malformed(where);
+      return;
+    default:
+      malformed(where);
+  }
+}
+
+/**
+ * Read an operator/changes journal into its records. Anything parseable that
+ * can't be interpreted as this ledger is refused, exactly as unreadable
+ * bytes are: a checkpoint whose snapshot isn't a record map (a null one
+ * included, since it still covers the entries it skips), or a record or
+ * entry missing what its kind requires.
+ */
+export function readOperatorChanges(load: { snapshot: unknown; entries: Array<{ entry: unknown }>; checkpointed: boolean }): Map<string, OperatorChangeRecord> {
+  const records = new Map<string, OperatorChangeRecord>();
+  if (load.checkpointed) {
+    const snapshot = load.snapshot;
+    if (!isObject(snapshot)) throw new Error('malformed operator/changes checkpoint: its snapshot is not a record map');
+    for (const [id, record] of Object.entries(snapshot)) {
+      checkRecord(record, id);
+      records.set(id, structuredClone(record));
+    }
+  }
+  for (const { entry } of load.entries) {
+    checkEntry(entry);
+    reduceOperatorChangesEntry(records, entry);
+  }
+  return records;
+}

@@ -33,7 +33,7 @@ describe('RecordJournal', () => {
   it('an empty journal loads nothing', () => {
     withStore((store) => {
       const journal = new RecordJournal<Entry, unknown>(store, { type: 'journal-test/entry' });
-      assert.deepStrictEqual(journal.load(), { snapshot: null, entries: [] });
+      assert.deepStrictEqual(journal.load(), { snapshot: null, entries: [], checkpointed: false });
       assert.strictEqual(journal.entriesSinceCheckpoint, 0);
     });
   });
@@ -105,7 +105,7 @@ describe('RecordJournal', () => {
       // A checkpoint after load covers what was loaded; the newest one wins.
       reader.checkpoint({ seen: ['a', 'b', 'c'] });
       const second = new RecordJournal<Entry, { seen: string[] }>(store, { type: 'journal-test/entry' }).load();
-      assert.deepStrictEqual(second, { snapshot: { seen: ['a', 'b', 'c'] }, entries: [] });
+      assert.deepStrictEqual(second, { snapshot: { seen: ['a', 'b', 'c'] }, entries: [], checkpointed: true });
       assert.deepStrictEqual(entriesOf(new RecordJournal<Entry, unknown>(store, { type: 'journal-test/other' })), ['x', 'y']);
     });
   });
@@ -153,6 +153,16 @@ describe('RecordJournal', () => {
     });
   });
 
+  it('reports a checkpoint whose snapshot is null as a checkpoint, distinct from none', () => {
+    withStore((store) => {
+      const journal = new RecordJournal<Entry, unknown>(store, { type: 'journal-test/entry' });
+      journal.append({ n: 'a' });
+      journal.checkpoint(null as unknown);
+      const loaded = new RecordJournal<Entry, unknown>(store, { type: 'journal-test/entry' }).load();
+      assert.deepStrictEqual(loaded, { snapshot: null, entries: [], checkpointed: true }, 'its covered entries are skipped: a reader must not take this for empty');
+    });
+  });
+
   it('a write that fails after reaching the store blocks further writes until load() replays it', () => {
     withStore((store) => {
       let failNextSync = false;
@@ -181,7 +191,7 @@ describe('RecordJournal', () => {
       journal.append({ n: 'B' });
       journal.checkpoint({ seen: ['A', 'B'] });
       assert.deepStrictEqual(new RecordJournal<Entry, { seen: string[] }>(store, { type: 'journal-test/entry' }).load(),
-        { snapshot: { seen: ['A', 'B'] }, entries: [] });
+        { snapshot: { seen: ['A', 'B'] }, entries: [], checkpointed: true });
 
       // A failure BEFORE the record reaches the store wrote nothing and leaves the journal usable.
       failNextSync = true;
