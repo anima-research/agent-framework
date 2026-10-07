@@ -369,6 +369,9 @@ export type TraceEvent =
       channelId: string;
       reason: string;
       textLen: number;
+      /** `failed`: nothing was posted; `unknown`: the request was dispatched
+       *  and no valid receipt came back, so it may have been. */
+      outcome?: 'failed' | 'unknown';
     })
 
   // Admin puppet: an operator executed a tool AS an agent and stored the
