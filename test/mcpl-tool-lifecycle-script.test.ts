@@ -180,7 +180,10 @@ describe('tool lifecycle for script-made calls (RFC-007, #235 F4)', () => {
       { type: 'tool_use', id: 'toolu_01SCRIPTAAAAAAAAAAAAAAAAA', name: 'code_execution', input: { code } },
       { type: 'tool_use', id: 'toolu_01MODELBBBBBBBBBBBBBBBBBB', name: 'prov--click', input: { x: 5, y: 6 } },
     ]);
+    // Each observer logs from its own process: wait for every log we read.
     await waitFor(() => lifecycle('obs-all').length >= 10, 'obs-all: five calls, both phases');
+    await waitFor(() => lifecycle('obs-comms').length >= 2, 'obs-comms: one call, both phases');
+    await waitFor(() => lifecycle('obs-run').length >= 2, 'obs-run: one call, both phases');
     await new Promise((r) => setTimeout(r, 300)); // a stray or duplicate would land here
 
     const script = JSON.stringify(membrane.lastStream?.receivedToolResults ?? []);
@@ -271,7 +274,8 @@ describe('tool lifecycle for script-made calls (RFC-007, #235 F4)', () => {
         name: 'code_execution',
         input: { code: 'r = await test__send({"text": "x", "boom": True})\nprint("got:", r)' },
       }]);
-      await waitFor(() => lifecycle('obs-all').length >= before.all + 4, 'both calls ended');
+      await waitFor(() => lifecycle('obs-all').length >= before.all + 4, 'obs-all: both calls ended');
+      await waitFor(() => lifecycle('obs-comms').length >= before.comms + 2, 'obs-comms: the call ended');
       await new Promise((r) => setTimeout(r, 300)); // a stray or duplicate would land here
 
       assert.equal(workDone, 1);
@@ -304,6 +308,7 @@ describe('tool lifecycle for script-made calls (RFC-007, #235 F4)', () => {
     }]);
     // The script was stopped and the turn's stream has ended (ending its open
     // calls), while the provider still holds the inner call's reply.
+    await waitFor(() => lifecycle('obs-all').length >= before + 3, 'the held call was reported');
     const whileHeld = lifecycle('obs-all').slice(before);
     assert.deepEqual(whileHeld.map((p) => `${p.tool}:${p.phase}`), [
       'code_execution:started',
