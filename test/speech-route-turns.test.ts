@@ -68,6 +68,15 @@ describe('speech route across a logical turn', () => {
     const framework = await makeFramework();
     const i = internals(framework);
     const scout = framework.getAgent('scout')!;
+    // A channel subsystem whose channels declare an MCPL RFC-011 publish
+    // target: a route is only ever a place the framework publishes to exactly.
+    i.channelRegistry = new Proxy({
+      publishTarget: () => 'root',
+      resolveLocus: () => null,
+      routeSpeech: async () => ({ delivered: true, channelId: 'x' }),
+      getDescriptor: () => undefined,
+      getChannelTools: () => [],
+    } as Record<string, unknown>, { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
 
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'one' }]));
     await i.startAgentStream(scout, fromChannel('chan-A'));

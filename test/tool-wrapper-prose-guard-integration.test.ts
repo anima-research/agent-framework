@@ -123,7 +123,7 @@ async function run(enabled?: boolean, allowedTools?: string[]) {
     resolveLocus: () => 'world:test',
     routeSpeech: async (_agent: string, speech: string) => { routed.push(speech); return { delivered: true, channelId: 'world:test' }; },
     sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
-    getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
+    getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, publishTarget: () => 'root', getChannelTools: () => [],
   }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
   framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
   await framework.runUntilIdle();
@@ -174,7 +174,7 @@ describe('tool wrapper prose guard integration', () => {
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
       resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
       sendOutgoingChunk: (_c: string, _a: string, _id: string, _i: number, delta: string) => { outgoing.push(delta); },
-      getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
+      getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, publishTarget: () => 'root', getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
     await framework.runUntilIdle();
@@ -191,7 +191,7 @@ describe('tool wrapper prose guard integration', () => {
     const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(), agents: [{ name: 'assistant', model: 'test', systemPrompt: 'sys', toolWrapperProseGuard: true }], modules: [module] });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
       resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
-      getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
+      getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, publishTarget: () => 'root', getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent); await framework.runUntilIdle();
     const all = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }>;
@@ -210,7 +210,7 @@ describe('tool wrapper prose guard integration', () => {
     const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(), agents: [{ name: 'assistant', model: 'test', systemPrompt: 'sys', maxStreamTokens: 1, toolWrapperProseGuard: true }], modules: [module] });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
       resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
-      getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
+      getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, publishTarget: () => 'root', getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent); await framework.runUntilIdle();
     const all = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }>;
@@ -232,7 +232,7 @@ describe('tool wrapper prose guard integration', () => {
       resolveLocus: () => 'world:test',
       routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
       sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
-      getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
+      getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, publishTarget: () => 'root', getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     (framework as unknown as Record<string, unknown>).channelEventModule = { getChannelId: () => 'world:test' };
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
@@ -262,7 +262,7 @@ describe('tool wrapper prose guard integration', () => {
     });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
       resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
-      getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
+      getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, publishTarget: () => 'root', getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
     await framework.runUntilIdle();
@@ -416,7 +416,7 @@ describe('tool wrapper prose guard integration', () => {
       routeSpeech: async () => ({ delivered: true, channelId: 'world:test' }),
       sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => outgoing.push(['chunk', delta]),
       sendOutgoingComplete: (_channel: string, _agent: string, _id: string, text: string) => outgoing.push(['complete', text]),
-      getDefaultPublishChannel: () => 'world:test', isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
+      getDefaultPublishChannel: () => 'world:test', isChannelOpen: () => true, getDescriptor: () => undefined, publishTarget: () => 'root', getChannelTools: () => [],
       resolveProseTarget: () => ({ channelId: 'world:test' }),
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     const created = await framework.createEphemeralAgent({ name: 'ephemeral-terminal', model: 'test', systemPrompt: 'sys', allowedTools: 'all' });
@@ -463,7 +463,7 @@ describe('tool wrapper prose guard integration', () => {
       routeSpeech: async () => ({ delivered: true, channelId: 'world:test' }),
       sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => events.push(`chunk:${delta}`),
       sendOutgoingComplete: (_channel: string, _agent: string, _id: string, text: string) => events.push(`complete:${text}`),
-      getDefaultPublishChannel: () => 'world:test', isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
+      getDefaultPublishChannel: () => 'world:test', isChannelOpen: () => true, getDescriptor: () => undefined, publishTarget: () => 'root', getChannelTools: () => [],
       resolveProseTarget: () => ({ channelId: 'world:test' }),
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     const created = await framework.createEphemeralAgent({ name: 'idle-terminal', model: 'test', systemPrompt: 'sys', allowedTools: 'all' });

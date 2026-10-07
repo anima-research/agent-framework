@@ -25,7 +25,7 @@ function makeRegistry(
 ) {
   const failures: RouteFailure[] = [];
   const traces: Array<{ type: string; [k: string]: unknown }> = [];
-  const publishCalls: Array<{ channelId?: string; conversationId?: string }> = [];
+  const publishCalls: Array<{ channelId?: string; conversationId?: string; threadId?: string | null }> = [];
 
   const openCalls: Array<{ channelId?: string }> = [];
   const closeCalls: Array<{ channelId?: string }> = [];
@@ -34,9 +34,10 @@ function makeRegistry(
   const mockServer = {
     // Post-policy state: full grant, so tests exercise delivery, not §5.3 denial.
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
-    sendChannelsPublish: async (params: { channelId?: string; conversationId?: string }) => {
+    sendChannelsPublish: async (params: { channelId?: string; conversationId?: string; threadId?: string | null }) => {
       publishCalls.push(params);
-      return publishResult;
+      // A conforming MCPL RFC-011 server: a delivery echoes the place asked for.
+      return publishResult?.delivered === true && 'threadId' in params ? { ...publishResult, threadId: params.threadId } : publishResult;
     },
     sendChannelsOpen: async (params: { channelId?: string }) => {
       if (failOpens) throw new Error('open refused by server');
@@ -94,14 +95,19 @@ function incoming(channelId: string, text: string, channelName?: string) {
 
 /** §14.5: channels/incoming no longer mints unknown channels — seed the
  *  registered state a conforming server would have created via
- *  channels/register before feeding incoming traffic. */
+ *  channels/register before feeding incoming traffic. Each channel declares
+ *  an MCPL RFC-011 publish target (`root`), as a conforming server's do. */
 function seedRegistered(registry: ChannelRegistry, serverId: string, ...ids: string[]): void {
   const map = (registry as unknown as {
-    channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
+    channels: Map<string, { serverId: string; descriptor: Record<string, unknown>; open: boolean }>;
   }).channels;
   for (const id of ids) {
     if (!map.has(`${serverId}:${id}`)) {
-      map.set(`${serverId}:${id}`, { serverId, descriptor: { id, type: serverId, label: id }, open: false });
+      map.set(`${serverId}:${id}`, {
+        serverId,
+        descriptor: { id, type: serverId, label: id, capabilities: { publish: { target: 'root' } } },
+        open: false,
+      });
     }
   }
 }
@@ -207,9 +213,9 @@ test('a route that names its server publishes there, even when another server re
   const published: Array<{ server: string; channelId?: string }> = [];
   const server = (id: string) => ({
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
-    sendChannelsPublish: async (params: { channelId?: string }) => {
+    sendChannelsPublish: async (params: { channelId?: string; threadId?: string | null }) => {
       published.push({ server: id, channelId: params.channelId });
-      return { delivered: true, messageId: `${id}-1` };
+      return { delivered: true, messageId: `${id}-1`, threadId: params.threadId };
     },
     sendChannelsOpen: async () => ({}),
   });
@@ -254,7 +260,7 @@ test('channel_publish without a channel goes to the caller\'s route, and its rec
 
   const res = await registry.handleChannelToolCall('channel_publish', { content: 'hello' }, { kind: 'agent', agentName: 'scout' });
   assert.equal(res.success, true);
-  assert.deepEqual(res.data, { delivered: true, status: 'delivered', serverId: 'discord', channelId: 'chanA', channelLabel: 'chanA', messageId: 'p-1' });
+  assert.deepEqual(res.data, { delivered: true, status: 'delivered', serverId: 'discord', channelId: 'chanA', channelLabel: 'chanA', threadId: null, messageId: 'p-1' });
   assert.equal(publishCalls.at(-1)?.channelId, 'chanA', 'the route, not the last inbound channel');
 });
 
@@ -312,11 +318,12 @@ test('channel_publish reports failed and unknown outcomes with the attempted des
   assert.equal((unknown.data as { status: string }).status, 'unknown');
 });
 
-test('ensureChannelRegistered keeps a DM closed while making its one-shot reply routable', async () => {
-  // A Discord DM arrives via push/event (channel closed), so it is never
-  // registered — routeSpeech would drop the reply. Registering it on inbound
-  // makes it a publishable destination; the woken turn's route (its DM)
-  // then targets it.
+test('ensureChannelRegistered keeps a DM closed; the reply goes out once its connector declares the channel', async () => {
+  // A Discord DM arrives via push/event (channel closed). The host registers
+  // it lazily so it resolves — but a host-minted channel carries no MCPL
+  // RFC-011 declaration, so the framework doesn't publish there: the
+  // connector might choose the place itself. A connector that registers the
+  // DM with a declaration (as discord-mcpl does) makes the reply routable.
   const dm = 'discord:dm:42';
   const { registry, publishCalls, lookup, traces } = makeRegistry(
     { delivered: true },
@@ -334,10 +341,18 @@ test('ensureChannelRegistered keeps a DM closed while making its one-shot reply 
   assert.equal(entry!.open, false, 'one-shot reachability is not a subscription');
   assert.ok(traces.some((t) => t.type === 'mcpl:channel-lazy-registered'));
 
+  const undeclared = await registry.routeSpeech('scout', 'replying in the DM', { serverId: 'discord', channelId: dm });
+  assert.equal(undeclared, null, 'no declaration, no publication');
+  assert.equal(publishCalls.length, 0);
+
+  await registry.handleChanged('discord', {
+    updated: [{ id: dm, type: 'discord', label: 'DM with Antra', direction: 'bidirectional', capabilities: { publish: { target: 'root' } } }],
+  });
   const res = await registry.routeSpeech('scout', 'replying in the DM', { serverId: 'discord', channelId: dm });
   assert.deepEqual(res, { delivered: true, channelId: dm },
-    'the DM reply must route back to the DM channel');
+    'the DM reply routes back to the DM channel once it is declared');
   assert.equal(publishCalls.at(-1)?.channelId, dm);
+  assert.equal(publishCalls.at(-1)?.threadId, null, 'at the channel itself');
 });
 
 test('ensureChannelRegistered is idempotent and does not reopen a closed channel', () => {

@@ -8,6 +8,11 @@
  * follow a partial multi-part post), a timeout, a lost connection, or a
  * missing/malformed receipt. The attempted destination is always named by
  * the registry, never by the caller's spelling.
+ *
+ * Every publish names its place inside the channel (MCPL RFC-011): a thread,
+ * or the root. It goes only to a channel that declares a publish target, a
+ * thread only to one that declares `exact`, and a delivery counts only when
+ * its echo names the place asked for.
  */
 import { test, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -22,17 +27,17 @@ import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
-type Publish = (params: { channelId: string }) => Promise<unknown>;
+type Publish = (params: { channelId: string; threadId?: string | null }) => Promise<unknown>;
 
 function registryWith(servers: Record<string, { publish: Publish; grant?: boolean }>, failures: unknown[] = []) {
-  const published: Array<{ serverId: string; channelId: string }> = [];
+  const published: Array<{ serverId: string; channelId: string; threadId?: string | null }> = [];
   const mocks = new Map<string, unknown>();
   for (const [id, s] of Object.entries(servers)) {
     mocks.set(id, {
       id,
       grant: new CapabilityGrant(new Set(s.grant === false ? [] : ALL_CAPABILITY_PATHS), []),
-      sendChannelsPublish: async (params: { channelId: string }) => {
-        published.push({ serverId: id, channelId: params.channelId });
+      sendChannelsPublish: async (params: { channelId: string; threadId?: string | null }) => {
+        published.push({ serverId: id, channelId: params.channelId, ...('threadId' in params ? { threadId: params.threadId } : {}) });
         return s.publish(params);
       },
       sendChannelsOpen: async () => ({}),
@@ -46,14 +51,20 @@ function registryWith(servers: Record<string, { publish: Publish; grant?: boolea
     { onRouteFailure: (info) => { failures.push(info); } },
   );
   const channels = (registry as unknown as {
-    channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
+    channels: Map<string, { serverId: string; descriptor: Record<string, unknown>; open: boolean }>;
   }).channels;
-  const seed = (serverId: string, id: string, label: string) =>
-    channels.set(`${serverId}:${id}`, { serverId, descriptor: { id, type: 'discord', label }, open: true });
+  /** A registered channel; it declares `target` (default root), or nothing for null. */
+  const seed = (serverId: string, id: string, label: string, target: 'exact' | 'root' | null = 'root') =>
+    channels.set(`${serverId}:${id}`, {
+      serverId,
+      descriptor: { id, type: 'discord', label, ...(target ? { capabilities: { publish: { target } } } : {}) },
+      open: true,
+    });
   return { registry, published, seed };
 }
 
-const ok: Publish = async () => ({ delivered: true, messageId: 'posted-1' });
+/** A conforming delivery: it echoes the place it was asked for. */
+const ok: Publish = async (params) => ({ delivered: true, messageId: 'posted-1', threadId: params.threadId });
 
 describe('ChannelRegistry.publish outcomes', () => {
   it('confirms only delivered:true, naming the destination from the registry', async () => {
@@ -62,7 +73,7 @@ describe('ChannelRegistry.publish outcomes', () => {
     const outcome = await registry.publish('agent', 'hello', { channelId: 'discord:g1:room' });
     assert.equal(outcome.status, 'delivered');
     assert.equal(outcome.messageId, 'posted-1');
-    assert.deepEqual(outcome.destination, { serverId: 'discord', channelId: 'discord:g1:room', label: '#room (Guild)' });
+    assert.deepEqual(outcome.destination, { serverId: 'discord', channelId: 'discord:g1:room', label: '#room (Guild)', threadId: null });
     assert.equal(typeof outcome.at, 'number');
   });
 
@@ -176,7 +187,7 @@ describe('ChannelRegistry.publish outcomes', () => {
     assert.equal(published.length, 0, 'never routed through whichever server came first');
     const exact = await registry.publish('agent', 'x', { serverId: 'beta', channelId: 'discord:g1:room' });
     assert.equal(exact.status, 'delivered');
-    assert.deepEqual(published, [{ serverId: 'beta', channelId: 'discord:g1:room' }]);
+    assert.deepEqual(published, [{ serverId: 'beta', channelId: 'discord:g1:room', threadId: null }]);
     assert.equal(exact.destination?.label, '#room (Beta)');
   });
 
@@ -186,6 +197,91 @@ describe('ChannelRegistry.publish outcomes', () => {
     const outcome = await registry.publish('agent', 'x', { channelId: 'c' });
     assert.equal(outcome.status, 'failed');
     assert.equal(published.length, 0);
+  });
+
+  it('names the root explicitly: a publish without a thread sends threadId null, never omits it', async () => {
+    const { registry, published, seed } = registryWith({ discord: { publish: ok } });
+    seed('discord', 'c', '#c');
+    assert.equal((await registry.publish('agent', 'x', { channelId: 'c' })).status, 'delivered');
+    assert.deepEqual(published, [{ serverId: 'discord', channelId: 'c', threadId: null }]);
+  });
+
+  it('posts into a thread only where the channel declares exact targeting', async () => {
+    const { registry, published, seed } = registryWith({ discord: { publish: ok } });
+    seed('discord', 'forum', '#forum', 'exact');
+    seed('discord', 'plain', '#plain', 'root');
+    const inThread = await registry.publish('agent', 'x', { channelId: 'forum', threadId: 't-1' });
+    assert.equal(inThread.status, 'delivered');
+    assert.equal(inThread.destination?.threadId, 't-1');
+    const onRoot = await registry.publish('agent', 'x', { channelId: 'plain', threadId: 't-1' });
+    assert.equal(onRoot.status, 'failed');
+    assert.match(onRoot.reason ?? '', /has no threads/);
+    assert.deepEqual(published, [{ serverId: 'discord', channelId: 'forum', threadId: 't-1' }], 'the threadless channel saw nothing');
+  });
+
+  it('never publishes to a channel that declares no publish target, and opens nothing first', async () => {
+    const opened: string[] = [];
+    const { registry, published, seed } = registryWith({ discord: { publish: ok } });
+    seed('discord', 'legacy', '#legacy', null);
+    const channels = (registry as unknown as { channels: Map<string, { open: boolean }> }).channels;
+    channels.get('discord:legacy')!.open = false;
+    (registry as unknown as { openChannelNow: (e: unknown) => Promise<void> }).openChannelNow = async () => { opened.push('legacy'); };
+    const outcome = await registry.publish('agent', 'x', { channelId: 'legacy' });
+    assert.equal(outcome.status, 'failed');
+    assert.match(outcome.reason ?? '', /doesn't declare where a post lands/);
+    assert.equal(outcome.destination?.channelId, 'legacy');
+    assert.deepEqual(published, [], 'the connector would choose the place itself');
+    assert.deepEqual(opened, [], 'refused before any side effect');
+  });
+
+  it('refuses an invalid thread id before dispatch', async () => {
+    const { registry, published, seed } = registryWith({ discord: { publish: ok } });
+    seed('discord', 'forum', '#forum', 'exact');
+    for (const threadId of ['', 7 as unknown as string, { id: 't' } as unknown as string]) {
+      assert.equal((await registry.publish('agent', 'x', { channelId: 'forum', threadId })).status, 'failed', JSON.stringify(threadId));
+    }
+    assert.equal(published.length, 0);
+  });
+
+  for (const [what, echo] of [
+    ['no echo at all', {}],
+    ['an echo of the root when a thread was asked for', { threadId: null }],
+    ['an echo of another thread', { threadId: 't-2' }],
+    ['an unreadable echo', { threadId: 42 }],
+  ] as const) {
+    it(`treats a delivery with ${what} as unknown: something was posted, not provably where asked`, async () => {
+      const { registry, seed } = registryWith({ discord: { publish: async () => ({ delivered: true, messageId: 'p-1', ...echo }) } });
+      seed('discord', 'forum', '#forum', 'exact');
+      const outcome = await registry.publish('agent', 'x', { channelId: 'forum', threadId: 't-1' });
+      assert.equal(outcome.status, 'unknown');
+      assert.equal(outcome.messageId, 'p-1');
+      assert.match(outcome.reason ?? '', /not thread t-1/);
+    });
+  }
+
+  it('a root publish needs a root echo', async () => {
+    const { registry, seed } = registryWith({ discord: { publish: async () => ({ delivered: true, messageId: 'p-1', threadId: 'stray' }) } });
+    seed('discord', 'c', '#c');
+    const outcome = await registry.publish('agent', 'x', { channelId: 'c' });
+    assert.equal(outcome.status, 'unknown');
+    assert.match(outcome.reason ?? '', /reported posting in thread stray, not the channel root/);
+  });
+
+  it('keeps a refusal\'s reason: delivered:false with no message is failed, in the connector\'s words', async () => {
+    const { registry, seed } = registryWith({ discord: { publish: async () => ({ delivered: false, reason: 'thread t-1 is archived' }) } });
+    seed('discord', 'forum', '#forum', 'exact');
+    const outcome = await registry.publish('agent', 'x', { channelId: 'forum', threadId: 't-1' });
+    assert.equal(outcome.status, 'failed');
+    assert.match(outcome.reason ?? '', /thread t-1 is archived/);
+  });
+
+  it('a channels/changed that withdraws the declaration applies to the next publish', async () => {
+    const { registry, published, seed } = registryWith({ discord: { publish: ok } });
+    seed('discord', 'c', '#c', 'root');
+    assert.equal((await registry.publish('agent', 'x', { channelId: 'c' })).status, 'delivered');
+    seed('discord', 'c', '#c', null);
+    assert.equal((await registry.publish('agent', 'x', { channelId: 'c' })).status, 'failed');
+    assert.equal(published.length, 1);
   });
 
   it('routeSpeech reports a failed and an uncertain delivery as different outcomes', async () => {

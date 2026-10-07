@@ -777,7 +777,9 @@ export class McplServerConnection extends EventEmitter {
    * When `params.stream` is true, sends as a notification (no ACK).
    */
   sendChannelsPublish(params: ChannelsPublishParams): Promise<ChannelsPublishResult | void> {
-    if (params.stream) {
+    // A targeted publish (MCPL RFC-011) is always a Request: a Notification
+    // has no result, so where it landed could never be confirmed.
+    if (params.stream && params.threadId === undefined) {
       this.sendNotification(McplMethod.ChannelsPublish, params as unknown as Record<string, unknown>);
       return Promise.resolve();
     }

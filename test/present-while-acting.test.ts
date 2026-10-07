@@ -159,6 +159,9 @@ function stubChannelRegistry(framework: AgentFramework, opts: { home?: boolean }
     isChannelOpen: () => true,
     getDescriptor: () => undefined,
     getChannelTools: () => [],
+    // Every channel declares an MCPL RFC-011 publish target, so it can be a
+    // route (a route is only ever a place the framework publishes to exactly).
+    publishTarget: () => 'root',
   };
   // Everything else driveStream/stop touches (startTyping, stopTyping,
   // stopAll, ensureChannelRegistered, ...) becomes a no-op via Proxy so the

@@ -176,21 +176,16 @@ test('vector 43: a mixed-lane edit keeps the stable reply target', async (t) => 
   await f.send('push/event', { ...f.params('e', 'second_version', { channelId: 'chat', key: 'message:m' }), origin: { messageId: 'm', authorId: 'u', authorName: 'User', threadId: 'thread' } });
   await f.turn();
   // Both lanes name one conversation — the same channel, thread and message —
-  // so the turn has a single reply target, never a hold between "two".
+  // so the turn has a single reply target, never a hold between "two"; and
+  // the channel posts into a named thread (RFC-011 exact), so the reply goes
+  // into that thread, not the channel root.
   const sources = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
     .map((m) => m.metadata?.inboundSource as { channelId?: string; threadId?: string; messageId?: string } | undefined)
     .filter((s) => s !== undefined)
     .map((s) => [s!.channelId, s!.threadId, s!.messageId]);
   assert.deepEqual(sources, [['chat', 'thread', 'm'], ['chat', 'thread', 'm']]);
-  // That target is a thread, and publishing carries no thread (shelf-355):
-  // plain speech is held rather than posted into the channel root, which is
-  // a different conversation.
-  const turn = (f.framework as unknown as { turnRoutes: Map<string, { route: unknown; hold?: unknown; unroutable?: { reason: string; conversation: { channelId: string; threadId?: string } } }> })
-    .turnRoutes.get('agent');
-  assert.equal(turn?.route, null);
-  assert.equal(turn?.hold, undefined);
-  assert.deepEqual([turn?.unroutable?.reason, turn?.unroutable?.conversation.channelId, turn?.unroutable?.conversation.threadId], ['thread', 'chat', 'thread']);
-  assert.equal(f.published.length, 0);
+  assert.equal(f.published.at(-1)?.channelId, 'chat');
+  assert.equal((f.published.at(-1) as { threadId?: unknown } | undefined)?.threadId, 'thread');
 });
 
 test('vectors 13/15: a channel-scoped push needs current channel authority and a declared channel', async (t) => {

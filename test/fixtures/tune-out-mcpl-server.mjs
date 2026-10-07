@@ -109,6 +109,8 @@ rl.on('line', (line) => {
           label: 'noisy',
           direction: 'bidirectional',
           initiallyOpen: true,
+          // MCPL RFC-011: the channel posts exactly where it is asked.
+          capabilities: { publish: { target: 'root' } },
         }],
       },
     });
@@ -134,7 +136,9 @@ rl.on('line', (line) => {
   }
   if (msg.method === 'channels/publish') {
     log('publish', { channelId: msg.params?.channelId });
-    if (msg.id !== undefined && msg.id !== null) reply(msg.id, { delivered: true });
+    // RFC-011: a delivery echoes the place it was asked for.
+    const placed = msg.params && 'threadId' in msg.params ? { threadId: msg.params.threadId } : {};
+    if (msg.id !== undefined && msg.id !== null) reply(msg.id, { delivered: true, ...placed });
     return;
   }
   if (msg.method === 'tools/list') {

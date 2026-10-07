@@ -81,7 +81,7 @@ import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.j
 import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SpeechRouteView } from './mcpl/channel-registry.js';
+import { ChannelRegistry, publishPlaceRefusal, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SpeechRouteView } from './mcpl/channel-registry.js';
 import { ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftReason, type DraftSource, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import {
   conversationKey,
@@ -89,6 +89,7 @@ import {
   inferTurnRoute,
   isConversational,
   routeConversation,
+  routeRefusal,
   suspendsRoute,
   type ConversationRef,
   type RouteCandidate,
@@ -1756,12 +1757,17 @@ export class AgentFramework {
                       ? { conversation: { kind: 'surface', surface: c.surface }, addressed: true, at: c.at }
                       : c.unroutable
                         ? {
-                            conversation: { kind: 'channel', ...(c.serverId ? { serverId: c.serverId } : {}), channelId: c.channelId },
+                            conversation: {
+                              kind: 'channel',
+                              ...(c.serverId ? { serverId: c.serverId } : {}),
+                              channelId: c.channelId,
+                              ...(c.threadId ? { threadId: c.threadId } : {}),
+                            },
                             addressed: c.addressed,
                             at: c.at,
                             unroutable: true,
                           }
-                        : framework.candidateForChannel(c.channelId, c.addressed, c.at, c.serverId, c.messageId)),
+                        : framework.candidateForChannel(c.channelId, c.addressed, c.at, c.serverId, c.messageId, c.threadId)),
                 }
               : {}),
           });
@@ -4701,6 +4707,13 @@ export class AgentFramework {
         destination: {
           type: ['string', 'null'],
           description: 'resend: where to publish — "#channel", "@person" or a channel id. null otherwise.',
+        },
+        threadId: {
+          type: ['string', 'null'],
+          description:
+            'resend: a thread of the destination channel to post in (the id from a [source: … · thread <id>] ' +
+            'line), where its connector can post into a named thread. null, like omitting it, means the ' +
+            "channel's root.",
         },
         confirmDuplicate: {
           type: ['boolean', 'null'],
@@ -9074,7 +9087,7 @@ export class AgentFramework {
 
   private static destinationText(d: PublishDestination): string {
     const label = d.label && d.label !== d.channelId ? `${d.label.startsWith('#') || d.label.startsWith('DM') ? d.label : `#${d.label}`} ` : '';
-    return `${label}(${d.channelId})`;
+    return `${label}(${d.channelId}${d.threadId ? `, thread ${d.threadId}` : ''})`;
   }
 
   /** One line per draft: id, state, when, why, size, preview. */
@@ -9231,6 +9244,7 @@ export class AgentFramework {
       if (ids.length > 20) return refuse('draftIds names more than 20 drafts; act on them in smaller groups.');
     }
     if (present(input.destination) && action !== 'resend') return unused('destination');
+    if (present(input.threadId) && action !== 'resend') return unused('threadId');
     if (present(input.confirmDuplicate) && action !== 'resend') return unused('confirmDuplicate');
     if (present(input.offset) && action !== 'list') return unused('offset');
 
@@ -9349,9 +9363,26 @@ export class AgentFramework {
     }
     const target = registry.resolveDestination({ channelId: resolved.channelId });
     if ('error' in target) return refuse(`Destination "${spec}": ${target.error}. Nothing was sent.`);
-    const destination = target.destination;
-    if (home && destination.channelId !== home) {
-      return refuse(`This conversation is bound to channel ${home}; resending to ${destination.channelId} is not allowed. Nothing was sent.`);
+    if (home && target.destination.channelId !== home) {
+      return refuse(`This conversation is bound to channel ${home}; resending to ${target.destination.channelId} is not allowed. Nothing was sent.`);
+    }
+    // The place inside the channel (MCPL RFC-011): the thread named with it,
+    // else the root — never a thread borrowed from where the words were held.
+    if (present(input.threadId) && (typeof input.threadId !== 'string' || !input.threadId.trim())) {
+      return refuse('threadId must be a thread id of the destination channel, or null for its root.');
+    }
+    const destination: PublishDestination = {
+      ...target.destination,
+      threadId: present(input.threadId) ? (input.threadId as string).trim() : null,
+    };
+    const placeRefusal = publishPlaceRefusal(registry.publishTarget(destination), destination.threadId ?? null);
+    if (placeRefusal) {
+      const descriptor = registry.getDescriptor(destination.channelId);
+      const why = descriptor
+        ? ChannelRegistry.placeRefusalText(placeRefusal, descriptor, destination.threadId ?? null)
+        : `${destination.channelId} can't be published to exactly`;
+      const consult = this.connectorToolsText(destination.serverId);
+      return refuse(`${why}.${consult ? ` ${consult}` : ''} Nothing was sent.`);
     }
 
     // Refuse up front, before anything is published, rather than half-way.
@@ -9403,7 +9434,7 @@ export class AgentFramework {
           stopped = true;
           continue;
         }
-        const outcome = await registry.publish(agentName, d.text, { serverId: destination.serverId, channelId: destination.channelId });
+        const outcome = await registry.publish(agentName, d.text, { serverId: destination.serverId, channelId: destination.channelId, threadId: destination.threadId ?? null });
         let recorded = true;
         try {
           this.proseDrafts.recordOutcome(agentName, d.id, attemptId, outcome);
@@ -9461,10 +9492,11 @@ export class AgentFramework {
     return undefined;
   }
 
-  /** Record a successful plain-prose delivery for this turn's receipt. */
+  /** Record a successful plain-prose delivery for this turn's receipt: its
+   *  channel, and its thread when it went into one (`channel\0thread`). */
   private recordProseDelivery(
     agentName: string,
-    outcome: { delivered: boolean; channelId: string } | null | undefined,
+    outcome: { delivered: boolean; channelId: string; threadId?: string | null } | null | undefined,
   ): void {
     if (!outcome?.delivered) return;
     let list = this.turnProseDeliveries.get(agentName);
@@ -9472,7 +9504,7 @@ export class AgentFramework {
       list = [];
       this.turnProseDeliveries.set(agentName, list);
     }
-    list.push(outcome.channelId);
+    list.push(outcome.threadId ? `${outcome.channelId}\u0000${outcome.threadId}` : outcome.channelId);
   }
 
   /**
@@ -9507,11 +9539,13 @@ export class AgentFramework {
         shown.push(`${id.slice('surface:'.length)} (the local surface that messaged you; not published to any channel)`);
         continue;
       }
-      const label = this.channelRegistry?.getDescriptor(id)?.label;
+      const [channelId, threadId] = id.split('\u0000') as [string, string | undefined];
+      const label = this.channelRegistry?.getDescriptor(channelId)?.label;
+      const where = threadId ? `${channelId}, thread ${threadId}` : channelId;
       shown.push(
-        label && label !== id
-          ? `${label.startsWith('#') ? label : `#${label}`} (${id})`
-          : id,
+        label && label !== channelId
+          ? `${label.startsWith('#') ? label : `#${label}`} (${where})`
+          : threadId ? `${channelId} (thread ${threadId})` : channelId,
       );
     }
     const notes: string[] = [];
@@ -9615,11 +9649,18 @@ export class AgentFramework {
     at: number,
     serverId?: string,
     messageId?: string,
+    threadId?: string,
   ): RouteCandidate {
     const server = serverId || this.channelRegistry?.getChannelServerId(channelId) || undefined;
     const label = this.channelRegistry?.getDescriptor(channelId)?.label;
     return {
-      conversation: { kind: 'channel', ...(server ? { serverId: server } : {}), channelId, ...(label ? { label } : {}) },
+      conversation: {
+        kind: 'channel',
+        ...(server ? { serverId: server } : {}),
+        channelId,
+        ...(threadId ? { threadId } : {}),
+        ...(label ? { label } : {}),
+      },
       addressed,
       ...(messageId ? { messageId } : {}),
       at,
@@ -9648,6 +9689,72 @@ export class AgentFramework {
     return turn && !turn.hold && turn.route?.kind === 'channel' ? turn.route.channelId : null;
   }
 
+  /**
+   * The exact place the agent's unaddressed speech is published to now — its
+   * channel route's server, channel and thread (null: the channel root) — or
+   * null when it has no channel route or is held.
+   */
+  private routeTarget(agentName: string): { serverId?: string; channelId: string; threadId: string | null } | null {
+    const turn = this.turnRoutes?.get(agentName);
+    if (!turn || turn.hold || turn.route?.kind !== 'channel') return null;
+    const route = turn.route;
+    return { ...(route.serverId ? { serverId: route.serverId } : {}), channelId: route.channelId, threadId: route.threadId ?? null };
+  }
+
+  /** A channel's declared publish target (MCPL RFC-011), read live from the registry. */
+  private publishTargetOf(channel: { serverId?: string; channelId: string }): 'exact' | 'root' | undefined {
+    return this.channelRegistry?.publishTarget(channel);
+  }
+
+  /**
+   * Connector tools worth consulting for a conversation the framework can't
+   * publish into, as the resident calls them — only what the connector
+   * actually lists: its tools of class `comms` (MCPL RFC-008), or whose own
+   * names begin send/reply/post/say; failing those, the prefix its tools
+   * share. A match says where to look, not that the tool can post there:
+   * the resident judges from the tool's own description.
+   */
+  private connectorSendTools(serverId: string | undefined): { tools: string[]; prefix?: string } {
+    if (!serverId) return { tools: [] };
+    const tools: string[] = [];
+    let prefix: string | undefined;
+    for (const tool of this.mcplTools ?? []) {
+      if (this.mcplToolServers?.get(tool.name) !== serverId) continue;
+      const hit = this.resolveMcplTool(tool.name);
+      prefix ??= hit?.[1];
+      const own = hit ? tool.name.slice(hit[1].length + 2) : tool.name;
+      const comms = this.effectiveToolClass(tool.name, true).classes.includes('comms' as ToolClass);
+      if (comms || /^(send|reply|post|say)(_|$)/i.test(own)) tools.push(tool.name);
+    }
+    return { tools: tools.slice(0, 4), ...(prefix ? { prefix } : {}) };
+  }
+
+  /** The connector tools to consult, in words; empty when it lists none. */
+  private connectorToolsText(serverId: string | undefined): string {
+    const { tools, prefix } = this.connectorSendTools(serverId);
+    if (tools.length > 0) return `Its connector's own tools may reach it; consult them: ${tools.map((t) => `\`${t}\``).join(', ')}.`;
+    if (prefix) return `Its connector's own tools (\`${prefix}--…\`) may reach it; consult their descriptions.`;
+    return '';
+  }
+
+  /** Why plain speech can't go to a conversation, and which connector tools to consult. */
+  private unroutableText(unroutable: NonNullable<TurnRoute['unroutable']>): string {
+    const c = unroutable.conversation;
+    const where = describeConversation(c);
+    const consult = c.kind === 'channel' ? this.connectorToolsText(c.serverId) : '';
+    const tail = consult ? ` ${consult}` : '';
+    switch (unroutable.reason) {
+      case 'untargetable':
+        return `${where}: its connector doesn't declare where a post lands (MCPL RFC-011) — it may choose a thread ` +
+          `itself — so publication from here is unavailable until it does.${tail}`;
+      case 'thread':
+        return `${where} is a thread, but its connector declares the channel has no threads, so publication from ` +
+          `here can't target it.${tail}`;
+      case 'unresolved':
+        return `${where} couldn't be resolved to a registered channel.${tail || ' Use an explicit send tool to reach it.'}`;
+    }
+  }
+
   /** The agent's route as the registry needs it (context, channel_publish default). */
   private speechRouteView(agentName: string): SpeechRouteView {
     const turn = this.turnRoutes.get(agentName);
@@ -9660,6 +9767,7 @@ export class AgentFramework {
       kind: 'channel',
       ...(route.serverId ? { serverId: route.serverId } : {}),
       channelId: route.channelId,
+      ...(route.threadId ? { threadId: route.threadId } : {}),
       ...(route.replyTo ? { replyTo: route.replyTo } : {}),
     };
   }
@@ -9689,9 +9797,7 @@ export class AgentFramework {
       const unroutable = turn?.unroutable;
       this.holdProseDrafts(agent, [text], 'no-destination', {
         ...hold,
-        ...(unroutable?.reason === 'thread'
-          ? { note: `the conversation that woke you is a thread (${describeConversation(unroutable.conversation)}); answer it with a send tool that names the thread` }
-          : {}),
+        ...(unroutable ? { note: this.unroutableText(unroutable) } : {}),
       });
       return;
     }
@@ -9704,7 +9810,8 @@ export class AgentFramework {
       this.holdProseDrafts(agent, [text], 'no-destination', hold);
       return;
     }
-    const target = route.serverId ? { serverId: route.serverId, channelId: route.channelId } : route.channelId;
+    // The route's exact place: its server, channel and thread (or root).
+    const target = this.routeTarget(agent.name)!;
     const outcome = await this.channelRegistry.routeSpeech(agent.name, text, target);
     this.recordProseDelivery(agent.name, outcome);
   }
@@ -9751,12 +9858,9 @@ export class AgentFramework {
         'Your unaddressed plain speech is held as drafts this turn rather than guessed: answer one with an ' +
         'explicit send (or channel_open it), and resend held words with the drafts tool.';
     } else if (!turn.route && turn.unroutable) {
-      const where = describeConversation(turn.unroutable.conversation);
-      text = turn.unroutable.reason === 'thread'
-        ? `[routing] The conversation that woke you is a thread (${where}), and plain speech can't be posted ` +
-          'into a thread: it is held as drafts. Answer it with a send tool that names the thread.'
-        : `[routing] The conversation that woke you (${where}) couldn't be resolved to a registered channel, ` +
-          'so your plain speech is held as drafts. Use an explicit send tool to reach it.';
+      text =
+        `[routing] Your plain speech can't go to the conversation in front of you, so it is held as drafts. ` +
+        this.unroutableText(turn.unroutable);
     } else if (!turn.route) {
       text =
         '[routing] Your plain speech currently has no destination — it is held as drafts you can resend. ' +
@@ -10486,7 +10590,7 @@ export class AgentFramework {
         // last saw traffic. A silent control-plane wake has none.
         const turn: TurnRoute = trigger?.suppressProse
           ? { route: null }
-          : inferTurnRoute(trigger?.routeCandidates ?? [], this.homeRoute(agent.name));
+          : inferTurnRoute(trigger?.routeCandidates ?? [], this.homeRoute(agent.name), (c) => this.publishTargetOf(c));
         this.turnRoutes.set(agent.name, turn);
         this.midTurnInputSignals.delete(agent.name);
         if (!trigger?.suppressProse) this.announceRouteIfChanged(agent.name, turn);
@@ -10856,10 +10960,21 @@ export class AgentFramework {
           },
         })
       : null;
+    // The place a stream's final publish targets (MCPL RFC-011 §6). A
+    // channel's stream can carry both the route's plain speech and envelope
+    // text sent to the channel's root, so a channel whose route is a thread
+    // isn't streamed at all (fail-closed: the stream could not name one
+    // place); every other stream names the root.
+    const streamPlace = (channelId: string): null | undefined => {
+      const target = this.routeTarget(agent.name);
+      return target && target.channelId === channelId && target.threadId !== null ? undefined : null;
+    };
     const emitOutgoing = (deltas: { channelId: string; delta: string }[]): void => {
       for (const rd of deltas) {
+        const place = streamPlace(rd.channelId);
+        if (place === undefined) continue;
         this.channelRegistry!.sendOutgoingChunk(
-          rd.channelId, agent.name, outgoingInferenceId, outgoingIndex++, rd.delta,
+          rd.channelId, agent.name, outgoingInferenceId, outgoingIndex++, rd.delta, place,
         );
       }
     };
@@ -12189,7 +12304,9 @@ export class AgentFramework {
       if (frameReachedTerminal && proseStream) {
         emitOutgoing(proseStream.finish());
         for (const [channelId, text] of proseStream.byChannel()) {
-          this.channelRegistry!.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text);
+          const place = streamPlace(channelId);
+          if (place === undefined) continue;
+          this.channelRegistry!.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text, place);
         }
       }
       this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`);
@@ -16199,10 +16316,19 @@ export class AgentFramework {
         // lastAnnouncedRoute tracks it so announce-on-change stays coherent.
         // Locus and hybrid modes only: explicit mode has no route.
         if (call.name === 'channel_open' && result?.success) {
-          const openInput = call.input as { channelId?: string; serverId?: string; setSpeechTarget?: boolean | null } | undefined;
+          const openInput = call.input as { channelId?: string; serverId?: string; threadId?: string | null; setSpeechTarget?: boolean | null } | undefined;
           const opened = (result.data as { channelId?: string } | undefined)?.channelId ?? openInput?.channelId;
           const openerAgent = this.agents.get(agentName);
           if (opened && openerAgent && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')) {
+            const unchanged = (): string => {
+              const turn = this.turnRoutes.get(agentName);
+              return turn?.hold
+                ? 'Your speech route is unchanged: it is held between ' +
+                  `${turn.hold.conversations.map(describeConversation).join(' and ')}, so unaddressed plain speech stays as drafts.`
+                : turn?.route
+                  ? `Your plain speech still goes to ${describeConversation(routeConversation(turn.route))}.`
+                  : 'You have no speech route, so unaddressed plain speech is held as drafts.';
+            };
             let routing: string;
             if (openInput?.setSpeechTarget !== false) {
               const resolved = this.channelRegistry!.resolveDestination({
@@ -16211,29 +16337,38 @@ export class AgentFramework {
               });
               const destination = resolved && 'destination' in resolved ? resolved.destination : undefined;
               const openedServer = destination?.serverId ?? openInput?.serverId;
+              // A channel named alone means its root — never a thread
+              // borrowed from an earlier route; a thread is named with it.
+              const threadId = typeof openInput?.threadId === 'string' && openInput.threadId ? openInput.threadId : undefined;
               const route: SpeechRoute = {
                 kind: 'channel',
                 ...(openedServer ? { serverId: openedServer } : {}),
                 channelId: opened,
+                ...(threadId ? { threadId } : {}),
                 ...(destination?.label ? { label: destination.label } : {}),
                 origin: 'open',
               };
-              const next: TurnRoute = { route };
-              this.turnRoutes.set(agentName, next);
-              this.lastAnnouncedRoute.set(agentName, AgentFramework.routeKey(next));
-              if (openerAgent.proseRouting === 'hybrid') this.proseTargetPins.delete(agentName);
-              routing =
-                `Your unaddressed plain speech now goes to ${describeConversation(routeConversation(route))} for the ` +
-                'rest of this turn. Other channels need an explicit send tool.';
-              console.error(`[routing] ${agentName}: channel_open -> speech route ${opened} (announced in tool result)`);
+              // Only a place the framework can publish into exactly becomes
+              // a route (MCPL RFC-011); otherwise the open stands, and the
+              // route doesn't move.
+              const refusal = routeRefusal(routeConversation(route), (c) => this.publishTargetOf(c));
+              if (refusal) {
+                routing =
+                  `Opened, but your plain speech can't go there: ${this.unroutableText({ conversation: routeConversation(route), reason: refusal })} ` +
+                  unchanged();
+                console.error(`[routing] ${agentName}: channel_open ${opened} not a speech route (${refusal})`);
+              } else {
+                const next: TurnRoute = { route };
+                this.turnRoutes.set(agentName, next);
+                this.lastAnnouncedRoute.set(agentName, AgentFramework.routeKey(next));
+                if (openerAgent.proseRouting === 'hybrid') this.proseTargetPins.delete(agentName);
+                routing =
+                  `Your unaddressed plain speech now goes to ${describeConversation(routeConversation(route))} for the ` +
+                  'rest of this turn. Other channels need an explicit send tool.';
+                console.error(`[routing] ${agentName}: channel_open -> speech route ${opened}${threadId ? ` thread ${threadId}` : ''} (announced in tool result)`);
+              }
             } else {
-              const turn = this.turnRoutes.get(agentName);
-              routing = turn?.hold
-                ? 'Opened for reading. Your speech route is unchanged: it is held between ' +
-                  `${turn.hold.conversations.map(describeConversation).join(' and ')}, so unaddressed plain speech stays as drafts.`
-                : turn?.route
-                  ? `Opened for reading. Your plain speech still goes to ${describeConversation(routeConversation(turn.route))}.`
-                  : 'Opened for reading. You have no speech route, so unaddressed plain speech is held as drafts.';
+              routing = `Opened for reading. ${unchanged()}`;
             }
             result = {
               ...result,
@@ -16506,7 +16641,7 @@ export class AgentFramework {
           console.error(`[sleep] ${agentName}: no prose target this turn — sleep announcement not posted (explicit mode never guesses)`);
         }
       } else {
-        const locus = this.routeChannelId(agentName);
+        const locus = this.routeTarget(agentName);
         this.channelRegistry.routeSpeech(agentName, text, locus).catch((err) => {
           console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
         });

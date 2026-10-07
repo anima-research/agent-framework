@@ -814,6 +814,8 @@ describe('drafts resend ownership', () => {
           resolve: (o) => resolve({ destination: { serverId: 'discord', channelId: target.channelId }, at: Date.now(), ...(o as object) }),
         })),
       getChannelTools: () => [],
+      // Every channel declares an MCPL RFC-011 publish target.
+      publishTarget: () => 'root',
     };
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(stub, {
       get: (t, prop: string) => (prop in t ? t[prop] : () => undefined),

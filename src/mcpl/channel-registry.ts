@@ -347,6 +347,13 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
             'Whether your unaddressed plain speech should go to this channel for the rest of this turn ' +
             '(default true). false opens it for reading only; the result says where your speech goes.',
         },
+        threadId: {
+          type: 'string',
+          description:
+            'With setSpeechTarget, a thread of this channel to speak into instead of its root (the thread ' +
+            'id from a [source: … · thread <id>] line). Only where the channel\'s connector can post into ' +
+            'a named thread; without it, your speech goes to the channel root.',
+        },
       },
       required: ['channelId'],
     },
@@ -387,14 +394,21 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
     name: 'channel_publish',
     description:
       'Publish a message to a channel — an explicit send. Without channelId it goes to your current speech ' +
-      'route (the conversation your plain speech is going to this turn); with no route it is refused, never ' +
-      'guessed. The receipt names where it went, and whether delivery was confirmed, failed (nothing posted) ' +
-      'or is unknown (it may have been posted).',
+      'route (the conversation your plain speech is going to this turn, thread included); with no route it is ' +
+      'refused, never guessed. With channelId it goes to that channel\'s root, or into threadId. The receipt ' +
+      'names where it went, and whether delivery was confirmed, failed (nothing posted) or is unknown (it may ' +
+      'have been posted).',
     inputSchema: {
       type: 'object' as const,
       properties: {
         channelId: { type: 'string', description: 'ID of the channel to publish to (defaults to your current speech route)' },
         serverId: { type: 'string', description: 'Owning MCPL server; needed only when channelId is registered by more than one.' },
+        threadId: {
+          type: 'string',
+          description:
+            'A thread of channelId to post in (the id from a [source: … · thread <id>] line); omitted, the post ' +
+            'goes to the channel root. Only where the channel\'s connector can post into a named thread.',
+        },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
@@ -485,6 +499,34 @@ export interface PublishDestination {
   channelId: string;
   /** The channel's registered label when the attempt was made. */
   label?: string;
+  /**
+   * The place inside the channel the publish asked for (MCPL RFC-011): a
+   * thread id, or null for the channel root. Absent only on a destination
+   * recorded before targeted publishing.
+   */
+  threadId?: string | null;
+}
+
+/**
+ * A channel's declared publish target (MCPL RFC-011
+ * `capabilities.publish.target`): `exact` posts exactly where a publish
+ * says (a thread, or the root), `root` has no threads. Undefined — no
+ * declaration, or a malformed one — means no guarantee: the framework does
+ * not publish there, because the connector may choose a place itself.
+ */
+export function declaredPublishTarget(descriptor: ChannelDescriptor | undefined): 'exact' | 'root' | undefined {
+  const target = (descriptor?.capabilities as { publish?: { target?: unknown } } | undefined)?.publish?.target;
+  return target === 'exact' || target === 'root' ? target : undefined;
+}
+
+/** Where a publish may go inside a channel, given its declaration: why not, or undefined when it may. */
+export function publishPlaceRefusal(
+  declared: 'exact' | 'root' | undefined,
+  threadId: string | null,
+): 'undeclared' | 'no-threads' | undefined {
+  if (!declared) return 'undeclared';
+  if (threadId !== null && declared !== 'exact') return 'no-threads';
+  return undefined;
 }
 
 /**
@@ -2930,11 +2972,13 @@ export class ChannelRegistry {
     inferenceId: string,
     index: number,
     delta: string,
+    /** The final publish's place (RFC-011 §6): a thread, or null for the root. */
+    threadId: string | null = null,
   ): void {
-    const server = this.streamingServerFor(channelId);
+    const server = this.streamingServerFor(channelId, threadId);
     if (!server) return;
     try {
-      server.sendChannelsOutgoingChunk({ inferenceId, conversationId, channelId, index, delta });
+      server.sendChannelsOutgoingChunk({ inferenceId, conversationId, channelId, index, delta, threadId });
     } catch { /* observer surface — never disturb the turn */ }
   }
 
@@ -2944,8 +2988,10 @@ export class ChannelRegistry {
     conversationId: string,
     inferenceId: string,
     text: string,
+    /** The final publish's place (RFC-011 §6): a thread, or null for the root. */
+    threadId: string | null = null,
   ): void {
-    const server = this.streamingServerFor(channelId);
+    const server = this.streamingServerFor(channelId, threadId);
     if (!server) return;
     try {
       server.sendChannelsOutgoingComplete({
@@ -2953,17 +2999,21 @@ export class ChannelRegistry {
         conversationId,
         channelId,
         content: [{ type: 'text', text }],
+        threadId,
       });
     } catch { /* observer surface — never disturb the turn */ }
   }
 
-  private streamingServerFor(channelId: string) {
+  private streamingServerFor(channelId: string, threadId: string | null) {
     // The map is keyed `${serverId}:${channelId}`; stream targets arrive as
     // bare descriptor ids (what resolveProseTarget returns). Scan like the
     // resolver does, and fail closed on cross-server ambiguity — the same
     // never-guess rule that governs delivery.
     const matches = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
     if (matches.length !== 1) return null;
+    // §14.3 fail-closed: nothing streams that delivery would refuse — and
+    // delivery publishes only where the place is declared (RFC-011 §6).
+    if (publishPlaceRefusal(declaredPublishTarget(matches[0]!.descriptor), threadId)) return null;
     const server = this.serverRegistry.getServer(matches[0]!.serverId);
     // §5.4: the GRANT gates streaming, not the raw advertisement. The old
     // `capabilities?.channels?.streaming` check was doubly wrong: undefined
@@ -3002,6 +3052,17 @@ export class ChannelRegistry {
         ...(entry.entry.descriptor.label ? { label: entry.entry.descriptor.label } : {}),
       },
     };
+  }
+
+  /**
+   * The publish target a registered channel declares (MCPL RFC-011), read
+   * live: a `channels/changed` that adds or withdraws it applies to the next
+   * decision. Undefined when the channel doesn't resolve to exactly one
+   * registration or declares nothing.
+   */
+  publishTarget(target: { serverId?: string; channelId: string }): 'exact' | 'root' | undefined {
+    const found = this.findExactEntry(target);
+    return 'error' in found ? undefined : declaredPublishTarget(found.entry.descriptor);
   }
 
   private findExactEntry(
@@ -3049,31 +3110,48 @@ export class ChannelRegistry {
    * destination is opened first (`openSource` names why), and a failed open
    * sends nothing.
    *
-   * Only the connector's `delivered: true` confirms a post. `failed` means
-   * nothing was posted: the attempt stopped before the request was written,
-   * or the connector answered `delivered: false` and named no message (no
-   * `messageId`, or null). Everything else is `unknown`: once the request
-   * has been handed to the transport, an error response, a timeout, a lost
-   * connection, or a missing, malformed or contradictory receipt (such as
-   * `delivered: false` beside a message id, valid or not) means the post may
-   * or may not exist, and the caller must not treat it as safe to retry
-   * blindly.
+   * Every publish names its place inside the channel (MCPL RFC-011): the
+   * target's `threadId`, or the channel root (null) when it names none. It
+   * goes only to a channel that declares `capabilities.publish.target`, and
+   * a thread only to one that declares `exact`; anything else is refused
+   * before anything is opened or sent, because the connector would choose
+   * a place itself.
+   *
+   * Only the connector's `delivered: true` with an echo of the requested
+   * place confirms a post. `failed` means nothing was posted: the attempt
+   * stopped before the request was written, or the connector answered
+   * `delivered: false` and named no message (no `messageId`, or null) — a
+   * refusal. Everything else is `unknown`: once the request has been handed
+   * to the transport, an error response, a timeout, a lost connection, or a
+   * missing, malformed or contradictory receipt (such as `delivered: false`
+   * beside a message id, valid or not, or a delivery whose echoed place is
+   * missing or different) means the post may or may not exist where it was
+   * asked to go, and the caller must not treat it as safe to retry blindly.
    */
   async publish(
     conversationId: string,
     text: string,
-    target: { serverId?: string; channelId: string },
+    target: { serverId?: string; channelId: string; threadId?: string | null },
     openSource: 'opened-by-delivery' | 'opened-by-reply' = 'opened-by-delivery',
   ): Promise<PublishOutcome> {
     const at = (): number => Date.now();
     const found = this.findExactEntry(target);
     if ('error' in found) return { status: 'failed', reason: found.error, at: at() };
     const entry = found.entry;
+    const place = target.threadId === undefined ? null : target.threadId;
     const destination: PublishDestination = {
       serverId: entry.serverId,
       channelId: entry.descriptor.id,
       ...(entry.descriptor.label ? { label: entry.descriptor.label } : {}),
+      threadId: place,
     };
+    if (place !== null && (typeof place !== 'string' || place === '')) {
+      return { status: 'failed', destination, reason: 'the thread to post in must be a non-empty thread id', at: at() };
+    }
+    const refusal = publishPlaceRefusal(declaredPublishTarget(entry.descriptor), place);
+    if (refusal) {
+      return { status: 'failed', destination, reason: ChannelRegistry.placeRefusalText(refusal, entry.descriptor, place), at: at() };
+    }
 
     if (!entry.open) {
       try {
@@ -3126,6 +3204,7 @@ export class ChannelRegistry {
         conversationId,
         channelId: entry.descriptor.id,
         content: [{ type: 'text', text }],
+        threadId: place,
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -3143,20 +3222,39 @@ export class ChannelRegistry {
         at: at(),
       };
     }
-    const receipt = (result ?? {}) as { delivered?: unknown; messageId?: unknown };
+    const receipt = (result ?? {}) as { delivered?: unknown; messageId?: unknown; threadId?: unknown; reason?: unknown };
     const messageId = typeof receipt.messageId === 'string' && receipt.messageId ? receipt.messageId : undefined;
     if (receipt.delivered === true) {
+      // RFC-011 §5: the echo must name the place asked for. Missing or
+      // different, something was posted — but not provably there.
+      if (!('threadId' in receipt) || receipt.threadId !== place) {
+        const asked = place === null ? 'the channel root' : `thread ${place}`;
+        const echoed = !('threadId' in receipt) || receipt.threadId === undefined
+          ? 'did not say where it posted'
+          : receipt.threadId === null
+            ? 'reported posting at the channel root'
+            : `reported posting in ${typeof receipt.threadId === 'string' ? `thread ${receipt.threadId}` : `an unreadable place ${JSON.stringify(receipt.threadId)}`}`;
+        return {
+          status: 'unknown',
+          destination,
+          ...(messageId ? { messageId } : {}),
+          reason: `server "${entry.serverId}" reported delivery but ${echoed}, not ${asked} (where it landed is unconfirmed)`,
+          at: at(),
+        };
+      }
       return { status: 'delivered', destination, ...(messageId ? { messageId } : {}), at: at() };
     }
     if (receipt.delivered === false) {
       // `delivered: false` proves nothing went out only when the receipt
-      // names no message at all. A message id beside it — valid or
-      // malformed — contradicts it: something may have been posted.
+      // names no message at all — a refusal (RFC-011 §4). A message id
+      // beside it — valid or malformed — contradicts it: something may have
+      // been posted.
       if (receipt.messageId === undefined || receipt.messageId === null) {
+        const why = typeof receipt.reason === 'string' && receipt.reason.trim() ? `: ${receipt.reason.trim()}` : '';
         return {
           status: 'failed',
           destination,
-          reason: `server "${entry.serverId}" reported delivered:false`,
+          reason: `server "${entry.serverId}" reported delivered:false${why}`,
           at: at(),
         };
       }
@@ -3183,6 +3281,19 @@ export class ChannelRegistry {
     };
   }
 
+  /** Why a publish's place was refused, in words a resident can act on. */
+  static placeRefusalText(
+    refusal: 'undeclared' | 'no-threads',
+    descriptor: ChannelDescriptor,
+    threadId: string | null,
+  ): string {
+    const where = descriptor.label && descriptor.label !== descriptor.id ? `${descriptor.label} (${descriptor.id})` : descriptor.id;
+    return refusal === 'undeclared'
+      ? `${where}'s connector doesn't declare where a post lands (MCPL RFC-011), so it may choose a thread itself; ` +
+        'the framework doesn\'t publish there'
+      : `${where} has no threads (its connector declares root), so a post into thread ${threadId} is refused`;
+  }
+
   /**
    * Plain speech for one turn segment: publish `text` to the turn's frozen
    * locus and report the PublishOutcome. A failure (or an uncertain outcome)
@@ -3199,7 +3310,7 @@ export class ChannelRegistry {
      *  stale global default and land the reply in the wrong channel (item-3,
      *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
      *  "this turn is pinned to no locus": fail loudly rather than guess. */
-    locusChannelId: string | null | { serverId?: string; channelId: string },
+    locusChannelId: string | null | { serverId?: string; channelId: string; threadId?: string | null },
   ): Promise<PublishOutcome> {
     const fail = (channelId: string | null, reason: string, outcome: PublishOutcome): PublishOutcome => {
       const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
@@ -3261,19 +3372,20 @@ export class ChannelRegistry {
   async routeSpeech(
     conversationId: string,
     text: string,
-    locusChannelId: string | null | { serverId?: string; channelId: string },
-  ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
+    locusChannelId: string | null | { serverId?: string; channelId: string; threadId?: string | null },
+  ): Promise<{ delivered: boolean; channelId: string; threadId?: string; messageId?: string } | null> {
     const outcome = await this.deliverSpeech(conversationId, text, locusChannelId);
     if (outcome.status !== 'delivered') return null;
     return {
       delivered: true,
       channelId: outcome.destination!.channelId,
+      ...(outcome.destination!.threadId ? { threadId: outcome.destination!.threadId } : {}),
       ...(outcome.messageId !== undefined ? { messageId: outcome.messageId } : {}),
     };
   }
 
   private async handleToolPublish(
-    input: { channelId?: string; serverId?: string; content?: string; text?: string },
+    input: { channelId?: string; serverId?: string; threadId?: string | null; content?: string; text?: string },
     origin?: ChannelToolOrigin,
   ): Promise<ToolResult> {
     // Resolve content: accept both `content` and `text` (backward compat)
@@ -3286,11 +3398,23 @@ export class ChannelRegistry {
       };
     }
 
-    // The destination: the one named, else the caller's current speech
-    // route — never the most recent inbound channel (shelf-355).
-    let target: { serverId?: string; channelId: string };
+    // The destination: the one named — its root, or the thread named with
+    // it — else the caller's current speech route, thread included; never
+    // the most recent inbound channel (shelf-355), and never a thread
+    // borrowed from an earlier route for a channel named explicitly.
+    if (input.threadId !== undefined && input.threadId !== null && (typeof input.threadId !== 'string' || !input.threadId)) {
+      return { success: false, error: 'threadId must be a thread id (or left out for the channel root). Nothing was sent.', isError: true };
+    }
+    if (input.threadId && !input.channelId) {
+      return { success: false, error: 'threadId needs the channelId it belongs to. Nothing was sent.', isError: true };
+    }
+    let target: { serverId?: string; channelId: string; threadId: string | null };
     if (input.channelId) {
-      target = { channelId: input.channelId, ...(input.serverId ? { serverId: input.serverId } : {}) };
+      target = {
+        channelId: input.channelId,
+        ...(input.serverId ? { serverId: input.serverId } : {}),
+        threadId: input.threadId || null,
+      };
     } else {
       const route = origin?.kind === 'agent' ? this.speechRouteResolver?.(origin.agentName) : undefined;
       if (route?.kind !== 'channel') {
@@ -3306,8 +3430,13 @@ export class ChannelRegistry {
         };
       }
       // The route's server when it has one; otherwise the id alone, resolved
-      // exactly as plain speech on the same route resolves it.
-      target = { channelId: route.channelId, ...(route.serverId ? { serverId: route.serverId } : {}) };
+      // exactly as plain speech on the same route resolves it — and its
+      // thread, when the route is one.
+      target = {
+        channelId: route.channelId,
+        ...(route.serverId ? { serverId: route.serverId } : {}),
+        threadId: route.threadId ?? null,
+      };
     }
 
     const outcome = await this.publish(
@@ -3316,8 +3445,13 @@ export class ChannelRegistry {
       target,
     );
     const where = outcome.destination
-      ? { serverId: outcome.destination.serverId, channelId: outcome.destination.channelId, ...(outcome.destination.label ? { channelLabel: outcome.destination.label } : {}) }
-      : { channelId: target.channelId, ...(target.serverId ? { serverId: target.serverId } : {}) };
+      ? {
+          serverId: outcome.destination.serverId,
+          channelId: outcome.destination.channelId,
+          ...(outcome.destination.label ? { channelLabel: outcome.destination.label } : {}),
+          threadId: outcome.destination.threadId ?? null,
+        }
+      : { channelId: target.channelId, ...(target.serverId ? { serverId: target.serverId } : {}), threadId: target.threadId };
     if (outcome.status === 'delivered') {
       return {
         success: true,
@@ -3332,7 +3466,8 @@ export class ChannelRegistry {
     // Not confirmed: say which, and where it was attempted. `unknown` may
     // already be posted (a partial multi-part send, a timeout): never invite
     // a blind retry.
-    const shown = `${where.channelId}${'channelLabel' in where && where.channelLabel ? ` (${where.channelLabel})` : ''}`;
+    const shown = `${where.channelId}${'channelLabel' in where && where.channelLabel ? ` (${where.channelLabel})` : ''}` +
+      `${where.threadId ? `, thread ${where.threadId}` : ''}`;
     return {
       success: false,
       error: outcome.status === 'unknown'

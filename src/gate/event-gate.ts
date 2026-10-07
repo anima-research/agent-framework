@@ -97,6 +97,9 @@ interface PendingEvent {
   /** The triggering message's id, when the metadata carries one: the reply
    *  edge of a speech route inferred from this event. */
   messageId?: string;
+  /** The thread the event belongs to, when the metadata carries one: part
+   *  of its conversation's identity (a thread is not its channel's root). */
+  threadId?: string;
   /** Conversational input rather than machinery (a reaction, a system
    *  marker): only conversational events are route candidates. */
   conversational: boolean;
@@ -111,6 +114,8 @@ export type GateRouteCandidate =
        *  the event named (or `user:<author>` when it named only an author). */
       channelId: string;
       serverId?: string;
+      /** The thread the conversation is, when it is one. */
+      threadId?: string;
       messageId?: string;
       addressed: boolean;
       at: number;
@@ -260,6 +265,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
         kind: 'channel',
         channelId: e.routeChannelId,
         ...(e.serverId ? { serverId: e.serverId } : {}),
+        ...(e.threadId ? { threadId: e.threadId } : {}),
         ...(e.messageId ? { messageId: e.messageId } : {}),
         addressed: e.addressed,
         at: e.timestamp,
@@ -275,6 +281,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
         kind: 'channel',
         channelId: e.channelId || `user:${e.authorId}`,
         ...(e.serverId ? { serverId: e.serverId } : {}),
+        ...(e.threadId ? { threadId: e.threadId } : {}),
         addressed: e.addressed,
         at: e.timestamp,
         unroutable: true,
@@ -1567,6 +1574,9 @@ export class EventGate {
       routeChannelId: this.routeChannelFor(info),
       ...(typeof info.metadata?.messageId === 'string' && info.metadata.messageId
         ? { messageId: info.metadata.messageId as string }
+        : {}),
+      ...(typeof info.metadata?.threadId === 'string' && info.metadata.threadId
+        ? { threadId: info.metadata.threadId as string }
         : {}),
       conversational: isConversational(info.tags, info.metadata),
     };

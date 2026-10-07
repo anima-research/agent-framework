@@ -96,7 +96,7 @@ function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'fals
     resolveLocus: () => 'world:commons',
     getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
-    getDescriptor: () => undefined,
+    getDescriptor: () => undefined, publishTarget: () => 'root',
     getChannelTools: () => [],
   };
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(explicit, {
@@ -346,7 +346,8 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     trigger(framework);
     await framework.runUntilIdle();
-    assert.deepEqual(routed, [{ text: 'Ordinary field speech.', locus: 'world:commons' }]);
+    // The route's exact place: its channel, at the root (MCPL RFC-011).
+    assert.deepEqual(routed, [{ text: 'Ordinary field speech.', locus: { channelId: 'world:commons', threadId: null } }]);
     await framework.stop();
   });
 

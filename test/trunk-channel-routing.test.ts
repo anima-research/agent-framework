@@ -38,6 +38,26 @@ function internals(framework: AgentFramework) {
   };
 }
 
+/**
+ * A channel subsystem stand-in whose channels all declare `target` as their
+ * MCPL RFC-011 publish target: a route is only ever a place the framework
+ * can publish to exactly. Plain speech it is asked to publish is recorded.
+ */
+function declaringRegistry(target: 'exact' | 'root' | undefined) {
+  const published: Array<{ text: string; to: unknown }> = [];
+  const registry = new Proxy({
+    publishTarget: () => target,
+    resolveLocus: () => null,
+    routeSpeech: async (_a: string, text: string, to: unknown) => {
+      published.push({ text, to });
+      return { delivered: true, channelId: 'x' };
+    },
+    getDescriptor: () => undefined,
+    getChannelTools: () => [],
+  } as Record<string, unknown>, { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
+  return { registry, published };
+}
+
 function channelIncoming(channelId: string, text: string): ProcessEvent {
   return {
     type: 'mcpl:channel-incoming',
@@ -313,6 +333,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
   it('a channel-incoming trunk turn takes its triggering conversation as its speech route', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the date is ...' }]));
     const framework = await makeFramework();
+    internals(framework).channelRegistry = declaringRegistry('root').registry;
 
     const event = channelIncoming('discord:guild:chanA', 'A: sleep && date');
     framework.pushEvent(event);
@@ -329,6 +350,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
   it('a DM push-event turn takes the reconstructed DM channel as its route (item-3 redux DM sub-case)', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi in the DM' }]));
     const framework = await makeFramework();
+    internals(framework).channelRegistry = declaringRegistry('root').registry;
 
     framework.pushEvent(dmPushEvent('42', 'hey scout, ping'));
     await framework.runUntilIdle();
@@ -345,6 +367,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
   it('the route belongs to the CURRENT turn, never a stale one', async () => {
     const framework = await makeFramework();
     const i = internals(framework);
+    i.channelRegistry = declaringRegistry('root').registry;
 
     // (Push the response right before each turn: MockMembrane's stream
     // consumes ALL queued responses at once.)
@@ -375,17 +398,30 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
-  it('a thread wakes the turn but plain speech is held: publishing carries no thread', async () => {
+  it('a thread is a route where its channel posts into named threads (MCPL RFC-011 exact)', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering the topic' }]));
     const framework = await makeFramework();
-    // A channel subsystem to deliver through (speech is only routed with one).
-    const published: string[] = [];
-    internals(framework).channelRegistry = new Proxy({
-      resolveLocus: () => null,
-      routeSpeech: async (_a: string, text: string) => { published.push(text); return { delivered: true, channelId: 'x' }; },
-      getDescriptor: () => undefined,
-      getChannelTools: () => [],
-    } as Record<string, unknown>, { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
+    const { registry, published } = declaringRegistry('exact');
+    internals(framework).channelRegistry = registry;
+    framework.pushEvent({
+      ...(channelIncoming('zulip:stream:7', 'on topic') as unknown as Record<string, unknown>),
+      serverId: 'zulip',
+      threadId: 'topic-a',
+    } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    const turn = internals(framework).turnRoutes.get('scout') as { route: { channelId?: string; threadId?: string } | null };
+    assert.equal(turn.route?.channelId, 'zulip:stream:7');
+    assert.equal(turn.route?.threadId, 'topic-a');
+    assert.deepEqual(published, [{ text: 'answering the topic', to: { serverId: 'zulip', channelId: 'zulip:stream:7', threadId: 'topic-a' } }],
+      'into the thread, never the channel root');
+    await framework.stop();
+  });
+
+  it('a thread on a channel that declares no threads wakes the turn but plain speech is held, never sent to the root', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering the topic' }]));
+    const framework = await makeFramework();
+    const { registry, published } = declaringRegistry('root');
+    internals(framework).channelRegistry = registry;
     framework.pushEvent({
       ...(channelIncoming('zulip:stream:7', 'on topic') as unknown as Record<string, unknown>),
       serverId: 'zulip',
@@ -397,12 +433,33 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.equal(turn.unroutable?.reason, 'thread');
     const texts = framework.getAgent('scout')!.getContextManager().getAllMessages()
       .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text);
-    assert.ok(texts.some((t) => t.startsWith('[routing] The conversation that woke you is a thread')));
+    assert.ok(texts.some((t) => t.startsWith('[routing] Your plain speech can\'t go to the conversation in front of you') &&
+      /is a thread, but its connector declares the channel has no threads/.test(t)));
     const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string; reason: string; note?: string }> } })
       .proseDrafts.open('scout');
     assert.deepEqual(drafts.map((d) => [d.text, d.reason]), [['answering the topic', 'no-destination']]);
-    assert.match(drafts[0]!.note ?? '', /a thread .*send tool that names the thread/);
+    assert.match(drafts[0]!.note ?? '', /is a thread, but its connector declares the channel has no threads/);
     assert.deepEqual(published, [], 'nothing went to the channel root');
+    await framework.stop();
+  });
+
+  it('a channel whose connector declares no publish target is no route: speech is held, nothing published', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello there' }]));
+    const framework = await makeFramework();
+    const { registry, published } = declaringRegistry(undefined);
+    internals(framework).channelRegistry = registry;
+    framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: hi'));
+    await framework.runUntilIdle();
+    const turn = internals(framework).turnRoutes.get('scout') as { route: unknown; unroutable?: { reason: string } };
+    assert.equal(turn.route, null);
+    assert.equal(turn.unroutable?.reason, 'untargetable');
+    const texts = framework.getAgent('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text);
+    const notice = texts.find((t) => t.startsWith('[routing]'));
+    assert.match(notice ?? '', /its connector doesn't declare where a post lands \(MCPL RFC-011\)/);
+    assert.match(notice ?? '', /publication from here is unavailable until it does/);
+    assert.doesNotMatch(notice ?? '', /consult/, 'no connector tools are claimed when the connector lists none');
+    assert.deepEqual(published, []);
     await framework.stop();
   });
 

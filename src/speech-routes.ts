@@ -16,6 +16,12 @@
  * selects one over an addressed candidate. Explicit sends name their own
  * destination and don't retarget narration.
  *
+ * A route is only ever a place the framework can publish to exactly (MCPL
+ * RFC-011): a channel whose connector declares `capabilities.publish.target`,
+ * and a thread only on one that declares `exact`. Anything else is
+ * unroutable, and speech for it is held rather than handed to a connector
+ * that would choose the place itself.
+ *
  * Pure: the framework supplies the candidates and the fork home, and owns
  * the per-turn state.
  */
@@ -67,10 +73,9 @@ export type SpeechRoute =
       /** As in ConversationRef: absent when unknown. */
       serverId?: string;
       channelId: string;
-      /** Never set on a route: plain speech can't be posted into a thread
-       *  (publishing carries no thread), so a thread conversation is never
-       *  inferred as a route. Kept for the type's symmetry with
-       *  ConversationRef. */
+      /** The thread the route speaks into — only on a channel whose
+       *  connector posts into a named thread (RFC-011 `exact`). Absent: the
+       *  channel root. */
       threadId?: string;
       /** The message being answered, kept across same-conversation arrivals. */
       replyTo?: string;
@@ -93,9 +98,28 @@ export interface TurnRoute {
     since: 'turn-start' | 'mid-turn';
   };
   /** No route because the one conversation the turn answers can't take
-   *  plain speech: a thread (publishing carries no thread), or a channel the
-   *  host couldn't resolve. Said in the routing notice and the drafts' note. */
-  unroutable?: { conversation: ConversationRef; reason: 'thread' | 'unresolved' };
+   *  plain speech, said in the routing notice and the drafts' note:
+   *  - `untargetable`: its channel's connector doesn't declare where a post
+   *    lands (RFC-011), so the framework doesn't publish there;
+   *  - `thread`: a thread on a channel whose connector can't post into a
+   *    named thread (it declares `root`: a contradiction the connector
+   *    shouldn't produce);
+   *  - `unresolved`: a channel the host couldn't resolve. */
+  unroutable?: { conversation: ConversationRef; reason: UnroutableReason };
+}
+
+export type UnroutableReason = 'untargetable' | 'thread' | 'unresolved';
+
+/** A channel's declared publish target (RFC-011), as the framework reads it. */
+export type PublishTargetOf = (channel: { serverId?: string; channelId: string }) => 'exact' | 'root' | undefined;
+
+/** Why a channel conversation can't be a route, or undefined when it can. */
+export function routeRefusal(c: ConversationRef, targetOf: PublishTargetOf): UnroutableReason | undefined {
+  if (c.kind !== 'channel') return undefined;
+  const declared = targetOf(c);
+  if (!declared) return 'untargetable';
+  if (c.threadId && declared !== 'exact') return 'thread';
+  return undefined;
 }
 
 /** Identity of a conversation: server, channel and thread, or the surface. */
@@ -134,11 +158,19 @@ export function describeConversation(c: ConversationRef): string {
  * infer a route only when they name one conversation, from the newest
  * candidate in it (its message is the reply edge). Several conversations
  * start the turn held, naming each; none leaves the turn without a route,
- * and so does one that can't take plain speech (a thread, or a channel that
- * couldn't be resolved), which the turn records as `unroutable`.
+ * and so does one that can't take plain speech — a channel the framework
+ * can't publish into exactly (`targetOf`, RFC-011), or one that couldn't be
+ * resolved — which the turn records as `unroutable`.
  */
-export function inferTurnRoute(candidates: readonly RouteCandidate[], home?: SpeechRoute | null): TurnRoute {
-  if (home) return { route: home };
+export function inferTurnRoute(
+  candidates: readonly RouteCandidate[],
+  home: SpeechRoute | null | undefined,
+  targetOf: PublishTargetOf,
+): TurnRoute {
+  if (home) {
+    const refusal = routeRefusal(routeConversation(home), targetOf);
+    return refusal ? { route: null, unroutable: { conversation: routeConversation(home), reason: refusal } } : { route: home };
+  }
   const addressed = candidates.filter((c) => c.addressed);
   const pool = addressed.length > 0 ? addressed : candidates;
   if (pool.length === 0) return { route: null };
@@ -157,11 +189,12 @@ export function inferTurnRoute(candidates: readonly RouteCandidate[], home?: Spe
   const [chosen] = newestByConversation.values();
   const c = chosen!.conversation;
   // A conversation whose channel isn't resolvable can't be spoken into, and
-  // neither can a thread: publishing carries no thread, so plain speech
-  // would land in the channel root — a different conversation than the one
-  // being answered. Both still compete for the turn (above).
+  // neither can one the framework can't publish into exactly: its connector
+  // would choose the place, which may be another conversation (RFC-011).
+  // Both still compete for the turn (above).
   if (chosen!.unroutable) return { route: null, unroutable: { conversation: c, reason: 'unresolved' } };
-  if (c.kind === 'channel' && c.threadId) return { route: null, unroutable: { conversation: c, reason: 'thread' } };
+  const refusal = routeRefusal(c, targetOf);
+  if (refusal) return { route: null, unroutable: { conversation: c, reason: refusal } };
   return c.kind === 'surface'
     ? { route: { kind: 'surface', surface: c.surface, origin: 'trigger' } }
     : {
@@ -169,6 +202,7 @@ export function inferTurnRoute(candidates: readonly RouteCandidate[], home?: Spe
           kind: 'channel',
           ...(c.serverId ? { serverId: c.serverId } : {}),
           channelId: c.channelId,
+          ...(c.threadId ? { threadId: c.threadId } : {}),
           ...(chosen!.messageId ? { replyTo: chosen!.messageId } : {}),
           ...(c.label ? { label: c.label } : {}),
           origin: 'trigger',
