@@ -1474,7 +1474,8 @@ describe('the mount boundary', () => {
       try {
         return await lstat(path, ...rest);
       } catch (err) {
-        if (String(path) === env.disk('sub/a.txt') && ++misses === 2) {
+        // By name: the lookups may go through the lexical or the canonical path.
+        if (basename(String(path)) === 'a.txt' && ++misses === 2) {
           // The empty directory that lacked it is replaced by one that has it.
           renameSync(env.disk('sub'), env.disk('old'));
           renameSync(env.disk('replacement'), env.disk('sub'));
@@ -1497,7 +1498,8 @@ describe('the mount boundary', () => {
     let swapped = false;
     const data = await withFsPromises('lstat', (lstat) => async (path, ...rest) => {
       const info = await lstat(path, ...rest);
-      if (!swapped && String(path) === env.disk('sub') && info.isFile()) {
+      // By name: the lookups may go through the lexical or the canonical path.
+      if (!swapped && basename(String(path)) === 'sub' && info.isFile()) {
         swapped = true;
         rmSync(env.disk('sub'));
         renameSync(env.disk('saved'), env.disk('sub'));
