@@ -118,6 +118,33 @@ export function capIds(ids: string[]): { ids: string[]; count: number; truncated
     : { ids, count: ids.length };
 }
 
+/**
+ * What a live surgery did about Discord awareness marks, reported apart from
+ * the body change itself. A surgery that returns has applied its body change;
+ * this says only whether marks were scheduled:
+ *
+ * - `none` — no marks were scheduled: the change removed no addressable
+ *   Discord message, or the awareness outbox is disabled (no
+ *   `discordAwarenessOutboxPath` and no `storePath`). It is not proof that
+ *   no addressable Discord message was removed: the surgery's `removedRefs`
+ *   (`discordRefs` in the operator log) say whether any was.
+ * - `queued` — the outbox batch is durably active and its delivery has been
+ *   handed to the background drain. It is not a delivery claim: per-message
+ *   outcomes stay in the outbox ledger.
+ * - `not-scheduled` — the body change landed, but recording the batch as
+ *   active failed, so it was retired from the ledger: none of its marks will
+ *   be delivered.
+ * - `unresolved` — the ledger could record neither the activation nor the
+ *   retirement. `batchId` names a retained batch whose scheduling outcome is
+ *   unresolved: any later reconciliation or restart that can read it may
+ *   promote and deliver it, and nothing here promises otherwise.
+ */
+export type SurgeryMarkerReceipt =
+  | { status: 'none'; queued: 0 }
+  | { status: 'queued'; queued: number; batchId: string }
+  | { status: 'not-scheduled'; queued: 0; error: string }
+  | { status: 'unresolved'; queued: 0; batchId: string; error: string };
+
 /** Thrown by live surgery methods when a request cannot be honored. `code`
  *  lets surfaces distinguish "agent busy — quiesce first" from bad input. */
 export class OperatorActionError extends Error {

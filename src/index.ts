@@ -142,7 +142,12 @@ export type {
 } from './recovery/discord-awareness-outbox.js';
 // Live operator surgery (rollback / suppress) and its durable action log
 export { OperatorLog, OperatorActionError, defaultOperatorLogPath } from './operator-log.js';
-export type { OperatorLogEntry, OperatorLogInput, OperatorRequester } from './operator-log.js';
+export type {
+  OperatorLogEntry,
+  OperatorLogInput,
+  OperatorRequester,
+  SurgeryMarkerReceipt,
+} from './operator-log.js';
 export { createOfflineRecoveryBranch } from './recovery/offline-branch.js';
 export type {
   OfflineRecoveryBranchOptions,
