@@ -176,6 +176,19 @@ describe('ChannelClockLedger', () => {
     assert.equal(l.delivered('r', CH, src('new', 500), ver('fresh'), BRANCH), true);
   });
 
+  it('keeps a delivery across an /undo-style branch rewind (lived time)', () => {
+    const l = open();
+    const before = store.currentBranch();
+    l.delivered('r', CH, src('m1', 1_100), ver('e1'), { id: before.id, name: before.name });
+    // Rewind: a new branch from an earlier point, then switch to it.
+    store.createBranchAt('undo-1', before.name, 0);
+    store.switchBranch('undo-1');
+    const reopened = open();
+    const c = clocks(reopened, 'r');
+    assert.equal(c.delivered?.messageId, 'm1', 'the delivery happened and stays delivered');
+    assert.equal(c.delivered?.branch.name, before.name, 'naming the branch it happened on');
+  });
+
   it('checkpoints and rebuilds from the checkpoint plus tail', () => {
     let l = open({ checkpointEvery: 3 });
     for (let i = 0; i < 7; i++) l.received(CH, src(`m${i}`, 1_000 + i), 'channels/incoming');
@@ -368,5 +381,15 @@ describe('request-owned evidence', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('history--folds folding sentence', () => {
+  it('names a strategy that never folds, never summarizes, or reports no layout', async () => {
+    const { foldingSentence } = await import('../src/modules/history/folds.js');
+    assert.match(foldingSentence('passthrough', ['raw']), /passthrough strategy never folds/);
+    assert.match(foldingSentence('windowed-passthrough', ['raw', 'omitted']), /never summarizes/);
+    assert.match(foldingSentence('custom', null), /does not report its rendered layout/);
+    assert.match(foldingSentence('autobiographical', ['raw', 'summary', 'omitted']), /folds history into summaries/);
   });
 });
