@@ -821,6 +821,7 @@ function schemaErrors(schema: Record<string, unknown>, value: Record<string, unk
   };
   const matches = (v: unknown, type: string): boolean => {
     switch (type) {
+      case 'object': return typeof v === 'object' && v !== null && !Array.isArray(v);
       case 'string': return typeof v === 'string';
       case 'integer': return typeof v === 'number' && Number.isInteger(v);
       case 'number': return typeof v === 'number';
@@ -830,6 +831,13 @@ function schemaErrors(schema: Record<string, unknown>, value: Record<string, unk
   };
   known(schema);
   const errors: string[] = [];
+  // Providers require a tool's input schema to describe an object.
+  if (schema.type === undefined) {
+    errors.push('root: no type');
+  } else {
+    const rootTypes = (Array.isArray(schema.type) ? schema.type : [schema.type]) as string[];
+    if (!rootTypes.some((t) => matches(value, t))) errors.push(`root: an object is not ${rootTypes.join(' | ')}`);
+  }
   const properties = (schema.properties ?? {}) as Record<string, Record<string, unknown>>;
   for (const name of (schema.required ?? []) as string[]) {
     if (!(name in value)) errors.push(`missing required ${name}`);
@@ -848,6 +856,13 @@ function schemaErrors(schema: Record<string, unknown>, value: Record<string, unk
 }
 
 describe('save_recent_image schema as each provider path is sent it (shelf-375; installed membrane)', () => {
+  it('the checker itself rejects a schema whose root does not describe an object', () => {
+    const properties = { path: { type: 'string' } };
+    assert.deepStrictEqual(schemaErrors({ type: 'object', properties }, { path: 'files/a.png' }), []);
+    assert.deepStrictEqual(schemaErrors({ type: 'string', properties }, { path: 'files/a.png' }), ['root: an object is not string']);
+    assert.deepStrictEqual(schemaErrors({ properties }, { path: 'files/a.png' }), ['root: no type']);
+  });
+
   const REF = 'img_k7x3q2_7';
   const SHAPES: Array<Record<string, unknown>> = [
     { path: 'files/a.png' },
