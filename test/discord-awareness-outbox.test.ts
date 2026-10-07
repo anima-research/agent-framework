@@ -895,6 +895,59 @@ test('turn-based host/command undo honours the marks choice for the messages its
   }
 });
 
+test('a turn undo records its marks choice and what it scheduled in the operator log, also for marks none', async () => {
+  const h = storeHarness();
+  try {
+    const messages = [
+      { id: 'i0', metadata: { ...ref('m0') } },
+      { id: 'i1', metadata: { ...ref('m1'), tags: ['chat:addressed'] } },
+      { id: 'i2', metadata: { ...ref('m2') } },
+    ];
+    const { framework, removed } = hostCommandFramework(h, messages);
+    // Each stubbed turn undo removes the next of these from the context.
+    let undoable = ['i1', 'i2'];
+    framework.undoLastTurn = () => {
+      const next = undoable[0];
+      if (!next) return { undone: false };
+      undoable = undoable.slice(1);
+      removed.add(next);
+      return { undone: true };
+    };
+    const logged: Array<Record<string, unknown>> = [];
+    framework.recordOperatorAction = (entry: Record<string, unknown>) => { logged.push(entry); return entry; };
+    let marked: any;
+    let local: any;
+    await muted(async () => {
+      marked = await framework.handleHostCommand('discord', {
+        command: 'undo', agentName: 'cairn', turns: 1, marks: 'addressed', requesterName: 'op',
+      });
+      local = await framework.handleHostCommand('discord', { command: 'undo', agentName: 'cairn', turns: 3 });
+      const nothing = await framework.handleHostCommand('discord', { command: 'undo', agentName: 'cairn', turns: 1, marks: 'all' });
+      assert.equal(nothing.undone, 0);
+    });
+    assert.equal(marked.markers.status, 'queued');
+    assert.equal(local.markers.status, 'none');
+    assert.deepEqual(logged, [
+      {
+        kind: 'undo-turns',
+        agent: 'cairn',
+        requester: { via: 'host-command:discord', name: 'op' },
+        params: { turns: 1, marks: { scope: 'addressed' } },
+        result: { undone: 1, markers: marked.markers },
+      },
+      {
+        kind: 'undo-turns',
+        agent: 'cairn',
+        requester: { via: 'host-command:discord' },
+        params: { turns: 3, marks: 'none' },
+        result: { undone: 1, markers: local.markers },
+      },
+    ], 'one entry per command that undid a turn, with the receipt it returned; none when nothing was undone');
+  } finally {
+    h.cleanup();
+  }
+});
+
 test('host/command hide takes the store reservation and marks only on request, through the journal', async () => {
   const h = storeHarness();
   try {

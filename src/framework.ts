@@ -5476,6 +5476,16 @@ export class AgentFramework {
       const after = new Set(this.addressingSnapshot(agentName).keys());
       const removed = [...before].filter(([id]) => !after.has(id)).map(([, carrier]) => carrier);
       markers = this.scheduleAppliedMarks('undo', agentName, serverId, removed, turnMarks);
+      // Each turn is logged by undoLastTurn; the command's marks choice
+      // (`none` included) and what it scheduled are logged here, as hide and
+      // rollback log theirs.
+      this.recordOperatorAction({
+        kind: 'undo-turns',
+        agent: agentName,
+        requester: hostCommandRequester(serverId, params),
+        params: { turns: requested, marks: describeMarksChoice(turnMarks) },
+        result: { undone, markers },
+      });
     } finally {
       release();
     }
