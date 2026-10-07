@@ -72,7 +72,7 @@ export function foldingSentence(strategy: string, forms: ReadonlyArray<'raw' | '
   return `The ${strategy} strategy folds history into summaries and can leave spans out; receipts record each change.`;
 }
 
-export function handleFolds(cm: ContextManager, input: FoldsInput): ToolResult {
+export function handleFolds(cm: ContextManager, input: FoldsInput, exportStatus?: unknown): ToolResult {
   const forms = cm.describeRenderedForms();
   const result = cm.listFoldReceipts({
     ...(input.since !== undefined ? { since: input.since } : {}),
@@ -102,6 +102,7 @@ export function handleFolds(cm: ContextManager, input: FoldsInput): ToolResult {
       folding: foldingSentence(forms.strategy, forms.forms),
       ...(source ? { source } : {}),
       receipts,
+      ...(exportStatus !== undefined ? { export: exportStatus } : {}),
       ...(result.note ? { note: result.note } : {}),
       ...(receipts.length === 0 && !result.note ? { note: 'No receipts on this branch yet (none since `since`, if given).' } : {}),
     },

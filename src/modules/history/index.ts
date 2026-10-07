@@ -266,6 +266,8 @@ export class HistoryModule implements Module {
 
   private ctx: ModuleContext | null = null;
   private cm: ContextManager | null = null;
+  /** The host's fold-export status, shown by history--folds (setFoldExportStatus). */
+  private foldExportStatus: (() => unknown) | undefined;
   private channelRegistry: ChannelRegistry | null = null;
   private readonly semanticCfg: SemanticIndexConfig | null;
   private semanticClient: SemanticIndexClient | null = null;
@@ -291,6 +293,15 @@ export class HistoryModule implements Module {
    * `channelId` as already the raw internal id — today's behavior,
    * unchanged.
    */
+  /**
+   * A host that projects fold receipts to a file (connectome-host's
+   * folds.jsonl) reports that export's status here, and history--folds shows
+   * it, including an export conflict and its target path.
+   */
+  setFoldExportStatus(provider: (() => unknown) | null): void {
+    this.foldExportStatus = provider ?? undefined;
+  }
+
   bind(contextManager: ContextManager, channelRegistry?: ChannelRegistry): void {
     this.cm = contextManager;
     this.channelRegistry = channelRegistry ?? null;
@@ -830,7 +841,7 @@ export class HistoryModule implements Module {
         case 'semantic_search':
           return await this.handleSemanticSearch((call.input ?? {}) as SemanticSearchInput);
         case 'folds':
-          return handleFolds(this.cm as ContextManager, (call.input ?? {}) as FoldsInput);
+          return handleFolds(this.cm as ContextManager, (call.input ?? {}) as FoldsInput, this.foldExportStatus?.());
         default:
           return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
       }
