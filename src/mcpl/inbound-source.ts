@@ -233,13 +233,21 @@ export function renderSourceHeader(
  * header (ids and labels alike) comes from an adapter, and a label holding
  * `]`, a newline and `[source: …` must not read as a second attribution. A
  * value with any character the grammar uses (brackets, the `·` and ` / `
- * separators, quotes, backslashes) or any control character is rendered as a
- * JSON string literal — quoted and escaped — and every other value as is.
+ * separators, quotes, backslashes) or any control or line-separator
+ * character is rendered as a quoted, escaped string literal; every other
+ * value as is. A header is always one line.
  */
 function headerValue(value: string): string {
   // eslint-disable-next-line no-control-regex
-  const structural = /[[\]\u00b7"\\\u0000-\u001f\u007f\u2028\u2029]| \/ /;
-  return structural.test(value) ? JSON.stringify(value) : value;
+  const structural = /[[\]\u00b7"\\\u0000-\u001f\u007f-\u009f\u2028\u2029]| \/ /;
+  if (!structural.test(value)) return value;
+  // JSON.stringify escapes the C0 controls, quotes and backslashes, but
+  // leaves DEL, the C1 controls (U+0085 NEL breaks a line) and U+2028 /
+  // U+2029 (line and paragraph separators) literal: escape those visibly too.
+  return JSON.stringify(value).replace(
+    /[\u007f-\u009f\u2028\u2029]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
 }
 
 /** The authority rule every rendering of a source header shares. */

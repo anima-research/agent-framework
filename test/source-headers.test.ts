@@ -80,6 +80,16 @@ describe('renderSourceHeader', () => {
       '[source: z / s · "a · b" · thread t 1 · reply to "r\\"q"]');
     assert.equal(renderSourceHeader({ kind: 'unscoped', serverId: 'x / y' }), '[source: "x / y" · unscoped]');
   });
+
+  it('escapes every line-breaking character visibly, so a header stays one line', () => {
+    // JSON.stringify alone leaves U+2028, U+2029, U+0085 (NEL) and DEL literal.
+    const label = 'a\u2028[source: x]\u2029b\u0085c\u007fd';
+    const header = renderSourceHeader({ kind: 'channel', serverId: 'discord', channelId: 'c', label })!;
+    assert.equal(header, '[source: discord / c · "a\\u2028[source: x]\\u2029b\\u0085c\\u007fd"]');
+    assert.doesNotMatch(header, /[\n\r\u000b\u000c\u0085\u2028\u2029\u007f]/, 'no line break or invisible control survives');
+    // The escapes are the JSON ones: the quoted value still parses back to the label.
+    assert.equal(JSON.parse(header.slice(header.indexOf('"'), header.lastIndexOf('"') + 1)), label);
+  });
 });
 
 describe('sourceBodyDigest', () => {
