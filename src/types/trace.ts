@@ -457,6 +457,49 @@ export type TraceEvent =
       serverId: string;
       error: string;
     })
+  // Configuration that is accepted but silently does nothing. Each mirrors
+  // a console line, so hosts that keep per-server logs from the trace bus
+  // see it too.
+  | (TraceEventBase & {
+      /** §5.3/§6.7: the server refused the host's policy Request. */
+      type: 'mcpl:policy-refused';
+      serverId: string;
+      /** The initial policy at connect, or the re-negotiation after a manifest change. */
+      phase: 'initial' | 'manifest-change';
+      reason: string | null;
+      /** `close`: the host closed the connection. `mcp-only`: the grant
+       *  stays empty and only plain MCP tools work. */
+      fallback: 'close' | 'mcp-only';
+    })
+  | (TraceEventBase & {
+      /** §6.4 derivation disabled a declared feature set. */
+      type: 'mcpl:feature-set-disabled';
+      serverId: string;
+      featureSet: string;
+      /** `invalid_uses`: `uses` absent, empty or unrecognized.
+       *  `missing_capabilities`: `uses` names capabilities the grant lacks. */
+      reason: 'invalid_uses' | 'missing_capabilities';
+      /** True when config selected the set (enabledFeatureSets omitted or
+       *  matching it, and not disabledFeatureSets): derivation overrode it. */
+      selectedByConfig: boolean;
+      /** invalid_uses: the unrecognized entries (empty when `uses` was absent or empty). */
+      unrecognized?: string[];
+      /** missing_capabilities: the capability paths the grant lacks. */
+      missing?: string[];
+    })
+  | (TraceEventBase & {
+      /** An operator tool-name pattern matches no model-facing tool. Emitted
+       *  once per pattern, after the servers it could name have listed. */
+      type: 'mcpl:tool-pattern-unmatched';
+      /** `toolClassOverrides`, `toolLifecycle.observe.tools` or `toolLifecycle.inputs.tools`. */
+      setting: string;
+      /** The server whose toolLifecycle config holds the pattern. */
+      serverId?: string;
+      pattern: string;
+      /** The pattern rewritten under the server's actual tool prefix. */
+      suggestion?: string;
+      hint: string;
+    })
   | (TraceEventBase & {
       type: 'mcpl:orphaned-response';
       serverId: string;
