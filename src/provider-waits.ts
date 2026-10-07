@@ -115,7 +115,11 @@ export interface ProviderWaitRelease {
 const RETRY_WRITE_MS = 30_000;
 /** How often unreadable recorded waits are read again. */
 const RETRY_READ_MS = 30_000;
-/** The model a release names when it covers every model (and how an unreadable history is listed). */
+/**
+ * The model that stands for every model: how list() shows the hold for
+ * unreadable records, and what release() takes as "every model" (the same as
+ * omitting it). No provider model is named that.
+ */
 export const EVERY_MODEL = '*';
 
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
@@ -212,6 +216,9 @@ export class ProviderWaits {
    * far its release reaches (ProviderWaitRelease).
    */
   release(agent: string, model: string | undefined, by: string): ProviderWaitRelease[] {
+    // EVERY_MODEL, as list() shows it, names every model: the same release
+    // as omitting the model, in this process and in the record alike.
+    if (model === EVERY_MODEL) model = undefined;
     this.reconcile();
     const now = this.now();
     const released = [...this.view.values()]

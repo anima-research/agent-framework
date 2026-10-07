@@ -266,6 +266,49 @@ describe('ProviderWaits: unreadable history fails closed (room-225 #46189, #4644
   }));
 });
 
+describe("ProviderWaits: '*' is every model, everywhere (room-225 #47372)", () => {
+  it("releasing the listed '*' is the same release as omitting the model: in process, in the record, and after recovery", () => withStoreDir((path) => {
+    const time = clock();
+    let store = JsStore.openOrCreate({ path });
+    try {
+      new ProviderWaits(store, { now: time.now, ...quiet }).set('r', 'zz-a', 600_000, 'zz recorded');
+      store.close();
+
+      store = JsStore.openOrCreate({ path });
+      const { surface, fail } = flaky(store);
+      fail.read = true;
+      const waits = new ProviderWaits(surface, { now: time.now, ...quiet });
+      const listed = waits.list('r');
+      assert.deepEqual(listed.map((w) => w.model), ['*']);
+      const receipt = waits.release('r', listed[0]!.model, 'operator');
+      assert.deepEqual(receipt.map((r) => [r.wait.model, r.release]), [['*', 'in-process override']]);
+      assert.equal(waits.active('r', 'zz-a'), undefined, 'lifted for every model in process');
+
+      fail.read = false;
+      time.advance(30_000);
+      assert.equal(waits.active('r', 'zz-a'), undefined, 'and the recorded release covers every model once readable');
+      store.close();
+
+      store = JsStore.openOrCreate({ path });
+      assert.equal(new ProviderWaits(store, { now: time.now, ...quiet }).active('r', 'zz-a'), undefined, 'and after a reopen');
+    } finally { if (!store.isClosed()) store.close(); }
+  }));
+
+  it('a specific-model release stays specific while the records are unreadable', () => withStoreDir((path) => {
+    const time = clock();
+    const store = JsStore.openOrCreate({ path });
+    try {
+      const { surface, fail } = flaky(store);
+      fail.read = true;
+      const waits = new ProviderWaits(surface, { now: time.now, ...quiet });
+      waits.release('r', 'zz-a', 'operator');
+      assert.equal(waits.active('r', 'zz-a'), undefined);
+      assert.equal(waits.active('r', 'zz-b')?.until, null, 'another model stays held');
+      assert.deepEqual(waits.list('r').map((w) => w.model), ['*'], 'the every-model hold is still listed');
+    } finally { store.close(); }
+  }));
+});
+
 // ---------------------------------------------------------------------------
 // The framework: a real store, context manager and admission.
 // ---------------------------------------------------------------------------
@@ -647,6 +690,11 @@ test("an operator release reaches the context strategy's compression lane, namin
       assert.deepEqual(asked, ['zz-model']);
       await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', requesterName: 'zz-operator' });
       assert.deepEqual(asked, ['zz-model'], 'nothing left to release: the lane is not asked again');
+      membrane.primary = 0; // fail the next primary again: a new wait
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-second', metadata: {} });
+      await fw.runUntilIdle();
+      await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model: '*', requesterName: 'zz-operator' });
+      assert.deepEqual(asked, ['zz-model', undefined], "'*' reaches the lane as every model");
       assert.ok(log.lines.some((line) => line.includes("compression lane's provider wait released")));
     } finally { await fw.stop(); log.restore(); }
   });

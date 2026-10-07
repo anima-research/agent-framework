@@ -84,7 +84,7 @@ import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
-import { ProviderWaits, type ProviderWait } from './provider-waits.js';
+import { ProviderWaits, EVERY_MODEL, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import {
   toolResultDataToHistoryString,
@@ -2361,6 +2361,9 @@ export class AgentFramework {
   releaseProviderWait(agentName: string, model?: string, by = 'operator'): Array<{
     model: string; until: string | null; release: 'recorded' | 'pending' | 'in-process override';
   }> {
+    // '*' (EVERY_MODEL, as providerWaits lists the unreadable-records hold)
+    // names every model, the same as omitting it, everywhere below.
+    if (model === EVERY_MODEL) model = undefined;
     const released = this.providerWaits?.release(agentName, model, by) ?? [];
     for (const { wait, release } of released) {
       console.error(`[provider-wait] agent=${agentName} model=${wait.model} released by ${by} (${release})`);
