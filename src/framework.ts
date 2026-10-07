@@ -2334,14 +2334,16 @@ export class AgentFramework {
    * Refuse an auxiliary call to a model the provider asked this agent to wait
    * on, without calling it. The refusal is a retryable rate limit carrying
    * the remaining wait, so a caller that paces (context-manager's compression
-   * lane) waits it out instead of spending a call.
+   * lane) waits it out instead of spending a call. It is marked
+   * `providerAdmission: 'deferred'`: no call was made, so a caller can keep
+   * the wait without counting a failed call (room-225 #47927).
    */
   private refuseHeldProviderModel(agentName: string, model: string | undefined): void {
     if (model === undefined) return;
     const wait = this.providerWaits?.active(agentName, model);
     if (!wait) return;
     const now = Date.now();
-    throw new MembraneError({
+    throw Object.assign(new MembraneError({
       type: 'rate_limit',
       retryable: true,
       ...(wait.until !== null ? { retryAfterMs: Math.max(0, wait.until - now) } : {}),
@@ -2349,7 +2351,7 @@ export class AgentFramework {
         `${wait.until === null ? 'until an operator releases it' : `until ${new Date(wait.until).toISOString()}`} ` +
         `(recorded ${new Date(wait.setAt).toISOString()}: ${wait.reason}); no call was made`,
       rawError: undefined,
-    });
+    }), { providerAdmission: 'deferred' as const });
   }
 
   /**

@@ -459,6 +459,8 @@ test('auxiliary admission: the same model is refused without a call; another mod
       assert.equal(refused.type, 'rate_limit');
       assert.ok(refused.retryAfterMs !== undefined && refused.retryAfterMs > 50_000 && refused.retryAfterMs <= 60_000);
       assert.match(refused.message, /no call was made/);
+      assert.equal((refused as unknown as { providerAdmission?: string }).providerAdmission, 'deferred',
+        'marked as a deferral, so a pacing caller does not count it as a failed call');
       assert.equal(membrane.auxiliary.length, 0, 'the provider was not called');
 
       await aux.complete(auxRequest('zz-compression-model'));
