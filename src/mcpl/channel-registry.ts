@@ -331,7 +331,10 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
       'message do not count, and showing an already-delivered version again never moves ' +
       'the clock. lastPartialAt: the most recent time a body from the channel first reached ' +
       'you only partially (cut, or altered on the way); it is history, and a later complete ' +
-      'arrival of that body shows in lastDeliveredAt, not here. Null means no observation ' +
+      'arrival of that body shows in lastDeliveredAt, not here. A round whose provider path ' +
+      'could not establish what it carried (for example an adapter that does not report ' +
+      'content it leaves out, or a request hook whose changes cannot be seen) confirms ' +
+      'neither a delivery nor a partial exposure: its bodies stay unconfirmed. Null means no observation ' +
       'since receiptClocks.trackingSince, ' +
       'not silence before it. The clocks cover one store and one resident ' +
       '(receiptClocks.storeId, agent): a session switch starts a separate history. ' +
