@@ -37,14 +37,15 @@
  * reconciling) stops neither the host nor delivery: the ledger becomes
  * unreadable. A read is all or nothing, and nothing is written or
  * checkpointed until a whole read succeeds, so no partial or empty state can
- * cover entries that weren't read. Meanwhile channel_list reports the open
- * gap, and no clocks at all until the journal has been read once. The read
- * is retried on use, at most every 30 s, and once more at stop. When it
- * succeeds, tracking resumes from the whole journal, dedup sets and coverage
- * included, and the unreadable interval is recorded as a gap. A run whose
- * journal never becomes readable writes nothing, so a later run can't show
- * that interval as a gap: recording it would mean appending to a journal no
- * one could read.
+ * cover entries that weren't read, even when the read fails inside recovery
+ * itself (a write that landed but reported failure makes the next write read
+ * the journal again). Meanwhile channel_list reports the open gap, and no
+ * clocks at all until the journal has been read once. The read is retried on
+ * use, at most every 30 s, and once more at stop. When it succeeds, tracking
+ * resumes from the whole journal, dedup sets and coverage included, and the
+ * unreadable interval is recorded as a gap. A run whose journal never becomes
+ * readable writes nothing, so a later run can't show that interval as a gap:
+ * recording it would mean appending to a journal no one could read.
  */
 
 import { createHash } from 'node:crypto';
@@ -221,8 +222,8 @@ export class ChannelClockLedger {
   private runStartedAt = 0;
   /** This run's start has been recorded (or attempted): the journal was read after start(). */
   private runBegun = false;
-  /** This run's start marker, until it is known to be recorded: it precedes the run's other entries. */
-  private pendingStart: number | null = null;
+  /** This run's start marker is still to be written: it precedes the run's other entries. */
+  private startPending = false;
   /** The journal has been read whole at least once, so memory holds its clocks. */
   private hasRead = false;
   /** Set while the journal can't be read: when the next attempt is due. Nothing is written meanwhile. */
@@ -368,11 +369,12 @@ export class ChannelClockLedger {
   /**
    * Bring memory in line with the journal after an ambiguous write (one that
    * failed after reaching the store): replay it, so decisions see whatever
-   * landed. False when that replay itself fails; the caller then records
-   * nothing, and the open coverage gap covers it.
+   * landed. False when that replay fails, or while the journal can't be
+   * read; the caller then records nothing, and the open coverage gap covers
+   * it.
    */
   private reconcile(): boolean {
-    return !this.journal.needsReconcile || this.read();
+    return this.unreadable === null && (!this.journal.needsReconcile || this.read());
   }
 
   /**
@@ -412,14 +414,16 @@ export class ChannelClockLedger {
   /**
    * Whether memory holds the journal as read whole. While it can't be read,
    * a due attempt (on use, at most every READ_RETRY_MS) reads it again, and
-   * a run whose start waited on the read begins once it succeeds.
+   * a run whose start waited on the read begins once it succeeds. Beginning
+   * writes, and a write that fails ambiguously makes the next one read again,
+   * which can fail too: so the answer is the state after beginning.
    */
   private readable(): boolean {
     if (!this.unreadable) return true;
     if (this.now() < this.unreadable.retryAt) return false;
     if (!this.read()) return false;
     if (this.started && !this.runBegun) this.beginRun();
-    return true;
+    return this.unreadable === null;
   }
 
   /**
@@ -440,18 +444,18 @@ export class ChannelClockLedger {
       }
     }
     if (this.state.trackingSince === null && this.pendingGap?.reason === 'ledger-unreadable') this.pendingGap = null;
-    this.pendingStart = this.now();
+    this.startPending = true;
     this.recordStart();
   }
 
   /**
-   * Write the pending start marker. If an earlier attempt landed but
-   * reported failure, the journal holds the same marker twice, which reduces
-   * the same as once.
+   * Write the pending start marker, stamped when it is written. If an
+   * earlier attempt landed but reported failure, the journal holds two
+   * markers for the run, which reduce like one: the later opens the run.
    */
   private recordStart(): boolean {
-    if (!this.write({ k: 'start', at: this.pendingStart! })) return false;
-    this.pendingStart = null;
+    if (!this.write({ k: 'start', at: this.now() })) return false;
+    this.startPending = false;
     return true;
   }
 
@@ -483,7 +487,7 @@ export class ChannelClockLedger {
     if (this.pendingGap && entry.k !== 'gap') {
       if (!this.flushPendingGap(this.now())) return false;
     }
-    if (this.pendingStart !== null && entry.k !== 'gap' && entry.k !== 'start') {
+    if (this.startPending && entry.k !== 'gap' && entry.k !== 'start') {
       if (!this.recordStart()) return false;
     }
     const assertsState = entry.k === 'dlv' || entry.k === 'part';

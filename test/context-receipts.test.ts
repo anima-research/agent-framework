@@ -255,10 +255,15 @@ describe('ChannelClockLedger', () => {
   /**
    * The store with faults switched on by the test: reads that fail, one
    * record read back damaged (a well-formed entry missing its fields), and
-   * an append that lands but reports failure.
+   * an append that lands but reports failure (then `afterLanding` runs).
    */
   const faulty = () => {
-    const faults = { failReads: false, damaged: null as string | null, landThenThrow: null as string | null };
+    const faults = {
+      failReads: false,
+      damaged: null as string | null,
+      landThenThrow: null as string | null,
+      afterLanding: null as (() => void) | null,
+    };
     const view = new Proxy(store, {
       get(target, prop, receiver) {
         if (prop === 'getRecordIdsByType' && faults.failReads) return () => { throw new Error('read failed'); };
@@ -273,6 +278,7 @@ describe('ChannelClockLedger', () => {
             const written = target.appendJson(type, payload);
             if (faults.landThenThrow !== null && (payload as { k?: string }).k === faults.landThenThrow) {
               faults.landThenThrow = null;
+              faults.afterLanding?.();
               throw new Error('write reported failure after landing');
             }
             return written;
@@ -386,6 +392,39 @@ describe('ChannelClockLedger', () => {
     clock = 40_000;
     l = open();
     assert.deepEqual(l.scope('r').gaps, [{ from: 5_000, to: 35_000, reason: 'ledger-unreadable' }]);
+  });
+
+  it('stays unreadable when the read that recovery\'s own writes call for fails, and writes nothing more until a later read succeeds (Hazel #50598)', () => {
+    let l = open();
+    clock = 2_000;
+    l.delivered('r', CH, src('old', 1_000), ver('old'), BRANCH);
+    const delivery = store.getRecordIdsByType(CLOCK_RECORD).at(-1)!;
+    // No stop: the run ended uncleanly. The next run can't read the journal at start.
+    const { view, faults } = faulty();
+    faults.failReads = true;
+    clock = 5_000;
+    l = new ChannelClockLedger(view, 'store-1', now);
+    l.start();
+    // At the first read that succeeds, the unclean-stop gap's write lands but
+    // reports failure, and the read that reconciles it meets a damaged entry.
+    faults.failReads = false;
+    faults.landThenThrow = 'gap';
+    faults.afterLanding = () => { faults.damaged = delivery; };
+    const after5s = () => entries().filter((e) => e.at >= 5_000).map((e) => e.k === 'gap' ? `gap ${e.from}-${e.to} ${e.reason}` : `${e.k} ${e.at}`);
+    clock = 35_000;
+    l.received(CH, src('new', 35_000), 'channels/incoming');
+    assert.deepEqual(after5s(), ['gap 2000-5000 unclean-stop'], 'only the write that landed; nothing after the failed read');
+    let scope = l.scope('r');
+    assert.equal(scope.degraded, true, 'still unreadable');
+    assert.equal(scope.gaps.at(-1)!.reason, 'ledger-unreadable (ongoing)');
+
+    faults.damaged = null;
+    clock = 65_000;
+    l.received(CH, src('later', 65_000), 'channels/incoming');
+    scope = l.scope('r');
+    assert.equal(scope.degraded, false);
+    assert.deepEqual(after5s(), ['gap 2000-5000 unclean-stop', 'gap 2000-65000 ledger-unreadable', 'start 65000', 'recv 65000']);
+    assert.equal(l.delivered('r', CH, src('old', 1_000), ver('old'), BRANCH), false, 'dedup read back');
   });
 });
 
