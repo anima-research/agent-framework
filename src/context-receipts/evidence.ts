@@ -92,6 +92,12 @@ export function recordedBodyDigest(metadata: unknown): string | undefined {
 export interface CopyFacts {
   /** The body is stored in shards: its head has a bodyGroupId. */
   sharded: boolean;
+  /**
+   * The size its shard group declared when it was written (CM shardCount).
+   * CM's provenance then checks every declared shard is stored and carried;
+   * a group without one can't show it was written whole.
+   */
+  shardCount?: number;
   /** `metadata.sourceBodyDigest`: the delivered body's digest, recorded at ingestion. */
   sourceDigest?: string;
   /**
@@ -104,11 +110,12 @@ export interface CopyFacts {
 }
 
 /** A stored copy's facts, from its head (the first shard, or the message itself). */
-export function copyFacts(head: { metadata?: unknown; bodyGroupId?: string }): CopyFacts {
+export function copyFacts(head: { metadata?: unknown; bodyGroupId?: string; shardCount?: number }): CopyFacts {
   const sourceDigest = digestField(head.metadata, 'sourceBodyDigest');
   const storedDigest = digestField(head.metadata, 'storedBodyDigest');
   return {
     sharded: Boolean(head.bodyGroupId),
+    ...(head.bodyGroupId && typeof head.shardCount === 'number' ? { shardCount: head.shardCount } : {}),
     ...(sourceDigest ? { sourceDigest } : {}),
     ...(storedDigest ? { storedDigest } : {}),
   };
@@ -158,20 +165,24 @@ function recoverableDigest(contents: ReadonlyArray<readonly ContentBlock[]>, fac
 /**
  * Whether this copy still presents what ingestion stored for the source item,
  * whatever its version basis (event id or digest):
- *  - `intact`: shards (which can't be edited), or an unsharded copy whose
- *    blocks still hash to its recorded stored digest;
+ *  - `intact`: a shard group that declared its size when written (its shards
+ *    can't be edited, and CM's provenance checks every declared shard is
+ *    stored and carried), or an unsharded copy whose blocks still hash to its
+ *    recorded stored digest;
  *  - `edited`: an unsharded copy whose blocks no longer hash to it. A
  *    supported context edit (CM editMessage) replaces content and keeps
  *    metadata, stamp included; the copy no longer presents the source body;
  *  - `unverifiable`: an unsharded copy with no stored digest to check
- *    against (stored before ingestion recorded one). Its bytes can be
- *    hashed, but nothing shows an edit never changed them.
+ *    against (stored before ingestion recorded one): its bytes can be
+ *    hashed, but nothing shows an edit never changed them. Or a shard group
+ *    with no declared size: its members are unchanged, but nothing shows
+ *    the group was written whole (an interrupted write leaves it short).
  * Only an intact copy can confirm delivery.
  */
 export type CopyFidelity = 'intact' | 'edited' | 'unverifiable';
 
 export function copyFidelity(contents: ReadonlyArray<readonly ContentBlock[]>, facts: CopyFacts): CopyFidelity {
-  if (facts.sharded) return 'intact';
+  if (facts.sharded) return facts.shardCount === undefined ? 'unverifiable' : 'intact';
   if (facts.storedDigest === undefined) return 'unverifiable';
   return contents.length === 1 && sourceBodyDigest(contents[0]!) === facts.storedDigest ? 'intact' : 'edited';
 }

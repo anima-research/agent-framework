@@ -455,7 +455,8 @@ describe('receipt evidence', () => {
     assert.equal(copyFidelity([oldCopy], stamped(oldCopy)), 'intact');
     assert.equal(copyFidelity([oldCopy], { sharded: false, sourceDigest: 'x' }), 'unverifiable', 'a stamp without its stored digest cannot vouch');
     assert.equal(copyFidelity([[body]], { sharded: false }), 'unverifiable', 'stored before stamping: hashable, but not shown unedited');
-    assert.equal(copyFidelity([[header('Old room')], [body]], { sharded: true }), 'intact', 'shards cannot be edited');
+    assert.equal(copyFidelity([[header('Old room')], [body]], { sharded: true, shardCount: 2 }), 'intact', 'a declared group: shards cannot be edited, and CM checks every declared shard');
+    assert.equal(copyFidelity([[header('Old room')], [body]], { sharded: true }), 'unverifiable', 'an undeclared group may have been written short');
     // Shards can't be edited, so a stamped sharded copy keeps its version.
     const shardedStamped = versionOf(src, [[header('Old room')], [body]], 's', 'head', { sharded: true, sourceDigest: sourceBodyDigest([body]) });
     assert.equal(shardedStamped.key, before.key);
