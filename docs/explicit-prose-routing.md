@@ -30,15 +30,26 @@ A prose segment's FIRST line may carry a routing prefix:
   "keep going" ability tool turns have — wanted for robotics-like loops where
   an end-of-turn pause is undesirable.
 - `{{unsent}}` anywhere in the body is replaced at delivery with the
-  retained undelivered text (see below), enabling verbatim resend without retyping.
+  latest bounced text, held as a draft (see below), enabling verbatim resend
+  without retyping.
 
 ## The bounce (unprefixed prose)
 
-Unprefixed prose with no sticky target is **never delivered**. It is retained
-per-agent (latest-wins) and a system notice is appended telling the
-agent how to resend: `>>#channel {{unsent}}`. The notice requests inference so
-the resend can happen immediately — capped at 2 consecutive bounce-wakes per
-agent (then notices append without waking, breaking any loop).
+Unprefixed prose with no sticky target is **never delivered**. It is held as a
+private draft (src/prose-drafts.ts), and a system notice naming the draft tells
+the agent how to resend: `>>#channel {{unsent}}`, or the `drafts` tool by id.
+The notice requests inference so the resend can happen immediately — capped at
+2 consecutive bounce-wakes per agent (then notices append without waking,
+breaking any loop).
+
+`{{unsent}}` means the latest bounce while that draft is open (latest-wins, as
+the clipboard it replaced was), and `>>skip_reply {{unsent}}` dismisses it.
+Earlier bounces stay in the agent's drafts, by id, until resent or dismissed;
+drafts survive restarts and branch moves, and a delivery through `{{unsent}}`
+is recorded on the draft like any resend. When the latest bounce's last
+delivery attempt may already have been posted (an unknown outcome),
+`{{unsent}}` is not substituted: the agent is told, and can resend it with the
+`drafts` tool's `confirmDuplicate`.
 
 ## What explicit mode retires (for that agent)
 

@@ -221,5 +221,10 @@ rl.on('line', (line) => {
     reply(msg.id, { tools: [] });
     return;
   }
+  if (msg.method === 'tools/call') {
+    // No tools: answer at once (a rollback's awareness markers call one).
+    replyError(msg.id, `no tool "${msg.params?.name}" on this fixture`);
+    return;
+  }
   // Responses to our own requests (register, incoming, push) need no handling.
 });

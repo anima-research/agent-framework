@@ -3021,6 +3021,47 @@ export class ChannelRegistry {
    * or malformed receipt is `unknown`: the post may or may not exist, and the
    * caller must not treat it as safe to retry blindly.
    */
+  /**
+   * Resolve a publish target to exactly one registered channel: `serverId`
+   * plus `channelId` when the caller has the server, otherwise a channel id
+   * registered by exactly one server. A shared id is refused, never resolved
+   * to whichever server registered it first.
+   */
+  resolveDestination(
+    target: { serverId?: string; channelId: string },
+  ): { destination: PublishDestination } | { error: string } {
+    const entry = this.findExactEntry(target);
+    if ('error' in entry) return entry;
+    return {
+      destination: {
+        serverId: entry.entry.serverId,
+        channelId: entry.entry.descriptor.id,
+        ...(entry.entry.descriptor.label ? { label: entry.entry.descriptor.label } : {}),
+      },
+    };
+  }
+
+  private findExactEntry(
+    target: { serverId?: string; channelId: string },
+  ): { entry: ChannelEntry } | { error: string } {
+    const matches = [...this.channels.values()].filter(
+      (e) => e.descriptor.id === target.channelId && (!target.serverId || e.serverId === target.serverId),
+    );
+    if (matches.length === 0) {
+      return {
+        error: target.serverId
+          ? `no registered channel "${target.channelId}" on server "${target.serverId}"`
+          : `no registered channel "${target.channelId}"`,
+      };
+    }
+    if (matches.length > 1) {
+      return {
+        error: `channel id "${target.channelId}" is registered by more than one MCPL server; the destination must name its server`,
+      };
+    }
+    return { entry: matches[0]! };
+  }
+
   async publish(
     conversationId: string,
     text: string,
@@ -3028,26 +3069,9 @@ export class ChannelRegistry {
     openSource: 'opened-by-delivery' | 'opened-by-reply' = 'opened-by-delivery',
   ): Promise<PublishOutcome> {
     const at = (): number => Date.now();
-    const matches = [...this.channels.values()].filter(
-      (e) => e.descriptor.id === target.channelId && (!target.serverId || e.serverId === target.serverId),
-    );
-    if (matches.length === 0) {
-      return {
-        status: 'failed',
-        reason: target.serverId
-          ? `no registered channel "${target.channelId}" on server "${target.serverId}"`
-          : `no registered channel "${target.channelId}"`,
-        at: at(),
-      };
-    }
-    if (matches.length > 1) {
-      return {
-        status: 'failed',
-        reason: `channel id "${target.channelId}" is registered by more than one MCPL server; the destination must name its server`,
-        at: at(),
-      };
-    }
-    const entry = matches[0]!;
+    const found = this.findExactEntry(target);
+    if ('error' in found) return { status: 'failed', reason: found.error, at: at() };
+    const entry = found.entry;
     const destination: PublishDestination = {
       serverId: entry.serverId,
       channelId: entry.descriptor.id,
@@ -3157,7 +3181,13 @@ export class ChannelRegistry {
     };
   }
 
-  async routeSpeech(
+  /**
+   * Plain speech for one turn segment: publish `text` to the turn's frozen
+   * locus and report the PublishOutcome. A failure (or an uncertain outcome)
+   * is surfaced as a trace and through onRouteFailure, so the agent learns
+   * its words did not (or may not have) reached anyone.
+   */
+  async deliverSpeech(
     conversationId: string,
     text: string,
     /** The turn's FROZEN locus, snapshotted once by the caller (resolveLocus
@@ -3168,42 +3198,41 @@ export class ChannelRegistry {
      *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
      *  "this turn is pinned to no locus": fail loudly rather than guess. */
     locusChannelId: string | null,
-  ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
-    // Surface a routing failure: emit a trace AND notify the host (which drops
-    // a `[discord-send-failed]` marker into chronicle) so the agent learns its
-    // reply did not (or may not have) reached anyone, instead of it vanishing
-    // silently.
-    const fail = (channelId: string | null, reason: string, outcome: 'failed' | 'unknown' = 'failed'): null => {
-      console.error(`[routeSpeech] ${conversationId}: ${reason} — speech ${outcome === 'unknown' ? 'delivery NOT confirmed' : 'NOT routed'} (${text.length} chars stay in chronicle)`);
+  ): Promise<PublishOutcome> {
+    const fail = (channelId: string | null, reason: string, outcome: PublishOutcome): PublishOutcome => {
+      const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
+      console.error(`[routeSpeech] ${conversationId}: ${reason} — speech ${status === 'unknown' ? 'delivery NOT confirmed' : 'NOT routed'} (${text.length} chars stay in chronicle)`);
       this.emitTraceFn({
         type: 'mcpl:speech-route-failed',
         conversationId,
         channelId: channelId ?? '',
         reason,
         textLen: text.length,
-        outcome,
+        outcome: status,
       });
-      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length, outcome });
-      return null;
+      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length, outcome: status });
+      return outcome;
     };
 
     // Runtime backstop for JS callers the compiler can't see: an omitted
     // locus is a routing bug at the call site, never something to paper over
     // with a live re-resolution.
     if (locusChannelId === undefined) {
-      return fail(null, 'caller passed no locus (routing bug: every speech path must snapshot the turn locus)');
+      const reason = 'caller passed no locus (routing bug: every speech path must snapshot the turn locus)';
+      return fail(null, reason, { status: 'failed', reason, at: Date.now() });
     }
     if (!locusChannelId) {
       // The turn froze with no locus (no home, no triggering channel, no
       // global inbound ever seen) — the agent was told its prose stays in
       // the archive; honor that.
-      return fail(null, 'turn has no locus (no home/trigger channel; nothing to deliver into)');
+      const reason = 'turn has no locus (no home/trigger channel; nothing to deliver into)';
+      return fail(null, reason, { status: 'failed', reason, at: Date.now() });
     }
 
     const outcome = await this.publish(conversationId, text, { channelId: locusChannelId });
     const channelId = outcome.destination?.channelId ?? locusChannelId;
     if (outcome.status !== 'delivered') {
-      return fail(channelId, outcome.reason ?? 'delivery not confirmed', outcome.status);
+      return fail(channelId, outcome.reason ?? 'delivery not confirmed', outcome);
     }
 
     console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${channelId} (server=${outcome.destination!.serverId}, delivered=true)`);
@@ -3220,8 +3249,22 @@ export class ChannelRegistry {
       // tap editing it down to the words actually voiced on interruption.
       ...(outcome.messageId !== undefined ? { messageId: outcome.messageId } : {}),
     });
+    return outcome;
+  }
 
-    return { delivered: true, channelId, ...(outcome.messageId !== undefined ? { messageId: outcome.messageId } : {}) };
+  /** deliverSpeech, reduced to the confirmed delivery (null when there was none). */
+  async routeSpeech(
+    conversationId: string,
+    text: string,
+    locusChannelId: string | null,
+  ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
+    const outcome = await this.deliverSpeech(conversationId, text, locusChannelId);
+    if (outcome.status !== 'delivered') return null;
+    return {
+      delivered: true,
+      channelId: outcome.destination!.channelId,
+      ...(outcome.messageId !== undefined ? { messageId: outcome.messageId } : {}),
+    };
   }
 
   private async handleToolPublish(input: { channelId?: string; content?: string; text?: string }): Promise<ToolResult> {

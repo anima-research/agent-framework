@@ -498,6 +498,30 @@ export type TraceEvent =
       /** Envelope kind of the acceptance the observer failed on. */
       kind: 'channel' | 'unscoped' | 'surface';
       error: string;
+    })
+
+  // Held prose drafts (src/prose-drafts.ts): plain speech kept privately
+  // instead of sent; a resident's explicit resend; a deliberate dismissal.
+  | (TraceEventBase & {
+      type: 'prose:drafts-held';
+      agentName: string;
+      reason: 'explicit-send' | 'no-destination' | 'ambiguous' | 'bounced';
+      draftIds: string[];
+      textLen: number;
+    })
+  | (TraceEventBase & {
+      type: 'prose:draft-resent';
+      agentName: string;
+      draftId: string;
+      status: 'delivered' | 'failed' | 'unknown';
+      serverId: string;
+      channelId: string;
+      messageId?: string;
+    })
+  | (TraceEventBase & {
+      type: 'prose:drafts-dismissed';
+      agentName: string;
+      draftIds: string[];
     });
 
 /**
