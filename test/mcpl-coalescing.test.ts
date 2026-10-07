@@ -988,12 +988,19 @@ test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the ser
   await f.send('push/event', f.params('1', 'outage_fallback', { deferred: true, initial: true }));
   failing = true;
   f.alwaysRespond();
-  for (let i = 0; i < 3; i++) {
-    await f.framework.runUntilIdle(); // freeze fails → recovery scheduled
-    await eventually(() => internals.pendingRequests.length > 0, `recovery wake ${i + 1}`);
+  // Observe the recovery transitions themselves, not the drains: runUntilIdle
+  // drains until idle, so a recovery timer that fires while a drain is still
+  // running is consumed by that same drain, which freezes and fails again.
+  // One drain can therefore carry several attempts. Drive until at least
+  // three recovery wakes have fired, ending with one still pending.
+  while (wakes.length < 3) {
+    await f.framework.runUntilIdle(); // each failed freeze schedules the next recovery
+    await eventually(() => internals.pendingRequests.length > 0, `recovery wake after ${wakes.length}`);
   }
-  assert.deepEqual(wakes.map((w) => w.attempt), [1, 2, 3], 'consecutive failures count up');
-  assert.deepEqual(wakes.map((w) => w.delayMs), [40, 80, 160], 'and the delay doubles');
+  // Every wake is one more consecutive failure, and its delay doubles from the
+  // base (capped at 60x), however the attempts fell across drains.
+  assert.deepEqual(wakes.map((w) => w.attempt), wakes.map((_, i) => i + 1), 'consecutive failures count up');
+  assert.deepEqual(wakes.map((w) => w.delayMs), wakes.map((_, i) => Math.min(40 * 2 ** i, 40 * 60)), 'and the delay doubles');
   assert.equal(coalescer.pendingBatches(), 1);
   assert(!f.context().includes('outage_fallback'));
   failing = false; // storage recovers
