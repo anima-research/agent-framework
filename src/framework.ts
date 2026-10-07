@@ -84,7 +84,7 @@ import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
 import { ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftReason, type DraftSource, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
-import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
+import { INBOUND_SOURCE_KEY, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import {
@@ -7214,6 +7214,12 @@ export class AgentFramework {
       this.noteInboundAccepted(source);
     }
     metadata[INBOUND_SOURCE_KEY] = source;
+    // The delivered body's version identity, and the stored copy's own
+    // digest (mcpl/inbound-source.ts sourceBodyDigest; room-220
+    // #46752–#47210). This lane stores the body as delivered, so the two
+    // agree until a decoration or a later edit sets them apart.
+    metadata.sourceBodyDigest = sourceBodyDigest(event.content);
+    metadata.storedBodyDigest = sourceBodyDigest(event.content);
 
     // Per-channel conversation routing: messages go to the channel's fork
     // agent (spawned from the template on first qualifying message), never
@@ -8381,6 +8387,9 @@ export class AgentFramework {
     metadata[INBOUND_SOURCE_KEY] = source;
 
     const content = [...event.content];
+    // The delivered body's version identity, before any host decoration
+    // (the closed-channel invitation below).
+    if (content.length > 0) metadata.sourceBodyDigest = sourceBodyDigest(content);
     if (triggerChannel) {
       const origin = (event.origin ?? {}) as Record<string, unknown>;
       const invitation = this.buildClosedChannelInvitation({
@@ -8411,6 +8420,9 @@ export class AgentFramework {
       event.origin?.source === 'heartbeat' &&
       event.origin?.silent === true &&
       content.length === 0;
+    // The stored copy's own digest, over exactly what is stored (decorations
+    // included, before storage shards it). A silent heartbeat stores nothing.
+    if (!silentHeartbeat) metadata.storedBodyDigest = sourceBodyDigest(content);
 
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {

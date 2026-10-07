@@ -27,6 +27,8 @@ import {
   type ToolResult,
 } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
+import { sourceBodyDigest, canonicalJson } from '../src/mcpl/inbound-source.js';
+import { createHash } from 'node:crypto';
 import { fixture, eventually, TS } from './helpers/coalescing-fixture.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs');
@@ -158,6 +160,42 @@ describe('inbound source envelope', () => {
     assert.deepEqual(source && { kind: source.kind, surface: (source as { surface: string }).surface }, { kind: 'surface', surface: 'tui' });
     assert.equal(conversationKey(source!), 'surface\u0000tui');
     assert.equal(observed.length, 1);
+  });
+
+  it('stamps the delivered body\'s digest and the stored copy\'s digest at ingestion', async () => {
+    command({ op: 'incoming', channelId: ROOM, messageId: 'm-d1', mode: 'ambient', text: 'digest me' });
+    await waitFor(() => !!storedWith((m) => m.messageId === 'm-d1'), 'message stored');
+    const message = storedWith((m) => m.messageId === 'm-d1')!;
+    const meta = message.metadata as Record<string, unknown>;
+    // The unsharded framing receipts already hash: canonicalJson([blocks]).
+    const expected = createHash('sha256').update(canonicalJson([[{ type: 'text', text: 'digest me' }]])).digest('hex');
+    assert.equal(meta.sourceBodyDigest, expected);
+    assert.equal(sourceBodyDigest([{ text: 'digest me', type: 'text' }]), expected, 'key order does not matter');
+    // This lane stores the body as delivered: the stored copy hashes the same.
+    assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content));
+    assert.equal(meta.storedBodyDigest, meta.sourceBodyDigest);
+    // Outside the frozen admission envelope.
+    assert.equal((readInboundSource(message.metadata) as unknown as Record<string, unknown>).sourceBodyDigest, undefined);
+
+    // An edit through the supported path keeps the metadata, so only the
+    // stored digest can reveal that the copy no longer holds the delivery.
+    const cm = framework.getAgent('scout')!.getContextManager();
+    cm.editMessage(message.id, [{ type: 'text', text: 'edited later' }]);
+    const edited = cm.getAllMessages().find((m) => m.id === message.id)!;
+    assert.equal((edited.metadata as Record<string, unknown>).storedBodyDigest, meta.storedBodyDigest);
+    assert.notEqual(sourceBodyDigest(edited.content), meta.storedBodyDigest);
+  });
+
+  it('on the push lane, the delivered digest excludes host decoration and the stored digest covers it', async () => {
+    command({ op: 'dm', eventId: 'ev-dig', authorId: '134', authorName: 'antra', rawChannelId: RAW_DM, text: 'psst' });
+    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-dig'), 'dm stored');
+    const message = storedWith((m) => m.eventId === 'ev-dig')!;
+    const meta = message.metadata as Record<string, unknown>;
+    assert.equal(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'psst' }]), 'the adapter body alone');
+    assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored');
+    // The DM's channel is closed, so the host appends its invitation.
+    assert.equal(message.content.length, 2);
+    assert.notEqual(meta.storedBodyDigest, meta.sourceBodyDigest, 'the closed-channel invitation decorates the stored copy');
   });
 
   it('keeps a stored envelope when the channel is renamed later', async () => {
