@@ -11,8 +11,20 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
-import { AgentFramework } from '../src/index.js';
+import {
+  AgentFramework,
+  readInboundSource,
+  type EventResponse,
+  type Module,
+  type ModuleContext,
+  type ProcessEvent,
+  type ProcessState,
+  type ToolCall,
+  type ToolDefinition,
+  type ToolResult,
+} from '../src/index.js';
 import { HistoryModule } from '../src/modules/history/index.js';
+import { versionOf, type ChannelClockLedger } from '../src/context-receipts/index.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs');
@@ -27,21 +39,49 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): P
   throw new Error(`timed out waiting for: ${what}`);
 }
 
-type Script = 'fail' | 'ok';
+/**
+ * `fail`: the provider call errors. `ok`: one round that stands. `tool`: a
+ * round that calls `probe--wait`, then a second round whose report says how
+ * much of the injected batch it carried (`carries`: 'all', or 0 as on
+ * membrane's XML path).
+ */
+type Script = 'fail' | 'ok' | { tool: true; carries: 'all' | 0 };
 
-/** One provider stream per script: a failure, or a round that stands. */
+const usage = { inputTokens: 40, outputTokens: 3, cacheReadTokens: 0 };
+const roundEvent = (index: number, extra: Record<string, unknown> = {}) =>
+  ({ type: 'usage', usage, round: { index, stopReason: 'end_turn', usage, fidelity: 'established', ...extra } }) as unknown as StreamEvent;
+const complete = () =>
+  ({ type: 'complete', response: createMockResponse([{ type: 'text', text: 'heard you' }]) }) as unknown as StreamEvent;
+
 class ScriptedStream implements YieldingStream {
   private done = false;
-  constructor(private readonly events: StreamEvent[]) {}
-  provideToolResults(): void { throw new Error('no tools in this fixture'); }
-  cancel(): void { this.done = true; }
-  get isWaitingForTools() { return false; }
-  get pendingToolCallIds() { return []; }
-  get toolDepth() { return 0; }
+  private waiting = false;
+  private wake: (() => void) | null = null;
+  injected: number[] = [];
+  constructor(private events: StreamEvent[], private readonly afterTools?: (injected: number) => StreamEvent[]) {
+    this.waiting = events.some((e) => e.type === 'tool-calls');
+  }
+  provideToolResults(_results: unknown[], options?: { injectedMessages?: unknown[] }): void {
+    const n = options?.injectedMessages?.length ?? 0;
+    this.injected.push(n);
+    this.waiting = false;
+    this.events.push(...(this.afterTools?.(n) ?? [complete()]));
+    this.wake?.();
+  }
+  cancel(): void { this.done = true; this.wake?.(); }
+  get isWaitingForTools() { return this.waiting; }
+  get pendingToolCallIds() { return this.waiting ? ['call-1'] : []; }
+  get toolDepth() { return this.injected.length; }
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
-    for (const event of this.events) {
-      if (this.done) return;
-      yield event;
+    while (!this.done) {
+      const event = this.events.shift();
+      if (event) {
+        yield event;
+        if (event.type === 'complete' || event.type === 'error') return;
+        continue;
+      }
+      await new Promise<void>((r) => { this.wake = r; });
+      this.wake = null;
     }
   }
 }
@@ -49,19 +89,54 @@ class ScriptedStream implements YieldingStream {
 class ScriptedMembrane {
   scripts: Script[] = [];
   requests: NormalizedRequest[] = [];
+  streams: ScriptedStream[] = [];
   streamYielding(request: NormalizedRequest): YieldingStream {
     this.requests.push(request);
     const script = this.scripts.shift() ?? 'ok';
+    let stream: ScriptedStream;
     if (script === 'fail') {
-      return new ScriptedStream([{ type: 'error', error: new Error('provider unavailable') } as unknown as StreamEvent]);
+      stream = new ScriptedStream([{ type: 'error', error: new Error('provider unavailable') } as unknown as StreamEvent]);
+    } else if (script === 'ok') {
+      stream = new ScriptedStream([roundEvent(0), complete()]);
+    } else {
+      const toolUse = { type: 'tool_use', id: 'call-1', name: 'probe--wait', input: {} };
+      stream = new ScriptedStream(
+        [
+          roundEvent(0),
+          {
+            type: 'tool-calls',
+            calls: [{ id: 'call-1', name: 'probe--wait', input: {} }],
+            context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: [toolUse] },
+          } as unknown as StreamEvent,
+        ],
+        (n) => [
+          roundEvent(1, n > 0 ? { injectedBatch: { batch: 0, applied: script.carries === 'all' ? n : 0 } } : {}),
+          complete(),
+        ],
+      );
     }
-    const usage = { inputTokens: 40, outputTokens: 3, cacheReadTokens: 0 };
-    return new ScriptedStream([
-      { type: 'usage', usage, round: { index: 0, stopReason: 'end_turn', usage, fidelity: 'established' } } as unknown as StreamEvent,
-      { type: 'complete', response: createMockResponse([{ type: 'text', text: 'heard you' }]) } as unknown as StreamEvent,
-    ]);
+    this.streams.push(stream);
+    return stream;
   }
   async complete(): Promise<never> { throw new Error('not used'); }
+}
+
+/** A tool that holds the turn open until the test lets it finish. */
+class ProbeModule implements Module {
+  readonly name = 'probe';
+  release: (() => void) | null = null;
+  entered = false;
+  async start(_ctx: ModuleContext): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return [{ name: 'wait', description: 'wait', inputSchema: { type: 'object' as const, properties: {} } }];
+  }
+  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
+    this.entered = true;
+    await new Promise<void>((r) => { this.release = r; });
+    return { success: true, data: 'done' };
+  }
+  async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> { return {}; }
 }
 
 describe('receipt clocks through the framework', () => {
@@ -69,12 +144,14 @@ describe('receipt clocks through the framework', () => {
   let commandPath: string;
   let framework: AgentFramework;
   let membrane: ScriptedMembrane;
+  let probe: ProbeModule;
 
   beforeEach(async () => {
     tempDir = mkdtempSync(join(tmpdir(), 'receipt-clocks-'));
     commandPath = join(tempDir, 'commands.jsonl');
     writeFileSync(commandPath, '');
     membrane = new ScriptedMembrane();
+    probe = new ProbeModule();
     const history = new HistoryModule();
     framework = await AgentFramework.create({
       storePath: join(tempDir, 'test.chronicle'),
@@ -86,8 +163,16 @@ describe('receipt clocks through the framework', () => {
         args: [FIXTURE],
         env: { STATUS_PATH: join(tempDir, 'status.jsonl'), COMMAND_PATH: commandPath },
       }],
-      modules: [history],
+      modules: [history, probe],
       errorPolicy: { maxRetries: 0, onInferenceError: () => ({ retry: false }) },
+      // Addressed items and DMs wake the resident; ambient chatter does not.
+      gate: {
+        configPath: join(tempDir, 'gate.json'),
+        config: {
+          policies: [{ name: 'wake', match: { tagsAny: ['chat:addressed', 'chat:dm'] }, behavior: 'always' }],
+          default: 'skip',
+        },
+      },
     });
     history.bind(framework.getAgent('scout')!.getContextManager());
     await framework.start();
@@ -107,6 +192,20 @@ describe('receipt clocks through the framework', () => {
     assert.ok(result.success, JSON.stringify(result));
     return result.data as never;
   }
+  const ledger = () => (framework as unknown as { clockLedger: ChannelClockLedger }).clockLedger;
+  const stored = (pred: (meta: Record<string, unknown>) => boolean) =>
+    framework.getAgent('scout')!.getContextManager().getAllMessages().find((m) => pred((m.metadata ?? {}) as Record<string, unknown>));
+  /** Whether the ledger holds a complete delivery of this stored item's version. */
+  const deliveredItem = (meta: (m: Record<string, unknown>) => boolean): boolean => {
+    const message = stored(meta)!;
+    const source = readInboundSource(message.metadata)!;
+    assert.equal(source.kind, 'channel');
+    if (source.kind !== 'channel') return false;
+    const ver = versionOf(source, [message.content], ledger().storeId, message.id);
+    return ledger().isDelivered('scout', ver, source.acceptedAt);
+  };
+  const idle = () => framework.getAgent('scout')!.state.status === 'idle';
+
   const roomClocks = async () => (await channelList()).channels.find((c) => c.id === ROOM)!.clocks as {
     lastReceivedAt: number | null; received?: { messageId?: string };
     lastDeliveredAt: number | null; delivered?: { messageId?: string; basis: string };
@@ -143,5 +242,76 @@ describe('receipt clocks through the framework', () => {
     const data = folds.data as { receipts: Array<{ kind: string }>; folding: string };
     assert.equal(data.receipts[0]?.kind, 'baseline');
     assert.match(data.folding, /passthrough|strategy/);
+  });
+
+  it('receives an item that wakes nobody without delivering it, until a round carries it', async () => {
+    command({ op: 'incoming', channelId: ROOM, messageId: 'm-amb', mode: 'ambient', text: 'just chatting' });
+    await waitFor(() => !!stored((m) => m.messageId === 'm-amb'), 'ambient item stored');
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(membrane.requests.length, 0, 'the gate did not wake the resident');
+    let clocks = await roomClocks();
+    assert.equal(clocks.received?.messageId, 'm-amb');
+    assert.equal(clocks.lastDeliveredAt, null);
+
+    command({ op: 'incoming', channelId: ROOM, messageId: 'm-addr', mode: 'addressed', text: 'now you' });
+    await waitFor(() => membrane.requests.length >= 1, 'woken');
+    await waitFor(idle, 'turn settles');
+    clocks = await roomClocks();
+    assert.equal(clocks.delivered?.messageId, 'm-addr');
+    assert.ok(deliveredItem((m) => m.messageId === 'm-amb'), 'the ambient body reached the resident in the same round');
+  });
+
+  it('identifies a push/event body by its event id', async () => {
+    command({ op: 'dm', eventId: 'ev-dm-1', authorId: '134', authorName: 'antra', rawChannelId: '1548000000000000001', text: 'psst' });
+    await waitFor(() => membrane.requests.length >= 1, 'woken by the DM');
+    await waitFor(idle, 'turn settles');
+    const message = stored((m) => (m.inboundSource as { eventId?: string } | undefined)?.eventId === 'ev-dm-1')!;
+    const source = readInboundSource(message.metadata)!;
+    assert.ok(source.kind === 'channel' && source.lane === 'push/event');
+    const clocks = ledger().clocksFor('scout', [source as never]).values().next().value!;
+    assert.equal(clocks.delivered?.basis, 'event');
+    assert.ok(clocks.lastReceivedAt);
+  });
+
+  it('delivers an item injected mid-turn at the round that carried it, during a long tool-using turn', async () => {
+    membrane.scripts = [{ tool: true, carries: 'all' }];
+    command({ op: 'incoming', channelId: ROOM, messageId: 'm-start', mode: 'addressed', text: 'do the thing' });
+    await waitFor(() => probe.entered, 'tool running');
+    command({ op: 'incoming', channelId: ROOM, messageId: 'm-mid', mode: 'addressed', text: 'also this' });
+    await waitFor(() => !!(framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length, 'deferred while the turn is alive');
+    let clocks = await roomClocks();
+    assert.equal(clocks.received?.messageId, 'm-mid', 'received at acceptance, while held');
+    assert.equal(clocks.delivered?.messageId, 'm-start');
+    probe.release!();
+    await waitFor(idle, 'turn settles');
+    assert.deepEqual(membrane.streams[0]!.injected, [1]);
+    clocks = await roomClocks();
+    assert.equal(clocks.delivered?.messageId, 'm-mid', 'delivered by the round that carried the injection');
+
+    // The next turn compiles the stored copy of the same body: the same
+    // version (content hashed key-order-independently), so no second delivery.
+    command({ op: 'incoming', channelId: ROOM, messageId: 'm-after', mode: 'addressed', text: 'next' });
+    await waitFor(() => membrane.requests.length >= 2, 'next turn');
+    await waitFor(idle, 'next turn settles');
+    const store = framework.getStore();
+    const midDeliveries = store.getRecordIdsByType('agent-framework/channel-clocks')
+      .map((rid) => JSON.parse(store.getRecord(rid)!.payload.toString('utf8')) as { k: string; src?: { messageId?: string } })
+      .filter((e) => e.k === 'dlv' && e.src?.messageId === 'm-mid');
+    assert.equal(midDeliveries.length, 1, 'injected and stored copies are one version');
+  });
+
+  it('does not count an injection the round did not carry (XML path) until a later compile carries it', async () => {
+    membrane.scripts = [{ tool: true, carries: 0 }, 'ok'];
+    command({ op: 'incoming', channelId: ROOM, messageId: 'x-start', mode: 'addressed', text: 'do the thing' });
+    await waitFor(() => probe.entered, 'tool running');
+    command({ op: 'incoming', channelId: ROOM, messageId: 'x-mid', mode: 'addressed', text: 'also this' });
+    await waitFor(() => !!(framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length, 'deferred');
+    probe.release!();
+    await waitFor(idle, 'turn settles');
+    assert.ok(!deliveredItem((m) => m.messageId === 'x-mid'), 'not carried, so not delivered');
+    command({ op: 'incoming', channelId: ROOM, messageId: 'x-next', mode: 'addressed', text: 'and?' });
+    await waitFor(() => membrane.requests.length >= 2, 'next turn');
+    await waitFor(idle, 'next turn settles');
+    assert.ok(deliveredItem((m) => m.messageId === 'x-mid'), 'the next compile carried it');
   });
 });

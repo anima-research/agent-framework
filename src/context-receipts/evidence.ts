@@ -49,10 +49,26 @@ export function sourceRefOf(source: InboundChannelSource, storeMessageId?: strin
   };
 }
 
+/**
+ * JSON with object keys sorted at every level. A body's digest must not
+ * depend on key order: the same content reads back from the store with its
+ * keys in a different order than it was written, so a mid-turn injection
+ * (hashed from the content as handed over) and the stored copy a later
+ * compile carries must hash alike.
+ */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
 function bodyDigest(contents: ReadonlyArray<readonly ContentBlock[]>): string {
-  const hash = createHash('sha256');
-  hash.update(JSON.stringify(contents));
-  return hash.digest('hex');
+  return createHash('sha256').update(canonicalJson(contents)).digest('hex');
 }
 
 /**

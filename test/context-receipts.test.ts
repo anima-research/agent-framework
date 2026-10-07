@@ -8,7 +8,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
-import type { CompileProvenance } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, type CompileProvenance } from '@animalabs/context-manager';
+import type { Membrane } from '@animalabs/membrane';
+import { Agent } from '../src/agent.js';
 import {
   ChannelClockLedger,
   CLOCK_RECORD,
@@ -281,6 +283,15 @@ describe('ContextReceipts', () => {
     assert.ok(delivered('i1'));
   });
 
+  it('records a replayed copy of an already-delivered version once', () => {
+    receipts.beginStream('r', 1, evidence([body(0, 'm1'), body(1, 'm1-replay', { ver: ver('m1'), src: src('m1', 1_000) })]));
+    receipts.usage('r', 1, round());
+    const dlv = store.getRecordIdsByType(CLOCK_RECORD)
+      .map((id) => JSON.parse(store.getRecord(id)!.payload.toString('utf8')) as { k: string })
+      .filter((e) => e.k === 'dlv');
+    assert.equal(dlv.length, 1);
+  });
+
   it('notices a membrane that does not report rounds', () => {
     receipts.beginStream('r', 1, evidence([body(0, 'm1')]));
     receipts.usage('r', 1, undefined);
@@ -302,6 +313,8 @@ describe('receipt evidence', () => {
     assert.equal(a.basis, 'message-digest', 'an unguaranteed eventId is not a version key');
     const edited = versionOf({ ...base, messageId: 'p1' }, [[{ type: 'text', text: 'hi!' }]], 's', 'm');
     assert.notEqual(a.key, edited.key, 'an edited body is a new version');
+    const reordered = versionOf({ ...base, eventId: 'adapter', messageId: 'p1' }, [[{ text: 'hi', type: 'text' } as never]], 's', 'm');
+    assert.equal(a.key, reordered.key, 'key order (as the store reads content back) does not change the version');
     assert.equal(versionOf(base, text, 's', 'm').basis, 'stored-copy');
   });
 
@@ -328,5 +341,32 @@ describe('receipt evidence', () => {
     assert.deepEqual(ev.bodies.map((b) => [b.index, b.storeMessageId, b.complete]), [[0, 's1', true]]);
     assert.ok(Object.isFrozen(ev) && Object.isFrozen(ev.bodies));
     assert.equal(injectedEvidence(0, 'x', { content: [], metadata: { inboundSource: { ...base, deferred: true } } }, 's'), null, 'a deferred notice is not a body');
+  });
+});
+
+describe('request-owned evidence', () => {
+  it('names the body as prepared, even if it is edited before the round is confirmed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'evidence-edit-'));
+    try {
+      const cm = await ContextManager.open({ path: join(dir, 'store'), strategy: new PassthroughStrategy(), namespace: 'agents/r' });
+      const source = {
+        kind: 'channel', lane: 'channels/incoming', serverId: 'discord', binding: 'b1',
+        channelId: 'discord:g:room', messageId: 'p1', acceptedAt: 5,
+      };
+      const id = cm.addMessage('someone', [{ type: 'text', text: 'original words' }], { inboundSource: source } as never);
+      const agent = new Agent({ name: 'r', model: 'test', systemPrompt: 's' }, cm, {} as Membrane);
+      const { evidence } = await agent.prepareActivationRequest([]);
+      assert.equal(evidence.bodies.length, 1);
+      const sent = evidence.bodies[0]!;
+      assert.equal(sent.complete, true);
+      cm.editMessage(id, [{ type: 'text', text: 'edited during inference' }]);
+      const asSent = versionOf(source as never, [[{ type: 'text', text: 'original words' }]], cm.getStoreId(), id);
+      const asEdited = versionOf(source as never, [[{ type: 'text', text: 'edited during inference' }]], cm.getStoreId(), id);
+      assert.equal(sent.ver.key, asSent.key);
+      assert.notEqual(sent.ver.key, asEdited.key);
+      cm.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
