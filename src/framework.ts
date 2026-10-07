@@ -721,9 +721,8 @@ function bodyGroupRun(
 
 function describeMarkers(m: SurgeryMarkerReceipt): string {
   if (m.status === 'queued') return `queued:${m.queued}`;
-  if (m.status === 'not-scheduled') {
-    return m.batchId ? `not-scheduled(batch ${m.batchId} left prepared)` : 'not-scheduled(batch retired)';
-  }
+  if (m.status === 'not-scheduled') return 'not-scheduled(batch retired)';
+  if (m.status === 'unresolved') return `unresolved(batch ${m.batchId} may still be delivered)`;
   return 'none';
 }
 
@@ -6294,13 +6293,15 @@ export class AgentFramework {
   /**
    * Record a surgery's prepared marker batch as active once its body change
    * has landed, and say what happened. Never throws: the body is already
-   * applied, so a ledger failure here is reported as `not-scheduled` rather
-   * than as a failed surgery an operator might retry. A batch that could not
-   * be activated is retired, so that the reconciliation which delivery runs
-   * next cannot promote it behind a receipt saying it was not scheduled; only
-   * when retiring fails too does it stay prepared (named by `batchId`). A
-   * batch with no refs (a suppression journal with nothing addressable) is
-   * still activated, which closes its resume journal; it schedules no marks.
+   * applied, so a ledger failure here is reported in the receipt rather than
+   * as a failed surgery an operator might retry. A batch that could not be
+   * activated is retired, so no later reconciliation can deliver it behind a
+   * receipt saying it was not scheduled (`not-scheduled`). If retiring fails
+   * too, the receipt says only that the outcome is `unresolved`: the batch is
+   * still prepared, and the reconciliation that delivery runs next may well
+   * promote it. A batch with no refs (a suppression journal with nothing
+   * addressable) is still activated, which closes its resume journal; it
+   * schedules no marks.
    */
   private activateSurgeryMarkers(
     batch: DiscordAwarenessBatch | null,
@@ -6326,14 +6327,18 @@ export class AgentFramework {
       );
       if (batch.refs.length === 0) return { status: 'none', queued: 0 };
       this.opsAlert(
-        'discord-awareness-not-scheduled',
+        retired ? 'discord-awareness-not-scheduled' : 'discord-awareness-unresolved',
         agentName,
-        `${verb} applied, but its ${batch.refs.length} awareness mark(s) were not scheduled: ${detail}`,
+        retired
+          ? `${verb} applied, but its ${batch.refs.length} awareness mark(s) were not scheduled ` +
+            `(batch ${batch.id} retired): ${detail}`
+          : `${verb} applied, but awareness batch ${batch.id} (${batch.refs.length} mark(s)) could be ` +
+            `neither activated nor retired; it may still be delivered: ${detail}`,
         { data: { batchId: batch.id, retired } },
       );
       return retired
         ? { status: 'not-scheduled', queued: 0, error: detail }
-        : { status: 'not-scheduled', queued: 0, error: detail, batchId: batch.id };
+        : { status: 'unresolved', queued: 0, batchId: batch.id, error: detail };
     }
     if (batch.refs.length === 0) return { status: 'none', queued: 0 };
     return { status: 'queued', queued: batch.refs.length, batchId: batch.id };

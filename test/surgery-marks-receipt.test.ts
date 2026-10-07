@@ -205,7 +205,7 @@ describe('surgery marker receipt', () => {
   });
 
   it('a rollback whose marker bookkeeping fails after the switch reports the body as applied', async () => {
-    await start(false);
+    await start(true);
     const { tail } = seed(2);
     const original = DiscordAwarenessOutbox.prototype.activate;
     DiscordAwarenessOutbox.prototype.activate = function () {
@@ -222,18 +222,23 @@ describe('surgery marker receipt', () => {
     assert.equal(result.messagesRemoved, 2);
     assert.equal(result.markers.status, 'not-scheduled');
     assert.match(result.markers.status === 'not-scheduled' ? result.markers.error : '', /injected ledger failure/);
-    assert.equal(result.markers.status === 'not-scheduled' && result.markers.batchId, undefined);
-    // The unactivated batch is retired, so the reconciliation that delivery
-    // runs cannot promote it behind a receipt that said "not scheduled".
-    await framework.syncDiscordAwarenessMarkers();
-    assert.deepEqual(ledger(), []);
-
     const entry = framework.getOperatorLog({ limit: 10 }).find((e) => e.kind === 'rollback');
     assert.equal(entry?.error, undefined, 'logged as an applied rollback, not a failure');
     assert.equal((entry?.result?.markers as { status?: string } | undefined)?.status, 'not-scheduled');
+
+    // "Not scheduled" holds across the reconciliation delivery runs and
+    // across a restart: the batch was retired, so nothing can promote it.
+    writeFileSync(holdPath, '1');
+    await framework.syncDiscordAwarenessMarkers();
+    assert.deepEqual(ledger(), []);
+    await framework.stop();
+    await start(true);
+    await framework.syncDiscordAwarenessMarkers();
+    assert.deepEqual(ledger(), []);
+    assert.equal(jsonl(callsPath).length, 0, 'no reaction was ever sent');
   });
 
-  it('names a batch it could neither activate nor retire, which stays prepared', async () => {
+  it('reports unresolved bookkeeping when the batch can be neither activated nor retired', async () => {
     await start(false);
     const { tail } = seed(2);
     const activate = DiscordAwarenessOutbox.prototype.activate;
@@ -251,11 +256,14 @@ describe('surgery marker receipt', () => {
       DiscordAwarenessOutbox.prototype.activate = activate;
       DiscordAwarenessOutbox.prototype.discard = discard;
     }
-    assert.equal(cm().currentBranch().name, result.targetBranch);
-    assert.equal(result.markers.status, 'not-scheduled');
+    assert.equal(cm().currentBranch().name, result.targetBranch, 'the rollback stands');
+    // The receipt promises nothing about this batch: it is still in the
+    // ledger, and a reconciliation may promote and deliver it.
+    assert.equal(result.markers.status, 'unresolved');
     const batches = ledger();
     assert.equal(batches.length, 1);
-    assert.equal(result.markers.status === 'not-scheduled' && result.markers.batchId, batches[0].id);
+    assert.equal(result.markers.status === 'unresolved' && result.markers.batchId, batches[0].id);
+    assert.match(result.markers.status === 'unresolved' ? result.markers.error : '', /injected ledger failure/);
   });
 
   it('a suppression whose marker bookkeeping fails after the last redaction stands', async () => {

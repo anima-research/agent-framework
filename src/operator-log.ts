@@ -128,16 +128,18 @@ export function capIds(ids: string[]): { ids: string[]; count: number; truncated
  *   handed to the background drain. It is not a delivery claim: per-message
  *   outcomes stay in the outbox ledger.
  * - `not-scheduled` — the body change landed, but recording the batch as
- *   active failed, so no mark will be delivered for it: the batch is retired
- *   from the ledger. Only if retiring it failed as well is `batchId` present:
- *   that batch stays prepared, and a later reconciliation (or, for a
- *   suppression, the next startup) that can write the ledger may still
- *   promote it.
+ *   active failed, so it was retired from the ledger: none of its marks will
+ *   be delivered.
+ * - `unresolved` — the ledger could record neither the activation nor the
+ *   retirement. The batch (`batchId`) is still in the ledger in its prepared
+ *   state, and any later reconciliation or restart that can read it may
+ *   promote and deliver it; nothing here promises otherwise.
  */
 export type SurgeryMarkerReceipt =
   | { status: 'none'; queued: 0 }
   | { status: 'queued'; queued: number; batchId: string }
-  | { status: 'not-scheduled'; queued: 0; error: string; batchId?: string };
+  | { status: 'not-scheduled'; queued: 0; error: string }
+  | { status: 'unresolved'; queued: 0; batchId: string; error: string };
 
 /** Thrown by live surgery methods when a request cannot be honored. `code`
  *  lets surfaces distinguish "agent busy — quiesce first" from bad input. */
