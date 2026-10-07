@@ -568,6 +568,43 @@ test('v2 import keeps what the old ledger recorded as evidence, holds pending wo
   assert.equal(existsSync(h.legacyPath), false);
 }));
 
+test('legacy evidence reads outcomes from the old writer\'s lastError, never from its reconciliation state', withJournal((_outbox, h) => {
+  // Entries exactly as the 64c480b writer leaves them (recordSuccess clears
+  // lastError, recordFailure sets it; setDesired rewrites deliveryStatus
+  // from the cached markerPresent without any request).
+  const legacy = {
+    version: 2,
+    batches: [{
+      id: 'reconciled', status: 'active', agentName: 'resident', sourceBranch: 'main', targetBranch: 'rollback/resident/9',
+      emoji: '💤', createdAt: 1,
+      refs: [
+        // An unknown add, then a switch to the source: "applied" only because
+        // the cache (false) matched desired (false). The add may have landed.
+        { ...ref('u1'), desired: false, markerPresent: false, deliveryStatus: 'applied', attempts: 1, lastAction: 'add',
+          lastError: 'MCPL server "discord" did not respond within 10000ms' },
+        // A confirmed add, then a switch to the source: "pending" is the
+        // removal the old writer wanted; the add really succeeded.
+        { ...ref('c1'), desired: false, markerPresent: true, deliveryStatus: 'pending', attempts: 1, lastAction: 'add' },
+      ],
+    }],
+  };
+  mkdirSync(join(h.dir, 'recovery'), { recursive: true });
+  writeFileSync(h.legacyPath, JSON.stringify(legacy));
+  const outbox = h.reopen();
+  const [view] = batches(outbox);
+  assert.deepEqual(view.legacy, { entries: 2, lastAddConfirmed: 1, lastRemoveConfirmed: 0, outcomesUnrecorded: 1 });
+  assert.equal(view.status, 'held', "the old writer's pending removal is held for release");
+
+  // The released removal's own requests are disclosed by cancel, like adds.
+  assert.equal(outbox.release('reconciled').removalsQueued, 1);
+  answer(outbox, 'c1', 'unknown');
+  answer(outbox, 'c1', 'confirmed');
+  const receipt = outbox.cancel('reconciled');
+  assert.equal(receipt.unresolvedAttempts, 1, 'the unknown removal attempt may still land');
+  assert.equal(receipt.confirmed, 1);
+  assert.equal(receipt.legacyOutcomesUnrecorded, 1);
+}));
+
 test('an imported active suppression is not proof its body completed: startup still verifies its intervals', withJournal((_outbox, h) => {
   mkdirSync(join(h.dir, 'recovery'), { recursive: true });
   writeFileSync(h.legacyPath, JSON.stringify({

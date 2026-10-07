@@ -265,15 +265,30 @@ export interface DiscordAwarenessLegacyEvidence {
   /** Attempts the old ledger counted (it kept only the last one's details). */
   attempts: number;
   lastAction: DiscordAwarenessAction;
-  /** The old ledger's status after the last attempt. */
-  lastStatus: 'pending' | 'applied' | 'permanent-failure';
+  /**
+   * The last attempt's outcome, as far as the old writer's fields establish
+   * it: it recorded a success by clearing `lastError` and a failure by
+   * setting it, and nothing else touched that field. `confirmed`: no error
+   * after an attempt. `not-sent`: AF refused before writing the request.
+   * `refused`: Discord answered that the message or channel is gone or
+   * inaccessible. `unrecorded`: any other error, so the request may have
+   * landed.
+   */
+  lastOutcome: 'confirmed' | 'not-sent' | 'refused' | 'unrecorded';
+  /**
+   * The old writer's reconciliation state at shutdown (`deliveryStatus`):
+   * whether its cached belief about the marker matched what it then wanted.
+   * Branch reconciliation rewrote it without any request, so it says
+   * nothing about any attempt's outcome.
+   */
+  oldDeliveryStatus: 'pending' | 'applied' | 'permanent-failure';
   lastError?: string;
   /** What the last error was: AF's refusal before writing a request, a
    *  Discord answer (message/channel gone or inaccessible), or anything else. */
   lastErrorKind?: 'pre-write-refusal' | 'discord-answer' | 'other';
   /** Recorded attempts whose outcome the old ledger does not establish:
-   *  every attempt before the last, and the last unless it was applied,
-   *  refused before writing, or answered by Discord. */
+   *  every attempt before the last (only the last one's details were kept),
+   *  and the last when its outcome is `unrecorded`. */
   outcomesUnrecorded: number;
 }
 
@@ -761,8 +776,10 @@ export class DiscordAwarenessOutbox {
       inFlight: 0,
       unknown: 0,
       confirmed: 0,
+      // Every request the batch itself made: its adds, and any removals its
+      // release queued.
       unresolvedAttempts: unresolvedDispatches(
-        [...state.ops.values()].filter((op) => op.cause.batchId === batchId && op.action === 'add'),
+        [...state.ops.values()].filter((op) => op.cause.batchId === batchId),
         (op, attempt) => this.attemptUnresolved(op, attempt),
       ),
       legacyOutcomesUnrecorded: [...state.legacy.values()].flat()
@@ -1086,8 +1103,8 @@ export class DiscordAwarenessOutbox {
           ? {
               legacy: {
                 entries: evidence.length,
-                lastAddConfirmed: evidence.filter((entry) => entry.lastAction === 'add' && entry.lastStatus === 'applied').length,
-                lastRemoveConfirmed: evidence.filter((entry) => entry.lastAction === 'remove' && entry.lastStatus === 'applied').length,
+                lastAddConfirmed: evidence.filter((entry) => entry.lastAction === 'add' && entry.lastOutcome === 'confirmed').length,
+                lastRemoveConfirmed: evidence.filter((entry) => entry.lastAction === 'remove' && entry.lastOutcome === 'confirmed').length,
                 outcomesUnrecorded: evidence.reduce((sum, entry) => sum + entry.outcomesUnrecorded, 0),
               },
             }
@@ -1571,12 +1588,18 @@ function importLegacy(parsed: unknown, path: string, sha256: string): JournalRec
   return records;
 }
 
-/** The facts a v2 entry recorded about its attempts, and what they leave open. */
+/**
+ * The facts a v2 entry recorded about its attempts, and what they leave open.
+ * Only `lastError` speaks to the last attempt's outcome (the old writer
+ * cleared it on success and set it on failure); `deliveryStatus` was its
+ * reconciliation state, rewritten by branch switches without any request,
+ * and is kept as that and nothing more.
+ */
 function legacyEvidence(
   batchId: string,
   key: DiscordAwarenessRef & { emoji: string },
   entry: LegacyEntry,
-  status: 'pending' | 'applied' | 'permanent-failure',
+  oldDeliveryStatus: 'pending' | 'applied' | 'permanent-failure',
 ): DiscordAwarenessLegacyEvidence {
   const attempts = entry.attempts!;
   const lastError = entry.lastError;
@@ -1584,21 +1607,20 @@ function legacyEvidence(
     : PRE_WRITE_REFUSAL.test(lastError) ? 'pre-write-refusal'
     : isPermanentDiscordReactionFailure(lastError) ? 'discord-answer'
     : 'other';
-  // The last attempt's outcome is established when the ledger saw it
-  // applied, or its error proves it was refused before writing or answered
-  // by Discord. Earlier attempts' details were never kept.
-  const lastEstablished = status === 'applied'
-    || lastErrorKind === 'pre-write-refusal'
-    || (status === 'permanent-failure' && lastErrorKind === 'discord-answer');
+  const lastOutcome = lastErrorKind === undefined ? 'confirmed'
+    : lastErrorKind === 'pre-write-refusal' ? 'not-sent'
+    : lastErrorKind === 'discord-answer' ? 'refused'
+    : 'unrecorded';
   return {
     batchId,
     key: { ...key },
     attempts,
     lastAction: entry.lastAction!,
-    lastStatus: status,
+    lastOutcome,
+    oldDeliveryStatus,
     ...(lastError !== undefined ? { lastError: boundDiscordAwarenessText(lastError) } : {}),
     ...(lastErrorKind ? { lastErrorKind } : {}),
-    outcomesUnrecorded: (attempts - 1) + (lastEstablished ? 0 : 1),
+    outcomesUnrecorded: (attempts - 1) + (lastOutcome === 'unrecorded' ? 1 : 0),
   };
 }
 
