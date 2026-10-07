@@ -2486,6 +2486,7 @@ export class AgentFramework {
    */
   private syncSubconsciousTools(): void {
     const allowed = this.subconsciousAllowedTools;
+    if (!allowed) return; // prototype-built harnesses: no field, no subconscious
     allowed.splice(
       0,
       allowed.length,
@@ -6264,7 +6265,9 @@ export class AgentFramework {
    * lease is granted as soon as the last turn or ephemeral run ends.
    */
   private tryGrantSafeBoundary(): void {
-    if (this.boundaryWaiters.length === 0 || this.heldLease || this.surgeryHold) return;
+    // Optional chaining: prototype-built harnesses leave fields undefined,
+    // which must read as "nobody waiting" (see surgeryHeld below).
+    if (!this.boundaryWaiters?.length || this.heldLease || this.surgeryHold) return;
     if (this.ephemeralRuns.size > 0 || this.storeBusyReasons().length > 0) return;
     const waiter = this.boundaryWaiters.shift()!;
     const { tokens, release } = this.takeStoreReservation(waiter.verb, 'safe-boundary');
@@ -9068,7 +9071,7 @@ export class AgentFramework {
       // A registered ephemeral stream's wakes pass too: the lease waits for
       // its run to end, and holding them would deadlock it. Once the lease is
       // granted, its reservation (surgeryHold, below) holds everything.
-      if (this.boundaryWaiters.length > 0 && !this.ephemeralRuns.has(agentName)) {
+      if (this.boundaryWaiters?.length && !this.ephemeralRuns.has(agentName)) {
         const held = requests.filter((r) => !isTurnContinuation(r.reason));
         if (held.length > 0) {
           this.pendingRequests.push(...held);
