@@ -198,6 +198,11 @@ test('channels/incoming: an empty message fails alone; its siblings and image-on
 
 test('wire: an empty push/event gets a -32602 error, stores nothing and wakes nobody', async (t) => {
   const f = await fixture(); t.after(f.close);
+  // Typed listener, no casts: the rejection is a TraceEvent union member.
+  const rejected: Array<{ serverId: string; featureSet: string; reason: string }> = [];
+  f.framework.onTrace((e) => {
+    if (e.type === 'mcpl:push-event-rejected') rejected.push({ serverId: e.serverId, featureSet: e.featureSet, reason: e.reason });
+  });
   const before = f.framework.getAgent('agent')!.getContextManager().getMessageCount();
   for (const [, content] of EMPTY_SHAPES) {
     const r = await f.send('push/event', { featureSet: 'doc', eventId: `e-${Math.random()}`, timestamp: TS, payload: { content } });
@@ -207,6 +212,7 @@ test('wire: an empty push/event gets a -32602 error, stores nothing and wakes no
   await f.framework.runUntilIdle();
   assert.equal(f.framework.getAgent('agent')!.getContextManager().getMessageCount(), before);
   assert.equal(f.membrane.calls.length, 0, 'no inference');
+  assert.deepEqual(rejected, EMPTY_SHAPES.map(() => ({ serverId: 'editor', featureSet: 'doc', reason: 'empty-content' })));
 });
 
 test('wire: an empty deferred notice is rejected (its fallback must be self-contained, RFC-006 §5.1)', async (t) => {
@@ -220,8 +226,13 @@ test('wire: an empty deferred notice is rejected (its fallback must be self-cont
 
 test('wire: a coalesced channel message with no content is rejected; an empty retraction is not', async (t) => {
   const f = await fixture(); t.after(f.close); await f.register();
+  const rejected: Array<{ channelId: string; messageId?: string; reason: string }> = [];
+  f.framework.onTrace((e) => {
+    if (e.type === 'mcpl:channel-incoming-rejected') rejected.push({ channelId: e.channelId, messageId: e.messageId, reason: e.reason });
+  });
   const empty = await f.send('channels/incoming', { messages: [f.channel('a', '', { initial: true })] });
   assert.deepEqual(empty.result.results, [{ messageId: 'm', accepted: false, reason: 'empty_content' }]);
+  assert.deepEqual(rejected, [{ channelId: 'chat', messageId: 'm', reason: 'empty-content' }]);
   await f.send('channels/incoming', { messages: [f.channel('b', 'original_text', { initial: true })] });
   await f.framework.runUntilIdle();
   const count = f.framework.getAgent('agent')!.getContextManager().getMessageCount();
@@ -244,14 +255,37 @@ test('wire: a retraction whose notice is only blank text appends nothing ("consu
   assert.equal(f.membrane.calls.length, calls, 'no wake');
 });
 
-test('wire: a render result of only blank text appends nothing (RFC-006 §5.2)', async (t) => {
-  const f = await fixture(); t.after(f.close);
+for (const [label, rendered] of [['only blank text', [{ type: 'text', text: ' ' }]], ['no content', []]] as const) {
+  test(`wire: a render of ${label} appends nothing and, as the only wake cause, starts no inference (RFC-006 §5.2)`, async (t) => {
+    const f = await fixture(); t.after(f.close);
+    f.renderer(async () => ({ content: rendered }));
+    await f.send('push/event', f.params('1', 'fallback_text', { deferred: true }));
+    await f.framework.runUntilIdle();
+    assert.equal(f.renders.length, 1);
+    assert(!f.context().includes('fallback_text'), 'an empty render is not a failed render: no fallback');
+    assert(!f.context().includes('coalescingSubject'), 'no materialized occurrence was stored');
+    assert.equal(f.membrane.calls.length, 0, 'no model call for a wake whose only cause rendered nothing');
+  });
+}
+
+test('wire: an empty render does not cancel a turn that has another cause', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
   f.renderer(async () => ({ content: [{ type: 'text', text: ' ' }] }));
+  await f.send('push/event', f.params('1', 'fallback_text', { deferred: true }));
+  await f.send('push/event', { featureSet: 'doc', eventId: 'plain', timestamp: TS, payload: { content: [{ type: 'text', text: 'real_news' }] } });
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 1);
+  assert.equal(f.membrane.calls.length, 1, 'the ordinary push still gets its turn');
+  assert(f.lastRequest().includes('real_news'));
+});
+
+test('wire: a rendered batch still starts its turn', async (t) => {
+  const f = await fixture(); t.after(f.close);
   await f.send('push/event', f.params('1', 'fallback_text', { deferred: true }));
   await f.framework.runUntilIdle();
   assert.equal(f.renders.length, 1);
-  assert(!f.context().includes('fallback_text'), 'a blank render is not a failed render: no fallback');
-  assert(!f.context().includes('coalescingSubject'), 'no materialized occurrence was stored');
+  assert.equal(f.membrane.calls.length, 1);
+  assert(f.lastRequest().includes('document_diff'));
 });
 
 // ---------------------------------------------------------------------------

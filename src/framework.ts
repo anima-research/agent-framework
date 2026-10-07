@@ -73,7 +73,7 @@ import { BUILTIN_TOOL_CLASSES, normalizeClassTable, parseDeclaredClasses, resolv
 import { PushHandler, convertBlock as convertPushBlock, type McplPushEvent } from './mcpl/push-handler.js';
 import {
   PushCoalescer, CoalesceError, PUSH_COALESCING_SUPPORT, validateCoalesceMember, validateCoalescedContent,
-  coalescingSubjectKey, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
+  coalescingSubjectKey, type AssemblyResult, type CoalescedOccurrence, type CoalescingPlacement, type CoalescingSnapshot,
   type CoalescingReceiptRecord,
 } from './mcpl/push-coalescer.js';
 import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, PushEventResult } from './mcpl/types.js';
@@ -7894,6 +7894,7 @@ export class AgentFramework {
         counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
         addressed: isAddressedMessage(occ.tags, origin),
         coalescingSubject: subject,
+        coalescingBatch: true,
       });
     }
   }
@@ -8400,8 +8401,16 @@ export class AgentFramework {
       // A silent tick never suppresses a genuine coalesced wake. If any
       // ordinary request shares this batch, the ordinary turn semantics win.
       const silentOnly = requests.every((r) => r.suppressProse === true);
+      // RFC-006 §5: when every cause is a deferred batch, the turn's content
+      // exists only once assembly renders it. Recorded for the whole batch
+      // (not inherited from requests[0]), so a requeued trigger stays honest.
+      const batchOnly = !budgetRestart && requests.every((r) => r.coalescingBatch === true && !!r.coalescingSubject);
       await this.startAgentStream(agent, {
         ...trigger,
+        coalescingBatch: batchOnly || undefined,
+        coalescingBatchSubjects: batchOnly
+          ? [...new Set(requests.flatMap((r) => r.coalescingBatchSubjects ?? [r.coalescingSubject!]))]
+          : undefined,
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         channelId: channelReq?.channelId,
@@ -9017,12 +9026,43 @@ export class AgentFramework {
     // boundary — after the deferred flush (same window: turn alive, compile
     // not yet run) and before the checkpoint (they are the turn's inputs).
     // Not on a context-budget restart: that continues the same logical turn.
+    let assembly: AssemblyResult | undefined;
     if (attempt === 0 && !continuingTurn && this.pushCoalescer?.pendingBatches()) {
       try {
-        await this.pushCoalescer.assemble(agent.name);
+        assembly = await this.pushCoalescer.assemble(agent.name);
       } catch (err) {
         console.error(`[coalescing] assembly for ${agent.name} failed:`, err);
       }
+    }
+
+    // A turn whose only causes were deferred batches, all of which rendered
+    // nothing (empty or blank render, §5.2; cancelled; revoked), has nothing
+    // new to show: running it would wake the model to `[Continue]` or an
+    // older message, an uncaused wake. Stop before the checkpoint, locus,
+    // typing and compile. A subject this assembly did not settle (rendered
+    // elsewhere, not yet frozen) keeps the turn, as before.
+    const batchSubjects = trigger?.coalescingBatchSubjects;
+    if (assembly && batchSubjects?.length
+      && batchSubjects.every((s) => assembly.settled.has(s) && !assembly.materialized.has(s))) {
+      console.error(`[coalescing] ${agent.name}: deferred render produced nothing; turn not started (no wake cause left)`);
+      this.emitTrace({ type: 'mcpl:coalescing', kind: 'turn-withdrawn', agentName: agent.name, subjects: batchSubjects });
+      // Release the turn and land anything deferred while assembly awaited
+      // the render, as a torn-down turn would.
+      if (this.activeTurnTokens.get(agent.name) === turnToken) {
+        this.activeTurnTokens.delete(agent.name);
+        this.activeTurnTriggers.delete(agent.name);
+      }
+      if (!this.activeTurnTokens.has(agent.name)
+        && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
+        for (const msg of this.drainDeferredFor(agent.name)) {
+          this.addMessage(msg.participant, msg.content, msg.metadata, {
+            deferredWriteId: msg.id,
+            ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+          });
+        }
+        this.ackDeferredWrites();
+      }
+      return false;
     }
 
     // Record turn checkpoint before inference (only on first attempt, not retries)

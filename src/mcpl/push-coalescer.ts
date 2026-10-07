@@ -110,6 +110,18 @@ interface Rendering<E> {
   batch: DeferredBatch<E>;
   cancelled: boolean;
   done: Promise<void>;
+  /** Set once the render (or its fallback) was delivered as content. */
+  materialized?: boolean;
+}
+
+/** What an assembly did, per subject, for the turn being assembled. */
+export interface AssemblyResult {
+  /** Subjects whose render this assembly waited on to completion. */
+  settled: Set<string>;
+  /** Of those, the subjects whose render or fallback was delivered as content.
+   *  A settled subject that is not here gave the turn nothing to read: empty
+   *  or blank render (§5.2), cancelled, or revoked at response. */
+  materialized: Set<string>;
 }
 
 interface SubjectState<E> {
@@ -588,20 +600,29 @@ export class PushCoalescer<E = unknown> {
    * Render and materialize every pending batch whose audience includes
    * `agentName`. Called by the host at a turn's assembly boundary, before the
    * compile. Bounded by the host's render timeout; a failed or late render
-   * materializes the admitted fallback (§5.3).
+   * materializes the admitted fallback (§5.3). Reports which subjects
+   * settled and which of them produced content, so the host can tell a turn
+   * whose only cause rendered nothing.
    */
-  async assemble(agentName: string): Promise<void> {
-    if (this.suspended) return;
+  async assemble(agentName: string): Promise<AssemblyResult> {
+    const result: AssemblyResult = { settled: new Set(), materialized: new Set() };
+    if (this.suspended) return result;
     const work: Promise<void>[] = [];
     for (const subject of [...this.subjects.keys()]) {
       // The handle is wrapped: a bare promise returned through `locked` would
       // be flattened by `then`, holding the lock until the render settled —
       // and the settlement itself needs the lock.
       const started = await this.locked(() => this.freeze(subject, agentName));
-      if (started) work.push(started.done);
+      if (started) {
+        work.push(started.done.then(() => {
+          result.settled.add(subject);
+          if (started.rendering.materialized) result.materialized.add(subject);
+        }));
+      }
     }
     await Promise.all(work);
     this.persist();
+    return result;
   }
 
   /**
@@ -610,13 +631,13 @@ export class PushCoalescer<E = unknown> {
    * the RPC. Returns the render's completion (shared by every assembly that
    * waits on this batch, vector 25) or undefined when nothing was started.
    */
-  private async freeze(subject: string, agentName: string): Promise<{ done: Promise<void> } | undefined> {
+  private async freeze(subject: string, agentName: string): Promise<{ done: Promise<void>; rendering: Rendering<E> } | undefined> {
     const state = this.subjects.get(subject);
     if (!state || this.suspended) return undefined;
     if (state.rendering) {
       // Another assembly froze this batch; share its outcome (vector 25).
       const rendering = state.rendering;
-      return (await this.host.audience(rendering.batch.latest)).includes(agentName) && state.rendering === rendering ? { done: rendering.done } : undefined;
+      return (await this.host.audience(rendering.batch.latest)).includes(agentName) && state.rendering === rendering ? { done: rendering.done, rendering } : undefined;
     }
     const batch = state.batch;
     if (!batch) return undefined;
@@ -659,7 +680,7 @@ export class PushCoalescer<E = unknown> {
       return undefined;
     }
     rendering.done = this.render(subject, state, rendering, agentName);
-    return { done: rendering.done };
+    return { done: rendering.done, rendering };
   }
 
   private async render(subject: string, state: SubjectState<E>, rendering: Rendering<E>, assemblingFor: string): Promise<void> {
@@ -703,6 +724,7 @@ export class PushCoalescer<E = unknown> {
         this.host.audit({ kind: 'rendered', subject, eventId: occurrence.eventId, source, empty });
         if (empty) return; // §5.2: nothing happened (blank text included)
         const placement = await this.host.deliver({ ...occurrence, timestamp, content }, content, assemblingFor);
+        rendering.materialized = true;
         if (placement?.deferredId) {
           // Landed in another agent's deferred queue (its turn is alive): still
           // unread there, so it stays replaceable and withdrawable.
