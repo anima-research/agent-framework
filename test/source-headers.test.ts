@@ -193,6 +193,14 @@ describe('source headers at ingestion', () => {
     assert.deepEqual(blocksOf((m) => m.eventId === 'tick-1'), ['[source: discord · unscoped]', 'tick']);
     const tick = stored().find((m) => m.metadata?.eventId === 'tick-1')!;
     assert.equal(tick.metadata?.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'tick' }]), 'the undecorated body');
+    assert.equal(tick.metadata?.storedBodyDigest, sourceBodyDigest(tick.content), 'the stored copy, header included');
+    // An edit through the supported path keeps the metadata, so only the
+    // stored digest can reveal that the copy no longer holds the delivery.
+    const cm = framework.getAgent('scout')!.getContextManager();
+    cm.editMessage(tick.id, [{ type: 'text', text: '[source: discord · unscoped]' }, { type: 'text', text: 'edited' }]);
+    const edited = cm.getAllMessages().find((m) => m.id === tick.id)!;
+    assert.equal(edited.metadata?.storedBodyDigest, tick.metadata?.storedBodyDigest, 'metadata survives the edit');
+    assert.notEqual(sourceBodyDigest(edited.content), edited.metadata?.storedBodyDigest, 'the stored hash no longer matches');
     const operator = stored().find((m) => m.participant === 'Operator')!;
     assert.deepEqual(operator.content.map((b) => (b as { text?: string }).text), ['hi there']);
   });
@@ -215,6 +223,12 @@ describe('source headers at ingestion', () => {
     assert.equal(original!.metadata?.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'before' }]));
     assert.equal(original!.metadata?.sourceHeader, '[source: discord / discord:g1:room · #room (Guild One)]');
     assert.equal(replay!.metadata?.sourceHeader, '[source: discord / discord:g1:room · #lobby (Guild One)]');
+    // The stored copy's own digest covers exactly what was stored, header
+    // included: it differs per copy and matches the stored blocks.
+    for (const copy of [original!, replay!]) {
+      assert.equal(copy.metadata?.storedBodyDigest, sourceBodyDigest(copy.content));
+    }
+    assert.notEqual(original!.metadata?.storedBodyDigest, replay!.metadata?.storedBodyDigest);
     // The stored header is the envelope's, not re-derived from the registry.
     const source = readInboundSource(stored().find((m) => m.metadata?.messageId === 'm-6')!.metadata);
     assert.equal(source?.kind === 'channel' && source.label, '#room (Guild One)');
