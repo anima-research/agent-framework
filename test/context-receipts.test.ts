@@ -426,6 +426,23 @@ describe('ChannelClockLedger', () => {
     assert.deepEqual(after5s(), ['gap 2000-5000 unclean-stop', 'gap 2000-65000 ledger-unreadable', 'start 65000', 'recv 65000']);
     assert.equal(l.delivered('r', CH, src('old', 1_000), ver('old'), BRANCH), false, 'dedup read back');
   });
+
+  it('treats a checkpoint this version does not write as unreadable, not as an empty start', () => {
+    let l = open();
+    clock = 2_000;
+    l.delivered('r', CH, src('m1', 1_000), ver('e1'), BRANCH);
+    l.stop();
+    // Another version's checkpoint covering every entry, as a downgrade would find it.
+    store.appendJson(`${CLOCK_RECORD}/checkpoint`, { through: store.getRecordIdsByType(CLOCK_RECORD).at(-1)!, snapshot: { v: 3 } });
+    const before = recordCount();
+    clock = 5_000;
+    l = open();
+    l.received(CH, src('m2', 5_000), 'channels/incoming');
+    assert.equal(l.delivered('r', CH, src('m1', 1_000), ver('e1'), BRANCH), false, 'not a first delivery of a forgotten version');
+    assert.equal(recordCount(), before, 'nothing written over it');
+    assert.equal(l.clocksFor('r', [CH]).size, 0);
+    assert.equal(l.scope('r').degraded, true);
+  });
 });
 
 describe('ContextReceipts', () => {

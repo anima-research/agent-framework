@@ -33,19 +33,20 @@
  * their interval grows too (a quarter of the remembered keys, at least 4000
  * entries), which keeps total checkpoint storage linear in deliveries.
  *
- * A journal that can't be read (a failed or damaged read, at start or while
- * reconciling) stops neither the host nor delivery: the ledger becomes
- * unreadable. A read is all or nothing, and nothing is written or
- * checkpointed until a whole read succeeds, so no partial or empty state can
- * cover entries that weren't read, even when the read fails inside recovery
- * itself (a write that landed but reported failure makes the next write read
- * the journal again). Meanwhile channel_list reports the open gap, and no
- * clocks at all until the journal has been read once. The read is retried on
- * use, at most every 30 s, and once more at stop. When it succeeds, tracking
- * resumes from the whole journal, dedup sets and coverage included, and the
- * unreadable interval is recorded as a gap. A run whose journal never becomes
- * readable writes nothing, so a later run can't show that interval as a gap:
- * recording it would mean appending to a journal no one could read.
+ * A journal that can't be read (a failed or damaged read, or a checkpoint
+ * this version doesn't write, at start or while reconciling) stops neither
+ * the host nor delivery: the ledger becomes unreadable. A read is all or
+ * nothing, and nothing is written or checkpointed until a whole read
+ * succeeds, so no partial or empty state can cover entries that weren't read,
+ * even when the read fails inside recovery itself (a write that landed but
+ * reported failure makes the next write read the journal again). Meanwhile
+ * channel_list reports the open gap, and no clocks at all until the journal
+ * has been read once. The read is retried on use, at most every 30 s, and
+ * once more at stop. When it succeeds, tracking resumes from the whole
+ * journal, dedup sets and coverage included, and the unreadable interval is
+ * recorded as a gap. A run whose journal never becomes readable writes
+ * nothing, so a later run can't show that interval as a gap: recording it
+ * would mean appending to a journal no one could read.
  */
 
 import { createHash } from 'node:crypto';
@@ -209,6 +210,23 @@ function emptyAgent(): AgentState {
 
 function emptySnapshot(): Snapshot {
   return { v: 2, trackingSince: null, channels: {}, agents: {}, seen: {}, gaps: [], openRun: null, lastAt: null };
+}
+
+/**
+ * A checkpoint's state, as this version writes it. Anything else (another
+ * version's checkpoint, or one damaged into other valid JSON) makes the
+ * journal unreadable rather than starting from an empty state, which the
+ * next checkpoint would make permanent.
+ */
+function checkedSnapshot(value: unknown): Snapshot {
+  const s = value as Partial<Snapshot> | null;
+  const isObject = (x: unknown) => typeof x === 'object' && x !== null && !Array.isArray(x);
+  const isTime = (x: unknown) => x === null || typeof x === 'number';
+  if (!isObject(s) || s!.v !== 2 || !isObject(s!.channels) || !isObject(s!.agents) || !Array.isArray(s!.gaps)
+    || !isTime(s!.trackingSince) || !isTime(s!.openRun) || !isTime(s!.lastAt)) {
+    throw new Error('clock ledger checkpoint is not a snapshot this version reads');
+  }
+  return s as Snapshot;
 }
 
 export class ChannelClockLedger {
@@ -387,7 +405,7 @@ export class ChannelClockLedger {
     const held = { state: this.state, delivered: this.deliveredSets, partial: this.partialSets };
     try {
       const { snapshot, entries } = this.journal.load();
-      this.state = snapshot && snapshot.v === 2 ? snapshot : emptySnapshot();
+      this.state = snapshot === null ? emptySnapshot() : checkedSnapshot(snapshot);
       this.deliveredSets = new Map();
       this.partialSets = new Map();
       for (const [agent, sets] of Object.entries(this.state.seen ?? {})) {
