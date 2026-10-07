@@ -52,7 +52,6 @@ import {
   fingerprintVouches,
   looksBinary,
   observePath,
-  parentOf,
   provenAbsent,
   readHead,
   readPath,
@@ -844,8 +843,10 @@ export async function pushPaths(
       if (!bi?.tombstone) continue;
       if (v.unconfirmed && d.kind === 'absent') {
         // Our own unlink already reached disk, unconfirmed: confirm it — its
-        // directory synced, nothing removed — applyDeletions or not.
-        plans.push({ path, kind: 'unlink', prior, before: p, expect });
+        // directory synced, nothing removed — applyDeletions or not. Only
+        // ever a confirmation, force or not: a file that appears meanwhile
+        // refuses it.
+        plans.push({ path, kind: 'unlink', prior, before: p, expect: { kind: 'absent' } });
         continue;
       }
       if (!opts.applyDeletions) {
@@ -885,8 +886,7 @@ export async function pushPaths(
       } else {
         // Its directory is synced whether this unlink removed the entry or
         // found it gone: either way the completion claims a durable absence.
-        const inDirectory = await unlinkContained(mount.view, mount.rootReal, step.path, step.expect);
-        effected.push({ step, dirs: inDirectory ? [parentOf(step.path)] : [] });
+        effected.push({ step, dirs: [await unlinkContained(mount.view, mount.rootReal, step.path, step.expect)] });
       }
     } catch (err) {
       const failure = err instanceof EffectFailed ? err : new EffectFailed(err instanceof Error ? err.message : String(err), true);

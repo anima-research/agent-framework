@@ -67,12 +67,11 @@ function noFollowFlag(view: MountView): number {
   return !view.followSymlinks && typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0;
 }
 
-/** The parent of a path, held for an effect, or why it can't be. */
+/** The parent of a path, held for an effect; proven absent; or why neither. */
 async function parentFor(view: MountView, rootReal: string, rel: string, create: boolean) {
   const held = await holdDir(view, rootReal, parentOf(rel), { create });
-  if (held.kind === 'held') return held.dir;
-  if (held.kind === 'absent') return null;
-  throw new EffectFailed(held.outside ? OUTSIDE_PARENT : held.reason, false);
+  if (held.kind === 'unobserved') throw new EffectFailed(held.outside ? OUTSIDE_PARENT : held.reason, false);
+  return held;
 }
 
 /** The hash of what `target` holds, read through a descriptor that must be the file `id` names. */
@@ -106,8 +105,9 @@ async function hashAt(target: string, id: { dev: bigint; ino: bigint }, flags: n
  * caller, after all of a push's effects: syncDirectories).
  */
 export async function writeContained(view: MountView, rootReal: string, rel: string, bytes: Buffer, expect: Expect): Promise<void> {
-  const parent = await parentFor(view, rootReal, rel, true);
-  if (parent === null) throw new EffectFailed('a parent path is not a directory', false);
+  const held = await parentFor(view, rootReal, rel, true);
+  if (held.kind !== 'held') throw new EffectFailed('a parent path is not a directory', false);
+  const parent = held.dir;
   const target = parent.at(nameOf(rel));
   const noFollow = noFollowFlag(view);
   if (!view.followSymlinks && !noFollow) {
@@ -174,20 +174,25 @@ export async function writeContained(view: MountView, rootReal: string, rel: str
 }
 
 /**
- * Unlink a mount-relative file; its directory is synced by the caller.
- * Returns whether the file's directory still exists — `false` when it is
- * gone, so there is no entry left to make durable. A file already gone (or,
- * with `absent` expected, confirmed gone) is not an error.
+ * Unlink a mount-relative file, or confirm it gone (`absent` expected: a
+ * file found there is never removed). Returns the mount directory whose
+ * entries make the absence durable, for the caller's barrier: the file's
+ * parent, or — when the parent itself is gone — the directory proven to lack
+ * it, since that removal may not be durable either.
  */
-export async function unlinkContained(view: MountView, rootReal: string, rel: string, expect: Expect): Promise<boolean> {
-  const parent = await parentFor(view, rootReal, rel, false);
-  if (parent === null) return false; // no directory, so no file
+export async function unlinkContained(view: MountView, rootReal: string, rel: string, expect: Expect): Promise<string> {
+  const held = await parentFor(view, rootReal, rel, false);
+  if (held.kind === 'absent') return held.by; // no directory, so no file
+  const parent = held.dir;
   const target = parent.at(nameOf(rel));
   let info;
   try {
     info = await lstat(target, { bigint: true });
   } catch (err) {
-    if (errno(err) === 'ENOENT') return true;
+    if (errno(err) === 'ENOENT') {
+      if (!(await parent.stillHere())) throw new EffectFailed(MOVED, false);
+      return parent.rel;
+    }
     throw new EffectFailed(`cannot stat (${errno(err) ?? message(err)})`, false);
   }
   // Confirming an unlink that already happened never removes a file that
@@ -212,21 +217,19 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
   } catch (err) {
     if (errno(err) !== 'ENOENT') throw new EffectFailed(`could not unlink the file: ${message(err)}`, true);
   }
-  return true;
+  return parent.rel;
 }
-
-/** Errors meaning a directory can't be synced on this filesystem, not that syncing it failed. */
-const DIRECTORY_SYNC_UNSUPPORTED = new Set(['EINVAL', 'ENOTSUP']);
 
 /**
  * Sync each mount directory (mount-relative), deepest first, so the entries
- * a push created or removed in them are durable. Returns the ones that
- * failed, with why. Where directories can't be synced at all (Windows, or a
- * filesystem answering EINVAL/ENOTSUP), there is nothing to wait for.
+ * a push created or removed in them are durable. Each is held first and the
+ * directory it holds is the one synced — never a replacement at its path.
+ * Returns the ones that failed, with why. Where directories can't be synced
+ * at all (Windows, or a filesystem answering EINVAL/ENOTSUP), there is
+ * nothing to wait for.
  */
 export async function syncDirectories(view: MountView, rootReal: string, rels: Iterable<string>): Promise<Map<string, string>> {
   const failed = new Map<string, string>();
-  if (process.platform === 'win32') return failed; // a directory can't be opened for sync there
   const depth = (rel: string): number => (rel === '' ? 0 : rel.split('/').length);
   for (const rel of [...new Set(rels)].sort((a, b) => depth(b) - depth(a))) {
     const held = await holdDir(view, rootReal, rel);
@@ -235,14 +238,7 @@ export async function syncDirectories(view: MountView, rootReal: string, rels: I
       continue;
     }
     try {
-      const handle = await open(held.dir.real, 'r');
-      try {
-        await handle.sync();
-      } catch (err) {
-        if (!DIRECTORY_SYNC_UNSUPPORTED.has(errno(err) ?? '')) throw err;
-      } finally {
-        await handle.close();
-      }
+      await held.dir.sync();
     } catch (err) {
       failed.set(rel, message(err));
     }

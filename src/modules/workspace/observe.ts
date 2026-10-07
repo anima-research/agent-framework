@@ -123,14 +123,27 @@ export interface HeldDir {
   at(name: string): string;
   /** Whether it is still the directory its logical path names: same location, same directory. */
   stillHere(): Promise<boolean>;
+  /**
+   * Make its entries durable: this very directory, never one that replaced
+   * it at its path. Throws if it can't (a filesystem that can't sync
+   * directories, or Windows, is not a failure).
+   */
+  sync(): Promise<void>;
 }
 
 export type Hold =
   | { kind: 'held'; dir: HeldDir }
-  /** No directory there, proven: nothing can exist beneath the path. */
-  | { kind: 'absent' }
+  /**
+   * No directory there, proven: nothing can exist beneath the path. `by` is
+   * the directory whose entries prove it — the one that lacks it, or that
+   * holds the non-directory in its place.
+   */
+  | { kind: 'absent'; by: string }
   /** Unproven either way; `outside` when it resolves outside the mount. */
   | { kind: 'unobserved'; reason: string; outside?: true };
+
+/** Errors meaning a directory can't be synced on this filesystem, not that syncing it failed. */
+const DIRECTORY_SYNC_UNSUPPORTED = new Set(['EINVAL', 'ENOTSUP']);
 
 class PathHeldDir implements HeldDir {
   constructor(
@@ -150,6 +163,22 @@ class PathHeldDir implements HeldDir {
     const info = await lstat(this.real, { bigint: true }).catch(() => null);
     return info !== null && info.isDirectory() && info.dev === this.dev && info.ino === this.ino;
   }
+
+  async sync(): Promise<void> {
+    if (process.platform === 'win32') return; // a directory can't be opened for sync there
+    const handle = await open(this.real, 'r');
+    try {
+      const info = await handle.stat({ bigint: true });
+      if (!info.isDirectory() || info.dev !== this.dev || info.ino !== this.ino) throw new Error(CHANGED);
+      try {
+        await handle.sync();
+      } catch (err) {
+        if (!DIRECTORY_SYNC_UNSUPPORTED.has(errno(err) ?? '')) throw err;
+      }
+    } finally {
+      await handle.close();
+    }
+  }
 }
 
 /** Hold the directory at a canonical location, if one is there. */
@@ -159,7 +188,10 @@ async function heldAt(view: MountView, rel: string, real: string): Promise<HeldD
   return new PathHeldDir(rel, real, lexicalOf(view, rel), info.dev, info.ino);
 }
 
-/** Where a mount directory is now: held, missing (unproven), not a directory, or not inside the mount. */
+/**
+ * Where a mount directory is now: held; missing — nothing there, or not a
+ * directory, either way for confirmAbsent to prove; or not inside the mount.
+ */
 async function locateDir(view: MountView, rootReal: string, rel: string): Promise<Hold | { kind: 'missing' }> {
   const lexical = lexicalOf(view, rel);
   let real: string;
@@ -179,10 +211,7 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
   }
   const held = await heldAt(view, rel, real);
   if (held) return { kind: 'held', dir: held };
-  if (rel === '') return { kind: 'unobserved', reason: ROOT_UNAVAILABLE };
-  // Not a directory: nothing can exist beneath it, if the path still names it.
-  const exists = await lstat(real).then(() => true, () => false);
-  return exists && (await realpath(lexical).catch(() => null)) === real ? { kind: 'absent' } : { kind: 'unobserved', reason: CHANGED };
+  return rel === '' ? { kind: 'unobserved', reason: ROOT_UNAVAILABLE } : { kind: 'missing' };
 }
 
 /**
@@ -196,8 +225,8 @@ export async function holdDir(view: MountView, rootReal: string, rel: string, op
   const found = await locateDir(view, rootReal, rel);
   if (found.kind !== 'missing') return found;
   if (opts.create) return createDir(view, rootReal, rel);
-  const proof = await confirmAbsent(view, rootReal, rel);
-  return proof === true ? { kind: 'absent' } : { kind: 'unobserved', reason: proof };
+  const proof = await confirmAbsent(view, rootReal, rel, 'beneath');
+  return typeof proof === 'string' ? { kind: 'unobserved', reason: proof } : { kind: 'absent', by: proof.by };
 }
 
 async function createDir(view: MountView, rootReal: string, rel: string): Promise<Hold> {
@@ -210,8 +239,7 @@ async function createDir(view: MountView, rootReal: string, rel: string): Promis
       base = found.dir;
       break;
     }
-    if (found.kind === 'absent') return { kind: 'unobserved', reason: 'a parent path is not a directory' };
-    if (found.kind === 'unobserved') return found;
+    if (found.kind !== 'missing') return found;
   }
   if (base === null) return { kind: 'unobserved', reason: ROOT_UNAVAILABLE };
   for (let i = depth; i < parts.length; i++) {
@@ -222,60 +250,70 @@ async function createDir(view: MountView, rootReal: string, rel: string): Promis
       const code = errno(err);
       if (code !== 'EEXIST') return { kind: 'unobserved', reason: `cannot create the directory ${childRel} (${code ?? String(err)})` };
     }
-    // Made, or made meanwhile by someone else: either way it must be a real
-    // directory now, never a symlink that appeared in its place.
+    // Made, or there already (made meanwhile, or not a directory): it must
+    // be a real directory now, never a symlink or file in its place.
     const held = await heldAt(view, childRel, base.at(parts[i]!));
-    if (!held) return { kind: 'unobserved', reason: CHANGED };
+    if (!held) return { kind: 'unobserved', reason: 'a parent path is not a directory' };
     base = held;
   }
   return { kind: 'held', dir: base };
 }
 
 /**
- * Prove that nothing exists at a mount-relative path: walking down from the
- * root, some directory inside the mount — still at its path afterwards —
- * lacks the next component, or a component is a file, beneath which nothing
- * can exist. Returns true, or why absence couldn't be shown. Symlinked
- * directories inside the mount are followed as parents; any other symlink
- * proves nothing.
+ * Prove that nothing exists at a mount-relative path (`entry`), or that no
+ * directory does, so nothing can exist beneath it (`beneath`). Walking down
+ * from the root through held directories: some directory, still the one its
+ * path names afterwards, lacks the next component; or a component is a
+ * non-directory, still the same one in a directory still at its path,
+ * beneath which nothing can exist. Symlinked directories inside the mount
+ * are followed as parents; any other symlink proves nothing. Returns the
+ * directory whose entries prove it, or why absence couldn't be shown.
  */
-export async function confirmAbsent(view: MountView, rootReal: string, rel: string): Promise<true | string> {
-  if ((await realpath(view.root).catch(() => null)) !== rootReal) return ROOT_UNAVAILABLE;
+export async function confirmAbsent(view: MountView, rootReal: string, rel: string, target: 'entry' | 'beneath' = 'entry'): Promise<{ by: string } | string> {
+  const root = await locateDir(view, rootReal, '');
+  if (root.kind !== 'held') return ROOT_UNAVAILABLE;
+  let cur: HeldDir = root.dir;
   const parts = rel.split('/');
-  let dirReal = rootReal;
   for (let i = 0; i < parts.length; i++) {
-    const entry = join(dirReal, parts[i]!);
+    const name = parts[i]!;
+    const last = i === parts.length - 1;
+    const childRel = parts.slice(0, i + 1).join('/');
     let info;
     try {
-      info = await lstat(entry);
+      info = await lstat(cur.at(name), { bigint: true });
     } catch (err) {
       const code = errno(err);
       if (code === 'ENOTDIR') return CHANGED;
       if (code !== 'ENOENT') return `cannot stat (${code ?? String(err)})`;
-      // The directory that lacks it must still be the one its path names.
-      return (await realpath(lexicalOf(view, parts.slice(0, i).join('/'))).catch(() => null)) === dirReal ? true : CHANGED;
+      // Absent from the directory that is still the one its path names.
+      return (await cur.stillHere()) ? { by: cur.rel } : CHANGED;
     }
-    if (i === parts.length - 1) return CHANGED; // present after all
     if (info.isDirectory()) {
-      dirReal = entry;
+      if (last) return CHANGED; // present after all
+      cur = new PathHeldDir(childRel, cur.at(name), lexicalOf(view, childRel), info.dev, info.ino);
       continue;
     }
     if (info.isSymbolicLink()) {
-      const target = await realpath(entry).catch(() => null);
-      if (target === null || !contained(rootReal, target)) return BENEATH_SYMLINK;
-      if (!(await stat(target).then((s) => s.isDirectory(), () => false))) return BENEATH_SYMLINK;
-      dirReal = target;
+      if (last && target === 'entry') return CHANGED; // present: the link itself
+      const located = await locateDir(view, rootReal, childRel);
+      if (located.kind !== 'held') return BENEATH_SYMLINK;
+      if (last) return CHANGED; // a directory there after all
+      cur = located.dir;
       continue;
     }
-    // A file (or another non-directory): nothing can exist beneath it.
-    return (await realpath(lexicalOf(view, parts.slice(0, i + 1).join('/'))).catch(() => null)) === entry ? true : CHANGED;
+    if (last && target === 'entry') return CHANGED; // present after all
+    // A non-directory: nothing can exist beneath it, while it is still this
+    // same one, in the directory still at its path.
+    const again = await lstat(cur.at(name), { bigint: true }).catch(() => null);
+    if (again === null || again.isDirectory() || again.isSymbolicLink() || again.dev !== info.dev || again.ino !== info.ino) return CHANGED;
+    return (await cur.stillHere()) ? { by: cur.rel } : CHANGED;
   }
   return CHANGED;
 }
 
 async function absence(view: MountView, rootReal: string, rel: string): Promise<Exclude<Observation, { kind: 'file' }>> {
   const proof = await confirmAbsent(view, rootReal, rel);
-  return proof === true ? { kind: 'absent' } : { kind: 'unobserved', reason: proof };
+  return typeof proof === 'string' ? { kind: 'unobserved', reason: proof } : { kind: 'absent' };
 }
 
 // ===========================================================================
@@ -598,8 +636,8 @@ async function holdChild(view: MountView, rootReal: string, parent: HeldDir, rel
     info = await lstat(real, { bigint: true });
   } catch (err) {
     if (errno(err) !== 'ENOENT') return { kind: 'unobserved', reason: `cannot stat (${errno(err) ?? String(err)})` };
-    const proof = await confirmAbsent(view, rootReal, rel);
-    return proof === true ? { kind: 'absent' } : { kind: 'unobserved', reason: proof };
+    const proof = await confirmAbsent(view, rootReal, rel, 'beneath');
+    return typeof proof === 'string' ? { kind: 'unobserved', reason: proof } : { kind: 'absent', by: proof.by };
   }
   if (!info.isDirectory()) return { kind: 'unobserved', reason: CHANGED_WALK };
   return { kind: 'held', dir: new PathHeldDir(rel, real, lexicalOf(view, rel), info.dev, info.ino) };
@@ -639,9 +677,9 @@ export async function walkScope(view: MountView, rootReal: string, scope: string
       const code = errno(err);
       if (code === 'ENOENT' || code === 'ENOTDIR') {
         // Gone since it was held: absent beneath only if that can be shown.
-        const proof = rel === '' ? ROOT_UNAVAILABLE : await confirmAbsent(view, rootReal, rel);
-        if (proof === true) walk.missing.add(rel);
-        else walk.incomplete.push({ path: rel, reason: proof, kind: 'error' });
+        const proof = rel === '' ? ROOT_UNAVAILABLE : await confirmAbsent(view, rootReal, rel, 'beneath');
+        if (typeof proof === 'string') walk.incomplete.push({ path: rel, reason: proof, kind: 'error' });
+        else walk.missing.add(rel);
         return;
       }
       walk.incomplete.push({ path: rel, reason: `cannot list (${code ?? String(err)})`, kind: 'error' });

@@ -20,7 +20,7 @@ import { basename, dirname, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DiskAgreement } from '../src/modules/workspace/disk-agreement.js';
-import { fingerprintVouches, filesystemTrustsCtime } from '../src/modules/workspace/observe.js';
+import { fingerprintVouches, filesystemTrustsCtime, observePath } from '../src/modules/workspace/observe.js';
 import { pushPaths, settleAdoptionBeforeMutation } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
@@ -188,7 +188,7 @@ async function withReadHook<T>(onRead: (calls: number) => void, fn: () => Promis
 }
 
 /** Run `fn` with node:fs/promises' `name` replaced by `make(original)`, as the code under test sees it. */
-async function withFsPromises<T>(name: 'readdir', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
+async function withFsPromises<T>(name: 'readdir' | 'lstat', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
   const fsp = createRequire(import.meta.url)('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
   const original = fsp[name]!;
   fsp[name] = make(original);
@@ -1074,6 +1074,41 @@ describe('restarts and faults', () => {
       assert.equal((m as any).agreement.get('work', 'new.txt').kind, 'content');
     });
 
+    test('confirming an unlink never removes a file that appeared since, force or not', async (t) => {
+      const env = new Env(t);
+      const m = await env.open();
+      await seedSynced(env, m, 'gone.txt', 'v1');
+      await call(m, 'delete', { path: 'work/gone.txt' });
+      await withSyncs(env, (_id, isDirectory) => isDirectory, () => call(m, 'materialize', { applyDeletions: true }));
+      const pending = (m as any).agreement.get('work', 'gone.txt');
+      assert.equal(pending.kind, 'pending');
+
+      const mount = (m as any).mounts.get('work');
+      const pushed = await pushPaths(env.store, (m as any).agreement, await (m as any).runtime(mount), ['gone.txt'], {
+        force: true,
+        beforeEffect: () => writeFileSync(env.disk('gone.txt'), 'a new file from the shell'),
+      });
+      assert.deepEqual(pushed.deleted, []);
+      assert.match(pushed.skipped[0]!.reason, /^not unlinked: a file appeared at this path since it was checked$/);
+      assert.equal(env.readDisk('gone.txt'), 'a new file from the shell');
+      assert.deepEqual((m as any).agreement.get('work', 'gone.txt'), pending, 'still owed, as before');
+    });
+
+    test('an unlink whose directory is gone is confirmed by syncing the directory that lacks it', async (t) => {
+      const env = new Env(t);
+      const m = await env.open();
+      await seedSynced(env, m, 'sub/gone.txt', 'v1');
+      await call(m, 'delete', { path: 'work/sub/gone.txt' });
+      await withSyncs(env, (_id, isDirectory) => isDirectory, () => call(m, 'materialize', { applyDeletions: true }));
+      assert.equal((m as any).agreement.get('work', 'sub/gone.txt').kind, 'pending');
+      rmSync(env.disk('sub'), { recursive: true });
+
+      const retry = await withSyncs(env, () => false, () => call(m, 'materialize', {}));
+      assert.deepEqual(retry.result.deleted, [{ mount: 'work', path: 'sub/gone.txt' }]);
+      assert.ok(retry.synced.includes(idOf(env.dir)), "the root, where the directory's removal is recorded, was synced");
+      assert.deepEqual((m as any).agreement.get('work', 'sub/gone.txt'), { kind: 'absent' });
+    });
+
     test('an unlink whose barrier failed is confirmed by the next materialize, not by a listing', async (t) => {
       const env = new Env(t);
       const m = await env.open();
@@ -1399,6 +1434,53 @@ describe('the mount boundary', () => {
     assert.equal(states.has('sub/secret.txt'), false, 'no outside name is listed');
     assert.equal(states.get('sub/a.txt'), 'unverified');
     assert.notEqual(env.store.treeGet(TREE, 'sub/a.txt'), null, 'nothing is removed on its absence');
+  });
+
+  test('absence is proven by the directory that lacks the entry, not by its name', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    mkdirSync(env.disk('sub'));
+    const mount = (m as any).mounts.get('work');
+    const runtime = await (m as any).runtime(mount);
+    env.writeDisk('replacement/a.txt', 'present in the replacement');
+    let misses = 0;
+    const seen = await withFsPromises('lstat', (lstat) => async (path, ...rest) => {
+      try {
+        return await lstat(path, ...rest);
+      } catch (err) {
+        if (String(path) === env.disk('sub/a.txt') && ++misses === 2) {
+          // The empty directory that lacked it is replaced by one that has it.
+          renameSync(env.disk('sub'), env.disk('old'));
+          renameSync(env.disk('replacement'), env.disk('sub'));
+        }
+        throw err;
+      }
+    }, () => observePath(runtime.view, runtime.rootReal, 'sub/a.txt'));
+    assert.equal(misses, 2);
+    assert.equal(seen.kind, 'unobserved', 'not absent: the directory that lacked it is gone');
+    assert.equal(env.readDisk('sub/a.txt'), 'present in the replacement');
+  });
+
+  test('a file standing where a directory was proves nothing once a directory is back', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    env.writeDisk('sub/a.txt', 'A');
+    await call(m, 'sync', {});
+    renameSync(env.disk('sub'), env.disk('saved'));
+    writeFileSync(env.disk('sub'), 'a file, for a moment');
+    let swapped = false;
+    const data = await withFsPromises('lstat', (lstat) => async (path, ...rest) => {
+      const info = await lstat(path, ...rest);
+      if (!swapped && String(path) === env.disk('sub') && info.isFile()) {
+        swapped = true;
+        rmSync(env.disk('sub'));
+        renameSync(env.disk('saved'), env.disk('sub'));
+      }
+      return info;
+    }, () => call(m, 'ls', { path: 'work/sub', recursive: true }));
+    assert.equal(swapped, true);
+    assert.equal((data.entries as Entry[]).find((e) => e.path === 'sub/a.txt')?.state, 'unverified');
+    assert.notEqual(env.store.treeGet(TREE, 'sub/a.txt'), null, 'nothing removed while it was present');
   });
 
   test('a path beneath a dangling symlink is not proven absent', async (t) => {
