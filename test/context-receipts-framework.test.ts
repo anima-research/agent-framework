@@ -181,6 +181,14 @@ describe('receipt clocks through the framework', () => {
   });
 
   afterEach(async () => {
+    // Let the fixture's last traffic land before stopping: an event that
+    // arrives after stop() closes the queue rejects with "Queue is closed".
+    const internals = framework as unknown as { queue: { isEmpty: boolean } };
+    await waitFor(
+      () => internals.queue.isEmpty && framework.getAgent('scout')!.state.status === 'idle',
+      'quiescent before stop',
+    ).catch(() => {});
+    await new Promise((r) => setTimeout(r, 100));
     await framework.stop();
     rmSync(tempDir, { recursive: true, force: true });
   });
