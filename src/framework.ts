@@ -1502,7 +1502,11 @@ export class AgentFramework {
     // Initialize module registry with callbacks
     this.moduleRegistry = new ModuleRegistry(store, this.queue, {
       getAgents: () => Array.from(this.agents.values()),
-      addMessage: (p, c, m) => this.addMessage(p, c, m),
+      addMessage: (p, c, m, o) => this.addMessage(p, c, m, o ? {
+        ...(o.forAgent !== undefined ? { forAgent: o.forAgent } : {}),
+        ...(o.placement ? { placement: o.placement } : {}),
+        ...(o.durable ? { durable: true } : {}),
+      } : undefined),
       editMessage: (id, c) => this.editMessage(id, c),
       removeMessage: (id) => this.removeMessage(id),
       getMessage: (id) => this.getMessage(id),
@@ -1843,7 +1847,8 @@ export class AgentFramework {
       if (!hostMode?.quiesced && restoredWrites > 0) {
         console.error(
           `[host-mode] ${restoredWrites} deferred context write(s) found at a serving boot ` +
-          `(an earlier resume did not finish its flush) — landing them now`,
+          `(persisted before the restart: a resume that didn't finish its flush, or a durable ` +
+          `module delivery still waiting) — landing them now`,
         );
         await framework.flushDeferredWrites('boot-recovery');
       }
@@ -3541,7 +3546,15 @@ export class AgentFramework {
    * Deferrals outside a quiesce window (turn-alive, mid-tool-cycle) are
    * still memory-only: they flush within the turn, as before.
    */
-  private persistDeferredWrites(): void {
+  /**
+   * Returns true when the durable queue is on disk as it now stands (written,
+   * or cleared because nothing is left), false when it is kept in memory
+   * only: not in persisted mode, over its size cap, or the write failed.
+   * `opts.force` enters persisted mode outside quiesce, for a module message
+   * that asked to be durable (ModuleMessageOptions.durable); the mode ends,
+   * as it does after quiesce, once the queue drains.
+   */
+  private persistDeferredWrites(opts?: { force?: boolean }): boolean {
     try {
       // The durable queue is everything not yet acked: writes still pending
       // AND writes handed to a context manager whose sync has not happened.
@@ -3549,7 +3562,7 @@ export class AgentFramework {
       // split: a re-deferred entry must not jump the queue.
       const durable = [...this.unackedDeferredWrites, ...this.deferredMessages].sort(bySeq);
       const scanFrom = Object.fromEntries(this.deferredScanFrom);
-      if ((this.quiesced || this.deferredWritesPersisted) && durable.length > 0) {
+      if ((this.quiesced || this.deferredWritesPersisted || opts?.force) && durable.length > 0) {
         const payload = JSON.stringify(durable);
         if (payload.length > DEFERRED_WRITES_PERSIST_CAP_BYTES) {
           if (!this.deferredWritesCapWarned) {
@@ -3560,7 +3573,7 @@ export class AgentFramework {
               `a crash before resume loses them`,
             );
           }
-          return;
+          return false;
         }
         if (this.deferredWritesPath) {
           this.writeRecoveryFile(this.deferredWritesPath, { version: 2, pending: durable, scanFrom });
@@ -3569,6 +3582,7 @@ export class AgentFramework {
           this.store.setStateJson(DEFERRED_WRITES_ID, { version: 2, pending: durable, scanFrom });
         }
         this.deferredWritesPersisted = true;
+        return true;
       } else if (this.deferredWritesPersisted) {
         if (this.deferredWritesPath) {
           this.writeRecoveryFile(this.deferredWritesPath, { version: 1, pending: [] });
@@ -3576,9 +3590,12 @@ export class AgentFramework {
           this.store.setStateJson(DEFERRED_WRITES_ID, []);
         }
         this.deferredWritesPersisted = false;
+        return true;
       }
+      return false;
     } catch (err) {
       console.error('[host-mode] failed to persist deferred context writes:', err);
+      return false;
     }
   }
 
@@ -13124,8 +13141,12 @@ export class AgentFramework {
        * minting a second, independently replayable one.
        */
       deferredWriteId?: string;
-      /** Out-param: where the message landed (RFC-006 needs to find it again). */
-      placement?: { agent?: string; messageId?: MessageId; deferredId?: string };
+      /** Out-param: where the message landed (RFC-006 needs to find it
+       *  again; a module's placement receipt). */
+      placement?: { agent?: string; messageId?: MessageId; deferredId?: string; durable?: boolean };
+      /** If deferred, persist the recovery queue even outside quiesce
+       *  (ModuleMessageOptions.durable). Deferral itself is unchanged. */
+      durable?: boolean;
       /**
        * RFC-006 assembly: the named agent's turn is alive but its compile has
        * not run yet (the same window the turn-start deferred flush writes
@@ -13197,8 +13218,14 @@ export class AgentFramework {
         this.unackedDeferredWrites = this.unackedDeferredWrites.filter((m) => m.id !== id);
       }
       this.deferredMessages.push({ id, seq: seq ?? ++this.deferredSeq, participant, content, metadata, forAgent: opts?.forAgent });
-      if (this.quiesced || this.deferredWritesPersisted) this.persistDeferredWrites();
-      if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.deferredId = id; }
+      const persisted = this.quiesced || this.deferredWritesPersisted || opts?.durable
+        ? this.persistDeferredWrites({ force: opts?.durable === true })
+        : false;
+      if (opts?.placement) {
+        opts.placement.agent = agent.name;
+        opts.placement.deferredId = id;
+        opts.placement.durable = persisted;
+      }
       return '' as MessageId; // Deferred — flushed at the target's next boundary
     }
 
@@ -13207,7 +13234,7 @@ export class AgentFramework {
       content,
       opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
     );
-    if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; }
+    if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; opts.placement.durable = true; }
     return stored;
   }
 

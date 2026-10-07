@@ -146,6 +146,43 @@ export interface AgentSettingsExtension {
 /**
  * Context provided to modules for interacting with the framework.
  */
+/** Delivery options for ModuleContext.addMessage. */
+export interface ModuleMessageOptions {
+  /**
+   * Deliver into this registered agent's window instead of the primary's,
+   * with the deferral guard evaluated against that agent's own turn state.
+   * An unknown name is logged and the message dropped (placement stays empty).
+   */
+  forAgent?: string;
+  /** Out-param: filled with where the message went. */
+  placement?: MessagePlacement;
+  /**
+   * If the message has to be deferred, keep it in the persisted
+   * crash-recovery queue (the one quiesce uses) rather than in memory only,
+   * so a restart before its flush replays it once (deduplicated by its
+   * deferred-write id). Deferral itself is unchanged: the same guard decides
+   * when it is held and when it lands.
+   */
+  durable?: boolean;
+}
+
+/** Where a module's message went (ModuleMessageOptions.placement). */
+export interface MessagePlacement {
+  /** The agent whose window it went to; unset when it was dropped. */
+  agent?: string;
+  /** Set when it was stored at once. */
+  messageId?: MessageId;
+  /** Set when it was deferred: the deferred write's id, also stamped as
+   *  `metadata.deferredWriteId` on the message when it lands. */
+  deferredId?: string;
+  /**
+   * True when it was stored, or deferred with its queue persisted. False
+   * when it is deferred in memory only: not asked to be durable, or the
+   * persist failed or exceeded its size cap.
+   */
+  durable?: boolean;
+}
+
 export interface ModuleContext {
   /**
    * Get persistent state for this module.
@@ -219,12 +256,18 @@ export interface ModuleContext {
   getModule<T extends Module>(name: string): T | null;
 
   /**
-   * Add a message to the conversation.
+   * Add a message to the conversation: the primary agent's, or with
+   * `options.forAgent`, that agent's. The framework's turn guard applies
+   * either way: while the target is mid-turn, mid tool cycle or quiesced, the
+   * message is deferred to its next boundary and the returned id is ''.
+   * `options.placement` reports where it went, and `options.durable` keeps a
+   * deferral in the crash-recovery queue (see ModuleMessageOptions).
    */
   addMessage(
     participant: string,
     content: ContentBlock[],
-    metadata?: MessageMetadata & { external?: ExternalIdRef }
+    metadata?: MessageMetadata & { external?: ExternalIdRef },
+    options?: ModuleMessageOptions,
   ): MessageId;
 
   /**

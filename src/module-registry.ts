@@ -11,6 +11,7 @@ import type {
 import type {
   Module,
   ModuleContext,
+  ModuleMessageOptions,
   ProcessState,
   ProcessQueue,
   ToolDefinition,
@@ -66,7 +67,7 @@ export class ModuleRegistry {
   private store: JsStore;
   private queue: ProcessQueue;
   private getAgents: () => Agent[];
-  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, options?: ModuleMessageOptions) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
   private getMessageFn: (id: MessageId) => StoredMessage | null;
@@ -90,7 +91,7 @@ export class ModuleRegistry {
     queue: ProcessQueue,
     options: {
       getAgents: () => Agent[];
-      addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+      addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, options?: ModuleMessageOptions) => MessageId;
       editMessage: (id: MessageId, content: ContentBlock[]) => void;
       removeMessage: (id: MessageId) => void;
       getMessage: (id: MessageId) => StoredMessage | null;
@@ -445,7 +446,7 @@ class ModuleContextImpl implements ModuleContext {
   private registry: ModuleRegistry;
   readonly isRestart: boolean;
   private getAgentsFn: () => Agent[];
-  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
+  private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, options?: ModuleMessageOptions) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
   private removeMessageFn: (id: MessageId) => void;
   private getMessageFn: (id: MessageId) => StoredMessage | null;
@@ -465,7 +466,7 @@ class ModuleContextImpl implements ModuleContext {
     registry: ModuleRegistry,
     isRestart: boolean,
     getAgents: () => Agent[],
-    addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId,
+    addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata, options?: ModuleMessageOptions) => MessageId,
     editMessage: (id: MessageId, content: ContentBlock[]) => void,
     removeMessage: (id: MessageId) => void,
     getMessage: (id: MessageId) => StoredMessage | null,
@@ -596,9 +597,10 @@ class ModuleContextImpl implements ModuleContext {
   addMessage(
     participant: string,
     content: ContentBlock[],
-    metadata?: MessageMetadata & { external?: ExternalIdRef }
+    metadata?: MessageMetadata & { external?: ExternalIdRef },
+    options?: ModuleMessageOptions,
   ): MessageId {
-    const id = this.addMessageFn(participant, content, metadata);
+    const id = this.addMessageFn(participant, content, metadata, options);
 
     // Track external ID if provided
     if (metadata?.external) {
