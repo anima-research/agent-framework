@@ -83,12 +83,29 @@ export interface DraftAttempt {
   outcome?: DraftAttemptOutcome;
 }
 
+/**
+ * A draft held with words copied from another draft that may already have
+ * been posted (`{{unsent}}` re-bounced while that draft was unconfirmed or in
+ * flight). The new draft keeps the whole authored text and carries the same
+ * duplication risk: it reads `unconfirmed` until a confirmed delivery.
+ */
+export interface InheritedRisk {
+  /** The draft whose words were copied in. */
+  draftId: string;
+  /** Its uncertain attempt, when there was one (absent: it was in flight). */
+  destination?: PublishDestination;
+  at?: number;
+  reason: string;
+}
+
 export interface Draft {
   id: string;
   agent: string;
   /** The held words, byte for byte. */
   text: string;
   reason: DraftReason;
+  /** Words copied in from a draft that may already have been posted. */
+  inheritedRisk?: InheritedRisk;
   /** Short context for the resident: the bounce reason, or the competing conversations. */
   note?: string;
   heldAt: number;
@@ -113,7 +130,7 @@ export type DraftState = 'held' | 'unconfirmed' | 'delivered' | 'dismissed';
 export function draftState(draft: Draft): DraftState {
   if (draft.attempts.some((a) => a.outcome?.status === 'delivered')) return 'delivered';
   if (draft.dismissedAt !== undefined) return 'dismissed';
-  return uncertainAttempt(draft) ? 'unconfirmed' : 'held';
+  return uncertainAttempt(draft) || draft.inheritedRisk ? 'unconfirmed' : 'held';
 }
 
 /** The most recent attempt that may have been posted (unknown or unrecorded
@@ -189,9 +206,9 @@ export class ProseDraftStore {
    * leaves the journal unreconciled: rebuild from it before rethrowing, so
    * the projection never disagrees with what the journal holds.
    */
-  private write(entry: DraftEntry, durable: boolean): void {
+  private write(entry: DraftEntry, durable: boolean, afterCommittedState = false): void {
     try {
-      this.journal.append(entry, { durable });
+      this.journal.append(entry, { durable, afterCommittedState });
     } catch (err) {
       if (this.journal.needsReconcile) this.reload();
       throw err;
@@ -225,7 +242,7 @@ export class ProseDraftStore {
    */
   hold(
     agent: string,
-    segments: Array<{ text: string; source: DraftSource; note?: string }>,
+    segments: Array<{ text: string; source: DraftSource; note?: string; inheritedRisk?: InheritedRisk }>,
     reason: DraftReason,
     note?: string,
   ): { held: Draft[]; notHeld?: { count: number; error: string } } {
@@ -239,6 +256,7 @@ export class ProseDraftStore {
         text: segment.text,
         reason,
         ...(segmentNote ? { note: segmentNote } : {}),
+        ...(segment.inheritedRisk ? { inheritedRisk: segment.inheritedRisk } : {}),
         heldAt: Date.now(),
         source: segment.source,
       };
@@ -269,9 +287,16 @@ export class ProseDraftStore {
     return this.open(agent).filter((d) => d.noticedAt === undefined).reverse();
   }
 
+  /**
+   * Record that a notice naming these drafts is in the resident's history.
+   * The notice is conversation state, buffered until the store syncs, while
+   * this record reaches the OS at once: so the store is synced FIRST
+   * (afterCommittedState), and a notice that never became durable can't
+   * leave a record that suppresses the crash catch-up.
+   */
   markNoticed(agent: string, ids: string[]): void {
     if (ids.length === 0) return;
-    this.write({ op: 'noticed', agent, ids, at: Date.now() }, true);
+    this.write({ op: 'noticed', agent, ids, at: Date.now() }, true, true);
   }
 
   dismiss(agent: string, id: string): void {

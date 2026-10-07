@@ -82,7 +82,7 @@ import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
-import { ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftReason, type DraftSource } from './prose-drafts.js';
+import { ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftReason, type DraftSource, type InheritedRisk } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import { safeSlice } from './safe-slice.js';
@@ -8840,12 +8840,14 @@ export class AgentFramework {
    */
   private holdProseDrafts(
     agent: Agent,
-    texts: Array<string | { text: string; note?: string }>,
+    texts: Array<string | { text: string; note?: string; inheritedRisk?: InheritedRisk }>,
     reason: DraftReason,
     opts: { round?: number; note?: string; notice: 'now' | 'later' },
   ): Draft[] {
     const segments = texts
-      .map((t) => (typeof t === 'string' ? { text: t, note: opts.note } : { text: t.text, note: t.note ?? opts.note }))
+      .map((t) => (typeof t === 'string'
+        ? { text: t, note: opts.note }
+        : { text: t.text, note: t.note ?? opts.note, inheritedRisk: t.inheritedRisk }))
       .filter((t) => t.text.trim().length > 0);
     if (segments.length === 0) return [];
     const turn = this.logicalTurnToolCalls.get(agent)?.turnToken ?? 0;
@@ -8857,9 +8859,10 @@ export class AgentFramework {
     }
     const { held, notHeld } = this.proseDrafts.hold(
       agent.name,
-      segments.map(({ text, note }, segment) => ({
+      segments.map(({ text, note, inheritedRisk }, segment) => ({
         text,
         ...(note ? { note } : {}),
+        ...(inheritedRisk ? { inheritedRisk } : {}),
         source: { branch, turn, round: opts.round ?? 0, segment } satisfies DraftSource,
       })),
       reason,
@@ -8951,14 +8954,32 @@ export class AgentFramework {
   private draftStateText(draft: Draft): string {
     const state = draftState(draft);
     if (state === 'unconfirmed') {
-      const risky = uncertainAttempt(draft)!;
-      return `UNCONFIRMED — an attempt to ${AgentFramework.destinationText(risky.destination)} at ` +
-        `${this.draftTime(risky.at)} may have been posted`;
+      const risky = uncertainAttempt(draft);
+      if (risky) {
+        return `UNCONFIRMED — an attempt to ${AgentFramework.destinationText(risky.destination)} at ` +
+          `${this.draftTime(risky.at)} may have been posted`;
+      }
+      return `UNCONFIRMED — it includes the words of ${draft.inheritedRisk!.draftId}, which may already have been posted`;
     }
     if (state === 'held') {
       return draft.attempts.length > 0 ? 'held (every attempt failed: nothing was posted)' : 'held (not sent)';
     }
     return state;
+  }
+
+  /** Why an unconfirmed draft may already have been posted, in full. */
+  private riskText(draft: Draft): string {
+    const risky = uncertainAttempt(draft);
+    if (risky) {
+      return `${draft.id}'s attempt to ${AgentFramework.destinationText(risky.destination)} at ` +
+        `${this.draftTime(risky.at)} may already have been posted: ${risky.outcome?.reason ?? 'its outcome was never recorded'}`;
+    }
+    const inherited = draft.inheritedRisk!;
+    const where = inherited.destination
+      ? `its attempt to ${AgentFramework.destinationText(inherited.destination)}` +
+        (inherited.at !== undefined ? ` at ${this.draftTime(inherited.at)}` : '')
+      : 'it';
+    return `${draft.id} includes the words of ${inherited.draftId}, and ${where} may already have been posted: ${inherited.reason}`;
   }
 
   /** A delivered draft's historical receipt. */
@@ -8999,19 +9020,40 @@ export class AgentFramework {
     }
   }
 
-  /** Turn end: every draft held this turn has now been named (receipt or notice). */
+  /**
+   * Logical turn end, after the turn's deferred notices are flushed: record
+   * as noticed exactly the drafts a stored message names (the receipt, a
+   * held-draft notice, a bounce notice). One whose notice never reached the
+   * history stays unnoticed, for the next turn's catch-up.
+   */
   private settleTurnDrafts(agent: Agent): void {
     const held = this.turnDrafts.get(agent.name);
     this.turnDrafts.delete(agent.name);
     this.turnDraftFailures.delete(agent.name);
     this.turnProsePrivate.delete(agent.name);
     if (!held?.length) return;
+    const named = this.draftsNamedInHistory(agent, held.map((d) => d.id));
+    if (named.length === 0) return;
     try {
-      this.proseDrafts.markNoticed(agent.name, held.map((d) => d.id));
+      this.proseDrafts.markNoticed(agent.name, named);
     } catch (err) {
       // Unmarked drafts are named again by the next turn's catch-up.
       console.error('[drafts] could not record notice:', err);
     }
+  }
+
+  /** Which of these drafts a stored notice or receipt names (scanning the
+   *  recent history, where this turn's notices are). */
+  private draftsNamedInHistory(agent: Agent, ids: string[]): string[] {
+    const wanted = new Set(ids);
+    const named = new Set<string>();
+    const messages = agent.getContextManager().getAllMessages();
+    for (let i = messages.length - 1, scanned = 0; i >= 0 && scanned < 500 && named.size < wanted.size; i--, scanned++) {
+      const draftIds = (messages[i]!.metadata as { draftIds?: unknown } | undefined)?.draftIds;
+      if (!Array.isArray(draftIds)) continue;
+      for (const id of draftIds) if (typeof id === 'string' && wanted.has(id)) named.add(id);
+    }
+    return ids.filter((id) => named.has(id));
   }
 
   /** Page size for drafts(action: "list"). */
@@ -9093,6 +9135,7 @@ export class AgentFramework {
         const lines = [
           `${d.id} — ${draftState(d)}; held ${this.draftTime(d.heldAt)} (${AgentFramework.DRAFT_REASON_TEXT[d.reason]})` +
             (d.note ? `; ${d.note}` : ''),
+          ...(d.inheritedRisk && draftState(d) === 'unconfirmed' && !uncertainAttempt(d) ? [`  ${this.riskText(d)}`] : []),
           ...d.attempts.map((a) => {
             const o = a.outcome;
             const status = !o
@@ -9246,14 +9289,13 @@ export class AgentFramework {
         }
         stopped = true;
         const after = this.proseDrafts.get(agentName, d.id);
-        const stillUncertain = after ? uncertainAttempt(after) : undefined;
+        const stillAtRisk = after !== undefined && draftState(after) === 'unconfirmed';
         lines.push(outcome.status === 'unknown'
           ? `${d.id}: delivery to ${where} NOT confirmed — it may or may not have been posted: ${outcome.reason ?? 'no valid receipt'}. ` +
             `Check the channel before sending it again (that needs confirmDuplicate: true)${unrecorded}.`
           : `${d.id}: not sent to ${where} — ${outcome.reason ?? 'refused'}. Nothing was posted by this attempt${unrecorded}.` +
-            (stillUncertain
-              ? ` An earlier attempt (to ${AgentFramework.destinationText(stillUncertain.destination)} at ` +
-                `${this.draftTime(stillUncertain.at)}) may still have been posted, so the draft stays unconfirmed.`
+            (stillAtRisk
+              ? ` The draft stays unconfirmed: ${this.riskText(after!)}.`
               : ' The draft stays held.'));
       }
     } finally {
@@ -9269,10 +9311,7 @@ export class AgentFramework {
     const state = draftState(d);
     if (state === 'dismissed') return `${d.id} was dismissed, so it can't be resent.`;
     if (state === 'unconfirmed' && !confirmDuplicate) {
-      const risky = uncertainAttempt(d)!;
-      return `${d.id}'s attempt to ${AgentFramework.destinationText(risky.destination)} at ${this.draftTime(risky.at)} ` +
-        `may already have been posted: ${risky.outcome?.reason ?? 'its outcome was never recorded'}. ` +
-        'Check that channel; to send it again anyway, resend with confirmDuplicate: true.';
+      return `${this.riskText(d)}. Check that channel; to send it again anyway, resend with confirmDuplicate: true.`;
     }
     return undefined;
   }
@@ -9354,7 +9393,11 @@ export class AgentFramework {
       const mid = agent.getContextManager().addMessage(
         'user',
         [{ type: 'text', text }],
-        { system: true, kind: 'delivery-receipt' } as MessageMetadata,
+        {
+          system: true,
+          kind: 'delivery-receipt',
+          ...(drafts.length > 0 ? { draftIds: drafts.map((d) => d.id) } : {}),
+        } as MessageMetadata,
       );
       this.emitTrace({ type: 'message:added', messageId: mid, source: 'delivery-receipt' });
     } catch (err) {
@@ -9510,11 +9553,8 @@ export class AgentFramework {
       return { draft, refused: true };
     }
     if (draftState(draft) !== 'unconfirmed') return { draft };
-    const risky = uncertainAttempt(draft)!;
     const text =
-      `[prose-routing] {{unsent}} is draft ${draft.id}, and an attempt to deliver it (to ` +
-      `${AgentFramework.destinationText(risky.destination)} at ${this.draftTime(risky.at)}) may already have been ` +
-      `posted: ${risky.outcome?.reason ?? 'its outcome was never recorded'}. Nothing was sent. Check that channel; ` +
+      `[prose-routing] {{unsent}} is draft ${draft.id}: ${this.riskText(draft)}. Nothing was sent. Check that channel; ` +
       `to send it again anyway use drafts(action: "resend", draftIds: ["${draft.id}"], destination: "#channel", confirmDuplicate: true).`;
     try {
       this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'prose-bounce' }, { forAgent: agent.name });
@@ -9756,19 +9796,32 @@ export class AgentFramework {
     const previousAtRisk = previous !== undefined
       && (draftState(previous) === 'unconfirmed' || this.draftsInFlight.has(`${name}\u0000${previous.id}`));
     let draft: Draft | undefined;
-    let keptRisky: Draft | undefined;
+    let inherited: InheritedRisk | undefined;
     if (previous && text.trim() === '{{unsent}}') {
       draft = previous;
     } else {
       const usesUnsent = text.includes('{{unsent}}');
-      if (usesUnsent && previousAtRisk) keptRisky = previous;
-      const expanded = !usesUnsent
-        ? text
-        : previousAtRisk
-          ? text.replaceAll('{{unsent}}', '').trim()
-          : text.replaceAll('{{unsent}}', previous?.text ?? '');
+      const expanded = usesUnsent ? text.replaceAll('{{unsent}}', previous?.text ?? '') : text;
+      if (usesUnsent && previous && previousAtRisk) {
+        // The whole authored attempt is kept, words of the risky draft
+        // included, and it carries that draft's duplication risk: it can be
+        // resent only with confirmDuplicate, like the draft it copies.
+        const risky = uncertainAttempt(previous);
+        inherited = {
+          draftId: previous.id,
+          ...(risky ? { destination: risky.destination, at: risky.at } : {}),
+          reason: risky
+            ? risky.outcome?.reason ?? 'its outcome was never recorded'
+            : 'it was being sent when these words were held',
+        };
+      }
       // The bounce notice below names the draft, so no separate held notice.
-      draft = this.holdProseDrafts(agent, [expanded], 'bounced', { round: hold.round, note: reason, notice: 'later' })[0];
+      draft = this.holdProseDrafts(
+        agent,
+        [{ text: expanded, ...(inherited ? { inheritedRisk: inherited } : {}) }],
+        'bounced',
+        { round: hold.round, note: reason, notice: 'later' },
+      )[0];
     }
     const streak = (this.proseBounceStreaks.get(name) ?? 0) + 1;
     this.proseBounceStreaks.set(name, streak);
@@ -9779,9 +9832,9 @@ export class AgentFramework {
         `drafts(action: "resend", draftIds: ["${draft.id}"], destination: "#channel"). ` +
         `"${prefix}skip_reply {{unsent}}" sets it aside.`
       : 'It could not be held as a draft; the words remain in your history.';
-    const risky = keptRisky
-      ? ` {{unsent}} referred to draft ${keptRisky.id}, which may already have been posted, so it was not copied: ` +
-        `it is still held as ${keptRisky.id}; resend it with the drafts tool and confirmDuplicate if you mean to.`
+    const risky = inherited && draft
+      ? ` It includes the words of draft ${inherited.draftId}, which may already have been posted, so ${draft.id} ` +
+        'can be resent only with the drafts tool and confirmDuplicate: true, after checking that channel.'
       : '';
     const notice =
       `[prose-routing] Your text (${text.length} chars) was not delivered — ${reason}.${cand} ${kept}${risky}` +
@@ -11363,10 +11416,6 @@ export class AgentFramework {
             if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
               this.appendProseDeliveryReceipt(agent);
             }
-            // The turn's drafts have now been named (receipt, held notice or
-            // bounce notice); a crash before this leaves them for the next
-            // turn's catch-up.
-            this.settleTurnDrafts(agent);
 
             // Explicit-prose `!` continuation: a prose segment this turn asked
             // to keep going (`>>#x !` / `>>private !`) — start another turn
@@ -11536,10 +11585,6 @@ export class AgentFramework {
                 if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
                   await turnSpeechChain;
                   this.appendProseDeliveryReceipt(agent);
-                }
-                if (cancelKind === 'turn_ended') {
-                  await turnSpeechChain;
-                  this.settleTurnDrafts(agent);
                 }
                 return;
               }
@@ -11851,6 +11896,16 @@ export class AgentFramework {
           });
         }
         this.ackDeferredWrites();
+      }
+
+      // The logical turn has ended and its notices are written: record the
+      // drafts they name as noticed (the store is synced first).
+      if (frameReachedTerminal && ownsPhysicalStream) {
+        try {
+          this.settleTurnDrafts(agent);
+        } catch (err) {
+          console.error('[drafts] turn-end settlement failed:', err);
+        }
       }
     }
   }

@@ -110,6 +110,41 @@ describe('ProseDraftStore', () => {
     }
   });
 
+  it('records a notice only after the history holding it is synced (afterCommittedState)', () => {
+    const { dir, store, drafts } = open();
+    try {
+      const { held } = drafts.hold('a', [{ text: 'x', source }], 'explicit-send');
+      const calls: string[] = [];
+      const real = { sync: store.sync.bind(store), appendJson: store.appendJson.bind(store) };
+      (store as unknown as { sync: () => void }).sync = () => { calls.push('sync'); real.sync(); };
+      (store as unknown as { appendJson: (t: string, p: unknown) => unknown }).appendJson = (t, p) => { calls.push(`append:${t}`); return real.appendJson(t, p); };
+      drafts.markNoticed('a', [held[0]!.id]);
+      assert.deepEqual(calls, ['sync', `append:${PROSE_DRAFT_RECORD_TYPE}`, 'sync']);
+      assert.ok(drafts.get('a', held[0]!.id)!.noticedAt);
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an inherited duplication risk keeps a draft unconfirmed until a confirmed delivery', () => {
+    const { dir, store, drafts } = open();
+    try {
+      const risky = { draftId: 'd-zzzzz', destination: dest(), at: 1, reason: 'no valid receipt' };
+      const [copy] = drafts.hold('a', [{ text: 'risky words and more', source, inheritedRisk: risky }], 'bounced').held;
+      assert.equal(draftState(copy!), 'unconfirmed');
+      const failed = drafts.beginAttempt('a', copy!.id, dest(), 'resend', true);
+      drafts.recordOutcome('a', copy!.id, failed, { status: 'failed', at: 2, destination: dest() });
+      assert.equal(draftState(drafts.get('a', copy!.id)!), 'unconfirmed', 'a failed attempt does not clear it');
+      const ok = drafts.beginAttempt('a', copy!.id, dest(), 'resend', true);
+      drafts.recordOutcome('a', copy!.id, ok, { status: 'delivered', at: 3, destination: dest() });
+      assert.equal(draftState(drafts.get('a', copy!.id)!), 'delivered');
+    } finally {
+      store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('{{unsent}} is the latest bounce while it is open, latest-wins', () => {
     const { dir, store, drafts } = open();
     try {
@@ -458,7 +493,7 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([resend('r1')], 'tool_use'), createMockResponse([])]);
       h.command({ op: 'publish-mode', mode: 'not-delivered' });
       await h.turn([createMockResponse([resend('r2', true)], 'tool_use'), createMockResponse([])]);
-      assert.match(h.toolResults()[0]!, /Nothing was posted by this attempt\. An earlier attempt \(to .*\) may still have been posted, so the draft stays unconfirmed/);
+      assert.match(h.toolResults()[0]!, /Nothing was posted by this attempt\. The draft stays unconfirmed: d-[a-z2-9]{5}'s attempt to .* may already have been posted: .*delivery uncertain/);
       assert.equal(draftState(h.store().get('scout', draft!.id)!), 'unconfirmed');
       h.command({ op: 'publish-mode', mode: 'delivered' });
       const before = h.publishes().length;
@@ -564,7 +599,7 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
-  it('explicit mode: a bounce that may already have been posted is never copied into a fresh draft', async () => {
+  it('explicit mode: re-bouncing {{unsent}} of a possibly-posted draft keeps the whole text and its risk', async () => {
     const h = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
     try {
       await h.turn([createMockResponse([text('risky words')])]);
@@ -573,17 +608,22 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
       assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed');
       h.command({ op: 'publish-mode', mode: 'delivered' });
-      // The destination does not resolve, so the envelope bounces: its other
-      // words are held, the possibly-posted text is not copied with them.
+      // The destination does not resolve, so the envelope bounces: the whole
+      // authored attempt is held, and it carries the copied draft's risk.
       await h.turn([createMockResponse([text('>>#nowhere {{unsent}} and a postscript')])]);
       const fresh = h.drafts().find((d) => d.id !== risky!.id)!;
-      assert.equal(fresh.text, 'and a postscript');
-      assert.ok(h.texts().some((t) => t.includes(`{{unsent}} referred to draft ${risky!.id}, which may already have been posted, so it was not copied`)));
-      // And {{unsent}} itself now means the fresh draft, never the risky one.
+      assert.equal(fresh.text, 'risky words and a postscript', 'nothing substituted or truncated');
+      assert.equal(fresh.inheritedRisk?.draftId, risky!.id);
+      assert.equal(draftState(fresh), 'unconfirmed');
+      assert.ok(h.texts().some((t) => t.includes(`It includes the words of draft ${risky!.id}, which may already have been posted, so ${fresh.id} can be resent only with the drafts tool and confirmDuplicate: true`)));
+      // {{unsent}} now means the fresh draft, and it is refused unconfirmed.
       const before = h.publishes().length;
       await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
-      assert.deepEqual(h.publishes().slice(before).map((p) => p.text), ['and a postscript']);
-      assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed', 'still needs its own confirmation');
+      assert.equal(h.publishes().length, before, 'neither draft goes out without confirmation');
+      assert.ok(h.texts().some((t) => t.startsWith(`[prose-routing] {{unsent}} is draft ${fresh.id}: ${fresh.id} includes the words of ${risky!.id}`)));
+      await h.turn([createMockResponse([drafts('r1', { action: 'resend', draftIds: [fresh.id], destination: ROOM, confirmDuplicate: true })], 'tool_use'), createMockResponse([])]);
+      assert.deepEqual(h.publishes().slice(before).map((p) => p.text), ['risky words and a postscript']);
+      assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed', 'the original still needs its own confirmation');
     } finally {
       await h.close();
     }
@@ -663,6 +703,37 @@ describe('held prose drafts, end to end', () => {
 // Concurrent resends through the actual drafts handler, with publish
 // completions under the test's control.
 // ---------------------------------------------------------------------------
+
+describe('draft notices and turn-end settlement', () => {
+  it('marks as noticed only the drafts a stored message names', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-settle-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+    });
+    try {
+      const internals = framework as unknown as {
+        proseDrafts: ProseDraftStore;
+        turnDrafts: Map<string, unknown[]>;
+        settleTurnDrafts(agent: unknown): void;
+      };
+      const agent = framework.getAgent('scout')!;
+      const [named, lost] = internals.proseDrafts.hold('scout', [{ text: 'named', source }, { text: 'lost', source }], 'explicit-send').held;
+      // Only the first draft's notice reached the history.
+      agent.getContextManager().addMessage('user', [{ type: 'text', text: '[drafts] …' }], { system: true, kind: 'prose-drafts', draftIds: [named!.id] } as never);
+      internals.turnDrafts.set('scout', [named, lost]);
+      internals.settleTurnDrafts(agent);
+      assert.ok(internals.proseDrafts.get('scout', named!.id)!.noticedAt);
+      assert.equal(internals.proseDrafts.get('scout', lost!.id)!.noticedAt, undefined, 'left for the catch-up');
+      assert.deepEqual(internals.proseDrafts.unnoticed('scout').map((d) => d.id), [lost!.id]);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('drafts resend ownership', () => {
   const setup = async () => {
