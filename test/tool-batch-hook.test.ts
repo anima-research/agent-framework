@@ -134,6 +134,42 @@ describe('Module.onToolBatchComplete', () => {
     await framework.stop();
   });
 
+  it('a hook that throws before returning its promise is traced and skipped, and later hooks still run', async () => {
+    // Registered before the robot module, so its synchronous throw would have
+    // escaped while the robot's hook was still to be called.
+    const thrower: Module = {
+      name: 'thrower',
+      async start() {},
+      async stop() {},
+      getTools: () => [],
+      handleToolCall: async () => ({ success: true }),
+      onProcess: async () => ({}),
+      onToolBatchComplete(): Promise<void> {
+        throw new Error('thrown before any promise');
+      },
+    };
+    scriptTwoCallRound();
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You act.' }],
+      modules: [thrower, tools],
+    });
+    const traces: TraceEvent[] = [];
+    framework.onTrace((e) => traces.push(e));
+
+    trigger(framework);
+    await framework.runUntilIdle();
+
+    const failed = traces.find((e) => e.type === 'module:batch_hook_failed') as
+      | { module: string; error: string } | undefined;
+    assert.equal(failed?.module, 'thrower');
+    assert.match(failed!.error, /thrown before any promise/);
+    assert.equal(tools.hookCalls.length, 1, "the other module's hook still ran");
+    assert.equal(membrane.lastStream!.receivedToolResults.length, 1, 'the round went on with its results');
+    await framework.stop();
+  });
+
   it('an agent cancelled during the hook has the result dropped, not provided', async () => {
     scriptTwoCallRound();
     const framework = await createFramework();

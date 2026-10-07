@@ -79,7 +79,8 @@ export interface WorkspaceConfig {
    * may hold the agent's next inference, in ms (default: 20000). A scan that
    * takes longer finishes in the background; the miss is recorded on the
    * mount's status and pushed as a `workspace:agent-action-scan-incomplete`
-   * event.
+   * event. So is a scan that finished without observing everything, with the
+   * regions it couldn't (`incomplete`).
    */
   agentActionScanDeadlineMs?: number;
 }
@@ -111,9 +112,17 @@ export interface MountState {
   /**
    * The last on-agent-action scan, as of `at`: `complete` when it has
    * finished at all, `withinDeadline` when it finished before the deadline
-   * released the round, and `reason` for a miss or a failure.
+   * released the round, `reason` for a miss or a failure, and `incomplete`
+   * for the regions a finished scan couldn't observe (each also pushed as a
+   * `workspace:agent-action-scan-incomplete` event).
    */
-  lastAgentActionScan?: { at: number; complete: boolean; withinDeadline: boolean; reason?: string };
+  lastAgentActionScan?: {
+    at: number;
+    complete: boolean;
+    withinDeadline: boolean;
+    reason?: string;
+    incomplete?: Array<{ path: string; reason: string }>;
+  };
   /**
    * Wall-clock time chokidar emitted `ready` for this mount, or null if the
    * watcher hasn't finished its initial scan. null after session start =

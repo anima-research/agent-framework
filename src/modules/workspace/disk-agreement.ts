@@ -10,12 +10,15 @@
  * intent — tombstones, store origin, conflicts — lives in BranchIntents and
  * rewinds with the tree.
  *
- * Every transition is write-ahead (see Reconciler): an `intent` entry
+ * Every transition is write-ahead (see reconcile.ts): an `intent` entry
  * (`pending`, with the prior value and the expected one) is durable before the
  * disk effect or tree adoption it announces, and the completion `set` is
- * appended only after that effect is durable. A pending path resolves at its
- * next observation; one whose disk copy matches neither candidate becomes
- * `interrupted`, a sticky state resolved only explicitly.
+ * appended only after that effect is durable. A pending adoption resolves at
+ * its next observation, by the tree. A pending disk effect resolves there only
+ * when disk shows it didn't happen (the prior) or can't tell (`interrupted`,
+ * a sticky state resolved only explicitly); one that shows on disk is
+ * completed only by a push whose barriers succeed, since its completion
+ * releases a draft's protection.
  */
 
 import type { JsStore } from '@animalabs/chronicle';
@@ -189,6 +192,16 @@ export class DiskAgreement {
   forget(mount: string, path: string): void {
     if (this.get(mount, path) === undefined) return;
     this.write({ t: 'forget', mount, path }, {});
+  }
+
+  /**
+   * Put back exactly the evidence a path had before an intent whose effect
+   * never touched it — whatever kind it was (agreed, pending, interrupted, or
+   * unknown) — so the intent leaves no trace in what P says.
+   */
+  restore(mount: string, path: string, value: Physical | undefined): void {
+    if (value === undefined) this.forget(mount, path);
+    else this.write({ t: 'set', mount, path, value }, {});
   }
 
   private write(entry: JournalEntry, opts: { durable?: boolean; afterCommittedState?: boolean }): void {

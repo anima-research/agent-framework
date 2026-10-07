@@ -1007,8 +1007,20 @@ export class WorkspaceModule implements Module {
   }
 
   async stop(): Promise<void> {
-    // Let passes and writes in flight finish before the store goes away.
-    await Promise.all([...this.mountTurns.values()]);
+    // No new watcher-driven passes, then let every pass and write finish
+    // before the store goes away — including any queued behind the ones in
+    // flight (a tool call, a scan continuing past its deadline): drained
+    // until no new tail appears.
+    for (const watcher of this.watchers.values()) {
+      await watcher.stop();
+    }
+    this.watchers.clear();
+    for (;;) {
+      const tails = [...this.mountTurns.values()];
+      await Promise.all(tails);
+      const now = [...this.mountTurns.values()];
+      if (now.length === tails.length && now.every((tail, i) => tail === tails[i])) break;
+    }
 
     // Persist state
     if (this.ctx) {
@@ -1024,12 +1036,6 @@ export class WorkspaceModule implements Module {
       }
       this.ctx.setState(state);
     }
-
-    // Stop watchers
-    for (const watcher of this.watchers.values()) {
-      await watcher.stop();
-    }
-    this.watchers.clear();
     this.ctx = null;
   }
 
@@ -2433,8 +2439,11 @@ export class WorkspaceModule implements Module {
         : [];
       const intents = this.intents.get(name)!.list();
       const conflictPaths = intents.filter(([, bi]) => bi.conflict).map(([p]) => p);
-      // Conflicts are pending too, past the watermark or not.
-      const pending = new Set([...changes.map((c) => c.path), ...conflictPaths]);
+      // Conflicts are pending too, past the watermark or not, and so is every
+      // entry whose evidence says disk doesn't hold it yet — a refused or
+      // failed push stays owed whatever the watermark does, exactly as the
+      // materialize selection counts it.
+      const pending = new Set([...changes.map((c) => c.path), ...conflictPaths, ...this.owedEntries(mount)]);
 
       const currentBranch = store.currentBranch();
       status[name] = {
@@ -2469,9 +2478,7 @@ export class WorkspaceModule implements Module {
    */
   private materializeSelection(mount: MountState, explicitPath: string): string[] {
     const store = this.getStore();
-    const agreement = this.agreementOrThrow();
-    const name = mount.config.name;
-    const intents = new Map(this.intents.get(name)!.list(explicitPath));
+    const intents = new Map(this.intents.get(mount.config.name)!.list(explicitPath));
     const selected = new Set<string>();
 
     if (explicitPath !== '') {
@@ -2487,14 +2494,30 @@ export class WorkspaceModule implements Module {
     } else {
       for (const c of store.treeDiff(mount.treeStateId, mount.lastMaterializedSeq, store.currentSequence())) selected.add(c.path);
     }
-    for (const e of entries) {
-      const p = agreement.get(name, e.path);
-      if (p === undefined ? intents.get(e.path)?.origin === 'store' : p.kind !== 'content' || p.hash !== e.blobHash) {
-        selected.add(e.path);
-      }
-    }
+    for (const path of this.owedEntries(mount)) selected.add(path);
     for (const [p, bi] of intents) if (bi.conflict || bi.tombstone) selected.add(p);
     return [...selected];
+  }
+
+  /**
+   * The workspace entries whose evidence says disk doesn't hold them yet: P
+   * differs from the entry (a draft, or a push still pending), or there is no
+   * P and the entry came from the workspace (a draft disk never had). What
+   * materialize considers owed, and what status counts as pending.
+   */
+  private owedEntries(mount: MountState): string[] {
+    const store = this.getStore();
+    const agreement = this.agreementOrThrow();
+    const name = mount.config.name;
+    const intents = this.intents.get(name)!;
+    const owed: string[] = [];
+    for (const e of store.treeList(mount.treeStateId)) {
+      const p = agreement.get(name, e.path);
+      if (p === undefined ? intents.get(e.path)?.origin === 'store' : p.kind !== 'content' || p.hash !== e.blobHash) {
+        owed.push(e.path);
+      }
+    }
+    return owed;
   }
 
   private async handleMaterialize(input: MaterializeInput): Promise<ToolResult> {
@@ -2525,40 +2548,39 @@ export class WorkspaceModule implements Module {
     // Branch guard, scoped to the mounts actually being materialized: a
     // linear continuation (current branch descends from the pinned branch at
     // or after the pinned seq) passes; genuine divergence refuses unless
-    // force. One mount's stale pin must never block another mount.
+    // force. One mount's stale pin must never block another mount. It is
+    // judged inside the mount's turn, on the same branch the selection is
+    // made on: a materialize queued behind a pass would otherwise select on
+    // whatever branch is current when its turn comes, unguarded. The push
+    // then writes nothing if the branch changes after that.
     const blocked: Array<{ mount: string; reason: string }> = [];
-    for (const { name, mount } of mountsToMaterialize) {
-      const reason = this.mountMaterializeBlockReason(store, mount);
-      if (!reason) continue;
-      if (input.force) {
-        // Disk reflects another line of history, so an incremental diff from
-        // the pinned seq is meaningless — reset tracking and re-materialize
-        // the full tree, exactly like materializeMount() after a deliberate
-        // branch switch.
-        mount.lastMaterializedSeq = 0;
-        mount.lastMaterializedBranchId = null;
-      } else {
-        blocked.push({ mount: name, reason });
-      }
-    }
-    mountsToMaterialize = mountsToMaterialize.filter(
-      ({ name }) => !blocked.some((b) => b.mount === name),
-    );
-    if (mountsToMaterialize.length === 0 && blocked.length > 0) {
-      return {
-        success: false,
-        error: `Cannot materialize: ${blocked.map((b) => `[${b.mount}] ${b.reason}`).join('; ')}`,
-        isError: true,
-      };
-    }
+    const guarded: string[] = [];
+    let proceeded = 0;
 
     for (const { name, mount } of mountsToMaterialize) {
       if (mount.config.mode === 'read-only') continue;
-      const pushed = await this.withMount(mount, () => {
+      const turn = await this.withMount(mount, async (): Promise<{ blocked: string } | { pushed: PushResult }> => {
         const branchId = store.currentBranch().id;
+        const reason = this.mountMaterializeBlockReason(store, mount);
+        if (reason) {
+          if (!input.force) return { blocked: reason };
+          // Disk reflects another line of history, so an incremental diff from
+          // the pinned seq is meaningless — reset tracking and re-materialize
+          // the full tree, exactly like materializeMount() after a deliberate
+          // branch switch.
+          mount.lastMaterializedSeq = 0;
+          mount.lastMaterializedBranchId = null;
+        }
         const paths = this.materializeSelection(mount, explicit?.relativePath ?? '');
-        return this.pushUnlocked(mount, paths, { force: input.force, applyDeletions: input.applyDeletions, branchId });
+        return { pushed: await this.pushUnlocked(mount, paths, { force: input.force, applyDeletions: input.applyDeletions, branchId }) };
       });
+      if ('blocked' in turn) {
+        blocked.push({ mount: name, reason: turn.blocked });
+        guarded.push(name);
+        continue;
+      }
+      proceeded++;
+      const pushed = turn.pushed;
 
       for (const p of pushed.written) allWritten.push({ mount: name, path: p });
       for (const p of pushed.deleted) allDeleted.push({ mount: name, path: p });
@@ -2583,6 +2605,14 @@ export class WorkspaceModule implements Module {
       if (pushed.written.length > 0 || pushed.unchanged.length > 0 || mount.lastMaterializedBranchId !== null) {
         mount.lastMaterializedBranchId = pushed.branchId;
       }
+    }
+
+    if (proceeded === 0 && guarded.length > 0 && guarded.length === mountsToMaterialize.length) {
+      return {
+        success: false,
+        error: `Cannot materialize: ${blocked.map((b) => `[${b.mount}] ${b.reason}`).join('; ')}`,
+        isError: true,
+      };
     }
 
     return {
@@ -2735,10 +2765,22 @@ export class WorkspaceModule implements Module {
     await Promise.all(mounts.map(async (mount) => {
       let late = false;
       const scan = this.withMount(mount, () => this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true })).then(
-        () => {
+        (pass) => {
+          // Finished — but a scan that couldn't see everything (the file cap,
+          // an unreadable or changing region, a branch that kept changing)
+          // says where, on status and as an event, like a missed deadline.
+          const incomplete = pass.incomplete.length > 0 ? { incomplete: pass.incomplete } : {};
           mount.lastAgentActionScan = late
-            ? { at: Date.now(), complete: true, withinDeadline: false, reason: 'finished after the deadline' }
-            : { at: Date.now(), complete: true, withinDeadline: true };
+            ? { at: Date.now(), complete: true, withinDeadline: false, reason: 'finished after the deadline', ...incomplete }
+            : { at: Date.now(), complete: true, withinDeadline: true, ...incomplete };
+          if (pass.incomplete.length > 0) {
+            this.ctx?.pushEvent({
+              type: 'workspace:agent-action-scan-incomplete',
+              mount: mount.config.name,
+              reason: 'the scan finished, but some regions could not be observed',
+              incomplete: pass.incomplete,
+            } as ProcessEvent);
+          }
         },
         (err: unknown) => {
           const reason = `scan failed: ${err instanceof Error ? err.message : String(err)}`;

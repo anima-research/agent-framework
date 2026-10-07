@@ -14,14 +14,25 @@
  *  - P pending (an intent whose effect may or may not have landed) resolves
  *    first; P interrupted is a sticky conflict.
  *
+ * Only a push completes a push. A pending disk intent is the module's own
+ * write or unlink, and its completion releases the protection a draft has
+ * (P := what was written), so it is recorded only by a push whose barriers
+ * succeeded. An observation that finds the intended outcome on disk decides
+ * the path's state from it but records nothing for it — no completion, no
+ * agreement, no branch-intent change — and the path stays owed until a push
+ * redoes it. Otherwise a crash that loses an unbarriered write would leave
+ * P saying the draft reached disk, and the rule would adopt the older disk
+ * version over it. (An explicit path sync still chooses disk, replacing
+ * whatever the path's evidence was; that adopts disk, it doesn't certify the
+ * push.)
+ *
  * Each pass observes disk first (the only async step), then reads S, P and
  * intent and applies every decision in one synchronous step, in the agreed
  * order: intents (durable) → tree commits and intent records → completions
  * (after `store.sync()`). The caller serializes passes per mount.
  */
 
-import { lstat, mkdir, open, unlink } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { stat } from 'node:fs/promises';
 import type { JsStore } from '@animalabs/chronicle';
 import {
   type Agreed,
@@ -38,15 +49,17 @@ import type { BranchIntent, BranchIntents, ConflictKind, ConflictRecord, DiskCou
 import {
   type MountView,
   type Walk,
-  effectStaysInMount,
   fingerprintVouches,
   looksBinary,
   observePath,
+  parentOf,
   provenAbsent,
+  readHead,
   readPath,
   sniffImageMime,
   walkScope,
 } from './observe.js';
+import { EffectFailed, type Expect, chainOf, syncDirectories, unlinkContained, writeContained } from './effects.js';
 
 export type EntryState =
   | 'synced'
@@ -132,7 +145,13 @@ type DiskFact =
       /** Text within limits, with its bytes: what disk→store sync may store. */
       ingestible: Buffer | null;
       mimeType?: string;
-    };
+    }
+  /**
+   * A file nothing tracks, too large to ingest: listed from its size and head
+   * alone. Its bytes were never hashed, so it can't be compared with anything
+   * — it is never evidence of agreement, only of a disk-only file.
+   */
+  | { kind: 'unhashed'; size: number; mtimeMs: number; mimeType?: string };
 
 function diskCandidate(d: DiskFact): Candidate | null {
   if (d.kind === 'absent') return ABSENT;
@@ -172,10 +191,11 @@ async function learnDisk(
   }
   const nothingTracked = p === undefined && !tracked.hasStore && !tracked.hasIntent;
   if (nothingTracked && seen.size > mount.view.maxFileSize) {
-    // A new oversize file only needs listing: its head for the MIME type.
-    const head = await readPath(mount.view, mount.rootReal, path, 0);
-    if (head.kind !== 'read') return head;
-    return { kind: 'file', hash: head.hash, size: head.size, mtimeMs: head.mtimeMs, fp: head.fp, ingestible: null, mimeType: sniffImageMime(head.head) };
+    // A new oversize file only needs listing: its size, and its head for the
+    // MIME type. Hashing it would read all of it, on every listing.
+    const head = await readHead(mount.view, mount.rootReal, path);
+    if (head.kind !== 'head') return head;
+    return { kind: 'unhashed', size: head.size, mtimeMs: head.mtimeMs, mimeType: sniffImageMime(head.head) };
   }
   const read = await readPath(mount.view, mount.rootReal, path, mount.view.maxFileSize);
   if (read.kind !== 'read') return read;
@@ -205,7 +225,14 @@ interface Verdict {
   conflict?: ConflictKind;
   op?: TreeOp;
   note?: string;
+  /**
+   * Disk shows what a pending push of ours intended, unconfirmed: the state
+   * is decided from it, and nothing at all is recorded (see module doc).
+   */
+  unconfirmed?: true;
 }
+
+const UNCONFIRMED_NOTE = 'disk holds what a materialize that has not completed put here; materialize again to complete it';
 
 function keepStoreSide(hasStore: boolean, bi: BranchIntent | null): EntryState {
   if (hasStore) return 'workspace-draft';
@@ -268,13 +295,15 @@ function resolvePending(
   s: { hash: string; size: number } | null,
   d: DiskFact,
   branchId: string,
-): { p: Physical | undefined; record?: Agreed | Interrupted | 'forget'; uncaptured?: true } {
+): { p: Physical | undefined; record?: Agreed | Interrupted | 'forget'; uncaptured?: true; unconfirmed?: true } {
   const prior = p.prior;
   const priorCandidate = prior ? candidateOf(prior) : null;
   if (p.effect === 'disk') {
     if (sameCandidate(dc, p.expect)) {
-      const agreed = p.expect.kind === 'absent' ? ({ kind: 'absent' } as Agreed) : agreedFromDisk(d);
-      return { p: agreed, record: agreed };
+      // Our own effect shows on disk, but nothing proves it durable: decided
+      // on, never recorded. Only a push whose barriers succeed completes it.
+      const shown = p.expect.kind === 'absent' ? ({ kind: 'absent' } as Agreed) : agreedFromDisk(d);
+      return { p: shown, unconfirmed: true };
     }
     if (priorCandidate && sameCandidate(dc, priorCandidate)) return { p: prior!, record: prior! };
     // A write whose prior was unknown left no file: it never created one (a
@@ -319,11 +348,20 @@ function decide(
     }
     return { state: 'unverified', note: d.reason };
   }
+  if (d.kind === 'unhashed') {
+    // Observed this way only when nothing tracks the path, which is then a
+    // disk-only file whatever else holds. Were anything to track it, its
+    // unhashed bytes could prove nothing about it.
+    if (pIn === undefined && s === null && bi === null) return { state: 'disk-only' };
+    return { state: 'unverified', note: 'not hashed' };
+  }
   const dc = diskCandidate(d)!;
   const sc: Candidate = s ? { kind: 'content', hash: s.hash } : ABSENT;
 
   if (adopt) {
-    // An explicit path sync: the store takes disk's state, whatever the evidence.
+    // An explicit path sync: the store takes disk's state, whatever the
+    // evidence — a pending push's included. That chooses disk; it doesn't
+    // certify the push.
     if (d.kind === 'absent') {
       return { state: 'synced', ...(s ? { adopt: 'remove' as const, op: 'deleted' as const } : {}), p: { kind: 'absent' }, intent: {} };
     }
@@ -341,6 +379,13 @@ function decide(
   let uncaptured = false;
   if (p?.kind === 'pending') {
     const resolved = resolvePending(p, dc, s, d, branchId);
+    if (resolved.unconfirmed) {
+      // Disk shows our pending push's outcome (P as it intended): the state
+      // follows from that, and nothing is recorded — no completion, no
+      // agreement, no branch-intent change — until a push confirms it.
+      const state: EntryState = sameCandidate(dc, sc) ? 'synced' : bi?.conflict ? 'conflict' : keepStoreSide(s !== null, bi);
+      return { state, note: UNCONFIRMED_NOTE, unconfirmed: true };
+    }
     p = resolved.p;
     resolution = resolved.record;
     uncaptured = resolved.uncaptured === true;
@@ -434,8 +479,10 @@ const GATHER_ATTEMPTS = 3;
 
 async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRuntime, scope: Scope, opts: PassOptions): Promise<Gathered> {
   // A missing mount root is an unavailable mount (an unmounted drive, a root
-  // being replaced), not proof that every file in it was deleted.
-  const rootAvailable = await lstat(mount.view.root).then((s) => s.isDirectory(), () => false);
+  // being replaced), not proof that every file in it was deleted. The root is
+  // the operator's choice and may itself be a symlink to a directory, so it
+  // is followed, as `rootReal` is: `followSymlinks` governs links within it.
+  const rootAvailable = await stat(mount.view.root).then((s) => s.isDirectory(), () => false);
 
   // The branch is labelled where the tracked candidates are read, with no
   // await between: the decision is checked against this label.
@@ -614,8 +661,8 @@ export async function reconcilePass(
     const entry = store.treeGet(mount.treeStateId, x.path);
     const report: PathReport = { path: x.path, state: x.verdict.state };
     if (entry) report.size = entry.size;
-    else if (x.d.kind === 'file') report.size = x.d.size;
-    if (x.verdict.state === 'disk-only' && x.d.kind === 'file' && x.d.mimeType) report.mimeType = x.d.mimeType;
+    else if (x.d.kind === 'file' || x.d.kind === 'unhashed') report.size = x.d.size;
+    if (x.verdict.state === 'disk-only' && (x.d.kind === 'file' || x.d.kind === 'unhashed') && x.d.mimeType) report.mimeType = x.d.mimeType;
     if (x.verdict.state === 'conflict' && after?.conflict) report.conflict = conflictReport(after.conflict, x.d);
     if (x.verdict.note) report.note = x.verdict.note;
     if (!(x.verdict.state === 'synced' && !entry)) result.reports.set(x.path, report);
@@ -662,28 +709,23 @@ export interface PushResult {
   sequence: number;
 }
 
-/** Errors meaning a directory can't be synced on this filesystem, not that syncing it failed. */
-const DIRECTORY_SYNC_UNSUPPORTED = new Set(['EINVAL', 'ENOTSUP']);
-
-/** A directory entry made durable where the platform can sync directories. */
-async function syncDirectory(path: string): Promise<void> {
-  if (process.platform === 'win32') return; // a directory can't be opened for sync there
-  const handle = await open(path, 'r');
-  try {
-    await handle.sync();
-  } catch (err) {
-    if (!DIRECTORY_SYNC_UNSUPPORTED.has((err as { code?: string }).code ?? '')) throw err;
-  } finally {
-    await handle.close();
-  }
-}
-
 /**
  * Make disk hold the store's version of each path, under the same rule:
  * drafts are written, agreement is left alone, conflicts and unverifiable
  * disk copies are refused unless `force`, and a workspace deletion reaches
  * disk only with `applyDeletions` (with `force` too when disk changed since).
- * Every write or unlink is announced by a durable intent first.
+ * A path whose earlier push shows on disk unconfirmed is pushed again, so its
+ * completion rests on barriers that succeeded.
+ *
+ * Every write or unlink is announced by a durable intent first, and checked
+ * at the point of effect (effects.ts): the boundary always, and — unless
+ * `force` — that disk still holds what was decided on. Then every directory
+ * whose entries the push created or removed is synced, from each written
+ * file's parent up to the mount root and each unlinked file's parent, once
+ * per push and after all of its effects, and only then are completions
+ * recorded. An effect that failed without touching its path puts the path's
+ * evidence back exactly as it was before the intent; one that touched it, or
+ * whose barrier failed, leaves the intent pending.
  */
 export async function pushPaths(
   store: JsStore,
@@ -700,23 +742,22 @@ export async function pushPaths(
   };
   if (mount.readOnly) return result;
 
-  type Plan = { path: string; kind: 'write' | 'unlink'; blob: Buffer; hash: string; prior: Agreed | null } | { path: string; kind: 'unlink'; blob: null; hash: null; prior: Agreed | null };
+  type Plan = {
+    path: string;
+    /** The path's evidence before this push's intent, put back if the effect never touches it. */
+    before: Physical | undefined;
+    prior: Agreed | null;
+    /** What the effect may find at the path. */
+    expect: Expect;
+  } & ({ kind: 'write'; blob: Buffer; hash: string } | { kind: 'unlink' });
   const plans: Plan[] = [];
 
-  // Observe disk, and where a write or unlink would land.
+  // Observe disk.
   const facts = new Map<string, DiskFact>();
-  const targets = new Map<string, true | string>();
   for (const path of paths) {
     const p = agreement.get(mount.name, path);
     facts.set(path, await learnDisk(mount, path, { p, hasStore: true, hasIntent: true }, {}));
-    targets.set(path, await effectStaysInMount(mount.view, mount.rootReal, path));
   }
-  // Not even force writes or unlinks outside the mount.
-  const plan = (next: Plan): void => {
-    const target = targets.get(next.path)!;
-    if (target === true) plans.push(next);
-    else result.skipped.push({ path: next.path, reason: `not ${next.kind === 'write' ? 'written' : 'unlinked'}: ${target}` });
-  };
 
   // Decide synchronously what to push.
   const branchId = store.currentBranch().id;
@@ -735,6 +776,10 @@ export async function pushPaths(
     const p = agreement.get(mount.name, path);
     const bi = mount.intents.get(path);
     const v = decide(d, s, p, bi, branchId, false);
+    // What the effect may find: what this observation saw, unless forced.
+    const expect: Expect = opts.force || d.kind === 'unobserved' || d.kind === 'unhashed'
+      ? { kind: 'any' }
+      : d.kind === 'absent' ? { kind: 'absent' } : { kind: 'content', hash: d.hash };
     if (v.adopt) {
       // Disk changed since it last agreed and the workspace copy didn't. Pushing
       // would silently revert the disk change; its evidence stays as it is, so
@@ -750,7 +795,7 @@ export async function pushPaths(
       }
       const priorP = p && (p.kind === 'absent' || p.kind === 'content') ? p : null;
       const blob = store.getBlob(s.hash);
-      if (blob) plan({ path, kind: 'write', blob, hash: s.hash, prior: priorP });
+      if (blob) plans.push({ path, kind: 'write', blob, hash: s.hash, prior: priorP, before: p, expect });
       continue;
     }
     // Whatever the verdict learned about disk (an agreement, a resolved
@@ -758,9 +803,12 @@ export async function pushPaths(
     if (v.p === 'forget') agreement.forget(mount.name, path);
     else if (v.p !== undefined) agreement.set(mount.name, path, v.p, { afterCommittedState: true });
     if (v.p !== undefined) recorded = true;
-    const known = v.p === 'forget' ? undefined : v.p !== undefined ? v.p : p;
+    // The prior a new intent carries is the last confirmed evidence: for a
+    // path whose earlier push is unconfirmed, that push's own prior, never
+    // the bytes it wrote.
+    const known = v.unconfirmed ? (p as Pending).prior ?? undefined : v.p === 'forget' ? undefined : v.p !== undefined ? v.p : p;
     const prior = known && (known.kind === 'absent' || known.kind === 'content') ? known : null;
-    if (v.state === 'synced') {
+    if (v.state === 'synced' && !v.unconfirmed) {
       if (v.intent !== undefined) {
         mount.intents.put(path, v.intent);
         recorded = true;
@@ -774,6 +822,8 @@ export async function pushPaths(
         continue;
       }
     }
+    // A file merely absent from this branch is left alone, an unconfirmed
+    // push of another branch's bytes included: nothing replays or unlinks it.
     if (v.state === 'not-in-branch' || v.state === 'disk-only') continue;
     if (v.state === 'conflict' && !opts.force) {
       const kind = bi?.conflict?.kind ?? v.conflict ?? 'both-changed';
@@ -792,12 +842,18 @@ export async function pushPaths(
       // Only a deliberate workspace deletion ever unlinks; a file that is
       // merely absent from this branch is never deleted from disk.
       if (!bi?.tombstone) continue;
+      if (v.unconfirmed && d.kind === 'absent') {
+        // Our own unlink already reached disk, unconfirmed: confirm it — its
+        // directory synced, nothing removed — applyDeletions or not.
+        plans.push({ path, kind: 'unlink', prior, before: p, expect });
+        continue;
+      }
       if (!opts.applyDeletions) {
         result.pendingDeletions.push(path);
         continue;
       }
       if (d.kind === 'absent') continue;
-      plan({ path, kind: 'unlink', blob: null, hash: null, prior });
+      plans.push({ path, kind: 'unlink', prior, before: p, expect });
       continue;
     }
     const blob = store.getBlob(s.hash);
@@ -805,7 +861,7 @@ export async function pushPaths(
       result.skipped.push({ path, reason: 'the workspace copy is missing from the store' });
       continue;
     }
-    plan({ path, kind: 'write', blob, hash: s.hash, prior });
+    plans.push({ path, kind: 'write', blob, hash: s.hash, prior, before: p, expect });
   }
 
   // 1. Durable intents before any disk effect.
@@ -813,54 +869,60 @@ export async function pushPaths(
     agreement.intend(mount.name, step.path, {
       effect: 'disk',
       prior: step.prior,
-      expect: step.kind === 'write' ? { kind: 'content', hash: step.hash! } : ABSENT,
+      expect: step.kind === 'write' ? { kind: 'content', hash: step.hash } : ABSENT,
       branchId,
     }, { durable: i === plans.length - 1 });
   });
 
-  // 2. Effects, each made durable before its completion.
+  // 2. Effects, each bound at its point of use.
+  const effected: Array<{ step: Plan; dirs: string[] }> = [];
   for (const step of plans) {
-    const absolute = join(mount.view.root, step.path);
     opts.beforeEffect?.(step.path);
-    let stage = step.kind === 'write' ? 'write the file' : 'unlink the file';
     try {
       if (step.kind === 'write') {
-        await mkdir(dirname(absolute), { recursive: true });
-        // Written and synced through one descriptor: durable, and needing only
-        // write permission (a write-only file is still written).
-        const handle = await open(absolute, 'w');
-        try {
-          await handle.writeFile(step.blob!);
-          stage = 'make the write durable (file fsync)';
-          await handle.sync();
-        } finally {
-          await handle.close();
-        }
-        stage = 'make the write durable (directory fsync)';
-        await syncDirectory(dirname(absolute));
+        await writeContained(mount.view, mount.rootReal, step.path, step.blob, step.expect);
+        effected.push({ step, dirs: chainOf(step.path) });
       } else {
-        await unlink(absolute).catch((err: NodeJS.ErrnoException) => { if (err.code !== 'ENOENT') throw err; });
-        stage = 'make the unlink durable (directory fsync)';
-        await syncDirectory(dirname(absolute));
+        // Its directory is synced whether this unlink removed the entry or
+        // found it gone: either way the completion claims a durable absence.
+        const inDirectory = await unlinkContained(mount.view, mount.rootReal, step.path, step.expect);
+        effected.push({ step, dirs: inDirectory ? [parentOf(step.path)] : [] });
       }
     } catch (err) {
-      // No completion: the intent stays pending, and the next observation
-      // resolves it from whatever disk then holds.
-      const message = err instanceof Error ? err.message : String(err);
-      result.skipped.push({ path: step.path, reason: `could not ${stage}: ${message}; the outcome is checked at the next observation` });
+      const failure = err instanceof EffectFailed ? err : new EffectFailed(err instanceof Error ? err.message : String(err), true);
+      if (!failure.touched) {
+        // Disk at this path is as planning saw it: its evidence goes back to
+        // exactly what it was, whatever kind that was.
+        agreement.restore(mount.name, step.path, step.before);
+        recorded = true;
+        result.skipped.push({ path: step.path, reason: `not ${step.kind === 'write' ? 'written' : 'unlinked'}: ${failure.message}` });
+      } else {
+        // No completion: the intent stays pending, and the next observation
+        // resolves it from whatever disk then holds.
+        result.skipped.push({ path: step.path, reason: `${failure.message}; the outcome is checked at the next observation` });
+      }
+    }
+  }
+
+  // 3. Barriers: every directory whose entries the push changed, synced
+  // once, after all of its effects. A directory created by an earlier,
+  // failed attempt is synced too: the whole chain, whoever made it.
+  const unsynced = await syncDirectories(mount.view, mount.rootReal, effected.flatMap((x) => x.dirs));
+
+  // 4. Completions. P is physical and global. Branch intent belongs to the
+  // branch this push planned on: it is settled only while that branch is
+  // still selected, and otherwise by convergence when the branch returns.
+  for (const { step, dirs } of effected) {
+    const failed = dirs.find((dir) => unsynced.has(dir));
+    if (failed !== undefined) {
+      result.skipped.push({
+        path: step.path,
+        reason: `could not make the ${step.kind === 'write' ? 'write' : 'unlink'} durable (directory fsync of ${failed === '' ? 'the mount root' : failed}): ` +
+          `${unsynced.get(failed)}; the outcome is checked at the next observation`,
+      });
       continue;
     }
-    // 3. Completion. P is physical and global. Branch intent belongs to the
-    // branch this push planned on: it is settled only while that branch is
-    // still selected, and otherwise by convergence when the branch returns.
-    const value: Agreed = step.kind === 'write'
-      ? await (async (): Promise<Agreed> => {
-        const seen = await readPath(mount.view, mount.rootReal, step.path, mount.view.maxFileSize);
-        return seen.kind === 'read' && seen.hash === step.hash
-          ? { kind: 'content', hash: step.hash!, size: seen.size, fp: seen.fp }
-          : { kind: 'content', hash: step.hash!, size: step.blob!.byteLength };
-      })()
-      : { kind: 'absent' };
+    const value: Agreed = step.kind === 'write' ? { kind: 'content', hash: step.hash, size: step.blob.byteLength } : { kind: 'absent' };
     agreement.set(mount.name, step.path, value);
     recorded = true;
     const planned = store.currentBranch().id === branchId;

@@ -424,7 +424,10 @@ export class ModuleRegistry {
       let timer: ReturnType<typeof setTimeout> | undefined;
       promises.push(
         Promise.race([
-          module.onToolBatchComplete(agentName),
+          // Called from a promise, so a hook that throws synchronously, before
+          // returning its promise, is caught below like any other failure
+          // instead of escaping the round (the result would never be provided).
+          Promise.resolve().then(() => module.onToolBatchComplete!(agentName)),
           new Promise<void>((_, rej) => {
             timer = setTimeout(() => rej(new Error(`onToolBatchComplete timed out after ${timeoutMs}ms`)), timeoutMs);
           }),
