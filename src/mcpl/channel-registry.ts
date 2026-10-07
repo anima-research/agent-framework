@@ -39,7 +39,7 @@ import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js
 import { expandCoreTags } from './tags.js';
 import { validateCoalescedContent } from './push-coalescer.js';
 import { CapabilityGrant } from './capability-grant.js';
-import { INBOUND_SOURCE_KEY, type InboundSource } from './inbound-source.js';
+import { INBOUND_SOURCE_KEY, renderSourceHeader, SOURCE_HEADER_RULE, type InboundSource } from './inbound-source.js';
 import { McplRequestError } from './server-connection.js';
 
 // ============================================================================
@@ -319,7 +319,7 @@ function convertBlock(block: McplContentBlock): ContentBlock {
 const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'channel_list',
-    description: 'List all available channels',
+    description: `List all available channels. ${SOURCE_HEADER_RULE}`,
     inputSchema: { type: 'object' as const, properties: {} },
   },
   {
@@ -327,7 +327,8 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
     description:
       'Open a channel to start receiving its ordinary ongoing traffic. The MCPL ' +
       'integration performs its own subscribe/join/attach operation. Optionally request ' +
-      'history preceding the message that invited you into the channel.',
+      'history preceding the message that invited you into the channel; each history item ' +
+      `carries its own [source: server / channel-id · label] line. ${SOURCE_HEADER_RULE}`,
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -397,7 +398,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
       'route (the conversation your plain speech is going to this turn, thread included); with no route it is ' +
       'refused, never guessed. With channelId it goes to that channel\'s root, or into threadId. The receipt ' +
       'names where it went, and whether delivery was confirmed, failed (nothing posted) or is unknown (it may ' +
-      'have been posted).',
+      `have been posted). ${SOURCE_HEADER_RULE}`,
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -2677,7 +2678,7 @@ export class ChannelRegistry {
         data: {
           channelId: input.channelId,
           status: alreadyDesiredOpen ? 'reconciled' : 'opened',
-          ...(result.history ? { history: result.history } : {}),
+          ...(result.history ? { history: this.stampHistory(entry.serverId, result.history) } : {}),
           ...(result.historyTruncated ? { historyTruncated: true } : {}),
         },
       };
@@ -2688,6 +2689,31 @@ export class ChannelRegistry {
         isError: true,
       };
     }
+  }
+
+  /**
+   * Each backscroll item with its own source header (shelf-356), rendered
+   * from the ITEM's channelId — not the channel that was opened — so a
+   * spliced item wears its true channel. The label is the registry's for that
+   * id, else the adapter's item `channelLabel`. An item that names no channel
+   * gets no header rather than a guessed one.
+   */
+  private stampHistory(serverId: string, items: ChannelIncomingMessage[]): Array<Record<string, unknown>> {
+    const text = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+    return items.map((item) => {
+      const raw = item as unknown as Record<string, unknown>;
+      const channelId = text(raw.channelId);
+      if (!channelId) return { ...raw };
+      const header = renderSourceHeader({
+        kind: 'channel',
+        serverId,
+        channelId,
+        label: this.getChannelLabel(serverId, channelId) ?? text(raw.channelLabel),
+        threadId: text(raw.threadId),
+        replyTo: text((raw.metadata as Record<string, unknown> | undefined)?.replyTo),
+      });
+      return { source: header, ...raw };
+    });
   }
 
   private async handleToolClose(

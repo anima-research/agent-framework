@@ -173,9 +173,10 @@ describe('inbound source envelope', () => {
     const expected = createHash('sha256').update(canonicalJson([[{ type: 'text', text: 'digest me' }]])).digest('hex');
     assert.equal(meta.sourceBodyDigest, expected);
     assert.equal(sourceBodyDigest([{ text: 'digest me', type: 'text' }]), expected, 'key order does not matter');
-    // This lane stores the body as delivered: the stored copy hashes the same.
+    // The stored copy carries its source header, so its own digest covers
+    // the header while the delivered body's digest does not.
     assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content));
-    assert.equal(meta.storedBodyDigest, meta.sourceBodyDigest);
+    assert.notEqual(meta.storedBodyDigest, meta.sourceBodyDigest);
     // Outside the frozen admission envelope.
     assert.equal((readInboundSource(message.metadata) as unknown as Record<string, unknown>).sourceBodyDigest, undefined);
 
@@ -220,8 +221,9 @@ describe('inbound source envelope', () => {
     const meta = message.metadata as Record<string, unknown>;
     assert.equal(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'psst' }]), 'the adapter body alone');
     assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored');
-    // The DM's channel is closed, so the host appends its invitation.
-    assert.equal(message.content.length, 2);
+    // The source header and, the DM's channel being closed, the host's
+    // invitation decorate the stored copy.
+    assert.equal(message.content.length, 3);
     assert.notEqual(meta.storedBodyDigest, meta.sourceBodyDigest, 'the closed-channel invitation decorates the stored copy');
   });
 
@@ -236,12 +238,13 @@ describe('inbound source envelope', () => {
     await waitFor(() => !!storedWith((m) => m.eventId === 'empty-1'), 'empty push stored');
     const message = storedWith((m) => m.eventId === 'empty-1')!;
     const meta = message.metadata as Record<string, unknown>;
-    assert.deepEqual(message.content, []);
+    // The stored copy is the empty body under its source header.
+    assert.deepEqual(message.content, [{ type: 'text', text: '[source: discord · unscoped]' }]);
     // The empty body in the one-element framing: SHA-256 of `[[]]`.
     const empty = createHash('sha256').update('[[]]').digest('hex');
     assert.equal(meta.sourceBodyDigest, empty, 'the empty delivered body');
-    assert.equal(meta.storedBodyDigest, empty, 'stored undecorated');
-    assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'the untouched copy matches its own witness');
+    assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored, header included');
+    assert.notEqual(meta.storedBodyDigest, empty, 'the header decorates the stored copy');
   });
 
   it('an empty DM pushed into a closed channel: the delivered digest is the empty body, the stored digest covers the invitation', async () => {
@@ -253,7 +256,7 @@ describe('inbound source envelope', () => {
     const message = storedWith((m) => m.eventId === 'ev-empty')!;
     const meta = message.metadata as Record<string, unknown>;
     assert.equal(meta.channelInvitation, true, 'stored with the closed-channel invitation');
-    assert.equal(message.content.length, 1, 'the invitation alone');
+    assert.equal(message.content.length, 2, 'the source header and the invitation');
     assert.equal(meta.sourceBodyDigest, sourceBodyDigest([]), 'the empty delivered body, not the adapter\'s value');
     assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored, not the adapter\'s value');
   });

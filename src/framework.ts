@@ -97,7 +97,7 @@ import {
   type TurnRoute,
 } from './speech-routes.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
-import { INBOUND_SOURCE_KEY, readInboundSource, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
+import { INBOUND_SOURCE_KEY, readInboundSource, renderSourceHeader, SOURCE_HEADER_RULE, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import {
@@ -7257,9 +7257,15 @@ export class AgentFramework {
     metadata[INBOUND_SOURCE_KEY] = source;
     // The delivered body's version identity (mcpl/inbound-source.ts
     // sourceBodyDigest; room-220 #46752–#47210), from the body as delivered,
-    // before any host decoration. The stored copy's own digest is taken at
-    // each storage site below, over exactly the blocks stored there.
+    // before the header decorates it. The stored copy's own digest is taken
+    // at each storage site below, over exactly the blocks stored there.
     metadata.sourceBodyDigest = sourceBodyDigest(event.content);
+    // The visible source header (shelf-356): stamped once, here, from this
+    // item's own frozen envelope, and stored with the message — a later
+    // rename, a recompile or a replay never rewrites it, and each message
+    // names its conversation when read alone. Creates, coalesced deliveries
+    // and RFC-006 corrections all pass through here.
+    event = { ...event, content: AgentFramework.withSourceHeader(source, event.content) };
 
     // Per-channel conversation routing: messages go to the channel's fork
     // agent (spawned from the template on first qualifying message), never
@@ -8495,6 +8501,11 @@ export class AgentFramework {
       event.origin?.source === 'heartbeat' &&
       event.origin?.silent === true &&
       content.length === 0;
+    // The visible source header (shelf-356), from this item's own envelope:
+    // its registered channel, or `unscoped` — never a guessed channel. A
+    // silent heartbeat stores no message, so it gets none.
+    const header = silentHeartbeat ? undefined : renderSourceHeader(source);
+    if (header) content.unshift({ type: 'text', text: header });
 
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
@@ -9683,6 +9694,57 @@ export class AgentFramework {
     };
   }
 
+  /** Content with its source header (shelf-356) as the first block. */
+  private static withSourceHeader(source: InboundSource, content: ContentBlock[]): ContentBlock[] {
+    const header = renderSourceHeader(source);
+    return header ? [{ type: 'text', text: header }, ...content] : [...content];
+  }
+
+  /**
+   * Once per resident, the first time it has channel traffic: what the
+   * `[source: …]` headers are, and that the canonical id is authoritative
+   * when a label differs. The rule is also in the channel tools'
+   * descriptions; this introduces it where the headers appear.
+   */
+  private maybeExplainSourceHeaders(agent: Agent): void {
+    if (!this.channelRegistry) return;
+    try {
+      const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+      const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      const explained = { ...((state.sourceHeadersExplained as Record<string, true> | undefined) ?? {}) };
+      if (explained[agent.name]) return;
+      // The recent tail is enough: a turn's own channel traffic is there,
+      // and a resident without any never pays for a full scan.
+      const messages = agent.getContextManager().getAllMessages();
+      let sees = false;
+      for (let i = messages.length - 1, n = 0; i >= 0 && n < 200 && !sees; i--, n++) {
+        sees = readInboundSource(messages[i]!.metadata)?.kind === 'channel';
+      }
+      if (!sees) return;
+      explained[agent.name] = true;
+      state.sourceHeadersExplained = explained;
+      this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+    } catch (err) {
+      console.error('maybeExplainSourceHeaders: state read/write failed:', err);
+      return;
+    }
+    try {
+      const id = agent.getContextManager().addMessage(
+        'user',
+        [{
+          type: 'text',
+          text:
+            '[source] Each channel message begins with a [source: server / channel-id · label] line naming the ' +
+            `conversation it came from (with a thread or the message it replies to, when it has one). ${SOURCE_HEADER_RULE}`,
+        }],
+        { system: true, kind: 'source-header-notice' },
+      );
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'source-header-notice' });
+    } catch (err) {
+      console.error('maybeExplainSourceHeaders: failed to append notice:', err);
+    }
+  }
+
   /** A route candidate for a registered channel id (gate and coalesced wakes). */
   private candidateForChannel(
     channelId: string,
@@ -10594,6 +10656,7 @@ export class AgentFramework {
 
     if (!continuingTurn) {
       if (attempt === 0) this.maybePrimeProseMode(agent);
+      if (attempt === 0) this.maybeExplainSourceHeaders(agent);
       // Name any held drafts no notice reached (a crash, an aborted turn),
       // privately, before this turn's compile.
       if (attempt === 0) this.noticeUnnoticedDrafts(agent);

@@ -198,3 +198,36 @@ export function canonicalJson(value: unknown): string {
 export function sourceBodyDigest(blocks: readonly unknown[]): string {
   return createHash('sha256').update(canonicalJson([blocks])).digest('hex');
 }
+
+/**
+ * The compact visible source header (shelf-356) every channel-bearing item
+ * carries in its stored content, so a message names its conversation when
+ * read alone — including the second of two consecutive messages from one
+ * channel. Grammar, agreed with discord-mcpl (room-203 #41210):
+ *
+ *   [source: <server-id> / <canonical-channel-id> · <label-at-receipt> · thread <id> · reply to <id>]
+ *   [source: <server-id> · unscoped]
+ *
+ * The label is the one the host held when it accepted the item (left out
+ * when unknown); the thread and reply tails appear only when the item has
+ * them. The canonical id is authoritative when a label differs. A local
+ * surface's input has no header: it is not channel traffic.
+ */
+export function renderSourceHeader(
+  fields:
+    | { kind: 'channel'; serverId: string; channelId: string; label?: string; threadId?: string; replyTo?: string }
+    | { kind: 'unscoped'; serverId: string }
+    | { kind: 'surface' },
+): string | undefined {
+  if (fields.kind === 'surface') return undefined;
+  if (fields.kind === 'unscoped') return `[source: ${fields.serverId} · unscoped]`;
+  const parts = [`${fields.serverId} / ${fields.channelId}`];
+  if (fields.label) parts.push(fields.label);
+  if (fields.threadId) parts.push(`thread ${fields.threadId}`);
+  if (fields.replyTo) parts.push(`reply to ${fields.replyTo}`);
+  return `[source: ${parts.join(' · ')}]`;
+}
+
+/** The authority rule every rendering of a source header shares. */
+export const SOURCE_HEADER_RULE =
+  'The channel id is authoritative when a label differs: labels can change, ids do not.';
