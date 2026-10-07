@@ -277,7 +277,8 @@ describe('ContextReceipts', () => {
   const round = (extra: Partial<RoundReport> = {}): RoundReport => ({
     index: 0,
     stopReason: 'end_turn',
-    usage: { inputTokens: 10 },
+    usage: { inputTokens: 10, outputTokens: 1 },
+    altered: { messages: [], injected: [] },
     fidelity: 'established',
     ...extra,
   });
@@ -315,7 +316,7 @@ describe('ContextReceipts', () => {
     assert.equal(ledger.scope('r').degraded, false);
     receipts.usage('r', 1, round({ index: 1 }));
     assert.equal(accepted.length, 1);
-    assert.deepEqual(accepted[0]!.usage, { inputTokens: 10 });
+    assert.deepEqual(accepted[0]!.usage, { inputTokens: 10, outputTokens: 1 });
     assert.equal(accepted[0]!.presentation, 'verbatim');
   });
 
@@ -501,7 +502,7 @@ describe('request-owned evidence', () => {
       const presentations: string[] = [];
       const receipts = new ContextReceipts(ledger, { acceptRound: (_a, _p, _u, _t, presentation) => { presentations.push(presentation); } });
       receipts.beginStream('r', 1, evidence);
-      receipts.usage('r', 1, { index: 0, stopReason: 'end_turn', usage: {}, altered: { messages: [], injected: [] }, fidelity: 'established' });
+      receipts.usage('r', 1, { index: 0, stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, altered: { messages: [], injected: [] }, fidelity: 'established' });
       assert.deepEqual(presentations, ['altered'], 'the producer preserved what it was given, but the compile was already changed');
       const key = channelKey({ binding: 'b1', channelId: 'discord:g:room' });
       assert.equal(ledger.clocksFor('r', [{ binding: 'b1', channelId: 'discord:g:room' }]).get(key)!.lastDeliveredAt, null);
@@ -535,7 +536,7 @@ describe('request-owned evidence', () => {
       ledger.start();
       const receipts = new ContextReceipts(ledger, { acceptRound: () => {} });
       receipts.beginStream('reader', 1, evidence);
-      receipts.usage('reader', 1, { index: 0, stopReason: 'end_turn', usage: {}, fidelity: 'established' });
+      receipts.usage('reader', 1, { index: 0, stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, altered: { messages: [], injected: [] }, fidelity: 'established' });
       const key = channelKey({ binding: 'b1', channelId: 'discord:g:room' });
       const ref = [{ binding: 'b1', channelId: 'discord:g:room' }];
       assert.equal(ledger.clocksFor('reader', ref).get(key)!.delivered?.messageId, 'p-aux');

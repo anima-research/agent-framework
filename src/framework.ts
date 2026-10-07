@@ -15,7 +15,6 @@ import {
   injectedEvidence,
   sourceRefOf,
   type BodyEvidence,
-  type RoundReport,
 } from './context-receipts/index.js';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
@@ -10871,7 +10870,7 @@ export class AgentFramework {
             // Membrane's report of the provider round that just stood:
             // confirms what reached the resident (receipt clocks) and
             // accepts the compile's layout (fold receipts).
-            this.contextReceipts.usage(agent.name, myStreamId, (event as { round?: RoundReport }).round);
+            this.contextReceipts.usage(agent.name, myStreamId, event.round);
             agent.lastStreamInputTokens = event.usage.inputTokens;
             agent.lastStreamRealInputTokens =
               (event.usage.inputTokens ?? 0) +

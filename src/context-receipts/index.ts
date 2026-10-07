@@ -20,6 +20,7 @@
  */
 
 import type { CompileProvenance } from '@animalabs/context-manager';
+import type { RoundReport } from '@animalabs/membrane';
 import type { BodyEvidence, RequestEvidence } from './evidence.js';
 import type { BranchStamp, ChannelClockLedger } from './clock-ledger.js';
 
@@ -28,21 +29,8 @@ export type { ChannelClocks, ChannelRef, ClockScope, SourceRef, VersionRef } fro
 export { requestEvidence, injectedEvidence, channelOf, sourceRefOf, versionOf, withPreparation } from './evidence.js';
 export type { BodyEvidence, RequestEvidence } from './evidence.js';
 
-/** One provider round's report, as membrane emits it on the usage event. */
-export interface RoundReport {
-  /** Zero-based returned-round index within the stream. */
-  index: number;
-  /** The mapped stop reason of the attempt that stands. */
-  stopReason: string;
-  /** This round's own usage; a field the provider did not report is absent. */
-  usage: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number };
-  /** The newest injected batch and how much of it this round carried. */
-  injectedBatch?: { batch: number; applied: number };
-  /** Consumer messages this round did not carry verbatim. */
-  altered?: { messages: number[]; injected: Array<[number, number]> };
-  /** 'unknown' when an unattributable change (or an uninstrumented path) may have altered content. */
-  fidelity?: 'established' | 'unknown';
-}
+/** One provider round's report: membrane's `UsageEvent.round`. */
+export type { RoundReport };
 
 interface InjectedBatch {
   /** Every message of the batch, bodies or not: the producer's coordinates. */

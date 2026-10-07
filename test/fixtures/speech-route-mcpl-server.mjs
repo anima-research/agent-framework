@@ -4,7 +4,8 @@
 // guild channels by default) and, on command, sends inbound traffic over
 // BOTH MCPL lanes. The TEST appends one JSON object per line to COMMAND_PATH:
 //   {"op":"incoming","channelId":…,"messageId":…,"mode":"ambient"|"addressed",
-//    "text":…, "threadId"?, "metadata"?, "eventId"?, "coalesce"?}
+//    "text":…, "content"? (content blocks, instead of text), "threadId"?,
+//    "metadata"?, "eventId"?, "coalesce"?}
 //   {"op":"dm","eventId":…,"authorId":…,"authorName"?,"rawChannelId":…,"text":…}
 //   {"op":"push","eventId":…,"origin"?,"tags"?,"text":…,"featureSet"?}
 //   {"op":"rename","channelId":…,"label":…}             (channels/changed)
@@ -61,7 +62,7 @@ function pollCommands() {
             ...(c.coalesce ? { coalesce: c.coalesce } : {}),
             author: { id: c.authorId ?? 'U-other', name: c.authorName ?? 'someone' },
             timestamp: c.timestamp ?? new Date().toISOString(),
-            content: textBlock(c.text ?? ''),
+            content: c.content ?? textBlock(c.text ?? ''),
             ...(c.metadata ? { metadata: c.metadata } : {}),
             tags: c.mode === 'addressed'
               ? ['chat:mention', 'chat:addressed', 'chat:from-human']

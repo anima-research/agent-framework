@@ -49,7 +49,7 @@ type Script = 'fail' | 'ok' | { tool: true; carries: 'all' | 0 };
 
 const usage = { inputTokens: 40, outputTokens: 3, cacheReadTokens: 0 };
 const roundEvent = (index: number, extra: Record<string, unknown> = {}) =>
-  ({ type: 'usage', usage, round: { index, stopReason: 'end_turn', usage, fidelity: 'established', ...extra } }) as unknown as StreamEvent;
+  ({ type: 'usage', usage, round: { index, stopReason: 'end_turn', usage, altered: { messages: [], injected: [] }, fidelity: 'established', ...extra } }) as unknown as StreamEvent;
 const complete = () =>
   ({ type: 'complete', response: createMockResponse([{ type: 'text', text: 'heard you' }]) }) as unknown as StreamEvent;
 
