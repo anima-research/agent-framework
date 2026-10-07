@@ -12,6 +12,7 @@ import { timingSafeEqual } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { AgentFramework } from '../framework.js';
 import { ResumeBlockedError } from '../framework.js';
+import { isReleaseModel } from '../provider-waits.js';
 import type { TraceEvent, ProcessEvent } from '../types/index.js';
 import type {
   ApiServerConfig,
@@ -426,10 +427,14 @@ export class ApiServer {
         this.requireAdminToken(params);
         const p = (params ?? {}) as { agentName?: unknown; model?: unknown; requester?: unknown };
         if (typeof p.agentName !== 'string' || p.agentName === '') throw new Error('agentName is required');
+        // Only an omitted model, or '*', releases every model: a malformed one
+        // is refused before anything changes, never widened.
+        const model = p.model;
+        if (!isReleaseModel(model)) throw new Error("model must be a model name, or '*' (or omitted) for every model");
         return {
           released: this.framework.releaseProviderWait(
             p.agentName,
-            typeof p.model === 'string' && p.model !== '' ? p.model : undefined,
+            model,
             typeof p.requester === 'string' && p.requester !== '' ? p.requester : 'api',
           ),
         };

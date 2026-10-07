@@ -15,7 +15,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { MembraneError } from '@animalabs/membrane';
 import type { NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, ApiServer } from '../src/index.js';
 import { ProviderWaits, waitDeadline, PROVIDER_WAIT_RECORD_TYPE } from '../src/provider-waits.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
@@ -266,6 +266,73 @@ describe('ProviderWaits: unreadable history fails closed (room-225 #46189, #4644
   }));
 });
 
+describe('ProviderWaits: a record that parses but is not a provider wait fails closed (PR #251 review)', () => {
+  const CHECKPOINT = `${PROVIDER_WAIT_RECORD_TYPE}/checkpoint`;
+  const wait = { agent: 'ada', model: 'zz-a', until: 1_700_000_600_000, reason: 'zz', setAt: 1_700_000_000_000 };
+  // Each writes one malformed record after a well-formed recorded wait; a
+  // checkpoint's `through` covers that wait, so reading it as empty drops it.
+  const malformed: Array<[string, (store: JsStore, through: string) => void]> = [
+    ['a checkpoint whose snapshot is {}', (store, through) => { store.appendJson(CHECKPOINT, { through, snapshot: {} }); }],
+    ['a checkpoint whose snapshot is null', (store, through) => { store.appendJson(CHECKPOINT, { through, snapshot: null }); }],
+    ['a checkpoint wait without its deadline', (store, through) => {
+      const { until: _until, ...partial } = wait;
+      store.appendJson(CHECKPOINT, { through, snapshot: { waits: [partial] } });
+    }],
+    ['a checkpoint holding one (agent, model) twice, the shorter last', (store, through) => {
+      store.appendJson(CHECKPOINT, { through, snapshot: { waits: [wait, { ...wait, until: wait.setAt + 1 }] } });
+    }],
+    ['an entry of a kind this reader does not know', (store) => {
+      store.appendJson(PROVIDER_WAIT_RECORD_TYPE, { kind: 'paused', agent: 'ada', model: 'zz-a', at: 1 });
+    }],
+    ['a set whose deadline is not an instant', (store) => {
+      store.appendJson(PROVIDER_WAIT_RECORD_TYPE, { kind: 'set', agent: 'ada', model: 'zz-a', until: 'later', reason: 'zz', at: 1 });
+    }],
+    ['a set whose deadline is past any Date', (store) => {
+      store.appendJson(PROVIDER_WAIT_RECORD_TYPE, { kind: 'set', agent: 'ada', model: 'zz-a', until: 1e300, reason: 'zz', at: 1 });
+    }],
+    ['a release that names no agent', (store) => {
+      store.appendJson(PROVIDER_WAIT_RECORD_TYPE, { kind: 'released', model: null, by: 'zz', at: 1 });
+    }],
+  ];
+  for (const [shape, write] of malformed) {
+    it(`${shape}: every (agent, model) is held, not read as no waits`, () => withStoreDir((path) => {
+      const time = clock();
+      let store = JsStore.openOrCreate({ path });
+      try {
+        new ProviderWaits(store, { now: time.now, ...quiet }).set('ada', 'zz-a', 600_000, 'zz recorded');
+        const [through] = store.getRecordIdsByType(PROVIDER_WAIT_RECORD_TYPE);
+        write(store, through!);
+        store.close();
+
+        store = JsStore.openOrCreate({ path });
+        const waits = new ProviderWaits(store, { now: time.now, ...quiet });
+        for (const [agent, model] of [['ada', 'zz-a'], ['bo', 'zz-b']] as const) {
+          const held = waits.active(agent, model);
+          assert.equal(held?.until, null, `${agent}/${model} held`);
+          assert.match(held!.reason, /could not be read \(.*malformed\)/);
+        }
+      } finally { if (!store.isClosed()) store.close(); }
+    }));
+  }
+
+  it("a release's `by` is never read back, so an odd requester does not make the history unreadable", () => withStoreDir((path) => {
+    const time = clock();
+    let store = JsStore.openOrCreate({ path });
+    try {
+      const waits = new ProviderWaits(store, { now: time.now, ...quiet });
+      waits.set('ada', 'zz-a', 600_000, 'zz recorded');
+      waits.set('ada', 'zz-b', 600_000, 'zz recorded');
+      waits.release('ada', 'zz-a', 42 as unknown as string);
+      store.close();
+
+      store = JsStore.openOrCreate({ path });
+      const reopened = new ProviderWaits(store, { now: time.now, ...quiet });
+      assert.equal(reopened.active('ada', 'zz-a'), undefined, 'released, and the history reads');
+      assert.equal(reopened.active('ada', 'zz-b')?.reason, 'zz recorded');
+    } finally { if (!store.isClosed()) store.close(); }
+  }));
+});
+
 describe("ProviderWaits: '*' is every model, everywhere (room-225 #47372)", () => {
   it("releasing the listed '*' is the same release as omitting the model: in process, in the record, and after recovery", () => withStoreDir((path) => {
     const time = clock();
@@ -364,9 +431,13 @@ class WaitingMembrane extends MockMembrane {
 
 type Internal = {
   consecutiveInferenceFailures: Map<string, number>;
-  providerAccelerationCooldowns: Map<string, { until: number; waitModel?: string; heldRequests: unknown[] }>;
+  providerAccelerationCooldowns: Map<string, { until: number; waitModel?: string; heldRequests: unknown[]; hostHoldError?: Error }>;
   auxiliaryMembraneFor(agentName: string): { complete(request: unknown): Promise<unknown> };
   handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+  store: JsStore;
+  providerWaits: ProviderWaits;
+  providerAccelerationDefaultCooldownMs: number;
+  providerAccelerationJitterMs: number;
 };
 
 async function framework(path: string, membrane: WaitingMembrane) {
@@ -698,6 +769,177 @@ test("an operator release reaches the context strategy's compression lane, namin
       await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model: '*', requesterName: 'zz-operator' });
       assert.deepEqual(asked, ['zz-model', undefined], "'*' reaches the lane as every model");
       assert.ok(log.lines.some((line) => line.includes("compression lane's provider wait released")));
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review round on PR #251: held-turn recovery, acceleration release, release
+// model scope.
+// ---------------------------------------------------------------------------
+
+/** Swap in waits whose reads fail until `fail.read` is cleared, re-read every 50 ms. */
+function unreadableWaits(internal: Internal) {
+  const { surface, fail } = flaky(internal.store);
+  fail.read = true;
+  internal.providerWaits = new ProviderWaits(surface, { retryReadMs: 50, ...quiet });
+  return fail;
+}
+
+test('a hold for unreadable records ends by itself once they read again: its own re-check finds them readable', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(0, undefined);
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const fail = unreadableWaits(internal);
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await fw.runUntilIdle();
+      assert.equal(membrane.primary, 0, 'held: the absence of recorded waits is unknown');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.until, Number.POSITIVE_INFINITY);
+
+      await sleep(200);
+      await fw.runUntilIdle();
+      assert.equal(membrane.primary, 0, 'still held while they cannot be read');
+
+      // No health call and no operator release: only the hold's own timer.
+      fail.read = false;
+      await sleep(200);
+      await fw.runUntilIdle();
+      assert.equal(membrane.primary, 1, 'the held turn runs once the records read again');
+      assert.equal(internal.providerAccelerationCooldowns.size, 0);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("once the records read again, a hold takes the recorded wait's deadline: it neither stays indefinite nor ends early", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(0, undefined);
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      const recorded = internal.providerWaits.set('resident', 'zz-model', 900, 'zz recorded before the reads failed').wait;
+      const fail = unreadableWaits(internal);
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await fw.runUntilIdle();
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.until, Number.POSITIVE_INFINITY);
+
+      await sleep(100);
+      fail.read = false;
+      await sleep(200);
+      await fw.runUntilIdle();
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.until, recorded.until, 'the recorded deadline, not the stand-in');
+      assert.equal(membrane.primary, 0, 'and not before it');
+
+      await sleep(Math.max(0, recorded.until! - Date.now()) + 150);
+      await fw.runUntilIdle();
+      assert.equal(membrane.primary, 1, 'the held turn runs once that wait passes');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+const accelerationLimited = (retryAfterMs: number, request: NormalizedRequest) => new MembraneError({
+  type: 'rate_limit', retryable: true, httpStatus: 429, retryAfterMs,
+  message: "This request would exceed your organization's maximum usage increase rate for input tokens per minute",
+  rawError: { status: 429 }, rawRequest: request,
+});
+
+test("releasing the stated wait of an organization-acceleration hold leaves AF's own pacing; another model's release leaves the hold", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const twentyMinutes = 20 * 60_000;
+    const membrane = new WaitingMembrane(0, undefined);
+    const stream = membrane.streamYielding.bind(membrane);
+    membrane.streamYielding = (request: NormalizedRequest) => {
+      if (membrane.primary === 0) { membrane.calls.push(request); membrane.primary++; return new ErrorStream(accelerationLimited(twentyMinutes, request)); }
+      return stream(request);
+    };
+    const { fw, internal } = await framework(path, membrane);
+    internal.providerAccelerationDefaultCooldownMs = 1_000;
+    internal.providerAccelerationJitterMs = 0;
+    try {
+      const before = Date.now();
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await fw.runUntilIdle();
+      const armedBy = Date.now();
+      assert.equal(membrane.primary, 1);
+      const hold = internal.providerAccelerationCooldowns.get('resident')!;
+      assert.equal(hold.waitModel, undefined, 'an acceleration hold parks the whole agent');
+      const statedUntil = hold.until;
+      assert.ok(statedUntil >= before + twentyMinutes, 'its length is the stated wait');
+
+      const other = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model: 'zz-other', requesterName: 'zz-operator' });
+      assert.equal(other.ok, true);
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.until, statedUntil, "another model's release leaves the hold");
+
+      const released = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model: 'zz-model', requesterName: 'zz-operator' });
+      assert.deepEqual((released.released as Array<{ model: string }>).map((w) => w.model), ['zz-model']);
+      const paced = internal.providerAccelerationCooldowns.get('resident');
+      assert.ok(paced, "AF's own pacing for the failure still holds");
+      assert.ok(paced.until >= before + 1_000 && paced.until <= armedBy + 1_000, `held to AF's own pacing (${paced.until - before} ms after the failure)`);
+      await fw.runUntilIdle();
+      assert.equal(membrane.primary, 1, 'not before that pacing passes');
+
+      await sleep(Math.max(0, paced.until - Date.now()) + 150);
+      await fw.runUntilIdle();
+      assert.equal(membrane.primary, 2, 'the held turn runs once it has');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("releasing a provider wait leaves a host hold the host's", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(1, 20 * 60_000);
+    const fw = await AgentFramework.create({
+      storePath: path, membrane: membrane.asMembrane(),
+      agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
+      modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      providerHold: () => ({ holdMs: 60_000, reason: 'zz weekly quota spent' }),
+    });
+    const internal = fw as unknown as Internal;
+    try {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await fw.runUntilIdle();
+      const hold = internal.providerAccelerationCooldowns.get('resident')!;
+      assert.ok(hold.hostHoldError, 'a host hold');
+      const until = hold.until;
+      assert.deepEqual(fw.providerWaitSnapshot('resident').map((w) => w.model), ['zz-model'], 'the stated wait is recorded beside it');
+
+      const released = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model: 'zz-model', requesterName: 'zz-operator' });
+      assert.deepEqual((released.released as Array<{ model: string }>).map((w) => w.model), ['zz-model']);
+      assert.deepEqual(fw.providerWaitSnapshot('resident'), [], 'the stated wait is released');
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.until, until, 'the host hold stands, unchanged');
+      await fw.runUntilIdle();
+      assert.equal(membrane.primary, 1, 'and still holds the turn');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test('a malformed release model is refused at both operator surfaces, never widened to every model', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(1, 60_000);
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await fw.runUntilIdle();
+      assert.deepEqual(fw.providerWaitSnapshot('resident').map((w) => w.model), ['zz-model']);
+      const api = new ApiServer(fw) as unknown as {
+        executeCommand(ws: unknown, command: string, params?: Record<string, unknown>): Promise<unknown>;
+      };
+      for (const model of ['', null, 42, ['zz-model'], {}]) {
+        const label = JSON.stringify(model);
+        const refused = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model, requesterName: 'zz-operator' });
+        assert.equal(refused.ok, false, `host command, model ${label}`);
+        assert.match(String(refused.error), /model must be a model name/);
+        await assert.rejects(api.executeCommand(undefined, 'host.releaseProviderWait', { agentName: 'resident', model }),
+          /model must be a model name/, `WS verb, model ${label}`);
+      }
+      assert.deepEqual(fw.providerWaitSnapshot('resident').map((w) => w.model), ['zz-model'], 'nothing was released');
+
+      const every = await api.executeCommand(undefined, 'host.releaseProviderWait', { agentName: 'resident', model: '*' }) as { released: Array<{ model: string }> };
+      assert.deepEqual(every.released.map((w) => w.model), ['zz-model'], "'*' still releases every model");
     } finally { await fw.stop(); log.restore(); }
   });
 });

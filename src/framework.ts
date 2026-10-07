@@ -84,7 +84,7 @@ import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
-import { ProviderWaits, EVERY_MODEL, type ProviderWait } from './provider-waits.js';
+import { ProviderWaits, EVERY_MODEL, isReleaseModel, type ProviderWait } from './provider-waits.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import {
   toolResultDataToHistoryString,
@@ -799,6 +799,12 @@ interface ProviderAccelerationCooldown {
    *  admitted per model by the provider waits themselves, so a compression
    *  model the provider did not limit keeps working. */
   waitModel?: string;
+  /** Set on an acceleration hold whose length is the provider's stated wait
+   *  (recorded for `model`), which replaced AF's own pacing for the failure.
+   *  `ownUntil` is when that pacing alone would have ended the hold: a
+   *  release of the stated wait shortens the hold to it, never past it. A
+   *  host hold never carries this: its length is the host's. */
+  statedWait?: { model: string; ownUntil: number };
 }
 interface ProviderAccelerationRecovery {
   startedAt: number;
@@ -2138,14 +2144,19 @@ export class AgentFramework {
       return typeof value === 'function' ? value.bind(this.membrane) : value;
     }}) as unknown as Membrane;
   }
-  private accelerationCooldownMs(agentName: string, error: MembraneError): number {
+  /** An acceleration hold's length: AF's own pacing (`ownMs`: its default
+   *  plus jitter, capped), or the provider's stated wait in its place
+   *  (`stated`). The stated wait is a lower bound: jitter only adds to it,
+   *  and the cap applies only to AF's own default. */
+  private accelerationCooldownMs(agentName: string, error: MembraneError): { delayMs: number; ownMs: number; stated: boolean } {
     let hash = 0; for (const ch of agentName) hash = ((hash * 31) + ch.charCodeAt(0)) >>> 0;
     const jitter = this.providerAccelerationJitterMs > 0 ? hash % (this.providerAccelerationJitterMs + 1) : 0;
-    // The provider's stated wait is a lower bound: jitter only adds to it,
-    // and the cap applies only to the framework's own default.
+    const ownMs = Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, this.providerAccelerationDefaultCooldownMs) + jitter);
     const stated = error.retryAfterMs;
-    if (typeof stated === 'number' && Number.isFinite(stated) && stated >= 0) return Math.max(1_000, stated) + jitter;
-    return Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, this.providerAccelerationDefaultCooldownMs) + jitter);
+    if (typeof stated === 'number' && Number.isFinite(stated) && stated >= 0) {
+      return { delayMs: Math.max(1_000, stated) + jitter, ownMs, stated: true };
+    }
+    return { delayMs: ownMs, ownMs, stated: false };
   }
   private sameInferenceRequest(a: InferenceRequest, b: InferenceRequest): boolean {
     return a.agentName === b.agentName && a.reason === b.reason && a.source === b.source &&
@@ -2197,7 +2208,9 @@ export class AgentFramework {
       return wait !== undefined && error instanceof MembraneError && error.retryable === true
         && this.holdForProviderWait(agent, wait, trigger ? [trigger] : []);
     }
-    const now = Date.now(); const delayMs = hostHold ? hostHold.holdMs : this.accelerationCooldownMs(agent.name, error as MembraneError);
+    const now = Date.now();
+    const pacing = hostHold ? undefined : this.accelerationCooldownMs(agent.name, error as MembraneError);
+    const delayMs = hostHold ? hostHold.holdMs : pacing!.delayMs;
     const existing = this.providerAccelerationCooldowns.get(agent.name);
     const held = existing?.heldRequests ?? [];
     if (trigger && !held.some((r) => this.sameInferenceRequest(r, trigger))) held.push(trigger);
@@ -2206,6 +2219,9 @@ export class AgentFramework {
     this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
       until: now + delayMs, timer, heldRequests: held, reason: hostHold?.reason ?? error.message,
       failures: (existing?.failures ?? 0) + 1, ...(hostHold ? { hostHoldError: error } : {}),
+      // The stated wait (recorded above for agent.model) set this hold's
+      // length: an operator release of it returns the hold to AF's own pacing.
+      ...(pacing?.stated ? { statedWait: { model: agent.model, ownUntil: now + pacing.ownMs } } : {}),
       ...(auxiliary && (!existing || existing.auxiliaryOrigin) ? { auxiliaryOrigin: true } : {}) });
     if (auxiliary && !existing) {
       console.error(`[provider-cooldown] agent=${agent.name} host hold (${hostHold!.reason}) from an auxiliary call — ` +
@@ -2220,19 +2236,30 @@ export class AgentFramework {
       `holding primary/auxiliary for ${delayMs}ms; ${held.length} request(s) retained`);
     return true;
   }
+  /** When a hold's timer next fires: at its deadline, stepped past what one
+   *  timer can hold. A hold with no deadline (a wait held until released, or
+   *  the stand-in for unreadable records) asks again as often as unreadable
+   *  records are read again: records that read again end it, and nothing
+   *  announces that. */
+  private providerHoldTimerMs(remaining: number): number {
+    return Number.isFinite(remaining)
+      ? Math.min(remaining, MAX_TIMER_DELAY_MS)
+      : this.providerWaits?.retryReadMs ?? MAX_TIMER_DELAY_MS;
+  }
   private releaseProviderAccelerationCooldown(agentName: string): void {
     const cooldown = this.providerAccelerationCooldowns.get(agentName); if (!cooldown) return;
-    // A provider wait that still binds (extended since, or indefinite) keeps
-    // holding; a different primary model now is not bound by it.
+    // A wait hold lasts exactly as long as its wait binds: longer once the
+    // wait is extended, while it is indefinite, and over once no wait binds
+    // (passed, released, or the stand-in for unreadable records lifted because
+    // they read again). A different primary model now is not bound by it.
     if (cooldown.waitModel !== undefined && this.agents.get(agentName)?.model === cooldown.waitModel) {
       const wait = this.providerWaits?.active(agentName, cooldown.waitModel);
-      if (wait) cooldown.until = wait.until ?? Number.POSITIVE_INFINITY;
+      cooldown.until = wait ? (wait.until ?? Number.POSITIVE_INFINITY) : Date.now();
     }
-    // Timers step through waits longer than one timer can hold.
     const remaining = cooldown.until - Date.now();
     if (remaining > 0 && (cooldown.waitModel === undefined || this.agents.get(agentName)?.model === cooldown.waitModel)) {
       clearTimeout(cooldown.timer);
-      cooldown.timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agentName), Math.min(remaining, MAX_TIMER_DELAY_MS));
+      cooldown.timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agentName), this.providerHoldTimerMs(remaining));
       cooldown.timer.unref?.();
       return;
     }
@@ -2317,7 +2344,7 @@ export class AgentFramework {
     // re-checks this wait at admission.
     if (existing && existing.waitModel === undefined) return true;
     if (existing) clearTimeout(existing.timer);
-    const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), Math.min(until - now, MAX_TIMER_DELAY_MS));
+    const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), this.providerHoldTimerMs(until - now));
     timer.unref?.();
     this.providerAccelerationCooldowns.set(agent.name, {
       startedAt: existing?.startedAt ?? now, until, timer, heldRequests: held,
@@ -2358,7 +2385,9 @@ export class AgentFramework {
    * Release provider waits: one model's for an agent, or every model's. The
    * explicit operator override for a wait that should not be honoured (the
    * passing of time needs no call). Recorded, so a restart does not bring the
-   * wait back; held primary turns are released into one fresh compile.
+   * wait back; held primary turns are released into one fresh compile. An
+   * acceleration hold the released wait lengthened keeps only AF's own pacing
+   * for its failure; a host hold stays the host's.
    */
   releaseProviderWait(agentName: string, model?: string, by = 'operator'): Array<{
     model: string; until: string | null; release: 'recorded' | 'pending' | 'in-process override';
@@ -2385,8 +2414,18 @@ export class AgentFramework {
       }
     }
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
-    if (cooldown?.waitModel !== undefined && (model === undefined || cooldown.waitModel === model)) {
-      cooldown.until = Date.now();
+    const covers = (held: string | undefined): boolean => held !== undefined && (model === undefined || held === model);
+    if (cooldown && covers(cooldown.waitModel)) {
+      // A wait hold asks its wait again: released, the hold ends.
+      this.releaseProviderAccelerationCooldown(agentName);
+    } else if (cooldown?.statedWait && covers(cooldown.statedWait.model)) {
+      // An acceleration hold the stated wait lengthened keeps only AF's own
+      // pacing for that failure, and is never lengthened by a release. A host
+      // hold carries no stated wait: its length stays the host's.
+      cooldown.until = Math.min(cooldown.until, cooldown.statedWait.ownUntil);
+      console.error(`[provider-wait] agent=${agentName} model=${cooldown.statedWait.model} acceleration hold keeps AF's own pacing only, ` +
+        (cooldown.until > Date.now() ? `until ${new Date(cooldown.until).toISOString()}` : 'which has passed'));
+      delete cooldown.statedWait;
       this.releaseProviderAccelerationCooldown(agentName);
     }
     return released.map(({ wait, release }) => ({
@@ -5361,6 +5400,11 @@ export class AgentFramework {
     }
 
     if (params.command === 'release-provider-wait') {
+      // Only an omitted model, or '*', releases every model: a malformed one
+      // is refused here, before anything changes, never widened.
+      if (!isReleaseModel(params.model)) {
+        return { ok: false, error: "release-provider-wait: model must be a model name, or '*' (or omitted) for every model" };
+      }
       console.error(`[host-command] release-provider-wait agent=${agentName} model=${params.model ?? '*'} by=${requester} (server=${serverId})`);
       const released = this.releaseProviderWait(agentName, params.model, requester);
       return { ok: true, released };

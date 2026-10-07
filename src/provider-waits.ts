@@ -113,7 +113,7 @@ export interface ProviderWaitRelease {
 
 /** How often a binding act this process could not record is offered to the journal again, absent another act. */
 const RETRY_WRITE_MS = 30_000;
-/** How often unreadable recorded waits are read again. */
+/** How often unreadable recorded waits are read again, by default (`retryReadMs`). */
 const RETRY_READ_MS = 30_000;
 /**
  * The model that stands for every model: how list() shows the hold for
@@ -122,9 +122,53 @@ const RETRY_READ_MS = 30_000;
  */
 export const EVERY_MODEL = '*';
 
+/**
+ * Whether a release's `model`, as an operator surface receives it, names a
+ * scope: omitted or EVERY_MODEL for every model, any other nonempty string
+ * for that model. Anything else is malformed and is refused, never taken as
+ * "every model".
+ */
+export function isReleaseModel(model: unknown): model is string | undefined {
+  return model === undefined || (typeof model === 'string' && model !== '');
+}
+
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 const live = (wait: ProviderWait | undefined, now: number): ProviderWait | undefined =>
   wait && (wait.until === null || wait.until > now) ? wait : undefined;
+
+// What a record must hold to be read as provider waits: every field the
+// reduction, or a reader of its waits, uses. A record that parses but lacks
+// one is unreadable (fail closed), never read as "no waits".
+const fieldsOf = (value: unknown): Record<string, unknown> | undefined =>
+  typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+const isText = (value: unknown): value is string => typeof value === 'string';
+/** A number a Date can hold (NaN and the infinities fail the comparison). */
+const isInstant = (value: unknown): value is number => typeof value === 'number' && Math.abs(value) <= MAX_DATE_MS;
+const isDeadline = (value: unknown): value is number | null => value === null || isInstant(value);
+
+function isWait(value: unknown): value is ProviderWait {
+  const wait = fieldsOf(value);
+  return wait !== undefined && isText(wait.agent) && isText(wait.model) && isDeadline(wait.until) &&
+    isText(wait.reason) && isInstant(wait.setAt);
+}
+
+/** A release's `by` and `at` are never read back, so they are not required. */
+function isEntry(value: unknown): value is ProviderWaitEntry {
+  const entry = fieldsOf(value);
+  if (entry === undefined || !isText(entry.agent)) return false;
+  if (entry.kind === 'set') {
+    return isText(entry.model) && isDeadline(entry.until) && isText(entry.reason) && isInstant(entry.at);
+  }
+  return entry.kind === 'released' && (entry.model === null || isText(entry.model));
+}
+
+function isSnapshot(value: unknown): value is ProviderWaitSnapshot {
+  const waits = fieldsOf(value)?.waits;
+  if (!Array.isArray(waits) || !waits.every(isWait)) return false;
+  // The writer keeps one wait per (agent, model). A repeated key has no
+  // reading that is sure to keep the longer wait.
+  return new Set(waits.map((wait) => keyOf(wait.agent, wait.model))).size === waits.length;
+}
 
 export class ProviderWaits {
   /**
@@ -150,14 +194,23 @@ export class ProviderWaits {
    */
   private unreadable: { error: string; at: number; lastTry: number; waived: Set<string> } | null = null;
   private lastWriteTry = 0;
+  /**
+   * How often unreadable recorded waits are read again. The hold that stands
+   * for them ends without any act (the records read again), so whoever holds
+   * on a wait with no deadline asks active() again this often.
+   */
+  readonly retryReadMs: number;
+  private readonly store: JsStore | null;
   private readonly journal: RecordJournal<ProviderWaitEntry, ProviderWaitSnapshot> | null;
   private readonly now: () => number;
   private readonly log: (line: string) => void;
 
   /** `store` null keeps waits in memory only (a framework without a store has no restart to survive). */
-  constructor(store: JsStore | null, opts: { now?: () => number; log?: (line: string) => void } = {}) {
+  constructor(store: JsStore | null, opts: { now?: () => number; log?: (line: string) => void; retryReadMs?: number } = {}) {
     this.now = opts.now ?? Date.now;
     this.log = opts.log ?? ((line) => console.error(line));
+    this.retryReadMs = opts.retryReadMs ?? RETRY_READ_MS;
+    this.store = store;
     this.journal = store ? new RecordJournal<ProviderWaitEntry, ProviderWaitSnapshot>(store, { type: PROVIDER_WAIT_RECORD_TYPE }) : null;
     this.load();
   }
@@ -269,13 +322,25 @@ export class ProviderWaits {
 
   /**
    * Read the journal into `durable`. A failure leaves the history unreadable
-   * (fail closed, reported once), never empty.
+   * (fail closed, reported once), never empty. So does a record that parses
+   * but cannot be read as provider waits: a checkpoint also stands for every
+   * entry before it, so a malformed one read as empty would drop them all.
    */
   private load(): boolean {
     if (!this.journal) return true;
     const now = this.now();
     try {
       const { snapshot, entries } = this.journal.load();
+      // RecordJournal shows a checkpoint whose snapshot is null as no
+      // checkpoint at all (it still skips the entries it covers); this writer
+      // never writes one, so finding such a record means it is malformed.
+      const malformedCheckpoint = snapshot === null
+        ? this.store!.getRecordIdsByType(this.journal.checkpointType).length > 0
+        : !isSnapshot(snapshot);
+      if (malformedCheckpoint) throw new Error('a provider-wait checkpoint is malformed');
+      for (const { id, entry } of entries) {
+        if (!isEntry(entry)) throw new Error(`provider-wait record ${id} is malformed`);
+      }
       const loaded = new Map<string, ProviderWait>();
       for (const wait of snapshot?.waits ?? []) loaded.set(keyOf(wait.agent, wait.model), { ...wait });
       for (const { entry } of entries) reduce(loaded, entry);
@@ -307,7 +372,7 @@ export class ProviderWaits {
   /** Offer unrecorded acts and unreadable history again, at most every so often, absent other acts. */
   private retry(): void {
     const now = this.now();
-    if (this.unreadable && now - this.unreadable.lastTry >= RETRY_READ_MS) this.load();
+    if (this.unreadable && now - this.unreadable.lastTry >= this.retryReadMs) this.load();
     if (this.pending.length > 0 && now - this.lastWriteTry >= RETRY_WRITE_MS) {
       this.reconcile();
       this.flush();
