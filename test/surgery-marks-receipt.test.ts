@@ -198,10 +198,21 @@ describe('surgery marker receipt', () => {
     writeFileSync(holdPath, '1');
     await waitFor('the probe to be answered after delivery', () =>
       jsonl(eventsPath).some((e) => e.event === 'probe-answered'));
-    const events = jsonl<{ event: string; at: number }>(eventsPath);
-    const lastReaction = Math.max(...events.filter((e) => e.event === 'reaction-answered').map((e) => e.at));
-    const probe = events.find((e) => e.event === 'probe-answered')!;
-    assert.ok(probe.at >= lastReaction, 'the probe is answered only after the held reactions');
+    // The server's own event order, not timestamps (two events can share a
+    // millisecond), and every expected reaction by id: one compared only with
+    // the reactions that happened to be answered would pass if the second
+    // surgery's batch were never delivered.
+    const events = jsonl<{ event: string; messageId?: string }>(eventsPath);
+    const probeIndex = events.findIndex((e) => e.event === 'probe-answered');
+    const answeredBeforeProbe = events.slice(0, probeIndex)
+      .filter((e) => e.event === 'reaction-answered')
+      .map((e) => e.messageId)
+      .sort();
+    assert.deepEqual(
+      answeredBeforeProbe,
+      ['amb-0', 'amb-2', 'amb-3'],
+      'both surgeries\' reactions are answered before channel traffic is released',
+    );
   });
 
   it('restoring the source while delivery runs keeps traffic gated until the running drain is done', async () => {
