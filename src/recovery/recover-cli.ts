@@ -61,7 +61,8 @@ Options:
   --outbox <path>             A pre-journal awareness ledger to import
                               (default: <store>/recovery/discord-awareness-outbox.json)
   --emoji <emoji>             Marker reaction (default: 💤)
-  --dry-run                   Inspect counts/addresses without writing
+  --dry-run                   Inspect a recovery's counts/addresses without
+                              writing (a recovery only; refused with --awareness)
   --help                      Show this help
 
 Awareness journal (host stopped):
@@ -73,11 +74,13 @@ Awareness journal (host stopped):
                               ref's configured MCPL route) on a batch's refs,
                               or on every ref an add was ever sent for
   --awareness release <ID>    Queue a held batch's recorded operations
+  Each acts at once: inspect first with --awareness list.
 
 Queued work is delivered when the host next connects to the Discord server.
-Each recovery and each cancel, retract or release (done or refused; not a
-dry run or a list) is recorded in <store>/operator-actions.jsonl, the host's
-operator log, with the OS account that ran it.
+Each recovery, and each cancel, retract or release, is recorded in
+<store>/operator-actions.jsonl, the host's operator log, with the OS account
+that ran it, whether it was carried out or refused. A dry run and a list
+record nothing.
 The agent host must be stopped before running this command.`;
 }
 
@@ -212,6 +215,11 @@ async function main(): Promise<void> {
   if (options.awareness) {
     if (!options.storePath) {
       throw new Error(`--awareness needs --store\n\n${usage()}`);
+    }
+    // There is no preview of a control: refuse rather than act on a command
+    // that asked not to change anything.
+    if (options.dryRun) {
+      throw new Error('--dry-run previews a recovery; it does not apply to --awareness (inspect with --awareness list)');
     }
     awareness(options);
     return;

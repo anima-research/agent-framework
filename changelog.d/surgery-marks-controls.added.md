@@ -29,5 +29,6 @@
 - `agent-framework-recover` records its acts in the store's operator log
   (`<store>/operator-actions.jsonl`), done or refused, with the OS account
   that ran it: each `--awareness` cancel, retract and release, and each
-  recovery with its marks choice and receipt (kind `recovery`). A dry run or
-  a list records nothing.
+  recovery with its marks choice and receipt (kind `recovery`). A list, and
+  a recovery's dry run, record nothing. `--dry-run` with `--awareness` is
+  refused: a control has no preview.

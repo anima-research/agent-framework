@@ -82,6 +82,50 @@ test('the offline awareness controls record each act in the operator log, done o
   }
 });
 
+test('--dry-run with an awareness control is refused before the store opens: nothing is done or recorded', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'recover-cli-log-'));
+  const storePath = join(dir, 'store');
+  const journal = () => {
+    const store = JsStore.openOrCreate({ path: storePath });
+    try {
+      const outbox = new DiscordAwarenessOutbox(store);
+      return { view: outbox.view(), operations: outbox.operations() };
+    } finally {
+      store.close();
+    }
+  };
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const outbox = new DiscordAwarenessOutbox(store);
+    const active = outbox.prepare({
+      agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', refs: [ref('m1')], scope: 'all',
+    })!;
+    outbox.activate(active.id);
+    const held = outbox.prepare({
+      agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/interrupted', refs: [ref('m2')], scope: 'all',
+    })!;
+    outbox.recoverAtStartup('main'); // its switch was never recorded: held
+    store.close();
+    const before = journal();
+    const heldView = before.view.find((v) => v.id === held.id);
+    assert.equal(heldView?.kind === 'batch' ? heldView.status : undefined, 'held');
+
+    for (const control of [['cancel', active.id], ['retract', 'all'], ['release', held.id]]) {
+      const run = recover(storePath, '--awareness', ...control, '--dry-run');
+      assert.equal(run.status, 1, `${control[0]} --dry-run is refused`);
+      assert.match(run.stderr, /--dry-run previews a recovery; it does not apply to --awareness/);
+    }
+    assert.deepEqual(journal(), before, 'nothing was cancelled, retracted or released');
+    assert.deepEqual(operatorLog(storePath), [], 'and nothing was recorded');
+
+    const missing = join(dir, 'no-such-store');
+    assert.equal(recover(missing, '--awareness', 'cancel', active.id, '--dry-run').status, 1);
+    assert.equal(existsSync(missing), false, 'refused before any store is opened or created');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('an offline recovery records its marks choice and receipt in the operator log; a dry run records nothing', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'recover-cli-log-'));
   const storePath = join(dir, 'store');
