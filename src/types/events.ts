@@ -209,6 +209,27 @@ export interface ToolCall {
   input: unknown;
   /** The agent that made this tool call. Set by the framework dispatch layer. */
   callerAgentName?: string;
+  /**
+   * Who initiated the call, when it isn't the agent's own model: 'puppet'
+   * for an operator acting through the agent's surface (puppetToolCall),
+   * 'host' for a module calling a tool (ModuleContext.callTool). Absent
+   * means the agent's model. Set where the call enters the framework and
+   * carried through every redispatch (the utils meta-tool, code_execution's
+   * inner calls), so a tool reached through a wrapper still sees who asked.
+   */
+  origin?: 'puppet' | 'host';
+  /**
+   * An operator change this call carries out, already admitted by the
+   * host's operator-change gate. Carried with `origin`, so a gated tool
+   * applies it instead of staging it again.
+   */
+  admission?: OperatorAdmission;
+}
+
+/** The host's admission of one operator change (see FrameworkConfig.operatorChangeGate). */
+export interface OperatorAdmission {
+  /** The host's id for the admitted change. */
+  id: string;
 }
 
 // ============================================================================

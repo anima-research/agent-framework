@@ -22,6 +22,7 @@ import type {
   FrameworkConfig,
   InferencePolicy,
   ErrorPolicy,
+  OperatorAdmission,
   ProviderHoldHook,
   ErrorAction,
   FrameworkState,
@@ -1372,6 +1373,13 @@ export class AgentFramework {
   private codeExecutionConfig: import('./types/index.js').CodeExecutionConfig | null = null;
   private codeExecutionRunners: Map<string, PyRunner> = new Map();
   private scriptToolWaiters: Map<string, (result: ToolResult) => void> = new Map();
+  /**
+   * Who initiated the interactive code_execution call running for each
+   * agent (its origin and admission), so the script's inner tool calls carry
+   * them too. The runner allows one interactive script per agent at a time.
+   * A background script binds its own at start.
+   */
+  private scriptCallProvenance: Map<string, Pick<ToolCall, 'origin' | 'admission'>> = new Map();
   /** Agents whose running script hit an endTurn-carrying inner result —
    *  deferred and applied to the final code_execution result instead of
    *  cancelling the stream mid-script (which would wedge the turn). */
@@ -1505,7 +1513,7 @@ export class AgentFramework {
       // framework hands to its own module registry. The public
       // executeToolCall() is shared with model/ephemeral callers and always
       // stamps agent origin (see there).
-      callTool: (call) => this.executeToolCallFrom(call, { kind: 'module' }),
+      callTool: (call) => this.executeToolCallFrom({ ...call, origin: call.origin ?? 'host' }, { kind: 'module' }),
       notifyOps: (kind, agentName, message, data) => this.notifyOps(kind, agentName, message, data),
     });
   }
@@ -11613,12 +11621,17 @@ export class AgentFramework {
    *   runAtSafeBoundary) it runs on the turn token that lease holds for the
    *   agent instead of refusing the hold and minting its own; the lease's
    *   release flushes what deferred meanwhile.
+   * - The call carries `origin: 'puppet'` through every dispatch path, so a
+   *   tool can tell an operator's act from the agent's own. `opts.admission`
+   *   marks it as carrying out an operator change the host already
+   *   admitted (FrameworkConfig.operatorChangeGate), which a gated tool
+   *   then applies instead of staging again.
    */
   async puppetToolCall(
     agentName: string,
     toolName: string,
     input: Record<string, unknown>,
-    opts?: { lease?: SafeBoundaryLease },
+    opts?: { lease?: SafeBoundaryLease; admission?: OperatorAdmission },
   ): Promise<{ toolUseId: string; result: ToolResult }> {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
@@ -11689,6 +11702,8 @@ export class AgentFramework {
         name: toolName,
         input,
         callerAgentName: agentName,
+        origin: 'puppet',
+        ...(opts?.admission ? { admission: opts.admission } : {}),
       });
       const durationMs = Date.now() - started;
 
@@ -11806,6 +11821,13 @@ export class AgentFramework {
     // model does.
     if (call.name === 'utils') {
       return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call);
+    }
+
+    // agent_settings, through the handler the model path uses. Without this
+    // route a puppeted agent_settings fell through to module-name parsing
+    // and failed as "Invalid tool name format".
+    if (call.name === 'agent_settings') {
+      return this.runAgentSettingsToolCall(call.callerAgentName ?? '__ephemeral__', call);
     }
 
     // Module tools
@@ -11979,8 +12001,12 @@ export class AgentFramework {
       surface.map((t) => t.name).filter((name) => name !== CODE_EXECUTION_TOOL_NAME),
     );
 
+    const provenance: Pick<ToolCall, 'origin' | 'admission'> | undefined = call.origin || call.admission
+      ? { ...(call.origin ? { origin: call.origin } : {}), ...(call.admission ? { admission: call.admission } : {}) }
+      : undefined;
+
     if (input.background === true) {
-      const started = this.startBackgroundScript(agentName, input.code, injected, timeLimitMs);
+      const started = this.startBackgroundScript(agentName, input.code, injected, timeLimitMs, provenance);
       if (capNote && started.success && started.data && typeof started.data === 'object') {
         (started.data as Record<string, unknown>).time_limit_note = capNote;
       }
@@ -11989,7 +12015,19 @@ export class AgentFramework {
 
     const runner = this.getOrCreateScriptRunner(agentName);
     this.scriptDeferredEndTurn.delete(agentName);
-    const exec = await runner.exec(input.code, injected, undefined, timeLimitMs !== undefined ? { deadlineMs: timeLimitMs } : undefined);
+    // A busy runner refuses this exec, so only an exec that can run sets
+    // the provenance its inner calls read; it's cleared when that exec ends.
+    const owned = !runner.busy;
+    if (owned) {
+      if (provenance) this.scriptCallProvenance.set(agentName, provenance);
+      else this.scriptCallProvenance.delete(agentName);
+    }
+    let exec: Awaited<ReturnType<typeof runner.exec>>;
+    try {
+      exec = await runner.exec(input.code, injected, undefined, timeLimitMs !== undefined ? { deadlineMs: timeLimitMs } : undefined);
+    } finally {
+      if (owned && this.scriptCallProvenance.get(agentName) === provenance) this.scriptCallProvenance.delete(agentName);
+    }
     const endTurn = this.scriptDeferredEndTurn.delete(agentName);
 
     return {
@@ -12022,6 +12060,8 @@ export class AgentFramework {
     code: string,
     injected: import('./code-execution/py-runner.js').InjectedTool[],
     timeLimitMs?: number,
+    /** Who started it: its inner calls carry this for the script's life. */
+    provenance?: Pick<ToolCall, 'origin' | 'admission'>,
   ): ToolResult {
     // v1: primary-agent-only. A conversation fork's or ephemeral's daemon
     // would outlive its owner and its wake would land in the primary
@@ -12071,7 +12111,7 @@ export class AgentFramework {
       scriptTimeoutMs: cfg?.scriptTimeoutMs,
       idleReclaimMs: 0, // dedicated runner; lifetime is the exec deadline
       label: `${agentName}:${scriptId}`,
-      onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args),
+      onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args, provenance),
     });
 
     const record: BackgroundScriptRecord = {
@@ -12395,7 +12435,8 @@ export class AgentFramework {
         scriptTimeoutMs: cfg?.scriptTimeoutMs,
         idleReclaimMs: cfg?.idleReclaimMs,
         label: agentName,
-        onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args),
+        onToolCall: (toolName, args) =>
+          this.handleScriptToolCall(agentName, toolName, args, this.scriptCallProvenance.get(agentName)),
       });
       this.codeExecutionRunners.set(agentName, runner);
     }
@@ -12415,11 +12456,12 @@ export class AgentFramework {
     agentName: string,
     toolName: string,
     args: Record<string, unknown>,
+    provenance?: Pick<ToolCall, 'origin' | 'admission'>,
   ): Promise<string> {
     if (toolName === CODE_EXECUTION_TOOL_NAME) {
       return 'Error: code_execution cannot be called from within a script';
     }
-    const result = await this.dispatchScriptToolCall(agentName, toolName, args);
+    const result = await this.dispatchScriptToolCall(agentName, toolName, args, provenance);
     if (result.endTurn) {
       // Deferred: applied to the final code_execution result (see
       // scriptDeferredEndTurn) — ending the turn mid-script would cancel the
@@ -12461,6 +12503,7 @@ export class AgentFramework {
     agentName: string,
     toolName: string,
     args: Record<string, unknown>,
+    provenance?: Pick<ToolCall, 'origin' | 'admission'>,
   ): Promise<ToolResult> {
     return new Promise<ToolResult>((resolve) => {
       const callId = `pytc-${randomUUID()}`;
@@ -12485,7 +12528,7 @@ export class AgentFramework {
       });
 
       try {
-        this.dispatchToolCall(agentName, { id: callId, name: toolName, input: args });
+        this.dispatchToolCall(agentName, { id: callId, name: toolName, input: args, ...provenance });
       } catch (error) {
         if (this.scriptToolWaiters.delete(callId)) {
           clearTimeout(safety);
@@ -16200,12 +16243,15 @@ export class AgentFramework {
           };
         }
         // Same dispatch as a first-class tool call — the module cannot tell
-        // which surface the call came through.
+        // which surface the call came through. Who initiated it, and any
+        // admission it carries, travel with it.
         return this.moduleRegistry.handleToolCall({
           id: call.id,
           name: def.name,
           input: args,
           callerAgentName: agentName,
+          ...(call.origin ? { origin: call.origin } : {}),
+          ...(call.admission ? { admission: call.admission } : {}),
         });
       }
       default:
@@ -16239,6 +16285,23 @@ export class AgentFramework {
   }
 
   private dispatchAgentSettingsToolCall(agentName: string, call: ToolCall): void {
+    const result = this.runAgentSettingsToolCall(agentName, call);
+    this.pushEvent({
+      type: 'tool-result',
+      callId: call.id,
+      agentName,
+      moduleName: 'agent',
+      result,
+    });
+  }
+
+  /**
+   * The agent_settings handler, for every dispatch path: the model's
+   * (dispatchAgentSettingsToolCall wraps it in a tool-result event) and the
+   * promise-based one puppetToolCall, ModuleContext.callTool and
+   * code_execution's callers use (executeToolCallFrom).
+   */
+  private runAgentSettingsToolCall(agentName: string, call: ToolCall): ToolResult {
     this.emitTrace({
       type: 'tool:started',
       module: 'agent',
@@ -16401,13 +16464,7 @@ export class AgentFramework {
       durationMs: 0,
       ...(result.isError ? { error: result.error } : {}),
     });
-    this.pushEvent({
-      type: 'tool-result',
-      callId: call.id,
-      agentName,
-      moduleName: 'agent',
-      result,
-    });
+    return result;
   }
 
   /** Aggregate the event-tag vocabulary: reserved chat:* core + each connected
