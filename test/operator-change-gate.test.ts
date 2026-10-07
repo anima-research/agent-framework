@@ -820,7 +820,7 @@ describe('operator-change gate: host/command undo by turns', () => {
     assert.equal(branch(), change.sourceBranch);
   });
 
-  it('treats a used destination as proof of the cut when its switch record was lost, after the source is restored', async () => {
+  it('establishes a cut this process saw complete when its switch record was lost, whatever the branches show since', async () => {
     await turn('one'); await turn('two'); await turn('three');
     await undo(2);
     const change = asked[0]!;
@@ -830,15 +830,17 @@ describe('operator-change gate: host/command undo by turns', () => {
     } finally {
       restore();
     }
-    await turn('on the destination'); // used
-    framework.getStore().switchBranch(change.sourceBranch); // left, and the source restored
+    // Branch state is no evidence either way: the destination used, then
+    // left, and the source restored.
+    await turn('on the destination');
+    framework.getStore().switchBranch(change.sourceBranch);
     const branches = () => framework.getStore().listBranches().map((x) => x.name).sort();
     const before = branches();
     const retried = await applyIt(change);
     assert.equal(retried.kind === 'undo-turns' && retried.alreadyApplied, true, 'committed: never cut again');
     assert.equal(branch(), change.sourceBranch);
     assert.deepEqual(branches(), before);
-    assert.equal(framework.getOperatorChangeRecord(change.id)!.switched, 1, 'its switch recorded now, from the evidence');
+    assert.equal(framework.getOperatorChangeRecord(change.id)!.switched, 1, 'its switch recorded now, from what this process saw');
   });
 
   for (const target of ['all', 'by id'] as const) {
@@ -1216,6 +1218,12 @@ describe('operator-change gate: host/command undo by turns', () => {
     const listed = recover('list');
     assert.deepEqual(listed.unresolved.map((u: { changeId: string; attempt: number; targetIsActive: boolean }) => [u.changeId, u.attempt, u.targetIsActive]),
       [[change.id, 1, true]], 'inspected without starting the host');
+    // A dry run is no preview of a decision: refused before the store opens, nothing recorded.
+    const dry = spawnSync(process.execPath, [cli, '--store', storePath, '--operator-change', 'resolve', change.id,
+      '--attempt', '1', '--verdict', 'not-committed', '--reason', 'only looking', '--dry-run'], { encoding: 'utf8' });
+    assert.equal(dry.status, 1);
+    assert.match(dry.stderr, /does not apply to --operator-change \(inspect with --operator-change list\)/);
+    assert.deepEqual(recover('list').unresolved.map((u: { attempt: number }) => u.attempt), [1], 'still unresolved: nothing was recorded');
     // A wrong attempt is refused, and the refusal is logged like the CLI's other acts.
     const wrong = spawnSync(process.execPath, [cli, '--store', storePath, '--operator-change', 'resolve', change.id,
       '--attempt', '2', '--verdict', 'not-committed', '--reason', 'wrong attempt'], { encoding: 'utf8' });
@@ -1842,6 +1850,45 @@ describe('operator journals that cannot be read', () => {
     store.appendJson('operator/changes', { kind: 'attempt', changeId: 'half' });
     store.sync();
     await assert.rejects(startOn(store), refusedAs('operator/changes'));
+  });
+
+  const hideEvidence = { ...evidence, target: 'main', source: 'main', removed: 2, ids: [{ id: 'm1', fingerprint: 'f1' }, { id: 'm2', fingerprint: 'f2' }] };
+  let ledgers = 0;
+  const refuses = async (entries: object[], why: RegExp) => {
+    const store = JsStore.openOrCreate({ path: join(dir, `ledger-${++ledgers}`) });
+    try {
+      for (const entry of entries) store.appendJson('operator/changes', entry);
+      store.sync();
+      await assert.rejects(startOn(store), (e: Error) => refusedAs('operator/changes')(e) && why.test(e.message));
+    } finally {
+      store.close();
+    }
+  };
+  const hideAttempt = (ev: object) => ({ kind: 'attempt', changeId: 'h', changeKind: 'hide', agent: 'scout', n: 1, at: 1, evidence: ev });
+
+  it("refuses a hide attempt without its ids, which recovery would read as an empty removal", async () => {
+    const { ids: _omitted, ...withoutIds } = hideEvidence;
+    await refuses([hideAttempt(withoutIds)], /a hide's ids/);
+  });
+
+  it('refuses a hide whose removal count differs from its ids', async () => {
+    await refuses([hideAttempt({ ...hideEvidence, removed: 3 })], /a hide removes exactly its ids/);
+  });
+
+  it('refuses a marks ref missing what delivery dereferences', async () => {
+    const marks = { scope: 'all', refs: [{ serverId: 's', channelId: 'c' }], unmarked: 0, notRemoved: 0 };
+    await refuses([hideAttempt({ ...hideEvidence, marks })], /a marks ref/);
+  });
+
+  it('refuses an outcome whose receipt lacks what its status needs', async () => {
+    const markers = { scope: 'all', unmarked: 0, notRemoved: 0, status: 'queued', queued: 1 };
+    await refuses([hideAttempt(hideEvidence), { kind: 'outcome', changeId: 'h', outcome: { n: 1, at: 2, removed: 2, markers } }], /markers receipt/);
+  });
+
+  it('refuses an outcome, or a switch, that names no attempt of its own', async () => {
+    const markers = { scope: 'none', unmarked: 0, notRemoved: 0, status: 'none', queued: 0 };
+    await refuses([hideAttempt(hideEvidence), { kind: 'outcome', changeId: 'h', outcome: { n: 2, at: 2, removed: 2, markers } }], /names no attempt of its own/);
+    await refuses([{ kind: 'switched', changeId: 'never-attempted', n: 1 }], /switched entry/);
   });
 
   it('refuses a null-snapshot checkpoint in the unstick journal too', async () => {

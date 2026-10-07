@@ -365,6 +365,11 @@ async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
   if (options.operatorChange) {
     if (!options.storePath) throw new Error(`--operator-change needs --store\n\n${usage()}`);
+    // A resolution is a decision, not a preview: refuse before opening the
+    // store rather than record one for a command that asked to change nothing.
+    if (options.dryRun) {
+      throw new Error('--dry-run previews a recovery; it does not apply to --operator-change (inspect with --operator-change list)');
+    }
     operatorChange(options);
     return;
   }

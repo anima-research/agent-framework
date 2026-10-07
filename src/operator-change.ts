@@ -407,6 +407,8 @@ export interface OperatorChangeResolutionReceipt {
 }
 
 const CHANGE_KINDS = new Set(['agent-settings', 'tool-presentation', 'undo-turns', 'unstick', 'hide', 'undo-messages']);
+/** The kinds whose application is journaled as attempts: the cuts and hide. */
+const CUT_KINDS = new Set(['undo-turns', 'undo-messages']);
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isText = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
 const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
@@ -415,7 +417,8 @@ function malformed(what: string): never {
   throw new Error(`malformed operator/changes ${what}`);
 }
 
-function checkEvidence(e: unknown, where: string): void {
+/** An attempt's evidence, checked as its kind's recovery consumes it. */
+function checkEvidence(e: unknown, where: string, kind: string): void {
   if (!isObject(e)) malformed(`${where}: evidence`);
   if (!isText(e.target) || !isText(e.source) || !isCount(e.sourceHead) || !isCount(e.removed) || typeof e.staged !== 'boolean') {
     malformed(`${where}: evidence fields`);
@@ -423,8 +426,19 @@ function checkEvidence(e: unknown, where: string): void {
   const marks = e.marks;
   if (!isObject(marks) || !['none', 'addressed', 'all'].includes(marks.scope as string) || !Array.isArray(marks.refs)
     || !isCount(marks.unmarked) || !isCount(marks.notRemoved)) malformed(`${where}: marks facts`);
-  if (e.ids !== undefined && (!Array.isArray(e.ids) || !e.ids.every((i) => isObject(i) && isText(i.id) && isText(i.fingerprint)))) {
-    malformed(`${where}: hide ids`);
+  if (!marks.refs.every((r) => isObject(r) && isText(r.serverId) && isText(r.channelId) && isText(r.messageId))) {
+    malformed(`${where}: a marks ref`);
+  }
+  if (kind === 'hide') {
+    // Recovery removes exactly these: missing ids must never read as an
+    // empty removal. (Empty is valid when none of them remained to hide.)
+    if (!Array.isArray(e.ids) || !e.ids.every((i) => isObject(i) && isText(i.id) && isText(i.fingerprint))) {
+      malformed(`${where}: a hide's ids`);
+    }
+    if (e.removed !== e.ids.length) malformed(`${where}: a hide removes exactly its ids`);
+    if (e.target !== e.source) malformed(`${where}: a hide stays on its branch`);
+  } else if (e.ids !== undefined) {
+    malformed(`${where}: a cut records no hide ids`);
   }
 }
 
@@ -433,54 +447,88 @@ function checkResolution(r: unknown, where: string): void {
     || (r.via !== 'live' && r.via !== 'offline')) malformed(`${where}: resolution`);
 }
 
-function checkOutcome(o: unknown, where: string): void {
-  if (!isObject(o) || !isCount(o.n) || !isCount(o.at) || !isCount(o.removed) || !isObject(o.markers) || !isText(o.markers.status)) {
-    malformed(`${where}: outcome`);
+/** The awareness receipt an outcome hands back, by status. */
+function checkMarkers(m: unknown, where: string): void {
+  if (!isObject(m) || !['none', 'addressed', 'all'].includes(m.scope as string) || !isCount(m.unmarked) || !isCount(m.notRemoved)) {
+    malformed(`${where}: markers facts`);
   }
+  const ok = m.status === 'none' ? m.queued === 0
+    : m.status === 'queued' ? isCount(m.queued) && isText(m.batchId)
+    : m.status === 'not-scheduled' ? m.queued === 0 && typeof m.error === 'string'
+    : m.status === 'unresolved' ? m.queued === 0 && isText(m.batchId) && typeof m.error === 'string'
+    : false;
+  if (!ok) malformed(`${where}: markers receipt`);
 }
 
+function checkOutcome(o: unknown, where: string): void {
+  if (!isObject(o) || !isCount(o.n) || !isCount(o.at) || !isCount(o.removed)) malformed(`${where}: outcome`);
+  checkMarkers(o.markers, `${where} outcome`);
+}
+
+/** A whole record, as reduced: its fields, each attempt's evidence by the
+ *  record's kind, and its references to its own attempts. */
 function checkRecord(r: unknown, id: string): asserts r is OperatorChangeRecord {
   const where = `record ${id}`;
   if (!isObject(r) || r.changeId !== id || !CHANGE_KINDS.has(r.kind as string) || !isText(r.agent) || !Array.isArray(r.attempts)) {
     malformed(where);
   }
+  const kind = r.kind as string;
+  if (r.attempts.length > 0 && !CUT_KINDS.has(kind) && kind !== 'hide') malformed(`${where}: a ${kind} records no attempts`);
+  const ns = new Set<number>();
   for (const a of r.attempts) {
-    if (!isObject(a) || !isCount(a.n) || !isCount(a.at)) malformed(`${where}: attempt`);
-    checkEvidence(a.evidence, `${where} attempt ${a.n}`);
+    if (!isObject(a) || !isCount(a.n) || !isCount(a.at) || ns.has(a.n)) malformed(`${where}: attempt`);
+    ns.add(a.n);
+    checkEvidence(a.evidence, `${where} attempt ${a.n}`, kind);
     if (a.failed !== undefined && typeof a.failed !== 'string') malformed(`${where} attempt ${a.n}: failed`);
-    if (a.resolution !== undefined) checkResolution(a.resolution, `${where} attempt ${a.n}`);
+    if (a.resolution !== undefined) {
+      if (!CUT_KINDS.has(kind)) malformed(`${where} attempt ${a.n}: only a cut is resolved`);
+      checkResolution(a.resolution, `${where} attempt ${a.n}`);
+    }
   }
-  if (r.switched !== undefined && !isCount(r.switched)) malformed(`${where}: switched`);
-  if (r.outcome !== undefined) checkOutcome(r.outcome, where);
+  if (r.switched !== undefined && !(CUT_KINDS.has(kind) && isCount(r.switched) && ns.has(r.switched))) malformed(`${where}: switched`);
+  if (r.outcome !== undefined) {
+    checkOutcome(r.outcome, where);
+    if ((r.attempts.length > 0 || CUT_KINDS.has(kind) || kind === 'hide') && !ns.has((r.outcome as { n: number }).n)) {
+      malformed(`${where}: its outcome names no attempt of its own`);
+    }
+  }
   if (r.completed !== undefined && r.completed !== true) malformed(`${where}: completed`);
   if (r.dropped !== undefined && !(isObject(r.dropped) && isCount(r.dropped.at))) malformed(`${where}: dropped`);
 }
 
-function checkEntry(e: unknown): asserts e is OperatorChangesEntry {
+/** One entry, checked before it's folded in: its own shape, and that it
+ *  refers to a change (and attempt) the ledger already holds. */
+function checkEntry(e: unknown, records: Map<string, OperatorChangeRecord>): asserts e is OperatorChangesEntry {
   if (!isObject(e) || !isText(e.changeId)) malformed('entry');
   const where = `${String(e.kind)} entry for ${e.changeId}`;
+  const record = records.get(e.changeId);
+  const hasAttempt = (n: unknown) => !!record && record.attempts.some((a) => a.n === n);
   switch (e.kind) {
     case 'attempt':
-      if (!CHANGE_KINDS.has(e.changeKind as string) || !isText(e.agent) || !isCount(e.n) || !isCount(e.at)) malformed(where);
-      checkEvidence(e.evidence, where);
+      if (!(CUT_KINDS.has(e.changeKind as string) || e.changeKind === 'hide') || !isText(e.agent) || !isCount(e.n) || !isCount(e.at)) malformed(where);
+      if (record && record.kind !== e.changeKind) malformed(`${where}: its kind differs from its change's`);
+      checkEvidence(e.evidence, where, e.changeKind as string);
       return;
     case 'switched':
-      if (!isCount(e.n)) malformed(where);
+      if (!isCount(e.n) || !hasAttempt(e.n)) malformed(where);
       return;
     case 'failed':
-      if (!isCount(e.n) || typeof e.error !== 'string') malformed(where);
+      if (!isCount(e.n) || typeof e.error !== 'string' || !hasAttempt(e.n)) malformed(where);
       return;
     case 'resolved':
-      if (!isCount(e.n)) malformed(where);
+      if (!isCount(e.n) || !hasAttempt(e.n)) malformed(where);
       checkResolution(e.resolution, where);
       return;
     case 'outcome':
+      if (!record) malformed(`${where}: no such change`);
       checkOutcome(e.outcome, where);
       return;
     case 'completed':
+      if (!record) malformed(`${where}: no such change`);
       return;
     case 'dropped':
       if (!CHANGE_KINDS.has(e.changeKind as string) || !isText(e.agent) || !isCount(e.at)) malformed(where);
+      if (record && record.kind !== e.changeKind) malformed(`${where}: its kind differs from its change's`);
       return;
     default:
       malformed(where);
@@ -505,8 +553,10 @@ export function readOperatorChanges(load: { snapshot: unknown; entries: Array<{ 
     }
   }
   for (const { entry } of load.entries) {
-    checkEntry(entry);
+    checkEntry(entry, records);
     reduceOperatorChangesEntry(records, entry);
   }
+  // The ledger as recovery will read it: every record whole, by its kind.
+  for (const [id, record] of records) checkRecord(record, id);
   return records;
 }
