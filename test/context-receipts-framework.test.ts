@@ -24,7 +24,7 @@ import {
   type ToolResult,
 } from '../src/index.js';
 import { HistoryModule } from '../src/modules/history/index.js';
-import { versionOf, type ChannelClockLedger } from '../src/context-receipts/index.js';
+import { recordedBodyDigest, versionOf, type ChannelClockLedger } from '../src/context-receipts/index.js';
 import { createMockResponse } from './helpers/mock-membrane.js';
 
 const FIXTURE = join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs');
@@ -209,7 +209,7 @@ describe('receipt clocks through the framework', () => {
     const source = readInboundSource(message.metadata)!;
     assert.equal(source.kind, 'channel');
     if (source.kind !== 'channel') return false;
-    const ver = versionOf(source, [message.content], ledger().storeId, message.id);
+    const ver = versionOf(source, [message.content], ledger().storeId, message.id, recordedBodyDigest(message.metadata));
     return ledger().isDelivered('scout', ver);
   };
   const idle = () => framework.getAgent('scout')!.state.status === 'idle';

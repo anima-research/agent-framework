@@ -91,8 +91,23 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? 'null';
 }
 
-function bodyDigest(contents: ReadonlyArray<readonly ContentBlock[]>): string {
-  return createHash('sha256').update(canonicalJson(contents)).digest('hex');
+/**
+ * A body's source digest: SHA-256 (hex) of `canonicalJson([blocks])`, over
+ * the content blocks of one undecorated, unsharded body. Ingestion records it
+ * for each delivery (`metadata.sourceBodyDigest`), and it is the digest an
+ * unsharded item stored before that hashes to, so both name one version.
+ */
+export function sourceBodyDigest(blocks: readonly ContentBlock[]): string {
+  return createHash('sha256').update(canonicalJson([blocks])).digest('hex');
+}
+
+/**
+ * The body digest ingestion recorded for an item, before any decoration or
+ * reshaping (`metadata.sourceBodyDigest`), if it recorded one.
+ */
+export function recordedBodyDigest(metadata: unknown): string | undefined {
+  const value = (metadata as { sourceBodyDigest?: unknown } | null | undefined)?.sourceBodyDigest;
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
 /**
@@ -100,19 +115,29 @@ function bodyDigest(contents: ReadonlyArray<readonly ContentBlock[]>): string {
  * guarantees (see VersionRef): the eventId on push/event and RFC-006
  * coalesced admission; else platform message id plus a digest of the body;
  * else the stored copy itself.
+ *
+ * The body digest is the one ingestion recorded for the delivery
+ * (`recorded`), before decoration or sharding, so a stored header, sharding,
+ * injection and compilation all carry one version. An item stored without
+ * one predates both decoration and the record: unsharded, its stored blocks
+ * are the delivered body and hash to the same digest; sharded, its source
+ * digest can't be recovered from the shards, so it falls back to the stored
+ * copy (a replay of it is then not recognizable).
  */
 export function versionOf(
   source: InboundChannelSource,
   contents: ReadonlyArray<readonly ContentBlock[]>,
   storeId: string,
   storeMessageId: string,
+  recorded?: string,
 ): VersionRef {
   const eventGuaranteed = source.eventId !== undefined && (source.lane === 'push/event' || source.coalesced === true);
   if (eventGuaranteed) {
     return { basis: 'event', key: JSON.stringify([source.binding, source.eventId]) };
   }
-  if (source.messageId) {
-    return { basis: 'message-digest', key: JSON.stringify([source.binding, source.channelId, source.messageId, bodyDigest(contents)]) };
+  const digest = recorded ?? (contents.length === 1 ? sourceBodyDigest(contents[0]!) : undefined);
+  if (source.messageId && digest) {
+    return { basis: 'message-digest', key: JSON.stringify([source.binding, source.channelId, source.messageId, digest]) };
   }
   return { basis: 'stored-copy', key: JSON.stringify([storeId, storeMessageId]) };
 }
@@ -172,7 +197,7 @@ export function requestEvidence(inputs: EvidenceInputs): RequestEvidence {
           ...(missing.length > 0 ? { missing } : {}),
           ch: channelOf(source),
           src: sourceRefOf(source, stored.id),
-          ver: versionOf(source, members.map((m) => m.content), inputs.storeId, stored.id),
+          ver: versionOf(source, members.map((m) => m.content), inputs.storeId, stored.id, recordedBodyDigest(stored.metadata)),
         }));
       }
     });
@@ -201,6 +226,6 @@ export function injectedEvidence(
     complete: true,
     ch: channelOf(source),
     src: sourceRefOf(source, storeMessageId),
-    ver: versionOf(source, [message.content], storeId, storeMessageId),
+    ver: versionOf(source, [message.content], storeId, storeMessageId, recordedBodyDigest(message.metadata)),
   });
 }

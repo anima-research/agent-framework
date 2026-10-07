@@ -19,6 +19,8 @@ import {
   requestEvidence,
   injectedEvidence,
   versionOf,
+  recordedBodyDigest,
+  sourceBodyDigest,
   type BodyEvidence,
   type RequestEvidence,
   type RoundReport,
@@ -424,6 +426,45 @@ describe('receipt evidence', () => {
     const reordered = versionOf({ ...base, eventId: 'adapter', messageId: 'p1' }, [[{ text: 'hi', type: 'text' } as never]], 's', 'm');
     assert.equal(a.key, reordered.key, 'key order (as the store reads content back) does not change the version');
     assert.equal(versionOf(base, text, 's', 'm').basis, 'stored-copy');
+  });
+
+  it('keeps one source-body version through decoration and sharding', () => {
+    const src = { ...base, messageId: 'p1' };
+    const body = { type: 'text' as const, text: 'unchanged body' };
+    const header = (label: string) => ({ type: 'text' as const, text: `[source: discord / discord:g:room · ${label}]` });
+    // Recorded at ingestion, before decoration: the stored header (here, a
+    // label changed by a rename between two acceptances) does not matter.
+    const before = versionOf(src, [[header('Old room'), body]], 's', 'copy-1', 'digest-of-body');
+    const after = versionOf(src, [[header('New room'), body]], 's', 'copy-2', 'digest-of-body');
+    assert.equal(before.key, after.key);
+    assert.notEqual(before.key, versionOf(src, [[header('New room'), body]], 's', 'copy-2', 'digest-of-another-body').key);
+    // The recorded digest is the shared source-body digest, so a stamped copy
+    // matches an undecorated, unsharded copy stored before the record.
+    const stamped = versionOf(src, [[header('New room'), body]], 's', 'copy-3', sourceBodyDigest([body]));
+    const legacy = versionOf(src, [[body]], 's', 'legacy');
+    assert.equal(stamped.key, legacy.key);
+    // A sharded copy stored without a record can't recover its source digest.
+    const legacySharded = versionOf(src, [[{ type: 'text', text: 'unchanged' }], [{ type: 'text', text: ' body' }]], 's', 'head');
+    assert.equal(legacySharded.basis, 'stored-copy');
+    assert.equal(recordedBodyDigest({ sourceBodyDigest: 'abc' }), 'abc');
+    assert.equal(recordedBodyDigest({ sourceBodyDigest: '' }), undefined);
+    assert.equal(recordedBodyDigest(undefined), undefined);
+  });
+
+  it('injected and compiled copies share the recorded version', () => {
+    const source = { ...base, messageId: 'p9' };
+    const metadata = { inboundSource: source, sourceBodyDigest: 'recorded' };
+    const injected = injectedEvidence(0, 's9', { content: [{ type: 'text', text: '[source: x]' }, { type: 'text', text: 'body' }], metadata }, 'store')!;
+    const head = { id: 's9', sequence: 9, participant: 'u', content: [{ type: 'text', text: '[source: x]' }], metadata, bodyGroupId: 'g', shardIndex: 0 };
+    const tail = { id: 's10', sequence: 10, participant: 'u', content: [{ type: 'text', text: 'body' }], metadata, bodyGroupId: 'g', shardIndex: 1 };
+    const compiled = requestEvidence({
+      agent: 'r', storeId: 'store',
+      provenance: { messages: [{ kind: 'raw', bodies: [{ messageId: 's9', sequence: 9, complete: true }] }] } as unknown as CompileProvenance,
+      requestIndexOf: [0],
+      getMessage: (id) => ([head, tail].find((m) => m.id === id) as never) ?? null,
+      groupMembers: () => [head, tail] as never,
+    });
+    assert.equal(compiled.bodies[0]!.ver.key, injected.ver.key);
   });
 
   it('marks a copy incomplete when preparation dropped one of its fragments', () => {
