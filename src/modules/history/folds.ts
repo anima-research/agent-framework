@@ -17,17 +17,20 @@ export interface FoldsInput {
 export const FOLDS_TOOL: ToolDefinition = {
   name: 'folds',
   description:
-    'Your fold record: each time a provider round that stood showed you history at a different ' +
-    'resolution than the previous one on the same branch, one receipt lists every run of messages ' +
-    'whose form changed — raw, partial raw (cut), a summary (its level, id and method), a different ' +
-    'summary, or omitted from the window — with store sequences and message ids, estimated tokens ' +
-    'before and after, the cause when recorded, and that round\'s provider usage (input, cache read, ' +
-    'cache write; unknown when not reported). That usage belongs to the whole round: no part of it is ' +
-    'the cost of the fold, and what a fold lost is not measured — compare a summary with its source ' +
-    'through `extract`. Messages that arrived since the previous round are arrivals, not folds. The ' +
-    'first receipt on a branch is a baseline: the layout as rendered then, with history before it ' +
-    'unknown. Each receipt describes the spans as rendered when it was written, even if messages were ' +
-    'edited or removed since. Newest first.',
+    'Your fold record. Each time a provider round that stood carried a compile rendering history at a ' +
+    'different resolution than the previous one on the same branch, one receipt lists every run of ' +
+    'messages whose form changed: raw, partial raw (cut), a summary (its level, id and method), a ' +
+    'different summary, or omitted from the window. Each run gives store sequences and message ids, an ' +
+    'exact message count, and estimated tokens before and after; the receipt adds the cause when ' +
+    'recorded and that round\'s provider usage (input, cache read, cache write; unknown when not ' +
+    'reported). That usage belongs to the whole round: no part of it is the cost of the fold. What a ' +
+    'fold lost is not measured; compare a summary with its source through `extract`. Each receipt also ' +
+    'says how that round presented the compile, as the provider path reported: `verbatim` (exactly as ' +
+    'compiled, so exactly what you were shown), `altered` (some content was not carried verbatim), or ' +
+    '`unknown`. Messages that arrived since the previous round are arrivals, not folds. The first ' +
+    'receipt on a branch is a baseline: the layout as rendered then, with history before it unknown. ' +
+    'Each receipt describes the spans as rendered when it was written, even if messages were edited or ' +
+    'removed since. Newest first.',
   inputSchema: {
     type: 'object' as const,
     properties: {
@@ -88,6 +91,7 @@ export function handleFolds(cm: ContextManager, input: FoldsInput, exportStatus?
     strategy: r.strategy,
     cause: r.cause,
     renderedTokens: r.renderedTokens,
+    presentation: r.presentation,
     roundUsage: { input: r.usage.input, cacheRead: r.usage.cacheRead, cacheWrite: r.usage.cacheWrite },
     ...(r.kind === 'baseline'
       ? { historyBefore: 'unknown', layout: (r.layout ?? []).map(runLine) }
