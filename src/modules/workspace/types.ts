@@ -109,10 +109,11 @@ export interface MountState {
   /** Branch ID that was active when this mount last materialized */
   lastMaterializedBranchId: string | null;
   /**
-   * The last on-agent-action scan: whether it finished before the agent's
-   * next inference, and if not, why.
+   * The last on-agent-action scan, as of `at`: `complete` when it has
+   * finished at all, `withinDeadline` when it finished before the deadline
+   * released the round, and `reason` for a miss or a failure.
    */
-  lastAgentActionScan?: { at: number; complete: boolean; reason?: string };
+  lastAgentActionScan?: { at: number; complete: boolean; withinDeadline: boolean; reason?: string };
   /**
    * Wall-clock time chokidar emitted `ready` for this mount, or null if the
    * watcher hasn't finished its initial scan. null after session start =

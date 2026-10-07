@@ -28,10 +28,11 @@
   an `interrupted` conflict). This replaces #109's stop-time baselines and refused paths, which
   an abrupt exit or a branch switch could lose or rewind; a store that saved them imports its
   baselines once.
-- **`watch: 'on-agent-action'` works as documented:** after each completed tool batch, before the
-  agent's next inference, the mount is scanned. A scan that outlasts `agentActionScanDeadlineMs`
-  lets the inference go ahead and is reported on `status` and as a
-  `workspace:agent-action-scan-incomplete` event.
+- **`watch: 'on-agent-action'` works as documented:** after each completed tool batch, before
+  anything continues the agent's turn, the mount is scanned. A scan that outlasts
+  `agentActionScanDeadlineMs` stops holding the round and continues in the background; the miss
+  is reported on `status` (`lastAgentActionScan`) and as a `workspace:agent-action-scan-incomplete`
+  event.
 - Disk text is stored as its raw bytes rather than through a UTF-8 round trip, so a file in
   another encoding no longer differs from its own stored copy.
 - `materialize` and `autoMaterialize` never write or unlink through a symlink the mount doesn't

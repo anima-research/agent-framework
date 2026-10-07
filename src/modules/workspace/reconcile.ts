@@ -20,7 +20,7 @@
  * (after `store.sync()`). The caller serializes passes per mount.
  */
 
-import { lstat, mkdir, open, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import {
@@ -213,6 +213,25 @@ function keepStoreSide(hasStore: boolean, bi: BranchIntent | null): EntryState {
 }
 
 /**
+ * Settle an adoption intent on the branch it was recorded on, by the tree
+ * alone: S at the adopted content means the commit landed and only its
+ * completion was lost; anything else means it didn't, and the rule runs again
+ * from the prior evidence (redoing the adoption if disk still holds it).
+ *
+ * Content is proof only while nothing else has written the path since, so
+ * every workspace mutation settles a pending intent first (the module's
+ * mutation boundary): a later write of the same content can't pass for the
+ * old adoption.
+ */
+function settleAdoption(p: Pending, s: { hash: string; size: number } | null): Agreed | 'forget' {
+  const sc: Candidate = s ? { kind: 'content', hash: s.hash } : ABSENT;
+  if (sameCandidate(sc, p.expect)) {
+    return p.expect.kind === 'absent' ? { kind: 'absent' } : { kind: 'content', hash: p.expect.hash, size: s!.size };
+  }
+  return p.prior ?? 'forget';
+}
+
+/**
  * Resolve a pending intent against what was observed. Returns the evidence
  * the rule should use, and whether that resolution should be recorded.
  */
@@ -223,7 +242,6 @@ function resolvePending(
   d: DiskFact,
   branchId: string,
 ): { p: Physical | undefined; record?: Agreed | Interrupted | 'forget'; uncaptured?: true } {
-  const sc: Candidate = s ? { kind: 'content', hash: s.hash } : ABSENT;
   const prior = p.prior;
   const priorCandidate = prior ? candidateOf(prior) : null;
   if (p.effect === 'disk') {
@@ -240,16 +258,14 @@ function resolvePending(
   }
   // An adoption: its meaning depends on the branch it was recorded on.
   if (p.branchId === branchId) {
-    if (sameCandidate(sc, p.expect)) {
-      // The tree commit landed; only the completion was lost.
-      const agreed: Agreed = p.expect.kind === 'absent'
-        ? { kind: 'absent' }
-        : sameCandidate(dc, p.expect) ? agreedFromDisk(d) : { kind: 'content', hash: p.expect.hash, size: s!.size };
+    const landed = sameCandidate(s ? { kind: 'content', hash: s.hash } : ABSENT, p.expect);
+    // Landed, with disk at the adopted content too: its fingerprint joins the evidence.
+    if (landed && p.expect.kind === 'content' && sameCandidate(dc, p.expect)) {
+      const agreed = agreedFromDisk(d);
       return { p: agreed, record: agreed };
     }
-    // The commit didn't land: the rule runs again from the prior evidence
-    // (redoing the adoption when disk still holds what was being adopted).
-    return prior ? { p: prior, record: prior } : { p: undefined, record: 'forget' };
+    const settled = settleAdoption(p, s);
+    return settled === 'forget' ? { p: undefined, record: 'forget' } : { p: settled, record: settled };
   }
   // Another branch, whose S says nothing of whether the adoption happened
   // over there. Disk still holding the prior is D = P: the store has that
@@ -270,6 +286,10 @@ function decide(
   adopt: boolean,
 ): Verdict {
   if (d.kind === 'unobserved') {
+    // Disk proves nothing, but an adoption on this branch settles by the tree.
+    if (pIn?.kind === 'pending' && pIn.effect === 'adopt' && pIn.branchId === branchId && !adopt) {
+      return { state: 'unverified', note: d.reason, p: settleAdoption(pIn, s) };
+    }
     return { state: 'unverified', note: d.reason };
   }
   const dc = diskCandidate(d)!;
@@ -373,6 +393,80 @@ function conflictReport(record: ConflictRecord, d: DiskFact): ConflictReport {
   };
 }
 
+/** A pass's view of its scope: candidates enumerated on one branch, and what disk showed for each. */
+interface Gathered {
+  branchId: string;
+  walk: Walk | null;
+  facts: Map<string, DiskFact>;
+  dirs: string[];
+  incomplete: Array<{ path: string; reason: string }>;
+}
+
+/** How often a pass gathers again when the branch changes under it. */
+const GATHER_ATTEMPTS = 3;
+
+async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRuntime, scope: Scope, opts: PassOptions): Promise<Gathered> {
+  const branchId = store.currentBranch().id;
+  const gathered: Gathered = { branchId, walk: null, facts: new Map(), dirs: [], incomplete: [] };
+
+  // A missing mount root is an unavailable mount (an unmounted drive, a root
+  // being replaced), not proof that every file in it was deleted.
+  const rootAvailable = await lstat(mount.view.root).then((s) => s.isDirectory(), () => false);
+  if (!rootAvailable) {
+    // Said whether or not anything is tracked: an unavailable mount must not
+    // read as a verified empty directory.
+    gathered.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason: 'the mount root is unavailable' });
+  }
+
+  // Which paths to decide: what disk shows, and what the store, P and intent
+  // track. The tracked ones are read synchronously, on this branch.
+  const candidates = new Set<string>();
+  let walk: Walk | null = null;
+  if (scope.kind === 'paths') {
+    for (const p of scope.paths) candidates.add(p);
+  } else {
+    const prefix = scope.dir ? scope.dir + '/' : undefined;
+    for (const e of store.treeList(mount.treeStateId, prefix)) if (inScope(e.path, scope)) candidates.add(e.path);
+    for (const [p] of agreement.paths(mount.name, scope.dir)) if (inScope(p, scope)) candidates.add(p);
+    for (const [p] of mount.intents.list(scope.dir)) if (inScope(p, scope)) candidates.add(p);
+    if (rootAvailable) {
+      walk = await walkScope(mount.view, mount.rootReal, scope.dir, scope.recursive, opts.cap ?? WALK_CAP);
+      for (const f of walk.files) if (inScope(f, scope)) candidates.add(f);
+      // Ignored names are listed only when something tracks them (above).
+      for (const [p, why] of walk.others) if (why !== 'ignored by the mount' && inScope(p, scope)) candidates.add(p);
+      for (const d of walk.dirs) if (inScope(d, { kind: 'dir', dir: scope.dir, recursive: false })) gathered.dirs.push(d);
+    }
+  }
+  gathered.walk = walk;
+
+  // Observe. Tracked facts are read again, synchronously, when deciding.
+  for (const path of candidates) {
+    if (!rootAvailable) {
+      gathered.facts.set(path, { kind: 'unobserved', reason: 'the mount root is unavailable' });
+      continue;
+    }
+    if (walk && provenAbsent(walk, path)) {
+      gathered.facts.set(path, { kind: 'absent' });
+      continue;
+    }
+    if (walk && !walk.files.has(path) && !walk.others.has(path)) {
+      // Beneath a region the walk didn't reach: unproven either way.
+      const region = walk.incomplete.find((r) => r.path === '' || path === r.path || path.startsWith(r.path + '/'));
+      gathered.facts.set(path, { kind: 'unobserved', reason: region ? region.reason : 'not reached by the walk' });
+      continue;
+    }
+    if (walk?.others.get(path) === 'ignored by the mount') {
+      gathered.facts.set(path, { kind: 'unobserved', reason: 'ignored by the mount' });
+      continue;
+    }
+    const p = agreement.get(mount.name, path);
+    const hasStore = store.treeGet(mount.treeStateId, path) !== null;
+    const hasIntent = mount.intents.get(path) !== null;
+    gathered.facts.set(path, await learnDisk(mount, path, { p, hasStore, hasIntent }, opts));
+  }
+  return gathered;
+}
+
 /**
  * One disk→store pass over a scope: the watcher's paths, a lazy read, a
  * listing's directory, a full scan, or a path sync (opts.adopt).
@@ -387,55 +481,26 @@ export async function reconcilePass(
   agreement.ensureReconciled();
   const result: PassResult = { ops: [], newConflicts: [], reports: new Map(), incomplete: [], dirs: [] };
 
-  // A missing mount root is an unavailable mount (an unmounted drive, a root
-  // being replaced), not proof that every file in it was deleted.
-  const rootAvailable = await lstat(mount.view.root).then((s) => s.isDirectory(), () => false);
-
-  // Which paths to decide: what disk shows, and what the store, P and intent track.
-  let walk: Walk | null = null;
-  const candidates = new Set<string>();
-  if (scope.kind === 'paths') {
-    for (const p of scope.paths) candidates.add(p);
-  } else {
-    if (rootAvailable) {
-      walk = await walkScope(mount.view, scope.dir, scope.recursive, opts.cap ?? WALK_CAP);
-      for (const f of walk.files) if (inScope(f, scope)) candidates.add(f);
-      // Ignored names are listed only when something tracks them (below).
-      for (const [p, why] of walk.others) if (why !== 'ignored by the mount' && inScope(p, scope)) candidates.add(p);
-      for (const d of walk.dirs) if (inScope(d, { kind: 'dir', dir: scope.dir, recursive: false })) result.dirs.push(d);
+  // Enumerate on one branch and observe disk (async). The decision below must
+  // describe the same branch the candidates came from: a branch switch during
+  // observation would otherwise yield a "complete" listing that omits the new
+  // branch's drafts. So a changed branch gathers again; a branch that keeps
+  // changing leaves the pass explicitly incomplete, deciding nothing.
+  let gathered: Gathered | null = null;
+  for (let attempt = 0; attempt < GATHER_ATTEMPTS; attempt++) {
+    const next = await gather(store, agreement, mount, scope, opts);
+    if (store.currentBranch().id === next.branchId) {
+      gathered = next;
+      break;
     }
-    const prefix = scope.dir ? scope.dir + '/' : undefined;
-    for (const e of store.treeList(mount.treeStateId, prefix)) if (inScope(e.path, scope)) candidates.add(e.path);
-    for (const [p] of agreement.paths(mount.name, scope.dir)) if (inScope(p, scope)) candidates.add(p);
-    for (const [p] of mount.intents.list(scope.dir)) if (inScope(p, scope)) candidates.add(p);
   }
-
-  // Observe (async). Tracked facts are re-read synchronously when deciding.
-  const facts = new Map<string, DiskFact>();
-  for (const path of candidates) {
-    if (!rootAvailable) {
-      facts.set(path, { kind: 'unobserved', reason: 'the mount root is unavailable' });
-      continue;
-    }
-    if (walk && provenAbsent(walk, path)) {
-      facts.set(path, { kind: 'absent' });
-      continue;
-    }
-    if (walk && !walk.files.has(path) && !walk.others.has(path)) {
-      // Beneath a region the walk didn't reach: unproven either way.
-      const region = walk.incomplete.find((r) => r.path === '' || path === r.path || path.startsWith(r.path + '/'));
-      facts.set(path, { kind: 'unobserved', reason: region ? region.reason : 'not reached by the walk' });
-      continue;
-    }
-    if (walk?.others.get(path) === 'ignored by the mount') {
-      facts.set(path, { kind: 'unobserved', reason: 'ignored by the mount' });
-      continue;
-    }
-    const p = agreement.get(mount.name, path);
-    const hasStore = store.treeGet(mount.treeStateId, path) !== null;
-    const hasIntent = mount.intents.get(path) !== null;
-    facts.set(path, await learnDisk(mount, path, { p, hasStore, hasIntent }, opts));
+  if (gathered === null) {
+    result.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason: 'the selected branch kept changing while the scan ran' });
+    return result;
   }
+  const { walk, facts } = gathered;
+  result.dirs.push(...gathered.dirs);
+  result.incomplete.push(...gathered.incomplete);
 
   // Decide and apply — synchronously, so nothing interleaves.
   const branchId = store.currentBranch().id;
@@ -492,9 +557,12 @@ export async function reconcilePass(
   // 4. Completions and agreements, after the commits they assert are synced —
   // this pass's, and any earlier tool write's an agreement rests on.
   let first = true;
+  let recorded = false;
   for (const x of planned) {
     const next = x.verdict.p;
+    if (x.verdict.adopt === 'drop') recorded = true; // its forget, in step 2
     if (next === undefined) continue;
+    recorded = true;
     if (next === 'forget') {
       agreement.forget(mount.name, x.path); // no-op when step 2 already did
       continue;
@@ -502,7 +570,10 @@ export async function reconcilePass(
     agreement.set(mount.name, x.path, next, { afterCommittedState: first });
     first = false;
   }
-  if (first && committed) store.sync();
+  // 5. Durable before returning. An agreement advance (D = S) has no pending
+  // intent to recover from, so losing its append would leave an older P that
+  // another branch would misread as a disk edit.
+  if (recorded || committed) agreement.barrier();
   agreement.maybeCheckpoint();
 
   // Reports.
@@ -538,6 +609,12 @@ export interface PushOptions {
   applyDeletions?: boolean;
   /** Called before each disk write/unlink, so the caller can suppress the watcher echo. */
   beforeEffect?: (path: string) => void;
+  /**
+   * The branch the caller chose `paths` on. If another is selected by the
+   * time the push decides, it writes nothing: a selection made on one branch
+   * pushed with another branch's content would be neither branch's materialize.
+   */
+  branchId?: string;
 }
 
 export interface PushResult {
@@ -548,17 +625,24 @@ export interface PushResult {
   skipped: Array<{ path: string; reason: string }>;
   /** Workspace deletions left on disk because applyDeletions wasn't given. */
   pendingDeletions: string[];
+  /** The branch and sequence the push planned on: what disk now reflects. */
+  branchId: string;
+  sequence: number;
 }
 
-async function fsyncPath(path: string, flags = 'r'): Promise<void> {
-  let handle;
+/** Errors meaning a directory can't be synced on this filesystem, not that syncing it failed. */
+const DIRECTORY_SYNC_UNSUPPORTED = new Set(['EINVAL', 'ENOTSUP']);
+
+/** A directory entry made durable where the platform can sync directories. */
+async function syncDirectory(path: string): Promise<void> {
+  if (process.platform === 'win32') return; // a directory can't be opened for sync there
+  const handle = await open(path, 'r');
   try {
-    handle = await open(path, flags);
     await handle.sync();
-  } catch {
-    // Directory fsync is not supported everywhere (Windows); the write stands.
+  } catch (err) {
+    if (!DIRECTORY_SYNC_UNSUPPORTED.has((err as { code?: string }).code ?? '')) throw err;
   } finally {
-    await handle?.close();
+    await handle.close();
   }
 }
 
@@ -577,7 +661,10 @@ export async function pushPaths(
   opts: PushOptions = {},
 ): Promise<PushResult> {
   agreement.ensureReconciled();
-  const result: PushResult = { written: [], unchanged: [], deleted: [], skipped: [], pendingDeletions: [] };
+  const result: PushResult = {
+    written: [], unchanged: [], deleted: [], skipped: [], pendingDeletions: [],
+    branchId: store.currentBranch().id, sequence: store.currentSequence(),
+  };
   if (mount.readOnly) return result;
 
   type Plan = { path: string; kind: 'write' | 'unlink'; blob: Buffer; hash: string; prior: Agreed | null } | { path: string; kind: 'unlink'; blob: null; hash: null; prior: Agreed | null };
@@ -600,6 +687,15 @@ export async function pushPaths(
 
   // Decide synchronously what to push.
   const branchId = store.currentBranch().id;
+  result.branchId = branchId;
+  result.sequence = store.currentSequence();
+  if (opts.branchId !== undefined && opts.branchId !== branchId) {
+    for (const path of paths) {
+      result.skipped.push({ path, reason: 'the selected branch changed after these paths were chosen; nothing was written — materialize again' });
+    }
+    return result;
+  }
+  let recorded = false;
   for (const [path, d] of facts) {
     const entry = store.treeGet(mount.treeStateId, path);
     const s = entry ? { hash: entry.blobHash, size: entry.size } : null;
@@ -628,10 +724,14 @@ export async function pushPaths(
     // intent) is recorded before anything is pushed over it.
     if (v.p === 'forget') agreement.forget(mount.name, path);
     else if (v.p !== undefined) agreement.set(mount.name, path, v.p, { afterCommittedState: true });
+    if (v.p !== undefined) recorded = true;
     const known = v.p === 'forget' ? undefined : v.p !== undefined ? v.p : p;
     const prior = known && (known.kind === 'absent' || known.kind === 'content') ? known : null;
     if (v.state === 'synced') {
-      if (v.intent !== undefined) mount.intents.put(path, v.intent);
+      if (v.intent !== undefined) {
+        mount.intents.put(path, v.intent);
+        recorded = true;
+      }
       if (s) result.unchanged.push(path);
       continue;
     }
@@ -646,6 +746,7 @@ export async function pushPaths(
       const kind = bi?.conflict?.kind ?? v.conflict ?? 'both-changed';
       if (v.conflict) {
         mount.intents.update(path, (cur) => ({ ...cur, conflict: { kind: v.conflict!, at: Date.now(), disk: counterpartOf(store, d) } }));
+        recorded = true;
       }
       result.skipped.push({
         path,
@@ -688,36 +789,59 @@ export async function pushPaths(
   for (const step of plans) {
     const absolute = join(mount.view.root, step.path);
     opts.beforeEffect?.(step.path);
+    let stage = step.kind === 'write' ? 'write the file' : 'unlink the file';
     try {
       if (step.kind === 'write') {
         await mkdir(dirname(absolute), { recursive: true });
-        await writeFile(absolute, step.blob!);
-        await fsyncPath(absolute, 'r+');
-        await fsyncPath(dirname(absolute));
+        // Written and synced through one descriptor: durable, and needing only
+        // write permission (a write-only file is still written).
+        const handle = await open(absolute, 'w');
+        try {
+          await handle.writeFile(step.blob!);
+          stage = 'make the write durable (file fsync)';
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        stage = 'make the write durable (directory fsync)';
+        await syncDirectory(dirname(absolute));
       } else {
         await unlink(absolute).catch((err: NodeJS.ErrnoException) => { if (err.code !== 'ENOENT') throw err; });
-        await fsyncPath(dirname(absolute));
+        stage = 'make the unlink durable (directory fsync)';
+        await syncDirectory(dirname(absolute));
       }
     } catch (err) {
-      // The intent stays pending; the next observation resolves it.
-      result.skipped.push({ path: step.path, reason: `disk ${step.kind} failed: ${err instanceof Error ? err.message : String(err)}` });
+      // No completion: the intent stays pending, and the next observation
+      // resolves it from whatever disk then holds.
+      const message = err instanceof Error ? err.message : String(err);
+      result.skipped.push({ path: step.path, reason: `could not ${stage}: ${message}; the outcome is checked at the next observation` });
       continue;
     }
-    // 3. Completion, and the branch intent it settles.
+    // 3. Completion. P is physical and global. Branch intent belongs to the
+    // branch this push planned on: it is settled only while that branch is
+    // still selected, and otherwise by convergence when the branch returns.
+    const value: Agreed = step.kind === 'write'
+      ? await (async (): Promise<Agreed> => {
+        const seen = await readPath(mount.view, mount.rootReal, step.path, mount.view.maxFileSize);
+        return seen.kind === 'read' && seen.hash === step.hash
+          ? { kind: 'content', hash: step.hash!, size: seen.size, fp: seen.fp }
+          : { kind: 'content', hash: step.hash!, size: step.blob!.byteLength };
+      })()
+      : { kind: 'absent' };
+    agreement.set(mount.name, step.path, value);
+    recorded = true;
+    const planned = store.currentBranch().id === branchId;
     if (step.kind === 'write') {
-      const seen = await readPath(mount.view, mount.rootReal, step.path, mount.view.maxFileSize);
-      const value: Agreed = seen.kind === 'read' && seen.hash === step.hash
-        ? { kind: 'content', hash: step.hash!, size: seen.size, fp: seen.fp }
-        : { kind: 'content', hash: step.hash!, size: step.blob!.byteLength };
-      agreement.set(mount.name, step.path, value);
-      mount.intents.update(step.path, (cur) => { const next = { ...cur }; delete next.conflict; delete next.origin; return next; });
+      if (planned) mount.intents.update(step.path, (cur) => { const next = { ...cur }; delete next.conflict; delete next.origin; return next; });
       result.written.push(step.path);
     } else {
-      agreement.set(mount.name, step.path, { kind: 'absent' });
-      mount.intents.put(step.path, null);
+      if (planned) mount.intents.put(step.path, null);
       result.deleted.push(step.path);
     }
   }
+  // Durable before returning, like a pass: agreements recorded here have no
+  // pending intent behind them, and completions shouldn't wait for one.
+  if (recorded) agreement.barrier();
   agreement.maybeCheckpoint();
   return result;
 }

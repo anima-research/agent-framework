@@ -139,9 +139,28 @@ export async function filesystemTrustsCtime(root: string): Promise<boolean> {
   }
 }
 
+/**
+ * Where a path's parent directory canonically lies: inside the mount, gone
+ * (nothing can exist beneath it), or somewhere a no-follow open would still
+ * reach through — O_NOFOLLOW guards only the final component.
+ */
+async function parentPlacement(rootReal: string, lexical: string): Promise<'inside' | 'gone' | { reason: string }> {
+  try {
+    const parent = await realpath(dirname(lexical));
+    return contained(rootReal, parent) ? 'inside' : { reason: 'a parent directory resolves outside the mount' };
+  } catch (err) {
+    const code = errno(err);
+    if (code === 'ENOENT' || code === 'ENOTDIR') return 'gone';
+    return { reason: `cannot resolve the parent directory (${code ?? String(err)})` };
+  }
+}
+
 /** Observe a mount-relative path without reading it. */
 export async function observePath(view: MountView, rootReal: string, relativePath: string): Promise<Observation> {
   const lexical = join(view.root, relativePath);
+  const placement = await parentPlacement(rootReal, lexical);
+  if (placement === 'gone') return { kind: 'absent' };
+  if (placement !== 'inside') return { kind: 'unobserved', reason: placement.reason };
   let info;
   try {
     info = await lstat(lexical, { bigint: true });
@@ -206,9 +225,18 @@ export async function readPath(
   try {
     const info = await handle.stat({ bigint: true });
     if (!info.isFile()) return { kind: 'unobserved', reason: info.isDirectory() ? 'a directory' : 'not a regular file' };
-    if (view.followSymlinks) {
-      const real = await realpath(lexical).catch(() => null);
-      if (real === null || !contained(rootReal, real)) return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
+    // The canonical boundary, as openContainedFile applies it: whatever the
+    // symlink policy, the opened file must canonically lie inside the mount
+    // (a symlinked parent escapes O_NOFOLLOW), and be the file the canonical
+    // path names now.
+    const real = await realpath(lexical).catch(() => null);
+    if (real === null) return { kind: 'unobserved', reason: 'the file changed while it was read' };
+    if (!contained(rootReal, real)) {
+      return { kind: 'unobserved', reason: view.followSymlinks ? 'a symlink that leaves the mount' : 'a parent directory resolves outside the mount' };
+    }
+    const named = await stat(real, { bigint: true }).catch(() => null);
+    if (named === null || named.dev !== info.dev || named.ino !== info.ino) {
+      return { kind: 'unobserved', reason: 'the file changed while it was read' };
     }
     const hashedAt = Date.now();
     const size = Number(info.size);
@@ -303,10 +331,30 @@ export function isIgnored(relativePath: string, name: string, patterns: string[]
 
 /**
  * List a directory scope ('' for the mount root), descending when recursive,
- * up to `cap` files in total.
+ * up to `cap` files in total. A scope reached through a directory that
+ * resolves outside the mount is not listed at all; beneath it, the walk only
+ * descends real directories, never symlinks.
  */
-export async function walkScope(view: MountView, scope: string, recursive: boolean, cap: number): Promise<Walk> {
+export async function walkScope(view: MountView, rootReal: string, scope: string, recursive: boolean, cap: number): Promise<Walk> {
   const walk: Walk = { files: new Set(), dirs: new Set(), others: new Map(), complete: new Set(), missing: new Set(), incomplete: [] };
+  if (scope !== '') {
+    let real: string;
+    try {
+      real = await realpath(join(view.root, scope));
+    } catch (err) {
+      const code = errno(err);
+      if (code === 'ENOENT' || code === 'ENOTDIR') {
+        walk.missing.add(scope);
+      } else {
+        walk.incomplete.push({ path: scope, reason: `cannot resolve the directory (${code ?? String(err)})`, kind: 'error' });
+      }
+      return walk;
+    }
+    if (!contained(rootReal, real)) {
+      walk.incomplete.push({ path: scope, reason: 'the directory resolves outside the mount', kind: 'error' });
+      return walk;
+    }
+  }
   let capped = false;
 
   const visit = async (dir: string): Promise<void> => {

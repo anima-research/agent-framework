@@ -13,12 +13,14 @@ import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { DiskAgreement } from '../src/modules/workspace/disk-agreement.js';
 import { fingerprintVouches, filesystemTrustsCtime } from '../src/modules/workspace/observe.js';
+import { pushPaths } from '../src/modules/workspace/reconcile.js';
 import type { MountConfig, WorkspaceConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import type { ProcessEvent } from '../src/types/events.js';
@@ -558,6 +560,182 @@ describe('restarts and faults', () => {
     });
   }
 
+  /** S = P = D = A, with an adoption of the shell's B left pending (killed after its intent). */
+  async function pendingAdoption(env: Env): Promise<WorkspaceModule> {
+    let m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    env.writeDisk('a.txt', 'B');
+    m = await env.fault(m, 'sync', 'after-intent');
+    assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'pending');
+    return m;
+  }
+
+  test('a write of the pending adoption\'s content is not taken for the old adoption landing', async (t) => {
+    const env = new Env(t);
+    const m = await pendingAdoption(env);
+    env.writeDisk('a.txt', 'C'); // disk moves on
+    await call(m, 'write', { path: 'work/a.txt', content: 'B' });
+    assert.equal(await stateOf(m, 'a.txt'), 'workspace-draft', 'the write is a draft over disk C');
+    assert.equal(await contentOf(m, 'a.txt'), 'B', 'and it survives the scan');
+    assert.equal(env.readDisk('a.txt'), 'C');
+  });
+
+  test('writeBinary settles the pending adoption first too', async (t) => {
+    const env = new Env(t);
+    const m = await pendingAdoption(env);
+    env.writeDisk('a.txt', 'C');
+    const res = await m.writeBinary('work/a.txt', Buffer.from('B'), 'text/plain');
+    assert.equal(res.success, true, String(res.error));
+    assert.equal(await stateOf(m, 'a.txt'), 'workspace-draft');
+    assert.equal(await contentOf(m, 'a.txt'), 'B');
+  });
+
+  test('an edit sees the disk version the settled adoption takes in, not stale text', async (t) => {
+    const env = new Env(t);
+    const m = await pendingAdoption(env);
+    env.writeDisk('a.txt', 'C');
+    const error = await refused(m, 'edit', { path: 'work/a.txt', oldString: 'A', newString: 'B' });
+    assert.match(error, /String not found/, 'the entry is disk\'s C by then, so an edit of A has nothing to replace');
+    assert.equal(await contentOf(m, 'a.txt'), 'C');
+    assert.equal(await stateOf(m, 'a.txt'), 'synced');
+  });
+
+  test('a delete settles the pending adoption first, and deletes what the workspace then holds', async (t) => {
+    const env = new Env(t);
+    const m = await pendingAdoption(env);
+    env.writeDisk('a.txt', 'C');
+    await call(m, 'delete', { path: 'work/a.txt' });
+    assert.equal(await stateOf(m, 'a.txt'), 'workspace-deleted');
+    assert.equal(env.readDisk('a.txt'), 'C');
+  });
+
+  test('with disk unreadable at the write, the pending adoption settles by the tree', { skip: IS_ROOT ? 'root reads every file' : false }, async (t) => {
+    const env = new Env(t);
+    const m = await pendingAdoption(env);
+    env.writeDisk('a.txt', 'C');
+    chmodSync(env.disk('a.txt'), 0o000);
+    try {
+      await call(m, 'write', { path: 'work/a.txt', content: 'B' });
+    } finally {
+      chmodSync(env.disk('a.txt'), 0o644);
+    }
+    const e = await entryOf(m, 'a.txt');
+    assert.equal(e?.state, 'conflict', 'disk C and the write B both changed since A: kept apart');
+    assert.equal(await contentOf(m, 'a.txt'), 'B');
+  });
+
+  for (const trigger of ['a scan', 'a materialize'] as const) {
+    test(`an agreement advance is durable before ${trigger} returns`, async (t) => {
+      const env = new Env(t);
+      const m = await env.open();
+      await seedSynced(env, m, 'a.txt', 'A');
+      await call(m, 'write', { path: 'work/a.txt', content: 'B' });
+      env.writeDisk('a.txt', 'B'); // D = S: agreement, with no intent behind it
+      const events: string[] = [];
+      const set = DiskAgreement.prototype.set;
+      const storeSync = env.store.sync;
+      DiskAgreement.prototype.set = function (this: DiskAgreement, ...args: Parameters<typeof set>) {
+        set.apply(this, args);
+        events.push(`set ${args[1]}`);
+      };
+      (env.store as unknown as { sync: () => void }).sync = function () {
+        events.push('sync');
+        storeSync.call(env.store);
+      };
+      try {
+        if (trigger === 'a scan') await call(m, 'ls', { path: 'work' });
+        else await call(m, 'materialize', {});
+      } finally {
+        DiskAgreement.prototype.set = set;
+        (env.store as unknown as { sync: () => void }).sync = storeSync;
+      }
+      const last = events.lastIndexOf('set a.txt');
+      assert.ok(last >= 0, `the agreement was recorded (${events.join(', ')})`);
+      assert.ok(events.indexOf('sync', last + 1) > last, `a barrier follows it (${events.join(', ')})`);
+    });
+  }
+
+  test('a push completed after a branch switch settles only the branch it planned on', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await call(m, 'write', { path: 'work/a.txt', content: 'A' }); // a draft disk never had
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('other', main);
+    env.store.switchBranch('other');
+    await call(m, 'write', { path: 'work/a.txt', content: 'B' });
+    env.writeDisk('a.txt', 'from the shell');
+    assert.equal(await stateOf(m, 'a.txt'), 'conflict'); // other's own intent: a recorded conflict
+    env.rmDisk('a.txt');
+    const intents = (m as any).intents.get('work');
+    const otherBefore = intents.get('a.txt');
+    env.store.switchBranch(main);
+
+    const mount = (m as any).mounts.get('work');
+    const runtime = await (m as any).runtime(mount);
+    const pushed = await pushPaths(env.store, (m as any).agreement, runtime, ['a.txt'], {
+      beforeEffect: () => queueMicrotask(() => env.store.switchBranch('other')),
+    });
+    assert.equal(env.store.currentBranch().name, 'other', 'the switch landed while the push wrote');
+    assert.deepEqual(pushed.written, ['a.txt']);
+    assert.equal(env.readDisk('a.txt'), 'A');
+    assert.deepEqual(intents.get('a.txt'), otherBefore, "the other branch's intent is untouched");
+    assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'content', 'the physical evidence is updated');
+
+    env.store.switchBranch(main);
+    assert.equal(await stateOf(m, 'a.txt'), 'synced', 'its own branch settles by convergence');
+    assert.equal(intents.get('a.txt'), null);
+  });
+
+  test('a failed durability barrier is reported, and its intent stays pending', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await call(m, 'write', { path: 'work/a.txt', content: 'v1' });
+    const probe = await open(join(env.root, 'probe'), 'w');
+    const proto = Object.getPrototypeOf(probe) as { sync: () => Promise<void> };
+    await probe.close();
+    const sync = proto.sync;
+    let calls = 0;
+    proto.sync = async function () {
+      calls++;
+      throw Object.assign(new Error('injected EIO'), { code: 'EIO' });
+    };
+    let res;
+    try {
+      res = await call(m, 'materialize', {});
+    } finally {
+      proto.sync = sync;
+    }
+    assert.equal(calls, 1, 'the file barrier failed; nothing after it ran');
+    assert.deepEqual(res.materialized, []);
+    assert.match(res.skipped[0].reason, /a\.txt: could not make the write durable \(file fsync\): injected EIO/);
+    assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'pending', 'no completion was recorded');
+    assert.equal(await stateOf(m, 'a.txt'), 'synced', 'the next observation resolves the intent from disk');
+  });
+
+  test('a directory that cannot be synced on its filesystem does not fail the write', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await call(m, 'write', { path: 'work/a.txt', content: 'v1' });
+    const probe = await open(join(env.root, 'probe'), 'w');
+    const proto = Object.getPrototypeOf(probe) as { sync: () => Promise<void> };
+    await probe.close();
+    const sync = proto.sync;
+    let calls = 0;
+    proto.sync = async function (this: unknown) {
+      calls++;
+      if (calls === 2) throw Object.assign(new Error('fsync of a directory: EINVAL'), { code: 'EINVAL' });
+      return sync.call(this);
+    };
+    let res;
+    try {
+      res = await call(m, 'materialize', {});
+    } finally {
+      proto.sync = sync;
+    }
+    assert.deepEqual(res.materialized, [{ mount: 'work', path: 'a.txt' }]);
+    assert.equal((m as any).agreement.get('work', 'a.txt').kind, 'content');
+  });
+
   test('a torn record tail after a materialize, then branch selection', async (t) => {
     const env = new Env(t);
     let m = await env.open();
@@ -703,6 +881,37 @@ describe('the mount boundary', () => {
     assert.throws(() => readFileSync(join(env.root, 'outdir', 'inner.txt')), /ENOENT/);
   });
 
+  for (const followSymlinks of [false, true]) {
+    test(`a symlinked parent never lets a read, listing or grep reach outside the mount (followSymlinks: ${followSymlinks})`, async (t) => {
+      const env = new Env(t);
+      const m = await env.open({ followSymlinks });
+      const outside = join(env.root, 'outside');
+      mkdirSync(outside);
+      writeFileSync(join(outside, 'secret.txt'), 'OUTSIDE_SENTINEL');
+      symlinkSync(outside, env.disk('escape'));
+
+      const error = await refused(m, 'read', { path: 'work/escape/secret.txt' });
+      assert.match(error, /outside the mount/);
+      assert.doesNotMatch(error, /OUTSIDE_SENTINEL/);
+      const scoped = await call(m, 'ls', { path: 'work/escape', recursive: true });
+      assert.deepEqual(scoped.entries, []);
+      assert.deepEqual(scoped.incomplete, [{ path: 'escape', reason: 'the directory resolves outside the mount' }]);
+      const whole = await listing(m);
+      assert.equal([...whole.keys()].some((p) => p.startsWith('escape/')), false);
+      assert.deepEqual((await call(m, 'grep', { pattern: 'OUTSIDE_SENTINEL' })).results, []);
+      assert.deepEqual((await call(m, 'grep', { pattern: 'OUTSIDE_SENTINEL', path: 'work/escape/secret.txt' })).results, []);
+      assert.equal(env.store.treeGet(TREE, 'escape/secret.txt'), null, 'nothing from outside was ingested');
+    });
+  }
+
+  test('an unavailable root with nothing tracked says so instead of listing a verified empty directory', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ path: join(env.root, 'never-created'), mode: 'read-only' });
+    const data = await call(m, 'ls', { path: 'work' });
+    assert.deepEqual(data.entries, []);
+    assert.deepEqual(data.incomplete, [{ path: '', reason: 'the mount root is unavailable' }]);
+  });
+
   test('a missing mount root is unavailable, not a deletion of everything in it', async (t) => {
     const env = new Env(t);
     const m = await env.open();
@@ -777,15 +986,83 @@ describe('on-agent-action', () => {
     const held = (m as any).withMount(mount, () => sleep(400)); // another pass holds the mount
 
     await m.onToolBatchComplete('agent');
-    const status = await call(m, 'status', {});
+    let status = await call(m, 'status', {});
     assert.equal(status.work.lastAgentActionScan.complete, false);
-    assert.match(status.work.lastAgentActionScan.reason, /still scanning/);
+    assert.equal(status.work.lastAgentActionScan.withinDeadline, false);
+    assert.match(status.work.lastAgentActionScan.reason, /deadline exceeded \(50 ms\); the scan continues/);
     assert.ok(env.events.some((e) => e.type === 'workspace:agent-action-scan-incomplete'));
     assert.equal(env.store.treeGet(TREE, 'late.txt'), null, 'nothing was claimed before the scan ran');
 
     await held;
     await (m as any).mountTurns.get('work');
     assert.notEqual(env.store.treeGet(TREE, 'late.txt'), null, 'the scan finished afterwards');
+    status = await call(m, 'status', {});
+    assert.deepEqual(
+      { complete: status.work.lastAgentActionScan.complete, withinDeadline: status.work.lastAgentActionScan.withinDeadline, reason: status.work.lastAgentActionScan.reason },
+      { complete: true, withinDeadline: false, reason: 'finished after the deadline' },
+    );
+  });
+
+  /** Run `fn` with FileHandle.readFile switching branches as `onRead` says. */
+  async function withReadHook<T>(onRead: (calls: number) => void, fn: () => Promise<T>): Promise<T> {
+    const probe = await open(join(tmpdir(), `read-hook-${process.pid}`), 'w');
+    const proto = Object.getPrototypeOf(probe) as { readFile: (...args: unknown[]) => Promise<Buffer> };
+    await probe.close();
+    const readFile = proto.readFile;
+    let calls = 0;
+    proto.readFile = async function (this: unknown, ...args: unknown[]) {
+      onRead(++calls);
+      return readFile.apply(this, args);
+    };
+    try {
+      return await fn();
+    } finally {
+      proto.readFile = readFile;
+    }
+  }
+
+  test('a branch switch while a pass reads disk makes it gather again, on the branch it then decides on', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('other', main);
+    env.store.switchBranch('other');
+    await call(m, 'write', { path: 'work/only-other.txt', content: 'a draft on other' });
+    env.store.switchBranch(main);
+
+    // The listing that lived through the switch is the one judged: a.txt's
+    // fingerprint is too fresh to vouch, so the pass reads it.
+    const data = await withReadHook((n) => { if (n === 1) env.store.switchBranch('other'); },
+      () => call(m, 'ls', { path: 'work', recursive: true }));
+    assert.equal(env.store.currentBranch().name, 'other');
+    assert.equal(data.incomplete, undefined);
+    const entries = new Map((data.entries as Entry[]).map((e) => [e.path, e.state]));
+    assert.equal(entries.get('only-other.txt'), 'workspace-draft', "the new branch's draft is decided, not omitted");
+    assert.equal(entries.get('a.txt'), 'synced');
+  });
+
+  test('a branch that keeps changing under a pass leaves it explicitly incomplete', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('other', main);
+    const data = await withReadHook((n) => env.store.switchBranch(n % 2 === 1 ? 'other' : main),
+      () => call(m, 'ls', { path: 'work', recursive: true }));
+    assert.deepEqual(data.entries, []);
+    assert.deepEqual(data.incomplete, [{ path: '', reason: 'the selected branch kept changing while the scan ran' }]);
+  });
+
+  test('a push whose selection was made on another branch writes nothing', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await call(m, 'write', { path: 'work/a.txt', content: 'A' });
+    const mount = (m as any).mounts.get('work');
+    const pushed = await pushPaths(env.store, (m as any).agreement, await (m as any).runtime(mount), ['a.txt'], { branchId: 'not-this-branch' });
+    assert.deepEqual(pushed.written, []);
+    assert.match(pushed.skipped[0]!.reason, /selected branch changed/);
+    assert.throws(() => env.readDisk('a.txt'), /ENOENT/);
   });
 
   test('a branch change while the scan waits applies to the branch current when it decides', async (t) => {

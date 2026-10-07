@@ -818,11 +818,15 @@ export class WorkspaceModule implements Module {
         // them over as disk-agreement evidence wherever the journal has none.
         // Its refused paths need nothing — they are re-observed as conflicts.
         if (this.agreement && meta.materializedHashes) {
+          let imported = false;
           for (const [path, hash] of Object.entries(meta.materializedHashes)) {
             if (this.agreement.get(name, path) === undefined) {
               this.agreement.set(name, path, { kind: 'content', hash, size: -1 });
+              imported = true;
             }
           }
+          // The next stop() saves module state without them: durable first.
+          if (imported) this.agreement.barrier();
         }
         // watcherReadyAt intentionally not restored — each session must
         // observe its own watcher attach, otherwise a stale timestamp
@@ -1390,6 +1394,7 @@ export class WorkspaceModule implements Module {
     }
     const store = this.getStore();
     return this.withMount(mount, async () => {
+      await this.settleBeforeMutation(mount, relativePath);
       const blobHash = store.storeBlob(data, mimeType);
       const materializeError = await this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: data.byteLength });
       if (materializeError) {
@@ -1830,7 +1835,7 @@ export class WorkspaceModule implements Module {
    * Returns the reason when the change reached the workspace but not disk, so
    * callers surface it in the tool result: the autoMaterialize contract is
    * that disk is the source of truth for downstream agents. The caller holds
-   * the mount's turn.
+   * the mount's turn and has settled the path first (settleBeforeMutation).
    */
   private async commitToolChange(
     mount: MountState,
@@ -1860,7 +1865,10 @@ export class WorkspaceModule implements Module {
     }
     if (!mount.config.autoMaterialize || mount.config.mode === 'read-only') return null;
 
-    const pushed = await this.pushUnlocked(mount, [relativePath], { applyDeletions: change.kind === 'remove' });
+    const pushed = await this.pushUnlocked(mount, [relativePath], {
+      applyDeletions: change.kind === 'remove',
+      branchId: store.currentBranch().id,
+    });
     const refused = pushed.skipped.find((s) => s.path === relativePath);
     if (!refused) return null;
     this.ctx?.pushEvent({
@@ -1876,6 +1884,19 @@ export class WorkspaceModule implements Module {
   // ==========================================================================
   // Lazy Sync
   // ==========================================================================
+
+  /**
+   * The mutation boundary: before a tool reads or changes a path's workspace
+   * entry, a pending intent on that path is settled by a pass over it. An
+   * adoption on this branch resolves by the tree's content, so once a new
+   * write had changed the tree, the write could pass for the old adoption's
+   * outcome and a real disk change would then overwrite it. The caller holds
+   * the mount's turn.
+   */
+  private async settleBeforeMutation(mount: MountState, relativePath: string): Promise<void> {
+    if (this.agreementOrThrow().get(mount.config.name, relativePath)?.kind !== 'pending') return;
+    await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
+  }
 
   /**
    * Before a read: a path the workspace doesn't hold is observed under the
@@ -2083,7 +2104,8 @@ export class WorkspaceModule implements Module {
     }
 
     const buffer = Buffer.from(input.content, 'utf-8');
-    const materializeError = await this.withMount(mount, () => {
+    const materializeError = await this.withMount(mount, async () => {
+      await this.settleBeforeMutation(mount, relativePath);
       const blobHash = store.storeBlob(buffer, 'text/plain');
       return this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: buffer.byteLength });
     });
@@ -2114,6 +2136,7 @@ export class WorkspaceModule implements Module {
     const store = this.getStore();
     return this.withMount(mount, async (): Promise<ToolResult> => {
       const report = await this.ensureSynced(mount, relativePath);
+      await this.settleBeforeMutation(mount, relativePath); // before the edit reads the entry
 
       const entry = store.treeGet(mount.treeStateId, relativePath);
       if (!entry) {
@@ -2181,6 +2204,7 @@ export class WorkspaceModule implements Module {
     const store = this.getStore();
     return this.withMount(mount, async (): Promise<ToolResult> => {
       const report = await this.ensureSynced(mount, relativePath);
+      await this.settleBeforeMutation(mount, relativePath);
       const entry = store.treeGet(mount.treeStateId, relativePath);
       if (!entry) {
         return { success: false, error: this.notInWorkspace(input.path, report), isError: true };
@@ -2526,8 +2550,9 @@ export class WorkspaceModule implements Module {
     for (const { name, mount } of mountsToMaterialize) {
       if (mount.config.mode === 'read-only') continue;
       const pushed = await this.withMount(mount, () => {
+        const branchId = store.currentBranch().id;
         const paths = this.materializeSelection(mount, explicit?.relativePath ?? '');
-        return this.pushUnlocked(mount, paths, { force: input.force, applyDeletions: input.applyDeletions });
+        return this.pushUnlocked(mount, paths, { force: input.force, applyDeletions: input.applyDeletions, branchId });
       });
 
       for (const p of pushed.written) allWritten.push({ mount: name, path: p });
@@ -2540,8 +2565,10 @@ export class WorkspaceModule implements Module {
       }
 
       // What disk still owes is kept by its evidence, so the watermark only
-      // marks where the next "changed since" diff starts.
-      mount.lastMaterializedSeq = store.currentSequence();
+      // marks where the next "changed since" diff starts. Both it and the pin
+      // are the push's own: what it planned from is what disk now reflects,
+      // whatever branch was selected while it wrote.
+      mount.lastMaterializedSeq = pushed.sequence;
       // Track which branch we materialized on. Re-pin on a clean empty
       // materialize too (previously-pinned mount, nothing pending): disk
       // already reflects the current branch's tree, and leaving the old pin
@@ -2549,7 +2576,7 @@ export class WorkspaceModule implements Module {
       // that happened to write nothing. A first materialize that found every
       // file already in place pins too: disk holds this branch's tree.
       if (pushed.written.length > 0 || pushed.unchanged.length > 0 || mount.lastMaterializedBranchId !== null) {
-        mount.lastMaterializedBranchId = store.currentBranch().id;
+        mount.lastMaterializedBranchId = pushed.branchId;
       }
     }
 
@@ -2587,13 +2614,15 @@ export class WorkspaceModule implements Module {
     // force: this path only runs after a deliberate undo/redo/branch switch
     // on the framework's own _config mount — restoring disk to the branch
     // state IS the operator intent, so the freshness guard yields.
-    const { written, unchanged } = await this.withMount(mount, () =>
-      this.pushUnlocked(mount, store.treeList(mount.treeStateId).map((e) => e.path), { force: true }));
-    mount.lastMaterializedSeq = store.currentSequence();
-    if (written.length > 0 || unchanged.length > 0) {
-      mount.lastMaterializedBranchId = store.currentBranch().id;
+    const pushed = await this.withMount(mount, () => {
+      const branchId = store.currentBranch().id;
+      return this.pushUnlocked(mount, store.treeList(mount.treeStateId).map((e) => e.path), { force: true, branchId });
+    });
+    mount.lastMaterializedSeq = pushed.sequence;
+    if (pushed.written.length > 0 || pushed.unchanged.length > 0) {
+      mount.lastMaterializedBranchId = pushed.branchId;
     }
-    return written;
+    return pushed.written;
   }
 
   private async handleSync(input: SyncInput): Promise<ToolResult> {
@@ -2686,13 +2715,13 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * After an agent's completed tool batch, before its next inference: scan
-   * every `watch: 'on-agent-action'` mount, so what the batch's tools did on
-   * disk (a shell command's files, a deletion) is in the workspace when the
-   * agent next looks. A scan that outlasts the deadline lets the inference go
-   * ahead without it: the miss is recorded on the mount's status and pushed as
-   * a `workspace:agent-action-scan-incomplete` event. The scan itself still
-   * finishes, deciding with the branch current when it applies.
+   * After an agent's completed tool batch, before anything continues its turn:
+   * scan every `watch: 'on-agent-action'` mount, so what the batch's tools did
+   * on disk (a shell command's files, a deletion) is in the workspace when the
+   * agent next looks. A scan that outlasts the deadline stops holding the
+   * round: the miss is recorded on the mount's status and pushed as a
+   * `workspace:agent-action-scan-incomplete` event, and the scan continues,
+   * deciding on the branch selected when it applies.
    */
   async onToolBatchComplete(_agentName?: string): Promise<void> {
     const mounts = [...this.mounts.values()].filter((m) => m.config.watch === 'on-agent-action');
@@ -2703,12 +2732,12 @@ export class WorkspaceModule implements Module {
       const scan = this.withMount(mount, () => this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true })).then(
         () => {
           mount.lastAgentActionScan = late
-            ? { at: Date.now(), complete: true, reason: 'finished after the agent\'s next inference had started' }
-            : { at: Date.now(), complete: true };
+            ? { at: Date.now(), complete: true, withinDeadline: false, reason: 'finished after the deadline' }
+            : { at: Date.now(), complete: true, withinDeadline: true };
         },
         (err: unknown) => {
           const reason = `scan failed: ${err instanceof Error ? err.message : String(err)}`;
-          mount.lastAgentActionScan = { at: Date.now(), complete: false, reason };
+          mount.lastAgentActionScan = { at: Date.now(), complete: false, withinDeadline: false, reason };
           this.ctx?.pushEvent({ type: 'workspace:agent-action-scan-incomplete', mount: mount.config.name, reason } as ProcessEvent);
         },
       );
@@ -2720,8 +2749,8 @@ export class WorkspaceModule implements Module {
       clearTimeout(timer);
       if (outcome === 'late') {
         late = true;
-        const reason = `still scanning after ${deadlineMs} ms; the agent's next inference went ahead without it`;
-        mount.lastAgentActionScan = { at: Date.now(), complete: false, reason };
+        const reason = `deadline exceeded (${deadlineMs} ms); the scan continues`;
+        mount.lastAgentActionScan = { at: Date.now(), complete: false, withinDeadline: false, reason };
         this.ctx?.pushEvent({ type: 'workspace:agent-action-scan-incomplete', mount: mount.config.name, reason } as ProcessEvent);
       }
     }));
