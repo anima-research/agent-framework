@@ -31,6 +31,17 @@
  * One writer per record type: a checkpoint covers every entry up to the last
  * one THIS journal loaded or appended, so entries another instance appended
  * to the same type in between would be covered without being reduced.
+ *
+ * An ambiguous write must be reconciled before the journal writes again. Once
+ * `append` or `checkpoint` has handed a record to the store, any failure from
+ * there on (the append itself, or a barrier after it) leaves it unknown
+ * whether that record exists, and the caller didn't reduce it. A later
+ * checkpoint would then cover it without its ever entering the reducer. So
+ * such a failure marks the journal unreconciled: every further `append` and
+ * `checkpoint` throws until `load()` has replayed the tail — the possibly
+ * written record included — for the caller to reduce. A failure BEFORE the
+ * record reaches the store (the `afterCommittedState` sync) wrote nothing and
+ * leaves the journal usable.
  */
 
 import type { JsStore } from '@animalabs/chronicle';
@@ -88,6 +99,8 @@ export class RecordJournal<Entry, Snapshot = never> {
   /** Highest entry id this journal has loaded or appended (0 when none). */
   private lastEntryId = 0n;
   private sinceCheckpoint = 0;
+  /** Set by a failure after a record reached the store; cleared by load(). */
+  private unreconciled: Error | null = null;
 
   constructor(store: JsStore, opts: { type: string; checkpointType?: string }) {
     if (!opts.type) throw new Error('RecordJournal: a record type is required');
@@ -106,8 +119,9 @@ export class RecordJournal<Entry, Snapshot = never> {
 
   /**
    * The latest checkpoint and every entry after it, whichever branch each was
-   * appended on. Also positions the journal, so later checkpoints cover what
-   * was loaded.
+   * appended on. The caller rebuilds its reduced state from exactly these —
+   * at open, and to reconcile after an ambiguous write. Also positions the
+   * journal, so later checkpoints cover what was loaded.
    */
   load(): JournalLoad<Entry, Snapshot> {
     let snapshot: Snapshot | null = null;
@@ -138,18 +152,24 @@ export class RecordJournal<Entry, Snapshot = never> {
 
     this.lastEntryId = tail.length > 0 ? tail[tail.length - 1]!.value : through;
     this.sinceCheckpoint = entries.length;
+    this.unreconciled = null;
     return { snapshot, entries };
+  }
+
+  /** True after an ambiguous write, until load() has replayed it. */
+  get needsReconcile(): boolean {
+    return this.unreconciled !== null;
   }
 
   /** Append one entry. The returned ref says where it landed, not that it's durable. */
   append(entry: Entry, opts: AppendOptions = {}): JournalRecordRef {
+    this.assertReconciled();
     if (opts.afterCommittedState) this.store.sync();
-    const record = this.store.appendJson(this.type, entry);
-    if (opts.durable) this.store.sync();
-    const value = idValue(record.id);
-    if (value > this.lastEntryId) this.lastEntryId = value;
-    this.sinceCheckpoint++;
-    return { id: record.id, sequence: record.sequence };
+    return this.write(this.type, entry, opts.durable === true, (ref) => {
+      const value = idValue(ref.id);
+      if (value > this.lastEntryId) this.lastEntryId = value;
+      this.sinceCheckpoint++;
+    });
   }
 
   /**
@@ -157,10 +177,33 @@ export class RecordJournal<Entry, Snapshot = never> {
    * loaded or appended. Like an entry, it's durable only with `durable`.
    */
   checkpoint(snapshot: Snapshot, opts: { durable?: boolean } = {}): JournalRecordRef {
+    this.assertReconciled();
     const payload: CheckpointPayload<Snapshot> = { through: this.lastEntryId.toString(), snapshot };
-    const record = this.store.appendJson(this.checkpointType, payload);
-    if (opts.durable) this.store.sync();
-    this.sinceCheckpoint = 0;
-    return { id: record.id, sequence: record.sequence };
+    return this.write(this.checkpointType, payload, opts.durable === true, () => {
+      this.sinceCheckpoint = 0;
+    });
+  }
+
+  /** Hand one record to the store; any failure from here on is ambiguous. */
+  private write(type: string, payload: unknown, durable: boolean, onWritten: (ref: JournalRecordRef) => void): JournalRecordRef {
+    try {
+      const record = this.store.appendJson(type, payload);
+      const ref = { id: record.id, sequence: record.sequence };
+      onWritten(ref);
+      if (durable) this.store.sync();
+      return ref;
+    } catch (err) {
+      this.unreconciled = err instanceof Error ? err : new Error(String(err));
+      throw err;
+    }
+  }
+
+  private assertReconciled(): void {
+    if (this.unreconciled) {
+      throw new Error(
+        `RecordJournal(${this.type}): an earlier write failed after reaching the store ` +
+        `(${this.unreconciled.message}); load() and reduce its tail before writing again`,
+      );
+    }
   }
 }

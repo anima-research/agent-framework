@@ -153,6 +153,48 @@ describe('RecordJournal', () => {
     });
   });
 
+  it('a write that fails after reaching the store blocks further writes until load() replays it', () => {
+    withStore((store) => {
+      let failNextSync = false;
+      const flaky = {
+        getRecordIdsByType: (type: string) => store.getRecordIdsByType(type),
+        getRecord: (id: string) => store.getRecord(id),
+        appendJson: (type: string, data: unknown) => store.appendJson(type, data),
+        sync: () => {
+          if (failNextSync) { failNextSync = false; throw new Error('disk full'); }
+          store.sync();
+        },
+      } as unknown as JsStore;
+      const journal = new RecordJournal<Entry, { seen: string[] }>(flaky, { type: 'journal-test/entry' });
+
+      // The durable barrier fails after A reached the store: the caller never reduces A.
+      failNextSync = true;
+      assert.throws(() => journal.append({ n: 'A' }, { durable: true }), /disk full/);
+      assert.strictEqual(journal.needsReconcile, true);
+      // Without reconciliation, a later write and checkpoint would cover A unreduced.
+      assert.throws(() => journal.append({ n: 'B' }), /load\(\) and reduce its tail before writing again/);
+      assert.throws(() => journal.checkpoint({ seen: ['B'] }), /load\(\) and reduce its tail/);
+
+      const reconciled = journal.load();
+      assert.deepStrictEqual(reconciled.entries.map((e) => e.entry.n), ['A'], 'load replays the ambiguous record');
+      assert.strictEqual(journal.needsReconcile, false);
+      journal.append({ n: 'B' });
+      journal.checkpoint({ seen: ['A', 'B'] });
+      assert.deepStrictEqual(new RecordJournal<Entry, { seen: string[] }>(store, { type: 'journal-test/entry' }).load(),
+        { snapshot: { seen: ['A', 'B'] }, entries: [] });
+
+      // A failure BEFORE the record reaches the store wrote nothing and leaves the journal usable.
+      failNextSync = true;
+      assert.throws(() => journal.append({ n: 'C' }, { afterCommittedState: true }), /disk full/);
+      assert.strictEqual(journal.needsReconcile, false);
+      journal.append({ n: 'D' });
+      assert.deepStrictEqual(
+        new RecordJournal<Entry, { seen: string[] }>(store, { type: 'journal-test/entry' }).load().entries.map((e) => e.entry.n),
+        ['D'],
+      );
+    });
+  });
+
   it('refuses a checkpoint type equal to the entry type', () => {
     withStore((store) => {
       assert.throws(() => new RecordJournal(store, { type: 't', checkpointType: 't' }), /distinct record types/);
