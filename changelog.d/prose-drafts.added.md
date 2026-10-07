@@ -24,7 +24,9 @@
   branch switches: undo, rollback and checkout never change them, and they
   survive restarts. Nothing is ever sent from them on its own.
 - A private notice names held drafts at the next tool boundary when the live
-  stream presents mid-turn messages, and the turn-end `[delivered]` receipt
+  stream presents mid-turn messages (a draft holding words copied from one
+  that may already have been posted is named with that risk and the
+  `confirmDuplicate` its resend needs), and the turn-end `[delivered]` receipt
   names every draft held in the turn by its state at turn end: still held
   ("held as drafts d-… (not sent …)"), delivered by the resident's resend
   (listed where it landed), unconfirmed, or dismissed. A draft no notice

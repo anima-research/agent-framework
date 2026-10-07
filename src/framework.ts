@@ -8966,14 +8966,25 @@ export class AgentFramework {
   private draftsHeldNotice(agentName: string, held: Draft[], reason: DraftReason): string {
     const ids = held.map((d) => d.id);
     const many = held.length > 1;
-    const idList = ids.map((id) => `"${id}"`).join(', ');
+    const quoted = (ds: Draft[]): string => ds.map((d) => `"${d.id}"`).join(', ');
+    // Words copied from a draft that may already have been posted resend
+    // only with the resident's confirmation; the rest resend freely.
+    const free = held.filter((d) => draftState(d) !== 'unconfirmed');
+    const risky = held.filter((d) => draftState(d) === 'unconfirmed');
+    const resend = [
+      ...(free.length > 0
+        ? [`drafts(action: "resend", draftIds: [${quoted(free)}], destination: "#channel") delivers ` +
+          `${free.length > 1 ? 'them' : 'it'} unchanged`]
+        : []),
+      ...risky.map((d) => `${this.riskText(d)}, so check that channel before resending ${d.id} ` +
+        `(drafts(action: "resend", draftIds: ["${d.id}"], destination: "#channel", confirmDuplicate: true))`),
+    ];
     // Named: residents that share one message slot (#197) share this window.
     return (
       `[drafts] ${agentName}: not sent — ${many ? `${held.length} plain-speech segments` : 'a plain-speech segment'} ` +
       `held as draft${many ? 's' : ''} ${ids.join(', ')} — ${AgentFramework.DRAFT_REASON_TEXT[reason]}. ` +
-      `Nothing publishes drafts but your own resend, and they stay until you act: drafts(action: "resend", draftIds: [${idList}], ` +
-      `destination: "#channel") delivers ${many ? 'them' : 'it'} unchanged; drafts(action: "dismiss", ` +
-      `draftIds: [${idList}]) sets ${many ? 'them' : 'it'} aside.`
+      `Nothing publishes drafts but your own resend, and they stay until you act: ${resend.join('; ')}; ` +
+      `drafts(action: "dismiss", draftIds: [${quoted(held)}]) sets ${many ? 'them' : 'it'} aside.`
     );
   }
 
@@ -9439,7 +9450,8 @@ export class AgentFramework {
         '(not sent — drafts can resend them unchanged, or dismiss them)',
       );
     }
-    for (const d of inState('unconfirmed')) {
+    const unconfirmed = inState('unconfirmed');
+    for (const d of unconfirmed) {
       notes.push(`draft ${d.id} is unconfirmed: ${this.riskText(d)} — check that channel before sending it again (resend needs confirmDuplicate: true)`);
     }
     const dismissed = inState('dismissed');
@@ -9448,7 +9460,7 @@ export class AgentFramework {
       const attempt = d.attempts.find((a) => a.outcome?.status === 'delivered')!;
       const how = attempt.via === 'resend' ? 'by your resend' : 'by your {{unsent}}';
       // A hybrid `{{unsent}}` envelope is already listed above, as the plain
-      // speech it was; a resend (or explicit mode's envelope) is not.
+      // speech it was; a resend is not.
       if (attempt.via === 'unsent-token' && seen.has(attempt.destination.channelId)) {
         notes.push(`draft ${d.id} delivered ${how}`);
       } else {
@@ -9468,10 +9480,11 @@ export class AgentFramework {
         : `${suppressed} plain-speech segment(s) suppressed`);
     }
     const suppressedNote = notes.join(' · ');
+    // Nothing is confirmed delivered, but an unconfirmed draft may have been.
     const text =
       shown.length > 0
         ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}`
-        : `[delivered] nothing — ${suppressedNote}`;
+        : `[delivered] nothing${unconfirmed.length > 0 ? ' confirmed' : ''} — ${suppressedNote}`;
     try {
       const mid = agent.getContextManager().addMessage(
         'user',
