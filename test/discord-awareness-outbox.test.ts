@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   DiscordAwarenessOutbox,
+  boundDiscordAwarenessText,
   extractDiscordAwarenessRefs,
   selectDiscordAwarenessRefs,
   type DiscordAwarenessRef,
@@ -322,6 +323,20 @@ test('release queues a held batch\'s recorded operations, explicitly', withJourn
   assert.equal(outbox.batches()[0].status, 'active');
   assert.equal(outbox.pendingDispatches('discord').length, 2);
   assert.throws(() => outbox.release(batch.id), /not held/);
+}));
+
+test('outside error text is bounded before it is journaled', withJournal((path) => {
+  assert.equal(boundDiscordAwarenessText('short'), 'short');
+  const huge = `${'x'.repeat(300)}${'界'.repeat(500_000)}😀tail`;
+  const bounded = boundDiscordAwarenessText(huge);
+  assert.ok(bounded.length <= 500, `bounded to ${bounded.length}`);
+  assert.match(bounded, /chars omitted/);
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(bounded), 'no lone surrogate');
+  const outbox = new DiscordAwarenessOutbox(path);
+  activeBatch(outbox, [ref('m1')]);
+  const dispatch = outbox.pendingDispatches('discord')[0];
+  outbox.recordOutcome(outbox.recordDispatching(dispatch), 'failed', { error: huge });
+  assert.ok(readFileSync(path, 'utf8').length < 5_000, 'the journal holds only the bounded text');
 }));
 
 test('a torn or uncommitted append applies none of its records', withJournal((path) => {

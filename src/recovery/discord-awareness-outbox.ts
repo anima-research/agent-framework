@@ -39,6 +39,23 @@ import { createHash, randomUUID } from 'node:crypto';
 export const DEFAULT_DISCORD_AWARENESS_EMOJI = '💤';
 
 /** The journal file under a store, next to the other recovery state. */
+/**
+ * Bound text that came from elsewhere (a Discord error body, a filesystem
+ * error) before it is journaled, logged or returned in a receipt: the journal
+ * is re-read on every operation, and a server's error text has no length
+ * limit of its own. Head and tail are kept, with the omitted length stated;
+ * a cut never splits a surrogate pair.
+ */
+export function boundDiscordAwarenessText(text: string, max = 500): string {
+  if (text.length <= max) return text;
+  const tailLength = Math.min(100, Math.floor(max / 4));
+  let head = text.slice(0, max - tailLength - 40);
+  let tail = text.slice(text.length - tailLength);
+  if (/[\uD800-\uDBFF]$/.test(head)) head = head.slice(0, -1);
+  if (/^[\uDC00-\uDFFF]/.test(tail)) tail = tail.slice(1);
+  return `${head} … [${text.length - head.length - tail.length} chars omitted] … ${tail}`;
+}
+
 export function defaultDiscordAwarenessOutboxPath(storePath: string): string {
   return join(storePath, 'recovery', 'discord-awareness-journal.jsonl');
 }
@@ -733,6 +750,7 @@ export class DiscordAwarenessOutbox {
     detail: { permanent?: boolean; error?: string } = {},
   ): void {
     const at = Date.now();
+    const error = detail.error !== undefined ? boundDiscordAwarenessText(detail.error) : undefined;
     try {
       this.append(attempts.map(({ opId, attempt }) => ({
         t: 'outcome' as const,
@@ -741,7 +759,7 @@ export class DiscordAwarenessOutbox {
         attempt,
         outcome,
         ...(outcome === 'failed' && detail.permanent ? { permanent: true } : {}),
-        ...(detail.error !== undefined ? { error: detail.error } : {}),
+        ...(error !== undefined ? { error } : {}),
       })));
     } finally {
       for (const { opId } of attempts) this.inFlight.delete(opId);

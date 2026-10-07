@@ -407,6 +407,7 @@ import {
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
   selectDiscordAwarenessRefs,
+  boundDiscordAwarenessText,
   type DiscordAwarenessBatch,
   type DiscordAwarenessBatchView,
   type DiscordAwarenessCancelReceipt,
@@ -6542,13 +6543,15 @@ export class AgentFramework {
     try {
       this.discordAwarenessOutbox!.activate(batch.id);
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
+      const detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
       let retired = false;
       let retireDetail = '';
       try {
         retired = this.discordAwarenessOutbox!.discard(batch.id);
       } catch (discardError) {
-        retireDetail = discardError instanceof Error ? discardError.message : String(discardError);
+        retireDetail = boundDiscordAwarenessText(
+          discardError instanceof Error ? discardError.message : String(discardError),
+        );
       }
       console.error(
         `[discord-awareness] ${verb} agent=${agentName}: body applied, but marker batch ${batch.id} ` +
@@ -6612,7 +6615,7 @@ export class AgentFramework {
       }) ?? null;
     } catch (error) {
       // The redaction stands; nothing was recorded, so nothing will be sent.
-      const detail = error instanceof Error ? error.message : String(error);
+      const detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
       this.opsAlert(
         'discord-awareness-not-scheduled',
         agentName,
@@ -6638,7 +6641,7 @@ export class AgentFramework {
   ): void {
     if (!this.discordAwarenessOutbox) return;
     this.syncDiscordAwarenessMarkers().catch((error) => {
-      const detail = error instanceof Error ? error.message : String(error);
+      const detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
       console.error(`[discord-awareness] delivery after ${occasion} failed: ${detail}`);
       this.opsAlert(
         'discord-awareness-delivery',
@@ -13700,7 +13703,9 @@ export class AgentFramework {
               outcome = 'unknown';
             }
           }
+          // Classify on the full text, then keep only a bounded copy.
           const permanent = outcome === 'failed' && isPermanentDiscordReactionFailure(detail ?? '');
+          if (detail !== undefined) detail = boundDiscordAwarenessText(detail);
           try {
             outbox.recordOutcome(attempts, outcome, {
               ...(permanent ? { permanent: true } : {}),
