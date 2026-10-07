@@ -397,4 +397,26 @@ describe('runAtSafeBoundary', () => {
     assert.equal(i.deferredMessages.length, 0, 'all landed');
     assert.equal(i.landedDeferredWrites.size, 0, 'and left no ids behind');
   });
+
+  it('refuses a direct surgery while an admitted creation is pending, in the reverse order too', async () => {
+    let releaseInit!: () => void;
+    let reachedInit!: () => void;
+    const initGate = new Promise<void>((r) => { releaseInit = r; });
+    const initStarted = new Promise<void>((r) => { reachedInit = r; });
+    const strategy = new PassthroughStrategy();
+    (strategy as unknown as { initialize: () => Promise<void> }).initialize = async () => { reachedInit(); await initGate; };
+    const creating = framework.createEphemeralAgent({ name: 'first', model: 'test-model', systemPrompt: 'test', strategy });
+    await initStarted;
+    assert.throws(
+      () => i.reserveStoreForSurgery('rollback', 'scout'),
+      (e: Error & { code?: string }) => e.code === 'agent-busy' && /ephemeral creation\(s\) pending/.test(e.message),
+      'the surgery refuses while the creation initializes',
+    );
+    releaseInit();
+    const created = await creating;
+    assert.throws(() => i.reserveStoreForSurgery('rollback', 'scout'), /ephemeral creation/, 'and while its candidate is unrun');
+    created.cleanup();
+    const release = i.reserveStoreForSurgery('rollback', 'scout'); // free now
+    release();
+  });
 });

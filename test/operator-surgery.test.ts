@@ -201,6 +201,15 @@ describe('live operator surgery', () => {
       processInferenceRequests(): Promise<void>;
     };
     try {
+      // A pending (admitted, unrun) candidate refuses the surgery outright:
+      // it was created against this branch and may initialize or run on it.
+      await assert.rejects(
+        framework.rollbackToMessage('scout', { messageId: ids[1] }),
+        (e: Error & { code?: string }) => e.code === 'agent-busy' && /ephemeral creation/.test(e.message),
+      );
+      // Released from pending, the candidate can still be run (wrongly)
+      // later: that admission is what the store hold must refuse.
+      worker.cleanup();
       const rollback = framework.rollbackToMessage('scout', { messageId: ids[1] });
       await new Promise((resolve) => setImmediate(resolve));
       assert.ok(internals.surgeryHold, 'store hold is up while the switch is awaited');

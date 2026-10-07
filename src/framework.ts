@@ -6225,6 +6225,11 @@ export class AgentFramework {
     for (const name of this.activeTurnTokens.keys()) {
       if (!this.agents.has(name)) busy.push(`${name} is turn-alive`);
     }
+    // An admitted ephemeral creation is initializing against, or about to
+    // run on, the current branch: a store reservation must wait for it in
+    // either order (creation also waits for a reservation taken first).
+    const pending = this.ephemeralPending?.size ?? 0;
+    if (pending > 0) busy.push(`${pending} ephemeral creation(s) pending`);
     return busy;
   }
 
