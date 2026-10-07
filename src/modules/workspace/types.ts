@@ -18,9 +18,11 @@ export interface MountConfig {
   mode: 'read-write' | 'read-only';
   /**
    * Watch mode for filesystem changes:
-   * - 'always': chokidar watches continuously, syncs on debounce
-   * - 'on-agent-action': sync from filesystem after each agent tool call
-   * - 'never': fully virtual, no automatic filesystem reads
+   * - 'always': chokidar watches continuously; each event re-observes its paths
+   * - 'on-agent-action': after each completed agent tool batch, the mount is
+   *   scanned before the agent's next inference
+   * - 'never': no background reads; listings and lazy reads still observe
+   *   the paths they show
    */
   watch?: 'always' | 'on-agent-action' | 'never';
   /** Debounce window in ms for watch: 'always' mode (default: 300) */
@@ -79,26 +81,30 @@ export interface WorkspaceConfig {
 // ============================================================================
 
 /**
- * Per-mount runtime state (not persisted — rebuilt on start).
+ * Per-mount runtime state (not persisted — rebuilt on start). What disk last
+ * agreed with lives in the module's disk-agreement journal (global chronicle
+ * records), and branch-local intent in `intentTreeStateId`.
  */
 export interface MountState {
   /** The mount config */
   config: MountConfig;
   /** Tree state ID in Chronicle */
   treeStateId: string;
+  /** Branch-local intent (tombstones, store origin, conflicts) for this mount's paths */
+  intentTreeStateId: string;
   /** Sequence number of last materialization */
   lastMaterializedSeq: number;
   /** Paths currently suppressed from watcher (recently materialized) */
   suppressedPaths: Set<string>;
-  /** Whether initial lazy sync has been completed */
+  /** Whether a full scan of the mount has completed this session */
   initialSyncDone: boolean;
   /** Branch ID that was active when this mount last materialized */
   lastMaterializedBranchId: string | null;
-  /** Per-file hash at time of last materialization — baseline for conflict detection */
-  materializedHashes: Map<string, string>;
-  /** Paths the materialize freshness guard refused (#109), owed to every
-   *  later materialize until one writes them or the tree drops them. */
-  refusedPaths: Set<string>;
+  /**
+   * The last on-agent-action scan: whether it finished before the agent's
+   * next inference, and if not, why.
+   */
+  lastAgentActionScan?: { at: number; complete: boolean; reason?: string };
   /**
    * Wall-clock time chokidar emitted `ready` for this mount, or null if the
    * watcher hasn't finished its initial scan. null after session start =
@@ -118,8 +124,13 @@ export interface WorkspaceModuleState {
   mounts: Record<string, {
     lastMaterializedSeq: number;
     lastMaterializedBranchId?: string;
-    /** Freshness-guard baselines (#109), so a restart doesn't drop the guard */
+    /**
+     * Freshness-guard baselines as #169 persisted them at stop. Read once at
+     * start, for stores that ran it, and imported as disk-agreement evidence
+     * where the journal has none; never written.
+     */
     materializedHashes?: Record<string, string>;
+    /** Read and ignored: conflicts are now branch-local intent records. */
     refusedPaths?: string[];
     watcherReadyAt?: number | null;
     watcherError?: string | null;
@@ -213,11 +224,18 @@ export interface MaterializeInput {
   mount?: string;
   /**
    * Materialize even when the current branch has genuinely diverged from the
-   * branch last materialized to disk (default: false). Not needed for linear
-   * continuations (child branches forked at or after the last materialized
-   * point) — those pass the guard automatically.
+   * branch last materialized to disk, and overwrite a disk copy in conflict
+   * (default: false). Not needed for linear continuations (child branches
+   * forked at or after the last materialized point) — those pass the guard
+   * automatically.
    */
   force?: boolean;
+  /**
+   * Also delete from disk the files deleted in the workspace whose disk copy
+   * is still one the workspace holds (default: false). With `force`, also
+   * those whose disk copy changed since.
+   */
+  applyDeletions?: boolean;
 }
 
 export interface SyncInput {
@@ -258,6 +276,8 @@ export interface WorkspaceDeletedEvent {
   type: 'workspace:deleted';
   paths: string[];
   mount: string;
+  /** Paths deleted on disk whose newer workspace version was kept as a conflict. */
+  conflicts?: string[];
   [key: string]: unknown;
 }
 

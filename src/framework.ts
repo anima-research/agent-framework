@@ -6611,6 +6611,29 @@ export class AgentFramework {
           result: event.result,
         });
       }
+      // The round's last pending result: let modules catch up with what the
+      // batch's tools did (the workspace scans `on-agent-action` mounts) before
+      // anything continues the turn. Bounded and fail-open; the agent may be
+      // reset or cancelled meanwhile, so its state is checked again after.
+      if (
+        agent && agent.state.status === 'waiting_for_tools'
+        && agent.state.pending.size === 1 && agent.state.pending.has(event.callId)
+      ) {
+        const failures = await this.moduleRegistry.notifyToolBatchComplete(event.agentName);
+        for (const failure of failures) {
+          this.emitTrace({ type: 'module:batch_hook_failed', agentName: event.agentName, module: failure.module, error: failure.error });
+        }
+        if ((agent.state as AgentState).status !== 'waiting_for_tools') {
+          this.emitTrace({
+            type: 'tool:result_dropped',
+            agentName: event.agentName,
+            callId: event.callId,
+            agentStatus: (agent.state as AgentState).status,
+            result: event.result,
+          });
+          return;
+        }
+      }
       if (agent && agent.state.status === 'waiting_for_tools') {
         agent.provideToolResult(event.callId, event.result);
 

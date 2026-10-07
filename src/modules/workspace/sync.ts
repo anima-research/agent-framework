@@ -1,16 +1,11 @@
 /**
- * Sync logic between filesystem and Chronicle tree state.
- *
- * Two directions:
- * - syncFromFs: filesystem → Chronicle (user changes)
- * - materializeToFs: Chronicle → filesystem (agent changes)
+ * Shared helpers for moving content between the filesystem and the Chronicle
+ * tree. The rules for when content moves — the three-way rule over disk, the
+ * store and disk-agreement evidence — live in reconcile.ts.
  */
 
 import { createHash } from 'node:crypto';
-import { readFile, writeFile, mkdir, readdir, stat, access } from 'node:fs/promises';
-import { join, dirname, relative, resolve, sep } from 'node:path';
-import type { JsStore, JsTreeEntry } from '@animalabs/chronicle';
-import type { MountState } from './types.js';
+import { resolve, sep } from 'node:path';
 
 export const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
 
@@ -18,7 +13,7 @@ export const DEFAULT_MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
  * Resolve a relative path within a mount and verify it doesn't escape.
  * Returns the absolute path, or null if the path is outside the mount.
  */
-function safePath(mountPath: string, relativePath: string): string | null {
+export function safePath(mountPath: string, relativePath: string): string | null {
   // Compare with the PLATFORM separator: resolve() emits backslashes on
   // Windows, so a '/'-suffixed root never prefix-matches there and every
   // in-mount path was reported as outside the mount.
@@ -31,8 +26,8 @@ function safePath(mountPath: string, relativePath: string): string | null {
 }
 
 /**
- * Hash file content to a full SHA-256 hex string.
- * Must match Chronicle's storeBlob() hash format (64-char hex).
+ * Hash content to a full SHA-256 hex string.
+ * Matches Chronicle's storeBlob() hash format (64-char hex).
  */
 export function hashContent(content: string | Buffer): string {
   const hash = createHash('sha256');
@@ -40,406 +35,19 @@ export function hashContent(content: string | Buffer): string {
   return hash.digest('hex');
 }
 
-/**
- * Check if content appears to be binary.
- */
+/** A path a sync or materialize did not act on, with the reason. */
 export interface SkippedFile {
-  /** Relative path of the file that was not synced */
+  /** Relative path of the file */
   path: string;
   /** Why, in words the resident can act on */
   reason: string;
 }
 
+/** Null bytes in the first 8KB: content disk→store sync won't store as text. */
 export function isBinary(buffer: Buffer): boolean {
-  // Check for null bytes in first 8KB
   const check = buffer.subarray(0, 8192);
   for (let i = 0; i < check.length; i++) {
     if (check[i] === 0) return true;
-  }
-  return false;
-}
-
-export interface ConflictInfo {
-  /** Relative path of the conflicted file */
-  path: string;
-  /** Blob hash of the agent's version (retrievable via store.getBlob()) */
-  agentBlobHash: string;
-}
-
-export type SyncOp = 'created' | 'modified' | 'deleted';
-
-export interface SyncedPath {
-  path: string;
-  op: SyncOp;
-}
-
-export interface SyncResult {
-  /** Paths that were synced, tagged with the op detected against tree state */
-  synced: SyncedPath[];
-  /** Paths that conflicted (both agent and user modified) — filesystem wins */
-  conflicts: ConflictInfo[];
-  /** Paths that were skipped, each with the reason — a silently skipped file
-   *  is indistinguishable from one that synced cleanly, which is how a
-   *  resident ends up believing a file is in their workspace when it never
-   *  arrived. */
-  skipped: SkippedFile[];
-}
-
-/**
- * Sync filesystem changes into Chronicle tree state.
- *
- * @param store Chronicle store
- * @param mount Mount state
- * @param paths Specific paths to sync (relative to mount). If empty, walks the directory.
- * @returns Sync result with synced/conflicted/skipped paths
- */
-export async function syncFromFs(
-  store: JsStore,
-  mount: MountState,
-  paths?: string[],
-): Promise<SyncResult> {
-  const result: SyncResult = { synced: [], conflicts: [], skipped: [] };
-  const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
-
-  const filesToSync = paths ?? await walkDirectory(mount.config.path, mount.config.ignore ?? []);
-
-  for (const relativePath of filesToSync) {
-    const absolutePath = safePath(mount.config.path, relativePath);
-    if (!absolutePath) {
-      result.skipped.push({ path: relativePath, reason: 'path resolves outside the mount' });
-      continue;
-    }
-
-    try {
-      await access(absolutePath);
-    } catch {
-      // File was deleted on disk — remove from tree
-      const existing = store.treeGet(mount.treeStateId, relativePath);
-      if (existing) {
-        store.treeRemove(mount.treeStateId, relativePath);
-        result.synced.push({ path: relativePath, op: 'deleted' });
-      }
-      mount.materializedHashes.delete(relativePath);
-      continue;
-    }
-
-    try {
-      const fileStat = await stat(absolutePath);
-      if (!fileStat.isFile()) continue;
-      if (fileStat.size > maxSize) {
-        result.skipped.push({
-          path: relativePath,
-          reason: `too large: ${fileStat.size} bytes > maxFileSize ${maxSize}`,
-        });
-        continue;
-      }
-
-      const buffer = await readFile(absolutePath);
-      if (isBinary(buffer)) {
-        // Disk -> store sync is text-only, at ANY size: the tree stores text
-        // blobs. Binary that must live in the store has to be written through
-        // writeBinary; binary that is only passing through should be read with
-        // readBinaryFromDisk instead of synced at all.
-        result.skipped.push({
-          path: relativePath,
-          reason: 'binary file — disk sync stores text only (read it from disk, or write it via a binary-aware tool)',
-        });
-        continue;
-      }
-
-      const content = buffer.toString('utf-8');
-      const hash = hashContent(content);
-
-      // Check current tree state
-      const existing = store.treeGet(mount.treeStateId, relativePath);
-
-      if (existing && existing.blobHash === hash) {
-        // No change. Disk and tree agree, so this is the baseline now.
-        mount.materializedHashes.set(relativePath, hashContent(buffer));
-        continue;
-      }
-
-      // Store blob and update tree
-      const blobHash = store.storeBlob(Buffer.from(content, 'utf-8'), 'text/plain');
-      const entry: JsTreeEntry = {
-        blobHash,
-        size: buffer.length,
-        mode: 0o644,
-      };
-
-      // Conflict detection: if the file existed in the tree AND the agent has
-      // modified it since last materialization, this is a genuine conflict
-      // (both agent and user changed the same file).
-      if (existing) {
-        const baselineHash = mount.materializedHashes.get(relativePath);
-        if (baselineHash && existing.blobHash !== baselineHash) {
-          // Agent changed the tree entry since we last materialized — conflict.
-          // Filesystem still wins, but agent's version is recoverable via agentBlobHash.
-          result.conflicts.push({
-            path: relativePath,
-            agentBlobHash: existing.blobHash,
-          });
-        }
-      }
-
-      store.treeSet(mount.treeStateId, relativePath, entry);
-      // The tree adopted the disk copy, so disk and tree agree: re-pin the
-      // baseline. Left at the old hash, materialize would read the adopted
-      // edit as a fresh external change and refuse every later agent edit
-      // to this file, with no sync able to clear it. Raw disk bytes, which is
-      // what materializeToFs compares against.
-      mount.materializedHashes.set(relativePath, hashContent(buffer));
-      result.synced.push({ path: relativePath, op: existing ? 'modified' : 'created' });
-    } catch (error) {
-      result.skipped.push({
-        path: relativePath,
-        reason: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-
-  return result;
-}
-
-export interface MaterializeResult {
-  /** Paths actually written to disk */
-  written: string[];
-  /** Paths whose disk copy already held exactly the tree's bytes: nothing
-   *  written, but disk reflects the current tree for them all the same. */
-  unchanged: string[];
-  /** Paths refused by the freshness guard, each with the reason — a silently
-   *  overwritten shell edit is unrecoverable, so divergence must surface
-   *  instead of being resolved toward the workspace copy (issue #109: a bulk
-   *  materialize reverted 217 shell-edited files to a stale snapshot). */
-  skipped: SkippedFile[];
-}
-
-/**
- * Materialize Chronicle tree state to filesystem.
- *
- * Freshness guard (#109): files get modified by two hands — this layer AND
- * direct shell/tool edits. Before overwriting, the disk content's hash is
- * compared against `materializedHashes` (the hash this layer last wrote): a
- * mismatch means another writer changed the file since, and the path is
- * refused loudly instead of silently reverted, unless `force`. Symmetric
- * with syncFromFs's conflict detection, and with the same blind spot: no
- * baseline (never materialized, or synced) means no guard. Baselines and
- * refused paths persist across restarts with the module state.
- *
- * Refused paths are kept in `mount.refusedPaths` and retried by every later
- * materialize, so the diff watermark can still advance: holding it back
- * would understate what disk holds to the branch guard, which reads the
- * same sequence.
- *
- * @param store Chronicle store
- * @param mount Mount state
- * @param paths Specific paths to materialize. If undefined, materializes all changed since last.
- * @param opts force: overwrite even where the disk copy changed under us.
- * @returns Paths written, and paths the freshness guard refused
- */
-export async function materializeToFs(
-  store: JsStore,
-  mount: MountState,
-  paths?: string[],
-  opts?: { force?: boolean },
-): Promise<MaterializeResult> {
-  if (mount.config.mode === 'read-only') {
-    return { written: [], unchanged: [], skipped: [] };
-  }
-
-  const written: string[] = [];
-  const unchanged: string[] = [];
-  const skipped: SkippedFile[] = [];
-
-  // Get changed files since last materialization
-  const currentSeq = store.currentSequence();
-  let filesToMaterialize: Array<{ path: string; blobHash: string }>;
-
-  if (paths) {
-    // Materialize specific paths
-    filesToMaterialize = [];
-    for (const p of paths) {
-      const entry = store.treeGet(mount.treeStateId, p);
-      if (entry) {
-        filesToMaterialize.push({ path: p, blobHash: entry.blobHash });
-      }
-    }
-  } else if (mount.lastMaterializedSeq > 0) {
-    // Diff since last materialization
-    const changes = store.treeDiff(
-      mount.treeStateId,
-      mount.lastMaterializedSeq,
-      currentSeq,
-    );
-    filesToMaterialize = changes
-      .filter(c => c.changeType === 'added' || c.changeType === 'modified')
-      .map(c => ({
-        path: c.path,
-        blobHash: c.newEntry!.blobHash,
-      }));
-
-    // Handle removals
-    for (const change of changes) {
-      if (change.changeType === 'removed') {
-        // Don't delete from filesystem — just skip.
-        // Agent removing from tree doesn't mean delete user's file.
-      }
-    }
-  } else {
-    // First materialization — materialize everything
-    const entries = store.treeList(mount.treeStateId);
-    filesToMaterialize = entries.map(e => ({
-      path: e.path,
-      blobHash: e.blobHash,
-    }));
-  }
-
-  // Paths an earlier materialize refused are still owed. A path the tree no
-  // longer has is owed nothing.
-  if (!paths) {
-    const queued = new Set(filesToMaterialize.map((f) => f.path));
-    for (const p of mount.refusedPaths) {
-      if (queued.has(p)) continue;
-      const entry = store.treeGet(mount.treeStateId, p);
-      if (entry) filesToMaterialize.push({ path: p, blobHash: entry.blobHash });
-      else mount.refusedPaths.delete(p);
-    }
-  }
-
-  for (const { path: relativePath, blobHash } of filesToMaterialize) {
-    const absolutePath = safePath(mount.config.path, relativePath);
-    if (!absolutePath) continue; // Path traversal — skip silently
-
-    const blob = store.getBlob(blobHash);
-    if (!blob) continue;
-
-    let diskBuffer: Buffer | null = null;
-    try {
-      diskBuffer = await readFile(absolutePath);
-    } catch (err) {
-      // Only absence proves there is nothing to overwrite. Any other read
-      // failure (EACCES on a write-only file, EISDIR, EIO...) means freshness
-      // cannot be verified, and writeFile may still succeed — so refuse
-      // rather than treat "unreadable" as "not there".
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'ENOENT' && !opts?.force) {
-        skipped.push({
-          path: relativePath,
-          reason:
-            `cannot verify disk copy (${code ?? (err as Error).message}) — ` +
-            'fix its permissions and materialize again, or pass force to overwrite it',
-        });
-        mount.refusedPaths.add(relativePath);
-        continue;
-      }
-    }
-    if (diskBuffer) {
-      const diskHash = hashContent(diskBuffer);
-      if (diskHash === blobHash) {
-        // Disk already holds exactly these bytes: re-pin the baseline and
-        // leave the file (and its mtime) alone.
-        mount.materializedHashes.set(relativePath, blobHash);
-        mount.refusedPaths.delete(relativePath);
-        unchanged.push(relativePath);
-        continue;
-      }
-      const baselineHash = mount.materializedHashes.get(relativePath);
-      if (!opts?.force && baselineHash !== undefined && diskHash !== baselineHash) {
-        skipped.push({
-          path: relativePath,
-          reason:
-            'stale copy: disk changed since last materialize (another writer) — ' +
-            'sync first to adopt the disk version, or pass force to overwrite it',
-        });
-        mount.refusedPaths.add(relativePath);
-        continue;
-      }
-    }
-
-    // Create parent directories
-    await mkdir(dirname(absolutePath), { recursive: true });
-
-    // Write file
-    await writeFile(absolutePath, blob);
-    written.push(relativePath);
-
-    // Record blob hash at materialization time for conflict detection
-    mount.materializedHashes.set(relativePath, blobHash);
-    mount.refusedPaths.delete(relativePath);
-  }
-
-  mount.lastMaterializedSeq = currentSeq;
-
-  return { written, unchanged, skipped };
-}
-
-/**
- * Walk a directory recursively, respecting ignore patterns.
- */
-async function walkDirectory(
-  basePath: string,
-  ignorePatterns: string[],
-): Promise<string[]> {
-  const results: string[] = [];
-  const maxFiles = 5000; // Safety limit
-
-  async function walk(dir: string) {
-    if (results.length >= maxFiles) return;
-
-    let entries;
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-
-    for (const entry of entries) {
-      if (results.length >= maxFiles) break;
-
-      const fullPath = join(dir, entry.name);
-      // Logical workspace paths are '/'-separated everywhere (mount-prefixed
-      // paths, chronicle tree paths); node's relative() emits backslashes on
-      // Windows, so normalize. No-op on POSIX (sep === '/').
-      const relativePath = relative(basePath, fullPath).split(sep).join('/');
-
-      // Check ignore patterns (simple glob matching)
-      if (shouldIgnore(relativePath, entry.name, ignorePatterns)) continue;
-
-      if (entry.isFile()) {
-        results.push(relativePath);
-      } else if (entry.isDirectory()) {
-        await walk(fullPath);
-      }
-    }
-  }
-
-  await walk(basePath);
-  return results;
-}
-
-/**
- * Simple ignore pattern matching.
- */
-function shouldIgnore(
-  relativePath: string,
-  name: string,
-  patterns: string[],
-): boolean {
-  for (const pattern of patterns) {
-    // Exact name match (e.g., ".git", "node_modules")
-    if (pattern === name) return true;
-
-    // Simple ** glob: "node_modules/**" matches anything under node_modules
-    if (pattern.endsWith('/**')) {
-      const prefix = pattern.slice(0, -3);
-      if (relativePath.startsWith(prefix + '/') || relativePath === prefix) return true;
-    }
-
-    // Extension glob: "*.pyc" matches any .pyc file
-    if (pattern.startsWith('*.')) {
-      const ext = pattern.slice(1);
-      if (name.endsWith(ext)) return true;
-    }
   }
   return false;
 }
