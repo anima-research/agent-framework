@@ -181,6 +181,11 @@ export async function createOfflineRecoveryBranch(
     if (targetBranch === sourceBranch) {
       throw new Error('Recovery branch name must differ from the active source branch');
     }
+    // A known collision is refused before anything is prepared: a batch
+    // whose target names an existing branch would be armed by starting it.
+    if (store.listBranches().some((branch) => branch.name === targetBranch)) {
+      throw new Error(`Recovery branch ${targetBranch} already exists; choose another --branch-name`);
+    }
 
     const result: OfflineRecoveryBranchResult = {
       dryRun: options.dryRun === true,
@@ -221,10 +226,12 @@ export async function createOfflineRecoveryBranch(
       })),
     });
 
-    // branchAt uses the target message's origin sequence. No message content is
-    // compiled or submitted to Membrane during this operation.
-    const createdBranch = contextManager.branchAt(target.id, targetBranch);
     try {
+      // branchAt uses the target message's origin sequence. No message
+      // content is compiled or submitted to Membrane during this operation.
+      // Creating the branch is part of the body: a failure here settles the
+      // batch like a failed switch or redaction.
+      const createdBranch = contextManager.branchAt(target.id, targetBranch);
       await contextManager.switchBranch(createdBranch);
       // Work from newest to oldest so earlier redactions never perturb the
       // live positions used by later range endpoints.

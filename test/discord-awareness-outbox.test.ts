@@ -799,7 +799,7 @@ function hostCommandFramework(h: ReturnType<typeof storeHarness>, messages: Arra
   };
   const framework = Object.create(AgentFramework.prototype) as any;
   framework.agents = new Map([['cairn', { state: { status: 'idle' }, getContextManager: () => contextManager }]]);
-  framework.store = { currentBranch: () => ({ name: currentBranch }), sync: () => h.store.sync() };
+  framework.store = { currentBranch: () => ({ name: currentBranch }), listBranches: () => [], sync: () => h.store.sync() };
   framework.discordAwarenessOutbox = h.outbox;
   framework.discordAwarenessEmoji = '🫥';
   framework.discordAwarenessDrains = new Map();

@@ -503,6 +503,21 @@ describe('surgery and awareness marks', () => {
     assert.equal(outbox().operations().length, 0);
   });
 
+  it('a rollback or suppression onto an existing branch is refused before any intent is prepared', async () => {
+    await start(false);
+    const { tail, removed } = seed(2);
+    cm().branchAt(cm().getAllMessages().at(-1)!.id, 'taken');
+    await assert.rejects(
+      framework.rollbackToMessage('resident', { messageId: tail, branchName: 'taken', marks: { scope: 'all' } }),
+      /Rollback branch taken already exists/,
+    );
+    await assert.rejects(
+      framework.suppressMessages('resident', { messageIds: [removed[0]], branchName: 'taken', marks: { scope: 'all' } }),
+      /Suppression branch taken already exists/,
+    );
+    assert.equal(outbox().batches().length, 0);
+  });
+
   it('a surgery that removes nothing addressable schedules no marks even when marks are chosen', async () => {
     await start(false);
     const keep = String(cm().addMessage('Operator', [{ type: 'text', text: 'kept' }], {}));

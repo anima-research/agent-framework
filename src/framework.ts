@@ -6182,6 +6182,11 @@ export class AgentFramework {
       if (targetBranch === sourceBranch) {
         throw new OperatorActionError('invalid', 'Rollback branch name must differ from the active branch');
       }
+      // A known collision is refused before any intent is prepared: a batch
+      // whose target names an existing branch would be armed by starting it.
+      if (this.store.listBranches().some((branch) => branch.name === targetBranch)) {
+        throw new OperatorActionError('invalid', `Rollback branch ${targetBranch} already exists`);
+      }
 
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
       // until the switch has landed and its marker scheduling has been
@@ -6327,6 +6332,9 @@ export class AgentFramework {
       const targetBranch = opts.branchName ?? `suppress/${agentName}/${Date.now()}`;
       if (targetBranch === sourceBranch) {
         throw new OperatorActionError('invalid', 'Suppression branch name must differ from the active branch');
+      }
+      if (this.store.listBranches().some((branch) => branch.name === targetBranch)) {
+        throw new OperatorActionError('invalid', `Suppression branch ${targetBranch} already exists`);
       }
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
       // until the fork is fully redacted and its marker scheduling has been

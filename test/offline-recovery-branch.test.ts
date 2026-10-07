@@ -431,3 +431,47 @@ test('a failed offline suppression retires its batch once the source is confirme
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('an offline recovery onto an existing branch is refused before any intent, and a branch-creation failure settles like any body failure', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-name-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'safe' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-safe' });
+    const last = cm.addMessage('user', [{ type: 'text', text: 'later' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-later', tags: ['chat:addressed'],
+    });
+    cm.branchAt(last, 'taken'); // an existing branch that still has both messages
+    cm.close();
+    store.close();
+    const inspect = () => {
+      const reopened = JsStore.openOrCreate({ path: storePath });
+      try {
+        return { branch: reopened.currentBranch().name, statuses: new DiscordAwarenessOutbox(reopened).batches().map((b) => b.status) };
+      } finally {
+        reopened.close();
+      }
+    };
+
+    await assert.rejects(
+      createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'all' }, branchName: 'taken' }),
+      /Recovery branch taken already exists/,
+    );
+    assert.deepEqual(inspect(), { branch: 'main', statuses: [] }, 'nothing prepared, so starting taken arms nothing');
+
+    const branchAt = ContextManager.prototype.branchAt;
+    ContextManager.prototype.branchAt = function () { throw new Error('injected branch failure'); };
+    try {
+      await assert.rejects(
+        createOfflineRecoveryBranch({ storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'all' }, branchName: 'fresh' }),
+        (error: Error) => /injected branch failure/.test(error.message) && !/kept/.test(error.message),
+      );
+    } finally {
+      ContextManager.prototype.branchAt = branchAt;
+    }
+    assert.deepEqual(inspect(), { branch: 'main', statuses: ['discarded'] });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
