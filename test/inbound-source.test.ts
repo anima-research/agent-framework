@@ -16,6 +16,8 @@ import {
   INBOUND_SOURCE_KEY,
   readInboundSource,
   conversationKey,
+  // The package's public digest: consumers import it from the root.
+  sourceBodyDigest,
   type InboundSource,
   type Module,
   type ModuleContext,
@@ -27,7 +29,7 @@ import {
   type ToolResult,
 } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
-import { sourceBodyDigest, canonicalJson } from '../src/mcpl/inbound-source.js';
+import { canonicalJson } from '../src/mcpl/inbound-source.js';
 import { createHash } from 'node:crypto';
 import { fixture, eventually, TS } from './helpers/coalescing-fixture.js';
 
@@ -221,6 +223,39 @@ describe('inbound source envelope', () => {
     // The DM's channel is closed, so the host appends its invitation.
     assert.equal(message.content.length, 2);
     assert.notEqual(meta.storedBodyDigest, meta.sourceBodyDigest, 'the closed-channel invitation decorates the stored copy');
+  });
+
+  it('an ordinary empty push is stored with the host\'s digests of its empty body, never the adapter\'s', async () => {
+    // Only a silent heartbeat stores nothing (test/silent-heartbeat.test.ts);
+    // any other push is stored, an empty one included, so it is stamped like
+    // any other — over whatever its origin claimed.
+    command({
+      op: 'push', eventId: 'empty-1', content: [],
+      origin: { source: 'timer', sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value' },
+    });
+    await waitFor(() => !!storedWith((m) => m.eventId === 'empty-1'), 'empty push stored');
+    const message = storedWith((m) => m.eventId === 'empty-1')!;
+    const meta = message.metadata as Record<string, unknown>;
+    assert.deepEqual(message.content, []);
+    // The empty body in the one-element framing: SHA-256 of `[[]]`.
+    const empty = createHash('sha256').update('[[]]').digest('hex');
+    assert.equal(meta.sourceBodyDigest, empty, 'the empty delivered body');
+    assert.equal(meta.storedBodyDigest, empty, 'stored undecorated');
+    assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'the untouched copy matches its own witness');
+  });
+
+  it('an empty DM pushed into a closed channel: the delivered digest is the empty body, the stored digest covers the invitation', async () => {
+    command({
+      op: 'dm', eventId: 'ev-empty', authorId: '134', authorName: 'antra', rawChannelId: RAW_DM, content: [],
+      origin: { sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value' },
+    });
+    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-empty'), 'empty dm stored');
+    const message = storedWith((m) => m.eventId === 'ev-empty')!;
+    const meta = message.metadata as Record<string, unknown>;
+    assert.equal(meta.channelInvitation, true, 'stored with the closed-channel invitation');
+    assert.equal(message.content.length, 1, 'the invitation alone');
+    assert.equal(meta.sourceBodyDigest, sourceBodyDigest([]), 'the empty delivered body, not the adapter\'s value');
+    assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored, not the adapter\'s value');
   });
 
   it('keeps a stored envelope when the channel is renamed later', async () => {

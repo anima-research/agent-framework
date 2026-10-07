@@ -5,8 +5,10 @@
 // BOTH MCPL lanes. The TEST appends one JSON object per line to COMMAND_PATH:
 //   {"op":"incoming","channelId":…,"messageId":…,"mode":"ambient"|"addressed",
 //    "text":…, "threadId"?, "metadata"?, "eventId"?, "coalesce"?}
-//   {"op":"dm","eventId":…,"authorId":…,"authorName"?,"rawChannelId":…,"text":…}
-//   {"op":"push","eventId":…,"origin"?,"tags"?,"text":…,"featureSet"?}
+//   {"op":"dm","eventId":…,"authorId":…,"authorName"?,"rawChannelId":…,"text":…,
+//    "content"? (content blocks, instead of text; [] included), "origin"?}
+//   {"op":"push","eventId":…,"origin"?,"tags"?,"text":…,"featureSet"?,
+//    "content"? (content blocks, instead of text; [] included)}
 //   {"op":"rename","channelId":…,"label":…}             (channels/changed)
 //   {"op":"publish-mode","mode":"delivered"|"not-delivered"|"no-receipt"|"error"|"hang"}
 //   {"op":"history","channelId":…,"history":[ChannelIncomingMessage…]}
@@ -90,7 +92,7 @@ function pollCommands() {
             ...(c.origin ?? {}),
           },
           tags: ['chat:dm', 'chat:addressed', 'chat:private'],
-          payload: { content: textBlock(c.text ?? '') },
+          payload: { content: c.content ?? textBlock(c.text ?? '') },
         },
       });
     } else if (c.op === 'push') {
@@ -105,7 +107,7 @@ function pollCommands() {
           timestamp: c.timestamp ?? new Date().toISOString(),
           ...(c.origin ? { origin: c.origin } : {}),
           ...(c.tags ? { tags: c.tags } : {}),
-          payload: { content: textBlock(c.text ?? '') },
+          payload: { content: c.content ?? textBlock(c.text ?? '') },
         },
       });
     } else if (c.op === 'rename') {

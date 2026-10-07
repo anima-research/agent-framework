@@ -159,6 +159,10 @@ export function conversationKey(source: InboundSource): string | undefined {
  * JSON with object keys sorted at every level and `undefined` values dropped,
  * so a value hashes alike however its keys were ordered (content read back
  * from the store has its keys in a different order than it was written).
+ *
+ * sourceBodyDigest's serializer, kept out of the package API: serialization
+ * and framing both stay inside sourceBodyDigest, so consumers don't
+ * duplicate either (`canonicalJson(blocks)` alone hashes differently).
  */
 export function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
@@ -187,6 +191,9 @@ export function canonicalJson(value: unknown): string {
  * materialization, a correction), not the admission. Neither proves later
  * presence or completeness; a copy that no longer hashes to its
  * storedBodyDigest was changed after delivery (editMessage keeps metadata).
+ *
+ * Exported from the package root, so a consumer checks a copy against either
+ * field with this same function rather than a copy of it.
  */
 export function sourceBodyDigest(blocks: readonly unknown[]): string {
   return createHash('sha256').update(canonicalJson([blocks])).digest('hex');
