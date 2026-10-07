@@ -82,7 +82,7 @@ import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin, type PublishDestination, type PublishOutcome } from './mcpl/channel-registry.js';
-import { ProseDraftStore, draftState, type Draft, type DraftReason, type DraftSource } from './prose-drafts.js';
+import { ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftReason, type DraftSource } from './prose-drafts.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import { safeSlice } from './safe-slice.js';
@@ -1116,7 +1116,8 @@ export class AgentFramework {
 
   // ---- Held prose drafts (src/prose-drafts.ts) ---------------------------
   /** Every resident's held drafts: suppressed, bounced or ambiguous plain
-   *  speech, kept privately until resent or dismissed. */
+   *  speech, never published except by their resident's resend, kept until
+   *  resent or dismissed. */
   private proseDrafts: ProseDraftStore;
   /** Drafts held during the current logical turn, for its `[delivered]`
    *  receipt. Cleared each fresh turn; restarts keep it. */
@@ -4652,7 +4653,8 @@ export class AgentFramework {
 
   /** Synthesized drafts tool — present whenever MCPL channels are
    *  configured. A resident's held drafts (src/prose-drafts.ts): plain speech
-   *  that was not sent, kept privately until resent or dismissed. Nullable
+   *  that was not sent, never published except by its resident's resend and
+   *  kept until resent or dismissed. Nullable
    *  fields, cast like save_recent_image's: a caller whose provider presents
    *  every property as required can still say "not in use". */
   private static readonly DRAFTS_TOOL = {
@@ -4660,8 +4662,8 @@ export class AgentFramework {
     description:
       'Your held drafts: plain speech of yours that was NOT sent — held back because an explicit send in the ' +
       'same round holds plain speech back, because a routing prefix bounced, or because it had no destination. ' +
-      'Drafts are private to you and stay until you resend or dismiss them; nothing is ever sent from here on ' +
-      'its own. list: your open drafts, newest first. read: drafts in full, with every delivery attempt. ' +
+      'Drafts are never published except by your own resend, only you can list or act on them, and they stay ' +
+      'until you resend or dismiss them. list: your open drafts, newest first. read: drafts in full, with every delivery attempt. ' +
       'resend: publish drafts verbatim, in the order given, to one destination ("#channel", "@person" or a ' +
       'channel id) — an explicit send, like send_message; it stops at the first draft not confirmed delivered. ' +
       'A draft already delivered returns its receipt instead of sending again. If an earlier attempt may ' +
@@ -8828,7 +8830,7 @@ export class AgentFramework {
   }
 
   /**
-   * Hold plain speech as private drafts (src/prose-drafts.ts) instead of
+   * Hold plain speech as drafts (src/prose-drafts.ts) instead of
    * letting it vanish: journaled durably and recorded for this turn's
    * receipt. `notice: 'now'` also queues a private notice naming them, which
    * the resident hears at its next tool boundary — only when the live stream
@@ -8916,7 +8918,7 @@ export class AgentFramework {
     return (
       `[drafts] ${agentName}: not sent — ${many ? `${held.length} plain-speech segments` : 'a plain-speech segment'} ` +
       `held as draft${many ? 's' : ''} ${ids.join(', ')} — ${AgentFramework.DRAFT_REASON_TEXT[reason]}. ` +
-      `Drafts are private to you and stay until you act: drafts(action: "resend", draftIds: [${idList}], ` +
+      `Nothing publishes drafts but your own resend, and they stay until you act: drafts(action: "resend", draftIds: [${idList}], ` +
       `destination: "#channel") delivers ${many ? 'them' : 'it'} unchanged; drafts(action: "dismiss", ` +
       `draftIds: [${idList}]) sets ${many ? 'them' : 'it'} aside.`
     );
@@ -8939,18 +8941,24 @@ export class AgentFramework {
 
   /** One line per draft: id, state, when, why, size, preview. */
   private draftLine(draft: Draft): string {
-    const state = draftState(draft);
-    const last = draft.attempts.at(-1);
-    let stateText: string = state;
-    if (state === 'unconfirmed' && last) {
-      stateText = `UNCONFIRMED — an attempt to ${AgentFramework.destinationText(last.destination)} at ` +
-        `${this.draftTime(last.at)} may have been posted`;
-    } else if (state === 'held' && last) {
-      stateText = `held (last attempt failed: nothing was posted)`;
-    }
+    const stateText = this.draftStateText(draft);
     return `${draft.id} · ${stateText} · held ${this.draftTime(draft.heldAt)} · ` +
       `${AgentFramework.DRAFT_REASON_SHORT[draft.reason]} · ${draft.text.length} chars · ` +
       AgentFramework.draftPreview(draft.text);
+  }
+
+  /** A draft's state in words that claim only what is known. */
+  private draftStateText(draft: Draft): string {
+    const state = draftState(draft);
+    if (state === 'unconfirmed') {
+      const risky = uncertainAttempt(draft)!;
+      return `UNCONFIRMED — an attempt to ${AgentFramework.destinationText(risky.destination)} at ` +
+        `${this.draftTime(risky.at)} may have been posted`;
+    }
+    if (state === 'held') {
+      return draft.attempts.length > 0 ? 'held (every attempt failed: nothing was posted)' : 'held (not sent)';
+    }
+    return state;
   }
 
   /** A delivered draft's historical receipt. */
@@ -8971,13 +8979,13 @@ export class AgentFramework {
     const pending = this.proseDrafts.unnoticed(agent.name);
     if (pending.length === 0) return;
     const shown = pending.slice(0, 8).map((d) =>
-      `${d.id} (held ${this.draftTime(d.heldAt)}, ${AgentFramework.DRAFT_REASON_SHORT[d.reason]}, ` +
-      `${d.text.length} chars: ${AgentFramework.draftPreview(d.text, 60)})`);
+      `${d.id} (${this.draftStateText(d)}; held ${this.draftTime(d.heldAt)}, ` +
+      `${AgentFramework.DRAFT_REASON_SHORT[d.reason]}, ${d.text.length} chars: ${AgentFramework.draftPreview(d.text, 60)})`);
     const more = pending.length > shown.length ? ` · and ${pending.length - shown.length} more` : '';
     const text =
       `[drafts] ${agent.name}: ${pending.length === 1 ? 'a held draft' : `${pending.length} held drafts`} of yours ` +
       `${pending.length === 1 ? 'has' : 'have'} not been named to you yet: ${shown.join(' · ')}${more}. ` +
-      'They were not sent. drafts(action: "list") shows your open drafts; resend or dismiss them by id.';
+      'drafts(action: "list") shows your open drafts; resend or dismiss them by id.';
     try {
       const mid = agent.getContextManager().addMessage(
         'user',
@@ -9161,85 +9169,112 @@ export class AgentFramework {
     // Refuse up front, before anything is published, rather than half-way.
     for (const d of drafts) {
       if (this.draftsInFlight.has(`${agentName}\u0000${d.id}`)) {
-        return refuse(`${d.id} is being sent right now; wait for that result before sending it again. Nothing was sent.`);
+        return refuse(`${d.id} is being sent right now (or is queued in a resend in progress); wait for that result before sending it again. Nothing was sent.`);
       }
-      const state = draftState(d);
-      if (state === 'dismissed') {
-        return refuse(`${d.id} was dismissed, so it can't be resent. Nothing was sent.`);
-      }
-      if (state === 'unconfirmed' && !confirmDuplicate) {
-        const last = d.attempts.at(-1)!;
-        return refuse(
-          `${d.id}'s last attempt (to ${AgentFramework.destinationText(last.destination)} at ${this.draftTime(last.at)}) ` +
-          `may already have been posted: ${last.outcome?.reason ?? 'its outcome was never recorded'}. ` +
-          'Check that channel; to send it again anyway, resend with confirmDuplicate: true. Nothing was sent.',
-        );
-      }
+      const refusal = this.resendRefusal(d, confirmDuplicate);
+      if (refusal) return refuse(`${refusal} Nothing was sent.`);
     }
 
+    // Claim every draft of the batch before the first await: a concurrent
+    // resend of any of them is refused while this batch owns it. Each draft
+    // is still re-read and re-checked at its own dispatch boundary below, so
+    // a dismissal (or a delivery) since the batch began is honoured.
+    const claims = drafts.map((d) => `${agentName}\u0000${d.id}`);
+    for (const claim of claims) this.draftsInFlight.add(claim);
     const lines: string[] = [];
     let stopped = false;
-    for (const d of drafts) {
-      if (stopped) {
-        lines.push(`${d.id}: not attempted (an earlier draft was not confirmed delivered).`);
-        continue;
-      }
-      if (draftState(d) === 'delivered') {
-        lines.push(`${this.draftReceipt(d)} — not sent again.`);
-        continue;
-      }
-      let attemptId: string;
-      try {
-        attemptId = this.proseDrafts.beginAttempt(agentName, d.id, destination, 'resend', draftState(d) === 'unconfirmed');
-      } catch (err) {
-        lines.push(`${d.id}: not sent — the attempt could not be recorded durably (${err instanceof Error ? err.message : String(err)}).`);
-        stopped = true;
-        continue;
-      }
-      const flight = `${agentName}\u0000${d.id}`;
-      this.draftsInFlight.add(flight);
-      let outcome: PublishOutcome;
-      try {
-        outcome = await registry.publish(agentName, d.text, { serverId: destination.serverId, channelId: destination.channelId });
-      } finally {
-        this.draftsInFlight.delete(flight);
-      }
-      let recorded = true;
-      try {
-        this.proseDrafts.recordOutcome(agentName, d.id, attemptId, outcome);
-      } catch (err) {
-        recorded = false;
-        console.error(`[drafts] ${agentName}: outcome of ${d.id} not recorded:`, err);
-      }
-      this.emitTrace({
-        type: 'prose:draft-resent',
-        agentName,
-        draftId: d.id,
-        status: outcome.status,
-        serverId: outcome.destination?.serverId ?? destination.serverId,
-        channelId: outcome.destination?.channelId ?? destination.channelId,
-        ...(outcome.messageId ? { messageId: outcome.messageId } : {}),
-      });
-      const where = AgentFramework.destinationText(outcome.destination ?? destination);
-      const unrecorded = recorded ? '' : ' (this outcome could not be recorded; the draft will read as unconfirmed)';
-      if (outcome.status === 'delivered') {
-        lines.push(`${d.id}: delivered to ${where}${outcome.messageId ? `, message ${outcome.messageId}` : ''}${unrecorded}.`);
-        let engaged = this.turnEngagedChannels.get(agentName);
-        if (!engaged) {
-          engaged = new Set();
-          this.turnEngagedChannels.set(agentName, engaged);
+    try {
+      for (const queued of drafts) {
+        if (stopped) {
+          lines.push(`${queued.id}: not attempted (an earlier draft was not confirmed delivered).`);
+          continue;
         }
-        engaged.add(destination.channelId);
-        continue;
+        // The current projection, not the batch's snapshot (it may have been
+        // rebuilt by a reconcile, or changed while an earlier draft was sent).
+        const d = this.proseDrafts.get(agentName, queued.id);
+        if (!d) {
+          lines.push(`${queued.id}: no longer found among your drafts — not sent.`);
+          stopped = true;
+          continue;
+        }
+        if (draftState(d) === 'delivered') {
+          lines.push(`${this.draftReceipt(d)} — not sent again.`);
+          continue;
+        }
+        const refusal = this.resendRefusal(d, confirmDuplicate);
+        if (refusal) {
+          lines.push(`${refusal} It changed while this resend was waiting — not sent.`);
+          stopped = true;
+          continue;
+        }
+        let attemptId: string;
+        try {
+          attemptId = this.proseDrafts.beginAttempt(agentName, d.id, destination, 'resend', draftState(d) === 'unconfirmed');
+        } catch (err) {
+          lines.push(`${d.id}: not sent — the attempt could not be recorded durably (${err instanceof Error ? err.message : String(err)}).`);
+          stopped = true;
+          continue;
+        }
+        const outcome = await registry.publish(agentName, d.text, { serverId: destination.serverId, channelId: destination.channelId });
+        let recorded = true;
+        try {
+          this.proseDrafts.recordOutcome(agentName, d.id, attemptId, outcome);
+        } catch (err) {
+          recorded = false;
+          console.error(`[drafts] ${agentName}: outcome of ${d.id} not recorded:`, err);
+        }
+        this.emitTrace({
+          type: 'prose:draft-resent',
+          agentName,
+          draftId: d.id,
+          status: outcome.status,
+          serverId: outcome.destination?.serverId ?? destination.serverId,
+          channelId: outcome.destination?.channelId ?? destination.channelId,
+          ...(outcome.messageId ? { messageId: outcome.messageId } : {}),
+        });
+        const where = AgentFramework.destinationText(outcome.destination ?? destination);
+        const unrecorded = recorded ? '' : ' (this outcome could not be recorded; the draft will read as unconfirmed)';
+        if (outcome.status === 'delivered') {
+          lines.push(`${d.id}: delivered to ${where}${outcome.messageId ? `, message ${outcome.messageId}` : ''}${unrecorded}.`);
+          let engaged = this.turnEngagedChannels.get(agentName);
+          if (!engaged) {
+            engaged = new Set();
+            this.turnEngagedChannels.set(agentName, engaged);
+          }
+          engaged.add(destination.channelId);
+          continue;
+        }
+        stopped = true;
+        const after = this.proseDrafts.get(agentName, d.id);
+        const stillUncertain = after ? uncertainAttempt(after) : undefined;
+        lines.push(outcome.status === 'unknown'
+          ? `${d.id}: delivery to ${where} NOT confirmed — it may or may not have been posted: ${outcome.reason ?? 'no valid receipt'}. ` +
+            `Check the channel before sending it again (that needs confirmDuplicate: true)${unrecorded}.`
+          : `${d.id}: not sent to ${where} — ${outcome.reason ?? 'refused'}. Nothing was posted by this attempt${unrecorded}.` +
+            (stillUncertain
+              ? ` An earlier attempt (to ${AgentFramework.destinationText(stillUncertain.destination)} at ` +
+                `${this.draftTime(stillUncertain.at)}) may still have been posted, so the draft stays unconfirmed.`
+              : ' The draft stays held.'));
       }
-      stopped = true;
-      lines.push(outcome.status === 'unknown'
-        ? `${d.id}: delivery to ${where} NOT confirmed — it may or may not have been posted: ${outcome.reason ?? 'no valid receipt'}. ` +
-          `Check the channel before sending it again (that needs confirmDuplicate: true)${unrecorded}.`
-        : `${d.id}: not sent to ${where} — ${outcome.reason ?? 'refused'}. Nothing was posted; the draft stays held${unrecorded}.`);
+    } finally {
+      for (const claim of claims) this.draftsInFlight.delete(claim);
     }
     const allDelivered = !stopped;
     return allDelivered ? ok(lines.join('\n')) : refuse(lines.join('\n'));
+  }
+
+  /** Why a draft can't be resent now (dismissed, or possibly already posted
+   *  without the resident's confirmation), or undefined when it can. */
+  private resendRefusal(d: Draft, confirmDuplicate: boolean): string | undefined {
+    const state = draftState(d);
+    if (state === 'dismissed') return `${d.id} was dismissed, so it can't be resent.`;
+    if (state === 'unconfirmed' && !confirmDuplicate) {
+      const risky = uncertainAttempt(d)!;
+      return `${d.id}'s attempt to ${AgentFramework.destinationText(risky.destination)} at ${this.draftTime(risky.at)} ` +
+        `may already have been posted: ${risky.outcome?.reason ?? 'its outcome was never recorded'}. ` +
+        'Check that channel; to send it again anyway, resend with confirmDuplicate: true.';
+    }
+    return undefined;
   }
 
   /** Record a successful plain-prose delivery for this turn's receipt. */
@@ -9464,12 +9499,22 @@ export class AgentFramework {
    */
   private takeUnsent(agent: Agent, prefix: '>>' | '>>>'): { draft?: Draft; refused?: true } {
     const draft = this.proseDrafts.latestBounce(agent.name);
-    if (!draft || draftState(draft) !== 'unconfirmed') return { draft };
-    const last = draft.attempts.at(-1)!;
+    if (!draft) return {};
+    if (this.draftsInFlight.has(`${agent.name}\u0000${draft.id}`)) {
+      const busy = `[prose-routing] {{unsent}} is draft ${draft.id}, which is being sent right now. Nothing was sent; wait for that result.`;
+      try {
+        this.addMessage('user', [{ type: 'text', text: busy }], { system: true, kind: 'prose-bounce' }, { forAgent: agent.name });
+      } catch (err) {
+        console.error('[drafts] in-flight-unsent notice failed:', err);
+      }
+      return { draft, refused: true };
+    }
+    if (draftState(draft) !== 'unconfirmed') return { draft };
+    const risky = uncertainAttempt(draft)!;
     const text =
-      `[prose-routing] {{unsent}} is draft ${draft.id}, and its last delivery attempt (to ` +
-      `${AgentFramework.destinationText(last.destination)} at ${this.draftTime(last.at)}) may already have been ` +
-      `posted: ${last.outcome?.reason ?? 'its outcome was never recorded'}. Nothing was sent. Check that channel; ` +
+      `[prose-routing] {{unsent}} is draft ${draft.id}, and an attempt to deliver it (to ` +
+      `${AgentFramework.destinationText(risky.destination)} at ${this.draftTime(risky.at)}) may already have been ` +
+      `posted: ${risky.outcome?.reason ?? 'its outcome was never recorded'}. Nothing was sent. Check that channel; ` +
       `to send it again anyway use drafts(action: "resend", draftIds: ["${draft.id}"], destination: "#channel", confirmDuplicate: true).`;
     try {
       this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'prose-bounce' }, { forAgent: agent.name });
@@ -9704,11 +9749,24 @@ export class AgentFramework {
   ): void {
     const name = agent.name;
     const previous = this.proseDrafts.latestBounce(name);
+    // A latest bounce that may already have been posted (unconfirmed, or in
+    // flight) is never copied into a fresh draft: that copy would resend
+    // without the confirmation its own uncertainty requires. It stays held as
+    // itself; only the resident's other words become a new draft.
+    const previousAtRisk = previous !== undefined
+      && (draftState(previous) === 'unconfirmed' || this.draftsInFlight.has(`${name}\u0000${previous.id}`));
     let draft: Draft | undefined;
+    let keptRisky: Draft | undefined;
     if (previous && text.trim() === '{{unsent}}') {
       draft = previous;
     } else {
-      const expanded = text.includes('{{unsent}}') ? text.replaceAll('{{unsent}}', previous?.text ?? '') : text;
+      const usesUnsent = text.includes('{{unsent}}');
+      if (usesUnsent && previousAtRisk) keptRisky = previous;
+      const expanded = !usesUnsent
+        ? text
+        : previousAtRisk
+          ? text.replaceAll('{{unsent}}', '').trim()
+          : text.replaceAll('{{unsent}}', previous?.text ?? '');
       // The bounce notice below names the draft, so no separate held notice.
       draft = this.holdProseDrafts(agent, [expanded], 'bounced', { round: hold.round, note: reason, notice: 'later' })[0];
     }
@@ -9721,8 +9779,12 @@ export class AgentFramework {
         `drafts(action: "resend", draftIds: ["${draft.id}"], destination: "#channel"). ` +
         `"${prefix}skip_reply {{unsent}}" sets it aside.`
       : 'It could not be held as a draft; the words remain in your history.';
+    const risky = keptRisky
+      ? ` {{unsent}} referred to draft ${keptRisky.id}, which may already have been posted, so it was not copied: ` +
+        `it is still held as ${keptRisky.id}; resend it with the drafts tool and confirmDuplicate if you mean to.`
+      : '';
     const notice =
-      `[prose-routing] Your text (${text.length} chars) was not delivered — ${reason}.${cand} ${kept}` +
+      `[prose-routing] Your text (${text.length} chars) was not delivered — ${reason}.${cand} ${kept}${risky}` +
       (prefix === '>>' ? ' The prose_help tool shows the full syntax.' : '');
     try {
       // Through framework.addMessage, NOT the context manager directly: while

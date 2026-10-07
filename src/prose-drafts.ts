@@ -8,7 +8,14 @@
  * unresolvable routing prefix bounces. Before drafts, the held words were
  * kept only as a count (or, in explicit mode, as one in-memory latest-wins
  * clipboard): the law was right, and the penalty was amnesia. A draft keeps
- * the exact words, privately, until the resident resends or dismisses them.
+ * the exact words until the resident resends or dismisses them.
+ *
+ * The boundary is publication and agency, not visibility: a draft is never
+ * published except by its resident's explicit resend (or `{{unsent}}`), and
+ * only that resident can list or act on it. Its notices go into the
+ * resident's own history — which residents that share one message slot
+ * (#197) share, as they already share the assistant turn the words came
+ * from.
  *
  * Durability is outside the conversation. Drafts live in a RecordJournal of
  * typed Chronicle records, which do not follow branch switches: undo,
@@ -93,9 +100,11 @@ export interface Draft {
 }
 
 /**
- * - `held`: never attempted, or the last attempt definitely failed — resend freely;
- * - `unconfirmed`: the last attempt's outcome is unknown (or was never
- *   recorded): it may have been posted, so a resend needs explicit confirmation;
+ * - `held`: never attempted, or every attempt definitely failed — resend freely;
+ * - `unconfirmed`: some attempt's outcome is unknown (or was never
+ *   recorded), and none was confirmed: it may have been posted, so a resend
+ *   needs explicit confirmation. A later attempt that fails does not resolve
+ *   an earlier one that may have landed — the uncertainty stays;
  * - `delivered`: an attempt was confirmed — its receipt is historical;
  * - `dismissed`: the resident set it aside.
  */
@@ -104,9 +113,18 @@ export type DraftState = 'held' | 'unconfirmed' | 'delivered' | 'dismissed';
 export function draftState(draft: Draft): DraftState {
   if (draft.attempts.some((a) => a.outcome?.status === 'delivered')) return 'delivered';
   if (draft.dismissedAt !== undefined) return 'dismissed';
-  const last = draft.attempts.at(-1);
-  if (last && (!last.outcome || last.outcome.status === 'unknown')) return 'unconfirmed';
-  return 'held';
+  return uncertainAttempt(draft) ? 'unconfirmed' : 'held';
+}
+
+/** The most recent attempt that may have been posted (unknown or unrecorded
+ *  outcome), when no attempt was confirmed. */
+export function uncertainAttempt(draft: Draft): DraftAttempt | undefined {
+  if (draft.attempts.some((a) => a.outcome?.status === 'delivered')) return undefined;
+  for (let i = draft.attempts.length - 1; i >= 0; i--) {
+    const attempt = draft.attempts[i]!;
+    if (!attempt.outcome || attempt.outcome.status === 'unknown') return attempt;
+  }
+  return undefined;
 }
 
 type DraftEntry =

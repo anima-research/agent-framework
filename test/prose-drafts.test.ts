@@ -420,7 +420,7 @@ describe('held prose drafts, end to end', () => {
 
       h.command({ op: 'publish-mode', mode: 'not-delivered' });
       await h.turn([createMockResponse([resend('r1')], 'tool_use'), createMockResponse([])]);
-      assert.match(h.toolResults()[0]!, /not sent to .* Nothing was posted; the draft stays held/);
+      assert.match(h.toolResults()[0]!, /not sent to .* Nothing was posted by this attempt\. The draft stays held\./);
       assert.equal(draftState(h.store().get('scout', draft!.id)!), 'held');
 
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
@@ -439,6 +439,32 @@ describe('held prose drafts, end to end', () => {
       assert.deepEqual(attempts.map((a) => [a.outcome?.status, a.confirmedDuplicate ?? false]), [
         ['failed', false], ['unknown', false], ['delivered', true],
       ]);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('an unknown outcome is not cleared by a later failure: the draft stays unconfirmed', async () => {
+    const h = await harness();
+    try {
+      await h.turn([
+        createMockResponse([text('maybe already out'), explicitSend('s1')], 'tool_use'),
+        createMockResponse([]),
+      ]);
+      const [draft] = h.drafts();
+      const resend = (id: string, confirm?: boolean) =>
+        drafts(id, { action: 'resend', draftIds: [draft!.id], destination: ROOM, ...(confirm ? { confirmDuplicate: true } : {}) });
+      h.command({ op: 'publish-mode', mode: 'no-receipt' });
+      await h.turn([createMockResponse([resend('r1')], 'tool_use'), createMockResponse([])]);
+      h.command({ op: 'publish-mode', mode: 'not-delivered' });
+      await h.turn([createMockResponse([resend('r2', true)], 'tool_use'), createMockResponse([])]);
+      assert.match(h.toolResults()[0]!, /Nothing was posted by this attempt\. An earlier attempt \(to .*\) may still have been posted, so the draft stays unconfirmed/);
+      assert.equal(draftState(h.store().get('scout', draft!.id)!), 'unconfirmed');
+      h.command({ op: 'publish-mode', mode: 'delivered' });
+      const before = h.publishes().length;
+      await h.turn([createMockResponse([resend('r3')], 'tool_use'), createMockResponse([])]);
+      assert.match(h.toolResults()[0]!, /may already have been posted: .*delivery uncertain.*confirmDuplicate: true\. Nothing was sent/);
+      assert.equal(h.publishes().length, before, 'no third publish without confirmation');
     } finally {
       await h.close();
     }
@@ -499,14 +525,20 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
-  it('a draft held in a turn that crashed is named by the next turn\'s catch-up notice', async () => {
+  it('drafts held in a turn that crashed are named by the next turn\'s catch-up notice, each by its actual state', async () => {
     const h = await harness();
     try {
-      // Held directly, as if the turn that held it died before its receipt.
+      // Held directly, as if the turn that held it died before its receipt;
+      // the second also died mid-send, its attempt never resolved.
       h.store().hold('scout', [{ text: 'orphaned words', source }], 'explicit-send');
+      const midSend = h.store().hold('scout', [{ text: 'half-sent words', source }], 'explicit-send').held[0]!;
+      h.store().beginAttempt('scout', midSend.id, dest(), 'resend', false);
       await h.turn([createMockResponse([])]);
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
-      assert.match(notice, /^\[drafts\] scout: a held draft of yours has not been named to you yet: d-[a-z2-9]{5} .*"orphaned words"/);
+      assert.match(notice, /^\[drafts\] scout: 2 held drafts of yours have not been named to you yet: /);
+      assert.match(notice, /d-[a-z2-9]{5} \(held \(not sent\); held .*"orphaned words"\)/);
+      assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*"half-sent words"`));
+      assert.doesNotMatch(notice, /They were not sent/);
       await h.turn([createMockResponse([])]);
       assert.equal(h.texts().filter((t) => t.startsWith('[drafts]')).length, 1, 'named once');
     } finally {
@@ -527,6 +559,31 @@ describe('held prose drafts, end to end', () => {
       const after = h.store().get('scout', bounced!.id)!;
       assert.equal(draftState(after), 'delivered');
       assert.equal(after.attempts[0]!.via, 'unsent-token');
+    } finally {
+      await h.close();
+    }
+  });
+
+  it('explicit mode: a bounce that may already have been posted is never copied into a fresh draft', async () => {
+    const h = await harness({ agents: [{ name: 'scout', proseRouting: 'explicit' }] });
+    try {
+      await h.turn([createMockResponse([text('risky words')])]);
+      const [risky] = h.drafts();
+      h.command({ op: 'publish-mode', mode: 'no-receipt' });
+      await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
+      assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed');
+      h.command({ op: 'publish-mode', mode: 'delivered' });
+      // The destination does not resolve, so the envelope bounces: its other
+      // words are held, the possibly-posted text is not copied with them.
+      await h.turn([createMockResponse([text('>>#nowhere {{unsent}} and a postscript')])]);
+      const fresh = h.drafts().find((d) => d.id !== risky!.id)!;
+      assert.equal(fresh.text, 'and a postscript');
+      assert.ok(h.texts().some((t) => t.includes(`{{unsent}} referred to draft ${risky!.id}, which may already have been posted, so it was not copied`)));
+      // And {{unsent}} itself now means the fresh draft, never the risky one.
+      const before = h.publishes().length;
+      await h.turn([createMockResponse([text(`>>${ROOM} {{unsent}}`)])]);
+      assert.deepEqual(h.publishes().slice(before).map((p) => p.text), ['and a postscript']);
+      assert.equal(draftState(h.store().get('scout', risky!.id)!), 'unconfirmed', 'still needs its own confirmation');
     } finally {
       await h.close();
     }
@@ -564,7 +621,7 @@ describe('held prose drafts, end to end', () => {
       await h.turn([createMockResponse([resend('a'), resend('b')], 'tool_use'), createMockResponse([])]);
       const [first, second] = h.toolResults();
       assert.match(first!, /delivered to/);
-      assert.match(second!, /is being sent right now; wait for that result/);
+      assert.match(second!, /is being sent right now \(or is queued in a resend in progress\); wait for that result/);
       assert.equal(h.publishes().filter((p) => p.text === 'once only').length, 1);
     } finally {
       await h.close();
@@ -598,6 +655,87 @@ describe('held prose drafts, end to end', () => {
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere']);
     } finally {
       await h.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Concurrent resends through the actual drafts handler, with publish
+// completions under the test's control.
+// ---------------------------------------------------------------------------
+
+describe('drafts resend ownership', () => {
+  const setup = async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-own-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+    });
+    const pending: Array<{ text: string; resolve: (o: unknown) => void }> = [];
+    const stub: Record<string, unknown> = {
+      resolveProseTarget: (spec: string) => ({ channelId: spec }),
+      resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'discord', channelId } }),
+      publish: (_agent: string, text: string, target: { channelId: string }) =>
+        new Promise((resolve) => pending.push({
+          text,
+          resolve: (o) => resolve({ destination: { serverId: 'discord', channelId: target.channelId }, at: Date.now(), ...(o as object) }),
+        })),
+      getChannelTools: () => [],
+    };
+    (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(stub, {
+      get: (t, prop: string) => (prop in t ? t[prop] : () => undefined),
+    });
+    const internals = framework as unknown as {
+      proseDrafts: ProseDraftStore;
+      handleDraftsTool(agent: string, input: unknown): Promise<{ success: boolean; data?: Array<{ text: string }>; error?: string }>;
+    };
+    const say = (r: { success: boolean; data?: Array<{ text: string }>; error?: string }) =>
+      r.success ? r.data!.map((b) => b.text).join('') : r.error!;
+    const tick = () => new Promise((r) => setTimeout(r, 5));
+    const [a, b] = internals.proseDrafts.hold('scout', [{ text: 'A words', source }, { text: 'B words', source }], 'explicit-send').held;
+    return {
+      dir, framework, internals, pending, say, tick, a: a!, b: b!,
+      close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); },
+    };
+  };
+
+  it('a batch owns its drafts: a concurrent resend of a queued draft is refused, and nothing is sent twice', async () => {
+    const t = await setup();
+    try {
+      const batch = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, t.b.id], destination: 'chan' });
+      await t.tick();
+      assert.deepEqual(t.pending.map((p) => p.text), ['A words'], 'the batch is waiting on A');
+      const concurrent = t.say(await t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.b.id], destination: 'chan' }));
+      assert.match(concurrent, new RegExp(`${t.b.id} is being sent right now \\(or is queued in a resend in progress\\)`));
+      t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
+      await t.tick();
+      assert.deepEqual(t.pending.map((p) => p.text), ['B words']);
+      t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-b' });
+      const result = t.say(await batch);
+      assert.match(result, /delivered to \(chan\), message m-a/);
+      assert.match(result, /delivered to \(chan\), message m-b/);
+      assert.equal(t.pending.length, 0, 'B was published exactly once');
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a draft dismissed while the batch waits is not published', async () => {
+    const t = await setup();
+    try {
+      const batch = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, t.b.id], destination: 'chan' });
+      await t.tick();
+      const dismissed = t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.b.id] }));
+      assert.match(dismissed, new RegExp(`${t.b.id}: dismissed`));
+      t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
+      const result = t.say(await batch);
+      assert.match(result, new RegExp(`${t.b.id} was dismissed, so it can't be resent\\. It changed while this resend was waiting — not sent\\.`));
+      assert.equal(t.pending.length, 0, 'B never reached publish');
+      assert.equal(draftState(t.internals.proseDrafts.get('scout', t.b.id)!), 'dismissed');
+    } finally {
+      await t.close();
     }
   });
 });

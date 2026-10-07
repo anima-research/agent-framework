@@ -36,7 +36,8 @@ A prose segment's FIRST line may carry a routing prefix:
 ## The bounce (unprefixed prose)
 
 Unprefixed prose with no sticky target is **never delivered**. It is held as a
-private draft (src/prose-drafts.ts), and a system notice naming the draft tells
+draft (src/prose-drafts.ts) — never published except by the agent's own
+resend — and a system notice naming the draft tells
 the agent how to resend: `>>#channel {{unsent}}`, or the `drafts` tool by id.
 The notice requests inference so the resend can happen immediately — capped at
 2 consecutive bounce-wakes per agent (then notices append without waking,
