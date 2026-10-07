@@ -181,7 +181,7 @@ describe('live operator surgery', () => {
     assert.equal(tokens.size, 0, 'and released after');
   });
 
-  it('holds the store against agents admitted AFTER the reservation: ephemeral admission is refused (ticket kept) and wakes are parked', async () => {
+  it('holds the store against agents admitted AFTER the reservation: a pending candidate refuses it, a creation requested under it is held, and wakes are parked', async () => {
     // Hold the awaited switch open so the surgery is mid-flight.
     const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
     const originalSwitch = c.switchBranch;
@@ -207,19 +207,24 @@ describe('live operator surgery', () => {
         framework.rollbackToMessage('scout', { messageId: ids[1] }),
         (e: Error & { code?: string }) => e.code === 'agent-busy' && /ephemeral creation/.test(e.message),
       );
-      // Released from pending, the candidate can still be run (wrongly)
-      // later: that admission is what the store hold must refuse.
+      // cleanup() withdraws the candidate for good: it can't run afterwards.
       worker.cleanup();
+      await assert.rejects(
+        framework.runEphemeralToCompletion(worker.agent, worker.contextManager),
+        /released by cleanup\(\)/,
+      );
+      assert.equal(internals.ephemeralCandidates.has(worker.agent), false, 'its generation ticket is gone');
       const rollback = framework.rollbackToMessage('scout', { messageId: ids[1] });
       await new Promise((resolve) => setImmediate(resolve));
       assert.ok(internals.surgeryHold, 'store hold is up while the switch is awaited');
 
-      await assert.rejects(
-        framework.runEphemeralToCompletion(worker.agent, worker.contextManager),
-        /under live roll back/,
-      );
-      assert.equal(internals.ephemeralCandidates.get(worker.agent), worker.contextManager,
-        'refused BEFORE consuming the generation ticket — a clean retry stays possible');
+      // A creation requested now is held, not admitted, until the surgery ends.
+      let lateCreated = false;
+      const late = framework.createEphemeralAgent({
+        name: 'late-worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+      }).then((c) => { lateCreated = true; return c; });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(lateCreated, false, 'no creation is admitted under the hold');
 
       // A wake arriving now is parked by the scheduler, not started.
       framework.nudgeAgent('scout', 'test');
@@ -232,6 +237,9 @@ describe('live operator surgery', () => {
       assert.equal(r.messagesRemoved, 3);
       assert.equal(internals.surgeryHold, null, 'hold released with the reservation');
       assert.equal(membrane.calls.length, 0);
+      const lateWorker = await late;
+      assert.equal(lateCreated, true, 'the held creation proceeds once the hold is released');
+      lateWorker.cleanup();
     } finally {
       c.switchBranch = originalSwitch;
       worker.cleanup();

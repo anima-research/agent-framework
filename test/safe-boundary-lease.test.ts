@@ -33,6 +33,8 @@ type Internals = {
   ephemeralPending: Set<object>;
   landedDeferredWrites: Set<string>;
   reserveStoreForSurgery(verb: string, agentName: string): () => void;
+  takeStoreReservation(verb: string, agentName: string): { release: () => void };
+  ephemeralCandidates: Map<unknown, unknown>;
   addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
 };
 
@@ -418,5 +420,29 @@ describe('runAtSafeBoundary', () => {
     created.cleanup();
     const release = i.reserveStoreForSurgery('rollback', 'scout'); // free now
     release();
+  });
+
+  it('withdraws a cleaned-up candidate for good', async () => {
+    const created = await framework.createEphemeralAgent({ name: 'withdrawn', model: 'test-model', systemPrompt: 'test' });
+    created.cleanup();
+    await assert.rejects(
+      framework.runEphemeralToCompletion(created.agent, created.contextManager),
+      /released by cleanup\(\) and can't run/,
+    );
+    assert.equal(i.ephemeralCandidates.has(created.agent), false);
+  });
+
+  it('still refuses a run under a store hold, keeping its ticket (defence in depth)', async () => {
+    // No public path holds the store while a candidate is pending; take the
+    // reservation directly to reach the run-time check behind that rule.
+    const created = await framework.createEphemeralAgent({ name: 'defended', model: 'test-model', systemPrompt: 'test' });
+    const hold = i.takeStoreReservation('rollback', 'scout');
+    try {
+      await assert.rejects(framework.runEphemeralToCompletion(created.agent, created.contextManager), /under live rollback/);
+      assert.equal(i.ephemeralCandidates.get(created.agent), created.contextManager, 'refused before consuming the ticket');
+    } finally {
+      hold.release();
+      created.cleanup();
+    }
   });
 });

@@ -1468,6 +1468,9 @@ export class AgentFramework {
    */
   private ephemeralPending: Set<object> = new Set();
   private ephemeralPendingByAgent: WeakMap<Agent, object> = new WeakMap();
+  /** Candidates withdrawn by their cleanup(): they can never run, since the
+   *  pending admission that protected their pre-run context is gone. */
+  private releasedEphemeralCandidates: WeakSet<Agent> = new WeakSet();
   /** Creations held until no lease is waiting or held (admitEphemeralCreation). */
   private boundaryClearedWaiters: Array<() => void> = [];
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
@@ -4270,8 +4273,9 @@ export class AgentFramework {
    *
    * Safe boundaries (runAtSafeBoundary): an admitted creation, and the
    * candidate it returns, count as pending until runEphemeralToCompletion
-   * takes the candidate or cleanup() runs, and a lease waits for every
-   * pending one. So call cleanup() for a candidate that will never run.
+   * takes the candidate or cleanup() runs, and a lease or surgery waits for
+   * every pending one. So call cleanup() for a candidate that will never
+   * run; cleanup() withdraws it, and it can't be run afterwards.
    * While a lease waits, a creation proceeds only when `opts.requestedBy`
    * names a stream the lease is already draining (an agent with its turn
    * alive, or a running ephemeral stream), which may need the new agent to
@@ -4316,7 +4320,12 @@ export class AgentFramework {
       const cleanup = () => {
         // Don't close the store — it's shared. Just release the CM.
         // Data persists in the store under the namespace for investigation.
-        // A candidate that never ran stops holding back safe boundaries.
+        // A candidate that never ran is withdrawn for good: its generation
+        // ticket goes with its pending admission, so it can't run later on
+        // a context nothing protected meanwhile, and it stops holding back
+        // safe boundaries and surgeries.
+        if (this.ephemeralCandidates.get(agent) === contextManager) this.ephemeralCandidates.delete(agent);
+        this.releasedEphemeralCandidates.add(agent);
         this.ephemeralPending.delete(pending);
         this.tryGrantSafeBoundary();
       };
@@ -4415,6 +4424,9 @@ export class AgentFramework {
         `framework is quiesced${this.quiesceReason ? ` (${this.quiesceReason})` : ''}: ` +
         `refusing new ephemeral run for ${agent.name} — resume() first`,
       );
+    }
+    if (this.releasedEphemeralCandidates.has(agent)) {
+      throw new Error(`Ephemeral agent "${agent.name}" was released by cleanup() and can't run; create a new one`);
     }
     // Only a fresh object returned by createEphemeralAgent may enter this path.
     // Never overwrite a resident/conversation owner or a concurrent run: their
