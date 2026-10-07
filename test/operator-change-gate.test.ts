@@ -1059,18 +1059,72 @@ describe('operator-change gate: host/command unstick, planned at staging', () =>
     await unstick(1);
     const change = asked[0]!;
     await step(change, 1);
-    const attempt = framework.rerunUnstick(change as never, { step: 1 }); // queued, not yet run
+    const attempt = framework.rerunUnstick(change as never, { step: 1 }); // queued first, not yet run
     host().pendingRequests.push({ agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'test', timestamp: Date.now() } as InferenceRequest);
     const store = framework.getStore();
     store.createBranch('moved-before-dispatch');
     store.switchBranch('moved-before-dispatch');
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ordinary answer' }]));
-    await framework.runUntilIdle();
+    const fw = framework as unknown as { startAgentStream: (agent: unknown, trigger: InferenceRequest) => Promise<unknown> };
+    const realStart = fw.startAgentStream.bind(fw);
+    const dispatched: InferenceRequest[] = [];
+    fw.startAgentStream = (agent, trigger) => { dispatched.push(trigger); return realStart(agent, trigger); };
+    try {
+      await framework.runUntilIdle();
+    } finally {
+      fw.startAgentStream = realStart;
+    }
+    assert.equal(dispatched.length, 1, 'one turn: the ordinary wake');
+    assert.equal(dispatched[0]!.unstick, undefined, 'the turn carries no unstick binding');
+    assert.notEqual(dispatched[0]!.reason, 'unstick-attempt', 'nor its reason');
     const outcome = await attempt;
     assert.equal(outcome.status === 'completed' && outcome.outcome, 'failed');
     assert.match(String(outcome.status === 'completed' && outcome.error), /moved before the re-run started/);
     assert.equal(texts().at(-1), 'ordinary answer', 'the ordinary wake still had its turn');
     assert.equal(framework.getUnstickOperation(change.id)!.attempts[0]!.outcome, 'failed', 'and it was not reported as the re-run');
+  });
+
+  it("settles a re-run the inference policy declines, leaving the agent's next re-run free", async () => {
+    await unstick(1);
+    const first = asked[0]!;
+    await step(first, 1);
+    const fw = framework as unknown as { inferencePolicy: { shouldInfer: (...args: unknown[]) => boolean } };
+    const realPolicy = fw.inferencePolicy;
+    fw.inferencePolicy = { ...realPolicy, shouldInfer: () => false };
+    let outcome;
+    try {
+      outcome = await rerun(first, 1);
+    } finally {
+      fw.inferencePolicy = realPolicy;
+    }
+    assert.deepEqual(outcome.status === 'completed' && [outcome.outcome, /policy declined/.test(String(outcome.error))], ['failed', true]);
+    assert.equal(framework.getUnstickOperation(first.id)!.attempts[0]!.outcome, 'failed');
+    host().addMessage('user', [{ type: 'text', text: 'second culprit' }]);
+    await unstick(1);
+    const second = asked[1]!;
+    await step(second, 1);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'back' }]));
+    const next = await rerun(second, 1);
+    assert.equal(next.status === 'completed' && next.outcome, 'responded', 'not refused as busy');
+  });
+
+  it('releases a waiting re-run as interrupted when the framework stops', async () => {
+    await unstick(1);
+    const change = asked[0]!;
+    await step(change, 1);
+    const fw = framework as unknown as { inferencePolicy: { shouldInfer: (...args: unknown[]) => boolean } };
+    const attempt = framework.rerunUnstick(change as never, { step: 1 }); // queued; nothing dispatches it
+    await framework.stop();
+    assert.deepEqual(await attempt, { step: 1, status: 'interrupted' });
+    void fw;
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', maxTokens: 1000 }],
+      modules: [],
+      operatorChangeGate: async (c) => { asked.push(structuredClone(c)); return decide(c); },
+    });
+    assert.equal(framework.getUnstickOperation(change.id)!.attempts[0]!.status, 'launched', 'the journal agrees: launched, which reads interrupted');
   });
 
   it('runs back to back as a host would: each step after the previous re-run has fully settled', async () => {

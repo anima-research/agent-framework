@@ -2203,6 +2203,12 @@ export class AgentFramework {
     this.pushCoalescer?.suspend();
     this.flushCoalescingSnapshot();
     this.running = false;
+    // A re-run still waiting has no turn coming: its journal says launched,
+    // which reads interrupted, and so does what its callers are told.
+    for (const [key, waiter] of this.unstickAttemptWaiters) {
+      this.unstickAttemptWaiters.delete(key);
+      waiter.resolve({ step: Number(key.slice(key.lastIndexOf('#') + 1)), status: 'interrupted' });
+    }
     // Flushed-but-unsynced deferred writes: sync and ack now, while the
     // store is still open, rather than leaving them to a reboot replay.
     this.ackDeferredWrites();
@@ -7268,6 +7274,19 @@ export class AgentFramework {
 
   /** Resolve an unstick re-run's waiter with its recorded outcome, at the
    *  end of its stream's teardown. */
+  /**
+   * Settle and release the unstick re-runs among requests that leave the
+   * queue without a turn. Every exit needs a terminal outcome: otherwise the
+   * caller waits forever and the agent's next re-run is refused as busy.
+   */
+  private failQueuedUnstick(requests: InferenceRequest[], error: string): void {
+    for (const r of requests) {
+      if (!r.unstick) continue;
+      this.settleUnstickAttempt(r.unstick, 'failed', { error });
+      this.releaseUnstickAttempt(r.unstick);
+    }
+  }
+
   private releaseUnstickAttempt(binding: { operationId: string; step: number }): void {
     const key = `${binding.operationId}#${binding.step}`;
     const result = this.unstickSettled.get(key);
@@ -10281,6 +10300,7 @@ export class AgentFramework {
           oldestRequestAge: now - oldest,
         });
         console.error(`[inference-dropped] agent=${agentName} reason=agent_not_found requests=${requests.length}`);
+        this.failQueuedUnstick(requests, `its agent ${agentName} no longer exists`);
         continue;
       }
 
@@ -10430,6 +10450,19 @@ export class AgentFramework {
         continue;
       }
 
+      // An unstick re-run is bound to the source it was approved on. If the
+      // store or branch moved before it could start, it fails without
+      // running. It leaves the batch before policy and turn semantics are
+      // taken from it, so ordinary wakes batched with it keep their turn and
+      // inherit nothing of it.
+      const movedRuns = requests.filter((r) => r.unstick
+        && (r.unstick.storeId !== this.storeIdentity() || r.unstick.sourceBranch !== this.store.currentBranch().name));
+      if (movedRuns.length > 0) {
+        this.failQueuedUnstick(movedRuns, 'its source branch or store moved before the re-run started');
+        requests = requests.filter((r) => !movedRuns.includes(r));
+        if (requests.length === 0) continue;
+      }
+
       // Check policy
       if (!this.inferencePolicy.shouldInfer(agentName, requests, state)) {
         // Loud drop: a queued request that dies here is otherwise invisible —
@@ -10439,6 +10472,7 @@ export class AgentFramework {
           `[inference-dropped] agent=${agentName} reason=policy-skip ` +
           `requests=${requests.length} triggers=${requests.map((r) => r.reason).join(',')}`,
         );
+        this.failQueuedUnstick(requests, 'the inference policy declined the re-run');
         // A context-budget restart inherits the predecessor's EventGate liveness.
         // If policy drops the queued successor, no driveStream remains to release it.
         if (budgetRestart) this.eventGate?.onInferenceEnded(agentName);
@@ -10507,19 +10541,6 @@ export class AgentFramework {
       // A silent tick never suppresses a genuine coalesced wake. If any
       // ordinary request shares this batch, the ordinary turn semantics win.
       const silentOnly = requests.every((r) => r.suppressProse === true);
-      // An unstick re-run is bound to the source it was approved on. If the
-      // store or branch moved before it could start, it fails without
-      // running; ordinary wakes batched with it keep their turn, unbound.
-      const movedRuns = requests.filter((r) => r.unstick
-        && (r.unstick.storeId !== this.storeIdentity() || r.unstick.sourceBranch !== this.store.currentBranch().name));
-      if (movedRuns.length > 0) {
-        for (const r of movedRuns) {
-          this.settleUnstickAttempt(r.unstick!, 'failed', { error: 'its source branch or store moved before the re-run started' });
-          this.releaseUnstickAttempt(r.unstick!);
-        }
-        requests = requests.filter((r) => !movedRuns.includes(r));
-        if (requests.length === 0) continue;
-      }
       // An unstick re-run in the batch binds the turn to its operation and
       // step, whichever request leads the batch.
       const unstickReq = requests.find((r) => r.unstick);
