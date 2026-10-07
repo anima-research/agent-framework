@@ -332,4 +332,29 @@ describe('receipt clocks through the framework', () => {
     assert.ok(membrane.startedAt.length >= 2);
     assert.ok(deliveries[0]!.at >= membrane.startedAt[1]!, 'delivered by a later request, not by the round that carried none of it');
   });
+
+  it('keeps no receipt state for a stream whose agent was disposed while its request was prepared', async () => {
+    const { agent, contextManager } = await framework.createEphemeralAgent({
+      name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all',
+    });
+    contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+    const prepare = agent.startStreamWithInjections.bind(agent);
+    let prepared = false;
+    agent.startStreamWithInjections = async (...args: Parameters<typeof prepare>) => {
+      // Slow enough for the idle watchdog to dispose the agent meanwhile.
+      await new Promise((r) => setTimeout(r, 300));
+      const result = await prepare(...args);
+      prepared = true;
+      return result;
+    };
+    await assert.rejects(
+      framework.runEphemeralToCompletion(agent, contextManager, { idleTimeoutMs: 50, idlePollMs: 10 }),
+      /stalled/,
+    );
+    await waitFor(() => prepared, 'the request prepared after disposal');
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(membrane.requests.length, 1, 'a stream was started, then abandoned');
+    const receipts = (framework as unknown as { contextReceipts: { streams: Map<string, unknown> } }).contextReceipts;
+    assert.equal(receipts.streams.size, 0);
+  });
 });

@@ -10513,7 +10513,6 @@ export class AgentFramework {
         takeKvSubmission,
         drainKvSubmissionIds,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools);
-      this.contextReceipts.beginStream(agent.name, agent.streamId, requestEvidence);
       if (this.agents.get(agent.name) !== agent) {
         stream.cancel();
         agent.cancelStream();
@@ -10522,6 +10521,10 @@ export class AgentFramework {
         return false;
       }
 
+      // Receipt state for this stream lives exactly as long as driveStream,
+      // whose finally ends it: registered only once the stream will be
+      // driven, so a setup abandoned above leaves nothing behind.
+      this.contextReceipts.beginStream(agent.name, agent.streamId, requestEvidence);
       const handle = this.driveStream(
         agent,
         stream,
