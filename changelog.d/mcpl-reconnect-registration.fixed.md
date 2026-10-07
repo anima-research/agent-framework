@@ -6,4 +6,5 @@
   stayed unknown channels until the server registered again. A reconnect
   now holds control traffic as well as data until the new grant is
   established, as initial connect already did, both for a connection that
-  was open and for one whose first connect had failed.
+  was open and for one whose first connect had failed, and even when
+  startup or a quiesce resume opens every connection meanwhile.

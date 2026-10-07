@@ -13874,14 +13874,26 @@ export class AgentFramework {
   }
 
   /**
-   * Open MCPL connections' planes (every connection when none is given). A
-   * quiesced host (issue #122) opens only control planes, so data planes stay
-   * held for the whole maintenance window; resume() calls this again once
-   * the flag is cleared. Control planes always come up, since host/command
-   * (and with it resume) rides the control plane.
+   * Per connection, the transport epoch whose §5.3 policy exchange a
+   * reconnect has in flight. Until it settles, that transport's traffic must
+   * wait for its grant, so its planes stay closed whoever else opens planes
+   * meanwhile (startup's staged open, resume()); the reconnect opens them.
+   */
+  private readonly mcplPolicyExchanges = new WeakMap<McplServerConnection, number>();
+
+  /**
+   * Open MCPL connections' planes (every connection when none is given),
+   * except a connection whose reconnect's policy exchange is still in flight
+   * (see mcplPolicyExchanges). A quiesced host (issue #122) opens only
+   * control planes, so data planes stay held for the whole maintenance
+   * window; resume() calls this again once the flag is cleared. Control
+   * planes always come up, since host/command (and with it resume) rides the
+   * control plane.
    */
   private readyMcplPlanes(connections?: McplServerConnection[]): void {
     for (const connection of connections ?? this.mcplServerRegistry?.getAllServers() ?? []) {
+      const exchange = this.mcplPolicyExchanges.get(connection);
+      if (exchange !== undefined && exchange === connection.transportEpoch) continue;
       if (this.quiesced) connection.readyControlPlane();
       else connection.ready();
     }
@@ -14574,7 +14586,11 @@ export class AgentFramework {
       // Request (whose response is never buffered) must be answered before
       // any plane opens, otherwise the first post-reconnect traffic, control
       // included (the server's channels/register), lands while the grant is
-      // still empty and is rejected fail-closed instead of delivered.
+      // still empty and is rejected fail-closed instead of delivered. The
+      // exchange is marked in flight for this transport, so no other opener
+      // (startup's staged open, resume) releases the traffic early.
+      const epoch = connection.transportEpoch;
+      this.mcplPolicyExchanges.set(connection, epoch);
       void (async () => {
         try {
           const config = this.mcplServerConfigs.get(connection.id);
@@ -14587,7 +14603,13 @@ export class AgentFramework {
             error instanceof Error ? error.message : error,
           );
         }
-        this.readyMcplPlanes([connection]);
+        // Settled, granted or not (an unanswered or refused policy leaves the
+        // grant empty and the connection MCP-only, as at initial connect):
+        // open the planes, unless a newer transport's exchange has taken over.
+        if (this.mcplPolicyExchanges.get(connection) === epoch) {
+          this.mcplPolicyExchanges.delete(connection);
+          this.readyMcplPlanes([connection]);
+        }
         this.handleToolsListChanged(connection.id);
         this.emitTrace({
           type: 'mcpl:server-reconnected',
