@@ -236,6 +236,9 @@ interface McplChannelIncomingEvent {
   tags?: string[];
   triggerInference?: boolean;
   targetAgents?: string[];
+  /** Host acceptance time (epoch ms), stamped where the message is admitted.
+   *  The framework's inbound source envelope reads it; nothing re-stamps it. */
+  acceptedAt?: number;
 }
 
 // ============================================================================
@@ -981,6 +984,7 @@ export class ChannelRegistry {
         metadata: message.metadata,
         ...(message.tags ? { tags: message.tags } : {}),
         triggerInference,
+        acceptedAt: Date.now(),
       };
 
       if (coalesced) {
@@ -1227,6 +1231,13 @@ export class ChannelRegistry {
 
   getDescriptor(channelId: string): ChannelDescriptor | undefined {
     return this.findChannelEntry(channelId)?.descriptor;
+  }
+
+  /** The registered label of `channelId` on exactly `serverId` (no
+   *  cross-server first match), or undefined when it has none. */
+  getChannelLabel(serverId: string, channelId: string): string | undefined {
+    const label = this.channels.get(`${serverId}:${channelId}`)?.descriptor.label;
+    return typeof label === 'string' && label.length > 0 ? label : undefined;
   }
 
   isChannelOpen(channelId: string): boolean {

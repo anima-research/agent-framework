@@ -485,6 +485,16 @@ export type TraceEvent =
       type: 'host:quiesced_boot';
       reason?: string;
       since?: number;
+    })
+
+  // Inbound acceptance observation (mcpl/inbound-source.ts): an installed
+  // InboundAcceptanceObserver threw. Delivery is unaffected; the observer's
+  // own coverage is interrupted for that acceptance.
+  | (TraceEventBase & {
+      type: 'inbound:observer-failed';
+      /** Envelope kind of the acceptance the observer failed on. */
+      kind: 'channel' | 'unscoped' | 'surface';
+      error: string;
     });
 
 /**

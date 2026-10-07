@@ -170,6 +170,10 @@ export interface CoalescerHost<E> {
   /** Persist one receipt now, before the acceptance is acknowledged. Throws
    *  on failure, which fails the acceptance (the producer retries). */
   recordReceipt?(record: CoalescingReceiptRecord): void;
+  /** One call per ADMITTED occurrence (never for a producer retry the receipt
+   *  deduplicates), after its receipt is recorded. Observation only: a throw
+   *  is contained here and never fails the acceptance. */
+  accepted?(occurrence: CoalescedOccurrence<E>): void;
   /** Make every write so far DURABLE (fsync, group-committed by the host).
    *  Awaited before an acceptance is acknowledged and before push/render is
    *  issued: a kill after either boundary must find the receipt, the
@@ -396,6 +400,11 @@ export class PushCoalescer<E = unknown> {
       throw new CoalesceError('eventId', 'host could not persist the acceptance; retry', -32000);
     }
     this.receipts.set(receiptKey, entry);
+    try {
+      this.host.accepted?.(occurrence);
+    } catch (error) {
+      this.host.audit({ kind: 'accepted-observer-failed', subject, eventId: occurrence.eventId, error: String(error) });
+    }
     this.prune();
     this.persist();
     // Written but not yet durable: the in-memory receipt deduplicates a retry

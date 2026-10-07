@@ -19,6 +19,7 @@ import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import { expandCoreTags } from './tags.js';
 import { validateCoalescedContent } from './push-coalescer.js';
+import type { InboundSource } from './inbound-source.js';
 
 // ============================================================================
 // McplPushEvent (the ProcessEvent shape pushed to the queue)
@@ -47,6 +48,11 @@ export interface McplPushEvent {
   coalescingSubject?: string;
   /** RFC-006 assembly: materialized for this agent's turn (store directly). */
   assemblingFor?: string;
+  /** Host acceptance time (epoch ms), stamped where the push is admitted. */
+  acceptedAt?: number;
+  /** Framework-owned source envelope, frozen at a coalesced occurrence's
+   *  acceptance so its later delivery cannot restamp it (inbound-source.ts). */
+  inboundSource?: InboundSource;
 }
 
 // ============================================================================
@@ -286,6 +292,7 @@ export class PushHandler {
       timestamp: params.timestamp,
       inferenceId,
       triggerInference,
+      acceptedAt: Date.now(),
     };
     if (coalesced) {
       // RFC-006: the coalescer decides whether this occurrence replaces an
