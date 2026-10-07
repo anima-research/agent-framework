@@ -227,7 +227,7 @@ function resolvePending(
   s: { hash: string; size: number } | null,
   d: DiskFact,
   branchId: string,
-): { p: Physical | undefined; record?: Agreed | Interrupted } {
+): { p: Physical | undefined; record?: Agreed | Interrupted | 'forget'; uncaptured?: true } {
   const sc: Candidate = s ? { kind: 'content', hash: s.hash } : ABSENT;
   const prior = p.prior;
   const priorCandidate = prior ? candidateOf(prior) : null;
@@ -237,6 +237,9 @@ function resolvePending(
       return { p: agreed, record: agreed };
     }
     if (priorCandidate && sameCandidate(dc, priorCandidate)) return { p: prior!, record: prior! };
+    // A write whose prior was unknown left no file: it never created one (a
+    // partial write leaves a file behind), so P is as unknown as before.
+    if (!prior && dc.kind === 'absent' && p.expect.kind === 'content') return { p: undefined, record: 'forget' };
     const interrupted: Interrupted = { kind: 'interrupted', candidates: [...(priorCandidate ? [priorCandidate] : []), p.expect] };
     return { p: interrupted, record: interrupted };
   }
@@ -251,13 +254,15 @@ function resolvePending(
     }
     // The commit didn't land: the rule runs again from the prior evidence
     // (redoing the adoption when disk still holds what was being adopted).
-    return { p: prior ?? undefined };
+    return prior ? { p: prior, record: prior } : { p: undefined, record: 'forget' };
   }
-  // Another branch: disk may hold either outcome, and S here says nothing of
-  // whether the adoption happened over there.
-  if ((priorCandidate && sameCandidate(dc, priorCandidate)) || sameCandidate(dc, p.expect)) return { p };
-  const interrupted: Interrupted = { kind: 'interrupted', candidates: [...(priorCandidate ? [priorCandidate] : []), p.expect] };
-  return { p: interrupted, record: interrupted };
+  // Another branch, whose S says nothing of whether the adoption happened
+  // over there. Disk still holding the prior is D = P: the store has that
+  // content. Disk holding the adopted content, or anything newer, may hold
+  // the only copy of it, so this branch lists it as a conflict and nothing
+  // pushes over it; P stays pending for the intent's own branch to resolve.
+  if (priorCandidate && sameCandidate(dc, priorCandidate)) return { p };
+  return { p, uncaptured: true };
 }
 
 /** The rule (see module doc). Pure. */
@@ -290,11 +295,13 @@ function decide(
   // A pending intent resolves first; its resolution is recorded unless the
   // verdict below records newer evidence.
   let p = pIn;
-  let resolution: Agreed | Interrupted | undefined;
+  let resolution: Agreed | Interrupted | 'forget' | undefined;
+  let uncaptured = false;
   if (p?.kind === 'pending') {
     const resolved = resolvePending(p, dc, s, d, branchId);
     p = resolved.p;
     resolution = resolved.record;
+    uncaptured = resolved.uncaptured === true;
   }
   const verdict = (v: Verdict): Verdict => (resolution && v.p === undefined ? { ...v, p: resolution } : v);
 
@@ -316,10 +323,10 @@ function decide(
   // A recorded conflict stays until it is resolved explicitly or disk and store converge.
   if (bi?.conflict) return verdict({ state: 'conflict' });
 
-  if (p?.kind === 'interrupted') return verdict({ state: 'conflict', conflict: 'interrupted' });
+  if (p?.kind === 'interrupted' || uncaptured) return verdict({ state: 'conflict', conflict: 'interrupted' });
 
   if (p?.kind === 'pending') {
-    // Unresolved from another branch, with disk holding one of its outcomes.
+    // Unresolved from another branch, with disk still holding its prior.
     return verdict({ state: keepStoreSide(s !== null, bi) });
   }
 
@@ -421,7 +428,7 @@ export async function reconcilePass(
     }
     if (walk && !walk.files.has(path) && !walk.others.has(path)) {
       // Beneath a region the walk didn't reach: unproven either way.
-      const region = walk.incomplete.find((r) => path === r.path || path.startsWith(r.path + '/'));
+      const region = walk.incomplete.find((r) => r.path === '' || path === r.path || path.startsWith(r.path + '/'));
       facts.set(path, { kind: 'unobserved', reason: region ? region.reason : 'not reached by the walk' });
       continue;
     }
@@ -492,7 +499,11 @@ export async function reconcilePass(
   let first = true;
   for (const x of planned) {
     const next = x.verdict.p;
-    if (next === undefined || next === 'forget') continue;
+    if (next === undefined) continue;
+    if (next === 'forget') {
+      agreement.forget(mount.name, x.path); // no-op when step 2 already did
+      continue;
+    }
     agreement.set(mount.name, x.path, next, { afterCommittedState: first });
     first = false;
   }
@@ -611,8 +622,9 @@ export async function pushPaths(
     }
     // Whatever the verdict learned about disk (an agreement, a resolved
     // intent) is recorded before anything is pushed over it.
-    if (v.p !== undefined && v.p !== 'forget') agreement.set(mount.name, path, v.p, { afterCommittedState: true });
-    const known = v.p !== undefined && v.p !== 'forget' ? v.p : p;
+    if (v.p === 'forget') agreement.forget(mount.name, path);
+    else if (v.p !== undefined) agreement.set(mount.name, path, v.p, { afterCommittedState: true });
+    const known = v.p === 'forget' ? undefined : v.p !== undefined ? v.p : p;
     const prior = known && (known.kind === 'absent' || known.kind === 'content') ? known : null;
     if (v.state === 'synced') {
       if (v.intent !== undefined) mount.intents.put(path, v.intent);

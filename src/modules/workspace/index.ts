@@ -52,7 +52,7 @@ import {
   reconcilePass,
 } from './reconcile.js';
 
-/** How long the after-batch scan may hold the agent's next inference. */
+/** Default for how long the after-batch scan may hold the agent's next inference. */
 const AGENT_ACTION_SCAN_DEADLINE_MS = 20_000;
 
 export type {
@@ -967,12 +967,10 @@ export class WorkspaceModule implements Module {
         watcher.start();
         this.watchers.set(name, watcher);
 
-        // Chokidar is started with ignoreInitial:true, so files already on
-        // disk at session start would be invisible. Trigger one syncFromFs
-        // pass — syncFromFs diffs disk against the tree state, so only files
-        // new-to-this-session's-tree fire workspace:created events. Fresh
-        // sessions see the existing catalog; restarts only see what appeared
-        // while the session was down.
+        // Chokidar is started with ignoreInitial:true, so changes made while
+        // the session was down would be invisible. One full pass catches up
+        // under the three-way rule: only real differences produce tree
+        // changes and events.
         void this.initialScan(name);
       }
 
@@ -2437,9 +2435,10 @@ export class WorkspaceModule implements Module {
    * last materialize, plus everything the evidence says disk still owes —
    * entries whose disk agreement differs (a refused or failed write stays
    * owed whatever the watermark does), drafts disk has never seen, recorded
-   * conflicts, and with `applyDeletions` the workspace deletions still on disk.
+   * conflicts, and workspace deletions still on disk (applied with
+   * `applyDeletions`, listed without it).
    */
-  private materializeSelection(mount: MountState, explicitPath: string, applyDeletions: boolean): string[] {
+  private materializeSelection(mount: MountState, explicitPath: string): string[] {
     const store = this.getStore();
     const agreement = this.agreementOrThrow();
     const name = mount.config.name;
@@ -2465,7 +2464,7 @@ export class WorkspaceModule implements Module {
         selected.add(e.path);
       }
     }
-    for (const [p, bi] of intents) if (bi.conflict || (applyDeletions && bi.tombstone)) selected.add(p);
+    for (const [p, bi] of intents) if (bi.conflict || bi.tombstone) selected.add(p);
     return [...selected];
   }
 
@@ -2527,7 +2526,7 @@ export class WorkspaceModule implements Module {
     for (const { name, mount } of mountsToMaterialize) {
       if (mount.config.mode === 'read-only') continue;
       const pushed = await this.withMount(mount, () => {
-        const paths = this.materializeSelection(mount, explicit?.relativePath ?? '', input.applyDeletions === true);
+        const paths = this.materializeSelection(mount, explicit?.relativePath ?? '');
         return this.pushUnlocked(mount, paths, { force: input.force, applyDeletions: input.applyDeletions });
       });
 
@@ -2695,9 +2694,10 @@ export class WorkspaceModule implements Module {
    * a `workspace:agent-action-scan-incomplete` event. The scan itself still
    * finishes, deciding with the branch current when it applies.
    */
-  async onToolBatchComplete(): Promise<void> {
+  async onToolBatchComplete(_agentName?: string): Promise<void> {
     const mounts = [...this.mounts.values()].filter((m) => m.config.watch === 'on-agent-action');
     if (mounts.length === 0 || !this.store) return;
+    const deadlineMs = this.config.agentActionScanDeadlineMs ?? AGENT_ACTION_SCAN_DEADLINE_MS;
     await Promise.all(mounts.map(async (mount) => {
       let late = false;
       const scan = this.withMount(mount, () => this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true })).then(
@@ -2714,13 +2714,13 @@ export class WorkspaceModule implements Module {
       );
       let timer: ReturnType<typeof setTimeout> | undefined;
       const deadline = new Promise<'late'>((resolveDeadline) => {
-        timer = setTimeout(() => resolveDeadline('late'), AGENT_ACTION_SCAN_DEADLINE_MS);
+        timer = setTimeout(() => resolveDeadline('late'), deadlineMs);
       });
       const outcome = await Promise.race([scan.then(() => 'done' as const), deadline]);
       clearTimeout(timer);
       if (outcome === 'late') {
         late = true;
-        const reason = `still scanning after ${AGENT_ACTION_SCAN_DEADLINE_MS / 1000}s; the agent's next inference went ahead without it`;
+        const reason = `still scanning after ${deadlineMs} ms; the agent's next inference went ahead without it`;
         mount.lastAgentActionScan = { at: Date.now(), complete: false, reason };
         this.ctx?.pushEvent({ type: 'workspace:agent-action-scan-incomplete', mount: mount.config.name, reason } as ProcessEvent);
       }

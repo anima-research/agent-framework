@@ -74,6 +74,14 @@ export interface WorkspaceConfig {
   deltaSnapshotEvery?: number;
   /** Full snapshot frequency for tree states (default: 10) */
   fullSnapshotEvery?: number;
+  /**
+   * How long the scan of `watch: 'on-agent-action'` mounts after a tool batch
+   * may hold the agent's next inference, in ms (default: 20000). A scan that
+   * takes longer finishes in the background; the miss is recorded on the
+   * mount's status and pushed as a `workspace:agent-action-scan-incomplete`
+   * event.
+   */
+  agentActionScanDeadlineMs?: number;
 }
 
 // ============================================================================
