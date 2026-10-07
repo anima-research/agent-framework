@@ -606,6 +606,7 @@ type UnstickJournalSnapshot = Record<string, UnstickOperationRecord>;
 type OperatorChangesEntry =
   | { kind: 'attempt'; changeId: string; changeKind: OperatorChangeRecord['kind']; agent: string; n: number; at: number; evidence: OperatorChangeEvidence }
   | { kind: 'switched'; changeId: string; n: number }
+  | { kind: 'failed'; changeId: string; n: number; error: string }
   | { kind: 'outcome'; changeId: string; outcome: OperatorChangeOutcome }
   | { kind: 'completed'; changeId: string }
   | { kind: 'dropped'; changeId: string; changeKind: OperatorChangeRecord['kind']; agent: string; at: number };
@@ -628,7 +629,10 @@ function reduceOperatorChangesEntry(records: Map<string, OperatorChangeRecord>, 
   const record = records.get(entry.changeId);
   if (!record) return;
   if (entry.kind === 'switched') record.switched = entry.n;
-  else if (entry.kind === 'outcome') record.outcome ??= entry.outcome;
+  else if (entry.kind === 'failed') {
+    const attempt = record.attempts.find((a) => a.n === entry.n);
+    if (attempt) attempt.failed = entry.error;
+  } else if (entry.kind === 'outcome') record.outcome ??= entry.outcome;
   else record.completed = true;
 }
 
@@ -704,6 +708,17 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
     MIN_DISCORD_AWARENESS_DEADLINE_MS,
     Math.min(MAX_DISCORD_AWARENESS_DEADLINE_MS, Math.floor(value)),
   );
+}
+
+/** An operator journal (operator/changes, operator/unstick) could not be
+ *  read. It may hold a body change that still needs recovery, so neither
+ *  startup nor an operation proceeds as if it were empty. */
+export class OperatorJournalUnreadableError extends Error {
+  constructor(journal: string, cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`The ${journal} journal could not be read: ${detail}`, { cause });
+    this.name = 'OperatorJournalUnreadableError';
+  }
 }
 
 class DiscordAwarenessAccountingError extends Error {
@@ -7102,19 +7117,32 @@ export class AgentFramework {
   } {
     if (!this.unstickJournalState) {
       const journal = new RecordJournal<UnstickJournalEntry, UnstickJournalSnapshot>(this.store, { type: 'operator/unstick' });
-      this.unstickJournalState = { journal, ops: new Map() };
-      this.reloadUnstickJournal();
+      this.unstickJournalState = { journal, ops: this.loadUnstickJournal(journal) };
     }
     return this.unstickJournalState;
   }
 
-  /** Rebuild the reduced operations from exactly what the journal holds: at
-   *  first use, and to reconcile after an ambiguous write. */
+  private loadUnstickJournal(journal: RecordJournal<UnstickJournalEntry, UnstickJournalSnapshot>): Map<string, UnstickOperationRecord> {
+    try {
+      const { snapshot, entries } = journal.load();
+      const ops = new Map(Object.entries(snapshot ?? {}).map(([id, op]) => [id, structuredClone(op)]));
+      for (const { entry } of entries) reduceUnstickEntry(ops, entry);
+      return ops;
+    } catch (error) {
+      throw new OperatorJournalUnreadableError('operator/unstick', error);
+    }
+  }
+
+  /** Rebuild the reduced operations from exactly what the journal holds,
+   *  after an ambiguous write. If it can't be read, nothing stays installed. */
   private reloadUnstickJournal(): void {
     const state = this.unstickJournalState!;
-    const { snapshot, entries } = state.journal.load();
-    state.ops = new Map(Object.entries(snapshot ?? {}).map(([id, op]) => [id, structuredClone(op)]));
-    for (const { entry } of entries) reduceUnstickEntry(state.ops, entry);
+    try {
+      state.ops = this.loadUnstickJournal(state.journal);
+    } catch (error) {
+      this.unstickJournalState = null;
+      throw error;
+    }
   }
 
   /** Append one journal entry and reduce it. A failure after the entry may
@@ -7151,19 +7179,35 @@ export class AgentFramework {
     records: Map<string, OperatorChangeRecord>;
   } {
     if (!this.changesJournalState) {
+      // Loaded before it is installed: a journal that can't be read is never
+      // mistaken for one with no operations.
       const journal = new RecordJournal<OperatorChangesEntry, OperatorChangesSnapshot>(this.store, { type: 'operator/changes' });
-      this.changesJournalState = { journal, records: new Map() };
-      this.reloadChangesJournal();
+      this.changesJournalState = { journal, records: this.loadChangesJournal(journal) };
     }
     return this.changesJournalState;
   }
 
-  /** Rebuild the reduced records from exactly what the journal holds. */
+  private loadChangesJournal(journal: RecordJournal<OperatorChangesEntry, OperatorChangesSnapshot>): Map<string, OperatorChangeRecord> {
+    try {
+      const { snapshot, entries } = journal.load();
+      const records = new Map(Object.entries(snapshot ?? {}).map(([id, record]) => [id, structuredClone(record)]));
+      for (const { entry } of entries) reduceOperatorChangesEntry(records, entry);
+      return records;
+    } catch (error) {
+      throw new OperatorJournalUnreadableError('operator/changes', error);
+    }
+  }
+
+  /** Rebuild the reduced records from exactly what the journal holds. If it
+   *  can't be read, nothing stays installed: the next use loads again. */
   private reloadChangesJournal(): void {
     const state = this.changesJournalState!;
-    const { snapshot, entries } = state.journal.load();
-    state.records = new Map(Object.entries(snapshot ?? {}).map(([id, record]) => [id, structuredClone(record)]));
-    for (const { entry } of entries) reduceOperatorChangesEntry(state.records, entry);
+    try {
+      state.records = this.loadChangesJournal(state.journal);
+    } catch (error) {
+      this.changesJournalState = null;
+      throw error;
+    }
   }
 
   /** Append one entry, durable, and reduce it. A failure after the entry may
@@ -7172,7 +7216,11 @@ export class AgentFramework {
   private journalChange(entry: OperatorChangesEntry): void {
     const ledger = this.changesLedger();
     try {
-      ledger.journal.append(entry, { durable: true });
+      // A record asserting the body committed (its switch, its outcome) is
+      // appended only after the store's committed state is synced, so a
+      // hard kill can never keep the record without the body it certifies.
+      const assertsBody = entry.kind === 'switched' || entry.kind === 'outcome';
+      ledger.journal.append(entry, { durable: true, ...(assertsBody ? { afterCommittedState: true } : {}) });
     } catch (error) {
       if (ledger.journal.needsReconcile) this.reloadChangesJournal();
       throw error;
@@ -7786,6 +7834,8 @@ export class AgentFramework {
       revalidate: (stale: (why: string) => never) => void;
       removal: () => Array<{ metadata?: unknown }>;
       cut: () => Promise<void>;
+      /** Put the source back if the cut left the destination active. */
+      restore: () => Promise<string>;
       finish: (outcome: OperatorChangeOutcome) => void;
     },
   ): Promise<{ outcome: OperatorChangeOutcome; alreadyApplied: boolean }> {
@@ -7807,9 +7857,17 @@ export class AgentFramework {
     };
     const known = record();
     if (known?.outcome) return settle(known.outcome, true);
-    const current = this.store.currentBranch().name;
+    let current = this.store.currentBranch().name;
     const last = known?.attempts[known.attempts.length - 1];
-    if (last) {
+    if (last && last.failed !== undefined) {
+      // That attempt failed, and its disposition was recorded before its
+      // source was restored: never a commitment, whatever its destination
+      // holds. If a crash came before the restore, finish it now.
+      if (current === destination) {
+        await steps.restore();
+        current = this.store.currentBranch().name;
+      }
+    } else if (last) {
       if (known!.switched === last.n || current === destination || this.destinationUsed(destination)) {
         if (known!.switched !== last.n) this.journalChange({ kind: 'switched', changeId: change.id, n: last.n });
         return settle(this.establishOutcome(change, last, 'undo'), true);
@@ -7840,7 +7898,21 @@ export class AgentFramework {
         ...(change.requester ? { requester: change.requester } : {}),
       },
     });
-    await steps.cut();
+    try {
+      await steps.cut();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      // Recorded before the source is restored, so recovery never reads a
+      // destination this attempt touched as its cut.
+      let recorded = '';
+      try {
+        this.journalChange({ kind: 'failed', changeId: change.id, n, error: detail });
+      } catch (journalError) {
+        recorded = `; its failure could not be recorded (${journalError instanceof Error ? journalError.message : String(journalError)})`;
+      }
+      const restored = await steps.restore();
+      throw new OperatorActionError('failed', `${label} ${change.id} failed; ${restored}${recorded}: ${detail}`, { cause: error });
+    }
     this.journalChange({ kind: 'switched', changeId: change.id, n });
     return settle(this.establishOutcome(change, record()!.attempts.find((a) => a.n === n)!, 'undo'), false);
   }
@@ -7880,6 +7952,12 @@ export class AgentFramework {
         }
         this.store.switchBranch(destination);
         this.materializeConfigMountAfterBranchSwitch();
+      },
+      restore: async () => {
+        if (this.store.currentBranch().name !== destination) return `active branch is ${this.store.currentBranch().name}`;
+        this.store.switchBranch(change.sourceBranch);
+        this.materializeConfigMountAfterBranchSwitch();
+        return `active branch restored to ${change.sourceBranch}`;
       },
       finish: (established) => {
         // The one redo entry back to the source tip, while the destination is
@@ -7952,19 +8030,11 @@ export class AgentFramework {
       },
       removal: () => this.planRollback(change.agent, change.tail.id).discarded,
       cut: async () => {
-        try {
-          const exists = this.store.listBranches().some((b) => b.name === destination);
-          await cm.switchBranch(exists ? destination : cm.branchAt(change.tail.id as MessageId, destination));
-        } catch (error) {
-          const restored = await this.restoreSourceBranch(cm, change.sourceBranch, destination, change.agent);
-          throw new OperatorActionError(
-            'failed',
-            `Undo of ${change.requestedMessages} message(s) ${change.id} failed; ${restored}: ${error instanceof Error ? error.message : String(error)}`,
-            { cause: error },
-          );
-        }
+        const exists = this.store.listBranches().some((b) => b.name === destination);
+        await cm.switchBranch(exists ? destination : cm.branchAt(change.tail.id as MessageId, destination));
         this.materializeConfigMountAfterBranchSwitch();
       },
+      restore: () => this.restoreSourceBranch(cm, change.sourceBranch, destination, change.agent),
       finish: (established) => {
         this.recordChangeAction({
           kind: 'rollback',
@@ -8111,16 +8181,16 @@ export class AgentFramework {
    * not provably committed is left for the host's retry.
    */
   private async reconcileOperatorChanges(): Promise<void> {
-    let records: OperatorChangeRecord[];
-    try {
-      records = [...this.changesLedger().records.values()];
-    } catch (error) {
-      console.error('[operator-changes] journal unreadable at startup:', error instanceof Error ? error.message : error);
-      return;
-    }
+    // Both operator journals are read before anything else runs: either may
+    // hold a body change that still needs recovery, so an unreadable one
+    // stops startup (OperatorJournalUnreadableError) rather than reading as
+    // empty.
+    this.unstickLedger();
+    const records = [...this.changesLedger().records.values()];
     for (const record of records) {
       if (record.outcome || record.dropped || record.attempts.length === 0) continue;
       const last = record.attempts[record.attempts.length - 1]!;
+      if (last.failed !== undefined) continue; // never committed: the host's retry starts a fresh attempt
       try {
         const current = this.store.currentBranch().name;
         if (record.kind === 'hide') {

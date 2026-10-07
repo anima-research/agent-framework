@@ -13,7 +13,10 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { JsStore } from '@animalabs/chronicle';
 import { join } from 'node:path';
 import { AgentFramework, AutobiographicalStrategy, WorkspaceModule } from '../src/index.js';
 import type {
@@ -982,6 +985,44 @@ describe('operator-change gate: host/command undo by turns', () => {
     assert.equal(again.kind === 'undo-messages' && again.alreadyApplied, true);
   });
 
+  for (const crashBeforeRestore of [false, true]) {
+    it(`never reads a failed cut as committed, though it wrote on its destination${crashBeforeRestore ? ', even when the crash came before its restore' : ''}`, async () => {
+      await say('m0'); await say('m1');
+      await host().handleHostCommand('discord', { command: 'undo', agentName: 'scout', messages: 2, marks: 'all', requesterName: 'nissa' });
+      const change = asked[0]!;
+      const destination = `undo-msgs/scout/op-${change.id}`;
+      const cmx = framework.getAgent('scout')!.getContextManager() as unknown as { switchBranch: (name: string) => Promise<unknown> };
+      const realSwitch = cmx.switchBranch.bind(cmx);
+      let armed = true;
+      // The store moves and strategy initialization writes on the destination
+      // before failing, as June's probe did.
+      cmx.switchBranch = async (name) => {
+        if (!armed) return realSwitch(name);
+        armed = false;
+        framework.getStore().switchBranch(name);
+        framework.getStore().setStateJson('probe/initializer', { wrote: true });
+        throw new Error('injected strategy initialization failure');
+      };
+      const fw = framework as unknown as { restoreSourceBranch: (...args: unknown[]) => Promise<string> };
+      const realRestore = fw.restoreSourceBranch.bind(fw);
+      if (crashBeforeRestore) fw.restoreSourceBranch = async () => { throw new Error('the process died before restoring'); };
+      try {
+        await assert.rejects(applyIt(change), crashBeforeRestore ? /died before restoring/ : /injected strategy initialization failure/);
+      } finally {
+        cmx.switchBranch = realSwitch;
+        fw.restoreSourceBranch = realRestore;
+      }
+      assert.equal(branch(), crashBeforeRestore ? destination : change.sourceBranch);
+      assert.equal(framework.getOperatorChangeRecord(change.id)!.attempts[0]!.failed !== undefined, true, 'its failure recorded first');
+      const retried = await applyIt(change);
+      assert.equal(retried.kind === 'undo-messages' && retried.alreadyApplied, undefined, 'a fresh attempt, not a recovered commitment');
+      assert.deepEqual(texts(), ['m0', 'reply to m0'], 'the cut really happened this time');
+      assert.deepEqual(receipt(retried), { status: 'queued', queued: 1, unmarked: 0, notRemoved: 0 }, 'marks from the attempt that committed');
+      const record = framework.getOperatorChangeRecord(change.id)!;
+      assert.deepEqual([record.attempts.length, record.outcome!.n], [2, 2]);
+    });
+  }
+
   it('refuses an undo by messages whose tail changed since staging', async () => {
     await say('m0'); await say('m1');
     await host().handleHostCommand('discord', { command: 'undo', agentName: 'scout', messages: 2, marks: 'none', requesterName: 'nissa' });
@@ -1494,5 +1535,129 @@ describe('surgery bound to the context it was previewed in', () => {
     const preview = a.previewSurgeryMarks('scout', { suppress: [target] });
     await assert.rejects(b.suppressMessages('scout', { messageIds: [target], expected: preview.context }), stale(/another store/));
     assert.equal(b.getAgent('scout')!.getContextManager().getAllMessages().length, 5);
+  });
+});
+
+
+describe('operator journals that cannot be read', () => {
+  let dir: string;
+  let quiet: { log: typeof console.log; error: typeof console.error };
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'operator-journal-unreadable-'));
+    quiet = { log: console.log, error: console.error };
+    console.log = () => {};
+    console.error = () => {};
+  });
+  afterEach(() => {
+    console.log = quiet.log;
+    console.error = quiet.error;
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const unreadable = (store: JsStore, type: string) => {
+    const real = store.getRecordIdsByType.bind(store);
+    store.getRecordIdsByType = (t: string) => {
+      if (t === type) throw new Error('injected read failure');
+      return real(t);
+    };
+  };
+
+  for (const type of ['operator/changes', 'operator/unstick']) {
+    it(`refuses to start when ${type} can't be read, rather than reading it as empty`, async () => {
+      const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+      unreadable(store, type);
+      await assert.rejects(
+        AgentFramework.create({
+          store,
+          membrane: new MockMembrane().asMembrane(),
+          agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', maxTokens: 1000 }],
+          modules: [],
+        }),
+        (e: Error) => e.name === 'OperatorJournalUnreadableError' && e.message.includes(type),
+      );
+    });
+  }
+
+  it('fails an operation mid-run when operator/changes becomes unreadable, never answering as if it were empty', async () => {
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'live'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', maxTokens: 1000 }],
+      modules: [],
+    });
+    try {
+      (framework as unknown as { changesJournalState: unknown }).changesJournalState = null; // the next use loads again
+      unreadable(framework.getStore() as JsStore, 'operator/changes');
+      for (const attempt of ['first', 'again']) {
+        assert.throws(() => framework.getOperatorChangeRecord('prior-hide'), (e: Error) => e.name === 'OperatorJournalUnreadableError',
+          `${attempt}: an unreadable journal is never installed as an empty one`);
+      }
+    } finally {
+      await framework.stop();
+    }
+  });
+});
+
+describe('a hard kill between a body change and its outcome record', () => {
+  it('never keeps an outcome without the body it certifies', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-outcome-kill-'));
+    try {
+      const index = fileURLToPath(new URL('../src/index.js', import.meta.url));
+      const mock = fileURLToPath(new URL('./helpers/mock-membrane.js', import.meta.url));
+      const script = join(dir, 'child.mjs');
+      writeFileSync(script, `
+        import { AgentFramework } from ${JSON.stringify(index)};
+        import { MockMembrane } from ${JSON.stringify(mock)};
+        import { writeFileSync } from 'node:fs';
+        import { join } from 'node:path';
+        const [mode, dir] = process.argv.slice(2);
+        console.log = () => {}; console.error = () => {};
+        const staged = [];
+        const fw = await AgentFramework.create({
+          storePath: join(dir, 'store'),
+          membrane: new MockMembrane().asMembrane(),
+          agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'x', maxTokens: 1000 }],
+          modules: [],
+          operatorChangeGate: async (c) => { staged.push(c); return { id: 'rev', text: 'staged' }; },
+        });
+        const cm = fw.getAgent('scout').getContextManager();
+        const texts = () => cm.getAllMessages().map((m) => m.content[0]?.text);
+        if (mode === 'check') {
+          const ids = JSON.parse((await import('node:fs')).readFileSync(join(dir, 'change.json'), 'utf8'));
+          const record = fw.getOperatorChangeRecord(ids.id);
+          writeFileSync(join(dir, 'after.json'), JSON.stringify({ removed: record?.outcome?.removed ?? null, texts: texts() }));
+          await fw.stop();
+          process.exit(0);
+        }
+        for (const id of ['m0', 'm1', 'm2', 'm3']) {
+          cm.addMessage('Member', [{ type: 'text', text: id }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: id });
+        }
+        fw.getStore().sync();
+        await fw.handleHostCommand('discord', { command: 'hide', agentName: 'scout', fromMessageId: 'm1', toMessageId: 'm2', marks: 'none' });
+        const change = staged[0];
+        writeFileSync(join(dir, 'change.json'), JSON.stringify({ id: change.id }));
+        const store = fw.getStore();
+        const realAppend = store.appendJson.bind(store);
+        const realSync = store.sync.bind(store);
+        let outcomeAppended = false;
+        store.appendJson = (type, data) => {
+          const record = realAppend(type, data);
+          if (type === 'operator/changes' && data && data.kind === 'outcome') outcomeAppended = true;
+          return record;
+        };
+        store.sync = () => { if (outcomeAppended) process.kill(process.pid, 'SIGKILL'); return realSync(); };
+        await fw.runAtSafeBoundary({ verb: 'apply' }, (lease) => fw.applyResolvedOperatorChange(change, { lease, admission: { id: 'rev' } }));
+        process.exit(3); // not reached: killed at the sync right after the outcome append
+      `);
+      const run = (mode: string) => spawnSync(process.execPath, [script, mode, dir], { encoding: 'utf8' });
+      const applied = run('apply');
+      assert.equal(applied.signal, 'SIGKILL', applied.stderr);
+      const check = run('check');
+      assert.equal(check.status, 0, check.stderr);
+      const after = JSON.parse(readFileSync(join(dir, 'after.json'), 'utf8')) as { removed: number | null; texts: string[] };
+      assert.equal(after.removed, 2, 'the outcome is known after reopen (recorded, or established at startup)');
+      assert.deepEqual(after.texts, ['m0', 'm3'], 'and the body it certifies is there with it');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

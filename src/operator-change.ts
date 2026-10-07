@@ -191,8 +191,10 @@ export interface OperatorChangeRecord {
   changeId: string;
   kind: ResolvedOperatorChange['kind'];
   agent: string;
-  /** Application attempts, in order, each with its evidence. */
-  attempts: Array<{ n: number; at: number; evidence: OperatorChangeEvidence }>;
+  /** Application attempts, in order, each with its evidence. `failed` is set
+   *  (with the error) when the attempt failed and restored its source: such
+   *  an attempt is never read as committed. */
+  attempts: Array<{ n: number; at: number; evidence: OperatorChangeEvidence; failed?: string }>;
   /** The attempt whose cut switched to its destination: recorded right
    *  after the switch, so it proves the cut whatever is active later. */
   switched?: number;
