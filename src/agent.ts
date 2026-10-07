@@ -518,6 +518,12 @@ export class Agent {
    *   default pace.
    * - cancel: a converging budget stops at the live budget; nothing else
    *   changes.
+   *
+   * A setting the action changes without naming it is reported too: a paced
+   * descent (an update's non-immediate decrease, or a budget reset below the
+   * live budget) with no pace set installs the default pace, exactly as
+   * updateRuntimeSettings and resetRuntimeSettings do, so transitionPaceTokens
+   * is reported at that default.
    */
   previewRuntimeSettingsTarget(
     change:
@@ -526,26 +532,29 @@ export class Agent {
       | { action: 'cancel' },
   ): Partial<Record<'contextBudgetTokens' | 'tailTokens' | 'transitionPaceTokens' | 'sameRoundThinkTextPolicy', number | string | null>> {
     const target: Partial<Record<'contextBudgetTokens' | 'tailTokens' | 'transitionPaceTokens' | 'sameRoundThinkTextPolicy', number | string | null>> = {};
+    const hot = this.getHotContextSettings();
+    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    // A paced descent with no pace set installs the default pace.
+    const unpaced = hot !== null && hot.transitionPaceTokens === undefined;
     if (change.action === 'update') {
       const p = change.patch;
       if (p.contextBudgetTokens !== undefined) target.contextBudgetTokens = p.contextBudgetTokens;
       if (p.tailTokens !== undefined) target.tailTokens = p.tailTokens;
       if (p.transitionPaceTokens !== undefined) target.transitionPaceTokens = p.transitionPaceTokens;
+      else if (p.contextBudgetTokens !== undefined && p.contextBudgetTokens < live && !p.immediate && unpaced) {
+        target.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;
+      }
       if (p.sameRoundThinkTextPolicy !== undefined) target.sameRoundThinkTextPolicy = p.sameRoundThinkTextPolicy;
       return target;
     }
     if (change.action === 'cancel') {
-      if (this.contextBudgetTargetTokens !== undefined) {
-        target.contextBudgetTokens = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
-      }
+      if (this.contextBudgetTargetTokens !== undefined) target.contextBudgetTokens = live;
       return target;
     }
     const keys = new Set(change.keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy']);
-    const hot = this.getHotContextSettings();
     let startsDescent = false;
     if (keys.has('contextBudgetTokens')) {
       const configured = this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
-      const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
       startsDescent = configured < live;
       target.contextBudgetTokens = configured;
     }
@@ -557,6 +566,8 @@ export class Agent {
       target.transitionPaceTokens = descending && this.configuredTransitionPaceTokens === undefined
         ? DEFAULT_TRANSITION_PACE_TOKENS
         : this.configuredTransitionPaceTokens ?? null;
+    } else if (startsDescent && unpaced) {
+      target.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;
     }
     if (keys.has('sameRoundThinkTextPolicy')) {
       target.sameRoundThinkTextPolicy = this.configuredSameRoundThinkTextPolicy ?? DEFAULT_SAME_ROUND_THINK_TEXT_POLICY;

@@ -376,6 +376,66 @@ describe('operator-change gate: self-change tools', () => {
   });
 });
 
+describe('operator-change gate: settings an action changes without naming them', () => {
+  it('stages the default pace a paced descent installs, for an update and a budget reset, and refuses it as stale once a pace is set', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-gate-pace-'));
+    const asked: ResolvedOperatorChange[] = [];
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{
+        name: 'ada', model: 'test', systemPrompt: '.', maxTokens: 10_000, contextBudgetTokens: 100_000,
+        // No kvStableReachTokens: no pace is set until a descent installs one.
+        strategy: new AutobiographicalStrategy({ adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 30_000 }),
+      }],
+      modules: [],
+      operatorChangeGate: async (change) => {
+        asked.push(structuredClone(change));
+        return { id: `rev-${asked.length}`, text: 'staged' };
+      },
+    });
+    const quiet = console.log;
+    console.log = () => {};
+    try {
+      const apply = (change: ResolvedOperatorChange) => framework.runAtSafeBoundary({ verb: 'apply' }, (lease) =>
+        framework.applyResolvedOperatorChange(change, { lease, admission: { id: change.id } }));
+      const settings = () => framework.getAgentRuntimeSettings('ada');
+
+      await framework.puppetToolCall('ada', 'agent_settings', { action: 'update', context_budget_tokens: 60_000 });
+      const decrease = asked[0]!;
+      assert.ok(decrease.kind === 'agent-settings');
+      assert.deepEqual([decrease.from, decrease.target], [
+        { contextBudgetTokens: 100_000, transitionPaceTokens: null },
+        { contextBudgetTokens: 60_000, transitionPaceTokens: 16_000 },
+      ], 'the approval shows the pace the descent installs');
+      framework.updateAgentRuntimeSettings('ada', { transitionPaceTokens: 4_000 }); // a pace set meanwhile
+      await assert.rejects(apply(decrease), (e: Error & { code?: string }) => e.code === 'stale');
+      assert.equal(settings().contextBudgetTokens, 100_000, 'nothing applied');
+
+      // A budget-only reset that starts a descent, with no pace set.
+      framework.updateAgentRuntimeSettings('ada', { contextBudgetTokens: 150_000 });
+      framework.resetAgentRuntimeSettings('ada', ['transitionPaceTokens']);
+      await framework.puppetToolCall('ada', 'agent_settings', { action: 'reset', settings: ['context_budget_tokens'] });
+      const reset = asked[1]!;
+      assert.ok(reset.kind === 'agent-settings');
+      assert.deepEqual([reset.from, reset.target], [
+        { contextBudgetTokens: 150_000, transitionPaceTokens: null },
+        { contextBudgetTokens: 100_000, transitionPaceTokens: 16_000 },
+      ]);
+      await apply(reset);
+      assert.deepEqual(
+        { contextBudgetTokens: settings().contextBudgetTokens, transitionPaceTokens: settings().transitionPaceTokens },
+        reset.target,
+        'applied exactly what was approved',
+      );
+    } finally {
+      console.log = quiet;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('operator-change gate: tool presentation', () => {
   it('stages an operator\'s presentation edit with its from-state, and applies it later under a lease', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'operator-gate-presentation-'));

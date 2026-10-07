@@ -526,3 +526,74 @@ it('preflight: no-op and increasing patches never throw on an already-over-floor
     );
   });
 });
+
+it('previewRuntimeSettingsTarget names every setting an action changes, at the value it is reported at after, the default pace of a paced descent included', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-settings-preview-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane,
+    agents: [{
+      name: 'agent',
+      model: 'test-model',
+      systemPrompt: 'test',
+      // No kvStableReachTokens: no transition pace is set, so a paced
+      // descent installs the default one.
+      strategy: new AutobiographicalStrategy({ adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 30_000 }),
+      contextBudgetTokens: 100_000,
+      maxTokens: 10_000,
+    }],
+    modules: [],
+  });
+  try {
+    const agent = framework.getAgent('agent')!;
+    const keys = ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy'] as const;
+    const reported = () => {
+      const snapshot = framework.getAgentRuntimeSettings('agent') as unknown as Record<string, unknown>;
+      return Object.fromEntries(keys.map((key) => [key, snapshot[key] ?? null])) as Record<string, unknown>;
+    };
+    type Action = Parameters<typeof agent.previewRuntimeSettingsTarget>[0];
+    // The preview must name exactly what the action changes, at the values
+    // getRuntimeSettings reports once it applied.
+    const check = (label: string, action: Action, apply: () => void) => {
+      const before = reported();
+      const target = agent.previewRuntimeSettingsTarget(action) as Record<string, unknown>;
+      apply();
+      const after = reported();
+      for (const key of keys) {
+        if (after[key] !== before[key]) {
+          assert.ok(key in target, `${label}: ${key} changes from ${String(before[key])} to ${String(after[key])}, but the preview omits it`);
+        }
+      }
+      for (const [key, value] of Object.entries(target)) {
+        assert.equal(value, after[key], `${label}: previewed ${key}=${String(value)}, reported ${String(after[key])}`);
+      }
+    };
+
+    assert.equal(reported().transitionPaceTokens, null, 'no pace is set to begin with');
+    check('a paced decrease with no pace set',
+      { action: 'update', patch: { contextBudgetTokens: 60_000 } },
+      () => framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 60_000 }));
+    assert.equal(reported().transitionPaceTokens, 16_000, 'the default pace was installed');
+    check('reset-all', { action: 'reset' }, () => framework.resetAgentRuntimeSettings('agent'));
+    check('an immediate decrease installs no pace',
+      { action: 'update', patch: { contextBudgetTokens: 80_000, immediate: true } },
+      () => framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 80_000, immediate: true }));
+    check('an increase', { action: 'update', patch: { contextBudgetTokens: 150_000 } },
+      () => framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 150_000 }));
+    assert.equal(reported().transitionPaceTokens, null);
+    check('a budget-only reset that starts a descent with no pace set',
+      { action: 'reset', keys: ['contextBudgetTokens'] },
+      () => framework.resetAgentRuntimeSettings('agent', ['contextBudgetTokens']));
+    assert.equal(reported().transitionPaceTokens, 16_000, 'the reset installed the default pace');
+    check('a decrease with an explicit pace',
+      { action: 'update', patch: { contextBudgetTokens: 50_000, transitionPaceTokens: 2_000 } },
+      () => framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 50_000, transitionPaceTokens: 2_000 }));
+    check('a paced decrease with a pace already set leaves it alone',
+      { action: 'update', patch: { contextBudgetTokens: 40_000 } },
+      () => framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 40_000 }));
+    check('cancel', { action: 'cancel' }, () => framework.cancelAgentRuntimeSettingsTransition('agent'));
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
