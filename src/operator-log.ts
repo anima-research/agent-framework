@@ -123,7 +123,11 @@ export function capIds(ids: string[]): { ids: string[]; count: number; truncated
  * the body change itself. A surgery that returns has applied its body change;
  * this says only whether marks were scheduled:
  *
- * - `none` — the change removed no addressable Discord message.
+ * - `none` — no marks were scheduled: the change removed no addressable
+ *   Discord message, or the awareness outbox is disabled (no
+ *   `discordAwarenessOutboxPath` and no `storePath`). It is not proof that
+ *   no addressable Discord message was removed: the surgery's `removedRefs`
+ *   (`discordRefs` in the operator log) say whether any was.
  * - `queued` — the outbox batch is durably active and its delivery has been
  *   handed to the background drain. It is not a delivery claim: per-message
  *   outcomes stay in the outbox ledger.
