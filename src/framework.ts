@@ -1003,6 +1003,15 @@ function truncateReason(reason: string, max = 160): string {
   return reason.length <= max ? reason : reason.slice(0, max) + '…';
 }
 
+/** Where one segment of a turn's plain speech was delivered, as resolved then. */
+interface ProseDelivery {
+  serverId?: string;
+  channelId: string;
+  /** The channel's label when the words were delivered. */
+  label?: string;
+  threadId?: string;
+}
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -1090,7 +1099,7 @@ export class AgentFramework {
    *  words landed (2026-07-31 misroute series; antra: minimal receipts).
    *  Cleared at every fresh turn's start; budget restarts keep it (same
    *  logical turn, receipt covers the whole turn). */
-  private turnProseDeliveries: Map<string, string[]> = new Map();
+  private turnProseDeliveries: Map<string, ProseDelivery[]> = new Map();
   /** Count of plain-prose segments SUPPRESSED this turn by sticky
    *  explicit-send silencing. The suppression rule itself is untouched
    *  (antra, 2026-07-31: visibility is enough) — but it must never be a
@@ -9492,11 +9501,15 @@ export class AgentFramework {
     return undefined;
   }
 
-  /** Record a successful plain-prose delivery for this turn's receipt: its
-   *  channel, and its thread when it went into one (`channel\0thread`). */
+  /**
+   * Record a successful plain-prose delivery for this turn's receipt: the
+   * destination as resolved when it was delivered — its server, channel,
+   * the label it had then, and its thread — so the receipt says exactly
+   * where the words went, whatever is renamed or shares an id later.
+   */
   private recordProseDelivery(
     agentName: string,
-    outcome: { delivered: boolean; channelId: string; threadId?: string | null } | null | undefined,
+    outcome: { delivered: boolean; channelId: string; serverId?: string; label?: string; threadId?: string | null } | null | undefined,
   ): void {
     if (!outcome?.delivered) return;
     let list = this.turnProseDeliveries.get(agentName);
@@ -9504,7 +9517,21 @@ export class AgentFramework {
       list = [];
       this.turnProseDeliveries.set(agentName, list);
     }
-    list.push(outcome.threadId ? `${outcome.channelId}\u0000${outcome.threadId}` : outcome.channelId);
+    const surface = outcome.channelId.startsWith('surface:');
+    const label = surface ? undefined : outcome.label ?? (outcome.serverId
+      ? this.channelRegistry?.resolveDestination({ serverId: outcome.serverId, channelId: outcome.channelId })
+      : this.channelRegistry?.resolveDestination({ channelId: outcome.channelId }));
+    list.push({
+      channelId: outcome.channelId,
+      ...(outcome.serverId ? { serverId: outcome.serverId } : {}),
+      ...(typeof label === 'string' ? { label } : label && 'destination' in label && label.destination.label ? { label: label.destination.label } : {}),
+      ...(outcome.threadId ? { threadId: outcome.threadId } : {}),
+    });
+  }
+
+  /** A delivery's identity for the receipt: server, channel and thread. */
+  private static deliveryKey(d: { serverId?: string; channelId: string; threadId?: string | null }): string {
+    return `${d.serverId ?? ''}\u0000${d.channelId}\u0000${d.threadId ?? ''}`;
   }
 
   /**
@@ -9531,21 +9558,28 @@ export class AgentFramework {
     this.turnProseSuppressed.delete(agent.name);
     const seen = new Set<string>();
     const shown: string[] = [];
-    for (const id of list ?? []) {
-      if (seen.has(id)) continue;
-      seen.add(id);
-      if (id.startsWith('surface:')) {
+    const unique: ProseDelivery[] = [];
+    for (const d of list ?? []) {
+      const key = AgentFramework.deliveryKey(d);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push(d);
+    }
+    // A channel id two servers share is named with its server.
+    const servers = new Map<string, Set<string>>();
+    for (const d of unique) servers.set(d.channelId, (servers.get(d.channelId) ?? new Set()).add(d.serverId ?? ''));
+    for (const d of unique) {
+      if (d.channelId.startsWith('surface:')) {
         // Speech on a surface route was shown there, never published.
-        shown.push(`${id.slice('surface:'.length)} (the local surface that messaged you; not published to any channel)`);
+        shown.push(`${d.channelId.slice('surface:'.length)} (the local surface that messaged you; not published to any channel)`);
         continue;
       }
-      const [channelId, threadId] = id.split('\u0000') as [string, string | undefined];
-      const label = this.channelRegistry?.getDescriptor(channelId)?.label;
-      const where = threadId ? `${channelId}, thread ${threadId}` : channelId;
+      const id = (servers.get(d.channelId)?.size ?? 0) > 1 && d.serverId ? `${d.serverId}/${d.channelId}` : d.channelId;
+      const where = d.threadId ? `${id}, thread ${d.threadId}` : id;
       shown.push(
-        label && label !== channelId
-          ? `${label.startsWith('#') ? label : `#${label}`} (${where})`
-          : threadId ? `${channelId} (thread ${threadId})` : channelId,
+        d.label && d.label !== d.channelId
+          ? `${d.label.startsWith('#') ? d.label : `#${d.label}`} (${where})`
+          : d.threadId || id !== d.channelId ? `${d.channelId} (${where})` : d.channelId,
       );
     }
     const notes: string[] = [];
@@ -9574,7 +9608,7 @@ export class AgentFramework {
       const how = attempt.via === 'resend' ? 'by your resend' : 'by your {{unsent}}';
       // A hybrid `{{unsent}}` envelope is already listed above, as the plain
       // speech it was; a resend is not.
-      if (attempt.via === 'unsent-token' && seen.has(attempt.destination.channelId)) {
+      if (attempt.via === 'unsent-token' && seen.has(AgentFramework.deliveryKey(attempt.destination))) {
         notes.push(`draft ${d.id} delivered ${how}`);
       } else {
         shown.push(`${AgentFramework.destinationText(attempt.destination)} (draft ${d.id}, ${how})`);
@@ -10081,7 +10115,7 @@ export class AgentFramework {
         }
         try {
           const outcome = await this.deliverWithUnsent(agent, body, resolved.channelId, unsent.draft);
-          this.recordProseDelivery(agent.name, outcome.status === 'delivered' ? { delivered: true, channelId: outcome.destination!.channelId } : null);
+          this.recordProseDelivery(agent.name, outcome.status === 'delivered' ? { delivered: true, ...outcome.destination! } : null);
           if (outcome.status === 'delivered') {
             this.proseBounceStreaks.delete(agent.name);
           } else {

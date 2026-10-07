@@ -132,4 +132,31 @@ describe('speech route across a logical turn', () => {
     assert.ok(texts.some((t) => t.startsWith('[routing] Your plain speech now goes to tui (the local surface that messaged you)')));
     await framework.stop();
   });
+
+  it('the [delivered] receipt names each destination as delivered: server, label then, and thread', async () => {
+    const framework = await makeFramework();
+    const scout = framework.getAgent('scout')!;
+    let currentLabel = '#Alpha (renamed later)';
+    (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+      getDescriptor: () => ({ label: currentLabel }),
+      resolveDestination: () => ({ error: 'shared id' }),
+      getChannelTools: () => [],
+    } as Record<string, unknown>, { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
+    const f = framework as unknown as {
+      recordProseDelivery(agent: string, outcome: unknown): void;
+      appendProseDeliveryReceipt(agent: unknown): void;
+    };
+    // The same channel id and thread on two servers, then a repeat of the first.
+    f.recordProseDelivery('scout', { delivered: true, serverId: 'alpha', channelId: 'shared', label: '#Alpha', threadId: 'topic' });
+    f.recordProseDelivery('scout', { delivered: true, serverId: 'beta', channelId: 'shared', label: '#Beta', threadId: 'topic' });
+    f.recordProseDelivery('scout', { delivered: true, serverId: 'alpha', channelId: 'shared', label: '#Alpha', threadId: 'topic' });
+    currentLabel = '#Renamed';
+    f.appendProseDeliveryReceipt(scout);
+    const receipt = scout.getContextManager().getAllMessages()
+      .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
+      .find((t) => t.startsWith('[delivered]'));
+    assert.equal(receipt, '[delivered] plain speech → #Alpha (alpha/shared, thread topic) · #Beta (beta/shared, thread topic)',
+      'two servers stay two destinations, each with the label it had when the words went out');
+    await framework.stop();
+  });
 });

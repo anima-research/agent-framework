@@ -1407,7 +1407,7 @@ export class ChannelRegistry {
         });
 
       case 'channel_publish':
-        return this.handleToolPublish(input as { channelId?: string; serverId?: string; content?: string; text?: string }, origin);
+        return this.handleToolPublish(input as { channelId?: string; serverId?: string; threadId?: string | null; content?: string; text?: string }, origin);
 
       case 'think':
         return this.handleToolThink(input as { content?: string });
@@ -3373,12 +3373,16 @@ export class ChannelRegistry {
     conversationId: string,
     text: string,
     locusChannelId: string | null | { serverId?: string; channelId: string; threadId?: string | null },
-  ): Promise<{ delivered: boolean; channelId: string; threadId?: string; messageId?: string } | null> {
+  ): Promise<{ delivered: boolean; serverId: string; channelId: string; label?: string; threadId?: string; messageId?: string } | null> {
     const outcome = await this.deliverSpeech(conversationId, text, locusChannelId);
     if (outcome.status !== 'delivered') return null;
+    // The destination as resolved at delivery — server, channel, the label it
+    // had then, and the thread — so a receipt names exactly where it went.
     return {
       delivered: true,
+      serverId: outcome.destination!.serverId,
       channelId: outcome.destination!.channelId,
+      ...(outcome.destination!.label ? { label: outcome.destination!.label } : {}),
       ...(outcome.destination!.threadId ? { threadId: outcome.destination!.threadId } : {}),
       ...(outcome.messageId !== undefined ? { messageId: outcome.messageId } : {}),
     };
@@ -3402,18 +3406,33 @@ export class ChannelRegistry {
     // it — else the caller's current speech route, thread included; never
     // the most recent inbound channel (shelf-355), and never a thread
     // borrowed from an earlier route for a channel named explicitly.
-    if (input.threadId !== undefined && input.threadId !== null && (typeof input.threadId !== 'string' || !input.threadId)) {
-      return { success: false, error: 'threadId must be a thread id (or left out for the channel root). Nothing was sent.', isError: true };
+    // Supplied selectors are checked before any default applies: an empty
+    // or non-string one is refused, never read as omission (which would
+    // widen it to "your route" or "whichever server has the id"). null means
+    // the field is not in use.
+    const refuse = (error: string): ToolResult => ({ success: false, error: `${error} Nothing was sent.`, isError: true });
+    const supplied = (v: unknown): boolean => v !== undefined && v !== null;
+    if (supplied(input.channelId) && (typeof input.channelId !== 'string' || !input.channelId)) {
+      return refuse('channelId must name a channel (leave it out to publish to your speech route).');
     }
-    if (input.threadId && !input.channelId) {
-      return { success: false, error: 'threadId needs the channelId it belongs to. Nothing was sent.', isError: true };
+    if (supplied(input.serverId) && (typeof input.serverId !== 'string' || !input.serverId)) {
+      return refuse('serverId must name a server (leave it out to resolve the channel id alone).');
+    }
+    if (supplied(input.threadId) && (typeof input.threadId !== 'string' || !input.threadId)) {
+      return refuse('threadId must be a thread id (or left out for the channel root).');
+    }
+    if (supplied(input.serverId) && !supplied(input.channelId)) {
+      return refuse('serverId needs the channelId it belongs to.');
+    }
+    if (supplied(input.threadId) && !supplied(input.channelId)) {
+      return refuse('threadId needs the channelId it belongs to.');
     }
     let target: { serverId?: string; channelId: string; threadId: string | null };
-    if (input.channelId) {
+    if (supplied(input.channelId)) {
       target = {
-        channelId: input.channelId,
-        ...(input.serverId ? { serverId: input.serverId } : {}),
-        threadId: input.threadId || null,
+        channelId: input.channelId as string,
+        ...(supplied(input.serverId) ? { serverId: input.serverId as string } : {}),
+        threadId: supplied(input.threadId) ? (input.threadId as string) : null,
       };
     } else {
       const route = origin?.kind === 'agent' ? this.speechRouteResolver?.(origin.agentName) : undefined;
