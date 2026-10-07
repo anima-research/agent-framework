@@ -160,8 +160,11 @@ export type ResolvedOperatorChange =
  *  from exactly this, never by rereading a branch later. */
 export interface OperatorChangeEvidence {
   /** The branch the body lands on: a cut's destination, or the hidden
-   *  messages' own branch. */
+   *  messages' own branch. A cut's destination is created by its attempt
+   *  alone (a name that already exists is refused before it begins). */
   target: string;
+  /** The branch the change was resolved on. */
+  source: string;
   /** The source branch's head when the attempt began. */
   sourceHead: number;
   /** A hide's exact messages, with their fingerprints. */
@@ -192,9 +195,16 @@ export interface OperatorChangeRecord {
   kind: ResolvedOperatorChange['kind'];
   agent: string;
   /** Application attempts, in order, each with its evidence. `failed` is set
-   *  (with the error) when the attempt failed and restored its source: such
-   *  an attempt is never read as committed. */
-  attempts: Array<{ n: number; at: number; evidence: OperatorChangeEvidence; failed?: string }>;
+   *  (with the error) when the framework saw the attempt fail. `resolution`
+   *  is an operator's attestation about an attempt whose result was never
+   *  recorded: kept as such, never made to look like a framework record. */
+  attempts: Array<{
+    n: number;
+    at: number;
+    evidence: OperatorChangeEvidence;
+    failed?: string;
+    resolution?: OperatorChangeResolution;
+  }>;
   /** The attempt whose cut switched to its destination: recorded right
    *  after the switch, so it proves the cut whatever is active later. */
   switched?: number;
@@ -203,6 +213,11 @@ export interface OperatorChangeRecord {
   completed?: true;
   /** The host dropped it before it applied; its staged choice was discarded. */
   dropped?: { at: number };
+  /** Read-time only, never journaled: the latest attempt has neither its
+   *  switch nor its failure recorded (and this process didn't see it), so
+   *  whether it applied is unknown, whatever its destination's state. It is
+   *  held until resolveOperatorChange records an operator's verdict. */
+  unresolved?: { n: number; target: string };
 }
 
 /** One step of an unstick operation, as journaled: `intent` before its shed
@@ -305,4 +320,88 @@ function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
   const keys = Object.keys(value as Record<string, unknown>).sort();
   return `{${keys.map((k) => `${JSON.stringify(k)}:${stableJson((value as Record<string, unknown>)[k])}`).join(',')}}`;
+}
+
+
+/** An operator's verdict on one attempt whose result was never recorded:
+ *  `committed` attests that it applied; `not-committed` that it did not,
+ *  abandoning it. Neither authorizes new work: a fresh attempt is the host's
+ *  decision on its next retry. */
+export interface OperatorChangeResolution {
+  verdict: 'committed' | 'not-committed';
+  reason: string;
+  requester?: OperatorRequester;
+  at: number;
+  /** Given through a running framework under its lease, or with the host
+   *  stopped through agent-framework-recover. */
+  via: 'live' | 'offline';
+}
+
+/** An operator/changes journal entry. */
+export type OperatorChangesEntry =
+  | { kind: 'attempt'; changeId: string; changeKind: OperatorChangeRecord['kind']; agent: string; n: number; at: number; evidence: OperatorChangeEvidence }
+  | { kind: 'switched'; changeId: string; n: number }
+  | { kind: 'failed'; changeId: string; n: number; error: string }
+  | { kind: 'resolved'; changeId: string; n: number; resolution: OperatorChangeResolution }
+  | { kind: 'outcome'; changeId: string; outcome: OperatorChangeOutcome }
+  | { kind: 'completed'; changeId: string }
+  | { kind: 'dropped'; changeId: string; changeKind: OperatorChangeRecord['kind']; agent: string; at: number };
+export type OperatorChangesSnapshot = Record<string, OperatorChangeRecord>;
+export const OPERATOR_CHANGES_JOURNAL = 'operator/changes';
+
+/** Fold one operator/changes entry in. An outcome, and an attempt's
+ *  resolution, are immutable: the first recorded stands. */
+export function reduceOperatorChangesEntry(records: Map<string, OperatorChangeRecord>, entry: OperatorChangesEntry): void {
+  if (entry.kind === 'attempt' || entry.kind === 'dropped') {
+    const record = records.get(entry.changeId)
+      ?? { changeId: entry.changeId, kind: entry.changeKind, agent: entry.agent, attempts: [] };
+    if (entry.kind === 'attempt') {
+      if (!record.attempts.some((a) => a.n === entry.n)) record.attempts.push({ n: entry.n, at: entry.at, evidence: entry.evidence });
+    } else {
+      record.dropped ??= { at: entry.at };
+    }
+    records.set(entry.changeId, record);
+    return;
+  }
+  const record = records.get(entry.changeId);
+  if (!record) return;
+  if (entry.kind === 'switched') record.switched = entry.n;
+  else if (entry.kind === 'failed' || entry.kind === 'resolved') {
+    const attempt = record.attempts.find((a) => a.n === entry.n);
+    if (attempt && entry.kind === 'failed') attempt.failed ??= entry.error;
+    if (attempt && entry.kind === 'resolved') attempt.resolution ??= entry.resolution;
+  } else if (entry.kind === 'outcome') record.outcome ??= entry.outcome;
+  else record.completed = true;
+}
+
+/**
+ * What decides a cut attempt: a framework record (its switch, its failure),
+ * an operator's resolution, or what the running process itself saw (`seen`).
+ * Nothing else, so missing evidence is never read as success: an attempt
+ * with none of these is `unresolved`, whatever its destination's state.
+ */
+export function cutAttemptDisposition(
+  record: OperatorChangeRecord,
+  attempt: OperatorChangeRecord['attempts'][number],
+  seen?: 'committed' | 'failed',
+): 'committed' | 'not-committed' | 'unresolved' {
+  if (record.switched === attempt.n || attempt.resolution?.verdict === 'committed' || seen === 'committed') return 'committed';
+  if (attempt.failed !== undefined || attempt.resolution?.verdict === 'not-committed' || seen === 'failed') return 'not-committed';
+  return 'unresolved';
+}
+
+/** What resolveOperatorChange (or agent-framework-recover --operator-change
+ *  resolve) did, step by step, and what remains. */
+export interface OperatorChangeResolutionReceipt {
+  changeId: string;
+  attempt: number;
+  /** The attestation as recorded. */
+  recorded: OperatorChangeResolution;
+  /** The source restored, when a not-committed attempt's destination was the
+   *  active body. */
+  restored?: string;
+  /** When the change settles from here. */
+  settlement: string;
+  /** Anything this didn't repair. */
+  remaining?: string;
 }

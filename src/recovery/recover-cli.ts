@@ -14,6 +14,17 @@ import {
   type OperatorLogInput,
   type OperatorRequester,
 } from '../operator-log.js';
+import { RecordJournal } from '../record-journal.js';
+import {
+  cutAttemptDisposition,
+  OPERATOR_CHANGES_JOURNAL,
+  reduceOperatorChangesEntry,
+  type OperatorChangeRecord,
+  type OperatorChangeResolution,
+  type OperatorChangeResolutionReceipt,
+  type OperatorChangesEntry,
+  type OperatorChangesSnapshot,
+} from '../operator-change.js';
 
 interface CliOptions {
   storePath?: string;
@@ -30,6 +41,11 @@ interface CliOptions {
   emoji?: string;
   marks: 'none' | 'addressed' | 'all';
   awareness?: { verb: 'list' | 'cancel' | 'retract' | 'release'; target?: string };
+  operatorChange?: { verb: 'list' } | { verb: 'resolve'; changeId: string };
+  attempt?: number;
+  verdict?: 'committed' | 'not-committed';
+  reason?: string;
+  requester?: string;
   dryRun: boolean;
 }
 
@@ -38,6 +54,9 @@ function usage(): string {
   agent-framework-recover --store <path> --agent <name> <anchor> [options]
   agent-framework-recover --store <path> --awareness <list|cancel ID|retract ID|all|release ID>
                               (cancel takes a batch id or a retract request id)
+  agent-framework-recover --store <path> --operator-change list
+  agent-framework-recover --store <path> --operator-change resolve <changeId> --attempt <n>
+                              --verdict <committed|not-committed> --reason <text> [--requester <name>]
 
 Creates and activates a Chronicle recovery branch while the normal host is
 down. The recovery is local to the resident: by default no Discord reaction is
@@ -75,6 +94,21 @@ Awareness journal (host stopped):
                               or on every ref an add was ever sent for
   --awareness release <ID>    Queue a held batch's recorded operations
   Each acts at once: inspect first with --awareness list.
+
+Gated operator changes (host stopped):
+  --operator-change list      Each held change: an attempt whose switch and
+                              failure were never recorded, with its evidence
+  --operator-change resolve <changeId>
+                              Record your verdict on its unresolved attempt
+                              (--attempt, --verdict, --reason required), as
+                              your attestation, distinct from what the
+                              framework observed. not-committed abandons the
+                              attempt; if its destination is the active
+                              branch, the next start restores the source
+                              before any agent initializes. A fresh attempt
+                              is the host's decision. committed attests that it applied:
+                              the next start establishes its outcome and
+                              activates its staged marks before any traffic.
 
 Queued work is delivered when the host next connects to the Discord server.
 Each recovery, and each cancel, retract or release, is recorded in
@@ -140,6 +174,22 @@ function parseArgs(args: string[]): CliOptions {
         }
         break;
       }
+      case '--operator-change': {
+        const verb = value();
+        if (verb === 'list') options.operatorChange = { verb };
+        else if (verb === 'resolve') options.operatorChange = { verb, changeId: value() };
+        else throw new Error('--operator-change must be list or resolve <changeId>');
+        break;
+      }
+      case '--attempt': options.attempt = Number(value()); break;
+      case '--verdict': {
+        const verdict = value();
+        if (verdict !== 'committed' && verdict !== 'not-committed') throw new Error('--verdict must be committed or not-committed');
+        options.verdict = verdict;
+        break;
+      }
+      case '--reason': options.reason = value(); break;
+      case '--requester': options.requester = value(); break;
       case '--dry-run': options.dryRun = true; break;
       case '--help':
       case '-h':
@@ -210,8 +260,91 @@ function awareness(options: CliOptions): void {
   }
 }
 
+/**
+ * The operator/changes journal with the host stopped: list the held changes,
+ * or record an operator's verdict on one. This process is the store's only
+ * writer, which stands in for the running framework's lease.
+ */
+function operatorChange(options: CliOptions): void {
+  const store = JsStore.openOrCreate({ path: options.storePath! });
+  try {
+    const journal = new RecordJournal<OperatorChangesEntry, OperatorChangesSnapshot>(store, { type: OPERATOR_CHANGES_JOURNAL });
+    const { snapshot, entries } = journal.load();
+    const records = new Map<string, OperatorChangeRecord>(
+      Object.entries(snapshot ?? {}).map(([id, record]) => [id, structuredClone(record)]),
+    );
+    for (const { entry } of entries) reduceOperatorChangesEntry(records, entry);
+    const active = store.currentBranch().name;
+    const held = (record: OperatorChangeRecord) => {
+      if (record.outcome || record.dropped || (record.kind !== 'undo-turns' && record.kind !== 'undo-messages')) return null;
+      const last = record.attempts[record.attempts.length - 1];
+      return last && cutAttemptDisposition(record, last) === 'unresolved' ? last : null;
+    };
+    const command = options.operatorChange!;
+    if (command.verb === 'list') {
+      const unresolved = [...records.values()].flatMap((record) => {
+        const attempt = held(record);
+        if (!attempt) return [];
+        const { target, source, removed, marks } = attempt.evidence;
+        return [{
+          changeId: record.changeId,
+          kind: record.kind,
+          agent: record.agent,
+          attempt: attempt.n,
+          source,
+          target,
+          targetIsActive: active === target,
+          targetExists: store.listBranches().some((b) => b.name === target),
+          removed,
+          marks: { scope: marks.scope, refs: marks.refs.length, unmarked: marks.unmarked, notRemoved: marks.notRemoved },
+        }];
+      });
+      console.log(JSON.stringify({ store: options.storePath, activeBranch: active, unresolved }, null, 2));
+      return;
+    }
+    const record = records.get(command.changeId);
+    const attempt = record ? held(record) : null;
+    if (!record || !attempt) throw new Error(`Operator change ${command.changeId} has no unresolved attempt to settle`);
+    if (options.attempt !== attempt.n) throw new Error(`--attempt ${options.attempt} is not its unresolved attempt (${attempt.n} is)`);
+    if (!options.verdict) throw new Error('--verdict committed|not-committed is required');
+    if (!options.reason?.trim()) throw new Error('--reason is required');
+    const resolution: OperatorChangeResolution = {
+      verdict: options.verdict,
+      reason: options.reason,
+      requester: { via: 'agent-framework-recover', ...(options.requester ? { name: options.requester } : {}) },
+      at: Date.now(),
+      via: 'offline',
+    };
+    journal.append({ kind: 'resolved', changeId: record.changeId, n: attempt.n, resolution }, { durable: true });
+    // Nothing in the store's body is touched here: a not-committed attempt
+    // whose destination is the active branch gets its source back at the
+    // next start, before any agent initializes on it.
+    const restoresAtStart = options.verdict === 'not-committed' && active === attempt.evidence.target;
+    const remaining = options.verdict === 'not-committed' && !restoresAtStart && active !== attempt.evidence.source
+      ? `the active branch is ${active}, neither the source ${attempt.evidence.source} nor the attempt's destination`
+      : undefined;
+    const receipt: OperatorChangeResolutionReceipt = {
+      changeId: record.changeId,
+      attempt: attempt.n,
+      recorded: resolution,
+      settlement: options.verdict === 'committed'
+        ? 'at the next start: startup establishes its outcome and activates its staged marks before any traffic'
+        : `abandoned${restoresAtStart ? `; the next start restores ${attempt.evidence.source} before any agent initializes` : ''}; a fresh attempt is the host's decision on its next retry`,
+      ...(remaining ? { remaining } : {}),
+    };
+    console.log(JSON.stringify(receipt, null, 2));
+  } finally {
+    store.close();
+  }
+}
+
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
+  if (options.operatorChange) {
+    if (!options.storePath) throw new Error(`--operator-change needs --store\n\n${usage()}`);
+    operatorChange(options);
+    return;
+  }
   if (options.awareness) {
     if (!options.storePath) {
       throw new Error(`--awareness needs --store\n\n${usage()}`);

@@ -4,7 +4,7 @@ export * from './types/index.js';
 // Core classes
 export { AgentFramework, BudgetPreflightError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus, SafeBoundaryLease, SafeBoundaryOptions } from './framework.js';
-export { OperatorJournalUnreadableError } from './framework.js';
+export { OperatorJournalUnreadableError, OperatorChangeRecoveryError } from './framework.js';
 export type {
   OperatorChangeReceipt,
   ResolvedOperatorChange,

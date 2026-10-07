@@ -532,18 +532,28 @@ describe('operator-change gate: host/command undo by turns', () => {
     assert.ok(framework.getOperatorLog().some((e) => e.kind === 'undo-turns' && (e.params as { admission?: string }).admission === 'rev-u'));
   });
 
-  it('finishes a cut an earlier attempt created but never switched to', async () => {
+  it('starts a fresh attempt on a branch of its own after one that created its destination but never switched', async () => {
     await turn('one'); await turn('two');
     await undo(1);
     const change = asked[0]!;
-    // As if a crash came between creating the destination and switching to it.
-    const store = framework.getStore();
-    const oldest = change.kind === 'undo-turns' ? change.checkpoints.at(-1)! : null;
-    store.createBranchAt(`undo/scout/op-${change.id}`, change.sourceBranch, oldest!.sequenceBefore);
-    const applied = await framework.runAtSafeBoundary({ verb: 'retry' }, (lease) =>
-      framework.applyResolvedOperatorChange(change, { lease, admission: { id: 'rev-u' } }));
+    // As if the process died between creating the destination and switching
+    // to it: the switch fails, and so does recording the failure.
+    const store = framework.getStore() as unknown as { switchBranch: (name: string) => unknown };
+    const realSwitch = store.switchBranch.bind(store);
+    store.switchBranch = () => { throw new Error('the process died before switching'); };
+    const restore = failJournalOnce('failed');
+    try {
+      await assert.rejects(applyIt(change), /died before switching/);
+    } finally {
+      store.switchBranch = realSwitch;
+      restore();
+    }
+    const record = framework.getOperatorChangeRecord(change.id)!;
+    assert.deepEqual([record.attempts.length, record.attempts[0]!.failed, record.switched], [1, undefined, undefined], 'an attempt with no disposition');
+    assert.ok(framework.getStore().listBranches().some((x) => x.name === `undo/scout/op-${change.id}`), 'its branch was created');
+    const applied = await applyIt(change);
     assert.equal(applied.kind === 'undo-turns' && applied.alreadyApplied, undefined, 'applied now');
-    assert.equal(branch(), `undo/scout/op-${change.id}`);
+    assert.equal(branch(), `undo/scout/op-${change.id}~2`, 'on its own branch, the unused one left alone');
     assert.deepEqual(texts(), ['one', 'reply to one', 'two']);
   });
 
@@ -632,7 +642,9 @@ describe('operator-change gate: host/command undo by turns', () => {
       if (later) await turn('after the failure');
       const retried = await applyIt(change);
       assert.equal(retried.kind === 'undo-turns' && retried.alreadyApplied === true, committed, 'a committed cut is recovered, never cut again');
-      assert.equal(branch(), destination);
+      // A fresh attempt cuts onto a branch of its own; one that never got as
+      // far as creating its branch reuses the first name.
+      assert.equal(branch(), seam === 'cut' ? `${destination}~2` : destination);
       assert.equal(framework.getOperatorLog().filter((e) => e.kind === 'undo-turns').length, 1, 'logged once');
       const record = framework.getOperatorChangeRecord(change.id)!;
       assert.equal(record.attempts.length, seam === 'cut' ? 2 : 1, seam === 'cut' ? 'the unapplied attempt, then a fresh one' : 'one attempt');
@@ -1022,6 +1034,224 @@ describe('operator-change gate: host/command undo by turns', () => {
       assert.deepEqual([record.attempts.length, record.outcome!.n], [2, 2]);
     });
   }
+
+  it('hides a one-shard body group as a range, and a shard of a larger group as its whole group', async () => {
+    type ShardStore = { messageStore: { append: (p: string, c: unknown[], m?: unknown, cb?: unknown, extra?: unknown) => { id: string } } };
+    const shards = (group: string, texts: string[], messageId: string) => texts.map((text, shardIndex) =>
+      (framework.getAgent('scout')!.getContextManager() as unknown as ShardStore).messageStore
+        .append('Member', [{ type: 'text', text }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId }, undefined, { bodyGroupId: group, shardIndex }).id);
+    await say('before');
+    shards('g1', ['lone'], 'lone');
+    shards('g3', ['big 0', 'big 1', 'big 2'], 'big');
+    for (const [fromMessageId, expected] of [['lone', 1], ['big', 3]] as const) {
+      await host().handleHostCommand('discord', { command: 'hide', agentName: 'scout', fromMessageId, toMessageId: fromMessageId, marks: 'none', requesterName: 'nissa' });
+      const change = asked.at(-1)!;
+      assert.equal(change.kind === 'hide' && change.messages.length, expected, 'the frozen plan names the whole group');
+      const applied = await applyIt(change);
+      assert.equal(applied.kind === 'hide' && applied.hidden, expected);
+    }
+    assert.deepEqual(texts().filter((t) => /lone|big/.test(t)), []);
+  });
+
+  it("refuses a branch already bearing its destination's name, made by no attempt of the change", async () => {
+    await turn('one'); await turn('two');
+    await undo(1);
+    const change = asked[0]!;
+    framework.getStore().createBranch(`undo/scout/op-${change.id}`); // someone else's branch, at the current tip
+    const before = texts();
+    await assert.rejects(applyIt(change), (e: Error & { code?: string }) => e.code === 'invalid' && /already exists, and no attempt/.test(e.message));
+    assert.deepEqual(texts(), before, 'nothing cut');
+    assert.equal(branch(), change.sourceBranch);
+    assert.equal(framework.getOperatorChangeRecord(change.id), null, 'nothing recorded either');
+  });
+
+  const reopen = async () => {
+    await framework.stop();
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', maxTokens: 1000 }],
+      modules: [],
+      operatorChangeGate: async (c) => { asked.push(structuredClone(c)); return decide(c); },
+    });
+  };
+  const quiesced = () => (framework as unknown as { quiesced: boolean }).quiesced;
+  const failCutAfterInitializerWrite = () => {
+    const cmx = framework.getAgent('scout')!.getContextManager() as unknown as { switchBranch: (name: string) => Promise<unknown> };
+    const real = cmx.switchBranch.bind(cmx);
+    let armed = true;
+    cmx.switchBranch = async (name) => {
+      if (!armed) return real(name);
+      armed = false;
+      framework.getStore().switchBranch(name);
+      framework.getStore().setStateJson('probe/initializer', { wrote: true });
+      throw new Error('injected strategy initialization failure');
+    };
+    return () => { cmx.switchBranch = real; };
+  };
+  const resolve = (changeId: string, attempt: number, verdict: 'committed' | 'not-committed', reason: string) =>
+    framework.runAtSafeBoundary({ verb: 'resolve' }, (lease) =>
+      framework.resolveOperatorChange(changeId, attempt, verdict, { lease, reason, requester: { via: 'test', name: 'nissa' } }));
+
+  it('holds an attempt whose failure record was lost once the process restarts, and settles it as not committed', async () => {
+    await say('m0'); await say('m1');
+    await host().handleHostCommand('discord', { command: 'undo', agentName: 'scout', messages: 2, marks: 'all', requesterName: 'nissa' });
+    const change = asked[0]!;
+    const undoCut = failCutAfterInitializerWrite();
+    const undoRecord = failJournalOnce('failed');
+    try {
+      await assert.rejects(applyIt(change), /injected strategy initialization failure/);
+    } finally {
+      undoCut(); undoRecord();
+    }
+    await reopen(); // what this process saw is gone
+    assert.equal(branch(), change.sourceBranch);
+    assert.equal(quiesced(), false, 'the original body is active, so traffic is safe');
+    assert.deepEqual(framework.getOperatorChangeRecord(change.id)!.unresolved, { n: 1, target: `undo-msgs/scout/op-${change.id}` });
+    await assert.rejects(applyIt(change), (e: Error & { code?: string }) => e.code === 'unresolved', 'never certified, never cut again');
+    await assert.rejects(resolve(change.id, 2, 'not-committed', 'wrong attempt'), (e: Error & { code?: string }) => e.code === 'stale');
+    const settled = await resolve(change.id, 1, 'not-committed', 'its initializer failed; nothing applied');
+    assert.deepEqual([settled.recorded.verdict, settled.recorded.via, settled.restored], ['not-committed', 'live', undefined]);
+    assert.match(settled.settlement, /abandoned/);
+    const applied = await applyIt(change);
+    assert.equal(applied.kind === 'undo-messages' && applied.toBranch, `undo-msgs/scout/op-${change.id}~2`, 'a fresh attempt, on its own branch');
+    assert.deepEqual(texts(), ['m0', 'reply to m0']);
+    assert.equal(framework.getOperatorChangeRecord(change.id)!.attempts[0]!.resolution!.reason, 'its initializer failed; nothing applied');
+  });
+
+  it('boots quiesced while an unresolved attempt left its destination active, and settles it as committed without publishing by itself', async () => {
+    await say('a0'); await say('a1'); await say('a2');
+    await undoWithMarks(2, 'all');
+    const change = asked[0]!;
+    const undoRecord = failJournalOnce('switched');
+    try {
+      await assert.rejects(applyIt(change), /injected switched failure/);
+    } finally {
+      undoRecord();
+    }
+    await reopen();
+    assert.equal(branch(), `undo/scout/op-${change.id}`);
+    assert.equal(quiesced(), true, 'no turn starts on a body nobody can vouch for');
+    await assert.rejects(applyIt(change), (e: Error & { code?: string }) => e.code === 'unresolved');
+    const staged = () => outbox().batches().find((x) => x.id === `op-${change.id}`)?.status;
+    assert.equal(staged(), 'staged', 'its marks wait');
+    const settled = await resolve(change.id, 1, 'committed', 'the switch completed; its record was lost');
+    assert.match(settled.settlement, /next retry or the next start/);
+    assert.equal(staged(), 'staged', 'the attestation publishes nothing');
+    const applied = await applyIt(change);
+    assert.equal(applied.kind === 'undo-turns' && applied.alreadyApplied, true);
+    assert.deepEqual(receipt(applied), { status: 'queued', queued: 1, unmarked: 0, notRemoved: 0 });
+    const record = framework.getOperatorChangeRecord(change.id)!;
+    assert.deepEqual([record.switched, record.attempts[0]!.resolution!.verdict], [undefined, 'committed'], 'an attestation, not a framework-observed switch');
+  });
+
+  it("restores a recorded failure's source at startup, before any traffic, when the process died before restoring it", async () => {
+    await say('m0'); await say('m1');
+    await host().handleHostCommand('discord', { command: 'undo', agentName: 'scout', messages: 2, marks: 'none', requesterName: 'nissa' });
+    const change = asked[0]!;
+    const undoCut = failCutAfterInitializerWrite();
+    const fw = framework as unknown as { restoreSourceBranch: (...args: unknown[]) => Promise<string> };
+    const realRestore = fw.restoreSourceBranch.bind(fw);
+    fw.restoreSourceBranch = async () => { throw new Error('the process died before restoring'); };
+    try {
+      await assert.rejects(applyIt(change), /died before restoring/);
+    } finally {
+      undoCut(); fw.restoreSourceBranch = realRestore;
+    }
+    assert.equal(branch(), `undo-msgs/scout/op-${change.id}`, 'left on the failed destination');
+    await reopen();
+    assert.equal(branch(), change.sourceBranch, 'restored before traffic');
+    assert.equal(quiesced(), false);
+    const applied = await applyIt(change); // the host's retry
+    assert.equal(applied.kind === 'undo-messages' && applied.toBranch, `undo-msgs/scout/op-${change.id}~2`);
+  });
+
+  it('settles a held attempt offline when the destination cannot even start, then starts normally', async () => {
+    await turn('one'); await turn('two'); await turn('three');
+    await undo(2);
+    const change = asked[0]!;
+    const undoRecord = failJournalOnce('switched');
+    try {
+      await assert.rejects(applyIt(change), /injected switched failure/);
+    } finally {
+      undoRecord();
+    }
+    await framework.stop();
+    const storePath = join(tempDir, 'test.chronicle');
+    const index = fileURLToPath(new URL('../src/index.js', import.meta.url));
+    const mockPath = fileURLToPath(new URL('./helpers/mock-membrane.js', import.meta.url));
+    const cli = fileURLToPath(new URL('../src/recovery/recover-cli.js', import.meta.url));
+    const script = join(tempDir, 'start.mjs');
+    // A context strategy that can't initialize on the cut body (it needs a
+    // message only the source has): the agent itself fails to start there.
+    writeFileSync(script, `
+      import { AgentFramework, AutobiographicalStrategy } from ${JSON.stringify(index)};
+      import { MockMembrane } from ${JSON.stringify(mockPath)};
+      console.log = () => {}; console.error = () => {};
+      class Picky extends AutobiographicalStrategy {
+        async initialize(ctx) {
+          if (!ctx.messageStore.getAll().some((m) => m.content?.[0]?.text === 'three')) throw new Error('cannot initialize on this body');
+          return super.initialize?.(ctx);
+        }
+      }
+      try {
+        const fw = await AgentFramework.create({ storePath: ${JSON.stringify(storePath)}, membrane: new MockMembrane().asMembrane(),
+          agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'x', maxTokens: 1000, strategy: new Picky() }], modules: [],
+          operatorChangeGate: async () => ({ id: 'rev', text: 'staged' }) });
+        process.stdout.write(JSON.stringify({ started: true, branch: fw.getStore().currentBranch().name, quiesced: fw.quiesced }));
+        await fw.stop();
+      } catch (error) {
+        process.stdout.write(JSON.stringify({ started: false, error: error.message }));
+      }
+    `);
+    const start = () => JSON.parse(spawnSync(process.execPath, [script], { encoding: 'utf8' }).stdout) as { started: boolean; branch?: string; quiesced?: boolean; error?: string };
+    const recover = (...args: string[]) => {
+      const run = spawnSync(process.execPath, [cli, '--store', storePath, '--operator-change', ...args], { encoding: 'utf8' });
+      assert.equal(run.status, 0, run.stderr);
+      return JSON.parse(run.stdout);
+    };
+    const failed = start();
+    assert.equal(failed.started, false, 'normal startup cannot finish');
+    assert.match(String(failed.error), /cannot initialize on this body/);
+    const listed = recover('list');
+    assert.deepEqual(listed.unresolved.map((u: { changeId: string; attempt: number; targetIsActive: boolean }) => [u.changeId, u.attempt, u.targetIsActive]),
+      [[change.id, 1, true]], 'inspected without starting the host');
+    const settled = recover('resolve', change.id, '--attempt', '1', '--verdict', 'not-committed', '--reason', 'the cut body cannot start', '--requester', 'nissa');
+    assert.deepEqual([settled.recorded.via, settled.recorded.verdict, settled.restored], ['offline', 'not-committed', undefined]);
+    assert.match(settled.settlement, new RegExp(`abandoned; the next start restores ${change.sourceBranch} before any agent initializes`));
+    assert.deepEqual(start(), { started: true, branch: change.sourceBranch, quiesced: false }, 'normal readiness: restored before the agent initialized');
+    await reopen().catch(() => {}); // the framework in this process was stopped above
+  });
+
+  it('establishes an offline committed verdict at the next start, as its receipt says', async () => {
+    await say('a0'); await say('a1'); await say('a2');
+    await undoWithMarks(2, 'all');
+    const change = asked[0]!;
+    const undoRecord = failJournalOnce('switched');
+    try {
+      await assert.rejects(applyIt(change), /injected switched failure/);
+    } finally {
+      undoRecord();
+    }
+    await framework.stop();
+    const cli = fileURLToPath(new URL('../src/recovery/recover-cli.js', import.meta.url));
+    const run = spawnSync(process.execPath, [cli, '--store', join(tempDir, 'test.chronicle'), '--operator-change', 'resolve', change.id,
+      '--attempt', '1', '--verdict', 'committed', '--reason', 'the switch completed'], { encoding: 'utf8' });
+    assert.equal(run.status, 0, run.stderr);
+    const settled = JSON.parse(run.stdout);
+    assert.match(settled.settlement, /next start: startup establishes its outcome and activates its staged marks before any traffic/);
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', maxTokens: 1000 }],
+      modules: [],
+      operatorChangeGate: async (c) => { asked.push(structuredClone(c)); return decide(c); },
+    });
+    const record = framework.getOperatorChangeRecord(change.id)!;
+    assert.deepEqual([record.outcome?.markers.status, record.outcome?.markers.queued], ['queued', 1], 'established at startup');
+    assert.equal(outbox().batches().find((x) => x.id === `op-${change.id}`)?.status, 'active');
+    assert.equal(quiesced(), false);
+  });
 
   it('refuses an undo by messages whose tail changed since staging', async () => {
     await say('m0'); await say('m1');
