@@ -318,7 +318,28 @@ function convertBlock(block: McplContentBlock): ContentBlock {
 const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'channel_list',
-    description: 'List all available channels',
+    description:
+      'List all available channels. Each channel carries receipt clocks, which are ' +
+      'diagnostics about delivery, not a record of attention or a claim that you chose ' +
+      'to ignore anyone. lastReceivedAt: when this host last accepted an item from the ' +
+      'channel (any item, including notices and deferred work), with that item\'s source ' +
+      'message id and source timestamp, so a delayed message is distinguishable from a ' +
+      'fresh one. lastDeliveredAt: when a provider round that stood (not a refusal) last ' +
+      'carried a new raw body from the channel to you, complete: every part present, ' +
+      'nothing truncated, no image or block removed on the way. Summaries that mention a ' +
+      'message do not count, and showing an already-delivered version again never moves ' +
+      'the clock. lastPartialAt: a body that reached you only partially and has not ' +
+      'arrived whole since. Null means no observation since receiptClocks.trackingSince, ' +
+      'not silence before it. The clocks cover one store and one resident ' +
+      '(receiptClocks.storeId, agent): a session switch starts a separate history. ' +
+      'Versions are identified by the producer event id where its lane guarantees one, ' +
+      'otherwise by platform message id plus body digest (a revision restoring earlier ' +
+      'bytes counts as that earlier version), otherwise by the stored copy (a replay is ' +
+      'then not recognizable); each delivery names its basis. Versions accepted before ' +
+      'receiptClocks.dedupHorizon are no longer remembered and never count as new. ' +
+      'receiptClocks.gaps lists intervals in which observations may be missing. A ' +
+      'missing inbound item is not evidence of upstream inactivity: a connector or ' +
+      'allowlist can keep it from reaching the host at all.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
   {
@@ -466,6 +487,16 @@ interface ChannelRegistryOptions {
    * acceptance here; coalesced work is stamped and observed by its own path.
    */
   acceptInbound?: (event: McplChannelIncomingEvent) => InboundSource | undefined;
+  /**
+   * Receipt clocks for channel_list (shelf-354): per listed channel, when the
+   * host last received from it and when a body from it last reached the
+   * calling resident, plus the scope those clocks cover. Keyed by
+   * `serverId\u0000channelId`.
+   */
+  describeChannelClocks?: (
+    agentName: string | undefined,
+    channels: Array<{ serverId: string; channelId: string }>,
+  ) => { scope: unknown; clocks: Map<string, unknown> };
   /**
    * RFC-006: an admitted `channels/incoming` message carrying `coalesce`, with
    * the event the ordinary path would have queued. The handler decides
@@ -670,6 +701,7 @@ export class ChannelRegistry {
   private migratedLegacyPolicies = new Set<string>();
   private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
   private acceptInbound?: ChannelRegistryOptions['acceptInbound'];
+  private describeChannelClocks?: ChannelRegistryOptions['describeChannelClocks'];
 
   constructor(
     serverRegistry: McplServerRegistry,
@@ -687,6 +719,7 @@ export class ChannelRegistry {
   ) {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
     this.acceptInbound = options?.acceptInbound;
+    this.describeChannelClocks = options?.describeChannelClocks;
     this.serverRegistry = serverRegistry;
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -1308,7 +1341,7 @@ export class ChannelRegistry {
   ): Promise<ToolResult> {
     switch (toolName) {
       case 'channel_list':
-        return this.handleToolList();
+        return this.handleToolList(origin);
 
       case 'channel_open':
         return this.handleToolOpen(input as {
@@ -2268,7 +2301,7 @@ export class ChannelRegistry {
   // Private: Tool Handlers
   // ==========================================================================
 
-  private handleToolList(): ToolResult {
+  private handleToolList(origin?: ChannelToolOrigin): ToolResult {
     const allChannels: Array<{
       id: string;
       type: string;
@@ -2277,6 +2310,7 @@ export class ChannelRegistry {
       open: boolean;
       desired: DesiredChannelState | 'unknown';
       serverId: string;
+      clocks?: unknown;
     }> = [];
 
     for (const entry of this.channels.values()) {
@@ -2291,10 +2325,18 @@ export class ChannelRegistry {
       });
     }
 
-    return {
-      success: true,
-      data: allChannels,
-    };
+    if (!this.describeChannelClocks) {
+      return { success: true, data: allChannels };
+    }
+    const agentName = origin?.kind === 'agent' ? origin.agentName : undefined;
+    const { scope, clocks } = this.describeChannelClocks(
+      agentName,
+      allChannels.map((c) => ({ serverId: c.serverId, channelId: c.id })),
+    );
+    for (const channel of allChannels) {
+      channel.clocks = clocks.get(`${channel.serverId}\u0000${channel.id}`);
+    }
+    return { success: true, data: { channels: allChannels, receiptClocks: scope } };
   }
 
   /**

@@ -12,14 +12,18 @@ import {
 export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
+  /** The channel bodies this request carries, frozen at preparation (receipt clocks). */
+  evidence?: RequestEvidence;
   takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined;
   drainKvSubmissionIds?: () => string[];
 }
+import { requestEvidence, type RequestEvidence } from './context-receipts/evidence.js';
 import type {
   ContextManager,
   TokenBudget,
   ContextInjection,
   CompileResult,
+  StoredMessage,
   HotContextSettingsStatus,
   HotContextSettingsUpdate,
 } from '@animalabs/context-manager';
@@ -786,6 +790,20 @@ export class Agent {
     budget?: TokenBudget,
     compressionTools: ToolDefinition[] = availableTools
   ): Promise<NormalizedRequest> {
+    return (await this.prepareActivationRequest(availableTools, injections, budget, compressionTools)).request;
+  }
+
+  /**
+   * `buildActivationRequest` together with the request-owned evidence of
+   * which channel bodies it carries (context-receipts/evidence.ts), captured
+   * now so later edits are never attributed to what was sent.
+   */
+  async prepareActivationRequest(
+    availableTools: ToolDefinition[],
+    injections?: ContextInjection[],
+    budget?: TokenBudget,
+    compressionTools: ToolDefinition[] = availableTools
+  ): Promise<{ request: NormalizedRequest; evidence: RequestEvidence }> {
     // Compression may revisit hidden tools in recorded history. Keep its full
     // definition set separate from the resident's advertised tools: the
     // autobiographical strategy must declare the same tools on its
@@ -811,11 +829,13 @@ export class Agent {
           system: this.buildSystemPrompt(prospectiveSystemInjections),
         })
       : undefined;
-    let { messages, systemInjections } = await this.compileWithInjections(
+    const compiled = await this.compileWithInjections(
       budget,
       injections,
       immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : undefined,
     );
+    let { messages } = compiled;
+    const { systemInjections } = compiled;
 
     // Sanitize: strip empty/whitespace text blocks and drop messages left with
     // no content. The Anthropic API rejects empty text blocks with 400
@@ -828,16 +848,24 @@ export class Agent {
     // 2026-07-10 on a resident agent: one empty block muted the agent's live
     // path entirely; twin of context-manager's stripEmptyTextBlocks on the
     // compression path.)
-    messages = messages
-      .map((m) => ({
-        ...m,
-        content: m.content.filter(
-          // typeof guard is deliberate runtime defense: history loaded from
-          // disk can carry a non-string `text` despite what the types claim.
-          (b: ContentBlock) => !(b.type === "text" && (typeof b.text !== "string" || b.text.trim() === "")),
-        ),
-      }))
-      .filter((m) => m.content.length > 0);
+    // Each compiled message's position in the request (-1 when dropped), so
+    // receipt evidence names request indices.
+    const requestIndexOf: number[] = [];
+    const sanitized: NormalizedMessage[] = [];
+    for (const m of messages) {
+      const content = m.content.filter(
+        // typeof guard is deliberate runtime defense: history loaded from
+        // disk can carry a non-string `text` despite what the types claim.
+        (b: ContentBlock) => !(b.type === "text" && (typeof b.text !== "string" || b.text.trim() === "")),
+      );
+      if (content.length === 0) {
+        requestIndexOf.push(-1);
+        continue;
+      }
+      requestIndexOf.push(sanitized.length);
+      sanitized.push({ ...m, content });
+    }
+    messages = sanitized;
 
     // Safety: ensure messages don't end with an assistant message.
     // Some models reject trailing assistant messages ("prefill not supported"),
@@ -849,7 +877,7 @@ export class Agent {
       }];
     }
 
-    return {
+    const request: NormalizedRequest = {
       messages: this.toolResultGuard.prepareRequest(messages),
       system: this.buildSystemPrompt(systemInjections),
       config: {
@@ -866,6 +894,33 @@ export class Agent {
       ...(this.providerParams && { providerParams: this.providerParams }),
       assistantParticipant: this.name,
     };
+    return { request, evidence: this.receiptEvidence(compiled, requestIndexOf) };
+  }
+
+  /** Evidence of the channel bodies a compiled request carries. */
+  private receiptEvidence(compiled: CompileResult, requestIndexOf: number[]): RequestEvidence {
+    const cm = this.contextManager as ContextManager & { getStoreId?: () => string };
+    let groups: Map<string, StoredMessage[]> | null = null;
+    return requestEvidence({
+      agent: this.name,
+      storeId: cm.getStoreId?.() ?? 'unknown',
+      provenance: compiled.provenance ?? null,
+      requestIndexOf,
+      getMessage: (id) => cm.getMessage(id),
+      groupMembers: (head) => {
+        if (!groups) {
+          groups = new Map();
+          for (const m of cm.getAllMessages()) {
+            if (!m.bodyGroupId) continue;
+            const list = groups.get(m.bodyGroupId) ?? [];
+            list.push(m);
+            groups.set(m.bodyGroupId, list);
+          }
+          for (const list of groups.values()) list.sort((a, b) => (a.shardIndex ?? 0) - (b.shardIndex ?? 0));
+        }
+        return groups.get(head.bodyGroupId!) ?? [head];
+      },
+    });
   }
 
   /**
@@ -911,7 +966,9 @@ export class Agent {
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
 
-    const request = await this.buildActivationRequest(availableTools, injections, budget, compressionTools);
+    const { request, evidence } = await this.prepareActivationRequest(availableTools, injections, budget, compressionTools);
+    // One-to-one: prepareRequest swaps guarded tool results in place, so
+    // the evidence's request indices still hold.
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
@@ -960,6 +1017,7 @@ export class Agent {
     return {
       stream,
       request,
+      evidence,
       ...(kvEnabled
         ? {
             takeKvSubmission: () => kvQueue.shift(),

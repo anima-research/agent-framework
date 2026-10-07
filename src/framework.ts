@@ -6,7 +6,17 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeF
 import { JsStore } from '@animalabs/chronicle';
 import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolResult as MembraneToolResult, ToolResultContentBlock } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
-import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
+import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError, storeIdentity } from '@animalabs/context-manager';
+import {
+  ChannelClockLedger,
+  ContextReceipts,
+  channelKey,
+  channelOf,
+  injectedEvidence,
+  sourceRefOf,
+  type BodyEvidence,
+  type RoundReport,
+} from './context-receipts/index.js';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
@@ -1021,6 +1031,10 @@ export class AgentFramework {
   /** Told once per inbound acceptance (mcpl/inbound-source.ts); unset unless
    *  a receipt consumer installs one. */
   private inboundAcceptanceObserver?: InboundAcceptanceObserver;
+  /** Per-channel receipt clocks for this store (shelf-354). */
+  private readonly clockLedger: ChannelClockLedger;
+  /** Round-by-round confirmation of what reached each resident. */
+  private readonly contextReceipts: ContextReceipts;
 
   /** Per-agent output locus FROZEN for the CURRENT logical turn. Resolved
    *  eagerly in startAgentStream (home → addressed trigger → global default)
@@ -1417,6 +1431,27 @@ export class AgentFramework {
     this.operatorLog = operatorLog;
     this.store = store;
     this.ownsStore = ownsStore;
+    this.clockLedger = new ChannelClockLedger(store, storeIdentity(store));
+    this.contextReceipts = new ContextReceipts(this.clockLedger, {
+      acceptRound: (agentName, provenance, usage, at) => {
+        this.agents.get(agentName)?.getContextManager().acceptRound({
+          provenance,
+          acceptedAt: at,
+          usage: {
+            inputTokens: usage.inputTokens,
+            cacheReadTokens: usage.cacheReadTokens,
+            cacheCreationTokens: usage.cacheCreationTokens,
+          },
+        });
+      },
+    });
+    this.inboundAcceptanceObserver = {
+      inboundAccepted: (source) => {
+        if (source.kind !== 'channel') return;
+        this.clockLedger.received(channelOf(source), sourceRefOf(source), source.lane);
+      },
+    };
+    this.clockLedger.start();
     this.membrane = membrane;
     this.inferencePolicy = inferencePolicy;
     this.errorPolicy = errorPolicy;
@@ -2018,6 +2053,10 @@ export class AgentFramework {
         console.error(`[tool-result-guard] agent=${agent.name} could not finish queued storage work at stop:`, error);
       }
     }
+
+    // Receipt tracking ends with the streams it observed: an outstanding
+    // coverage gap, then the clean-stop marker, then a checkpoint.
+    this.clockLedger.stop();
 
     // Final sync before closing
     try {
@@ -6674,11 +6713,13 @@ export class AgentFramework {
           // queued, they flush at the target's own next boundary — with
           // injection — or in driveStream's finally when its turn ends.
           const midTurnInjections: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }> = [];
+          // Receipt evidence for injected channel bodies, by batch index.
+          const injectedBodies: BodyEvidence[] = [];
           {
             const deferred = this.drainDeferredFor(agent.name);
             if (deferred.length > 0) {
               for (const msg of deferred) {
-                agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
+                const storedId = agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
                 // Injection guards: tool blocks would corrupt the tool-cycle
                 // structure the membrane enforces, and a message named as the
                 // agent itself would render as an ASSISTANT turn on the wire
@@ -6688,6 +6729,8 @@ export class AgentFramework {
                   (b) => b.type === 'tool_use' || b.type === 'tool_result'
                 );
                 if (!hasToolBlocks && msg.participant !== agent.name) {
+                  const evidence = injectedEvidence(midTurnInjections.length, storedId, msg, this.clockLedger.storeId);
+                  if (evidence) injectedBodies.push(evidence);
                   midTurnInjections.push({
                     participant: msg.participant,
                     content: msg.content,
@@ -6892,6 +6935,9 @@ export class AgentFramework {
             // Mid-turn messages collected above ride along as injected user
             // messages (membrane ≥0.5.72) — appended after the tool_result
             // envelope so the next round of THIS turn hears them.
+            if (midTurnInjections.length > 0) {
+              this.contextReceipts.injectedBatch(agent.name, agent.streamId, injectedBodies);
+            }
             currentState.stream.provideToolResults(
               agent.toolResultGuard.submissionResults(membraneResults),
               midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections } : undefined,
@@ -7619,6 +7665,37 @@ export class AgentFramework {
   private coalescingBinding(serverId: string): string {
     const config = this.mcplServerConfigs.get(serverId);
     return createHash('sha256').update(JSON.stringify([serverId, config?.url ?? null, config?.command ?? null, config?.args ?? null])).digest('hex').slice(0, 16);
+  }
+
+  /**
+   * channel_list's receipt clocks for one resident (shelf-354). A call with
+   * no agent origin (a module) gets the host-level received clocks only.
+   */
+  private describeChannelClocks(
+    agentName: string | undefined,
+    channels: Array<{ serverId: string; channelId: string }>,
+  ): { scope: unknown; clocks: Map<string, unknown> } {
+    const refs = channels.map((c) => ({ ...c, binding: this.coalescingBinding(c.serverId) }));
+    const resident = agentName ?? '';
+    const byKey = this.clockLedger.clocksFor(resident, refs);
+    const clocks = new Map<string, unknown>();
+    for (const ref of refs) {
+      const value = byKey.get(channelKey(ref));
+      if (!value) continue;
+      clocks.set(`${ref.serverId}\u0000${ref.channelId}`, agentName
+        ? value
+        : { lastReceivedAt: value.lastReceivedAt, ...(value.received ? { received: value.received } : {}) });
+    }
+    const scope = agentName ? this.clockLedger.scope(agentName) : { ...this.clockLedger.scope(''), agent: null };
+    return {
+      scope: {
+        ...scope,
+        ...(this.contextReceipts.roundReportsMissing
+          ? { roundReports: 'unavailable: this membrane does not report provider rounds, so nothing is confirmed delivered' }
+          : {}),
+      },
+      clocks,
+    };
   }
 
   /**
@@ -9483,9 +9560,11 @@ export class AgentFramework {
       const {
         stream,
         request: compiledRequest,
+        evidence: requestEvidence,
         takeKvSubmission,
         drainKvSubmissionIds,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools);
+      this.contextReceipts.beginStream(agent.name, agent.streamId, requestEvidence);
       if (this.agents.get(agent.name) !== agent) {
         stream.cancel();
         agent.cancelStream();
@@ -10788,6 +10867,10 @@ export class AgentFramework {
           }
 
           case 'usage': {
+            // Membrane's report of the provider round that just stood:
+            // confirms what reached the resident (receipt clocks) and
+            // accepts the compile's layout (fold receipts).
+            this.contextReceipts.usage(agent.name, myStreamId, (event as { round?: RoundReport }).round);
             agent.lastStreamInputTokens = event.usage.inputTokens;
             agent.lastStreamRealInputTokens =
               (event.usage.inputTokens ?? 0) +
@@ -10931,6 +11014,7 @@ export class AgentFramework {
       agent.reset();
       if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
     } finally {
+      this.contextReceipts.endStream(agent.name, myStreamId);
       const unsettledKvSubmissions = drainKvSubmissionIds?.() ?? [];
       if (unsettledKvSubmissions.length > 0) {
         try {
@@ -13257,6 +13341,7 @@ export class AgentFramework {
           this.noteInboundAccepted(source);
           return source;
         },
+        describeChannelClocks: (agentName, channels) => this.describeChannelClocks(agentName, channels),
         sendTypingFn: (serverId, channelId, metadata, op) => {
           const server = this.mcplServerRegistry!.getServer(serverId);
           if (server) {

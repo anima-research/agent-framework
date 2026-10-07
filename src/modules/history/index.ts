@@ -50,6 +50,7 @@ import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
 import { SemanticIndexClient, SemanticIndexer, messageIndexText, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
+import { FOLDS_TOOL, handleFolds, type FoldsInput } from './folds.js';
 
 // ============================================================================
 // Tool input shapes
@@ -772,6 +773,7 @@ export class HistoryModule implements Module {
           },
         },
       },
+      FOLDS_TOOL,
       ...(this.semanticCfg ? [this.semanticSearchTool()] : []),
     ];
   }
@@ -827,6 +829,8 @@ export class HistoryModule implements Module {
           return this.handleOverview((call.input ?? {}) as OverviewInput);
         case 'semantic_search':
           return await this.handleSemanticSearch((call.input ?? {}) as SemanticSearchInput);
+        case 'folds':
+          return handleFolds(this.cm as ContextManager, (call.input ?? {}) as FoldsInput);
         default:
           return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
       }
