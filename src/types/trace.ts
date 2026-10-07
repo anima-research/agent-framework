@@ -66,12 +66,15 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'inference:failed';
       agentName: string;
+      /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
       error: string;
+      /** Bounded like `error`. */
       stack?: string;
     })
   | (TraceEventBase & {
       type: 'inference:exhausted';
       agentName: string;
+      /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
       error: string;
       /** Whether membrane classified the failure as retryable (observability). */
       retryable?: boolean;
@@ -80,6 +83,10 @@ export type TraceEvent =
        * The poison-history breaker fires only on 'invalid_request'.
        */
       errorType?: string;
+      /** The provider's HTTP status, when the failure carried one. */
+      httpStatus?: number;
+      /** The provider's own error code, when it sent one (at most 128 characters). */
+      providerErrorCode?: string;
     })
 
   // Streaming inference lifecycle
