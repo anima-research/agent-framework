@@ -182,6 +182,12 @@ export interface ContextInheritance {
    * of its parent's refusals. A fork that stands in for the parent's
    * attention is created with it, so it is not asked the thing the parent
    * said no to without knowing. Named in the creation event either way.
+   *
+   * Consultable, never rendered: the ledger steers what the child's
+   * strategy will and will not compress; nothing in it is ever placed in a
+   * compiled request. Refusal records are the most classifier-sensitive
+   * content in the pipeline, so this is a stated property of the
+   * declaration, not an accident of the implementation.
    */
   refusals?: boolean;
   /**

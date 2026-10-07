@@ -159,6 +159,8 @@ The child's writes go to a Chronicle branch of its own (`dendrite/<name>`). That
 
 By default a fork does not inherit its parent's compression-refusal ledger (what the parent declined to compress, and why): a task fork is free of its parent's refusals. `inheritRefusals: true` brings it along, for a fork that stands in for the parent's attention and must not be asked the thing the parent said no to without knowing. Either way the creation record and event state it (`inherit.refusals`), so nobody discovers the difference by being asked. Inherited entries are the parent's; the child's own refusals append after them on its branch.
 
+The ledger is **consultable, never rendered**: it steers what the child's strategy will and will not compress, and nothing in it is placed in a compiled request. Refusal records are the most classifier-sensitive content in the pipeline, so this is part of the declaration, not something that happens to be true.
+
 ### Reusing or redoing the solve
 
 - `solve: 'reuse'` (default): the child keeps the parent's rendering. Fold state arrives through the store. The part that lives only in memory (the previous compile's cache identities, an in-flight budget transition, a hot-tuned tail) is handed from the parent's strategy to the child's.
