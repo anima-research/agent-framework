@@ -11,9 +11,13 @@
   redactions are resumed whenever its branch is active at startup,
   independent of what happened to its marks.
 - A journal record that certifies a body change (a marks activation, a
-  completed suppression, a retired batch) is now written only after that
-  change is synced to the store. Previously a crash could keep marks active
-  for a rollback the store had lost.
+  completed suppression, a retired batch, or the batch a `hide` or turn
+  `undo` records after its change) is now written only after that change is
+  synced to the store. Previously a crash could keep marks active for a
+  rollback the store had lost. If writing a `hide` or turn `undo` batch
+  fails, its receipt follows what the journal then holds: a batch that
+  reached the store is activated, retired or reported `unresolved`, never
+  reported `not-scheduled` while it could still be delivered.
 - Awareness delivery no longer holds MCPL traffic. Previously every MCPL data
   plane waited at startup, at reconnect, at a tools list change and after each
   surgery until every queued mark had been attempted, which at Discord's pace

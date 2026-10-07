@@ -933,3 +933,174 @@ test('host/command hide takes the store reservation and marks only on request, t
     h.cleanup();
   }
 });
+
+const JOURNAL_APPEND = `append ${DISCORD_AWARENESS_RECORD_TYPE}`;
+/** The call that just happened was a journal entry's append. */
+const rightAfterAppend = (calls: string[]) => calls.at(-1) === JOURNAL_APPEND;
+/** A journal entry has been appended (since the seams were made). */
+const afterAnAppend = (calls: string[]) => calls.includes(JOURNAL_APPEND);
+
+/**
+ * The harness store with its journal seams observed and faultable. `fail`
+ * makes calls at a seam throw while `matches` holds for the calls before
+ * them (up to `times` of them): `before` the real call, so nothing reaches
+ * the store, or `after` it, so it did.
+ */
+function journalSeams(store: JsStore) {
+  type Seam = 'sync' | 'append' | 'list';
+  const calls: string[] = [];
+  const faults: Array<{ seam: Seam; when: 'before' | 'after'; matches: (calls: string[]) => boolean; times: number }> = [];
+  const through = <T>(seam: Seam, label: string, call: () => T): T => {
+    const fault = faults.find((candidate) => candidate.seam === seam && candidate.times > 0 && candidate.matches(calls));
+    calls.push(label);
+    if (fault) fault.times--;
+    if (fault?.when === 'before') throw new Error(`injected ${seam} failure`);
+    const result = call();
+    if (fault?.when === 'after') throw new Error(`injected ${seam} failure`);
+    return result;
+  };
+  const proxy = new Proxy(store, {
+    get(target, prop) {
+      if (prop === 'sync') return () => through('sync', 'sync', () => target.sync());
+      if (prop === 'appendJson') {
+        return (type: string, payload: unknown) => through('append', `append ${type}`, () => target.appendJson(type, payload));
+      }
+      if (prop === 'getRecordIdsByType') {
+        return (type: string) => through('list', `list ${type}`, () => target.getRecordIdsByType(type));
+      }
+      const value = Reflect.get(target, prop);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  return {
+    store: proxy as JsStore,
+    calls,
+    fail: (seam: Seam, when: 'before' | 'after', matches: (calls: string[]) => boolean, times = 1) => {
+      faults.push({ seam, when, matches, times });
+    },
+  };
+}
+
+/**
+ * A hide with marks over a journal whose store faults as `arrange` says.
+ * The removal shows in the calls as `remove`.
+ */
+async function hideOverFaultyJournal(arrange: (seams: ReturnType<typeof journalSeams>) => void) {
+  const h = storeHarness();
+  const seams = journalSeams(h.store);
+  const outbox = new DiscordAwarenessOutbox(seams.store);
+  outbox.batches(); // loaded before the hide, as a running framework's is
+  const { framework, removed } = hostCommandFramework(h, [
+    { id: 'i0', metadata: { ...ref('m0') } },
+    { id: 'i1', metadata: { ...ref('m1'), tags: ['chat:addressed'] } },
+  ]);
+  framework.discordAwarenessOutbox = outbox;
+  framework.agents.get('cairn').getContextManager().removeMessage = (id: string) => {
+    seams.calls.push('remove');
+    removed.add(id);
+  };
+  const alerts: string[] = [];
+  framework.opsAlert = (kind: string) => { alerts.push(kind); };
+  arrange(seams);
+  const result: any = await muted(() => framework.handleHostCommand('discord', {
+    command: 'hide', agentName: 'cairn', fromMessageId: 'm1', marks: 'all',
+  }));
+  return { h, seams, result, alerts };
+}
+
+test('a hide records its batch only after the removal is synced: the batch can never outlive the change', async () => {
+  const { h, seams, result } = await hideOverFaultyJournal(() => {});
+  try {
+    assert.equal(result.markers.status, 'queued');
+    const removal = seams.calls.indexOf('remove');
+    const batchAppend = seams.calls.indexOf(JOURNAL_APPEND, removal);
+    assert.ok(removal >= 0 && batchAppend > removal, `calls: ${seams.calls.join(', ')}`);
+    assert.ok(
+      seams.calls.slice(removal, batchAppend).includes('sync'),
+      `the removal is synced before the batch is appended: ${seams.calls.join(', ')}`,
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('an applied change\'s batch that failed before reaching the store is not scheduled, and nothing delivers it', async () => {
+  // The barrier sync between the removal and the batch's append fails:
+  // nothing is written.
+  const { h, result, alerts } = await hideOverFaultyJournal((seams) => {
+    seams.fail('sync', 'before', (calls) => calls.includes('remove') && !afterAnAppend(calls));
+  });
+  try {
+    assert.equal(result.ok, true, 'the hide stands');
+    assert.equal(result.markers.status, 'not-scheduled');
+    const fresh = new DiscordAwarenessOutbox(h.store);
+    assert.equal(fresh.batches().length, 0, 'nothing was recorded');
+    assert.deepEqual(fresh.recoverAtStartup('main'), { activated: [], held: [], unknownAttempts: 0 });
+    assert.equal(fresh.pendingDispatches('discord').length, 0);
+    assert.match(result.markers.error, /recording the batch failed: injected sync failure/);
+    assert.deepEqual(alerts, ['discord-awareness-not-scheduled']);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('an applied change\'s batch that reached the store before its barrier failed is settled, and the receipt follows it', async () => {
+  // The append lands and its durability sync fails: the batch is in the
+  // journal, so the operator's choice is carried out (here, activated)
+  // rather than reported as never scheduled.
+  const { h, result, alerts } = await hideOverFaultyJournal((seams) => {
+    seams.fail('sync', 'before', rightAfterAppend);
+  });
+  try {
+    assert.equal(result.markers.status, 'queued', 'not a not-scheduled receipt over a batch that would be delivered');
+    assert.equal(result.markers.queued, 1);
+    const fresh = new DiscordAwarenessOutbox(h.store);
+    const [batch] = fresh.batches();
+    assert.equal(batch.id, result.markers.batchId);
+    assert.equal(batch.status, 'active');
+    assert.deepEqual(fresh.pendingDispatches('discord').map((d) => d.key.messageId), ['m1']);
+    assert.deepEqual(fresh.recoverAtStartup('main'), { activated: [], held: [], unknownAttempts: 0 });
+    assert.deepEqual(alerts, []);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('an applied change\'s batch that landed but can be neither activated nor retired is unresolved, with its id', async () => {
+  // The append lands, and every sync from its own on fails: the batch is
+  // in the journal, and activation and retirement each write nothing.
+  const { h, result, alerts } = await hideOverFaultyJournal((seams) => {
+    seams.fail('sync', 'before', afterAnAppend, Number.POSITIVE_INFINITY);
+  });
+  try {
+    assert.equal(result.markers.status, 'unresolved');
+    const fresh = new DiscordAwarenessOutbox(h.store);
+    const [batch] = fresh.batches();
+    assert.equal(batch.id, result.markers.batchId, 'the receipt names the retained batch');
+    assert.equal(batch.status, 'prepared');
+    // As the receipt says, a startup that reads it may deliver it.
+    assert.deepEqual(fresh.recoverAtStartup('main').activated, [batch.id]);
+    assert.match(result.markers.error, /recording the batch failed.*retiring it also failed/);
+    assert.deepEqual(alerts, ['discord-awareness-unresolved']);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test('an applied change\'s batch whose journal cannot be read back after a failed write is unresolved, with its id', async () => {
+  // The append lands, its durability sync fails, and the read-back fails.
+  const { h, result, alerts } = await hideOverFaultyJournal((seams) => {
+    seams.fail('sync', 'before', rightAfterAppend);
+    seams.fail('list', 'before', afterAnAppend);
+  });
+  try {
+    assert.equal(result.markers.status, 'unresolved');
+    const [batch] = new DiscordAwarenessOutbox(h.store).batches();
+    assert.equal(batch.id, result.markers.batchId, 'the receipt names the batch that may be delivered');
+    assert.equal(batch.status, 'prepared');
+    assert.match(result.markers.error, /reading the journal back also failed: injected list failure/);
+    assert.deepEqual(alerts, ['discord-awareness-unresolved']);
+  } finally {
+    h.cleanup();
+  }
+});

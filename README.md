@@ -349,8 +349,9 @@ const result = await framework.rollbackToMessage('cairn', {
   accepted them. `result.markers` says whether they were scheduled (`queued`
   with a count and batch id), not chosen or not in scope (`none`), not to be
   delivered because recording the batch failed after the body change and it
-  was retired (`not-scheduled`), or `unresolved` (neither activation nor
-  retirement could be recorded; it names a batch that may still be
+  was retired or never recorded (`not-scheduled`), or `unresolved` (neither
+  activation nor retirement could be recorded, or the journal could not be
+  read back to say whether the batch was; it names a batch that may still be
   delivered). Every receipt also counts the removed messages left unmarked.
   Marker bookkeeping never fails or undoes an applied rollback or
   suppression.
@@ -373,7 +374,8 @@ const result = await framework.rollbackToMessage('cairn', {
   surgery's adds carry the moment of its marks choice, even when activation
   comes later, so a retract made in between prevails; a release is a new
   act. A record that certifies a body change (an activation, a completed
-  suppression, a retirement) is written only after that change is synced.
+  suppression, a retirement, or the batch a hide or turn undo records after
+  its change) is written only after that change is synced.
   A batch whose surgery was interrupted before its branch switch was
   recorded is held at startup until an operator releases it; an interrupted
   suppression's redactions are resumed whenever its branch is active at

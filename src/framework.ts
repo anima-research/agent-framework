@@ -416,6 +416,7 @@ import {
   type DiscordAwarenessReleaseReceipt,
   type DiscordAwarenessRetractReceipt,
   type DiscordAwarenessScope,
+  type DiscordAwarenessSettlement,
 } from './recovery/discord-awareness-outbox.js';
 import {
   OperatorActionError,
@@ -737,7 +738,7 @@ function describeMarksChoice(marks: DiscordAwarenessMarks | undefined): Record<s
 
 function describeMarkers(m: SurgeryMarkerReceipt): string {
   if (m.status === 'queued') return `queued:${m.queued}(${m.scope}; unmarked ${m.unmarked})`;
-  if (m.status === 'not-scheduled') return 'not-scheduled(batch retired)';
+  if (m.status === 'not-scheduled') return 'not-scheduled(none will be sent)';
   if (m.status === 'unresolved') return `unresolved(batch ${m.batchId} may still be delivered)`;
   return 'none';
 }
@@ -6644,36 +6645,52 @@ export class AgentFramework {
     // A suppression-only batch carries no marks: its activation records the
     // body complete, and the receipt has nothing to report.
     if (batch.refs.length === 0) return { ...facts, status: 'none', queued: 0 };
+    return this.settledMarkerReceipt(settled, batch.id, batch.refs.length, verb, agentName, facts);
+  }
+
+  /**
+   * The receipt for a batch whose body change has landed, from what the
+   * journal settled. Anything short of `queued` is logged and raised as an
+   * ops alert: the body stands either way.
+   */
+  private settledMarkerReceipt(
+    settled: DiscordAwarenessSettlement,
+    batchId: string,
+    marks: number,
+    verb: 'rollback' | 'suppress' | 'hide' | 'undo',
+    agentName: string,
+    facts: SurgeryMarkerFacts,
+  ): SurgeryMarkerReceipt {
     if (settled.status === 'queued') {
-      return { ...facts, status: 'queued', queued: settled.queued, batchId: batch.id };
+      return { ...facts, status: 'queued', queued: settled.queued, batchId };
     }
     const retired = settled.status === 'not-scheduled';
     console.error(
-      `[discord-awareness] ${verb} agent=${agentName}: body applied, but marker batch ${batch.id} ` +
-        `could not be activated (${settled.error}); ${retired ? 'batch retired' : 'batch left prepared'}`,
+      `[discord-awareness] ${verb} agent=${agentName}: body applied, but marker batch ${batchId} ` +
+        `was not activated (${settled.error}); ${retired ? 'none of its marks will be sent' : 'it may still be delivered'}`,
     );
     this.opsAlert(
       retired ? 'discord-awareness-not-scheduled' : 'discord-awareness-unresolved',
       agentName,
       retired
-        ? `${verb} applied, but its ${batch.refs.length} awareness mark(s) were not scheduled ` +
-          `(batch ${batch.id} retired): ${settled.error}`
-        : `${verb} applied, but awareness batch ${batch.id} (${batch.refs.length} mark(s)) could be ` +
-          `neither activated nor retired; it may still be delivered: ${settled.error}`,
-      { data: { batchId: batch.id, retired } },
+        ? `${verb} applied, but its ${marks} awareness mark(s) were not scheduled and none will be sent ` +
+          `(batch ${batchId}): ${settled.error}`
+        : `${verb} applied, but awareness batch ${batchId} (${marks} mark(s)) could not be settled; ` +
+          `it may still be delivered: ${settled.error}`,
+      { data: { batchId, retired } },
     );
     return retired
       ? { ...facts, status: 'not-scheduled', queued: 0, error: settled.error }
-      : { ...facts, status: 'unresolved', queued: 0, batchId: batch.id, error: settled.error };
+      : { ...facts, status: 'unresolved', queued: 0, batchId, error: settled.error };
   }
 
   /**
    * Marks for a change already applied in place (an in-place `hide`, or a
-   * turn undo), scheduled after it. The batch targets the current branch and
-   * is explicit (activated here, after the change is synced); a crash
-   * between its two journal records leaves it prepared for exactly this
-   * branch, which startup completes. Old records without a serverId are
-   * routed through the server that issued the command.
+   * turn undo), recorded and settled after it by the journal
+   * (settleApplied): the batch is written only once the change is synced,
+   * and a failed write is reported from what the journal then holds. Old
+   * records without a serverId are routed through the server that issued
+   * the command. Never throws: the change stands either way.
    */
   private scheduleAppliedMarks(
     verb: 'hide' | 'undo',
@@ -6691,22 +6708,12 @@ export class AgentFramework {
       unmarked: selection.unmarked,
       notRemoved: selection.notRemoved,
     };
-    let batch: DiscordAwarenessBatch | null;
+    if (!this.discordAwarenessOutbox || selection.refs.length === 0) return { ...facts, status: 'none', queued: 0 };
+    let branch: string;
     try {
-      const branch = this.store.currentBranch().name;
-      batch = this.discordAwarenessOutbox?.prepare({
-        agentName,
-        sourceBranch: branch,
-        targetBranch: branch,
-        refs: selection.refs,
-        scope: marksScope(marks),
-        unmarked: selection.unmarked,
-        notRemoved: selection.notRemoved,
-        emoji: this.discordAwarenessEmoji,
-        activationPolicy: 'explicit',
-      }) ?? null;
+      branch = this.store.currentBranch().name;
     } catch (error) {
-      // The redaction stands; nothing was recorded, so nothing will be sent.
+      // Nothing was recorded, so nothing will be sent.
       const detail = boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
       this.opsAlert(
         'discord-awareness-not-scheduled',
@@ -6715,7 +6722,17 @@ export class AgentFramework {
       );
       return { ...facts, status: 'not-scheduled', queued: 0, error: detail };
     }
-    const receipt = this.activateSurgeryMarkers(batch, verb, agentName, facts);
+    const applied = this.discordAwarenessOutbox.settleApplied({
+      agentName,
+      branch,
+      refs: selection.refs,
+      scope: marksScope(marks),
+      unmarked: selection.unmarked,
+      notRemoved: selection.notRemoved,
+      emoji: this.discordAwarenessEmoji,
+    });
+    if (!applied) return { ...facts, status: 'none', queued: 0 };
+    const receipt = this.settledMarkerReceipt(applied.settled, applied.batchId, applied.marks, verb, agentName, facts);
     if (receipt.status === 'queued') this.deliverDiscordAwarenessInBackground(verb, agentName);
     return receipt;
   }

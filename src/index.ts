@@ -150,11 +150,13 @@ export type {
   DiscordAwarenessOp,
   DiscordAwarenessOpStatus,
   DiscordAwarenessOutcome,
+  DiscordAwarenessPrepareInput,
   DiscordAwarenessRef,
   DiscordAwarenessReleaseAction,
   DiscordAwarenessReleaseReceipt,
   DiscordAwarenessRetractReceipt,
   DiscordAwarenessScope,
+  DiscordAwarenessSettlement,
   DiscordSuppressionInterval,
 } from './recovery/discord-awareness-outbox.js';
 // Live operator surgery (rollback / suppress) and its durable action log

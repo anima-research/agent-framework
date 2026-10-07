@@ -31,8 +31,9 @@ import { RecordJournal, type AppendOptions } from '../record-journal.js';
  * it survives branch switches, rollbacks, `deleteBranch` and a killed
  * process, and lives and dies with its store. Each append is one record
  * holding a group of journal records that apply together. A record that
- * asserts a branch change (an activation after a switch or redaction) is
- * appended only after that state is synced, so it can never outlive it.
+ * asserts a branch change (an activation after a switch or redaction, or a
+ * batch recorded after an in-place change) is appended only after that
+ * state is synced, so it can never outlive it.
  */
 
 export const DEFAULT_DISCORD_AWARENESS_EMOJI = '💤';
@@ -138,6 +139,33 @@ export interface DiscordAwarenessBatchRecord {
   /** Idempotent interval operations used to resume an interrupted suppression. */
   suppressionIntervals?: DiscordSuppressionInterval[];
 }
+
+/** A surgery's request, as it prepares a batch. */
+export interface DiscordAwarenessPrepareInput {
+  agentName: string;
+  sourceBranch: string;
+  targetBranch: string;
+  refs: DiscordAwarenessRef[];
+  scope: DiscordAwarenessBatchRecord['scope'];
+  emoji?: string;
+  activationPolicy?: 'target-branch' | 'explicit';
+  suppressionIntervals?: DiscordSuppressionInterval[];
+  unmarked?: number;
+  notRemoved?: number;
+}
+
+/**
+ * What the journal will do with a batch whose body change has landed:
+ * - `queued`: it is active, its requests recorded;
+ * - `not-scheduled`: none of its marks will be sent (it was retired, or
+ *   never recorded);
+ * - `unresolved`: neither could be established; a later startup that can
+ *   read the batch may activate it.
+ */
+export type DiscordAwarenessSettlement =
+  | { status: 'queued'; queued: number }
+  | { status: 'not-scheduled'; error: string }
+  | { status: 'unresolved'; error: string };
 
 export type DiscordAwarenessBatchStatus = 'prepared' | 'active' | 'held' | 'discarded';
 
@@ -535,39 +563,60 @@ export class DiscordAwarenessOutbox {
    * carries neither marks nor a suppression journal. A prepared batch never
    * delivers: activate() (or startup's crash completion) does.
    */
-  prepare(input: {
-    agentName: string;
-    sourceBranch: string;
-    targetBranch: string;
-    refs: DiscordAwarenessRef[];
-    scope: DiscordAwarenessBatchRecord['scope'];
-    emoji?: string;
-    activationPolicy?: 'target-branch' | 'explicit';
-    suppressionIntervals?: DiscordSuppressionInterval[];
-    unmarked?: number;
-    notRemoved?: number;
-  }): DiscordAwarenessBatch | null {
-    const refs = dedupeRefs(input.refs);
-    if (refs.length === 0 && !input.suppressionIntervals?.length) return null;
-    const batch: DiscordAwarenessBatchRecord = {
-      id: randomUUID(),
-      agentName: input.agentName,
-      sourceBranch: input.sourceBranch,
-      targetBranch: input.targetBranch,
-      emoji: input.emoji ?? DEFAULT_DISCORD_AWARENESS_EMOJI,
-      createdAt: Date.now(),
-      scope: input.scope,
-      refs,
-      ...(input.unmarked ? { unmarked: input.unmarked } : {}),
-      ...(input.notRemoved ? { notRemoved: input.notRemoved } : {}),
-      activationPolicy: input.activationPolicy ?? 'target-branch',
-      ...(input.suppressionIntervals?.length
-        ? { suppressionIntervals: input.suppressionIntervals.map((interval) => ({ ...interval })) }
-        : {}),
-    };
+  prepare(input: DiscordAwarenessPrepareInput): DiscordAwarenessBatch | null {
+    const batch = batchRecord(input);
+    if (!batch) return null;
     // Durable before the surgery's switch, so startup can crash-complete it.
     this.append([{ t: 'batch', at: batch.createdAt, batch }], { durable: true });
     return { ...structuredClone(batch), status: 'prepared' };
+  }
+
+  /**
+   * Marks for a body change already applied on `branch` (an in-place hide, a
+   * turn undo): a batch for exactly that branch, recorded and activated in
+   * one call, with what the journal will do (as settleActivation reports
+   * it). Its record asserts the change before it, so it is written only
+   * after that change is synced: a crash can never keep the batch and lose
+   * the change. A batch left prepared by a crash between its two records is
+   * for exactly this branch, which startup completes. If writing it fails,
+   * the journal is read back, so the result follows what it holds: a batch
+   * that is not there is `not-scheduled` (nothing was recorded); one that is
+   * there is settled like any prepared batch (activated, else retired, else
+   * `unresolved`); and if the journal can't be read back, `unresolved`, since
+   * the batch may be there. Returns null when there is nothing to mark.
+   * Never throws.
+   */
+  settleApplied(
+    input: Omit<DiscordAwarenessPrepareInput, 'sourceBranch' | 'targetBranch' | 'activationPolicy' | 'suppressionIntervals'>
+      & { branch: string },
+  ): { batchId: string; marks: number; settled: DiscordAwarenessSettlement } | null {
+    const { branch, ...rest } = input;
+    const batch = batchRecord({ ...rest, sourceBranch: branch, targetBranch: branch, activationPolicy: 'explicit' });
+    if (!batch) return null;
+    const settle = (settled: DiscordAwarenessSettlement) => ({ batchId: batch.id, marks: batch.refs.length, settled });
+    try {
+      this.load();
+    } catch (error) {
+      // Nothing is written to a journal that can't be read.
+      return settle({ status: 'not-scheduled', error: `the journal could not be read: ${errorText(error)}` });
+    }
+    try {
+      this.append([{ t: 'batch', at: batch.createdAt, batch }], { afterCommittedState: true, durable: true });
+    } catch (error) {
+      const detail = `recording the batch failed: ${errorText(error)}`;
+      let landed: boolean;
+      try {
+        landed = this.load().batches.has(batch.id);
+      } catch (readError) {
+        return settle({ status: 'unresolved', error: `${detail}; reading the journal back also failed: ${errorText(readError)}` });
+      }
+      if (!landed) return settle({ status: 'not-scheduled', error: detail });
+      // It reached the store: carry out the choice it records, like any
+      // prepared batch, and report what that settles.
+      const settled = this.settleActivation(batch.id);
+      return settle(settled.status === 'queued' ? settled : { ...settled, error: `${detail}; ${settled.error}` });
+    }
+    return settle(this.settleActivation(batch.id));
   }
 
   /**
@@ -614,10 +663,7 @@ export class DiscordAwarenessOutbox {
    *   the batch may activate it.
    * Never throws.
    */
-  settleActivation(batchId: string):
-    | { status: 'queued'; queued: number }
-    | { status: 'not-scheduled'; error: string }
-    | { status: 'unresolved'; error: string } {
+  settleActivation(batchId: string): DiscordAwarenessSettlement {
     let detail: string;
     try {
       return { status: 'queued', queued: this.activate(batchId) };
@@ -1635,6 +1681,33 @@ function legacyEvidence(
     ...(lastErrorKind ? { lastErrorKind } : {}),
     outcomesUnrecorded: (attempts - 1) + (lastOutcome === 'unrecorded' ? 1 : 0),
   };
+}
+
+/** A new batch's record, or null when it carries neither marks nor a
+ *  suppression journal. */
+function batchRecord(input: DiscordAwarenessPrepareInput): DiscordAwarenessBatchRecord | null {
+  const refs = dedupeRefs(input.refs);
+  if (refs.length === 0 && !input.suppressionIntervals?.length) return null;
+  return {
+    id: randomUUID(),
+    agentName: input.agentName,
+    sourceBranch: input.sourceBranch,
+    targetBranch: input.targetBranch,
+    emoji: input.emoji ?? DEFAULT_DISCORD_AWARENESS_EMOJI,
+    createdAt: Date.now(),
+    scope: input.scope,
+    refs,
+    ...(input.unmarked ? { unmarked: input.unmarked } : {}),
+    ...(input.notRemoved ? { notRemoved: input.notRemoved } : {}),
+    activationPolicy: input.activationPolicy ?? 'target-branch',
+    ...(input.suppressionIntervals?.length
+      ? { suppressionIntervals: input.suppressionIntervals.map((interval) => ({ ...interval })) }
+      : {}),
+  };
+}
+
+function errorText(error: unknown): string {
+  return boundDiscordAwarenessText(error instanceof Error ? error.message : String(error));
 }
 
 // ---------------------------------------------------------------------------

@@ -144,11 +144,12 @@ export interface SurgeryMarkerFacts {
  * - `queued` — one add request per mark is durably recorded and delivery has
  *   started. It is not a delivery claim: per-request outcomes stay in the
  *   awareness journal.
- * - `not-scheduled` — the body change landed, but recording the batch as
- *   active failed, so it was retired from the journal: none of its marks will
- *   be delivered.
+ * - `not-scheduled` — the body change landed, but the batch was never
+ *   recorded, or recording it as active failed and it was retired from the
+ *   journal: none of its marks will be delivered.
  * - `unresolved` — the journal could record neither the activation nor the
- *   retirement. `batchId` names a retained batch whose scheduling outcome is
+ *   retirement, or could not be read back to say whether the batch was
+ *   recorded at all. `batchId` names the batch, whose scheduling outcome is
  *   unresolved: any later reconciliation or restart that can read it may
  *   activate and deliver it, and nothing here promises otherwise.
  */
