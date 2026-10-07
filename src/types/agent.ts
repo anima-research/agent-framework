@@ -305,7 +305,7 @@ export interface CompletedToolCall {
 export interface InferenceRequest {
   /** An admitted unstick operation's re-run (rerunUnstick): the turn records
    *  its outcome against this operation and step instead of shedding. */
-  unstick?: { operationId: string; step: number };
+  unstick?: { operationId: string; step: number; storeId: string; sourceBranch: string };
   /** Host-owned identity for withdrawal of an unconsumed coalesced wake. */
   coalescingSubject?: string;
   coalescingEventId?: string;

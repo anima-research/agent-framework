@@ -11,7 +11,7 @@
  * applies exactly what was resolved, never the relative command again: a
  * change that no longer holds is refused as `stale` and the host restages it.
  */
-import type { OperatorRequester } from './operator-log.js';
+import type { OperatorRequester, SurgeryMarkerReceipt } from './operator-log.js';
 
 /** The host's receipt for a staged change, shown to whoever asked: the
  *  change is accepted and queued, not applied. */
@@ -38,6 +38,10 @@ interface ResolvedOperatorChangeBase {
   /** The active branch when resolved: the stable identity application
    *  checks. Appending messages (a notice, an answer) doesn't change it. */
   sourceBranch: string;
+  /** The store it was resolved in (AgentFramework's store identity). Branch
+   *  names and message ids mean something only within one store, so a
+   *  change is refused anywhere else, a replacement store included. */
+  storeId: string;
 }
 
 /** agent_settings update / reset / cancel, from an operator or a module. */
@@ -73,6 +77,15 @@ export interface ResolvedUndoTurnsChange extends ResolvedOperatorChangeBase {
   /** The checkpoints it undoes, newest first. Application makes one cut at
    *  the oldest one's sequenceBefore, onto a branch named for this change. */
   checkpoints: Array<{ turnIndex: number; sequenceBefore: number; branchName: string }>;
+  /** The operator's awareness-marks choice, frozen at staging: 'none', or a
+   *  scope with exactly the refs the cut would have removed then. The cut
+   *  can also reach messages that arrive later; application marks only the
+   *  frozen refs it actually removed, reports later removals as unmarked,
+   *  and never widens the set. */
+  marks: 'none' | { scope: 'addressed' | 'all'; refs: Array<{ serverId: string; channelId: string; messageId: string }> };
+  /** The MCPL server the command came from: marks whose message names no
+   *  server are routed through it. */
+  serverId?: string;
 }
 
 /**
@@ -149,6 +162,9 @@ export type AppliedOperatorChange =
       /** The cut had already been applied (the active branch is its
        *  destination): nothing changed this time. */
       alreadyApplied?: true;
+      /** The awareness marks receipt: scheduled once, by the first
+       *  application to get that far, and reported again by any retry. */
+      markers?: SurgeryMarkerReceipt;
     }
   | {
       kind: 'unstick';

@@ -1624,13 +1624,15 @@ export class AgentFramework {
   private activeAdmissions: Map<string, ResolvedOperatorChange> = new Map();
   /** Admitted undo cuts whose bookkeeping finished in this process. */
   private completedOperatorCuts: Set<string> = new Set();
+  /** This store's identity (storeIdentity), once read or minted. */
+  private storeIdentityValue: string | null = null;
   /** The unstick journal and its reduced operations (unstickLedger). */
   private unstickJournalState: {
     journal: RecordJournal<UnstickJournalEntry, UnstickJournalSnapshot>;
     ops: Map<string, UnstickOperationRecord>;
   } | null = null;
   /** Unstick re-runs this process launched and hasn't settled, by operation#step. */
-  private unstickAttemptWaiters: Map<string, { promise: Promise<UnstickAttemptOutcome>; resolve: (outcome: UnstickAttemptOutcome) => void }> = new Map();
+  private unstickAttemptWaiters: Map<string, { agent: string; promise: Promise<UnstickAttemptOutcome>; resolve: (outcome: UnstickAttemptOutcome) => void }> = new Map();
   /** Outcomes recorded but not yet released to their waiters (the turn is
    *  still tearing down), by operation#step. */
   private unstickSettled: Map<string, UnstickAttemptOutcome> = new Map();
@@ -5832,7 +5834,10 @@ export class AgentFramework {
 
     const requested = Math.max(1, Math.min(20, Math.floor(params.turns ?? 1)));
     if (this.operatorChangeGate) {
-      return this.gatedUndoTurns(agentName, requested, hostCommandRequester(serverId, params));
+      return this.gatedUndoTurns(agentName, requested, hostCommandRequester(serverId, params), {
+        marks: params.marks === 'addressed' || params.marks === 'all' ? { scope: params.marks } : 'none',
+        serverId,
+      });
     }
     const turnMarks: DiscordAwarenessMarks = params.marks === 'addressed' || params.marks === 'all'
       ? { scope: params.marks }
@@ -6818,6 +6823,7 @@ export class AgentFramework {
       ...(requester ? { requester } : {}),
       resolvedAt: Date.now(),
       sourceBranch: this.store.currentBranch().name,
+      storeId: this.storeIdentity(),
     };
     if (tool === 'agent_settings') {
       return { ...base, kind: 'agent-settings', input: structuredClone(input), ...this.resolveSettingsEffect(agentName, input) };
@@ -6842,6 +6848,7 @@ export class AgentFramework {
       throw new OperatorActionError('stale', `Change ${change.id} for ${change.agent} no longer holds: ${what}`);
     };
     if (!this.agents.has(change.agent)) throw new OperatorActionError('unknown-agent', `Unknown agent: ${change.agent}`);
+    if (change.storeId !== this.storeIdentity()) stale('it was resolved against another store');
     const branch = this.store.currentBranch().name;
     if (branch !== change.sourceBranch) stale(`the active branch moved from ${change.sourceBranch} to ${branch}`);
     if (change.kind === 'agent-settings') {
@@ -6919,7 +6926,12 @@ export class AgentFramework {
    * applyResolvedOperatorChange under a lease. Without a gate, host/command
    * keeps its per-turn loop.
    */
-  private async gatedUndoTurns(agentName: string, requested: number, requester: OperatorRequester): Promise<{
+  private async gatedUndoTurns(
+    agentName: string,
+    requested: number,
+    requester: OperatorRequester,
+    publication: { marks: 'none' | { scope: 'addressed' | 'all' }; serverId: string },
+  ): Promise<{
     ok: boolean;
     error?: string;
     code?: string;
@@ -6932,7 +6944,7 @@ export class AgentFramework {
     if (agent.state.status !== 'idle') {
       return { ok: false, error: `Cannot undo while agent is ${agent.state.status}` };
     }
-    const change = this.resolveUndoTurns(agentName, requested, requester);
+    const change = this.resolveUndoTurns(agentName, requested, requester, publication);
     if (!change) return { ok: true, undone: 0, requested, lastVisible: null };
     const answer = await this.askOperatorChangeGate(change);
     if (answer.outcome === 'gate-failed') {
@@ -6944,6 +6956,50 @@ export class AgentFramework {
   // ---------------------------------------------------------------------------
   // Admitted unstick (ResolvedUnstickChange): planned steps, re-runs, journal
   // ---------------------------------------------------------------------------
+
+  /**
+   * This store's identity: a UUID recorded once, in a typed record that
+   * doesn't follow branch switches, so it names the store whichever branch
+   * is active and is never shared by a replacement or fresh store.
+   */
+  private storeIdentity(): string {
+    if (this.storeIdentityValue) return this.storeIdentityValue;
+    const ids = this.store.getRecordIdsByType('framework/store-identity')
+      .map((id) => ({ id, value: BigInt(id) }))
+      .sort((a, b) => (a.value < b.value ? -1 : a.value > b.value ? 1 : 0));
+    if (ids.length > 0) {
+      const record = this.store.getRecord(ids[0]!.id);
+      const parsed = record ? JSON.parse(Buffer.from(record.payload).toString('utf-8')) as { id?: unknown } : null;
+      if (typeof parsed?.id === 'string') return (this.storeIdentityValue = parsed.id);
+    }
+    const minted = randomUUID();
+    this.store.appendJson('framework/store-identity', { id: minted, at: Date.now() });
+    this.store.sync();
+    return (this.storeIdentityValue = minted);
+  }
+
+  /**
+   * The one marker an admitted unstick leaves, set to what its steps have
+   * shed so far. Found by its operation id, it is written idempotently: a
+   * repaired or restarted step never counts twice. It describes the planned
+   * removals, not "the most recent turns": later messages were kept.
+   */
+  private setUnstickMarker(agent: Agent, change: ResolvedUnstickChange, shedSteps: number, category: string): void {
+    const cm = agent.getContextManager();
+    const text =
+      `[unstick] An operator set aside ${shedSteps} earlier exchange(s) from this conversation ` +
+      `(approved to take up to ${change.plan.length}, newest first) because the model kept refusing on them ` +
+      `(content filter: ${category}). Their content is not reproduced here, so this note can't re-trigger ` +
+      `the filter; the originals remain in the raw record. Messages that arrived after them were kept. ` +
+      `You are clear to continue: if you were mid-task, take a different approach; otherwise carry on with ` +
+      `whatever is in front of you, or briefly acknowledge the gap and ask what's next.`;
+    const existing = cm.getAllMessages().find((m) => {
+      const meta = (m.metadata ?? {}) as { kind?: unknown; operationId?: unknown };
+      return meta.kind === 'unstick-marker' && meta.operationId === change.id;
+    });
+    if (existing) cm.editMessage(existing.id, [{ type: 'text', text }]);
+    else cm.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'unstick-marker', operationId: change.id, category });
+  }
 
   /** The unstick journal, loaded and reduced on first use. Store-bound and
    *  branch-independent (RecordJournal): an operation's intents and outcomes
@@ -6981,11 +7037,12 @@ export class AgentFramework {
     }
     reduceUnstickEntry(ledger.ops, entry);
     if (ledger.journal.entriesSinceCheckpoint >= 64) {
-      // Keep the newest operations; older ones are long finished.
-      const kept = [...ledger.ops.entries()].slice(-32);
+      // Every operation stays: its record is the authority for at-most-once
+      // re-runs and the outcomes getUnstickOperation reports, finished or
+      // not. Records are small and operations rare; the checkpoint only
+      // bounds the replay.
       try {
-        ledger.journal.checkpoint(Object.fromEntries(kept));
-        ledger.ops = new Map(kept);
+        ledger.journal.checkpoint(Object.fromEntries(ledger.ops));
       } catch (error) {
         console.error('[unstick] journal checkpoint failed (replay stays longer):', error instanceof Error ? error.message : error);
         if (ledger.journal.needsReconcile) this.reloadUnstickJournal();
@@ -7031,6 +7088,7 @@ export class AgentFramework {
       ...(requester ? { requester } : {}),
       resolvedAt: Date.now(),
       sourceBranch: this.store.currentBranch().name,
+      storeId: this.storeIdentity(),
       kind: 'unstick',
       cap,
       plan,
@@ -7059,6 +7117,7 @@ export class AgentFramework {
     }
     const agent = this.agents.get(change.agent);
     if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${change.agent}`);
+    if (change.storeId !== this.storeIdentity()) stale('it was resolved against another store');
     const op = this.unstickLedger().ops.get(change.id);
     const journaled = op?.steps.find((s) => s.step === step);
     if (journaled?.status === 'shed') return { step, shedIds: journaled.messageIds, alreadyApplied: true };
@@ -7097,7 +7156,7 @@ export class AgentFramework {
       if (byId.has(id)) cm.removeMessage(id as MessageId);
     }
     const lastRefusal = op?.attempts.filter((a) => a.outcome === 'refused').at(-1)?.category;
-    this.updateRewindMarker(agent, lastRefusal ?? 'unknown');
+    this.setUnstickMarker(agent, change, step, lastRefusal ?? 'unknown');
     this.journalUnstick({ kind: 'step-done', operationId: change.id, step }, { afterCommittedState: true });
     this.recordOperatorAction({
       kind: 'unstick-step',
@@ -7124,6 +7183,10 @@ export class AgentFramework {
       throw new OperatorActionError('invalid', `Unstick ${change.id}: step ${step} hasn't been applied, so there is nothing to re-run`);
     }
     const key = `${change.id}#${step}`;
+    // Whoever else is waiting for this attempt is waiting for its turn to
+    // settle: a duplicate caller gets the same promise, outcome recorded or not.
+    const waiting = this.unstickAttemptWaiters.get(key);
+    if (waiting) return waiting.promise;
     const existing = op.attempts.find((a) => a.step === step);
     if (existing) {
       if (existing.status === 'completed') {
@@ -7135,18 +7198,28 @@ export class AgentFramework {
           ...(existing.error ? { error: existing.error } : {}),
         };
       }
-      return this.unstickAttemptWaiters.get(key)?.promise ?? { step, status: 'interrupted' };
+      return { step, status: 'interrupted' };
+    }
+    // One re-run per agent at a time: a batched turn carries one binding, so
+    // a second would be stranded. Refused before anything is recorded.
+    for (const other of this.unstickAttemptWaiters.values()) {
+      if (other.agent === change.agent) {
+        throw new OperatorActionError(
+          'agent-busy',
+          `An unstick re-run for ${change.agent} is already in flight; re-run step ${step} of ${change.id} once it settles`,
+        );
+      }
     }
     this.journalUnstick({ kind: 'attempt-launched', operationId: change.id, agent: change.agent, step }, { durable: true });
     let resolve!: (outcome: UnstickAttemptOutcome) => void;
     const promise = new Promise<UnstickAttemptOutcome>((r) => { resolve = r; });
-    this.unstickAttemptWaiters.set(key, { promise, resolve });
+    this.unstickAttemptWaiters.set(key, { agent: change.agent, promise, resolve });
     this.pendingRequests.push({
       agentName: change.agent,
       reason: 'unstick-attempt',
       source: 'framework',
       timestamp: Date.now(),
-      unstick: { operationId: change.id, step },
+      unstick: { operationId: change.id, step, storeId: change.storeId, sourceBranch: change.sourceBranch },
     });
     this.recordOperatorAction({
       kind: 'unstick-attempt',
@@ -7227,10 +7300,31 @@ export class AgentFramework {
 
   /** Resolve host/command undo by turns to the exact checkpoints it would
    *  undo, newest first; null when there is nothing to undo. */
-  private resolveUndoTurns(agentName: string, requested: number, requester?: OperatorRequester): ResolvedUndoTurnsChange | null {
+  private resolveUndoTurns(
+    agentName: string,
+    requested: number,
+    requester?: OperatorRequester,
+    publication?: { marks: 'none' | { scope: 'addressed' | 'all' }; serverId: string },
+  ): ResolvedUndoTurnsChange | null {
     const checkpoints = this.getTurnCheckpoints(agentName);
     if (checkpoints.length === 0) return null;
     const taken = checkpoints.slice(-requested).reverse();
+    // Freeze the publication choice to the refs the cut would remove now:
+    // every message stored after the oldest staged turn began.
+    let marks: ResolvedUndoTurnsChange['marks'] = 'none';
+    const choice = publication?.marks ?? 'none';
+    if (choice !== 'none') {
+      const cutAt = taken[taken.length - 1]!.sequenceBefore;
+      const wouldRemove = this.agents.get(agentName)!.getContextManager().getAllMessages()
+        .filter((m) => Number(m.sequence) > cutAt)
+        .map((m) => ({
+          metadata: {
+            ...((m.metadata ?? {}) as Record<string, unknown>),
+            serverId: (m.metadata as { serverId?: unknown } | undefined)?.serverId ?? publication!.serverId,
+          },
+        }));
+      marks = { scope: choice.scope, refs: selectDiscordAwarenessRefs(wouldRemove, choice).refs };
+    }
     return {
       id: randomUUID(),
       agent: agentName,
@@ -7238,9 +7332,12 @@ export class AgentFramework {
       ...(requester ? { requester } : {}),
       resolvedAt: Date.now(),
       sourceBranch: this.store.currentBranch().name,
+      storeId: this.storeIdentity(),
       kind: 'undo-turns',
       requestedTurns: requested,
       checkpoints: taken.map((c) => ({ turnIndex: c.turnIndex, sequenceBefore: c.sequenceBefore, branchName: c.branchName })),
+      marks,
+      ...(publication?.serverId ? { serverId: publication.serverId } : {}),
     };
   }
 
@@ -7268,19 +7365,24 @@ export class AgentFramework {
     fromBranch: string;
     toBranch: string;
     alreadyApplied?: true;
+    markers?: SurgeryMarkerReceipt;
   } {
     const stale = (what: string): never => {
       throw new OperatorActionError('stale', `Undo ${change.id} for ${change.agent} no longer holds: ${what}`);
     };
     if (!this.agents.has(change.agent)) throw new OperatorActionError('unknown-agent', `Unknown agent: ${change.agent}`);
+    if (change.storeId !== this.storeIdentity()) stale('it was resolved against another store');
     const destination = this.undoTurnsDestination(change);
     const undone = change.checkpoints.length;
     const current = this.store.currentBranch().name;
     if (current === destination) {
       // The cut happened. Finish whatever bookkeeping an interrupted attempt
       // left undone, without cutting again, and only then report it applied.
-      this.finishUndoTurnsCut(change, admission);
-      return { requested: change.requestedTurns, undone, fromBranch: change.sourceBranch, toBranch: destination, alreadyApplied: true };
+      const markers = this.finishUndoTurnsCut(change, admission);
+      return {
+        requested: change.requestedTurns, undone, fromBranch: change.sourceBranch, toBranch: destination, alreadyApplied: true,
+        ...(markers ? { markers } : {}),
+      };
     }
     // The destination exists if an earlier attempt got as far as creating
     // it. Never written to (its head still at its branch point), that
@@ -7305,10 +7407,19 @@ export class AgentFramework {
     // source: the destination, cut before the oldest staged turn recorded
     // itself, keeps only the older checkpoints, and the source tip keeps
     // every checkpoint for redo to return to.
+    // What the cut removes from this agent's context is whatever is in it
+    // now and not after: addressing metadata only, read within the same
+    // reservation that holds the switch.
+    const before = this.addressingSnapshot(change.agent);
     if (!created) this.store.createBranchAt(destination, change.sourceBranch, oldest.sequenceBefore);
     this.store.switchBranch(destination);
-    this.finishUndoTurnsCut(change, admission);
-    return { requested: change.requestedTurns, undone, fromBranch: change.sourceBranch, toBranch: destination };
+    const after = new Set(this.addressingSnapshot(change.agent).keys());
+    const removed = [...before].filter(([id]) => !after.has(id)).map(([, carrier]) => carrier);
+    const markers = this.finishUndoTurnsCut(change, admission, removed);
+    return {
+      requested: change.requestedTurns, undone, fromBranch: change.sourceBranch, toBranch: destination,
+      ...(markers ? { markers } : {}),
+    };
   }
 
   /**
@@ -7321,29 +7432,52 @@ export class AgentFramework {
    * - the one redo entry back to the source tip;
    * - the trace and the operator-log record, once per process.
    */
-  private finishUndoTurnsCut(change: ResolvedUndoTurnsChange, admission?: OperatorAdmission): void {
+  private finishUndoTurnsCut(
+    change: ResolvedUndoTurnsChange,
+    admission?: OperatorAdmission,
+    removed?: Array<{ metadata: Record<string, unknown> }>,
+  ): SurgeryMarkerReceipt | undefined {
     const destination = this.undoTurnsDestination(change);
     const oldest = change.checkpoints[change.checkpoints.length - 1]!;
-    const marker = (): { changeId?: unknown; completed?: unknown } | undefined => {
+    const marker = (): { changeId?: unknown; completed?: unknown; marked?: unknown; markers?: SurgeryMarkerReceipt } | undefined => {
       const framework = this.store.getStateJson(FRAMEWORK_STATE_ID);
       return (framework && typeof framework === 'object' ? framework as Record<string, unknown> : {}).operatorCut as
-        { changeId?: unknown; completed?: unknown } | undefined;
+        { changeId?: unknown; completed?: unknown; marked?: unknown; markers?: SurgeryMarkerReceipt } | undefined;
     };
-    const writeMarker = (completed: boolean) => {
+    const writeMarker = (state: { markers?: SurgeryMarkerReceipt }) => {
       const framework = this.store.getStateJson(FRAMEWORK_STATE_ID);
       this.store.setStateJson(FRAMEWORK_STATE_ID, {
         ...(framework && typeof framework === 'object' ? framework as Record<string, unknown> : {}),
-        operatorCut: { changeId: change.id, at: Date.now(), ...(completed ? { completed: true } : {}) },
+        operatorCut: { changeId: change.id, at: Date.now(), ...(state.markers ? { marked: true, markers: state.markers } : {}) },
       });
     };
     // A completed cut is left exactly as it is, whatever happened since on
     // its branch (later turns and their checkpoints, a redo stack): only
-    // its durability is confirmed again.
+    // its durability is confirmed again, and its marks receipt reported.
     if (marker()?.changeId === change.id && marker()?.completed === true) {
       this.store.sync();
-      return;
+      return marker()?.markers;
     }
-    if (marker()?.changeId !== change.id) writeMarker(false);
+    if (marker()?.changeId !== change.id) writeMarker({});
+    // Marks, once: what the cut actually removed, limited to the refs frozen
+    // at staging. A repair that has no snapshot left treats a frozen ref as
+    // removed when its message is gone from the destination (later
+    // arrivals' counts are then unknown, and reported as none).
+    // Scheduled once; every later answer reports the receipt recorded then.
+    let markers = marker()?.markers;
+    if (marker()?.marked !== true) {
+      let carriers = removed;
+      if (!carriers) {
+        const present = new Set(
+          [...this.addressingSnapshot(change.agent).values()].map((c) => `${c.metadata.channelId}|${c.metadata.messageId}`),
+        );
+        carriers = (change.marks === 'none' ? [] : change.marks.refs)
+          .filter((ref) => !present.has(`${ref.channelId}|${ref.messageId}`))
+          .map((ref) => ({ metadata: { ...ref } }));
+      }
+      markers = this.scheduleAppliedMarks('undo', change.agent, change.serverId ?? '', carriers, change.marks);
+      writeMarker({ markers });
+    }
     // Checkpoints need no bookkeeping: the lists are branch-scoped, and the
     // destination, cut where the oldest staged turn had yet to record
     // itself, inherits exactly the older ones. Later turns add their own.
@@ -7362,8 +7496,8 @@ export class AgentFramework {
       redoStack.push({ branchName: change.sourceBranch, checkpoints: [], changeId: change.id });
     }
     if (this.completedOperatorCuts.has(change.id)) {
-      this.completeUndoTurnsCut(change);
-      return;
+      this.completeUndoTurnsCut(change, markers);
+      return markers;
     }
     this.emitTrace({
       type: 'undo:completed',
@@ -7387,18 +7521,19 @@ export class AgentFramework {
       result: { sourceBranch: change.sourceBranch, targetBranch: destination },
     });
     this.completedOperatorCuts.add(change.id);
-    this.completeUndoTurnsCut(change);
+    this.completeUndoTurnsCut(change, markers);
+    return markers;
   }
 
   /** Mark an admitted undo cut complete on its destination and make that
    *  durable: branch state persists only on sync(), so completion is
    *  reported only after the sync succeeds (a failure throws, and a retry
    *  confirms it again). */
-  private completeUndoTurnsCut(change: ResolvedUndoTurnsChange): void {
+  private completeUndoTurnsCut(change: ResolvedUndoTurnsChange, markers?: SurgeryMarkerReceipt): void {
     const framework = this.store.getStateJson(FRAMEWORK_STATE_ID);
     this.store.setStateJson(FRAMEWORK_STATE_ID, {
       ...(framework && typeof framework === 'object' ? framework as Record<string, unknown> : {}),
-      operatorCut: { changeId: change.id, at: Date.now(), completed: true },
+      operatorCut: { changeId: change.id, at: Date.now(), marked: true, ...(markers ? { markers } : {}), completed: true },
     });
     this.store.sync();
   }
@@ -7425,11 +7560,9 @@ export class AgentFramework {
       return { kind: 'unstick', ...this.applyUnstickStep(change, opts.step, opts.admission) };
     }
     if (change.kind === 'undo-turns') {
+      // Marks are scheduled within the cut's bookkeeping, under the lease;
+      // their delivery runs in the background and is never this undo's.
       const applied = this.applyUndoTurns(change, opts.admission);
-      // Installs the MCPL data-plane gate now, under the lease, and drains in
-      // the background: remote delivery is never awaited inside the lease,
-      // and its failure is never this undo's.
-      if (!applied.alreadyApplied) this.deliverDiscordAwarenessInBackground('undo', change.agent);
       return { kind: 'undo-turns', ...applied };
     }
     this.revalidateSelfChange(change);
@@ -10374,6 +10507,19 @@ export class AgentFramework {
       // A silent tick never suppresses a genuine coalesced wake. If any
       // ordinary request shares this batch, the ordinary turn semantics win.
       const silentOnly = requests.every((r) => r.suppressProse === true);
+      // An unstick re-run is bound to the source it was approved on. If the
+      // store or branch moved before it could start, it fails without
+      // running; ordinary wakes batched with it keep their turn, unbound.
+      const movedRuns = requests.filter((r) => r.unstick
+        && (r.unstick.storeId !== this.storeIdentity() || r.unstick.sourceBranch !== this.store.currentBranch().name));
+      if (movedRuns.length > 0) {
+        for (const r of movedRuns) {
+          this.settleUnstickAttempt(r.unstick!, 'failed', { error: 'its source branch or store moved before the re-run started' });
+          this.releaseUnstickAttempt(r.unstick!);
+        }
+        requests = requests.filter((r) => !movedRuns.includes(r));
+        if (requests.length === 0) continue;
+      }
       // An unstick re-run in the batch binds the turn to its operation and
       // step, whichever request leads the batch.
       const unstickReq = requests.find((r) => r.unstick);
