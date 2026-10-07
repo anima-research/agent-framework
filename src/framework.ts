@@ -5957,8 +5957,9 @@ export class AgentFramework {
    *
    * Returns once the switch has landed and the marker batch is durably active
    * (`markers`), without waiting for Discord to accept the reactions: delivery
-   * runs after the store reservation is released, behind the MCPL data-plane
-   * gate, and its per-message outcomes stay in the outbox ledger.
+   * is started, behind the MCPL data-plane gate, and continues without the
+   * caller or the store reservation waiting on it; its per-message outcomes
+   * stay in the outbox ledger.
    *
    * Throws `OperatorActionError` (`agent-busy`, `unknown-message`, …) — the
    * agent must be idle; nothing is queued.
@@ -6061,7 +6062,8 @@ export class AgentFramework {
         // apart from the body (`markers`).
         markers = this.activateSurgeryMarkers(markerBatch, 'rollback', agentName);
         // Installs the MCPL data-plane gate synchronously, before the store is
-        // released; the drain itself runs after this call returns.
+        // released, and starts delivery without awaiting it (the first
+        // reaction request may already be on the wire when this returns).
         this.deliverDiscordAwarenessInBackground('rollback', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
@@ -6109,7 +6111,8 @@ export class AgentFramework {
    * the batch is `explicit`-activated only after every removal succeeded, and
    * a crash mid-way is finished at next boot (resumePreparedDiscordSuppressions).
    * Like rollbackToMessage, it returns once the body change and the batch's
-   * activation are durable (`markers`); delivery runs in the background.
+   * activation are durable (`markers`); delivery continues without the caller
+   * waiting on it.
    *
    * Not retroactive over derived state: a message already folded into an
    * autobiographical summary stays in that summary — roll back to before it
@@ -6250,7 +6253,8 @@ export class AgentFramework {
         // loses nothing.)
         markers = this.activateSurgeryMarkers(markerBatch, 'suppress', agentName);
         // Installs the MCPL data-plane gate synchronously, before the store is
-        // released; the drain itself runs after this call returns.
+        // released, and starts delivery without awaiting it (the first
+        // reaction request may already be on the wire when this returns).
         this.deliverDiscordAwarenessInBackground('suppress', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
@@ -6345,13 +6349,15 @@ export class AgentFramework {
   }
 
   /**
-   * Hand awareness delivery to the background, without holding the caller.
+   * Start awareness delivery without the caller awaiting it.
    * `syncDiscordAwarenessMarkers` installs the MCPL data-plane gate
    * synchronously, before its first await, so calling this while a surgery
    * still holds the store keeps MCPL-borne wakes behind the gate exactly as
-   * before. Only the surgery's response and its store reservation stop
-   * waiting on remote reactions. A failure is accounted by the gate itself
-   * (connections recycled); here it is logged and raised as an ops alert.
+   * before. The drain starts in the same synchronous run (the first reaction
+   * request can be written before this returns) and continues independently;
+   * only the surgery's response and its store reservation stop waiting on
+   * remote reactions. A failure is accounted by the gate itself (connections
+   * recycled); here it is logged and raised as an ops alert.
    */
   private deliverDiscordAwarenessInBackground(verb: 'rollback' | 'suppress', agentName: string): void {
     if (!this.discordAwarenessOutbox) return;
