@@ -7214,12 +7214,11 @@ export class AgentFramework {
       this.noteInboundAccepted(source);
     }
     metadata[INBOUND_SOURCE_KEY] = source;
-    // The delivered body's version identity, and the stored copy's own
-    // digest (mcpl/inbound-source.ts sourceBodyDigest; room-220
-    // #46752–#47210). This lane stores the body as delivered, so the two
-    // agree until a decoration or a later edit sets them apart.
+    // The delivered body's version identity (mcpl/inbound-source.ts
+    // sourceBodyDigest; room-220 #46752–#47210), from the body as delivered,
+    // before any host decoration. The stored copy's own digest is taken at
+    // each storage site below, over exactly the blocks stored there.
     metadata.sourceBodyDigest = sourceBodyDigest(event.content);
-    metadata.storedBodyDigest = sourceBodyDigest(event.content);
 
     // Per-channel conversation routing: messages go to the channel's fork
     // agent (spawned from the template on first qualifying message), never
@@ -7232,7 +7231,7 @@ export class AgentFramework {
       if (!target) return undefined;
       if (this.conversationRouter && this.conversationAgentHomes.has(target.name)) {
         metadata.triggered = event.triggerInference ?? false;
-        const id = target.getContextManager().addMessage('user', event.content, metadata);
+        const id = target.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(metadata, event.content));
         // A correction may target an older engagement. Refresh only the
         // binding whose agent actually received the message.
         if (this.conversationRouter.getBinding(event.channelId)?.agentName === target.name) {
@@ -7301,7 +7300,7 @@ export class AgentFramework {
     }
 
     const placement: CoalescingPlacement = { agent: '' };
-    const id = this.addMessage('user', incomingContent, metadata, { placement, bypassDeferralFor: event.assemblingFor });
+    const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), { placement, bypassDeferralFor: event.assemblingFor });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
     if (event.triggerInference && !divert) {
@@ -7416,7 +7415,7 @@ export class AgentFramework {
     const trigger = decision.trigger && event.triggerInference !== false;
     messageMetadata.triggered = trigger;
 
-    const id = agent.getContextManager().addMessage('user', event.content, messageMetadata);
+    const id = agent.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
     router.touch(event.channelId);
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
@@ -7791,6 +7790,23 @@ export class AgentFramework {
       ...(sourceTimestamp ? { sourceTimestamp } : {}),
       ...(fields.deferred ? { deferred: true as const } : {}),
     };
+  }
+
+  /**
+   * An inbound item's metadata with its stored copy's own digest
+   * (`storedBodyDigest`): the delivered-body digest's function over exactly
+   * the blocks handed to storage here — every decoration included, before
+   * storage shards them. Taken at each storage site, never earlier, because
+   * a path can still decorate the body after ingestion stamped it (the
+   * closed-channel invitation; room-220 #48282). An edit through
+   * editMessage keeps metadata but not this hash.
+   */
+  private static withStoredDigest(
+    metadata: Record<string, unknown>,
+    content: readonly ContentBlock[],
+  ): Record<string, unknown> {
+    metadata.storedBodyDigest = sourceBodyDigest(content);
+    return metadata;
   }
 
   /** Source envelope of a channels/incoming event (lane facts as given). */
@@ -8420,13 +8436,10 @@ export class AgentFramework {
       event.origin?.source === 'heartbeat' &&
       event.origin?.silent === true &&
       content.length === 0;
-    // The stored copy's own digest, over exactly what is stored (decorations
-    // included, before storage shards it). A silent heartbeat stores nothing.
-    if (!silentHeartbeat) metadata.storedBodyDigest = sourceBodyDigest(content);
 
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
-      const id = this.addMessage('user', content, metadata, { placement, bypassDeferralFor: event.assemblingFor });
+      const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), { placement, bypassDeferralFor: event.assemblingFor });
       this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
     } else {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${event.eventId}`);

@@ -186,6 +186,31 @@ describe('inbound source envelope', () => {
     assert.notEqual(sourceBodyDigest(edited.content), meta.storedBodyDigest);
   });
 
+  it('a message accepted while its channel was open but stored after it closed: the stored digest covers the invitation', async () => {
+    // Tessa-974's discriminator (room-220 #48282): the invitation is
+    // appended after ingestion stamped the delivered digest, at storage
+    // time, when the channel has closed in between.
+    const registry = (framework as unknown as {
+      channelRegistry: { handleChannelToolCall(name: string, input: unknown, caller: unknown): Promise<unknown>; isChannelOpen(id: string): boolean };
+    }).channelRegistry;
+    const fw = framework as unknown as { pushEvent(e: { type: string }): void };
+    const held: Array<{ type: string }> = [];
+    const push = fw.pushEvent.bind(framework);
+    fw.pushEvent = (e) => { if (e.type === 'mcpl:channel-incoming') held.push(e); else push(e); };
+    command({ op: 'incoming', channelId: ROOM, messageId: 'm-closed', mode: 'addressed', text: 'hello while open' });
+    await waitFor(() => held.length > 0, 'incoming accepted and held');
+    await registry.handleChannelToolCall('channel_close', { channelId: ROOM }, { kind: 'agent', agentName: 'scout' });
+    assert.equal(registry.isChannelOpen(ROOM), false);
+    fw.pushEvent = push;
+    for (const e of held) push(e);
+    await waitFor(() => !!storedWith((m) => m.messageId === 'm-closed'), 'message stored');
+    const message = storedWith((m) => m.messageId === 'm-closed')!;
+    const meta = message.metadata as Record<string, unknown>;
+    assert.equal(meta.channelInvitation, true, 'stored with the closed-channel invitation');
+    assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'the untouched copy matches its own witness');
+    assert.equal(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'hello while open' }]), 'the delivered body alone');
+  });
+
   it('on the push lane, the delivered digest excludes host decoration and the stored digest covers it', async () => {
     command({ op: 'dm', eventId: 'ev-dig', authorId: '134', authorName: 'antra', rawChannelId: RAW_DM, text: 'psst' });
     await waitFor(() => !!storedWith((m) => m.eventId === 'ev-dig'), 'dm stored');
