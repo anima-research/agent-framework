@@ -2189,7 +2189,14 @@ export class AgentFramework {
     // cooldown stays a primary-path mechanism.
     const hostHold = this.consultProviderHold(error, agent.name);
     const acceleration = !hostHold && !auxiliary && isOrganizationAccelerationRateLimit(error);
-    if (!acceleration && !hostHold) return wait !== undefined && this.holdForProviderWait(agent, wait, trigger ? [trigger] : []);
+    // The stated wait binds later calls whatever the failure was. Retaining
+    // and retrying THIS request is for a failure the provider says may be
+    // retried: a non-retryable one keeps its terminal disposition (marker,
+    // failure streak), and the wait applies to the calls that follow it.
+    if (!acceleration && !hostHold) {
+      return wait !== undefined && error instanceof MembraneError && error.retryable === true
+        && this.holdForProviderWait(agent, wait, trigger ? [trigger] : []);
+    }
     const now = Date.now(); const delayMs = hostHold ? hostHold.holdMs : this.accelerationCooldownMs(agent.name, error as MembraneError);
     const existing = this.providerAccelerationCooldowns.get(agent.name);
     const held = existing?.heldRequests ?? [];
@@ -2351,17 +2358,35 @@ export class AgentFramework {
    * passing of time needs no call). Recorded, so a restart does not bring the
    * wait back; held primary turns are released into one fresh compile.
    */
-  releaseProviderWait(agentName: string, model?: string, by = 'operator'): Array<{ model: string; until: string | null }> {
+  releaseProviderWait(agentName: string, model?: string, by = 'operator'): Array<{
+    model: string; until: string | null; release: 'recorded' | 'pending' | 'in-process override';
+  }> {
     const released = this.providerWaits?.release(agentName, model, by) ?? [];
-    for (const wait of released) {
-      console.error(`[provider-wait] agent=${agentName} model=${wait.model} released by ${by}`);
+    for (const { wait, release } of released) {
+      console.error(`[provider-wait] agent=${agentName} model=${wait.model} released by ${by} (${release})`);
+    }
+    // The agent's context strategy may pace its own provider calls by the
+    // same stated wait (context-manager's compression lane). The release is
+    // the operator's word on that wait too; the strategy's own backoff stays.
+    if (released.length > 0) {
+      const strategy = this.agents.get(agentName)?.getContextManager().getStrategy() as
+        { releaseCompressionPause?: (model?: string) => boolean } | undefined;
+      try {
+        if (strategy?.releaseCompressionPause?.(model)) {
+          console.error(`[provider-wait] agent=${agentName} model=${model ?? '*'} compression lane's provider wait released`);
+        }
+      } catch (error) {
+        console.error(`[provider-wait] agent=${agentName} could not release the compression lane's wait: ${safeSlice(error instanceof Error ? error.message : String(error), 0, 300)}`);
+      }
     }
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
     if (cooldown?.waitModel !== undefined && (model === undefined || cooldown.waitModel === model)) {
       cooldown.until = Date.now();
       this.releaseProviderAccelerationCooldown(agentName);
     }
-    return released.map((wait) => ({ model: wait.model, until: wait.until === null ? null : new Date(wait.until).toISOString() }));
+    return released.map(({ wait, release }) => ({
+      model: wait.model, until: wait.until === null ? null : new Date(wait.until).toISOString(), release,
+    }));
   }
 
   /** Provider waits binding now, for health and doctor tooling. */
@@ -9165,6 +9190,21 @@ export class AgentFramework {
       }
       if (this.providerAdmissionClosed) {
         this.releasePrimaryProviderGate(agent.name);
+        return;
+      }
+    }
+    // The last admission boundary before this primary call. With the gate
+    // held and no auxiliary call in flight, no new provider wait can be
+    // recorded for this agent before the call (auxiliary admission waits on
+    // the gate). But one may have been recorded since the scheduler's check:
+    // an auxiliary call this wake parked behind can fail with a stated wait
+    // on the primary model. That wait binds this wake too: hold it, don't call.
+    if (ownsProviderGate) {
+      const wait = this.providerWaits?.active(agent.name, agent.model);
+      if (wait && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [])) {
+        this.releasePrimaryProviderGate(agent.name);
+        console.error(`[provider-wait] agent=${agent.name} model=${agent.model} binds at admission ` +
+          `(recorded after the wake was scheduled); wake held, not started`);
         return;
       }
     }

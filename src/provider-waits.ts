@@ -27,6 +27,7 @@
 
 import type { JsStore } from '@animalabs/chronicle';
 import { RecordJournal } from './record-journal.js';
+import { safeSlice } from './safe-slice.js';
 
 export const PROVIDER_WAIT_RECORD_TYPE = 'framework/provider-wait';
 
@@ -94,48 +95,96 @@ export interface ProviderWaitChange {
   changed: boolean;
 }
 
+/**
+ * One wait a release lifted. `release` says how far that reaches:
+ * - 'recorded': the release is durably recorded, so a restart keeps it;
+ * - 'pending': it binds in this process, but its record has not landed yet
+ *   and is offered again at the next act (a restart before then restores the
+ *   wait);
+ * - 'in-process override': the hold that stands for unreadable recorded
+ *   waits, lifted for this process only (a restart that still cannot read
+ *   them holds again). The release itself is still offered to the journal,
+ *   so once the history can be read it applies there, in order.
+ */
+export interface ProviderWaitRelease {
+  wait: ProviderWait;
+  release: 'recorded' | 'pending' | 'in-process override';
+}
+
+/** How often a binding act this process could not record is offered to the journal again, absent another act. */
+const RETRY_WRITE_MS = 30_000;
+/** How often unreadable recorded waits are read again. */
+const RETRY_READ_MS = 30_000;
+/** The model a release names when it covers every model (and how an unreadable history is listed). */
+export const EVERY_MODEL = '*';
+
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+const live = (wait: ProviderWait | undefined, now: number): ProviderWait | undefined =>
+  wait && (wait.until === null || wait.until > now) ? wait : undefined;
+
 export class ProviderWaits {
-  private readonly waits = new Map<string, ProviderWait>();
+  /**
+   * The reduction of exactly what the journal holds: its latest checkpoint and
+   * every entry after it, as loaded or as appended and synced. A checkpoint
+   * records this, so it covers the same ordered acts the journal does.
+   */
+  private durable = new Map<string, ProviderWait>();
+  /**
+   * Acts of this process not yet known to be durably recorded, in the order
+   * they were made. They bind here from the moment they are made, and are
+   * offered to the journal, in order, at every later act until one lands.
+   */
+  private readonly pending: ProviderWaitEntry[] = [];
+  /** What binds in this process: `durable` with `pending` applied in order. */
+  private view = new Map<string, ProviderWait>();
+  /**
+   * Set while the recorded waits cannot be read. Their absence is then
+   * unknown, not "no waits": every (agent, model) is held (fail closed) until
+   * they can be read or an operator releases the agent's waits. Releases made
+   * meanwhile are kept in `waived` (agent, model or EVERY_MODEL) for this
+   * process; a restart that still cannot read them holds again.
+   */
+  private unreadable: { error: string; at: number; lastTry: number; waived: Set<string> } | null = null;
+  private lastWriteTry = 0;
   private readonly journal: RecordJournal<ProviderWaitEntry, ProviderWaitSnapshot> | null;
   private readonly now: () => number;
   private readonly log: (line: string) => void;
 
-  /**
-   * `store` null keeps waits in memory only (a framework without a store has
-   * no restart to survive). Loading replays the journal; a journal that
-   * cannot be read is reported and the framework starts with no waits, the
-   * same as before this existed, rather than refusing to start.
-   */
+  /** `store` null keeps waits in memory only (a framework without a store has no restart to survive). */
   constructor(store: JsStore | null, opts: { now?: () => number; log?: (line: string) => void } = {}) {
     this.now = opts.now ?? Date.now;
     this.log = opts.log ?? ((line) => console.error(line));
     this.journal = store ? new RecordJournal<ProviderWaitEntry, ProviderWaitSnapshot>(store, { type: PROVIDER_WAIT_RECORD_TYPE }) : null;
-    try {
-      this.reload();
-    } catch (error) {
-      this.log(`[provider-wait] could not read recorded provider waits; starting with none: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    this.load();
   }
 
-  /** The wait binding (agent, model) now, if any. */
+  /**
+   * The wait binding (agent, model) now, if any. While the recorded waits
+   * cannot be read, an indefinite wait saying so, unless an operator released
+   * this agent's waits since.
+   */
   active(agent: string, model: string): ProviderWait | undefined {
-    const key = keyOf(agent, model);
-    const wait = this.waits.get(key);
-    if (!wait) return undefined;
-    if (wait.until !== null && wait.until <= this.now()) {
-      this.waits.delete(key);
-      return undefined;
-    }
-    return wait;
+    this.retry();
+    if (this.unreadable && !this.waived(agent, model)) return this.unreadableWait(agent, model);
+    const wait = live(this.view.get(keyOf(agent, model)), this.now());
+    return wait ? { ...wait } : undefined;
   }
 
-  /** Every wait binding now, for one agent or all. */
+  /**
+   * Every wait binding now, for one agent or all. While the recorded waits
+   * cannot be read, it leads with an indefinite wait on EVERY_MODEL saying
+   * so (for the agent asked about, or for EVERY_MODEL agents).
+   */
   list(agent?: string): ProviderWait[] {
+    this.retry();
     const result: ProviderWait[] = [];
-    for (const wait of [...this.waits.values()]) {
+    if (this.unreadable && (agent === undefined || !this.waived(agent, EVERY_MODEL))) {
+      result.push(this.unreadableWait(agent ?? EVERY_MODEL, EVERY_MODEL));
+    }
+    const now = this.now();
+    for (const wait of this.view.values()) {
       if (agent !== undefined && wait.agent !== agent) continue;
-      const live = this.active(wait.agent, wait.model);
-      if (live) result.push({ ...live });
+      if (live(wait, now)) result.push({ ...wait });
     }
     return result;
   }
@@ -143,55 +192,163 @@ export class ProviderWaits {
   /** Record a provider's stated wait for (agent, model). */
   set(agent: string, model: string, retryAfterMs: unknown, reason: string): ProviderWaitChange {
     const at = this.now();
+    // Decide against what the journal now holds: an earlier ambiguous write
+    // is reconciled first.
+    this.reconcile();
     const entry: ProviderWaitEntry = { kind: 'set', agent, model, until: waitDeadline(retryAfterMs, at), reason, at };
-    const before = this.active(agent, model);
-    reduce(this.waits, entry);
-    const wait = this.waits.get(keyOf(agent, model))!;
-    const changed = before === undefined || wait !== before;
-    if (changed) this.persist(entry);
-    return { wait: { ...wait }, changed };
-  }
-
-  /** Release (agent, model)'s wait, or every wait of the agent; recorded. */
-  release(agent: string, model: string | undefined, by: string): ProviderWait[] {
-    const released = this.list(agent).filter((wait) => model === undefined || wait.model === model);
-    if (released.length === 0) return [];
-    const entry: ProviderWaitEntry = { kind: 'released', agent, model: model ?? null, by, at: this.now() };
-    reduce(this.waits, entry);
-    this.persist(entry);
-    return released;
-  }
-
-  private reload(): void {
-    if (!this.journal) return;
-    const { snapshot, entries } = this.journal.load();
-    const loaded = new Map<string, ProviderWait>();
-    for (const wait of snapshot?.waits ?? []) loaded.set(keyOf(wait.agent, wait.model), wait);
-    for (const { entry } of entries) reduce(loaded, entry);
-    // What this process holds in memory but could not persist still binds.
-    for (const wait of this.waits.values()) {
-      reduce(loaded, { kind: 'set', agent: wait.agent, model: wait.model, until: wait.until, reason: wait.reason, at: wait.setAt });
-    }
-    this.waits.clear();
-    for (const [key, wait] of loaded) this.waits.set(key, wait);
+    const before = live(this.view.get(keyOf(agent, model)), at);
+    const changed = before === undefined || outlasts(entry.until, before.until);
+    if (changed) this.apply(entry);
+    // An unchanged binding is not proof it was recorded: offer what is pending.
+    this.flush();
+    return { wait: { ...this.view.get(keyOf(agent, model))! }, changed };
   }
 
   /**
-   * Durable before the caller acts: a lost wait would admit one early call
-   * after a crash. A failed write leaves the wait binding in memory (it still
-   * holds in this process) and is reported; an ambiguous one is reconciled
-   * before the next write.
+   * Release (agent, model)'s wait, or every wait of the agent when `model` is
+   * omitted; recorded. While the recorded waits cannot be read, it also lifts
+   * the hold that stands for them, exactly as far as the release names (that
+   * model, or every model), in this process only. Each lifted wait says how
+   * far its release reaches (ProviderWaitRelease).
    */
-  private persist(entry: ProviderWaitEntry): void {
-    if (!this.journal) return;
+  release(agent: string, model: string | undefined, by: string): ProviderWaitRelease[] {
+    this.reconcile();
+    const now = this.now();
+    const released = [...this.view.values()]
+      .filter((wait) => wait.agent === agent && (model === undefined || wait.model === model) && live(wait, now))
+      .map((wait) => ({ ...wait }));
+    const target = model ?? EVERY_MODEL;
+    let override: ProviderWait | undefined;
+    if (this.unreadable && !this.waived(agent, target)) {
+      override = this.unreadableWait(agent, target);
+      this.unreadable.waived.add(keyOf(agent, target));
+    }
+    if (released.length === 0 && !override) return [];
+    const entry: ProviderWaitEntry = { kind: 'released', agent, model: model ?? null, by, at: now };
+    this.apply(entry);
+    this.flush();
+    const recorded = !this.pending.includes(entry);
+    return [
+      ...(override ? [{ wait: override, release: 'in-process override' as const }] : []),
+      ...released.map((wait) => ({ wait, release: recorded ? 'recorded' as const : 'pending' as const })),
+    ];
+  }
+
+  private waived(agent: string, model: string): boolean {
+    const waived = this.unreadable?.waived;
+    return waived !== undefined && (waived.has(keyOf(agent, EVERY_MODEL)) || waived.has(keyOf(agent, model)));
+  }
+
+  private unreadableWait(agent: string, model: string): ProviderWait {
+    return {
+      agent, model, until: null, setAt: this.unreadable!.at,
+      reason: `recorded provider waits could not be read (${this.unreadable!.error}); held until they can be read or an operator releases this agent's waits`,
+    };
+  }
+
+  /** Make an act bind in this process, ahead of its record. */
+  private apply(entry: ProviderWaitEntry): void {
+    this.pending.push(entry);
+    reduce(this.view, entry);
+  }
+
+  /** Rebuild what binds from the journal's reduction and this process's pending acts, in order. */
+  private rebuildView(): void {
+    const view = new Map<string, ProviderWait>();
+    for (const [key, wait] of this.durable) view.set(key, { ...wait });
+    for (const entry of this.pending) reduce(view, entry);
+    this.view = view;
+  }
+
+  /**
+   * Read the journal into `durable`. A failure leaves the history unreadable
+   * (fail closed, reported once), never empty.
+   */
+  private load(): boolean {
+    if (!this.journal) return true;
+    const now = this.now();
     try {
-      if (this.journal.needsReconcile) this.reload();
-      this.journal.append(entry, { durable: true });
-      if (this.journal.entriesSinceCheckpoint >= CHECKPOINT_EVERY) {
-        this.journal.checkpoint({ waits: this.list() });
-      }
+      const { snapshot, entries } = this.journal.load();
+      const loaded = new Map<string, ProviderWait>();
+      for (const wait of snapshot?.waits ?? []) loaded.set(keyOf(wait.agent, wait.model), { ...wait });
+      for (const { entry } of entries) reduce(loaded, entry);
+      this.durable = loaded;
     } catch (error) {
-      this.log(`[provider-wait] could not record ${entry.kind} for agent=${entry.agent} model=${entry.model ?? '*'}; it holds in this process only: ${error instanceof Error ? error.message : String(error)}`);
+      if (this.unreadable) {
+        this.unreadable.lastTry = now;
+      } else {
+        this.unreadable = { error: safeSlice(errorText(error), 0, 300), at: now, lastTry: now, waived: new Set() };
+        this.log(`[provider-wait] recorded provider waits could not be read (${this.unreadable.error}): ` +
+          'no provider call is admitted until they can be read or an operator releases an agent\'s waits ' +
+          '(release-provider-wait); inspection is unaffected');
+      }
+      return false;
+    }
+    if (this.unreadable) {
+      this.log(`[provider-wait] recorded provider waits are readable again; ${loaded(this.durable, now)} bind`);
+      this.unreadable = null;
+    }
+    this.rebuildView();
+    return true;
+  }
+
+  /** Reconcile an ambiguous write before deciding anything against the journal. */
+  private reconcile(): void {
+    if (this.journal?.needsReconcile) this.load();
+  }
+
+  /** Offer unrecorded acts and unreadable history again, at most every so often, absent other acts. */
+  private retry(): void {
+    const now = this.now();
+    if (this.unreadable && now - this.unreadable.lastTry >= RETRY_READ_MS) this.load();
+    if (this.pending.length > 0 && now - this.lastWriteTry >= RETRY_WRITE_MS) {
+      this.reconcile();
+      this.flush();
     }
   }
+
+  /**
+   * Record pending acts in order, each durable before the next: a lost wait
+   * would admit an early call after a crash. The first that fails stays
+   * pending with every act after it (they still bind in this process) and is
+   * reported; an ambiguous one is reconciled before the next attempt, so an
+   * act may be recorded twice, which reduces the same. A checkpoint records
+   * the journal's own reduction, never this process's unrecorded acts, and
+   * never while the history is unreadable (it would cover entries that were
+   * never reduced).
+   */
+  private flush(): void {
+    if (!this.journal) {
+      for (const entry of this.pending.splice(0)) reduce(this.durable, entry);
+      return;
+    }
+    this.lastWriteTry = this.now();
+    while (this.pending.length > 0) {
+      if (this.journal.needsReconcile && !this.load()) return;
+      if (this.journal.needsReconcile) return;
+      const entry = this.pending[0]!;
+      try {
+        this.journal.append(entry, { durable: true });
+      } catch (error) {
+        this.log(`[provider-wait] could not record ${entry.kind} for agent=${entry.agent} model=${entry.model ?? EVERY_MODEL} ` +
+          `(${this.pending.length} act(s) pending); it holds in this process and is offered again at the next act: ${safeSlice(errorText(error), 0, 300)}`);
+        return;
+      }
+      this.pending.shift();
+      reduce(this.durable, entry);
+    }
+    if (this.unreadable || this.journal.entriesSinceCheckpoint < CHECKPOINT_EVERY) return;
+    const now = this.now();
+    try {
+      this.journal.checkpoint({ waits: [...this.durable.values()].filter((wait) => live(wait, now)) }, { durable: true });
+    } catch (error) {
+      this.log(`[provider-wait] could not checkpoint provider waits; the journal still replays in full: ${safeSlice(errorText(error), 0, 300)}`);
+    }
+  }
+}
+
+function loaded(waits: Map<string, ProviderWait>, now: number): number {
+  let count = 0;
+  for (const wait of waits.values()) if (live(wait, now)) count++;
+  return count;
 }
