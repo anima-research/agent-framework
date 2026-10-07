@@ -173,7 +173,10 @@ awareness journal kept in the store itself, and the marks are delivered when
 the host and that agent's `discord-mcpl` bot next connect (see
 [Live surgery and Discord awareness marks](#live-surgery-and-discord-awareness-marks)).
 If the branch is made but the marks can't be recorded, the output's `markers`
-says so and the branch stands.
+says so and the branch stands. Like a live surgery, the recovery (with its
+marks choice and receipt) is recorded in the store's operator log,
+`operator-actions.jsonl`, with the OS account that ran it; so is each
+`--awareness` cancel, retract and release. A dry run records nothing.
 Portal and other non-Discord records are ignored.
 
 When the safe point is an assistant/tool-side record rather than a Discord

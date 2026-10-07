@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { userInfo } from 'node:os';
 import { JsStore } from '@animalabs/chronicle';
 import { createOfflineRecoveryBranch } from './offline-branch.js';
 import {
@@ -7,6 +8,12 @@ import {
   defaultDiscordAwarenessOutboxPath,
   type DiscordAwarenessMarks,
 } from './discord-awareness-outbox.js';
+import {
+  OperatorLog,
+  defaultOperatorLogPath,
+  type OperatorLogInput,
+  type OperatorRequester,
+} from '../operator-log.js';
 
 interface CliOptions {
   storePath?: string;
@@ -68,6 +75,9 @@ Awareness journal (host stopped):
   --awareness release <ID>    Queue a held batch's recorded operations
 
 Queued work is delivered when the host next connects to the Discord server.
+Each recovery and each cancel, retract or release (done or refused; not a
+dry run or a list) is recorded in <store>/operator-actions.jsonl, the host's
+operator log, with the OS account that ran it.
 The agent host must be stopped before running this command.`;
 }
 
@@ -138,6 +148,28 @@ function parseArgs(args: string[]): CliOptions {
   return options;
 }
 
+/** Who ran the command, as far as the CLI can say: the OS account. */
+function cliRequester(): OperatorRequester {
+  try {
+    return { via: 'cli', name: userInfo().username };
+  } catch {
+    return { via: 'cli' };
+  }
+}
+
+/**
+ * Record an act in the store's operator log (`<store>/operator-actions.jsonl`,
+ * where the host records its own), whether it was done or refused, like the
+ * live surfaces' acts. Best-effort: a logging failure never fails the act.
+ */
+function recordOperatorAction(storePath: string, entry: OperatorLogInput): void {
+  new OperatorLog(defaultOperatorLogPath(storePath)).append(entry);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function awareness(options: CliOptions): void {
   // The journal lives in the store; with the host stopped, this process is
   // its only writer.
@@ -147,14 +179,28 @@ function awareness(options: CliOptions): void {
       legacyPath: options.outboxPath ?? defaultDiscordAwarenessOutboxPath(options.storePath!),
     });
     const { verb, target } = options.awareness!;
-    const by = 'agent-framework-recover';
-    let result: unknown;
-    switch (verb) {
-      case 'list': result = { store: options.storePath, batches: outbox.view() }; break;
-      case 'cancel': result = outbox.cancel(target!, by); break;
-      case 'retract': result = outbox.retract(target!, by); break;
-      case 'release': result = outbox.release(target!, by); break;
+    if (verb === 'list') {
+      console.log(JSON.stringify({ store: options.storePath, batches: outbox.view() }, null, 2));
+      return;
     }
+    const by = 'agent-framework-recover';
+    // Logged as the live controls log theirs.
+    const logBase: OperatorLogInput = {
+      kind: `awareness-${verb}`,
+      agent: '*',
+      requester: cliRequester(),
+      params: verb === 'release' ? { batchId: target } : { target },
+    };
+    let result: object;
+    try {
+      result = verb === 'cancel' ? outbox.cancel(target!, by)
+        : verb === 'retract' ? outbox.retract(target!, by)
+        : outbox.release(target!, by);
+    } catch (error) {
+      recordOperatorAction(options.storePath!, { ...logBase, error: errorMessage(error) });
+      throw error;
+    }
+    recordOperatorAction(options.storePath!, { ...logBase, result: { ...result } });
     console.log(JSON.stringify(result, null, 2));
   } finally {
     store.close();
@@ -181,22 +227,57 @@ async function main(): Promise<void> {
   // A CLI choice and its application are the same moment (the host is
   // stopped), so the scope is evaluated now rather than frozen to refs.
   const marks: DiscordAwarenessMarks = options.marks === 'none' ? 'none' : { scope: options.marks };
-  const result = await createOfflineRecoveryBranch({
-    storePath: options.storePath,
-    agentName: options.agentName,
-    messageId: options.messageId,
-    contextId: options.contextId,
-    messages: options.messages,
-    suppressMessageIds: options.suppressMessageIds,
-    suppressRanges: options.suppressRanges,
-    branchName: options.branchName,
-    namespace: options.namespace,
-    discordServerId: options.discordServerId,
-    outboxPath: options.outboxPath,
-    emoji: options.emoji,
-    marks,
-    dryRun: options.dryRun,
-  });
+  // A real recovery is recorded in the operator log, done or failed, with
+  // its marks choice and receipt, as a live rollback or suppression is. A
+  // dry run changes nothing and records nothing.
+  const logBase: OperatorLogInput = {
+    kind: 'recovery',
+    agent: options.agentName,
+    requester: cliRequester(),
+    params: {
+      ...(options.messageId !== undefined ? { messageId: options.messageId } : {}),
+      ...(options.contextId !== undefined ? { contextId: options.contextId } : {}),
+      ...(options.messages !== undefined ? { messages: options.messages } : {}),
+      ...(options.suppressMessageIds.length > 0 ? { suppressMessageIds: options.suppressMessageIds } : {}),
+      ...(options.suppressRanges.length > 0 ? { suppressRanges: options.suppressRanges } : {}),
+      marks: marks === 'none' ? 'none' : { scope: marks.scope },
+    },
+  };
+  let result: Awaited<ReturnType<typeof createOfflineRecoveryBranch>>;
+  try {
+    result = await createOfflineRecoveryBranch({
+      storePath: options.storePath,
+      agentName: options.agentName,
+      messageId: options.messageId,
+      contextId: options.contextId,
+      messages: options.messages,
+      suppressMessageIds: options.suppressMessageIds,
+      suppressRanges: options.suppressRanges,
+      branchName: options.branchName,
+      namespace: options.namespace,
+      discordServerId: options.discordServerId,
+      outboxPath: options.outboxPath,
+      emoji: options.emoji,
+      marks,
+      dryRun: options.dryRun,
+    });
+  } catch (error) {
+    if (!options.dryRun) recordOperatorAction(options.storePath, { ...logBase, error: errorMessage(error) });
+    throw error;
+  }
+  if (!result.dryRun) {
+    recordOperatorAction(options.storePath, {
+      ...logBase,
+      result: {
+        sourceBranch: result.sourceBranch,
+        targetBranch: result.targetBranch,
+        messagesRemoved: result.messagesRemoved,
+        messagesSuppressed: result.messagesSuppressed,
+        discordRefs: result.discordAddressable,
+        ...(result.markers ? { markers: result.markers } : {}),
+      },
+    });
+  }
 
   console.log(JSON.stringify({
     ...result,

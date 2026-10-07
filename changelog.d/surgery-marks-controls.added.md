@@ -22,3 +22,8 @@
   available as the `host/command` `marks` verb (`action: list | cancel |
   retract | release`, `target`) and, with the host stopped, as
   `agent-framework-recover --awareness list|cancel|retract|release`.
+- `agent-framework-recover` records its acts in the store's operator log
+  (`<store>/operator-actions.jsonl`), done or refused, with the OS account
+  that ran it: each `--awareness` cancel, retract and release, and each
+  recovery with its marks choice and receipt (kind `recovery`). A dry run or
+  a list records nothing.
