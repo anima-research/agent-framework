@@ -70,10 +70,13 @@ function makeHarness(opts?: { tick?: () => Promise<void>; addMessage?: (p: strin
     }),
   }]]);
   const errs: string[] = [];
+  // The arguments as passed: printing an object (rather than a string built
+  // from it) is what wrote a MembraneError's whole rawRequest to stderr.
+  const rawArgs: unknown[][] = [];
   const orig = console.error;
-  console.error = (...a: unknown[]) => { errs.push(a.map(String).join(' ')); };
+  console.error = (...a: unknown[]) => { rawArgs.push(a); errs.push(a.map(String).join(' ')); };
   const restore = () => { console.error = orig; };
-  return { fw, traces, logged, markers, errs, restore, ticks: () => ticks };
+  return { fw, traces, logged, markers, errs, rawArgs, restore, ticks: () => ticks };
 }
 
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 20));
@@ -154,26 +157,71 @@ test('an over-budget phrase quoted inside a classified provider error does not k
     await settle();
   } finally { unclassified.restore(); }
   assert.equal(unclassified.ticks(), 8);
+
+  // ...decided on the whole reason, even where the excerpts omit the phrase.
+  const long = makeHarness();
+  try {
+    long.fw.noteInferenceExhausted('cairn', `${'x'.repeat(50_000)} Context would exceed hard budget ${'y'.repeat(50_000)}`);
+    await settle();
+  } finally { long.restore(); }
+  assert.equal(long.ticks(), 8, 'presentation bounds never change the decision');
 });
 
-test('failure logs print a bounded projection, never the error object with its request', async () => {
-  const error = hugeProviderError();
-  const kicked = makeHarness({ tick: async () => { throw error; } });
+test('each excerpt states the whole length when it was cut, and only then', () => {
+  const { fw, markers, logged, restore } = makeHarness();
+  const reason = `zz-reason ${'r'.repeat(990)}`; // 1,000 chars: cut for the marker, whole in the logs
   try {
-    kicked.fw.noteInferenceExhausted('cairn', 'Context would exceed hard budget', undefined, 'over_budget');
-    await settle();
-  } finally { kicked.restore(); }
-  const kick = kicked.errs.find((e) => e.includes('drain kick failed'))!;
-  assert.ok(kick, 'the drain kick failure is logged');
-  assert.ok(kick.length < 2_500, `drain kick log line is ${kick.length} chars`);
-  assert.match(kick, /MembraneError \(invalid_request, HTTP 400, zz_bad_request, retryable=false\): Bad request: zz-head/);
+    fw.noteInferenceExhausted('cairn', reason, false, 'invalid_request');
+  } finally { restore(); }
+  assert.ok(markers[0].meta.reason.length <= 600);
+  assert.equal(markers[0].meta.reasonChars, 1_000);
+  assert.equal(logged[0].reason, reason);
+  assert.equal('reasonChars' in logged[0], false);
+});
 
-  const refused = makeHarness({ addMessage: () => { throw error; } });
+/** Every argument a failure log passed is a bounded string: no object for the runtime to inspect. */
+function assertBoundedStrings(rawArgs: unknown[][], marker: string): string {
+  const call = rawArgs.find((args) => typeof args[0] === 'string' && (args[0] as string).includes(marker));
+  assert.ok(call, `a log line containing "${marker}"`);
+  for (const arg of call!) assert.equal(typeof arg, 'string', `${marker}: an argument was a ${typeof arg}`);
+  const line = call!.join(' ');
+  assert.ok(line.length < 2_500, `${marker} line is ${line.length} chars`);
+  return line;
+}
+
+test('failure logs print a bounded projection, never the error object with its request', async () => {
+  // A short message with a huge request: Membrane's message cap does not help
+  // here; only not printing the object does.
+  const short = new MembraneError({
+    type: 'invalid_request', retryable: false, httpStatus: 400, providerErrorCode: 'zz_bad_request',
+    message: 'Bad request: zz-short', rawError: { status: 400 }, rawRequest: { system: echo() },
+  });
+  for (const error of [hugeProviderError(), short]) {
+    const kicked = makeHarness({ tick: async () => { throw error; } });
+    try {
+      kicked.fw.noteInferenceExhausted('cairn', 'Context would exceed hard budget', undefined, 'over_budget');
+      await settle();
+    } finally { kicked.restore(); }
+    const kick = assertBoundedStrings(kicked.rawArgs, 'drain kick failed');
+    assert.match(kick, /MembraneError \(invalid_request, HTTP 400, zz_bad_request, retryable=false\): Bad request: zz-/);
+
+    const refused = makeHarness({ addMessage: () => { throw error; } });
+    try {
+      refused.fw.noteInferenceExhausted('cairn', 'boom');
+    } finally { refused.restore(); }
+    assertBoundedStrings(refused.rawArgs, 'could not record chronicle marker');
+  }
+
+  // Every component of the projection is bounded, the name and type included.
+  const named = new Error('zz-short');
+  named.name = `Zz${'N'.repeat(MEGA)}`;
+  (named as Error & { type?: string }).type = `t${'T'.repeat(MEGA)}`;
+  const odd = makeHarness({ tick: async () => { throw named; } });
   try {
-    refused.fw.noteInferenceExhausted('cairn', 'boom');
-  } finally { refused.restore(); }
-  const markerFailure = refused.errs.find((e) => e.includes('could not record chronicle marker'))!;
-  assert.ok(markerFailure.length < 2_500, `marker failure log line is ${markerFailure.length} chars`);
+    odd.fw.noteInferenceExhausted('cairn', 'Context would exceed hard budget', undefined, 'over_budget');
+    await settle();
+  } finally { odd.restore(); }
+  assertBoundedStrings(odd.rawArgs, 'drain kick failed');
 });
 
 test('emitTrace: listeners get bounded error and stack; the marker still learns the full length', () => {

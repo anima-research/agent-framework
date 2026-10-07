@@ -1009,14 +1009,16 @@ function describeFailure(error: unknown): string {
     const fields = error as Error & {
       type?: unknown; httpStatus?: unknown; providerErrorCode?: unknown; retryable?: unknown;
     };
+    // Every component is remote or caller-supplied text, the name included.
     const classification = [
-      typeof fields.type === 'string' ? fields.type : undefined,
+      typeof fields.type === 'string' ? boundFailureText(fields.type, PROVIDER_ERROR_CODE_MAX_CHARS) : undefined,
       typeof fields.httpStatus === 'number' ? `HTTP ${fields.httpStatus}` : undefined,
       boundProviderErrorCode(fields.providerErrorCode),
       typeof fields.retryable === 'boolean' ? `retryable=${fields.retryable}` : undefined,
     ].filter((part): part is string => part !== undefined);
-    const head = classification.length > 0 ? `${error.name} (${classification.join(', ')})` : error.name;
-    return `${head}: ${boundFailureText(error.message)}`;
+    const name = boundFailureText(String(error.name), PROVIDER_ERROR_CODE_MAX_CHARS);
+    const head = classification.length > 0 ? `${name} (${classification.join(', ')})` : name;
+    return boundFailureText(`${head}: ${boundFailureText(String(error.message))}`);
   } catch {
     return '[failure could not be described]';
   }
@@ -12892,8 +12894,10 @@ export class AgentFramework {
       ...(retryable !== undefined ? { retryable } : {}),
       ...(httpStatus !== undefined ? { httpStatus } : {}),
       ...(providerErrorCode !== undefined ? { providerErrorCode } : {}),
-      ...(rawReason.length > reason.length ? { reasonChars: rawReason.length } : {}),
     };
+    // Each excerpt says how long the whole was when it was cut.
+    const cutAt = (excerpt: string): Record<string, unknown> =>
+      excerpt === rawReason ? {} : { reasonChars: rawReason.length };
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
     this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: reason.slice(0, 300) });
@@ -12913,7 +12917,7 @@ export class AgentFramework {
     // redirects: logs/failures.log under the host's working directory. This is
     // what connectome-doctor reads. Legacy fields kept; `kind` and the
     // classification fields are additive.
-    this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted', ...classification });
+    this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted', ...classification, ...cutAt(reason) });
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
@@ -12933,7 +12937,7 @@ export class AgentFramework {
               `rather than retrying identically (e.g. drop an oversized attachment ` +
               `or an unsupported setting).`,
           }],
-          { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification },
+          { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
       } catch (err) {
         console.error(`[inference-failed] could not record chronicle marker for ${agentName}: ${describeFailure(err)}`);
@@ -12963,7 +12967,8 @@ export class AgentFramework {
     const overBudget =
       errorType === 'over_budget' ||
       errorType === 'context_refusal' ||
-      (errorType === undefined && /exceed hard budget|no summary covers/i.test(reason));
+      // Decided on the whole reason: presentation bounds never change it.
+      (errorType === undefined && /exceed hard budget|no summary covers/i.test(rawReason));
     // Observability: a refused compile means the agent cannot think AT ALL
     // this turn — surface it on the ops-alert pipeline (ops:alert trace +
     // webhook → fleet-watch) immediately, not only at the hard-down streak.
