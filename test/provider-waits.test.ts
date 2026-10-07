@@ -498,14 +498,63 @@ test('a retry policy delay past one timer is waited in full, and stop() ends the
         onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 2 ? { retry: true, delayMs: 3_000_000_000 } : { retry: false }),
       },
     });
+    let stopped = false;
     try {
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
       void fw.runUntilIdle();
       await sleep(300);
       assert.equal(membrane.primary, 1, 'a 34-day delay does not fire almost at once');
-    } finally {
       const stopping = fw.stop();
       await Promise.race([stopping, sleep(5_000).then(() => { throw new Error('stop() did not end the wait'); })]);
+      stopped = true;
+      await sleep(200);
+      assert.equal(membrane.primary, 1, 'stop() cancels the retry: no call after it (room-225 #46745)');
+    } finally {
+      if (!stopped) await fw.stop();
+      log.restore();
+    }
+  });
+});
+
+test('stop() cancels a retry wait on the path that does not own provider admission (a conversation agent)', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    class ThrowingMembrane extends WaitingMembrane {
+      override streamYielding(request: NormalizedRequest): YieldingStream {
+        this.calls.push(request); this.primary++;
+        return new ErrorStream(new Error('zz transient'));
+      }
+    }
+    const membrane = new ThrowingMembrane(0, undefined);
+    const fw = await AgentFramework.create({
+      storePath: path, membrane: membrane.asMembrane(),
+      agents: [{ name: 'resident', model: 'zz-model', systemPrompt: 'system' }],
+      modules: [new InputModule()], syncIntervalMs: 0, maintenanceIntervalMs: 0,
+      errorPolicy: {
+        maxRetries: 2,
+        onInferenceError: (_e: Error, _a: string, attempt: number) => (attempt < 2 ? { retry: true, delayMs: 3_000_000_000 } : { retry: false }),
+      },
+    });
+    const internal = fw as unknown as {
+      conversationAgentHomes: Map<string, string>;
+      retryWaitWakers: Set<unknown>;
+      startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
+    };
+    let stopped = false;
+    try {
+      internal.conversationAgentHomes.set('resident', 'world:zz');
+      fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text: 'zz-direct' }]);
+      const run = internal.startAgentStream(fw.getAgent('resident'), { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
+      for (let i = 0; i < 300 && internal.retryWaitWakers.size === 0; i++) await sleep(10);
+      assert.equal(membrane.primary, 1);
+      assert.ok(internal.retryWaitWakers.size > 0, 'parked in the policy delay');
+      await fw.stop();
+      stopped = true;
+      await run;
+      await sleep(200);
+      assert.equal(membrane.primary, 1, 'no call after stop()');
+    } finally {
+      if (!stopped) await fw.stop();
       log.restore();
     }
   });

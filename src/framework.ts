@@ -9138,6 +9138,12 @@ export class AgentFramework {
   ): Promise<void> {
     const ownsProviderGate =
       !this.ephemeralRuns.has(agent.name) && !this.conversationAgentHomes.has(agent.name);
+    // A stopping framework starts no turn, whoever owns provider admission
+    // (conversation agents and ephemeral runs do not take the gate).
+    if (this.providerAdmissionClosed) {
+      if (ownsProviderGate && providerGateAlreadyHeld) this.releasePrimaryProviderGate(agent.name);
+      return;
+    }
     if (ownsProviderGate && !providerGateAlreadyHeld) {
       this.acquirePrimaryProviderGate(agent.name);
       const gate = this.providerGate(agent.name);
@@ -9555,6 +9561,16 @@ export class AgentFramework {
       if (action.retry) {
         // A policy's delay can be a provider's retry-after: wait all of it.
         await this.waitForRetry(action.delayMs);
+        if (this.providerAdmissionClosed) {
+          // stop() ended the wait: that cancels the retry, it does not hasten
+          // it. Nothing is written (the store is closing); this frame still
+          // owns its token, since no retry frame replaced it.
+          if (this.activeTurnTokens.get(agent.name) === turnToken) {
+            this.activeTurnTokens.delete(agent.name);
+            this.activeTurnTriggers.delete(agent.name);
+          }
+          return false;
+        }
         // The retry re-enters startAgentStream, which replaces this frame's
         // turn token with its own; cleanup belongs to the innermost frame.
         await this.startAgentStream(agent, trigger, attempt + 1);
@@ -10688,7 +10704,9 @@ export class AgentFramework {
             if (action.retry) {
               // A policy's delay can be a provider's retry-after: wait all of it.
               await this.waitForRetry(action.delayMs);
-              await this.startAgentStream(agent, trigger, attempt + 1);
+              // stop() ending the wait cancels the retry (this frame's finally
+              // clears the token); it is never permission to retry at once.
+              if (!this.providerAdmissionClosed) await this.startAgentStream(agent, trigger, attempt + 1);
             } else {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
