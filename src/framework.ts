@@ -9039,11 +9039,14 @@ export class AgentFramework {
     // nothing (empty or blank render, §5.2; cancelled; revoked), has nothing
     // new to show: running it would wake the model to `[Continue]` or an
     // older message, an uncaused wake. Stop before the checkpoint, locus,
-    // typing and compile. A subject this assembly did not settle (rendered
-    // elsewhere, not yet frozen) keeps the turn, as before.
+    // typing and compile. Any batch this assembly materialized keeps the
+    // turn, including one that was not among its causes (a batch whose wake
+    // the freeze withdrew, or one that never qualified for a wake). A cause
+    // this assembly did not settle (rendered elsewhere, not yet frozen) keeps
+    // the turn, as before.
     const batchSubjects = trigger?.coalescingBatchSubjects;
-    if (assembly && batchSubjects?.length
-      && batchSubjects.every((s) => assembly.settled.has(s) && !assembly.materialized.has(s))) {
+    if (assembly && batchSubjects?.length && assembly.materialized.size === 0
+      && batchSubjects.every((s) => assembly.settled.has(s))) {
       console.error(`[coalescing] ${agent.name}: deferred render produced nothing; turn not started (no wake cause left)`);
       this.emitTrace({ type: 'mcpl:coalescing', kind: 'turn-withdrawn', agentName: agent.name, subjects: batchSubjects });
       // Release the turn and land anything deferred while assembly awaited

@@ -268,6 +268,43 @@ for (const [label, rendered] of [['only blank text', [{ type: 'text', text: ' ' 
   });
 }
 
+test('wire: two deferred batches that both render nothing start no inference', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.renderer(async (p) => ({ content: p.key === 'a' ? [] : [{ type: 'text', text: '  ' }] }));
+  await f.send('push/event', f.params('1', 'fallback_a', { deferred: true, key: 'a' }));
+  await f.send('push/event', f.params('2', 'fallback_b', { deferred: true, key: 'b' }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 2);
+  assert.equal(f.membrane.calls.length, 0);
+  assert(!f.context().includes('coalescingSubject'));
+});
+
+test('wire: of two deferred batches, one with content keeps the turn', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.renderer(async (p) => ({ content: p.key === 'a' ? [] : [{ type: 'text', text: 'b_changed' }] }));
+  await f.send('push/event', f.params('1', 'fallback_a', { deferred: true, key: 'a' }));
+  await f.send('push/event', f.params('2', 'fallback_b', { deferred: true, key: 'b' }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 2);
+  assert.equal(f.membrane.calls.length, 1);
+  assert(f.lastRequest().includes('b_changed') && !f.lastRequest().includes('fallback_a'));
+});
+
+test('wire: content from a batch that was not among the turn\'s causes keeps the turn', async (t) => {
+  const f = await fixture(); t.after(f.close);
+  f.renderer(async (p) => ({ content: p.key === 'a' ? [] : [{ type: 'text', text: 'ambient_b' }] }));
+  await f.send('push/event', f.params('1', 'fallback_a', { deferred: true, key: 'a' }));
+  await f.send('push/event', f.params('2', 'fallback_b', { deferred: true, key: 'b' }));
+  // As if b never qualified for a wake: only a's wake remains, but b still
+  // renders at this turn's assembly.
+  const internals = f.framework as unknown as { pendingRequests: Array<{ coalescingSubject?: string }> };
+  internals.pendingRequests = internals.pendingRequests.filter((r) => !r.coalescingSubject?.endsWith(',"b"]'));
+  await f.framework.runUntilIdle();
+  assert.equal(f.renders.length, 2);
+  assert.equal(f.membrane.calls.length, 1);
+  assert(f.lastRequest().includes('ambient_b'));
+});
+
 test('wire: an empty render does not cancel a turn that has another cause', async (t) => {
   const f = await fixture(); t.after(f.close); await f.register();
   f.renderer(async () => ({ content: [{ type: 'text', text: ' ' }] }));
