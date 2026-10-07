@@ -622,6 +622,32 @@ export interface HostModeStatus {
 }
 
 /**
+ * A store-wide reservation held across one host callback
+ * (`runAtSafeBoundary`). While it is held no turn starts for any agent,
+ * exactly as during a live surgery, and lease-aware operator methods accept
+ * it so they run inside that reservation instead of refusing it.
+ */
+export interface SafeBoundaryLease {
+  readonly id: string;
+  readonly verb: string;
+  /** Epoch ms when the lease was granted. */
+  readonly since: number;
+  /** The agents whose turn tokens the lease holds: every agent registered
+   *  when it was granted. One registered later is covered by the hold. */
+  readonly agents: readonly string[];
+}
+
+export interface SafeBoundaryOptions {
+  /** What the lease is for, named in refusals and busy traces. */
+  verb: string;
+  requester?: OperatorRequester;
+  /** Aborting while the lease waits withdraws the request (the promise
+   *  rejects with an AbortError). Once granted, the callback runs to its end
+   *  and the lease is released after it; the signal no longer applies. */
+  signal?: AbortSignal;
+}
+
+/**
  * Thrown by `resume()` when the current runtime settings do not compile for
  * one or more agents — returning to service would OverBudget-wedge them on
  * the first wake. Drain quarantine / advance merges to lower the floor, or
@@ -1404,6 +1430,18 @@ export class AgentFramework {
    * scheduler, ephemeral admission and puppet entry points.
    */
   private surgeryHold: { verb: string; agentName: string; since: number } | null = null;
+  /**
+   * Hosts waiting for a safe boundary (`runAtSafeBoundary`), oldest first.
+   * While any wait, new resident turns are held (see processInferenceRequests)
+   * so the store drains to the boundary instead of being re-woken past it.
+   */
+  private boundaryWaiters: Array<{
+    verb: string;
+    requester?: OperatorRequester;
+    grant: (held: { lease: SafeBoundaryLease; release: () => void }) => void;
+  }> = [];
+  /** The lease currently held, and the turn token it reserved per agent. */
+  private heldLease: { lease: SafeBoundaryLease; tokens: Map<string, number> } | null = null;
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
   /** Framework-global inference gate; older generations cannot release it. */
@@ -6027,6 +6065,22 @@ export class AgentFramework {
         `Cannot ${verb}: a live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} is already in progress`,
       );
     }
+    const busy = this.storeBusyReasons();
+    if (busy.length > 0) {
+      throw new OperatorActionError(
+        'agent-busy',
+        `Cannot ${verb} while ${busy.join(', ')} — every agent sharing the store must be idle (quiesce the host first)`,
+      );
+    }
+    return this.takeStoreReservation(verb, agentName).release;
+  }
+
+  /**
+   * Why the store isn't at a safe boundary, one reason per busy agent; empty
+   * when every agent sharing it is idle with no turn alive (the scheduler's
+   * own busy test, status + turn-alive).
+   */
+  private storeBusyReasons(): string[] {
     const busy: string[] = [];
     for (const [name, a] of this.agents) {
       if (a.state.status !== 'idle') busy.push(`${name} is ${a.state.status}`);
@@ -6035,12 +6089,15 @@ export class AgentFramework {
     for (const name of this.activeTurnTokens.keys()) {
       if (!this.agents.has(name)) busy.push(`${name} is turn-alive`);
     }
-    if (busy.length > 0) {
-      throw new OperatorActionError(
-        'agent-busy',
-        `Cannot ${verb} while ${busy.join(', ')} — every agent sharing the store must be idle (quiesce the host first)`,
-      );
-    }
+    return busy;
+  }
+
+  /**
+   * Take the store reservation reserveStoreForSurgery describes, for a
+   * caller that has already found the store free. Returns the tokens it
+   * holds, so a lease can run its holder's work under them.
+   */
+  private takeStoreReservation(verb: string, agentName: string): { tokens: Map<string, number>; release: () => void } {
     const reserved = new Map<string, number>();
     for (const name of this.agents.keys()) {
       const token = this.nextTurnToken++;
@@ -6052,7 +6109,7 @@ export class AgentFramework {
     const hold = { verb, agentName, since: Date.now() };
     this.surgeryHold = hold;
     let released = false;
-    return () => {
+    const release = () => {
       if (released) return;
       released = true;
       if (this.surgeryHold === hold) this.surgeryHold = null;
@@ -6062,20 +6119,133 @@ export class AgentFramework {
       // Writers that deferred behind the reservation land now, on the branch
       // the operator chose (or the restored source) — the same end-of-turn
       // flush driveStream/puppet perform, under the same guard.
+      // Each write carries its deferredWriteId and the batch is acknowledged,
+      // as the puppet and resume flushes do: drainDeferredFor hands entries
+      // to the durable un-acked queue, so a persisted deferral stored here
+      // without its id would replay as a duplicate after a crash.
       if (this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
         for (const name of reserved.keys()) {
           if (this.activeTurnTokens.has(name)) continue;
           for (const msg of this.drainDeferredFor(name)) {
             try {
-              this.addMessage(msg.participant, msg.content, msg.metadata,
-                msg.forAgent ? { forAgent: msg.forAgent } : undefined);
+              this.addMessage(msg.participant, msg.content, msg.metadata, {
+                deferredWriteId: msg.id,
+                ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+              });
             } catch (error) {
               console.error(`[operator] post-surgery deferred flush failed for ${name}: ${error instanceof Error ? error.message : String(error)}`);
             }
           }
         }
+        this.ackDeferredWrites();
       }
     };
+    return { tokens: reserved, release };
+  }
+
+  /**
+   * Run `fn` at a safe boundary, holding the store reservation across it.
+   *
+   * The request waits until every agent sharing the store is idle with no
+   * turn alive, no ephemeral run is registered, and no other lease or live
+   * surgery holds the store. Then it takes the same reservation a live
+   * surgery takes (a turn token for every agent, plus the store-wide hold
+   * for agents registered later), runs `fn`, and releases in `finally`;
+   * release flushes writers that deferred behind it.
+   *
+   * While a request waits, new turns of agents that aren't running as
+   * ephemeral streams are held, as quiesce holds them, so the store drains
+   * to the boundary instead of being re-woken past it. Continuations of a
+   * held turn still run, and so do a registered ephemeral stream's own
+   * wakes, since the lease waits for those runs to end. Requests are granted
+   * oldest first. Aborting `opts.signal` while waiting withdraws the request;
+   * after the grant, `fn` runs to its end.
+   *
+   * Operator methods that would refuse the hold take the lease instead:
+   * `puppetToolCall(…, { lease })` runs under the lease's token for that
+   * agent.
+   */
+  async runAtSafeBoundary<T>(opts: SafeBoundaryOptions, fn: (lease: SafeBoundaryLease) => Promise<T>): Promise<T> {
+    const withdrawn = () => {
+      const error = new Error(`safe boundary for ${opts.verb} withdrawn before it was granted`);
+      error.name = 'AbortError';
+      return error;
+    };
+    if (opts.signal?.aborted) throw withdrawn();
+    const requested = Date.now();
+    const held = await new Promise<{ lease: SafeBoundaryLease; release: () => void }>((resolve, reject) => {
+      let onAbort: (() => void) | undefined;
+      const waiter = {
+        verb: opts.verb,
+        ...(opts.requester ? { requester: opts.requester } : {}),
+        grant: (granted: { lease: SafeBoundaryLease; release: () => void }) => {
+          if (onAbort) opts.signal?.removeEventListener('abort', onAbort);
+          resolve(granted);
+        },
+      };
+      if (opts.signal) {
+        onAbort = () => {
+          const at = this.boundaryWaiters.indexOf(waiter);
+          if (at < 0) return; // already granted
+          this.boundaryWaiters.splice(at, 1);
+          reject(withdrawn());
+        };
+        opts.signal.addEventListener('abort', onAbort, { once: true });
+      }
+      this.boundaryWaiters.push(waiter);
+      this.tryGrantSafeBoundary();
+    });
+    console.log(
+      `[safe-boundary] ${held.lease.verb}: granted after ${held.lease.since - requested}ms ` +
+      `(${held.lease.agents.length} agent(s) reserved` +
+      `${opts.requester ? `, for ${opts.requester.name ?? opts.requester.id ?? 'operator'} via ${opts.requester.via}` : ''})`,
+    );
+    try {
+      return await fn(held.lease);
+    } finally {
+      held.release();
+      console.log(`[safe-boundary] ${held.lease.verb}: released after ${Date.now() - held.lease.since}ms`);
+    }
+  }
+
+  /**
+   * Grant the oldest waiting lease if the store is at a safe boundary now.
+   * Called when a request arrives and on every scheduler pass, so a waiting
+   * lease is granted as soon as the last turn or ephemeral run ends.
+   */
+  private tryGrantSafeBoundary(): void {
+    if (this.boundaryWaiters.length === 0 || this.heldLease || this.surgeryHold) return;
+    if (this.ephemeralRuns.size > 0 || this.storeBusyReasons().length > 0) return;
+    const waiter = this.boundaryWaiters.shift()!;
+    const { tokens, release } = this.takeStoreReservation(waiter.verb, 'safe-boundary');
+    const lease: SafeBoundaryLease = Object.freeze({
+      id: randomUUID(),
+      verb: waiter.verb,
+      since: Date.now(),
+      agents: Object.freeze([...tokens.keys()]),
+    });
+    const entry = { lease, tokens };
+    this.heldLease = entry;
+    waiter.grant({
+      lease,
+      release: () => {
+        if (this.heldLease === entry) this.heldLease = null;
+        release();
+        // The next waiter may be grantable at once.
+        this.tryGrantSafeBoundary();
+      },
+    });
+  }
+
+  /** The tokens `lease` holds, or a refusal naming why it can't be used. */
+  private heldLeaseTokens(lease: SafeBoundaryLease, verb: string): Map<string, number> {
+    if (!this.heldLease || this.heldLease.lease !== lease) {
+      throw new OperatorActionError(
+        'invalid',
+        `Cannot ${verb} under lease ${lease.id} (${lease.verb}): it is not the lease currently held`,
+      );
+    }
+    return this.heldLease.tokens;
   }
 
   /**
@@ -7067,8 +7237,15 @@ export class AgentFramework {
     // Close idle conversation forks (no-op unless conversations configured)
     this.sweepExpiredConversations();
 
+    // A waiting safe-boundary lease is granted the moment the store is free:
+    // before the scheduler can start another turn, and again after it, for a
+    // pass that ended the last turn.
+    this.tryGrantSafeBoundary();
+
     // Check for inference requests
     await this.processInferenceRequests();
+
+    this.tryGrantSafeBoundary();
 
     // Yield to the event loop between iterations. A pending inference request
     // is not necessarily runnable: while its agent is streaming or waiting for
@@ -8830,6 +9007,24 @@ export class AgentFramework {
         // the batch to the continuation(s) alone before the trigger selection.
         requests.length = 0;
         requests.push(...passThrough);
+      }
+
+      // A host waiting for a safe boundary (runAtSafeBoundary) holds new
+      // turns as quiesce does: the wakes stay queued, so the store drains to
+      // the boundary instead of being re-woken past it. Continuations of a
+      // held turn pass, since that turn has to end for the boundary to come.
+      // A registered ephemeral stream's wakes pass too: the lease waits for
+      // its run to end, and holding them would deadlock it. Once the lease is
+      // granted, its reservation (surgeryHold, below) holds everything.
+      if (this.boundaryWaiters.length > 0 && !this.ephemeralRuns.has(agentName)) {
+        const held = requests.filter((r) => !isTurnContinuation(r.reason));
+        if (held.length > 0) {
+          this.pendingRequests.push(...held);
+          const passThrough = requests.filter((r) => isTurnContinuation(r.reason));
+          if (passThrough.length === 0) continue;
+          requests.length = 0;
+          requests.push(...passThrough);
+        }
       }
 
       const turnAlive = !budgetRestart && this.activeTurnTokens.has(agentName);
@@ -11414,28 +11609,46 @@ export class AgentFramework {
    *   deliberately NOT in the stored messages — metadata there would break
    *   byte-parity with real turns. Whether to disclose to the resident is
    *   the operator's call; the princess precedent was disclosed first.
+   * - Under a held safe-boundary lease (`opts.lease`, from
+   *   runAtSafeBoundary) it runs on the turn token that lease holds for the
+   *   agent instead of refusing the hold and minting its own; the lease's
+   *   release flushes what deferred meanwhile.
    */
   async puppetToolCall(
     agentName: string,
     toolName: string,
     input: Record<string, unknown>,
+    opts?: { lease?: SafeBoundaryLease },
   ): Promise<{ toolUseId: string; result: ToolResult }> {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
-    // Idle AND no turn alive: status reads 'idle' from dequeue until the
-    // stream registers, and again while a turn's teardown is pending
-    // (the scheduler's own busy test, 'idle+turn-alive').
-    if (this.surgeryHold) {
-      throw new Error(
-        `puppet refused: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} — retry when it completes`,
-      );
-    }
-    if (agent.state.status !== 'idle' || this.activeTurnTokens.has(agentName)) {
-      const shown = agent.state.status === 'idle' ? 'idle+turn-alive' : agent.state.status;
-      throw new Error(
-        `puppet refused: agent ${agentName} is ${shown} (requires idle — ` +
-        `injecting a turn under an active stream corrupts wire ordering)`,
-      );
+    // Under a lease: the agent's turn token is the lease's. An agent
+    // registered after the grant has none, so it can't be puppeted here.
+    let leaseToken: number | undefined;
+    if (opts?.lease) {
+      leaseToken = this.heldLeaseTokens(opts.lease, `puppet ${toolName} as ${agentName}`).get(agentName);
+      if (leaseToken === undefined || this.activeTurnTokens.get(agentName) !== leaseToken) {
+        throw new Error(`puppet refused: lease ${opts.lease.id} (${opts.lease.verb}) holds no turn for ${agentName}`);
+      }
+      if (agent.state.status !== 'idle') {
+        throw new Error(`puppet refused: agent ${agentName} is ${agent.state.status} under lease ${opts.lease.id}`);
+      }
+    } else {
+      // Idle AND no turn alive: status reads 'idle' from dequeue until the
+      // stream registers, and again while a turn's teardown is pending
+      // (the scheduler's own busy test, 'idle+turn-alive').
+      if (this.surgeryHold) {
+        throw new Error(
+          `puppet refused: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} — retry when it completes`,
+        );
+      }
+      if (agent.state.status !== 'idle' || this.activeTurnTokens.has(agentName)) {
+        const shown = agent.state.status === 'idle' ? 'idle+turn-alive' : agent.state.status;
+        throw new Error(
+          `puppet refused: agent ${agentName} is ${shown} (requires idle — ` +
+          `injecting a turn under an active stream corrupts wire ordering)`,
+        );
+      }
     }
     const onSurface = this.getToolsForAgent(agentName)
       .some((t) => t.name === toolName && agent.canUseTool(t.name));
@@ -11463,9 +11676,11 @@ export class AgentFramework {
     // requeues wakes) and the addMessage guard reads (cross-turn writers
     // defer), so for the duration this behaves like a turn with no stream.
     // Token-matched release in finally, same leak-proofing as
-    // startAgentStream: a token nobody clears wedges the agent.
-    const turnToken = this.nextTurnToken++;
-    this.activeTurnTokens.set(agentName, turnToken);
+    // startAgentStream: a token nobody clears wedges the agent. Under a
+    // lease the lease's token already reserves the agent, and the lease
+    // releases it.
+    const turnToken = leaseToken ?? this.nextTurnToken++;
+    if (leaseToken === undefined) this.activeTurnTokens.set(agentName, turnToken);
     let ownedToEnd = false;
     try {
       const started = Date.now();
@@ -11525,7 +11740,11 @@ export class AgentFramework {
       );
       return { toolUseId, result };
     } finally {
-      if (this.activeTurnTokens.get(agentName) === turnToken) this.activeTurnTokens.delete(agentName);
+      if (leaseToken !== undefined) {
+        // The lease owns the token, and its release flushes what deferred.
+      } else if (this.activeTurnTokens.get(agentName) === turnToken) {
+        this.activeTurnTokens.delete(agentName);
+      }
       // Messages deferred while we held the token land now, after the pair
       // — the same end-of-turn flush driveStream performs, under the same
       // tool-cycle guard. (No wake is requested: the agent sees the pair,
