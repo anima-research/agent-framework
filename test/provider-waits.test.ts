@@ -762,12 +762,12 @@ test("an operator release reaches the context strategy's compression lane, namin
       await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model: 'zz-model', requesterName: 'zz-operator' });
       assert.deepEqual(asked, ['zz-model']);
       await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', requesterName: 'zz-operator' });
-      assert.deepEqual(asked, ['zz-model'], 'nothing left to release: the lane is not asked again');
+      assert.deepEqual(asked, ['zz-model', undefined], 'an explicit release reaches the lane even with nothing left to release here');
       membrane.primary = 0; // fail the next primary again: a new wait
       fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-second', metadata: {} });
       await fw.runUntilIdle();
       await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model: '*', requesterName: 'zz-operator' });
-      assert.deepEqual(asked, ['zz-model', undefined], "'*' reaches the lane as every model");
+      assert.deepEqual(asked, ['zz-model', undefined, undefined], "'*' reaches the lane as every model");
       assert.ok(log.lines.some((line) => line.includes("compression lane's provider wait released")));
     } finally { await fw.stop(); log.restore(); }
   });
@@ -940,6 +940,49 @@ test('a malformed release model is refused at both operator surfaces, never wide
 
       const every = await api.executeCommand(undefined, 'host.releaseProviderWait', { agentName: 'resident', model: '*' }) as { released: Array<{ model: string }> };
       assert.deepEqual(every.released.map((w) => w.model), ['zz-model'], "'*' still releases every model");
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test('an explicit release reaches the compression lane with exactly its scope, even when no wait binds here', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(0, undefined);
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      // The lane holds a pause the framework no longer has: no wait binds here
+      // (as after the records read again, or a release in another process).
+      const paused = new Set(['zz-model', 'zz-compression-model']);
+      const asked: Array<string | undefined> = [];
+      const strategy = fw.getAgent('resident')!.getContextManager().getStrategy() as unknown as { releaseCompressionPause?: (model?: string) => boolean };
+      strategy.releaseCompressionPause = (model?: string) => {
+        asked.push(model);
+        if (model !== undefined) return paused.delete(model);
+        const had = paused.size > 0; paused.clear(); return had;
+      };
+      const release = (model?: unknown) => internal.handleHostCommand('zz-surface', {
+        command: 'release-provider-wait', agentName: 'resident', requesterName: 'zz-operator', ...(model === undefined ? {} : { model }),
+      });
+      assert.deepEqual(fw.providerWaitSnapshot('resident'), [], 'no wait binds here');
+
+      const other = await release('zz-other');
+      assert.deepEqual(other.released, [], 'the receipt lists only waits released here');
+      assert.deepEqual(asked, ['zz-other'], 'the lane is asked with exactly the named model');
+      assert.deepEqual([...paused].sort(), ['zz-compression-model', 'zz-model'], "other models' pauses stand");
+
+      const named = await release('zz-model');
+      assert.deepEqual(named.released, []);
+      assert.deepEqual(asked, ['zz-other', 'zz-model']);
+      assert.deepEqual([...paused], ['zz-compression-model'], 'the named pause is released, and only it');
+      assert.ok(log.lines.some((line) => line.includes("model=zz-model compression lane's provider wait released")));
+
+      const refused = await release('');
+      assert.equal(refused.ok, false);
+      assert.deepEqual(asked, ['zz-other', 'zz-model'], 'a refused release never reaches the lane');
+
+      await release();
+      assert.deepEqual(asked, ['zz-other', 'zz-model', undefined], 'an omitted model reaches it as every model');
+      assert.equal(paused.size, 0);
     } finally { await fw.stop(); log.restore(); }
   });
 });

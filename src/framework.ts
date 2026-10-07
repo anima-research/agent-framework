@@ -2401,17 +2401,19 @@ export class AgentFramework {
     }
     // The agent's context strategy may pace its own provider calls by the
     // same stated wait (context-manager's compression lane). The release is
-    // the operator's word on that wait too; the strategy's own backoff stays.
-    if (released.length > 0) {
-      const strategy = this.agents.get(agentName)?.getContextManager().getStrategy() as
-        { releaseCompressionPause?: (model?: string) => boolean } | undefined;
-      try {
-        if (strategy?.releaseCompressionPause?.(model)) {
-          console.error(`[provider-wait] agent=${agentName} model=${model ?? '*'} compression lane's provider wait released`);
-        }
-      } catch (error) {
-        console.error(`[provider-wait] agent=${agentName} could not release the compression lane's wait: ${safeSlice(error instanceof Error ? error.message : String(error), 0, 300)}`);
+    // the operator's word on that wait too, so it reaches the lane with its
+    // scope even when no wait binds here: the lane can hold a pause after
+    // this framework's own wait is gone (the records read again, the wait
+    // passed, or it was released in another process). The strategy's own
+    // backoff stays, and the receipt still lists only waits released here.
+    const strategy = this.agents.get(agentName)?.getContextManager().getStrategy() as
+      { releaseCompressionPause?: (model?: string) => boolean } | undefined;
+    try {
+      if (strategy?.releaseCompressionPause?.(model)) {
+        console.error(`[provider-wait] agent=${agentName} model=${model ?? '*'} compression lane's provider wait released`);
       }
+    } catch (error) {
+      console.error(`[provider-wait] agent=${agentName} could not release the compression lane's wait: ${safeSlice(error instanceof Error ? error.message : String(error), 0, 300)}`);
     }
     const cooldown = this.providerAccelerationCooldowns.get(agentName);
     const covers = (held: string | undefined): boolean => held !== undefined && (model === undefined || held === model);
