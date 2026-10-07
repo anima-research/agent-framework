@@ -204,6 +204,54 @@ describe('surgery marker receipt', () => {
     assert.ok(probe.at >= lastReaction, 'the probe is answered only after the held reactions');
   });
 
+  it('restoring the source while delivery runs keeps traffic gated until the running drain is done', async () => {
+    await start(true);
+    const { tail } = seed(3);
+
+    const rollback = await settlesWithin(
+      framework.rollbackToMessage('resident', { messageId: tail }),
+      3_000,
+      'rollbackToMessage with reactions held',
+    );
+    await waitFor('the first reaction call to reach the server', () => jsonl(callsPath).length >= 1);
+
+    // The operator restores the source the way the branch-switch API does
+    // (store switch, then synchronization) while the first add_reaction still
+    // waits for its reply. Reconciliation makes every mark undesired, and the
+    // held one is not present yet, so the ledger shows nothing pending: only
+    // the running drain knows it will still send its saved adds.
+    framework.getStore().switchBranch(rollback.sourceBranch);
+    const restored = framework.syncDiscordAwarenessMarkers();
+
+    writeFileSync(probePath, '1');
+    await waitFor('the probe to be sent', () => jsonl(eventsPath).some((e) => e.event === 'probe-sent'));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(
+      jsonl(eventsPath).some((e) => e.event === 'probe-answered'),
+      false,
+      'channel traffic waits for the running drain even though nothing appears pending',
+    );
+
+    writeFileSync(holdPath, '1');
+    await settlesWithin(restored, 5_000, "the restore's synchronization");
+    await waitFor('the probe to be answered after delivery', () =>
+      jsonl(eventsPath).some((e) => e.event === 'probe-answered'));
+
+    // Every reaction request the drain made, including the removals the
+    // restore needs, was answered before channel traffic was released, and
+    // the restore leaves no mark behind.
+    const events = jsonl<{ event: string }>(eventsPath);
+    const probeIndex = events.findIndex((e) => e.event === 'probe-answered');
+    const answered = (from: number, to?: number) =>
+      events.slice(from, to).filter((e) => e.event === 'reaction-answered').length;
+    assert.equal(answered(0, probeIndex), jsonl(callsPath).length, 'every reaction call answered before the probe');
+    assert.equal(answered(probeIndex), 0, 'no reaction answered after the probe');
+    assert.deepEqual(
+      ledger()[0].refs.map((ref) => [ref.messageId, ref.desired, ref.markerPresent, ref.deliveryStatus]),
+      [['amb-0', false, false, 'applied'], ['amb-1', false, false, 'applied'], ['amb-2', false, false, 'applied']],
+    );
+  });
+
   it('a rollback whose marker bookkeeping fails after the switch reports the body as applied', async () => {
     await start(true);
     const { tail } = seed(2);

@@ -13295,7 +13295,10 @@ export class AgentFramework {
     await this.refreshMcplTools();
   }
 
-  /** Reconcile the durable ledger with Chronicle, then deliver every server's work. */
+  /**
+   * Reconcile the durable ledger with Chronicle, then deliver every server's
+   * work, joining any drain still running.
+   */
   async syncDiscordAwarenessMarkers(_onlyServerId?: string): Promise<void> {
     if (!this.discordAwarenessOutbox) return;
     // A targeted retry may discover pending work for other Discord servers
@@ -13510,13 +13513,25 @@ export class AgentFramework {
       throw new DiscordAwarenessAccountingError('branch reconciliation', error);
     }
     const pending = this.readDiscordAwarenessPending();
-    if (pending.length === 0) {
+    // A drain that is still running holds operations it read before this
+    // reconciliation, and it sends them whatever the ledger now says. A branch
+    // move can hide them from `pending`: restoring a rollback's source makes
+    // its marks undesired, and an add whose reply has not arrived is not yet
+    // present, so the ledger shows nothing to do while the drain goes on to
+    // send its saved adds and then the removals they need. So a generation
+    // accounts for every running drain as well as for every pending
+    // operation, and joins those drains instead of releasing the data planes
+    // beside them.
+    const serverIds = [...new Set([
+      ...pending.map((operation) => operation.ref.serverId),
+      ...this.discordAwarenessDrains.keys(),
+    ])];
+    if (serverIds.length === 0) {
       return {
         requiresBarrier: false,
         promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }),
       };
     }
-    const serverIds = [...new Set(pending.map((operation) => operation.ref.serverId))];
     const promise = Promise.all(
       serverIds.map((serverId) => this.drainDiscordAwarenessOutbox(serverId)),
     ).then((outcomes): DiscordAwarenessDrainOutcome => {
@@ -13546,10 +13561,10 @@ export class AgentFramework {
 
   /**
    * Install one framework-global Discord-awareness generation before releasing
-   * any inference-bearing event. With pending work, every MCPL data plane is
-   * paused while all control planes remain live. With no pending work, ready()
-   * runs synchronously so request responders preserve their historical
-   * same-stack behavior.
+   * any inference-bearing event. With pending work or a drain still running,
+   * every MCPL data plane is paused while all control planes remain live.
+   * With neither, ready() runs synchronously so request responders preserve
+   * their historical same-stack behavior.
    */
   private installMcplDataPlaneGate(): DiscordAwarenessBarrier {
     for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
