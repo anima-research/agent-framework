@@ -77,12 +77,11 @@ export interface ResolvedUndoTurnsChange extends ResolvedOperatorChangeBase {
   /** The checkpoints it undoes, newest first. Application makes one cut at
    *  the oldest one's sequenceBefore, onto a branch named for this change. */
   checkpoints: Array<{ turnIndex: number; sequenceBefore: number; branchName: string }>;
-  /** The operator's awareness-marks choice, frozen at staging: 'none', or a
-   *  scope with exactly the refs the cut would have removed then. The cut
-   *  can also reach messages that arrive later; application marks only the
-   *  frozen refs it actually removed, reports later removals as unmarked,
-   *  and never widens the set. */
-  marks: 'none' | { scope: 'addressed' | 'all'; refs: Array<{ serverId: string; channelId: string; messageId: string }> };
+  /** The operator's awareness-marks choice, frozen at staging to the refs
+   *  the cut would have removed then. The cut can also reach messages that
+   *  arrive later; application marks only the frozen refs it actually
+   *  removed, reports later removals as unmarked, and never widens the set. */
+  marks: FrozenMarks;
   /** The MCPL server the command came from: marks whose message names no
    *  server are routed through it. */
   serverId?: string;
@@ -108,11 +107,101 @@ export interface ResolvedUnstickChange extends ResolvedOperatorChangeBase {
   plan: Array<{ step: number; messageIds: string[]; fingerprints: string[] }>;
 }
 
+/** An operator's awareness-marks choice frozen at staging: 'none', or a
+ *  scope with exactly the refs the change would have removed then. With
+ *  refs, staging records the choice in the awareness journal (a staged
+ *  batch), whose position is its authorization for life. */
+export type FrozenMarks =
+  | 'none'
+  | { scope: 'addressed' | 'all'; refs: Array<{ serverId: string; channelId: string; messageId: string }> };
+
+/** host/command hide: a redaction in place, on the source branch. */
+export interface ResolvedHideChange extends ResolvedOperatorChangeBase {
+  kind: 'hide';
+  /** The Discord message ids the operator named. */
+  fromMessageId: string;
+  toMessageId?: string;
+  /** The messages it hides, oldest first: exactly these, each only while
+   *  its content is unchanged. */
+  messages: Array<{ id: string; fingerprint: string }>;
+  /** Frozen to the refs among those messages. */
+  marks: FrozenMarks;
+  /** The MCPL server the command came from (marks without a server route there). */
+  serverId?: string;
+}
+
+/** host/command undo by messages: a branch cut at the message that becomes
+ *  the tail. Like undo-turns, the cut also takes messages that arrive after
+ *  staging; marks cover only the refs frozen here. */
+export interface ResolvedUndoMessagesChange extends ResolvedOperatorChangeBase {
+  kind: 'undo-messages';
+  requestedMessages: number;
+  /** The message that becomes the tail (the end of its body group), with its
+   *  content fingerprint. */
+  tail: { id: string; fingerprint: string };
+  /** How many messages followed it at staging. */
+  messagesAfter: number;
+  /** Frozen to the refs among the messages that followed it at staging. */
+  marks: FrozenMarks;
+  /** The MCPL server the command came from (marks without a server route there). */
+  serverId?: string;
+}
+
 export type ResolvedOperatorChange =
   | ResolvedSettingsChange
   | ResolvedPresentationChange
   | ResolvedUndoTurnsChange
-  | ResolvedUnstickChange;
+  | ResolvedUnstickChange
+  | ResolvedHideChange
+  | ResolvedUndoMessagesChange;
+
+/** What one application attempt's body change will do, captured under its
+ *  lease before the change. A committed attempt's outcome is established
+ *  from exactly this, never by rereading a branch later. */
+export interface OperatorChangeEvidence {
+  /** The branch the body lands on: a cut's destination, or the hidden
+   *  messages' own branch. */
+  target: string;
+  /** The source branch's head when the attempt began. */
+  sourceHead: number;
+  /** A hide's exact messages, with their fingerprints. */
+  ids?: Array<{ id: string; fingerprint: string }>;
+  /** Messages the body change removes. */
+  removed: number;
+  /** Its marks facts: the frozen refs it removes (`refs`), the addressable
+   *  removals it leaves unmarked, and the frozen refs it doesn't remove. */
+  marks: { scope: 'none' | 'addressed' | 'all'; refs: Array<{ serverId: string; channelId: string; messageId: string }>; unmarked: number; notRemoved: number };
+  /** Whether staging recorded a publication choice to activate. */
+  staged: boolean;
+  requester?: OperatorRequester;
+}
+
+/** A gated body change's established outcome: recorded once, immutable. */
+export interface OperatorChangeOutcome {
+  /** The attempt it established. */
+  n: number;
+  at: number;
+  removed: number;
+  /** The awareness receipt: the staged choice's activation, or none. */
+  markers: SurgeryMarkerReceipt;
+}
+
+/** The body record of one gated operator change (journal operator/changes). */
+export interface OperatorChangeRecord {
+  changeId: string;
+  kind: ResolvedOperatorChange['kind'];
+  agent: string;
+  /** Application attempts, in order, each with its evidence. */
+  attempts: Array<{ n: number; at: number; evidence: OperatorChangeEvidence }>;
+  /** The attempt whose cut switched to its destination: recorded right
+   *  after the switch, so it proves the cut whatever is active later. */
+  switched?: number;
+  outcome?: OperatorChangeOutcome;
+  /** Its bookkeeping (the operator-log record) is done. */
+  completed?: true;
+  /** The host dropped it before it applied; its staged choice was discarded. */
+  dropped?: { at: number };
+}
 
 /** One step of an unstick operation, as journaled: `intent` before its shed
  *  (with exactly what it will remove), `shed` once it is done. */
@@ -154,6 +243,24 @@ export type AppliedOperatorChange =
   | { kind: 'agent-settings'; result: unknown }
   | { kind: 'tool-presentation'; result: unknown }
   | {
+      kind: 'hide';
+      /** Messages its established outcome removed. */
+      hidden: number;
+      /** Established earlier: nothing was removed by this call. */
+      alreadyApplied?: true;
+      markers: SurgeryMarkerReceipt;
+    }
+  | {
+      kind: 'undo-messages';
+      requested: number;
+      /** Messages the cut removed, later arrivals included. */
+      messagesRemoved: number;
+      fromBranch: string;
+      toBranch: string;
+      alreadyApplied?: true;
+      markers: SurgeryMarkerReceipt;
+    }
+  | {
       kind: 'undo-turns';
       requested: number;
       undone: number;
@@ -162,9 +269,8 @@ export type AppliedOperatorChange =
       /** The cut had already been applied (the active branch is its
        *  destination): nothing changed this time. */
       alreadyApplied?: true;
-      /** The awareness marks receipt: scheduled once, by the first
-       *  application to get that far, and reported again by any retry. */
-      markers?: SurgeryMarkerReceipt;
+      /** The awareness receipt of its established outcome. */
+      markers: SurgeryMarkerReceipt;
     }
   | {
       kind: 'unstick';

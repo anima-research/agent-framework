@@ -162,6 +162,11 @@ export type SurgeryMarkerReceipt = SurgeryMarkerFacts & (
 
 /** What a surgery would remove and which messages each marks scope covers. */
 export interface SurgeryMarksPreview {
+  /** The store and branch it was computed on. Pass it back as the
+   *  surgery's `expected`: the surgery is refused, before any change, if
+   *  either differs under its reservation (a session switch or branch move
+   *  since the preview). */
+  context: { storeId: string; branch: string };
   messagesRemoved: number;
   /** Removed messages that carry a Discord address at all. */
   addressable: number;
