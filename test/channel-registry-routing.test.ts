@@ -128,6 +128,32 @@ test('handleIncoming REJECTS an unknown channel instead of minting it (§14.5)',
   assert.equal(registry.resolveLocus('cairn'), null, 'a rejected message must not establish a locus');
 });
 
+test('the gate reads a message\'s thread from the protocol field, never from adapter metadata', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const registry = new ChannelRegistry(
+    { getServer: () => undefined } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+    { shouldTriggerInference: (_content, metadata) => { seen.push(metadata); return true; } },
+  );
+  seedRegistered(registry, 'slack', 'slack:C1');
+  const message = (extra: Record<string, unknown>) => ({
+    messages: [{
+      channelId: 'slack:C1', messageId: `m-${seen.length}`, author: { id: 'u1', name: 'Ada' },
+      timestamp: '2026-10-07T00:00:00.000Z', content: [{ type: 'text' as const, text: 'hi' }], ...extra,
+    }],
+  });
+  // A root message whose adapter metadata happens to carry a threadId key.
+  await registry.handleIncoming('slack', message({ metadata: { threadId: 'forged', messageId: 'forged-m' } }));
+  // A thread message whose adapter metadata disagrees with the protocol field.
+  await registry.handleIncoming('slack', message({ threadId: '1700.0001', metadata: { threadId: 'forged' } }));
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0]!.threadId, undefined, 'a root message stays at the root');
+  assert.equal(seen[0]!.messageId, 'm-0', 'the protocol message id wins too');
+  assert.equal(seen[1]!.threadId, '1700.0001');
+});
+
 test('routeSpeech surfaces a failure when the server reports delivered:false', async () => {
   const { registry, failures, traces } = makeRegistry({ delivered: false });
   seedRegistered(registry, 'discord', 'ch-x');

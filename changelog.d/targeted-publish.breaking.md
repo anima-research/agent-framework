@@ -16,11 +16,11 @@
     - `channel_publish`, draft resends and `>>` envelopes to such a channel
       are refused, with nothing sent.
 
-    The connector's own send tools are unaffected. Declaring releases:
-    discord-mcpl#67, slack-mcpl#20, telegram-mcpL#2, portal#46,
-    eidoverse-worlds#223 and anima-dnd. pocket-body stays undeclared by its
-    owner's decision, so its deliberate tools (`ring`, `say`, `listen`) remain
-    the way to reach it.
+    The connector's own send tools are unaffected. The declaring changes are
+    open as discord-mcpl#67, slack-mcpl#20, telegram-mcpL#2, portal#46 and
+    eidoverse-worlds#223. anima-dnd's awaits its maintainers' choice of route
+    (anima-dnd#1). pocket-body stays undeclared by its owner's decision, so its
+    deliberate tools (`ring`, `say`, `listen`) remain the way to reach it.
   - **Host-minted channels count as undeclared.** That covers a DM channel
     the framework registers lazily from a push event, because the connector
     never described it. Connectors that register their DM channels with a

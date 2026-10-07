@@ -336,7 +336,7 @@ describe('explicit prose routing', () => {
     const texts = cm.getAllMessages().flatMap(m => m.content)
       .filter(b => b.type === 'text').map(b => (b as { text: string }).text);
     assert.ok(texts.includes(authored), 'source/author view retains exact envelope');
-    assert.ok(texts.includes('[delivered] plain speech → discord:g:cafe'), 'canonical destination receipt enters context');
+    assert.ok(texts.includes('[delivered] plain speech → (stub / discord:g:cafe)'), 'canonical destination receipt enters context, server named');
     await framework.stop();
   });
 

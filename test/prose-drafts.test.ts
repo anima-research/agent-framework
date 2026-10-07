@@ -353,7 +353,7 @@ describe('held prose drafts, end to end', () => {
       const [list, read, resend] = h.toolResults();
       assert.match(list!, /3 open drafts, newest first/);
       assert.ok(read!.endsWith(`exactly as a resend publishes it):\n${segments[1]}`), `read shows the text in full: ${read}`);
-      assert.match(resend!, new RegExp(`${ids[0]}: delivered to #room \\(Guild One\\) \\(${ROOM}\\), message posted-2`));
+      assert.match(resend!, new RegExp(`${ids[0]}: delivered to #room \\(Guild One\\) \\(discord / ${ROOM}\\), message posted-2`));
       const sent = h.publishes().slice(1);
       assert.deepEqual(sent.map((p) => [p.channelId, p.text]), segments.map((s) => [ROOM, s]), 'verbatim, in order');
       assert.ok(h.store().open('scout').length === 0, 'nothing left open');
@@ -528,7 +528,7 @@ describe('held prose drafts, end to end', () => {
         createMockResponse([]),
       ]);
       const [receipt, refused] = h.toolResults();
-      assert.match(receipt!, new RegExp(`${deliver!.id}: delivered — confirmed at .* to #room \\(Guild One\\) \\(${ROOM}\\), message posted-\\d+ .*not sent again`));
+      assert.match(receipt!, new RegExp(`${deliver!.id}: delivered — confirmed at .* to #room \\(Guild One\\) \\(discord / ${ROOM}\\), message posted-\\d+ .*not sent again`));
       assert.match(refused!, new RegExp(`${dismiss!.id} was dismissed`));
       assert.equal(h.publishes().length, published, 'no new publish');
     } finally {
@@ -572,7 +572,7 @@ describe('held prose drafts, end to end', () => {
       const notice = h.texts().find((t) => t.startsWith('[drafts]'))!;
       assert.match(notice, /^\[drafts\] scout: 2 held drafts of yours have not been named to you yet: /);
       assert.match(notice, /d-[a-z2-9]{5} \(held \(not sent\); held .*"orphaned words"\)/);
-      assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .* may have been posted; .*"half-sent words"`));
+      assert.match(notice, new RegExp(`${midSend.id} \\(UNCONFIRMED — an attempt to #room \\(Guild One\\) \\(discord / ${ROOM}\\) at .* may have been posted; .*"half-sent words"`));
       assert.doesNotMatch(notice, /They were not sent/);
       await h.turn([createMockResponse([])]);
       assert.equal(h.texts().filter((t) => t.startsWith('[drafts]')).length, 1, 'named once');
@@ -840,7 +840,7 @@ describe('drafts resend ownership', () => {
       const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' });
       await t.tick();
       t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
-      assert.match(t.say(await sending), /delivered to \(chan\), message m-a/);
+      assert.match(t.say(await sending), /delivered to \(discord \/ chan\), message m-a/);
       // The channel is gone: destination resolution would now fail.
       const registry = (t.framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
       registry.resolveProseTarget = () => ({ error: 'no channel matches' });
@@ -869,8 +869,8 @@ describe('drafts resend ownership', () => {
       assert.deepEqual(t.pending.map((p) => p.text), ['B words']);
       t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-b' });
       const result = t.say(await batch);
-      assert.match(result, /delivered to \(chan\), message m-a/);
-      assert.match(result, /delivered to \(chan\), message m-b/);
+      assert.match(result, /delivered to \(discord \/ chan\), message m-a/);
+      assert.match(result, /delivered to \(discord \/ chan\), message m-b/);
       assert.equal(t.pending.length, 0, 'B was published exactly once');
     } finally {
       await t.close();
@@ -1012,7 +1012,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       ]);
       assert.deepEqual(h.publishes().map((p) => p.text), ['an explicit note elsewhere', 'resend me']);
       assert.equal(h.texts().find((t) => t.startsWith('[delivered]')),
-        `[delivered] plain speech → #room (Guild One) (${ROOM}) (draft ${ids[0]}, by your resend) · ` +
+        `[delivered] plain speech → #room (Guild One) (discord / ${ROOM}) (draft ${ids[0]}, by your resend) · ` +
         `1 plain-speech segment(s) held as draft ${ids[2]} (not sent — drafts can resend them unchanged, or dismiss them) · ` +
         `draft ${ids[1]} dismissed by you`);
 
@@ -1023,7 +1023,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
         createMockResponse([]),
       ]);
       assert.match(h.texts().filter((t) => t.startsWith('[delivered]')).at(-1)!, new RegExp(
-        `^\\[delivered\\] nothing confirmed — draft ${ids[3]} is unconfirmed: ${ids[3]}'s attempt to #room \\(Guild One\\) \\(${ROOM}\\) at .+ ` +
+        `^\\[delivered\\] nothing confirmed — draft ${ids[3]} is unconfirmed: ${ids[3]}'s attempt to #room \\(Guild One\\) \\(discord / ${ROOM}\\) at .+ ` +
         'may already have been posted: .+ — check that channel before sending it again \\(resend needs confirmDuplicate: true\\)$'));
     } finally {
       await h.close();
@@ -1078,7 +1078,7 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
       const words = notice.content.map((b) => (b as { text?: string }).text ?? '').join('');
       assert.ok(words.startsWith(`[drafts] scout: 2 plain-speech segments held as drafts ${free.id}, ${copy.id} — `), `no "not sent" over words that may be out: ${words}`);
       assert.ok(words.includes(`drafts(action: "resend", draftIds: ["${free.id}"], destination: "#channel") delivers it unchanged`), words);
-      assert.ok(words.includes(`${copy.id} includes the words of ${original.id}, and ${original.id}'s attempt to #room (Guild One) (${ROOM})`), words);
+      assert.ok(words.includes(`${copy.id} includes the words of ${original.id}, and ${original.id}'s attempt to #room (Guild One) (discord / ${ROOM})`), words);
       assert.ok(words.includes(`so check that channel before resending ${copy.id} (drafts(action: "resend", draftIds: ["${copy.id}"], destination: "#channel", confirmDuplicate: true))`), words);
       assert.ok(!words.includes(`draftIds: ["${free.id}", "${copy.id}"], destination`), 'no plain resend offered for the copy');
     } finally {

@@ -1046,6 +1046,11 @@ export class ChannelRegistry {
         triggerInference = this.shouldTriggerInference(
           textContent,
           {
+            // The adapter's own metadata first; the protocol's fields after
+            // it, always present (even undefined), so an adapter metadata key
+            // can never stand in for them — the gate's route candidates read
+            // threadId and messageId from here, and a thread decides where a
+            // post lands (MCPL RFC-011).
             ...message.metadata,
             eventType: 'mcpl:channel-incoming',
             serverId,

@@ -417,6 +417,37 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
+  it('a thread route is not streamed; a root route streams with threadId null (RFC-011 §6)', async () => {
+    const framework = await makeFramework();
+    const { registry, published } = declaringRegistry('exact');
+    const streamed: Array<{ kind: string; channelId: string; threadId: unknown }> = [];
+    Object.assign(registry as Record<string, unknown>, {
+      sendOutgoingChunk: (channelId: string, _a: string, _i: string, _n: number, _d: string, threadId: unknown) =>
+        streamed.push({ kind: 'chunk', channelId, threadId }),
+      sendOutgoingComplete: (channelId: string, _a: string, _i: string, _t: string, threadId: unknown) =>
+        streamed.push({ kind: 'complete', channelId, threadId }),
+    });
+    internals(framework).channelRegistry = registry;
+
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'into the thread' }]));
+    framework.pushEvent({
+      ...(channelIncoming('zulip:stream:7', 'on topic') as unknown as Record<string, unknown>),
+      serverId: 'zulip',
+      threadId: 'topic-a',
+    } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    assert.equal(streamed.length, 0, 'one channel stream could carry thread speech and root envelopes alike: none at all');
+    assert.equal(published.length, 1, 'the speech itself was still published, into the thread');
+
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'at the root' }]));
+    framework.pushEvent({ ...(channelIncoming('zulip:stream:7', 'at root') as unknown as Record<string, unknown>), serverId: 'zulip' } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    assert.ok(streamed.some((e) => e.kind === 'chunk'), 'the root route streams');
+    assert.ok(streamed.every((e) => e.channelId === 'zulip:stream:7' && e.threadId === null), JSON.stringify(streamed));
+    assert.equal(streamed.filter((e) => e.kind === 'complete').length, 1);
+    await framework.stop();
+  });
+
   it('a thread on a channel that declares no threads wakes the turn but plain speech is held, never sent to the root', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering the topic' }]));
     const framework = await makeFramework();

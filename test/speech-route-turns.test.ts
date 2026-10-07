@@ -155,8 +155,15 @@ describe('speech route across a logical turn', () => {
     const receipt = scout.getContextManager().getAllMessages()
       .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
       .find((t) => t.startsWith('[delivered]'));
-    assert.equal(receipt, '[delivered] plain speech → #Alpha (alpha/shared, thread topic) · #Beta (beta/shared, thread topic)',
+    assert.equal(receipt, '[delivered] plain speech → #Alpha (alpha / shared, thread topic) · #Beta (beta / shared, thread topic)',
       'two servers stay two destinations, each with the label it had when the words went out');
+    // A single delivery names its server too: the receipt is self-contained.
+    f.recordProseDelivery('scout', { delivered: true, serverId: 'beta', channelId: 'shared', label: '#Beta', threadId: 'topic' });
+    f.appendProseDeliveryReceipt(scout);
+    const second = scout.getContextManager().getAllMessages()
+      .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
+      .filter((t) => t.startsWith('[delivered]')).at(-1);
+    assert.equal(second, '[delivered] plain speech → #Beta (beta / shared, thread topic)');
     await framework.stop();
   });
 });

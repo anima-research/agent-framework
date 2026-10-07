@@ -284,6 +284,39 @@ describe('ChannelRegistry.publish outcomes', () => {
     assert.equal(published.length, 1);
   });
 
+  it('streams only where it would publish, carrying the same place (RFC-011 §6)', () => {
+    const chunks: Array<{ channelId: string; threadId?: unknown }> = [];
+    const completes: Array<{ channelId: string; threadId?: unknown }> = [];
+    const server = {
+      grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
+      sendChannelsOutgoingChunk: (p: { channelId: string; threadId?: unknown }) => chunks.push({ channelId: p.channelId, threadId: p.threadId }),
+      sendChannelsOutgoingComplete: (p: { channelId: string; threadId?: unknown }) => completes.push({ channelId: p.channelId, threadId: p.threadId }),
+    };
+    const registry = new ChannelRegistry(
+      { getServer: () => server } as unknown as McplServerRegistry,
+      {} as FeatureSetManager,
+      () => {},
+      () => {},
+      {},
+    );
+    const channels = (registry as unknown as { channels: Map<string, unknown> }).channels;
+    const seedIt = (id: string, target: 'exact' | 'root' | null) => channels.set(`discord:${id}`, {
+      serverId: 'discord',
+      descriptor: { id, type: 'discord', label: id, ...(target ? { capabilities: { publish: { target } } } : {}) },
+      open: true,
+    });
+    seedIt('exact', 'exact');
+    seedIt('root', 'root');
+    seedIt('none', null);
+    for (const [channelId, threadId] of [['exact', null], ['exact', 't-1'], ['root', null], ['root', 't-1'], ['none', null]] as const) {
+      registry.sendOutgoingChunk(channelId, 'agent', 'inf-1', 0, 'Hello', threadId);
+      registry.sendOutgoingComplete(channelId, 'agent', 'inf-1', 'Hello', threadId);
+    }
+    const expected = [{ channelId: 'exact', threadId: null }, { channelId: 'exact', threadId: 't-1' }, { channelId: 'root', threadId: null }];
+    assert.deepEqual(chunks, expected, 'no stream into a thread where there are none, nor to an undeclared channel');
+    assert.deepEqual(completes, expected);
+  });
+
   it('routeSpeech reports a failed and an uncertain delivery as different outcomes', async () => {
     const failures: Array<{ outcome?: string }> = [];
     const { registry, seed } = registryWith({ discord: { publish: async () => ({}) }, other: { publish: async () => ({ delivered: false }) } }, failures);

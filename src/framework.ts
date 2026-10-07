@@ -9095,8 +9095,24 @@ export class AgentFramework {
   }
 
   private static destinationText(d: PublishDestination): string {
-    const label = d.label && d.label !== d.channelId ? `${d.label.startsWith('#') || d.label.startsWith('DM') ? d.label : `#${d.label}`} ` : '';
-    return `${label}(${d.channelId}${d.threadId ? `, thread ${d.threadId}` : ''})`;
+    return AgentFramework.placeText(d);
+  }
+
+  /**
+   * A destination in words, self-contained: its label as recorded, then the
+   * server and channel it resolved to — written `server / channel-id`, as
+   * the source headers write them — and its thread. The server is always
+   * named, never inferred from what else is on screen: the same channel id
+   * (and label) can exist on another server.
+   */
+  private static placeText(d: { serverId?: string; channelId: string; label?: string; threadId?: string | null }): string {
+    const id = d.serverId ? `${d.serverId} / ${d.channelId}` : d.channelId;
+    const where = d.threadId ? `${id}, thread ${d.threadId}` : id;
+    if (d.label && d.label !== d.channelId) {
+      const label = d.label.startsWith('#') || d.label.startsWith('DM') ? d.label : `#${d.label}`;
+      return `${label} (${where})`;
+    }
+    return d.serverId || d.threadId ? `(${where})` : d.channelId;
   }
 
   /** One line per draft: id, state, when, why, size, preview. */
@@ -9565,22 +9581,13 @@ export class AgentFramework {
       seen.add(key);
       unique.push(d);
     }
-    // A channel id two servers share is named with its server.
-    const servers = new Map<string, Set<string>>();
-    for (const d of unique) servers.set(d.channelId, (servers.get(d.channelId) ?? new Set()).add(d.serverId ?? ''));
     for (const d of unique) {
       if (d.channelId.startsWith('surface:')) {
         // Speech on a surface route was shown there, never published.
         shown.push(`${d.channelId.slice('surface:'.length)} (the local surface that messaged you; not published to any channel)`);
         continue;
       }
-      const id = (servers.get(d.channelId)?.size ?? 0) > 1 && d.serverId ? `${d.serverId}/${d.channelId}` : d.channelId;
-      const where = d.threadId ? `${id}, thread ${d.threadId}` : id;
-      shown.push(
-        d.label && d.label !== d.channelId
-          ? `${d.label.startsWith('#') ? d.label : `#${d.label}`} (${where})`
-          : d.threadId || id !== d.channelId ? `${d.channelId} (${where})` : d.channelId,
-      );
+      shown.push(AgentFramework.placeText(d));
     }
     const notes: string[] = [];
     // Each of the turn's drafts as it stands now: a mid-turn notice lets the
@@ -16402,7 +16409,10 @@ export class AgentFramework {
                 console.error(`[routing] ${agentName}: channel_open -> speech route ${opened}${threadId ? ` thread ${threadId}` : ''} (announced in tool result)`);
               }
             } else {
-              routing = `Opened for reading. ${unchanged()}`;
+              const ignored = typeof openInput?.threadId === 'string' && openInput.threadId
+                ? ` threadId ${openInput.threadId} chooses where speech goes, so with setSpeechTarget: false it was not used.`
+                : '';
+              routing = `Opened for reading.${ignored} ${unchanged()}`;
             }
             result = {
               ...result,

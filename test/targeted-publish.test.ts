@@ -177,7 +177,7 @@ describe('targeted publish (MCPL RFC-011)', () => {
       createMockResponse([]),
     ], GENERAL);
     assert.deepEqual(publishes().map((p) => [p.channelId, p.threadId, p.text]), [[ROOM, 't-5', 'words for later']]);
-    assert.match(toolResults(), /delivered to #room \(Guild One\) \(discord:g1:room, thread t-5\)/);
+    assert.match(toolResults(), /delivered to #room \(Guild One\) \(discord \/ discord:g1:room, thread t-5\)/);
   });
 
   it('resending to a channel that declares nothing is refused before anything is attempted', async () => {
@@ -205,6 +205,15 @@ describe('targeted publish (MCPL RFC-011)', () => {
       [ROOM, 't-6', 'in t-6'],
       [ROOM, null, 'at the root of room'],
     ], 'an explicit channel-only choice never borrows the thread the turn came from');
+  });
+
+  it('channel_open with a thread but setSpeechTarget: false says the thread was not used', async () => {
+    await turn([
+      call('channel_open', { channelId: ROOM, threadId: 't-9', setSpeechTarget: false }),
+      say('still to general'),
+    ], GENERAL);
+    assert.deepEqual(publishes().map((p) => [p.channelId, p.threadId]), [[GENERAL, null]]);
+    assert.match(toolResults(), /Opened for reading\. threadId t-9 chooses where speech goes, so with setSpeechTarget: false it was not used\./);
   });
 
   it('channel_open on a channel that declares nothing opens it but sets no speech target', async () => {
