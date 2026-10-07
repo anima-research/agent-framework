@@ -4589,8 +4589,11 @@ export class AgentFramework {
   /** Synthesized save_image tool — present when a workspace module is
    *  registered. Lets the agent persist an image it has already seen in its
    *  own context (Discord attachments arrive inlined as base64 and are
-   *  otherwise unreachable as files). */
-  private static readonly SAVE_IMAGE_TOOL: import('./types/index.js').ToolDefinition = {
+   *  otherwise unreachable as files). Cast like tool-presentation's tools:
+   *  membrane's ToolParameter types `type` as one string, but the nullable
+   *  selectors need JSON Schema's type array, which the native, XML and
+   *  Responses paths all pass or render through. */
+  private static readonly SAVE_IMAGE_TOOL = {
     name: 'save_recent_image',
     description:
       'Save one or more recent images from your own context to workspace files. ' +
@@ -4605,7 +4608,8 @@ export class AgentFramework {
       'restart) the call fails and writes nothing — it never substitutes an older ' +
       'image. When other tool calls in the same batch are still running, the save ' +
       'waits for them so their images are counted. Receipts carry source tool call, MIME, byte size and SHA-256. Saved ' +
-      'files are visible via workspace tools and the /files/ endpoint.',
+      'files are visible via workspace tools and the /files/ endpoint. Select by `ref` or by ' +
+      '`index`/`count`; a selector you are not using may be omitted or passed as null.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4613,24 +4617,31 @@ export class AgentFramework {
           type: 'string',
           description: 'Mount-prefixed destination path, e.g. "project/photos/name.png".',
         },
+        // Nullable selectors: a caller whose provider presents every property
+        // as required must still be able to say "not this selector". null and
+        // omission mean the same thing; any other supplied value is checked.
         index: {
-          type: 'number',
-          description: 'Which image, counting back from the most recent (0 = most recent). Default 0.',
+          type: ['integer', 'null'],
+          description:
+            'Which image, counting back from the most recent (0 = most recent). Default 0. ' +
+            'null, like omitting it, means the default.',
         },
         count: {
-          type: 'number',
-          description: 'How many images to save, starting at `index` and going further back. Default 1.',
+          type: ['integer', 'null'],
+          description:
+            'How many images to save, starting at `index` and going further back. Default 1. ' +
+            'null, like omitting it, means the default.',
         },
         ref: {
-          type: 'string',
+          type: ['string', 'null'],
           description:
             'Save a specific tool-result image by its history ref (e.g. "img_k7x3q2_7", as shown in its placeholder in your context) instead of by position. ' +
-            'Mutually exclusive with `index`/`count`.',
+            'Mutually exclusive with a non-null `index`/`count`. null, like omitting it, means no ref.',
         },
       },
       required: ['path'],
     },
-  };
+  } as unknown as import('./types/index.js').ToolDefinition;
 
   /** Synthesized fetch_reference tool — RFC-005 on-demand dereference.
    *  Present when a workspace module is registered (storage target). */
@@ -15393,20 +15404,38 @@ export class AgentFramework {
         let count = 1;
         /** Direct-ref mode: the one ref to find in the scannable context. */
         let wantedRef: string | null = null;
-        if (input.ref !== undefined) {
+        // A selector is in use only when it carries a value: null and omission
+        // both mean "not this selector", so callers whose provider presents
+        // every property as required can still choose one. A SUPPLIED value is
+        // never read as absent — an empty or malformed ref, or an index that
+        // isn't an integer, is refused rather than turned into a different
+        // image than the one the caller named.
+        const supplied = (value: unknown): boolean => value !== undefined && value !== null;
+        /** An integer number, or a string of decimal digits (the compatibility
+         *  form for paths that deliver numbers as text); NaN for anything else.
+         *  Number() would read "", " ", false and [] as 0 — the newest image. */
+        const selectorInteger = (value: unknown): number => {
+          if (typeof value === 'number') return Number.isInteger(value) ? value : Number.NaN;
+          if (typeof value === 'string' && /^[0-9]+$/.test(value)) return Number(value);
+          return Number.NaN;
+        };
+        if (supplied(input.ref)) {
           if (typeof input.ref !== 'string' || !TOOL_IMAGE_REF_RE.test(input.ref)) {
             throw new Error('save_recent_image: `ref` must look like "img_k7x3q2_7" (copy it from the image placeholder in your context)');
           }
-          if (input.index !== undefined || input.count !== undefined) {
-            throw new Error('save_recent_image: `ref` is mutually exclusive with `index`/`count`');
+          if (supplied(input.index) || supplied(input.count)) {
+            throw new Error(
+              'save_recent_image: `ref` is mutually exclusive with `index`/`count` — pass null (or omit) ' +
+              'for the selector you are not using',
+            );
           }
           wantedRef = input.ref;
         } else {
-          index = input.index === undefined ? 0 : Number(input.index);
+          index = supplied(input.index) ? selectorInteger(input.index) : 0;
           if (!Number.isInteger(index) || index < 0) {
             throw new Error('save_recent_image: `index` must be a non-negative integer');
           }
-          count = input.count === undefined ? 1 : Number(input.count);
+          count = supplied(input.count) ? selectorInteger(input.count) : 1;
           const MAX_COUNT = 20;
           if (!Number.isInteger(count) || count < 1 || count > MAX_COUNT) {
             throw new Error(`save_recent_image: \`count\` must be an integer in 1..${MAX_COUNT}`);
