@@ -21,6 +21,7 @@ import {
   versionOf,
   recordedBodyDigest,
   sourceBodyDigest,
+  copyIntact,
   type BodyEvidence,
   type RequestEvidence,
   type RoundReport,
@@ -442,10 +443,15 @@ describe('receipt evidence', () => {
     assert.equal(before.key, after.key);
     // A stamped copy matches an undecorated, unsharded copy stored before the record.
     assert.equal(before.key, versionOf(src, [[body]], 's', 'legacy').key);
-    // An edit after ingestion keeps the stamp but not the stored digest: the
-    // changed text can't count as the delivered body.
-    const edited = versionOf(src, [[header('Old room'), { type: 'text', text: 'edited body' }]], 's', 'copy-1', stamped(oldCopy));
-    assert.equal(edited.basis, 'stored-copy');
+    // An edit after ingestion keeps the copy's identity (it is still a copy of
+    // that item); copyIntact, which completeness requires, says it no longer
+    // presents the body.
+    const editedBlocks = [header('Old room'), { type: 'text' as const, text: 'edited body' }];
+    assert.equal(versionOf(src, [editedBlocks], 's', 'copy-1', stamped(oldCopy)).key, before.key);
+    assert.equal(copyIntact([editedBlocks], stamped(oldCopy)), false);
+    assert.equal(copyIntact([oldCopy], stamped(oldCopy)), true);
+    assert.equal(copyIntact([oldCopy], { sharded: false, sourceDigest: 'x' }), false, 'a stamp without its stored digest cannot vouch');
+    assert.equal(copyIntact([[body]], { sharded: false }), true, 'stored before stamping: cannot be checked');
     // Shards can't be edited, so a stamped sharded copy keeps its version.
     const shardedStamped = versionOf(src, [[header('Old room')], [body]], 's', 'head', { sharded: true, sourceDigest: sourceBodyDigest([body]) });
     assert.equal(shardedStamped.key, before.key);
@@ -540,6 +546,45 @@ describe('receipt evidence', () => {
 });
 
 describe('request-owned evidence', () => {
+  for (const lane of ['channels/incoming', 'push/event'] as const) {
+    it(`an inbound body edited before preparation is a partial exposure, not a delivery (${lane})`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'evidence-edit-'));
+      try {
+        const cm = await ContextManager.open({ path: join(dir, 'store'), strategy: new PassthroughStrategy(), namespace: 'agents/r' });
+        const source = {
+          kind: 'channel', lane, serverId: 'discord', binding: 'b1', channelId: 'discord:g:room', acceptedAt: 5,
+          ...(lane === 'push/event' ? { eventId: 'ev-7' } : { messageId: 'p7' }),
+        };
+        const header = { type: 'text' as const, text: '[source: discord / discord:g:room · #room]' };
+        const body = { type: 'text' as const, text: 'ORIGINAL text' };
+        const stored = [header, body];
+        const id = cm.addMessage('someone', stored, {
+          inboundSource: source, sourceBodyDigest: sourceBodyDigest([body]), storedBodyDigest: sourceBodyDigest(stored),
+        } as never);
+        cm.editMessage(id, [header, { type: 'text', text: 'EDITED text' }]);
+        const agent = new Agent({ name: 'r', model: 'test', systemPrompt: 's' }, cm, {} as Membrane);
+        const { request, evidence } = await agent.prepareActivationRequest([]);
+        assert.ok(JSON.stringify(request.messages).includes('EDITED text'));
+        assert.equal(evidence.bodies[0]!.complete, false);
+        assert.deepEqual(evidence.bodies[0]!.missing, ['edited']);
+        assert.equal(evidence.bodies[0]!.ver.basis, lane === 'push/event' ? 'event' : 'message-digest');
+
+        const ledger = new ChannelClockLedger(cm.getStore(), cm.getStoreId());
+        ledger.start();
+        const receipts = new ContextReceipts(ledger, { acceptRound: () => {} });
+        receipts.beginStream('r', 1, evidence);
+        receipts.usage('r', 1, { index: 0, stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, altered: { messages: [], injected: [] }, fidelity: 'established' });
+        const clocks = ledger.clocksFor('r', [{ binding: 'b1', channelId: 'discord:g:room' }]).get(channelKey({ binding: 'b1', channelId: 'discord:g:room' }))!;
+        assert.equal(clocks.lastDeliveredAt, null, 'the original body was never shown');
+        assert.ok(clocks.partial?.missing.includes('edited'));
+        ledger.stop();
+        cm.close();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
   it('composes request preparation\'s own changes: a compile it altered is never presented verbatim', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'evidence-prep-'));
     try {

@@ -75,10 +75,11 @@ export interface SourceRef {
  *    body). A revision restoring earlier bytes of the same message counts as
  *    that earlier version;
  *  - `stored-copy`: the stored message itself, when its source body can't be
- *    recovered: no platform message id, a copy edited after ingestion, or a
- *    body stored in shards before ingestion recorded digests, even with a
- *    platform message id. Identity unknown: a replay of the same source item
- *    can't be recognized.
+ *    recovered: no platform message id, or a body stored in shards before
+ *    ingestion recorded digests, even with a platform message id. Identity
+ *    unknown: a replay of the same source item can't be recognized.
+ * Whatever the basis, a copy edited after ingestion keeps its identity but
+ * can't establish delivery (evidence copyIntact): it is a partial exposure.
  */
 export interface VersionRef {
   basis: 'event' | 'message-digest' | 'stored-copy';

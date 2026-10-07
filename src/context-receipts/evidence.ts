@@ -148,14 +148,14 @@ export function copyFacts(head: { metadata?: unknown; bodyGroupId?: string }): C
  *
  * The body digest is the one ingestion recorded for the delivery, before
  * decoration or sharding, so a stored header, sharding, injection and
- * compilation all carry one version. It applies while the copy is still what
- * ingestion stored: an unsharded copy must still hash to its recorded stored
- * digest (an edit after ingestion breaks that), and shards can't be edited at
- * all. A copy stored without a record predates decoration: unsharded, its
- * stored blocks are the delivered body; sharded (by its own sharding facts,
- * not by how many shards a view returned), the source digest can't be
- * recovered. A copy whose body can't be recovered falls back to the stored
- * copy: a replay of it is then not recognizable.
+ * compilation all carry one version. A copy stored without a record
+ * predates decoration: unsharded, its stored blocks are the delivered body;
+ * sharded (by its own sharding facts, not by how many shards a view
+ * returned), the source digest can't be recovered, and it falls back to the
+ * stored copy: a replay of it is then not recognizable.
+ *
+ * Identity says which source item a copy is of, not that the copy still
+ * presents it: see copyIntact, which completeness requires.
  */
 export function versionOf(
   source: InboundChannelSource,
@@ -175,16 +175,26 @@ export function versionOf(
   return { basis: 'stored-copy', key: JSON.stringify([storeId, storeMessageId]) };
 }
 
-/** The delivered body's digest, when this copy can still vouch for it. */
+/** The delivered body's digest: recorded, or recoverable from an unsharded legacy copy. */
 function recoverableDigest(contents: ReadonlyArray<readonly ContentBlock[]>, facts: CopyFacts): string | undefined {
-  const whole = !facts.sharded && contents.length === 1 ? contents[0]! : undefined;
-  if (facts.sourceDigest) {
-    if (facts.sharded) return facts.sourceDigest;
-    return whole && facts.storedDigest !== undefined && sourceBodyDigest(whole) === facts.storedDigest
-      ? facts.sourceDigest
-      : undefined;
-  }
-  return whole ? sourceBodyDigest(whole) : undefined;
+  if (facts.sourceDigest) return facts.sourceDigest;
+  return !facts.sharded && contents.length === 1 ? sourceBodyDigest(contents[0]!) : undefined;
+}
+
+/**
+ * Whether this copy still presents what ingestion stored for the source item,
+ * whatever its version basis (event id or digest). A supported context edit
+ * (CM editMessage) replaces an unsharded copy's content and keeps its
+ * metadata, stamp included; such a copy no longer presents the source body
+ * and can't establish its delivery. Shards can't be edited. A stamped
+ * unsharded copy is intact while its blocks hash to its recorded stored
+ * digest (a stamp without one can't vouch for the copy). A copy stored
+ * before stamping can't be checked, and counts as intact.
+ */
+export function copyIntact(contents: ReadonlyArray<readonly ContentBlock[]>, facts: CopyFacts): boolean {
+  if (facts.sharded) return true;
+  if (facts.sourceDigest === undefined && facts.storedDigest === undefined) return true;
+  return contents.length === 1 && facts.storedDigest !== undefined && sourceBodyDigest(contents[0]!) === facts.storedDigest;
 }
 
 /** Tags that make an item a notice about a body rather than a body. */
@@ -233,16 +243,19 @@ export function requestEvidence(inputs: EvidenceInputs): RequestEvidence {
         const source = readInboundSource(stored.metadata);
         if (!source || source.kind !== 'channel' || !isBody(stored, source)) continue;
         const members = stored.bodyGroupId ? inputs.groupMembers(stored) : [stored];
+        const contents = members.map((m) => m.content);
+        const facts = copyFacts(stored);
         const lostFragment = droppedFragments.has(body.messageId);
-        const missing = [...(body.missing ?? []), ...(lostFragment ? ['preparation'] : [])];
+        const intact = copyIntact(contents, facts);
+        const missing = [...(body.missing ?? []), ...(lostFragment ? ['preparation'] : []), ...(intact ? [] : ['edited'])];
         bodies.push(Object.freeze({
           index,
           storeMessageId: stored.id,
-          complete: body.complete && !lostFragment,
+          complete: body.complete && !lostFragment && intact,
           ...(missing.length > 0 ? { missing } : {}),
           ch: channelOf(source),
           src: sourceRefOf(source, stored.id),
-          ver: versionOf(source, members.map((m) => m.content), inputs.storeId, stored.id, copyFacts(stored)),
+          ver: versionOf(source, contents, inputs.storeId, stored.id, facts),
         }));
       }
     });
@@ -271,15 +284,15 @@ export function injectedEvidence(
 ): BodyEvidence | null {
   const source = readInboundSource(message.metadata);
   if (!source || source.kind !== 'channel' || !isBody({ metadata: message.metadata as StoredMessage['metadata'] }, source)) return null;
+  const facts = { ...copyFacts({ metadata: message.metadata }), sharded: Boolean(stored?.bodyGroupId) };
+  const intact = copyIntact([message.content], { ...facts, sharded: false });
   return Object.freeze({
     index,
     storeMessageId,
-    complete: true,
+    complete: intact,
+    ...(intact ? {} : { missing: ['edited'] }),
     ch: channelOf(source),
     src: sourceRefOf(source, storeMessageId),
-    ver: versionOf(source, [message.content], storeId, storeMessageId, {
-      ...copyFacts({ metadata: message.metadata }),
-      sharded: Boolean(stored?.bodyGroupId),
-    }),
+    ver: versionOf(source, [message.content], storeId, storeMessageId, facts),
   });
 }

@@ -26,7 +26,7 @@ import type { BranchStamp, ChannelClockLedger } from './clock-ledger.js';
 
 export { ChannelClockLedger, channelKey, CLOCK_RECORD } from './clock-ledger.js';
 export type { ChannelClocks, ChannelRef, ClockScope, SourceRef, VersionRef } from './clock-ledger.js';
-export { requestEvidence, injectedEvidence, channelOf, sourceRefOf, versionOf, recordedBodyDigest, sourceBodyDigest, copyFacts, withPreparation } from './evidence.js';
+export { requestEvidence, injectedEvidence, channelOf, sourceRefOf, versionOf, recordedBodyDigest, sourceBodyDigest, copyFacts, copyIntact, withPreparation } from './evidence.js';
 export type { BodyEvidence, CopyFacts, RequestEvidence } from './evidence.js';
 
 /** One provider round's report: membrane's `UsageEvent.round`. */
