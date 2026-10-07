@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { NormalizedRequest, StreamEvent, YieldingStream } from '@animalabs/membrane';
+import { WindowedPassthroughStrategy } from '@animalabs/context-manager';
 import {
   AgentFramework,
   readInboundSource,
@@ -356,5 +357,57 @@ describe('receipt clocks through the framework', () => {
     assert.equal(membrane.requests.length, 1, 'a stream was started, then abandoned');
     const receipts = (framework as unknown as { contextReceipts: { streams: Map<string, unknown> } }).contextReceipts;
     assert.equal(receipts.streams.size, 0);
+  });
+});
+
+describe('history--folds answers for the agent that calls it', () => {
+  it('shows each resident its own strategy and fold record, and refuses a caller it cannot resolve', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'folds-caller-'));
+    const history = new HistoryModule();
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: new ScriptedMembrane() as never,
+      agents: [
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' },
+        { name: 'second', model: 'test-model', systemPrompt: 'You are second.', strategy: new WindowedPassthroughStrategy() },
+      ],
+      modules: [history],
+    });
+    try {
+      const scoutCm = framework.getAgent('scout')!.getContextManager();
+      history.bind(scoutCm);
+      history.setFoldExportStatus(() => ({ target: 'folds.jsonl', state: 'current' }));
+      await framework.start();
+      // One accepted round for scout: its baseline receipt. second has none.
+      scoutCm.addMessage('alice', [{ type: 'text', text: 'hello' }]);
+      const { provenance } = await scoutCm.compile();
+      assert.ok(scoutCm.acceptRound({ provenance: provenance!, usage: { inputTokens: 10 } }));
+      const folds = async (caller: string) => {
+        const result = await framework.executeToolCall({ id: `f-${caller}`, name: 'history--folds', input: {}, callerAgentName: caller } as never);
+        return result as { success: boolean; error?: string; data?: { folding: string; receipts: Array<{ kind: string }>; export?: unknown } };
+      };
+
+      const own = await folds('scout');
+      assert.ok(own.success, JSON.stringify(own));
+      assert.match(own.data!.folding, /^The passthrough strategy/);
+      assert.deepEqual(own.data!.receipts.map((r) => r.kind), ['baseline']);
+      assert.deepEqual(own.data!.export, { target: 'folds.jsonl', state: 'current' }, 'the export projects the bound resident\'s record');
+
+      const other = await folds('second');
+      assert.ok(other.success, JSON.stringify(other));
+      assert.match(other.data!.folding, /^The windowed-passthrough strategy/);
+      assert.deepEqual(other.data!.receipts, [], 'not scout\'s baseline');
+      assert.equal(other.data!.export, undefined, 'nor scout\'s export');
+
+      const unknown = await folds('nobody');
+      assert.equal(unknown.success, false);
+      assert.match(unknown.error!, /no agent by that name/);
+      const anonymous = await history.handleToolCall({ id: 'f-none', name: 'folds', input: {} });
+      assert.equal(anonymous.success, false);
+      assert.match(anonymous.error!, /no calling agent/);
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

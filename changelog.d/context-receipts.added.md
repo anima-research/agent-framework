@@ -36,14 +36,16 @@
     run, or a ledger write that failed, which never blocks delivery.
   - Request preparation captures immutable evidence of the bodies each request
     carries (`Agent.prepareActivationRequest`; `StartStreamResult.evidence`).
-- `history--folds {since?, limit?, branch?}`: the resident's fold record, from
-  the context manager's journal (shelf-381). Receipts come newest first, with
-  one readable line per changed run or baseline run, the cause, the round's
-  provider usage (whole-round, never a fold's cost), and a sentence naming how
-  the strategy renders history ("never folds", "never summarizes"). A host that
-  projects receipts to a file reports its export status through
-  `HistoryModule.setFoldExportStatus`, and the tool shows it. Nothing is
-  injected into context.
+- `history--folds {since?, limit?, branch?}`: the calling agent's fold record,
+  from its own context manager's journal (shelf-381), resolved through the new
+  `ModuleContext.getAgentContextManager(agentName)`; a conversation fork or a
+  second resident sees its own record, not the bound resident's. Receipts come
+  newest first, with one readable line per changed run or baseline run, the
+  cause, the round's provider usage (whole-round, never a fold's cost), and a
+  sentence naming how the strategy renders history ("never folds", "never
+  summarizes"). A host that projects the bound resident's receipts to a file
+  reports its export status through `HistoryModule.setFoldExportStatus`, and
+  the tool shows it to that resident. Nothing is injected into context.
 - The first provider round of a compile that stands now calls
   `ContextManager.acceptRound`, which writes fold receipts. It passes that
   round's own usage and its presentation. The presentation is `altered` when
