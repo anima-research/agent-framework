@@ -27,14 +27,18 @@ interface TraceEntry {
   [key: string]: unknown;
 }
 
-function makeGate(configPath: string, opts?: { initialConfig?: GateConfig }) {
+function makeGate(configPath: string, opts?: {
+  initialConfig?: GateConfig;
+  resolveRouteChannel?: (info: GateEventInfo) => string | undefined;
+}) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number }> = [];
+  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string }> = [];
 
   const gate = new EventGate({
     configPath,
     initialConfig: opts?.initialConfig,
+    ...(opts?.resolveRouteChannel ? { resolveRouteChannel: opts.resolveRouteChannel } : {}),
     emitTrace: (e) => traces.push(e as TraceEntry),
     addMessage: (p, c, m) => { messages.push({ participant: p, content: c, metadata: m }); return ''; },
     requestInference: (a, r, s, p) => inferenceRequests.push({ agentName: a, reason: r, source: s, ...(p ?? {}) }),
@@ -448,6 +452,136 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests[0].channelId, undefined, 'a raw snowflake is not a composite channel id — not reported');
     assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:42');
     assert.strictEqual(inferenceRequests[0].addressed, true);
+  });
+
+  it('an addressed batch names its registered route channel; ambient-only batches name none', async () => {
+    const path = writeConfig('debounce-route.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    // The host maps a push origin to its registered composite id.
+    const resolveRouteChannel = (info: GateEventInfo) =>
+      info.eventType === 'mcpl:push-event' ? `discord:dm:${String(info.metadata?.channelId)}` : info.channelId;
+    const { gate, inferenceRequests, messages } = makeGate(path, { resolveRouteChannel });
+
+    // DM (addressed, raw id) then newer ambient chatter elsewhere.
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'dm',
+      tags: ['chat:dm', 'chat:addressed'], metadata: { authorId: '42', channelId: '1548' } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:general', content: 'chatter',
+      metadata: { authorId: '7' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].routeChannelId, 'discord:dm:1548', 'the addressed event names the route');
+    assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:42', 'route and author come from the same event');
+    assert.strictEqual(inferenceRequests[0].channelId, undefined, 'telemetry channel unchanged for push events');
+    // The batched-wake line names the registered id, not the raw snowflake.
+    const text = JSON.stringify(messages.at(-1)?.content);
+    assert.ok(text.includes('discord:dm:1548'), 'gate line shows the registered channel id');
+
+    // Ambient-only batch: telemetry provenance, no route.
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: 'x',
+      metadata: { authorId: '8' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 2);
+    assert.strictEqual(inferenceRequests[1].channelId, 'discord:g:room');
+    assert.strictEqual(inferenceRequests[1].routeChannelId, undefined, 'ambient chatter never sets a route');
+  });
+
+  it('the default resolver routes an addressed channel-incoming event; a push event needs the host resolver', async () => {
+    const path = writeConfig('debounce-route-default.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: '@agent hi',
+      tags: ['chat:addressed'], metadata: { authorId: '1' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests[0].routeChannelId, 'discord:g:room');
+
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'dm',
+      tags: ['chat:dm', 'chat:addressed'], metadata: { authorId: '42', channelId: '1548' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests[1].routeChannelId, undefined, 'a raw id is never used as a route');
+  });
+
+  it('the newest addressed event decides the route even when it has none (no guessing an older one)', async () => {
+    const path = writeConfig('debounce-route-newest.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path); // default resolver: push → no route
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: '@agent first',
+      tags: ['chat:addressed'], metadata: { authorId: '1' } }));
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'dm later',
+      tags: ['chat:dm', 'chat:addressed'], metadata: { authorId: '42', channelId: '1548' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests[0].counterparty, 'discord:user:42');
+    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined,
+      'the DM is the newest addressed event; replying to the older mention would answer the wrong person');
+  });
+
+  it('an addressed push that names only its registered channel (no raw id, no author) still routes', async () => {
+    const path = writeConfig('debounce-route-only.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const resolveRouteChannel = (info: GateEventInfo) =>
+      typeof info.metadata?.mcplChannelId === 'string' ? info.metadata.mcplChannelId : undefined;
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'surface', channelId: 'surface:room:general',
+      content: 'chatter', metadata: { authorId: '7' } }));
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'surface', content: 'dm',
+      tags: ['chat:dm', 'chat:addressed'], metadata: { mcplChannelId: 'surface:dm:42' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].routeChannelId, 'surface:dm:42');
+    assert.strictEqual(inferenceRequests[0].addressed, true);
+    assert.strictEqual(inferenceRequests[0].counterparty, undefined, 'no author on the chosen event, none borrowed from the chatter');
+  });
+
+  it('a newer AMBIENT route-only push does not hide an earlier event\'s channel and author', async () => {
+    const path = writeConfig('debounce-route-only-ambient.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const resolveRouteChannel = (info: GateEventInfo) =>
+      typeof info.metadata?.mcplChannelId === 'string' ? info.metadata.mcplChannelId : info.channelId || undefined;
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'surface', channelId: 'surface:room:general',
+      content: 'chatter', metadata: { authorId: '7' } }));
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'surface', content: 'status ping',
+      metadata: { mcplChannelId: 'surface:room:feed' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].channelId, 'surface:room:general', 'telemetry keeps the attributable event');
+    assert.strictEqual(inferenceRequests[0].counterparty, 'surface:user:7');
+    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined, 'ambient batches never route');
+  });
+
+  it('a throwing route resolver never breaks gating', async () => {
+    const path = writeConfig('debounce-route-throw.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel: () => { throw new Error('boom'); } });
+    const decision = gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room',
+      content: '@agent hi', tags: ['chat:addressed'] }));
+    assert.strictEqual(decision.policyName, 'chat');
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].routeChannelId, undefined);
   });
 
   it('a batched wake with no channel-bearing event carries no provenance', async () => {

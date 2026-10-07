@@ -129,6 +129,16 @@ export class FeatureSetManager {
   private servers = new Map<string, ServerState>();
 
   /**
+   * @param emitTrace Receives an `mcpl:feature-set-disabled` trace beside
+   *   each §6.4 disablement's console line, so hosts that keep per-server
+   *   logs from the trace bus see a set that config enabled but derivation
+   *   turned off. Omit for scratch derivations (nothing is installed).
+   */
+  constructor(
+    private readonly emitTrace?: (event: { type: string; [key: string]: unknown }) => void,
+  ) {}
+
+  /**
    * Initialize a server's feature set state from its capabilities and host config.
    *
    * Called after a server connects and advertises its capabilities.
@@ -201,28 +211,43 @@ export class FeatureSetManager {
     // resolution so it can only remove: nothing a declaration or a config
     // says can supply a capability the grant lacks.
     if (grant) {
+      // Named only when the operator listed it: with enabledFeatureSets
+      // omitted every declared set is selected, which is no surprise.
+      const explicitSelection = config?.enabledFeatureSets !== undefined;
+      const disable = (
+        name: string,
+        reason: 'invalid_uses' | 'missing_capabilities',
+        detail: string,
+        extra: { unrecognized?: string[]; missing?: string[] },
+      ): void => {
+        const selectedByConfig = state.enabled.delete(name);
+        const note = explicitSelection && selectedByConfig ? ' — overrides enabledFeatureSets' : '';
+        console.error(`[mcpl] ${serverId}/${name} disabled: ${detail}${note}`);
+        this.emitTrace?.({
+          type: 'mcpl:feature-set-disabled',
+          serverId,
+          featureSet: name,
+          reason,
+          selectedByConfig,
+          ...extra,
+        });
+      };
       for (const [name, decl] of Object.entries(declared)) {
         const uses = (decl as { uses?: unknown }).uses;
         if (!Array.isArray(uses) || uses.length === 0) {
-          if (state.enabled.delete(name) || true) {
-            console.error(`[mcpl] ${serverId}/${name} disabled: invalid_uses (§6.4 — uses absent or empty)`);
-          }
+          disable(name, 'invalid_uses', 'invalid_uses (§6.4 — uses absent or empty)', { unrecognized: [] });
           continue;
         }
         const unknown = uses.filter((u) => typeof u !== 'string' || !isKnownCapabilityPath(u));
         if (unknown.length > 0) {
-          state.enabled.delete(name);
-          console.error(
-            `[mcpl] ${serverId}/${name} disabled: invalid_uses (§6.4 — unrecognized: ${unknown.join(', ')})`,
-          );
+          disable(name, 'invalid_uses', `invalid_uses (§6.4 — unrecognized: ${unknown.join(', ')})`, {
+            unrecognized: unknown.map((u) => (typeof u === 'string' ? u : JSON.stringify(u))),
+          });
           continue;
         }
         const missing = (uses as string[]).filter((u) => !grant.has(u));
         if (missing.length > 0) {
-          state.enabled.delete(name);
-          console.error(
-            `[mcpl] ${serverId}/${name} disabled: missing capabilities ${missing.join(', ')} (§6.4)`,
-          );
+          disable(name, 'missing_capabilities', `missing capabilities ${missing.join(', ')} (§6.4)`, { missing });
         }
       }
     }

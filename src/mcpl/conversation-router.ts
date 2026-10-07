@@ -27,6 +27,11 @@
  * a restarted host must NOT reuse generation 1's agent name, or it would
  * reopen the previous engagement's Chronicle namespace and re-seed the
  * template context on top of the old history.
+ *
+ * DEPRECATED (anima-research/agent-framework#235): per-channel conversation
+ * routing is being retired. Behavior is unchanged for now; the framework
+ * logs one `[deprecated]` line when it is configured. Removal is a
+ * follow-up.
  */
 
 import type { ContextStrategy } from '@animalabs/context-manager';
@@ -49,6 +54,20 @@ export type TriggerRule = 'always' | 'mention';
  * inferring on every message of a four-human group DM is a firehose). */
 export type ChannelKind = 'dm' | 'groupDm' | 'channel';
 
+/** Logged once by the framework when `FrameworkConfig.conversations` is set. */
+export const CONVERSATION_ROUTING_DEPRECATION_NOTICE =
+  'Per-channel conversation routing (FrameworkConfig.conversations) is deprecated and will ' +
+  'be removed in a future release. Its \'mention\' bind/trigger rule reads ' +
+  'metadata.mentioned, which not every channel server sets (discord-mcpl does not), so on ' +
+  'such channels an @-mention neither binds a fork nor triggers a bound one. Routing still ' +
+  'works for now. See anima-research/agent-framework#235.';
+
+/**
+ * @deprecated Per-channel conversation routing is deprecated and will be
+ * removed (anima-research/agent-framework#235). Its 'mention' bind/trigger
+ * rule reads `metadata.mentioned`, which not every channel server sets.
+ * Behavior is unchanged for now.
+ */
 export interface ConversationRouterConfig {
   /** Agent whose context seeds new forks (the "trunk"/warm checkpoint). */
   templateAgent: string;
@@ -61,7 +80,15 @@ export interface ConversationRouterConfig {
    * Defaults: dm 'always', groupDm 'mention', channel 'mention'. */
   trigger?: { dm?: TriggerRule; groupDm?: TriggerRule; channel?: TriggerRule };
 
-  /** Idle time before a binding expires and the fork is closed. Default 12h. */
+  /**
+   * Idle time before a binding expires and the fork is closed. Default 12h.
+   *
+   * Expiry is checked at most about once a minute, so the sweep usually
+   * notices an expired binding up to ~60s after the TTL elapses. That is the
+   * usual extra delay, not a deadline for closing the fork: the closure turn
+   * can be delayed further (e.g. while the host is quiesced, it stays queued
+   * until resume).
+   */
   idleTtlMs?: number;
 
   /** Final system-initiated user message sent to a fork on expiry. */
@@ -116,6 +143,12 @@ export const DEFAULT_CLOSURE_PROMPT =
 // ConversationRouter
 // ============================================================================
 
+/**
+ * @deprecated Per-channel conversation routing is deprecated and will be
+ * removed (anima-research/agent-framework#235). Behavior is unchanged for
+ * now; the framework logs one `[deprecated]` line when it constructs a
+ * router from `FrameworkConfig.conversations`.
+ */
 export class ConversationRouter {
   private config: ConversationRouterConfig;
 
