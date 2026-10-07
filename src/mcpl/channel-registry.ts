@@ -2712,7 +2712,15 @@ export class ChannelRegistry {
         threadId: text(raw.threadId),
         replyTo: text((raw.metadata as Record<string, unknown> | undefined)?.replyTo),
       });
-      return { source: header, ...raw };
+      // The host's header is authoritative: it is written after the item's
+      // own fields, so an adapter-supplied `source` can't replace it; the
+      // adapter's value, if any, is kept under `adapterSource`.
+      const { source: adapterSource, ...rest } = raw;
+      return {
+        ...rest,
+        ...(adapterSource !== undefined ? { adapterSource } : {}),
+        source: header,
+      };
     });
   }
 

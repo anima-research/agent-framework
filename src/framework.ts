@@ -7256,15 +7256,20 @@ export class AgentFramework {
     }
     metadata[INBOUND_SOURCE_KEY] = source;
     // The delivered body's version identity (mcpl/inbound-source.ts
-    // sourceBodyDigest; room-220 #46752–#47210), from the body as delivered,
-    // before the header decorates it. The stored copy's own digest is taken
-    // at each storage site below, over exactly the blocks stored there.
+    // sourceBodyDigest; room-220 #46752–#47210), recorded first, from the
+    // body as delivered — before the header decorates it or storage shards
+    // it. The header text is recorded beside it. Neither proves later
+    // presence or completeness: they describe this delivery at stamping.
+    // The stored copy's own digest is taken at each storage site below,
+    // over exactly the blocks stored there.
     metadata.sourceBodyDigest = sourceBodyDigest(event.content);
     // The visible source header (shelf-356): stamped once, here, from this
     // item's own frozen envelope, and stored with the message — a later
     // rename, a recompile or a replay never rewrites it, and each message
     // names its conversation when read alone. Creates, coalesced deliveries
     // and RFC-006 corrections all pass through here.
+    const header = renderSourceHeader(source);
+    if (header) metadata.sourceHeader = header;
     event = { ...event, content: AgentFramework.withSourceHeader(source, event.content) };
 
     // Per-channel conversation routing: messages go to the channel's fork
@@ -8466,8 +8471,8 @@ export class AgentFramework {
     metadata[INBOUND_SOURCE_KEY] = source;
 
     const content = [...event.content];
-    // The delivered body's version identity, before any host decoration
-    // (the closed-channel invitation below). Every push gets one, an empty
+    // The delivered body's version identity, before any host decoration (the
+    // invitation and the source header below). Every push gets one, an empty
     // body included, written over any value the adapter's origin carried.
     // A silent heartbeat stores nothing, so its metadata is never kept.
     metadata.sourceBodyDigest = sourceBodyDigest(content);
@@ -8505,7 +8510,10 @@ export class AgentFramework {
     // its registered channel, or `unscoped` — never a guessed channel. A
     // silent heartbeat stores no message, so it gets none.
     const header = silentHeartbeat ? undefined : renderSourceHeader(source);
-    if (header) content.unshift({ type: 'text', text: header });
+    if (header) {
+      content.unshift({ type: 'text', text: header });
+      metadata.sourceHeader = header;
+    }
 
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
@@ -9708,10 +9716,11 @@ export class AgentFramework {
    */
   private maybeExplainSourceHeaders(agent: Agent): void {
     if (!this.channelRegistry) return;
+    let state: Record<string, unknown>;
     try {
       const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
-      const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
-      const explained = { ...((state.sourceHeadersExplained as Record<string, true> | undefined) ?? {}) };
+      state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      const explained = (state.sourceHeadersExplained as Record<string, true> | undefined) ?? {};
       if (explained[agent.name]) return;
       // The recent tail is enough: a turn's own channel traffic is there,
       // and a resident without any never pays for a full scan.
@@ -9721,13 +9730,13 @@ export class AgentFramework {
         sees = readInboundSource(messages[i]!.metadata)?.kind === 'channel';
       }
       if (!sees) return;
-      explained[agent.name] = true;
-      state.sourceHeadersExplained = explained;
-      this.store.setStateJson(FRAMEWORK_STATE_ID, state);
     } catch (err) {
-      console.error('maybeExplainSourceHeaders: state read/write failed:', err);
+      console.error('maybeExplainSourceHeaders: state read failed:', err);
       return;
     }
+    // The notice is stored first, and only a stored notice is recorded as
+    // given — in the same store, after it — so a failed append leaves the
+    // explanation due at the next turn instead of suppressing it.
     try {
       const id = agent.getContextManager().addMessage(
         'user',
@@ -9742,6 +9751,17 @@ export class AgentFramework {
       this.emitTrace({ type: 'message:added', messageId: id, source: 'source-header-notice' });
     } catch (err) {
       console.error('maybeExplainSourceHeaders: failed to append notice:', err);
+      return;
+    }
+    try {
+      state.sourceHeadersExplained = {
+        ...((state.sourceHeadersExplained as Record<string, true> | undefined) ?? {}),
+        [agent.name]: true,
+      };
+      this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+    } catch (err) {
+      // The notice stands; at worst it is given once more.
+      console.error('maybeExplainSourceHeaders: failed to record the notice:', err);
     }
   }
 

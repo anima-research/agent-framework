@@ -220,12 +220,26 @@ export function renderSourceHeader(
     | { kind: 'surface' },
 ): string | undefined {
   if (fields.kind === 'surface') return undefined;
-  if (fields.kind === 'unscoped') return `[source: ${fields.serverId} · unscoped]`;
-  const parts = [`${fields.serverId} / ${fields.channelId}`];
-  if (fields.label) parts.push(fields.label);
-  if (fields.threadId) parts.push(`thread ${fields.threadId}`);
-  if (fields.replyTo) parts.push(`reply to ${fields.replyTo}`);
+  if (fields.kind === 'unscoped') return `[source: ${headerValue(fields.serverId)} · unscoped]`;
+  const parts = [`${headerValue(fields.serverId)} / ${headerValue(fields.channelId)}`];
+  if (fields.label) parts.push(headerValue(fields.label));
+  if (fields.threadId) parts.push(`thread ${headerValue(fields.threadId)}`);
+  if (fields.replyTo) parts.push(`reply to ${headerValue(fields.replyTo)}`);
   return `[source: ${parts.join(' · ')}]`;
+}
+
+/**
+ * A header field, rendered so it can't become structure: every value in a
+ * header (ids and labels alike) comes from an adapter, and a label holding
+ * `]`, a newline and `[source: …` must not read as a second attribution. A
+ * value with any character the grammar uses (brackets, the `·` and ` / `
+ * separators, quotes, backslashes) or any control character is rendered as a
+ * JSON string literal — quoted and escaped — and every other value as is.
+ */
+function headerValue(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  const structural = /[[\]\u00b7"\\\u0000-\u001f\u007f\u2028\u2029]| \/ /;
+  return structural.test(value) ? JSON.stringify(value) : value;
 }
 
 /** The authority rule every rendering of a source header shares. */
