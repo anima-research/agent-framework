@@ -144,6 +144,15 @@ export function requestEvidence(inputs: EvidenceInputs): RequestEvidence {
   const bodies: BodyEvidence[] = [];
   const provenance = inputs.provenance;
   if (provenance) {
+    // A copy (one stored body) can span several compiled messages. If request
+    // preparation dropped any of them, the copy wasn't carried whole, so its
+    // surviving fragments can't be complete. A copy dropped entirely leaves
+    // no evidence at all: it was never an exposure.
+    const droppedFragments = new Set<string>();
+    provenance.messages.forEach((sources, compiledIndex) => {
+      if (sources.kind !== 'raw' || (inputs.requestIndexOf[compiledIndex] ?? -1) >= 0) return;
+      for (const body of sources.bodies) droppedFragments.add(body.messageId);
+    });
     provenance.messages.forEach((sources, compiledIndex) => {
       if (sources.kind !== 'raw') return;
       const index = inputs.requestIndexOf[compiledIndex] ?? -1;
@@ -154,11 +163,13 @@ export function requestEvidence(inputs: EvidenceInputs): RequestEvidence {
         const source = readInboundSource(stored.metadata);
         if (!source || source.kind !== 'channel' || !isBody(stored, source)) continue;
         const members = stored.bodyGroupId ? inputs.groupMembers(stored) : [stored];
+        const lostFragment = droppedFragments.has(body.messageId);
+        const missing = [...(body.missing ?? []), ...(lostFragment ? ['preparation'] : [])];
         bodies.push(Object.freeze({
           index,
           storeMessageId: stored.id,
-          complete: body.complete,
-          ...(body.missing ? { missing: [...body.missing] } : {}),
+          complete: body.complete && !lostFragment,
+          ...(missing.length > 0 ? { missing } : {}),
           ch: channelOf(source),
           src: sourceRefOf(source, stored.id),
           ver: versionOf(source, members.map((m) => m.content), inputs.storeId, stored.id),

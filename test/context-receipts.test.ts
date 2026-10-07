@@ -425,6 +425,32 @@ describe('receipt evidence', () => {
     assert.equal(versionOf(base, text, 's', 'm').basis, 'stored-copy');
   });
 
+  it('marks a copy incomplete when preparation dropped one of its fragments', () => {
+    const stored = new Map([
+      ['s1', { id: 's1', sequence: 1, participant: 'u', content: [{ type: 'text', text: 'a' }], metadata: { inboundSource: { ...base, messageId: 'p1' } } }],
+    ]);
+    const provenance = {
+      messages: [
+        { kind: 'raw', bodies: [{ messageId: 's1', sequence: 1, complete: true }] },
+        { kind: 'raw', bodies: [{ messageId: 's1', sequence: 1, complete: true }] },
+      ],
+    } as unknown as CompileProvenance;
+    const ev = requestEvidence({
+      agent: 'r', storeId: 'store-1', provenance,
+      requestIndexOf: [-1, 0],
+      getMessage: (id) => (stored.get(id) as never) ?? null,
+      groupMembers: (head) => [head],
+    });
+    assert.deepEqual(ev.bodies.map((b) => [b.index, b.complete, b.missing]), [[0, false, ['preparation']]]);
+    const whollyDropped = requestEvidence({
+      agent: 'r', storeId: 'store-1', provenance,
+      requestIndexOf: [-1, -1],
+      getMessage: (id) => (stored.get(id) as never) ?? null,
+      groupMembers: (head) => [head],
+    });
+    assert.equal(whollyDropped.bodies.length, 0, 'a copy dropped entirely is no exposure');
+  });
+
   it('maps compiled bodies to request indices, keeping only channel bodies', () => {
     const stored = new Map([
       ['s1', { id: 's1', sequence: 1, participant: 'u', content: [{ type: 'text', text: 'a' }], metadata: { inboundSource: { ...base, messageId: 'p1' } } }],
@@ -436,7 +462,7 @@ describe('receipt evidence', () => {
         { kind: 'raw', bodies: [{ messageId: 's1', sequence: 1, complete: true }] },
         { kind: 'raw', bodies: [{ messageId: 's2', sequence: 2, complete: true }] },
         { kind: 'raw', bodies: [{ messageId: 's3', sequence: 3, complete: true }] },
-        { kind: 'raw', bodies: [{ messageId: 's1', sequence: 1, complete: false, missing: ['content'] }] },
+        { kind: 'raw', bodies: [{ messageId: 's4', sequence: 4, complete: true }] },
       ],
     } as unknown as CompileProvenance;
     const ev = requestEvidence({
