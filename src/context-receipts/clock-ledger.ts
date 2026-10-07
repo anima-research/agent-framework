@@ -267,12 +267,16 @@ export class ChannelClockLedger {
    * true when it was a first delivery (the clock moved).
    */
   delivered(agent: string, ch: ChannelRef, src: SourceRef, ver: VersionRef, branch: BranchStamp, at = this.now()): boolean {
+    // Eligibility is decided on reconciled state: an earlier append that
+    // failed after landing may already hold this very delivery.
+    if (!this.reconcile()) return false;
     if (this.deliveredSets.get(agent)?.has(versionDigest(ver))) return false;
     return this.write({ k: 'dlv', at, agent, ch, src, ver, branch });
   }
 
   /** A partial copy of `ver` reached `agent` before any complete one. */
   partial(agent: string, ch: ChannelRef, src: SourceRef, ver: VersionRef, branch: BranchStamp, why: string[], at = this.now()): boolean {
+    if (!this.reconcile()) return false;
     const digest = versionDigest(ver);
     if (this.deliveredSets.get(agent)?.has(digest) || this.partialSets.get(agent)?.has(digest)) return false;
     return this.write({ k: 'part', at, agent, ch, src, ver, branch, why });
@@ -315,6 +319,23 @@ export class ChannelClockLedger {
   }
 
   // --------------------------------------------------------------------------
+
+  /**
+   * Bring memory in line with the journal after an ambiguous write (one that
+   * failed after reaching the store): replay it, so decisions see whatever
+   * landed. False when that replay itself fails; the caller then records
+   * nothing, and the open coverage gap covers it.
+   */
+  private reconcile(): boolean {
+    if (!this.journal.needsReconcile) return true;
+    try {
+      this.reload();
+      return true;
+    } catch (err) {
+      console.error('[receipts] clock ledger could not reconcile after a failed write:', err);
+      return false;
+    }
+  }
 
   private reload(): void {
     const { snapshot, entries } = this.journal.load();

@@ -67,8 +67,8 @@ export interface ContextReceiptHooks {
   acceptRound(agent: string, provenance: CompileProvenance, usage: RoundReport['usage'], at: number, presentation: Presentation): void;
 }
 
-/** One source version and every request fragment that carries it in a round. */
-interface VersionCarriage {
+/** One copy of a version in a round's request, over all its fragments. */
+interface CopyCarriage {
   body: BodyEvidence;
   complete: boolean;
   missing: Set<string>;
@@ -129,14 +129,18 @@ export class ContextReceipts {
     if (established && evidence) {
       const branch = branchOf(evidence);
       const alteredInjected = new Set((round.altered?.injected ?? []).map(([b, i]) => `${b}:${i}`));
-      // A body can reach the request in several fragments (a split message,
-      // a sharded body, the same version compiled and injected). It is
-      // delivered complete only when every fragment carrying it in this
-      // round arrived complete and unaltered.
-      const carried = new Map<string, VersionCarriage>();
-      const carry = (body: BodyEvidence, altered: boolean) => {
+      // A version can reach the request as several COPIES (a compiled
+      // stored copy, an injected copy, a replayed stored copy), and one copy
+      // can span several FRAGMENTS (a split message, a sharded body). A copy
+      // is complete only when every one of its fragments arrived complete
+      // and unaltered; a version is delivered when ANY of its copies was
+      // complete, and is a partial exposure otherwise.
+      const versions = new Map<string, Map<string, CopyCarriage>>();
+      const carry = (copy: string, body: BodyEvidence, altered: boolean) => {
         const id = JSON.stringify([body.ver.basis, body.ver.key]);
-        const entry = carried.get(id) ?? { body, complete: true, missing: new Set<string>() };
+        let copies = versions.get(id);
+        if (!copies) versions.set(id, (copies = new Map()));
+        const entry = copies.get(copy) ?? { body, complete: true, missing: new Set<string>() };
         if (!body.complete) {
           entry.complete = false;
           for (const why of body.missing ?? []) entry.missing.add(why);
@@ -145,18 +149,25 @@ export class ContextReceipts {
           entry.complete = false;
           entry.missing.add('wire-alteration');
         }
-        carried.set(id, entry);
+        copies.set(copy, entry);
       };
-      for (const body of evidence.bodies) carry(body, alteredMessages.has(body.index));
+      for (const body of evidence.bodies) carry(`stored:${body.storeMessageId}`, body, alteredMessages.has(body.index));
       state.batches.forEach((batch, n) => {
         for (const body of batch.bodies) {
-          if (body.index < batch.applied) carry(body, alteredInjected.has(`${n}:${body.index}`));
+          if (body.index < batch.applied) carry(`injected:${n}:${body.index}`, body, alteredInjected.has(`${n}:${body.index}`));
         }
       });
       this.ledger.withCommittedState(() => {
-        for (const entry of carried.values()) {
-          if (entry.complete) this.ledger.delivered(agent, entry.body.ch, entry.body.src, entry.body.ver, branch, at);
-          else this.ledger.partial(agent, entry.body.ch, entry.body.src, entry.body.ver, branch, [...entry.missing], at);
+        for (const copies of versions.values()) {
+          const whole = [...copies.values()].find((c) => c.complete);
+          if (whole) {
+            this.ledger.delivered(agent, whole.body.ch, whole.body.src, whole.body.ver, branch, at);
+            continue;
+          }
+          const first = copies.values().next().value!;
+          const missing = new Set<string>();
+          for (const c of copies.values()) for (const why of c.missing) missing.add(why);
+          this.ledger.partial(agent, first.body.ch, first.body.src, first.body.ver, branch, [...missing], at);
         }
       });
     }

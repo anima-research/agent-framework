@@ -147,6 +147,38 @@ describe('ChannelClockLedger', () => {
     assert.equal(clocks(l, 'r').received?.messageId, 'm2');
   });
 
+  it('never records a delivery twice after an append that landed but reported failure', () => {
+    let landThenThrow = false;
+    const flaky = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === 'appendJson') {
+          return (type: string, payload: unknown) => {
+            const written = target.appendJson(type, payload);
+            if (landThenThrow && (payload as { k?: string }).k === 'dlv') {
+              landThenThrow = false;
+              throw new Error('write reported failure after landing');
+            }
+            return written;
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as JsStore;
+    const l = new ChannelClockLedger(flaky, 'store-1', now);
+    l.start();
+    landThenThrow = true;
+    clock = 100;
+    assert.equal(l.delivered('r', CH, src('m1', 50), ver('e1'), BRANCH), false, 'the write reported failure');
+    clock = 200;
+    assert.equal(l.delivered('r', CH, src('m1', 50), ver('e1'), BRANCH), false, 'reconciled: it had landed');
+    const dlv = store.getRecordIdsByType(CLOCK_RECORD)
+      .map((id) => JSON.parse(store.getRecord(id)!.payload.toString('utf8')) as { k: string; at: number })
+      .filter((e) => e.k === 'dlv');
+    assert.deepEqual(dlv.map((e) => e.at), [100]);
+    assert.equal(clocks(l, 'r').lastDeliveredAt, 100);
+  });
+
   it('writes no stop marker when the outstanding gap cannot be written, so the next start reports it', () => {
     let failing = false;
     const flaky = new Proxy(store, {
@@ -298,10 +330,21 @@ describe('ContextReceipts', () => {
     assert.deepEqual(accepted.map((a) => a.presentation), ['altered', 'unknown']);
   });
 
+  it('delivers a version when any one copy arrived whole, even if another copy was partial', () => {
+    receipts.beginStream('r', 1, evidence([
+      body(0, 'old-copy', { storeMessageId: 's-old', ver: ver('v'), src: src('m1', 1_000), complete: false, missing: ['content'] }),
+      body(1, 'fresh-copy', { storeMessageId: 's-fresh', ver: ver('v'), src: src('m1', 1_000) }),
+    ]));
+    receipts.usage('r', 1, round());
+    const c = ledger.clocksFor('r', [CH]).get(channelKey(CH))!;
+    assert.ok(c.lastDeliveredAt, 'the complete copy establishes delivery');
+    assert.equal(c.lastPartialAt, null);
+  });
+
   it('delivers a body only when every fragment carrying it arrived whole', () => {
     // One version compiled into two request messages (a split message); the
     // producer altered the second fragment.
-    receipts.beginStream('r', 1, evidence([body(0, 'm1'), body(1, 'm1-part2', { ver: ver('m1'), src: src('m1', 1_000) })]));
+    receipts.beginStream('r', 1, evidence([body(0, 'm1'), body(1, 'm1-part2', { storeMessageId: 's-m1', ver: ver('m1'), src: src('m1', 1_000) })]));
     receipts.usage('r', 1, round({ altered: { messages: [1], injected: [] } }));
     const c = ledger.clocksFor('r', [CH]).get(channelKey(CH))!;
     assert.equal(c.lastDeliveredAt, null, 'not delivered: one fragment was altered');
