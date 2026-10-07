@@ -8889,7 +8889,7 @@ export class AgentFramework {
         this.addMessage(
           'user',
           [{ type: 'text', text: this.draftsHeldNotice(agent.name, held, reason) }],
-          { system: true, kind: 'prose-drafts', draftIds: held.map((d) => d.id) } as MessageMetadata,
+          { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: held.map((d) => d.id) } as MessageMetadata,
           { forAgent: agent.name },
         );
       } catch (err) {
@@ -8975,11 +8975,13 @@ export class AgentFramework {
         `${this.draftTime(risky.at)} may already have been posted: ${risky.outcome?.reason ?? 'its outcome was never recorded'}`;
     }
     const inherited = draft.inheritedRisk!;
+    const owner = inherited.sourceDraftId ?? inherited.draftId;
+    const via = owner !== inherited.draftId ? `, which itself includes the words of ${owner}` : '';
     const where = inherited.destination
-      ? `its attempt to ${AgentFramework.destinationText(inherited.destination)}` +
+      ? `${owner}'s attempt to ${AgentFramework.destinationText(inherited.destination)}` +
         (inherited.at !== undefined ? ` at ${this.draftTime(inherited.at)}` : '')
-      : 'it';
-    return `${draft.id} includes the words of ${inherited.draftId}, and ${where} may already have been posted: ${inherited.reason}`;
+      : owner;
+    return `${draft.id} includes the words of ${inherited.draftId}${via}, and ${where} may already have been posted: ${inherited.reason}`;
   }
 
   /** A delivered draft's historical receipt. */
@@ -9011,7 +9013,7 @@ export class AgentFramework {
       const mid = agent.getContextManager().addMessage(
         'user',
         [{ type: 'text', text }],
-        { system: true, kind: 'prose-drafts', draftIds: pending.map((d) => d.id) } as MessageMetadata,
+        { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: pending.map((d) => d.id) } as MessageMetadata,
       );
       this.emitTrace({ type: 'message:added', messageId: mid, source: 'prose-drafts' });
       this.proseDrafts.markNoticed(agent.name, pending.map((d) => d.id));
@@ -9042,16 +9044,17 @@ export class AgentFramework {
     }
   }
 
-  /** Which of these drafts a stored notice or receipt names (scanning the
-   *  recent history, where this turn's notices are). */
+  /** Which of these drafts a stored notice or receipt OF THIS RESIDENT names
+   *  (draft ids are unique only per resident, and residents can share one
+   *  history), scanning the recent history, where this turn's notices are. */
   private draftsNamedInHistory(agent: Agent, ids: string[]): string[] {
     const wanted = new Set(ids);
     const named = new Set<string>();
     const messages = agent.getContextManager().getAllMessages();
     for (let i = messages.length - 1, scanned = 0; i >= 0 && scanned < 500 && named.size < wanted.size; i--, scanned++) {
-      const draftIds = (messages[i]!.metadata as { draftIds?: unknown } | undefined)?.draftIds;
-      if (!Array.isArray(draftIds)) continue;
-      for (const id of draftIds) if (typeof id === 'string' && wanted.has(id)) named.add(id);
+      const meta = messages[i]!.metadata as { draftIds?: unknown; draftOwner?: unknown } | undefined;
+      if (meta?.draftOwner !== agent.name || !Array.isArray(meta.draftIds)) continue;
+      for (const id of meta.draftIds) if (typeof id === 'string' && wanted.has(id)) named.add(id);
     }
     return ids.filter((id) => named.has(id));
   }
@@ -9183,6 +9186,13 @@ export class AgentFramework {
     }
 
     // resend
+    // Idempotence first: a request whose drafts were all delivered returns
+    // their historical receipts, whether or not the former destination is
+    // still registered or resolvable — nothing needs sending, so nothing
+    // needs authorizing.
+    if (drafts.every((d) => draftState(d) === 'delivered')) {
+      return ok(drafts.map((d) => `${this.draftReceipt(d)} — not sent again.`).join('\n'));
+    }
     const registry = this.channelRegistry;
     if (!registry) return refuse('No channels are configured, so there is nowhere to resend to.');
     const home = this.conversationAgentHomes.get(agentName);
@@ -9396,7 +9406,7 @@ export class AgentFramework {
         {
           system: true,
           kind: 'delivery-receipt',
-          ...(drafts.length > 0 ? { draftIds: drafts.map((d) => d.id) } : {}),
+          ...(drafts.length > 0 ? { draftOwner: agent.name, draftIds: drafts.map((d) => d.id) } : {}),
         } as MessageMetadata,
       );
       this.emitTrace({ type: 'message:added', messageId: mid, source: 'delivery-receipt' });
@@ -9805,15 +9815,27 @@ export class AgentFramework {
       if (usesUnsent && previous && previousAtRisk) {
         // The whole authored attempt is kept, words of the risky draft
         // included, and it carries that draft's duplication risk: it can be
-        // resent only with confirmDuplicate, like the draft it copies.
+        // resent only with confirmDuplicate, like the draft it copies. The
+        // evidence is the risk's own: the copied draft's uncertain attempt,
+        // else the risk that draft itself inherited, else (truly) that it
+        // was in flight when copied.
         const risky = uncertainAttempt(previous);
-        inherited = {
-          draftId: previous.id,
-          ...(risky ? { destination: risky.destination, at: risky.at } : {}),
-          reason: risky
-            ? risky.outcome?.reason ?? 'its outcome was never recorded'
-            : 'it was being sent when these words were held',
-        };
+        inherited = risky
+          ? {
+              draftId: previous.id,
+              destination: risky.destination,
+              at: risky.at,
+              reason: risky.outcome?.reason ?? 'its outcome was never recorded',
+            }
+          : previous.inheritedRisk
+            ? {
+                draftId: previous.id,
+                sourceDraftId: previous.inheritedRisk.sourceDraftId ?? previous.inheritedRisk.draftId,
+                ...(previous.inheritedRisk.destination ? { destination: previous.inheritedRisk.destination } : {}),
+                ...(previous.inheritedRisk.at !== undefined ? { at: previous.inheritedRisk.at } : {}),
+                reason: previous.inheritedRisk.reason,
+              }
+            : { draftId: previous.id, reason: 'it was being sent when these words were held' };
       }
       // The bounce notice below names the draft, so no separate held notice.
       draft = this.holdProseDrafts(
@@ -9850,7 +9872,7 @@ export class AgentFramework {
       const id = this.addMessage(
         'user',
         [{ type: 'text', text: notice }],
-        { system: true, kind: 'prose-bounce', ...(draft ? { draftIds: [draft.id] } : {}) } as MessageMetadata,
+        { system: true, kind: 'prose-bounce', ...(draft ? { draftOwner: name, draftIds: [draft.id] } : {}) } as MessageMetadata,
         { forAgent: name },
       );
       if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-bounce' });

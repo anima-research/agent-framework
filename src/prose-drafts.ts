@@ -92,7 +92,11 @@ export interface DraftAttempt {
 export interface InheritedRisk {
   /** The draft whose words were copied in. */
   draftId: string;
-  /** Its uncertain attempt, when there was one (absent: it was in flight). */
+  /** The draft whose attempt is the uncertain one, when the copied draft
+   *  itself carried inherited risk (a chain of re-bounces): the evidence is
+   *  that original attempt's, never re-invented. */
+  sourceDraftId?: string;
+  /** That uncertain attempt, when there was one (absent: it was in flight). */
   destination?: PublishDestination;
   at?: number;
   reason: string;

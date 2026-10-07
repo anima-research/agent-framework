@@ -722,7 +722,7 @@ describe('draft notices and turn-end settlement', () => {
       const agent = framework.getAgent('scout')!;
       const [named, lost] = internals.proseDrafts.hold('scout', [{ text: 'named', source }, { text: 'lost', source }], 'explicit-send').held;
       // Only the first draft's notice reached the history.
-      agent.getContextManager().addMessage('user', [{ type: 'text', text: '[drafts] …' }], { system: true, kind: 'prose-drafts', draftIds: [named!.id] } as never);
+      agent.getContextManager().addMessage('user', [{ type: 'text', text: '[drafts] …' }], { system: true, kind: 'prose-drafts', draftOwner: 'scout', draftIds: [named!.id] } as never);
       internals.turnDrafts.set('scout', [named, lost]);
       internals.settleTurnDrafts(agent);
       assert.ok(internals.proseDrafts.get('scout', named!.id)!.noticedAt);
@@ -731,6 +731,66 @@ describe('draft notices and turn-end settlement', () => {
     } finally {
       await framework.stop();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('draft identity and risk evidence', () => {
+  const setupFramework = async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'prose-drafts-ident-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout' }, { name: 'other', model: 'test-model', systemPrompt: 'other' }],
+      modules: [],
+    });
+    const internals = framework as unknown as {
+      proseDrafts: ProseDraftStore;
+      turnDrafts: Map<string, unknown[]>;
+      settleTurnDrafts(agent: unknown): void;
+      bounceProse(agent: unknown, text: string, reason: string): void;
+      riskText(draft: unknown): string;
+    };
+    return { dir, framework, internals, close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); } };
+  };
+
+  it('a notice names drafts of its own resident only: the same id under another resident is not settled by it', async () => {
+    const t = await setupFramework();
+    try {
+      (t.internals.proseDrafts as unknown as { newId: (agent: string) => string }).newId = () => 'd-same2';
+      const [mine] = t.internals.proseDrafts.hold('scout', [{ text: 'scout words', source }], 'explicit-send').held;
+      t.internals.proseDrafts.hold('other', [{ text: 'other words', source }], 'explicit-send');
+      // Only the OTHER resident's notice for "d-same2" is in the shared history.
+      t.framework.getAgent('other')!.getContextManager().addMessage('user', [{ type: 'text', text: '[drafts] other: …' }],
+        { system: true, kind: 'prose-drafts', draftOwner: 'other', draftIds: ['d-same2'] } as never);
+      t.internals.turnDrafts.set('scout', [mine]);
+      t.internals.settleTurnDrafts(t.framework.getAgent('scout')!);
+      assert.equal(t.internals.proseDrafts.get('scout', 'd-same2')!.noticedAt, undefined);
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a re-bounce of inherited risk keeps the original attempt as its evidence', async () => {
+    const t = await setupFramework();
+    try {
+      const agent = t.framework.getAgent('scout')!;
+      const [original] = t.internals.proseDrafts.hold('scout', [{ text: 'first', source }], 'bounced').held;
+      t.internals.proseDrafts.beginAttempt('scout', original!.id, dest(), 'unsent-token', false); // never resolved
+      t.internals.bounceProse(agent, '{{unsent}} second', 'no such channel');
+      const copy = t.internals.proseDrafts.open('scout').find((d) => d.text === 'first second')!;
+      assert.equal(copy.inheritedRisk?.draftId, original!.id);
+      t.internals.bounceProse(agent, '{{unsent}} third', 'no such channel');
+      const again = t.internals.proseDrafts.open('scout').find((d) => d.text === 'first second third')!;
+      assert.equal(again.inheritedRisk?.draftId, copy.id);
+      assert.equal(again.inheritedRisk?.sourceDraftId, original!.id);
+      assert.deepEqual(again.inheritedRisk?.destination, dest());
+      assert.equal(again.inheritedRisk?.reason, 'its outcome was never recorded');
+      const text = t.internals.riskText(again);
+      assert.match(text, new RegExp(`${again.id} includes the words of ${copy.id}, which itself includes the words of ${original!.id}, and ${original!.id}'s attempt to #room \\(Guild One\\)`));
+      assert.doesNotMatch(text, /being sent/);
+    } finally {
+      await t.close();
     }
   });
 });
@@ -771,6 +831,28 @@ describe('drafts resend ownership', () => {
       close: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); },
     };
   };
+
+  it('an all-delivered resend returns its receipts even when the destination no longer resolves', async () => {
+    const t = await setup();
+    try {
+      const sending = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' });
+      await t.tick();
+      t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
+      assert.match(t.say(await sending), /delivered to \(chan\), message m-a/);
+      // The channel is gone: destination resolution would now fail.
+      const registry = (t.framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+      registry.resolveProseTarget = () => ({ error: 'no channel matches' });
+      registry.resolveDestination = () => ({ error: 'no registered channel' });
+      const again = t.say(await t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: '#gone' }));
+      assert.match(again, new RegExp(`${t.a.id}: delivered — confirmed at .* message m-a .*not sent again`));
+      assert.equal(t.pending.length, 0);
+      // A mixed batch still needs a destination that resolves.
+      const mixed = t.say(await t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, t.b.id], destination: '#gone' }));
+      assert.match(mixed, /Destination "#gone" did not resolve/);
+    } finally {
+      await t.close();
+    }
+  });
 
   it('a batch owns its drafts: a concurrent resend of a queued draft is refused, and nothing is sent twice', async () => {
     const t = await setup();
