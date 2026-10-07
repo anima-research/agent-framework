@@ -16,9 +16,11 @@
     otherwise by the stored copy. Each delivery names its basis, and
     re-presenting a delivered version never moves a clock.
   - The clocks live in a store-scoped, unbranched `RecordJournal`, so a
-    delivery survives `/undo`. `receiptClocks` names the scope (store id,
-    agent), `trackingSince`, the dedup horizon and coverage gaps: an unclean
-    previous run, or a ledger write that failed, which never blocks delivery.
+    delivery survives `/undo`. Deduplication is exact and persistent: every
+    delivered version is remembered, so a version counts when it first reaches
+    the resident at any age, and never again. `receiptClocks` names the scope
+    (store id, agent), `trackingSince` and coverage gaps: an unclean previous
+    run, or a ledger write that failed, which never blocks delivery.
   - Request preparation captures immutable evidence of the bodies each request
     carries (`Agent.prepareActivationRequest`; `StartStreamResult.evidence`).
 - `history--folds {since?, limit?, branch?}`: the resident's fold record, from

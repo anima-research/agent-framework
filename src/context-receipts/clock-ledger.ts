@@ -22,12 +22,15 @@
  *  - `part`: a resident's first partial exposure to a version not yet
  *    delivered complete.
  *
- * Deduplication. A version is delivered at most once per resident. The
- * ledger remembers recent delivered (and partially exposed) version keys,
- * bounded in count; a version whose acceptance predates that memory's
- * horizon is never counted as a first delivery, so re-presenting very old
- * history (an unfold, a replay) cannot refresh a clock. The horizon is
- * reported with the clocks.
+ * Deduplication is exact and persistent. A version is delivered at most
+ * once per resident, however long ago it was accepted. Every delivered (and
+ * partially exposed) version is remembered as a 64-bit digest of its key,
+ * and the full sets ride in each checkpoint as one packed base64 string.
+ * Re-presenting a delivered version (an unfold, a replay, every later round)
+ * never moves a clock, and a version that has never reached the resident
+ * counts when it first does, at any age. Checkpoints grow with the sets, so
+ * their interval grows too (a quarter of the remembered keys, at least 4000
+ * entries), which keeps total checkpoint storage linear in deliveries.
  */
 
 import { createHash } from 'node:crypto';
@@ -36,11 +39,7 @@ import { RecordJournal } from '../record-journal.js';
 
 export const CLOCK_RECORD = 'agent-framework/channel-clocks';
 
-/** Delivered version keys remembered per resident. */
-const DELIVERED_MEMORY = 8192;
-/** Partially exposed version keys remembered per resident. */
-const PARTIAL_MEMORY = 2048;
-/** Entries between checkpoints. */
+/** Minimum entries between checkpoints. */
 const CHECKPOINT_EVERY = 4000;
 /** Coverage gaps listed with the clocks (most recent). */
 const GAPS_KEPT = 20;
@@ -107,25 +106,25 @@ interface PartialStamp extends ClockStamp {
   why: string[];
 }
 
-/** One resident's dedup memory: hashed version key -> source acceptance time. */
-interface Memory {
-  keys: Record<string, number>;
-  /** Acceptance time below which versions are no longer remembered. */
-  horizon: number;
-}
-
+/** One resident's clocks, by channel key. */
 interface AgentState {
   delivered: Record<string, DeliveryStamp>;
   partial: Record<string, PartialStamp>;
-  dmem: Memory;
-  pmem: Memory;
+}
+
+/** A resident's persisted dedup sets: packed 8-byte version digests, base64. */
+interface PackedSets {
+  delivered: string;
+  partial: string;
 }
 
 interface Snapshot {
-  v: 1;
+  v: 2;
   trackingSince: number | null;
   channels: Record<string, { ch: ChannelRef; received: ClockStamp }>;
   agents: Record<string, AgentState>;
+  /** Exact dedup sets per resident (rebuilt into memory at load). */
+  seen: Record<string, PackedSets>;
   gaps: Array<{ from: number; to: number; reason: string }>;
   /** Start time of a run with no stop recorded yet. */
   openRun: number | null;
@@ -147,8 +146,6 @@ export interface ClockScope {
   storeId: string;
   agent: string;
   trackingSince: number | null;
-  /** Versions accepted before this were not remembered (dedup horizon). */
-  dedupHorizon: number | null;
   /** Recent intervals in which observations may be missing. */
   gaps: Array<{ from: number; to: number; reason: string }>;
   /** True while a ledger write failure is unresolved. */
@@ -163,39 +160,30 @@ export function channelKey(ch: Pick<ChannelRef, 'binding' | 'channelId'>): strin
   return JSON.stringify([ch.binding, ch.channelId]);
 }
 
-function versionHash(ver: VersionRef): string {
-  return shortHash(JSON.stringify([ver.basis, ver.key]));
+
+/** A version's 64-bit digest, as 16 hex characters. */
+function versionDigest(ver: VersionRef): string {
+  return createHash('sha256').update(JSON.stringify([ver.basis, ver.key])).digest('hex').slice(0, 16);
 }
 
-function shortHash(text: string): string {
-  return createHash('sha256').update(text).digest('base64url').slice(0, 16);
+function pack(set: ReadonlySet<string>): string {
+  return Buffer.from([...set].join(''), 'hex').toString('base64');
+}
+
+function unpack(packed: string | undefined): Set<string> {
+  const out = new Set<string>();
+  if (!packed) return out;
+  const hex = Buffer.from(packed, 'base64').toString('hex');
+  for (let i = 0; i + 16 <= hex.length; i += 16) out.add(hex.slice(i, i + 16));
+  return out;
 }
 
 function emptyAgent(): AgentState {
-  return { delivered: {}, partial: {}, dmem: { keys: {}, horizon: 0 }, pmem: { keys: {}, horizon: 0 } };
+  return { delivered: {}, partial: {} };
 }
 
 function emptySnapshot(): Snapshot {
-  return { v: 1, trackingSince: null, channels: {}, agents: {}, gaps: [], openRun: null, lastAt: null };
-}
-
-/**
- * Remember a key. Past 1.25 x `cap`, forget the oldest by acceptance time
- * down to `cap` and raise the horizon to the newest forgotten one, so
- * nothing at or before the horizon can count as new.
- */
-function remember(mem: Memory, key: string, acceptedAt: number, cap: number): void {
-  mem.keys[key] = acceptedAt;
-  const size = Object.keys(mem.keys).length;
-  if (size <= Math.floor(cap * 1.25)) return;
-  const ordered = Object.entries(mem.keys).sort((a, b) => a[1] - b[1]);
-  const drop = ordered.slice(0, size - cap);
-  for (const [k] of drop) delete mem.keys[k];
-  mem.horizon = Math.max(mem.horizon, drop[drop.length - 1]![1]);
-}
-
-function known(mem: Memory, key: string, acceptedAt: number): boolean {
-  return key in mem.keys || acceptedAt <= mem.horizon;
+  return { v: 2, trackingSince: null, channels: {}, agents: {}, seen: {}, gaps: [], openRun: null, lastAt: null };
 }
 
 export class ChannelClockLedger {
@@ -207,19 +195,18 @@ export class ChannelClockLedger {
   /** Inside batch(): the store has been synced for this batch's writes. */
   private batch: { synced: boolean } | null = null;
 
-  private readonly deliveredMemory: number;
-  private readonly partialMemory: number;
   private readonly checkpointEvery: number;
+  /** Exact dedup sets per resident: delivered and partially exposed version digests. */
+  private deliveredSets = new Map<string, Set<string>>();
+  private partialSets = new Map<string, Set<string>>();
 
   constructor(
     private readonly store: JsStore,
     readonly storeId: string,
     private readonly now: () => number = Date.now,
-    limits: { deliveredMemory?: number; partialMemory?: number; checkpointEvery?: number } = {},
+    limits: { checkpointEvery?: number } = {},
   ) {
     this.journal = new RecordJournal<ClockEntry, Snapshot>(store, { type: CLOCK_RECORD });
-    this.deliveredMemory = limits.deliveredMemory ?? DELIVERED_MEMORY;
-    this.partialMemory = limits.partialMemory ?? PARTIAL_MEMORY;
     this.checkpointEvery = limits.checkpointEvery ?? CHECKPOINT_EVERY;
   }
 
@@ -248,7 +235,7 @@ export class ChannelClockLedger {
     }
     if (!this.write({ k: 'stop', at })) return;
     try {
-      this.journal.checkpoint(this.state, { durable: true });
+      this.journal.checkpoint(this.snapshot(), { durable: true });
     } catch (err) {
       console.error('[receipts] clock checkpoint at stop failed:', err);
     }
@@ -279,25 +266,20 @@ export class ChannelClockLedger {
    * true when it was a first delivery (the clock moved).
    */
   delivered(agent: string, ch: ChannelRef, src: SourceRef, ver: VersionRef, branch: BranchStamp, at = this.now()): boolean {
-    const a = this.state.agents[agent];
-    const key = versionHash(ver);
-    if (a && known(a.dmem, key, src.acceptedAt)) return false;
+    if (this.deliveredSets.get(agent)?.has(versionDigest(ver))) return false;
     return this.write({ k: 'dlv', at, agent, ch, src, ver, branch });
   }
 
   /** A partial copy of `ver` reached `agent` before any complete one. */
   partial(agent: string, ch: ChannelRef, src: SourceRef, ver: VersionRef, branch: BranchStamp, why: string[], at = this.now()): boolean {
-    const a = this.state.agents[agent];
-    const key = versionHash(ver);
-    if (a && (known(a.dmem, key, src.acceptedAt) || known(a.pmem, key, src.acceptedAt))) return false;
+    const digest = versionDigest(ver);
+    if (this.deliveredSets.get(agent)?.has(digest) || this.partialSets.get(agent)?.has(digest)) return false;
     return this.write({ k: 'part', at, agent, ch, src, ver, branch, why });
   }
 
-  /** Whether `agent` already has a complete delivery of `ver` (or it predates memory). */
-  isDelivered(agent: string, ver: VersionRef, acceptedAt: number): boolean {
-    const a = this.state.agents[agent];
-    if (!a) return false;
-    return known(a.dmem, versionHash(ver), acceptedAt);
+  /** Whether `agent` already has a complete delivery of `ver`. */
+  isDelivered(agent: string, ver: VersionRef): boolean {
+    return this.deliveredSets.get(agent)?.has(versionDigest(ver)) ?? false;
   }
 
   /** The clocks of the given channels for one resident. */
@@ -322,13 +304,10 @@ export class ChannelClockLedger {
   }
 
   scope(agent: string): ClockScope {
-    const a = this.state.agents[agent];
-    const horizon = a ? Math.max(a.dmem.horizon, 0) : 0;
     return {
       storeId: this.storeId,
       agent,
       trackingSince: this.state.trackingSince,
-      dedupHorizon: horizon > 0 ? horizon : null,
       gaps: [...this.state.gaps, ...(this.pendingGap ? [{ from: this.pendingGap.from, to: this.now(), reason: `${this.pendingGap.reason} (ongoing)` }] : [])],
       degraded: this.pendingGap !== null,
     };
@@ -338,8 +317,32 @@ export class ChannelClockLedger {
 
   private reload(): void {
     const { snapshot, entries } = this.journal.load();
-    this.state = snapshot && snapshot.v === 1 ? snapshot : emptySnapshot();
+    this.state = snapshot && snapshot.v === 2 ? snapshot : emptySnapshot();
+    this.deliveredSets = new Map();
+    this.partialSets = new Map();
+    for (const [agent, sets] of Object.entries(this.state.seen ?? {})) {
+      this.deliveredSets.set(agent, unpack(sets.delivered));
+      this.partialSets.set(agent, unpack(sets.partial));
+    }
+    this.state.seen = {};
     for (const { entry } of entries) this.reduce(entry);
+  }
+
+  /** The reduced state with the dedup sets packed in, for a checkpoint. */
+  private snapshot(): Snapshot {
+    const seen: Record<string, PackedSets> = {};
+    const agents = new Set([...this.deliveredSets.keys(), ...this.partialSets.keys()]);
+    for (const agent of agents) {
+      seen[agent] = { delivered: pack(this.deliveredSets.get(agent) ?? new Set()), partial: pack(this.partialSets.get(agent) ?? new Set()) };
+    }
+    return { ...this.state, seen };
+  }
+
+  private rememberedKeys(): number {
+    let n = 0;
+    for (const set of this.deliveredSets.values()) n += set.size;
+    for (const set of this.partialSets.values()) n += set.size;
+    return n;
   }
 
   /**
@@ -367,9 +370,9 @@ export class ChannelClockLedger {
       return false;
     }
     this.reduce(entry);
-    if (this.journal.entriesSinceCheckpoint >= this.checkpointEvery) {
+    if (this.journal.entriesSinceCheckpoint >= Math.max(this.checkpointEvery, Math.floor(this.rememberedKeys() / 4))) {
       try {
-        this.journal.checkpoint(this.state);
+        this.journal.checkpoint(this.snapshot());
       } catch (err) {
         this.noteFailure(err);
       }
@@ -441,7 +444,12 @@ export class ChannelClockLedger {
         if (!prev || entry.at >= prev.at) {
           a.delivered[key] = { at: entry.at, src: entry.src, basis: entry.ver.basis, branch: entry.branch };
         }
-        remember(a.dmem, versionHash(entry.ver), entry.src.acceptedAt, this.deliveredMemory);
+        const digest = versionDigest(entry.ver);
+        let set = this.deliveredSets.get(entry.agent);
+        if (!set) this.deliveredSets.set(entry.agent, (set = new Set()));
+        set.add(digest);
+        // Delivered whole supersedes any partial exposure of the same version.
+        this.partialSets.get(entry.agent)?.delete(digest);
         break;
       }
       case 'part': {
@@ -451,7 +459,9 @@ export class ChannelClockLedger {
         if (!prev || entry.at >= prev.at) {
           a.partial[key] = { at: entry.at, src: entry.src, why: entry.why };
         }
-        remember(a.pmem, versionHash(entry.ver), entry.src.acceptedAt, this.partialMemory);
+        let set = this.partialSets.get(entry.agent);
+        if (!set) this.partialSets.set(entry.agent, (set = new Set()));
+        set.add(versionDigest(entry.ver));
         break;
       }
     }

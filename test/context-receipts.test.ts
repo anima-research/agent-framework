@@ -167,13 +167,22 @@ describe('ChannelClockLedger', () => {
     assert.ok(next.scope('r').gaps.some((g) => g.reason === 'unclean-stop'));
   });
 
-  it('never counts a version older than its dedup memory', () => {
-    const l = open({ deliveredMemory: 2 });
-    for (let i = 0; i < 4; i++) l.delivered('r', CH, src(`m${i}`, 100 + i), ver(`e${i}`), BRANCH);
-    const horizon = l.scope('r').dedupHorizon;
-    assert.ok(horizon !== null && horizon >= 101);
-    assert.equal(l.delivered('r', CH, src('old', 100), ver('never-seen'), BRANCH), false, 'accepted before the horizon');
-    assert.equal(l.delivered('r', CH, src('new', 500), ver('fresh'), BRANCH), true);
+  it('counts a version when it first arrives, however long ago it was accepted, and only once', () => {
+    let l = open({ checkpointEvery: 3 });
+    // Many newer versions reach the resident first...
+    for (let i = 0; i < 50; i++) l.delivered('r', CH, src(`m${i}`, 10_000 + i), ver(`e${i}`), BRANCH);
+    // ...then a body accepted long before all of them arrives at last: a genuine first delivery.
+    clock = 20_000;
+    assert.equal(l.delivered('r', CH, src('held', 1), ver('held'), BRANCH), true);
+    assert.equal(clocks(l, 'r').delivered?.messageId, 'held');
+    // Exactly once, across checkpoints and a restart.
+    l.stop();
+    l = open({ checkpointEvery: 3 });
+    for (let i = 0; i < 50; i++) assert.equal(l.delivered('r', CH, src(`m${i}`, 10_000 + i), ver(`e${i}`), BRANCH), false);
+    assert.equal(l.delivered('r', CH, src('held', 1), ver('held'), BRANCH), false);
+    assert.equal(l.isDelivered('r', ver('held')), true);
+    // Equal acceptance times are no collision.
+    assert.equal(l.delivered('r', CH, src('twin', 1), ver('twin'), BRANCH), true);
   });
 
   it('keeps a delivery across an /undo-style branch rewind (lived time)', () => {

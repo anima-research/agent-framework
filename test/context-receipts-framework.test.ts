@@ -202,7 +202,7 @@ describe('receipt clocks through the framework', () => {
     assert.equal(source.kind, 'channel');
     if (source.kind !== 'channel') return false;
     const ver = versionOf(source, [message.content], ledger().storeId, message.id);
-    return ledger().isDelivered('scout', ver, source.acceptedAt);
+    return ledger().isDelivered('scout', ver);
   };
   const idle = () => framework.getAgent('scout')!.state.status === 'idle';
 

@@ -335,8 +335,8 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
       'Versions are identified by the producer event id where its lane guarantees one, ' +
       'otherwise by platform message id plus body digest (a revision restoring earlier ' +
       'bytes counts as that earlier version), otherwise by the stored copy (a replay is ' +
-      'then not recognizable); each delivery names its basis. Versions accepted before ' +
-      'receiptClocks.dedupHorizon are no longer remembered and never count as new. ' +
+      'then not recognizable); each delivery names its basis. Every delivered version is ' +
+      'remembered, so one counts when it first reaches you, however long ago it was accepted. ' +
       'receiptClocks.gaps lists intervals in which observations may be missing. A ' +
       'missing inbound item is not evidence of upstream inactivity: a connector or ' +
       'allowlist can keep it from reaching the host at all.',
