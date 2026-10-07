@@ -5,7 +5,9 @@
   and `count: null` were all refused, so neither selector worked for them. A supplied value
   is still checked, never read as absent: an empty or malformed `ref` is refused as before,
   and an `index` or `count` given as an empty or whitespace string, a boolean or an array is
-  now refused with the existing message instead of being coerced to 0, which saved the newest
-  image rather than the one the caller meant. Integer numbers and decimal-digit strings are
+  now refused with the existing message instead of being coerced. Before, such an `index`
+  was read as a number (`""`, `false` and `[]` as 0), which saved the newest image rather
+  than the one the caller meant; such a `count` was either refused by the range check or,
+  for `true` or `[2]`, accepted as 1 or 2. Integer numbers and decimal-digit strings are
   accepted. The conflict refusal for a `ref` alongside a non-null `index`/`count` now names
   the null option.
