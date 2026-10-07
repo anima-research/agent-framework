@@ -243,6 +243,35 @@ describe('receipts through the ingestion stamps', () => {
     assert.deepEqual(p.entries('part', 'i-1').map((e) => e.why), [['shards']]);
   });
 
+  it('a copy stored with the closed-channel invitation, untouched, is intact and delivered (Tessa #48282)', async () => {
+    const h = await open();
+    const p = probes(h);
+    // Accepted while its channel is open, then held until the channel closes,
+    // so storage appends the invitation after ingestion stamped the body.
+    const registry = (h.framework as unknown as {
+      channelRegistry: { handleChannelToolCall(name: string, input: unknown, caller: unknown): Promise<unknown>; isChannelOpen(id: string): boolean };
+    }).channelRegistry;
+    const fw = h.framework as unknown as { pushEvent(e: { type: string }): void };
+    const held: Array<{ type: string }> = [];
+    const push = fw.pushEvent.bind(h.framework);
+    fw.pushEvent = (e) => { if (e.type === 'mcpl:channel-incoming') held.push(e); else push(e); };
+    h.command({ op: 'incoming', channelId: ROOM, messageId: 'q-1', mode: 'addressed', text: 'said while open' });
+    await waitFor(() => held.length > 0, 'accepted and held');
+    await registry.handleChannelToolCall('channel_close', { channelId: ROOM }, { kind: 'agent', agentName: 'scout' });
+    assert.equal(registry.isChannelOpen(ROOM), false);
+    fw.pushEvent = push;
+    for (const e of held) push(e);
+    await waitFor(() => p.copies('q-1').length === 1, 'stored');
+    const stored = p.copies('q-1')[0]!;
+    assert.equal((stored.metadata as { channelInvitation?: boolean }).channelInvitation, true, 'stored with the invitation');
+    await waitFor(() => p.idle(), 'settled');
+    h.command({ op: 'incoming', channelId: 'discord:g1:general', messageId: 'q-trigger', mode: 'addressed', text: 'over here' });
+    await waitFor(() => p.entries('dlv', 'q-trigger').length === 1 && p.idle(), 'a compile carrying it');
+    assert.ok(h.adapter.requests.some((r) => JSON.stringify(r.messages).includes('said while open')), 'it was carried');
+    assert.equal(p.entries('dlv', 'q-1').length, 1, 'its own witness matches, so it can confirm');
+    assert.equal(p.entries('part', 'q-1').length, 0, 'never read as edited');
+  });
+
   it('a body stored before stamping is never confirmed, nor shown lost (legacy control)', async () => {
     const h = await open();
     const p = probes(h);
