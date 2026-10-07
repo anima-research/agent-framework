@@ -96,6 +96,9 @@ export interface MountState {
   lastMaterializedBranchId: string | null;
   /** Per-file hash at time of last materialization — baseline for conflict detection */
   materializedHashes: Map<string, string>;
+  /** Paths the materialize freshness guard refused (#109), owed to every
+   *  later materialize until one writes them or the tree drops them. */
+  refusedPaths: Set<string>;
   /**
    * Wall-clock time chokidar emitted `ready` for this mount, or null if the
    * watcher hasn't finished its initial scan. null after session start =
@@ -115,6 +118,9 @@ export interface WorkspaceModuleState {
   mounts: Record<string, {
     lastMaterializedSeq: number;
     lastMaterializedBranchId?: string;
+    /** Freshness-guard baselines (#109), so a restart doesn't drop the guard */
+    materializedHashes?: Record<string, string>;
+    refusedPaths?: string[];
     watcherReadyAt?: number | null;
     watcherError?: string | null;
   }>;
