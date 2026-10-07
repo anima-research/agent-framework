@@ -178,7 +178,7 @@ export interface SurgeryMarksPreview {
  *  lets surfaces distinguish "agent busy — quiesce first" from bad input. */
 export class OperatorActionError extends Error {
   constructor(
-    readonly code: 'unknown-agent' | 'agent-busy' | 'unknown-message' | 'invalid' | 'failed',
+    readonly code: 'unknown-agent' | 'agent-busy' | 'unknown-message' | 'invalid' | 'failed' | 'stale',
     message: string,
     options?: { cause?: unknown },
   ) {

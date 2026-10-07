@@ -109,7 +109,8 @@ test('puppetToolCall executes with agent provenance and stores the pair', async 
       'princess', 'mcpl--eido--look', {},
     );
 
-    assert.match(toolUseId, /^toolu_01[A-Za-z0-9]{22}$/, 'anthropic-shaped id');
+    // null only for a change the operator-change gate staged; none here.
+    assert.match(toolUseId ?? '', /^toolu_01[A-Za-z0-9]{22}$/, 'anthropic-shaped id');
     assert.equal(result.success, true);
     assert.equal(executed.length, 1);
     assert.equal(executed[0].callerAgentName, 'princess', 'executes AS the agent');

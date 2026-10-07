@@ -10,6 +10,16 @@ import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverB
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
 import { callProvenance } from './call-provenance.js';
+import {
+  selfChangeKind,
+  sameValue,
+  type AppliedOperatorChange,
+  type OperatorChangeReceipt,
+  type ResolvedOperatorChange,
+  type ResolvedPresentationChange,
+  type ResolvedSettingsChange,
+  type RuntimeSettingsValues,
+} from './operator-change.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
 import type {
   MessageId,
@@ -1473,6 +1483,11 @@ export class AgentFramework {
   private releasedEphemeralCandidates: WeakSet<Agent> = new WeakSet();
   /** Creations held until no lease is waiting or held (admitEphemeralCreation). */
   private boundaryClearedWaiters: Array<() => void> = [];
+  /** The host's operator-change gate (FrameworkConfig.operatorChangeGate). */
+  private operatorChangeGate: FrameworkConfig['operatorChangeGate'] | null = null;
+  /** Admissions applyResolvedOperatorChange is carrying out, by admission id:
+   *  each lets exactly its change's tool call through the gate. */
+  private activeAdmissions: Map<string, ResolvedOperatorChange> = new Map();
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
   /** Framework-global inference gate; older generations cannot release it. */
@@ -1670,6 +1685,7 @@ export class AgentFramework {
       new OperatorLog(operatorLogPath),
     );
     framework.providerHoldHook = config.providerHold;
+    framework.operatorChangeGate = config.operatorChangeGate ?? null;
 
     // Startup reconciliation of the awareness journal, before any delivery.
     // It derives nothing from branch ancestry: a surgery that crashed after
@@ -6457,6 +6473,287 @@ export class AgentFramework {
       );
     }
     return this.heldLease.tokens;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Operator-change admission (FrameworkConfig.operatorChangeGate)
+  // ---------------------------------------------------------------------------
+
+  /** Ask the host's gate about one resolved change. Without a gate the answer
+   *  is apply, today's behaviour; a gate that throws or answers nonsense
+   *  refuses the change (fails closed). Staging and refusals are logged. */
+  private async askOperatorChangeGate(change: ResolvedOperatorChange): Promise<
+    | { outcome: 'apply' }
+    | { outcome: 'staged'; receipt: OperatorChangeReceipt }
+    | { outcome: 'gate-failed'; error: string }
+  > {
+    const gate = this.operatorChangeGate;
+    if (!gate) return { outcome: 'apply' };
+    let answer: { outcome: 'apply' } | { outcome: 'staged'; receipt: OperatorChangeReceipt } | { outcome: 'gate-failed'; error: string };
+    try {
+      const decision = await gate(change);
+      if (decision?.decision === 'apply') answer = { outcome: 'apply' };
+      else if (decision?.decision === 'staged'
+        && typeof decision.receipt?.id === 'string' && typeof decision.receipt?.text === 'string') {
+        answer = { outcome: 'staged', receipt: { id: decision.receipt.id, text: decision.receipt.text } };
+      } else answer = { outcome: 'gate-failed', error: 'the operator-change gate returned no valid decision' };
+    } catch (error) {
+      answer = { outcome: 'gate-failed', error: error instanceof Error ? error.message : String(error) };
+    }
+    if (answer.outcome !== 'apply') {
+      this.recordOperatorAction({
+        kind: answer.outcome === 'staged' ? 'operator-change-staged' : 'operator-change-refused',
+        agent: change.agent,
+        ...(change.requester ? { requester: change.requester } : {}),
+        params: { changeId: change.id, change: change.kind, surface: change.surface },
+        ...(answer.outcome === 'staged'
+          ? { result: { receipt: answer.receipt.id } }
+          : { error: `gate failed: ${answer.error}` }),
+      });
+    }
+    return answer;
+  }
+
+  /** The change `admission` was registered for (applyResolvedOperatorChange,
+   *  or an applied puppet call), when it is exactly this agent, tool and
+   *  input. Any other admission covers nothing. */
+  private admittedChange(
+    admission: OperatorAdmission | undefined,
+    agentName: string,
+    tool: string,
+    input: unknown,
+  ): ResolvedSettingsChange | ResolvedPresentationChange | null {
+    if (!admission) return null;
+    const change = this.activeAdmissions?.get(admission.id);
+    if (!change || change.agent !== agentName) return null;
+    const changeTool = change.kind === 'agent-settings' ? 'agent_settings' : change.tool;
+    return tool === changeTool && sameValue(change.input, input) ? change : null;
+  }
+
+  /** The core patch / reset keys and extension keys an agent_settings input touches. */
+  private parseSettingsChange(input: Record<string, unknown>): {
+    action: { action: 'update'; patch: AgentRuntimeSettingsPatch } | { action: 'reset'; keys?: Array<keyof AgentRuntimeSettingsPatch> } | { action: 'cancel' };
+    extensionKeys: string[];
+  } {
+    const extensions = [...this.collectAgentSettingsExtensions().values()];
+    const extKeyOwner = (key: string) => extensions.find((ext) => ext.keys.includes(key));
+    const core: Record<string, keyof AgentRuntimeSettingsPatch> = {
+      context_budget_tokens: 'contextBudgetTokens',
+      tail_tokens: 'tailTokens',
+      transition_pace_tokens: 'transitionPaceTokens',
+      same_round_think_text_policy: 'sameRoundThinkTextPolicy',
+    };
+    if (input.action === 'cancel') return { action: { action: 'cancel' }, extensionKeys: [] };
+    if (input.action === 'update') {
+      const patch: AgentRuntimeSettingsPatch = {};
+      const extensionKeys: string[] = [];
+      for (const [key, value] of Object.entries(input)) {
+        if (key === 'action' || key === 'immediate' || value === undefined) continue;
+        const coreKey = core[key];
+        if (coreKey === 'sameRoundThinkTextPolicy') {
+          if (typeof value !== 'string') throw new Error(`${key} must be a string`);
+          patch.sameRoundThinkTextPolicy = value as AgentRuntimeSettingsPatch['sameRoundThinkTextPolicy'];
+        } else if (coreKey) {
+          if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${key} must be a number`);
+          (patch as Record<string, unknown>)[coreKey] = value;
+        } else if (extKeyOwner(key)) extensionKeys.push(key);
+        else throw new Error(`Unknown setting: ${key}`);
+      }
+      return { action: { action: 'update', patch }, extensionKeys };
+    }
+    if (input.action === 'reset') {
+      if (input.settings === undefined) {
+        return { action: { action: 'reset' }, extensionKeys: extensions.flatMap((ext) => (ext.reset ? ext.keys : [])) };
+      }
+      if (!Array.isArray(input.settings)) throw new Error('reset `settings` must be an array');
+      const keys: Array<keyof AgentRuntimeSettingsPatch> = [];
+      const extensionKeys: string[] = [];
+      for (const name of input.settings) {
+        if (typeof name === 'string' && core[name]) keys.push(core[name]);
+        else if (typeof name === 'string' && extKeyOwner(name)) extensionKeys.push(name);
+        else throw new Error(`Unknown reset setting: ${String(name)}`);
+      }
+      return { action: keys.length > 0 ? { action: 'reset', keys } : { action: 'reset', keys: [] }, extensionKeys };
+    }
+    throw new Error('agent_settings: action must be get, update, reset, or cancel');
+  }
+
+  /** The current values of the given settings: core keys from the snapshot
+   *  (unset reads null), extension keys from their owners. */
+  private currentSettingsValues(agentName: string, coreKeys: string[], extensionKeys: string[]): {
+    core: RuntimeSettingsValues;
+    extensions: Record<string, unknown>;
+  } {
+    const snapshot = this.getAgentRuntimeSettings(agentName) as unknown as Record<string, unknown>;
+    const core: Record<string, unknown> = {};
+    for (const key of coreKeys) core[key] = snapshot[key] ?? null;
+    const extensions: Record<string, unknown> = {};
+    if (extensionKeys.length > 0) {
+      for (const ext of this.collectAgentSettingsExtensions().values()) {
+        const values = ext.get(agentName);
+        for (const key of extensionKeys) if (ext.keys.includes(key)) extensions[key] = values[key] ?? null;
+      }
+    }
+    return { core: core as RuntimeSettingsValues, extensions };
+  }
+
+  /** Resolve an operator's or module's mutating self-change call to the
+   *  absolute change the gate sees. Throws on invalid input. */
+  private resolveSelfChange(
+    agentName: string,
+    tool: string,
+    input: Record<string, unknown>,
+    surface: 'puppet' | 'host',
+    requester?: OperatorRequester,
+  ): ResolvedSettingsChange | ResolvedPresentationChange {
+    const agent = this.agents.get(agentName);
+    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    const base = {
+      id: randomUUID(),
+      agent: agentName,
+      surface,
+      ...(requester ? { requester } : {}),
+      resolvedAt: Date.now(),
+      sourceBranch: this.store.currentBranch().name,
+    };
+    if (tool === 'agent_settings') {
+      const { action, extensionKeys } = this.parseSettingsChange(input);
+      const target = agent.previewRuntimeSettingsTarget(action);
+      const current = this.currentSettingsValues(agentName, Object.keys(target), extensionKeys);
+      return {
+        ...base,
+        kind: 'agent-settings',
+        input: structuredClone(input),
+        from: current.core,
+        target,
+        ...(extensionKeys.length > 0 ? { extensions: current.extensions } : {}),
+      };
+    }
+    const name = (input as { name?: unknown }).name;
+    const entry = typeof name === 'string'
+      ? this.inspectToolPresentation(agentName)?.entries.find((e) => e.name === name)
+      : undefined;
+    if (!entry) throw new Error(`Tool presentation has no entry ${JSON.stringify(name)} for ${agentName}`);
+    return {
+      ...base,
+      kind: 'tool-presentation',
+      tool: tool as ResolvedPresentationChange['tool'],
+      input: structuredClone(input),
+      from: { name: entry.name, visible: entry.visible, description: entry.description },
+    };
+  }
+
+  /** Refuse (stale) a self-change whose from-state or target no longer holds. */
+  private revalidateSelfChange(change: ResolvedSettingsChange | ResolvedPresentationChange): void {
+    const stale = (what: string) => {
+      throw new OperatorActionError('stale', `Change ${change.id} for ${change.agent} no longer holds: ${what}`);
+    };
+    if (!this.agents.has(change.agent)) throw new OperatorActionError('unknown-agent', `Unknown agent: ${change.agent}`);
+    if (change.kind === 'agent-settings') {
+      const { action, extensionKeys } = this.parseSettingsChange(change.input);
+      const current = this.currentSettingsValues(change.agent, Object.keys(change.from), extensionKeys);
+      if (!sameValue(current.core, change.from)) {
+        stale(`its settings moved from ${JSON.stringify(change.from)} to ${JSON.stringify(current.core)}`);
+      }
+      if (change.extensions && !sameValue(current.extensions, change.extensions)) {
+        stale(`its host-managed settings moved from ${JSON.stringify(change.extensions)} to ${JSON.stringify(current.extensions)}`);
+      }
+      const target = this.agents.get(change.agent)!.previewRuntimeSettingsTarget(action);
+      if (!sameValue(target, change.target)) {
+        stale(`it would now set ${JSON.stringify(target)}, not the approved ${JSON.stringify(change.target)}`);
+      }
+      return;
+    }
+    const entry = this.inspectToolPresentation(change.agent)?.entries.find((e) => e.name === change.from.name);
+    const now = entry ? { name: entry.name, visible: entry.visible, description: entry.description } : null;
+    if (!sameValue(now, change.from)) {
+      stale(`the presentation of ${change.from.name} moved from ${JSON.stringify(change.from)} to ${JSON.stringify(now)}`);
+    }
+  }
+
+  /**
+   * Run a self-change tool call (agent_settings, tool presentation) through
+   * the gate when an operator or a module made it. The agent's own model
+   * calls (no origin), reads, and calls carrying an admission registered for
+   * exactly this change run as before. Otherwise the call is resolved and
+   * the gate decides: staged returns its receipt as the call's error; apply
+   * revalidates and runs exactly that call; a failed gate refuses it.
+   */
+  private async gatedSelfChange(agentName: string, call: ToolCall, run: () => ToolResult): Promise<ToolResult> {
+    if (!this.operatorChangeGate || call.origin === undefined) return run();
+    if (!selfChangeKind(call.name, call.input)) return run();
+    const input = (call.input ?? {}) as Record<string, unknown>;
+    const admitted = this.admittedChange(call.admission, agentName, call.name, input);
+    if (admitted) {
+      // The last check before the change runs, with no await in between.
+      try {
+        this.revalidateSelfChange(admitted);
+      } catch (error) {
+        return { success: false, isError: true, error: error instanceof Error ? error.message : String(error) };
+      }
+      return run();
+    }
+    let change: ResolvedSettingsChange | ResolvedPresentationChange;
+    try {
+      change = this.resolveSelfChange(agentName, call.name, input, call.origin);
+    } catch {
+      return run(); // invalid input: the handler reports its own error
+    }
+    const answer = await this.askOperatorChangeGate(change);
+    if (answer.outcome === 'staged') {
+      return { success: false, isError: true, error: answer.receipt.text, data: { staged: answer.receipt } };
+    }
+    if (answer.outcome === 'gate-failed') {
+      return { success: false, isError: true, error: `Operator change refused: ${answer.error}` };
+    }
+    try {
+      this.revalidateSelfChange(change);
+    } catch (error) {
+      return { success: false, isError: true, error: error instanceof Error ? error.message : String(error) };
+    }
+    return run();
+  }
+
+  /**
+   * Apply a staged change at a safe boundary, under the host's held lease.
+   * Revalidates first and refuses with OperatorActionError('stale') when the
+   * change no longer holds, so the host can restage it. `admission` is the
+   * host's id for the admitted change; for the change's duration it lets
+   * exactly this change's tool call through the gate, and nothing else.
+   * An operator's (puppet) change is carried out as the puppet call it was,
+   * on the lease's token, so the agent's context records it as before; a
+   * module's is applied by the handler directly.
+   */
+  async applyResolvedOperatorChange(
+    change: ResolvedOperatorChange,
+    opts: { lease: SafeBoundaryLease; admission: OperatorAdmission },
+  ): Promise<AppliedOperatorChange> {
+    this.heldLeaseTokens(opts.lease, `apply ${change.kind} for ${change.agent}`);
+    this.revalidateSelfChange(change);
+    const tool = change.kind === 'agent-settings' ? 'agent_settings' : change.tool;
+    this.activeAdmissions.set(opts.admission.id, change);
+    try {
+      let result: ToolResult;
+      if (change.surface === 'puppet') {
+        result = (await this.puppetToolCall(change.agent, tool, change.input, { lease: opts.lease, admission: opts.admission })).result;
+      } else {
+        const call: ToolCall = { id: `admitted-${change.id}`, name: tool, input: change.input, callerAgentName: change.agent, origin: 'host', admission: opts.admission };
+        result = change.kind === 'agent-settings'
+          ? this.runAgentSettingsToolCall(change.agent, call)
+          : this.editToolPresentation(change.agent, call);
+      }
+      this.recordOperatorAction({
+        kind: 'operator-change-applied',
+        agent: change.agent,
+        ...(change.requester ? { requester: change.requester } : {}),
+        params: { changeId: change.id, change: change.kind, surface: change.surface, admission: opts.admission.id },
+        ...(result.isError ? { error: result.error ?? 'failed' } : { result: { applied: true } }),
+      });
+      if (result.isError) throw new OperatorActionError('failed', result.error ?? `${change.kind} failed`);
+      return { kind: change.kind, result: result.data } as AppliedOperatorChange;
+    } finally {
+      this.activeAdmissions.delete(opts.admission.id);
+    }
   }
 
   /**
@@ -11838,6 +12135,55 @@ export class AgentFramework {
     agentName: string,
     toolName: string,
     input: Record<string, unknown>,
+    opts?: { lease?: SafeBoundaryLease; admission?: OperatorAdmission; requester?: OperatorRequester },
+  ): Promise<{ toolUseId: string | null; result: ToolResult; staged?: OperatorChangeReceipt }> {
+    if (!this.agents.get(agentName)) throw new Error(`Unknown agent: ${agentName}`);
+    // An operator's mutating self-change (agent_settings update/reset/cancel,
+    // a tool-presentation edit) goes through the host's gate before anything
+    // runs. Staged: nothing executes and no pair is stored, since a pair
+    // would testify the tool ran; the receipt comes back with toolUseId null.
+    // Apply: the call proceeds as exactly the resolved change, revalidated,
+    // and admitted for its own duration only.
+    if (
+      this.operatorChangeGate &&
+      selfChangeKind(toolName, input) &&
+      !this.admittedChange(opts?.admission, agentName, toolName, input)
+    ) {
+      let change: ResolvedSettingsChange | ResolvedPresentationChange | undefined;
+      try {
+        change = this.resolveSelfChange(agentName, toolName, input, 'puppet', opts?.requester);
+      } catch {
+        change = undefined; // invalid input: the tool refuses it itself, as before
+      }
+      if (change) {
+        const answer = await this.askOperatorChangeGate(change);
+        if (answer.outcome === 'staged') {
+          return {
+            toolUseId: null,
+            result: { success: false, isError: true, error: answer.receipt.text },
+            staged: answer.receipt,
+          };
+        }
+        if (answer.outcome === 'gate-failed') {
+          throw new Error(`puppet refused: the operator-change gate failed (${answer.error})`);
+        }
+        this.revalidateSelfChange(change);
+        const admission: OperatorAdmission = { id: change.id };
+        this.activeAdmissions.set(admission.id, change);
+        try {
+          return await this.puppetToolCallUngated(agentName, toolName, input, { ...opts, admission });
+        } finally {
+          this.activeAdmissions.delete(admission.id);
+        }
+      }
+    }
+    return this.puppetToolCallUngated(agentName, toolName, input, opts);
+  }
+
+  private async puppetToolCallUngated(
+    agentName: string,
+    toolName: string,
+    input: Record<string, unknown>,
     opts?: { lease?: SafeBoundaryLease; admission?: OperatorAdmission },
   ): Promise<{ toolUseId: string; result: ToolResult }> {
     const agent = this.agents.get(agentName);
@@ -11988,7 +12334,10 @@ export class AgentFramework {
   }
 
   private async executeToolCallFrom(call: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
-    if (isPresentationTool(call.name)) return this.editToolPresentation(call.callerAgentName ?? '__ephemeral__', call);
+    if (isPresentationTool(call.name)) {
+      const agentName = call.callerAgentName ?? '__ephemeral__';
+      return this.gatedSelfChange(agentName, call, () => this.editToolPresentation(agentName, call));
+    }
     // Client-side programmatic tool calling for promise-based callers
     // (SubagentModule ephemerals). Keyed by callerAgentName so each ephemeral
     // gets its own interpreter state.
@@ -12034,7 +12383,8 @@ export class AgentFramework {
     // route a puppeted agent_settings fell through to module-name parsing
     // and failed as "Invalid tool name format".
     if (call.name === 'agent_settings') {
-      return this.runAgentSettingsToolCall(call.callerAgentName ?? '__ephemeral__', call);
+      const agentName = call.callerAgentName ?? '__ephemeral__';
+      return this.gatedSelfChange(agentName, call, () => this.runAgentSettingsToolCall(agentName, call));
     }
 
     // Module tools
@@ -13092,8 +13442,15 @@ export class AgentFramework {
     // Enrich call with caller identity so modules can resolve the calling agent
     const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
     if (isPresentationTool(call.name)) {
-      const result = this.editToolPresentation(agentName, enrichedCall);
-      this.pushEvent({type:'tool-result',callId:call.id,agentName,moduleName:'tool-presentation',result});
+      const push = (result: ToolResult) =>
+        this.pushEvent({type:'tool-result',callId:call.id,agentName,moduleName:'tool-presentation',result});
+      // Only a call an operator or module made (a script's inner call can
+      // carry one) waits on the gate; the model's own call stays synchronous.
+      if (enrichedCall.origin !== undefined && this.operatorChangeGate) {
+        void this.gatedSelfChange(agentName, enrichedCall, () => this.editToolPresentation(agentName, enrichedCall)).then(push);
+      } else {
+        push(this.editToolPresentation(agentName, enrichedCall));
+      }
       return;
     }
 
@@ -16516,14 +16873,20 @@ export class AgentFramework {
   }
 
   private dispatchAgentSettingsToolCall(agentName: string, call: ToolCall): void {
-    const result = this.runAgentSettingsToolCall(agentName, call);
-    this.pushEvent({
+    const push = (result: ToolResult) => this.pushEvent({
       type: 'tool-result',
       callId: call.id,
       agentName,
       moduleName: 'agent',
       result,
     });
+    // Only a call an operator or module made (a script's inner call can carry
+    // one) waits on the gate; the model's own call stays synchronous.
+    if (call.origin !== undefined && this.operatorChangeGate) {
+      void this.gatedSelfChange(agentName, call, () => this.runAgentSettingsToolCall(agentName, call)).then(push);
+    } else {
+      push(this.runAgentSettingsToolCall(agentName, call));
+    }
   }
 
   /**

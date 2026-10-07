@@ -504,6 +504,66 @@ export class Agent {
     return this.updateRuntimeSettings(overrides);
   }
 
+  /**
+   * The concrete value each setting a runtime-settings action touches would
+   * be reported at (getRuntimeSettings) once the action applied, computed
+   * without changing anything. An operator approves these values, and
+   * application checks they still hold, so a reset applies what was
+   * approved rather than whatever the configuration says later.
+   *
+   * - update: the patch's values (a decrease reports its target at once).
+   * - reset: the configured value each key returns to. A key with nothing
+   *   configured keeps its current value; transitionPaceTokens with nothing
+   *   configured reports unset (null) unless a descent it starts needs the
+   *   default pace.
+   * - cancel: a converging budget stops at the live budget; nothing else
+   *   changes.
+   */
+  previewRuntimeSettingsTarget(
+    change:
+      | { action: 'update'; patch: AgentRuntimeSettingsPatch }
+      | { action: 'reset'; keys?: Array<keyof AgentRuntimeSettingsPatch> }
+      | { action: 'cancel' },
+  ): Partial<Record<'contextBudgetTokens' | 'tailTokens' | 'transitionPaceTokens' | 'sameRoundThinkTextPolicy', number | string | null>> {
+    const target: Partial<Record<'contextBudgetTokens' | 'tailTokens' | 'transitionPaceTokens' | 'sameRoundThinkTextPolicy', number | string | null>> = {};
+    if (change.action === 'update') {
+      const p = change.patch;
+      if (p.contextBudgetTokens !== undefined) target.contextBudgetTokens = p.contextBudgetTokens;
+      if (p.tailTokens !== undefined) target.tailTokens = p.tailTokens;
+      if (p.transitionPaceTokens !== undefined) target.transitionPaceTokens = p.transitionPaceTokens;
+      if (p.sameRoundThinkTextPolicy !== undefined) target.sameRoundThinkTextPolicy = p.sameRoundThinkTextPolicy;
+      return target;
+    }
+    if (change.action === 'cancel') {
+      if (this.contextBudgetTargetTokens !== undefined) {
+        target.contextBudgetTokens = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+      }
+      return target;
+    }
+    const keys = new Set(change.keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy']);
+    const hot = this.getHotContextSettings();
+    let startsDescent = false;
+    if (keys.has('contextBudgetTokens')) {
+      const configured = this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+      const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+      startsDescent = configured < live;
+      target.contextBudgetTokens = configured;
+    }
+    if (keys.has('tailTokens') && hot) {
+      target.tailTokens = this.configuredTailTokens ?? hot.tailTokens;
+    }
+    if (keys.has('transitionPaceTokens') && hot) {
+      const descending = startsDescent || (!keys.has('contextBudgetTokens') && this.contextBudgetTargetTokens !== undefined);
+      target.transitionPaceTokens = descending && this.configuredTransitionPaceTokens === undefined
+        ? DEFAULT_TRANSITION_PACE_TOKENS
+        : this.configuredTransitionPaceTokens ?? null;
+    }
+    if (keys.has('sameRoundThinkTextPolicy')) {
+      target.sameRoundThinkTextPolicy = this.configuredSameRoundThinkTextPolicy ?? DEFAULT_SAME_ROUND_THINK_TEXT_POLICY;
+    }
+    return target;
+  }
+
   private validateRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
     if (Object.keys(patch).length === 0) throw new Error('At least one setting is required');
     if (patch.contextBudgetTokens !== undefined) {

@@ -192,6 +192,20 @@ export interface FrameworkConfig {
    */
   providerHold?: ProviderHoldHook;
 
+  /**
+   * The host's gate for the framework's own operator mutations: host/command
+   * undo, hide and unstick, and an operator's or module's mutating
+   * agent_settings / tool-presentation calls. Each is resolved to an absolute
+   * change first; the gate answers `apply` (the framework applies exactly
+   * that change now, after revalidating it) or `staged` with a receipt (the
+   * host applies it later through applyResolvedOperatorChange). The agent's
+   * own model calls never reach it. A gate that throws refuses the change.
+   * Absent: every operator path behaves as it always has.
+   */
+  operatorChangeGate?: (
+    change: import('../operator-change.js').ResolvedOperatorChange,
+  ) => Promise<import('../operator-change.js').OperatorChangeDecision>;
+
   /** Interval for periodic store sync in milliseconds (default: 1000ms, 0 to disable) */
   syncIntervalMs?: number;
 

@@ -4,6 +4,15 @@ export * from './types/index.js';
 // Core classes
 export { AgentFramework, BudgetPreflightError, ResumeBlockedError } from './framework.js';
 export type { RuntimeSettingsPreview, HostModeStatus, SafeBoundaryLease, SafeBoundaryOptions } from './framework.js';
+export type {
+  OperatorChangeDecision,
+  OperatorChangeReceipt,
+  ResolvedOperatorChange,
+  ResolvedSettingsChange,
+  ResolvedPresentationChange,
+  RuntimeSettingsValues,
+  AppliedOperatorChange,
+} from './operator-change.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';
 export { ProcessQueueImpl } from './queue.js';
