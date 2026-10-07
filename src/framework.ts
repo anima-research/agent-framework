@@ -3508,6 +3508,12 @@ export class AgentFramework {
    * it. Any other keeps the established poison policy (logged where it
    * failed, then dropped) so one bad write can't wedge the queue behind it.
    */
+  /** Record a landed write for the next ack, only while it is un-acked:
+   *  memory-only deferrals never enter that set, so they leave no id behind. */
+  private markDeferredWriteLanded(id: string): void {
+    if (this.unackedDeferredWrites.some((m) => m.id === id)) this.landedDeferredWrites.add(id);
+  }
+
   private settleUnackedDeferredWrites(): void {
     const failedDurable = this.unackedDeferredWrites.filter(
       (m) => m.durable && !this.landedDeferredWrites.has(m.id),
@@ -4277,18 +4283,18 @@ export class AgentFramework {
     contextManager: ContextManager;
     cleanup: () => void;
   }> {
-    await this.admitEphemeralCreation(opts?.requestedBy);
+    // From admission until the candidate runs or is cleaned up, the ticket
+    // is pending and a waiting lease isn't granted.
+    const pending = await this.admitEphemeralCreation(opts?.requestedBy);
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier
     // generation before runEphemeralToCompletion has a chance to reject it.
     if (this.usedEphemeralAgentNames.has(config.name) || this.agents.has(config.name)) {
+      this.ephemeralPending.delete(pending);
+      this.tryGrantSafeBoundary();
       throw new Error(`Ephemeral agent name \"${config.name}\" is already registered or has been used in this framework`);
     }
     this.usedEphemeralAgentNames.add(config.name);
-    // Synchronously after admission: from here until the candidate runs or
-    // is cleaned up, a waiting lease isn't granted.
-    const pending = {};
-    this.ephemeralPending.add(pending);
     try {
       const namespace = `subagent/${config.name}`;
 
@@ -6243,6 +6249,8 @@ export class AgentFramework {
       if (released) return;
       released = true;
       if (this.surgeryHold === hold) this.surgeryHold = null;
+      // Creations held behind this hold may proceed (unless a lease waits).
+      queueMicrotask(() => this.notifyBoundaryCleared());
       for (const [name, token] of reserved) {
         if (this.activeTurnTokens.get(name) === token) this.activeTurnTokens.delete(name);
       }
@@ -6382,12 +6390,30 @@ export class AgentFramework {
    * is waiting or held. A held request doesn't count as pending, so it never
    * blocks the grant it is waiting for.
    */
-  private async admitEphemeralCreation(requestedBy?: string): Promise<void> {
-    for (;;) {
-      if (!this.boundaryWaiters?.length && !this.heldLease) return;
-      if (!this.heldLease && requestedBy !== undefined && this.isDrainingStream(requestedBy)) return;
+  private async admitEphemeralCreation(requestedBy?: string): Promise<object> {
+    // The check and the pending ticket are taken in one synchronous step,
+    // with no await in between: a lease requested in the same tick as the
+    // creation must find the ticket already pending.
+    let ticket = this.tryAdmitEphemeralCreation(requestedBy);
+    while (!ticket) {
       await new Promise<void>((resolve) => this.boundaryClearedWaiters.push(resolve));
+      ticket = this.tryAdmitEphemeralCreation(requestedBy);
     }
+    return ticket;
+  }
+
+  /** Admit a creation now, returning its pending ticket, or null when it has
+   *  to wait. The store hold (surgeryHold) covers a held lease and a direct
+   *  rollback or suppress alike: nothing initializes under either. */
+  private tryAdmitEphemeralCreation(requestedBy?: string): object | null {
+    const admitted = this.surgeryHold
+      ? false
+      : !this.boundaryWaiters?.length
+        || (requestedBy !== undefined && this.isDrainingStream(requestedBy));
+    if (!admitted) return null;
+    const ticket = {};
+    this.ephemeralPending.add(ticket);
+    return ticket;
   }
 
   /** A stream a waiting lease is draining: a registered ephemeral run, or an
@@ -6399,10 +6425,10 @@ export class AgentFramework {
   }
 
   /** Release creations held by admitEphemeralCreation once no lease is
-   *  waiting or held. */
+   *  waiting and nothing holds the store. Each re-checks on waking. */
   private notifyBoundaryCleared(): void {
-    if (this.boundaryWaiters?.length || this.heldLease) return;
-    for (const resume of this.boundaryClearedWaiters.splice(0)) resume();
+    if (this.boundaryWaiters?.length || this.surgeryHold) return;
+    for (const resume of this.boundaryClearedWaiters?.splice(0) ?? []) resume();
   }
 
   /** The tokens `lease` holds, or a refusal naming why it can't be used. */
@@ -7543,7 +7569,7 @@ export class AgentFramework {
             if (deferred.length > 0) {
               for (const msg of deferred) {
                 agent.getContextManager().addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
-                this.landedDeferredWrites.add(msg.id);
+                this.markDeferredWriteLanded(msg.id);
                 // Injection guards: tool blocks would corrupt the tool-cycle
                 // structure the membrane enforces, and a message named as the
                 // agent itself would render as an ASSISTANT turn on the wire
@@ -9927,7 +9953,7 @@ export class AgentFramework {
             const id = agent.getContextManager().addMessage(
               msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id),
             );
-            this.landedDeferredWrites.add(msg.id);
+            this.markDeferredWriteLanded(msg.id);
             this.emitTrace({ type: 'message:added', messageId: id, source: 'deferred-flush:turn-start' });
           } catch (err) {
             console.error(
@@ -13394,7 +13420,7 @@ export class AgentFramework {
       content,
       opts?.deferredWriteId ? withDeferredWriteId(metadata, opts.deferredWriteId) : metadata,
     );
-    if (opts?.deferredWriteId) this.landedDeferredWrites.add(opts.deferredWriteId);
+    if (opts?.deferredWriteId) this.markDeferredWriteLanded(opts.deferredWriteId);
     if (opts?.placement) { opts.placement.agent = agent.name; opts.placement.messageId = stored; opts.placement.durable = true; }
     return stored;
   }

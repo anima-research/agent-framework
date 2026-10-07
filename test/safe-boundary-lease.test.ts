@@ -31,6 +31,8 @@ type Internals = {
   deferredMessages: unknown[];
   unackedDeferredWrites: unknown[];
   ephemeralPending: Set<object>;
+  landedDeferredWrites: Set<string>;
+  reserveStoreForSurgery(verb: string, agentName: string): () => void;
   addMessage(participant: string, content: ContentBlock[], metadata?: Record<string, unknown>, opts?: { forAgent?: string }): string;
 };
 
@@ -353,5 +355,46 @@ describe('runAtSafeBoundary', () => {
     assert.equal(landed(), 1, 'lands at the next boundary, once');
     assert.equal(i.deferredMessages.length, 0);
     assert.equal(i.unackedDeferredWrites.length, 0);
+  });
+
+  it('takes the creation ticket before yielding, so a lease asked for in the same tick waits for it', async () => {
+    const order: string[] = [];
+    const strategy = new PassthroughStrategy();
+    (strategy as unknown as { initialize: () => Promise<void> }).initialize = async () => {
+      await tick();
+      order.push('initialized');
+    };
+    const creating = framework.createEphemeralAgent({ name: 'same-tick', model: 'test-model', systemPrompt: 'test', strategy });
+    const leased = framework.runAtSafeBoundary({ verb: 'same tick' }, async () => { order.push('lease'); });
+    const created = await creating;
+    i.tryGrantSafeBoundary();
+    await tick();
+    assert.deepEqual(order, ['initialized'], 'the lease waited for the creation and its candidate');
+    created.cleanup();
+    await leased;
+    assert.deepEqual(order, ['initialized', 'lease']);
+  });
+
+  it("holds a creation behind a direct surgery's store hold, not only behind a lease", async () => {
+    const release = i.reserveStoreForSurgery('rollback', 'scout');
+    let created = false;
+    const creating = framework.createEphemeralAgent({ name: 'behind-surgery', model: 'test-model', systemPrompt: 'test' })
+      .then((c) => { created = true; return c; });
+    await tick();
+    assert.equal(created, false, 'held while the surgery holds the store');
+    release();
+    const c = await creating;
+    assert.equal(created, true, 'proceeds once the hold is released');
+    c.cleanup();
+  });
+
+  it('keeps no landed-write ids for memory-only deferrals', async () => {
+    i.activeTurnTokens.set('other', 9_999);
+    for (let n = 0; n < 4; n++) i.addMessage('user', [{ type: 'text', text: `ordinary ${n}` }], undefined, { forAgent: 'other' });
+    assert.equal(i.deferredMessages.length, 4);
+    i.activeTurnTokens.delete('other');
+    await framework.runAtSafeBoundary({ verb: 'flush' }, async () => {});
+    assert.equal(i.deferredMessages.length, 0, 'all landed');
+    assert.equal(i.landedDeferredWrites.size, 0, 'and left no ids behind');
   });
 });
