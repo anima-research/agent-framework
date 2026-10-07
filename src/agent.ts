@@ -1,5 +1,6 @@
 import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, YieldingStream } from '@animalabs/membrane';
 import { isAbortedResponse } from '@animalabs/membrane';
+import { correctImageMediaTypes } from './image-media-type.js';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard, TOOL_RESULT_GUARD_NOTICE } from './tool-result-guard.js';
@@ -598,7 +599,7 @@ export class Agent {
     const result = await this.contextManager.compile(this.compileBudget(budget));
     if (watermark) this.consumedWatermark = watermark;
     if (!budget) this.settleRuntimeSettingsTransition();
-    return result;
+    return { ...result, messages: correctImageMediaTypes(result.messages) };
   }
 
   /**
@@ -617,7 +618,7 @@ export class Agent {
     );
     if (watermark) this.consumedWatermark = watermark;
     if (!budget) this.settleRuntimeSettingsTransition();
-    return result;
+    return { ...result, messages: correctImageMediaTypes(result.messages) };
   }
 
   // ==========================================================================
