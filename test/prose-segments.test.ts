@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
-import { splitProseSegments } from '../src/prose-segments.js';
+import { splitProseRuns, splitProseSegments } from '../src/prose-segments.js';
 
 const textBlock = (text: string): ContentBlock => ({ type: 'text', text } as ContentBlock);
 const toolUse = (id: string): ContentBlock =>
@@ -59,4 +59,25 @@ test('a plain no-tool turn yields a single segment (unchanged behaviour)', () =>
 
 test('a tool-only turn (no prose) yields no segments', () => {
   assert.deepEqual(splitProseSegments([toolUse('t1'), toolResult('t1')]), []);
+});
+
+test('runs keep the words exactly as written; segments are those runs trimmed for routing', () => {
+  const content: ContentBlock[] = [
+    textBlock('    indented code\n    second line\n'),
+    toolUse('t1'), toolResult('t1'),
+    textBlock('\n\nAfter the tool.  '),
+    toolUse('t2'), toolResult('t2'),
+    textBlock(' \n\t'),
+  ];
+  assert.deepEqual(splitProseRuns(content), ['    indented code\n    second line\n', '\n\nAfter the tool.  ']);
+  assert.deepEqual(splitProseSegments(content), ['indented code\n    second line', 'After the tool.']);
+});
+
+test('a refused XML attempt and its notice are boundaries too, and a turn-ending attempt leaves only its prose', () => {
+  const attempt = { type: 'tool_attempt', rawXml: '<invoke name="send_message">' } as unknown as ContentBlock;
+  const notice = { type: 'tool_notice', notices: [{ ordinal: 0, kind: 'refused', message: 'boundary' }] } as unknown as ContentBlock;
+  assert.deepEqual(splitProseSegments([textBlock('Before the attempt.'), attempt, notice, textBlock('After its notice.')]),
+    ['Before the attempt.', 'After its notice.']);
+  assert.deepEqual(splitProseSegments([textBlock('Again.'), attempt]), ['Again.']);
+  assert.deepEqual(splitProseRuns([textBlock('Before. '), attempt, notice, textBlock(' After.')]), ['Before. ', ' After.']);
 });

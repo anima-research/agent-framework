@@ -5,10 +5,9 @@
  * body that was actually sent.
  */
 
-import { createHash } from 'node:crypto';
 import type { ContentBlock } from '@animalabs/membrane';
 import type { CompileProvenance, StoredMessage } from '@animalabs/context-manager';
-import { readInboundSource, type InboundChannelSource } from '../mcpl/inbound-source.js';
+import { readInboundSource, sourceBodyDigest, type InboundChannelSource } from '../mcpl/inbound-source.js';
 import type { ChannelRef, SourceRef, VersionRef } from './clock-ledger.js';
 
 /** One channel body a request message carries. */
@@ -73,33 +72,8 @@ export function sourceRefOf(source: InboundChannelSource, storeMessageId?: strin
   };
 }
 
-/**
- * JSON with object keys sorted at every level. A body's digest must not
- * depend on key order: the same content reads back from the store with its
- * keys in a different order than it was written, so a mid-turn injection
- * (hashed from the content as handed over) and the stored copy a later
- * compile carries must hash alike.
- */
-function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  if (value && typeof value === 'object') {
-    const entries = Object.entries(value as Record<string, unknown>)
-      .filter(([, v]) => v !== undefined)
-      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')}}`;
-  }
-  return JSON.stringify(value) ?? 'null';
-}
-
-/**
- * A body's source digest: SHA-256 (hex) of `canonicalJson([blocks])`, over
- * the content blocks of one undecorated, unsharded body. Ingestion records it
- * for each delivery (`metadata.sourceBodyDigest`), and it is the digest an
- * unsharded item stored before that hashes to, so both name one version.
- */
-export function sourceBodyDigest(blocks: readonly ContentBlock[]): string {
-  return createHash('sha256').update(canonicalJson([blocks])).digest('hex');
-}
+/** The shared source-body digest (mcpl/inbound-source.ts): one implementation for producer and receipts. */
+export { sourceBodyDigest };
 
 function digestField(metadata: unknown, field: 'sourceBodyDigest' | 'storedBodyDigest'): string | undefined {
   const value = (metadata as Record<string, unknown> | null | undefined)?.[field];

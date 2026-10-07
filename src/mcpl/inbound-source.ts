@@ -21,6 +21,8 @@
  * key: `eventId` is present only when the producer supplied one.
  */
 
+import { createHash } from 'node:crypto';
+
 /** The MCPL admission lane that accepted an item. Its contract decides what
  *  an `eventId` is worth: `push/event` deduplicates by eventId, and RFC-006
  *  coalesced admission (`coalesced: true`) guarantees stable retries and
@@ -151,4 +153,41 @@ export function conversationKey(source: InboundSource): string | undefined {
   }
   if (source.kind === 'surface') return `surface\u0000${source.surface}`;
   return undefined;
+}
+
+/**
+ * JSON with object keys sorted at every level and `undefined` values dropped,
+ * so a value hashes alike however its keys were ordered (content read back
+ * from the store has its keys in a different order than it was written).
+ */
+export function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+/**
+ * The version identity of a delivered body (agreed with the receipts lane,
+ * room-220 #46752–#47210): SHA-256 hex of `canonicalJson([blocks])` over the
+ * ContentBlock[] the framework stores for the body — after MCPL conversion,
+ * before any host decoration is added and before storage shards it. The
+ * one-element array keeps the framing an undecorated, unsharded stored copy
+ * has always hashed to, so a stamped copy and an older copy of the same body
+ * share a version.
+ *
+ * Ingestion stamps it as `metadata.sourceBodyDigest`, and the same function
+ * over exactly the blocks handed to storage (decorations included) as
+ * `metadata.storedBodyDigest`, on both MCPL lanes. Both live outside the
+ * frozen admission envelope: they describe the body actually delivered (a
+ * materialization, a correction), not the admission. Neither proves later
+ * presence or completeness; a copy that no longer hashes to its
+ * storedBodyDigest was changed after delivery (editMessage keeps metadata).
+ */
+export function sourceBodyDigest(blocks: readonly unknown[]): string {
+  return createHash('sha256').update(canonicalJson([blocks])).digest('hex');
 }
