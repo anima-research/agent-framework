@@ -107,7 +107,9 @@ export type {
 } from './mcpl/index.js';
 
 // Per-channel conversation routing
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './mcpl/index.js';
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export type {
   ConversationRouterConfig,
   ConversationBinding,
