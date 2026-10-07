@@ -786,24 +786,49 @@ export class DiscordAwarenessOutbox {
         .filter((evidence) => evidence.batchId === batchId)
         .reduce((sum, evidence) => sum + evidence.outcomesUnrecorded, 0),
     };
-    if (batch.cancelled) return receipt;
     const at = Date.now();
     const records: JournalRecord[] = [{ t: 'cancelled', at, batchId, ...(by ? { by } : {}) }];
-    for (const op of state.ops.values()) {
-      if (op.cause.batchId !== batchId) continue;
-      const status = this.opStatus(op);
-      if (status === 'confirmed') {
+    const ops = [...state.ops.values()].filter((op) => op.cause.batchId === batchId);
+    records.push(...this.stopRequests(ops, receipt, at, 'batch-cancelled', !!batch.cancelled));
+    // A repeated cancel writes nothing; its receipt is still today's history.
+    if (!batch.cancelled) this.append(records, { durable: true });
+    return receipt;
+  }
+
+  /**
+   * Count what history says about these requests into a cancel receipt, and
+   * return the records that stop the ones still able to go out (none when
+   * the group was already cancelled). History is counted whatever each
+   * request's cancel state: an attempt on the wire or unanswered may land
+   * after any cancel, and a confirmation is a fact about Discord.
+   */
+  private stopRequests(
+    ops: DiscordAwarenessOp[],
+    receipt: DiscordAwarenessCancelReceipt,
+    at: number,
+    reason: 'batch-cancelled' | 'request-cancelled',
+    alreadyCancelled: boolean,
+  ): JournalRecord[] {
+    const records: JournalRecord[] = [];
+    for (const op of ops) {
+      const last = op.attempts.at(-1);
+      if (last?.outcome === 'confirmed') {
         receipt.confirmed++;
         continue;
       }
+      if (last && last.outcome === undefined) {
+        if (this.inFlight.has(op.opId)) receipt.inFlight++;
+        else receipt.unknown++;
+      } else if (last?.outcome === 'unknown') {
+        receipt.unknown++;
+      }
+      if (alreadyCancelled || op.cancelled) continue;
+      const status = this.opStatus(op);
+      if (status !== 'requested' && status !== 'dispatching' && status !== 'unknown') continue;
       if (status === 'requested') receipt.cancelled++;
-      else if (status === 'dispatching') receipt.inFlight++;
-      else if (status === 'unknown') receipt.unknown++;
-      else continue; // failed or already cancelled
-      records.push({ t: 'op-cancelled', at, opId: op.opId, reason: 'batch-cancelled' });
+      records.push({ t: 'op-cancelled', at, opId: op.opId, reason });
     }
-    this.append(records, { durable: true });
-    return receipt;
+    return records;
   }
 
   /** Stop a retract's removals that are still due; nothing sent is undone. */
@@ -821,22 +846,10 @@ export class DiscordAwarenessOutbox {
       unresolvedAttempts: unresolvedDispatches(ops, (op, attempt) => this.attemptUnresolved(op, attempt)),
       legacyOutcomesUnrecorded: 0,
     };
-    if (retract.cancelled) return receipt;
     const at = Date.now();
     const records: JournalRecord[] = [{ t: 'request-cancelled', at, requestId, ...(by ? { by } : {}) }];
-    for (const op of ops) {
-      const status = this.opStatus(op);
-      if (status === 'confirmed') {
-        receipt.confirmed++;
-        continue;
-      }
-      if (status === 'requested') receipt.cancelled++;
-      else if (status === 'dispatching') receipt.inFlight++;
-      else if (status === 'unknown') receipt.unknown++;
-      else continue;
-      records.push({ t: 'op-cancelled', at, opId: op.opId, reason: 'request-cancelled' });
-    }
-    this.append(records, { durable: true });
+    records.push(...this.stopRequests(ops, receipt, at, 'request-cancelled', !!retract.cancelled));
+    if (!retract.cancelled) this.append(records, { durable: true });
     return receipt;
   }
 

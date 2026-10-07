@@ -218,6 +218,33 @@ test('the cancel receipt keeps an earlier unresolved request after a later answe
   assert.equal(receipt.unresolvedAttempts, 2, 'both first attempts may still land');
 }));
 
+test('a repeated cancel writes nothing, and its receipt is still the truthful history', withJournal((outbox, h) => {
+  const batch = activeBatch(outbox, [ref('m1'), ref('m2')]);
+  const onWire = outbox.claimDispatch('discord', (d) => d.key.messageId !== 'm1')!;
+  const first = outbox.cancel(batch.id);
+  assert.deepEqual({ cancelled: first.cancelled, inFlight: first.inFlight, confirmed: first.confirmed }, { cancelled: 1, inFlight: 1, confirmed: 0 });
+  outbox.recordOutcome(onWire.attempts, 'confirmed');
+  const records = h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length;
+  const again = outbox.cancel(batch.id);
+  assert.deepEqual(
+    { cancelled: again.cancelled, inFlight: again.inFlight, unknown: again.unknown, confirmed: again.confirmed, unresolvedAttempts: again.unresolvedAttempts },
+    { cancelled: 0, inFlight: 0, unknown: 0, confirmed: 1, unresolvedAttempts: 0 },
+  );
+  assert.equal(h.store.getRecordIdsByType(DISCORD_AWARENESS_RECORD_TYPE).length, records, 'nothing new written');
+
+  // The same for a retract request.
+  const other = activeBatch(outbox, [ref('m3'), ref('m4')]);
+  answer(outbox, 'm3', 'confirmed');
+  answer(outbox, 'm4', 'confirmed');
+  const { requestId } = outbox.retract(other.id);
+  const removal = outbox.claimDispatch('discord', (d) => d.key.messageId !== 'm3')!;
+  const stopped = outbox.cancel(requestId);
+  assert.deepEqual({ cancelled: stopped.cancelled, inFlight: stopped.inFlight }, { cancelled: 1, inFlight: 1 });
+  outbox.recordOutcome(removal.attempts, 'confirmed');
+  const repeated = outbox.cancel(requestId);
+  assert.deepEqual({ cancelled: repeated.cancelled, inFlight: repeated.inFlight, confirmed: repeated.confirmed }, { cancelled: 0, inFlight: 0, confirmed: 1 });
+}));
+
 test('cancelling a batch its surgery has not activated stops every mark; its body can still resume', withJournal((outbox) => {
   const rollback = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 'rollback/cairn/1', refs: [ref('m1'), ref('m2')], scope: 'all' })!;
   assert.equal(outbox.cancel(rollback.id, 'operator').cancelled, 2);
