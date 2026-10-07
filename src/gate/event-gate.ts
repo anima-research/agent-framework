@@ -13,6 +13,7 @@
 
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
 import { isConversational } from '../speech-routes.js';
+import { readInboundSource } from '../mcpl/inbound-source.js';
 import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
 
@@ -1554,6 +1555,15 @@ export class EventGate {
 
   private handleDebounce(policy: GatePolicy, info: GateEventInfo): void {
     const debounceMs = (policy.behavior as { debounce: number }).debounce;
+    // The item's frozen source envelope, when its lane supplies one, names
+    // its conversation — server, registered channel, thread, message — ahead
+    // of anything in free-form metadata (the direct path reads the same
+    // envelope, so both paths agree on where a reply goes).
+    const envelope = readInboundSource(info.metadata);
+    const conversation = envelope?.kind === 'channel' ? envelope : undefined;
+    const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+    const messageId = conversation ? conversation.messageId : str(info.metadata?.messageId);
+    const threadId = conversation ? conversation.threadId : str(info.metadata?.threadId);
 
     const event: PendingEvent = {
       policyName: policy.name,
@@ -1569,15 +1579,11 @@ export class EventGate {
           ? (info.metadata.channelName as string)
           : undefined,
       authorId: this.extractAuthorId(info.metadata) ?? undefined,
-      serverId: info.serverId || undefined,
+      serverId: conversation?.serverId ?? (info.serverId || undefined),
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
-      routeChannelId: this.routeChannelFor(info),
-      ...(typeof info.metadata?.messageId === 'string' && info.metadata.messageId
-        ? { messageId: info.metadata.messageId as string }
-        : {}),
-      ...(typeof info.metadata?.threadId === 'string' && info.metadata.threadId
-        ? { threadId: info.metadata.threadId as string }
-        : {}),
+      routeChannelId: conversation?.channelId ?? this.routeChannelFor(info),
+      ...(messageId ? { messageId } : {}),
+      ...(threadId ? { threadId } : {}),
       conversational: isConversational(info.tags, info.metadata),
     };
 

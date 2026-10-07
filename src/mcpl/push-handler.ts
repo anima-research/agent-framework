@@ -19,7 +19,7 @@ import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import { expandCoreTags } from './tags.js';
 import { validateCoalescedContent } from './push-coalescer.js';
-import type { InboundSource } from './inbound-source.js';
+import { INBOUND_SOURCE_KEY, type InboundSource } from './inbound-source.js';
 
 // ============================================================================
 // McplPushEvent (the ProcessEvent shape pushed to the queue)
@@ -263,28 +263,10 @@ export class PushHandler {
     // 3. Convert content blocks
     const content: ContentBlock[] = params.payload.content.map(convertBlock);
 
-    // 4. Check shouldTriggerInference callback
-    let triggerInference = true;
-    if (this.shouldTriggerInference) {
-      const textContent = content
-        .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
-        .map((b) => b.text)
-        .join('\n');
-      const metadata: Record<string, unknown> = {
-        serverId,
-        featureSet: params.featureSet,
-        eventId: params.eventId,
-        eventType: 'mcpl:push-event',
-        ...(params.origin ?? {}),
-        ...(params.tags ? { tags: params.tags } : {}),
-      };
-      triggerInference = this.shouldTriggerInference(textContent, metadata);
-    }
-
-    // 5. Generate inferenceId
+    // 4. Generate inferenceId
     const inferenceId = `${serverId}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
-    // 6. Push event to queue
+    // 5. The event; whether it triggers inference is decided below.
     const pushEvent: McplPushEvent = {
       type: 'mcpl:push-event',
       serverId,
@@ -295,9 +277,39 @@ export class PushHandler {
       tags: params.tags,
       timestamp: params.timestamp,
       inferenceId,
-      triggerInference,
+      triggerInference: true,
       acceptedAt: Date.now(),
     };
+    // The source envelope of an ordinary push is frozen at admission, before
+    // it is gated, queued or acknowledged: nothing that changes while it
+    // waits can rewrite where it came from, and the gate reads the same
+    // envelope the direct path does. (A coalesced push's envelope is frozen
+    // by its coalescer when it is delivered.)
+    const inboundSource = coalesced ? undefined : this.acceptInbound?.(pushEvent);
+    if (inboundSource) pushEvent.inboundSource = inboundSource;
+
+    // 6. Check shouldTriggerInference callback
+    if (this.shouldTriggerInference) {
+      const textContent = content
+        .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
+        .map((b) => b.text)
+        .join('\n');
+      // The server's origin first; the host's own fields after it, so an
+      // origin key can never stand in for which server sent this or what
+      // kind of event it is; the frozen envelope last, which the gate's
+      // route candidates read first.
+      const metadata: Record<string, unknown> = {
+        ...(params.origin ?? {}),
+        serverId,
+        featureSet: params.featureSet,
+        eventId: params.eventId,
+        eventType: 'mcpl:push-event',
+        ...(params.tags ? { tags: params.tags } : {}),
+        ...(inboundSource ? { [INBOUND_SOURCE_KEY]: inboundSource } : {}),
+      };
+      pushEvent.triggerInference = this.shouldTriggerInference(textContent, metadata);
+    }
+
     if (coalesced) {
       // RFC-006: the coalescer decides whether this occurrence replaces an
       // unread one, appends, or withdraws; it delivers through the same event
@@ -314,11 +326,6 @@ export class PushHandler {
       }
       return;
     }
-    // The source envelope is frozen at admission, before queueing or the
-    // acknowledgement: nothing that changes while the push waits in the
-    // queue can rewrite where it came from.
-    const inboundSource = this.acceptInbound?.(pushEvent);
-    if (inboundSource) pushEvent.inboundSource = inboundSource;
     this.pushEventFn(pushEvent);
 
     // 7. Emit trace

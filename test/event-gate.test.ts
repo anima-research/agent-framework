@@ -632,6 +632,31 @@ describe('debounce', () => {
     ]);
   });
 
+  it('a candidate takes its conversation from the frozen envelope, ahead of free-form metadata', async () => {
+    const path = writeConfig('debounce-route-envelope.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    // The route resolver would read the forged origin; the envelope wins.
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel: () => 'slack:FORGED' });
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'forged-server', channelId: 'C1', content: '@agent in a thread',
+      tags: ['chat:addressed'],
+      metadata: {
+        authorId: '1', messageId: 'forged-m', threadId: 'forged-t',
+        inboundSource: {
+          kind: 'channel', lane: 'push/event', serverId: 'slack', binding: 'b1', channelId: 'slack:C1',
+          threadId: '1700.0001', messageId: 'm-env', acceptedAt: 1,
+        },
+      } }));
+    await new Promise(r => setTimeout(r, 150));
+    const candidates = (inferenceRequests[0].routeCandidates ?? []).map(({ at: _at, ...rest }) => rest);
+    assert.deepStrictEqual(candidates, [
+      { kind: 'channel', channelId: 'slack:C1', serverId: 'slack', threadId: '1700.0001', messageId: 'm-env', addressed: true },
+    ]);
+  });
+
   it('a reaction in the batch is never a route candidate (the same predicate as mid-turn)', async () => {
     const path = writeConfig('debounce-route-reaction.json', {
       policies: [

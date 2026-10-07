@@ -39,7 +39,7 @@ import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js
 import { expandCoreTags } from './tags.js';
 import { validateCoalescedContent } from './push-coalescer.js';
 import { CapabilityGrant } from './capability-grant.js';
-import type { InboundSource } from './inbound-source.js';
+import { INBOUND_SOURCE_KEY, type InboundSource } from './inbound-source.js';
 import { McplRequestError } from './server-connection.js';
 
 // ============================================================================
@@ -1036,34 +1036,8 @@ export class ChannelRegistry {
       };
       if (!coalesced) markAccepted();
 
-      // Determine whether to trigger inference
-      let triggerInference = true;
-      if (this.shouldTriggerInference) {
-        const textContent = message.content
-          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-          .map((b) => b.text)
-          .join('\n');
-        triggerInference = this.shouldTriggerInference(
-          textContent,
-          {
-            // The adapter's own metadata first; the protocol's fields after
-            // it, always present (even undefined), so an adapter metadata key
-            // can never stand in for them — the gate's route candidates read
-            // threadId and messageId from here, and a thread decides where a
-            // post lands (MCPL RFC-011).
-            ...message.metadata,
-            eventType: 'mcpl:channel-incoming',
-            serverId,
-            channelId: message.channelId,
-            messageId: message.messageId,
-            threadId: message.threadId,
-            author: message.author,
-            ...(message.tags ? { tags: message.tags } : {}),
-          },
-        );
-      }
-
-      // Build the incoming event
+      // Build the incoming event; whether it triggers inference is decided
+      // just below.
       const event: McplChannelIncomingEvent = {
         type: 'mcpl:channel-incoming',
         serverId,
@@ -1075,9 +1049,44 @@ export class ChannelRegistry {
         timestamp: message.timestamp,
         metadata: message.metadata,
         ...(message.tags ? { tags: message.tags } : {}),
-        triggerInference,
+        triggerInference: true,
         acceptedAt: Date.now(),
       };
+
+      // The source envelope of an ordinary message is frozen here, at
+      // admission, before it is gated, queued or acknowledged: a rename or
+      // rebind while it waits cannot change where it says it came from, and
+      // the gate reads the same envelope the direct path does. (A coalesced
+      // message's envelope is frozen by its coalescer when it is delivered.)
+      const inboundSource = coalesced ? undefined : this.acceptInbound?.(event);
+      if (inboundSource) event.inboundSource = inboundSource;
+
+      // Determine whether to trigger inference
+      if (this.shouldTriggerInference) {
+        const textContent = message.content
+          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+          .map((b) => b.text)
+          .join('\n');
+        event.triggerInference = this.shouldTriggerInference(
+          textContent,
+          {
+            // The adapter's own metadata first; the protocol's fields after
+            // it, always present (even undefined), so an adapter metadata key
+            // can never stand in for them; and the frozen envelope last, which
+            // the gate's route candidates read first (a thread decides where a
+            // post lands, MCPL RFC-011).
+            ...message.metadata,
+            eventType: 'mcpl:channel-incoming',
+            serverId,
+            channelId: message.channelId,
+            messageId: message.messageId,
+            threadId: message.threadId,
+            author: message.author,
+            ...(message.tags ? { tags: message.tags } : {}),
+            ...(inboundSource ? { [INBOUND_SOURCE_KEY]: inboundSource } : {}),
+          },
+        );
+      }
 
       if (coalesced) {
         // RFC-006 §14.3: a coalesced message is admitted like any other and
@@ -1098,12 +1107,6 @@ export class ChannelRegistry {
         }
         continue;
       }
-
-      // The source envelope is frozen here, at admission, before the message
-      // is queued or acknowledged: a rename or rebind while it waits in the
-      // queue cannot change where it says it came from.
-      const inboundSource = this.acceptInbound?.(event);
-      if (inboundSource) event.inboundSource = inboundSource;
 
       // Push to the processing queue
       // Cast through unknown because McplChannelIncomingEvent matches the
