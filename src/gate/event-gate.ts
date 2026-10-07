@@ -12,6 +12,7 @@
  */
 
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
+import { isConversational } from '../speech-routes.js';
 import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
 
@@ -96,6 +97,9 @@ interface PendingEvent {
   /** The triggering message's id, when the metadata carries one: the reply
    *  edge of a speech route inferred from this event. */
   messageId?: string;
+  /** Conversational input rather than machinery (a reaction, a system
+   *  marker): only conversational events are route candidates. */
+  conversational: boolean;
 }
 
 /** One conversation a batched gate wake carries, for the framework's
@@ -248,6 +252,9 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
   }
   const routeCandidates: GateRouteCandidate[] = [];
   for (const e of events) {
+    // A reaction or system marker answers nothing: never a route candidate
+    // (the framework's mid-turn rule, applied at turn start too).
+    if (!e.conversational) continue;
     if (e.routeChannelId) {
       routeCandidates.push({
         kind: 'channel',
@@ -1561,6 +1568,7 @@ export class EventGate {
       ...(typeof info.metadata?.messageId === 'string' && info.metadata.messageId
         ? { messageId: info.metadata.messageId as string }
         : {}),
+      conversational: isConversational(info.tags, info.metadata),
     };
 
     const existing = this.debounceTimers.get(policy.name);

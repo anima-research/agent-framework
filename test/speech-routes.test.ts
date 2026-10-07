@@ -8,6 +8,7 @@ import {
   conversationKey,
   describeConversation,
   inferTurnRoute,
+  isConversational,
   suspendsRoute,
   type ConversationRef,
   type RouteCandidate,
@@ -83,10 +84,20 @@ describe('inferTurnRoute', () => {
       candidate(channel('forum', { threadId: 't2' }), true, 2),
     ]);
     assert.equal(threads.hold?.conversations.length, 2);
-    const one = inferTurnRoute([candidate(channel('forum', { threadId: 't1', label: 'forum' }), true, 1, 'm1')]);
-    assert.deepEqual(one.route, {
-      kind: 'channel', serverId: 'discord', channelId: 'forum', threadId: 't1', replyTo: 'm1', label: 'forum', origin: 'trigger',
-    });
+  });
+
+  it('a thread conversation competes but is never a route: publishing carries no thread', () => {
+    const thread = channel('forum', { threadId: 't1', label: 'forum' });
+    const one = inferTurnRoute([candidate(thread, true, 1, 'm1')]);
+    assert.deepEqual(one, { route: null, unroutable: { conversation: thread, reason: 'thread' } },
+      'speech would otherwise land in the channel root, a different conversation');
+    const held = inferTurnRoute([candidate(thread, true, 1), candidate(channel('room'), true, 2)]);
+    assert.equal(held.hold?.conversations.length, 2, 'it still holds a turn when it competes');
+  });
+
+  it('a channel whose server is unknown routes without a placeholder server', () => {
+    const turn = inferTurnRoute([candidate({ kind: 'channel', channelId: 'solo' }, true, 1, 'm1')]);
+    assert.deepEqual(turn.route, { kind: 'channel', channelId: 'solo', replyTo: 'm1', origin: 'trigger' });
   });
 
   it('a conversation whose channel could not be resolved competes, but is never the route', () => {
@@ -94,7 +105,7 @@ describe('inferTurnRoute', () => {
     const competing = inferTurnRoute([candidate(channel('room'), true, 1, 'm1'), raw]);
     assert.equal(competing.route, null);
     assert.equal(competing.hold?.conversations.length, 2, 'never the older conversation by default');
-    assert.deepEqual(inferTurnRoute([raw]), { route: null });
+    assert.deepEqual(inferTurnRoute([raw]), { route: null, unroutable: { conversation: channel('1548'), reason: 'unresolved' } });
   });
 
   it('a local surface is addressed by nature, and routes to the surface', () => {
@@ -131,6 +142,16 @@ describe('suspendsRoute', () => {
     }
     assert.equal(suspendsRoute({ ...routeA, hold: { since: 'turn-start', conversations: [] } }, arrival, notEngaged), false);
     assert.equal(suspendsRoute({ route: null }, arrival, notEngaged), false);
+  });
+});
+
+describe('isConversational', () => {
+  it('reactions and system markers are machinery, everything else is conversation', () => {
+    assert.equal(isConversational(['chat:reaction'], {}), false);
+    assert.equal(isConversational(['chat:reaction-remove'], {}), false, 'a removal is machinery too');
+    assert.equal(isConversational(['chat:ambient'], { system: true }), false);
+    assert.equal(isConversational(['chat:addressed'], {}), true);
+    assert.equal(isConversational(undefined, undefined), true);
   });
 });
 

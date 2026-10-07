@@ -611,6 +611,23 @@ describe('debounce', () => {
     ]);
   });
 
+  it('a reaction in the batch is never a route candidate (the same predicate as mid-turn)', async () => {
+    const path = writeConfig('debounce-route-reaction.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: '👍',
+      tags: ['chat:reaction', 'chat:addressed'], metadata: { authorId: '1', messageId: 'r-1' } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:general', content: 'hi',
+      metadata: { authorId: '2', messageId: 'm-2' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.deepStrictEqual((inferenceRequests[0].routeCandidates ?? []).map((c) => c.channelId), ['discord:g:general']);
+  });
+
   it('a batched wake with no channel-bearing event carries no provenance', async () => {
     const path = writeConfig('debounce-noprov.json', {
       policies: [

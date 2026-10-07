@@ -87,6 +87,7 @@ import {
   conversationKey,
   describeConversation,
   inferTurnRoute,
+  isConversational,
   routeConversation,
   suspendsRoute,
   type ConversationRef,
@@ -229,9 +230,7 @@ const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>): 'send'
 const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
   if (!metadata) return true;
   const m = metadata as Record<string, unknown>;
-  if (m.system === true) return false;
-  if (Array.isArray(m.tags) && m.tags.includes('chat:reaction')) return false;
-  return true;
+  return isConversational(Array.isArray(m.tags) ? (m.tags as string[]) : undefined, m);
 };
 
 /**
@@ -1757,7 +1756,7 @@ export class AgentFramework {
                       ? { conversation: { kind: 'surface', surface: c.surface }, addressed: true, at: c.at }
                       : c.unroutable
                         ? {
-                            conversation: { kind: 'channel', serverId: c.serverId ?? '', channelId: c.channelId },
+                            conversation: { kind: 'channel', ...(c.serverId ? { serverId: c.serverId } : {}), channelId: c.channelId },
                             addressed: c.addressed,
                             at: c.at,
                             unroutable: true,
@@ -6914,15 +6913,21 @@ export class AgentFramework {
             if (turn?.route && competing) {
               const m = competing.metadata as Record<string, unknown> | undefined;
               const arrival = this.candidateFromSource(readInboundSource(m), true)!.conversation;
+              const addressedArrival = isAddressedMessage(m?.tags as string[] | undefined, m);
               const current = routeConversation(turn.route);
               const held: TurnRoute = { route: turn.route, hold: { conversations: [current, arrival], since: 'mid-turn' } };
               this.turnRoutes.set(agent.name, held);
               this.lastAnnouncedRoute.set(agent.name, AgentFramework.routeKey(held));
+              // Name the actual cause: someone addressed the resident, or a
+              // conversation it sent into this turn continued.
+              const cause = addressedArrival
+                ? `${describeConversation(arrival)} addressed you mid-turn`
+                : `${describeConversation(arrival)}, where you sent a message this turn, continued mid-turn`;
               const noticeContent: ContentBlock[] = [{
                 type: 'text',
                 text:
-                  `[routing] ${describeConversation(arrival)} addressed you mid-turn, so your unaddressed plain ` +
-                  `speech could now answer either conversation. For the rest of this turn it is held as drafts ` +
+                  `[routing] ${cause}, so your unaddressed plain speech could now answer either conversation. ` +
+                  'For the rest of this turn it is held as drafts ' +
                   `instead of going to ${describeConversation(current)}. Answer either one with an explicit send ` +
                   '(or a channel_open); held words can be resent from your drafts.',
               }];
@@ -7254,7 +7259,9 @@ export class AgentFramework {
         this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
         if (event.triggerInference) {
           const addressedHere = isAddressedMessage(event.tags, event.metadata);
-          const candidate = this.candidateFromSource(source, addressedHere);
+          const candidate = isConversational(event.tags, event.metadata)
+            ? this.candidateFromSource(source, addressedHere)
+            : undefined;
           this.pendingRequests.push({
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
             channelId: event.channelId,
@@ -7329,7 +7336,9 @@ export class AgentFramework {
       // tune-out's wake routing is the first setter.)
       const targetAgents = event.targetAgents
         ?? [...this.agents.keys()].filter((n) => n !== this.subconsciousAgentName);
-      const candidate = this.candidateFromSource(source, addressed);
+      // A reaction or system marker can wake a turn, but answers nothing:
+      // it is never a route candidate (the same predicate as mid-turn).
+      const candidate = isConversational(event.tags, event.metadata) ? this.candidateFromSource(source, addressed) : undefined;
       for (const agentName of targetAgents) {
         if (!this.agents.has(agentName)) continue;
         this.pendingRequests.push({
@@ -7439,7 +7448,9 @@ export class AgentFramework {
     if (trigger) {
       const addressedHere = isAddressedMessage(event.tags, event.metadata);
       // A fork's home route always wins; the candidate is carried for parity.
-      const candidate = this.candidateFromSource(readInboundSource(messageMetadata), addressedHere);
+      const candidate = isConversational(event.tags, event.metadata)
+        ? this.candidateFromSource(readInboundSource(messageMetadata), addressedHere)
+        : undefined;
       this.pendingRequests.push({
         agentName: agent.name,
         reason: 'mcpl:channel-incoming',
@@ -8259,7 +8270,9 @@ export class AgentFramework {
     const channelId = occ.scope.kind === 'channel' ? occ.scope.id : this.derivePushEventChannel(origin)?.channelId;
     const authorId = occ.identity?.author?.id ?? (typeof origin?.authorId === 'string' ? origin.authorId : undefined);
     const addressedHere = isAddressedMessage(occ.tags, origin);
-    const candidate = this.candidateFromSource(occ.event.event.inboundSource, addressedHere);
+    const candidate = isConversational(occ.tags, origin as Record<string, unknown> | undefined)
+      ? this.candidateFromSource(occ.event.event.inboundSource, addressedHere)
+      : undefined;
     for (const agentName of await this.coalescedAudience(occ)) {
       this.pendingRequests.push({
         agentName,
@@ -8478,7 +8491,9 @@ export class AgentFramework {
       // A push that names a conversation (a DM, an addressed-while-closed
       // message) is a route candidate like its channels/incoming
       // counterpart; an unscoped push names none.
-      const pushCandidate = silentHeartbeat ? undefined : this.candidateFromSource(source, pushAddressed);
+      const pushCandidate = silentHeartbeat || !isConversational(event.tags, event.origin as Record<string, unknown> | undefined)
+        ? undefined
+        : this.candidateFromSource(source, pushAddressed);
       for (const agentName of targetAgents) {
         this.pendingRequests.push({
           agentName,
@@ -9601,10 +9616,10 @@ export class AgentFramework {
     serverId?: string,
     messageId?: string,
   ): RouteCandidate {
-    const server = serverId || this.channelRegistry?.getChannelServerId(channelId) || '';
+    const server = serverId || this.channelRegistry?.getChannelServerId(channelId) || undefined;
     const label = this.channelRegistry?.getDescriptor(channelId)?.label;
     return {
-      conversation: { kind: 'channel', serverId: server, channelId, ...(label ? { label } : {}) },
+      conversation: { kind: 'channel', ...(server ? { serverId: server } : {}), channelId, ...(label ? { label } : {}) },
       addressed,
       ...(messageId ? { messageId } : {}),
       at,
@@ -9616,9 +9631,10 @@ export class AgentFramework {
     const home = this.conversationAgentHomes.get(agentName) ?? this.channelRegistry?.resolveLocus(agentName) ?? null;
     if (!home) return null;
     const label = this.channelRegistry?.getDescriptor(home)?.label;
+    const serverId = this.channelRegistry?.getChannelServerId(home) ?? undefined;
     return {
       kind: 'channel',
-      serverId: this.channelRegistry?.getChannelServerId(home) ?? '',
+      ...(serverId ? { serverId } : {}),
       channelId: home,
       ...(label ? { label } : {}),
       origin: 'home',
@@ -9642,9 +9658,8 @@ export class AgentFramework {
     if (route.kind === 'surface') return { kind: 'surface', surface: route.surface };
     return {
       kind: 'channel',
-      serverId: route.serverId,
+      ...(route.serverId ? { serverId: route.serverId } : {}),
       channelId: route.channelId,
-      ...(route.threadId ? { threadId: route.threadId } : {}),
       ...(route.replyTo ? { replyTo: route.replyTo } : {}),
     };
   }
@@ -9671,7 +9686,13 @@ export class AgentFramework {
     }
     const route = turn?.route;
     if (!route) {
-      this.holdProseDrafts(agent, [text], 'no-destination', hold);
+      const unroutable = turn?.unroutable;
+      this.holdProseDrafts(agent, [text], 'no-destination', {
+        ...hold,
+        ...(unroutable?.reason === 'thread'
+          ? { note: `the conversation that woke you is a thread (${describeConversation(unroutable.conversation)}); answer it with a send tool that names the thread` }
+          : {}),
+      });
       return;
     }
     if (route.kind === 'surface') {
@@ -9691,13 +9712,14 @@ export class AgentFramework {
   /** A turn route in words, for logs. */
   private static routeText(turn: TurnRoute): string {
     if (turn.hold) return `held between ${turn.hold.conversations.map(describeConversation).join(' and ')}`;
-    return turn.route ? describeConversation(routeConversation(turn.route)) : 'none';
+    if (turn.route) return describeConversation(routeConversation(turn.route));
+    return turn.unroutable ? `none (${turn.unroutable.reason}: ${describeConversation(turn.unroutable.conversation)})` : 'none';
   }
 
   /** Identity of a turn route for announce-on-change. */
   private static routeKey(turn: TurnRoute): string {
     if (turn.hold) return `held:${turn.hold.conversations.map(conversationKey).sort().join('|')}`;
-    if (!turn.route) return 'none';
+    if (!turn.route) return turn.unroutable ? `unroutable:${conversationKey(turn.unroutable.conversation)}` : 'none';
     return conversationKey(routeConversation(turn.route));
   }
 
@@ -9728,6 +9750,13 @@ export class AgentFramework {
         `[routing] More than one conversation is waiting for you: ${turn.hold.conversations.map(describeConversation).join('; ')}. ` +
         'Your unaddressed plain speech is held as drafts this turn rather than guessed: answer one with an ' +
         'explicit send (or channel_open it), and resend held words with the drafts tool.';
+    } else if (!turn.route && turn.unroutable) {
+      const where = describeConversation(turn.unroutable.conversation);
+      text = turn.unroutable.reason === 'thread'
+        ? `[routing] The conversation that woke you is a thread (${where}), and plain speech can't be posted ` +
+          'into a thread: it is held as drafts. Answer it with a send tool that names the thread.'
+        : `[routing] The conversation that woke you (${where}) couldn't be resolved to a registered channel, ` +
+          'so your plain speech is held as drafts. Use an explicit send tool to reach it.';
     } else if (!turn.route) {
       text =
         '[routing] Your plain speech currently has no destination — it is held as drafts you can resend. ' +
@@ -16181,9 +16210,10 @@ export class AgentFramework {
                 ...(openInput?.serverId ? { serverId: openInput.serverId } : {}),
               });
               const destination = resolved && 'destination' in resolved ? resolved.destination : undefined;
+              const openedServer = destination?.serverId ?? openInput?.serverId;
               const route: SpeechRoute = {
                 kind: 'channel',
-                serverId: destination?.serverId ?? openInput?.serverId ?? '',
+                ...(openedServer ? { serverId: openedServer } : {}),
                 channelId: opened,
                 ...(destination?.label ? { label: destination.label } : {}),
                 origin: 'open',

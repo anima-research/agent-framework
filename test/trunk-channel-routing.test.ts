@@ -362,6 +362,50 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
+  it('a reaction that wakes a turn answers nothing: no route candidate', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noticed' }]));
+    const framework = await makeFramework();
+    framework.pushEvent({
+      ...(channelIncoming('discord:guild:chanA', '👍') as unknown as Record<string, unknown>),
+      tags: ['chat:reaction', 'chat:addressed'],
+    } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 1);
+    assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null });
+    await framework.stop();
+  });
+
+  it('a thread wakes the turn but plain speech is held: publishing carries no thread', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering the topic' }]));
+    const framework = await makeFramework();
+    // A channel subsystem to deliver through (speech is only routed with one).
+    const published: string[] = [];
+    internals(framework).channelRegistry = new Proxy({
+      resolveLocus: () => null,
+      routeSpeech: async (_a: string, text: string) => { published.push(text); return { delivered: true, channelId: 'x' }; },
+      getDescriptor: () => undefined,
+      getChannelTools: () => [],
+    } as Record<string, unknown>, { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
+    framework.pushEvent({
+      ...(channelIncoming('zulip:stream:7', 'on topic') as unknown as Record<string, unknown>),
+      serverId: 'zulip',
+      threadId: 'topic-a',
+    } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    const turn = internals(framework).turnRoutes.get('scout') as { route: unknown; unroutable?: { reason: string } };
+    assert.equal(turn.route, null);
+    assert.equal(turn.unroutable?.reason, 'thread');
+    const texts = framework.getAgent('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text);
+    assert.ok(texts.some((t) => t.startsWith('[routing] The conversation that woke you is a thread')));
+    const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string; reason: string; note?: string }> } })
+      .proseDrafts.open('scout');
+    assert.deepEqual(drafts.map((d) => [d.text, d.reason]), [['answering the topic', 'no-destination']]);
+    assert.match(drafts[0]!.note ?? '', /a thread .*send tool that names the thread/);
+    assert.deepEqual(published, [], 'nothing went to the channel root');
+    await framework.stop();
+  });
+
   it('a no-trigger (heartbeat) turn has no speech route, whatever the previous turn had', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tick' }]));
     const framework = await makeFramework();

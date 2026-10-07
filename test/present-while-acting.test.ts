@@ -462,6 +462,11 @@ describe('present while acting', () => {
 
     assert.deepEqual(routed, [], 'neither conversation is guessed');
     assert.deepEqual(heldDrafts(framework).map((d) => [d.text, d.reason]), [['Good plan on both counts.', 'ambiguous']]);
+    // The notice names the actual cause: a continued conversation, not an address.
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .map((o) => o?.injectedMessages ?? []).flat().map((m) => JSON.stringify(m.content));
+    assert.ok(wired.some((t) => t.includes('[routing] discord:guild:portables, where you sent a message this turn, continued mid-turn')));
+    assert.ok(!wired.some((t) => t.includes('addressed you mid-turn')));
 
     await framework.stop();
   });

@@ -472,7 +472,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 
 /** An agent's current speech route as the registry needs it. */
 export type SpeechRouteView =
-  | { kind: 'channel'; serverId: string; channelId: string; threadId?: string; replyTo?: string }
+  | { kind: 'channel'; serverId?: string; channelId: string; threadId?: string; replyTo?: string }
   | { kind: 'surface'; surface: string }
   /** Competing conversations hold unaddressed speech (usable addresses). */
   | { kind: 'held'; conversations: string[] }
@@ -3305,7 +3305,9 @@ export class ChannelRegistry {
           isError: true,
         };
       }
-      target = { serverId: route.serverId, channelId: route.channelId };
+      // The route's server when it has one; otherwise the id alone, resolved
+      // exactly as plain speech on the same route resolves it.
+      target = { channelId: route.channelId, ...(route.serverId ? { serverId: route.serverId } : {}) };
     }
 
     const outcome = await this.publish(

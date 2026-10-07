@@ -258,6 +258,20 @@ test('channel_publish without a channel goes to the caller\'s route, and its rec
   assert.equal(publishCalls.at(-1)?.channelId, 'chanA', 'the route, not the last inbound channel');
 });
 
+test('a route whose server is unknown resolves the same way for channel_publish as for plain speech', async () => {
+  const { registry, publishCalls } = makeRegistry(
+    { delivered: true, messageId: 'p-2' } as { delivered?: boolean },
+    () => undefined,
+    () => ({ kind: 'channel', channelId: 'chanA' }),
+  );
+  seedRegistered(registry, 'discord', 'chanA');
+  const published = await registry.handleChannelToolCall('channel_publish', { content: 'explicit' }, { kind: 'agent', agentName: 'scout' });
+  assert.equal(published.success, true, JSON.stringify(published));
+  const spoken = await registry.routeSpeech('scout', 'plain speech', 'chanA');
+  assert.deepEqual(spoken, { delivered: true, channelId: 'chanA', messageId: 'p-2' });
+  assert.deepEqual(publishCalls.map((c) => c.channelId), ['chanA', 'chanA']);
+});
+
 test('channel_publish without a channel or a route is refused, never guessed', async () => {
   const views: Record<string, SpeechRouteView> = {
     held: { kind: 'held', conversations: ['#chanA (chanA)', '#chanB (chanB)'] },

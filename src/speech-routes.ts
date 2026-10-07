@@ -24,7 +24,10 @@
 export type ConversationRef =
   | {
       kind: 'channel';
-      serverId: string;
+      /** The MCPL server, when known. Absent — never a placeholder — when the
+       *  channel id couldn't be tied to one server; delivery then resolves
+       *  the id alone, the same way on every path. */
+      serverId?: string;
       channelId: string;
       threadId?: string;
       /** The channel's registered label when it was seen. */
@@ -61,8 +64,13 @@ export type RouteOrigin =
 export type SpeechRoute =
   | {
       kind: 'channel';
-      serverId: string;
+      /** As in ConversationRef: absent when unknown. */
+      serverId?: string;
       channelId: string;
+      /** Never set on a route: plain speech can't be posted into a thread
+       *  (publishing carries no thread), so a thread conversation is never
+       *  inferred as a route. Kept for the type's symmetry with
+       *  ConversationRef. */
       threadId?: string;
       /** The message being answered, kept across same-conversation arrivals. */
       replyTo?: string;
@@ -84,13 +92,17 @@ export interface TurnRoute {
     conversations: ConversationRef[];
     since: 'turn-start' | 'mid-turn';
   };
+  /** No route because the one conversation the turn answers can't take
+   *  plain speech: a thread (publishing carries no thread), or a channel the
+   *  host couldn't resolve. Said in the routing notice and the drafts' note. */
+  unroutable?: { conversation: ConversationRef; reason: 'thread' | 'unresolved' };
 }
 
 /** Identity of a conversation: server, channel and thread, or the surface. */
 export function conversationKey(c: ConversationRef): string {
   return c.kind === 'surface'
     ? `surface:${c.surface}`
-    : `channel:${c.serverId}\u0000${c.channelId}\u0000${c.threadId ?? ''}`;
+    : `channel:${c.serverId ?? ''}\u0000${c.channelId}\u0000${c.threadId ?? ''}`;
 }
 
 /** The conversation a route speaks into. */
@@ -99,7 +111,7 @@ export function routeConversation(route: SpeechRoute): ConversationRef {
     ? { kind: 'surface', surface: route.surface }
     : {
         kind: 'channel',
-        serverId: route.serverId,
+        ...(route.serverId ? { serverId: route.serverId } : {}),
         channelId: route.channelId,
         ...(route.threadId ? { threadId: route.threadId } : {}),
         ...(route.label ? { label: route.label } : {}),
@@ -121,8 +133,9 @@ export function describeConversation(c: ConversationRef): string {
  * considered if there are any, else every (conversational) candidate; they
  * infer a route only when they name one conversation, from the newest
  * candidate in it (its message is the reply edge). Several conversations
- * start the turn held, naming each; none, or one whose channel couldn't be
- * resolved, leaves the turn without a route.
+ * start the turn held, naming each; none leaves the turn without a route,
+ * and so does one that can't take plain speech (a thread, or a channel that
+ * couldn't be resolved), which the turn records as `unroutable`.
  */
 export function inferTurnRoute(candidates: readonly RouteCandidate[], home?: SpeechRoute | null): TurnRoute {
   if (home) return { route: home };
@@ -142,22 +155,40 @@ export function inferTurnRoute(candidates: readonly RouteCandidate[], home?: Spe
     return { route: null, hold: { conversations, since: 'turn-start' } };
   }
   const [chosen] = newestByConversation.values();
-  // A conversation whose channel isn't resolvable can't be spoken into.
-  if (chosen!.unroutable) return { route: null };
   const c = chosen!.conversation;
+  // A conversation whose channel isn't resolvable can't be spoken into, and
+  // neither can a thread: publishing carries no thread, so plain speech
+  // would land in the channel root — a different conversation than the one
+  // being answered. Both still compete for the turn (above).
+  if (chosen!.unroutable) return { route: null, unroutable: { conversation: c, reason: 'unresolved' } };
+  if (c.kind === 'channel' && c.threadId) return { route: null, unroutable: { conversation: c, reason: 'thread' } };
   return c.kind === 'surface'
     ? { route: { kind: 'surface', surface: c.surface, origin: 'trigger' } }
     : {
         route: {
           kind: 'channel',
-          serverId: c.serverId,
+          ...(c.serverId ? { serverId: c.serverId } : {}),
           channelId: c.channelId,
-          ...(c.threadId ? { threadId: c.threadId } : {}),
           ...(chosen!.messageId ? { replyTo: chosen!.messageId } : {}),
           ...(c.label ? { label: c.label } : {}),
           origin: 'trigger',
         },
       };
+}
+
+/**
+ * Whether an item is conversational input — something the resident might be
+ * answering — rather than machinery: a system marker (send-failure notices,
+ * routing notices) or a reaction or its removal (`chat:reaction`,
+ * `chat:reaction-remove`, MCPL RFC-001) is not. One
+ * predicate for every place that asks: turn-start route candidates, mid-turn
+ * holds, and clearing send suppression.
+ */
+export function isConversational(tags: readonly string[] | undefined, metadata?: Record<string, unknown>): boolean {
+  if (metadata?.system === true) return false;
+  // Both reaction tags (MCPL RFC-001 / SPEC §16.2 keep them distinct).
+  if (tags?.includes('chat:reaction') || tags?.includes('chat:reaction-remove')) return false;
+  return true;
 }
 
 /**
