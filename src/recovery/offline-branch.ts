@@ -184,7 +184,7 @@ export async function createOfflineRecoveryBranch(
     // A known collision is refused before anything is prepared: a batch
     // whose target names an existing branch would be armed by starting it.
     if (store.listBranches().some((branch) => branch.name === targetBranch)) {
-      throw new Error(`Recovery branch ${targetBranch} already exists; choose another --branch-name`);
+      throw new Error(`Recovery branch ${targetBranch} already exists; choose another --branch`);
     }
 
     const result: OfflineRecoveryBranchResult = {
