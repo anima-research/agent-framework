@@ -541,10 +541,8 @@ export class ApiServer {
 
     store.switchBranch(params.name);
     this.currentBranch = params.name;
-
-    // Reversible Discord awareness markers are part of the branch projection.
-    // Do not acknowledge the switch until add/remove operations were attempted.
-    await this.framework.syncDiscordAwarenessMarkers();
+    // Awareness marks are one-shot: a branch switch never adds or removes
+    // them (retract or release explicitly instead).
 
     // Materialize config files from the new branch
     const ws = this.framework.getModule('workspace');
@@ -598,7 +596,6 @@ export class ApiServer {
 
     if (result.undone) {
       this.currentBranch = result.toBranch!;
-      await this.framework.syncDiscordAwarenessMarkers();
       this.broadcast('branch:switched', {
         from: result.fromBranch,
         to: result.toBranch,
@@ -618,7 +615,6 @@ export class ApiServer {
 
     if (result.redone) {
       this.currentBranch = result.toBranch!;
-      await this.framework.syncDiscordAwarenessMarkers();
       this.broadcast('branch:switched', {
         from: result.fromBranch,
         to: result.toBranch,

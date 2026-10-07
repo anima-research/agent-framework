@@ -354,8 +354,8 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * Close the data plane synchronously while leaving an already-released
-   * control plane live. Used before reconnect adoption and list-change
-   * reconciliation so no new inference event can beat barrier installation.
+   * control plane live. Used before reconnect adoption, so no data event can
+   * arrive before the server's grant is re-established, and by quiesce.
    */
   pauseDataPlane(): void {
     this.dataPlaneReady = false;
@@ -363,8 +363,8 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * Override emit to buffer server→host events until the corresponding plane
-   * is ready. Lifecycle events always pass through so reconnect can install a
-   * new data-plane gate before the fresh transport is exposed.
+   * is ready. Lifecycle events always pass through so the reconnect listener
+   * runs before the fresh transport's buffered traffic is released.
    */
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     const name = typeof event === 'string' ? event : '';
@@ -954,9 +954,9 @@ export class McplServerConnection extends EventEmitter {
       );
 
       // Close the data plane before the new transport can emit. The reconnect
-      // lifecycle event bypasses buffering; its framework listener installs the
-      // awareness barrier synchronously, then releases control traffic needed
-      // to establish the server while data remains held.
+      // lifecycle event bypasses buffering; its framework listener releases
+      // the control traffic needed to re-establish the server's grant while
+      // data stays held until the grant is in place.
       this.pauseDataPlane();
       this.resetPolicyForTransportBoundary();
       this.transport = transport;

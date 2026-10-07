@@ -30,6 +30,7 @@ test('offline recovery branches without compiling and queues discarded Discord r
     store.close();
 
     const result = await createOfflineRecoveryBranch({
+      marks: { scope: 'all' },
       storePath,
       agentName: 'cairn',
       messageId: 'm-safe',
@@ -54,9 +55,9 @@ test('offline recovery branches without compiling and queues discarded Discord r
 
     const batches = new DiscordAwarenessOutbox(
       defaultDiscordAwarenessOutboxPath(storePath),
-    ).pending('discord');
+    ).pendingDispatches('discord');
     assert.equal(batches.length, 2);
-    assert.deepEqual(batches.map((operation) => operation.ref.messageId), ['m-toxic-1', 'm-toxic-2']);
+    assert.deepEqual(batches.map((dispatch) => dispatch.key.messageId), ['m-toxic-1', 'm-toxic-2']);
 
     // The outbox is metadata-only: quarantined text must never leak to it.
     const rawOutbox = await import('node:fs').then(({ readFileSync }) =>
@@ -91,6 +92,7 @@ test('offline recovery can branch at the current message and suppress an exact l
     store.close();
 
     const result = await createOfflineRecoveryBranch({
+      marks: { scope: 'all' },
       storePath,
       agentName: 'cairn',
       messageId: 'm-current',
@@ -150,6 +152,7 @@ test('offline recovery suppresses inclusive ranges in context order', async () =
     store.close();
 
     const result = await createOfflineRecoveryBranch({
+      marks: { scope: 'all' },
       storePath,
       agentName: 'cairn',
       messageId: 'm-current',
@@ -179,10 +182,10 @@ test('offline recovery suppresses inclusive ranges in context order', async () =
 
     const batches = new DiscordAwarenessOutbox(
       defaultDiscordAwarenessOutboxPath(storePath),
-    ).pending('discord');
+    ).pendingDispatches('discord');
     assert.equal(batches.length, 3);
     assert.deepEqual(
-      batches.map((operation) => operation.ref.messageId),
+      batches.map((dispatch) => dispatch.key.messageId),
       ['m-from', 'm-inside', 'm-to'],
     );
   } finally {
@@ -207,6 +210,7 @@ test('offline recovery accepts an exact internal context ID anchor', async () =>
     store.close();
 
     const result = await createOfflineRecoveryBranch({
+      marks: { scope: 'all' },
       storePath,
       agentName: 'cairn',
       contextId: String(coherentAssistantId),
@@ -263,6 +267,59 @@ test('suppression rejects a range that splits a tool exchange', async () => {
         suppressRanges: [{ fromMessageId: 'm-from', toMessageId: 'm-to' }],
       }),
       /split tool exchange tool-1/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('offline recovery is local by default; addressed marks only messages that addressed the agent', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-marks-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const seed = async () => {
+      const store = JsStore.openOrCreate({ path: storePath });
+      const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+      cm.addMessage('user', [{ type: 'text', text: 'safe' }], {
+        serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-safe',
+      });
+      cm.addMessage('user', [{ type: 'text', text: 'hey @cairn' }], {
+        serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-addressed', tags: ['chat:addressed', 'chat:mention'],
+      });
+      cm.addMessage('user', [{ type: 'text', text: 'ambient chatter' }], {
+        serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-ambient', tags: ['chat:ambient'],
+      });
+      cm.close();
+      store.close();
+    };
+    await seed();
+    const local = await createOfflineRecoveryBranch({
+      storePath, agentName: 'cairn', messageId: 'm-safe', branchName: 'recovery/cairn/local',
+    });
+    assert.equal(local.marksScope, 'none');
+    assert.equal(local.discordAddressable, 2);
+    assert.equal(local.discordMarkersQueued, 0);
+    assert.equal(local.unmarked, 2);
+    const outbox = new DiscordAwarenessOutbox(defaultDiscordAwarenessOutboxPath(storePath));
+    assert.equal(outbox.pendingDispatches('discord').length, 0, 'nothing is queued for Discord');
+    assert.equal(outbox.batches().length, 0);
+
+    // A dry run with addressed shows exactly what would be marked.
+    rmSync(storePath, { recursive: true, force: true });
+    await seed();
+    const preview = await createOfflineRecoveryBranch({
+      storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'addressed' }, dryRun: true,
+    });
+    assert.deepEqual(preview.refs.map((ref) => ref.messageId), ['m-addressed']);
+    const marked = await createOfflineRecoveryBranch({
+      storePath, agentName: 'cairn', messageId: 'm-safe', marks: { scope: 'addressed' }, branchName: 'recovery/cairn/marked',
+    });
+    assert.equal(marked.discordMarkersQueued, 1);
+    assert.equal(marked.unmarked, 1);
+    assert.deepEqual(
+      new DiscordAwarenessOutbox(defaultDiscordAwarenessOutboxPath(storePath)).pendingDispatches('discord')
+        .map((dispatch) => dispatch.key.messageId),
+      ['m-addressed'],
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });

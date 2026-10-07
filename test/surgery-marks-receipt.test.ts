@@ -1,17 +1,22 @@
 /**
- * Live surgery reports its body change apart from the Discord awareness marks
- * it schedules, and does not wait on Discord to accept them.
+ * Live surgery and Discord awareness marks, end to end against a fake
+ * Discord MCPL server.
  *
  * Field incident (2026-10-07): a web-UI rollback removed 918 Discord messages
- * from a resident's context. rollbackToMessage awaited the serial reaction
- * drain inside its store reservation, so the operator's surgery-result never
- * arrived within the client's 60 s, the store stayed reserved, and every MCPL
- * data plane stayed paused for the whole drain. These tests hold the fake
- * server's reaction replies to model that drain.
+ * from a resident's context, and the framework queued a 💤 reaction on every
+ * one of them, mostly other people's ambient messages in a busy channel. The
+ * rollback awaited the serial reaction drain inside its store reservation and
+ * held every MCPL data plane until it finished.
  *
- * The receipt is a scheduling statement (`markers`), never a delivery claim,
- * and a ledger failure after the body change landed is reported as
- * `not-scheduled` instead of a failed surgery an operator might retry.
+ * The contract these tests pin:
+ * - a surgery is local unless the operator chooses marks (`marks`, default
+ *   `none`); `addressed` covers messages tagged chat:addressed; a choice
+ *   with `refs` marks only those refs, never later arrivals;
+ * - the surgery returns with a marker-scheduling receipt, never a delivery
+ *   claim, and never fails an applied body change over marker bookkeeping;
+ * - delivery runs in the background and never holds MCPL traffic;
+ * - cancel and retract are explicit, and their receipts disclose requests
+ *   whose outcome is unknown.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -19,6 +24,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { JsStore } from '@animalabs/chronicle';
 import { AgentFramework, DiscordAwarenessOutbox } from '../src/index.js';
 import type { OperatorLogEntry } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
@@ -54,7 +60,7 @@ async function settlesWithin<T>(promise: Promise<T>, ms: number, what: string): 
   }
 }
 
-describe('surgery marker receipt', () => {
+describe('surgery and awareness marks', () => {
   let dir: string;
   let storePath: string;
   let callsPath: string;
@@ -64,35 +70,35 @@ describe('surgery marker receipt', () => {
   let framework: AgentFramework;
 
   const cm = () => framework.getAgent('resident')!.getContextManager();
-  const outboxPath = () => join(storePath, 'recovery', 'discord-awareness-outbox.json');
-  const ledger = () => new DiscordAwarenessOutbox(outboxPath()).batches();
+  const outbox = () => new DiscordAwarenessOutbox(join(storePath, 'recovery', 'discord-awareness-journal.jsonl'));
+  const answered = () => jsonl(eventsPath).filter((e) => e.event === 'reaction-answered').length;
+  const calls = () => jsonl<{ name: string; args: { messageId: string; emoji: string } }>(callsPath);
 
-  async function start(withDiscord: boolean): Promise<void> {
+  async function start(withDiscord: boolean, awarenessDeadlineMs?: number): Promise<void> {
     framework = await AgentFramework.create({
       storePath,
       membrane: new MockMembrane().asMembrane(),
       agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'You are a resident.' }],
       modules: [],
       maintenanceIntervalMs: 0,
+      ...(awarenessDeadlineMs ? { discordAwarenessDeadlineMs: awarenessDeadlineMs } : {}),
       ...(withDiscord ? {
         mcplServers: [{
           id: 'discord',
           command: process.execPath,
           args: [FIXTURE],
-          env: {
-            CALLS_PATH: callsPath,
-            EVENTS_PATH: eventsPath,
-            HOLD_PATH: holdPath,
-            PROBE_PATH: probePath,
-          },
+          env: { CALLS_PATH: callsPath, EVENTS_PATH: eventsPath, HOLD_PATH: holdPath, PROBE_PATH: probePath },
           enabledFeatureSets: ['chat'],
         }],
       } : {}),
     });
   }
 
-  /** A kept message, the rollback target, then `n` addressable messages. */
-  function seed(n: number): { tail: string; removed: string[] } {
+  /**
+   * A kept message, the rollback target, then `n` messages from a busy
+   * channel; those whose index is in `addressed` addressed the resident.
+   */
+  function seed(n: number, addressed: number[] = []): { tail: string; removed: string[] } {
     cm().addMessage('Operator', [{ type: 'text', text: 'kept' }], {
       serverId: 'discord', channelId: 'discord:g1:dm', messageId: 'kept',
     });
@@ -101,8 +107,11 @@ describe('surgery marker receipt', () => {
     }));
     const removed: string[] = [];
     for (let i = 0; i < n; i++) {
-      removed.push(String(cm().addMessage(`Member${i}`, [{ type: 'text', text: `ambient ${i}` }], {
-        serverId: 'discord', channelId: 'discord:g1:c1', messageId: `amb-${i}`,
+      removed.push(String(cm().addMessage(`Member${i}`, [{ type: 'text', text: `message ${i}` }], {
+        serverId: 'discord',
+        channelId: 'discord:g1:c1',
+        messageId: `amb-${i}`,
+        tags: addressed.includes(i) ? ['chat:addressed', 'chat:mention'] : ['chat:ambient'],
       })));
     }
     return { tail, removed };
@@ -123,144 +132,114 @@ describe('surgery marker receipt', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('rollback returns once the batch is active, before Discord has accepted any reaction', async () => {
+  it('a rollback is local by default: no reaction, and the receipt counts what stayed unmarked', async () => {
     await start(true);
-    const { tail } = seed(3);
+    const { tail } = seed(5, [3]);
+    writeFileSync(holdPath, '1');
+    const result = await framework.rollbackToMessage('resident', { messageId: tail });
+    assert.equal(result.messagesRemoved, 5);
+    assert.equal(result.removedRefs.length, 5);
+    assert.deepEqual(result.markers, { scope: 'none', unmarked: 5, notRemoved: 0, status: 'none', queued: 0 });
+    await framework.syncDiscordAwarenessMarkers();
+    assert.equal(calls().length, 0);
+    assert.equal(outbox().batches().length, 0);
+    const entry = framework.getOperatorLog({ limit: 5 }).find((e) => e.kind === 'rollback');
+    assert.equal(entry?.params?.marks, 'none');
+  });
+
+  it('addressed marks only the messages that addressed the resident', async () => {
+    await start(true);
+    const { tail } = seed(6, [1, 4]);
+    writeFileSync(holdPath, '1');
+    const preview = framework.previewSurgeryMarks('resident', { rollbackTo: tail });
+    assert.equal(preview.messagesRemoved, 6);
+    assert.equal(preview.addressable, 6);
+    assert.equal(preview.scopes.addressed.count, 2);
+    assert.deepEqual(preview.scopes.addressed.channels, [{ channelId: 'discord:g1:c1', count: 2 }]);
+    assert.equal(preview.scopes.all.count, 6);
+
+    const result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'addressed' } });
+    assert.equal(result.markers.status, 'queued');
+    assert.equal(result.markers.queued, 2);
+    assert.equal(result.markers.unmarked, 4);
+    await waitFor('two reactions answered', () => answered() === 2);
+    await framework.syncDiscordAwarenessMarkers();
+    assert.deepEqual(calls().map((c) => `${c.name}:${c.args.messageId}:${c.args.emoji}`).sort(), [
+      'add_reaction:amb-1:💤',
+      'add_reaction:amb-4:💤',
+    ]);
+  });
+
+  it('a choice bound to previewed refs never widens to messages that arrive before it applies', async () => {
+    await start(true);
+    const { tail } = seed(3, [0, 2]);
+    writeFileSync(holdPath, '1');
+    const preview = framework.previewSurgeryMarks('resident', { rollbackTo: tail });
+    const authorized = preview.scopes.addressed.refs;
+    assert.equal(authorized.length, 2);
+    // An addressed message arrives while the operator is deciding.
+    cm().addMessage('Late', [{ type: 'text', text: '@resident are you there?' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'late-1', tags: ['chat:addressed'],
+    });
+    const result = await framework.rollbackToMessage('resident', {
+      messageId: tail,
+      marks: { scope: 'addressed', refs: authorized },
+    });
+    assert.equal(result.messagesRemoved, 4, 'the rollback still removes everything after its anchor');
+    assert.equal(result.markers.queued, 2);
+    assert.equal(result.markers.unmarked, 2, 'the late arrival is removed locally, unmarked');
+    await waitFor('two reactions answered', () => answered() === 2);
+    assert.ok(!calls().some((c) => c.args.messageId === 'late-1'));
+  });
+
+  it('returns once marks are scheduled, before Discord has accepted any, and never holds channel traffic', async () => {
+    await start(true);
+    const { tail, removed } = seed(4);
 
     const result = await settlesWithin(
-      framework.rollbackToMessage('resident', { messageId: tail }),
+      framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } }),
       3_000,
       'rollbackToMessage with reactions held',
     );
-
-    assert.equal(result.messagesRemoved, 3);
     assert.equal(result.markers.status, 'queued');
-    assert.equal(result.markers.queued, 3);
-    const [batch] = ledger();
-    assert.equal(batch.status, 'active', 'the batch is durably active before the call returns');
-    assert.equal(result.markers.status === 'queued' && result.markers.batchId, batch.id);
-    assert.equal(
-      jsonl(eventsPath).filter((e) => e.event === 'reaction-answered').length,
-      0,
-      'no reaction had been accepted when the rollback returned',
-    );
+    assert.equal(result.markers.queued, 4);
+    assert.equal(answered(), 0, 'no reaction had been accepted when the rollback returned');
+    await waitFor('the first reaction call to reach the server', () => calls().length >= 1);
 
-    // Delivery continues in the background and completes once Discord answers.
-    writeFileSync(holdPath, '1');
-    await waitFor('all three reactions answered', () =>
-      jsonl(eventsPath).filter((e) => e.event === 'reaction-answered').length === 3);
-    await framework.syncDiscordAwarenessMarkers();
-    const entries = ledger()[0].refs;
-    assert.deepEqual(entries.map((ref) => ref.deliveryStatus), ['applied', 'applied', 'applied']);
-    assert.deepEqual(
-      jsonl<{ name: string; args: { emoji: string } }>(callsPath).map((call) => `${call.name}:${call.args.emoji}`),
-      ['add_reaction:💤', 'add_reaction:💤', 'add_reaction:💤'],
+    // The store is free: a second surgery is admitted during delivery.
+    cm().addMessage('Someone', [{ type: 'text', text: 'new' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'after-1',
+    });
+    const fresh = cm().getAllMessages().at(-1)!;
+    const second = await settlesWithin(
+      framework.suppressMessages('resident', { messageIds: [String(fresh.id)] }),
+      3_000,
+      'a second surgery during delivery',
     );
+    assert.equal(second.markers.status, 'none');
+
+    // Channel traffic sent while reactions are held is answered anyway.
+    writeFileSync(probePath, '1');
+    await waitFor('the probe to be answered while reactions are still held', () =>
+      jsonl(eventsPath).some((e) => e.event === 'probe-answered'));
+    assert.equal(answered(), 0, 'the probe was not waiting behind the marks');
+
+    writeFileSync(holdPath, '1');
+    await waitFor('all four adds confirmed in the journal', () => {
+      const journal = outbox();
+      return journal.operations().filter((op) => journal.operationStatus(op) === 'confirmed').length === 4;
+    });
+    // Exactly the rolled-back messages, nothing from the later suppression.
+    assert.deepEqual(
+      outbox().operations().map((op) => `${op.action}:${op.key.messageId}`).sort(),
+      ['add:amb-0', 'add:amb-1', 'add:amb-2', 'add:amb-3'],
+    );
+    assert.equal(removed.length, 4);
 
     const logged = new Map<string, OperatorLogEntry>(
       framework.getOperatorLog({ limit: 10 }).map((entry) => [entry.kind, entry]),
     );
     assert.deepEqual(logged.get('rollback')?.result?.markers, result.markers);
-  });
-
-  it('releases the store while delivery runs, but keeps MCPL traffic behind the delivery gate', async () => {
-    await start(true);
-    const { removed } = seed(4);
-
-    await settlesWithin(
-      framework.rollbackToMessage('resident', { messageId: removed[1] }),
-      3_000,
-      'rollbackToMessage with reactions held',
-    );
-    await waitFor('the first reaction call to reach the server', () => jsonl(callsPath).length >= 1);
-
-    // The store reservation is released: a second surgery is admitted while
-    // the first one's reactions are still unanswered.
-    const second = await settlesWithin(
-      framework.suppressMessages('resident', { messageIds: [removed[0]] }),
-      3_000,
-      'a second surgery during delivery',
-    );
-    assert.equal(second.messagesRemoved, 1);
-    assert.equal(second.markers.status, 'queued');
-
-    // The gate was installed before release: ordinary channel traffic sent
-    // during delivery is not answered until the reactions are.
-    writeFileSync(probePath, '1');
-    await waitFor('the probe to be sent', () => jsonl(eventsPath).some((e) => e.event === 'probe-sent'));
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    assert.equal(
-      jsonl(eventsPath).some((e) => e.event === 'probe-answered'),
-      false,
-      'channel traffic waits behind the delivery gate',
-    );
-
-    writeFileSync(holdPath, '1');
-    await waitFor('the probe to be answered after delivery', () =>
-      jsonl(eventsPath).some((e) => e.event === 'probe-answered'));
-    // The server's own event order, not timestamps (two events can share a
-    // millisecond), and every expected reaction by id: one compared only with
-    // the reactions that happened to be answered would pass if the second
-    // surgery's batch were never delivered.
-    const events = jsonl<{ event: string; messageId?: string }>(eventsPath);
-    const probeIndex = events.findIndex((e) => e.event === 'probe-answered');
-    const answeredBeforeProbe = events.slice(0, probeIndex)
-      .filter((e) => e.event === 'reaction-answered')
-      .map((e) => e.messageId)
-      .sort();
-    assert.deepEqual(
-      answeredBeforeProbe,
-      ['amb-0', 'amb-2', 'amb-3'],
-      'both surgeries\' reactions are answered before channel traffic is released',
-    );
-  });
-
-  it('restoring the source while delivery runs keeps traffic gated until the running drain is done', async () => {
-    await start(true);
-    const { tail } = seed(3);
-
-    const rollback = await settlesWithin(
-      framework.rollbackToMessage('resident', { messageId: tail }),
-      3_000,
-      'rollbackToMessage with reactions held',
-    );
-    await waitFor('the first reaction call to reach the server', () => jsonl(callsPath).length >= 1);
-
-    // The operator restores the source the way the branch-switch API does
-    // (store switch, then synchronization) while the first add_reaction still
-    // waits for its reply. Reconciliation makes every mark undesired, and the
-    // held one is not present yet, so the ledger shows nothing pending: only
-    // the running drain knows it will still send its saved adds.
-    framework.getStore().switchBranch(rollback.sourceBranch);
-    const restored = framework.syncDiscordAwarenessMarkers();
-
-    writeFileSync(probePath, '1');
-    await waitFor('the probe to be sent', () => jsonl(eventsPath).some((e) => e.event === 'probe-sent'));
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    assert.equal(
-      jsonl(eventsPath).some((e) => e.event === 'probe-answered'),
-      false,
-      'channel traffic waits for the running drain even though nothing appears pending',
-    );
-
-    writeFileSync(holdPath, '1');
-    await settlesWithin(restored, 5_000, "the restore's synchronization");
-    await waitFor('the probe to be answered after delivery', () =>
-      jsonl(eventsPath).some((e) => e.event === 'probe-answered'));
-
-    // Every reaction request the drain made, including the removals the
-    // restore needs, was answered before channel traffic was released, and
-    // the restore leaves no mark behind.
-    const events = jsonl<{ event: string }>(eventsPath);
-    const probeIndex = events.findIndex((e) => e.event === 'probe-answered');
-    const answered = (from: number, to?: number) =>
-      events.slice(from, to).filter((e) => e.event === 'reaction-answered').length;
-    assert.equal(answered(0, probeIndex), jsonl(callsPath).length, 'every reaction call answered before the probe');
-    assert.equal(answered(probeIndex), 0, 'no reaction answered after the probe');
-    assert.deepEqual(
-      ledger()[0].refs.map((ref) => [ref.messageId, ref.desired, ref.markerPresent, ref.deliveryStatus]),
-      [['amb-0', false, false, 'applied'], ['amb-1', false, false, 'applied'], ['amb-2', false, false, 'applied']],
-    );
   });
 
   it('a rollback whose marker bookkeeping fails after the switch reports the body as applied', async () => {
@@ -272,29 +251,25 @@ describe('surgery marker receipt', () => {
     };
     let result: Awaited<ReturnType<AgentFramework['rollbackToMessage']>>;
     try {
-      result = await framework.rollbackToMessage('resident', { messageId: tail });
+      result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } });
     } finally {
       DiscordAwarenessOutbox.prototype.activate = original;
     }
 
     assert.equal(cm().currentBranch().name, result.targetBranch, 'the rollback stands');
-    assert.equal(result.messagesRemoved, 2);
     assert.equal(result.markers.status, 'not-scheduled');
     assert.match(result.markers.status === 'not-scheduled' ? result.markers.error : '', /injected ledger failure/);
     const entry = framework.getOperatorLog({ limit: 10 }).find((e) => e.kind === 'rollback');
     assert.equal(entry?.error, undefined, 'logged as an applied rollback, not a failure');
-    assert.equal((entry?.result?.markers as { status?: string } | undefined)?.status, 'not-scheduled');
 
-    // "Not scheduled" holds across the reconciliation delivery runs and
-    // across a restart: the batch was retired, so nothing can promote it.
+    // "Not scheduled" holds across delivery and a full restart.
     writeFileSync(holdPath, '1');
     await framework.syncDiscordAwarenessMarkers();
-    assert.deepEqual(ledger(), []);
     await framework.stop();
     await start(true);
     await framework.syncDiscordAwarenessMarkers();
-    assert.deepEqual(ledger(), []);
-    assert.equal(jsonl(callsPath).length, 0, 'no reaction was ever sent');
+    assert.equal(outbox().operations().length, 0);
+    assert.equal(calls().length, 0, 'no reaction was ever sent');
   });
 
   it('reports unresolved bookkeeping when the batch can be neither activated nor retired', async () => {
@@ -310,19 +285,16 @@ describe('surgery marker receipt', () => {
     };
     let result: Awaited<ReturnType<AgentFramework['rollbackToMessage']>>;
     try {
-      result = await framework.rollbackToMessage('resident', { messageId: tail });
+      result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } });
     } finally {
       DiscordAwarenessOutbox.prototype.activate = activate;
       DiscordAwarenessOutbox.prototype.discard = discard;
     }
     assert.equal(cm().currentBranch().name, result.targetBranch, 'the rollback stands');
-    // The receipt promises nothing about this batch: it is still in the
-    // ledger, and a reconciliation may promote and deliver it.
     assert.equal(result.markers.status, 'unresolved');
-    const batches = ledger();
+    const batches = outbox().batches();
     assert.equal(batches.length, 1);
     assert.equal(result.markers.status === 'unresolved' && result.markers.batchId, batches[0].id);
-    assert.match(result.markers.status === 'unresolved' ? result.markers.error : '', /injected ledger failure/);
   });
 
   it('a suppression whose marker bookkeeping fails after the last redaction stands', async () => {
@@ -334,24 +306,73 @@ describe('surgery marker receipt', () => {
     };
     let result: Awaited<ReturnType<AgentFramework['suppressMessages']>>;
     try {
-      result = await framework.suppressMessages('resident', { messageIds: [removed[1]] });
+      result = await framework.suppressMessages('resident', { messageIds: [removed[1]], marks: { scope: 'all' } });
     } finally {
       DiscordAwarenessOutbox.prototype.activate = original;
     }
-
     assert.equal(cm().currentBranch().name, result.targetBranch, 'the suppression is not undone');
-    assert.deepEqual(result.removedIds, [removed[1]]);
     assert.ok(!cm().getAllMessages().some((m) => String(m.id) === removed[1]));
     assert.equal(result.markers.status, 'not-scheduled');
-    assert.deepEqual(ledger(), [], 'every interval committed, so the retired journal loses nothing');
+    assert.equal(outbox().batches().every((batch) => batch.status === 'discarded' || batch.status === 'active'), true);
   });
 
-  it('a surgery that removes nothing addressable schedules no marks', async () => {
+  it('cancel stops unsent marks without removing any; retract removes this bot\'s marks and discloses an unknown add', async () => {
+    // A short awareness deadline turns a withheld reply into "no response".
+    await start(true, 150);
+    const { tail } = seed(3);
+    const result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'all' } });
+    assert.equal(result.markers.status, 'queued');
+    const batchId = result.markers.status === 'queued' ? result.markers.batchId : '';
+    // The first add goes out and is never answered within the deadline.
+    await waitFor('the first add to time out as unknown', () =>
+      outbox().operations().some((op) => outbox().operationStatus(op) === 'unknown'));
+
+    const cancelled = framework.cancelDiscordAwareness(batchId, { requester: { via: 'test', name: 'operator' } });
+    assert.equal(cancelled.confirmed, 0);
+    assert.equal(cancelled.unknown + cancelled.inFlight + cancelled.cancelled, 3);
+    assert.ok(cancelled.unknown + cancelled.inFlight >= 1, 'the timed-out add may still land');
+
+    // Discord finally answers the withheld request: the late add lands.
+    writeFileSync(holdPath, '1');
+    await waitFor('the withheld add to be answered', () => answered() >= 1);
+    const sentBeforeRetract = calls().length;
+    assert.ok(calls().every((c) => c.name === 'add_reaction'));
+
+    const retracted = framework.retractDiscordAwareness(batchId, { requester: { via: 'test', name: 'operator' } });
+    assert.ok(retracted.removalsQueued >= 1);
+    assert.ok(retracted.keysWithUnresolvedAdds >= 1, 'the unknown add is disclosed, not assumed absent');
+    await waitFor('the removals to be sent', () =>
+      calls().slice(sentBeforeRetract).filter((c) => c.name === 'remove_reaction').length === retracted.removalsQueued);
+    const kinds = framework.getOperatorLog({ limit: 10 }).map((e) => e.kind);
+    assert.ok(kinds.includes('awareness-cancel') && kinds.includes('awareness-retract'));
+  });
+
+  it('marks chosen where no awareness journal exists are reported as not scheduled, not as unwanted', async () => {
+    // A caller-supplied store and no storePath: no default journal location.
+    framework = await AgentFramework.create({
+      store: JsStore.openOrCreate({ path: storePath }),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'resident', model: 'test-model', systemPrompt: 'You are a resident.' }],
+      modules: [],
+      maintenanceIntervalMs: 0,
+      operatorLogPath: false,
+    });
+    const { tail } = seed(2, [0]);
+    const result = await framework.rollbackToMessage('resident', { messageId: tail, marks: { scope: 'addressed' } });
+    assert.equal(result.messagesRemoved, 2);
+    assert.equal(result.markers.status, 'not-scheduled');
+    assert.match(result.markers.status === 'not-scheduled' ? result.markers.error : '', /no awareness journal/);
+    assert.equal(result.markers.unmarked, 1);
+    const local = await framework.rollbackToMessage('resident', { messageId: String(cm().getAllMessages()[0].id) });
+    assert.equal(local.markers.status, 'none', 'nothing chosen is still none');
+  });
+
+  it('a surgery that removes nothing addressable schedules no marks even when marks are chosen', async () => {
     await start(false);
     const keep = String(cm().addMessage('Operator', [{ type: 'text', text: 'kept' }], {}));
     cm().addMessage('resident', [{ type: 'text', text: 'local only' }], {});
-    const result = await framework.rollbackToMessage('resident', { messageId: keep });
-    assert.deepEqual(result.markers, { status: 'none', queued: 0 });
-    assert.equal(ledger().length, 0);
+    const result = await framework.rollbackToMessage('resident', { messageId: keep, marks: { scope: 'all' } });
+    assert.deepEqual(result.markers, { scope: 'all', unmarked: 0, notRemoved: 0, status: 'none', queued: 0 });
+    assert.equal(outbox().batches().length, 0);
   });
 });

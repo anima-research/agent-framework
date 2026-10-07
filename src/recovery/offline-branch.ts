@@ -5,7 +5,10 @@ import {
   DiscordAwarenessOutbox,
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
+  selectDiscordAwarenessRefs,
+  type DiscordAwarenessMarks,
   type DiscordAwarenessRef,
+  type DiscordMessageMetadataCarrier,
 } from './discord-awareness-outbox.js';
 
 export interface OfflineRecoveryBranchOptions {
@@ -28,6 +31,11 @@ export interface OfflineRecoveryBranchOptions {
   discordServerId?: string;
   outboxPath?: string;
   emoji?: string;
+  /**
+   * Awareness marks on the removed Discord messages: an explicit publication
+   * choice, `none` by default. The recovery itself stays local either way.
+   */
+  marks?: DiscordAwarenessMarks;
   dryRun?: boolean;
 }
 
@@ -37,8 +45,18 @@ export interface OfflineRecoveryBranchResult {
   targetBranch: string;
   messagesRemoved: number;
   messagesSuppressed: number;
+  /** Removed messages that carry a Discord address. */
+  discordAddressable: number;
+  /** The publication scope recorded for this recovery. */
+  marksScope: 'none' | 'addressed' | 'all';
+  /** Marks requested (queued once the branch is activated); not delivered. */
   discordMarkersQueued: number;
+  /** The refs that will be marked (empty unless marks were chosen). */
   refs: DiscordAwarenessRef[];
+  /** Removed addressable messages left unmarked. */
+  unmarked: number;
+  /** Authorized refs (marks.refs) this recovery does not remove. */
+  notRemoved: number;
   outboxPath: string;
 }
 
@@ -81,7 +99,7 @@ export async function createOfflineRecoveryBranch(
     let target: StoredWindowMessage;
     let targetIndex: number;
     let removedCount: number;
-    let refs: DiscordAwarenessRef[];
+    let carriers: DiscordMessageMetadataCarrier[];
 
     if (options.messageId) {
       // Search backward in bounded windows: recovery anchors are normally near
@@ -98,12 +116,7 @@ export async function createOfflineRecoveryBranch(
       target = located.message;
       targetIndex = located.index;
       removedCount = total - located.index - 1;
-      refs = collectDiscordRefs(
-        contextManager,
-        located.index + 1,
-        total,
-        options.discordServerId,
-      );
+      carriers = collectDiscordCarriers(contextManager, located.index + 1, total);
     } else if (options.contextId) {
       const located = findInternalMessageFromTail(contextManager, total, options.contextId.trim());
       if (!located) {
@@ -112,12 +125,7 @@ export async function createOfflineRecoveryBranch(
       target = located.message;
       targetIndex = located.index;
       removedCount = total - located.index - 1;
-      refs = collectDiscordRefs(
-        contextManager,
-        located.index + 1,
-        total,
-        options.discordServerId,
-      );
+      carriers = collectDiscordCarriers(contextManager, located.index + 1, total);
     } else {
       // Count mode remains for compatibility. Read only the target plus suffix,
       // avoiding full-history materialization and attachment blob inflation.
@@ -132,7 +140,7 @@ export async function createOfflineRecoveryBranch(
       target = countTarget;
       targetIndex = total - count! - 1;
       removedCount = count!;
-      refs = extractDiscordAwarenessRefs(discarded, options.discordServerId);
+      carriers = discarded.map(addressingOnly);
     }
 
     validateAnchorBoundary(contextManager, targetIndex, total, target);
@@ -142,7 +150,6 @@ export async function createOfflineRecoveryBranch(
       targetIndex,
       options.suppressMessageIds ?? [],
       options.suppressRanges ?? [],
-      options.discordServerId,
     );
     validateRemovalIntegrity(
       contextManager,
@@ -157,7 +164,11 @@ export async function createOfflineRecoveryBranch(
         ...suppression.intervals,
       ],
     );
-    refs = dedupeDiscordRefs([...refs, ...suppression.refs]);
+    carriers = [...carriers, ...suppression.carriers];
+    const addressable = extractDiscordAwarenessRefs(carriers, options.discordServerId).length;
+    const marks = options.marks ?? 'none';
+    const selection = selectDiscordAwarenessRefs(carriers, marks, options.discordServerId);
+    const refs = selection.refs;
 
     const sourceBranch = store.currentBranch().name;
     const targetBranch = options.branchName
@@ -174,8 +185,12 @@ export async function createOfflineRecoveryBranch(
       targetBranch,
       messagesRemoved: removedCount,
       messagesSuppressed: suppression.messageCount,
+      discordAddressable: addressable,
+      marksScope: marks === 'none' ? 'none' : marks.scope,
       discordMarkersQueued: refs.length,
       refs,
+      unmarked: selection.unmarked,
+      notRemoved: selection.notRemoved,
       outboxPath,
     };
     if (options.dryRun) return result;
@@ -186,6 +201,9 @@ export async function createOfflineRecoveryBranch(
       sourceBranch,
       targetBranch,
       refs,
+      scope: marks === 'none' ? 'none' : marks.scope,
+      unmarked: selection.unmarked,
+      notRemoved: selection.notRemoved,
       emoji: options.emoji ?? DEFAULT_DISCORD_AWARENESS_EMOJI,
       // Merely seeing targetBranch active does not prove branch-local
       // suppressions finished. Only the recovery operation may activate this
@@ -368,8 +386,7 @@ function buildSuppressionPlan(
   targetIndex: number,
   rawMessageIds: string[],
   rawRanges: Array<{ fromMessageId: string; toMessageId: string }>,
-  forcedServerId?: string,
-): { intervals: SuppressionInterval[]; refs: DiscordAwarenessRef[]; messageCount: number } {
+): { intervals: SuppressionInterval[]; carriers: DiscordMessageMetadataCarrier[]; messageCount: number } {
   const messageIds = rawMessageIds.map(normalizeDiscordMessageId);
   const ranges = rawRanges.map((range) => ({
     fromMessageId: normalizeDiscordMessageId(range.fromMessageId),
@@ -379,7 +396,7 @@ function buildSuppressionPlan(
     ...messageIds,
     ...ranges.flatMap((range) => [range.fromMessageId, range.toMessageId]),
   ]);
-  if (wanted.size === 0) return { intervals: [], refs: [], messageCount: 0 };
+  if (wanted.size === 0) return { intervals: [], carriers: [], messageCount: 0 };
 
   const locations = new Map<string, MessageLocation>();
   for (let offset = 0; offset <= targetIndex; offset += RECOVERY_SCAN_WINDOW) {
@@ -466,45 +483,48 @@ function buildSuppressionPlan(
     }
   }
 
-  const refs: DiscordAwarenessRef[] = [];
+  const carriers: DiscordMessageMetadataCarrier[] = [];
   for (const interval of merged) {
-    refs.push(...collectDiscordRefs(
-      contextManager,
-      interval.start,
-      interval.end + 1,
-      forcedServerId,
-    ));
+    carriers.push(...collectDiscordCarriers(contextManager, interval.start, interval.end + 1));
   }
   return {
     intervals: merged,
-    refs: dedupeDiscordRefs(refs),
+    carriers,
     messageCount: merged.reduce((sum, interval) => sum + interval.end - interval.start + 1, 0),
   };
 }
 
-function collectDiscordRefs(
+/**
+ * The addressing metadata of removed messages, read in bounded windows: only
+ * the Discord address and the MCPL tags (for `addressed` selection) are kept,
+ * never content. A sharded message may repeat its metadata across adjacent
+ * records; selection dedupes by address.
+ */
+function collectDiscordCarriers(
   contextManager: ContextManager,
   start: number,
   end: number,
-  forcedServerId?: string,
-): DiscordAwarenessRef[] {
-  const refs: DiscordAwarenessRef[] = [];
+): DiscordMessageMetadataCarrier[] {
+  const carriers: DiscordMessageMetadataCarrier[] = [];
   for (let offset = start; offset < end; offset += RECOVERY_SCAN_WINDOW) {
     const messages = contextManager.getMessageWindow(
       offset,
       Math.min(RECOVERY_SCAN_WINDOW, end - offset),
       { resolveBlobs: false },
     ).messages;
-    refs.push(...extractDiscordAwarenessRefs(messages, forcedServerId));
+    carriers.push(...messages.map(addressingOnly));
   }
-  // A sharded message may repeat Discord metadata across adjacent records.
-  return dedupeDiscordRefs(refs);
+  return carriers;
 }
 
-function dedupeDiscordRefs(refs: DiscordAwarenessRef[]): DiscordAwarenessRef[] {
-  const deduped = new Map<string, DiscordAwarenessRef>();
-  for (const ref of refs) {
-    deduped.set(`${ref.serverId}\0${ref.channelId}\0${ref.messageId}`, ref);
-  }
-  return [...deduped.values()];
+function addressingOnly(message: { metadata?: Record<string, unknown> }): DiscordMessageMetadataCarrier {
+  const metadata = message.metadata ?? {};
+  return {
+    metadata: {
+      serverId: metadata.serverId,
+      channelId: metadata.channelId,
+      messageId: metadata.messageId,
+      tags: metadata.tags,
+    },
+  };
 }

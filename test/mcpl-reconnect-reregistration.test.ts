@@ -131,14 +131,11 @@ async function makeHarness() {
     getAllServers: () => [connection],
     getServer: (id: string) => id === connection.id ? connection : null,
   };
-  fw.discordAwarenessBarrier = null;
-  fw.discordAwarenessBarrierGeneration = 0;
   fw.wireMcplEvents(connection);
   await fw.registerMcplServerFeatures(config, connection);
 
-  // The push handler responds synchronously when no awareness barrier is
-  // up, but during reconnect the §5.3 policy round-trip holds the barrier
-  // across a microtask — so the harness settles the loop once before
+  // During reconnect the §5.3 policy round-trip spans a microtask before
+  // the data plane reopens — so the harness settles the loop once before
   // asserting. (Was 'must respond synchronously' pre-0.5.)
   const sendPush = async (eventId: string): Promise<PushEventResult> => {
     let result: PushEventResult | undefined;
