@@ -117,6 +117,8 @@ class ProbeModule implements Module {
   readonly name = 'probe';
   release: (() => void) | null = null;
   entered = false;
+  /** Calls so far; the latest one is held until `release`. */
+  calls = 0;
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
   getTools(): ToolDefinition[] {
@@ -124,6 +126,7 @@ class ProbeModule implements Module {
   }
   async handleToolCall(_call: ToolCall): Promise<ToolResult> {
     this.entered = true;
+    this.calls++;
     await new Promise<void>((r) => { this.release = r; });
     return { success: true, data: 'done' };
   }
@@ -270,6 +273,46 @@ describe('receipts from the real membrane producer', () => {
     assert.ok(second.includes('also this'), 'membrane carried the injection in the second round');
     const clocks = await p.roomClocks();
     assert.equal(clocks.delivered?.messageId, 'n-mid');
+  });
+
+  it('native: a second injected batch, after a tool boundary that injected nothing, is confirmed in its own coordinates', async () => {
+    const h = await open('native');
+    const p = probes(h);
+    const held = () => (h.framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length;
+    const running = (call: number) => waitFor(() => h.probe.calls >= call, `tool call ${call} running`);
+    h.adapter.turns = ['tool', 'tool', 'tool', 'text'];
+    h.command({ op: 'incoming', channelId: ROOM, messageId: 'b-start', mode: 'addressed', text: 'do the thing' });
+    await running(1);
+    // Batch 0, at the first boundary: one body.
+    h.command({ op: 'incoming', channelId: ROOM, messageId: 'b0', mode: 'addressed', text: 'first aside' });
+    await waitFor(() => held() === 1, 'held for the first boundary');
+    h.probe.release!();
+    // The second boundary injects nothing.
+    await running(2);
+    h.probe.release!();
+    // Batch 1, at the third boundary: a text body, then one membrane can't carry verbatim.
+    await running(3);
+    h.command({ op: 'incoming', channelId: ROOM, messageId: 'b1-text', mode: 'addressed', text: 'second aside' });
+    await waitFor(() => held() === 1, 'batch 1, first message held');
+    h.command({
+      op: 'incoming', channelId: ROOM, messageId: 'b1-img', mode: 'addressed',
+      content: [{ type: 'text', text: 'and this' }, { type: 'image', data: SVG, mimeType: 'image/svg+xml' }],
+    });
+    await waitFor(() => held() === 2, 'batch 1, both messages held');
+    h.probe.release!();
+    await waitFor(p.idle, 'turn settles');
+
+    assert.equal(h.adapter.requests.length, 4);
+    assert.ok(JSON.stringify(h.adapter.requests[1]!.messages).includes('first aside'), 'the second round carried batch 0');
+    assert.ok(!JSON.stringify(h.adapter.requests[2]!.messages).includes('second aside'), 'the third round carried no new injection');
+    const fourth = JSON.stringify(h.adapter.requests[3]!.messages);
+    assert.ok(fourth.includes('second aside') && fourth.includes('and this'), 'the fourth round carried batch 1');
+    assert.equal(p.versionState('b0').delivered, true, 'batch 0, position 0');
+    assert.equal(p.versionState('b1-text').delivered, true, 'batch 1, position 0');
+    assert.equal(p.versionState('b1-img').delivered, false, 'batch 1, position 1: altered on the way');
+    const clocks = await p.roomClocks();
+    assert.equal(clocks.partial?.messageId, 'b1-img');
+    assert.deepEqual(clocks.partial?.missing, ['wire-alteration']);
   });
 
   it('xml: an injection the prefill path cannot carry is not delivered until a later compile carries it', async () => {
