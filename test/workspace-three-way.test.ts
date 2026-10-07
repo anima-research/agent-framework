@@ -12,7 +12,7 @@
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -188,7 +188,7 @@ async function withReadHook<T>(onRead: (calls: number) => void, fn: () => Promis
 }
 
 /** Run `fn` with node:fs/promises' `name` replaced by `make(original)`, as the code under test sees it. */
-async function withFsPromises<T>(name: 'readdir' | 'lstat', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
+async function withFsPromises<T>(name: 'readdir' | 'lstat' | 'open', make: (original: (...args: any[]) => Promise<any>) => (...args: any[]) => Promise<any>, fn: () => Promise<T>): Promise<T> {
   const fsp = createRequire(import.meta.url)('node:fs/promises') as Record<string, (...args: any[]) => Promise<any>>;
   const original = fsp[name]!;
   fsp[name] = make(original);
@@ -1120,11 +1120,15 @@ describe('restarts and faults', () => {
       assert.equal((m as any).agreement.get('work', 'gone.txt').kind, 'pending');
       await listing(m);
       assert.equal((m as any).agreement.get('work', 'gone.txt').kind, 'pending', 'a listing records nothing');
+      let status = (await call(m, 'status', {})).work;
+      assert.deepEqual([status.pendingChanges, status.pendingWorkspaceDeletions], [1, 1], 'still owed, and said so');
 
       const retry = await withSyncs(env, () => false, () => call(m, 'materialize', {}));
       assert.deepEqual(retry.result.deleted, [{ mount: 'work', path: 'gone.txt' }], 'confirmed without applyDeletions: it already reached disk');
       assert.ok(retry.synced.includes(idOf(env.dir)));
       assert.deepEqual((m as any).agreement.get('work', 'gone.txt'), { kind: 'absent' });
+      status = (await call(m, 'status', {})).work;
+      assert.deepEqual([status.pendingChanges, status.pendingWorkspaceDeletions], [0, 0]);
     });
   });
 
@@ -1372,6 +1376,28 @@ describe('the mount boundary', () => {
     assert.match(pushed.skipped[0]!.reason, /^not written: a file appeared at this path since it was checked$/);
     assert.equal((m as any).agreement.get('work', 'new.txt'), undefined, 'still unknown, as before the intent');
     assert.equal(await stateOf(m, 'new.txt'), 'conflict');
+  });
+
+  test('even a forced write never lands in a file renamed away after it was opened', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'v1');
+    await call(m, 'write', { path: 'work/a.txt', content: 'the workspace draft' });
+    let swapped = false;
+    const pushed = await withFsPromises('open', (open) => async (path, flags, ...rest) => {
+      const handle = await open(path, flags, ...rest);
+      if (!swapped && basename(String(path)) === 'a.txt' && typeof flags === 'number' && (flags & fsConstants.O_WRONLY) !== 0) {
+        swapped = true; // renamed away once opened, and a new file put at its path
+        renameSync(env.disk('a.txt'), env.disk('backup.txt'));
+        writeFileSync(env.disk('a.txt'), 'a new disk edit');
+      }
+      return handle;
+    }, () => pushWith(env, m, ['a.txt'], { force: true }));
+    assert.equal(swapped, true);
+    assert.deepEqual(pushed.written, []);
+    assert.match(pushed.skipped[0]!.reason, /disk changed since it was checked/);
+    assert.equal(env.readDisk('backup.txt'), 'v1', 'the renamed file is untouched');
+    assert.equal(env.readDisk('a.txt'), 'a new disk edit', 'and so is the file now at the path');
   });
 
   test('a refused write puts back whatever evidence the path had, an interrupted one included', async (t) => {
@@ -1779,6 +1805,19 @@ describe('materialize, status and shutdown', () => {
     assert.equal(res.success, false, 'refused on the branch it would have written');
     assert.match(String(res.error), /diverged/);
     assert.equal(existsSync(env.disk('div.txt')), false, 'nothing written');
+  });
+
+  test('status counts a workspace deletion as pending until a push applies it', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'gone.txt', 'v1');
+    await call(m, 'delete', { path: 'work/gone.txt' });
+    await call(m, 'materialize', {}); // left on disk: applyDeletions wasn't given
+    let status = (await call(m, 'status', {})).work;
+    assert.deepEqual([status.pendingChanges, status.pendingWorkspaceDeletions], [1, 1]);
+    await call(m, 'materialize', { applyDeletions: true });
+    status = (await call(m, 'status', {})).work;
+    assert.deepEqual([status.pendingChanges, status.pendingWorkspaceDeletions], [0, 0]);
   });
 
   test("status counts a push that didn't reach disk as pending, past the watermark", async (t) => {

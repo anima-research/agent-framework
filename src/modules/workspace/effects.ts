@@ -3,7 +3,7 @@
  * barriers that make them durable — under the mount boundary.
  *
  * Each effect is bound at its point of use, not at planning time: the parent
- * directory is held (located inside the mount, see observe.ts), the file is
+ * directory is checked (located inside the mount, see observe.ts), the file is
  * reached through it, and before anything is changed the effect checks that
  * it acts on what was decided on — a regular file inside the mount, at this
  * path, still holding the bytes planning saw (unless `force`, which overrides
@@ -18,9 +18,9 @@
  * path's entry; they stay, empty, if the write is refused.
  *
  * Node has no openat, so a create, mkdir or unlink still resolves its path by
- * name after the parent was located: a swap of one of the parent's ancestors
- * in that window can redirect it. The content of a write can't be: it goes
- * through a descriptor located first.
+ * name after the parent was checked: a parent replaced concurrently in that
+ * window can redirect that one operation. Content writes stay bound to the
+ * descriptor verified inside the mount before modification.
  */
 
 import { createHash } from 'node:crypto';
@@ -33,7 +33,7 @@ import {
   OUTSIDE_PARENT,
   contained,
   errno,
-  holdDir,
+  checkDir,
   nameOf,
   parentOf,
 } from './observe.js';
@@ -67,11 +67,11 @@ function noFollowFlag(view: MountView): number {
   return !view.followSymlinks && typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0;
 }
 
-/** The parent of a path, held for an effect; proven absent; or why neither. */
+/** The parent of a path, checked for an effect; proven absent; or why neither. */
 async function parentFor(view: MountView, rootReal: string, rel: string, create: boolean) {
-  const held = await holdDir(view, rootReal, parentOf(rel), { create });
-  if (held.kind === 'unobserved') throw new EffectFailed(held.outside ? OUTSIDE_PARENT : held.reason, false);
-  return held;
+  const checked = await checkDir(view, rootReal, parentOf(rel), { create });
+  if (checked.kind === 'unobserved') throw new EffectFailed(checked.outside ? OUTSIDE_PARENT : checked.reason, false);
+  return checked;
 }
 
 /** The hash of what `target` holds, read through a descriptor that must be the file `id` names. */
@@ -105,9 +105,9 @@ async function hashAt(target: string, id: { dev: bigint; ino: bigint }, flags: n
  * caller, after all of a push's effects: syncDirectories).
  */
 export async function writeContained(view: MountView, rootReal: string, rel: string, bytes: Buffer, expect: Expect): Promise<void> {
-  const held = await parentFor(view, rootReal, rel, true);
-  if (held.kind !== 'held') throw new EffectFailed('a parent path is not a directory', false);
-  const parent = held.dir;
+  const checked = await parentFor(view, rootReal, rel, true);
+  if (checked.kind !== 'checked') throw new EffectFailed('a parent path is not a directory', false);
+  const parent = checked.dir;
   const target = parent.at(nameOf(rel));
   const noFollow = noFollowFlag(view);
   if (!view.followSymlinks && !noFollow) {
@@ -181,9 +181,9 @@ export async function writeContained(view: MountView, rootReal: string, rel: str
  * it, since that removal may not be durable either.
  */
 export async function unlinkContained(view: MountView, rootReal: string, rel: string, expect: Expect): Promise<string> {
-  const held = await parentFor(view, rootReal, rel, false);
-  if (held.kind === 'absent') return held.by; // no directory, so no file
-  const parent = held.dir;
+  const checked = await parentFor(view, rootReal, rel, false);
+  if (checked.kind === 'absent') return checked.by; // no directory, so no file
+  const parent = checked.dir;
   const target = parent.at(nameOf(rel));
   let info;
   try {
@@ -222,7 +222,7 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
 
 /**
  * Sync each mount directory (mount-relative), deepest first, so the entries
- * a push created or removed in them are durable. Each is held first and the
+ * a push created or removed in them are durable. Each is checked first and the
  * directory it holds is the one synced — never a replacement at its path.
  * Returns the ones that failed, with why. Where directories can't be synced
  * at all (Windows, or a filesystem answering EINVAL/ENOTSUP), there is
@@ -232,13 +232,13 @@ export async function syncDirectories(view: MountView, rootReal: string, rels: I
   const failed = new Map<string, string>();
   const depth = (rel: string): number => (rel === '' ? 0 : rel.split('/').length);
   for (const rel of [...new Set(rels)].sort((a, b) => depth(b) - depth(a))) {
-    const held = await holdDir(view, rootReal, rel);
-    if (held.kind !== 'held') {
-      failed.set(rel, held.kind === 'absent' ? 'the directory is gone' : held.reason);
+    const checked = await checkDir(view, rootReal, rel);
+    if (checked.kind !== 'checked') {
+      failed.set(rel, checked.kind === 'absent' ? 'the directory is gone' : checked.reason);
       continue;
     }
     try {
-      await held.dir.sync();
+      await checked.dir.sync();
     } catch (err) {
       failed.set(rel, message(err));
     }

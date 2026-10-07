@@ -45,6 +45,8 @@
   overwritten. Refused paths are listed as skipped with the reason. Every directory from a
   written file up to the mount root is synced before the write counts as done, directories it
   had to create included. Listings likewise accept a directory's contents only while it is
-  still the directory at its path. Node has no `openat`, so a parent directory swapped for a
-  symlink in the instant between that check and a create, `mkdir` or unlink can still redirect
-  it; file contents are never written outside the mount.
+  still the directory at its path. Each check is made where the operation happens, against what
+  is there at that moment. Node has no `openat`, so a parent directory replaced concurrently in
+  the window between a check and a create, `mkdir`, unlink or listing can still redirect that
+  one operation. Content writes stay bound to the descriptor verified inside the mount before
+  modification.

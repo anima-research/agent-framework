@@ -12,9 +12,9 @@
  * and then read, so what is read and the fingerprint recorded with its hash
  * describe the same file, inside the mount.
  *
- * Directories are held (HeldDir): located inside the mount when taken, and
- * what they showed — a listing, an absence — is accepted only while each is
- * still the directory its logical path names. A walk records which
+ * Directories are checked (CheckedDir): located inside the mount, with their
+ * identity, and what they showed — a listing, an absence — is accepted only
+ * if each is still the directory its logical path names afterwards. A walk records which
  * directories it listed completely, and only those prove a file absent: an
  * unreadable directory, an ignored subtree, the file cap, a symlink the walk
  * doesn't descend, or a directory that changed while it was listed leave
@@ -23,9 +23,14 @@
  * the entry (confirmAbsent). A missing parent alone proves nothing, since a
  * dangling symlink or a swapped directory looks just like one.
  *
- * Node has no openat or fdopendir, so a directory is held by its canonical
- * path and identity, and checked again after use: a swap of one of its
- * ancestors and back again within that window (an ABA) can still pass.
+ * Each check is made where the operation happens, against what is there at
+ * that moment, so the boundary holds against what is in the mount, including
+ * what appears while an operation runs. Node has no openat or fdopendir, so
+ * a directory is checked by its canonical path and identity, not held open:
+ * a parent replaced concurrently in the window between a check and its use
+ * (or replaced and restored around it) can still redirect a listing or
+ * lookup there. File contents are bound regardless: a file is read only
+ * through a descriptor bound to its path first.
  */
 
 import { createHash } from 'node:crypto';
@@ -110,29 +115,11 @@ function lexicalOf(view: MountView, rel: string): string {
 }
 
 // ===========================================================================
-// Held directories
+// Checked directories
 // ===========================================================================
 
-/** A directory inside the mount, located when it was held. */
-export interface HeldDir {
-  /** Mount-relative path ('' for the root). */
-  readonly rel: string;
-  /** Its canonical location when held. */
-  readonly real: string;
-  /** A path that reaches `name` in this directory. */
-  at(name: string): string;
-  /** Whether it is still the directory its logical path names: same location, same directory. */
-  stillHere(): Promise<boolean>;
-  /**
-   * Make its entries durable: this very directory, never one that replaced
-   * it at its path. Throws if it can't (a filesystem that can't sync
-   * directories, or Windows, is not a failure).
-   */
-  sync(): Promise<void>;
-}
-
-export type Hold =
-  | { kind: 'held'; dir: HeldDir }
+export type DirCheck =
+  | { kind: 'checked'; dir: CheckedDir }
   /**
    * No directory there, proven: nothing can exist beneath the path. `by` is
    * the directory whose entries prove it — the one that lacks it, or that
@@ -145,27 +132,43 @@ export type Hold =
 /** Errors meaning a directory can't be synced on this filesystem, not that syncing it failed. */
 const DIRECTORY_SYNC_UNSUPPORTED = new Set(['EINVAL', 'ENOTSUP']);
 
-class PathHeldDir implements HeldDir {
+/**
+ * A directory inside the mount, as it was checked: its canonical path and
+ * its identity. Its entries are named through that path, and what it showed
+ * is accepted only while it is still the directory its logical path names
+ * (see the module doc for what that does and doesn't bind).
+ */
+export class CheckedDir {
   constructor(
+    /** Mount-relative path ('' for the root). */
     readonly rel: string,
+    /** Its canonical location when checked. */
     readonly real: string,
     private readonly lexical: string,
     private readonly dev: bigint,
     private readonly ino: bigint,
   ) {}
 
+  /** A path that reaches `name` in this directory. */
   at(name: string): string {
     return join(this.real, name);
   }
 
+  /** Whether it is still the directory its logical path names: same location, same directory. */
   async stillHere(): Promise<boolean> {
     if ((await realpath(this.lexical).catch(() => null)) !== this.real) return false;
     const info = await lstat(this.real, { bigint: true }).catch(() => null);
     return info !== null && info.isDirectory() && info.dev === this.dev && info.ino === this.ino;
   }
 
+  /**
+   * Make its entries durable: this very directory, never one that replaced
+   * it at its path. Throws if it can't; a filesystem that can't sync
+   * directories (or Windows, where a directory can't be opened for it) is
+   * not a failure.
+   */
   async sync(): Promise<void> {
-    if (process.platform === 'win32') return; // a directory can't be opened for sync there
+    if (process.platform === 'win32') return;
     const handle = await open(this.real, 'r');
     try {
       const info = await handle.stat({ bigint: true });
@@ -181,18 +184,18 @@ class PathHeldDir implements HeldDir {
   }
 }
 
-/** Hold the directory at a canonical location, if one is there. */
-async function heldAt(view: MountView, rel: string, real: string): Promise<HeldDir | null> {
+/** Check the directory at a canonical location, if one is there. */
+async function checkedAt(view: MountView, rel: string, real: string): Promise<CheckedDir | null> {
   const info = await lstat(real, { bigint: true }).catch(() => null);
   if (!info?.isDirectory()) return null;
-  return new PathHeldDir(rel, real, lexicalOf(view, rel), info.dev, info.ino);
+  return new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino);
 }
 
 /**
- * Where a mount directory is now: held; missing — nothing there, or not a
+ * Where a mount directory is now: checked; missing — nothing there, or not a
  * directory, either way for confirmAbsent to prove; or not inside the mount.
  */
-async function locateDir(view: MountView, rootReal: string, rel: string): Promise<Hold | { kind: 'missing' }> {
+async function locateDir(view: MountView, rootReal: string, rel: string): Promise<DirCheck | { kind: 'missing' }> {
   const lexical = lexicalOf(view, rel);
   let real: string;
   try {
@@ -209,19 +212,19 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
   } else if (!contained(rootReal, real)) {
     return { kind: 'unobserved', reason: OUTSIDE_PARENT, outside: true };
   }
-  const held = await heldAt(view, rel, real);
-  if (held) return { kind: 'held', dir: held };
+  const checked = await checkedAt(view, rel, real);
+  if (checked) return { kind: 'checked', dir: checked };
   return rel === '' ? { kind: 'unobserved', reason: ROOT_UNAVAILABLE } : { kind: 'missing' };
 }
 
 /**
- * Hold the directory at a mount-relative path. With `create`, missing
+ * Check the directory at a mount-relative path. With `create`, missing
  * directories are made one at a time beneath the deepest one that exists;
  * the mount root itself is never created (a missing root is an unavailable
  * mount). Without it, a missing directory is `absent` only where that can be
  * proven (confirmAbsent).
  */
-export async function holdDir(view: MountView, rootReal: string, rel: string, opts: { create?: boolean } = {}): Promise<Hold> {
+export async function checkDir(view: MountView, rootReal: string, rel: string, opts: { create?: boolean } = {}): Promise<DirCheck> {
   const found = await locateDir(view, rootReal, rel);
   if (found.kind !== 'missing') return found;
   if (opts.create) return createDir(view, rootReal, rel);
@@ -229,13 +232,13 @@ export async function holdDir(view: MountView, rootReal: string, rel: string, op
   return typeof proof === 'string' ? { kind: 'unobserved', reason: proof } : { kind: 'absent', by: proof.by };
 }
 
-async function createDir(view: MountView, rootReal: string, rel: string): Promise<Hold> {
+async function createDir(view: MountView, rootReal: string, rel: string): Promise<DirCheck> {
   const parts = rel.split('/');
-  let base: HeldDir | null = null;
+  let base: CheckedDir | null = null;
   let depth = parts.length - 1;
   for (; depth >= 0; depth--) {
     const found = await locateDir(view, rootReal, parts.slice(0, depth).join('/'));
-    if (found.kind === 'held') {
+    if (found.kind === 'checked') {
       base = found.dir;
       break;
     }
@@ -252,17 +255,17 @@ async function createDir(view: MountView, rootReal: string, rel: string): Promis
     }
     // Made, or there already (made meanwhile, or not a directory): it must
     // be a real directory now, never a symlink or file in its place.
-    const held = await heldAt(view, childRel, base.at(parts[i]!));
-    if (!held) return { kind: 'unobserved', reason: 'a parent path is not a directory' };
-    base = held;
+    const checked = await checkedAt(view, childRel, base.at(parts[i]!));
+    if (!checked) return { kind: 'unobserved', reason: 'a parent path is not a directory' };
+    base = checked;
   }
-  return { kind: 'held', dir: base };
+  return { kind: 'checked', dir: base };
 }
 
 /**
  * Prove that nothing exists at a mount-relative path (`entry`), or that no
  * directory does, so nothing can exist beneath it (`beneath`). Walking down
- * from the root through held directories: some directory, still the one its
+ * from the root through checked directories: some directory, still the one its
  * path names afterwards, lacks the next component; or a component is a
  * non-directory, still the same one in a directory still at its path,
  * beneath which nothing can exist. Symlinked directories inside the mount
@@ -271,8 +274,8 @@ async function createDir(view: MountView, rootReal: string, rel: string): Promis
  */
 export async function confirmAbsent(view: MountView, rootReal: string, rel: string, target: 'entry' | 'beneath' = 'entry'): Promise<{ by: string } | string> {
   const root = await locateDir(view, rootReal, '');
-  if (root.kind !== 'held') return ROOT_UNAVAILABLE;
-  let cur: HeldDir = root.dir;
+  if (root.kind !== 'checked') return ROOT_UNAVAILABLE;
+  let cur: CheckedDir = root.dir;
   const parts = rel.split('/');
   for (let i = 0; i < parts.length; i++) {
     const name = parts[i]!;
@@ -290,13 +293,13 @@ export async function confirmAbsent(view: MountView, rootReal: string, rel: stri
     }
     if (info.isDirectory()) {
       if (last) return CHANGED; // present after all
-      cur = new PathHeldDir(childRel, cur.at(name), lexicalOf(view, childRel), info.dev, info.ino);
+      cur = new CheckedDir(childRel, cur.at(name), lexicalOf(view, childRel), info.dev, info.ino);
       continue;
     }
     if (info.isSymbolicLink()) {
       if (last && target === 'entry') return CHANGED; // present: the link itself
       const located = await locateDir(view, rootReal, childRel);
-      if (located.kind !== 'held') return BENEATH_SYMLINK;
+      if (located.kind !== 'checked') return BENEATH_SYMLINK;
       if (last) return CHANGED; // a directory there after all
       cur = located.dir;
       continue;
@@ -625,11 +628,11 @@ export function isIgnored(relativePath: string, name: string, patterns: string[]
 }
 
 /**
- * A subdirectory a held directory's listing showed, held in turn: still a
+ * A subdirectory a checked directory's listing showed, checked in turn: still a
  * real directory beneath that same directory. One that became a symlink or a
  * file since is never followed, and proves nothing.
  */
-async function holdChild(view: MountView, rootReal: string, parent: HeldDir, rel: string): Promise<Hold> {
+async function checkChild(view: MountView, rootReal: string, parent: CheckedDir, rel: string): Promise<DirCheck> {
   const real = parent.at(nameOf(rel));
   let info;
   try {
@@ -640,7 +643,7 @@ async function holdChild(view: MountView, rootReal: string, parent: HeldDir, rel
     return typeof proof === 'string' ? { kind: 'unobserved', reason: proof } : { kind: 'absent', by: proof.by };
   }
   if (!info.isDirectory()) return { kind: 'unobserved', reason: CHANGED_WALK };
-  return { kind: 'held', dir: new PathHeldDir(rel, real, lexicalOf(view, rel), info.dev, info.ino) };
+  return { kind: 'checked', dir: new CheckedDir(rel, real, lexicalOf(view, rel), info.dev, info.ino) };
 }
 
 /**
@@ -653,7 +656,7 @@ async function holdChild(view: MountView, rootReal: string, parent: HeldDir, rel
  */
 export async function walkScope(view: MountView, rootReal: string, scope: string, recursive: boolean, cap: number): Promise<Walk> {
   const walk: Walk = { files: new Set(), dirs: new Set(), others: new Map(), complete: new Set(), missing: new Set(), incomplete: [] };
-  const top = await holdDir(view, rootReal, scope);
+  const top = await checkDir(view, rootReal, scope);
   if (top.kind === 'absent') {
     walk.missing.add(scope);
     return walk;
@@ -664,7 +667,7 @@ export async function walkScope(view: MountView, rootReal: string, scope: string
   }
   let capped = false;
 
-  const visit = async (dir: HeldDir): Promise<void> => {
+  const visit = async (dir: CheckedDir): Promise<void> => {
     const rel = dir.rel;
     if (capped) {
       walk.incomplete.push({ path: rel, reason: `not visited: the file cap (${cap}) was reached`, kind: 'cap' });
@@ -676,7 +679,7 @@ export async function walkScope(view: MountView, rootReal: string, scope: string
     } catch (err) {
       const code = errno(err);
       if (code === 'ENOENT' || code === 'ENOTDIR') {
-        // Gone since it was held: absent beneath only if that can be shown.
+        // Gone since it was checked: absent beneath only if that can be shown.
         const proof = rel === '' ? ROOT_UNAVAILABLE : await confirmAbsent(view, rootReal, rel, 'beneath');
         if (typeof proof === 'string') walk.incomplete.push({ path: rel, reason: proof, kind: 'error' });
         else walk.missing.add(rel);
@@ -727,8 +730,8 @@ export async function walkScope(view: MountView, rootReal: string, scope: string
     walk.complete.add(rel);
     if (!recursive) return;
     for (const sub of subdirs) {
-      const child = await holdChild(view, rootReal, dir, sub);
-      if (child.kind === 'held') await visit(child.dir);
+      const child = await checkChild(view, rootReal, dir, sub);
+      if (child.kind === 'checked') await visit(child.dir);
       else if (child.kind === 'absent') walk.missing.add(sub);
       else walk.incomplete.push({ path: sub, reason: child.reason, kind: 'error' });
     }

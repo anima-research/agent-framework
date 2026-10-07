@@ -2439,11 +2439,14 @@ export class WorkspaceModule implements Module {
         : [];
       const intents = this.intents.get(name)!.list();
       const conflictPaths = intents.filter(([, bi]) => bi.conflict).map(([p]) => p);
-      // Conflicts are pending too, past the watermark or not, and so is every
-      // entry whose evidence says disk doesn't hold it yet — a refused or
-      // failed push stays owed whatever the watermark does, exactly as the
-      // materialize selection counts it.
-      const pending = new Set([...changes.map((c) => c.path), ...conflictPaths, ...this.owedEntries(mount)]);
+      // A workspace deletion is pending until a push confirms it on disk:
+      // left there without applyDeletions, or unlinked but unconfirmed.
+      const deletionPaths = intents.filter(([, bi]) => bi.tombstone).map(([p]) => p);
+      // Conflicts and deletions are pending too, past the watermark or not,
+      // and so is every entry whose evidence says disk doesn't hold it yet —
+      // a refused or failed push stays owed whatever the watermark does,
+      // exactly as the materialize selection counts it.
+      const pending = new Set([...changes.map((c) => c.path), ...conflictPaths, ...deletionPaths, ...this.owedEntries(mount)]);
 
       const currentBranch = store.currentBranch();
       status[name] = {
@@ -2455,7 +2458,7 @@ export class WorkspaceModule implements Module {
         currentSeq,
         pendingChanges: pending.size,
         conflicts: conflictPaths.length,
-        workspaceDeletionsOnDisk: intents.filter(([, bi]) => bi.tombstone).length,
+        pendingWorkspaceDeletions: deletionPaths.length,
         initialSyncDone: mount.initialSyncDone,
         currentBranch: currentBranch.name,
         lastMaterializedBranch: mount.lastMaterializedBranchId,
