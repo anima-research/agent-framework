@@ -7,3 +7,8 @@
   `_meta["agent-framework/parentToolCallId"]`, that call's `toolCallId`. A
   stream's end does not abort these calls: one still running when its script
   is killed is reported `completed` or `failed` when it finishes.
+- Two `code_execution` calls in one model response no longer hang the turn.
+  The runner now claims itself before it waits for the interpreter, so the
+  second call is refused with "already running" and the first runs normally.
+  Before, both got through: the second was refused by the interpreter, the
+  first script's result was dropped, and its tool call never answered.

@@ -114,6 +114,8 @@ export class PyRunner {
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private execCounter = 0;
   private disposed = false;
+  /** An exec has passed the busy check but is still awaiting the interpreter. */
+  private starting = false;
 
   constructor(options: PyRunnerOptions) {
     this.pythonPath = options.pythonPath ?? 'python3';
@@ -125,7 +127,7 @@ export class PyRunner {
   }
 
   get busy(): boolean {
-    return this.pending !== null;
+    return this.pending !== null || this.starting;
   }
 
   /**
@@ -150,7 +152,7 @@ export class PyRunner {
     if (this.disposed) {
       return { stdout: '', stderr: 'code_execution runner disposed', returnCode: 1, aborted: true };
     }
-    if (this.pending) {
+    if (this.busy) {
       return {
         stdout: '',
         stderr: 'RuntimeError: another code_execution script is already running for this agent',
@@ -160,6 +162,7 @@ export class PyRunner {
     }
     this.clearIdleTimer();
 
+    this.starting = true; // claimed before the await: a same-tick second exec must see it
     try {
       await this.ensureChild();
     } catch (err) {
@@ -171,6 +174,8 @@ export class PyRunner {
         returnCode: 1,
         aborted: true,
       };
+    } finally {
+      this.starting = false; // `pending` is set below, with no await in between
     }
 
     const execId = `e${++this.execCounter}`;

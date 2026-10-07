@@ -4,7 +4,8 @@
 //   _meta["mcpl/class"] (RFC-008), and `run`, unclassed. `run` returns an
 //   error result. Every result carries RESULT-MARKER, which must never reach
 //   an observer (tool results are never carried). A call whose arguments
-//   carry `delay_ms` is answered that much later.
+//   carry `delay_ms` is answered that much later; one carrying `hold` (a
+//   file path) is answered once that file exists.
 // ROLE=observer: advertises toolLifecycle {observe, inputs}, offers its own
 //   tool `ping` (its own calls must not be reported to it), and once the §5.3
 //   policy exchange is done sends `tools/observe` with the rules in FILTER
@@ -120,8 +121,16 @@ rl.on('line', (line) => {
       content: [{ type: 'text', text: `RESULT-MARKER from ${name}` }],
       isError: name === 'run',
     });
+    const hold = msg.params?.arguments?.hold;
     const delayMs = Number(msg.params?.arguments?.delay_ms ?? 0);
-    if (delayMs > 0) setTimeout(answer, delayMs);
+    if (typeof hold === 'string') {
+      const poll = setInterval(() => {
+        if (existsSync(hold)) {
+          clearInterval(poll);
+          answer();
+        }
+      }, 20);
+    } else if (delayMs > 0) setTimeout(answer, delayMs);
     else answer();
     return;
   }

@@ -261,6 +261,29 @@ describe('PyRunner (real python3)', () => {
     }
   });
 
+  it('rejects a second exec issued before the first has started (same tick)', async () => {
+    // exec() awaits the interpreter before it records the running script, so
+    // a check made only after that await let two execs in at once.
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      for (const warm of [false, true]) {
+        const first = runner.exec('import asyncio\nawait asyncio.sleep(0.2)\nprint("first ran")', []);
+        const second = runner.exec('print("second ran")', []);
+        const [a, b] = await Promise.race([
+          Promise.all([first, second]),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`warm=${warm}: an exec never settled`)), 10_000)),
+        ]);
+        assert.strictEqual(b.returnCode, 1, `warm=${warm}`);
+        assert.match(b.stderr, /already running/);
+        assert.strictEqual(a.returnCode, 0, `warm=${warm}: ${a.stderr}`);
+        assert.match(a.stdout, /first ran/);
+        assert.ok(!a.stdout.includes('second ran') && !b.stdout.includes('second ran'));
+      }
+    } finally {
+      runner.dispose();
+    }
+  });
+
   it('fails gracefully when the python binary is missing', async () => {
     const runner = new PyRunner({
       pythonPath: '/definitely/not/a/python',
@@ -432,6 +455,53 @@ describe('framework code_execution integration (real python3)', () => {
         !wireResult.content.includes('"echoed"'),
         'intermediate tool results must not reach the model-facing result',
       );
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('two code_execution calls in one response: one runs, the other is refused, the turn completes', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-two-');
+    const membrane = new MockMembrane();
+    const module = new ScriptToolModule();
+    const code = (label: string) => [
+      'import asyncio, json',
+      `r = json.loads(await test__echo({"message": "${label}"}))`,
+      'await asyncio.sleep(0.2)',
+      `print("ran:", r["echoed"]["message"])`,
+    ].join('\n');
+
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_two_a', name: 'code_execution', input: { code: code('a') } },
+      { type: 'tool_use', id: 'call_two_b', name: 'code_execution', input: { code: code('b') } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Both answered.' }]));
+
+    const framework = await createFrameworkWithCodeExecution(storePath, membrane, module);
+    try {
+      const created = await framework.createEphemeralAgent({
+        name: 'pair',
+        model: 'test-model',
+        systemPrompt: 'Run both.',
+        allowedTools: 'all',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      framework.start();
+      const result = await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('the turn never completed')), 15_000)),
+      ]);
+      assert.strictEqual(result.speech, 'Both answered.');
+
+      const [results] = membrane.lastStream!.receivedToolResults as Array<Array<{ toolUseId: string; content: string }>>;
+      const byId = new Map(results.map((r) => [r.toolUseId, r.content]));
+      assert.match(byId.get('call_two_a') ?? '', /ran: a/, 'the first script ran');
+      assert.match(byId.get('call_two_b') ?? '', /already running/, 'the second was refused');
+      assert.ok(!(byId.get('call_two_b') ?? '').includes('ran: b'));
+      const echoed = module.calls.filter((c) => c.name.endsWith('--echo') || c.name === 'echo').map((c) => (c.input as { message: string }).message);
+      assert.deepStrictEqual(echoed, ['a']);
     } finally {
       await framework.stop();
       rmSync(tempDir, { recursive: true, force: true });

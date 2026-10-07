@@ -3,7 +3,8 @@
  * a real framework, a real python interpreter, real MCPL servers over stdio.
  *
  *   prov         offers `click` (classed `computer`) and `run` (unclassed,
- *                returns an error result); `delay_ms` delays an answer
+ *                returns an error result); `delay_ms` delays an answer, and
+ *                `hold` holds it until a file exists
  *   obs-all      observe, no filter: every call, metadata only
  *   obs-comms    filter `class: comms`
  *   obs-run      filter `serverTool: run`
@@ -16,7 +17,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { AgentFramework } from '../src/index.js';
@@ -89,6 +90,8 @@ describe('tool lifecycle for script-made calls (RFC-007, #235 F4)', () => {
 
   const lifecycle = (id: ObserverId): Params[] =>
     readLog(logs[id]).filter((e) => e.event === 'lifecycle').map((e) => e.params!);
+  /** The stream's teardown, which ends (aborts) its open calls, has run. */
+  const streamEnded = () => !(framework as unknown as { activeStreams: Map<string, unknown> }).activeStreams.has('scout');
 
   async function runTurn(blocks: unknown[]): Promise<void> {
     const callsBefore = membrane.calls.length;
@@ -105,7 +108,7 @@ describe('tool lifecycle for script-made calls (RFC-007, #235 F4)', () => {
       () => membrane.calls.length > callsBefore && (membrane.lastStream?.receivedToolResults.length ?? 0) >= 1,
       'the tool round answered',
     );
-    await new Promise((r) => setTimeout(r, 300)); // the turn's last round, and its stream's end
+    await waitFor(streamEnded, "the turn's stream ended");
   }
 
   before(async () => {
@@ -244,20 +247,75 @@ describe('tool lifecycle for script-made calls (RFC-007, #235 F4)', () => {
     assert.equal(readLog(logs.prov).filter((e) => e.event === 'lifecycle').length, 0, 'the provider holds no grant');
   });
 
+  it('a dispatch that throws after doing work is reported started then failed, not dropped', async () => {
+    // Some host tools change state and then throw synchronously (sleep with
+    // a huge `seconds` sets the gate, then fails formatting its reply).
+    // Stand one in for test--send.
+    const internals = framework as unknown as {
+      dispatchToolCall(agentName: string, call: { name: string; input: unknown }): void;
+    };
+    const original = internals.dispatchToolCall;
+    let workDone = 0;
+    internals.dispatchToolCall = function (this: unknown, agentName, call) {
+      if (call.name === 'test--send' && (call.input as { boom?: boolean }).boom) {
+        workDone++;
+        throw new RangeError('Invalid time value');
+      }
+      return original.call(this, agentName, call);
+    };
+    try {
+      const before = { all: lifecycle('obs-all').length, comms: lifecycle('obs-comms').length };
+      await runTurn([{
+        type: 'tool_use',
+        id: 'toolu_01THROWSDDDDDDDDDDDDDDDDDD',
+        name: 'code_execution',
+        input: { code: 'r = await test__send({"text": "x", "boom": True})\nprint("got:", r)' },
+      }]);
+      await waitFor(() => lifecycle('obs-all').length >= before.all + 4, 'both calls ended');
+      await new Promise((r) => setTimeout(r, 300)); // a stray or duplicate would land here
+
+      assert.equal(workDone, 1);
+      assert.match(JSON.stringify(membrane.lastStream!.receivedToolResults), /got: Error: Invalid time value/);
+      const events = lifecycle('obs-all').slice(before.all);
+      assert.deepEqual(events.map((p) => `${p.tool}:${p.phase}`), [
+        'code_execution:started',
+        'test--send:started',
+        'test--send:failed',
+        'code_execution:completed',
+      ]);
+      assert.deepEqual(events[2]._meta, { [SCRIPT_PARENT_META_KEY]: events[0].toolCallId });
+      assert.deepEqual(
+        lifecycle('obs-comms').slice(before.comms).map((p) => `${p.tool}:${p.phase}`),
+        ['test--send:started', 'test--send:failed'],
+      );
+    } finally {
+      delete (internals as { dispatchToolCall?: unknown }).dispatchToolCall;
+    }
+  });
+
   it('a call still running when its script is killed is reported completed when it finishes', async () => {
     const before = lifecycle('obs-all').length;
+    const release = join(tempDir, 'release-orphan');
     await runTurn([{
       type: 'tool_use',
       id: 'toolu_01ORPHANCCCCCCCCCCCCCCCCCC',
       name: 'code_execution',
-      input: { code: 'await prov__click({"x": 1, "y": 1, "delay_ms": 3000})', time_limit_ms: 1000 },
+      input: { code: `await prov__click({"x": 1, "y": 1, "hold": ${JSON.stringify(release)}})`, time_limit_ms: 1000 },
     }]);
-    // The turn ended (its stream's calls were aborted) while the inner call ran on.
-    const turnEndedWhileRunning = lifecycle('obs-all').slice(before).filter((p) => p.tool === 'prov--click');
-    assert.deepEqual(turnEndedWhileRunning.map((p) => p.phase), ['started']);
+    // The script was stopped and the turn's stream has ended (ending its open
+    // calls), while the provider still holds the inner call's reply.
+    const whileHeld = lifecycle('obs-all').slice(before);
+    assert.deepEqual(whileHeld.map((p) => `${p.tool}:${p.phase}`), [
+      'code_execution:started',
+      'prov--click:started',
+      'code_execution:completed',
+    ]);
 
+    // Held for at least 200ms more, after the call had already started.
+    await new Promise((r) => setTimeout(r, 200));
+    writeFileSync(release, '');
     await waitFor(() => lifecycle('obs-all').length >= before + 4, 'the orphaned call finished');
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise((r) => setTimeout(r, 300)); // a stray or duplicate would land here
     const events = lifecycle('obs-all').slice(before);
     assert.deepEqual(events.map((p) => `${p.tool}:${p.phase}`), [
       'code_execution:started',
@@ -267,6 +325,6 @@ describe('tool lifecycle for script-made calls (RFC-007, #235 F4)', () => {
     ]);
     const end = events[3];
     assert.equal(end.isError, false);
-    assert.ok((end.durationMs as number) >= 2500, `durationMs ${String(end.durationMs)} covers the whole call`);
+    assert.ok((end.durationMs as number) >= 200, `durationMs ${String(end.durationMs)} covers the hold`);
   });
 });

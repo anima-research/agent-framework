@@ -11723,8 +11723,15 @@ export class AgentFramework {
       try {
         this.dispatchToolCall(agentName, call);
       } catch (error) {
-        // Never started: nothing was sent, so nothing is owed.
-        this.toolLifecycleEmitter?.refuse(agentName, callId);
+        // Dispatch threw. Not a refusal (refusal sites call refuse() and
+        // answer): the tool may have done work first (sleep sets the gate,
+        // then formats its reply), so the call started and the host got no
+        // result — `failed`, as for a dispatch that rejects.
+        if (origin) {
+          this.toolLifecycleEmitter?.open(agentName, callId);
+          this.toolLifecycleEmitter?.markDispatchFailure(agentName, callId);
+          this.toolLifecycleEmitter?.onResult(agentName, callId, undefined);
+        }
         if (this.scriptToolWaiters.delete(callId)) {
           clearTimeout(safety);
           const err = error instanceof Error ? error : new Error(String(error));
