@@ -65,6 +65,8 @@ export interface PyRunnerOptions {
   toolCallTimeoutMs?: number;
   /** Whole-script deadline; exceeded -> cancel, grace, kill. */
   scriptTimeoutMs?: number;
+  /** How long a script gets to stop after its deadline before the interpreter is killed (default 10s). */
+  cancelGraceMs?: number;
   /** Idle interpreter reclaim (state lost), mirroring container reclaim. */
   idleReclaimMs?: number;
   onToolCall: ScriptToolCallHandler;
@@ -101,6 +103,7 @@ export class PyRunner {
   private readonly pythonPath: string;
   private readonly toolCallTimeoutMs: number;
   private readonly scriptTimeoutMs: number;
+  private readonly cancelGraceMs: number;
   private readonly idleReclaimMs: number;
   private readonly onToolCall: ScriptToolCallHandler;
   private readonly label: string;
@@ -119,6 +122,7 @@ export class PyRunner {
     this.pythonPath = options.pythonPath ?? 'python3';
     this.toolCallTimeoutMs = options.toolCallTimeoutMs ?? DEFAULT_TOOL_CALL_TIMEOUT_MS;
     this.scriptTimeoutMs = options.scriptTimeoutMs ?? DEFAULT_SCRIPT_TIMEOUT_MS;
+    this.cancelGraceMs = options.cancelGraceMs ?? CANCEL_GRACE_MS;
     this.idleReclaimMs = options.idleReclaimMs ?? DEFAULT_IDLE_RECLAIM_MS;
     this.onToolCall = options.onToolCall;
     this.label = options.label ?? 'pytc';
@@ -195,7 +199,8 @@ export class PyRunner {
         this.send({ op: 'cancel', id: execId, reason: 'deadline' });
         // The cancel lands only when the script awaits. Blocking code (time.sleep, a
         // busy loop, a blocking read) never does, so interrupt it as well: the runtime
-        // raises KeyboardInterrupt in the script's own code and ignores SIGINT elsewhere.
+        // raises KeyboardInterrupt in the script's own code, or cancels a script that
+        // is waiting (it may resume into blocking code before the cancel op is read).
         this.interruptChild();
         pending.killTimer = setTimeout(() => {
           pending.deadlineMs = null; // this message already says why
@@ -208,7 +213,7 @@ export class PyRunner {
             aborted: true,
           });
           this.reclaim('deadline-kill');
-        }, CANCEL_GRACE_MS);
+        }, this.cancelGraceMs);
       }, deadlineMs);
       // A day-scale background deadline must not hold the process open.
       if (background) pending.deadlineTimer.unref?.();

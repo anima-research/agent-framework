@@ -1038,11 +1038,28 @@ describe('code_execution time limit vs blocking code (real python3)', { skip: pr
     }
   });
 
-  it('SIGINT between scripts or while a script awaits a tool does nothing', async () => {
+  it('SIGINT between scripts does nothing', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const first = await runner.exec('import os\nx = 1\nprint(f"pid={os.getpid()}")', []);
+      const pid = Number(pidOf(first.stdout));
+      assert.ok(pid > 0, first.stdout);
+      process.kill(pid, 'SIGINT');
+      await new Promise((r) => setTimeout(r, 200));
+      const result = await runner.exec('print(x)\nprint(f"pid={os.getpid()}")', []);
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.strictEqual(result.stdout, `1\npid=${pid}\n`);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('SIGINT while a script waits cancels it before it can resume into blocking code', async () => {
     let pid = 0;
     const runner = new PyRunner({
       onToolCall: async () => {
-        // The script is suspended on this call: the signal must not touch it.
+        // The script is suspended on this call. The signal arrives with no cancel op behind it;
+        // the result does, and the script would then block.
         process.kill(pid, 'SIGINT');
         await new Promise((r) => setTimeout(r, 200));
         return 'tool ok';
@@ -1052,11 +1069,53 @@ describe('code_execution time limit vs blocking code (real python3)', { skip: pr
       const first = await runner.exec('import os\nprint(f"pid={os.getpid()}")', []);
       pid = Number(pidOf(first.stdout));
       assert.ok(pid > 0, first.stdout);
-      process.kill(pid, 'SIGINT');
-      await new Promise((r) => setTimeout(r, 200));
-      const result = await runner.exec('print(await test__echo({}))\nprint(f"pid={os.getpid()}")', ECHO_TOOLS);
-      assert.strictEqual(result.returnCode, 0, result.stderr);
-      assert.strictEqual(result.stdout, `tool ok\npid=${pid}\n`);
+      const started = Date.now();
+      const result = await runner.exec('import time\nprint(await test__echo({}))\ntime.sleep(30)', ECHO_TOOLS);
+      assert.strictEqual(result.returnCode, 1);
+      assert.strictEqual(result.stdout, '');
+      // Cancelled at its await (or, if the signal beat the script to it, interrupted there).
+      assert.match(result.stderr, /KeyboardInterrupt: script (cancelled|interrupted) by host/);
+      assert.ok(Date.now() - started < 5000, 'stopped at once, not after the blocking call');
+      const after = await runner.exec('print(f"pid={os.getpid()}")', []);
+      assert.strictEqual(after.stdout, `pid=${pid}\n`, 'same interpreter');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('a script that resumes from an await into blocking code at its limit is stopped', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      for (let i = 0; i < 3; i++) {
+        const started = Date.now();
+        const result = await runner.exec('import asyncio, time\nawait asyncio.sleep(1)\ntime.sleep(5)\nprint("after")', [], undefined, { deadlineMs: 1000 });
+        assert.strictEqual(result.returnCode, 1, result.stderr);
+        assert.strictEqual(result.stdout, '');
+        assert.match(result.stderr, /script stopped: it reached its 1s time limit/);
+        assert.ok(Date.now() - started < 3000, `stopped at the limit (${Date.now() - started}ms)`);
+      }
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('a script that ignores the interrupt is killed after the grace, and its interpreter state is gone', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '', cancelGraceMs: 500 });
+    try {
+      assert.strictEqual((await runner.exec('x = 41', [])).returnCode, 0);
+      const code = 'import time\ntry:\n    time.sleep(60)\nexcept KeyboardInterrupt:\n    time.sleep(60)';
+      const started = Date.now();
+      const killed = await runner.exec(code, [], undefined, { deadlineMs: 1000 });
+      assert.strictEqual(killed.aborted, true);
+      assert.strictEqual(killed.returnCode, 1);
+      assert.match(
+        killed.stderr,
+        /script stopped: it reached its 1s time limit and did not respond, so it was killed and the interpreter restarted \(variables from earlier scripts are gone\)/,
+      );
+      assert.ok(Date.now() - started < 5000, `killed after the grace (${Date.now() - started}ms)`);
+      const after = await runner.exec('print(x)', []);
+      assert.strictEqual(after.returnCode, 1);
+      assert.match(after.stderr, /NameError: name 'x' is not defined/);
     } finally {
       runner.dispose();
     }

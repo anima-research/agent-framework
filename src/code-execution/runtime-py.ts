@@ -38,8 +38,8 @@
  *                {op:"exec_result", id, stdout, stderr, return_code, tail?}
  *
  * At a deadline the host sends cancel and then SIGINT (not on Windows): the
- * cancel stops a script waiting on an await, the signal one stuck in blocking
- * code (see _on_sigint).
+ * cancel stops a script waiting on an await, the signal also one stuck in
+ * blocking code (see _on_sigint).
  *
  * IMPORTANT: the python source below must not contain backticks or the
  * sequence dollar+brace (TS template literal syntax). String.raw preserves
@@ -178,6 +178,18 @@ _current_exec_task = None
 # it raised, so _run_script can tell it from the script's own exceptions.
 _interrupt_armed = False
 _host_interrupt = None
+# Whether the running script was cancelled (cancel op or SIGINT): only once.
+_script_cancelled = False
+
+
+def _cancel_script():
+    global _script_cancelled
+    task = _current_exec_task
+    if task is None or task.done() or _script_cancelled:
+        return False
+    _script_cancelled = True
+    task.cancel()
+    return True
 
 
 def _make_tool_fn(tool_name, py_name):
@@ -369,7 +381,7 @@ async def _run_script(exec_id, code):
 
 
 async def main():
-    global _current_exec_id, _current_exec_task
+    global _current_exec_id, _current_exec_task, _script_cancelled
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
 
@@ -418,6 +430,7 @@ async def main():
                 })
                 continue
             _current_exec_id = msg.get("id")
+            _script_cancelled = False
             _current_exec_task = asyncio.ensure_future(
                 _run_script(msg.get("id"), msg.get("code") or "")
             )
@@ -430,8 +443,7 @@ async def main():
             if fut is not None and not fut.done():
                 fut.set_result(msg.get("error") or None)
         elif op == "cancel":
-            if _current_exec_task is not None and not _current_exec_task.done():
-                _current_exec_task.cancel()
+            _cancel_script()
         elif op == "exit":
             break
 
@@ -446,16 +458,18 @@ async def main():
 
 # At the deadline the host sends a cancel op, which lands only when the script
 # awaits: a script blocked in time.sleep(), a busy loop or a blocking read
-# never gives the event loop control back. So the host also sends SIGINT, and
-# this turns it into KeyboardInterrupt in the running script, where
-# _run_script catches it: the output so far and the interpreter's globals
-# survive. It raises at most once per script, and only with _run_script's
-# frame on the stack -- checking the current task is not enough, as asyncio
-# runs its own code for the task between steps, and an exception raised there
-# escapes the event loop and ends the interpreter. Anywhere else it does
-# nothing: between scripts, while the script waits on an await (the cancel op
-# covers that), in the protocol loop, and mid-way through a protocol write,
-# which an exception would leave torn.
+# never gives the event loop control back. So the host also sends SIGINT,
+# which stops the running script once, whatever it is doing:
+#   - In its own code, it raises KeyboardInterrupt there; _run_script catches
+#     it, so the output so far and the interpreter's globals survive. Only
+#     with _run_script's frame on the stack: checking the current task is not
+#     enough, as asyncio runs its own code for the task between steps, and an
+#     exception raised there escapes the event loop and ends the interpreter.
+#   - Anywhere else (waiting on an await, or mid-way through a protocol write,
+#     which an exception would leave torn) it cancels the script, as the
+#     cancel op would. Not waiting for that op matters: the script may resume
+#     into blocking code before the op is read.
+# Between scripts it does nothing.
 _RUN_SCRIPT_CODE = _run_script.__code__
 _SEND_CODE = send.__code__
 
@@ -464,15 +478,19 @@ def _on_sigint(signum, frame):
     global _interrupt_armed, _host_interrupt
     if not _interrupt_armed:
         return
+    _interrupt_armed = False
     while frame is not None:
         code = frame.f_code
         if code is _SEND_CODE:
-            return
+            break
         if code is _RUN_SCRIPT_CODE:
-            _interrupt_armed = False
             _host_interrupt = KeyboardInterrupt("script interrupted by host")
             raise _host_interrupt
         frame = frame.f_back
+    if _cancel_script():
+        # select() resumes its wait after a signal; wake it so the
+        # cancellation runs now (as asyncio.run's own SIGINT handler does).
+        _current_exec_task.get_loop().call_soon_threadsafe(lambda: None)
 
 
 if __name__ == "__main__":
