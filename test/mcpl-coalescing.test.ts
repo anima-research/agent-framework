@@ -974,7 +974,9 @@ test('R16b: a producer retry re-wakes a batch left asleep by a failed freeze', a
   assert(f.lastRequest().includes('asleep_fallback'));
 });
 
-test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the series resets on recovery', async (t) => {
+// The timeout bounds a drain that never returns, such as a backoff regressed
+// to a tight loop; npm test sets no timeout of its own.
+test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the series resets on recovery', { timeout: 30_000 }, async (t) => {
   const f = await fixture(); t.after(f.close);
   const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number; recovery: Map<string, { attempt: number; timer?: unknown }> } }).pushCoalescer;
   coalescer.options.recoveryBackoffMs = 40;
@@ -988,12 +990,24 @@ test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the ser
   await f.send('push/event', f.params('1', 'outage_fallback', { deferred: true, initial: true }));
   failing = true;
   f.alwaysRespond();
-  for (let i = 0; i < 3; i++) {
-    await f.framework.runUntilIdle(); // freeze fails → recovery scheduled
-    await eventually(() => internals.pendingRequests.length > 0, `recovery wake ${i + 1}`);
+  // Observe the recovery transitions themselves, not the drains: runUntilIdle
+  // drains until idle, so a recovery timer that fires while a drain is still
+  // running is consumed by that same drain, which freezes and fails again.
+  // One drain can therefore carry several attempts. Drive until at least
+  // three recovery wakes have fired, ending with one still pending.
+  while (wakes.length < 3) {
+    const before = wakes.length;
+    await f.framework.runUntilIdle(); // each failed freeze schedules the next recovery
+    await eventually(() => internals.pendingRequests.length > 0, `recovery wake after ${wakes.length}`);
+    // Between attempts only the recovery timer re-wakes the batch, and it
+    // traces before it queues the request: every round adds a wake, so a
+    // lost trace fails here instead of looping forever.
+    assert(wakes.length > before, 'each re-wake is a traced recovery wake');
   }
-  assert.deepEqual(wakes.map((w) => w.attempt), [1, 2, 3], 'consecutive failures count up');
-  assert.deepEqual(wakes.map((w) => w.delayMs), [40, 80, 160], 'and the delay doubles');
+  // Every wake is one more consecutive failure, and its delay doubles from the
+  // base (capped at 60x), however the attempts fell across drains.
+  assert.deepEqual(wakes.map((w) => w.attempt), wakes.map((_, i) => i + 1), 'consecutive failures count up');
+  assert.deepEqual(wakes.map((w) => w.delayMs), wakes.map((_, i) => Math.min(40 * 2 ** i, 40 * 60)), 'and the delay doubles');
   assert.equal(coalescer.pendingBatches(), 1);
   assert(!f.context().includes('outage_fallback'));
   failing = false; // storage recovers
