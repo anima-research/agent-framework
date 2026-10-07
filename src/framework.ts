@@ -83,7 +83,7 @@ import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
-import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
+import { INBOUND_SOURCE_KEY, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import {
@@ -7106,16 +7106,9 @@ export class AgentFramework {
     if (event.inboundSource) {
       source = event.inboundSource;
     } else {
-      source = this.channelSource({
-        serverId: event.serverId,
-        channelId: event.channelId,
-        threadId: event.threadId,
-        messageId: event.messageId,
-        eventId: event.eventId,
-        replyTo: event.metadata?.replyTo,
-        acceptedAt: event.acceptedAt,
-        sourceTimestamp: event.timestamp,
-      });
+      // Only a caller that bypassed admission (none in the framework's own
+      // lanes) arrives without a frozen envelope.
+      source = this.channelEventSource(event, 'channels/incoming');
       this.noteInboundAccepted(source);
     }
     metadata[INBOUND_SOURCE_KEY] = source;
@@ -7654,6 +7647,8 @@ export class AgentFramework {
    * stamped (a direct framework caller), which is the closest observation.
    */
   private channelSource(fields: {
+    lane: InboundLane;
+    coalesced?: boolean;
     serverId: string;
     channelId: string;
     threadId?: unknown;
@@ -7674,6 +7669,8 @@ export class AgentFramework {
     const sourceTimestamp = str(fields.sourceTimestamp);
     return {
       kind: 'channel',
+      lane: fields.lane,
+      ...(fields.coalesced ? { coalesced: true as const } : {}),
       serverId: fields.serverId,
       binding: this.coalescingBinding(fields.serverId),
       channelId: fields.channelId,
@@ -7688,12 +7685,38 @@ export class AgentFramework {
     };
   }
 
+  /** Source envelope of a channels/incoming event (lane facts as given). */
+  private channelEventSource(
+    event: {
+      serverId: string; channelId: string; threadId?: string; messageId?: string; eventId?: string;
+      metadata?: Record<string, unknown>; acceptedAt?: number; timestamp?: string;
+    },
+    lane: InboundLane,
+    coalesced = false,
+  ): InboundChannelSource {
+    return this.channelSource({
+      lane,
+      coalesced,
+      serverId: event.serverId,
+      channelId: event.channelId,
+      threadId: event.threadId,
+      messageId: event.messageId,
+      eventId: event.eventId,
+      replyTo: event.metadata?.replyTo,
+      acceptedAt: event.acceptedAt,
+      sourceTimestamp: event.timestamp,
+    });
+  }
+
   /** Source envelope of a push event: its derived channel, else unscoped. */
-  private pushSource(event: McplPushEvent, deferred = false): InboundSource {
+  private pushSource(event: McplPushEvent, coalesced: { deferred: boolean } | undefined = undefined): InboundSource {
     const origin = (event.origin ?? {}) as Record<string, unknown>;
+    const deferred = coalesced?.deferred ?? false;
     const channel = this.derivePushEventChannel(event.origin);
     if (channel) {
       return this.channelSource({
+        lane: 'push/event',
+        coalesced: !!coalesced,
         serverId: event.serverId,
         channelId: channel.channelId,
         threadId: origin.threadId,
@@ -7708,6 +7731,8 @@ export class AgentFramework {
     }
     const unscoped: InboundUnscopedSource = {
       kind: 'unscoped',
+      lane: 'push/event',
+      ...(coalesced ? { coalesced: true as const } : {}),
       serverId: event.serverId,
       binding: this.coalescingBinding(event.serverId),
       ...(typeof event.eventId === 'string' && event.eventId ? { eventId: event.eventId } : {}),
@@ -7867,6 +7892,8 @@ export class AgentFramework {
       // The inbound source envelope, frozen at acceptance: deferral, fan-out
       // and replay deliver it unchanged (mcpl/inbound-source.ts).
       const inboundSource = this.channelSource({
+        lane: 'channels/incoming',
+        coalesced: true,
         serverId,
         channelId: message.channelId,
         threadId: message.threadId,
@@ -7910,6 +7937,8 @@ export class AgentFramework {
       // lane). A channel-scoped push belongs to the channel its subject names.
       const inboundSource: InboundSource = c.channelId
         ? this.channelSource({
+            lane: 'push/event',
+            coalesced: true,
             serverId,
             channelId: c.channelId,
             threadId: origin.threadId,
@@ -7920,7 +7949,7 @@ export class AgentFramework {
             sourceTimestamp: params.timestamp,
             deferred: !!c.deferred,
           })
-        : this.pushSource(event, !!c.deferred);
+        : this.pushSource(event, { deferred: !!c.deferred });
       return this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
@@ -13183,6 +13212,13 @@ export class AgentFramework {
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       triggerFilter,
       (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
+      // An ordinary push: freeze its envelope and observe the acceptance at
+      // admission, before it is queued.
+      (event) => {
+        const source = this.pushSource(event);
+        this.noteInboundAccepted(source);
+        return source;
+      },
     );
 
     // Server-initiated inference router (Step 6)
@@ -13214,6 +13250,13 @@ export class AgentFramework {
         store: this.store,
         handleCoalescedIncoming: (serverId, message, event) =>
           this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent),
+        // An ordinary channels/incoming message: freeze its envelope and
+        // observe the acceptance at admission, before it is queued.
+        acceptInbound: (event) => {
+          const source = this.channelEventSource(event, 'channels/incoming');
+          this.noteInboundAccepted(source);
+          return source;
+        },
         sendTypingFn: (serverId, channelId, metadata, op) => {
           const server = this.mcplServerRegistry!.getServer(serverId);
           if (server) {

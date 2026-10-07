@@ -183,6 +183,10 @@ export class PushHandler {
     emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
     shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean,
     private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent) => Promise<PushEventResult>,
+    /** An ordinary (uncoalesced) push was just admitted, before it is queued
+     *  or acknowledged: return its source envelope, frozen now
+     *  (mcpl/inbound-source.ts). Coalesced work is stamped by its own path. */
+    private readonly acceptInbound?: (event: McplPushEvent) => InboundSource | undefined,
   ) {
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -310,6 +314,11 @@ export class PushHandler {
       }
       return;
     }
+    // The source envelope is frozen at admission, before queueing or the
+    // acknowledgement: nothing that changes while the push waits in the
+    // queue can rewrite where it came from.
+    const inboundSource = this.acceptInbound?.(pushEvent);
+    if (inboundSource) pushEvent.inboundSource = inboundSource;
     this.pushEventFn(pushEvent);
 
     // 7. Emit trace

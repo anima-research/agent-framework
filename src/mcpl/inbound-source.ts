@@ -21,9 +21,20 @@
  * key: `eventId` is present only when the producer supplied one.
  */
 
+/** The MCPL admission lane that accepted an item. Its contract decides what
+ *  an `eventId` is worth: `push/event` deduplicates by eventId, and RFC-006
+ *  coalesced admission (`coalesced: true`) guarantees stable retries and
+ *  distinct versions; a `channels/incoming` eventId outside coalescing is
+ *  adapter-supplied with no such guarantee. */
+export type InboundLane = 'channels/incoming' | 'push/event';
+
 /** An item that belongs to a registered channel. */
 export interface InboundChannelSource {
   kind: 'channel';
+  /** The admission lane that accepted it (see InboundLane). */
+  lane: InboundLane;
+  /** Accepted through RFC-006 coalesced admission. */
+  coalesced?: true;
   /** MCPL server (connection) id the item arrived through, as the host names it. */
   serverId: string;
   /** RFC-006 endpoint binding of that connection at acceptance. A recipe that
@@ -56,6 +67,8 @@ export interface InboundChannelSource {
 /** An MCPL push that names no channel (heartbeats, timers, feature-set events). */
 export interface InboundUnscopedSource {
   kind: 'unscoped';
+  lane: 'push/event';
+  coalesced?: true;
   serverId: string;
   binding: string;
   eventId?: string;
@@ -90,30 +103,39 @@ export interface InboundAcceptanceObserver {
 /** Metadata key the framework stamps. */
 export const INBOUND_SOURCE_KEY = 'inboundSource';
 
-const str = (v: unknown): string | undefined => (typeof v === 'string' && v.length > 0 ? v : undefined);
+const isText = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+const optionalText = (v: unknown): boolean => v === undefined || isText(v);
+const optionalTrue = (v: unknown): boolean => v === undefined || v === true;
 
 /**
- * Read a stored item's source back from its metadata. Returns undefined for
- * anything that is not a well-formed framework stamp (older messages, and any
- * shape this version does not recognize) — never a guess.
+ * Read a stored item's source back from its metadata, validating every field
+ * a consumer relies on: identity strings are non-empty strings, `acceptedAt`
+ * is a finite number, flags are exactly `true` when present, and the lane is
+ * one this version knows. Anything else (older messages, a shape this
+ * version does not recognize, a damaged import) is undefined — never a guess.
  */
 export function readInboundSource(metadata: unknown): InboundSource | undefined {
   if (!metadata || typeof metadata !== 'object') return undefined;
   const raw = (metadata as Record<string, unknown>)[INBOUND_SOURCE_KEY];
-  if (!raw || typeof raw !== 'object') return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const s = raw as Record<string, unknown>;
-  if (typeof s.acceptedAt !== 'number') return undefined;
+  if (typeof s.acceptedAt !== 'number' || !Number.isFinite(s.acceptedAt)) return undefined;
+  if (s.kind === 'surface') {
+    return isText(s.surface) ? (s as unknown as InboundSurfaceSource) : undefined;
+  }
+  const effectFlags = optionalTrue(s.coalesced) && optionalTrue(s.deferred) && optionalTrue(s.materialized);
+  if (!isText(s.serverId) || !isText(s.binding) || !effectFlags) return undefined;
+  if (!optionalText(s.eventId) || !optionalText(s.sourceTimestamp)) return undefined;
   if (s.kind === 'channel') {
-    if (!str(s.serverId) || !str(s.binding) || !str(s.channelId)) return undefined;
+    if (s.lane !== 'channels/incoming' && s.lane !== 'push/event') return undefined;
+    if (!isText(s.channelId)) return undefined;
+    for (const field of ['threadId', 'messageId', 'label', 'replyTo'] as const) {
+      if (!optionalText(s[field])) return undefined;
+    }
     return s as unknown as InboundChannelSource;
   }
   if (s.kind === 'unscoped') {
-    if (!str(s.serverId) || !str(s.binding)) return undefined;
-    return s as unknown as InboundUnscopedSource;
-  }
-  if (s.kind === 'surface') {
-    if (!str(s.surface)) return undefined;
-    return s as unknown as InboundSurfaceSource;
+    return s.lane === 'push/event' ? (s as unknown as InboundUnscopedSource) : undefined;
   }
   return undefined;
 }

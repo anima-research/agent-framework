@@ -114,6 +114,8 @@ describe('inbound source envelope', () => {
     const source = readInboundSource(message.metadata);
     assert.ok(source && source.kind === 'channel');
     assert.equal(source.serverId, 'discord');
+    assert.equal(source.lane, 'channels/incoming');
+    assert.equal(source.coalesced, undefined);
     assert.match(source.binding, /^[0-9a-f]{16}$/);
     assert.equal(source.channelId, ROOM);
     assert.equal(source.messageId, 'm-1');
@@ -170,6 +172,62 @@ describe('inbound source envelope', () => {
     assert.equal(second?.kind === 'channel' && second.label, '#lobby (Guild One)');
   });
 
+  /**
+   * Hold MCPL events between admission and processing (the framework's
+   * queue), so a test can change the world while an accepted item waits.
+   */
+  const holdQueue = () => {
+    const held: ProcessEvent[] = [];
+    const original = framework.pushEvent.bind(framework);
+    (framework as unknown as { pushEvent: (e: ProcessEvent) => void }).pushEvent = (event: ProcessEvent) => {
+      if (event.type === 'mcpl:channel-incoming' || event.type === 'mcpl:push-event') held.push(event);
+      else original(event);
+    };
+    return {
+      held,
+      release: () => {
+        (framework as unknown as { pushEvent: (e: ProcessEvent) => void }).pushEvent = original;
+        for (const event of held.splice(0)) original(event);
+      },
+    };
+  };
+  const registryLabel = (channelId: string) =>
+    (framework as unknown as { channelRegistry: { getChannelLabel(s: string, c: string): string | undefined } })
+      .channelRegistry.getChannelLabel('discord', channelId);
+
+  it('freezes an ordinary channels/incoming envelope at admission: observed before queueing, and a rename while queued does not change it', async () => {
+    const queue = holdQueue();
+    command({ op: 'incoming', channelId: ROOM, messageId: 'm-10', mode: 'ambient', text: 'queued words' });
+    await waitFor(() => queue.held.length === 1, 'message admitted and held in the queue');
+    assert.equal(observed.length, 1, 'observed at admission, before processing');
+    assert.equal(observed[0]!.kind === 'channel' && observed[0]!.label, '#room (Guild One)');
+    assert.equal(observed[0]!.kind === 'channel' && observed[0]!.lane, 'channels/incoming');
+    command({ op: 'rename', channelId: ROOM, label: '#lobby (Guild One)' });
+    await waitFor(() => registryLabel(ROOM) === '#lobby (Guild One)', 'rename applied');
+    queue.release();
+    await waitFor(() => !!storedWith((m) => m.messageId === 'm-10'), 'message stored');
+    assert.deepEqual(readInboundSource(storedWith((m) => m.messageId === 'm-10')!.metadata), observed[0]);
+    assert.equal(observed.length, 1, 'processing is not a second acceptance');
+  });
+
+  it('freezes an ordinary push envelope at admission: a rename while queued does not change it', async () => {
+    const queue = holdQueue();
+    command({
+      op: 'push', eventId: 'ev-room', text: 'pushed into the room',
+      origin: { source: 'discord', mcplChannelId: ROOM, messageId: 'pm-1', authorName: 'someone' },
+      tags: ['chat:mention', 'chat:addressed'],
+    });
+    await waitFor(() => queue.held.length === 1, 'push admitted and held in the queue');
+    assert.equal(observed.length, 1);
+    assert.equal(observed[0]!.kind === 'channel' && observed[0]!.lane, 'push/event');
+    assert.equal(observed[0]!.kind === 'channel' && observed[0]!.label, '#room (Guild One)');
+    command({ op: 'rename', channelId: ROOM, label: '#lobby (Guild One)' });
+    await waitFor(() => registryLabel(ROOM) === '#lobby (Guild One)', 'rename applied');
+    queue.release();
+    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-room'), 'push stored');
+    assert.deepEqual(readInboundSource(storedWith((m) => m.eventId === 'ev-room')!.metadata), observed[0]);
+  });
+
   it('delivers normally when the acceptance observer throws, and reports the failure', async () => {
     const traces: Array<Record<string, unknown>> = [];
     framework.onTrace((e) => { if (e.type === 'inbound:observer-failed') traces.push(e as unknown as Record<string, unknown>); });
@@ -185,18 +243,44 @@ describe('inbound source envelope', () => {
 });
 
 describe('readInboundSource', () => {
+  const channel = { kind: 'channel', lane: 'channels/incoming', serverId: 's', binding: 'b', channelId: 'c', acceptedAt: 1 };
+  const read = (value: unknown) => readInboundSource({ [INBOUND_SOURCE_KEY]: value });
+
   it('reads only well-formed framework stamps', () => {
-    const channel = { kind: 'channel', serverId: 's', binding: 'b', channelId: 'c', acceptedAt: 1 };
-    assert.deepEqual(readInboundSource({ [INBOUND_SOURCE_KEY]: channel }), channel);
-    assert.equal(readInboundSource({ [INBOUND_SOURCE_KEY]: { ...channel, acceptedAt: 'soon' } }), undefined);
-    assert.equal(readInboundSource({ [INBOUND_SOURCE_KEY]: { ...channel, channelId: '' } }), undefined);
-    assert.equal(readInboundSource({ [INBOUND_SOURCE_KEY]: { kind: 'mystery', acceptedAt: 1 } }), undefined);
+    assert.deepEqual(read(channel), channel);
+    assert.deepEqual(read({ ...channel, coalesced: true, deferred: true, materialized: true, eventId: 'e', label: '#c' }),
+      { ...channel, coalesced: true, deferred: true, materialized: true, eventId: 'e', label: '#c' });
+    assert.deepEqual(read({ kind: 'unscoped', lane: 'push/event', serverId: 's', binding: 'b', acceptedAt: 1 }),
+      { kind: 'unscoped', lane: 'push/event', serverId: 's', binding: 'b', acceptedAt: 1 });
     assert.equal(readInboundSource({ source: 'discord' }), undefined);
     assert.equal(readInboundSource(undefined), undefined);
   });
 
+  it('refuses a stamp with any field its consumers rely on malformed', () => {
+    for (const bad of [
+      { ...channel, acceptedAt: 'soon' },
+      { ...channel, acceptedAt: Number.POSITIVE_INFINITY },
+      { ...channel, acceptedAt: Number.NaN },
+      { ...channel, channelId: '' },
+      { ...channel, lane: 'carrier-pigeon' },
+      { ...channel, lane: undefined },
+      { ...channel, deferred: false },
+      { ...channel, materialized: 'yes' },
+      { ...channel, coalesced: 1 },
+      { ...channel, messageId: 42 },
+      { ...channel, label: '' },
+      { ...channel, sourceTimestamp: {} },
+      { kind: 'unscoped', lane: 'channels/incoming', serverId: 's', binding: 'b', acceptedAt: 1 },
+      { kind: 'surface', surface: '', acceptedAt: 1 },
+      { kind: 'mystery', acceptedAt: 1 },
+      [channel],
+    ]) {
+      assert.equal(read(bad), undefined, JSON.stringify(bad));
+    }
+  });
+
   it('keys conversations by server, channel and thread', () => {
-    const base = { kind: 'channel' as const, serverId: 's', binding: 'b', channelId: 'c', acceptedAt: 1 };
+    const base = { kind: 'channel' as const, lane: 'channels/incoming' as const, serverId: 's', binding: 'b', channelId: 'c', acceptedAt: 1 };
     assert.notEqual(conversationKey(base), conversationKey({ ...base, serverId: 't' }));
     assert.notEqual(conversationKey(base), conversationKey({ ...base, threadId: 'th' }));
     assert.equal(conversationKey(base), conversationKey({ ...base, messageId: 'other', acceptedAt: 2 }));
@@ -226,6 +310,8 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     assert.deepEqual(observed.map((s) => (s as { eventId?: string }).eventId), ['1', '2']);
     const stored = sourceOf(f, 'edit_latest');
     assert.ok(stored && stored.kind === 'unscoped');
+    assert.equal(stored.lane, 'push/event');
+    assert.equal(stored.coalesced, true);
     assert.deepEqual(stored, observed[1], 'the delivered copy carries the envelope frozen at its acceptance');
   });
 
@@ -253,6 +339,8 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     const stored = sourceOf(f, 'first_words');
     assert.ok(stored && stored.kind === 'channel');
     assert.equal(stored.channelId, 'chat');
+    assert.equal(stored.lane, 'channels/incoming');
+    assert.equal(stored.coalesced, true);
     assert.equal(stored.messageId, 'm');
     assert.equal(stored.eventId, 'e1');
     assert.equal(stored.sourceTimestamp, TS);

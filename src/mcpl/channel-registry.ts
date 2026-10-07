@@ -39,6 +39,7 @@ import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js
 import { expandCoreTags } from './tags.js';
 import { validateCoalescedContent } from './push-coalescer.js';
 import { CapabilityGrant } from './capability-grant.js';
+import type { InboundSource } from './inbound-source.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -236,9 +237,10 @@ interface McplChannelIncomingEvent {
   tags?: string[];
   triggerInference?: boolean;
   targetAgents?: string[];
-  /** Host acceptance time (epoch ms), stamped where the message is admitted.
-   *  The framework's inbound source envelope reads it; nothing re-stamps it. */
+  /** Host acceptance time (epoch ms), stamped where the message is admitted. */
   acceptedAt?: number;
+  /** Source envelope frozen at admission (mcpl/inbound-source.ts). */
+  inboundSource?: InboundSource;
 }
 
 // ============================================================================
@@ -458,6 +460,13 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 
 interface ChannelRegistryOptions {
   /**
+   * An ordinary (uncoalesced) `channels/incoming` message has just been
+   * admitted, before it is queued or acknowledged: return its source
+   * envelope, frozen now (mcpl/inbound-source.ts). The framework observes the
+   * acceptance here; coalesced work is stamped and observed by its own path.
+   */
+  acceptInbound?: (event: McplChannelIncomingEvent) => InboundSource | undefined;
+  /**
    * RFC-006: an admitted `channels/incoming` message carrying `coalesce`, with
    * the event the ordinary path would have queued. The handler decides
    * replace / append / withdraw and returns the per-message result. Throws a
@@ -660,6 +669,7 @@ export class ChannelRegistry {
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
   private migratedLegacyPolicies = new Set<string>();
   private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
+  private acceptInbound?: ChannelRegistryOptions['acceptInbound'];
 
   constructor(
     serverRegistry: McplServerRegistry,
@@ -676,6 +686,7 @@ export class ChannelRegistry {
     },
   ) {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
+    this.acceptInbound = options?.acceptInbound;
     this.serverRegistry = serverRegistry;
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -1006,6 +1017,12 @@ export class ChannelRegistry {
         }
         continue;
       }
+
+      // The source envelope is frozen here, at admission, before the message
+      // is queued or acknowledged: a rename or rebind while it waits in the
+      // queue cannot change where it says it came from.
+      const inboundSource = this.acceptInbound?.(event);
+      if (inboundSource) event.inboundSource = inboundSource;
 
       // Push to the processing queue
       // Cast through unknown because McplChannelIncomingEvent matches the
