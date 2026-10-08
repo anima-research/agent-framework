@@ -37,7 +37,8 @@ import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
-import { validateCoalescedContent } from './push-coalescer.js';
+import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
+import { isVisiblyEmptyContent } from './visible-content.js';
 import { CapabilityGrant } from './capability-grant.js';
 import { INBOUND_SOURCE_KEY, type InboundSource } from './inbound-source.js';
 import { McplRequestError } from './server-connection.js';
@@ -1023,18 +1024,38 @@ export class ChannelRegistry {
       // ACCEPTED from here down: semantic processing only for admitted
       // messages. §16.3 core-tag closure, then content conversion.
       const coalesced = message.coalesce !== undefined && !!this.handleCoalescedIncoming;
+      // Only a coalescing retraction may be empty (pure withdrawal, RFC-006
+      // §6; the coalescer appends nothing for it). Any other message that
+      // shows the model nothing would wake it with no visible cause.
+      const emptyAllowed = coalesced && (message.coalesce as { retract?: unknown } | null)?.retract === true;
+      const rejectEmpty = () => {
+        console.error(`[channel-incoming-rejected] server=${serverId} channel=${message.channelId} messageId=${message.messageId} reason=empty-content`);
+        this.emitTraceFn({
+          type: 'mcpl:channel-incoming-rejected',
+          serverId,
+          channelId: message.channelId,
+          messageId: message.messageId,
+          reason: 'empty-content',
+        });
+        results.push({ messageId: message.messageId, accepted: false, reason: 'empty_content' });
+      };
       if (coalesced) {
         // RFC-006 §13: malformed content on a coalesced item is that item's
         // failure, not the batch's — check the shape before converting.
         try {
-          validateCoalescedContent(message.content);
+          validateCoalescedContent(message.content, undefined, { allowEmpty: emptyAllowed });
         } catch (error) {
-          results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+          if (error instanceof EmptyContentError) rejectEmpty();
+          else results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
           continue;
         }
       }
       if (message.tags) message.tags = expandCoreTags(message.tags);
       const convertedContent: ContentBlock[] = message.content.map(convertBlock);
+      if (!emptyAllowed && isVisiblyEmptyContent(convertedContent)) {
+        rejectEmpty();
+        continue;
+      }
 
       // An accepted message never retargets speech: a route comes from a
       // turn's own wake or a deliberate choice, never from whichever channel
