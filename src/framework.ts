@@ -1067,6 +1067,9 @@ export class AgentFramework {
    *  driveStream to clear sticky explicit-send suppression before handling
    *  the next model round. Never affects routing: the turn locus is frozen. */
   private midTurnInputSignals: Set<string> = new Set();
+  /** A refused skip_reply self-wake silences its own round, then releases
+   *  silencing when the resumed provider round begins. */
+  private refusedSkipReplyWakeRounds: Map<string, boolean> = new Map();
   /** Last outbound locus announced to each agent as a durable `[routing]`
    *  window message. Announce-on-change only: steady state emits nothing
    *  (KV-safe, no per-turn chatter). In-memory — after a process restart the
@@ -2466,6 +2469,26 @@ export class AgentFramework {
     // Copy: getChannelTools() returns the registry's shared definitions
     // array; pushing onto it would append another tune_out on every call.
     const channelTools = [...(this.channelRegistry?.getChannelTools() ?? [])];
+    // Match the sleep/wake surface: when no EventGate exists, do not advertise
+    // a self-wake argument the host cannot honor. Plain skip_reply remains.
+    if (!this.eventGate) {
+      const index = channelTools.findIndex((tool) => tool.name === 'skip_reply');
+      if (index >= 0) {
+        const tool = channelTools[index]!;
+        const schema = tool.inputSchema as {
+          type: 'object'; properties: NonNullable<import('./types/index.js').ToolDefinition['inputSchema']['properties']>; required?: string[];
+        };
+        const { wake_in_seconds: _wake, ...properties } = schema.properties;
+        channelTools[index] = {
+          ...tool,
+          description: tool.description.replace(
+            ' To end this turn but come back on your own shortly, set wake_in_seconds.',
+            '',
+          ),
+          inputSchema: { ...schema, properties },
+        };
+      }
+    }
     if (this.tuneOutCoordinator) {
       channelTools.push(AgentFramework.TUNE_OUT_TOOL);
     }
@@ -9226,6 +9249,9 @@ export class AgentFramework {
         // A framework retry is a new physical stream in the same logical turn.
         this.logicalTurnToolCalls.set(agent, { turnToken, count: previousLogicalToolState?.count ?? 0 });
       }
+      // Fresh turn: stale refusal state from an aborted predecessor must not
+      // affect this turn.
+      this.refusedSkipReplyWakeRounds.delete(agent.name);
       // Fresh turn: forget the previous turn's explicit-send engagements and
       // prose deliveries — both are strictly turn-scoped (a restart continues
       // the same logical turn and keeps them).
@@ -9641,6 +9667,14 @@ export class AgentFramework {
     const discardGuardHeld = (): void => { guardHeld = []; };
 
     const adoptInjectedRound = (): void => {
+      // The refused call's own round stays private, honoring skip_reply. Once
+      // the provider resumes after seeing the error, ordinary prose is public
+      // again even without a fresh external message.
+      const silenceBeforeRefusal = this.refusedSkipReplyWakeRounds.get(agent.name);
+      if (silenceBeforeRefusal !== undefined) {
+        this.refusedSkipReplyWakeRounds.delete(agent.name);
+        turnSilenced = silenceBeforeRefusal;
+      }
       if (!this.midTurnInputSignals.has(agent.name)) return;
       this.midTurnInputSignals.delete(agent.name);
 
@@ -9806,6 +9840,17 @@ export class AgentFramework {
 
             agent.enterWaitingForTools(event.calls, stream);
 
+            const hasRefusedWake = !this.eventGate && event.calls.some((call) => {
+              if (call.name !== 'skip_reply') return false;
+              const secs = Number((call.input as Record<string, unknown> | undefined)?.wake_in_seconds);
+              return Number.isFinite(secs) && secs > 0;
+            });
+            if (hasRefusedWake) {
+              const otherwiseSilenced = turnSilenced || event.calls.some((call) =>
+                call.name !== 'skip_reply' && isSilencingTool(call.name));
+              this.refusedSkipReplyWakeRounds.set(agent.name, otherwiseSilenced);
+            }
+
             for (const call of event.calls) {
               // RFC-007: register at the one dispatch point for model-issued
               // calls, keyed by (agent, call id) with this inference's id;
@@ -9833,9 +9878,7 @@ export class AgentFramework {
               const hasSameRoundPrivateThink =
                 roundToolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
-              if (roundToolNames.some(isSilencingTool)) {
-                turnSilenced = true;
-              }
+              if (roundToolNames.some(isSilencingTool)) turnSilenced = true;
               if (roundContent && roundContent.length > 0) {
                 liveProseRouting = true;
                 const roundSegments = splitProseSegments(assistantBlocks);
@@ -10928,6 +10971,7 @@ export class AgentFramework {
       // then re-defers, and the successor's own turn-start flush / boundary
       // injection / teardown delivers the messages at a correct position.
       if (myTurnToken !== undefined && this.activeTurnTokens.get(agent.name) === myTurnToken) {
+        this.refusedSkipReplyWakeRounds.delete(agent.name);
         this.activeTurnTokens.delete(agent.name);
         this.activeTurnTriggers.delete(agent.name);
       }
@@ -12376,8 +12420,23 @@ export class AgentFramework {
           const { inMs } = this.eventGate.armSelfWake(agentName, secs, 'skip_reply');
           console.error(`[self-wake] agent=${agentName} armed in ${Math.round(inMs / 1000)}s (skip_reply)`);
         } else if (inputObj.wake_in_seconds !== undefined && !this.eventGate) {
-          delete inputObj.wake_in_seconds;
-          console.error(`[self-wake] agent=${agentName} wake_in_seconds requested but no EventGate — ignored`);
+          // Refuse instead of stripping the request and returning a false
+          // skip_reply success. Without EventGate no timer can be armed; leave
+          // the turn alive so the agent can choose another continuation plan.
+          const error =
+            'No EventGate configured (FrameworkConfig.gate is unset). ' +
+            'skip_reply wake_in_seconds was not armed; omit it to stay idle until an external wake.';
+          console.error(`[self-wake] agent=${agentName} ${error}`);
+          this.emitTrace({
+            type: 'tool:failed', module: 'channels', tool: enrichedCall.name,
+            callId: enrichedCall.id, error,
+          });
+          this.pushEvent({
+            type: 'tool-result', callId: enrichedCall.id, agentName,
+            moduleName: 'channels',
+            result: { success: false, error, isError: true },
+          });
+          return;
         }
       }
       this.dispatchChannelToolCall(agentName, enrichedCall);
