@@ -519,6 +519,14 @@ type DiscordAwarenessDrainOutcome =
   | { status: 'delivered'; delivered: number; failed: number }
   | { status: 'unavailable'; accounted: number };
 
+/** One drain pass's place in the registry (see runDiscordAwarenessDrain). */
+interface DiscordAwarenessDrainPass {
+  /** Set as the pass stops claiming, in the same synchronous step. */
+  ended: boolean;
+  /** Its promise, once registered. */
+  drain?: Promise<DiscordAwarenessDrainOutcome>;
+}
+
 function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
   if (value === undefined || !Number.isFinite(value) || value <= 0) {
     return DEFAULT_DISCORD_AWARENESS_DEADLINE_MS;
@@ -13752,7 +13760,30 @@ export class AgentFramework {
     const existing = this.discordAwarenessDrains.get(serverId);
     if (existing) return existing;
 
-    const drain = (async () => {
+    const pass: DiscordAwarenessDrainPass = { ended: false };
+    const drain = this.runDiscordAwarenessDrain(serverId, pass);
+    // A pass that ended before its first await (nothing was due, the route
+    // was down, or its first claim failed) is never registered.
+    if (!pass.ended) {
+      pass.drain = drain;
+      this.discordAwarenessDrains.set(serverId, drain);
+    }
+    return drain;
+  }
+
+  /**
+   * One pass of drainDiscordAwarenessOutbox. It leaves the registry in the
+   * same synchronous step as its last claim, so a registered pass always has
+   * a claim ahead of it: a request that joins it is served by it, and one
+   * made after its last claim starts a new pass. Leaving any later, when its
+   * promise settles, would let a request join a pass that will never claim
+   * again, and that work would stay due until some unrelated trigger.
+   */
+  private async runDiscordAwarenessDrain(
+    serverId: string,
+    pass: DiscordAwarenessDrainPass,
+  ): Promise<DiscordAwarenessDrainOutcome> {
+    try {
       const outbox = this.discordAwarenessOutbox!;
       const connection = this.mcplServerRegistry?.getServer(serverId);
       if (!connection?.isConnected) {
@@ -13854,12 +13885,12 @@ export class AgentFramework {
         );
       }
       return { status: 'delivered' as const, delivered, failed };
-    })().finally(() => {
-      this.discordAwarenessDrains.delete(serverId);
-    });
-
-    this.discordAwarenessDrains.set(serverId, drain);
-    return drain;
+    } finally {
+      pass.ended = true;
+      if (pass.drain !== undefined && this.discordAwarenessDrains.get(serverId) === pass.drain) {
+        this.discordAwarenessDrains.delete(serverId);
+      }
+    }
   }
 
   private readDiscordAwarenessDispatches(serverId?: string) {

@@ -782,6 +782,105 @@ test('a drain whose route goes away stops claiming: the rest stays queued, with 
   }
 });
 
+test('a retract made just after a drain finds nothing due is delivered on its own trigger', async () => {
+  // A drain that had made its final claim but not yet left the registry was
+  // handed the retract's trigger, and never looked again: the removal stayed
+  // due until some unrelated trigger. Each depth puts the retract one
+  // microtask further from that final claim.
+  const sent: Record<number, string[]> = {};
+  const due: Record<number, number> = {};
+  for (const depth of [0, 1, 2, 3]) {
+    const h = storeHarness();
+    try {
+      const batch = activeBatch(h.outbox, [ref('m1')]);
+      const calls: string[] = [];
+      const connection = {
+        isConnected: true,
+        sendToolsCallWithDeadline: async (name: string, args: Record<string, unknown>) => {
+          calls.push(`${name}:${args.messageId}`);
+          return { content: [{ type: 'text', text: 'ok' }] };
+        },
+      };
+      const framework = Object.create(AgentFramework.prototype) as any;
+      framework.discordAwarenessOutbox = h.outbox;
+      framework.discordAwarenessDrains = new Map();
+      framework.discordAwarenessDeadlineMs = 1000;
+      framework.mcplServerRegistry = { getServer: () => connection };
+      framework.operatorLog = new OperatorLog(undefined);
+      framework.opsAlert = () => {};
+      const claim = h.outbox.claimDispatch.bind(h.outbox);
+      let retracted: Promise<void> | undefined;
+      h.outbox.claimDispatch = (serverId, skip) => {
+        const claimed = claim(serverId, skip);
+        if (!claimed && !retracted) {
+          retracted = Promise.resolve().then(async () => {
+            for (let i = 0; i < depth; i++) await null;
+            framework.retractDiscordAwareness(batch.id);
+          });
+        }
+        return claimed;
+      };
+      await muted(async () => {
+        await framework.drainDiscordAwarenessOutbox('discord');
+        await retracted;
+        while (framework.discordAwarenessDrains.size > 0) {
+          await Promise.allSettled([...framework.discordAwarenessDrains.values()]);
+        }
+      });
+      sent[depth] = calls;
+      due[depth] = h.outbox.pendingDispatches('discord').length;
+    } finally {
+      h.cleanup();
+    }
+  }
+  const delivered = ['add_reaction:m1', 'remove_reaction:m1'];
+  assert.deepEqual(sent, { 0: delivered, 1: delivered, 2: delivered, 3: delivered });
+  assert.deepEqual(due, { 0: 0, 1: 0, 2: 0, 3: 0 });
+});
+
+test('one drain pass per server: a request while its reply is out joins the pass, which sends the new work next', async () => {
+  const h = storeHarness();
+  try {
+    activeBatch(h.outbox, [ref('m1')]);
+    const calls: string[] = [];
+    let answerFirst!: () => void;
+    const firstAnswered = new Promise<void>((resolve) => { answerFirst = resolve; });
+    const connection = {
+      isConnected: true,
+      sendToolsCallWithDeadline: async (name: string, args: Record<string, unknown>) => {
+        calls.push(`${name}:${args.messageId}`);
+        if (calls.length === 1) await firstAnswered;
+        return { content: [{ type: 'text', text: 'ok' }] };
+      },
+    };
+    const framework = Object.create(AgentFramework.prototype) as any;
+    framework.discordAwarenessOutbox = h.outbox;
+    framework.discordAwarenessDrains = new Map();
+    framework.discordAwarenessDeadlineMs = 1000;
+    framework.mcplServerRegistry = { getServer: () => connection };
+    await muted(async () => {
+      const first = framework.drainDiscordAwarenessOutbox('discord');
+      assert.deepEqual(calls, ['add_reaction:m1'], 'the first request leaves before the call returns');
+      // Work for another message while m1's reply is out. Only the registry
+      // holds it back: the per-key guard would let a second pass send it.
+      activeBatch(h.outbox, [ref('m2')], { targetBranch: 'rollback/cairn/2' });
+      const second = framework.drainDiscordAwarenessOutbox('discord');
+      assert.equal(second, first, 'the running pass is joined');
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(calls, ['add_reaction:m1'], 'nothing more leaves while the reply is out');
+      answerFirst();
+      assert.deepEqual(await first, { status: 'delivered', delivered: 2, failed: 0 });
+      assert.deepEqual(calls, ['add_reaction:m1', 'add_reaction:m2'], 'the joined pass sent the new work');
+      assert.equal(framework.discordAwarenessDrains.size, 0);
+      // A pass with nothing due ends before its first await: never registered.
+      void framework.drainDiscordAwarenessOutbox('discord');
+      assert.equal(framework.discordAwarenessDrains.size, 0);
+    });
+  } finally {
+    h.cleanup();
+  }
+});
+
 test('framework resumes an interrupted suppression before activating its marks', async () => {
   const h = storeHarness();
   try {
