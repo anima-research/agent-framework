@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, renameSync, cpSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { AgentFramework, type Module, type ModuleContext } from '../src/index.js';
+import { AgentFramework, ShutdownTimeoutError, DEFAULT_SHUTDOWN_TIMEOUT_MS,
+  type Module, type ModuleContext } from '../src/index.js';
 import { MockMembrane } from './helpers/mock-membrane.js';
-import { ShutdownTimeoutError } from '../src/shutdown.js';
 import { McplTransport } from '../src/mcpl/transport.js';
 import { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
@@ -36,6 +36,89 @@ test('successful stop persists Chronicle state for a new framework', async t => 
   const reopened = await AgentFramework.create(config);
   try { assert.deepEqual(reopened.getStore().getStateJson('shutdown-test'), expected); }
   finally { await reopened.stop(); }
+});
+
+// The author's host reproduction allows a finite six-second module stop.
+// Chronicle state written before and during teardown must survive reopen.
+test('bare stop waits for a slow finite module and persists its final state', async t => {
+  const completed = deferred();
+  let context!: ModuleContext;
+  const slow = module('slow', async () => {
+    await new Promise<void>(done => setTimeout(done, 6000));
+    try { context.setState({ completed: true }); } finally { completed.resolve(); }
+  });
+  slow.start = async ctx => { context = ctx; };
+  const { framework, store, config } = await fixture(t, [slow]);
+  store.registerState({ id: 'before-stop', strategy: 'snapshot' });
+  store.setStateJson('before-stop', { written: true });
+  try { await framework.stop(); }
+  finally {
+    // A failing baseline must not leave the delayed module writing to a
+    // store removed by the fixture's cleanup.
+    await completed.promise;
+  }
+  const reopened = await AgentFramework.create({ ...config, modules: [] });
+  try {
+    assert.deepEqual(reopened.getStore().getStateJson('before-stop'), { written: true });
+    assert.deepEqual(reopened.getStore().getStateJson('modules/slow/state'),
+      { completed: true, externalIdMap: {} });
+  } finally { await reopened.stop(); }
+});
+
+// Fleet owns its child deadline and permits cleanup beyond five seconds.
+// The framework must not impose a shorter deadline on that owner.
+test('bare parent stop waits for a nested child shutdown beyond five seconds', async t => {
+  const completed = deferred();
+  const child = await fixture(t, [module('child-slow', async () => {
+    await new Promise<void>(done => setTimeout(done, 6000));
+    completed.resolve();
+  })]);
+  let childStopped = false;
+  const parent = await fixture(t, [module('fleet', async () => {
+    await child.framework.stop();
+    await new Promise<void>(done => setTimeout(done, 50));
+    childStopped = true;
+  })]);
+  try {
+    await parent.framework.stop();
+    assert.equal(childStopped, true);
+    assert.equal(parent.store.isClosed(), true);
+    assert.equal(child.store.isClosed(), true);
+  } finally {
+    await completed.promise;
+  }
+});
+
+test('borrowed-store lifecycle changes invalidate a successful stop memo', async t => {
+  const { store, config } = await fixture(t);
+  const framework = await AgentFramework.create({ ...config, store });
+  await framework.stop();
+  let calls = 0;
+  await framework.addModule(module('later', async () => { calls++; }));
+  await framework.stop();
+  assert.equal(calls, 1);
+  framework.start();
+  await framework.stop();
+  assert.equal((framework as any).running, false);
+});
+
+test('real Chronicle consumed close failure remains terminal with its original error', async t => {
+  const { framework, store, config } = await fixture(t);
+  const close = store.close.bind(store);
+  let closeCalls = 0, closeFailure: unknown;
+  store.close = () => {
+    closeCalls++;
+    // Fault only close's internal sync, after the framework's final sync.
+    renameSync(config.storePath, `${config.storePath}.moved`);
+    try { close(); } catch (error) { closeFailure = error; throw error; }
+  };
+  const stopped = framework.stop();
+  await assert.rejects(stopped);
+  assert.equal(store.isClosed(), true, 'Chronicle consumes its native handle before sync');
+  await assert.rejects(framework.stop(), error => error === closeFailure);
+  assert.equal(closeCalls, 1);
+  assert.throws(() => framework.start(), /owned store is closed/);
+  await assert.rejects(framework.addModule(module('later', async () => {})), /owned store is closed/);
 });
 
 test('final sync failure rejects stop and still closes an owned store', async t => {
@@ -71,7 +154,7 @@ test('module stop failure waits for peers and preserves storage for retry', asyn
     assert.deepEqual(order, ['failed']);
   } finally { release(); }
   assert.equal((await stopped).error, failure);
-  assert.deepEqual(order, ['failed', 'delayed-stopped']);
+  assert.deepEqual(order, ['failed', 'delayed-stopped', 'sync']);
 });
 
 test('sync and close failures are both retained', async t => {
@@ -94,7 +177,7 @@ test('module synchronous throw does not prevent stopping other modules', async t
   store.sync = () => { syncCalls++; sync(); };
   await assert.rejects(framework.stop(), error => error === failure);
   assert.equal(otherStopped, true);
-  assert.equal(syncCalls, 0);
+  assert.equal(syncCalls, 1);
 });
 
 test('failed final storage repair rejects stop after sync and owned close', async t => {
@@ -151,7 +234,7 @@ for (const synchronous of [false, true]) {
       assert.deepEqual(order, []);
     } finally { release(); }
     assert.equal((await stopped).error, failure);
-    assert.deepEqual(order, ['connection-closed']);
+    assert.deepEqual(order, ['connection-closed', 'sync']);
     assert.equal(registry.getAllServers().length, 1);
     assert.equal(registry.getServer('failing') !== null, true);
   });
@@ -195,7 +278,7 @@ test('timeout retains original contexts and pending cleanup; retry only repeats 
   assert.equal(framework.getModule('pending'), pending);
   assert.equal(framework.getModule('successful'), null);
   assert.equal((registry as unknown as { speechHandlers: unknown[] }).speechHandlers.length, 1);
-  assert.equal(syncCalls, 0); assert.equal(closeCalls, 0);
+  assert.equal(syncCalls, 1); assert.equal(closeCalls, 0);
   assert.deepEqual(failedContext.getState(), { attempts: 1, externalIdMap: {} });
   // Concurrent retries share one real attempt, including the still running peer.
   const retry = framework.stop(1000);
@@ -204,7 +287,7 @@ test('timeout retains original contexts and pending cleanup; retry only repeats 
   assert.equal(failedCalls, 2); assert.equal(pendingCalls, 1); assert.equal(successfulCalls, 1);
   waiting.resolve();
   await retry;
-  assert.equal(syncCalls, 1); assert.equal(closeCalls, 1);
+  assert.equal(syncCalls, 2); assert.equal(closeCalls, 1);
   assert.equal((registry as unknown as { speechHandlers: unknown[] }).speechHandlers.length, 0);
   assert.equal(framework.getModule('retryable'), null);
   await framework.stop();
@@ -230,15 +313,85 @@ test('hang-only cleanup is bounded and later rejection remains observed', async 
   await new Promise<void>(done => setImmediate(done));
 });
 
-test('incomplete teardown skips final tool-result repair and storage operations', async t => {
+test('incomplete teardown attempts final tool-result repair and sync without closing storage', async t => {
   const failure = new Error('module incomplete');
   const { framework, store } = await fixture(t, [module('failed', async () => { throw failure; })], true);
-  let repairCalls = 0;
+  let repairCalls = 0, syncCalls = 0;
   framework.getAgent('assistant')!.toolResultGuard.flushUnrecorded = () => { repairCalls++; };
-  store.sync = () => { assert.fail('no final sync before teardown'); };
+  const sync = store.sync.bind(store);
+  store.sync = () => { syncCalls++; sync(); };
   store.close = () => { assert.fail('no close before teardown'); };
   await assert.rejects(framework.stop(), error => error === failure);
-  assert.equal(repairCalls, 0);
+  assert.equal(repairCalls, 1);
+  assert.equal(syncCalls, 1);
+});
+
+test('explicit timeout syncs available state before host exit and leaves cleanup owned', async t => {
+  const waiting = deferred();
+  let context!: ModuleContext, calls = 0;
+  const pending = module('pending', async () => {
+    calls++;
+    context.setState({ beforeTimeout: true });
+    await waiting.promise;
+  });
+  pending.start = async ctx => { context = ctx; };
+  const { framework, store, config } = await fixture(t, [pending]);
+  try {
+    await assert.rejects(framework.stop(15), ShutdownTimeoutError);
+    assert.equal(store.isClosed(), false);
+    // Chronicle locks the live store. A separate disk copy verifies persisted
+    // bytes without closing the pending cleanup owner's handle to sync them.
+    const snapshotPath = `${config.storePath}.snapshot`;
+    cpSync(config.storePath, snapshotPath, { recursive: true });
+    const observer = await AgentFramework.create({ ...config, storePath: snapshotPath, modules: [] });
+    try {
+      assert.deepEqual(observer.getStore().getStateJson('modules/pending/state'),
+        { beforeTimeout: true, externalIdMap: {} });
+    } finally { await observer.stop(); }
+    const retry = framework.stop();
+    waiting.resolve();
+    await retry;
+    assert.equal(calls, 1, 'a caller timeout does not restart the registry cleanup');
+  } finally { waiting.resolve(); }
+});
+
+test('failed teardown retains repair and sync failures without closing pending storage', async t => {
+  const teardownFailure = new Error('teardown failed');
+  const repairFailure = new Error('repair failed');
+  const syncFailure = new Error('sync failed');
+  const { framework, store } = await fixture(t, [
+    module('failed', async () => { throw teardownFailure; }),
+  ], true);
+  framework.getAgent('assistant')!.toolResultGuard.flushUnrecorded = () => { throw repairFailure; };
+  store.sync = () => { throw syncFailure; };
+  store.close = () => { assert.fail('pending cleanup retains the store'); };
+  await assert.rejects(framework.stop(), error => error instanceof AggregateError &&
+    error.errors.includes(teardownFailure) && error.errors.includes(repairFailure) &&
+    error.errors.includes(syncFailure));
+  assert.equal(store.isClosed(), false);
+});
+
+test('host-facing diagnostics include both registry labels and observed failures', async t => {
+  assert.equal(DEFAULT_SHUTDOWN_TIMEOUT_MS, undefined);
+  const waiting = deferred();
+  const failure = new Error('observed module failure');
+  const { framework } = await fixture(t, [
+    module('failed', async () => { throw failure; }),
+    module('pending', async () => { await waiting.promise; }),
+  ]);
+  const registry = new McplServerRegistry();
+  (registry as any).servers.set('pending-server', { close: async () => { await waiting.promise; } });
+  (framework as any).mcplServerRegistry = registry;
+  try {
+    await assert.rejects(framework.stop(15), error => {
+      assert.ok(error instanceof AggregateError);
+      const message = String(error);
+      assert.match(message, /module:pending/);
+      assert.match(message, /mcpl:pending-server/);
+      assert.match(message, /observed module failure/);
+      return true;
+    });
+  } finally { waiting.resolve(); }
 });
 
 test('invalid shutdown budgets fail before effects', async t => {

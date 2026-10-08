@@ -306,7 +306,8 @@ export class ModuleRegistry {
   }
 
   /**
-   * Stop all modules.
+   * Stop all modules. A caller may bound its wait without cancelling cleanup.
+   * The default waits for each module's own shutdown contract.
    */
   async stopAll(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
     validateShutdownTimeout(timeoutMs);

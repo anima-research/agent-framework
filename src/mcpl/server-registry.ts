@@ -136,7 +136,8 @@ export class McplServerRegistry {
   }
 
   /**
-   * Close all server connections and clear the registry.
+   * Close all server connections, retaining failed or pending attempts.
+   * An explicit timeout bounds the caller's wait without cancelling cleanup.
    */
   async closeAll(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
     validateShutdownTimeout(timeoutMs);
