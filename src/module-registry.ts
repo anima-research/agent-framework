@@ -25,7 +25,7 @@ import type {
   TraceEventListener,
 } from './types/index.js';
 import type { Agent } from './agent.js';
-import { callProvenance } from './call-provenance.js';
+import { callProvenance, normalizeOrigin } from './call-provenance.js';
 
 const MODULE_STATE_PREFIX = 'modules/';
 
@@ -301,12 +301,13 @@ export class ModuleRegistry {
 
     // Create a call with the un-prefixed name (preserving caller identity,
     // who initiated it, and any operator admission it carries)
+    const origin = normalizeOrigin(call.origin);
     const moduleCall: ToolCall = {
       id: call.id,
       name: toolName,
       input: call.input,
       callerAgentName: call.callerAgentName,
-      ...(call.origin ? { origin: call.origin } : {}),
+      ...(origin ? { origin } : {}),
       ...(call.admission ? { admission: call.admission } : {}),
     };
 
@@ -315,7 +316,7 @@ export class ModuleRegistry {
       // so a tool it delegates to through ctx.callTool keeps that actor.
       return await callProvenance.run(
         {
-          ...(call.origin ? { origin: call.origin } : {}),
+          ...(origin ? { origin } : {}),
           ...(call.admission ? { admission: call.admission } : {}),
         },
         () => module.handleToolCall(moduleCall),

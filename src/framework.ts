@@ -9,7 +9,7 @@ import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
-import { callProvenance } from './call-provenance.js';
+import { callProvenance, normalizeOrigin } from './call-provenance.js';
 import {
   selfChangeKind,
   sameValue,
@@ -1911,7 +1911,7 @@ export class AgentFramework {
       // call behind it (a module's own timer or event) the host.
       callTool: (call) => {
         const ambient = callProvenance.getStore();
-        const origin = call.origin ?? (ambient ? ambient.origin : 'host');
+        const origin = normalizeOrigin(call.origin) ?? (ambient ? ambient.origin : 'host');
         const admission = call.admission ?? ambient?.admission;
         const { origin: _o, admission: _a, ...rest } = call;
         return this.executeToolCallFrom(
@@ -14342,10 +14342,14 @@ export class AgentFramework {
    * never confer module trust, whatever the input claims. Module origin
    * exists only through the private closure handed to ModuleRegistry
    * (ctx.callTool → executeToolCallFrom with {kind:'module'}). Callers that
-   * don't identify themselves fail safe to agent semantics too.
+   * don't identify themselves fail safe to agent semantics too. An origin the
+   * caller names is normalized (normalizeOrigin): a value other than
+   * 'puppet' or 'host' is the host's, never the agent's own.
    */
   async executeToolCall(call: ToolCall): Promise<ToolResult> {
-    return this.executeToolCallFrom(call, {
+    const { origin: named, ...rest } = call;
+    const origin = normalizeOrigin(named);
+    return this.executeToolCallFrom({ ...rest, ...(origin ? { origin } : {}) }, {
       kind: 'agent',
       agentName: call.callerAgentName ?? '__ephemeral__',
     });

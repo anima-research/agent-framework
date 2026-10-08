@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
-import type { InferenceRequest, Module, ModuleContext, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
+import type { InferenceRequest, Module, ModuleContext, ResolvedOperatorChange, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 class ProbeModule implements Module {
@@ -171,5 +171,132 @@ describe('tool-call origin', () => {
       { id: 'nested', origin: undefined },
       { id: 'independent', origin: 'host' },
     ]);
+  });
+});
+
+/**
+ * The gate's boundary is call origin: only the agent's own model call, or
+ * work that call started for that same agent, applies a self-change
+ * directly. Each path below once labelled an imposed change as the agent's
+ * own (found in #255's review); each must reach the gate now, as the actor
+ * who imposed it, with nothing applied.
+ */
+class Delegator implements Module {
+  readonly name = 'dlg';
+  ctx!: ModuleContext;
+  last?: Promise<ToolResult>;
+  async start(ctx: ModuleContext): Promise<void> { this.ctx = ctx; }
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return ['retarget', 'self_set', 'notify'].map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {} } }));
+  }
+  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    const input = (call.input ?? {}) as { target?: string; tokens?: number };
+    if (call.name === 'retarget') {
+      return this.ctx.callTool({ id: 'r', name: 'agent_settings', input: budget(input.tokens ?? 131_000), callerAgentName: input.target });
+    }
+    if (call.name === 'self_set') {
+      this.last = this.ctx.callTool({ id: 's', name: 'agent_settings', input: budget(input.tokens ?? 132_000), callerAgentName: call.callerAgentName });
+      return this.last;
+    }
+    // notify: pushes an ordinary event and nothing more.
+    this.ctx.pushEvent({ type: 'custom', name: 'dlg-notify', data: {} } as never);
+    return { success: true, data: 'notified' };
+  }
+  async onProcess(): Promise<Record<string, never>> { return {}; }
+}
+
+/** A separate module that reacts to traces on its own: the host's actor. */
+class Governor implements Module {
+  readonly name = 'gov';
+  ctx!: ModuleContext;
+  now?: Promise<ToolResult>;
+  later?: Promise<ToolResult>;
+  async start(ctx: ModuleContext): Promise<void> {
+    this.ctx = ctx;
+    ctx.onTrace((ev) => {
+      const event = ev as { type: string; processEvent?: { name?: string } };
+      if (event.type !== 'process:received' || event.processEvent?.name !== 'dlg-notify' || this.now) return;
+      this.now = ctx.callTool({ id: 'g1', name: 'agent_settings', input: budget(133_000), callerAgentName: 'scout' });
+      this.later = new Promise((resolve) => setTimeout(() => resolve(
+        ctx.callTool({ id: 'g2', name: 'agent_settings', input: budget(134_000), callerAgentName: 'scout' }),
+      ), 5));
+    });
+  }
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] { return []; }
+  async handleToolCall(): Promise<ToolResult> { return { success: true }; }
+  async onProcess(): Promise<Record<string, never>> { return {}; }
+}
+
+const budget = (tokens: number) => ({ action: 'update', context_budget_tokens: tokens });
+
+describe("tool-call origin: the agent's own, and nothing else, skips the gate", () => {
+  let tempDir: string;
+  let membrane: MockMembrane;
+  let dlg: Delegator;
+  let gov: Governor;
+  let framework: AgentFramework;
+  let asked: ResolvedOperatorChange[];
+  let quiet: { log: typeof console.log; error: typeof console.error };
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'tool-call-origin-gate-'));
+    membrane = new MockMembrane();
+    dlg = new Delegator();
+    gov = new Governor();
+    asked = [];
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [
+        { name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', maxTokens: 1000 },
+        { name: 'other', model: 'test-model', systemPrompt: 'You are other.', maxTokens: 1000 },
+      ],
+      modules: [dlg, gov],
+      codeExecution: { enabled: true },
+      operatorChangeGate: async (change) => {
+        asked.push(structuredClone(change));
+        return { id: `rev-${asked.length}`, text: `staged ${change.kind}` };
+      },
+    });
+    quiet = { log: console.log, error: console.error };
+    console.log = () => {};
+    console.error = () => {};
+  });
+  afterEach(async () => {
+    console.log = quiet.log;
+    console.error = quiet.error;
+    await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const tokens = (agent = 'scout') => framework.getAgentRuntimeSettings(agent).contextBudgetTokens;
+  const modelCalls = async (name: string, input: Record<string, unknown>) => {
+    membrane.pushResponse(createMockResponse([{ type: 'tool_use', id: `toolu_${name.replace(/\W/g, '')}`, name, input }], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'done' }]));
+    (framework as unknown as Internals).pendingRequests.push(
+      { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'test', timestamp: Date.now() } as InferenceRequest,
+    );
+    await framework.runUntilIdle();
+  };
+  const surfaces = () => asked.map((c) => `${c.agent}:${c.surface}`);
+
+  it("reads an origin a module names as the host's unless it's 'puppet', never as the agent's own", async () => {
+    for (const origin of ['', 0, false, Number.NaN, 'agent', 'PUPPET', {}]) {
+      await dlg.ctx.callTool({ id: 'n', name: 'agent_settings', input: budget(136_000), callerAgentName: 'scout', origin } as unknown as ToolCall);
+    }
+    await dlg.ctx.callTool({ id: 'p', name: 'agent_settings', input: budget(137_000), callerAgentName: 'scout', origin: 'puppet' });
+    for (const origin of [null, undefined]) {
+      await dlg.ctx.callTool({ id: 'u', name: 'agent_settings', input: budget(138_000), callerAgentName: 'scout', origin } as unknown as ToolCall);
+    }
+    await framework.executeToolCall({ id: 'x', name: 'agent_settings', input: budget(139_000), callerAgentName: 'scout', origin: '' } as unknown as ToolCall);
+    assert.deepEqual(surfaces(), [
+      ...Array(7).fill('scout:host'),
+      'scout:puppet',
+      'scout:host', 'scout:host', // no origin and no call behind it: the host
+      'scout:host', // the public entry normalizes too
+    ]);
+    assert.equal(tokens(), 100_000);
   });
 });

@@ -17,3 +17,14 @@ import type { ToolCall } from './types/index.js';
 export type CallProvenance = Pick<ToolCall, 'origin' | 'admission'>;
 
 export const callProvenance = new AsyncLocalStorage<CallProvenance>();
+
+/**
+ * A caller-supplied origin as the framework reads it: absent (undefined or
+ * null) stays absent, 'puppet' stays the operator's, and any other value is
+ * the host's. Types forbid other values, but an untyped module or host can
+ * pass anything, and a falsy one must never read as the agent's own.
+ */
+export function normalizeOrigin(origin: unknown): ToolCall['origin'] {
+  if (origin === undefined || origin === null) return undefined;
+  return origin === 'puppet' ? 'puppet' : 'host';
+}
