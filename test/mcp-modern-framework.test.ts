@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, WorkspaceModule } from '../src/index.js';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolDefinition, ToolResult } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
@@ -50,14 +50,18 @@ const lines = (file: string) => (existsSync(file) ? readFileSync(file, 'utf8').s
 
 interface Harness { framework: AgentFramework; membrane: MockMembrane; dir: string }
 
-async function withModern(fn: (h: Harness) => Promise<void>, extraServers: Record<string, unknown>[] = []): Promise<void> {
+async function withModern(
+  fn: (h: Harness) => Promise<void>,
+  extraServers: Record<string, unknown>[] = [],
+  extraModules: Module[] = [],
+): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'modern-framework-'));
   const membrane = new MockMembrane();
   const framework = await AgentFramework.create({
     storePath: join(dir, 'store'),
     membrane: membrane.asMembrane(),
     agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
-    modules: [new Waker()],
+    modules: [new Waker(), ...extraModules],
     mcplServers: [
       {
         id: 'modern',
@@ -178,6 +182,114 @@ test('scripts get structured results whole, as one JSON object', async () => {
     // Without structured content the script contract is unchanged (pinned):
     // the history rendering, which JSON-encodes a text result.
     assert.equal(await handle('agent', 'mcpl--modern--echo', { text: 'x' }), JSON.stringify('echo:x'));
+  });
+});
+
+// The script cap measures the serialized object's length (Iris-1827,
+// room-293): `sized` pads structuredContent so that length is exact.
+const SCRIPT_CAP = 5_000_000;
+const sizedObject = (pad: number, isError = false) => ({
+  content: [],
+  structuredContent: { pad: 'x'.repeat(pad) },
+  isError,
+  // A tool error with no text carries the framework's own error text.
+  ...(isError ? { error: 'Tool call failed' } : {}),
+});
+/** The pad that makes the script's JSON exactly `chars` long. */
+const padFor = (chars: number, isError = false) => chars - JSON.stringify(sizedObject(0, isError)).length;
+const scriptHandle = (framework: AgentFramework) => (framework as unknown as {
+  handleScriptToolCall: (agent: string, tool: string, args: Record<string, unknown>) => Promise<string>;
+}).handleScriptToolCall.bind(framework);
+
+async function withWorkspace(fn: (h: Harness & { workspace: WorkspaceModule }) => Promise<void>): Promise<void> {
+  const board = mkdtempSync(join(tmpdir(), 'modern-board-'));
+  const workspace = new WorkspaceModule({ mounts: [{ name: 'board', path: board, mode: 'read-write', watch: 'never' }] });
+  try {
+    await withModern((h) => {
+      // The host wires the store after create(), as conhost does.
+      workspace.initStore(h.framework.getStore());
+      return fn({ ...h, workspace });
+    }, [], [workspace]);
+  } finally {
+    rmSync(board, { recursive: true, force: true });
+  }
+}
+
+/** A saved file's bytes, read back through the workspace as a resident would. */
+async function readSaved(workspace: WorkspaceModule, path: string): Promise<string> {
+  const read = await workspace.readBinary(path);
+  assert.ok('data' in read, `readable: ${path} (${'error' in read ? read.error : ''})`);
+  return read.data.toString('utf8');
+}
+
+async function savedObject(workspace: WorkspaceModule, savedTo: string): Promise<unknown> {
+  assert.match(savedTo, /^board\/tool-results\/\d{4}-\d{2}-\d{2}-script-[0-9a-f-]{36}\.json$/);
+  return JSON.parse(await readSaved(workspace, savedTo));
+}
+
+test('script results: exactly at the cap arrive inline; one past it are saved whole, a tool error included', async () => {
+  await withWorkspace(async ({ framework, workspace }) => {
+    framework.start();
+    const handle = scriptHandle(framework);
+
+    const at = await handle('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP) });
+    assert.equal(at.length, SCRIPT_CAP);
+    assert.deepEqual(JSON.parse(at), sizedObject(padFor(SCRIPT_CAP)));
+
+    const over = JSON.parse(await handle('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1) }));
+    assert.deepEqual(Object.keys(over).sort(), ['isError', 'oversized']);
+    assert.equal(over.isError, false);
+    assert.equal(over.oversized.chars, SCRIPT_CAP + 1);
+    assert.deepEqual(await savedObject(workspace, over.oversized.savedTo), sizedObject(padFor(SCRIPT_CAP + 1)), 'the whole object, recoverable');
+
+    const failed = JSON.parse(await handle('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1, true), isError: true }));
+    assert.equal(failed.isError, true, 'a tool error stays visible without reading the file');
+    assert.equal(failed.oversized.chars, SCRIPT_CAP + 1);
+    assert.notEqual(failed.oversized.savedTo, over.oversized.savedTo);
+    assert.deepEqual(await savedObject(workspace, failed.oversized.savedTo), sizedObject(padFor(SCRIPT_CAP + 1, true), true));
+  });
+});
+
+test('script results past the cap: no workspace, or a failed write, is a failure to deliver, never a success', async () => {
+  const assertUndelivered = (out: { isError: boolean; error: string; oversized: unknown }) => {
+    assert.equal(out.isError, true);
+    assert.match(out.error, /exceeds the 5000000-char script result cap and could not be saved to the workspace, so it could not be delivered; the tool may already have completed/);
+    assert.deepEqual(out.oversized, { chars: SCRIPT_CAP + 1, savedTo: null });
+  };
+  await withModern(async ({ framework }) => {
+    framework.start();
+    assertUndelivered(JSON.parse(await scriptHandle(framework)('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1) })));
+  });
+  await withWorkspace(async ({ framework, workspace }) => {
+    framework.start();
+    workspace.writeBinary = async () => ({ success: false, error: 'disk full', isError: true });
+    assertUndelivered(JSON.parse(await scriptHandle(framework)('agent', 'mcpl--modern--sized', { pad: padFor(SCRIPT_CAP + 1) })));
+  });
+});
+
+test('saved payloads: call ids that sanitize to one label still get distinct files', async () => {
+  await withWorkspace(async ({ framework, workspace }) => {
+    const read = (framework as unknown as {
+      mcpToolResult: (result: unknown, callId: string, mcplPeer: boolean) => Promise<ToolResult>;
+    }).mcpToolResult.bind(framework);
+    const audio = (bytes: string) => ({ content: [{ type: 'audio', data: Buffer.from(bytes).toString('base64'), mimeType: 'audio/wav' }] });
+    const savedTo = (result: ToolResult) => /saved to workspace file (\S+)\]/.exec(String(result.data))?.[1];
+    // `call:a` and `call/a` sanitize alike; so do ids that differ only past the kept prefix.
+    const long = 'x'.repeat(90);
+    const results = [
+      await read(audio('first'), 'call:a', false),
+      await read(audio('second'), 'call/a', false),
+      await read(audio('third'), `${long}-1`, false),
+      await read(audio('fourth'), `${long}-2`, false),
+    ];
+    const paths = results.map(savedTo);
+    assert.ok(paths.every((p) => typeof p === 'string'), JSON.stringify(results));
+    assert.equal(new Set(paths).size, 4, `distinct paths: ${paths.join(', ')}`);
+    assert.deepEqual(
+      await Promise.all(paths.map((p) => readSaved(workspace, p!))),
+      ['first', 'second', 'third', 'fourth'],
+      'each file keeps its own call\'s bytes',
+    );
   });
 });
 

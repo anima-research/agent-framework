@@ -11909,7 +11909,7 @@ export class AgentFramework {
     const workspace = this.getWorkspaceModule();
     const mount = workspace ? this.firstWritableMountName(workspace) : null;
     if (workspace && mount) {
-      const path = `${mount}/tool-results/${new Date().toISOString().slice(0, 10)}-script-${randomUUID().slice(0, 8)}.json`;
+      const path = `${mount}/tool-results/${new Date().toISOString().slice(0, 10)}-script-${randomUUID()}.json`;
       const written = await workspace.writeBinary(path, Buffer.from(json, 'utf8'), 'application/json').catch(() => null);
       if (written?.success) {
         return JSON.stringify({ isError: object.isError, oversized: { chars: json.length, savedTo: path } });
@@ -15422,7 +15422,11 @@ export class AgentFramework {
   ): Promise<ToolResult> {
     const hasStructured = Object.prototype.hasOwnProperty.call(result, 'structuredContent');
     if (!mcplPeer) {
-      const label = `${new Date().toISOString().slice(0, 10)}-${callId}`.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
+      // The date and call id make a saved payload's name readable; the UUID
+      // makes it unique. Sanitizing and truncating map distinct ids to one
+      // label (`call:a` and `call/a`), and a later write would replace the
+      // earlier result's file.
+      const label = `${new Date().toISOString().slice(0, 10)}-${callId}`.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80) + `-${randomUUID()}`;
       const workspace = this.getWorkspaceModule();
       const mount = workspace ? this.firstWritableMountName(workspace) : null;
       const save = workspace && mount

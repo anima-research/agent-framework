@@ -3,9 +3,10 @@
   content types:
   - text stays text, and inline images stay native;
   - audio and binary resources are saved to the workspace (`tool-results/`),
-    with a bounded stub saying where. If a payload can't be saved, the result
-    is reported as incomplete (`isError`), noting the tool may already have
-    completed, never as a success with part of it missing;
+    each under a unique name, with a bounded stub saying where. If a payload
+    can't be saved, the result is reported as incomplete (`isError`), noting
+    the tool may already have completed, never as a success with part of it
+    missing;
   - a `resource_link` is shown as a reference and never fetched;
   - an embedded text resource shows its text.
 
