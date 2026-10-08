@@ -7986,7 +7986,9 @@ export class AgentFramework {
    * An inbound item's metadata with its stored copy's own digest
    * (`storedBodyDigest`): the delivered-body digest's function over exactly
    * the blocks handed to storage here — every decoration included, before
-   * storage shards them. Taken at each storage site, never earlier, because
+   * storage shards them. That function hashes blocks as the store keeps them
+   * (inline media re-encoded and relabeled from its bytes), so the copy read
+   * back hashes to this too. Taken at each storage site, never earlier, because
    * a path can still decorate the body after ingestion stamped it (the
    * closed-channel invitation; room-220 #48282). An edit through
    * editMessage keeps metadata but not this hash.
@@ -9444,6 +9446,12 @@ export class AgentFramework {
   /** Drafts with a delivery attempt in flight, `${agent}\u0000${id}`: a
    *  parallel resend (or `{{unsent}}`) of the same draft is refused. */
   private draftsInFlight = new Set<string>();
+  /** The drafts in draftsInFlight whose attempt is out right now (journaled,
+   *  its publish awaited). A dismissal of one is refused, and the resident
+   *  told to wait for that result, since a dismissal can't call back words
+   *  already on their way. A draft only queued in a resend batch can still
+   *  be dismissed: the batch honours that when it reaches the draft. */
+  private draftsSending = new Set<string>();
 
   /**
    * The resident's `drafts` tool: list, read, resend and dismiss its own held
@@ -9541,6 +9549,14 @@ export class AgentFramework {
     }
 
     if (action === 'dismiss') {
+      // Refuse up front, before anything is dismissed, rather than half-way.
+      const sending = drafts.find((d) => this.draftsSending.has(`${agentName}\u0000${d.id}`));
+      if (sending) {
+        return refuse(
+          `${sending.id} is being sent right now, and dismissing it can't call those words back; ` +
+          'wait for that result before dismissing it. Nothing was dismissed.',
+        );
+      }
       const lines: string[] = [];
       for (const d of drafts) {
         const state = draftState(d);
@@ -9666,7 +9682,10 @@ export class AgentFramework {
           stopped = true;
           continue;
         }
+        const sendingKey = `${agentName}\u0000${d.id}`;
+        this.draftsSending.add(sendingKey);
         const outcome = await registry.publish(agentName, d.text, { serverId: destination.serverId, channelId: destination.channelId, threadId: destination.threadId ?? null });
+        this.draftsSending.delete(sendingKey);
         let recorded = true;
         try {
           this.proseDrafts.recordOutcome(agentName, d.id, attemptId, outcome);
@@ -9702,7 +9721,10 @@ export class AgentFramework {
               : ' The draft stays held.'));
       }
     } finally {
-      for (const claim of claims) this.draftsInFlight.delete(claim);
+      for (const claim of claims) {
+        this.draftsInFlight.delete(claim);
+        this.draftsSending.delete(claim);
+      }
     }
     const allDelivered = !stopped;
     return allDelivered ? ok(lines.join('\n')) : refuse(lines.join('\n'));
@@ -9810,8 +9832,15 @@ export class AgentFramework {
     for (const d of unconfirmed) {
       notes.push(`draft ${d.id} is unconfirmed: ${this.riskText(d)} — check that channel before sending it again (resend needs confirmDuplicate: true)`);
     }
+    // A dismissal sets a draft aside; it doesn't unsay that the draft's own
+    // attempt may already have been posted.
     const dismissed = inState('dismissed');
-    if (dismissed.length > 0) notes.push(`draft${dismissed.length === 1 ? '' : 's'} ${idList(dismissed)} dismissed by you`);
+    const dismissedAtRisk = dismissed.filter((d) => uncertainAttempt(d));
+    const dismissedQuietly = dismissed.filter((d) => !uncertainAttempt(d));
+    for (const d of dismissedAtRisk) notes.push(`draft ${d.id} dismissed by you, but ${this.riskText(d)}`);
+    if (dismissedQuietly.length > 0) {
+      notes.push(`draft${dismissedQuietly.length === 1 ? '' : 's'} ${idList(dismissedQuietly)} dismissed by you`);
+    }
     for (const d of inState('delivered')) {
       const attempt = d.attempts.find((a) => a.outcome?.status === 'delivered')!;
       const how = attempt.via === 'resend' ? 'by your resend' : 'by your {{unsent}}';
@@ -9836,11 +9865,12 @@ export class AgentFramework {
         : `${suppressed} plain-speech segment(s) suppressed`);
     }
     const suppressedNote = notes.join(' · ');
-    // Nothing is confirmed delivered, but an unconfirmed draft may have been.
+    // Nothing is confirmed delivered, but an unconfirmed draft (or a dismissed
+    // one whose own attempt is uncertain) may have been.
     const text =
       shown.length > 0
         ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}`
-        : `[delivered] nothing${unconfirmed.length > 0 ? ' confirmed' : ''} — ${suppressedNote}`;
+        : `[delivered] nothing${unconfirmed.length > 0 || dismissedAtRisk.length > 0 ? ' confirmed' : ''} — ${suppressedNote}`;
     try {
       const mid = agent.getContextManager().addMessage(
         'user',
@@ -10406,12 +10436,18 @@ export class AgentFramework {
       }
     }
     const flight = unsent ? `${agent.name}\u0000${unsent.id}` : undefined;
-    if (flight) this.draftsInFlight.add(flight);
+    if (flight) {
+      this.draftsInFlight.add(flight);
+      this.draftsSending.add(flight);
+    }
     let outcome: PublishOutcome;
     try {
       outcome = await registry.deliverSpeech(agent.name, body, channelId);
     } finally {
-      if (flight) this.draftsInFlight.delete(flight);
+      if (flight) {
+        this.draftsInFlight.delete(flight);
+        this.draftsSending.delete(flight);
+      }
     }
     if (unsent && attemptId) {
       try {
@@ -10523,10 +10559,22 @@ export class AgentFramework {
     }
   }
 
-  /** `>>skip_reply {{unsent}}` and its hybrid form: set the latest bounce draft aside. */
+  /** `>>skip_reply {{unsent}}` and its hybrid form: set the latest bounce
+   *  draft aside — unless it is being sent right now, which a dismissal
+   *  can't call back: the resident is told instead. */
   private dismissLatestBounce(agent: Agent): void {
     const draft = this.proseDrafts.latestBounce(agent.name);
     if (!draft) return;
+    if (this.draftsSending.has(`${agent.name}\u0000${draft.id}`)) {
+      const busy = `[prose-routing] {{unsent}} is draft ${draft.id}, which is being sent right now. It was not set aside, ` +
+        'since that can\'t call back words already on their way; wait for that result.';
+      try {
+        this.addMessage('user', [{ type: 'text', text: busy }], { system: true, kind: 'prose-bounce' }, { forAgent: agent.name });
+      } catch (err) {
+        console.error('[drafts] in-flight-dismiss notice failed:', err);
+      }
+      return;
+    }
     try {
       this.proseDrafts.dismiss(agent.name, draft.id);
       this.emitTrace({ type: 'prose:drafts-dismissed', agentName: agent.name, draftIds: [draft.id] });
