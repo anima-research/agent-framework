@@ -404,11 +404,24 @@ export interface OperatorChangeResolutionReceipt {
   /** The attestation as recorded. */
   recorded: OperatorChangeResolution;
   /** The source restored, when a not-committed attempt's destination was the
-   *  active body. */
+   *  active body and restoring it succeeded. A failed restoration is named
+   *  in `remaining` instead. */
   restored?: string;
   /** When the change settles from here. */
   settlement: string;
   /** Anything this didn't repair. */
+  remaining?: string;
+}
+
+/** What restoreOperatorChangeSource did: the source of an abandoned
+ *  attempt whose destination was still the active body. */
+export interface OperatorChangeRestorationReceipt {
+  changeId: string;
+  attempt: number;
+  /** The source restored, when restoring it succeeded. */
+  restored?: string;
+  /** What still needs repair when it didn't: the destination stays active
+   *  and traffic stays held. */
   remaining?: string;
 }
 

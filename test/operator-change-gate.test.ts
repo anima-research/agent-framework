@@ -1303,6 +1303,115 @@ describe('operator-change gate: host/command undo by turns', () => {
     assert.equal(status.quiesced, false, 'settled: resume proceeds');
   });
 
+  // Every CM branch switch fails until the returned function is called.
+  const failEverySwitch = () => {
+    const cmx = framework.getAgent('scout')!.getContextManager() as unknown as { switchBranch: (name: string) => Promise<unknown> };
+    const real = cmx.switchBranch.bind(cmx);
+    cmx.switchBranch = async () => { throw new Error('injected restore failure'); };
+    return () => { cmx.switchBranch = real; };
+  };
+  const restoreSource = (changeId: string) => framework.runAtSafeBoundary({ verb: 'restore' }, (lease) =>
+    framework.restoreOperatorChangeSource(changeId, { lease, requester: { via: 'test', name: 'nissa' } }));
+
+  it('holds an abandoned destination a not-committed settlement could not restore: resume() refuses, forced or not, until the source is restored live', async () => {
+    await say('a0'); await say('a1'); await say('a2');
+    await undoWithMarks(2, 'all');
+    const change = asked[0]!;
+    const undoRecord = failJournalOnce('switched');
+    try {
+      await assert.rejects(applyIt(change), /injected switched failure/);
+    } finally {
+      undoRecord();
+    }
+    await reopen();
+    const destination = `undo/scout/op-${change.id}`;
+    assert.deepEqual([branch(), quiesced()], [destination, true]);
+    const undoSwitch = failEverySwitch();
+    let settled: Awaited<ReturnType<typeof resolve>>;
+    try {
+      settled = await resolve(change.id, 1, 'not-committed', 'nothing applied');
+    } finally {
+      undoSwitch();
+    }
+    assert.equal(settled.restored, undefined, 'nothing was restored');
+    assert.match(settled.remaining!, new RegExp(`the source ${change.sourceBranch} could not be restored: .*injected restore failure`));
+    assert.equal(branch(), destination);
+    assert.equal(framework.getOperatorChangeRecord(change.id)!.unresolved, undefined, 'its verdict is recorded');
+
+    const abandoned = [{ changeId: change.id, agent: 'scout', kind: 'undo-turns', attempt: 1, target: destination, source: change.sourceBranch }];
+    for (const opts of [undefined, { force: true }]) {
+      await assert.rejects(framework.resume(opts), (e: unknown) => {
+        assert.ok(e instanceof ResumeBlockedError);
+        assert.deepEqual([e.restorationRequired, e.unresolved, e.verdicts], [abandoned, [], []]);
+        assert.ok(e.message.includes(`restoreOperatorChangeSource("${change.id}", { lease })`));
+        assert.doesNotMatch(e.message, /resolveOperatorChange|--verdict/, 'no further attestation is asked for');
+        return true;
+      });
+    }
+    const viaCommand = await host().handleHostCommand('discord', { command: 'resume', force: true, requesterName: 'nissa' });
+    assert.deepEqual([viaCommand.ok, viaCommand.restorationRequired], [false, abandoned]);
+    assert.equal(quiesced(), true);
+
+    const restored = await restoreSource(change.id);
+    assert.deepEqual(restored, { changeId: change.id, attempt: 1, restored: change.sourceBranch });
+    assert.equal(branch(), change.sourceBranch);
+    assert.ok(framework.getOperatorLog().some((e) => e.kind === 'restore-operator-change-source' && (e.params as { changeId?: string }).changeId === change.id));
+    await assert.rejects(restoreSource(change.id), (e: Error & { code?: string }) => e.code === 'invalid' && /nothing to restore/.test(e.message));
+    assert.equal((await framework.resume()).quiesced, false, 'the known body is back: resume proceeds');
+  });
+
+  it('holds traffic itself when a live attempt fails and its source cannot be restored, until a live restoration, then serves the source', async () => {
+    await say('m0'); await say('m1');
+    await host().handleHostCommand('discord', { command: 'undo', agentName: 'scout', messages: 2, marks: 'none', requesterName: 'nissa' });
+    const change = asked[0]!;
+    const destination = `undo-msgs/scout/op-${change.id}`;
+    const undoCut = failCutAfterInitializerWrite();
+    let undoSwitch = () => {};
+    const cmx = framework.getAgent('scout')!.getContextManager() as unknown as { switchBranch: (name: string) => Promise<unknown> };
+    const cutting = cmx.switchBranch;
+    cmx.switchBranch = async (name) => { // the cut fails as before; then every restore fails
+      const result = cutting(name);
+      undoSwitch = failEverySwitch();
+      return result;
+    };
+    try {
+      await assert.rejects(applyIt(change), /injected strategy initialization failure/);
+    } finally {
+      undoSwitch(); undoCut();
+    }
+    assert.equal(branch(), destination, 'left on the abandoned destination');
+    assert.equal(quiesced(), true, 'the framework held traffic without anyone calling resume()');
+
+    const providerCalls = membrane.calls.length;
+    host().pendingRequests.push({ agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'test', timestamp: Date.now() } as InferenceRequest);
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, providerCalls, 'a queued wake does not run on the abandoned body after the lease released');
+    await assert.rejects(framework.resume({ force: true }), (e: unknown) => e instanceof ResumeBlockedError && e.restorationRequired[0]?.target === destination);
+
+    // A retry that fails again keeps the hold, and says so: the host's retry
+    // of the change, and a live restoration.
+    const failing = failEverySwitch();
+    let again: Awaited<ReturnType<typeof restoreSource>>;
+    try {
+      await assert.rejects(applyIt(change), (e: Error & { code?: string }) =>
+        e.code === 'failed' && /abandoned attempt 1 left .* active, and restoring its source .* failed again/.test(e.message));
+      again = await restoreSource(change.id);
+    } finally {
+      failing();
+    }
+    assert.equal(again.restored, undefined);
+    assert.match(again.remaining!, /could not be restored: .*injected restore failure/);
+    assert.deepEqual([branch(), quiesced()], [destination, true]);
+
+    assert.deepEqual(await restoreSource(change.id), { changeId: change.id, attempt: 1, restored: change.sourceBranch });
+    await framework.resume();
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'back on the source' }]));
+    await framework.runUntilIdle();
+    assert.ok(membrane.calls.length > providerCalls, 'the parked wake ran once resumed');
+    assert.equal(branch(), change.sourceBranch, 'on the source body');
+    assert.ok(texts().includes('back on the source'));
+  });
+
   it('lets resume() proceed while an unresolved attempt left its source, not its destination, active', async () => {
     await say('m0'); await say('m1');
     await host().handleHostCommand('discord', { command: 'undo', agentName: 'scout', messages: 2, marks: 'all', requesterName: 'nissa' });

@@ -1007,6 +1007,7 @@ export class ApiServer {
               error: error.message,
               verdicts: error.verdicts,
               ...(error.unresolved.length > 0 ? { unresolved: error.unresolved } : {}),
+              ...(error.restorationRequired.length > 0 ? { restorationRequired: error.restorationRequired } : {}),
               hostMode: this.framework.getHostModeStatus(),
             });
           } else {

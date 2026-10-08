@@ -3,7 +3,7 @@ export * from './types/index.js';
 
 // Core classes
 export { AgentFramework, BudgetPreflightError, ResumeBlockedError } from './framework.js';
-export type { RuntimeSettingsPreview, HostModeStatus, SafeBoundaryLease, SafeBoundaryOptions, UnresolvedActiveBody } from './framework.js';
+export type { RuntimeSettingsPreview, HostModeStatus, SafeBoundaryLease, SafeBoundaryOptions, UnresolvedActiveBody, AbandonedActiveBody } from './framework.js';
 export { OperatorJournalUnreadableError, OperatorChangeRecoveryError } from './framework.js';
 export type {
   OperatorChangeReceipt,
@@ -18,6 +18,8 @@ export type {
   UnstickStepRecord,
   UnstickAttemptRecord,
   UnstickAttemptOutcome,
+  OperatorChangeResolutionReceipt,
+  OperatorChangeRestorationReceipt,
 } from './operator-change.js';
 export { Agent } from './agent.js';
 export type { StartStreamResult } from './agent.js';
