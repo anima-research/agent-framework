@@ -37,6 +37,12 @@
  *                {op:"wake", id, exec_id, line, payload}
  *                {op:"exec_result", id, stdout, stderr, return_code, tail?}
  *
+ * A tool_call's or wake's exec_id is the exec whose work made it: bound in a
+ * contextvar when the exec starts, so every task and callback its script
+ * starts (each copies the context it was created in) reports that exec, even
+ * after it ends or while a later one runs. The host serves only the exec
+ * that is running.
+ *
  * IMPORTANT: the python source below must not contain backticks or the
  * sequence dollar+brace (TS template literal syntax). String.raw preserves
  * backslashes, so \n inside python string literals is fine.
@@ -45,6 +51,7 @@
 export const PYTHON_RUNTIME_SOURCE: string = String.raw`
 import ast
 import asyncio
+import contextvars
 import inspect
 import io
 import json
@@ -166,7 +173,8 @@ _pending_tool_futures = {}
 _pending_wake_futures = {}
 _next_tool_call_id = 0
 _next_wake_id = 0
-_current_exec_id = None
+# The exec the running work belongs to (see the protocol notes above).
+_exec_id = contextvars.ContextVar("exec_id", default=None)
 _current_exec_task = None
 
 
@@ -187,7 +195,7 @@ def _make_tool_fn(tool_name, py_name):
         send({
             "op": "tool_call",
             "id": call_id,
-            "exec_id": _current_exec_id,
+            "exec_id": _exec_id.get(),
             "name": tool_name,
             "args": args,
         })
@@ -227,7 +235,7 @@ async def wake_agent(payload=None):
     send({
         "op": "wake",
         "id": wake_id,
-        "exec_id": _current_exec_id,
+        "exec_id": _exec_id.get(),
         "line": line,
         "payload": payload,
     })
@@ -279,8 +287,23 @@ def handle_init(msg):
         SCRIPT_GLOBALS.pop("wake_agent", None)
 
 
+def _started_by(task, exec_id, started):
+    # Whether this exec's own work started the task: read from the context
+    # it runs in where Python exposes it (3.12+). Older interpreters fall
+    # back to "created during this exec", which also counts a task that a
+    # task left by an earlier exec started meanwhile.
+    get_context = getattr(task, "get_context", None)
+    if get_context is not None:
+        return get_context().get(_exec_id) == exec_id
+    return task not in started
+
+
 async def _run_script(exec_id, code):
-    global _current_exec_id, _current_exec_task
+    global _current_exec_task
+    # This task runs in its own copy of the context: the binding reaches the
+    # script and whatever it starts, and nothing else.
+    _exec_id.set(exec_id)
+    started = asyncio.all_tasks()
     if BACKGROUND:
         out = LogTee(LOG_PATH, TAIL_CHARS)
         err = out  # interleave, terminal-style; tail is shared
@@ -304,7 +327,6 @@ async def _run_script(exec_id, code):
         return_code = 1
     finally:
         sys.stdout, sys.stderr, sys.stdin = old_out, old_err, old_in
-        _current_exec_id = None
         _current_exec_task = None
         for fut in list(_pending_tool_futures.values()):
             if not fut.done():
@@ -314,6 +336,21 @@ async def _run_script(exec_id, code):
             if not fut.done():
                 fut.cancel()
         _pending_wake_futures.clear()
+
+    # Tasks this script started that are still running outlive its exec, and
+    # with it their standing: the host refuses their tool calls from now on.
+    # Say so where the script's author reads (a background interpreter is
+    # disposed with its exec, so its tasks end with it).
+    left = [
+        t for t in asyncio.all_tasks()
+        if t is not asyncio.current_task() and not t.done() and _started_by(t, exec_id, started)
+    ]
+    if left and not BACKGROUND:
+        err.write(
+            "\n[code_execution] " + str(len(left)) + " task(s) this script started were still running "
+            "when it ended. Their tool calls are refused from now on: await them before the script "
+            "ends, or use a background script.\n"
+        )
 
     if BACKGROUND:
         out.flush()
@@ -344,7 +381,7 @@ async def _run_script(exec_id, code):
 
 
 async def main():
-    global _current_exec_id, _current_exec_task
+    global _current_exec_task
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
 
@@ -382,7 +419,6 @@ async def main():
                     "return_code": 1,
                 })
                 continue
-            _current_exec_id = msg.get("id")
             _current_exec_task = asyncio.ensure_future(
                 _run_script(msg.get("id"), msg.get("code") or "")
             )

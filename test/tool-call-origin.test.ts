@@ -338,4 +338,119 @@ describe("tool-call origin: the agent's own, and nothing else, skips the gate", 
     ]);
     assert.equal(tokens(), 100_000);
   });
+
+  it('refuses a tool call from a task a script left running, after its exec and during a later one', async () => {
+    framework.start();
+    const settle = (name: string) => [
+      `for _ in range(500):`,
+      `    if "${name}" in globals(): break`,
+      `    await asyncio.sleep(0.01)`,
+    ];
+    // The puppet's script leaves a task that calls after its exec has ended.
+    const first = await framework.puppetToolCall('scout', 'code_execution', {
+      code: [
+        'import asyncio',
+        'async def _after():',
+        '    await asyncio.sleep(0.3)',
+        '    globals()["late1"] = await agent_settings({"action": "update", "context_budget_tokens": 134000})',
+        'asyncio.ensure_future(_after())',
+        'print("scheduled")',
+      ].join('\n'),
+    });
+    assert.equal(first.result.success, true, String(first.result.error));
+    const out = first.result.data as { stdout: string; stderr: string };
+    assert.equal(out.stdout.trim(), 'scheduled');
+    assert.match(out.stderr, /1 task\(s\) this script started were still running when it ended/);
+
+    // The next one reads what that task got back, and leaves a task that
+    // calls only once the agent's own script is running.
+    const second = await framework.puppetToolCall('scout', 'code_execution', {
+      code: [
+        'import asyncio',
+        ...settle('late1'),
+        'print(late1)',
+        'async def _during():',
+        '    while not globals().get("agent_running"):',
+        '        await asyncio.sleep(0.01)',
+        '    globals()["late2"] = await agent_settings({"action": "update", "context_budget_tokens": 135000})',
+        'asyncio.ensure_future(_during())',
+      ].join('\n'),
+    });
+    assert.match((second.result.data as { stdout: string }).stdout, /earlier code_execution script left running/);
+
+    // The agent's own script waits for that call, then makes its own.
+    await modelCalls('code_execution', {
+      code: [
+        'import asyncio',
+        'agent_running = True',
+        ...settle('late2'),
+        'print(await agent_settings({"action": "update", "context_budget_tokens": 126000}))',
+      ].join('\n'),
+    });
+    assert.equal(tokens(), 126_000, "the agent's own script applies its own change");
+    assert.deepEqual(asked, [], 'neither leftover call reached the gate: both were refused');
+    assert.match(await readGlobal(framework, 'late2'), /earlier code_execution script left running/,
+      "the puppet's task, firing during the agent's own exec, was refused");
+  });
+
+  it("refuses a call from a thread the script started, which can't be traced to it, while serving the script's own", async () => {
+    framework.start();
+    const { result } = await framework.puppetToolCall('scout', 'code_execution', {
+      code: [
+        'import asyncio, threading',
+        'loop = asyncio.get_running_loop()',
+        'box = {}',
+        'def worker():',
+        '    box["thread"] = asyncio.run_coroutine_threadsafe(',
+        '        agent_settings({"action": "update", "context_budget_tokens": 140000}), loop).result(timeout=10)',
+        't = threading.Thread(target=worker)',
+        't.start()',
+        'while t.is_alive():',
+        '    await asyncio.sleep(0.02)',
+        'print(box["thread"])',
+        'print(await agent_settings({"action": "update", "context_budget_tokens": 141000}))',
+      ].join('\n'),
+    });
+    assert.equal(result.success, true, String(result.error));
+    assert.match((result.data as { stdout: string }).stdout, /can't be traced to the running code_execution script/);
+    assert.deepEqual(surfaces(), ['scout:puppet'], "only the script's own call reached the gate, as the puppet's");
+    assert.equal(tokens(), 100_000);
+  });
+
+  it('says nothing of tasks that finished with the script, or of a thread it joined', async () => {
+    framework.start();
+    const { result } = await framework.puppetToolCall('scout', 'code_execution', {
+      code: [
+        'import asyncio, threading',
+        'await asyncio.gather(*(asyncio.sleep(0.01) for _ in range(3)))',
+        't = threading.Thread(target=lambda: None)',
+        't.start()',
+        't.join()',
+        'print("done")',
+      ].join('\n'),
+    });
+    assert.equal(result.success, true, String(result.error));
+    assert.deepEqual(result.data && { stdout: (result.data as { stdout: string }).stdout.trim(), stderr: (result.data as { stderr: string }).stderr }, { stdout: 'done', stderr: '' });
+  });
+
+  it("keeps a background script's calls its starter's for its whole life", async () => {
+    framework.start();
+    const started = await framework.puppetToolCall('scout', 'code_execution', {
+      code: ['import asyncio', 'await asyncio.sleep(0.2)', 'await agent_settings({"action": "update", "context_budget_tokens": 142000})'].join('\n'),
+      background: true,
+    });
+    assert.equal(started.result.success, true, String(started.result.error));
+    const deadline = Date.now() + 10_000;
+    while (asked.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(surfaces(), ['scout:puppet']);
+    assert.equal(tokens(), 100_000);
+  });
 });
+
+/** A script global, read by a host script. */
+async function readGlobal(framework: AgentFramework, name: string): Promise<string> {
+  const read = await framework.executeToolCall({
+    id: `read-${name}`, name: 'code_execution', input: { code: `print(${name})` }, callerAgentName: 'scout', origin: 'host',
+  });
+  return (read.data as { stdout?: string } | undefined)?.stdout ?? String(read.error);
+}

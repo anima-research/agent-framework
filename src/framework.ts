@@ -1715,13 +1715,6 @@ export class AgentFramework {
   private codeExecutionConfig: import('./types/index.js').CodeExecutionConfig | null = null;
   private codeExecutionRunners: Map<string, PyRunner> = new Map();
   private scriptToolWaiters: Map<string, (result: ToolResult) => void> = new Map();
-  /**
-   * Who initiated the interactive code_execution call running for each
-   * agent (its origin and admission), so the script's inner tool calls carry
-   * them too. The runner allows one interactive script per agent at a time.
-   * A background script binds its own at start.
-   */
-  private scriptCallProvenance: Map<string, Pick<ToolCall, 'origin' | 'admission'>> = new Map();
   /** Agents whose running script hit an endTurn-carrying inner result —
    *  deferred and applied to the final code_execution result instead of
    *  cancelling the stream mid-script (which would wedge the turn). */
@@ -14845,19 +14838,12 @@ export class AgentFramework {
 
     const runner = this.getOrCreateScriptRunner(agentName);
     this.scriptDeferredEndTurn.delete(agentName);
-    // A busy runner refuses this exec, so only an exec that can run sets
-    // the provenance its inner calls read; it's cleared when that exec ends.
-    const owned = !runner.busy;
-    if (owned) {
-      if (provenance) this.scriptCallProvenance.set(agentName, provenance);
-      else this.scriptCallProvenance.delete(agentName);
-    }
-    let exec: Awaited<ReturnType<typeof runner.exec>>;
-    try {
-      exec = await runner.exec(input.code, injected, undefined, timeLimitMs !== undefined ? { deadlineMs: timeLimitMs } : undefined);
-    } finally {
-      if (owned && this.scriptCallProvenance.get(agentName) === provenance) this.scriptCallProvenance.delete(agentName);
-    }
+    // The exec carries who started it: its own inner calls, and only those,
+    // are made as that actor (PyRunner serves only the running exec's work).
+    const exec = await runner.exec(input.code, injected, undefined, {
+      ...(timeLimitMs !== undefined ? { deadlineMs: timeLimitMs } : {}),
+      ...(provenance ? { provenance } : {}),
+    });
     const endTurn = this.scriptDeferredEndTurn.delete(agentName);
 
     return {
@@ -14941,7 +14927,7 @@ export class AgentFramework {
       scriptTimeoutMs: cfg?.scriptTimeoutMs,
       idleReclaimMs: 0, // dedicated runner; lifetime is the exec deadline
       label: `${agentName}:${scriptId}`,
-      onToolCall: (toolName, args) => this.handleScriptToolCall(agentName, toolName, args, provenance),
+      onToolCall: (toolName, args, execProvenance) => this.handleScriptToolCall(agentName, toolName, args, execProvenance),
     });
 
     const record: BackgroundScriptRecord = {
@@ -14967,7 +14953,7 @@ export class AgentFramework {
         logPath: logAbsPath,
         lifetimeMs,
         onWake: (line, payload) => this.handleScriptWake(record, line, payload),
-      })
+      }, provenance ? { provenance } : undefined)
       .then((exec) => this.settleBackgroundScript(record, exec))
       .catch((err) => {
         // exec never rejects by contract; this is the belt-and-suspenders.
@@ -15265,8 +15251,7 @@ export class AgentFramework {
         scriptTimeoutMs: cfg?.scriptTimeoutMs,
         idleReclaimMs: cfg?.idleReclaimMs,
         label: agentName,
-        onToolCall: (toolName, args) =>
-          this.handleScriptToolCall(agentName, toolName, args, this.scriptCallProvenance.get(agentName)),
+        onToolCall: (toolName, args, provenance) => this.handleScriptToolCall(agentName, toolName, args, provenance),
       });
       this.codeExecutionRunners.set(agentName, runner);
     }

@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface, type Interface } from 'node:readline';
 import { PYTHON_RUNTIME_SOURCE } from './runtime-py.js';
+import type { ToolCall } from '../types/index.js';
 
 export interface InjectedTool {
   /** Python identifier the tool is bound to (sanitized, `--` -> `__`). */
@@ -53,10 +54,16 @@ export interface BackgroundExecOptions {
   lifetimeMs: number;
 }
 
-/** Resolves inner tool calls. Must never reject — map errors to strings. */
+/** Who started an exec (its origin and admission): the calls its own work
+ *  makes carry it. Absent: the agent's own model. */
+export type ExecProvenance = Pick<ToolCall, 'origin' | 'admission'>;
+
+/** Resolves inner tool calls, each with the provenance of the exec whose
+ *  work made it. Must never reject — map errors to strings. */
 export type ScriptToolCallHandler = (
   toolName: string,
   args: Record<string, unknown>,
+  provenance: ExecProvenance | undefined,
 ) => Promise<string>;
 
 export interface PyRunnerOptions {
@@ -77,6 +84,17 @@ const DEFAULT_SCRIPT_TIMEOUT_MS = 600_000;
 const DEFAULT_IDLE_RECLAIM_MS = 300_000;
 const CANCEL_GRACE_MS = 10_000;
 
+/** What a tool call gets back when it isn't the running exec's own work
+ *  (see handleLine): `execId` is the exec it reported, if any. */
+function refusalFor(execId: unknown): string {
+  return typeof execId === 'string'
+    ? 'Error: this tool call came from a task that an earlier code_execution script left running. ' +
+      'Tool calls are served only to the running script and the tasks it started.'
+    : 'Error: this tool call came from work that can\'t be traced to the running code_execution script, ' +
+      'such as a coroutine sent from a thread started without the script\'s context. ' +
+      'Tool calls are served only to the running script and the tasks it started.';
+}
+
 /** The longest delay Node's timers honour (~24.8 days); a longer one fires after ~1 ms. */
 export const MAX_TIMER_MS = 2_147_483_647;
 
@@ -89,6 +107,8 @@ export function formatLimit(ms: number): string {
 
 interface PendingExec {
   id: string;
+  /** Who started it: its inner calls carry this (ScriptToolCallHandler). */
+  provenance: ExecProvenance | undefined;
   resolve: (result: ExecResult) => void;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
   killTimer: ReturnType<typeof setTimeout> | null;
@@ -140,12 +160,14 @@ export class PyRunner {
    *
    * `opts.deadlineMs` replaces the runner's scriptTimeoutMs for this exec (a
    * per-call time limit); a background exec uses its `lifetimeMs` instead.
+   * `opts.provenance` is who started the exec: the tool calls its own work
+   * makes carry it, and only while it runs (see handleLine).
    */
   async exec(
     code: string,
     tools: InjectedTool[],
     background?: BackgroundExecOptions,
-    opts?: { deadlineMs?: number },
+    opts?: { deadlineMs?: number; provenance?: ExecProvenance },
   ): Promise<ExecResult> {
     if (this.disposed) {
       return { stdout: '', stderr: 'code_execution runner disposed', returnCode: 1, aborted: true };
@@ -180,6 +202,7 @@ export class PyRunner {
     const result = await new Promise<ExecResult>((resolve) => {
       const pending: PendingExec = {
         id: execId,
+        provenance: opts?.provenance,
         resolve,
         deadlineTimer: null,
         killTimer: null,
@@ -334,7 +357,7 @@ export class PyRunner {
   private readyResolver: (() => void) | null = null;
 
   private handleLine(line: string): void {
-    let msg: { op?: string; id?: string; name?: string; args?: unknown; stdout?: string; stderr?: string; return_code?: number };
+    let msg: { op?: string; id?: string; exec_id?: unknown; name?: string; args?: unknown; stdout?: string; stderr?: string; return_code?: number };
     try {
       msg = JSON.parse(line);
     } catch {
@@ -351,11 +374,19 @@ export class PyRunner {
         const callId = msg.id;
         const toolName = msg.name;
         if (!callId || !toolName) return;
+        // Only the running exec's own work is served, as whoever started that
+        // exec. A task an earlier exec left running reports that exec, whose
+        // standing (its turn, lease or admission) ended with it.
+        const pending = this.servingExec(msg.exec_id);
+        if (!pending) {
+          this.send({ op: 'tool_result', id: callId, result: refusalFor(msg.exec_id) });
+          return;
+        }
         const args =
           msg.args && typeof msg.args === 'object' && !Array.isArray(msg.args)
             ? (msg.args as Record<string, unknown>)
             : {};
-        this.onToolCall(toolName, args)
+        this.onToolCall(toolName, args, pending.provenance)
           .catch((err) => `Error: ${err instanceof Error ? err.message : String(err)}`)
           .then((result) => {
             this.send({ op: 'tool_result', id: callId, result });
@@ -370,7 +401,7 @@ export class PyRunner {
           ? (msg as { line: number }).line
           : -1;
         const payload = (msg as { payload?: unknown }).payload;
-        const handler = this.onWake;
+        const handler = this.servingExec(msg.exec_id) ? this.onWake : null;
         const refuse = handler
           ? handler(line, payload).catch((err: unknown) =>
               `wake handler failed: ${err instanceof Error ? err.message : String(err)}`)
@@ -398,6 +429,12 @@ export class PyRunner {
       default:
         console.error(`[pytc:${this.label}] unknown protocol op: ${String(msg.op)}`);
     }
+  }
+
+  /** The running exec, if `execId` names it: the only exec whose work is served. */
+  private servingExec(execId: unknown): PendingExec | null {
+    const pending = this.pending;
+    return pending && !pending.settled && execId === pending.id ? pending : null;
   }
 
   private settlePending(result: ExecResult): void {
