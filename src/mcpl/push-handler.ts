@@ -205,10 +205,14 @@ export class PushHandler {
    * 1. Validate feature set
    * 2. Convert content blocks; reject visibly-empty content
    * 3. Deduplicate by eventId
-   * 4. Optionally check shouldTriggerInference callback
-   * 5. Push event to queue
-   * 6. Emit trace
-   * 7. Respond with accepted + inferenceId
+   * 4. Generate inferenceId
+   * 5. Build the event and its host source envelope (accepted now for an
+   *    ordinary push; only built for a coalesced one, whose coalescer
+   *    freezes it)
+   * 6. Optionally check shouldTriggerInference, with that envelope; then
+   *    hand a coalesced push to its coalescer, or queue an ordinary one
+   * 7. Emit trace
+   * 8. Respond with accepted + inferenceId
    */
   async handlePushEvent(
     serverId: string,
