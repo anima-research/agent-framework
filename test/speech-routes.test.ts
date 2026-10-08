@@ -36,6 +36,25 @@ describe('inferTurnRoute', () => {
     assert.deepEqual(turn, { route: home });
   });
 
+  it('a fork home answers the newest message the wake carried in the home conversation itself', () => {
+    const home: SpeechRoute = { kind: 'channel', serverId: 'discord', channelId: 'home', origin: 'home' };
+    const turn = inferTurnRoute([
+      candidate(channel('home'), false, 1, 'm-old'),
+      candidate(channel('home'), false, 3, 'm-new'),
+      candidate(channel('elsewhere'), true, 4, 'm-else'),
+      candidate(channel('home', { threadId: 't1' }), true, 5, 'm-thread'),
+    ], home, exactEverywhere);
+    assert.deepEqual(turn, { route: { ...home, replyTo: 'm-new' } });
+    // Addressed candidates in the home conversation come first, as for an inferred route.
+    const addressed = inferTurnRoute([
+      candidate(channel('home'), true, 1, 'm-asked'),
+      candidate(channel('home'), false, 2, 'm-later'),
+    ], home, rootEverywhere);
+    assert.deepEqual(addressed, { route: { ...home, replyTo: 'm-asked' } });
+    // A candidate without a message gives no reply edge.
+    assert.deepEqual(inferTurnRoute([candidate(channel('home'), true, 1)], home, rootEverywhere), { route: home });
+  });
+
   it('no candidates: no route', () => {
     assert.deepEqual(inferTurnRoute([], undefined, rootEverywhere), { route: null });
   });
