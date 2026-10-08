@@ -188,6 +188,12 @@ export class StdioTransport extends McplTransport {
     });
 
     this.child.on('error', (err) => this.emit('error', err));
+    // A write racing the child's exit fails with EPIPE on stdin. That is the
+    // exit's echo, which 'close' already reports, never a reason to crash: an
+    // unhandled stream 'error' would end the host.
+    this.child.stdin?.on('error', (err) => {
+      if (this.listenerCount('error') > 0) this.emit('error', err);
+    });
     this.child.on('exit', (code, signal) =>
       this.markClosed({ code, signal, reason: 'child process exited' }),
     );
@@ -216,21 +222,55 @@ export class StdioTransport extends McplTransport {
     this.child.stdin?.write(json + '\n');
   }
 
-  async close(): Promise<void> {
-    this.markClosed({ reason: 'closed by host' });
-    this.rl.close();
-    if (this.child && !this.child.killed) {
-      this.child.kill();
+  private closing: Promise<void> | null = null;
+
+  /**
+   * Close and reap: resolves once the child has actually exited, not merely
+   * been signalled (`child.killed` is true as soon as a signal is sent). A
+   * child that outlives SIGTERM by {@link STDIO_EXIT_GRACE_MS} gets SIGKILL.
+   * If it still hasn't exited after that bound again, close rejects: an
+   * explicit cleanup failure, rather than waiting forever or claiming an
+   * exit that wasn't seen. Calls share one attempt; a later call succeeds if
+   * the child has exited since.
+   */
+  close(): Promise<void> {
+    if (!this.closing) {
+      this.closing = this.reap();
+      return this.closing;
     }
-    await new Promise<void>((resolve) => {
-      if (!this.child || this.child.exitCode !== null || this.child.killed) {
-        resolve();
-      } else {
-        this.child.once('exit', () => resolve());
-      }
+    // A later call re-checks a failed verdict: a child that has exited since
+    // is reaped now. No new signals are sent.
+    return this.closing.catch((error: unknown) => {
+      if (this.child.exitCode !== null || this.child.signalCode !== null) return;
+      throw error;
     });
   }
+
+  private async reap(): Promise<void> {
+    this.markClosed({ reason: 'closed by host' });
+    this.rl.close();
+    const child = this.child;
+    // Never started (a spawn error): there is no process to reap.
+    if (child.pid === undefined) return;
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+    const exitWithin = (ms: number) => new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), ms);
+      void exited.then(() => { clearTimeout(timer); resolve(true); });
+    });
+    child.kill('SIGTERM');
+    if (await exitWithin(STDIO_EXIT_GRACE_MS)) return;
+    console.error(`[mcpl] stdio child ${child.pid} ignored SIGTERM for ${STDIO_EXIT_GRACE_MS}ms — sending SIGKILL`);
+    child.kill('SIGKILL');
+    if (await exitWithin(STDIO_EXIT_GRACE_MS)) return;
+    throw new Error(
+      `stdio child ${child.pid} did not exit within ${STDIO_EXIT_GRACE_MS}ms of SIGKILL; it could not be reaped`,
+    );
+  }
 }
+
+/** How long a stdio child gets to exit after SIGTERM, and again after SIGKILL. */
+const STDIO_EXIT_GRACE_MS = 2_000;
 
 // ---------------------------------------------------------------------------
 // WebSocket

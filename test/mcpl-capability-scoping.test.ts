@@ -179,7 +179,7 @@ process.stdin.on('data', (c) => {
     if (!line.trim()) continue;
     let m; try { m = JSON.parse(line); } catch { continue; }
     if (m.method === 'initialize') {
-      send({ jsonrpc: '2.0', id: m.id, result: { capabilities: { experimental: { mcpl: {
+      send({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: {
         version: '0.4',
         pushEvents: true,
         contextHooks: { beforeInference: true, afterInference: { blocking: true } },

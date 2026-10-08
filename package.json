@@ -49,11 +49,13 @@
     "@animalabs/chronicle": "^0.4.0",
     "@animalabs/context-manager": "^0.13.0",
     "@animalabs/membrane": "^0.5.78",
+    "@modelcontextprotocol/client": "^2.3.1",
     "chokidar": "^4.0.3",
     "discord.js": "^14.25.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@modelcontextprotocol/server": "^2.3.1",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.13",
     "discord.js": "^14.25.1",

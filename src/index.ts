@@ -90,7 +90,18 @@ export type { McplServerConfig } from './mcpl/index.js';
 // MCPL client connection (exposed so external tooling — server playtests,
 // health probes, protocol harnesses — can dial an MCPL server exactly the
 // way the framework host does, over stdio or WebSocket)
-export { McplServerConnection } from './mcpl/index.js';
+export { McplServerConnection, McplRequestError, McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/index.js';
+export { ModernMcpConnection } from './mcpl/index.js';
+export type { ModernToolCallResult } from './mcpl/index.js';
+export {
+  LEGACY_MCP_PROTOCOL_VERSION,
+  MODERN_MCP_PROTOCOL_VERSION,
+  resolveServerBinding,
+  serverConfigProblems,
+  serverConfigWarnings,
+  checkServerConfig,
+} from './mcpl/index.js';
+export type { McpProtocolFamily, McpTransportKind, ServerBinding } from './mcpl/index.js';
 export type { McplHostCapabilities } from './mcpl/index.js';
 
 // MCPL tool lifecycle (RFC-007) and tool classes (RFC-008): the types a host

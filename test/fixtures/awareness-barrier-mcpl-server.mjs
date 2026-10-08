@@ -166,6 +166,7 @@ function beginServerTraffic() {
 function handle(message) {
   if (message.method === 'initialize') {
     reply(message.id, {
+      protocolVersion: '2024-11-05',
       capabilities: {
         experimental: {
           mcpl: {

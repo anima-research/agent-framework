@@ -266,6 +266,46 @@ A pattern that matches no tool is reported once, as a console line and an
 A pattern that could name a server's tools is not judged until that server
 has listed them, so late connects and reconnects don't cause early reports.
 
+#### Modern MCP servers (2026-07-28)
+
+The same `mcplServers` list also takes servers that speak modern MCP
+(revision `2026-07-28`), reached through the official SDK client. The
+configuration chooses the family, and nothing is probed:
+
+| Configuration | Family | Transport |
+|---|---|---|
+| `url: 'ws://…'` / `'wss://…'` | MCPL (MCP `2024-11-05`) | WebSocket |
+| `url: 'http://…'` / `'https://…'` | modern MCP | Streamable HTTP (`token` / `accessProvider` as bearer) |
+| `command` | MCPL | stdio |
+| `command` + `protocol: 'modern'` | modern MCP | stdio |
+
+```typescript
+{
+  mcplServers: [
+    { id: 'docs', url: 'https://mcp.example.com/mcp', accessProvider: getToken },
+    { id: 'search', command: 'search-mcp', protocol: 'modern', reconnect: true },
+  ],
+}
+```
+
+A modern server's tools get the same prefix, `enabledTools`/`disabledTools`,
+class overrides and dispatch as an MCPL server's, and `listMcplServers()`
+shows its `family`, `protocolVersion` and `transport`. Its config differs in
+two ways:
+- It has no MCPL surface (grant, push, channels, inference requests, feature
+  sets), so setting MCPL-only fields on one is a configuration error.
+- `requestTimeoutMs` is one deadline per tool call and must be 1 to 2^31−1;
+  0 is refused, where MCPL reads it as no watchdog.
+
+At the deadline, cancellation is requested for a leg still in flight;
+between the rounds of an `input_required` continuation nothing is in flight
+to cancel. Either way the outcome is reported as unknown (`no-response`),
+and the call is never retried. A call that ends for any other reason after
+the server asked for another round, before its final answer, is reported
+the same way, since the server may already have acted. An MCPL server that
+refuses `2024-11-05` with `-32022` fails with `McplProtocolVersionError`,
+which names the fix, and is not retried.
+
 #### Feature sets
 
 `enabledFeatureSets` and `disabledFeatureSets` select which of a server's
