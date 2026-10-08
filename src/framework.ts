@@ -922,22 +922,35 @@ export interface UnresolvedActiveBody {
   target: string;
 }
 
-/** A cut whose latest attempt was abandoned (not committed: its failure
- *  recorded or seen, or an operator's not-committed verdict) while its
- *  destination is still the active body, because restoring its source
- *  failed: a body nobody approved. Its source must be restored
- *  (restoreOperatorChangeSource, or a restart) or the host moved to a
- *  known-safe body; the verdict is already recorded, so no attestation is
- *  needed. */
+/** A cut whose latest attempt was abandoned (it didn't commit: its failure
+ *  recorded or seen, or an operator's not-committed verdict) and whose
+ *  source hasn't been restored: its destination is still the active body,
+ *  or a restoration moved the store back to the source but failed before
+ *  the source's context initialized. Neither is a usable body. Restore it
+ *  (restoreOperatorChangeSource), restart, or move the host to a
+ *  known-safe body; no attestation is needed. */
 export interface AbandonedActiveBody {
   changeId: string;
   agent: string;
   kind: 'undo-turns' | 'undo-messages';
   attempt: number;
-  /** The abandoned destination, which is the active branch. */
+  /** The abandoned destination. */
   target: string;
   /** The branch to restore. */
   source: string;
+  /** The branch active now: the destination, or the source when a
+   *  restoration selected it but didn't complete. */
+  active: string;
+  /** Whether the journal holds that the attempt didn't commit (its failure,
+   *  or a not-committed verdict). It decides what a restart does while the
+   *  destination is active: when recorded, startup restores the source
+   *  before any agent initializes; when only this process saw the failure,
+   *  startup finds the attempt unresolved and boots quiesced until it is
+   *  settled not-committed. With the source active, a restart initializes
+   *  it afresh either way. */
+  recorded: boolean;
+  /** Why this process's last restoration of it failed, when one was tried. */
+  restorationFailure?: string;
 }
 
 /**
@@ -1787,6 +1800,11 @@ export class AgentFramework {
   /** What this process saw of each cut attempt (change id -> attempt ->
    *  result). It binds even when the record of it couldn't be written. */
   private cutKnowledge: Map<string, Map<number, 'committed' | 'failed'>> = new Map();
+  /** Restorations of an abandoned cut's source that this process tried and
+   *  that didn't complete (change id -> its attempt, and why): the store may
+   *  already be back on the source, its context never initialized there. In
+   *  memory only: the next start initializes whatever body it boots on. */
+  private incompleteRestorations: Map<string, { attempt: number; failure: string }> = new Map();
   /** The operator/changes journal, loaded on first use (changesLedger). */
   private changesJournalState: {
     journal: RecordJournal<OperatorChangesEntry, OperatorChangesSnapshot>;
@@ -3717,7 +3735,8 @@ export class AgentFramework {
    * strategy cannot preview would hold hosts hostage to a diagnostic.
    *
    * Also refuses, whatever `force` says, while the active body is the
-   * destination of a cut attempt that didn't commit:
+   * destination of a cut attempt whose commitment is unresolved or known
+   * not to have happened:
    * - unresolved (the condition startup boots quiesced on): a resume isn't an
    *   operator's attestation about that body. The error's `unresolved` names
    *   each change and attempt; settle them with resolveOperatorChange, or
@@ -3773,12 +3792,24 @@ export class AgentFramework {
         );
       }
       for (const a of restorationRequired) {
+        const where = a.active === a.target
+          ? `its destination ${a.target} is still the active body`
+          : `a restoration selected its source ${a.source} but didn't complete (${a.restorationFailure})`;
+        const basis = a.recorded
+          ? 'its failure or not-committed verdict is recorded'
+          : 'this process saw it fail, but its failure couldn\'t be recorded';
+        const restart = a.active !== a.target
+          ? 'restart the host (the source initializes afresh at startup)'
+          : a.recorded
+            ? 'restart the host (startup restores the source before any agent initializes)'
+            : 'restart the host, which finds the attempt unresolved and boots quiesced until it is settled ' +
+              'not-committed (resolveOperatorChange, or agent-framework-recover --operator-change resolve), which restores the source';
         reasons.push(
           `operator change ${a.changeId} (${a.kind} for ${a.agent}) was abandoned: its attempt ${a.attempt} didn't ` +
-          `commit, but its destination ${a.target} is still the active body, and its source ${a.source} must be ` +
-          `restored before traffic. Its verdict is recorded, and force doesn't override this: restore it live with ` +
-          `restoreOperatorChangeSource(${JSON.stringify(a.changeId)}, { lease }), restart the host (startup restores ` +
-          `the source before any agent initializes), or move the host to a known-safe body`,
+          `commit (${basis}), but ${where}, and its source ${a.source} must be restored before traffic. No ` +
+          `attestation is needed, and force doesn't override this: restore it live with ` +
+          `restoreOperatorChangeSource(${JSON.stringify(a.changeId)}, { lease }), ${restart}, or move the host to a ` +
+          `known-safe body`,
         );
       }
       if (overBudget) {
@@ -7441,15 +7472,41 @@ export class AgentFramework {
     return copy;
   }
 
-  /** Whether a cut's latest attempt holds the active body: its destination
-   *  is the active branch and the attempt didn't commit, either unresolved
-   *  (nobody can vouch for that body) or abandoned with its source not
-   *  restored (a body nobody approved). Decided as everywhere else, by the
-   *  record and what this process saw (cutAttemptDisposition). */
-  private activeBodyHold(record: OperatorChangeRecord): { held: 'unresolved' | 'abandoned'; n: number; target: string; source: string } | null {
+  /** Whether a cut's latest attempt holds the active body. Its commitment
+   *  is unresolved or known not to have happened, and either its
+   *  destination is the active branch, or a restoration of its source
+   *  selected the source without completing (the source's context never
+   *  initialized). Unresolved: nobody can vouch for
+   *  that body. Abandoned: a body nobody approved, its source still to
+   *  restore. Decided as everywhere else, by the record and what this
+   *  process saw (cutAttemptDisposition), never by branch position alone.
+   *
+   *  The limit: only the framework's tracked operations are covered. A
+   *  cut's destination is a branch of its own, so its being active is read
+   *  as that attempt's doing. A selection made outside them (a host calling
+   *  the context manager's switchBranch or the store itself) leaves no
+   *  record and can't be told apart, so it must not reselect the
+   *  destination of a retained unresolved or abandoned attempt: that
+   *  reapplies the attempt's hold, and at the next start its source
+   *  restoration, even after an earlier settlement or restoration
+   *  succeeded. A host that needs such a selection needs tracked
+   *  activation ownership for it, not a past repair. */
+  private activeBodyHold(record: OperatorChangeRecord): {
+    held: 'unresolved' | 'abandoned';
+    n: number;
+    target: string;
+    source: string;
+    active: string;
+    recorded: boolean;
+    restorationFailure?: string;
+  } | null {
     if (record.outcome || record.dropped || (record.kind !== 'undo-turns' && record.kind !== 'undo-messages')) return null;
     const last = record.attempts[record.attempts.length - 1];
-    if (!last || last.evidence.target !== this.store.currentBranch().name) return null;
+    if (!last) return null;
+    const active = this.store.currentBranch().name;
+    const incomplete = this.incompleteRestorations.get(record.changeId);
+    const pending = incomplete?.attempt === last.n ? incomplete : undefined;
+    if (active !== last.evidence.target && !(pending && active === last.evidence.source)) return null;
     const disposition = cutAttemptDisposition(record, last, this.cutKnowledge.get(record.changeId)?.get(last.n));
     if (disposition === 'committed') return null;
     return {
@@ -7457,12 +7514,15 @@ export class AgentFramework {
       n: last.n,
       target: last.evidence.target,
       source: last.evidence.source,
+      active,
+      recorded: last.failed !== undefined || last.resolution?.verdict === 'not-committed',
+      ...(pending ? { restorationFailure: pending.failure } : {}),
     };
   }
 
   /** The cuts holding the active body: what resume() refuses, startup boots
    *  quiesced on (unresolved) or restores before any agent initializes
-   *  (abandoned), and a failed restoration holds traffic on. */
+   *  (abandoned and recorded), and an incomplete restoration holds traffic on. */
   private heldActiveBodies(): { unresolved: UnresolvedActiveBody[]; restorationRequired: AbandonedActiveBody[] } {
     const unresolved: UnresolvedActiveBody[] = [];
     const restorationRequired: AbandonedActiveBody[] = [];
@@ -7470,29 +7530,64 @@ export class AgentFramework {
       const hold = this.activeBodyHold(record);
       if (!hold) continue;
       const body = { changeId: record.changeId, agent: record.agent, kind: record.kind as UnresolvedActiveBody['kind'], attempt: hold.n, target: hold.target };
-      if (hold.held === 'unresolved') unresolved.push(body);
-      else restorationRequired.push({ ...body, source: hold.source });
+      if (hold.held === 'unresolved') {
+        unresolved.push(body);
+        continue;
+      }
+      restorationRequired.push({
+        ...body,
+        source: hold.source,
+        active: hold.active,
+        recorded: hold.recorded,
+        ...(hold.restorationFailure !== undefined ? { restorationFailure: hold.restorationFailure } : {}),
+      });
     }
     return { unresolved, restorationRequired };
   }
 
   /**
-   * Hold traffic when restoring an abandoned attempt's source failed and its
-   * destination is still the active body, a body nobody approved: the
-   * framework quiesces in memory, as startup holds an unresolved active body
-   * (wakes park, writes defer, data planes pause), so the hold doesn't
-   * depend on anyone calling resume(). resume() then refuses until the
-   * source is restored (restoreOperatorChangeSource, or a restart, which
-   * restores it before any agent initializes) or the host moves to a
-   * known-safe body. Not persisted: the next start decides afresh. Decided
-   * from what the caller saw, without rereading the journal, so a journal
-   * that just failed can't keep the hold from being taken.
+   * Restore an abandoned cut attempt's source: switch the agent's context
+   * back to it, strategy initialization included. It completed only if that
+   * switch finished. A switch that moved the store back but failed to
+   * initialize is no restored body, whatever the active branch's name, so an
+   * incomplete restoration is kept (incompleteRestorations) and holds
+   * traffic until one completes. Re-run on a store already back on the
+   * source, it initializes the source. Never throws: it reports what
+   * happened.
+   */
+  private async restoreCutSource(abandoned: { changeId: string; agent: string; attempt: number; target: string; source: string }): Promise<{ completed: boolean; detail: string }> {
+    const cm = this.agents.get(abandoned.agent)?.getContextManager();
+    try {
+      if (!cm) throw new Error(`unknown agent ${abandoned.agent}`);
+      await cm.switchBranch(abandoned.source);
+      this.materializeConfigMountAfterBranchSwitch();
+      this.incompleteRestorations.delete(abandoned.changeId);
+      return { completed: true, detail: `active branch restored to ${abandoned.source}` };
+    } catch (error) {
+      const failure = error instanceof Error ? error.message : String(error);
+      this.incompleteRestorations.set(abandoned.changeId, { attempt: abandoned.attempt, failure });
+      this.holdAbandonedBody(abandoned);
+      const status = `RESTORE TO ${abandoned.source} FAILED (${failure}); the active branch is ${this.store.currentBranch().name}`;
+      console.error(`[operator-changes] agent=${abandoned.agent} ${abandoned.changeId}: ${status}`);
+      return { completed: false, detail: status };
+    }
+  }
+
+  /**
+   * Hold traffic while an abandoned attempt's source isn't restored and
+   * nothing else holds it: the framework quiesces in memory, as startup holds
+   * an unresolved active body (wakes park, writes defer, data planes pause),
+   * so the hold doesn't depend on anyone calling resume(). resume() then
+   * refuses until a restoration completes (restoreOperatorChangeSource, the
+   * host's retry, or a restart) or the host moves to a known-safe body. Not
+   * persisted: the next start decides afresh. Taken from what the caller
+   * saw, without rereading the journal, so a journal that just failed can't
+   * prevent it.
    */
   private holdAbandonedBody(abandoned: { changeId: string; agent: string; attempt: number; target: string; source: string }): void {
-    if (this.store.currentBranch().name !== abandoned.target) return;
     const { changeId, agent } = abandoned;
-    const reason = `operator change ${changeId} was abandoned, but its attempt ${abandoned.attempt} left ${abandoned.target} ` +
-      `active: its source ${abandoned.source} could not be restored`;
+    const reason = `operator change ${changeId} was abandoned, but its source ${abandoned.source} isn't restored ` +
+      `(its attempt ${abandoned.attempt} cut to ${abandoned.target}; the active branch is ${this.store.currentBranch().name})`;
     if (!this.quiesced) {
       this.quiesced = true;
       this.quiesceReason = reason;
@@ -7503,18 +7598,19 @@ export class AgentFramework {
     this.opsAlert(
       'operator-change-restoration-required',
       agent,
-      `${reason}; traffic is held until it is restored (restoreOperatorChangeSource, or a restart) and the host resumes`,
+      `${reason}; traffic is held until a restoration completes (restoreOperatorChangeSource, or a restart) and the host resumes`,
     );
   }
 
   /**
-   * Restore the source of an abandoned cut whose destination is still the
-   * active body, under the held lease: its latest attempt didn't commit (its
-   * failure recorded or seen, or an operator's not-committed verdict), and
-   * restoring its source failed when it failed or was settled. It carries
-   * out what is already recorded, so it takes no verdict; a fresh attempt
-   * stays the host's decision on its next retry. Refuses unless that holds.
-   * If restoring fails again, traffic stays held and the receipt says so.
+   * Restore the source of an abandoned cut under the held lease: its latest
+   * attempt didn't commit (its failure recorded or seen, or an operator's
+   * not-committed verdict), and its destination is still the active body,
+   * or an earlier restoration selected the source without completing. It
+   * carries out what is already decided, so it takes no verdict; a fresh
+   * attempt stays the host's decision on its next retry. Refuses unless
+   * that holds. Restored only when the source's context finished switching;
+   * otherwise traffic stays held and the receipt says what remains.
    */
   async restoreOperatorChangeSource(
     changeId: string,
@@ -7526,19 +7622,14 @@ export class AgentFramework {
     if (!record || hold?.held !== 'abandoned') {
       throw new OperatorActionError(
         'invalid',
-        `Operator change ${changeId} has no abandoned attempt whose destination is the active body; there is nothing to restore`,
+        `Operator change ${changeId} has no abandoned attempt whose source is still to restore; there is nothing to restore`,
       );
     }
-    const agent = this.agents.get(record.agent);
-    if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${record.agent}`);
-    const outcome = await this.restoreSourceBranch(agent.getContextManager(), hold.source, hold.target, record.agent);
-    this.materializeConfigMountAfterBranchSwitch();
-    const failed = this.store.currentBranch().name === hold.target;
-    if (failed) this.holdAbandonedBody({ changeId, agent: record.agent, attempt: hold.n, target: hold.target, source: hold.source });
+    const result = await this.restoreCutSource({ changeId, agent: record.agent, attempt: hold.n, target: hold.target, source: hold.source });
     const receipt: OperatorChangeRestorationReceipt = {
       changeId,
       attempt: hold.n,
-      ...(failed ? { remaining: `the source ${hold.source} could not be restored: ${outcome}` } : { restored: hold.source }),
+      ...(result.completed ? { restored: hold.source } : { remaining: `the source ${hold.source} is not restored: ${result.detail}` }),
     };
     this.recordOperatorAction({
       kind: 'restore-operator-change-source',
@@ -7596,18 +7687,12 @@ export class AgentFramework {
     let restored: string | undefined;
     let remaining: string | undefined;
     if (verdict === 'not-committed' && this.store.currentBranch().name === target.target) {
-      const agent = this.agents.get(record.agent);
-      if (!agent) throw new OperatorActionError('unknown-agent', `Unknown agent: ${record.agent}`);
-      const outcome = await this.restoreSourceBranch(agent.getContextManager(), target.source, target.target, record.agent);
-      this.materializeConfigMountAfterBranchSwitch();
-      if (this.store.currentBranch().name === target.target) {
-        // The verdict stands; carrying it out is what remains. The abandoned
-        // body is held until its source is restored (restoreOperatorChangeSource).
-        remaining = `the source ${target.source} could not be restored: ${outcome}`;
-        this.holdAbandonedBody({ changeId, agent: record.agent, attempt, target: target.target, source: target.source });
-      } else {
-        restored = target.source;
-      }
+      if (!this.agents.has(record.agent)) throw new OperatorActionError('unknown-agent', `Unknown agent: ${record.agent}`);
+      const result = await this.restoreCutSource({ changeId, agent: record.agent, attempt, target: target.target, source: target.source });
+      // The verdict stands either way. An incomplete restoration is what
+      // remains, and holds traffic until one completes.
+      if (result.completed) restored = target.source;
+      else remaining = `the source ${target.source} is not restored: ${result.detail}`;
     }
     const receipt: OperatorChangeResolutionReceipt = {
       changeId,
@@ -8227,8 +8312,6 @@ export class AgentFramework {
       removal: () => Array<{ metadata?: unknown }>;
       /** Create `destination` (it never exists yet) and switch to it. */
       cut: (destination: string) => Promise<void>;
-      /** Put the source back if the cut left `destination` active. */
-      restore: (destination: string) => Promise<string>;
       finish: (outcome: OperatorChangeOutcome, target: string) => void;
     },
   ): Promise<{ outcome: OperatorChangeOutcome; alreadyApplied: boolean; target: string }> {
@@ -8272,17 +8355,19 @@ export class AgentFramework {
         return settle(this.establishOutcome(change, last, 'undo'), true);
       }
       if (disposition === 'not-committed') {
-        // Never a commitment, whatever its destination holds. If the
-        // process died before restoring the source, restore it now.
-        if (current === target) {
-          const restored = await steps.restore(target);
+        // Never a commitment, whatever its destination holds. If its source
+        // was never restored (the process died first, or a restoration
+        // didn't complete, even one that selected the source), restore it
+        // now, and only then make a fresh attempt.
+        const pending = this.incompleteRestorations.get(change.id)?.attempt === last.n;
+        if (current === target || (pending && current === last.evidence.source)) {
+          const result = await this.restoreCutSource({ changeId: change.id, agent: change.agent, attempt: last.n, target, source: last.evidence.source });
           current = this.store.currentBranch().name;
-          if (current === target) {
-            this.holdAbandonedBody({ changeId: change.id, agent: change.agent, attempt: last.n, target, source: last.evidence.source });
+          if (!result.completed) {
             throw new OperatorActionError(
               'failed',
-              `${label} ${change.id}: its abandoned attempt ${last.n} left ${target} active, and restoring its source ` +
-                `${last.evidence.source} failed again (${restored}); traffic is held until it is restored`,
+              `${label} ${change.id}: its abandoned attempt ${last.n} cut to ${target}, and restoring its source ` +
+                `${last.evidence.source} failed again (${result.detail}); traffic is held until it is restored`,
             );
           }
         }
@@ -8348,9 +8433,11 @@ export class AgentFramework {
       } catch (journalError) {
         recorded = `; its failure could not be recorded (${journalError instanceof Error ? journalError.message : String(journalError)})`;
       }
-      const restored = await steps.restore(destination);
-      // An abandoned destination left active holds traffic until restored.
-      this.holdAbandonedBody({ changeId: change.id, agent: change.agent, attempt: n, target: destination, source: change.sourceBranch });
+      // The cut left its destination active: restore the source, completely
+      // (restoreCutSource holds traffic if it can't).
+      const restored = this.store.currentBranch().name === destination
+        ? (await this.restoreCutSource({ changeId: change.id, agent: change.agent, attempt: n, target: destination, source: change.sourceBranch })).detail
+        : `active branch is ${this.store.currentBranch().name}`;
       throw new OperatorActionError('failed', `${label} ${change.id} failed; ${restored}${recorded}: ${detail}`, { cause: error });
     }
     note('committed');
@@ -8390,12 +8477,6 @@ export class AgentFramework {
         this.store.createBranchAt(destination, change.sourceBranch, oldest.sequenceBefore);
         this.store.switchBranch(destination);
         this.materializeConfigMountAfterBranchSwitch();
-      },
-      restore: async (destination) => {
-        if (this.store.currentBranch().name !== destination) return `active branch is ${this.store.currentBranch().name}`;
-        this.store.switchBranch(change.sourceBranch);
-        this.materializeConfigMountAfterBranchSwitch();
-        return `active branch restored to ${change.sourceBranch}`;
       },
       finish: (established, destination) => {
         // The one redo entry back to the source tip, while the destination is
@@ -8471,7 +8552,6 @@ export class AgentFramework {
         await cm.switchBranch(cm.branchAt(change.tail.id as MessageId, destination));
         this.materializeConfigMountAfterBranchSwitch();
       },
-      restore: (destination) => this.restoreSourceBranch(cm, change.sourceBranch, destination, change.agent),
       finish: (established, destination) => {
         this.recordChangeAction({
           kind: 'rollback',
@@ -8618,6 +8698,8 @@ export class AgentFramework {
    * Before any agent initializes on it: when an abandoned cut (its attempt
    * failed, or an operator settled it as not committed) left its destination
    * as the active branch, switch the store back to the source and sync it.
+   * The active branch is read as that attempt's doing (see activeBodyHold
+   * for the limit of that reading).
    */
   private restoreAbandonedCutSources(): void {
     this.unstickLedger();

@@ -1139,14 +1139,14 @@ describe('operator-change gate: host/command undo by turns', () => {
         framework.getStore().setStateJson('probe/initializer', { wrote: true });
         throw new Error('injected strategy initialization failure');
       };
-      const fw = framework as unknown as { restoreSourceBranch: (...args: unknown[]) => Promise<string> };
-      const realRestore = fw.restoreSourceBranch.bind(fw);
-      if (crashBeforeRestore) fw.restoreSourceBranch = async () => { throw new Error('the process died before restoring'); };
+      const fw = framework as unknown as { restoreCutSource: (...args: unknown[]) => Promise<unknown> };
+      const realRestore = fw.restoreCutSource.bind(fw);
+      if (crashBeforeRestore) fw.restoreCutSource = async () => { throw new Error('the process died before restoring'); };
       try {
         await assert.rejects(applyIt(change), crashBeforeRestore ? /died before restoring/ : /injected strategy initialization failure/);
       } finally {
         cmx.switchBranch = realSwitch;
-        fw.restoreSourceBranch = realRestore;
+        fw.restoreCutSource = realRestore;
       }
       assert.equal(branch(), crashBeforeRestore ? destination : change.sourceBranch);
       assert.equal(framework.getOperatorChangeRecord(change.id)!.attempts[0]!.failed !== undefined, true, 'its failure recorded first');
@@ -1334,11 +1334,14 @@ describe('operator-change gate: host/command undo by turns', () => {
       undoSwitch();
     }
     assert.equal(settled.restored, undefined, 'nothing was restored');
-    assert.match(settled.remaining!, new RegExp(`the source ${change.sourceBranch} could not be restored: .*injected restore failure`));
+    assert.match(settled.remaining!, new RegExp(`the source ${change.sourceBranch} is not restored: RESTORE TO ${change.sourceBranch} FAILED \\(injected restore failure\\)`));
     assert.equal(branch(), destination);
     assert.equal(framework.getOperatorChangeRecord(change.id)!.unresolved, undefined, 'its verdict is recorded');
 
-    const abandoned = [{ changeId: change.id, agent: 'scout', kind: 'undo-turns', attempt: 1, target: destination, source: change.sourceBranch }];
+    const abandoned = [{
+      changeId: change.id, agent: 'scout', kind: 'undo-turns', attempt: 1, target: destination, source: change.sourceBranch,
+      active: destination, recorded: true, restorationFailure: 'injected restore failure',
+    }];
     for (const opts of [undefined, { force: true }]) {
       await assert.rejects(framework.resume(opts), (e: unknown) => {
         assert.ok(e instanceof ResumeBlockedError);
@@ -1394,13 +1397,13 @@ describe('operator-change gate: host/command undo by turns', () => {
     let again: Awaited<ReturnType<typeof restoreSource>>;
     try {
       await assert.rejects(applyIt(change), (e: Error & { code?: string }) =>
-        e.code === 'failed' && /abandoned attempt 1 left .* active, and restoring its source .* failed again/.test(e.message));
+        e.code === 'failed' && /abandoned attempt 1 cut to .*, and restoring its source .* failed again/.test(e.message));
       again = await restoreSource(change.id);
     } finally {
       failing();
     }
     assert.equal(again.restored, undefined);
-    assert.match(again.remaining!, /could not be restored: .*injected restore failure/);
+    assert.match(again.remaining!, /is not restored: RESTORE TO .* FAILED \(injected restore failure\)/);
     assert.deepEqual([branch(), quiesced()], [destination, true]);
 
     assert.deepEqual(await restoreSource(change.id), { changeId: change.id, attempt: 1, restored: change.sourceBranch });
@@ -1410,6 +1413,117 @@ describe('operator-change gate: host/command undo by turns', () => {
     assert.ok(membrane.calls.length > providerCalls, 'the parked wake ran once resumed');
     assert.equal(branch(), change.sourceBranch, 'on the source body');
     assert.ok(texts().includes('back on the source'));
+  });
+
+  // The strategy's initializer fails until the returned function is called:
+  // a real CM switch then selects the branch but never initializes there.
+  const failInitialization = () => {
+    const strategy = framework.getAgent('scout')!.getContextManager().getStrategy() as unknown as Record<string, unknown>;
+    const own = Object.prototype.hasOwnProperty.call(strategy, 'initialize');
+    const real = strategy.initialize;
+    strategy.initialize = async () => { throw new Error('injected initializer failure'); };
+    return () => { if (own) strategy.initialize = real; else delete strategy.initialize; };
+  };
+
+  it('counts a restoration only once the source\'s context initialized: one that selected the source and failed stays held until a live restoration completes', async () => {
+    await say('a0'); await say('a1'); await say('a2');
+    await undoWithMarks(2, 'all');
+    const change = asked[0]!;
+    const undoRecord = failJournalOnce('switched');
+    try {
+      await assert.rejects(applyIt(change), /injected switched failure/);
+    } finally {
+      undoRecord();
+    }
+    await reopen();
+    const destination = `undo/scout/op-${change.id}`;
+    const undoInit = failInitialization();
+    let settled: Awaited<ReturnType<typeof resolve>>;
+    try {
+      settled = await resolve(change.id, 1, 'not-committed', 'nothing applied');
+    } finally {
+      undoInit();
+    }
+    assert.equal(branch(), change.sourceBranch, 'the store is back on the source…');
+    assert.equal(settled.restored, undefined, '…but nothing was restored');
+    assert.match(settled.remaining!, /is not restored: RESTORE TO .* FAILED \(injected initializer failure\)/);
+    await assert.rejects(framework.resume({ force: true }), (e: unknown) => {
+      assert.ok(e instanceof ResumeBlockedError);
+      assert.deepEqual(e.restorationRequired, [{
+        changeId: change.id, agent: 'scout', kind: 'undo-turns', attempt: 1, target: destination, source: change.sourceBranch,
+        active: change.sourceBranch, recorded: true, restorationFailure: 'injected initializer failure',
+      }]);
+      assert.match(e.message, /a restoration selected its source .* but didn't complete \(injected initializer failure\)/);
+      assert.match(e.message, /the source initializes afresh at startup/);
+      return true;
+    });
+    const strategy = framework.getAgent('scout')!.getContextManager().getStrategy() as unknown as Record<string, unknown>;
+    const own = Object.prototype.hasOwnProperty.call(strategy, 'initialize');
+    const initialize = strategy.initialize as ((ctx: unknown) => Promise<void>) | undefined;
+    let initialized = 0;
+    strategy.initialize = async (ctx: unknown) => { initialized++; await initialize?.call(strategy, ctx); };
+    try {
+      assert.deepEqual(await restoreSource(change.id), { changeId: change.id, attempt: 1, restored: change.sourceBranch });
+    } finally {
+      if (own) strategy.initialize = initialize; else delete strategy.initialize;
+    }
+    assert.equal(initialized, 1, 'the retry initialized the source it found selected');
+    assert.equal((await framework.resume()).quiesced, false);
+  });
+
+  it("completes a selected-but-uninitialized restoration on the host's retry, and only then attempts afresh", async () => {
+    await say('m0'); await say('m1');
+    await host().handleHostCommand('discord', { command: 'undo', agentName: 'scout', messages: 2, marks: 'none', requesterName: 'nissa' });
+    const change = asked[0]!;
+    const destination = `undo-msgs/scout/op-${change.id}`;
+    const undoCut = failCutAfterInitializerWrite(); // the cut selects its destination, then fails
+    const undoInit = failInitialization(); // and restoring selects the source but can't initialize it
+    try {
+      await assert.rejects(applyIt(change), /injected strategy initialization failure/);
+      undoCut();
+      assert.deepEqual([branch(), quiesced()], [change.sourceBranch, true], 'selected, not restored: held');
+      // The host's retry while the source still can't initialize: refused, and no fresh attempt.
+      await assert.rejects(applyIt(change), (e: Error & { code?: string }) => e.code === 'failed' && /failed again/.test(e.message));
+      assert.equal(framework.getOperatorChangeRecord(change.id)!.attempts.length, 1, 'no fresh attempt on an uninitialized source');
+    } finally {
+      undoInit(); undoCut();
+    }
+    await assert.rejects(framework.resume(), (e: unknown) => e instanceof ResumeBlockedError && e.restorationRequired[0]?.active === change.sourceBranch);
+
+    const applied = await applyIt(change); // the host's retry: completes the restoration, then attempts afresh
+    assert.equal(applied.kind === 'undo-messages' && applied.toBranch, `${destination}~2`);
+    assert.deepEqual(texts(), ['m0', 'reply to m0']);
+    assert.equal((await framework.resume()).quiesced, false);
+  });
+
+  it('says a restart finds the attempt unresolved when only this process saw it fail', async () => {
+    await say('m0'); await say('m1');
+    await host().handleHostCommand('discord', { command: 'undo', agentName: 'scout', messages: 2, marks: 'none', requesterName: 'nissa' });
+    const change = asked[0]!;
+    const destination = `undo-msgs/scout/op-${change.id}`;
+    const undoCut = failCutAfterInitializerWrite();
+    const undoRecord = failJournalOnce('failed'); // its failure can't be recorded
+    let undoSwitch = () => {};
+    const cmx = framework.getAgent('scout')!.getContextManager() as unknown as { switchBranch: (name: string) => Promise<unknown> };
+    const cutting = cmx.switchBranch;
+    cmx.switchBranch = async (name) => { // after the cut, every restore fails
+      const result = cutting(name);
+      undoSwitch = failEverySwitch();
+      return result;
+    };
+    try {
+      await assert.rejects(applyIt(change), /injected strategy initialization failure/);
+    } finally {
+      undoSwitch(); undoRecord(); undoCut();
+    }
+    assert.equal(branch(), destination);
+    await assert.rejects(framework.resume(), (e: unknown) => {
+      assert.ok(e instanceof ResumeBlockedError);
+      assert.deepEqual([e.restorationRequired[0]?.recorded, e.restorationRequired[0]?.active], [false, destination]);
+      assert.match(e.message, /this process saw it fail, but its failure couldn't be recorded/);
+      assert.match(e.message, /restart the host, which finds the attempt unresolved and boots quiesced until it is settled not-committed/);
+      return true;
+    });
   });
 
   it('lets resume() proceed while an unresolved attempt left its source, not its destination, active', async () => {
@@ -1436,13 +1550,13 @@ describe('operator-change gate: host/command undo by turns', () => {
     await host().handleHostCommand('discord', { command: 'undo', agentName: 'scout', messages: 2, marks: 'none', requesterName: 'nissa' });
     const change = asked[0]!;
     const undoCut = failCutAfterInitializerWrite();
-    const fw = framework as unknown as { restoreSourceBranch: (...args: unknown[]) => Promise<string> };
-    const realRestore = fw.restoreSourceBranch.bind(fw);
-    fw.restoreSourceBranch = async () => { throw new Error('the process died before restoring'); };
+    const fw = framework as unknown as { restoreCutSource: (...args: unknown[]) => Promise<unknown> };
+    const realRestore = fw.restoreCutSource.bind(fw);
+    fw.restoreCutSource = async () => { throw new Error('the process died before restoring'); };
     try {
       await assert.rejects(applyIt(change), /died before restoring/);
     } finally {
-      undoCut(); fw.restoreSourceBranch = realRestore;
+      undoCut(); fw.restoreCutSource = realRestore;
     }
     assert.equal(branch(), `undo-msgs/scout/op-${change.id}`, 'left on the failed destination');
     await reopen();
