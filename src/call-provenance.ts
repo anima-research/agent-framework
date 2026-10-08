@@ -8,13 +8,18 @@
  * the work: the agent's model (no origin), an operator's puppet, or the
  * host. That includes delegation from a callback the handler scheduled
  * after returning, because AsyncLocalStorage follows the work it started.
+ * The agent's own origin passes on only to a call for that same agent: one
+ * agent's turn never changes another agent's body as its own.
  * Work that no tool call started has no store: a module's own timer, or its
  * event handler, acts for the host.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { ToolCall } from './types/index.js';
 
-export type CallProvenance = Pick<ToolCall, 'origin' | 'admission'>;
+export type CallProvenance = Pick<ToolCall, 'origin' | 'admission'> & {
+  /** The agent the initiating call acted for (its callerAgentName). */
+  agent?: string;
+};
 
 export const callProvenance = new AsyncLocalStorage<CallProvenance>();
 
@@ -27,4 +32,20 @@ export const callProvenance = new AsyncLocalStorage<CallProvenance>();
 export function normalizeOrigin(origin: unknown): ToolCall['origin'] {
   if (origin === undefined || origin === null) return undefined;
   return origin === 'puppet' ? 'puppet' : 'host';
+}
+
+/**
+ * Who a module's delegated call (ModuleContext.callTool) acts for: the origin
+ * the module named, normalized; otherwise the initiating call's origin, the
+ * agent's own only for that same agent; and with no call behind it, the host.
+ */
+export function delegatedOrigin(
+  call: Pick<ToolCall, 'origin' | 'callerAgentName'>,
+  ambient: CallProvenance | undefined,
+): ToolCall['origin'] {
+  const named = normalizeOrigin(call.origin);
+  if (named) return named;
+  if (!ambient) return 'host';
+  if (ambient.origin) return ambient.origin;
+  return ambient.agent !== undefined && call.callerAgentName === ambient.agent ? undefined : 'host';
 }

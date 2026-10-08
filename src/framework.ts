@@ -9,7 +9,7 @@ import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
-import { callProvenance, normalizeOrigin } from './call-provenance.js';
+import { callProvenance, delegatedOrigin, normalizeOrigin } from './call-provenance.js';
 import {
   selfChangeKind,
   sameValue,
@@ -1907,11 +1907,12 @@ export class AgentFramework {
       // executeToolCall() is shared with model/ephemeral callers and always
       // stamps agent origin (see there).
       // Who asked travels with a delegated call: inside a module tool
-      // handler (or work it started) the initiator of that call; with no
-      // call behind it (a module's own timer or event) the host.
+      // handler (or work it started) the initiator of that call, the
+      // agent's own only for that same agent; with no call behind it (a
+      // module's own timer or event) the host (delegatedOrigin).
       callTool: (call) => {
         const ambient = callProvenance.getStore();
-        const origin = normalizeOrigin(call.origin) ?? (ambient ? ambient.origin : 'host');
+        const origin = delegatedOrigin(call, ambient);
         const admission = call.admission ?? ambient?.admission;
         const { origin: _o, admission: _a, ...rest } = call;
         return this.executeToolCallFrom(

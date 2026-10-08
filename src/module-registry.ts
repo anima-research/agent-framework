@@ -313,11 +313,13 @@ export class ModuleRegistry {
 
     try {
       // The handler, and any work it starts, runs as this call's initiator,
-      // so a tool it delegates to through ctx.callTool keeps that actor.
+      // so a tool it delegates to through ctx.callTool keeps that actor (the
+      // agent's own origin only for this same agent).
       return await callProvenance.run(
         {
           ...(origin ? { origin } : {}),
           ...(call.admission ? { admission: call.admission } : {}),
+          ...(call.callerAgentName !== undefined ? { agent: call.callerAgentName } : {}),
         },
         () => module.handleToolCall(moduleCall),
       );

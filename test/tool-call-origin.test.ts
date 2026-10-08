@@ -282,6 +282,21 @@ describe("tool-call origin: the agent's own, and nothing else, skips the gate", 
   };
   const surfaces = () => asked.map((c) => `${c.agent}:${c.surface}`);
 
+  it("applies the agent's own change, and one a module delegates for that same agent, directly", async () => {
+    await modelCalls('agent_settings', budget(125_000));
+    assert.equal(tokens(), 125_000);
+    await modelCalls('dlg--self_set', { tokens: 126_000 });
+    await dlg.last;
+    assert.equal(tokens(), 126_000);
+    assert.deepEqual(asked, [], 'the gate is never asked');
+  });
+
+  it("stages a change a module delegates for another agent from one agent's own call, as the host's", async () => {
+    await modelCalls('dlg--retarget', { target: 'other', tokens: 131_000 });
+    assert.deepEqual(surfaces(), ['other:host'], "scout's turn can't change other's body as other's own");
+    assert.deepEqual([tokens('other'), tokens()], [100_000, 100_000]);
+  });
+
   it("reads an origin a module names as the host's unless it's 'puppet', never as the agent's own", async () => {
     for (const origin of ['', 0, false, Number.NaN, 'agent', 'PUPPET', {}]) {
       await dlg.ctx.callTool({ id: 'n', name: 'agent_settings', input: budget(136_000), callerAgentName: 'scout', origin } as unknown as ToolCall);
