@@ -11,7 +11,8 @@
  * The agent's own origin passes on only to a call for that same agent: one
  * agent's turn never changes another agent's body as its own.
  * Work that no tool call started has no store: a module's own timer, or its
- * event handler, acts for the host.
+ * event handler, acts for the host. A trace listener is notified as the
+ * host's too, even when the trace was emitted inside another module's call.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { ToolCall } from './types/index.js';
@@ -22,6 +23,9 @@ export type CallProvenance = Pick<ToolCall, 'origin' | 'admission'> & {
 };
 
 export const callProvenance = new AsyncLocalStorage<CallProvenance>();
+
+/** The provenance of work the host does on its own, such as notifying a listener. */
+export const HOST_PROVENANCE: CallProvenance = Object.freeze({ origin: 'host' });
 
 /**
  * A caller-supplied origin as the framework reads it: absent (undefined or

@@ -9,7 +9,7 @@ import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
-import { callProvenance, delegatedOrigin, normalizeOrigin } from './call-provenance.js';
+import { callProvenance, delegatedOrigin, HOST_PROVENANCE, normalizeOrigin } from './call-provenance.js';
 import {
   selfChangeKind,
   sameValue,
@@ -16254,13 +16254,21 @@ export class AgentFramework {
       timestamp: Date.now(),
     } as TraceEvent;
 
-    for (const listener of this.traceListeners) {
-      try {
-        listener(traceEvent);
-      } catch (error) {
-        console.error('Trace listener error:', error);
+    const notify = () => {
+      for (const listener of this.traceListeners) {
+        try {
+          listener(traceEvent);
+        } catch (error) {
+          console.error('Trace listener error:', error);
+        }
       }
-    }
+    };
+    // A listener observes the work that emitted the trace; it never acts as
+    // the call behind it. Inside a module's tool call, listeners (another
+    // module's included) are notified as the host's, and so is anything they
+    // start (call-provenance.ts).
+    if (callProvenance.getStore()) callProvenance.run(HOST_PROVENANCE, notify);
+    else notify();
   }
 
   /**

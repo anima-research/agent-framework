@@ -312,6 +312,15 @@ describe("tool-call origin: the agent's own, and nothing else, skips the gate", 
     assert.equal(tokens(), 100_000);
   });
 
+  it("stages a change another module's trace listener makes during the agent's own call, and one it schedules, as the host's", async () => {
+    await modelCalls('dlg--notify', {});
+    assert.ok(gov.now, 'the listener fired');
+    await gov.now;
+    await gov.later;
+    assert.deepEqual(surfaces(), ['scout:host', 'scout:host']);
+    assert.equal(tokens(), 100_000);
+  });
+
   it("reads an origin a module names as the host's unless it's 'puppet', never as the agent's own", async () => {
     for (const origin of ['', 0, false, Number.NaN, 'agent', 'PUPPET', {}]) {
       await dlg.ctx.callTool({ id: 'n', name: 'agent_settings', input: budget(136_000), callerAgentName: 'scout', origin } as unknown as ToolCall);
