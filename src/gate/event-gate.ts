@@ -143,14 +143,12 @@ export interface WakeProvenance {
   counterparty?: string;
   /** True when the chosen event was `chat:addressed`. */
   addressed?: boolean;
-  /** Speech locus for the wake: the routable channel of the chosen event,
-   *  set ONLY when that event addressed the agent (mention / reply / DM) and
-   *  the host resolved its registered channel. A batched wake used to carry
-   *  no locus at all, so its reply fell back to the process-global
-   *  most-recent-inbound channel — which any ambient message elsewhere,
-   *  arriving a second after the DM that caused the wake, could retarget
-   *  (2026-09-30: a DM reply published into a guild channel). Ambient-only
-   *  batches still set nothing and keep the legacy fallback. */
+  /** The routable channel of the chosen event, set ONLY when that event
+   *  addressed the agent (mention / reply / DM) and the host resolved its
+   *  registered channel: the framework marks the wake addressed there.
+   *  Ambient-only batches set nothing. It is not the speech route, which the
+   *  framework infers from `routeCandidates` (shelf-355); no wake falls back
+   *  to the most recent inbound channel any more. */
   routeChannelId?: string;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
@@ -248,7 +246,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     // A resolved route counts as naming a channel only for an ADDRESSED
     // event: a push whose origin declares only `mcplChannelId` (no raw
     // channel id, no author) is still a routable addressed message, and
-    // skipping it would leave its wake on the most-recent-inbound fallback.
+    // skipping it would hide that the wake was addressed there.
     // An ambient one stays out: the route is never reported for it, so as
     // the pick it would carry no telemetry at all and hide an earlier event
     // that names its channel and author.
@@ -1682,9 +1680,9 @@ export class EventGate {
     // ADDRESSED event first, else the newest event naming a channel or an
     // author; channel + author + addressed from that ONE event. When that
     // event addressed the agent and its registered channel is known,
-    // `routeChannelId` names the turn's speech locus too — the reply goes
-    // back to whoever addressed the agent, not to whichever channel last saw
-    // any traffic. Ambient-only batches carry telemetry only.
+    // `routeChannelId` marks the wake addressed there. The turn's speech
+    // route comes from `routeCandidates`, every conversation in the batch
+    // (shelf-355), never from whichever channel last saw any traffic.
     const provenance = wakeProvenance(events);
     for (const agentName of this.getAgentNamesFn()) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);

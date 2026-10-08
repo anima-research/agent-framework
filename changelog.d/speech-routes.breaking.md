@@ -14,3 +14,18 @@
   - **Unchanged:** fork homes, explicit sends naming a channel, and
     `resolveProseTarget`/`resolveDestination`. No sibling package version
     changes.
+- **Operators whose residents speak on scheduled wakes:** a turn woken only
+  by events that name no conversation now has no speech route, unless the
+  resident is a conversation fork, whose home is its route. That covers
+  heartbeat-mcpl's message-mode heartbeats and its reminders, whose `origin`
+  names no conversation, as well as timers and self-wakes. Their plain speech
+  used to go to the most recent inbound channel. It is now held as
+  `no-destination` drafts, which the turn's `[delivered]` receipt names.
+  - **Migration:** a routine that should post names its place on every
+    wake. Before speaking, the resident can `channel_open` the channel,
+    which sets the speech route for that turn only, or it can send
+    explicitly with `channel_publish` and a `channelId`, or with the
+    connector's own send tool. The heartbeat's or reminder's own message can
+    say where. Held words can be resent with `drafts`.
+  - **Unaffected:** heartbeat-mcpl's silent ticks, whose prose was already
+    private.

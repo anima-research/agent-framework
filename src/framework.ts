@@ -1802,12 +1802,11 @@ export class AgentFramework {
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
             // A batch that contains an ADDRESSED message (mention / reply /
-            // DM) routes like the direct path does: the reply goes to that
-            // message's channel. Without it the turn froze on the
-            // process-global most-recent-inbound channel, which an ambient
-            // message elsewhere could retarget between the DM's arrival and
-            // the debounce firing (2026-09-30). Ambient-only batches set no
-            // locus and keep the legacy fallback.
+            // DM) marks the wake addressed, with that message's channel as
+            // the request's channelId, as the direct path does; an
+            // ambient-only batch sets neither. Neither is the speech route: a
+            // true new turn infers that from the batch's route candidates
+            // below (shelf-355).
             //
             // The wake is broadcast to every agent, conversation forks
             // included, and a fork speaks only in its home channel: the
@@ -7998,7 +7997,9 @@ export class AgentFramework {
    * An inbound item's metadata with its stored copy's own digest
    * (`storedBodyDigest`): the delivered-body digest's function over exactly
    * the blocks handed to storage here — every decoration included, before
-   * storage shards them. Taken at each storage site, never earlier, because
+   * storage shards them. That function hashes blocks as the store keeps them
+   * (inline media re-encoded and relabeled from its bytes), so the copy read
+   * back hashes to this too. Taken at each storage site, never earlier, because
    * a path can still decorate the body after ingestion stamped it (the
    * closed-channel invitation; room-220 #48282). An edit through
    * editMessage keeps metadata but not this hash.
@@ -8765,7 +8766,8 @@ export class AgentFramework {
    * discord-mcpl's `mcplChannelId()` / `parseMcplChannelId()` convention so the
    * fix works even against a discord-mcpl build that predates `mcplChannelId`.
    * Returns undefined for push events with no channel provenance (heartbeats,
-   * timers), which correctly keep the global fallback.
+   * reminders, timers): they name no conversation, so they are no route
+   * candidate, and a turn they alone wake infers no speech route (shelf-355).
    */
   private derivePushEventChannel(
     origin: Record<string, unknown> | undefined,
@@ -9005,17 +9007,19 @@ export class AgentFramework {
       // requests[0] in that mixed batch bypassed the turn lock because a
       // restart existed, then treated the continuation as a fresh turn.
       const trigger = budgetRestart ?? requests[0];
-      // Route this turn's auto-published speech to the channel that triggered
-      // it (item-3 redux). A batched wake may carry several triggering channels
-      // (messages arrived in >1 channel while the agent was busy/idle):
+      // The channel that triggered this turn (the trigger's channelId), and
+      // the provenance below. Neither is the speech route, which a true new
+      // turn infers from every request's route candidates (shelf-355). A
+      // batched wake may carry several triggering channels (messages arrived
+      // in >1 channel while the agent was busy/idle):
       //   1. the most recent ADDRESSED channel wins (mention / reply / DM —
       //      someone explicitly spoke TO the agent);
       //   2. else the most recent channel-bearing request (ambient message in
-      //      an open channel — legacy last-inbound semantics).
+      //      an open channel).
       // Ambient chatter must not outrank an addressed message just by being
       // newest (2026-07-21 Cairn lounge misroute, turn-start variant).
       // Non-channel wakes (heartbeats, module events, reactions — which never
-      // carry channelId) leave both undefined → global fallback.
+      // carry channelId) leave both undefined: the turn has no trigger channel.
       // Track the winning REQUEST, not just its channel: channel, addressed
       // and counterparty must come from the same message, or a batch of
       // "ambient from A, then addressed from B" would report B's channel
@@ -9461,6 +9465,12 @@ export class AgentFramework {
   /** Drafts with a delivery attempt in flight, `${agent}\u0000${id}`: a
    *  parallel resend (or `{{unsent}}`) of the same draft is refused. */
   private draftsInFlight = new Set<string>();
+  /** The drafts in draftsInFlight whose attempt is out right now (journaled,
+   *  its publish awaited). A dismissal of one is refused, and the resident
+   *  told to wait for that result, since a dismissal can't call back words
+   *  already on their way. A draft only queued in a resend batch can still
+   *  be dismissed: the batch honours that when it reaches the draft. */
+  private draftsSending = new Set<string>();
 
   /**
    * The resident's `drafts` tool: list, read, resend and dismiss its own held
@@ -9558,6 +9568,14 @@ export class AgentFramework {
     }
 
     if (action === 'dismiss') {
+      // Refuse up front, before anything is dismissed, rather than half-way.
+      const sending = drafts.find((d) => this.draftsSending.has(`${agentName}\u0000${d.id}`));
+      if (sending) {
+        return refuse(
+          `${sending.id} is being sent right now, and dismissing it can't call those words back; ` +
+          'wait for that result before dismissing it. Nothing was dismissed.',
+        );
+      }
       const lines: string[] = [];
       for (const d of drafts) {
         const state = draftState(d);
@@ -9683,7 +9701,10 @@ export class AgentFramework {
           stopped = true;
           continue;
         }
+        const sendingKey = `${agentName}\u0000${d.id}`;
+        this.draftsSending.add(sendingKey);
         const outcome = await registry.publish(agentName, d.text, { serverId: destination.serverId, channelId: destination.channelId, threadId: destination.threadId ?? null });
+        this.draftsSending.delete(sendingKey);
         let recorded = true;
         try {
           this.proseDrafts.recordOutcome(agentName, d.id, attemptId, outcome);
@@ -9719,7 +9740,10 @@ export class AgentFramework {
               : ' The draft stays held.'));
       }
     } finally {
-      for (const claim of claims) this.draftsInFlight.delete(claim);
+      for (const claim of claims) {
+        this.draftsInFlight.delete(claim);
+        this.draftsSending.delete(claim);
+      }
     }
     const allDelivered = !stopped;
     return allDelivered ? ok(lines.join('\n')) : refuse(lines.join('\n'));
@@ -9827,8 +9851,15 @@ export class AgentFramework {
     for (const d of unconfirmed) {
       notes.push(`draft ${d.id} is unconfirmed: ${this.riskText(d)} — check that channel before sending it again (resend needs confirmDuplicate: true)`);
     }
+    // A dismissal sets a draft aside; it doesn't unsay that the draft's own
+    // attempt may already have been posted.
     const dismissed = inState('dismissed');
-    if (dismissed.length > 0) notes.push(`draft${dismissed.length === 1 ? '' : 's'} ${idList(dismissed)} dismissed by you`);
+    const dismissedAtRisk = dismissed.filter((d) => uncertainAttempt(d));
+    const dismissedQuietly = dismissed.filter((d) => !uncertainAttempt(d));
+    for (const d of dismissedAtRisk) notes.push(`draft ${d.id} dismissed by you, but ${this.riskText(d)}`);
+    if (dismissedQuietly.length > 0) {
+      notes.push(`draft${dismissedQuietly.length === 1 ? '' : 's'} ${idList(dismissedQuietly)} dismissed by you`);
+    }
     for (const d of inState('delivered')) {
       const attempt = d.attempts.find((a) => a.outcome?.status === 'delivered')!;
       const how = attempt.via === 'resend' ? 'by your resend' : 'by your {{unsent}}';
@@ -9853,11 +9884,12 @@ export class AgentFramework {
         : `${suppressed} plain-speech segment(s) suppressed`);
     }
     const suppressedNote = notes.join(' · ');
-    // Nothing is confirmed delivered, but an unconfirmed draft may have been.
+    // Nothing is confirmed delivered, but an unconfirmed draft (or a dismissed
+    // one whose own attempt is uncertain) may have been.
     const text =
       shown.length > 0
         ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}`
-        : `[delivered] nothing${unconfirmed.length > 0 ? ' confirmed' : ''} — ${suppressedNote}`;
+        : `[delivered] nothing${unconfirmed.length > 0 || dismissedAtRisk.length > 0 ? ' confirmed' : ''} — ${suppressedNote}`;
     try {
       const mid = agent.getContextManager().addMessage(
         'user',
@@ -10016,7 +10048,11 @@ export class AgentFramework {
    * surface speaks only what was published, where it was published —
    * never held, private, failed or unconfirmed words. The chunk names the
    * outcome's own server and channel, and the root; a thread placement isn't
-   * streamed, so a channel's stream names one place.
+   * streamed, so a channel's stream names one place. Each publish is its own
+   * message, so a later one on a channel that has already streamed opens with
+   * a paragraph break: deltas concatenated (what a voice consumer speaks) and
+   * the completion keep the messages apart instead of running "Let me
+   * look.Found it." together.
    */
   private streamPublished(
     agentName: string,
@@ -10031,15 +10067,18 @@ export class AgentFramework {
       stream = { conversationId: agentName, index: 0, channels: new Map() };
       streams.set(moment.inferenceId, stream);
     }
+    const key = `${published.serverId}\u0000${published.channelId}`;
+    // Only what this channel actually streamed counts: a chunk that didn't go
+    // out leaves no entry, so it never earns the next one a separator.
+    const channel = stream.channels.get(key);
+    const delta = channel ? `\n\n${text}` : text;
     const sent = this.channelRegistry.sendOutgoingChunk(
       { serverId: published.serverId, channelId: published.channelId },
-      agentName, moment.inferenceId, stream.index++, text,
+      agentName, moment.inferenceId, stream.index++, delta,
     );
     if (!sent) return;
-    const key = `${published.serverId}\u0000${published.channelId}`;
-    const channel = stream.channels.get(key);
-    if (channel) channel.text += text;
-    else stream.channels.set(key, { serverId: published.serverId, channelId: published.channelId, text });
+    if (channel) channel.text += delta;
+    else stream.channels.set(key, { serverId: published.serverId, channelId: published.channelId, text: delta });
   }
 
   /**
@@ -10479,12 +10518,18 @@ export class AgentFramework {
       }
     }
     const flight = unsent ? `${agent.name}\u0000${unsent.id}` : undefined;
-    if (flight) this.draftsInFlight.add(flight);
+    if (flight) {
+      this.draftsInFlight.add(flight);
+      this.draftsSending.add(flight);
+    }
     let outcome: PublishOutcome;
     try {
       outcome = await registry.deliverSpeech(agent.name, body, channelId);
     } finally {
-      if (flight) this.draftsInFlight.delete(flight);
+      if (flight) {
+        this.draftsInFlight.delete(flight);
+        this.draftsSending.delete(flight);
+      }
     }
     if (unsent && attemptId) {
       try {
@@ -10596,10 +10641,22 @@ export class AgentFramework {
     }
   }
 
-  /** `>>skip_reply {{unsent}}` and its hybrid form: set the latest bounce draft aside. */
+  /** `>>skip_reply {{unsent}}` and its hybrid form: set the latest bounce
+   *  draft aside — unless it is being sent right now, which a dismissal
+   *  can't call back: the resident is told instead. */
   private dismissLatestBounce(agent: Agent): void {
     const draft = this.proseDrafts.latestBounce(agent.name);
     if (!draft) return;
+    if (this.draftsSending.has(`${agent.name}\u0000${draft.id}`)) {
+      const busy = `[prose-routing] {{unsent}} is draft ${draft.id}, which is being sent right now. It was not set aside, ` +
+        'since that can\'t call back words already on their way; wait for that result.';
+      try {
+        this.addMessage('user', [{ type: 'text', text: busy }], { system: true, kind: 'prose-bounce' }, { forAgent: agent.name });
+      } catch (err) {
+        console.error('[drafts] in-flight-dismiss notice failed:', err);
+      }
+      return;
+    }
     try {
       this.proseDrafts.dismiss(agent.name, draft.id);
       this.emitTrace({ type: 'prose:drafts-dismissed', agentName: agent.name, draftIds: [draft.id] });

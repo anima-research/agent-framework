@@ -321,20 +321,21 @@ export interface InferenceRequest {
   timestamp: number;
   /**
    * The MCPL channel whose message triggered this inference, if any (composite
-   * id, e.g. `discord:guild:channel` / `discord:dm:id`). The framework routes
-   * the turn's auto-published plain-text speech here so a single TRUNK agent
-   * replies in the channel it is answering — not the process-global most-recent-
-   * inbound locus, which a concurrent message elsewhere can hijack (item-3
-   * redux). Undefined for non-channel wakes (heartbeat, timers, module events),
-   * which correctly fall back to the global default channel.
+   * id, e.g. `discord:guild:channel` / `discord:dm:id`). It is not where the
+   * turn's plain speech goes: that is the turn's speech route, inferred from
+   * `routeCandidates` (src/speech-routes.ts). Undefined for non-channel wakes
+   * (heartbeat, timers, module events), which name no conversation; a turn
+   * they alone wake has no inferred route, and nothing falls back to the most
+   * recent inbound channel.
    */
   channelId?: string;
   /**
    * True when the triggering message explicitly addressed the agent (mention,
    * reply-to-bot, DM — `chat:addressed` in MCPL RFC-001 terms). When a wake
    * batch spans several channels, an addressed channel outranks ambient
-   * chatter for the turn's frozen speech locus: overheard conversation must
-   * not capture the agent's voice just by being newest.
+   * chatter for the turn's trigger channel, as addressed candidates do for its
+   * speech route: overheard conversation must not capture the agent's voice
+   * just by being newest.
    */
   addressed?: boolean;
   /**
@@ -349,8 +350,8 @@ export interface InferenceRequest {
    * Where the wake came from, for telemetry ONLY — never a speech locus.
    * Set by the EventGate for batched wakes (composite channel id of the
    * chosen event when the event carried one; push-event raw ids are not
-   * used). Routing keeps reading `channelId`, set from registered ids: by
-   * the direct channel paths, and by a gate wake only when its chosen event
+   * used). `channelId`, by contrast, is set from registered ids: by the
+   * direct channel paths, and by a gate wake only when its chosen event
    * addressed the agent and the host resolved that event's registered
    * channel (ambient-only batches leave it unset).
    */
