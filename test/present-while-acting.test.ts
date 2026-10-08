@@ -32,8 +32,8 @@ import type {
   ToolResult,
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
-import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
-import type { ContentBlock } from '@animalabs/membrane';
+import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import type { ContentBlock, StreamEvent } from '@animalabs/membrane';
 
 // ---------------------------------------------------------------------------
 // Test module: tools that optionally emit a mid-turn external message
@@ -190,6 +190,15 @@ function triggerFromChannel(framework: AgentFramework, channelId = 'chan-A'): vo
       addressed: true, messageId: 'm-trigger', at: Date.now(),
     }],
   });
+}
+
+/** The framework's engagement record (turnEngagement), as its send paths write and the hold reads it. */
+function engage(framework: AgentFramework) {
+  return framework as unknown as {
+    noteSendEngagement(agent: string, status: 'delivered' | 'unknown' | 'failed', place: { serverId?: string; channelId: string; threadId?: string | null }): void;
+    noteChannelEngagement(agent: string, serverId: string | undefined, channelId: string): void;
+    engagementOf(agent: string, c: { kind: 'channel'; serverId?: string; channelId: string; threadId?: string }): string | undefined;
+  };
 }
 
 function heldDrafts(framework: AgentFramework): Array<{ text: string; reason: string; note?: string }> {
@@ -448,15 +457,13 @@ describe('present while acting', () => {
       tags: ['chat:ambient', 'chat:from-human'],
       inboundSource: envelope('discord:guild:portables'),
     };
-    // Simulate an explicit send into #portables earlier in THIS turn (the
-    // production record happens on the MCPL send path; the harness module's
-    // tools are not MCPL, so seed the turn-scoped set mid-turn — after the
+    // Simulate an explicit send into #portables earlier in THIS turn, as a
+    // delivered resend or channel_publish records it (the harness module's
+    // tools are not MCPL, so seed the turn's engagement mid-turn — after the
     // turn-start clear, before the injection boundary).
     const origHandle = module.handleToolCall.bind(module);
     module.handleToolCall = async (call) => {
-      (framework as unknown as {
-        turnEngagedChannels: Map<string, Set<string>>;
-      }).turnEngagedChannels.set('assistant', new Set(['discord:guild:portables']));
+      engage(framework).noteSendEngagement('assistant', 'delivered', { serverId: 'srv', channelId: 'discord:guild:portables', threadId: null });
       return origHandle(call);
     };
 
@@ -495,9 +502,8 @@ describe('present while acting', () => {
     };
     const origHandle = module.handleToolCall.bind(module);
     module.handleToolCall = async (call) => {
-      (framework as unknown as {
-        turnEngagedChannels: Map<string, Set<string>>;
-      }).turnEngagedChannels.set('assistant', new Set(['discord:guild:hospital']));
+      // As a connector's own send tool records it: the channel.
+      engage(framework).noteChannelEngagement('assistant', 'srv', 'discord:guild:hospital');
       return origHandle(call);
     };
 
@@ -1046,4 +1052,439 @@ describe('present while acting', () => {
 
     await framework.stop();
   });
+});
+
+// ---------------------------------------------------------------------------
+// Speech goes where the route stood when its words were written (#256 review)
+// ---------------------------------------------------------------------------
+
+describe('speech follows the moment its words were written', () => {
+  let tempDir: string;
+  let membrane: MockMembrane;
+  let module: RobotModule;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'pwa-moment-'));
+    membrane = new MockMembrane();
+    module = new RobotModule();
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  async function createFramework(proseRouting?: 'hybrid'): Promise<AgentFramework> {
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.', ...(proseRouting ? { proseRouting } : {}) }],
+      modules: [module],
+    });
+    module.framework = framework;
+    return framework;
+  }
+
+  type Registry = Record<string, unknown>;
+  const registryOf = (framework: AgentFramework): Registry =>
+    (framework as unknown as { channelRegistry: Registry }).channelRegistry;
+
+  /** channel_open succeeds for whatever channel it names. */
+  function opensChannels(framework: AgentFramework): void {
+    registryOf(framework).handleChannelToolCall = async (name: string, input: { channelId?: string }) =>
+      name === 'channel_open' ? { success: true, data: { channelId: input.channelId, opened: true } } : { success: true };
+  }
+
+  /** The registry method's first call waits `ms` first, so later speech queues behind it. */
+  function slowFirst(framework: AgentFramework, method: 'routeSpeech' | 'deliverSpeech', ms = 60): void {
+    const registry = registryOf(framework);
+    const fast = registry[method] as (...args: unknown[]) => Promise<unknown>;
+    let first = true;
+    registry[method] = async (...args: unknown[]) => {
+      if (first) {
+        first = false;
+        await new Promise((r) => setTimeout(r, ms));
+      }
+      return fast(...args);
+    };
+  }
+
+  /** An addressed arrival from another conversation, at the next tool call: it holds an inferred route. */
+  function addressedArrivalElsewhere(): void {
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, over here?';
+    module.interjectionMetadata = {
+      channelId: 'discord:dm:antra', tags: ['chat:addressed'], inboundSource: envelope('discord:dm:antra'),
+    };
+  }
+
+  /** Wake the agent from a thread of `channelId`. */
+  function triggerFromThread(framework: AgentFramework, channelId: string, threadId: string): void {
+    (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+      agentName: 'assistant', reason: 'mcpl:channel-incoming', source: 'srv', timestamp: Date.now(),
+      channelId, addressed: true,
+      routeCandidates: [{
+        conversation: { kind: 'channel', serverId: 'srv', channelId, threadId },
+        addressed: true, messageId: 'm-trigger', at: Date.now(),
+      }],
+    });
+  }
+
+  // ---- queued speech (review findings 2 and 4) ----------------------------
+
+  it('a channel_open landing while earlier words wait on the speech chain does not move them', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'First words.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Second words, still for chan-A.' },
+      { type: 'tool_use', id: 'c2', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Third words, for the observatory.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework, { home: false });
+    opensChannels(framework);
+    slowFirst(framework, 'routeSpeech');
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'First words.', locus: 'chan-A' },
+      { text: 'Second words, still for chan-A.', locus: 'chan-A' },
+      { text: 'Third words, for the observatory.', locus: 'discord:guild:observatory' },
+    ]);
+
+    await framework.stop();
+  });
+
+  it('hybrid: words written under a `>>>` choice keep it though a channel_open lands before they are published', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#alpha Pinned words.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'More for alpha.' },
+      { type: 'tool_use', id: 'c2', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'After the open.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework('hybrid');
+    const routed = stubChannelRegistry(framework, { home: false });
+    opensChannels(framework);
+    slowFirst(framework, 'deliverSpeech');
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'Pinned words.', locus: 'chan-alpha' },
+      { text: 'More for alpha.', locus: 'chan-alpha' },
+      { text: 'After the open.', locus: 'discord:guild:observatory' },
+    ], 'the open supersedes the pin for words written after it, and only those');
+
+    await framework.stop();
+  });
+
+  it('hybrid: a channel_open that sets the speech route ends a `>>>skip_reply` suppression', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>skip_reply An aside to myself.' },
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Hello, observatory.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework('hybrid');
+    const routed = stubChannelRegistry(framework, { home: false });
+    opensChannels(framework);
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'Hello, observatory.', locus: 'discord:guild:observatory' }]);
+    const results = JSON.stringify(membrane.lastStream!.receivedToolResults.flat());
+    assert.ok(results.includes('Your unaddressed plain speech now goes to discord:guild:observatory'));
+
+    await framework.stop();
+  });
+
+  it('hybrid: a channel_open with setSpeechTarget: false leaves a `>>>skip_reply` suppression in place', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>skip_reply An aside to myself.' },
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'discord:guild:observatory', setSpeechTarget: false } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Still private.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework('hybrid');
+    const routed = stubChannelRegistry(framework, { home: false });
+    opensChannels(framework);
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, []);
+    assert.deepEqual(heldDrafts(framework), [], 'kept private, not drafted');
+
+    await framework.stop();
+  });
+
+  it('hybrid: a framework retry continues the turn, keeping its `>>>` choice and engagement', async () => {
+    const pinnedRound = [
+      { type: 'text', text: '>>>#alpha Pinned words.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[];
+    class ToolThenErrorStream {
+      private events: StreamEvent[] = [{
+        type: 'tokens', content: '>>>#alpha Pinned words.', meta: { type: 'text', visible: true, blockIndex: 0 },
+      } as StreamEvent, {
+        type: 'tool-calls',
+        calls: [{ id: 'c1', name: 'robot--move', input: { dir: 'north' } }],
+        context: { rawText: '', preamble: '', depth: 0, previousResults: [], accumulated: '', roundContent: pinnedRound },
+      } as StreamEvent];
+      private wake: (() => void) | null = null;
+      private done = false;
+      get isWaitingForTools() { return !this.done; }
+      get pendingToolCallIds() { return this.done ? [] : ['c1']; }
+      get toolDepth() { return 0; }
+      provideToolResults(): void { this.done = true; this.events.push({ type: 'error', error: new Error('connection reset') } as StreamEvent); this.wake?.(); this.wake = null; }
+      cancel(): void { this.done = true; this.wake?.(); this.wake = null; }
+      async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+        while (true) { while (this.events.length) yield this.events.shift()!; if (this.done) return; await new Promise<void>((r) => { this.wake = r; }); }
+      }
+    }
+    let streams = 0;
+    const retrying = {
+      complete: async () => createMockResponse([{ type: 'text', text: 'unused' }] as ContentBlock[]),
+      streamYielding: () => streams++ === 0
+        ? new ToolThenErrorStream()
+        : new MockYieldingStream([createMockResponse([{ type: 'text', text: 'Unprefixed, after the retry.' }] as ContentBlock[])]),
+    };
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'retry.chronicle'),
+      membrane: retrying as unknown as import('@animalabs/membrane').Membrane,
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'You are a robot pilot.', proseRouting: 'hybrid' }],
+      modules: [module],
+      errorPolicy: { maxRetries: 1, onInferenceError: (_e: Error, _a: string, attempt: number) => ({ retry: attempt < 1, delayMs: 0 }) },
+    });
+    module.framework = framework;
+    const routed = stubChannelRegistry(framework, { home: false });
+    const origHandle = module.handleToolCall.bind(module);
+    module.handleToolCall = async (call) => {
+      engage(framework).noteSendEngagement('assistant', 'delivered', { serverId: 'srv', channelId: 'chan-T', threadId: 't1' });
+      return origHandle(call);
+    };
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.equal(streams, 2, 'the failed stream was retried once');
+    assert.deepEqual(routed, [
+      { text: 'Pinned words.', locus: 'chan-alpha' },
+      { text: 'Unprefixed, after the retry.', locus: 'chan-alpha' },
+    ], 'the pin the failed attempt chose still carries unprefixed speech');
+    assert.equal(engage(framework).engagementOf('assistant', { kind: 'channel', serverId: 'srv', channelId: 'chan-T', threadId: 't1' }), 'delivered',
+      'the send the failed attempt made still counts');
+
+    await framework.stop();
+  });
+
+  // ---- engagement by conversation (review finding 6) ----------------------
+
+  it('a send whose place the host knows engages that thread only: ambient chatter in a sibling thread holds nothing', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Still answering chan-A.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework, { home: false });
+    module.toolDelayMs = 25;
+    module.interjection = 'unrelated chatter in another thread';
+    module.interjectionMetadata = {
+      channelId: 'chan-T', tags: ['chat:ambient', 'chat:from-human'], inboundSource: { ...envelope('chan-T'), threadId: 't2' },
+    };
+    const origHandle = module.handleToolCall.bind(module);
+    module.handleToolCall = async (call) => {
+      engage(framework).noteSendEngagement('assistant', 'delivered', { serverId: 'srv', channelId: 'chan-T', threadId: 't1' });
+      return origHandle(call);
+    };
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'Still answering chan-A.', locus: 'chan-A' }]);
+    assert.deepEqual(heldDrafts(framework), []);
+
+    await framework.stop();
+  });
+
+  it('engagement holds as certainly as the host knows it: there, maybe there, or somewhere in the channel', async () => {
+    const cases: Array<{
+      name: string;
+      record: (f: AgentFramework) => void;
+      arrivalThread: string;
+      notice: string;
+    }> = [
+      {
+        name: 'a delivered send, followed up in its own thread',
+        record: (f) => engage(f).noteSendEngagement('assistant', 'delivered', { serverId: 'srv', channelId: 'chan-T', threadId: 't1' }),
+        arrivalThread: 't1',
+        notice: 'chan-T (thread t1), where you sent a message this turn, continued mid-turn',
+      },
+      {
+        name: 'an unconfirmed send, followed up in its own thread',
+        record: (f) => engage(f).noteSendEngagement('assistant', 'unknown', { serverId: 'srv', channelId: 'chan-T', threadId: 't1' }),
+        arrivalThread: 't1',
+        notice: 'chan-T (thread t1), where you tried to send a message this turn (its delivery wasn\'t confirmed), continued mid-turn',
+      },
+      {
+        name: 'a connector send tool, whose place in the channel the host can\'t know',
+        record: (f) => engage(f).noteChannelEngagement('assistant', 'srv', 'chan-T'),
+        arrivalThread: 't2',
+        notice: 'chan-T (thread t2) continued mid-turn, in a channel you sent something into this turn (where in the channel isn\'t known)',
+      },
+    ];
+    for (const c of cases) {
+      membrane = new MockMembrane();
+      module = new RobotModule();
+      membrane.pushResponse(createMockResponse([
+        { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+      ] as ContentBlock[], 'tool_use'));
+      membrane.pushResponse(createMockResponse([
+        { type: 'text', text: 'Which conversation is this for?' },
+      ] as ContentBlock[]));
+      tempDir = mkdtempSync(join(tmpdir(), 'pwa-moment-'));
+      const framework = await createFramework();
+      const routed = stubChannelRegistry(framework, { home: false });
+      module.toolDelayMs = 25;
+      module.interjection = 'a follow-up';
+      module.interjectionMetadata = {
+        channelId: 'chan-T', tags: ['chat:ambient', 'chat:from-human'], inboundSource: { ...envelope('chan-T'), threadId: c.arrivalThread },
+      };
+      const origHandle = module.handleToolCall.bind(module);
+      module.handleToolCall = async (call) => {
+        c.record(framework);
+        return origHandle(call);
+      };
+
+      triggerFromChannel(framework, 'chan-A');
+      await framework.runUntilIdle();
+
+      assert.deepEqual(routed, [], c.name);
+      assert.deepEqual(heldDrafts(framework).map((d) => d.reason), ['ambiguous'], c.name);
+      const wired = membrane.lastStream!.receivedToolResultOptions
+        .map((o) => o?.injectedMessages ?? []).flat().map((m) => JSON.stringify(m.content));
+      assert.ok(wired.some((t) => t.includes(`[routing] ${c.notice}`)), `${c.name}: ${wired.join(' | ')}`);
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('channel_publish engages the conversation its outcome names when delivered or unknown, and nothing when it fails', async () => {
+    const framework = await createFramework();
+    stubChannelRegistry(framework, { home: false });
+    const dispatch = (framework as unknown as { dispatchChannelToolCall(agent: string, call: unknown): void });
+    const outcomes: Array<[string, string, string | undefined]> = [
+      ['delivered', 't1', 'delivered'],
+      ['unknown', 't2', 'unknown'],
+      ['failed', 't3', undefined],
+    ];
+    for (const [status, threadId, expected] of outcomes) {
+      registryOf(framework).handleChannelToolCall = async () => ({
+        success: status === 'delivered',
+        data: { delivered: status === 'delivered', status, serverId: 'srv', channelId: 'chan-T', threadId },
+      });
+      dispatch.dispatchChannelToolCall('assistant', { id: `p-${status}`, name: 'channel_publish', input: { channelId: 'chan-T', threadId, content: 'hi' } });
+      await new Promise((r) => setTimeout(r, 5));
+      assert.equal(engage(framework).engagementOf('assistant', { kind: 'channel', serverId: 'srv', channelId: 'chan-T', threadId }), expected, status);
+    }
+    await framework.stop();
+  });
+
+  // ---- supplied selectors (review finding 5) ------------------------------
+
+  it('channel_open refuses an invalid thread, server or setSpeechTarget before opening anything', async () => {
+    const framework = await createFramework();
+    stubChannelRegistry(framework, { home: false });
+    let opened = 0;
+    registryOf(framework).handleChannelToolCall = async () => { opened++; return { success: true, data: { channelId: 'chan-B' } }; };
+    const results: Array<{ callId: string; result: { success: boolean; error?: string } }> = [];
+    const f = framework as unknown as {
+      dispatchChannelToolCall(agent: string, call: unknown): void;
+      pushEvent(e: unknown): void;
+    };
+    const push = f.pushEvent.bind(framework);
+    f.pushEvent = (e: unknown) => {
+      const ev = e as { type?: string; callId?: string; result?: { success: boolean; error?: string } };
+      if (ev.type === 'tool-result') results.push({ callId: ev.callId!, result: ev.result! });
+      else push(e);
+    };
+    const invalid: Array<[Record<string, unknown>, RegExp]> = [
+      [{ channelId: 'chan-B', threadId: '' }, /threadId must be a thread id/],
+      [{ channelId: 'chan-B', threadId: 7 }, /threadId must be a thread id/],
+      [{ channelId: 'chan-B', serverId: '' }, /serverId must name a server/],
+      [{ channelId: 'chan-B', setSpeechTarget: 'false' }, /setSpeechTarget must be true or false/],
+    ];
+    for (const [i, [input, why]] of invalid.entries()) {
+      f.dispatchChannelToolCall('assistant', { id: `o${i}`, name: 'channel_open', input });
+    }
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(opened, 0, 'nothing was opened');
+    assert.equal(results.length, invalid.length);
+    for (const [i, [, why]] of invalid.entries()) {
+      const r = results.find((x) => x.callId === `o${i}`)!;
+      assert.equal(r.result.success, false);
+      assert.match(r.result.error ?? '', why);
+      assert.match(r.result.error ?? '', /Nothing was opened\./);
+    }
+    // null means "not in use", as for channel_publish's selectors.
+    f.dispatchChannelToolCall('assistant', { id: 'ok', name: 'channel_open', input: { channelId: 'chan-B', threadId: null, serverId: null, setSpeechTarget: null } });
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(opened, 1);
+    await framework.stop();
+  });
+
+  it('a conversation fork refuses a supplied but empty channelId instead of reading it as its home', async () => {
+    const framework = await createFramework();
+    stubChannelRegistry(framework, { home: false });
+    (framework as unknown as { conversationAgentHomes: Map<string, string> }).conversationAgentHomes.set('assistant', 'chan-home');
+    const handled: Array<{ name: string; input: Record<string, unknown> }> = [];
+    registryOf(framework).handleChannelToolCall = async (name: string, input: Record<string, unknown>) => {
+      handled.push({ name, input });
+      return { success: true, data: {} };
+    };
+    const results: Array<{ callId: string; result: { success: boolean; error?: string } }> = [];
+    const f = framework as unknown as { dispatchChannelToolCall(agent: string, call: unknown): void; pushEvent(e: unknown): void };
+    const push = f.pushEvent.bind(framework);
+    f.pushEvent = (e: unknown) => {
+      const ev = e as { type?: string; callId?: string; result?: { success: boolean; error?: string } };
+      if (ev.type === 'tool-result') results.push({ callId: ev.callId!, result: ev.result! });
+      else push(e);
+    };
+    f.dispatchChannelToolCall('assistant', { id: 'empty', name: 'channel_publish', input: { channelId: '', content: 'hi' } });
+    f.dispatchChannelToolCall('assistant', { id: 'number', name: 'channel_close', input: { channelId: 5 } });
+    f.dispatchChannelToolCall('assistant', { id: 'null', name: 'channel_publish', input: { channelId: null, content: 'hi' } });
+    f.dispatchChannelToolCall('assistant', { id: 'absent', name: 'channel_publish', input: { content: 'hi' } });
+    await new Promise((r) => setTimeout(r, 5));
+    assert.match(results.find((r) => r.callId === 'empty')!.result.error ?? '', /channelId must name a channel .*Nothing was sent\./);
+    assert.match(results.find((r) => r.callId === 'number')!.result.error ?? '', /channelId must name a channel .*Nothing was closed\./);
+    assert.deepEqual(handled.map((h) => [h.name, h.input.channelId]), [
+      ['channel_publish', 'chan-home'],
+      ['channel_publish', 'chan-home'],
+    ], 'only an omitted (or null) channelId means the home');
+    await framework.stop();
+  });
+
+  // ---- outgoing streams (review finding 1) --------------------------------
+
 });

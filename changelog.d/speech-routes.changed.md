@@ -17,17 +17,31 @@
   routing fix kept for ambient-only batches, and this change replaces it. A surface
   route shows speech on that surface and publishes it to no channel.
 - Context-budget restarts, guard retries and framework retries keep the
-  turn's route. Only the next true new turn decides again.
+  turn's route, and everything else the turn has chosen or done: its
+  explicit-send engagement, its `>>` or `>>>` choice, and the deliveries and
+  drafts its receipt reports. Only the next true new turn decides again.
+- **Speech goes where the route stood when its words were written.** A
+  `channel_open`, or a hold, that lands while earlier words still wait to be
+  published governs only words written after it; the same goes for a
+  `channel_open` superseding a hybrid `>>>` choice. A text-only or trailing
+  reply is published along its own turn's route, even once the agent is idle
+  and a next turn may have begun.
 - **Mid-turn ambiguity hold replaces the addressed re-pin.** When a presented
   mid-turn arrival from another conversation addresses the resident, or
   continues a conversation the resident explicitly sent into this turn, an
   inferred route is held for the rest of the turn instead of moving to the
-  newcomer. A notice rides the same injection batch. Ambient chatter,
-  reactions and arrivals in the same conversation change nothing, and the
-  reply edge stays on the message that woke the turn. Deliberate routes are
+  newcomer. A notice rides the same injection batch. A send whose place the
+  host knows (a resend or `channel_publish`, delivered or unconfirmed)
+  engages exactly that conversation, thread included; a connector's own send
+  tool chooses its place itself, so it engages its whole channel, and the
+  notice says where in the channel isn't known. Ambient chatter in a
+  conversation the resident hasn't sent into this turn, reactions, and
+  arrivals in the same conversation change nothing, and the reply edge stays
+  on the message that woke the turn. Deliberate routes are
   never held: a fork's home, a `channel_open`, and a hybrid `>>>` target.
 - **`channel_open` sets the speech route** for the rest of the turn by
-  default, replacing an inferred route, a hold, or a hybrid `>>>` target. The
+  default, replacing an inferred route, a hold, a hybrid `>>>` target, or the
+  suppression a `>>>skip_reply` or a failed envelope left. The
   new `setSpeechTarget: false` opens the channel for reading only, and the
   result says where speech goes then.
 - **`channel_publish` is an explicit send through the publish executor.**
@@ -41,8 +55,12 @@
 - The beforeInference channel context (`defaultOutgoing` and `incoming`),
   refusal reactions, rewind notices and the failure log now use the agent's
   own route and its reply edge, so what the agent is told matches where its
-  words go.
+  words go. A fork's reply edge is the wake's newest addressed message in
+  its home conversation, or else its newest message there.
 - A batched gate wake reports every conversation in its batch to the
   framework (`WakeProvenance.routeCandidates`). An addressed event whose
   registered channel the host can't resolve still competes, so the turn is
-  held, but it is never itself a route.
+  held, but it is never itself a route. A coalesced item is gated with the
+  host's source envelope too, the one its coalescer then freezes, and an
+  `inboundSource` key in a connector's origin or metadata is never read as
+  one.
