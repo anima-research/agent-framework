@@ -256,3 +256,33 @@ test('a failed launch that cannot be reaped halts reconnecting; close() settles 
   await until(() => { try { process.kill(stuck[0]!.pid, 0); return false; } catch { return true; } }, 'the stuck child gone');
   await connection.close();
 });
+
+test('concurrent close() calls share one teardown and its verdict; a later close re-checks', async () => {
+  const log = scratchLog();
+  const realSpawn = StdioTransport.spawn;
+  let stuck: { pid: number; kill: (signal?: string) => boolean } | null = null;
+  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = (config) => {
+    const transport = realSpawn.call(StdioTransport, config);
+    const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
+    const realKill = child.kill.bind(child);
+    child.kill = () => true; // teardown can't reap it
+    stuck = { pid: child.pid, kill: realKill };
+    return transport;
+  };
+  cleanups.push(() => {
+    (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = realSpawn;
+    stuck?.kill('SIGKILL');
+  });
+  const connection = await connect('', log);
+  const settled: string[] = [];
+  const first = connection.close().then(() => settled.push('first:ok'), () => settled.push('first:failed'));
+  const second = connection.close().then(() => settled.push('second:ok'), () => settled.push('second:failed'));
+  await new Promise((r) => setTimeout(r, 1000));
+  assert.deepEqual(settled, [], 'neither resolves while teardown is pending');
+  await Promise.all([first, second]);
+  assert.deepEqual(settled, ['first:failed', 'second:failed'], 'one verdict, in order');
+  // Once the child is gone, a later close re-checks and settles.
+  stuck!.kill('SIGKILL');
+  await until(() => { try { process.kill(stuck!.pid, 0); return false; } catch { return true; } }, 'the child gone');
+  await connection.close();
+});

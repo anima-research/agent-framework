@@ -357,6 +357,7 @@ export class ModernMcpConnection extends EventEmitter {
   /** A failed generation's cleanup couldn't reap its child: keep owning it,
    *  and halt reconnecting until close() settles it. */
   private holdUnreaped(session: Session, failure: Error): void {
+    if (this.unreaped.some((held) => held.session === session)) return;
     this.unreaped.push({ session, failure });
     this.emit('error', new Error(
       `MCP server "${this.id}": ${failure.message}. Not starting another launch while it may still be running; close the connection to retry the reap.`,
@@ -658,37 +659,50 @@ export class ModernMcpConnection extends EventEmitter {
     return failure;
   }
 
-  /** Close for good: no reconnect, no reopened subscription, no connect left
-   *  in flight. Awaits the in-flight connect's end, and rejects if a child
-   *  could not be reaped. */
-  async close(): Promise<void> {
+  /** The close in flight, which later calls wait behind. */
+  private closing: Promise<void> | null = null;
+
+  /**
+   * Close for good: no reconnect, no reopened subscription, no connect left
+   * in flight. Awaits the in-flight connect's end, and rejects if a child
+   * could not be reaped. Calls queue behind the one in flight, so none
+   * resolves while teardown is still pending. A call after a failed close
+   * re-checks what wasn't reaped.
+   */
+  close(): Promise<void> {
+    const previous = this.closing;
+    const next = (previous ? previous.catch(() => {}) : Promise.resolve()).then(() => this.closeStep());
+    this.closing = next;
+    return next;
+  }
+
+  private async closeStep(): Promise<void> {
     this.closedByHost = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.cancelRelisten();
-    const failures: Error[] = [];
     const opening = this.opening;
-    if (opening) {
-      // Closing the transport ends the probe; the connect then rejects and
-      // its own cleanup runs. Wait for that, so nothing outlives close().
-      const failure = await ModernMcpConnection.closeSession(opening.session);
-      if (failure) failures.push(failure);
-      await opening.done.catch(() => {});
-    }
     const session = this.session;
     this.session = null;
-    if (session) {
-      const failure = await ModernMcpConnection.closeSession(session);
-      if (failure) failures.push(failure);
-      this.emit('close', { reason: 'closed by host' });
-    }
-    // Generations a failed cleanup couldn't reap: try again, report the rest.
-    const held = this.unreaped;
+    // Every generation this connection still owns: a connect in flight, the
+    // live one, and any a failed cleanup couldn't reap.
+    const targets: Session[] = [];
+    if (opening) targets.push(opening.session);
+    if (session) targets.push(session);
+    for (const held of this.unreaped) if (!targets.includes(held.session)) targets.push(held.session);
     this.unreaped = [];
-    for (const { session: stuck } of held) {
-      const failure = await ModernMcpConnection.closeSession(stuck);
-      if (failure) failures.push(failure);
+    const failures: Error[] = [];
+    for (const target of targets) {
+      // Closing the transport ends a probe in flight too: its connect then
+      // rejects and its own cleanup runs (sharing this verdict).
+      const failure = await ModernMcpConnection.closeSession(target);
+      if (failure) {
+        failures.push(failure);
+        if (!this.unreaped.some((held) => held.session === target)) this.unreaped.push({ session: target, failure });
+      }
     }
+    if (opening) await opening.done.catch(() => {});
+    if (session) this.emit('close', { reason: 'closed by host' });
     if (failures.length > 0) {
       throw new Error(`MCP server "${this.id}" did not close cleanly: ${failures.map((f) => f.message).join('; ')}`);
     }
