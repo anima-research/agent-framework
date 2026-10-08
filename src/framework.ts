@@ -99,7 +99,7 @@ import {
   type TurnRoute,
 } from './speech-routes.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
-import { INBOUND_SOURCE_KEY, readInboundSource, renderSourceHeader, SOURCE_HEADER_RULE, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
+import { INBOUND_SOURCE_KEY, markHeaderOpenings, readInboundSource, renderSourceHeader, SOURCE_HEADER_RULE, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import {
@@ -7395,11 +7395,11 @@ export class AgentFramework {
     metadata[INBOUND_SOURCE_KEY] = source;
     // The delivered body's version identity (mcpl/inbound-source.ts
     // sourceBodyDigest; room-220 #46752–#47210), recorded first, from the
-    // body as delivered — before the header decorates it or storage shards
-    // it. The header text is recorded beside it. Neither proves later
-    // presence or completeness: they describe this delivery at stamping.
-    // The stored copy's own digest is taken at each storage site below,
-    // over exactly the blocks stored there.
+    // body as delivered — before the header decorates it, its header-shaped
+    // text is marked, or storage shards it. The header text is recorded
+    // beside it. Neither proves later presence or completeness: they
+    // describe this delivery at stamping. The stored copy's own digest is
+    // taken at each storage site below, over exactly the blocks stored there.
     metadata.sourceBodyDigest = sourceBodyDigest(event.content);
     // The visible source header (shelf-356): stamped once, here, from this
     // item's own frozen envelope, and stored with the message — a later
@@ -7408,7 +7408,7 @@ export class AgentFramework {
     // and RFC-006 corrections all pass through here.
     const header = renderSourceHeader(source);
     if (header) metadata.sourceHeader = header;
-    event = { ...event, content: AgentFramework.withSourceHeader(source, event.content) };
+    event = { ...event, content: AgentFramework.withSourceHeader(header, event.content) };
 
     // Per-channel conversation routing: messages go to the channel's fork
     // agent (spawned from the template on first qualifying message), never
@@ -8653,13 +8653,14 @@ export class AgentFramework {
     }
     metadata[INBOUND_SOURCE_KEY] = source;
 
-    const content = [...event.content];
     // The delivered body's version identity, before any host decoration (the
-    // invitation and the source header below). Every push that reaches here
-    // gets one, written over any value the adapter's origin carried. (A
-    // visibly-empty push is refused at admission; the silent-heartbeat marker
-    // stores nothing, so its metadata is never kept.)
-    metadata.sourceBodyDigest = sourceBodyDigest(content);
+    // invitation, the source header and its marking of header-shaped text
+    // below). Every push that reaches here gets one, written over any value
+    // the adapter's origin carried. (A visibly-empty push is refused at
+    // admission; the silent-heartbeat marker stores nothing, so its metadata
+    // is never kept.)
+    metadata.sourceBodyDigest = sourceBodyDigest(event.content);
+    const invitations: ContentBlock[] = [];
     if (triggerChannel) {
       const origin = (event.origin ?? {}) as Record<string, unknown>;
       const invitation = this.buildClosedChannelInvitation({
@@ -8675,7 +8676,7 @@ export class AgentFramework {
           typeof origin.missedCharacters === 'number' ? origin.missedCharacters : undefined,
       });
       if (invitation) {
-        content.push(invitation.block);
+        invitations.push(invitation.block);
         Object.assign(metadata, invitation.metadataPatch);
       }
     }
@@ -8683,16 +8684,15 @@ export class AgentFramework {
     // Silent heartbeat ticks are control-plane wakes, not autobiography.
     // Accept the no-message path only for the heartbeat feature's own exact
     // marker with an empty payload — arbitrary MCPL servers cannot hide
-    // content merely by setting `origin.silent`.
-    const silentHeartbeat = isSilentHeartbeatMarker({ ...event, content });
+    // content merely by setting `origin.silent`. It reads the blocks before
+    // the header decorates them.
+    const silentHeartbeat = isSilentHeartbeatMarker({ ...event, content: [...event.content, ...invitations] });
     // The visible source header (shelf-356), from this item's own envelope:
     // its registered channel, or `unscoped` — never a guessed channel. A
     // silent heartbeat stores no message, so it gets none.
     const header = silentHeartbeat ? undefined : renderSourceHeader(source);
-    if (header) {
-      content.unshift({ type: 'text', text: header });
-      metadata.sourceHeader = header;
-    }
+    if (header) metadata.sourceHeader = header;
+    const content = [...AgentFramework.withSourceHeader(header, event.content), ...invitations];
 
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
@@ -9934,17 +9934,25 @@ export class AgentFramework {
     };
   }
 
-  /** Content with its source header (shelf-356) as the first block. */
-  private static withSourceHeader(source: InboundSource, content: ContentBlock[]): ContentBlock[] {
-    const header = renderSourceHeader(source);
-    return header ? [{ type: 'text', text: header }, ...content] : [...content];
+  /**
+   * An adapter's blocks as stored under their source header (shelf-356): the
+   * header first, then the blocks with every header-shaped opening in their
+   * text marked (markHeaderOpenings), so beside it no other `[source:` can
+   * pass for the host's. Both MCPL lanes attach headers only through here.
+   * Without a header (a silent heartbeat stores nothing), the blocks as
+   * given.
+   */
+  private static withSourceHeader(header: string | undefined, content: readonly ContentBlock[]): ContentBlock[] {
+    return header ? [{ type: 'text', text: header }, ...markHeaderOpenings(content)] : [...content];
   }
 
   /**
-   * Once per resident, the first time it has channel traffic: what the
-   * `[source: …]` headers are, and that the canonical id is authoritative
-   * when a label differs. The rule is also in the channel tools'
-   * descriptions; this introduces it where the headers appear.
+   * Once per resident, the first time it holds an item with a source header
+   * (channel traffic, or a push that names no channel): what the
+   * `[source: …]` headers are, that the canonical id is authoritative when a
+   * label differs, and that `\[source…` in a message is its sender's text.
+   * The rule is also in the channel tools' descriptions; this introduces it
+   * where the headers appear.
    */
   private maybeExplainSourceHeaders(agent: Agent): void {
     if (!this.channelRegistry) return;
@@ -9958,12 +9966,13 @@ export class AgentFramework {
       // prototype, and a `__proto__` key doesn't survive the store's round trip.
       explained = Array.isArray(state.sourceHeadersExplained) ? state.sourceHeadersExplained : [];
       if (explained.includes(agent.name)) return;
-      // Any retained channel item counts, however much later traffic stands
-      // between it and this turn. getAllMessages is the store's cached view
-      // (each compile reads the same one), so this is a pass over memory,
-      // and none runs once the notice is recorded.
+      // Any retained item stored with a header counts, a channel item or an
+      // unscoped push, however much later traffic stands between it and this
+      // turn. getAllMessages is the store's cached view (each compile reads
+      // the same one), so this is a pass over memory, and none runs once the
+      // notice is recorded.
       const sees = agent.getContextManager().getAllMessages()
-        .some((message) => readInboundSource(message.metadata)?.kind === 'channel');
+        .some((message) => typeof (message.metadata as { sourceHeader?: unknown } | undefined)?.sourceHeader === 'string');
       if (!sees) return;
     } catch (err) {
       console.error('maybeExplainSourceHeaders: state read failed:', err);
@@ -9979,7 +9988,8 @@ export class AgentFramework {
           type: 'text',
           text:
             '[source] Each channel message begins with a [source: server / channel-id · label] line naming the ' +
-            `conversation it came from (with a thread or the message it replies to, when it has one). ${SOURCE_HEADER_RULE}`,
+            'conversation it came from (with a thread or the message it replies to, when it has one), and an event ' +
+            `that names no conversation with [source: server · unscoped]. ${SOURCE_HEADER_RULE}`,
         }],
         { system: true, kind: 'source-header-notice' },
       );

@@ -40,7 +40,7 @@ import { expandCoreTags } from './tags.js';
 import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { isVisiblyEmptyContent } from './visible-content.js';
 import { CapabilityGrant } from './capability-grant.js';
-import { INBOUND_SOURCE_KEY, renderSourceHeader, SOURCE_HEADER_RULE, type InboundSource } from './inbound-source.js';
+import { INBOUND_SOURCE_KEY, markHeaderOpenings, renderSourceHeader, SOURCE_HEADER_RULE, type InboundSource } from './inbound-source.js';
 import { McplRequestError } from './server-connection.js';
 
 // ============================================================================
@@ -2740,13 +2740,19 @@ export class ChannelRegistry {
    * `source` is the host's key on every item: an adapter-supplied `source`
    * is kept under `adapterSource` whether or not the item names a channel,
    * so a `source` field is always the host's header, and its absence means
-   * the item named no channel.
+   * the item named no channel. Every item's own text is marked as a stored
+   * item's is (markHeaderOpenings), so beside those headers a `[source:`
+   * written in a message reads `\[source:`.
    */
   private stampHistory(serverId: string, items: ChannelIncomingMessage[]): Array<Record<string, unknown>> {
     const text = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
     return items.map((item) => {
       const { source: adapterSource, ...rest } = item as unknown as Record<string, unknown>;
-      const kept = { ...rest, ...(adapterSource !== undefined ? { adapterSource } : {}) };
+      const kept = {
+        ...rest,
+        ...(Array.isArray(rest.content) ? { content: markHeaderOpenings(rest.content as object[]) } : {}),
+        ...(adapterSource !== undefined ? { adapterSource } : {}),
+      };
       const channelId = text(rest.channelId);
       if (!channelId) return kept;
       const header = renderSourceHeader({

@@ -26,6 +26,7 @@
 
 import type { ContextManager, StoredMessage } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
+import { withoutSourceHeader } from '../../mcpl/inbound-source.js';
 
 export interface SemanticIndexConfig {
   /** Base URL of the embed-service, e.g. `http://100.90.161.34:8804`. */
@@ -159,10 +160,16 @@ export class SemanticIndexClient {
   }
 }
 
-/** Text to embed for one message, or '' when there is nothing worth indexing. */
+/**
+ * Text to embed for one message, or '' when there is nothing worth indexing.
+ * It leaves out the source header the host stored first (shelf-356): the
+ * index carries where an item was said as `channel`, and a header embedded
+ * with every item would dominate a short message's vector. A hit's snippet
+ * is rebuilt from this same text.
+ */
 export function messageIndexText(msg: StoredMessage, includePrivateTools = true): string {
   const parts: string[] = [];
-  for (const block of msg.content as ContentBlock[]) {
+  for (const block of withoutSourceHeader(msg.content as ContentBlock[], msg.metadata)) {
     if (block.type === 'text' && typeof block.text === 'string') {
       parts.push(block.text);
     } else if (includePrivateTools && block.type === 'tool_use' && PRIVATE_PROSE_TOOLS.has(block.name)) {

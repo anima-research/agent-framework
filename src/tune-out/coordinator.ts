@@ -21,6 +21,7 @@ import type { StoredMessage } from '@animalabs/context-manager';
 import type { ChannelRegistry, TuneOutParams } from '../mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../mcpl/server-registry.js';
 import { CapabilityGrant } from '../mcpl/capability-grant.js';
+import { withoutSourceHeader } from '../mcpl/inbound-source.js';
 
 /** Defaults for tune_out tool params. */
 export const TUNE_OUT_DEFAULTS = {
@@ -214,7 +215,10 @@ export class TuneOutCoordinator {
 
     const lines = shown.map((m) => {
       const author = (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
-      const text = m.content
+      // The body without its source header (shelf-356): the backlog names
+      // its channel itself, and each entry reads `author: body` rather than
+      // opening on the header.
+      const text = withoutSourceHeader(m.content, m.metadata)
         .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
         .map((b) => b.text)
         .join('\n');
