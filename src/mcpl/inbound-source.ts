@@ -156,9 +156,18 @@ export function conversationKey(source: InboundSource): string | undefined {
 }
 
 /**
- * JSON with object keys sorted at every level and `undefined` values dropped,
- * so a value hashes alike however its keys were ordered (content read back
- * from the store has its keys in a different order than it was written).
+ * JSON with object keys sorted at every level, written as the store keeps a
+ * value: `undefined` values are dropped, a string is well-formed (the store
+ * writes UTF-8, so each lone surrogate comes back as U+FFFD), and an entry
+ * whose key isn't well-formed is dropped (the store doesn't keep it). So a
+ * value hashes alike however its keys were ordered (content read back from
+ * the store has them in a different order than it was written), and alike
+ * before and after the store.
+ *
+ * It expects JSON-shaped values, as the MCPL lanes deliver them (parsed from
+ * JSON). Any other object is written by its own enumerable entries, unlike
+ * JSON.stringify: a Date becomes `{}`, as the store's own write keeps it, but
+ * a deferred write recovered from its JSON file brings it back as a string.
  *
  * sourceBodyDigest's serializer, kept out of the package API: serialization
  * and framing both stay inside sourceBodyDigest, so consumers don't
@@ -168,33 +177,100 @@ export function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
   if (value && typeof value === 'object') {
     const entries = Object.entries(value as Record<string, unknown>)
-      .filter(([, v]) => v !== undefined)
+      .filter(([k, v]) => v !== undefined && k.isWellFormed())
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
     return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(',')}}`;
   }
+  if (typeof value === 'string') return JSON.stringify(value.toWellFormed());
   return JSON.stringify(value) ?? 'null';
+}
+
+/**
+ * A block as the store hands it back. Context-manager keeps inline media as
+ * blobs (blob-manager.ts): an image whose source isn't a URL, and every
+ * document, audio or video block, comes back as `{ type, source: { type:
+ * 'base64', data, mediaType } }` and nothing else, its data re-encoded from
+ * the decoded bytes, and an image's media type taken from its bytes'
+ * signature where they have one. Any other block comes back as it was given.
+ */
+function storedBlock(block: unknown): unknown {
+  const media = block as { type?: unknown; source?: { type?: unknown; data?: unknown; mediaType?: unknown } } | null;
+  const blob = media?.type === 'image'
+    ? media.source?.type !== 'url'
+    : media?.type === 'document' || media?.type === 'audio' || media?.type === 'video';
+  const source = media?.source;
+  if (!blob || typeof source?.data !== 'string') return block;
+  const data = canonicalBase64(source.data);
+  const mediaType = media!.type === 'image'
+    ? sniffRasterImageMediaType(Buffer.from(data.slice(0, 32), 'base64')) ?? source.mediaType
+    : source.mediaType;
+  return { type: media!.type, source: { type: 'base64', data, mediaType } };
+}
+
+/**
+ * Base64 as the store writes it back from the decoded bytes: padded, with no
+ * whitespace, the standard alphabet and zero unused bits. Data already in
+ * that form, as every stored copy's is, is returned without decoding it all.
+ */
+function canonicalBase64(data: string): string {
+  if (data.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(data)) {
+    const last = data.slice(-4);
+    if (Buffer.from(last, 'base64').toString('base64') === last) return data;
+  }
+  return Buffer.from(data, 'base64').toString('base64');
+}
+
+/**
+ * The store's own test for raster image types with an unambiguous byte
+ * signature, copied from context-manager's blob-manager.ts (it isn't
+ * exported): the store relabels an image whose bytes match one of these.
+ */
+function sniffRasterImageMediaType(bytes: Uint8Array): string | null {
+  if (bytes.length >= 8 &&
+      bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
+      bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a) {
+    return 'image/png';
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'image/jpeg';
+  }
+  if (bytes.length >= 6) {
+    const signature = Buffer.from(bytes.subarray(0, 6)).toString('ascii');
+    if (signature === 'GIF87a' || signature === 'GIF89a') return 'image/gif';
+  }
+  if (bytes.length >= 12 &&
+      Buffer.from(bytes.subarray(0, 4)).toString('ascii') === 'RIFF' &&
+      Buffer.from(bytes.subarray(8, 12)).toString('ascii') === 'WEBP') {
+    return 'image/webp';
+  }
+  return null;
 }
 
 /**
  * The version identity of a delivered body (agreed with the receipts lane,
  * room-220 #46752–#47210): SHA-256 hex of `canonicalJson([blocks])` over the
  * ContentBlock[] the framework stores for the body — after MCPL conversion,
- * before any host decoration is added and before storage shards it. The
- * one-element array keeps the framing an undecorated, unsharded stored copy
- * has always hashed to, so a stamped copy and an older copy of the same body
- * share a version.
+ * before any host decoration is added and before storage shards it — with
+ * each block as the store keeps it (storedBlock, canonicalJson). So a body
+ * hashes alike as delivered, as handed to storage, as injected into a live
+ * turn, and as read back from the store. The one-element array keeps the
+ * framing an undecorated, unsharded stored copy has always hashed to, so a
+ * stamped copy and an older copy of the same body share a version.
  *
  * Ingestion stamps it as `metadata.sourceBodyDigest`, and the same function
  * over exactly the blocks handed to storage (decorations included) as
  * `metadata.storedBodyDigest`, on both MCPL lanes. Both live outside the
  * frozen admission envelope: they describe the body actually delivered (a
  * materialization, a correction), not the admission. Neither proves later
- * presence or completeness; a copy that no longer hashes to its
+ * presence or completeness; a stored copy that no longer hashes to its
  * storedBodyDigest was changed after delivery (editMessage keeps metadata).
+ * Check a copy read back with its blobs resolved (getAllMessages, getMessage,
+ * or getMessageWindow without `resolveBlobs: false`): a blob reference never
+ * matches.
  *
  * Exported from the package root, so a consumer checks a copy against either
  * field with this same function rather than a copy of it.
  */
 export function sourceBodyDigest(blocks: readonly unknown[]): string {
-  return createHash('sha256').update(canonicalJson([blocks])).digest('hex');
+  return createHash('sha256').update(canonicalJson([blocks.map(storedBlock)])).digest('hex');
 }
