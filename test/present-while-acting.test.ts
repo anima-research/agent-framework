@@ -1829,6 +1829,15 @@ describe('speech follows the moment its words were written', () => {
     const framework = await createFramework();
     stubChannelRegistry(framework, { home: false });
     const streams = recordStreams(framework);
+    // The abort doesn't stop robot--move: the test owns that call, and waits
+    // for it after stop() (its late result meets the stopped framework).
+    const handle = module.handleToolCall.bind(module);
+    let toolSettled: Promise<unknown> = Promise.resolve();
+    module.handleToolCall = (call) => {
+      const running = handle(call);
+      toolSettled = running.catch(() => undefined);
+      return running;
+    };
 
     triggerFromChannel(framework, 'chan-A');
     const idle = framework.runUntilIdle();
@@ -1843,6 +1852,8 @@ describe('speech follows the moment its words were written', () => {
     assert.deepEqual(streams.completes, [{ channelId: 'chan-A', text: 'Narrating.', threadId: null }]);
 
     await framework.stop();
+    await toolSettled;
+    await new Promise((r) => setImmediate(r));
   });
 
   it('completion never replays a chunk the registry refused to stream', async () => {
