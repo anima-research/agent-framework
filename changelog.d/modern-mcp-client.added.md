@@ -14,12 +14,16 @@
   - **HTTP credentials:** come from `token`/`accessProvider`, as a cached
     bearer refreshed once on 401.
   - **Deadline:** each call gets one `requestTimeoutMs` deadline across every
-    leg. At the deadline cancellation is requested, the outcome is reported
-    as unknown, and nothing is replayed.
+    leg and the pauses between them. At the deadline cancellation is
+    requested for a leg in flight (between continuation rounds none is), the
+    outcome is reported as unknown, and nothing is replayed.
   - **Failures:** reported as `McplRequestError`, with the outcome taken from
     what actually crossed the transport: `not-sent`, `error-response` (HTTP
-    401/403 with `data.httpStatus`) or `no-response`. A server answer that
-    can't be used is a plain error.
+    401/403 with `data.httpStatus`) or `no-response`. Only an error or a
+    `complete` result is a final answer: a call that ends after an
+    `input_required` answer, or after a result type this revision doesn't
+    define, is `no-response`. A complete result that can't be used is a
+    plain error.
   - **Lifetime:** reconnects use the legacy backoff settings. A tool-list
     change subscription is kept open, reopened if refused or lost, and its
     changes go through ordinary admission, so they park under quiesce like

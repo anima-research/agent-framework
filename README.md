@@ -297,10 +297,14 @@ two ways:
 - `requestTimeoutMs` is one deadline per tool call and must be 1 to 2^31−1;
   0 is refused, where MCPL reads it as no watchdog.
 
-At the deadline cancellation is requested, the outcome is reported as
-unknown, and the call is never retried. An MCPL server that refuses
-`2024-11-05` with `-32022` fails with `McplProtocolVersionError`, which names
-the fix, and is not retried.
+At the deadline, cancellation is requested for a leg still in flight;
+between the rounds of an `input_required` continuation nothing is in flight
+to cancel. Either way the outcome is reported as unknown (`no-response`),
+and the call is never retried. A call that ends for any other reason after
+the server asked for another round, before its final answer, is reported
+the same way, since the server may already have acted. An MCPL server that
+refuses `2024-11-05` with `-32022` fails with `McplProtocolVersionError`,
+which names the fix, and is not retried.
 
 #### Feature sets
 

@@ -7,6 +7,11 @@
  * - a result that fails validation is an answer that can't be used (1 call,
  *   answered), never a claimed server error;
  * - a JSON-RPC error on the wire is `error-response` with its code and data;
+ * - a call that ends after an `input_required` answer, before a final one, is
+ *   `no-response`: at the deadline (with nothing in flight to cancel), with
+ *   the connection gone, or when this client can't go on (PR #262 review);
+ *   so is one whose answer has a result type this revision doesn't define,
+ *   or none;
  * - a list-change subscription refused at connect is reopened;
  * - `close()` during a reconnect handshake ends the launch it was waiting on.
  */
@@ -164,6 +169,86 @@ test('an input_required continuation keeps its evidence: the second leg decides 
     return true;
   });
   assert.equal(calls(log, 'cont'), 4, 'two legs each');
+});
+
+test('a deadline between continuation rounds is no-response, and claims no cancellation', async () => {
+  // The SDK pauses 250 ms before a state-only round. With a shorter budget,
+  // the deadline passes inside that pause whenever leg 1 answers in time.
+  const log = scratchLog();
+  const connection = await connect('', log, { requestTimeoutMs: 240 });
+  await connection.listTools();
+  await assert.rejects(connection.callTool('cont', { leg2: 'ok' }), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'no-response');
+    assert.match(
+      err.message,
+      /did not finish tools\/call "cont" within 240ms: it asked for another round \(input_required\), and the deadline passed before that round was sent, so nothing was in flight to cancel\. The outcome is unknown/,
+    );
+    assert.doesNotMatch(err.message, /Cancellation was requested|answered/);
+    return true;
+  });
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(calls(log, 'cont'), 1, 'only leg 1 reached the wire');
+  assert.equal(wire(log).filter((e) => e.method === 'notifications/cancelled').length, 0, 'nothing was cancelled');
+});
+
+test('a connection lost between continuation rounds is no-response, not an answer', async () => {
+  const log = scratchLog();
+  const connection = await connect('', log);
+  await connection.listTools();
+  await assert.rejects(connection.callTool('cont', { leg1: 'exit', leg2: 'ok' }), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'no-response');
+    assert.match(
+      err.message,
+      /did not finish tools\/call "cont": it asked for another round \(input_required\), and the call ended before that round was sent: Not connected\. The outcome is unknown/,
+    );
+    return true;
+  });
+  assert.equal(calls(log, 'cont'), 1);
+});
+
+test('a continuation this client cannot go on with is no-response: the server may have acted', async () => {
+  const log = scratchLog();
+  const connection = await connect('', log);
+  await connection.listTools();
+  // Input this client can't supply: it advertises no elicitation.
+  await assert.rejects(connection.callTool('cont', { leg1: 'elicit' }), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'no-response');
+    assert.match(err.message, /it asked for another round \(input_required\), and the call ended before that round was sent: Cannot fulfil input request 'confirm'/);
+    return true;
+  });
+  assert.equal(calls(log, 'cont'), 1);
+  // A server that sheds load on every round meets the rounds cap: the first
+  // leg and ten retries.
+  await assert.rejects(connection.callTool('cont', { leg2: 'again' }), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'no-response');
+    assert.match(err.message, /the call ended before that round was sent: Multi-round-trip request 'tools\/call' still required input after 10 rounds/);
+    return true;
+  });
+  assert.equal(calls(log, 'cont'), 1 + 11);
+});
+
+test('a result type this revision does not define, or none, is not a final answer: no-response', async () => {
+  const log = scratchLog();
+  const connection = await connect('', log);
+  await connection.listTools();
+  await assert.rejects(connection.callTool('task', {}), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'no-response');
+    assert.match(err.message, /did not finish tools\/call "task": its answer was not a complete result: Unsupported result type 'task'.*The outcome is unknown/);
+    return true;
+  });
+  await assert.rejects(connection.callTool('bare', {}), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'no-response');
+    assert.match(err.message, /did not finish tools\/call "bare": its answer was not a complete result: .*missing required resultType.*The outcome is unknown/);
+    return true;
+  });
+  assert.equal(calls(log, 'task'), 1);
+  assert.equal(calls(log, 'bare'), 1);
 });
 
 test('concurrent continuations never cross their evidence', async () => {

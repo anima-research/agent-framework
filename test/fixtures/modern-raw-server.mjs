@@ -16,7 +16,10 @@
 // a tool list change on the open subscription), nullframe (writes JSON lines
 // that aren't JSON-RPC messages, then answers), cont (a state-only
 // input_required first leg; the second leg does what arguments.leg2 says:
-// 'error', 'hang' or 'ok'), die (exits).
+// 'error', 'hang', 'ok', or 'again' for another state-only round every time.
+// arguments.leg1 'exit' exits just after the first leg's answer, and
+// 'elicit' asks for elicitation input instead), task (a result type this
+// revision doesn't define), bare (a result with no resultType), die (exits).
 import { createInterface } from 'node:readline';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 
@@ -82,6 +85,8 @@ createInterface({ input: process.stdin }).on('line', (line) => {
           { name: 'touch', inputSchema: { type: 'object' } },
           { name: 'nullframe', inputSchema: { type: 'object' } },
           { name: 'cont', inputSchema: { type: 'object' } },
+          { name: 'task', inputSchema: { type: 'object' } },
+          { name: 'bare', inputSchema: { type: 'object' } },
           { name: 'die', inputSchema: { type: 'object' } },
         ],
       });
@@ -96,17 +101,32 @@ createInterface({ input: process.stdin }).on('line', (line) => {
         return result(m.id, { content: [{ type: 'text', text: subscription === null ? 'no subscription' : 'touched' }] });
       }
       if (name === 'die') { setTimeout(() => process.exit(5), 10); return result(m.id, { content: [{ type: 'text', text: 'bye' }] }); }
+      if (name === 'task') return send({ jsonrpc: '2.0', id: m.id, result: { resultType: 'task', taskId: 'task-1' } });
+      if (name === 'bare') return send({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: 'no resultType' }] } });
       if (name === 'nullframe') {
         process.stdout.write('null\n[1,2]\n"just a string"\n{"no":"jsonrpc"}\n');
         return result(m.id, { content: [{ type: 'text', text: 'after the noise' }] });
       }
       if (name === 'cont') {
-        const leg2 = m.params?.arguments?.leg2;
+        const { leg1, leg2 } = m.params?.arguments ?? {};
         if (m.params?.requestState === undefined) {
-          return send({ jsonrpc: '2.0', id: m.id, result: { resultType: 'input_required', requestState: `state-for-${leg2}` } });
+          if (leg1 === 'elicit') {
+            return send({
+              jsonrpc: '2.0',
+              id: m.id,
+              result: {
+                resultType: 'input_required',
+                inputRequests: { confirm: { method: 'elicitation/create', params: { message: 'Proceed?', requestedSchema: { type: 'object', properties: {} } } } },
+              },
+            });
+          }
+          send({ jsonrpc: '2.0', id: m.id, result: { resultType: 'input_required', requestState: `state-for-${leg2}` } });
+          if (leg1 === 'exit') setTimeout(() => process.exit(5), 10);
+          return;
         }
         if (leg2 === 'error') return error(m.id, -32603, 'second leg failed', { leg: 2, state: m.params.requestState });
         if (leg2 === 'hang') return;
+        if (leg2 === 'again') return send({ jsonrpc: '2.0', id: m.id, result: { resultType: 'input_required', requestState: `${m.params.requestState}+` } });
         return result(m.id, { content: [{ type: 'text', text: `leg 2 done (${m.params.requestState})` }] });
       }
       return result(m.id, { content: [{ type: 'text', text: 'plain' }] });

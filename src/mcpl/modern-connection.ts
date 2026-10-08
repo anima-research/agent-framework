@@ -14,13 +14,17 @@
  * - **HTTP credentials** come from `token`/`accessProvider`: a cached bearer
  *   token, re-resolved once when the server answers 401.
  * - **One deadline per tool call** (`requestTimeoutMs`, always positive)
- *   bounds every leg of the call. At the deadline the SDK requests
- *   cancellation and the outcome is unknown. Calls are never replayed.
+ *   bounds every leg of the call and the pauses between them. At the
+ *   deadline the SDK requests cancellation of a leg in flight; between
+ *   continuation rounds nothing is in flight. Either way the outcome is
+ *   unknown. Calls are never replayed.
  * - **Request outcomes from the wire.** A failed call is classified by what
  *   crossed Connectome's transport boundary, never by the error's class. The
  *   SDK raises the same error classes locally (an invalid outputSchema before
  *   dispatch, output validation after a successful result) as it does for
- *   server answers.
+ *   server answers. A call's answer is the server's final one: an
+ *   `input_required` answer asks for another round, so a call that ends
+ *   after one has no answer.
  * - **Lifetime.** On a lost transport the connection restarts with the same
  *   backoff settings as legacy, when `reconnect` is set. List-change
  *   awareness is kept while the connection lives: a subscription the server
@@ -79,12 +83,15 @@ export interface ModernToolCallResult {
  * any of its requests handed to the transport, and how did the server answer
  * the most recent one? A logical call can take several legs: a
  * header-mismatch retry, or the rounds of an `input_required` continuation.
+ * Only an error or a `complete` result is the server's final answer.
+ * `input-required` asks for another round, and a result of any other type,
+ * or of none (`unrecognized`), doesn't say the call finished.
  */
 interface WireRecord {
   readonly method: string;
   handedOff: boolean;
   currentId?: string | number;
-  answer: 'none' | 'result' | 'error';
+  answer: 'none' | 'error' | 'complete' | 'input-required' | 'unrecognized';
   error?: { code: number; message: string; data?: unknown };
 }
 
@@ -173,7 +180,9 @@ class ObservedTransport implements Transport {
       record.answer = 'error';
       record.error = message.error as WireRecord['error'];
     } else {
-      record.answer = 'result';
+      const result = (message as { result?: unknown }).result;
+      const type = typeof result === 'object' && result !== null ? (result as { resultType?: unknown }).resultType : undefined;
+      record.answer = type === 'complete' ? 'complete' : type === 'input_required' ? 'input-required' : 'unrecognized';
     }
     return record;
   }
@@ -725,7 +734,9 @@ export class ModernMcpConnection extends EventEmitter {
 
   /**
    * Map a failure onto the request-outcome contract by what crossed the
-   * transport boundary for this request, claiming no more than that shows:
+   * transport boundary for this request, claiming no more than that shows.
+   * The call's answer is the server's final one: an error or a `complete`
+   * result.
    * - nothing handed to the transport: `not-sent`, whatever the SDK raised
    *   (a pre-dispatch validation, a signal already aborted, no transport);
    * - an HTTP 401/403 refusal: `error-response`. The server answered, at the
@@ -733,9 +744,17 @@ export class ModernMcpConnection extends EventEmitter {
    *   JSON-RPC code space's (absent);
    * - the most recent leg answered with a JSON-RPC error: `error-response`
    *   with that error's code and data;
-   * - the most recent leg answered with a result: the server acted, but what
-   *   it returned can't be used (output validation, input this client can't
-   *   supply, a rounds cap). That's a plain error, not a request outcome;
+   * - the most recent leg answered with a complete result: the server
+   *   finished, but what it returned can't be used (output validation).
+   *   That's a plain error, not a request outcome;
+   * - the most recent leg answered without finishing the call: `no-response`,
+   *   since the server may have acted on what it received. An
+   *   `input_required` answer asks for another round, and the call can end
+   *   before that round is sent: at the deadline, when the connection is
+   *   gone, or when this client can't go on (input it can't supply, the
+   *   rounds cap). Nothing is in flight then, so nothing is cancelled. A
+   *   result of a type this client doesn't recognize ends the call where it
+   *   is;
    * - handed off and unanswered: `no-response`. At the deadline, cancellation
    *   was requested and the outcome is unknown.
    */
@@ -753,12 +772,28 @@ export class ModernMcpConnection extends EventEmitter {
       const { code, message: wireMessage, data } = record.error;
       return new McplRequestError(`${prefix} returned error for ${what}: [${code}] ${wireMessage}`, 'error-response', code, data);
     }
-    if (record.answer === 'result') {
+    if (record.answer === 'complete') {
       return new Error(`${prefix} answered ${what}, but the result can't be used: ${message}`);
     }
-    if (error instanceof SdkError && error.code === SdkErrorCode.RequestTimeout) {
+    const deadline = error instanceof SdkError && error.code === SdkErrorCode.RequestTimeout;
+    const within = deadline && timeoutMs ? ` within ${timeoutMs}ms` : '';
+    if (record.answer === 'input-required' || record.answer === 'unrecognized') {
+      const reason = /[.!?]$/.test(message) ? message : `${message}.`;
+      const ending = record.answer === 'unrecognized'
+        ? `its answer was not a complete result: ${reason}`
+        : deadline
+          ? 'it asked for another round (input_required), and the deadline passed before that round was sent, so nothing was in flight to cancel.'
+          : `it asked for another round (input_required), and the call ended before that round was sent: ${reason}`;
       return new McplRequestError(
-        `${prefix} did not answer ${what}${timeoutMs ? ` within ${timeoutMs}ms` : ''}. Cancellation was requested; ` +
+        `${prefix} did not finish ${what}${within}: ${ending} ` +
+          `The outcome is unknown: the server may already have acted on the call. Verify state before retrying; ` +
+          `a blind retry of a side-effecting tool may duplicate it.`,
+        'no-response',
+      );
+    }
+    if (deadline) {
+      return new McplRequestError(
+        `${prefix} did not answer ${what}${within}. Cancellation was requested; ` +
           `the outcome is unknown: the tool may still complete server-side. Verify state before retrying; ` +
           `a blind retry of a side-effecting tool may duplicate it.`,
         'no-response',
