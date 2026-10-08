@@ -2074,6 +2074,69 @@ describe('operator journals that cannot be read', () => {
     await assert.rejects(startOn(store), refusedAs('operator/unstick'));
   });
 
+  // operator/unstick, read as applyUnstickStep and rerunUnstick read it.
+  const unstickStore = (snapshot: object | undefined, entries: object[]) => {
+    const store = JsStore.openOrCreate({ path: join(dir, `unstick-${++ledgers}`) });
+    if (snapshot) {
+      const covered = store.appendJson('operator/unstick', { kind: 'step-intent', operationId: 'covered', agent: 'scout', step: 1, messageIds: ['c'] });
+      store.appendJson('operator/unstick/checkpoint', { through: String(covered.id), snapshot });
+    }
+    for (const entry of entries) store.appendJson('operator/unstick', entry);
+    store.sync();
+    return store;
+  };
+  const unstickRefuses = async (snapshot: object | undefined, entries: object[], why: RegExp) => {
+    const store = unstickStore(snapshot, entries);
+    try {
+      await assert.rejects(startOn(store), (e: Error) => refusedAs('operator/unstick')(e) && why.test(e.message));
+    } finally {
+      store.close();
+    }
+  };
+  const operation = (attempts: object[], steps: object[] = [{ step: 1, status: 'shed', messageIds: ['m1', 'm2'] }]) =>
+    ({ op: { operationId: 'op', agent: 'scout', steps, attempts } });
+  const intent = (step: number, agent = 'scout') => ({ kind: 'step-intent', operationId: 'op', agent, step, messageIds: [`m${step}`] });
+  const shed = (step: number) => ({ kind: 'step-done', operationId: 'op', step });
+  const launched = (step: number) => ({ kind: 'attempt-launched', operationId: 'op', agent: 'scout', step });
+
+  it('refuses an unstick checkpoint whose attempt or step misstates what it records, rather than reporting an outcome it lacks', async () => {
+    await unstickRefuses(operation([{ step: 1, status: 'completed' }]), [], /operation op: attempt 1 \(launched with no outcome, or completed with one\)/);
+    await unstickRefuses(operation([{ step: 1, status: 'completed', outcome: 'maybe' }]), [], /attempt 1/);
+    await unstickRefuses(operation([{ step: 1, status: 'done', outcome: 'responded' }]), [], /attempt 1/);
+    await unstickRefuses(operation([{ step: 1, status: 'launched', outcome: 'refused' }]), [], /attempt 1/);
+    await unstickRefuses(operation([{ step: 1, status: 'completed', outcome: 'refused', category: 7 }]), [], /attempt 1/);
+    await unstickRefuses(operation([{ step: 1, status: 'launched' }, { step: 1, status: 'launched' }]), [], /an attempt/);
+    await unstickRefuses(operation([], [{ step: 1, status: 'finished', messageIds: ['m1'] }]), [], /a step/);
+    await unstickRefuses(operation([], [{ step: 1, status: 'shed', messageIds: [7] }]), [], /a step/);
+    await unstickRefuses(operation([], [{ step: 0.5, status: 'shed', messageIds: ['m1'] }]), [], /a step/);
+  });
+
+  it('refuses unstick entries that misstate their ids, or name a step or attempt the ledger never held', async () => {
+    await unstickRefuses(undefined, [{ ...intent(1), messageIds: [1, 2] }], /step-intent entry for op step 1/);
+    await unstickRefuses(undefined, [shed(1)], /no such step/);
+    await unstickRefuses(undefined, [intent(1), launched(1)], /its step was never shed/);
+    await unstickRefuses(undefined, [intent(1), shed(1), { kind: 'attempt-done', operationId: 'op', step: 1, outcome: 'refused' }], /no such attempt/);
+    await unstickRefuses(undefined, [intent(1), shed(1), launched(1), { kind: 'attempt-done', operationId: 'op', step: 1, outcome: 'refused', error: {} }], /attempt-done entry/);
+    await unstickRefuses(undefined, [intent(1), intent(2, 'someone-else')], /its agent differs/);
+  });
+
+  it('reads a well-formed unstick ledger, its checkpoint and the entries after it, as before', async () => {
+    const store = unstickStore(operation([{ step: 1, status: 'completed', outcome: 'refused', category: 'safety' }]),
+      [intent(2), shed(2), launched(2), { kind: 'attempt-done', operationId: 'op', step: 2, outcome: 'responded' }]);
+    const framework = await startOn(store);
+    try {
+      assert.deepEqual(framework.getUnstickOperation('op'), {
+        operationId: 'op',
+        agent: 'scout',
+        steps: [{ step: 1, status: 'shed', messageIds: ['m1', 'm2'] }, { step: 2, status: 'shed', messageIds: ['m2'] }],
+        attempts: [{ step: 1, status: 'completed', outcome: 'refused', category: 'safety' }, { step: 2, status: 'completed', outcome: 'responded' }],
+      });
+    } finally {
+      await framework.stop();
+      store.close();
+    }
+  });
+
   it('refuses a malformed ledger offline as well', () => {
     const path = join(dir, 'offline');
     const store = JsStore.openOrCreate({ path });

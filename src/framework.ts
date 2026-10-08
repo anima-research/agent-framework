@@ -613,36 +613,83 @@ type UnstickJournalSnapshot = Record<string, UnstickOperationRecord>;
 
 /**
  * Read the unstick journal into its operations, refusing anything parseable
- * that can't be interpreted as this ledger (a null-snapshot checkpoint, or
- * a record or entry missing what it requires), exactly as unreadable bytes.
+ * that can't be interpreted as this ledger, exactly as unreadable bytes are
+ * refused: a checkpoint whose snapshot isn't an operation map (a null one
+ * included), an operation or entry missing or misstating what its kind
+ * requires, or an entry naming an operation, step or attempt the ledger
+ * doesn't hold. Every operation is checked whole again once the entries are
+ * folded in, so the ledger is validated as applyUnstickStep and rerunUnstick
+ * read it: a step is an intent or shed with its message ids, and an attempt
+ * is launched with no outcome, or completed with one.
  */
 function readUnstickJournal(load: { snapshot: unknown; entries: Array<{ entry: unknown }>; checkpointed: boolean }): Map<string, UnstickOperationRecord> {
-  const malformed = (what: string): never => { throw new Error(`malformed operator/unstick ${what}`); };
+  const malformed: (what: string) => never = (what) => { throw new Error(`malformed operator/unstick ${what}`); };
   const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
-  const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+  const isText = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+  const isStep = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 1;
+  const isIds = (v: unknown): v is string[] => Array.isArray(v) && v.every(isText);
+  const isOutcome = (v: unknown): boolean => v === 'responded' || v === 'refused' || v === 'failed';
+  const isDetail = (r: Record<string, unknown>): boolean =>
+    (r.category === undefined || typeof r.category === 'string') && (r.error === undefined || typeof r.error === 'string');
+  const checkOperation: (op: unknown, id: string) => void = (op, id) => {
+    const where = `operation ${id}`;
+    if (!isObject(op) || op.operationId !== id || !isText(op.agent) || !Array.isArray(op.steps) || !Array.isArray(op.attempts)) {
+      malformed(where);
+    }
+    const steps = new Set<number>();
+    for (const s of op.steps) {
+      if (!isObject(s) || !isStep(s.step) || steps.has(s.step) || (s.status !== 'intent' && s.status !== 'shed') || !isIds(s.messageIds)) {
+        malformed(`${where}: a step`);
+      }
+      steps.add(s.step);
+    }
+    const attempts = new Set<number>();
+    for (const a of op.attempts) {
+      if (!isObject(a) || !isStep(a.step) || attempts.has(a.step)) malformed(`${where}: an attempt`);
+      attempts.add(a.step);
+      const ok = a.status === 'launched'
+        ? a.outcome === undefined && a.category === undefined && a.error === undefined
+        : a.status === 'completed' && isOutcome(a.outcome) && isDetail(a);
+      if (!ok) malformed(`${where}: attempt ${a.step} (launched with no outcome, or completed with one)`);
+    }
+  };
   const ops = new Map<string, UnstickOperationRecord>();
   if (load.checkpointed) {
     const snapshot = load.snapshot;
     if (!isObject(snapshot)) throw new Error('malformed operator/unstick checkpoint: its snapshot is not an operation map');
     for (const [id, op] of Object.entries(snapshot)) {
-      if (!isObject(op) || op.operationId !== id || typeof op.agent !== 'string' || !Array.isArray(op.steps) || !Array.isArray(op.attempts)
-        || !op.steps.every((x) => isObject(x) && isCount(x.step) && typeof x.status === 'string' && Array.isArray(x.messageIds))
-        || !op.attempts.every((x) => isObject(x) && isCount(x.step) && typeof x.status === 'string')) {
-        malformed(`operation ${id}`);
-      }
+      checkOperation(op, id);
       ops.set(id, structuredClone(op as unknown as UnstickOperationRecord));
     }
   }
   for (const { entry } of load.entries) {
     const e = entry as Record<string, unknown>;
-    const ok = isObject(e) && typeof e.operationId === 'string' && e.operationId.length > 0 && isCount(e.step) && (
-      (e.kind === 'step-intent' && typeof e.agent === 'string' && Array.isArray(e.messageIds))
-      || e.kind === 'step-done'
-      || (e.kind === 'attempt-launched' && typeof e.agent === 'string')
-      || (e.kind === 'attempt-done' && ['responded', 'refused', 'failed'].includes(e.outcome as string)));
-    if (!ok) malformed(`entry ${isObject(e) ? String(e.kind) : typeof e}`);
+    if (!isObject(e) || !isText(e.operationId) || !isStep(e.step)) malformed(`entry ${isObject(e) ? String(e.kind) : typeof e}`);
+    const where = `${String(e.kind)} entry for ${e.operationId} step ${e.step}`;
+    const op = ops.get(e.operationId);
+    switch (e.kind) {
+      case 'step-intent':
+        if (!isText(e.agent) || !isIds(e.messageIds)) malformed(where);
+        break;
+      case 'step-done':
+        if (!op?.steps.some((s) => s.step === e.step)) malformed(`${where}: no such step`);
+        break;
+      case 'attempt-launched':
+        if (!isText(e.agent)) malformed(where);
+        if (!op?.steps.some((s) => s.step === e.step && s.status === 'shed')) malformed(`${where}: its step was never shed`);
+        break;
+      case 'attempt-done':
+        if (!isOutcome(e.outcome) || !isDetail(e)) malformed(where);
+        if (!op?.attempts.some((a) => a.step === e.step)) malformed(`${where}: no such attempt`);
+        break;
+      default:
+        malformed(where);
+    }
+    if ('agent' in e && op && op.agent !== e.agent) malformed(`${where}: its agent differs from its operation's`);
     reduceUnstickEntry(ops, entry as UnstickJournalEntry);
   }
+  // The ledger as it will be read: every operation whole.
+  for (const [id, op] of ops) checkOperation(op, id);
   return ops;
 }
 
