@@ -13388,6 +13388,11 @@ export class AgentFramework {
           // only configuration can fix it).
           willRetry: config.reconnect === true && !(error instanceof McplProtocolVersionError),
         });
+        // So the server doesn't vanish quietly: alert at once, as the
+        // reconnect path does for the same verdict, since no attempt follows.
+        if (error instanceof McplProtocolVersionError) {
+          this.opsAlert('mcpl-down', config.id, `MCPL server unreachable at startup: ${err.message}`);
+        }
       }
     }
 

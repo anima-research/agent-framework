@@ -10,7 +10,9 @@
   with `protocol: 'modern'`. A protocol-version verdict is never retried: no
   reconnect stub, and a reconnecting connection stops its backoff loop
   (`reconnect-failed` carries `permanent: true` and raises the ops alert at
-  once). The established revision is on `connection.protocolVersion`.
+  once). At startup the verdict raises the same `mcpl-down` ops alert, so a
+  server refused for its revision doesn't drop out with only a log line. The
+  established revision is on `connection.protocolVersion`.
 - `tools/list` now follows `nextCursor` across pages, so a paginating server's
   whole inventory reaches the agent; before, every page after the first was
   silently dropped. A repeated cursor, or more than 100 pages, is an error

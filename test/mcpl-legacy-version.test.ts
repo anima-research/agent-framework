@@ -2,7 +2,8 @@
  * The legacy engine's protocol boundary and inventory (room-284, shelf-487):
  * - it offers and accepts exactly MCP 2024-11-05; anything else is a typed
  *   McplProtocolVersionError carrying what each side said;
- * - such a verdict is never retried (no reconnect stub, no backoff loop);
+ * - such a verdict is never retried (no reconnect stub, no backoff loop), and
+ *   at startup it raises the ops alert at once, as it does on reconnect;
  * - tools/list follows nextCursor to the complete inventory, and refuses a
  *   server whose cursors don't terminate.
  */
@@ -15,6 +16,8 @@ import { fileURLToPath } from 'node:url';
 
 import { McplServerConnection, McplProtocolVersionError, McplRequestError } from '../src/mcpl/server-connection.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
+import { AgentFramework } from '../src/framework.js';
+import type { Module, ModuleContext, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SERVER = join(here, 'fixtures', 'legacy-version-server.mjs');
@@ -124,6 +127,36 @@ test('a version verdict on reconnect stops the backoff loop', async () => {
   const starts = existsSync(startLog) ? readFileSync(startLog, 'utf8').split('\n').filter(Boolean).length : 0;
   assert.equal(starts, 2);
   assert.equal(failures.length, 1);
+});
+
+test('a version verdict at startup raises the ops alert at once, as on reconnect', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'legacy-version-'));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  // Modules start before the MCP servers connect, so this one sees startup.
+  const traces: TraceEvent[] = [];
+  const watcher: Module = {
+    name: 'trace-watcher',
+    async start(ctx: ModuleContext) { ctx.onTrace((event) => traces.push(event)); },
+    async stop() {},
+    getTools: (): ToolDefinition[] => [],
+    handleToolCall: async (): Promise<ToolResult> => ({ success: false, error: 'no tools', isError: true }),
+    onProcess: async () => ({}),
+  };
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: { complete: async () => { throw new Error('not used'); } } as unknown as import('@animalabs/membrane').Membrane,
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [watcher],
+    mcplServers: [config('missing', { reconnect: true })],
+  });
+  cleanups.push(() => framework.stop());
+  const failed = traces.find((t) => t.type === 'mcpl:server-connect-failed') as { serverId?: string; willRetry?: boolean } | undefined;
+  assert.equal(failed?.serverId, 'legacy');
+  assert.equal(failed?.willRetry, false);
+  const alert = traces.find((t) => t.type === 'ops:alert') as { kind?: string; agentName?: string; message?: string } | undefined;
+  assert.equal(alert?.kind, 'mcpl-down');
+  assert.equal(alert?.agentName, 'legacy');
+  assert.match(alert?.message ?? '', /unreachable at startup: .*protocolVersion \(none\)/);
 });
 
 test('tools/list follows nextCursor to the complete inventory', async () => {
