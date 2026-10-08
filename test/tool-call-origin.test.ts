@@ -297,6 +297,21 @@ describe("tool-call origin: the agent's own, and nothing else, skips the gate", 
     assert.deepEqual([tokens('other'), tokens()], [100_000, 100_000]);
   });
 
+  it('stages a delegated change from a tool-call event a module pushed on its own, as the host\'s unless it names the operator', async () => {
+    const push = (callId: string, origin?: unknown) => dlg.ctx.pushEvent({
+      type: 'tool-call', callId, agentName: 'scout', moduleName: 'dlg', toolName: 'self_set',
+      call: { id: callId, name: 'dlg--self_set', input: {}, ...(origin !== undefined ? { origin } : {}) },
+    } as never);
+    push('pushed-1');
+    await framework.runUntilIdle();
+    await dlg.last;
+    push('pushed-2', 'puppet');
+    await framework.runUntilIdle();
+    await dlg.last;
+    assert.deepEqual(surfaces(), ['scout:host', 'scout:puppet']);
+    assert.equal(tokens(), 100_000);
+  });
+
   it("reads an origin a module names as the host's unless it's 'puppet', never as the agent's own", async () => {
     for (const origin of ['', 0, false, Number.NaN, 'agent', 'PUPPET', {}]) {
       await dlg.ctx.callTool({ id: 'n', name: 'agent_settings', input: budget(136_000), callerAgentName: 'scout', origin } as unknown as ToolCall);

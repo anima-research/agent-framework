@@ -1701,6 +1701,13 @@ export class AgentFramework {
   /** Forks whose TTL closure turn has been queued — disposed (removed from
    * agents/agentConfigs/conversationAgentHomes) when their stream ends. */
   private closingConversationAgents: Set<string> = new Set();
+  /**
+   * The tool-call events this framework's own dispatch (dispatchToolCall)
+   * created. Only these carry their call's origin as given, the agent's own
+   * included: a tool-call event a module or the host pushed on its own acts
+   * for the host (dispatchToolCallEvent).
+   */
+  private readonly dispatchedToolCallEvents = new WeakSet<ToolCallEvent>();
   // Client-side programmatic tool calling (`code_execution`). Null unless
   // config.codeExecution.enabled. One PyRunner per agent (interpreter state
   // is per-agent, like a per-agent container); waiters resolve script-inner
@@ -15863,19 +15870,27 @@ export class AgentFramework {
     const moduleName = sepIndex >= 0 ? enrichedCall.name.substring(0, sepIndex) : 'unknown';
     const toolName = sepIndex >= 0 ? call.name.substring(sepIndex + 2) : call.name;
 
-    this.pushEvent({
+    const event: ToolCallEvent = {
       type: 'tool-call',
       callId: call.id,
       agentName,
       moduleName,
       toolName,
       call,
-    });
+    };
+    this.dispatchedToolCallEvents.add(event);
+    this.pushEvent(event);
   }
 
 
   private dispatchToolCallEvent(event: ToolCallEvent): void {
-    const { call, agentName, moduleName } = event;
+    const { agentName, moduleName } = event;
+    // Only this framework's own dispatch speaks for the call's initiator; a
+    // tool-call event anything else queued (a module, the host) acts for the
+    // host unless it names the operator.
+    const call: ToolCall = this.dispatchedToolCallEvents.has(event)
+      ? event.call
+      : { ...event.call, origin: normalizeOrigin(event.call.origin) ?? 'host' };
     this.emitTrace({
       type: 'tool:started',
       module: moduleName,
