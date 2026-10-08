@@ -1744,6 +1744,23 @@ describe('operator-change gate: host/command undo by turns', () => {
     assert.deepEqual(applied.kind === 'undo-turns' && [applied.undone, applied.requested], [1, 3]);
   });
 
+  it('says what the cut removed, later arrivals included, beside what followed its cut at staging', async () => {
+    await turn('one'); await turn('two');
+    await undo(1);
+    const change = asked[0]!;
+    assert.equal(change.kind === 'undo-turns' && change.messagesAfter, 1, "at staging the cut would remove two's reply");
+    await turn('alice: new 1'); await turn('bob: new 2'); await turn('carol: new 3');
+    const apply = () => framework.runAtSafeBoundary({ verb: 'apply' }, (lease) =>
+      framework.applyResolvedOperatorChange(change, { lease, admission: { id: 'rev-u' } }));
+    const applied = await apply();
+    assert.deepEqual(applied.kind === 'undo-turns' && [applied.undone, applied.messagesRemoved], [1, 7],
+      'one turn undone; the cut removed its reply and the six messages that arrived after staging');
+    assert.deepEqual(texts(), ['one', 'reply to one', 'two']);
+    const again = await apply();
+    assert.deepEqual(again.kind === 'undo-turns' && [again.alreadyApplied, again.messagesRemoved], [true, 7],
+      'a retry reports the established count');
+  });
+
   it('refuses when the gate fails, and asks nothing when there is nothing to undo', async () => {
     const empty = await undo(1);
     assert.deepEqual([empty.ok, empty.undone], [true, 0]);

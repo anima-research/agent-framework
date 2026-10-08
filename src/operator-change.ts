@@ -83,6 +83,12 @@ export interface ResolvedUndoTurnsChange extends ResolvedOperatorChangeBase {
   /** The checkpoints it undoes, newest first. Application makes one cut at
    *  the oldest one's sequenceBefore, onto a branch named for this change. */
   checkpoints: Array<{ turnIndex: number; sequenceBefore: number; branchName: string }>;
+  /** How many messages followed the cut point when the change was resolved
+   *  (staged). The cut also removes what arrives later, so the applied
+   *  receipt's `messagesRemoved` minus this is how many arrived after it was
+   *  staged, less any of these removed in place meanwhile (by a hide or an
+   *  unstick step, for instance). */
+  messagesAfter: number;
   /** The operator's awareness-marks choice, frozen at staging to the refs
    *  the cut would have removed then. The cut can also reach messages that
    *  arrive later; application marks only the frozen refs it actually
@@ -145,7 +151,11 @@ export interface ResolvedUndoMessagesChange extends ResolvedOperatorChangeBase {
   /** The message that becomes the tail (the end of its body group), with its
    *  content fingerprint. */
   tail: { id: string; fingerprint: string };
-  /** How many messages followed it at staging. */
+  /** How many messages followed the tail when the change was resolved
+   *  (staged). The cut also removes what arrives later, so the applied
+   *  receipt's `messagesRemoved` minus this is how many arrived after it was
+   *  staged, less any of these removed in place meanwhile (by a hide or an
+   *  unstick step, for instance). */
   messagesAfter: number;
   /** Frozen to the refs among the messages that followed it at staging. */
   marks: FrozenMarks;
@@ -276,7 +286,8 @@ export type AppliedOperatorChange =
   | {
       kind: 'undo-messages';
       requested: number;
-      /** Messages the cut removed, later arrivals included. */
+      /** Messages the cut removed, later arrivals included (compare the
+       *  change's `messagesAfter`). */
       messagesRemoved: number;
       fromBranch: string;
       toBranch: string;
@@ -287,6 +298,9 @@ export type AppliedOperatorChange =
       kind: 'undo-turns';
       requested: number;
       undone: number;
+      /** Messages the cut removed, later arrivals included (compare the
+       *  change's `messagesAfter`). */
+      messagesRemoved: number;
       fromBranch: string;
       toBranch: string;
       /** The cut had already been applied (the active branch is its

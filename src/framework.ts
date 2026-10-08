@@ -8097,14 +8097,11 @@ export class AgentFramework {
     const checkpoints = this.getTurnCheckpoints(agentName);
     if (checkpoints.length === 0) return null;
     const taken = checkpoints.slice(-requested).reverse();
-    // Freeze the publication choice to the refs the cut would remove now:
-    // every message stored after the oldest staged turn began.
+    // What the cut would remove now: every message stored after the oldest
+    // staged turn began. The publication choice is frozen to its refs.
     const cutAt = taken[taken.length - 1]!.sequenceBefore;
-    const marks = this.freezeMarks(
-      this.agents.get(agentName)!.getContextManager().getAllMessages().filter((m) => Number(m.sequence) > cutAt),
-      publication?.marks ?? 'none',
-      publication?.serverId ?? '',
-    );
+    const after = this.agents.get(agentName)!.getContextManager().getAllMessages().filter((m) => Number(m.sequence) > cutAt);
+    const marks = this.freezeMarks(after, publication?.marks ?? 'none', publication?.serverId ?? '');
     return {
       id: randomUUID(),
       agent: agentName,
@@ -8116,6 +8113,7 @@ export class AgentFramework {
       kind: 'undo-turns',
       requestedTurns: requested,
       checkpoints: taken.map((c) => ({ turnIndex: c.turnIndex, sequenceBefore: c.sequenceBefore, branchName: c.branchName })),
+      messagesAfter: after.length,
       marks,
       ...(publication?.serverId ? { serverId: publication.serverId } : {}),
     };
@@ -8550,6 +8548,7 @@ export class AgentFramework {
   private async applyUndoTurns(change: ResolvedUndoTurnsChange, admission?: OperatorAdmission): Promise<{
     requested: number;
     undone: number;
+    messagesRemoved: number;
     fromBranch: string;
     toBranch: string;
     alreadyApplied?: true;
@@ -8612,6 +8611,7 @@ export class AgentFramework {
     return {
       requested: change.requestedTurns,
       undone: change.checkpoints.length,
+      messagesRemoved: outcome.removed,
       fromBranch: change.sourceBranch,
       toBranch: target,
       ...(alreadyApplied ? { alreadyApplied: true as const } : {}),
