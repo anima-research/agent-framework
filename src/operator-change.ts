@@ -67,6 +67,12 @@ export interface ResolvedPresentationChange extends ResolvedOperatorChangeBase {
   input: Record<string, unknown>;
   /** The targeted tool's presentation entry when resolved. */
   from: { name: string; visible: boolean; description: string };
+  /** The entry as the edit leaves it, resolved at staging exactly as the
+   *  presentation resolves (ToolPresentation.previewEdit): a description
+   *  reset shows the wording it exposes, the component default or else the
+   *  installed description. Application applies the edit only if it still
+   *  leaves exactly this. */
+  target: { name: string; visible: boolean; description: string };
 }
 
 /** host/command undo by turns: the exact turn checkpoints it undoes. */

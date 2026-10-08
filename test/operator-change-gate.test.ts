@@ -486,6 +486,68 @@ describe('operator-change gate: tool presentation', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('stages a description reset with the wording it exposes, and refuses it as stale when that wording moves under an unchanged personal description', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-gate-reset-target-'));
+    const profile = join(dir, 'workspace-defaults.json');
+    const personal = join(dir, 'tools.json');
+    writeFileSync(profile, JSON.stringify({ version: 1, tools: { 'workspace--glob': { description: 'default wording A' } } }));
+    writeFileSync(personal, JSON.stringify({ version: 1, tools: { 'workspace--glob': { description: 'mine' } } }));
+    const workspace = new WorkspaceModule({ mounts: [{ name: 'board', path: dir, mode: 'read-write', watch: 'never' }] });
+    const asked: ResolvedOperatorChange[] = [];
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{
+        name: 'ada', model: 'test', systemPrompt: '.',
+        strategy: new AutobiographicalStrategy({ adaptiveResolution: true, foldingStrategy: 'kv-stable', recentWindowTokens: 30000, kvStableReachTokens: 8000 }),
+        toolPresentation: { path: personal, cataloguePath: 'board/tools.md', defaults: [{ source: 'Module: workspace', path: profile }] },
+      }],
+      modules: [workspace],
+      operatorChangeGate: async (change) => {
+        asked.push(structuredClone(change));
+        return { id: `rev-${asked.length}`, text: 'staged' };
+      },
+    });
+    const quiet = console.log;
+    console.log = () => {};
+    try {
+      const shown = () => framework.inspectToolPresentation('ada')!.entries.find((e) => e.name === 'workspace--glob')!.description;
+      const apply = (change: ResolvedOperatorChange) => framework.runAtSafeBoundary({ verb: 'apply' }, (lease) =>
+        framework.applyResolvedOperatorChange(change, { lease, admission: { id: change.id } }));
+      const reset = { name: 'workspace--glob', description: null };
+
+      await framework.puppetToolCall('ada', 'set_tool_description', reset);
+      const first = asked[0]!;
+      assert.ok(first.kind === 'tool-presentation');
+      assert.deepEqual([first.from.description, first.target.description], ['mine', 'default wording A'],
+        'the approval shows the wording the reset exposes');
+
+      // The default changes while the personal description, all `from` sees, stays.
+      writeFileSync(profile, JSON.stringify({ version: 1, tools: { 'workspace--glob': { description: 'default wording B' } } }));
+      assert.equal(shown(), 'mine');
+      await assert.rejects(apply(first), (e: Error & { code?: string }) =>
+        e.code === 'stale' && /would now leave workspace--glob/.test(e.message) && /default wording B/.test(e.message));
+      assert.equal(shown(), 'mine', 'nothing applied');
+
+      await framework.puppetToolCall('ada', 'set_tool_description', reset);
+      const second = asked[1]!;
+      assert.ok(second.kind === 'tool-presentation');
+      assert.equal(second.target.description, 'default wording B');
+      await apply(second);
+      assert.equal(shown(), 'default wording B', 'exactly the approved wording');
+
+      // An edit the presentation would refuse is refused at staging, never staged.
+      const refused = await framework.puppetToolCall('ada', 'set_tool_description', { name: 'workspace--glob', description: 7 });
+      assert.equal(refused.staged, undefined);
+      assert.match(String(refused.result.error), /couldn't be resolved .*Invalid description/);
+      assert.equal(asked.length, 2);
+    } finally {
+      console.log = quiet;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('operator-change gate: host/command undo by turns', () => {

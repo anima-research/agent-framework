@@ -41,3 +41,45 @@ test('component and resident descriptions both retain catalogue discovery on edi
   const own=p.resolve(tools,sources).advertised[0];assert.match(own.description,/mine/);assert.match(own.description,/workspace--read.*board\/recovery.md/);
  } finally {rmSync(dir,{recursive:true,force:true});}
 });
+
+test('previewEdit resolves what an edit would leave, a reset exposing the default it reveals, and writes nothing',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'component-preview-'));
+ try {
+  const path=join(dir,'resident.json'),profile=join(dir,'framework.json');
+  writeFileSync(profile,JSON.stringify({version:1,tools:{send:{description:'clear'},set_tool_visibility:{description:'profile wording'}}}));
+  const p=new ToolPresentation({path,cataloguePath:'board/catalogue.md',defaults:[{source:'Framework',path:profile}]});
+  const tools=['send','set_tool_visibility','plain'].map(name=>({name,description:'installed '+name,inputSchema:{type:'object' as const}}));
+  const sources=new Map(tools.map(t=>[t.name,'Framework']));
+  writeFileSync(path,JSON.stringify({version:1,tools:{send:{description:'mine'},set_tool_visibility:{description:'mine too'},plain:{description:'mine as well'}}}));
+  const before=readFileSync(path,'utf8');
+  const entry=(snapshot: ReturnType<ToolPresentation['resolve']>,name: string)=>snapshot.entries.find(e=>e.name===name)!;
+  // Each preview equals what the edit itself then leaves.
+  for (const [tool,input] of [
+   ['set_tool_description',{name:'send',description:null}],
+   ['set_tool_description',{name:'set_tool_visibility',description:null}],
+   ['set_tool_description',{name:'plain',description:null}],
+   ['set_tool_description',{name:'send',description:'newer'}],
+   ['set_tool_visibility',{name:'plain',visible:false}],
+  ] as const) {
+   const preview=entry(p.previewEdit(tool,input,tools,sources),input.name);
+   assert.equal(readFileSync(path,'utf8'),before,'a preview writes nothing');
+   assert.equal(p.edit(tool,input,tools).success,true);
+   const after=entry(p.resolve(tools,sources),input.name);
+   assert.deepEqual({visible:preview.visible,description:preview.description},{visible:after.visible,description:after.description},`${tool} ${JSON.stringify(input)}`);
+   writeFileSync(path,before);
+  }
+  assert.equal(entry(p.previewEdit('set_tool_description',{name:'send',description:null},tools,sources),'send').description,'clear','the component default');
+  assert.equal(entry(p.previewEdit('set_tool_description',{name:'plain',description:null},tools,sources),'plain').description,'installed plain','else the installed wording');
+  assert.match(entry(p.previewEdit('set_tool_description',{name:'set_tool_visibility',description:null},tools,sources),'set_tool_visibility').description,/^profile wording\nCatalogue: workspace--read/,'with the editing tools\' signpost');
+  // A preview refuses what the edit would refuse, with the same reason.
+  for (const [tool,input] of [
+   ['set_tool_visibility',{name:'workspace--read',visible:false}],
+   ['set_tool_description',{name:'unknown',description:null}],
+   ['set_tool_description',{name:'send',description:7}],
+  ] as const) {
+   const refused=p.edit(tool,input,[...tools,{name:'workspace--read',description:'read',inputSchema:{type:'object' as const}}]);
+   assert.equal(refused.success,false);
+   assert.throws(()=>p.previewEdit(tool,input,[...tools,{name:'workspace--read',description:'read',inputSchema:{type:'object' as const}}],sources),(e: Error)=>String(e)===refused.error);
+  }
+ } finally {rmSync(dir,{recursive:true,force:true});}
+});

@@ -3204,6 +3204,12 @@ export class AgentFramework {
   }
 
   inspectToolPresentation(agentName: string, snapshot?: InferenceToolSnapshot): PresentationSnapshot | null {
+    const inputs = this.toolPresentationInputs(agentName, snapshot);
+    return inputs ? inputs.presentation.resolve(inputs.tools, inputs.sources) : null;
+  }
+
+  /** An agent's presentation, with the tools and sources it resolves. */
+  private toolPresentationInputs(agentName: string, snapshot?: InferenceToolSnapshot) {
     const presentation = this.toolPresentations.get(agentName);
     if (!presentation) return null;
     const tools = this.availableToolsForPresentation(agentName, snapshot);
@@ -3220,7 +3226,19 @@ export class AgentFramework {
       }
       if (!sources.has(tool.name)) sources.set(tool.name, 'Framework');
     }
-    return presentation.resolve(tools, sources);
+    return { presentation, tools, sources };
+  }
+
+  /** The targeted entry as a presentation edit would leave it, written
+   *  nowhere (ToolPresentation.previewEdit). Throws when the edit couldn't
+   *  be made, with the reason the edit itself would give. */
+  private presentationEditTarget(agentName: string, tool: string, input: Record<string, unknown>): ResolvedPresentationChange['target'] {
+    const inputs = this.toolPresentationInputs(agentName);
+    if (!inputs) throw new Error(`Tool presentation is not enabled for ${agentName}`);
+    const entry = inputs.presentation.previewEdit(tool, input, inputs.tools, inputs.sources)
+      .entries.find((e) => e.name === input.name);
+    if (!entry) throw new Error(`Tool presentation has no entry ${JSON.stringify(input.name)} for ${agentName}`);
+    return { name: entry.name, visible: entry.visible, description: entry.description };
   }
 
   private advertisedToolsForAgent(agentName: string, snapshot?: InferenceToolSnapshot) {
@@ -6975,6 +6993,7 @@ export class AgentFramework {
       tool: tool as ResolvedPresentationChange['tool'],
       input: structuredClone(input),
       from: { name: entry.name, visible: entry.visible, description: entry.description },
+      target: this.presentationEditTarget(agentName, tool, input),
     };
   }
 
@@ -7013,6 +7032,18 @@ export class AgentFramework {
     const now = entry ? { name: entry.name, visible: entry.visible, description: entry.description } : null;
     if (!sameValue(now, change.from)) {
       stale(`the presentation of ${change.from.name} moved from ${JSON.stringify(change.from)} to ${JSON.stringify(now)}`);
+    }
+    // The from-state can hold while what the edit exposes moves: a personal
+    // description masks the component default and installed wording that a
+    // reset would reveal.
+    let target: ResolvedPresentationChange['target'];
+    try {
+      target = this.presentationEditTarget(change.agent, change.tool, change.input);
+    } catch (error) {
+      stale(`it can no longer be resolved (${error instanceof Error ? error.message : String(error)})`);
+    }
+    if (!sameValue(target!, change.target)) {
+      stale(`it would now leave ${change.from.name} as ${JSON.stringify(target!)}, not the approved ${JSON.stringify(change.target)}`);
     }
   }
 

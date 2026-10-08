@@ -51,6 +51,34 @@ export function presentationTools(path: string): ToolDefinition[] {
   ] as unknown as ToolDefinition[];
 }
 
+/** One checked edit: the tool it names, the field it sets, and the value (null resets a description). */
+interface PresentationEdit { name: string; field: 'visible' | 'description'; value: unknown }
+
+/** edit()'s argument checks, shared with previewEdit; throws what edit() reports as its error. */
+function checkEdit(tool: string, input: unknown, available: ToolDefinition[]): PresentationEdit {
+  if (!isPresentationTool(tool)) throw new Error('Unknown editing tool');
+  const value = input as Record<string, unknown>;
+  const field = tool === 'set_tool_visibility' ? 'visible' : 'description';
+  if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.name !== 'string'
+    || Object.keys(value).some(k=> !['name',field].includes(k)) || !Object.hasOwn(value,field)) throw new Error('Invalid editing arguments');
+  if (!available.some(t=>t.name===value.name)) throw new Error('Tool is not currently available to this agent');
+  if (field === 'visible' ? typeof value.visible !== 'boolean' : value.description !== null && typeof value.description !== 'string') throw new Error(`Invalid ${field}`);
+  return {name:value.name as string,field,value:value[field]};
+}
+
+/** Make a checked edit to `doc` in place and return the file it makes; throws if that file would be refused. */
+function applyEdit(doc: PresentationDocument, edit: PresentationEdit): string {
+  const old = Object.hasOwn(doc.tools,edit.name) ? doc.tools[edit.name] : {};
+  const updated = {...old};
+  if (edit.field === 'description' && edit.value === null) delete updated.description;
+  else Object.assign(updated,{[edit.field]:edit.value});
+  Object.defineProperty(doc.tools,edit.name,{value:updated,enumerable:true,writable:true,configurable:true});
+  const next = JSON.stringify(doc,null,2)+'\n';
+  parsePresentation(next);
+  if (Buffer.byteLength(next)>MAX_BYTES) throw new Error('Presentation exceeds 256 KiB');
+  return next;
+}
+
 /** Per-agent presentation; files are the sole persistent source, independent of editor identity. */
 export class ToolPresentation {
   constructor(readonly config: ToolPresentationConfig) {}
@@ -72,6 +100,21 @@ export class ToolPresentation {
     let raw = '', doc: PresentationDocument = {version:1,tools:{}}, diagnostics: string[] = [];
     try { raw = this.read(); doc = parsePresentation(raw); }
     catch (error) { diagnostics.push(`Overrides not applied: ${String(error)}. Default visibility and component descriptions retained.`); }
+    return this.resolveDocument(raw, doc, diagnostics, tools, sources);
+  }
+  /**
+   * The snapshot an edit would leave, written nowhere: edit()'s own checks
+   * and change, resolved exactly as resolve() resolves the file (component
+   * defaults, installed descriptions, catalogue signposts). A description
+   * reset therefore shows the wording it would expose. Throws what edit()
+   * would report as its error.
+   */
+  previewEdit(tool: string, input: unknown, tools: ToolDefinition[], sources: ReadonlyMap<string, string> = new Map()): PresentationSnapshot {
+    const edit = checkEdit(tool, input, tools);
+    const doc = parsePresentation(this.read());
+    return this.resolveDocument(applyEdit(doc, edit), doc, [], tools, sources);
+  }
+  private resolveDocument(raw: string, doc: PresentationDocument, diagnostics: string[], tools: ToolDefinition[], sources: ReadonlyMap<string, string>): PresentationSnapshot {
     const defaults = new Map<string, {description: string; path: string}>();
     const configuredSources = new Set<string>();
     for (const profile of this.config.defaults ?? []) {
@@ -112,26 +155,13 @@ export class ToolPresentation {
     const lock = this.config.path + '.lock';
     let fd: number | undefined, tempFd: number | undefined, temp: string | undefined;
     try {
-      if (!isPresentationTool(tool)) throw new Error('Unknown editing tool');
-      const value = input as Record<string, unknown>;
-      const field = tool === 'set_tool_visibility' ? 'visible' : 'description';
-      if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.name !== 'string'
-        || Object.keys(value).some(k=> !['name',field].includes(k)) || !Object.hasOwn(value,field)) throw new Error('Invalid editing arguments');
-      if (!available.some(t=>t.name===value.name)) throw new Error('Tool is not currently available to this agent');
-      if (field === 'visible' ? typeof value.visible !== 'boolean' : value.description !== null && typeof value.description !== 'string') throw new Error(`Invalid ${field}`);
+      const edit = checkEdit(tool, input, available);
       fd = openSync(lock, 'wx', 0o600);
       let mode = 0o600;
       try { const stat = lstatSync(this.config.path); if (stat.isSymbolicLink()) throw new Error('Edit the target file directly; tool editing refuses symlinks'); mode = stat.mode & 0o777; }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
       const before = this.read(), doc = parsePresentation(before);
-      const old = Object.hasOwn(doc.tools,value.name) ? doc.tools[value.name] : {};
-      const updated = {...old};
-      if (field === 'description' && value.description === null) delete updated.description;
-      else Object.assign(updated,{[field]:value[field]});
-      Object.defineProperty(doc.tools,value.name,{value:updated,enumerable:true,writable:true,configurable:true});
-      const next = JSON.stringify(doc,null,2)+'\n';
-      parsePresentation(next);
-      if (Buffer.byteLength(next)>MAX_BYTES) throw new Error('Presentation exceeds 256 KiB');
+      const next = applyEdit(doc, edit);
       temp = this.config.path + '.' + randomUUID() + '.tmp';
       tempFd = openSync(temp,'wx',0o600);
       writeFileSync(tempFd,next);
@@ -141,7 +171,7 @@ export class ToolPresentation {
       if (!named.isFile() || named.dev !== opened.dev || named.ino !== opened.ino)
         throw new Error('Temporary file changed concurrently; retry after checking the directory');
       renameSync(temp,this.config.path); temp=undefined;
-      return {success:true,data:{name:value.name,[field]:value[field],effective:'next newly compiled request',catalogue:this.config.cataloguePath}};
+      return {success:true,data:{name:edit.name,[edit.field]:edit.value,effective:'next newly compiled request',catalogue:this.config.cataloguePath}};
     } catch (error) { return {success:false,isError:true,error:String(error)}; }
     finally { if(tempFd!==undefined) closeSync(tempFd); if(temp) try{unlinkSync(temp);}catch{} if(fd!==undefined){closeSync(fd);unlinkSync(lock);} }
   }
