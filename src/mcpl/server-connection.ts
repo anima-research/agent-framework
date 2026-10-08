@@ -601,10 +601,10 @@ export class McplServerConnection extends EventEmitter {
   ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean; protocolVersion: string }> {
     // This engine speaks the legacy family only. A configuration that
     // resolves to the modern family belongs to ModernMcpConnection; refuse it
-    // here rather than dialing an http(s) url as a WebSocket. A configuration
-    // that doesn't resolve at all keeps openTransport's existing errors.
-    let family: string | null = null;
-    try { family = resolveServerBinding(config).family; } catch { /* openTransport reports it */ }
+    // here rather than dialing an http(s) url as a WebSocket. One that names
+    // no usable transport is an error too, before anything is spawned or
+    // dialed.
+    const family = resolveServerBinding(config).family;
     if (family === 'modern') {
       throw new Error(
         `MCP server "${config.id}" is configured for modern MCP (${MODERN_MCP_PROTOCOL_VERSION}); ` +

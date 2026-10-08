@@ -7,6 +7,7 @@
 //   invalid-schema       tools/list advertises an outputSchema that doesn't compile
 //   listen-fail-first    the first subscriptions/listen of each launch is refused
 //   hang-discover-later  launches after the first never answer server/discover
+//   hang-discover        no launch ever answers server/discover
 //   ignore-sigterm       the process survives SIGTERM (only SIGKILL ends it)
 // Tools: op (outputSchema {value: integer}, answers with a string: invalid
 // structured content), plain (text), err (a JSON-RPC error), touch (announces
@@ -40,6 +41,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   switch (m.method) {
     case 'server/discover':
       if (flags.has('hang-discover-later') && launch > 1) return;
+      if (flags.has('hang-discover')) return;
       return result(m.id, {
         supportedVersions: ['2026-07-28'],
         capabilities: { tools: { listChanged: true } },

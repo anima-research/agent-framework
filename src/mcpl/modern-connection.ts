@@ -349,23 +349,38 @@ export class ModernMcpConnection extends EventEmitter {
   }
 
   /**
-   * Connect, or with `reconnect` set, return a connection that keeps
-   * retrying in the background when the first attempt fails (the legacy
-   * engine's contract). Configuration errors always throw.
+   * A connection that hasn't started: configuration is validated (and
+   * throws), nothing is launched or dialed. An owner can register it, and
+   * wire its events, before {@link start}, so a connect in flight is
+   * already the owner's to close.
    */
-  static async connect(config: McplServerConfig): Promise<ModernMcpConnection> {
-    const connection = new ModernMcpConnection(config);
+  static create(config: McplServerConfig): ModernMcpConnection {
+    return new ModernMcpConnection(config);
+  }
+
+  /**
+   * The first connect. Without `reconnect` a failure throws. With it, the
+   * connection keeps retrying in the background, as the legacy engine's
+   * stub does, and reports `connect-failed`. A connection closed before or
+   * during its first connect resolves unconnected.
+   */
+  async start(): Promise<void> {
     try {
-      await connection.open();
+      await this.open();
     } catch (error) {
-      if (!connection.reconnectEnabled) throw error;
-      console.error(`MCP server "${config.id}" initial connect failed, will retry:`, (error as Error).message);
-      connection.reconnectAttempts = 1;
-      // A macrotask, so the caller has wired its listeners (synchronously,
-      // right after this resolves) before the event fires.
-      setImmediate(() => connection.emit('connect-failed', { error: (error as Error).message, attempt: 0 }));
-      connection.scheduleReconnect();
+      if (this.closedByHost) return;
+      if (!this.reconnectEnabled) throw error;
+      console.error(`MCP server "${this.id}" initial connect failed, will retry:`, (error as Error).message);
+      this.reconnectAttempts = 1;
+      this.emit('connect-failed', { error: (error as Error).message, attempt: 0 });
+      this.scheduleReconnect();
     }
+  }
+
+  /** {@link create} and {@link start} in one step. */
+  static async connect(config: McplServerConfig): Promise<ModernMcpConnection> {
+    const connection = ModernMcpConnection.create(config);
+    await connection.start();
     return connection;
   }
 
@@ -375,6 +390,8 @@ export class ModernMcpConnection extends EventEmitter {
 
   /** One connect generation: a fresh client over a fresh transport. */
   private async open(): Promise<void> {
+    // Closed before this connect began: launch nothing.
+    if (this.closedByHost) return;
     const generation = ++this.generation;
     this.cancelRelisten();
     const inner: Transport = this.transportKind === 'stdio'
@@ -415,16 +432,16 @@ export class ModernMcpConnection extends EventEmitter {
     try {
       await done;
     } catch (error) {
-      await client.close().catch(() => {});
-      await wire.close().catch(() => {});
+      const failure = await ModernMcpConnection.closeSession(session);
+      if (failure) this.emit('error', failure);
       throw error;
     } finally {
       if (this.opening?.session === session) this.opening = null;
     }
     if (!this.isCurrent(generation)) {
       // Superseded or closed while connecting: this generation never serves.
-      await client.close().catch(() => {});
-      await wire.close().catch(() => {});
+      const failure = await ModernMcpConnection.closeSession(session);
+      if (failure) this.emit('error', failure);
       return;
     }
     this.session = session;
@@ -593,27 +610,49 @@ export class ModernMcpConnection extends EventEmitter {
     }
   }
 
+  /**
+   * Close one generation: the transport first (during discovery the SDK
+   * hasn't attached it yet, so only closing it ends the probe), then the
+   * client. The transport's close is the reaping verdict, and its failure is
+   * returned, never swallowed.
+   */
+  private static async closeSession(session: Session): Promise<Error | null> {
+    let failure: Error | null = null;
+    try {
+      await session.wire.close();
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error(String(error));
+    }
+    await session.client.close().catch(() => { /* SDK teardown; the verdict is the transport's */ });
+    return failure;
+  }
+
   /** Close for good: no reconnect, no reopened subscription, no connect left
-   *  in flight. Awaits the in-flight connect's end. */
+   *  in flight. Awaits the in-flight connect's end, and rejects if a child
+   *  could not be reaped. */
   async close(): Promise<void> {
     this.closedByHost = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.cancelRelisten();
+    const failures: Error[] = [];
     const opening = this.opening;
     if (opening) {
       // Closing the transport ends the probe; the connect then rejects and
       // its own cleanup runs. Wait for that, so nothing outlives close().
-      await opening.session.wire.close().catch(() => {});
-      await opening.session.client.close().catch(() => {});
+      const failure = await ModernMcpConnection.closeSession(opening.session);
+      if (failure) failures.push(failure);
       await opening.done.catch(() => {});
     }
     const session = this.session;
     this.session = null;
     if (session) {
-      await session.client.close().catch(() => {});
-      await session.wire.close().catch(() => {});
+      const failure = await ModernMcpConnection.closeSession(session);
+      if (failure) failures.push(failure);
       this.emit('close', { reason: 'closed by host' });
+    }
+    if (failures.length > 0) {
+      throw new Error(`MCP server "${this.id}" did not close cleanly: ${failures.map((f) => f.message).join('; ')}`);
     }
   }
 

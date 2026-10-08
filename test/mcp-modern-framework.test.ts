@@ -95,16 +95,19 @@ test('modern tools are listed under the prefix, and status names family, revisio
   });
 });
 
-test('direct path: structured kept by presence, tool errors fail, media is described', async () => {
+test('direct path: data stays the raw content; tool errors fail; structured by presence', async () => {
   await withModern(async ({ framework }) => {
     const only = await framework.executeToolCall(call('mcpl--modern--structured_only'));
     assert.equal(only.success, true);
+    assert.deepEqual(only.data, [], 'the raw content array, as module callers have always received it');
     assert.deepEqual(only.structured, { answer: 42, ok: false, nothing: null });
-    assert.equal(only.data, '{"answer":42,"ok":false,"nothing":null}');
 
     const zero = await framework.executeToolCall(call('mcpl--modern--structured_zero'));
     assert.ok('structured' in zero);
     assert.equal(zero.structured, 0);
+
+    const echo = await framework.executeToolCall(call('mcpl--modern--echo', { text: 'x' }));
+    assert.deepEqual(echo, { success: true, data: [{ type: 'text', text: 'echo:x' }] });
 
     const fail = await framework.executeToolCall(call('mcpl--modern--fail'));
     assert.equal(fail.success, false);
@@ -112,12 +115,27 @@ test('direct path: structured kept by presence, tool errors fail, media is descr
     assert.equal(fail.error, 'the tool failed on purpose');
 
     const media = await framework.executeToolCall(call('mcpl--modern--media'));
-    assert.ok(Array.isArray(media.data), 'an image keeps the array');
-    const text = (media.data as Array<{ type: string; text?: string }>).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
-    assert.match(text, /\[resource link "report\.pdf": file:\/\/\/srv\/report\.pdf, application\/pdf; not fetched\]/);
+    assert.deepEqual((media.data as Array<{ type: string }>).map((b) => b.type),
+      ['text', 'resource_link', 'resource', 'resource', 'audio', 'image'], 'every block as sent');
+  });
+});
+
+test('model path: a payload the host cannot retain is reported as an incomplete result', async () => {
+  await withModern(async ({ framework, membrane }) => {
+    framework.start();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'toolu_01MODERNMEDIA00000000000', name: 'mcpl--modern--media', input: {} },
+    ] as never, 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as never);
+    await waitFor('the tool round', () => (membrane.lastStream?.receivedToolResults.length ?? 0) >= 1);
+    const [delivered] = membrane.lastStream!.receivedToolResults[0] as Array<{ content: unknown; isError: boolean }>;
+    // No workspace here: audio and the blob can be neither shown nor kept.
+    assert.equal(delivered!.isError, true);
+    const text = JSON.stringify(delivered!.content);
+    assert.match(text, /result incomplete: 2 payload\(s\) could not be retained/);
+    assert.match(text, /resource link \\"report\.pdf\\": file:\/\/\/srv\/report\.pdf, application\/pdf; not fetched/);
     assert.match(text, /embedded note text/);
-    assert.match(text, /\[audio: audio\/wav, \d+ B\. Not shown/);
-    assert.ok((media.data as Array<{ type: string }>).some((b) => b.type === 'image'));
   });
 });
 
@@ -144,9 +162,21 @@ test('scripts get structured results whole, as one JSON object', async () => {
       handleScriptToolCall: (agent: string, tool: string, args: Record<string, unknown>) => Promise<string>;
     }).handleScriptToolCall.bind(framework);
     const out = JSON.parse(await handle('agent', 'mcpl--modern--structured_and_text', {}));
-    assert.deepEqual(out, { content: 'Found 2 rows.', structuredContent: { rows: [{ id: 1 }, { id: 2 }] }, isError: false });
-    // Without structured content the script contract is unchanged: the
-    // history rendering, which JSON-encodes a text result.
+    assert.deepEqual(out, {
+      content: [{ type: 'text', text: 'Found 2 rows.' }],
+      structuredContent: { rows: [{ id: 1 }, { id: 2 }] },
+      isError: false,
+    });
+    // Image plus scores: both views reach the script whole, the image's
+    // payload included (no placeholder stands in for it).
+    const scored = JSON.parse(await handle('agent', 'mcpl--modern--scored_image', {}));
+    assert.deepEqual(scored, {
+      content: [{ type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' }],
+      structuredContent: { score: 0.9, label: 'cat' },
+      isError: false,
+    });
+    // Without structured content the script contract is unchanged (pinned):
+    // the history rendering, which JSON-encodes a text result.
     assert.equal(await handle('agent', 'mcpl--modern--echo', { text: 'x' }), JSON.stringify('echo:x'));
   });
 });
@@ -161,7 +191,21 @@ test('MCPL policy on a modern server is a configuration error at connect', async
       framework.connectMcplServer({ id: 'bad2', url: 'https://example.invalid/mcp', protocol: 'modern' }),
       /applies only to stdio/,
     );
-    assert.ok(!framework.listMcplServers().some((s) => s.id === 'bad' || s.id === 'bad2'), 'nothing registered');
+    // Selector combinations that name no usable transport are errors too,
+    // not a fall-through to some other opener.
+    await assert.rejects(
+      framework.connectMcplServer({ id: 'bad3', url: 'https://example.invalid/mcp', transport: 'websocket' }),
+      /does not match url/,
+    );
+    await assert.rejects(
+      framework.connectMcplServer({ id: 'bad4', url: 'ws://127.0.0.1:1/mcpl', transport: 'http' }),
+      /does not match url/,
+    );
+    await assert.rejects(
+      framework.connectMcplServer({ id: 'bad5', command: process.execPath, transport: 'http' }),
+      /transport "http" requires "url"/,
+    );
+    assert.ok(!framework.listMcplServers().some((s) => s.id.startsWith('bad')), 'nothing registered');
   });
 });
 
@@ -188,11 +232,19 @@ process.stdin.on('data', (c) => {
   }
 });
 `;
-  await withModern(async ({ framework }) => {
-    const result = await framework.executeToolCall(call('mcpl--plain--docs'));
-    assert.equal(result.success, true);
-    assert.deepEqual(result.structured, { count: 2 });
-    assert.equal(result.data, '[resource link "a.md": https://example.invalid/a.md; not fetched]\n[resource memo://n, text/plain]\nnote body');
+  await withModern(async ({ framework, membrane }) => {
+    framework.start();
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'toolu_01LEGACYDOCS000000000000', name: 'mcpl--plain--docs', input: {} },
+    ] as never, 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Done.' }]));
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as never);
+    await waitFor('the tool round', () => (membrane.lastStream?.receivedToolResults.length ?? 0) >= 1);
+    const [delivered] = membrane.lastStream!.receivedToolResults[0] as Array<{ content: string; isError: boolean }>;
+    assert.equal(delivered!.isError, false);
+    // No server text block: the structured value is shown beside the stubs.
+    assert.equal(JSON.parse(delivered!.content),
+      '[resource link "a.md": https://example.invalid/a.md; not fetched]\n[resource memo://n, text/plain]\nnote body\n{"count":2}');
     const status = framework.listMcplServers().find((s) => s.id === 'plain')!;
     assert.equal(status.family, 'legacy');
     assert.equal(status.protocolVersion, '2024-11-05');
@@ -252,7 +304,33 @@ test('quiesce: a lost modern child reconnects and relists without starting a tur
 
     assert.equal(membrane.calls.length, callsBefore, 'no turn started');
     assert.equal(framework.getHostModeStatus().gatedRequests, gatedBefore, 'no wake parked: the inventory is unchanged');
-    assert.deepEqual((await framework.executeToolCall(call('mcpl--modern--echo', { text: 'back' }))).data, 'echo:back');
+    assert.deepEqual((await framework.executeToolCall(call('mcpl--modern--echo', { text: 'back' }))).data, [{ type: 'text', text: 'echo:back' }]);
     await framework.resume();
   });
+});
+
+test('the framework owns a modern connect in flight: stop() ends it, and a second connect is refused', async () => {
+  const RAW = join(here, 'fixtures', 'modern-raw-server.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'modern-framework-'));
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: new MockMembrane().asMembrane(),
+    agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
+    modules: [],
+  });
+  try {
+    const log = join(dir, 'hang.jsonl');
+    const config = { id: 'hang', command: process.execPath, args: [RAW, 'hang-discover', log], protocol: 'modern' as const };
+    const pending = framework.connectMcplServer(config);
+    await waitFor('the launch waiting on discover', () => lines(log).some((l) => l.includes('server/discover')));
+    await assert.rejects(framework.connectMcplServer(config), /already registered/);
+    const pid = (JSON.parse(lines(log)[0]!) as { pid: number }).pid;
+    await framework.stop();
+    const alive = (p: number) => { try { process.kill(p, 0); return true; } catch { return false; } };
+    assert.equal(alive(pid), false, 'the launch in flight was reaped by stop()');
+    await pending.catch(() => {});
+    assert.ok(!framework.listMcplServers().some((s) => s.id === 'hang' && s.connected), 'nothing installed after stop');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

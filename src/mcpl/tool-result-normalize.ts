@@ -9,12 +9,17 @@
  *   and inline images stay native. Anything the provider format can't carry
  *   (audio, binary blobs) is saved to the workspace, and a bounded stub says
  *   where it went: a stub tells the reader where the payload is; it never
- *   replaces it silently. A `resource_link` is shown as a reference and never
+ *   replaces it silently. If a payload can't be saved, the result is a
+ *   failure to materialize it, not a success. A `resource_link` is shown as a reference and never
  *   fetched. An embedded resource shows its text, or is saved like a blob.
  * - **`structuredContent` is the machine-readable view.** It is kept by
- *   presence on `ToolResult.structured`, for scripts and modules. The model
- *   sees it rendered as JSON only when the content carries no text, because
+ *   presence on `ToolResult.structured`. The model sees it rendered as JSON
+ *   only when the server's content has no text block of its own, because
  *   otherwise the server already chose what the model reads.
+ *
+ * This is the model's reading. Programs get the server's result itself:
+ * the direct path returns the raw content, and a script receives a
+ * structured result whole (framework.ts).
  *
  * Before this, a structured-only result reached the model as an empty string,
  * and a mixed result became one JSON string with its image as base64 text
@@ -63,7 +68,8 @@ export interface StandardToolResult {
 /**
  * Normalize a standard MCP tool result into the framework's `ToolResult`.
  * `label` names saved payloads (one per call; payloads get an index suffix).
- * Without `save`, payloads are described but not saved, and the stub says so.
+ * A payload that can't be retained (no `save`, or saving failed) makes the
+ * result a failure to materialize, never a success with part of it lost.
  */
 export async function normalizeStandardToolResult(
   result: StandardToolResult,
@@ -73,16 +79,21 @@ export async function normalizeStandardToolResult(
   const raw = Array.isArray(result.content) ? result.content : [];
   const blocks: Block[] = [];
   let saved = 0;
+  /** Payloads that could be neither shown nor retained. */
+  let lost = 0;
 
   const payloadStub = async (kind: string, base64: string, mimeType: string, origin?: string): Promise<string> => {
     const size = humanSize(decodedSize(base64));
     const what = `[${kind}${origin ? ` ${bounded(origin)}` : ''}: ${bounded(mimeType)}, ${size}`;
-    if (!save) return `${what}. Not shown: the model can't take this type, and no workspace is mounted to save it]`;
+    if (!save) {
+      lost++;
+      return `${what}. Not retained: the model can't take this type, and no workspace is mounted to save it]`;
+    }
     const path = await save(`${label}-${++saved}.${extensionFor(mimeType)}`, Buffer.from(base64, 'base64'), mimeType)
       .catch(() => null);
-    return path
-      ? `${what}, saved to workspace file ${path}]`
-      : `${what}. Not shown: the model can't take this type, and saving it to the workspace failed]`;
+    if (path) return `${what}, saved to workspace file ${path}]`;
+    lost++;
+    return `${what}. Not retained: the model can't take this type, and saving it to the workspace failed]`;
   };
 
   for (const entry of raw) {
@@ -131,8 +142,13 @@ export async function normalizeStandardToolResult(
   }
 
   const hasStructured = Object.prototype.hasOwnProperty.call(result, 'structuredContent');
-  const hasText = blocks.some((b) => b.type === 'text' && b.text.trim().length > 0);
-  if (hasStructured && !hasText) {
+  // Only the server's own text blocks count as its presentation for the
+  // model. Stubs this module wrote are notices, not the server's text.
+  const serverText = raw.some((entry) => {
+    const block = entry as { type?: unknown; text?: unknown } | null;
+    return !!block && block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0;
+  });
+  if (hasStructured && !serverText) {
     blocks.push({ type: 'text', text: JSON.stringify(result.structuredContent) ?? 'null' });
   }
 
@@ -140,6 +156,17 @@ export async function normalizeStandardToolResult(
   const structured = hasStructured ? { structured: result.structuredContent } : {};
   if (result.isError) {
     return { success: false, error: text || 'Tool call failed', isError: true, ...structured };
+  }
+  if (lost > 0) {
+    // The server answered, but part of its answer is gone: report that as a
+    // failure to materialize the result, never as a success.
+    return {
+      success: false,
+      error: `[result incomplete: ${lost} payload(s) could not be retained, so this result is not complete; ` +
+        `the tool may already have completed]\n${text}`,
+      isError: true,
+      ...structured,
+    };
   }
   const hasImage = blocks.some((b) => b.type === 'image');
   return {

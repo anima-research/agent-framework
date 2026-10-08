@@ -44,6 +44,7 @@ test('a configuration that names no usable transport throws', () => {
   assert.throws(() => resolveServerBinding(cfg({ url: 'ws://x', transport: 'http' })), /does not match url/);
   assert.throws(() => resolveServerBinding(cfg({ url: 'https://x', transport: 'websocket' })), /does not match url/);
   assert.throws(() => resolveServerBinding(cfg({ url: 'ws://x', transport: 'stdio' })), /requires "command"/);
+  assert.throws(() => resolveServerBinding(cfg({ command: 'srv', transport: 'http' })), /transport "http" requires "url"/);
 });
 
 test('every legacy configuration shape passes validation unchanged', () => {

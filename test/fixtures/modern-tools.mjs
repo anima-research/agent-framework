@@ -28,6 +28,11 @@ export function createServer(opts = {}) {
     async () => ({ content: [{ type: 'text', text: 'Found 2 rows.' }], structuredContent: { rows: [{ id: 1 }, { id: 2 }] } }));
   server.registerTool('structured_zero', { description: 'Falsy structured value', inputSchema: obj() },
     async () => ({ content: [], structuredContent: 0 }));
+  server.registerTool('scored_image', { description: 'An image with machine-readable scores', inputSchema: obj() },
+    async () => ({
+      content: [{ type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' }],
+      structuredContent: { score: 0.9, label: 'cat' },
+    }));
   server.registerTool('media', { description: 'Mixed standard content', inputSchema: obj() },
     async () => ({
       content: [

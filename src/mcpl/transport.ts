@@ -222,13 +222,22 @@ export class StdioTransport extends McplTransport {
     this.child.stdin?.write(json + '\n');
   }
 
+  private closing: Promise<void> | null = null;
+
   /**
    * Close and reap: resolves once the child has actually exited, not merely
    * been signalled (`child.killed` is true as soon as a signal is sent). A
-   * child that outlives SIGTERM by {@link STDIO_EXIT_GRACE_MS} gets SIGKILL,
-   * and close waits that long again, so shutdown stays bounded.
+   * child that outlives SIGTERM by {@link STDIO_EXIT_GRACE_MS} gets SIGKILL.
+   * If it still hasn't exited after that bound again, close rejects: an
+   * explicit cleanup failure, rather than waiting forever or claiming an
+   * exit that wasn't seen. Calls share one attempt.
    */
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    this.closing ??= this.reap();
+    return this.closing;
+  }
+
+  private async reap(): Promise<void> {
     this.markClosed({ reason: 'closed by host' });
     this.rl.close();
     const child = this.child;
@@ -244,7 +253,10 @@ export class StdioTransport extends McplTransport {
     if (await exitWithin(STDIO_EXIT_GRACE_MS)) return;
     console.error(`[mcpl] stdio child ${child.pid} ignored SIGTERM for ${STDIO_EXIT_GRACE_MS}ms — sending SIGKILL`);
     child.kill('SIGKILL');
-    await exitWithin(STDIO_EXIT_GRACE_MS);
+    if (await exitWithin(STDIO_EXIT_GRACE_MS)) return;
+    throw new Error(
+      `stdio child ${child.pid} did not exit within ${STDIO_EXIT_GRACE_MS}ms of SIGKILL; it could not be reaped`,
+    );
   }
 }
 

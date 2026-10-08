@@ -98,6 +98,8 @@ export function resolveServerBinding(config: BindingFields): ServerBinding {
         `MCP server "${config.id}": transport "${config.transport}" does not match url "${config.url}"`,
       );
     }
+  } else if (config.transport !== undefined) {
+    throw new Error(`MCP server "${config.id}": transport "${config.transport}" requires "url"`);
   } else {
     throw new Error(`MCP server "${config.id}": needs "command" (stdio) or "url" (WebSocket or HTTP)`);
   }

@@ -18,6 +18,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
+import { StdioTransport } from '../src/mcpl/transport.js';
 import { McplRequestError } from '../src/mcpl/server-connection.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 
@@ -206,4 +207,15 @@ test('close() reaps: a child that ignores SIGTERM is killed before close resolve
   const alive = (p: number) => { try { process.kill(p, 0); return true; } catch { return false; } };
   assert.equal(alive(pid), false, 'dead when close() resolved');
   assert.ok(wire(log).some((e) => e.event === 'sigterm-ignored'), 'it really did ignore SIGTERM');
+});
+
+test('a child that cannot be reaped fails close() explicitly, never a claimed exit', async () => {
+  const transport = StdioTransport.spawn({ id: 'stuck', command: process.execPath, args: ['-e', 'setInterval(() => {}, 1 << 30)'] });
+  const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
+  const realKill = child.kill.bind(child);
+  child.kill = () => true; // signals never arrive: the child outlives both bounds
+  cleanups.push(() => { realKill('SIGKILL'); });
+  await assert.rejects(transport.close(), /did not exit within 2000ms of SIGKILL; it could not be reaped/);
+  // Calls share the one attempt and its verdict.
+  await assert.rejects(transport.close(), /could not be reaped/);
 });

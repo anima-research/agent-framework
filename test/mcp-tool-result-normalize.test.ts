@@ -77,9 +77,31 @@ test('audio and binary resources are saved to the workspace and described', asyn
     '[resource memo://bin: application/octet-stream, 7 B, saved to workspace file home/tool-results/2026-10-08-call1-2.bin]');
 });
 
-test('without a workspace the stub says the payload was not shown, and why', async () => {
-  const r = await normalizeStandardToolResult({ content: [{ type: 'audio', data: b64('x'), mimeType: 'audio/mpeg' }] }, 'L', null);
-  assert.equal(r.data, "[audio: audio/mpeg, 1 B. Not shown: the model can't take this type, and no workspace is mounted to save it]");
+test('a payload that cannot be retained makes the result a failure to materialize, not a success', async () => {
+  const r = await normalizeStandardToolResult({
+    content: [{ type: 'text', text: 'here is the clip' }, { type: 'audio', data: b64('x'), mimeType: 'audio/mpeg' }],
+  }, 'L', null);
+  assert.equal(r.success, false);
+  assert.equal(r.isError, true);
+  assert.equal(r.error,
+    '[result incomplete: 1 payload(s) could not be retained, so this result is not complete; the tool may already have completed]\n' +
+    'here is the clip\n' +
+    "[audio: audio/mpeg, 1 B. Not retained: the model can't take this type, and no workspace is mounted to save it]");
+  const failedSave = await normalizeStandardToolResult(
+    { content: [{ type: 'resource', resource: { uri: 'memo://b', blob: b64('zz') } }] },
+    'L',
+    async () => null,
+  );
+  assert.equal(failedSave.success, false);
+  assert.match(failedSave.error!, /saving it to the workspace failed/);
+});
+
+test('generated stubs are not the server\'s text: structured still shows beside them', async () => {
+  const r = await normalizeStandardToolResult({
+    content: [{ type: 'resource_link', uri: 'file:///r.csv', name: 'r.csv' }],
+    structuredContent: { rows: 3 },
+  }, 'L', null);
+  assert.equal(r.data, '[resource link "r.csv": file:///r.csv; not fetched]\n{"rows":3}');
 });
 
 test('a resource link is shown as a reference and never fetched; embedded text is shown', async () => {

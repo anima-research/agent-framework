@@ -2035,7 +2035,15 @@ export class AgentFramework {
       shutdownPromises.push(this.mcplServerRegistry.closeAll());
     }
     shutdownPromises.push(this.closeModernMcpConnections());
-    await Promise.all(shutdownPromises);
+    // Every part shuts down even if one fails (a child that could not be
+    // reaped, say); each failure is reported, and the rest of stop() runs.
+    for (const outcome of await Promise.allSettled(shutdownPromises)) {
+      if (outcome.status === 'rejected') {
+        const reason = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+        console.error(`[shutdown] ${reason}`);
+        this.emitTrace({ type: 'mcpl:server-error', serverId: 'shutdown', error: reason });
+      }
+    }
 
     // Streams may queue storage repairs while being cancelled above. Retry
     // after their teardown, while the store is still open, before final sync.
@@ -11215,11 +11223,8 @@ export class AgentFramework {
     }
     const args = (call.input && typeof call.input === 'object') ? call.input as Record<string, unknown> : {};
     try {
-      // The same reading as the model path, so a tool error is a failure
-      // here too (this path used to report every answer as success).
-      if (modern) return await this.mcpToolResult(await modern.callTool(toolName, args), call.id, false);
-      const result = await server!.sendToolsCall(toolName, args);
-      return await this.mcpToolResult(result, call.id, server!.capabilities !== null);
+      const result = modern ? await modern.callTool(toolName, args) : await server!.sendToolsCall(toolName, args);
+      return AgentFramework.directToolResult(result);
     } catch (err) {
       return {
         success: false,
@@ -11866,22 +11871,48 @@ export class AgentFramework {
     // Scripts get (nearly) full data — the script environment IS the spill:
     // filtering big results in code is the whole point. 5MB protocol safety
     // cap only; no context-cap truncation, no file spill.
-    if (structured) {
-      // Inside the object, text content is the text itself; arrays get the
-      // history rendering (images as placeholders). The same 5MB protocol
-      // safety cap applies, over the whole object.
-      const content = result.isError
-        ? (result.error ?? '')
-        : typeof result.data === 'string'
-          ? result.data
-          : result.data === undefined ? '' : toolResultDataToHistoryString(result.data, 5_000_000);
-      return truncateForHistory(JSON.stringify({
-        content,
-        structuredContent: result.structured,
-        isError: result.isError === true,
-      }), 5_000_000);
-    }
+    if (structured) return this.scriptStructuredResult(result);
     return toolResultDataToHistoryString(result.data, 5_000_000);
+  }
+
+  /** The 5MB protocol safety cap on what a script receives. */
+  private static readonly SCRIPT_RESULT_MAX_CHARS = 5_000_000;
+
+  /**
+   * A structured MCP result as a script receives it: one JSON object holding
+   * both of the server's views, `{ content, structuredContent, isError }`,
+   * plus `error` (the text) on a tool error. `content` is the content array
+   * as the server sent it (the dispatch gave this call the direct reading),
+   * so payloads and images survive. Past the size cap the result stays
+   * valid JSON: the whole object is saved to the workspace, and the script
+   * gets `{ isError, oversized: { chars, savedTo } }`. If it can't be saved,
+   * the script gets a failure to materialize the result, saying the tool may
+   * already have completed, never a success missing its result.
+   */
+  private async scriptStructuredResult(result: ToolResult): Promise<string> {
+    const object = {
+      content: Array.isArray(result.data) ? result.data : [],
+      structuredContent: result.structured,
+      isError: result.isError === true,
+      ...(result.isError ? { error: result.error ?? '' } : {}),
+    };
+    const json = JSON.stringify(object);
+    if (json.length <= AgentFramework.SCRIPT_RESULT_MAX_CHARS) return json;
+    const workspace = this.getWorkspaceModule();
+    const mount = workspace ? this.firstWritableMountName(workspace) : null;
+    if (workspace && mount) {
+      const path = `${mount}/tool-results/${new Date().toISOString().slice(0, 10)}-script-${randomUUID().slice(0, 8)}.json`;
+      const written = await workspace.writeBinary(path, Buffer.from(json, 'utf8'), 'application/json').catch(() => null);
+      if (written?.success) {
+        return JSON.stringify({ isError: object.isError, oversized: { chars: json.length, savedTo: path } });
+      }
+    }
+    return JSON.stringify({
+      isError: true,
+      error: `the result (${json.length} chars) exceeds the ${AgentFramework.SCRIPT_RESULT_MAX_CHARS}-char script result cap ` +
+        `and could not be saved to the workspace, so it could not be delivered; the tool may already have completed`,
+      oversized: { chars: json.length, savedTo: null },
+    });
   }
 
   /**
@@ -13381,7 +13412,10 @@ export class AgentFramework {
   private async closeModernMcpConnections(): Promise<void> {
     const modern = [...this.modernServers().values()];
     this.modernServers().clear();
-    await Promise.all(modern.map((connection) => connection.close()));
+    const failures = (await Promise.allSettled(modern.map((connection) => connection.close())))
+      .filter((o): o is PromiseRejectedResult => o.status === 'rejected')
+      .map((o) => (o.reason instanceof Error ? o.reason.message : String(o.reason)));
+    if (failures.length > 0) throw new Error(failures.join('; '));
   }
 
   /** Reconcile the durable ledger with Chronicle, then deliver every server's work. */
@@ -13741,17 +13775,20 @@ export class AgentFramework {
       throw new Error('MCPL subsystem is not initialized');
     }
 
-    // Configuration mistakes the family brought (protocol on a URL, a modern
-    // deadline of 0, MCPL policy on a modern server) fail here, before any
-    // routing is registered. A configuration that names no usable transport
-    // keeps the transport's own error, as before.
-    let family: 'legacy' | 'modern' | null = null;
-    try { family = resolveServerBinding(config).family; } catch { /* the transport reports it */ }
-    if (family !== null) {
-      const problems = serverConfigProblems(config);
-      if (problems.length > 0) {
-        throw new Error(`MCP server "${config.id}" configuration: ${problems.join('; ')}`);
-      }
+    // Configuration mistakes fail here, before any routing is registered: a
+    // combination naming no usable transport (an http(s) url with transport
+    // 'websocket', transport 'http' with a ws url or with no url at all),
+    // protocol on a URL, a modern deadline of 0, MCPL policy on a modern
+    // server. Every valid legacy shape resolves exactly as before.
+    let family: 'legacy' | 'modern';
+    try {
+      family = resolveServerBinding(config).family;
+    } catch (error) {
+      throw new Error(`MCP server "${config.id}" configuration: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const problems = serverConfigProblems(config);
+    if (problems.length > 0) {
+      throw new Error(`MCP server "${config.id}" configuration: ${problems.join('; ')}`);
     }
     if (this.modernServers().has(config.id) || this.mcplServerRegistry.getServer(config.id)) {
       throw new Error(`MCPL server "${config.id}" is already registered`);
@@ -13764,9 +13801,29 @@ export class AgentFramework {
     this.mcplServerConfigs.set(config.id, config);
 
     if (family === 'modern') {
-      const modern = await ModernMcpConnection.connect(config);
+      // Registered and wired before its first connect, so the connect in
+      // flight is already the framework's: stop() and disconnect close it,
+      // and a second connect for the same id is refused above.
+      const modern = ModernMcpConnection.create(config);
       this.modernServers().set(config.id, modern);
       this.wireModernEvents(modern);
+      try {
+        await modern.start();
+      } catch (error) {
+        if (this.modernServers().get(config.id) === modern) this.modernServers().delete(config.id);
+        // The connect error is the one to report; a cleanup failure beside
+        // it is reported too, never in its place.
+        await modern.close().catch((cleanup: unknown) => {
+          this.emitTrace({
+            type: 'mcpl:server-error',
+            serverId: config.id,
+            error: cleanup instanceof Error ? cleanup.message : String(cleanup),
+          });
+        });
+        throw error;
+      }
+      // Closed (stop, disconnect) while connecting: nothing more to set up.
+      if (this.modernServers().get(config.id) !== modern) return;
       this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
       return;
     }
@@ -14197,9 +14254,12 @@ export class AgentFramework {
     const oldToolNames = new Set(this.mcplTools.map(t => t.name));
 
     const modern = this.modernServers().get(id);
+    // A child that can't be reaped fails the disconnect, but only after the
+    // rest of the removal is done.
+    let closeFailure: unknown = null;
     if (modern) {
       this.modernServers().delete(id);
-      await modern.close();
+      await modern.close().catch((error: unknown) => { closeFailure = error; });
     }
     await this.mcplServerRegistry.removeServer(id);
     this.channelRegistry?.removeServer(id);
@@ -14217,6 +14277,7 @@ export class AgentFramework {
 
     await this.refreshMcplTools();
     this.emitMcplToolDiff(oldToolNames, id);
+    if (closeFailure) throw closeFailure;
   }
 
   /**
@@ -15012,10 +15073,20 @@ export class AgentFramework {
       });
     };
 
+    // A script's call that returns structured content gets the server's
+    // result itself (the direct reading): the script receives both views
+    // whole, so nothing the model reading lowers (stubs, image placeholders,
+    // generated JSON) stands in for what the server sent.
+    const forScript = this.scriptToolWaiters?.has(call.id) ?? false;
+    const reading = (result: { content?: unknown; isError?: boolean; structuredContent?: unknown }, mcpl: boolean) =>
+      forScript && Object.prototype.hasOwnProperty.call(result, 'structuredContent')
+        ? Promise.resolve(AgentFramework.directToolResult(result))
+        : this.mcpToolResult(result, call.id, mcpl);
+
     if (modern) {
       // Modern MCP: no state exchange, no channels, no RFC-005 references.
       modern.callTool(toolName, args)
-        .then((result) => this.mcpToolResult(result, call.id, false))
+        .then((result) => reading(result, false))
         .then((result) => {
           this.emitTrace({ type: 'tool:completed', module: `mcpl:${serverId}`, tool: toolName, callId: call.id, durationMs: Date.now() - startTime });
           this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: `mcpl:${serverId}`, result });
@@ -15084,7 +15155,7 @@ export class AgentFramework {
           await this.autoFetchReferences(result.content, serverId, true)
             .catch((e) => console.error('[rfc005] autofetch error:', (e as Error).message));
         }
-        return { result, toolResult: await this.mcpToolResult(result, call.id, mcplPeer) };
+        return { result, toolResult: await reading(result, mcplPeer) };
       })
       .then(({ result, toolResult }) => {
         const durationMs = Date.now() - startTime;
@@ -15167,8 +15238,31 @@ export class AgentFramework {
   }
 
   /**
-   * The framework's ToolResult for an MCP tool result, on both dispatch
-   * paths (model and direct). A standard peer, meaning an MCP-only legacy
+   * The direct path's reading of an MCP tool result (executeToolCall,
+   * ModuleContext.callTool). `data` stays the raw content array, as module
+   * callers have always received it. Two things change: a tool error
+   * (`isError: true`) is now a failure, where every answer used to count as
+   * success, and `structured` is added by presence.
+   */
+  private static directToolResult(result: { content?: unknown; isError?: boolean; structuredContent?: unknown }): ToolResult {
+    const structured = Object.prototype.hasOwnProperty.call(result, 'structuredContent')
+      ? { structured: result.structuredContent }
+      : {};
+    if (result.isError) {
+      const text = (Array.isArray(result.content) ? result.content : [])
+        .filter((b): b is { type: 'text'; text: string } => !!b && (b as { type?: unknown }).type === 'text' && typeof (b as { text?: unknown }).text === 'string')
+        .map((b) => b.text)
+        .join('\n');
+      // The raw content rides along on a failure too: it is the server's
+      // own account of the error, for a program that wants more than text.
+      return { success: false, data: result.content, error: text || 'Tool call failed', isError: true, ...structured };
+    }
+    return { success: true, data: result.content, ...structured };
+  }
+
+  /**
+   * The framework's ToolResult for an MCP tool result on the model path
+   * (model dispatch, and scripts, which ride it). A standard peer, meaning an MCP-only legacy
    * server or any modern server, gets the standard reading
    * (tool-result-normalize.ts): typed content blocks, workspace-saved
    * payloads, and `structured` kept by presence. An MCPL peer keeps the
