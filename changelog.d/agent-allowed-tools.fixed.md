@@ -1,0 +1,1 @@
+- Enforce registered agents' allowedTools before model, script, and public agent-origin tool dispatch, with paired error results and refusal tracing. Denied tools cannot silence or privatize public prose. Preserve trusted module dispatch, unregistered legacy ephemeral callers. The prose_help tool follows the same explicit allowlist as the current tool surface.

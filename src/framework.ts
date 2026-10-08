@@ -9829,7 +9829,9 @@ export class AgentFramework {
             // with verbatim roundContent are live-routed (see liveProseRouting
             // note above — the fallback preamble is cumulative in XML mode).
             if (this.channelRegistry) {
-              const roundToolNames = event.calls.map((c) => c.name);
+              const roundToolNames = event.calls
+                .filter((c) => this.canAgentUseTool(agent.name, c.name))
+                .map((c) => c.name);
               const hasSameRoundPrivateThink =
                 roundToolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
@@ -10377,7 +10379,7 @@ export class AgentFramework {
               const toolNames = response.content
                 .filter((b) => b.type === 'tool_use')
                 .map((b) => (b as unknown as { name?: string }).name)
-                .filter((n): n is string => typeof n === 'string');
+                .filter((n): n is string => typeof n === 'string' && this.canAgentUseTool(agent.name, n));
               const silenced = liveProseRouting
                 ? turnSilenced
                 : turnSilenced || toolNames.some(isSilencingTool);
@@ -11137,6 +11139,11 @@ export class AgentFramework {
   }
 
   private async executeToolCallFrom(call: ToolCall, origin: ChannelToolOrigin): Promise<ToolResult> {
+    if (origin.kind === 'agent') {
+      const refusal = this.agentToolPermissionFailure(origin.agentName, call);
+      if (refusal) return refusal;
+    }
+
     if (isPresentationTool(call.name)) return this.editToolPresentation(call.callerAgentName ?? '__ephemeral__', call);
     // Client-side programmatic tool calling for promise-based callers
     // (SubagentModule ephemerals). Keyed by callerAgentName so each ephemeral
@@ -12259,7 +12266,32 @@ export class AgentFramework {
     return best;
   }
 
+  /** Registered agent policy.
+   * Unregistered legacy ephemerals retain their full programmatic surface. */
+  private canAgentUseTool(agentName: string, toolName: string): boolean {
+    const agent = this.agents.get(agentName);
+    return !agent || agent.canUseTool(toolName);
+  }
+
+  private agentToolPermissionFailure(agentName: string, call: ToolCall): ToolResult | undefined {
+    if (this.canAgentUseTool(agentName, call.name)) return undefined;
+    const error = `Tool '${call.name}' is not permitted by this agent's allowedTools.`;
+    this.toolLifecycleEmitter?.refuse(agentName, call.id);
+    this.emitTrace({
+      type: 'tool:failed', module: 'framework', tool: call.name, callId: call.id, error,
+    });
+    return { success: false, error, isError: true };
+  }
+
   private dispatchToolCall(agentName: string, call: ToolCall): void {
+    const refusal = this.agentToolPermissionFailure(agentName, call);
+    if (refusal) {
+      this.pushEvent({
+        type: 'tool-result', callId: call.id, agentName, moduleName: 'framework', result: refusal,
+      });
+      return;
+    }
+
     // Enrich call with caller identity so modules can resolve the calling agent
     const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
     if (isPresentationTool(call.name)) {
