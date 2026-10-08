@@ -27,10 +27,12 @@
   `skip_reply`), held (an explicit send's silence) or unsent, so held,
   private, failed and unconfirmed words never stream, and a voice surface
   speaks only what was posted. A thread placement isn't streamed, so a
-  channel's stream names one place. Each physical stream completes, after its
-  last speech, exactly what it streamed. Voice therefore follows each
-  published round rather than overlapping generation; speech still lands
-  between tool rounds.
+  channel's stream names one place. Each publish is its own message, so
+  within one stream a later one on the same channel opens its delta with a
+  paragraph break (`\n\n`), and the stream's text keeps the messages apart.
+  Each physical stream completes, after its last speech, exactly what it
+  streamed. Voice therefore follows each published round rather than
+  overlapping generation; speech still lands between tool rounds.
 - **Publishing rechecks after opening.** When a publish has to open a closed
   channel first, it checks the destination again before sending: a channel
   removed, or a declaration withdrawn, while the open was pending refuses the

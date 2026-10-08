@@ -1704,6 +1704,14 @@ describe('speech follows the moment its words were written', () => {
     const routed = stubChannelRegistry(framework, { home: false });
     (framework as unknown as { proseBounceStreaks: Map<string, number> }).proseBounceStreaks.set('assistant', 100);
     const registry = registryOf(framework);
+    // routeSpeech's outcome names the resolved server, as the real registry's
+    // does, so the envelope's publish (deliverSpeech) and the route's
+    // (routeSpeech) are one stream entry on chan-beta.
+    const route = registry.routeSpeech as (...args: unknown[]) => Promise<Record<string, unknown> | null>;
+    registry.routeSpeech = async (...args: unknown[]) => {
+      const outcome = await route(...args);
+      return outcome ? { ...outcome, serverId: 'stub' } : outcome;
+    };
     const deliver = registry.deliverSpeech as (...args: unknown[]) => Promise<unknown>;
     let calls = 0;
     registry.deliverSpeech = async (...args: unknown[]) => {
@@ -1717,7 +1725,10 @@ describe('speech follows the moment its words were written', () => {
     triggerFromChannel(framework, 'chan-A');
     await framework.runUntilIdle();
     assert.deepEqual(routed, [{ text: 'Second.', locus: 'chan-beta' }, { text: 'More for beta.', locus: 'chan-beta' }]);
-    assert.equal(streams.streamedTo('chan-beta'), 'Second.More for beta.');
+    assert.equal(streams.streamedTo('chan-beta'), 'Second.\n\nMore for beta.');
+    assert.deepEqual(streams.completes.filter((c) => c.channelId === 'chan-beta'),
+      [{ channelId: 'chan-beta', text: 'Second.\n\nMore for beta.', threadId: null }],
+      'one stream entry, one completion, for the envelope and the route alike');
     await framework.stop();
   });
 
@@ -1808,10 +1819,38 @@ describe('speech follows the moment its words were written', () => {
 
     assert.deepEqual(events.map(([kind, , text]) => [kind, text]), [
       ['chunk', 'Narrating.'],
-      ['chunk', 'Done.'],
-      ['complete', 'Narrating.Done.'],
+      ['chunk', '\n\nDone.'],
+      ['complete', 'Narrating.\n\nDone.'],
     ]);
     assert.equal(new Set(events.map(([, id]) => id)).size, 1, 'one physical stream, one inference');
+
+    await framework.stop();
+  });
+
+  it('each later message on a channel opens a paragraph in its stream, and the completion is the deltas joined', async () => {
+    // Two rounds publish two messages to chan-A. A voice consumer speaks the
+    // deltas as they come (discord-mcpl's voice output appends them into one
+    // utterance), so they must not run "Let me look.Found it." together.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Let me look.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Found it.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework, { home: false });
+    const streams = recordStreams(framework);
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'Let me look.', locus: 'chan-A' }, { text: 'Found it.', locus: 'chan-A' }],
+      'each message is published as written, with no separator');
+    assert.deepEqual(streams.chunks.map((c) => c.delta), ['Let me look.', '\n\nFound it.']);
+    assert.deepEqual(streams.completes, [{ channelId: 'chan-A', text: 'Let me look.\n\nFound it.', threadId: null }]);
+    assert.equal(streams.completes[0]!.text, streams.streamedTo('chan-A'), 'the completion is exactly the deltas, concatenated');
 
     await framework.stop();
   });

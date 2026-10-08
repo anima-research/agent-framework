@@ -9936,7 +9936,11 @@ export class AgentFramework {
    * surface speaks only what was published, where it was published —
    * never held, private, failed or unconfirmed words. The chunk names the
    * outcome's own server and channel, and the root; a thread placement isn't
-   * streamed, so a channel's stream names one place.
+   * streamed, so a channel's stream names one place. Each publish is its own
+   * message, so a later one on a channel that has already streamed opens with
+   * a paragraph break: deltas concatenated (what a voice consumer speaks) and
+   * the completion keep the messages apart instead of running "Let me
+   * look.Found it." together.
    */
   private streamPublished(
     agentName: string,
@@ -9951,15 +9955,18 @@ export class AgentFramework {
       stream = { conversationId: agentName, index: 0, channels: new Map() };
       streams.set(moment.inferenceId, stream);
     }
+    const key = `${published.serverId}\u0000${published.channelId}`;
+    // Only what this channel actually streamed counts: a chunk that didn't go
+    // out leaves no entry, so it never earns the next one a separator.
+    const channel = stream.channels.get(key);
+    const delta = channel ? `\n\n${text}` : text;
     const sent = this.channelRegistry.sendOutgoingChunk(
       { serverId: published.serverId, channelId: published.channelId },
-      agentName, moment.inferenceId, stream.index++, text,
+      agentName, moment.inferenceId, stream.index++, delta,
     );
     if (!sent) return;
-    const key = `${published.serverId}\u0000${published.channelId}`;
-    const channel = stream.channels.get(key);
-    if (channel) channel.text += text;
-    else stream.channels.set(key, { serverId: published.serverId, channelId: published.channelId, text });
+    if (channel) channel.text += delta;
+    else stream.channels.set(key, { serverId: published.serverId, channelId: published.channelId, text: delta });
   }
 
   /**
