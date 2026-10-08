@@ -50,7 +50,9 @@ function declaringRegistry(target: 'exact' | 'root' | undefined) {
     resolveLocus: () => null,
     routeSpeech: async (_a: string, text: string, to: unknown) => {
       published.push({ text, to });
-      return { delivered: true, channelId: 'x' };
+      // As the real registry reports a delivery: where it went, its thread included.
+      const dest = (to ?? {}) as { serverId?: string; channelId?: string; threadId?: string | null };
+      return { delivered: true, serverId: dest.serverId ?? 'x', channelId: dest.channelId ?? 'x', ...(dest.threadId ? { threadId: dest.threadId } : {}) };
     },
     getDescriptor: () => undefined,
     getChannelTools: () => [],
@@ -417,15 +419,15 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
-  it('a thread route is not streamed; a root route streams with threadId null (RFC-011 §6)', async () => {
+  it('a thread placement is not streamed; a root publication streams after it is confirmed, at the root (RFC-011 §6)', async () => {
     const framework = await makeFramework();
     const { registry, published } = declaringRegistry('exact');
-    const streamed: Array<{ kind: string; channelId: string; threadId: unknown }> = [];
+    const streamed: Array<{ kind: string; serverId: string; channelId: string; text: string; published: number }> = [];
     Object.assign(registry as Record<string, unknown>, {
-      sendOutgoingChunk: (channelId: string, _a: string, _i: string, _n: number, _d: string, threadId: unknown) =>
-        streamed.push({ kind: 'chunk', channelId, threadId }),
-      sendOutgoingComplete: (channelId: string, _a: string, _i: string, _t: string, threadId: unknown) =>
-        streamed.push({ kind: 'complete', channelId, threadId }),
+      sendOutgoingChunk: (d: { serverId: string; channelId: string }, _a: string, _i: string, _n: number, delta: string) =>
+        streamed.push({ kind: 'chunk', serverId: d.serverId, channelId: d.channelId, text: delta, published: published.length }),
+      sendOutgoingComplete: (d: { serverId: string; channelId: string }, _a: string, _i: string, text: string) =>
+        streamed.push({ kind: 'complete', serverId: d.serverId, channelId: d.channelId, text, published: published.length }),
     });
     internals(framework).channelRegistry = registry;
 
@@ -442,9 +444,10 @@ describe('Trunk channel routing (item-3 redux)', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'at the root' }]));
     framework.pushEvent({ ...(channelIncoming('zulip:stream:7', 'at root') as unknown as Record<string, unknown>), serverId: 'zulip' } as unknown as ProcessEvent);
     await framework.runUntilIdle();
-    assert.ok(streamed.some((e) => e.kind === 'chunk'), 'the root route streams');
-    assert.ok(streamed.every((e) => e.channelId === 'zulip:stream:7' && e.threadId === null), JSON.stringify(streamed));
-    assert.equal(streamed.filter((e) => e.kind === 'complete').length, 1);
+    assert.deepEqual(streamed, [
+      { kind: 'chunk', serverId: 'zulip', channelId: 'zulip:stream:7', text: 'at the root', published: 2 },
+      { kind: 'complete', serverId: 'zulip', channelId: 'zulip:stream:7', text: 'at the root', published: 2 },
+    ], 'after its confirmed publish, on the server it resolved to');
     await framework.stop();
   });
 

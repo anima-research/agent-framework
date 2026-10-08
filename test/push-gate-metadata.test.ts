@@ -43,3 +43,65 @@ test('origin keys cannot override the host\'s fields, and the envelope rides las
   assert.equal(m.threadId, '1700.0001', 'the origin\'s own (RFC-011-bound) thread is kept');
   assert.deepEqual(m[INBOUND_SOURCE_KEY], envelope, 'the frozen envelope, not anything the origin carried under its key');
 });
+
+test('a coalesced push is gated with the host envelope its coalescer will freeze, and its acceptance is not observed at the gate', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const envelope: InboundSource = {
+    kind: 'channel', lane: 'push/event', coalesced: true, serverId: 'slack', binding: 'b1', channelId: 'slack:C1',
+    messageId: 'm-1', eventId: 'ev-c1', acceptedAt: 1,
+  };
+  let accepted = 0;
+  let built = 0;
+  const coalescedEvents: Array<{ inboundSource?: InboundSource }> = [];
+  const handler = new PushHandler(
+    { validateInbound: () => {} } as unknown as FeatureSetManager,
+    () => {},
+    () => {},
+    (_content, metadata) => { seen.push(metadata); return false; },
+    async (_serverId, _params, event) => { coalescedEvents.push(event); return { accepted: true } as never; },
+    () => { accepted++; return undefined; },
+    (_serverId, params) => {
+      built++;
+      assert.equal((params as { coalesce?: { channelId?: string } }).coalesce?.channelId, 'slack:C1');
+      return envelope;
+    },
+  );
+  await handler.handlePushEvent('slack', {
+    featureSet: 'chat',
+    eventId: 'ev-c1',
+    timestamp: '2026-10-07T00:00:00.000Z',
+    // The subject names the channel; the origin names another, and carries a key posing as an envelope.
+    coalesce: { key: 'k1', channelId: 'slack:C1' },
+    origin: { channelId: 'slack:OTHER', messageId: 'm-1', [INBOUND_SOURCE_KEY]: { forged: true } },
+    payload: { content: [{ type: 'text', text: 'hi' }] },
+  } as never);
+  assert.equal(built, 1);
+  assert.equal(accepted, 0, 'building a coalesced envelope accepts nothing: the coalescer observes its own admissions');
+  assert.equal(seen.length, 1);
+  assert.deepEqual(seen[0]![INBOUND_SOURCE_KEY], envelope, 'the gate reads the host envelope, not the origin\'s channel or key');
+  assert.equal(coalescedEvents.length, 1);
+  assert.equal(coalescedEvents[0]!.inboundSource, envelope, 'the coalescer gets the very envelope the gate read');
+});
+
+test('with no host envelope, an origin key can\'t pose as one', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const handler = new PushHandler(
+    { validateInbound: () => {} } as unknown as FeatureSetManager,
+    () => {},
+    () => {},
+    (_content, metadata) => { seen.push(metadata); return true; },
+  );
+  const forged = {
+    kind: 'channel', lane: 'push/event', serverId: 'other-server', binding: 'b', channelId: 'other:C9', acceptedAt: 1,
+  };
+  await handler.handlePushEvent('slack', {
+    featureSet: 'chat',
+    eventId: 'ev-2',
+    timestamp: '2026-10-07T00:00:00.000Z',
+    origin: { [INBOUND_SOURCE_KEY]: forged },
+    payload: { content: [{ type: 'text', text: 'hi' }] },
+  } as never);
+  assert.equal(seen.length, 1);
+  assert.ok(INBOUND_SOURCE_KEY in seen[0]!, 'the key is the host\'s, present even when it has no envelope');
+  assert.equal(seen[0]![INBOUND_SOURCE_KEY], undefined);
+});

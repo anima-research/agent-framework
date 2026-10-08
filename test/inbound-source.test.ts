@@ -227,38 +227,40 @@ describe('inbound source envelope', () => {
     assert.notEqual(meta.storedBodyDigest, meta.sourceBodyDigest, 'the closed-channel invitation decorates the stored copy');
   });
 
-  it('an ordinary empty push is stored with the host\'s digests of its empty body, never the adapter\'s', async () => {
-    // Only a silent heartbeat stores nothing (test/silent-heartbeat.test.ts);
-    // any other push is stored, an empty one included, so it is stamped like
-    // any other — over whatever its origin claimed.
-    command({
-      op: 'push', eventId: 'empty-1', content: [],
-      origin: { source: 'timer', sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value' },
-    });
-    await waitFor(() => !!storedWith((m) => m.eventId === 'empty-1'), 'empty push stored');
-    const message = storedWith((m) => m.eventId === 'empty-1')!;
+  it('a visibly-empty ordinary push is refused and stores nothing; an accepted push carries the host\'s digests, never the adapter\'s', async () => {
+    // Admission (main #236): content with nothing visible is refused with
+    // -32602 unless it is the exact silent-heartbeat marker or an RFC-006
+    // retraction, so it never reaches storage and has no witnesses. Every
+    // push that is accepted is stored with the host's own digests, written
+    // over whatever its origin claimed.
+    const forged = { sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value' };
+    command({ op: 'push', eventId: 'empty-1', content: [], origin: { source: 'timer', ...forged } });
+    command({ op: 'push', eventId: 'full-1', text: 'tick', origin: { source: 'timer', ...forged } });
+    await waitFor(() => !!storedWith((m) => m.eventId === 'full-1'), 'accepted push stored');
+    assert.equal(storedWith((m) => m.eventId === 'empty-1'), undefined, 'the empty push was refused at admission, before the next was handled');
+    const message = storedWith((m) => m.eventId === 'full-1')!;
     const meta = message.metadata as Record<string, unknown>;
-    // The stored copy is the empty body under its source header.
-    assert.deepEqual(message.content, [{ type: 'text', text: '[source: discord · unscoped]' }]);
-    // The empty body in the one-element framing: SHA-256 of `[[]]`.
-    const empty = createHash('sha256').update('[[]]').digest('hex');
-    assert.equal(meta.sourceBodyDigest, empty, 'the empty delivered body');
-    assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored, header included');
-    assert.notEqual(meta.storedBodyDigest, empty, 'the header decorates the stored copy');
+    assert.equal(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'tick' }]), 'the delivered body, not the adapter\'s value');
+    assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored, not the adapter\'s value');
+    // The stored copy carries its source header, which the delivered body's
+    // digest leaves out.
+    assert.deepEqual(message.content[0], { type: 'text', text: '[source: discord · unscoped]' });
+    assert.notEqual(meta.storedBodyDigest, meta.sourceBodyDigest, 'the header decorates the stored copy');
   });
 
-  it('an empty DM pushed into a closed channel: the delivered digest is the empty body, the stored digest covers the invitation', async () => {
+  it('a DM pushed into a closed channel carries the host\'s digests, never the adapter\'s: the delivered body, and the stored copy with its invitation', async () => {
     command({
-      op: 'dm', eventId: 'ev-empty', authorId: '134', authorName: 'antra', rawChannelId: RAW_DM, content: [],
+      op: 'dm', eventId: 'ev-forged', authorId: '134', authorName: 'antra', rawChannelId: RAW_DM, text: 'psst again',
       origin: { sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value' },
     });
-    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-empty'), 'empty dm stored');
-    const message = storedWith((m) => m.eventId === 'ev-empty')!;
+    await waitFor(() => !!storedWith((m) => m.eventId === 'ev-forged'), 'dm stored');
+    const message = storedWith((m) => m.eventId === 'ev-forged')!;
     const meta = message.metadata as Record<string, unknown>;
     assert.equal(meta.channelInvitation, true, 'stored with the closed-channel invitation');
-    assert.equal(message.content.length, 2, 'the source header and the invitation');
-    assert.equal(meta.sourceBodyDigest, sourceBodyDigest([]), 'the empty delivered body, not the adapter\'s value');
+    assert.equal(message.content.length, 3, 'the source header, the body and the invitation');
+    assert.equal(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'psst again' }]), 'the delivered body, not the adapter\'s value');
     assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored, not the adapter\'s value');
+    assert.notEqual(meta.storedBodyDigest, meta.sourceBodyDigest, 'the invitation decorates the stored copy');
   });
 
   it('keeps a stored envelope when the channel is renamed later', async () => {

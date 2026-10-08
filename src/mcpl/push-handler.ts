@@ -18,8 +18,9 @@ import type {
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import { expandCoreTags } from './tags.js';
-import { validateCoalescedContent } from './push-coalescer.js';
+import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { INBOUND_SOURCE_KEY, type InboundSource } from './inbound-source.js';
+import { isSilentHeartbeatMarker, isVisiblyEmptyContent } from './visible-content.js';
 
 // ============================================================================
 // McplPushEvent (the ProcessEvent shape pushed to the queue)
@@ -187,6 +188,10 @@ export class PushHandler {
      *  or acknowledged: return its source envelope, frozen now
      *  (mcpl/inbound-source.ts). Coalesced work is stamped by its own path. */
     private readonly acceptInbound?: (event: McplPushEvent) => InboundSource | undefined,
+    /** A coalesced push's source envelope, built — not accepted — before it
+     *  is gated: its coalescer freezes and carries this same envelope, and
+     *  observes the acceptance itself if it admits the occurrence. */
+    private readonly coalescedSource?: (serverId: string, params: PushEventParams, event: McplPushEvent) => InboundSource | undefined,
   ) {
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -198,12 +203,16 @@ export class PushHandler {
    * Handle a push/event message from an MCPL server.
    *
    * 1. Validate feature set
-   * 2. Deduplicate by eventId
-   * 3. Optionally check shouldTriggerInference callback
-   * 4. Convert content blocks
-   * 5. Push event to queue
-   * 6. Emit trace
-   * 7. Respond with accepted + inferenceId
+   * 2. Convert content blocks; reject visibly-empty content
+   * 3. Deduplicate by eventId
+   * 4. Generate inferenceId
+   * 5. Build the event and its host source envelope (accepted now for an
+   *    ordinary push; only built for a coalesced one, whose coalescer
+   *    freezes it)
+   * 6. Optionally check shouldTriggerInference, with that envelope; then
+   *    hand a coalesced push to its coalescer, or queue an ordinary one
+   * 7. Emit trace
+   * 8. Respond with accepted + inferenceId
    */
   async handlePushEvent(
     serverId: string,
@@ -239,29 +248,45 @@ export class PushHandler {
       return;
     }
 
-    // 2. Deduplicate by eventId. A coalesced occurrence is deduplicated by the
-    // coalescer's receipts instead (RFC-006 §3.1: a retry within the window
-    // gets its original result, which this set could not return).
     const coalesced = params.coalesce !== undefined && !!this.handleCoalesced;
+    // Empty content is meaningful only for a coalescing retraction (pure
+    // withdrawal, RFC-006 §6 — the coalescer appends nothing for it) and for
+    // the silent-heartbeat marker. Anything else that shows the model nothing
+    // would wake it with no visible cause.
+    const emptyAllowed = (coalesced && params.coalesce?.retract === true)
+      || isSilentHeartbeatMarker({ serverId, featureSet: params.featureSet, origin: params.origin, content: params.payload?.content });
     if (coalesced) {
       // RFC-006 §13: malformed content is a -32602, checked before conversion.
       try {
-        validateCoalescedContent(params.payload?.content);
+        validateCoalescedContent(params.payload?.content, undefined, { allowEmpty: emptyAllowed });
       } catch (error) {
         const err = error as Error & { code?: number; field?: string };
+        if (err instanceof EmptyContentError) this.traceEmptyRejection(serverId, params);
         if (responder?.respondError) responder.respondError(err.code ?? -32602, err.message, { field: err.field });
-        else responder?.respond({ accepted: false, reason: err.message });
+        else responder?.respond({ accepted: false, reason: err instanceof EmptyContentError ? err.reason : err.message });
         return;
       }
     }
+
+    // 2. Convert content blocks, and refuse content with nothing visible in
+    // it — before dedup, so a refused eventId is not burned for a retry.
+    const content: ContentBlock[] = params.payload.content.map(convertBlock);
+    if (!emptyAllowed && isVisiblyEmptyContent(content)) {
+      const err = new EmptyContentError();
+      this.traceEmptyRejection(serverId, params);
+      if (responder?.respondError) responder.respondError(err.code, err.message, { field: err.field });
+      else responder?.respond({ accepted: false, reason: err.reason });
+      return;
+    }
+
+    // 3. Deduplicate by eventId. A coalesced occurrence is deduplicated by the
+    // coalescer's receipts instead (RFC-006 §3.1: a retry within the window
+    // gets its original result, which this set could not return).
     if (!coalesced && this.dedup.checkAndAdd(params.eventId)) {
       console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=duplicate`);
       responder?.respond({ accepted: false, reason: 'duplicate' });
       return;
     }
-
-    // 3. Convert content blocks
-    const content: ContentBlock[] = params.payload.content.map(convertBlock);
 
     // 4. Generate inferenceId
     const inferenceId = `${serverId}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -280,12 +305,15 @@ export class PushHandler {
       triggerInference: true,
       acceptedAt: Date.now(),
     };
-    // The source envelope of an ordinary push is frozen at admission, before
-    // it is gated, queued or acknowledged: nothing that changes while it
-    // waits can rewrite where it came from, and the gate reads the same
-    // envelope the direct path does. (A coalesced push's envelope is frozen
-    // by its coalescer when it is delivered.)
-    const inboundSource = coalesced ? undefined : this.acceptInbound?.(pushEvent);
+    // The source envelope is the host's, built at admission, before the item
+    // is gated, queued or acknowledged: nothing that changes while it waits
+    // can rewrite where it came from, and the gate reads the same envelope
+    // the direct path does. An ordinary push's acceptance is observed now; a
+    // coalesced push's envelope is only built here, and its coalescer
+    // freezes it and observes the acceptance if it admits the occurrence.
+    const inboundSource = coalesced
+      ? this.coalescedSource?.(serverId, params, pushEvent)
+      : this.acceptInbound?.(pushEvent);
     if (inboundSource) pushEvent.inboundSource = inboundSource;
 
     // 6. Check shouldTriggerInference callback
@@ -296,8 +324,9 @@ export class PushHandler {
         .join('\n');
       // The server's origin first; the host's own fields after it, so an
       // origin key can never stand in for which server sent this or what
-      // kind of event it is; the frozen envelope last, which the gate's
-      // route candidates read first.
+      // kind of event it is; the frozen envelope last — always present, even
+      // undefined, so an origin key can't pose as it either — which the
+      // gate's route candidates read first.
       const metadata: Record<string, unknown> = {
         ...(params.origin ?? {}),
         serverId,
@@ -305,7 +334,7 @@ export class PushHandler {
         eventId: params.eventId,
         eventType: 'mcpl:push-event',
         ...(params.tags ? { tags: params.tags } : {}),
-        ...(inboundSource ? { [INBOUND_SOURCE_KEY]: inboundSource } : {}),
+        [INBOUND_SOURCE_KEY]: inboundSource,
       };
       pushEvent.triggerInference = this.shouldTriggerInference(textContent, metadata);
     }
@@ -338,5 +367,17 @@ export class PushHandler {
 
     // 8. Respond
     responder?.respond({ accepted: true, inferenceId });
+  }
+
+  /** Loud, like every other push rejection: the producer's wake went nowhere. */
+  private traceEmptyRejection(serverId: string, params: PushEventParams): void {
+    console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=empty-content`);
+    this.emitTraceFn({
+      type: 'mcpl:push-event-rejected',
+      serverId,
+      eventId: params.eventId,
+      featureSet: params.featureSet,
+      reason: 'empty-content',
+    });
   }
 }

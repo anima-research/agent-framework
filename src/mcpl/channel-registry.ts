@@ -37,7 +37,8 @@ import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
-import { validateCoalescedContent } from './push-coalescer.js';
+import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
+import { isVisiblyEmptyContent } from './visible-content.js';
 import { CapabilityGrant } from './capability-grant.js';
 import { INBOUND_SOURCE_KEY, renderSourceHeader, SOURCE_HEADER_RULE, type InboundSource } from './inbound-source.js';
 import { McplRequestError } from './server-connection.js';
@@ -565,6 +566,17 @@ interface ChannelRegistryOptions {
    */
   acceptInbound?: (event: McplChannelIncomingEvent) => InboundSource | undefined;
   /**
+   * A `channels/incoming` message carrying `coalesce`: its source envelope,
+   * built — not accepted — before it is gated. Its coalescer freezes and
+   * carries this same envelope, and observes the acceptance itself if it
+   * admits the occurrence.
+   */
+  coalescedSource?: (
+    serverId: string,
+    message: ChannelIncomingMessage,
+    event: McplChannelIncomingEvent,
+  ) => InboundSource | undefined;
+  /**
    * RFC-006: an admitted `channels/incoming` message carrying `coalesce`, with
    * the event the ordinary path would have queued. The handler decides
    * replace / append / withdraw and returns the per-message result. Throws a
@@ -752,6 +764,7 @@ export class ChannelRegistry {
   private migratedLegacyPolicies = new Set<string>();
   private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
   private acceptInbound?: ChannelRegistryOptions['acceptInbound'];
+  private coalescedSource?: ChannelRegistryOptions['coalescedSource'];
 
   constructor(
     serverRegistry: McplServerRegistry,
@@ -769,6 +782,7 @@ export class ChannelRegistry {
   ) {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
     this.acceptInbound = options?.acceptInbound;
+    this.coalescedSource = options?.coalescedSource;
     this.serverRegistry = serverRegistry;
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -1011,18 +1025,38 @@ export class ChannelRegistry {
       // ACCEPTED from here down: semantic processing only for admitted
       // messages. §16.3 core-tag closure, then content conversion.
       const coalesced = message.coalesce !== undefined && !!this.handleCoalescedIncoming;
+      // Only a coalescing retraction may be empty (pure withdrawal, RFC-006
+      // §6; the coalescer appends nothing for it). Any other message that
+      // shows the model nothing would wake it with no visible cause.
+      const emptyAllowed = coalesced && (message.coalesce as { retract?: unknown } | null)?.retract === true;
+      const rejectEmpty = () => {
+        console.error(`[channel-incoming-rejected] server=${serverId} channel=${message.channelId} messageId=${message.messageId} reason=empty-content`);
+        this.emitTraceFn({
+          type: 'mcpl:channel-incoming-rejected',
+          serverId,
+          channelId: message.channelId,
+          messageId: message.messageId,
+          reason: 'empty-content',
+        });
+        results.push({ messageId: message.messageId, accepted: false, reason: 'empty_content' });
+      };
       if (coalesced) {
         // RFC-006 §13: malformed content on a coalesced item is that item's
         // failure, not the batch's — check the shape before converting.
         try {
-          validateCoalescedContent(message.content);
+          validateCoalescedContent(message.content, undefined, { allowEmpty: emptyAllowed });
         } catch (error) {
-          results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+          if (error instanceof EmptyContentError) rejectEmpty();
+          else results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
           continue;
         }
       }
       if (message.tags) message.tags = expandCoreTags(message.tags);
       const convertedContent: ContentBlock[] = message.content.map(convertBlock);
+      if (!emptyAllowed && isVisiblyEmptyContent(convertedContent)) {
+        rejectEmpty();
+        continue;
+      }
 
       // An accepted message never retargets speech: a route comes from a
       // turn's own wake or a deliberate choice, never from whichever channel
@@ -1054,12 +1088,16 @@ export class ChannelRegistry {
         acceptedAt: Date.now(),
       };
 
-      // The source envelope of an ordinary message is frozen here, at
-      // admission, before it is gated, queued or acknowledged: a rename or
-      // rebind while it waits cannot change where it says it came from, and
-      // the gate reads the same envelope the direct path does. (A coalesced
-      // message's envelope is frozen by its coalescer when it is delivered.)
-      const inboundSource = coalesced ? undefined : this.acceptInbound?.(event);
+      // The source envelope is the host's, built here, at admission, before
+      // the message is gated, queued or acknowledged: a rename or rebind
+      // while it waits cannot change where it says it came from, and the
+      // gate reads the same envelope the direct path does. An ordinary
+      // message's acceptance is observed now; a coalesced one's envelope is
+      // only built here, and its coalescer freezes it and observes the
+      // acceptance if it admits the occurrence.
+      const inboundSource = coalesced
+        ? this.coalescedSource?.(serverId, message, event)
+        : this.acceptInbound?.(event);
       if (inboundSource) event.inboundSource = inboundSource;
 
       // Determine whether to trigger inference
@@ -1073,9 +1111,10 @@ export class ChannelRegistry {
           {
             // The adapter's own metadata first; the protocol's fields after
             // it, always present (even undefined), so an adapter metadata key
-            // can never stand in for them; and the frozen envelope last, which
-            // the gate's route candidates read first (a thread decides where a
-            // post lands, MCPL RFC-011).
+            // can never stand in for them; and the frozen envelope last —
+            // always present, even undefined, so an adapter key can't pose as
+            // it either — which the gate's route candidates read first (a
+            // thread decides where a post lands, MCPL RFC-011).
             ...message.metadata,
             eventType: 'mcpl:channel-incoming',
             serverId,
@@ -1084,7 +1123,7 @@ export class ChannelRegistry {
             threadId: message.threadId,
             author: message.author,
             ...(message.tags ? { tags: message.tags } : {}),
-            ...(inboundSource ? { [INBOUND_SOURCE_KEY]: inboundSource } : {}),
+            [INBOUND_SOURCE_KEY]: inboundSource,
           },
         );
       }
@@ -2999,62 +3038,62 @@ export class ChannelRegistry {
    *  process-global default). Public so a multi-segment caller can snapshot it
    *  ONCE and pin every segment to it via routeSpeech's `overrideChannelId`. */
   /**
-   * MCPL Spec 14.3 outgoing streaming: forward a moderated text delta to the
-   * server owning the channel, AS THE MODEL GENERATES. Emitted only when that
-   * server declared `channels.streaming` in its initialize capabilities —
-   * servers that never opted in (the whole existing fleet) receive nothing.
-   * Fire-and-forget and never throws: streaming is an observer surface; the
-   * authoritative delivery is the eventual channels/publish.
+   * MCPL Spec 14.3 outgoing streaming: forward prose the agent has published
+   * to the server owning the channel. Emitted only when that server declared
+   * `channels.streaming` in its initialize capabilities — servers that never
+   * opted in receive nothing. The framework streams only text a confirmed
+   * publish placed at the channel's root (never speculatively: §14.3), so
+   * every chunk names the root (`threadId: null`). `destination` is the
+   * publish outcome's own server and channel, never re-resolved from a bare
+   * channel id. Fire-and-forget and never throws: streaming is an observer
+   * surface; the authoritative delivery is channels/publish. Says whether the
+   * chunk went out, so a caller completes only what was streamed.
    */
   sendOutgoingChunk(
-    channelId: string,
+    destination: { serverId: string; channelId: string },
     conversationId: string,
     inferenceId: string,
     index: number,
     delta: string,
-    /** The final publish's place (RFC-011 §6): a thread, or null for the root. */
-    threadId: string | null = null,
-  ): void {
-    const server = this.streamingServerFor(channelId, threadId);
-    if (!server) return;
+  ): boolean {
+    const server = this.streamingServerFor(destination);
+    if (!server) return false;
     try {
-      server.sendChannelsOutgoingChunk({ inferenceId, conversationId, channelId, index, delta, threadId });
-    } catch { /* observer surface — never disturb the turn */ }
+      server.sendChannelsOutgoingChunk({ inferenceId, conversationId, channelId: destination.channelId, index, delta, threadId: null });
+      return true;
+    } catch {
+      /* observer surface — never disturb the turn */
+      return false;
+    }
   }
 
-  /** Spec 14.3 companion: final moderated content per channel at stream end. */
+  /** Spec 14.3 companion: the final content of one channel's stream, at its end. */
   sendOutgoingComplete(
-    channelId: string,
+    destination: { serverId: string; channelId: string },
     conversationId: string,
     inferenceId: string,
     text: string,
-    /** The final publish's place (RFC-011 §6): a thread, or null for the root. */
-    threadId: string | null = null,
   ): void {
-    const server = this.streamingServerFor(channelId, threadId);
+    const server = this.streamingServerFor(destination);
     if (!server) return;
     try {
       server.sendChannelsOutgoingComplete({
         inferenceId,
         conversationId,
-        channelId,
+        channelId: destination.channelId,
         content: [{ type: 'text', text }],
-        threadId,
+        threadId: null,
       });
     } catch { /* observer surface — never disturb the turn */ }
   }
 
-  private streamingServerFor(channelId: string, threadId: string | null) {
-    // The map is keyed `${serverId}:${channelId}`; stream targets arrive as
-    // bare descriptor ids (what resolveProseTarget returns). Scan like the
-    // resolver does, and fail closed on cross-server ambiguity — the same
-    // never-guess rule that governs delivery.
-    const matches = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
-    if (matches.length !== 1) return null;
+  private streamingServerFor(destination: { serverId: string; channelId: string }) {
+    const found = this.findExactEntry(destination);
+    if ('error' in found) return null;
     // §14.3 fail-closed: nothing streams that delivery would refuse — and
     // delivery publishes only where the place is declared (RFC-011 §6).
-    if (publishPlaceRefusal(declaredPublishTarget(matches[0]!.descriptor), threadId)) return null;
-    const server = this.serverRegistry.getServer(matches[0]!.serverId);
+    if (publishPlaceRefusal(declaredPublishTarget(found.entry.descriptor), null)) return null;
+    const server = this.serverRegistry.getServer(found.entry.serverId);
     // §5.4: the GRANT gates streaming, not the raw advertisement. The old
     // `capabilities?.channels?.streaming` check was doubly wrong: undefined
     // for the boolean `channels: true` shape (masking discord-mcpl's latent
@@ -3177,14 +3216,15 @@ export class ChannelRegistry {
     const at = (): number => Date.now();
     const found = this.findExactEntry(target);
     if ('error' in found) return { status: 'failed', reason: found.error, at: at() };
-    const entry = found.entry;
+    let entry = found.entry;
     const place = target.threadId === undefined ? null : target.threadId;
-    const destination: PublishDestination = {
-      serverId: entry.serverId,
-      channelId: entry.descriptor.id,
-      ...(entry.descriptor.label ? { label: entry.descriptor.label } : {}),
+    const destinationOf = (e: ChannelEntry): PublishDestination => ({
+      serverId: e.serverId,
+      channelId: e.descriptor.id,
+      ...(e.descriptor.label ? { label: e.descriptor.label } : {}),
       threadId: place,
-    };
+    });
+    let destination = destinationOf(entry);
     if (place !== null && (typeof place !== 'string' || place === '')) {
       return { status: 'failed', destination, reason: 'the thread to post in must be a non-empty thread id', at: at() };
     }
@@ -3220,6 +3260,21 @@ export class ChannelRegistry {
           reason: `channel is closed and open failed: ${(err as Error).message}`,
           at: at(),
         };
+      }
+      // The open waited on the connector, and a `channels/changed` meanwhile
+      // can have removed the channel or withdrawn its declaration. Recheck
+      // the entry the destination resolved to (its server and channel, never
+      // the original selector, which could now resolve to another server)
+      // immediately before sending.
+      const current = this.findExactEntry({ serverId: entry.serverId, channelId: entry.descriptor.id });
+      if ('error' in current) {
+        return { status: 'failed', destination, reason: `the channel went away while it was being opened: ${current.error}`, at: at() };
+      }
+      entry = current.entry;
+      destination = destinationOf(entry);
+      const withdrawn = publishPlaceRefusal(declaredPublishTarget(entry.descriptor), place);
+      if (withdrawn) {
+        return { status: 'failed', destination, reason: ChannelRegistry.placeRefusalText(withdrawn, entry.descriptor, place), at: at() };
       }
     }
 

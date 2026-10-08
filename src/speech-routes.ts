@@ -153,7 +153,10 @@ export function describeConversation(c: ConversationRef): string {
 
 /**
  * The turn's route from its wake candidates (a true new turn only).
- * A fork's home always wins. Otherwise the addressed candidates are
+ * A fork's home always wins; the message it answers is the newest of the
+ * candidates in the home conversation itself (addressed ones first), as for
+ * an inferred route, and none when no candidate is there. Otherwise the
+ * addressed candidates are
  * considered if there are any, else every (conversational) candidate; they
  * infer a route only when they name one conversation, from the newest
  * candidate in it (its message is the reply edge). Several conversations
@@ -168,11 +171,14 @@ export function inferTurnRoute(
   targetOf: PublishTargetOf,
 ): TurnRoute {
   if (home) {
-    const refusal = routeRefusal(routeConversation(home), targetOf);
-    return refusal ? { route: null, unroutable: { conversation: routeConversation(home), reason: refusal } } : { route: home };
+    const conversation = routeConversation(home);
+    const refusal = routeRefusal(conversation, targetOf);
+    if (refusal) return { route: null, unroutable: { conversation, reason: refusal } };
+    const key = conversationKey(conversation);
+    const replyTo = newestOf(considered(candidates.filter((c) => conversationKey(c.conversation) === key)))?.messageId;
+    return { route: replyTo && home.kind === 'channel' ? { ...home, replyTo } : home };
   }
-  const addressed = candidates.filter((c) => c.addressed);
-  const pool = addressed.length > 0 ? addressed : candidates;
+  const pool = considered(candidates);
   if (pool.length === 0) return { route: null };
   const newestByConversation = new Map<string, RouteCandidate>();
   for (const candidate of pool) {
@@ -208,6 +214,19 @@ export function inferTurnRoute(
           origin: 'trigger',
         },
       };
+}
+
+/** The candidates a route is inferred from: the addressed ones if any, else all. */
+function considered(candidates: readonly RouteCandidate[]): readonly RouteCandidate[] {
+  const addressed = candidates.filter((c) => c.addressed);
+  return addressed.length > 0 ? addressed : candidates;
+}
+
+/** The newest candidate (the latest of equals). */
+function newestOf(candidates: readonly RouteCandidate[]): RouteCandidate | undefined {
+  let newest: RouteCandidate | undefined;
+  for (const candidate of candidates) if (!newest || candidate.at >= newest.at) newest = candidate;
+  return newest;
 }
 
 /**
