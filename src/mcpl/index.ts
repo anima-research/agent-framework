@@ -158,7 +158,9 @@ export { InferenceRouter } from './inference-router.js';
 export { ChannelRegistry } from './channel-registry.js';
 
 // Per-channel conversation routing (fork-per-channel agents)
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './conversation-router.js';
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export type {
   ConversationRouterConfig,
   ConversationBinding,

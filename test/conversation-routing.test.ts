@@ -4,7 +4,7 @@
  * conversation when FrameworkConfig.conversations is set.
  */
 
-import { describe, it, beforeEach, afterEach } from 'node:test';
+import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -84,6 +84,63 @@ describe('Conversation routing', () => {
       }),
       /templateAgent "nope"/,
     );
+  });
+
+  // Deprecation (agent-framework#235): behavior unchanged, one stderr line.
+  function deprecationWarnings(warn: { mock: { calls: Array<{ arguments: unknown[] }> } }): string[] {
+    return warn.mock.calls
+      .map((c) => String(c.arguments[0]))
+      .filter((line) => line.startsWith('[deprecated]') && line.includes('conversation routing'));
+  }
+
+  it('configured: logs one [deprecated] line per framework and still routes', async () => {
+    const warn = mock.method(console, 'warn', () => {});
+    let framework: AgentFramework | undefined;
+    try {
+      framework = await makeFramework();
+      assert.equal(deprecationWarnings(warn).length, 1, 'warned once at creation');
+      assert.match(deprecationWarnings(warn)[0]!, /agent-framework#235/);
+
+      // Routing is unchanged: a DM and a channel mention each spawn a fork.
+      // (One queued response per stream: MockMembrane hands a stream every
+      // response still queued.)
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi alice!' }]));
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D1', text: 'hello there', channelType: 'im' }));
+      await framework.runUntilIdle();
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'On it.' }]));
+      framework.pushEvent(incomingEvent({ channelId: 'slack:C1', text: 'bot, help', mentioned: true }));
+      await framework.runUntilIdle();
+      assert.ok(framework.getAgent('conversation-slack-D1-g1'), 'DM fork spawned');
+      assert.ok(framework.getAgent('conversation-slack-C1-g1'), 'channel-mention fork spawned');
+      assert.equal(membrane.calls.length, 2, 'both forks ran inference');
+
+      assert.equal(deprecationWarnings(warn).length, 1, 'spawning forks does not warn again');
+    } finally {
+      warn.mock.restore();
+      await framework?.stop();
+    }
+  });
+
+  it('not configured: no [deprecated] line', async () => {
+    const warn = mock.method(console, 'warn', () => {});
+    let framework: AgentFramework | undefined;
+    try {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi alice!' }]));
+      framework = await AgentFramework.create({
+        storePath: join(tempDir, 'test.chronicle'),
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'You are the trunk.' }],
+        modules: [],
+      });
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D1', text: 'hello there', channelType: 'im' }));
+      await framework.runUntilIdle();
+
+      assert.equal(framework.getConversationRouter(), null);
+      assert.deepEqual(deprecationWarnings(warn), []);
+    } finally {
+      warn.mock.restore();
+      await framework?.stop();
+    }
   });
 
   it('DM message spawns a fork, routes the message there, and triggers inference', async () => {
