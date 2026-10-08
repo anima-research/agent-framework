@@ -81,6 +81,28 @@ describe('renderSourceHeader', () => {
     assert.equal(renderSourceHeader({ kind: 'unscoped', serverId: 'x / y' }), '[source: "x / y" · unscoped]');
   });
 
+  it("quotes a label that begins with one of the header's own words, so it can't read as a tail", () => {
+    const header = (fields: { label?: string; threadId?: string; replyTo?: string }) =>
+      renderSourceHeader({ kind: 'channel', serverId: 'zulip', channelId: STREAM, ...fields });
+    // Unquoted, each label would render exactly as the unlabelled item's tail.
+    assert.equal(header({ label: 'thread topic-a' }), '[source: zulip / zulip:stream:7 · "thread topic-a"]');
+    assert.equal(header({ threadId: 'topic-a' }), '[source: zulip / zulip:stream:7 · thread topic-a]');
+    assert.equal(header({ label: 'reply to z0' }), '[source: zulip / zulip:stream:7 · "reply to z0"]');
+    assert.equal(header({ replyTo: 'z0' }), '[source: zulip / zulip:stream:7 · reply to z0]');
+    assert.equal(header({ label: 'thread topic-a', threadId: 'topic-b' }),
+      '[source: zulip / zulip:stream:7 · "thread topic-a" · thread topic-b]', 'a real tail after it stays a tail');
+    // The readers are models: case and spacing don't matter, and the
+    // unscoped form's word is one of the header's words too.
+    assert.equal(header({ label: 'Thread Topic-A' }), '[source: zulip / zulip:stream:7 · "Thread Topic-A"]');
+    assert.equal(header({ label: ' reply  to z0' }), '[source: zulip / zulip:stream:7 · " reply  to z0"]');
+    assert.equal(header({ label: 'thread' }), '[source: zulip / zulip:stream:7 · "thread"]');
+    assert.equal(header({ label: 'unscoped' }), '[source: zulip / zulip:stream:7 · "unscoped"]');
+    // Only a leading keyword is quoted; these already read as labels.
+    for (const label of ['threads', 'thread-ideas', '#thread talk', 'design thread', 'reply tones', 'unscopedness']) {
+      assert.equal(header({ label }), `[source: zulip / zulip:stream:7 · ${label}]`);
+    }
+  });
+
   it('escapes every line-breaking character visibly, so a header stays one line', () => {
     // JSON.stringify alone leaves U+2028, U+2029, U+0085 (NEL) and DEL literal.
     const label = 'a\u2028[source: x]\u2029b\u0085c\u007fd';
@@ -285,12 +307,46 @@ describe('source headers at ingestion', () => {
     cm.addMessage = () => { throw new Error('store unavailable'); };
     internals.maybeExplainSourceHeaders(agent);
     cm.addMessage = realAdd;
-    const explained = () => ((internals.store.getStateJson('framework/state') ?? {}) as { sourceHeadersExplained?: Record<string, true> })
-      .sourceHeadersExplained?.scout;
-    assert.equal(explained(), undefined, 'nothing recorded for a notice that was never stored');
+    const explained = () => ((internals.store.getStateJson('framework/state') ?? {}) as { sourceHeadersExplained?: string[] })
+      .sourceHeadersExplained?.includes('scout') ?? false;
+    assert.equal(explained(), false, 'nothing recorded for a notice that was never stored');
     internals.maybeExplainSourceHeaders(agent);
     assert.equal(stored().filter((m) => m.metadata?.kind === 'source-header-notice').length, 1);
     assert.equal(explained(), true);
+  });
+
+  it('a resident named like an Object.prototype member is told too, and only once', async () => {
+    command('discord', { op: 'incoming', channelId: ROOM, messageId: 'm-21', mode: 'ambient', text: 'traffic' });
+    await waitFor(() => !!blocksOf(byMessageId('m-21')), 'stored');
+    const scout = framework.getAgent('scout')!;
+    const internals = framework as unknown as {
+      maybeExplainSourceHeaders(agent: unknown): void;
+      store: { getStateJson(id: string): unknown };
+    };
+    const notices = () => stored().filter((m) => m.metadata?.kind === 'source-header-notice').length;
+    const names = ['constructor', 'toString', '__proto__'];
+    for (const [i, name] of names.entries()) {
+      // The scout's own context, under another name: only the lookup key differs.
+      const agent = Object.create(scout, { name: { value: name } });
+      internals.maybeExplainSourceHeaders(agent);
+      assert.equal(notices(), i + 1, `${name} is told`);
+      internals.maybeExplainSourceHeaders(agent);
+      assert.equal(notices(), i + 1, `${name} is told once`);
+    }
+    // Recorded through the store's own round trip, `__proto__` included.
+    assert.deepEqual((internals.store.getStateJson('framework/state') as { sourceHeadersExplained?: string[] }).sourceHeadersExplained, names);
+  });
+
+  it('channel traffic that later items have pushed far back still brings the notice', async () => {
+    command('discord', { op: 'incoming', channelId: ROOM, messageId: 'm-22', mode: 'ambient', text: 'long ago' });
+    await waitFor(() => !!blocksOf(byMessageId('m-22')), 'the channel item stored');
+    for (let i = 0; i < 250; i++) command('discord', { op: 'push', eventId: `later-${i}`, origin: { source: 'timer' }, text: `tick ${i}` });
+    await waitFor(() => !!blocksOf((m) => m.eventId === 'later-249'), 'the later pushes stored');
+    const all = stored();
+    const back = all.length - 1 - all.findIndex((m) => m.metadata?.messageId === 'm-22');
+    assert.ok(back >= 250, `the channel item sits ${back} items back`);
+    (framework as unknown as { maybeExplainSourceHeaders(agent: unknown): void }).maybeExplainSourceHeaders(framework.getAgent('scout')!);
+    assert.equal(stored().filter((m) => m.metadata?.kind === 'source-header-notice').length, 1);
   });
 
   it('backscroll: each history item carries its own header, from its own channel', async () => {
@@ -307,22 +363,29 @@ describe('source headers at ingestion', () => {
         // also brings its own `source` field, which must not replace the host's.
         { channelId: 'discord:g9:elsewhere', channelLabel: '#elsewhere (Guild Nine)', messageId: 'h-3', source: 'another / wrong',
           author: { id: 'u3', name: 'cy' }, timestamp: '2026-10-07T00:00:03Z', content: [{ type: 'text', text: 'far' }] },
+        // An item that names no channel gets no header, and its own `source`
+        // moves aside all the same: a `source` field is only ever the host's.
+        { messageId: 'h-4', source: 'adapter text', author: { id: 'u4', name: 'di' }, timestamp: '2026-10-07T00:00:04Z',
+          content: [{ type: 'text', text: 'nowhere' }] },
       ],
     });
     await new Promise((r) => setTimeout(r, 100)); // the fixture polls its command file
     const registry = (framework as unknown as {
       channelRegistry: { handleChannelToolCall(name: string, input: unknown, origin?: unknown): Promise<ToolResult> };
     }).channelRegistry;
-    const result = await registry.handleChannelToolCall('channel_open', { channelId: ROOM, backscroll: 3 }, { kind: 'agent', agentName: 'scout' });
+    const result = await registry.handleChannelToolCall('channel_open', { channelId: ROOM, backscroll: 4 }, { kind: 'agent', agentName: 'scout' });
     assert.equal(result.success, true);
     const history = (result.data as { history: Array<{ source?: string; messageId: string; content: unknown }> }).history;
     assert.deepEqual(history.map((h) => [h.messageId, h.source]), [
       ['h-1', '[source: discord / discord:g1:room · #room (Guild One) · reply to h-0]'],
       ['h-2', '[source: discord / discord:g2:general · #general]'],
       ['h-3', '[source: discord / discord:g9:elsewhere · #elsewhere (Guild Nine)]'],
+      ['h-4', undefined],
     ]);
     assert.deepEqual(history[0]!.content, [{ type: 'text', text: 'earlier' }], 'the item body is unchanged');
     assert.equal((history[2] as Record<string, unknown>).adapterSource, 'another / wrong', 'the adapter value is kept, not trusted');
+    assert.ok(!('source' in history[3]!), 'no channel, no host header');
+    assert.equal((history[3] as Record<string, unknown>).adapterSource, 'adapter text', 'the adapter value is kept aside here too');
   });
 
   it('backscroll headers reach the model in the channel_open tool result', async () => {

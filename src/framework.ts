@@ -9717,18 +9717,21 @@ export class AgentFramework {
   private maybeExplainSourceHeaders(agent: Agent): void {
     if (!this.channelRegistry) return;
     let state: Record<string, unknown>;
+    let explained: unknown[];
     try {
       const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
       state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
-      const explained = (state.sourceHeadersExplained as Record<string, true> | undefined) ?? {};
-      if (explained[agent.name]) return;
-      // The recent tail is enough: a turn's own channel traffic is there,
-      // and a resident without any never pays for a full scan.
-      const messages = agent.getContextManager().getAllMessages();
-      let sees = false;
-      for (let i = messages.length - 1, n = 0; i >= 0 && n < 200 && !sees; i--, n++) {
-        sees = readInboundSource(messages[i]!.metadata)?.kind === 'channel';
-      }
+      // The residents already told, as a list of names rather than an object
+      // keyed by them: an object answers `constructor` or `toString` from its
+      // prototype, and a `__proto__` key doesn't survive the store's round trip.
+      explained = Array.isArray(state.sourceHeadersExplained) ? state.sourceHeadersExplained : [];
+      if (explained.includes(agent.name)) return;
+      // Any retained channel item counts, however much later traffic stands
+      // between it and this turn. getAllMessages is the store's cached view
+      // (each compile reads the same one), so this is a pass over memory,
+      // and none runs once the notice is recorded.
+      const sees = agent.getContextManager().getAllMessages()
+        .some((message) => readInboundSource(message.metadata)?.kind === 'channel');
       if (!sees) return;
     } catch (err) {
       console.error('maybeExplainSourceHeaders: state read failed:', err);
@@ -9754,10 +9757,7 @@ export class AgentFramework {
       return;
     }
     try {
-      state.sourceHeadersExplained = {
-        ...((state.sourceHeadersExplained as Record<string, true> | undefined) ?? {}),
-        [agent.name]: true,
-      };
+      state.sourceHeadersExplained = [...explained, agent.name];
       this.store.setStateJson(FRAMEWORK_STATE_ID, state);
     } catch (err) {
       // The notice stands; at worst it is given once more.

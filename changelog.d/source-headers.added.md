@@ -9,10 +9,17 @@
   recompile or a replay never rewrites it, and a message names its channel
   when read alone, even the second of two consecutive messages. Adapter body
   text is unchanged, and console/API input has no header.
+- A header value that could read as structure is written as a quoted JSON
+  string: one holding a bracket, `·`, ` / `, a quote, a backslash or a
+  control character, and a label beginning with `thread`, `reply to` or
+  `unscoped`. A header stays one line, and a label never reads as a thread
+  or reply.
 - `channel_open` backscroll items each gain a `source` field. It is rendered
   from the item's own `channelId`, so an item spliced in from another channel
   wears its true channel. The label comes from the registry for that id, else
-  the adapter's item `channelLabel`.
+  the adapter's item `channelLabel`. `source` is the host's key: an item's
+  own `source` is kept as `adapterSource`, and an item that names no channel
+  has no `source`.
 - The canonical id is authoritative when a label differs. That rule is stated
   in the `channel_list`, `channel_open` and `channel_publish` descriptions,
   and in a one-time `[source]` notice the first time a resident has channel

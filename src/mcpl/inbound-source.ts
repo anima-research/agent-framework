@@ -222,7 +222,7 @@ export function renderSourceHeader(
   if (fields.kind === 'surface') return undefined;
   if (fields.kind === 'unscoped') return `[source: ${headerValue(fields.serverId)} · unscoped]`;
   const parts = [`${headerValue(fields.serverId)} / ${headerValue(fields.channelId)}`];
-  if (fields.label) parts.push(headerValue(fields.label));
+  if (fields.label) parts.push(labelValue(fields.label));
   if (fields.threadId) parts.push(`thread ${headerValue(fields.threadId)}`);
   if (fields.replyTo) parts.push(`reply to ${headerValue(fields.replyTo)}`);
   return `[source: ${parts.join(' · ')}]`;
@@ -240,7 +240,23 @@ export function renderSourceHeader(
 function headerValue(value: string): string {
   // eslint-disable-next-line no-control-regex
   const structural = /[[\]\u00b7"\\\u0000-\u001f\u007f-\u009f\u2028\u2029]| \/ /;
-  if (!structural.test(value)) return value;
+  return structural.test(value) ? quoted(value) : value;
+}
+
+/**
+ * The label, rendered so it can't read as another field. It stands right
+ * after the channel id, where an unlabelled item's thread or reply tail
+ * would, so a label beginning with one of the header's own words (`thread`,
+ * `reply to`, `unscoped`) is quoted too: `· "thread topic-a"` is a label,
+ * `· thread topic-a` a thread. Case and spacing are ignored, because the
+ * readers are models rather than a parser, and quoting loses nothing.
+ */
+function labelValue(label: string): string {
+  return /^\s*(?:thread|reply\s+to|unscoped)(?:\s|$)/i.test(label) ? quoted(label) : headerValue(label);
+}
+
+/** A value as a quoted, escaped string literal that always stays on one line. */
+function quoted(value: string): string {
   // JSON.stringify escapes the C0 controls, quotes and backslashes, but
   // leaves DEL, the C1 controls (U+0085 NEL breaks a line) and U+2028 /
   // U+2029 (line and paragraph separators) literal: escape those visibly too.

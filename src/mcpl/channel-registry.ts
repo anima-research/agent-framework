@@ -2697,30 +2697,28 @@ export class ChannelRegistry {
    * spliced item wears its true channel. The label is the registry's for that
    * id, else the adapter's item `channelLabel`. An item that names no channel
    * gets no header rather than a guessed one.
+   *
+   * `source` is the host's key on every item: an adapter-supplied `source`
+   * is kept under `adapterSource` whether or not the item names a channel,
+   * so a `source` field is always the host's header, and its absence means
+   * the item named no channel.
    */
   private stampHistory(serverId: string, items: ChannelIncomingMessage[]): Array<Record<string, unknown>> {
     const text = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
     return items.map((item) => {
-      const raw = item as unknown as Record<string, unknown>;
-      const channelId = text(raw.channelId);
-      if (!channelId) return { ...raw };
+      const { source: adapterSource, ...rest } = item as unknown as Record<string, unknown>;
+      const kept = { ...rest, ...(adapterSource !== undefined ? { adapterSource } : {}) };
+      const channelId = text(rest.channelId);
+      if (!channelId) return kept;
       const header = renderSourceHeader({
         kind: 'channel',
         serverId,
         channelId,
-        label: this.getChannelLabel(serverId, channelId) ?? text(raw.channelLabel),
-        threadId: text(raw.threadId),
-        replyTo: text((raw.metadata as Record<string, unknown> | undefined)?.replyTo),
+        label: this.getChannelLabel(serverId, channelId) ?? text(rest.channelLabel),
+        threadId: text(rest.threadId),
+        replyTo: text((rest.metadata as Record<string, unknown> | undefined)?.replyTo),
       });
-      // The host's header is authoritative: it is written after the item's
-      // own fields, so an adapter-supplied `source` can't replace it; the
-      // adapter's value, if any, is kept under `adapterSource`.
-      const { source: adapterSource, ...rest } = raw;
-      return {
-        ...rest,
-        ...(adapterSource !== undefined ? { adapterSource } : {}),
-        source: header,
-      };
+      return { ...kept, source: header };
     });
   }
 
