@@ -790,6 +790,15 @@ export class OperatorChangeRecoveryError extends Error {
   }
 }
 
+/** A safe-boundary request refused, or a waiting one rejected, because the
+ *  framework is stopping: an AbortError, like a withdrawn request, since
+ *  nothing was granted. */
+function stoppingRefusal(verb: string): Error {
+  const error = new Error(`safe boundary for ${verb} refused: the framework is stopping`);
+  error.name = 'AbortError';
+  return error;
+}
+
 class DiscordAwarenessAccountingError extends Error {
   constructor(operation: string, cause: unknown) {
     const detail = cause instanceof Error ? cause.message : String(cause);
@@ -1763,7 +1772,11 @@ export class AgentFramework {
    * agent admitted mid-switch, a wake for an agent created later — at the
    * scheduler, ephemeral admission and puppet entry points.
    */
-  private surgeryHold: { verb: string; agentName: string; since: number } | null = null;
+  private surgeryHold: { verb: string; agentName: string; since: number; released: Promise<void> } | null = null;
+  /** Set by stop() before its first await: no lease, direct surgery,
+   *  ephemeral creation or ephemeral run enters the store from then on
+   *  (closeStoreAdmission). */
+  private stopping = false;
   /**
    * Hosts waiting for a safe boundary (`runAtSafeBoundary`), oldest first.
    * While any wait, new resident turns are held (see processInferenceRequests)
@@ -1773,6 +1786,8 @@ export class AgentFramework {
     verb: string;
     requester?: OperatorRequester;
     grant: (held: { lease: SafeBoundaryLease; release: () => void }) => void;
+    /** Reject the request: stop() refuses every request still waiting. */
+    refuse: (error: Error) => void;
   }> = [];
   /** The lease currently held, and the turn token it reserved per agent. */
   private heldLease: { lease: SafeBoundaryLease; tokens: Map<string, number> } | null = null;
@@ -1785,6 +1800,10 @@ export class AgentFramework {
    */
   private ephemeralPending: Set<object> = new Set();
   private ephemeralPendingByAgent: WeakMap<Agent, object> = new WeakMap();
+  /** Admitted creations still initializing (opening their context in the
+   *  store): stop() lets them finish before closing it. A finished
+   *  candidate waiting for its caller isn't here. */
+  private ephemeralInitializations: Set<Promise<void>> = new Set();
   /** Candidates withdrawn by their cleanup(): they can never run, since the
    *  pending admission that protected their pre-run context is gone. */
   private releasedEphemeralCandidates: WeakSet<Agent> = new WeakSet();
@@ -2390,12 +2409,33 @@ export class AgentFramework {
   }
 
   /**
-   * Stop the event loop.
+   * Stop the event loop. Admission closes synchronously, before the first
+   * await (turns, provider calls, leases, direct surgeries and ephemeral
+   * creations), then the store reservation's holder and any creation still
+   * initializing finish, then everything is torn down. Never
+   * await stop() inside a lease callback: initiate it there, return, and
+   * await it outside.
    */
   async stop(): Promise<void> {
+    // Admission closes before the first await: no turn starts and no
+    // provider call is made, no lease or direct surgery takes the store
+    // reservation, no ephemeral creation enters the store, and waiting lease
+    // requests and creations are refused. A host can therefore initiate
+    // shutdown inside a lease callback, return, and await this outside, with
+    // nothing admitted in between.
+    this.running = false;
+    this.providerAdmissionClosed = true;
+    this.closeStoreAdmission();
+    // Whoever holds the store reservation (a lease's callback, a direct
+    // surgery's awaited work) finishes before anything it may use is torn
+    // down. Admission is closed, so no other holder can follow it.
+    const reservation = this.surgeryHold;
+    if (reservation) await reservation.released;
+    // So does a creation admitted before shutdown and still opening its
+    // context in the store (none is admitted after).
+    if (this.ephemeralInitializations.size > 0) await Promise.all(this.ephemeralInitializations);
     this.pushCoalescer?.suspend();
     this.flushCoalescingSnapshot();
-    this.running = false;
     // A re-run still waiting has no turn coming: its journal says launched,
     // which reads interrupted, and so does what its callers are told.
     for (const [key, waiter] of this.unstickAttemptWaiters) {
@@ -2405,7 +2445,6 @@ export class AgentFramework {
     // Flushed-but-unsynced deferred writes: sync and ack now, while the
     // store is still open, rather than leaving them to a reboot replay.
     this.ackDeferredWrites();
-    this.providerAdmissionClosed = true;
     this.queue.close();
     this.tuneOutCoordinator?.stop();
 
@@ -4761,6 +4800,13 @@ export class AgentFramework {
     // From admission until the candidate runs or is cleaned up, the ticket
     // is pending and a waiting lease isn't granted.
     const pending = await this.admitEphemeralCreation(opts?.requestedBy);
+    // Admitted, but stop() may have begun before this continuation ran, and
+    // it only waits for initializations registered by then: refuse now,
+    // before touching the store, releasing the ticket.
+    if (this.stopping) {
+      this.ephemeralPending.delete(pending);
+      throw new Error('Ephemeral agent creation refused: the framework is stopping');
+    }
     // Names are Chronicle namespaces and generation identities. Reserve before
     // opening the namespace so a second creation cannot append to an earlier
     // generation before runEphemeralToCompletion has a chance to reject it.
@@ -4770,6 +4816,9 @@ export class AgentFramework {
       throw new Error(`Ephemeral agent name \"${config.name}\" is already registered or has been used in this framework`);
     }
     this.usedEphemeralAgentNames.add(config.name);
+    let initialized!: () => void;
+    const initializing = new Promise<void>((resolve) => { initialized = resolve; });
+    this.ephemeralInitializations.add(initializing);
     try {
       const namespace = `subagent/${config.name}`;
 
@@ -4807,6 +4856,9 @@ export class AgentFramework {
       this.ephemeralPending.delete(pending);
       this.tryGrantSafeBoundary();
       throw error;
+    } finally {
+      this.ephemeralInitializations.delete(initializing);
+      initialized();
     }
   }
 
@@ -4898,6 +4950,11 @@ export class AgentFramework {
     }
     if (this.releasedEphemeralCandidates.has(agent)) {
       throw new Error(`Ephemeral agent "${agent.name}" was released by cleanup() and can't run; create a new one`);
+    }
+    // Shutdown has begun: nothing new enters the store. Refused before the
+    // candidate is consumed; its caller cleans it up.
+    if (this.stopping) {
+      throw new Error(`Ephemeral agent "${agent.name}" refused: the framework is stopping`);
     }
     // Only a fresh object returned by createEphemeralAgent may enter this path.
     // Never overwrite a resident/conversation owner or a concurrent run: their
@@ -6763,6 +6820,9 @@ export class AgentFramework {
   }
 
   private reserveStoreForSurgery(verb: string, agentName: string): () => void {
+    if (this.stopping) {
+      throw new OperatorActionError('invalid', `Cannot ${verb}: the framework is stopping`);
+    }
     if (this.surgeryHold) {
       throw new OperatorActionError(
         'agent-busy',
@@ -6815,13 +6875,15 @@ export class AgentFramework {
     }
     // The token snapshot only covers agents that exist now; the hold covers
     // arrivals during the awaited switch (see surgeryHold).
-    const hold = { verb, agentName, since: Date.now() };
+    let markReleased!: () => void;
+    const hold = { verb, agentName, since: Date.now(), released: new Promise<void>((resolve) => { markReleased = resolve; }) };
     this.surgeryHold = hold;
     let released = false;
     const release = () => {
       if (released) return;
       released = true;
       if (this.surgeryHold === hold) this.surgeryHold = null;
+      markReleased();
       // Creations held behind this hold may proceed (unless a lease waits).
       queueMicrotask(() => this.notifyBoundaryCleared());
       for (const [name, token] of reserved) {
@@ -6854,6 +6916,18 @@ export class AgentFramework {
     return { tokens: reserved, release };
   }
 
+  /** stop()'s first step for the store: no lease, direct surgery or
+   *  ephemeral creation is admitted from now on, and every lease request or
+   *  creation still waiting is refused, so nothing enters the store once
+   *  shutdown has begun. */
+  private closeStoreAdmission(): void {
+    this.stopping = true;
+    for (const waiter of this.boundaryWaiters?.splice(0) ?? []) waiter.refuse(stoppingRefusal(waiter.verb));
+    // Creations parked behind a lease or surgery wake now and are refused
+    // (tryAdmitEphemeralCreation): none enters the store once stopping.
+    for (const resume of this.boundaryClearedWaiters?.splice(0) ?? []) resume();
+  }
+
   /**
    * Run `fn` at a safe boundary, holding the store reservation across it.
    *
@@ -6875,6 +6949,13 @@ export class AgentFramework {
    * Operator methods that would refuse the hold take the lease instead:
    * `puppetToolCall(…, { lease })` runs under the lease's token for that
    * agent.
+   *
+   * Once stop() has begun, a request is refused, and one still waiting is
+   * rejected, with an AbortError saying the framework is stopping; nothing
+   * is granted after. A granted `fn` runs to its end before stop() tears
+   * down anything it may use. To shut down with no grant in between, a host
+   * calls stop() inside `fn`, returns, and awaits the shutdown outside:
+   * awaiting stop() inside `fn` waits for itself.
    */
   async runAtSafeBoundary<T>(opts: SafeBoundaryOptions, fn: (lease: SafeBoundaryLease) => Promise<T>): Promise<T> {
     const withdrawn = () => {
@@ -6883,6 +6964,7 @@ export class AgentFramework {
       return error;
     };
     if (opts.signal?.aborted) throw withdrawn();
+    if (this.stopping) throw stoppingRefusal(opts.verb);
     const requested = Date.now();
     const held = await new Promise<{ lease: SafeBoundaryLease; release: () => void }>((resolve, reject) => {
       let onAbort: (() => void) | undefined;
@@ -6892,6 +6974,10 @@ export class AgentFramework {
         grant: (granted: { lease: SafeBoundaryLease; release: () => void }) => {
           if (onAbort) opts.signal?.removeEventListener('abort', onAbort);
           resolve(granted);
+        },
+        refuse: (error: Error) => {
+          if (onAbort) opts.signal?.removeEventListener('abort', onAbort);
+          reject(error);
         },
       };
       if (opts.signal) {
@@ -6979,6 +7065,7 @@ export class AgentFramework {
    *  to wait. The store hold (surgeryHold) covers a held lease and a direct
    *  rollback or suppress alike: nothing initializes under either. */
   private tryAdmitEphemeralCreation(requestedBy?: string): object | null {
+    if (this.stopping) throw new Error('Ephemeral agent creation refused: the framework is stopping');
     const admitted = this.surgeryHold
       ? false
       : !this.boundaryWaiters?.length

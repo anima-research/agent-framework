@@ -446,3 +446,197 @@ describe('runAtSafeBoundary', () => {
     }
   });
 });
+
+describe('stop() and the store reservation', () => {
+  let tempDir: string;
+  let membrane: MockMembrane;
+  let framework: AgentFramework;
+  let i: Internals;
+  let stopped: boolean;
+  let quiet: { log: typeof console.log; error: typeof console.error };
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'safe-boundary-stop-'));
+    membrane = new MockMembrane();
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+    });
+    i = framework as unknown as Internals;
+    stopped = false;
+    quiet = { log: console.log, error: console.error };
+    console.log = () => {};
+    console.error = () => {};
+  });
+  afterEach(async () => {
+    console.log = quiet.log;
+    console.error = quiet.error;
+    if (!stopped) await framework.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  // What a promise settled to within `ms`, or 'pending'.
+  const within = async <T>(promise: Promise<T>, ms = 200): Promise<T | Error | 'pending'> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        promise.catch((e: Error) => e),
+        new Promise<'pending'>((resolve) => { timer = setTimeout(() => resolve('pending'), ms); }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const held = () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const inside = new Promise<void>((resolve) => { entered = resolve; });
+    return { gate, release, inside, entered };
+  };
+
+  it('waits for a granted callback before tearing down anything it uses, and the callback still has its store', async () => {
+    const lease = held();
+    const leased = framework.runAtSafeBoundary({ verb: 'held' }, async () => {
+      lease.entered();
+      await lease.gate;
+      framework.getStore().setStateJson('probe/after-stop', { ok: true }); // host bookkeeping after stop() began
+      framework.getStore().sync();
+      return 'done';
+    });
+    await lease.inside;
+    stopped = true;
+    const stopping = framework.stop();
+    assert.equal(await within(stopping), 'pending', 'stop() waits for the granted callback');
+    lease.release();
+    assert.equal(await leased, 'done', 'the callback finished against an open store');
+    await stopping;
+  });
+
+  it('refuses a waiting request and any new one, and takes no direct surgery, once stop() begins', async () => {
+    const first = held();
+    const firstDone = framework.runAtSafeBoundary({ verb: 'first' }, async () => { first.entered(); await first.gate; });
+    await first.inside;
+    let secondRan = false;
+    const second = framework.runAtSafeBoundary({ verb: 'second' }, async () => { secondRan = true; });
+    await tick();
+    stopped = true;
+    const stopping = framework.stop();
+    const refused = await within(second);
+    assert.ok(refused instanceof Error && refused.name === 'AbortError'
+      && /safe boundary for second refused: the framework is stopping/.test(refused.message), String(refused));
+    const late = await within(framework.runAtSafeBoundary({ verb: 'late' }, async () => {}));
+    assert.ok(late instanceof Error && /late refused: the framework is stopping/.test(late.message), String(late));
+    assert.throws(() => i.reserveStoreForSurgery('rollback', 'scout'),
+      (e: Error & { code?: string }) => e.code === 'invalid' && /Cannot rollback: the framework is stopping/.test(e.message));
+    first.release();
+    await firstDone;
+    await stopping;
+    assert.equal(secondRan, false, 'nothing was granted after stop() began');
+  });
+
+  it('closes admission at once when stop() is initiated inside a callback: a queued wake never runs, and shutdown completes once it returns', async () => {
+    const calls = membrane.calls.length;
+    let stopping!: Promise<void>;
+    stopped = true;
+    await framework.runAtSafeBoundary({ verb: 'handoff' }, async () => {
+      i.pendingRequests.push(wake('scout')); // a wake already queued
+      stopping = framework.stop(); // initiated, not awaited
+      const intruder = await within(framework.runAtSafeBoundary({ verb: 'intruder' }, async () => {}));
+      assert.ok(intruder instanceof Error && /intruder refused: the framework is stopping/.test(intruder.message), String(intruder));
+      framework.getStore().setStateJson('probe/handoff', { applying: true }); // the callback's own work, store open
+      framework.getStore().sync();
+    });
+    // The lease is released: a scheduler pass now starts nothing.
+    await i.processInferenceRequests();
+    assert.equal(await within(stopping, 5_000), undefined, 'shutdown completed');
+    assert.equal(membrane.calls.length, calls, 'no provider call after the callback returned');
+  });
+
+  // A strategy whose initializer (run as an ephemeral creation opens its
+  // context in the store) blocks until released, counting its calls.
+  const gatedStrategy = () => {
+    const gate = held();
+    let calls = 0;
+    const strategy = new PassthroughStrategy();
+    (strategy as unknown as { initialize: () => Promise<void> }).initialize = async () => { calls++; gate.entered(); await gate.gate; };
+    return { strategy, gate, calls: () => calls };
+  };
+
+  it('refuses a creation parked behind a lease once stop() begins, before it enters the store', async () => {
+    const lease = held();
+    const leased = framework.runAtSafeBoundary({ verb: 'held' }, async () => { lease.entered(); await lease.gate; });
+    await lease.inside;
+    const init = gatedStrategy();
+    const creating = framework.createEphemeralAgent({ name: 'parked', model: 'test-model', systemPrompt: 'test', strategy: init.strategy });
+    await tick();
+    stopped = true;
+    const stopping = framework.stop();
+    const refused = await within(creating);
+    assert.ok(refused instanceof Error && /creation refused: the framework is stopping/.test(refused.message), String(refused));
+    lease.release();
+    await leased;
+    await stopping;
+    assert.equal(init.calls(), 0, 'its initializer never ran');
+  });
+
+  it('lets a creation admitted before stop() finish initializing before the store closes', async () => {
+    const init = gatedStrategy();
+    const creating = framework.createEphemeralAgent({ name: 'admitted', model: 'test-model', systemPrompt: 'test', strategy: init.strategy });
+    await init.gate.inside;
+    stopped = true;
+    const stopping = framework.stop();
+    assert.equal(await within(stopping), 'pending', 'stop() waits for the initializer');
+    init.gate.release();
+    const created = await creating; // no "Store has been closed"
+    created.cleanup();
+    await stopping;
+    assert.equal(init.calls(), 1);
+  });
+
+  it('refuses a creation admitted in the same turn stop() begins, before its initializer runs', async () => {
+    const init = gatedStrategy();
+    const creating = framework.createEphemeralAgent({ name: 'raced', model: 'test-model', systemPrompt: 'test', strategy: init.strategy });
+    stopped = true;
+    const stopping = framework.stop(); // admitted above, its continuation not yet run
+    const refused = await within(creating);
+    assert.ok(refused instanceof Error && /creation refused: the framework is stopping/.test(refused.message), String(refused));
+    await stopping;
+    assert.equal(init.calls(), 0, 'its initializer never ran');
+    assert.equal(i.ephemeralPending.size, 0, 'its ticket was released');
+  });
+
+  it('refuses to run a finished candidate once stop() begins, without consuming it', async () => {
+    const created = await framework.createEphemeralAgent({ name: 'finished', model: 'test-model', systemPrompt: 'test' });
+    stopped = true;
+    const stopping = framework.stop();
+    await assert.rejects(
+      framework.runEphemeralToCompletion(created.agent, created.contextManager),
+      /Ephemeral agent "finished" refused: the framework is stopping/,
+    );
+    assert.equal(i.ephemeralCandidates.get(created.agent), created.contextManager, 'refused before consuming the candidate');
+    created.cleanup();
+    await stopping;
+  });
+
+  it("waits for a direct surgery's awaited switch before tearing down", async () => {
+    for (const text of ['one', 'two', 'three']) i.addMessage('user', [{ type: 'text', text }]);
+    const cm = framework.getAgent('scout')!.getContextManager();
+    const anchor = String(cm.getAllMessages()[0]!.id);
+    const cmx = cm as unknown as { switchBranch: (name: string) => Promise<void> };
+    const real = cmx.switchBranch.bind(cm);
+    const switching = held();
+    cmx.switchBranch = async (name) => { switching.entered(); await switching.gate; return real(name); };
+    const rollback = framework.rollbackToMessage('scout', { messageId: anchor });
+    await switching.inside;
+    stopped = true;
+    const stopping = framework.stop();
+    assert.equal(await within(stopping), 'pending', 'stop() waits for the surgery holding the store');
+    switching.release();
+    const done = await rollback;
+    assert.ok(done, 'the surgery completed against an open store');
+    await stopping;
+  });
+});
