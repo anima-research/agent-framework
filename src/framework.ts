@@ -1802,12 +1802,11 @@ export class AgentFramework {
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
             // A batch that contains an ADDRESSED message (mention / reply /
-            // DM) routes like the direct path does: the reply goes to that
-            // message's channel. Without it the turn froze on the
-            // process-global most-recent-inbound channel, which an ambient
-            // message elsewhere could retarget between the DM's arrival and
-            // the debounce firing (2026-09-30). Ambient-only batches set no
-            // locus and keep the legacy fallback.
+            // DM) marks the wake addressed, with that message's channel as
+            // the request's channelId, as the direct path does; an
+            // ambient-only batch sets neither. Neither is the speech route: a
+            // true new turn infers that from the batch's route candidates
+            // below (shelf-355).
             //
             // The wake is broadcast to every agent, conversation forks
             // included, and a fork speaks only in its home channel: the
@@ -8746,7 +8745,8 @@ export class AgentFramework {
    * discord-mcpl's `mcplChannelId()` / `parseMcplChannelId()` convention so the
    * fix works even against a discord-mcpl build that predates `mcplChannelId`.
    * Returns undefined for push events with no channel provenance (heartbeats,
-   * timers), which correctly keep the global fallback.
+   * reminders, timers): they name no conversation, so they are no route
+   * candidate, and a turn they alone wake infers no speech route (shelf-355).
    */
   private derivePushEventChannel(
     origin: Record<string, unknown> | undefined,
@@ -8986,17 +8986,19 @@ export class AgentFramework {
       // requests[0] in that mixed batch bypassed the turn lock because a
       // restart existed, then treated the continuation as a fresh turn.
       const trigger = budgetRestart ?? requests[0];
-      // Route this turn's auto-published speech to the channel that triggered
-      // it (item-3 redux). A batched wake may carry several triggering channels
-      // (messages arrived in >1 channel while the agent was busy/idle):
+      // The channel that triggered this turn (the trigger's channelId), and
+      // the provenance below. Neither is the speech route, which a true new
+      // turn infers from every request's route candidates (shelf-355). A
+      // batched wake may carry several triggering channels (messages arrived
+      // in >1 channel while the agent was busy/idle):
       //   1. the most recent ADDRESSED channel wins (mention / reply / DM —
       //      someone explicitly spoke TO the agent);
       //   2. else the most recent channel-bearing request (ambient message in
-      //      an open channel — legacy last-inbound semantics).
+      //      an open channel).
       // Ambient chatter must not outrank an addressed message just by being
       // newest (2026-07-21 Cairn lounge misroute, turn-start variant).
       // Non-channel wakes (heartbeats, module events, reactions — which never
-      // carry channelId) leave both undefined → global fallback.
+      // carry channelId) leave both undefined: the turn has no trigger channel.
       // Track the winning REQUEST, not just its channel: channel, addressed
       // and counterparty must come from the same message, or a batch of
       // "ambient from A, then addressed from B" would report B's channel
