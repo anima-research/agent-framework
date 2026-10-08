@@ -216,17 +216,24 @@ function emptySnapshot(): Snapshot {
  * A checkpoint's state, as this version writes it. Anything else (another
  * version's checkpoint, or one damaged into other valid JSON) makes the
  * journal unreadable rather than starting from an empty state, which the
- * next checkpoint would make permanent.
+ * next checkpoint would make permanent. That includes the dedup sets: each
+ * resident's must be canonical base64 of whole 32-byte digests, since a set
+ * read as empty or short would count delivered versions again.
  */
 function checkedSnapshot(value: unknown): Snapshot {
-  const s = value as Partial<Snapshot> | null;
-  const isObject = (x: unknown) => typeof x === 'object' && x !== null && !Array.isArray(x);
+  const isObject = (x: unknown): x is Record<string, unknown> => typeof x === 'object' && x !== null && !Array.isArray(x);
   const isTime = (x: unknown) => x === null || typeof x === 'number';
-  if (!isObject(s) || s!.v !== 2 || !isObject(s!.channels) || !isObject(s!.agents) || !Array.isArray(s!.gaps)
-    || !isTime(s!.trackingSince) || !isTime(s!.openRun) || !isTime(s!.lastAt)) {
+  const isPacked = (x: unknown) => {
+    if (typeof x !== 'string') return false;
+    const bytes = Buffer.from(x, 'base64');
+    return bytes.length % 32 === 0 && bytes.toString('base64') === x;
+  };
+  if (!isObject(value) || value.v !== 2 || !isObject(value.channels) || !isObject(value.agents) || !Array.isArray(value.gaps)
+    || !isTime(value.trackingSince) || !isTime(value.openRun) || !isTime(value.lastAt)
+    || !isObject(value.seen) || !Object.values(value.seen).every((sets) => isObject(sets) && isPacked(sets.delivered) && isPacked(sets.partial))) {
     throw new Error('clock ledger checkpoint is not a snapshot this version reads');
   }
-  return s as Snapshot;
+  return value as unknown as Snapshot;
 }
 
 export class ChannelClockLedger {
@@ -408,7 +415,7 @@ export class ChannelClockLedger {
       this.state = snapshot === null ? emptySnapshot() : checkedSnapshot(snapshot);
       this.deliveredSets = new Map();
       this.partialSets = new Map();
-      for (const [agent, sets] of Object.entries(this.state.seen ?? {})) {
+      for (const [agent, sets] of Object.entries(this.state.seen)) {
         this.deliveredSets.set(agent, unpack(sets.delivered));
         this.partialSets.set(agent, unpack(sets.partial));
       }

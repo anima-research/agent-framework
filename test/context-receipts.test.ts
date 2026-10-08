@@ -443,6 +443,32 @@ describe('ChannelClockLedger', () => {
     assert.equal(l.clocksFor('r', [CH]).size, 0);
     assert.equal(l.scope('r').degraded, true);
   });
+
+  it('treats a checkpoint whose dedup sets are missing or cut short as unreadable, never as forgetting (Hazel #50719)', () => {
+    let l = open();
+    clock = 2_000;
+    l.delivered('r', CH, src('m1', 1_000), ver('e1'), BRANCH);
+    l.stop();
+    const checkpoints = `${CLOCK_RECORD}/checkpoint`;
+    const real = JSON.parse(store.getRecord(store.getRecordIdsByType(checkpoints).at(-1)!)!.payload.toString('utf8')) as {
+      through: string; snapshot: { seen: Record<string, { delivered: string; partial: string }> };
+    };
+    assert.equal(Buffer.from(real.snapshot.seen.r!.delivered, 'base64').length, 32, 'the real checkpoint remembers e1');
+    const withoutSets = structuredClone(real) as { snapshot: Record<string, unknown> };
+    delete withoutSets.snapshot.seen;
+    const cutShort = structuredClone(real);
+    cutShort.snapshot.seen.r!.delivered = real.snapshot.seen.r!.delivered.slice(0, -4);
+    for (const [damage, checkpoint] of [['sets missing', withoutSets], ['a set cut short', cutShort]] as const) {
+      store.appendJson(checkpoints, checkpoint);
+      const before = recordCount();
+      clock += 1_000;
+      l = open();
+      assert.equal(l.delivered('r', CH, src('m1', 1_000), ver('e1'), BRANCH), false, `${damage}: e1 is not delivered again`);
+      assert.equal(recordCount(), before, `${damage}: nothing written over it`);
+      assert.equal(l.scope('r').degraded, true, damage);
+      l.stop();
+    }
+  });
 });
 
 describe('ContextReceipts', () => {
