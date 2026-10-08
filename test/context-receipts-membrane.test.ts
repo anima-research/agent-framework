@@ -55,6 +55,27 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): P
 /** `text`: one round that ends the turn. `tool`: a round that calls probe--wait. */
 type Turn = 'text' | 'tool';
 
+/**
+ * Holds provider requests from the `from`-th on (1-based) until `release`.
+ * An addressed message injected mid-turn also wakes its own turn once the
+ * turn that carried it ends, and that gap is too short to catch by polling
+ * for idle. Holding the next request lets a test look at the state after
+ * the turn under test, before any later round reports. A held request is
+ * recorded only once it is released.
+ */
+class RequestHold {
+  from: number | null = null;
+  private waiting: Array<() => void> = [];
+  get count(): number { return this.waiting.length; }
+  async pass(index: number): Promise<void> {
+    if (this.from !== null && index >= this.from) await new Promise<void>((r) => { this.waiting.push(r); });
+  }
+  release(): void {
+    this.from = null;
+    for (const r of this.waiting.splice(0)) r();
+  }
+}
+
 /** A provider that plays turns in the shape of the configured tool mode. */
 class ScriptedAdapter implements ProviderAdapter {
   readonly name = 'scripted';
@@ -62,10 +83,12 @@ class ScriptedAdapter implements ProviderAdapter {
   readonly usageCacheConvention = 'cache-excluded' as const;
   turns: Turn[] = [];
   requests: ProviderRequest[] = [];
+  readonly hold = new RequestHold();
   constructor(private readonly mode: 'native' | 'xml') {}
   supportsModel(): boolean { return true; }
   async complete(): Promise<ProviderResponse> { throw new Error('not used'); }
   async stream(request: ProviderRequest, callbacks: StreamCallbacks, _options?: ProviderRequestOptions): Promise<ProviderResponse> {
+    await this.hold.pass(this.requests.length + 1);
     this.requests.push(request);
     const turn = this.turns.shift() ?? 'text';
     const usage = { inputTokens: 40, outputTokens: 3, cacheReadTokens: 0 };
@@ -92,8 +115,10 @@ class ScriptedAnthropic extends AnthropicAdapter {
   turns: Turn[] = [];
   requests: ProviderRequest[] = [];
   sent: Array<{ messages: unknown[] }> = [];
+  readonly hold = new RequestHold();
   constructor() { super({ apiKey: 'test', cacheKeepalive: { enabled: false } }); }
   override async stream(request: ProviderRequest, callbacks: StreamCallbacks, options?: ProviderRequestOptions): Promise<ProviderResponse> {
+    await this.hold.pass(this.requests.length + 1);
     this.requests.push(request);
     const wire = (this as unknown as { buildRequest(r: ProviderRequest, cb?: (b?: unknown) => void): { messages: unknown[] } })
       .buildRequest(request, options?.onContentAltered);
@@ -184,8 +209,9 @@ async function open(mode: 'native' | 'xml' | 'anthropic'): Promise<Harness> {
 
 afterEach(async () => {
   if (!harness) return;
-  const { framework, tempDir } = harness;
+  const { framework, tempDir, adapter } = harness;
   harness = null;
+  adapter.hold.release();
   const internals = framework as unknown as { queue: { isEmpty: boolean } };
   await waitFor(() => internals.queue.isEmpty && framework.getAgent('scout')!.state.status === 'idle', 'quiescent before stop').catch(() => {});
   await new Promise((r) => setTimeout(r, 100));
@@ -221,7 +247,9 @@ function probes(h: Harness) {
     assert.ok(result.success, JSON.stringify(result));
     return (result.data as { receipts: Array<{ kind: string; presentation?: string }> }).receipts;
   };
-  return { idle, versionState, roomClocks, folds, stored };
+  /** The turn under test has ended: idle, or the next turn's request is held. */
+  const turnEnded = () => idle() || h.adapter.hold.count > 0;
+  return { idle, turnEnded, versionState, roomClocks, folds, stored };
 }
 
 describe('receipts from the real membrane producer', () => {
@@ -262,12 +290,13 @@ describe('receipts from the real membrane producer', () => {
     const h = await open('native');
     const p = probes(h);
     h.adapter.turns = ['tool', 'text'];
+    h.adapter.hold.from = 3;
     h.command({ op: 'incoming', channelId: ROOM, messageId: 'n-start', mode: 'addressed', text: 'do the thing' });
     await waitFor(() => h.probe.entered, 'tool running');
     h.command({ op: 'incoming', channelId: ROOM, messageId: 'n-mid', mode: 'addressed', text: 'also this' });
     await waitFor(() => !!(h.framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length, 'deferred while the turn is alive');
     h.probe.release!();
-    await waitFor(p.idle, 'turn settles');
+    await waitFor(p.turnEnded, 'turn ends');
     assert.equal(h.adapter.requests.length, 2);
     const second = JSON.stringify(h.adapter.requests[1]!.messages);
     assert.ok(second.includes('also this'), 'membrane carried the injection in the second round');
@@ -281,6 +310,7 @@ describe('receipts from the real membrane producer', () => {
     const held = () => (h.framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length;
     const running = (call: number) => waitFor(() => h.probe.calls >= call, `tool call ${call} running`);
     h.adapter.turns = ['tool', 'tool', 'tool', 'text'];
+    h.adapter.hold.from = 5;
     h.command({ op: 'incoming', channelId: ROOM, messageId: 'b-start', mode: 'addressed', text: 'do the thing' });
     await running(1);
     // Batch 0, at the first boundary: one body.
@@ -300,7 +330,7 @@ describe('receipts from the real membrane producer', () => {
     });
     await waitFor(() => held() === 2, 'batch 1, both messages held');
     h.probe.release!();
-    await waitFor(p.idle, 'turn settles');
+    await waitFor(p.turnEnded, 'turn ends');
 
     assert.equal(h.adapter.requests.length, 4);
     assert.ok(JSON.stringify(h.adapter.requests[1]!.messages).includes('first aside'), 'the second round carried batch 0');
@@ -319,13 +349,16 @@ describe('receipts from the real membrane producer', () => {
     const h = await open('xml');
     const p = probes(h);
     h.adapter.turns = ['tool', 'text', 'text'];
+    h.adapter.hold.from = 3;
     h.command({ op: 'incoming', channelId: ROOM, messageId: 'x-start', mode: 'addressed', text: 'do the thing' });
     await waitFor(() => h.probe.entered, 'tool running');
     h.command({ op: 'incoming', channelId: ROOM, messageId: 'x-mid', mode: 'addressed', text: 'also this' });
     await waitFor(() => !!(h.framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length, 'deferred while the turn is alive');
     h.probe.release!();
-    await waitFor(p.idle, 'turn settles');
+    await waitFor(p.turnEnded, 'turn ends');
+    assert.equal(h.adapter.requests.length, 2);
     assert.equal(p.versionState('x-mid').delivered, false, 'membrane reported applied 0');
+    h.adapter.hold.release();
     h.command({ op: 'incoming', channelId: ROOM, messageId: 'x-next', mode: 'addressed', text: 'and?' });
     await waitFor(() => h.adapter.requests.length >= 3, 'next turn');
     await waitFor(p.idle, 'next turn settles');
@@ -336,6 +369,7 @@ describe('receipts from the real membrane producer', () => {
     const h = await open('anthropic');
     const p = probes(h);
     h.adapter.turns = ['tool', 'text'];
+    h.adapter.hold.from = 3;
     h.command({ op: 'incoming', channelId: ROOM, messageId: 'a-start', mode: 'addressed', text: 'do the thing' });
     await waitFor(() => h.probe.entered, 'tool running');
     h.command({
@@ -344,7 +378,7 @@ describe('receipts from the real membrane producer', () => {
     });
     await waitFor(() => !!(h.framework as unknown as { deferredMessages: unknown[] }).deferredMessages.length, 'deferred while the turn is alive');
     h.probe.release!();
-    await waitFor(p.idle, 'turn settles');
+    await waitFor(p.turnEnded, 'turn ends');
     const sent = (h.adapter as ScriptedAnthropic).sent;
     assert.equal(sent.length, 2);
     assert.ok(JSON.stringify(sent[1]!.messages).includes('also this'), 'the injection was carried');
