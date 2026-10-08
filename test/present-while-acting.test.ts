@@ -206,7 +206,7 @@ describe('present while acting', () => {
       type: 'external-message',
       source: 'test',
       content: 'go',
-      metadata: {},
+      metadata: { channelId: 'test:channel' },
     } as unknown as ProcessEvent);
   }
 
@@ -1794,6 +1794,32 @@ describe('present while acting', () => {
 
     await framework.stop();
   });
+
+  it('channel_open keeps a private turn private and leaves its frozen pin unchanged', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c-private', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Still private after open.' }] as ContentBlock[]));
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall = async () =>
+      ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
+    const agent = framework.getAgent('assistant')!;
+    const internals = framework as unknown as { turnRouting: Map<string, { locus?: string; nonChannelOrigin: boolean }> };
+    await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
+      .startAgentStream(agent, {
+        agentName: 'assistant', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
+      });
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, []);
+    assert.equal(internals.turnRouting.get('assistant')?.locus, undefined);
+    assert.equal(internals.turnRouting.get('assistant')?.nonChannelOrigin, true);
+    const results = membrane.lastStream!.receivedToolResults.flat() as Array<{ content?: unknown }>;
+    assert.ok(JSON.stringify(results).includes('plain speech stays private'));
+    await framework.stop();
+  });
+
 
   it('reactions and system markers injected mid-turn do not clear send suppression', async () => {
     // A reaction (`chat:reaction` tag) or a `system: true` marker is not

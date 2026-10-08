@@ -593,6 +593,8 @@ interface TurnRouting {
   deliveries: string[];
   /** Plain-prose segments the turn suppressed, reported by its receipt. */
   suppressed: number;
+  nonChannelOrigin: boolean;
+  privateSuppressed: number;
   /**
    * The messages that would re-pin the locus (repinChannel) that no tool
    * boundary of the turn weighed, in the order they were stored
@@ -625,7 +627,7 @@ interface Arrival {
 function freshTurnRouting(): TurnRouting {
   return {
     engaged: new Set(), destination: null, hybridHold: false,
-    continuation: false, deliveries: [], suppressed: 0, arrivals: [],
+    continuation: false, deliveries: [], suppressed: 0, nonChannelOrigin: false, privateSuppressed: 0, arrivals: [],
   };
 }
 
@@ -8728,7 +8730,7 @@ export class AgentFramework {
             const routing = this.routingOf(agent.name);
             let newLocus: string | undefined;
             for (const inj of midTurnInjections) newLocus = this.repinChannel(inj.metadata, routing) ?? newLocus;
-            if (newLocus) {
+            if (newLocus && !routing.nonChannelOrigin) {
               // What this boundary just stored is newer than any arrival the
               // turn holds, so the arrivals can't move the locus back.
               routing.arrivals = [];
@@ -8800,6 +8802,7 @@ export class AgentFramework {
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               ephemeralSystemPrompt: this.activeTurnTriggers.get(agent.name)?.ephemeralSystemPrompt,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
+              nonChannelOrigin: this.activeTurnTriggers.get(agent.name)?.nonChannelOrigin,
             });
           } else if (currentState.stream) {
             // What this round appends is in the next call's prompt. If that
@@ -8963,6 +8966,7 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
+            nonChannelOrigin: isNonChannelSurfaceEvent(event),
           });
         }
       }
@@ -10482,8 +10486,8 @@ export class AgentFramework {
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
-        channelId: channelReq?.channelId,
-        addressed: addressedReq !== undefined,
+        channelId: trigger.nonChannelOrigin ? undefined : channelReq?.channelId,
+        addressed: trigger.nonChannelOrigin ? false : addressedReq !== undefined,
         // A context-budget restart continues the same logical turn: it keeps
         // the channel for routing but names no author — the restart is its
         // own cause, and borrowing another request's author would be false
@@ -10516,6 +10520,12 @@ export class AgentFramework {
   private recordProseSuppression(routing: TurnRouting, count: number): void {
     if (count <= 0) return;
     routing.suppressed += count;
+  }
+
+  private suppressPrivateTurnProse(routing: TurnRouting, count: number): void {
+    if (count <= 0) return;
+    console.error('[routing] prose NOT auto-published (private non-channel turn)');
+    routing.suppressed += count; routing.privateSuppressed += count;
   }
 
   /** Record a successful plain-prose delivery for this turn's receipt. */
@@ -10558,12 +10568,12 @@ export class AgentFramework {
           : id,
       );
     }
-    const suppressedNote =
-      suppressed > 0
-        ? agent.proseRouting === 'disabled'
-          ? `${suppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)`
-          : `${suppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`
-        : '';
+    const notes: string[] = [];
+    if (routing.privateSuppressed > 0) notes.push(`${routing.privateSuppressed} plain-speech segment(s) kept private (non-channel turn — publish only with an explicit send tool)`);
+    const otherSuppressed = Math.max(0, suppressed - routing.privateSuppressed);
+    if (otherSuppressed > 0) notes.push(agent.proseRouting === 'disabled' ? `${otherSuppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)` : `${otherSuppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`);
+    routing.privateSuppressed = 0;
+    const suppressedNote = notes.join(' · ');
     const text =
       shown.length > 0
         ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}`
@@ -10662,6 +10672,7 @@ export class AgentFramework {
     const open = this.openLogical.get(agentName);
     if (!open) return;
     if ((metadata as { tuneOut?: unknown } | undefined)?.tuneOut) return;
+    if (open.nonChannelOrigin) return;
     const channelId = this.repinChannel(metadata, open);
     if (channelId) open.arrivals.push({ messageId, channelId });
   }
@@ -11509,6 +11520,7 @@ export class AgentFramework {
     }
 
     if (opensTurn) {
+      routing.nonChannelOrigin = trigger?.nonChannelOrigin === true;
       // The turn's trigger channel (item-3 redux): the channel of a
       // channel/DM-triggered turn, and none for a heartbeat / no-trigger
       // turn, which falls back to the global default rather than inheriting
@@ -11527,7 +11539,7 @@ export class AgentFramework {
       // (announce-on-change only — no per-turn chatter, append-only for KV
       // stability).
       if (turnProseRouting !== 'explicit' && turnProseRouting !== 'disabled') {
-        const locus = this.channelRegistry?.resolveLocus(agent.name) ?? null;
+        const locus = routing.nonChannelOrigin ? null : this.channelRegistry?.resolveLocus(agent.name) ?? null;
         if (locus !== null) routing.locus = locus;
         if (attempt === 0) this.announceLocusIfChanged(agent.name, locus);
       }
@@ -12285,6 +12297,8 @@ export class AgentFramework {
                     // private round's, a >>skip_reply envelope's or a target
                     // that didn't resolve leave the destination as it was.
                     proseStream?.retarget(streamRouting.destination);
+                  } else if (streamRouting.nonChannelOrigin) {
+                    this.suppressPrivateTurnProse(streamRouting, roundSegments.length);
                   } else if (turnSilenced) {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (turn silenced)`,
@@ -12750,6 +12764,8 @@ export class AgentFramework {
                 if (turnProseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
                   this.recordProseSuppression(streamRouting, 1);
+                } else if (streamRouting.nonChannelOrigin) {
+                  this.suppressPrivateTurnProse(streamRouting, 1);
                 } else if (turnSilenced && turnProseRouting !== 'explicit') {
                   // Only reachable on a guard recovery that carried the
                   // same-turn send suppression, or a suppressProse trigger
@@ -12854,6 +12870,8 @@ export class AgentFramework {
                     }
                   }
                 }
+              } else if (streamRouting.nonChannelOrigin) {
+                this.suppressPrivateTurnProse(streamRouting, segments.length);
               } else if (silenced || segments.length === 0) {
                 console.error(
                   `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> trailing prose NOT routed ` +
@@ -18069,18 +18087,17 @@ export class AgentFramework {
           if (opened) {
             callingTurn.triggerChannel = opened;
             const openerAgent = this.agents.get(agentName);
-            // The move is one this result tells the agent, so it needs the
-            // turn that called still open. A result that lands after the turn
-            // settled is dropped, so the agent never reads it, whether or not
-            // a later start has replaced the turn's routing state yet: the
-            // turn's locus stays where the agent was last told, for a resume
-            // that opens the turn again, and so does the announce baseline,
-            // which is the agent's across turns.
+            // Only the turn that called may move its own locus. A private
+            // non-channel turn may open for incoming traffic, but its prose
+            // stays private; explicit publish remains available.
+            const privateTurn = callingTurn.nonChannelOrigin;
             if (openerAgent
               && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')
-              && this.openLogical.get(agentName) === callingTurn) {
+              && this.openLogical.get(agentName) === callingTurn
+              && !privateTurn) {
               callingTurn.locus = opened;
               this.lastAnnouncedLocus.set(agentName, opened);
+
               result = {
                 ...result,
                 data: {
@@ -19283,7 +19300,10 @@ export class AgentFramework {
       // are omitted rather than fabricated — the hardcoded 200000 was false
       // for residents configured at 300k/600k.
       model: { id: agent.model },
-      channels: this.channelRegistry?.buildChannelContext(agent.name),
+      channels: this.channelRegistry?.buildChannelContext(agent.name, {
+        frozenLocus: this.turnRouting.get(agent.name)?.locus ?? null,
+        privateTurn: this.turnRouting.get(agent.name)?.nonChannelOrigin === true,
+      }),
     };
   }
 }

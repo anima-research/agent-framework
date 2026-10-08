@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
+import { isNonChannelSurfaceEvent } from '../src/framework.js';
 import type { InferenceRequest } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
@@ -21,6 +22,19 @@ function internals(framework: AgentFramework) {
     startAgentStream(agent: unknown, trigger?: InferenceRequest): Promise<void>;
   };
 }
+
+describe('non-channel surface classification', () => {
+  it('treats an unknown future external-message source as private', () => {
+    assert.equal(isNonChannelSurfaceEvent({
+      type: 'external-message', source: 'future-operator-console', content: 'hello', metadata: {},
+    } as never), true);
+    assert.equal(isNonChannelSurfaceEvent({
+      type: 'external-message', source: 'future-operator-console', content: 'hello', metadata: {},
+      channelId: 'discord:g:room',
+    } as never), false);
+    assert.equal(isNonChannelSurfaceEvent({ type: 'mcpl:channel-incoming', channelId: 'room' } as never), false);
+  });
+});
 
 describe('Turn trigger provenance', () => {
   let tempDir: string;
@@ -164,3 +178,39 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 });
+
+describe('private non-channel trigger batching', () => {
+  let tempDir: string;
+  beforeEach(() => { tempDir = mkdtempSync(join(tmpdir(), 'private-batch-test-')); });
+  afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
+
+  it('does not borrow a sibling channel request from the same batch', async () => {
+    const membrane = new MockMembrane();
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'), membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout' }], modules: [],
+    });
+    const i = internals(framework);
+    const captured: InferenceRequest[] = [];
+    i.startAgentStream = async (_agent: unknown, trigger?: InferenceRequest) => {
+      if (trigger) captured.push(trigger);
+    };
+    const t = Date.now();
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: t, nonChannelOrigin: true },
+      { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t + 1,
+        channelId: 'discord:g:room', addressed: true },
+    );
+    await i.processInferenceRequests();
+    assert.ok(i.pendingRequests.some((r) => r.channelId === 'discord:g:room'));
+    await i.processInferenceRequests();
+    assert.equal(captured[0]?.nonChannelOrigin, true);
+    assert.equal(captured[0]?.channelId, undefined);
+    assert.equal(captured[0]?.addressed, false);
+    assert.equal(captured[1]?.channelId, 'discord:g:room', 'requeued channel request gets its own turn');
+    assert.equal(captured[1]?.addressed, true);
+    await framework.stop();
+  });
+});
+
+

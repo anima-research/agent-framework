@@ -125,7 +125,7 @@ async function run(enabled?: boolean, allowedTools?: string[]) {
     sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
   }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
-  framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+  framework.pushEvent({ type: 'external-message', source: 'test', channelId: 'test:channel', content: 'go', metadata: {} } as unknown as ProcessEvent);
   await framework.runUntilIdle();
   const all = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }>;
   await framework.stop();
@@ -176,7 +176,7 @@ describe('tool wrapper prose guard integration', () => {
       sendOutgoingChunk: (_c: string, _a: string, _id: string, _i: number, delta: string) => { outgoing.push(delta); },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    framework.pushEvent({ type: 'external-message', source: 'test', channelId: 'test:channel', content: 'go', metadata: {} } as unknown as ProcessEvent);
     await framework.runUntilIdle();
     const all = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }>;
     await framework.stop();
@@ -193,7 +193,7 @@ describe('tool wrapper prose guard integration', () => {
       resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent); await framework.runUntilIdle();
+    framework.pushEvent({ type: 'external-message', source: 'test', channelId: 'test:channel', content: 'go', metadata: {} } as unknown as ProcessEvent); await framework.runUntilIdle();
     const all = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }>;
     await framework.stop();
     assert.equal(module.calls, 1); assert.equal(membrane.calls, 2); assert.deepEqual(routed, ['<mcpl--heartbeat--heartbeat_status>\n</mcpl--heartbeat--heartbeat_status>']);
@@ -212,7 +212,7 @@ describe('tool wrapper prose guard integration', () => {
       resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent); await framework.runUntilIdle();
+    framework.pushEvent({ type: 'external-message', source: 'test', channelId: 'test:channel', content: 'go', metadata: {} } as unknown as ProcessEvent); await framework.runUntilIdle();
     const all = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }>;
     await framework.stop();
     assert.equal(module.calls, 1); assert.equal(membrane.calls, 2); assert.deepEqual(routed, ['<mcpl--heartbeat--heartbeat_status>\n</mcpl--heartbeat--heartbeat_status>']);
@@ -235,7 +235,7 @@ describe('tool wrapper prose guard integration', () => {
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     (framework as unknown as Record<string, unknown>).channelEventModule = { getChannelId: () => 'world:test' };
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    framework.pushEvent({ type: 'external-message', source: 'test', channelId: 'test:channel', content: 'go', metadata: {} } as unknown as ProcessEvent);
     await framework.runUntilIdle();
     const all = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }>;
     await framework.stop();
@@ -264,7 +264,7 @@ describe('tool wrapper prose guard integration', () => {
       resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} } as unknown as ProcessEvent);
+    framework.pushEvent({ type: 'external-message', source: 'test', channelId: 'test:channel', content: 'go', metadata: {} } as unknown as ProcessEvent);
     await framework.runUntilIdle();
     const all = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }>;
     await framework.stop();
