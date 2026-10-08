@@ -1760,6 +1760,86 @@ describe('operator-change gate: host/command unstick, planned at staging', () =>
     await assert.rejects(step(change, 2), (e: Error & { code?: string }) => e.code === 'stale' && /active branch moved/.test(e.message));
   });
 
+  // A re-run's outcome, or 'pending' if it hasn't settled while the framework
+  // was driven for `ms`.
+  const outcomeWithin = async (outcome: Promise<unknown>, ms = 3_000) => {
+    let settled: unknown = 'pending';
+    void outcome.then((o) => { settled = o; }, (e) => { settled = e; });
+    const deadline = Date.now() + ms;
+    while (settled === 'pending' && Date.now() < deadline) {
+      await framework.runUntilIdle();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return settled;
+  };
+  // The provider refuses to set up the stream `times` times, then serves.
+  const failSetup = (times: number, message: string) => {
+    const real = membrane.streamYielding.bind(membrane);
+    let left = times;
+    membrane.streamYielding = (...args: Parameters<MockMembrane['streamYielding']>) => {
+      if (left-- > 0) throw new Error(message);
+      return real(...args);
+    };
+    return () => { membrane.streamYielding = real; };
+  };
+  type Policies = {
+    errorPolicy: { onInferenceError: (e: Error, agent: string, attempt: number) => { retry: boolean; delayMs?: number } };
+    providerHoldHook?: (e: Error) => { holdMs: number } | undefined;
+  };
+
+  it('settles and releases a re-run whose turn fails before its stream starts: its caller hears, and the agent is not left busy', async () => {
+    await unstick(3);
+    const change = asked[0]!;
+    await step(change, 1);
+    (framework as unknown as Policies).errorPolicy = { onInferenceError: () => ({ retry: false }) };
+    const undoSetup = failSetup(1, 'provider setup refused the request');
+    try {
+      const outcome = await outcomeWithin(framework.rerunUnstick(change as never, { step: 1 }));
+      assert.deepEqual(outcome, { step: 1, status: 'completed', outcome: 'failed', error: 'provider setup refused the request' });
+    } finally {
+      undoSetup();
+    }
+    assert.equal(host().unstickAttemptWaiters.size, 0, 'released');
+    assert.deepEqual(framework.getUnstickOperation(change.id)!.attempts,
+      [{ step: 1, status: 'completed', outcome: 'failed', error: 'provider setup refused the request' }], 'journaled');
+    // The agent isn't held busy: another operation's re-run starts and runs.
+    await unstick(1);
+    const other = asked[1]!;
+    await step(other, 1);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answered' }]));
+    const second = await outcomeWithin(framework.rerunUnstick(other as never, { step: 1 }));
+    assert.deepEqual(second, { step: 1, status: 'completed', outcome: 'responded' });
+  });
+
+  it('keeps a re-run bound through a setup retry and a provider hold, reporting the turn that finally ran', async () => {
+    await unstick(3);
+    const change = asked[0]!;
+    await step(change, 1);
+    (framework as unknown as Policies).errorPolicy = {
+      onInferenceError: (_e, _agent, attempt) => (attempt < 1 ? { retry: true, delayMs: 1 } : { retry: false }),
+    };
+    let undoSetup = failSetup(1, 'transient setup failure');
+    try {
+      membrane.pushResponse(refusal());
+      const retried = await outcomeWithin(framework.rerunUnstick(change as never, { step: 1 }));
+      assert.deepEqual(retried, { step: 1, status: 'completed', outcome: 'refused', category: 'unknown' }, 'the retried turn\'s own outcome');
+    } finally {
+      undoSetup();
+    }
+    await step(change, 2);
+    let holds = 1; // the host holds once; asked again when the slice expires, it releases
+    (framework as unknown as Policies).providerHoldHook = (e) => (/quota/.test(e.message) && holds-- > 0 ? { holdMs: 1_000 } : undefined);
+    undoSetup = failSetup(1, 'quota exhausted for now');
+    try {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'back' }]));
+      const held = await outcomeWithin(framework.rerunUnstick(change as never, { step: 2 }), 6_000);
+      assert.deepEqual(held, { step: 2, status: 'completed', outcome: 'responded' }, 'held, then run: not failed by the hold');
+    } finally {
+      undoSetup();
+    }
+    assert.equal(host().unstickAttemptWaiters.size, 0);
+  });
+
   it('finishes an interrupted step on its planned exchange, never another', async () => {
     await unstick(2);
     const change = asked[0]!;

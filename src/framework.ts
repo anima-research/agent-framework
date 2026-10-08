@@ -12273,7 +12273,29 @@ export class AgentFramework {
         this.activeTurnTriggers.delete(agent.name);
       }
       if (!tokenHandedOff && ownsProviderGate) this.releasePrimaryProviderGate(agent.name);
+      // An unstick re-run whose turn ended before any stream started (setup
+      // failed terminally, the agent was replaced, or something threw before
+      // the stream) has its outcome now, unless a retry, a requeue or a
+      // provider hold carries it on. Released last, once the turn is over,
+      // as driveStream's teardown releases it.
+      if (!tokenHandedOff && trigger?.unstick && !this.unstickRunCarried(agent.name, trigger.unstick)) {
+        this.settleUnstickAttempt(trigger.unstick, 'failed', { error: 'the re-run ended before its stream started' });
+        this.releaseUnstickAttempt(trigger.unstick);
+      }
     }
+  }
+
+  /** Whether an unstick re-run's binding still travels with a turn that may
+   *  run: the agent's live turn (a retry frame that started its stream), a
+   *  queued request (a requeue, or a budget restart), or a request a provider
+   *  hold keeps. Another turn carries it only if it is bound to the same
+   *  operation and step. */
+  private unstickRunCarried(agentName: string, binding: { operationId: string; step: number }): boolean {
+    const carries = (r: InferenceRequest | undefined) =>
+      r?.unstick?.operationId === binding.operationId && r.unstick.step === binding.step;
+    return carries(this.activeTurnTriggers.get(agentName))
+      || this.pendingRequests.some((r) => r.agentName === agentName && carries(r))
+      || (this.providerAccelerationCooldowns.get(agentName)?.heldRequests.some(carries) ?? false);
   }
 
   /**
@@ -12610,6 +12632,9 @@ export class AgentFramework {
           speech: '',
           error: err.message,
         });
+        // An unstick re-run failed with the provider's error; the caller's
+        // finally (startAgentStream) releases it once the turn is over.
+        if (trigger?.unstick) this.settleUnstickAttempt(trigger.unstick, 'failed', { error: err.message });
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
