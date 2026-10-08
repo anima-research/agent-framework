@@ -16,20 +16,27 @@
  * - **One deadline per tool call** (`requestTimeoutMs`, always positive)
  *   bounds every leg of the call. At the deadline the SDK requests
  *   cancellation and the outcome is unknown. Calls are never replayed.
+ * - **Request outcomes from the wire.** A failed call is classified by what
+ *   crossed Connectome's transport boundary, never by the error's class. The
+ *   SDK raises the same error classes locally (an invalid outputSchema before
+ *   dispatch, output validation after a successful result) as it does for
+ *   server answers.
  * - **Lifetime.** On a lost transport the connection restarts with the same
- *   backoff settings as legacy, when `reconnect` is set. A lost list-change
- *   stream is reopened while the connection lives. Each connect is a
- *   generation, so a superseded client can never touch a newer one.
+ *   backoff settings as legacy, when `reconnect` is set. List-change
+ *   awareness is kept while the connection lives: a subscription the server
+ *   advertises but that didn't open, or that ended, is reopened. Each connect
+ *   is a generation, so a superseded client never touches a newer one.
+ *   `close()` owns a connect in flight too.
  *
  * Nothing here is MCPL: a modern server has no grant, no planes and no
  * server→host requests. The framework uses this connection only through its
  * tool paths, and the MCPL machinery never sees it.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { EventEmitter } from 'node:events';
 
 import {
   Client,
-  ProtocolError,
   SdkError,
   SdkErrorCode,
   SdkHttpError,
@@ -38,7 +45,9 @@ import {
   type CallToolResult,
   type JSONRPCMessage,
   type McpSubscription,
+  type MessageExtraInfo,
   type Transport,
+  type TransportSendOptions,
 } from '@modelcontextprotocol/client';
 
 import { StdioTransport, type McplTransport } from './transport.js';
@@ -63,6 +72,102 @@ export interface ModernToolCallResult {
 }
 
 /**
+ * What crossed Connectome's transport boundary for one logical request: were
+ * any of its requests handed to the transport, and how did the server answer
+ * the most recent one? A logical call can take several legs: a
+ * header-mismatch retry, or the rounds of an `input_required` continuation.
+ */
+interface WireRecord {
+  readonly method: string;
+  handedOff: boolean;
+  currentId?: string | number;
+  answer: 'none' | 'result' | 'error';
+  error?: { code: number; message: string; data?: unknown };
+}
+
+/** The logical request a send belongs to. The SDK hands each request to the
+ *  transport inside the caller's async chain, so the scope reaches `send`. */
+const wireScope = new AsyncLocalStorage<WireRecord>();
+
+/**
+ * The boundary between the SDK and the actual transport. It records, for the
+ * logical request in scope, each request of the observed method that it
+ * hands on, and the answer that comes back for it. Everything else passes
+ * through untouched: the SDK sees the inner transport's own members.
+ */
+class ObservedTransport implements Transport {
+  onclose?: () => void;
+  onerror?: (error: Error) => void;
+  onmessage?: <T extends JSONRPCMessage>(message: T, extra?: MessageExtraInfo) => void;
+  private readonly awaiting = new Map<string | number, WireRecord>();
+
+  constructor(private readonly inner: Transport) {}
+
+  get sessionId(): string | undefined {
+    return this.inner.sessionId;
+  }
+
+  get hasPerRequestStream(): boolean | undefined {
+    return this.inner.hasPerRequestStream;
+  }
+
+  setProtocolVersion(version: string): void {
+    this.inner.setProtocolVersion?.(version);
+  }
+
+  setSupportedProtocolVersions(versions: string[]): void {
+    this.inner.setSupportedProtocolVersions?.(versions);
+  }
+
+  async start(): Promise<void> {
+    this.inner.onmessage = (message, extra) => {
+      this.observe(message);
+      this.onmessage?.(message, extra);
+    };
+    this.inner.onerror = (error) => this.onerror?.(error);
+    this.inner.onclose = () => this.onclose?.();
+    await this.inner.start();
+  }
+
+  async send(message: JSONRPCMessage, options?: TransportSendOptions): Promise<void> {
+    const record = wireScope.getStore();
+    if (record && 'method' in message && 'id' in message && message.method === record.method) {
+      // Handed off from here on: past this point nothing proves it unsent.
+      record.handedOff = true;
+      record.currentId = message.id;
+      record.answer = 'none';
+      record.error = undefined;
+      this.awaiting.set(message.id, record);
+    }
+    await this.inner.send(message, options);
+  }
+
+  async close(): Promise<void> {
+    await this.inner.close();
+  }
+
+  /** Drop a finished request's entries (unanswered legs included). */
+  forget(record: WireRecord): void {
+    for (const [id, entry] of this.awaiting) if (entry === record) this.awaiting.delete(id);
+  }
+
+  private observe(message: JSONRPCMessage): void {
+    if (!('id' in message) || (!('result' in message) && !('error' in message))) return;
+    const record = this.awaiting.get(message.id as string | number);
+    if (!record) return;
+    this.awaiting.delete(message.id as string | number);
+    // A superseded leg's late answer says nothing about the current one.
+    if (record.currentId !== message.id) return;
+    if ('error' in message) {
+      record.answer = 'error';
+      record.error = message.error as WireRecord['error'];
+    } else {
+      record.answer = 'result';
+    }
+  }
+}
+
+/**
  * SDK `Transport` over Connectome's stdio spawner. Framing is the same
  * newline-delimited JSON-RPC as legacy. Lines that are not JSON are ignored,
  * as the legacy engine ignores them. Because this is a custom transport, the
@@ -73,7 +178,7 @@ export interface ModernToolCallResult {
 class SpawnerStdioTransport implements Transport {
   onclose?: () => void;
   onerror?: (error: Error) => void;
-  onmessage?: (message: JSONRPCMessage) => void;
+  onmessage?: <T extends JSONRPCMessage>(message: T, extra?: MessageExtraInfo) => void;
   private line: McplTransport | null = null;
 
   constructor(
@@ -137,6 +242,13 @@ function bearerAuth(config: McplServerConfig): AuthProvider | undefined {
   };
 }
 
+/** One connect generation's client and the boundary it talks through. */
+interface Session {
+  readonly generation: number;
+  readonly client: Client;
+  readonly wire: ObservedTransport;
+}
+
 export class ModernMcpConnection extends EventEmitter {
   readonly id: string;
   readonly family = 'modern' as const;
@@ -144,8 +256,9 @@ export class ModernMcpConnection extends EventEmitter {
   /** The pinned revision, once a connect has established it; null before. */
   protocolVersion: string | null = null;
 
-  private client: Client | null = null;
-  private connected = false;
+  private session: Session | null = null;
+  /** A connect in flight, owned so `close()` can end it. */
+  private opening: { session: Session; done: Promise<void> } | null = null;
   private generation = 0;
   private closedByHost = false;
   private readonly reconnectEnabled: boolean;
@@ -153,7 +266,8 @@ export class ModernMcpConnection extends EventEmitter {
   private readonly reconnectMaxIntervalMs: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
-  private relistenTimer: ReturnType<typeof setTimeout> | null = null;
+  /** At most one pending reopen, and only ever for the current generation. */
+  private relisten: { generation: number; timer: ReturnType<typeof setTimeout> } | null = null;
   private relistenAttempts = 0;
 
   private constructor(private readonly config: McplServerConfig) {
@@ -180,7 +294,7 @@ export class ModernMcpConnection extends EventEmitter {
   }
 
   get isConnected(): boolean {
-    return this.connected;
+    return this.session !== null;
   }
 
   /** Whether a lost connection will be re-established in the background. */
@@ -209,14 +323,18 @@ export class ModernMcpConnection extends EventEmitter {
     return connection;
   }
 
-  /** One connect generation: a fresh client and transport. */
+  private isCurrent(generation: number): boolean {
+    return generation === this.generation && !this.closedByHost;
+  }
+
+  /** One connect generation: a fresh client over a fresh transport. */
   private async open(): Promise<void> {
     const generation = ++this.generation;
-    const live = () => generation === this.generation && !this.closedByHost;
-
-    const transport: Transport = this.transportKind === 'stdio'
-      ? new SpawnerStdioTransport(this.config, (line) => { if (live()) this.emit('stderr', { line }); })
+    this.cancelRelisten();
+    const inner: Transport = this.transportKind === 'stdio'
+      ? new SpawnerStdioTransport(this.config, (line) => { if (this.isCurrent(generation)) this.emit('stderr', { line }); })
       : new StreamableHTTPClientTransport(new URL(this.config.url!), { authProvider: bearerAuth(this.config) });
+    const wire = new ObservedTransport(inner);
 
     const client = new Client(
       { name: 'agent-framework', version: '1.0.0' },
@@ -229,77 +347,98 @@ export class ModernMcpConnection extends EventEmitter {
           tools: {
             autoRefresh: false,
             debounceMs: 0,
-            onChanged: () => { if (live()) this.emit('tools-list-changed'); },
+            onChanged: () => { if (this.isCurrent(generation)) this.emit('tools-list-changed'); },
           },
         },
       },
     );
     client.onerror = (error: Error) => {
       // The SDK reports late responses to deadline-abandoned calls here
-      // ("unknown message ID"), among other out-of-band errors. They are
-      // logged, never delivered: the call's outcome was already reported.
-      if (live()) this.emit('error', error);
+      // ("unknown message ID"), and a list-change subscription it could not
+      // open at connect, among other out-of-band errors. They are logged,
+      // never delivered: the call's outcome was already reported.
+      if (this.isCurrent(generation)) this.emit('error', error);
     };
     client.onclose = () => {
-      if (live()) this.handleLost('transport closed');
+      if (this.isCurrent(generation)) this.handleLost(generation, 'transport closed');
     };
 
+    const session: Session = { generation, client, wire };
+    const done = client.connect(wire, { timeout: CONNECT_TIMEOUT_MS });
+    this.opening = { session, done };
     try {
-      await client.connect(transport, { timeout: CONNECT_TIMEOUT_MS });
+      await done;
     } catch (error) {
       await client.close().catch(() => {});
+      await wire.close().catch(() => {});
       throw error;
+    } finally {
+      if (this.opening?.session === session) this.opening = null;
     }
-    if (!live()) {
+    if (!this.isCurrent(generation)) {
+      // Superseded or closed while connecting: this generation never serves.
       await client.close().catch(() => {});
+      await wire.close().catch(() => {});
       return;
     }
-    this.client = client;
-    this.connected = true;
+    this.session = session;
     this.protocolVersion = MODERN_MCP_PROTOCOL_VERSION;
     this.reconnectAttempts = 0;
-    this.watchSubscription(client.autoOpenedSubscription, generation);
+    this.keepListening(session, client.autoOpenedSubscription);
   }
 
   /**
-   * Keep list-change awareness while the connection lives. The SDK opens the
-   * subscription at connect when the server advertises tool list changes.
-   * When the subscription ends without our asking, it is reopened with
-   * backoff, and the inventory is refreshed once it's back, since changes
-   * may have been missed in between. A transport loss is the reconnect
-   * path's job, not this one's.
+   * Keep list-change awareness while this generation lives. The SDK opens the
+   * subscription at connect when the server advertises tool list changes. If
+   * that open failed (the SDK reports it through `onerror` and connects
+   * anyway), or the subscription later ends without our asking, it is
+   * reopened with backoff. Once it's back the inventory is refreshed, since
+   * changes may have been missed. A lost transport is the reconnect path's
+   * job, not this one's.
    */
-  private watchSubscription(subscription: McpSubscription | undefined, generation: number): void {
-    if (!subscription) return;
+  private keepListening(session: Session, subscription: McpSubscription | undefined): void {
+    if (!session.client.getServerCapabilities()?.tools?.listChanged) return;
+    if (!subscription) {
+      this.scheduleRelisten(session.generation);
+      return;
+    }
     void subscription.closed.then((reason) => {
-      if (reason === 'local' || generation !== this.generation || this.closedByHost || !this.connected) return;
-      this.scheduleRelisten(generation);
+      if (reason === 'local' || this.session !== session || !this.isCurrent(session.generation)) return;
+      this.scheduleRelisten(session.generation);
     });
   }
 
-  private scheduleRelisten(generation: number): void {
-    if (this.relistenTimer) return;
-    const delay = this.backoffDelay(this.relistenAttempts);
-    this.relistenTimer = setTimeout(() => {
-      this.relistenTimer = null;
-      void this.relisten(generation);
-    }, delay);
-    this.relistenTimer.unref?.();
+  private cancelRelisten(): void {
+    if (this.relisten) clearTimeout(this.relisten.timer);
+    this.relisten = null;
   }
 
-  private async relisten(generation: number): Promise<void> {
-    const client = this.client;
-    if (!client || generation !== this.generation || this.closedByHost || !this.connected) return;
+  private scheduleRelisten(generation: number): void {
+    if (!this.isCurrent(generation)) return;
+    if (this.relisten?.generation === generation) return;
+    this.cancelRelisten();
+    const timer = setTimeout(() => {
+      if (this.relisten?.timer === timer) this.relisten = null;
+      void this.reopenSubscription(generation);
+    }, this.backoffDelay(Math.max(1, this.relistenAttempts)));
+    timer.unref?.();
+    this.relisten = { generation, timer };
+  }
+
+  private async reopenSubscription(generation: number): Promise<void> {
+    const session = this.session;
+    if (!session || session.generation !== generation || !this.isCurrent(generation)) return;
     try {
-      const subscription = await client.listen({ toolsListChanged: true }, { timeout: CONNECT_TIMEOUT_MS });
-      if (generation !== this.generation || this.closedByHost) {
+      const subscription = await session.client.listen({ toolsListChanged: true }, { timeout: CONNECT_TIMEOUT_MS });
+      if (this.session !== session || !this.isCurrent(generation)) {
         await subscription.close().catch(() => {});
         return;
       }
       this.relistenAttempts = 0;
-      this.watchSubscription(subscription, generation);
+      this.keepListening(session, subscription);
       this.emit('tools-list-changed');
     } catch (error) {
+      if (this.session !== session || !this.isCurrent(generation)) return;
       this.relistenAttempts++;
       this.emit('error', new Error(`MCP server "${this.id}" could not reopen its list-change subscription: ${(error as Error).message}`));
       this.scheduleRelisten(generation);
@@ -307,10 +446,10 @@ export class ModernMcpConnection extends EventEmitter {
   }
 
   /** The transport went away (child exit, or a closed HTTP client). */
-  private handleLost(reason: string): void {
-    if (!this.connected) return;
-    this.connected = false;
-    this.client = null;
+  private handleLost(generation: number, reason: string): void {
+    if (this.session?.generation !== generation) return;
+    this.session = null;
+    this.cancelRelisten();
     this.emit('close', { reason });
     if (this.willReconnect) this.scheduleReconnect();
   }
@@ -332,34 +471,41 @@ export class ModernMcpConnection extends EventEmitter {
   }
 
   private async attemptReconnect(): Promise<void> {
-    if (!this.willReconnect || this.connected) return;
+    if (!this.willReconnect || this.session) return;
     const attempt = Math.max(1, this.reconnectAttempts);
     try {
       await this.open();
-      if (!this.connected) return;
+      if (!this.session) return;
       console.error(`MCP server "${this.id}" reconnected`);
       this.emit('reconnect', { attempts: attempt });
     } catch (error) {
+      if (this.closedByHost) return;
       this.reconnectAttempts = attempt + 1;
       this.emit('reconnect-failed', { error: (error as Error).message, attempt });
       this.scheduleReconnect();
     }
   }
 
-  /** The server's complete tool inventory (the SDK follows every page). */
+  /**
+   * The server's complete tool inventory. The SDK follows every page; one
+   * budget, {@link LIST_TIMEOUT_MS}, bounds the whole walk, not each page.
+   * Its failures use the request-outcome contract with `tools/list` as the
+   * observed method. A relist the SDK makes inside a tool call is auxiliary
+   * to that call, and leaves the call's evidence alone.
+   */
   async listTools(): Promise<McpToolDefinition[]> {
-    const client = this.requireClient('tools/list');
-    try {
-      const { tools } = await client.listTools(undefined, { cacheMode: 'refresh', timeout: LIST_TIMEOUT_MS });
-      return tools.map((tool) => ({
-        name: tool.name,
-        ...(tool.description !== undefined ? { description: tool.description } : {}),
-        inputSchema: tool.inputSchema as Record<string, unknown>,
-        ...(tool._meta !== undefined ? { _meta: tool._meta as Record<string, unknown> } : {}),
-      }));
-    } catch (error) {
-      throw this.requestFailure('tools/list', error);
-    }
+    const { tools } = await this.request('tools/list', 'tools/list', (client) =>
+      client.listTools(undefined, {
+        cacheMode: 'refresh',
+        timeout: LIST_TIMEOUT_MS,
+        signal: AbortSignal.timeout(LIST_TIMEOUT_MS),
+      }), LIST_TIMEOUT_MS);
+    return tools.map((tool) => ({
+      name: tool.name,
+      ...(tool.description !== undefined ? { description: tool.description } : {}),
+      inputSchema: tool.inputSchema as Record<string, unknown>,
+      ...(tool._meta !== undefined ? { _meta: tool._meta as Record<string, unknown> } : {}),
+    }));
   }
 
   /**
@@ -369,87 +515,103 @@ export class ModernMcpConnection extends EventEmitter {
    * before dispatch (an auth refresh, or a header-mismatch relist).
    */
   async callTool(name: string, args: Record<string, unknown>): Promise<ModernToolCallResult> {
-    const client = this.requireClient('tools/call');
     const timeoutMs = this.requestTimeoutMs;
-    try {
-      const result = await client.callTool(
+    const result = await this.request('tools/call', `tools/call "${name}"`, (client) =>
+      client.callTool(
         { name, arguments: args },
         { timeout: timeoutMs, maxTotalTimeout: timeoutMs, signal: AbortSignal.timeout(timeoutMs) },
-      );
-      return {
-        content: result.content ?? [],
-        ...(result.isError !== undefined ? { isError: result.isError } : {}),
-        ...('structuredContent' in result ? { structuredContent: result.structuredContent } : {}),
-        ...(result._meta !== undefined ? { _meta: result._meta as Record<string, unknown> } : {}),
-      };
+      ), timeoutMs);
+    return {
+      content: result.content ?? [],
+      ...(result.isError !== undefined ? { isError: result.isError } : {}),
+      ...('structuredContent' in result ? { structuredContent: result.structuredContent } : {}),
+      ...(result._meta !== undefined ? { _meta: result._meta as Record<string, unknown> } : {}),
+    };
+  }
+
+  /** Run one logical request in a wire scope, and classify its failure by
+   *  what that scope saw. */
+  private async request<T>(method: string, what: string, run: (client: Client) => Promise<T>, timeoutMs?: number): Promise<T> {
+    const session = this.session;
+    if (!session) {
+      // Connectome refuses before anything reaches the SDK: provably not sent.
+      throw new McplRequestError(`Cannot send ${what}: connection to "${this.id}" is not established`, 'not-sent');
+    }
+    const record: WireRecord = { method, handedOff: false, answer: 'none' };
+    try {
+      return await wireScope.run(record, () => run(session.client));
     } catch (error) {
-      throw this.requestFailure(`tools/call "${name}"`, error, timeoutMs);
+      throw this.requestFailure(what, record, error, timeoutMs);
+    } finally {
+      session.wire.forget(record);
     }
   }
 
-  /** Close for good: no reconnect, no reopened subscription. */
+  /** Close for good: no reconnect, no reopened subscription, no connect left
+   *  in flight. Awaits the in-flight connect's end. */
   async close(): Promise<void> {
     this.closedByHost = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    if (this.relistenTimer) clearTimeout(this.relistenTimer);
     this.reconnectTimer = null;
-    this.relistenTimer = null;
-    const client = this.client;
-    const wasConnected = this.connected;
-    this.client = null;
-    this.connected = false;
-    if (client) await client.close().catch(() => {});
-    if (wasConnected) this.emit('close', { reason: 'closed by host' });
-  }
-
-  /** Connectome refuses before anything reaches the SDK: provably not sent. */
-  private requireClient(method: string): Client {
-    if (!this.client || !this.connected) {
-      throw new McplRequestError(`Cannot send ${method}: connection to "${this.id}" is not established`, 'not-sent');
+    this.cancelRelisten();
+    const opening = this.opening;
+    if (opening) {
+      // Closing the transport ends the probe; the connect then rejects and
+      // its own cleanup runs. Wait for that, so nothing outlives close().
+      await opening.session.wire.close().catch(() => {});
+      await opening.session.client.close().catch(() => {});
+      await opening.done.catch(() => {});
     }
-    return this.client;
+    const session = this.session;
+    this.session = null;
+    if (session) {
+      await session.client.close().catch(() => {});
+      await session.wire.close().catch(() => {});
+      this.emit('close', { reason: 'closed by host' });
+    }
   }
 
   /**
-   * Map an SDK failure onto the request-outcome contract, claiming no more
-   * than the failure establishes:
-   * - `error-response`: the server answered with an error. That is a
-   *   JSON-RPC error, or an HTTP auth refusal, which carries the status as
-   *   its code.
-   * - `no-response`: everything after hand-off that proves nothing about
-   *   delivery, including the deadline, where cancellation was requested and
-   *   the outcome is unknown.
-   * A call the server answered with a result Connectome can't use (it fails
-   * validation, or needs input this client can't supply) is a plain error:
-   * the server did act, so no request outcome applies.
+   * Map a failure onto the request-outcome contract by what crossed the
+   * transport boundary for this request, claiming no more than that shows:
+   * - nothing handed to the transport: `not-sent`, whatever the SDK raised
+   *   (a pre-dispatch validation, a signal already aborted, no transport);
+   * - an HTTP 401/403 refusal: `error-response`. The server answered, at the
+   *   HTTP layer, so the status is in `data.httpStatus` and `code` stays the
+   *   JSON-RPC code space's (absent);
+   * - the most recent leg answered with a JSON-RPC error: `error-response`
+   *   with that error's code and data;
+   * - the most recent leg answered with a result: the server acted, but what
+   *   it returned can't be used (output validation, input this client can't
+   *   supply, a rounds cap). That's a plain error, not a request outcome;
+   * - handed off and unanswered: `no-response`. At the deadline, cancellation
+   *   was requested and the outcome is unknown.
    */
-  private requestFailure(what: string, error: unknown, timeoutMs?: number): Error {
+  private requestFailure(what: string, record: WireRecord, error: unknown, timeoutMs?: number): Error {
     const prefix = `MCP server "${this.id}"`;
-    if (error instanceof ProtocolError) {
-      return new McplRequestError(`${prefix} returned error for ${what}: [${error.code}] ${error.message}`, 'error-response', error.code, error.data);
-    }
-    if (error instanceof SdkHttpError && (error.code === SdkErrorCode.ClientHttpAuthentication || error.code === SdkErrorCode.ClientHttpForbidden)) {
-      return new McplRequestError(`${prefix} refused ${what}: HTTP ${error.status} (${error.message})`, 'error-response', error.status, error.data);
-    }
-    if (error instanceof SdkError) {
-      switch (error.code) {
-        case SdkErrorCode.RequestTimeout:
-          return new McplRequestError(
-            `${prefix} did not answer ${what}${timeoutMs ? ` within ${timeoutMs}ms` : ''}. Cancellation was requested; ` +
-              `the outcome is unknown: the tool may still complete server-side. Verify state before retrying; ` +
-              `a blind retry of a side-effecting tool may duplicate it.`,
-            'no-response',
-          );
-        case SdkErrorCode.InvalidResult:
-        case SdkErrorCode.UnsupportedResultType:
-        case SdkErrorCode.InputRequiredRoundsExceeded:
-        case SdkErrorCode.CapabilityNotSupported:
-          return new Error(`${prefix} answered ${what}, but the result can't be used: ${error.message}`);
-        default:
-          return new McplRequestError(`${prefix} ${what} failed: ${error.message}`, 'no-response');
-      }
-    }
     const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof SdkHttpError && (error.code === SdkErrorCode.ClientHttpAuthentication || error.code === SdkErrorCode.ClientHttpForbidden)) {
+      const data = error.data && typeof error.data === 'object' ? error.data : {};
+      return new McplRequestError(`${prefix} refused ${what}: HTTP ${error.status} (${message})`, 'error-response', undefined, { ...data, httpStatus: error.status });
+    }
+    if (!record.handedOff) {
+      return new McplRequestError(`${prefix} ${what} was not sent: ${message}`, 'not-sent');
+    }
+    if (record.answer === 'error' && record.error) {
+      const { code, message: wireMessage, data } = record.error;
+      return new McplRequestError(`${prefix} returned error for ${what}: [${code}] ${wireMessage}`, 'error-response', code, data);
+    }
+    if (record.answer === 'result') {
+      return new Error(`${prefix} answered ${what}, but the result can't be used: ${message}`);
+    }
+    if (error instanceof SdkError && error.code === SdkErrorCode.RequestTimeout) {
+      return new McplRequestError(
+        `${prefix} did not answer ${what}${timeoutMs ? ` within ${timeoutMs}ms` : ''}. Cancellation was requested; ` +
+          `the outcome is unknown: the tool may still complete server-side. Verify state before retrying; ` +
+          `a blind retry of a side-effecting tool may duplicate it.`,
+        'no-response',
+      );
+    }
     return new McplRequestError(`${prefix} ${what} failed: ${message}`, 'no-response');
   }
 }

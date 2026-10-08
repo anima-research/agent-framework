@@ -917,10 +917,12 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * Send `tools/list` and return the server's complete tool inventory,
-   * following `nextCursor` across pages (2024-11-05 pagination). A server
-   * whose cursors don't terminate — a repeated cursor, or more than
-   * {@link MAX_TOOL_LIST_PAGES} pages — gets an error rather than a silently
-   * partial inventory.
+   * following `nextCursor` across pages (2024-11-05 pagination). Cursors are
+   * opaque strings, `''` included: only an absent `nextCursor` ends the
+   * inventory. A page that isn't well formed (no `tools` array, a cursor
+   * that isn't a string), or cursors that don't terminate (a repeat, or more
+   * than {@link MAX_TOOL_LIST_PAGES} pages), are errors, never a partial or
+   * empty inventory published as complete.
    */
   async sendToolsList(): Promise<{ tools: McpToolDefinition[] }> {
     const tools: McpToolDefinition[] = [];
@@ -928,17 +930,22 @@ export class McplServerConnection extends EventEmitter {
     let cursor: string | undefined;
     let first: Record<string, unknown> | undefined;
     for (let page = 0; page < MAX_TOOL_LIST_PAGES; page++) {
-      const result = await this.sendRequest('tools/list', cursor === undefined ? {} : { cursor }) as {
-        tools?: McpToolDefinition[];
-        nextCursor?: unknown;
-      };
+      const result = await this.sendRequest('tools/list', cursor === undefined ? {} : { cursor }) as Record<string, unknown> | null;
+      const malformed = (why: string) =>
+        new Error(`MCPL server "${this.id}" sent a malformed tools/list page ${page + 1}: ${why}`);
+      if (!result || typeof result !== 'object' || !Array.isArray(result.tools)) {
+        throw malformed('no tools array');
+      }
       first ??= result;
-      tools.push(...(result.tools ?? []));
-      if (typeof result.nextCursor !== 'string' || result.nextCursor === '') {
+      tools.push(...(result.tools as McpToolDefinition[]));
+      if (result.nextCursor === undefined) {
         // The first page's other fields are kept as they came, so a
         // single-page answer is returned exactly as before.
         const { nextCursor: _done, ...rest } = first as { nextCursor?: unknown };
         return { ...rest, tools };
+      }
+      if (typeof result.nextCursor !== 'string') {
+        throw malformed(`nextCursor must be a string, got ${JSON.stringify(result.nextCursor)}`);
       }
       if (seen.has(result.nextCursor)) {
         throw new Error(`MCPL server "${this.id}" repeated tools/list cursor ${JSON.stringify(result.nextCursor)}`);

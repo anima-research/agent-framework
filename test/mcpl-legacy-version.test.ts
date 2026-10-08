@@ -132,10 +132,21 @@ test('tools/list follows nextCursor to the complete inventory', async () => {
   assert.deepEqual(tools.map((t) => t.name), ['a1', 'a2', 'b1', 'c1', 'die']);
 });
 
-test('an empty nextCursor ends the inventory', async () => {
+test('an empty-string cursor is a cursor: only an absent nextCursor ends the inventory', async () => {
   const connection = await connect(config('ok', { env: { MODE_LIST: 'empty' } }));
   const { tools } = await connection.sendToolsList();
-  assert.deepEqual(tools.map((t) => t.name), ['only']);
+  assert.deepEqual(tools.map((t) => t.name), ['first', 'second']);
+});
+
+test('a malformed page is an error, never a partial or empty inventory', async () => {
+  for (const [mode, pattern] of [
+    ['notools', /malformed tools\/list page 1: no tools array/],
+    ['badcursor', /malformed tools\/list page 1: nextCursor must be a string, got 5/],
+    ['nullcursor', /malformed tools\/list page 1: nextCursor must be a string, got null/],
+  ] as const) {
+    const connection = await connect(config('ok', { env: { MODE_LIST: mode } }));
+    await assert.rejects(connection.sendToolsList(), pattern, mode);
+  }
 });
 
 test('a repeating cursor is an error, not a silently partial inventory', async () => {

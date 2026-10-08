@@ -122,7 +122,7 @@ test('HTTP: a credential the server keeps refusing fails the connect, naming 401
   await assert.rejects(ModernMcpConnection.connect({ id: 'remote', url, token: 'stale' }), /401/);
 });
 
-test('HTTP: an auth wall on a call is an error-response carrying the status', async () => {
+test('HTTP: an auth wall on a call is an error-response with the status in data', async () => {
   let allow = true;
   const { url, server } = await startServer(() => allow);
   cleanups.push(() => new Promise<void>((resolve) => { server.closeAllConnections?.(); server.close(() => resolve()); }));
@@ -132,7 +132,9 @@ test('HTTP: an auth wall on a call is an error-response carrying the status', as
   await assert.rejects(connection.callTool('echo', { text: 'x' }), (err: unknown) => {
     assert.ok(err instanceof McplRequestError);
     assert.equal(err.outcome, 'error-response');
-    assert.equal(err.code, 401);
+    // The status is HTTP's, not a JSON-RPC code: it rides in data.
+    assert.equal(err.code, undefined);
+    assert.equal((err.data as { httpStatus?: number }).httpStatus, 401);
     return true;
   });
 });

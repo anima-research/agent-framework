@@ -9,9 +9,10 @@
 //   missing       no protocolVersion at all
 //   ok-then-reject  `ok` on the first start recorded in startLog, `reject` after
 //
-// tools/list pages: `ok` serves three pages (cursors p2, p3). Tool `cursor-loop`
-// mode is selected with MODE_LIST=loop (always nextCursor "same") or
-// MODE_LIST=empty (nextCursor ""). Tool `die` exits the process.
+// tools/list pages: by default three pages (cursors p2, p3). MODE_LIST picks
+// an edge case: loop (always nextCursor "same"), empty (nextCursor "" then a
+// second page), notools (no tools array), badcursor (nextCursor 5),
+// nullcursor (nextCursor null). Tool `die` exits the process.
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 
 let mode = process.argv[2] ?? 'ok';
@@ -49,7 +50,12 @@ process.stdin.on('data', (chunk) => {
     } else if (m.method === 'tools/list') {
       const cursor = m.params?.cursor;
       if (listMode === 'loop') reply(m.id, { tools: [tool(`loop-${cursor ?? 'first'}`)], nextCursor: 'same' });
-      else if (listMode === 'empty') reply(m.id, { tools: [tool('only')], nextCursor: '' });
+      // '' is an opaque cursor like any other: it continues to a second page.
+      else if (listMode === 'empty' && cursor === undefined) reply(m.id, { tools: [tool('first')], nextCursor: '' });
+      else if (listMode === 'empty' && cursor === '') reply(m.id, { tools: [tool('second')] });
+      else if (listMode === 'notools') reply(m.id, {});
+      else if (listMode === 'badcursor') reply(m.id, { tools: [tool('x')], nextCursor: 5 });
+      else if (listMode === 'nullcursor') reply(m.id, { tools: [tool('x')], nextCursor: null });
       else if (cursor === undefined) reply(m.id, { tools: [tool('a1'), tool('a2')], nextCursor: 'p2' });
       else if (cursor === 'p2') reply(m.id, { tools: [tool('b1')], nextCursor: 'p3' });
       else if (cursor === 'p3') reply(m.id, { tools: [tool('c1'), tool('die')] });
