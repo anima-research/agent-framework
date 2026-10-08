@@ -27,7 +27,7 @@ process.stdin.on('data', (c) => {
     if (!line.trim()) continue;
     let m; try { m = JSON.parse(line); } catch { continue; }
     const out = (o) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, ...o }) + '\\n');
-    if (m.method === 'initialize') out({ result: { capabilities: {} } });
+    if (m.method === 'initialize') out({ result: { protocolVersion: '2024-11-05', capabilities: {} } });
     else if (m.method === 'tools/call' && m.params.name === 'fail') {
       out({ error: { code: -32001, message: 'POSTED: part 1 of 2', data: { posted: ['111'] } } });
     } else if (m.method === 'tools/call' && m.params.name === 'exit') {

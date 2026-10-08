@@ -106,7 +106,17 @@ export {
 } from './errors.js';
 
 // Server connection and registry
-export { McplServerConnection, McplRequestError } from './server-connection.js';
+export { McplServerConnection, McplRequestError, McplProtocolVersionError } from './server-connection.js';
+export {
+  LEGACY_MCP_PROTOCOL_VERSION,
+  MODERN_MCP_PROTOCOL_VERSION,
+  MAX_TIMER_MS,
+  MCPL_ONLY_POLICY_FIELDS,
+  resolveServerBinding,
+  serverConfigProblems,
+  checkServerConfig,
+} from './protocol-family.js';
+export type { McpProtocolFamily, McpTransportKind, ServerBinding } from './protocol-family.js';
 export { McplServerRegistry, type McplCapabilityQuery } from './server-registry.js';
 
 // Feature set management (permission layer)

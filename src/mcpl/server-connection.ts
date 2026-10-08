@@ -15,6 +15,11 @@ import { openTransport, type McplTransport, type TransportCloseInfo } from './tr
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
 import { CAPABILITY_DISABLED } from './errors.js';
+import {
+  LEGACY_MCP_PROTOCOL_VERSION,
+  MODERN_MCP_PROTOCOL_VERSION,
+  resolveServerBinding,
+} from './protocol-family.js';
 
 import type {
   McplServerConfig,
@@ -59,8 +64,67 @@ const INITIALIZE_TIMEOUT_MS = 30_000;
  *  tool work while still bounding the hang. */
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 
-/** MCP protocol version used in the initialize handshake. */
-const MCP_PROTOCOL_VERSION = '2024-11-05';
+/** MCP protocol version used in the initialize handshake: the only revision
+ *  this legacy engine offers or accepts. */
+const MCP_PROTOCOL_VERSION = LEGACY_MCP_PROTOCOL_VERSION;
+
+/** JSON-RPC code for an unsupported protocol version (MCP 2026-07-28 §basic,
+ *  the code a modern-only server answers our `initialize` with). */
+const UNSUPPORTED_PROTOCOL_VERSION_CODE = -32022;
+
+/** Upper bound on `tools/list` pages, against a server whose cursors never
+ *  end. Generous: real inventories fit in a handful of pages. */
+const MAX_TOOL_LIST_PAGES = 100;
+
+/**
+ * The server and this legacy engine have no protocol revision in common, so
+ * the connection was never established. This is a protocol-negotiation fact,
+ * not a request outcome. Retrying cannot change it: the engine offers one
+ * revision, and only configuration can fix the mismatch. A connection that
+ * gets this error does not schedule reconnects.
+ *
+ * - `rejected`: the server answered `initialize` with error -32022.
+ *   `supported` is the server's own list, when it gave one.
+ * - `mismatch`: the server answered `initialize` with a revision other than
+ *   2024-11-05, or with none.
+ */
+export class McplProtocolVersionError extends Error {
+  readonly offered = MCP_PROTOCOL_VERSION;
+  constructor(
+    message: string,
+    readonly kind: 'rejected' | 'mismatch',
+    /** Revision the server answered with (`mismatch`; null when it gave none). */
+    readonly returned: string | null,
+    /** Revisions the server says it supports (`rejected`, when stated). */
+    readonly supported: readonly string[] | null,
+    /** The JSON-RPC error's code and data, verbatim (`rejected`). */
+    readonly code?: number,
+    readonly data?: unknown,
+  ) {
+    super(message);
+    this.name = 'McplProtocolVersionError';
+  }
+}
+
+function protocolVersionRejection(id: string, error: { code: number; message: string; data?: unknown }): McplProtocolVersionError {
+  const data = error.data as { supported?: unknown } | undefined;
+  const supported = Array.isArray(data?.supported) && data.supported.every((v) => typeof v === 'string')
+    ? (data.supported as string[])
+    : null;
+  const modernHint = supported?.includes(MODERN_MCP_PROTOCOL_VERSION)
+    ? ` It speaks modern MCP: configure it with protocol: 'modern' (stdio) or reach it over http(s).`
+    : '';
+  return new McplProtocolVersionError(
+    `MCPL server "${id}" does not support MCP ${MCP_PROTOCOL_VERSION}` +
+      (supported ? ` (it supports: ${supported.join(', ') || 'none listed'}).` : ` (${error.message}).`) +
+      modernHint,
+    'rejected',
+    null,
+    supported,
+    error.code,
+    error.data,
+  );
+}
 
 /**
  * Why a request to an MCPL server produced no result, as far as the host can
@@ -143,6 +207,10 @@ export class McplServerConnection extends EventEmitter {
   /** OUTER standard MCP capabilities.tools was present at handshake (§5.1 —
    *  the sole source of the `tools` capability path). */
   mcpToolsAdvertised = false;
+
+  /** The MCP revision established by the last successful handshake (always
+   *  2024-11-05 for this engine), or null before the first one. */
+  protocolVersion: string | null = null;
 
   /** Host-owned per-server authority for host/command (config
    *  allowHostCommands, default false). No capability path exists and the
@@ -499,11 +567,12 @@ export class McplServerConnection extends EventEmitter {
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
   ): Promise<McplServerConnection> {
-    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised } = await McplServerConnection.handshake(config, hostCapabilities);
+    const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion } = await McplServerConnection.handshake(config, hostCapabilities);
 
     const connection = new McplServerConnection(config.id, capabilities, transport);
     connection.droppedCapabilities = droppedCapabilities;
     connection.mcpToolsAdvertised = mcpToolsAdvertised;
+    connection.protocolVersion = protocolVersion;
     connection.allowHostCommands = config.allowHostCommands === true;
     connection.requestTimeoutMs = config.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 
@@ -529,7 +598,19 @@ export class McplServerConnection extends EventEmitter {
   private static async handshake(
     config: McplServerConfig,
     hostCapabilities: McplHostCapabilities,
-  ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean }> {
+  ): Promise<{ transport: McplTransport; capabilities: McplCapabilities | null; droppedCapabilities: ReadonlySet<string>; mcpToolsAdvertised: boolean; protocolVersion: string }> {
+    // This engine speaks the legacy family only. A configuration that
+    // resolves to the modern family belongs to ModernMcpConnection; refuse it
+    // here rather than dialing an http(s) url as a WebSocket. A configuration
+    // that doesn't resolve at all keeps openTransport's existing errors.
+    let family: string | null = null;
+    try { family = resolveServerBinding(config).family; } catch { /* openTransport reports it */ }
+    if (family === 'modern') {
+      throw new Error(
+        `MCP server "${config.id}" is configured for modern MCP (${MODERN_MCP_PROTOCOL_VERSION}); ` +
+        `McplServerConnection speaks the legacy family (${MCP_PROTOCOL_VERSION} + MCPL) only`,
+      );
+    }
     const transport = await openTransport(config);
 
     try {
@@ -547,7 +628,7 @@ export class McplServerConnection extends EventEmitter {
 
       // Await the initialize response, racing an early transport close/error and
       // a timeout. All three paths clean up their listeners.
-      const { mcpl: rawCapabilities, mcpToolsAdvertised } = await new Promise<{ mcpl: McplCapabilities | null; mcpToolsAdvertised: boolean }>((resolve, reject) => {
+      const { mcpl: rawCapabilities, mcpToolsAdvertised, protocolVersion } = await new Promise<{ mcpl: McplCapabilities | null; mcpToolsAdvertised: boolean; protocolVersion: string }>((resolve, reject) => {
         const cleanup = () => {
           transport.off('line', onLine);
           transport.off('close', onClose);
@@ -564,10 +645,26 @@ export class McplServerConnection extends EventEmitter {
           if (msg.id !== initId) return;
           cleanup();
           if (msg.error) {
-            reject(new Error(`MCPL server "${config.id}" initialize error: ${msg.error.message}`));
+            reject(msg.error.code === UNSUPPORTED_PROTOCOL_VERSION_CODE
+              ? protocolVersionRejection(config.id, msg.error)
+              : new Error(`MCPL server "${config.id}" initialize error: ${msg.error.message}`));
             return;
           }
           const result = msg.result as Record<string, unknown> | undefined;
+          // The server's answer is the established revision. This engine
+          // implements exactly one, so any other answer (or none) means the
+          // two sides never agreed on what they're speaking.
+          const returned = typeof result?.protocolVersion === 'string' ? result.protocolVersion : null;
+          if (returned !== MCP_PROTOCOL_VERSION) {
+            reject(new McplProtocolVersionError(
+              `MCPL server "${config.id}" answered initialize with protocolVersion ` +
+                `${returned === null ? '(none)' : JSON.stringify(returned)}; this client's legacy engine speaks only ${MCP_PROTOCOL_VERSION}`,
+              'mismatch',
+              returned,
+              null,
+            ));
+            return;
+          }
           const caps = result?.capabilities as Record<string, unknown> | undefined;
           const experimental = caps?.experimental as Record<string, unknown> | undefined;
           // §5.1: `tools` capability is the OUTER standard MCP member — the
@@ -576,6 +673,7 @@ export class McplServerConnection extends EventEmitter {
           resolve({
             mcpl: (experimental?.mcpl as McplCapabilities) ?? null,
             mcpToolsAdvertised: caps?.tools !== undefined,
+            protocolVersion: returned,
           });
         };
         const onClose = (info: TransportCloseInfo) => {
@@ -613,7 +711,7 @@ export class McplServerConnection extends EventEmitter {
         console.error(`MCPL server "${config.id}" capabilities masked by host config: ${dropped.join(', ')}`);
       }
 
-      return { transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised };
+      return { transport, capabilities: scoped, droppedCapabilities: new Set(dropped), mcpToolsAdvertised, protocolVersion };
     } catch (err) {
       // Never leak the child / socket if the handshake fails.
       await transport.close().catch(() => { /* best effort */ });
@@ -634,7 +732,9 @@ export class McplServerConnection extends EventEmitter {
     try {
       return await McplServerConnection.connect(config, hostCapabilities);
     } catch (error) {
-      if (!config.reconnect) {
+      // No common protocol revision is a configuration fact, not an outage:
+      // a retry stub would restart the server forever for nothing.
+      if (!config.reconnect || error instanceof McplProtocolVersionError) {
         throw error;
       }
 
@@ -815,9 +915,38 @@ export class McplServerConnection extends EventEmitter {
   // Standard MCP methods
   // ==========================================================================
 
-  /** Send `tools/list` and return the server's tool definitions. */
-  sendToolsList(): Promise<{ tools: McpToolDefinition[] }> {
-    return this.sendRequest('tools/list', {}) as Promise<{ tools: McpToolDefinition[] }>;
+  /**
+   * Send `tools/list` and return the server's complete tool inventory,
+   * following `nextCursor` across pages (2024-11-05 pagination). A server
+   * whose cursors don't terminate — a repeated cursor, or more than
+   * {@link MAX_TOOL_LIST_PAGES} pages — gets an error rather than a silently
+   * partial inventory.
+   */
+  async sendToolsList(): Promise<{ tools: McpToolDefinition[] }> {
+    const tools: McpToolDefinition[] = [];
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    let first: Record<string, unknown> | undefined;
+    for (let page = 0; page < MAX_TOOL_LIST_PAGES; page++) {
+      const result = await this.sendRequest('tools/list', cursor === undefined ? {} : { cursor }) as {
+        tools?: McpToolDefinition[];
+        nextCursor?: unknown;
+      };
+      first ??= result;
+      tools.push(...(result.tools ?? []));
+      if (typeof result.nextCursor !== 'string' || result.nextCursor === '') {
+        // The first page's other fields are kept as they came, so a
+        // single-page answer is returned exactly as before.
+        const { nextCursor: _done, ...rest } = first as { nextCursor?: unknown };
+        return { ...rest, tools };
+      }
+      if (seen.has(result.nextCursor)) {
+        throw new Error(`MCPL server "${this.id}" repeated tools/list cursor ${JSON.stringify(result.nextCursor)}`);
+      }
+      seen.add(result.nextCursor);
+      cursor = result.nextCursor;
+    }
+    throw new Error(`MCPL server "${this.id}" tools/list did not finish within ${MAX_TOOL_LIST_PAGES} pages`);
   }
 
   /** Send `tools/call` and return the result. Optionally includes state/checkpoint for stateful tools. */
@@ -948,7 +1077,7 @@ export class McplServerConnection extends EventEmitter {
     const attempt = Math.max(1, this.reconnectAttempts);
 
     try {
-      const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised } = await McplServerConnection.handshake(
+      const { transport, capabilities, droppedCapabilities, mcpToolsAdvertised, protocolVersion } = await McplServerConnection.handshake(
         this.config,
         this.hostCapabilities,
       );
@@ -963,6 +1092,7 @@ export class McplServerConnection extends EventEmitter {
       this.capabilities = capabilities;
       this.droppedCapabilities = droppedCapabilities;
       this.mcpToolsAdvertised = mcpToolsAdvertised;
+      this.protocolVersion = protocolVersion;
       this.allowHostCommands = this.config?.allowHostCommands === true;
       this.closed = false;
       this.nextRequestId = 1;
@@ -975,8 +1105,13 @@ export class McplServerConnection extends EventEmitter {
     } catch (error) {
       console.error(`MCPL server "${this.id}" reconnect failed:`, (error as Error).message);
       this.reconnectAttempts = attempt + 1;
-      this.emit('reconnect-failed', { error: (error as Error).message, attempt });
-      this.scheduleReconnect();
+      // No common protocol revision: every further attempt would restart the
+      // server to hear the same answer. Stop retrying; the configuration is
+      // what has to change. Every other failure keeps the backoff loop.
+      const permanent = error instanceof McplProtocolVersionError;
+      if (permanent) this.reconnectEnabled = false;
+      this.emit('reconnect-failed', { error: (error as Error).message, attempt, ...(permanent ? { permanent: true } : {}) });
+      if (!permanent) this.scheduleReconnect();
     }
   }
 

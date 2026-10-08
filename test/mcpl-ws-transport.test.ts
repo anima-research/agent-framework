@@ -28,7 +28,7 @@ function startMockMcplWsServer(onSocket?: (ws: WebSocket) => void) {
       const reply = (result: unknown) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }));
       switch (msg.method) {
         case 'initialize':
-          reply({ capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
+          reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
           break;
         case 'notifications/initialized':
           break; // notification, no reply
@@ -133,7 +133,7 @@ process.stdin.on('data', (c) => {
     if (!line.trim()) continue;
     let m; try { m = JSON.parse(line); } catch { continue; }
     const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n');
-    if (m.method === 'initialize') reply({ capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
+    if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
     else if (m.method === 'tools/list') reply({ tools: [{ name: 'echo', description: 'e', inputSchema: { type: 'object' } }] });
     else if (m.method === 'tools/call') reply({ content: [{ type: 'text', text: String((m.params && m.params.arguments && m.params.arguments.text) || '') }] });
   }

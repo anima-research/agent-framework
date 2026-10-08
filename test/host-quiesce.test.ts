@@ -364,7 +364,7 @@ process.stdin.on('data', (c) => {
     if (!line.trim()) continue;
     let m; try { m = JSON.parse(line); } catch { continue; }
     const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n');
-    if (m.method === 'initialize') reply({ capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
+    if (m.method === 'initialize') reply({ protocolVersion: '2024-11-05', capabilities: { experimental: { mcpl: { version: '0.4', pushEvents: true } } } });
     else if (m.method === 'tools/list') reply({ tools: [] });
     else if (m.id === 900) log('push-response', { error: m.error ?? null });
     else if (m.id === 901) log('resume-response', { result: m.result ?? null, error: m.error ?? null });

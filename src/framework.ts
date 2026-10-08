@@ -391,6 +391,7 @@ import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
+import { McplProtocolVersionError } from './mcpl/server-connection.js';
 import type {
   McplServerConfig,
   McplHostCapabilities,
@@ -13311,7 +13312,9 @@ export class AgentFramework {
           serverId: config.id,
           error: err.message,
           attempt: 0,
-          willRetry: config.reconnect === true,
+          // A protocol-version verdict is never retried (no common revision;
+          // only configuration can fix it).
+          willRetry: config.reconnect === true && !(error instanceof McplProtocolVersionError),
         });
       }
     }
@@ -14485,7 +14488,7 @@ export class AgentFramework {
         willRetry: connection.willReconnect,
       });
     });
-    connection.on('reconnect-failed', (params: { error: string; attempt: number }) => {
+    connection.on('reconnect-failed', (params: { error: string; attempt: number; permanent?: boolean }) => {
       this.emitTrace({
         type: 'mcpl:server-connect-failed',
         serverId: connection.id,
@@ -14493,11 +14496,13 @@ export class AgentFramework {
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
-      // The reconnect loop never gives up (backoff caps at ~300s), so
-      // "the server is effectively down" is an attempt-count judgment:
+      // The reconnect loop gives up only on a protocol-version verdict
+      // (`permanent`), which no later attempt can change — alert at once,
+      // since no fifth attempt will come. Otherwise backoff caps at ~300s,
+      // so "the server is effectively down" is an attempt-count judgment:
       // 5 failed attempts ≈ a few minutes of outage. Throttled per
       // (serverId, kind), so a long outage re-posts every ~15 min.
-      if (params.attempt >= 5) {
+      if (params.permanent || params.attempt >= 5) {
         this.opsAlert(
           'mcpl-down',
           connection.id,

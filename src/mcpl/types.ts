@@ -243,18 +243,31 @@ export interface McplServerConfig {
   inheritEnv?: boolean;
 
   /**
-   * WebSocket URL for the network transport (`ws://` or `wss://`). Mutually
-   * exclusive with `command`. When set (or `transport: 'websocket'`), the host
-   * dials this endpoint instead of spawning a process — newline-delimited
-   * JSON-RPC MCPL runs over the socket identically to stdio.
+   * URL for a network server, used instead of `command`. Its scheme decides
+   * the protocol family:
+   * - `ws://` or `wss://` is a legacy MCPL server over MCPL's WebSocket
+   *   binding. The host dials it and runs the same newline-delimited JSON-RPC
+   *   as over stdio.
+   * - `http://` or `https://` is a modern MCP (2026-07-28) server over
+   *   Streamable HTTP.
    */
   url?: string;
 
   /**
-   * Transport selector. Defaults to `'websocket'` when a bare `url` is given
-   * (no `command`), `'stdio'` otherwise. Set explicitly to disambiguate.
+   * Transport selector. When it is absent, a `command` means stdio and a bare
+   * `url` means the transport its scheme names. Set it explicitly to
+   * disambiguate; it must agree with the url's scheme.
    */
-  transport?: 'stdio' | 'websocket';
+  transport?: 'stdio' | 'websocket' | 'http';
+
+  /**
+   * Protocol family for a stdio (`command`) server. Defaults to `'legacy'`,
+   * which is MCP 2024-11-05 + MCPL and today's behavior. `'modern'` speaks
+   * MCP 2026-07-28 through the SDK-backed modern engine. A network server's
+   * family comes from its url's scheme, so setting this on one is a
+   * configuration error. There is no probing between families.
+   */
+  protocol?: 'legacy' | 'modern';
 
   /**
    * Bearer token for WebSocket auth. Appended to `url` as a `token` query
@@ -1315,6 +1328,8 @@ export interface McpToolDefinition {
   name: string;
   description?: string;
   inputSchema: Record<string, unknown>;
+  /** Server metadata for the tool (e.g. RFC-008 `mcpl/class` hints). */
+  _meta?: Record<string, unknown>;
 }
 
 /**
