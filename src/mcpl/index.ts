@@ -116,6 +116,7 @@ export {
   MCPL_ONLY_POLICY_FIELDS,
   resolveServerBinding,
   serverConfigProblems,
+  serverConfigWarnings,
   checkServerConfig,
 } from './protocol-family.js';
 export type { McpProtocolFamily, McpTransportKind, ServerBinding } from './protocol-family.js';

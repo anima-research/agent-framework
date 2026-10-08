@@ -620,6 +620,15 @@ export class McplServerConnection extends EventEmitter {
     hostCapabilities: McplHostCapabilities,
   ): Promise<McplServerConnection> {
     McplServerConnection.checkConfig(config);
+    return McplServerConnection.connectChecked(config, hostCapabilities);
+  }
+
+  /** {@link connect}, for a configuration its caller has already checked
+   *  (and warned about) once. */
+  private static async connectChecked(
+    config: McplServerConfig,
+    hostCapabilities: McplHostCapabilities,
+  ): Promise<McplServerConnection> {
     let established: Awaited<ReturnType<typeof McplServerConnection.handshake>>;
     try {
       established = await McplServerConnection.handshake(config, hostCapabilities);
@@ -825,7 +834,7 @@ export class McplServerConnection extends EventEmitter {
     // Outside the retry path below: a configuration error is never retried.
     McplServerConnection.checkConfig(config);
     try {
-      return await McplServerConnection.connect(config, hostCapabilities);
+      return await McplServerConnection.connectChecked(config, hostCapabilities);
     } catch (error) {
       // No common protocol revision is a configuration fact, not an outage:
       // a retry stub would restart the server forever for nothing.

@@ -98,6 +98,7 @@ export {
   MODERN_MCP_PROTOCOL_VERSION,
   resolveServerBinding,
   serverConfigProblems,
+  serverConfigWarnings,
   checkServerConfig,
 } from './mcpl/index.js';
 export type { McpProtocolFamily, McpTransportKind, ServerBinding } from './mcpl/index.js';

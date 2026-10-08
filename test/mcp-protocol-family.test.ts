@@ -10,9 +10,12 @@ import assert from 'node:assert/strict';
 import {
   resolveServerBinding,
   serverConfigProblems,
+  serverConfigWarnings,
+  checkServerConfig,
   MCPL_ONLY_POLICY_FIELDS,
   MAX_TIMER_MS,
 } from '../src/mcpl/protocol-family.js';
+import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
 import type { McplServerConfig } from '../src/mcpl/types.js';
 
 const cfg = (c: Partial<McplServerConfig>): McplServerConfig => ({ id: 's', ...c });
@@ -101,4 +104,46 @@ test('MCPL policy on a modern server is rejected, empty values are not', () => {
     toolLifecycle: {} as never,
   });
   assert.deepEqual(serverConfigProblems(empty), []);
+});
+
+test('a credential sent in cleartext to a host that is not loopback is warned about, never refused', () => {
+  const provider = async () => 'fresh';
+  const warned = (c: Partial<McplServerConfig>) => serverConfigWarnings(cfg(c));
+  // The Authorization header over http, and the ?token= query over ws.
+  assert.match(warned({ url: 'http://10.0.0.5:8080/mcp', token: 't' })[0]!, /credential goes to 10\.0\.0\.5:8080 unencrypted \(http:\/\/\).*use https:\/\//);
+  assert.match(warned({ url: 'ws://mcp.lan/mcpl', accessProvider: provider })[0]!, /credential goes to mcp\.lan unencrypted \(ws:\/\/\).*use wss:\/\//);
+  assert.equal(serverConfigProblems(cfg({ url: 'http://10.0.0.5:8080/mcp', token: 't' })).length, 0, 'still usable');
+  // Nothing to warn about: encrypted, loopback, no credential, or not dialed.
+  for (const quiet of [
+    { url: 'https://10.0.0.5/mcp', token: 't' },
+    { url: 'wss://mcp.lan/mcpl', token: 't' },
+    { url: 'http://localhost:8080/mcp', token: 't' },
+    { url: 'http://127.0.0.1:8080/mcp', token: 't' },
+    { url: 'http://127.0.0.2:8080/mcp', token: 't' },
+    { url: 'ws://0.0.0.0:8080/mcpl', token: 't' },
+    { url: 'http://[::1]:8080/mcp', token: 't' },
+    { url: 'ws://app.localhost/mcpl', token: 't' },
+    { url: 'http://10.0.0.5:8080/mcp' },
+    { command: 'srv', url: 'http://10.0.0.5/mcp', token: 't' },
+    { url: 'ftp://10.0.0.5/mcp', token: 't' },
+  ]) assert.deepEqual(warned(quiet), [], JSON.stringify(quiet));
+});
+
+test('both engines admit a configuration through checkServerConfig, which logs its warnings', () => {
+  const lines: string[] = [];
+  const realWarn = console.warn;
+  console.warn = (...args: unknown[]) => { lines.push(args.join(' ')); };
+  try {
+    checkServerConfig(cfg({ url: 'ws://mcp.lan/mcpl', token: 't' }));
+    assert.equal(lines.length, 1);
+    assert.match(lines[0]!, /^\[mcp\] MCP server "s": its credential goes to mcp\.lan unencrypted/);
+    // The modern engine checks at create(), before anything is dialed.
+    ModernMcpConnection.create(cfg({ id: 'm', url: 'http://10.0.0.5:8080/mcp', token: 't' }));
+    assert.equal(lines.length, 2);
+    assert.match(lines[1]!, /MCP server "m": its credential goes to 10\.0\.0\.5:8080 unencrypted/);
+    checkServerConfig(cfg({ url: 'https://10.0.0.5/mcp', token: 't' }));
+    assert.equal(lines.length, 2, 'nothing for https');
+  } finally {
+    console.warn = realWarn;
+  }
 });

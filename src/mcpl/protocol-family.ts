@@ -154,9 +154,45 @@ export function serverConfigProblems(config: McplServerConfig): string[] {
   return problems;
 }
 
-/** Throw one error listing every problem, or return the resolved binding. */
+/** A host a connection to which never leaves this machine. The unspecified
+ *  addresses count: a connection to 0.0.0.0 or [::] reaches this host. */
+function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return host === 'localhost' || host.endsWith('.localhost') || host === '[::1]' || /^127(\.\d{1,3}){3}$/.test(host) ||
+    host === '0.0.0.0' || host === '[::]';
+}
+
+/**
+ * What is usable in a server configuration but worth an operator's attention,
+ * as messages; empty when there is nothing. A credential (`token` or
+ * `accessProvider`) for an `http://` or `ws://` url whose host isn't loopback
+ * crosses the network in cleartext, in the `Authorization` header or the
+ * WebSocket `?token=` query. That can be deliberate, on a private network or
+ * behind a TLS-terminating proxy, so it is a warning and never a refusal.
+ */
+export function serverConfigWarnings(config: McplServerConfig): string[] {
+  if (!config.token && !config.accessProvider) return [];
+  let transport: McpTransportKind;
+  try {
+    transport = resolveServerBinding(config).transport;
+  } catch {
+    return []; // an unusable configuration is serverConfigProblems' to report
+  }
+  if (transport === 'stdio') return [];
+  const url = new URL(config.url!);
+  if ((url.protocol !== 'http:' && url.protocol !== 'ws:') || isLoopbackHost(url.hostname)) return [];
+  const secure = url.protocol === 'http:' ? 'https' : 'wss';
+  return [
+    `MCP server "${config.id}": its credential goes to ${url.host} unencrypted (${url.protocol}//), where anything on the ` +
+      `network path can read it; use ${secure}:// unless that network is trusted`,
+  ];
+}
+
+/** Throw one error listing every problem. Otherwise log each warning and
+ *  return the resolved binding. Both engines admit a configuration here. */
 export function checkServerConfig(config: McplServerConfig): ServerBinding {
   const problems = serverConfigProblems(config);
   if (problems.length > 0) throw new Error(problems.join('; '));
+  for (const warning of serverConfigWarnings(config)) console.warn(`[mcp] ${warning}`);
   return resolveServerBinding(config);
 }
