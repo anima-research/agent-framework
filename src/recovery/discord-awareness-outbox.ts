@@ -1294,7 +1294,12 @@ export class DiscordAwarenessOutbox {
     return state;
   }
 
-  /** Import a pre-journal ledger beside the store once (by hash), then rename it. */
+  /**
+   * Import a pre-journal ledger beside the store, then rename it. A file
+   * whose hash was imported before is only renamed, and a batch the journal
+   * already holds is never imported again, so a restored or re-saved copy of
+   * an imported ledger changes nothing (see importLegacy).
+   */
   private importLegacyLedger(state: JournalState): void {
     if (!this.legacyPath) return;
     let raw: string;
@@ -1314,7 +1319,7 @@ export class DiscordAwarenessOutbox {
       } catch {
         throw new Error(`Invalid Discord awareness ledger ${this.legacyPath}`);
       }
-      this.append(importLegacy(parsed, this.legacyPath, sha256), { durable: true });
+      this.append(importLegacy(parsed, this.legacyPath, sha256, state.batches), { durable: true });
     }
     // Imported (now or by an earlier process that stopped before renaming):
     // the file is inert; move it out of the way.
@@ -1557,18 +1562,32 @@ interface LegacyBatch {
  * attempts and never a judgment about what is on Discord. Pending work, and
  * batches still prepared, are held for an operator: they were queued before
  * marks were an explicit choice. Nothing imported is ever dispatched.
+ *
+ * Each batch is imported once. A batch the journal already holds, or a
+ * second listing of one in this file, is skipped whole: its evidence would
+ * be counted twice, and holding it again would offer the operator a release
+ * of adds they may since have retracted. Batches new to the journal import
+ * as above.
  */
-function importLegacy(parsed: unknown, path: string, sha256: string): JournalRecord[] {
+function importLegacy(
+  parsed: unknown,
+  path: string,
+  sha256: string,
+  journalBatches: ReadonlyMap<string, unknown>,
+): JournalRecord[] {
   const document = parsed as { version?: unknown; batches?: unknown };
   if (!document || (document.version !== 1 && document.version !== 2) || !Array.isArray(document.batches)) {
     throw new Error(`Invalid Discord awareness ledger ${path}`);
   }
   const at = Date.now();
   const records: JournalRecord[] = [];
+  const imported = new Set<string>();
   for (const raw of document.batches as LegacyBatch[]) {
     if (!raw || typeof raw.id !== 'string' || !Array.isArray(raw.refs)) {
       throw new Error(`Invalid Discord awareness ledger ${path}`);
     }
+    if (journalBatches.has(raw.id) || imported.has(raw.id)) continue;
+    imported.add(raw.id);
     const legacyActive = raw.status === 'active' || raw.status === 'pending';
     const refs = raw.refs.map((entry) => ({
       serverId: entry.serverId,

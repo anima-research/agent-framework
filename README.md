@@ -409,8 +409,9 @@ const result = await framework.rollbackToMessage('cairn', {
 
 A pre-journal awareness ledger (`discord-awareness-outbox.json` under the
 store, or `discordAwarenessOutboxPath`) is imported once on first use and the
-file renamed `.migrated-v2`. What it recorded about each message is kept as
-evidence (attempt count; the last action and the outcome its error field
+file renamed `.migrated-v2`; a copy put back at that path later imports only
+batches the journal doesn't already hold. What it recorded about each message
+is kept as evidence (attempt count; the last action and the outcome its error field
 establishes; the old writer's delivery status, labelled as the
 reconciliation state it was; and how many attempt outcomes it leaves
 unrecorded), never as a claim about what is on Discord,

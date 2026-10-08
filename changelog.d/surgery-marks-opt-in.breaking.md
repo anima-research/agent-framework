@@ -36,7 +36,8 @@
   `view()`, `cancel()`, `retract()`, `release()` and `settleActivation()`.
   `discordAwarenessOutboxPath` now only names a previous JSON ledger to
   import. Such a file (by default `<store>/recovery/discord-awareness-outbox.json`)
-  is imported once on first use and renamed `.migrated-v2`. What it recorded
-  is kept as evidence, never as synthesized attempts or as proof that a
-  suppression's body completed, and its undelivered work is held for an
+  is imported once on first use and renamed `.migrated-v2`; a copy put back
+  there later imports only batches the journal doesn't already hold. What it
+  recorded is kept as evidence, never as synthesized attempts or as proof that
+  a suppression's body completed, and its undelivered work is held for an
   explicit release.

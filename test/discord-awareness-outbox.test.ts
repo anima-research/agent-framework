@@ -628,6 +628,51 @@ test('v2 import keeps what the old ledger recorded as evidence, holds pending wo
   assert.equal(existsSync(h.legacyPath), false);
 }));
 
+test('a restored copy of an imported ledger changes nothing: import is once per batch, not once per file', withJournal((_outbox, h) => {
+  const pending = (id: string, messageId: string) => ({
+    id, status: 'active', agentName: 'resident', sourceBranch: 'main', targetBranch: `rollback/resident/${id}`,
+    emoji: '💤', createdAt: 1,
+    refs: [{ ...ref(messageId), desired: true, markerPresent: false, deliveryStatus: 'pending', attempts: 1, lastAction: 'add',
+      lastError: 'MCPL server "discord" did not respond within 10000ms' }],
+  });
+  const legacy = { version: 2, batches: [pending('restored', 'm1')] };
+  mkdirSync(join(h.dir, 'recovery'), { recursive: true });
+  writeFileSync(h.legacyPath, JSON.stringify(legacy));
+  const outbox = h.reopen();
+  // The operator releases the held add, it lands, and then they retract it.
+  outbox.release('restored', 'operator');
+  answer(outbox, 'm1', 'confirmed');
+  outbox.retract('restored', 'operator');
+  const view = outbox.view();
+  const operations = outbox.operations();
+
+  // A byte-different copy of the same ledger (pretty-printed, as a backup
+  // may be) is put back at the old path: it is moved aside and changes
+  // nothing. Before, the batch read as held again, with its evidence
+  // doubled, and a second release would have re-added the retracted mark.
+  writeFileSync(h.legacyPath, JSON.stringify(legacy, null, 2));
+  const restored = h.reopen();
+  assert.deepEqual(restored.view(), view);
+  assert.deepEqual(restored.operations(), operations);
+  assert.throws(() => restored.release('restored'), /is active, not held/);
+  assert.equal(existsSync(h.legacyPath), false);
+
+  // A file that also holds a batch the journal has never seen imports that
+  // batch alone, once even if the file lists it twice, held like any import.
+  writeFileSync(h.legacyPath, JSON.stringify({
+    version: 2,
+    batches: [pending('restored', 'm1'), pending('later', 'm2'), pending('later', 'm2')],
+  }));
+  const widened = h.reopen();
+  const later = batches(widened).find((v) => v.id === 'later')!;
+  assert.equal(later.status, 'held');
+  assert.equal(later.held!.releaseActions, 1);
+  assert.deepEqual(later.legacy, { entries: 1, lastAddConfirmed: 0, lastRemoveConfirmed: 0, outcomesUnrecorded: 1 });
+  assert.deepEqual(widened.view().filter((v) => v.id !== 'later'), view);
+  assert.deepEqual(widened.operations(), operations);
+  assert.equal(existsSync(h.legacyPath), false);
+}));
+
 test('legacy evidence reads outcomes from the old writer\'s lastError, never from its reconciliation state', withJournal((_outbox, h) => {
   // Entries exactly as the 64c480b writer leaves them (recordSuccess clears
   // lastError, recordFailure sets it; setDesired rewrites deliveryStatus
