@@ -13849,8 +13849,15 @@ export class AgentFramework {
     // stop() began while the handshake ran: its teardown has already
     // collected the registry, so this connection would outlive it. Close it.
     if (this.mcpServerAdmissionClosed) {
-      await this.mcplServerRegistry.removeServer(config.id).catch(() => {});
-      throw new Error(`MCP server "${config.id}" was not connected: the framework stopped while it was connecting`);
+      // A cleanup that can't reap the child is reported with the refusal,
+      // not in place of it and not dropped.
+      let cleanup = '';
+      try {
+        await this.mcplServerRegistry.removeServer(config.id);
+      } catch (error) {
+        cleanup = `; its cleanup also failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      throw new Error(`MCP server "${config.id}" was not connected: the framework stopped while it was connecting${cleanup}`);
     }
 
     // Wire listeners before either startup staging or the runtime global gate
