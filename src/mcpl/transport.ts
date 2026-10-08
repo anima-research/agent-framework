@@ -188,6 +188,12 @@ export class StdioTransport extends McplTransport {
     });
 
     this.child.on('error', (err) => this.emit('error', err));
+    // A write racing the child's exit fails with EPIPE on stdin. That is the
+    // exit's echo, which 'close' already reports, never a reason to crash: an
+    // unhandled stream 'error' would end the host.
+    this.child.stdin?.on('error', (err) => {
+      if (this.listenerCount('error') > 0) this.emit('error', err);
+    });
     this.child.on('exit', (code, signal) =>
       this.markClosed({ code, signal, reason: 'child process exited' }),
     );
@@ -216,21 +222,34 @@ export class StdioTransport extends McplTransport {
     this.child.stdin?.write(json + '\n');
   }
 
+  /**
+   * Close and reap: resolves once the child has actually exited, not merely
+   * been signalled (`child.killed` is true as soon as a signal is sent). A
+   * child that outlives SIGTERM by {@link STDIO_EXIT_GRACE_MS} gets SIGKILL,
+   * and close waits that long again, so shutdown stays bounded.
+   */
   async close(): Promise<void> {
     this.markClosed({ reason: 'closed by host' });
     this.rl.close();
-    if (this.child && !this.child.killed) {
-      this.child.kill();
-    }
-    await new Promise<void>((resolve) => {
-      if (!this.child || this.child.exitCode !== null || this.child.killed) {
-        resolve();
-      } else {
-        this.child.once('exit', () => resolve());
-      }
+    const child = this.child;
+    // Never started (a spawn error): there is no process to reap.
+    if (child.pid === undefined) return;
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+    const exitWithin = (ms: number) => new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), ms);
+      void exited.then(() => { clearTimeout(timer); resolve(true); });
     });
+    child.kill('SIGTERM');
+    if (await exitWithin(STDIO_EXIT_GRACE_MS)) return;
+    console.error(`[mcpl] stdio child ${child.pid} ignored SIGTERM for ${STDIO_EXIT_GRACE_MS}ms — sending SIGKILL`);
+    child.kill('SIGKILL');
+    await exitWithin(STDIO_EXIT_GRACE_MS);
   }
 }
+
+/** How long a stdio child gets to exit after SIGTERM, and again after SIGKILL. */
+const STDIO_EXIT_GRACE_MS = 2_000;
 
 // ---------------------------------------------------------------------------
 // WebSocket

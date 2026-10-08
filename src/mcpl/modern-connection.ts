@@ -41,6 +41,7 @@ import {
   SdkErrorCode,
   SdkHttpError,
   StreamableHTTPClientTransport,
+  parseJSONRPCMessage,
   type AuthProvider,
   type CallToolResult,
   type JSONRPCMessage,
@@ -61,6 +62,8 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 30_000;
 /** Inventory listing has its own bound: it is host work, not a resident's call. */
 const LIST_TIMEOUT_MS = 30_000;
+/** Startup stderr kept for the first listener. */
+const STDERR_BACKLOG_LINES = 200;
 
 /** A modern tool result as the framework consumes it. `structuredContent` is
  *  kept by presence: `false`, `0` and `null` are values, not absence. */
@@ -121,8 +124,13 @@ class ObservedTransport implements Transport {
 
   async start(): Promise<void> {
     this.inner.onmessage = (message, extra) => {
-      this.observe(message);
-      this.onmessage?.(message, extra);
+      // An answer to a request in scope is handed to the SDK inside that
+      // request's scope. The SDK drives an input_required continuation from
+      // this very callback, outside the caller's async chain, and the next
+      // leg's send must still be recorded against the right call.
+      const record = this.observe(message);
+      if (record) wireScope.run(record, () => this.onmessage?.(message, extra));
+      else this.onmessage?.(message, extra);
     };
     this.inner.onerror = (error) => this.onerror?.(error);
     this.inner.onclose = () => this.onclose?.();
@@ -151,19 +159,23 @@ class ObservedTransport implements Transport {
     for (const [id, entry] of this.awaiting) if (entry === record) this.awaiting.delete(id);
   }
 
-  private observe(message: JSONRPCMessage): void {
-    if (!('id' in message) || (!('result' in message) && !('error' in message))) return;
+  /** Record an answer to a request in scope; returns its record when it
+   *  answers that record's current leg. */
+  private observe(message: JSONRPCMessage): WireRecord | undefined {
+    if (typeof message !== 'object' || message === null) return undefined;
+    if (!('id' in message) || (!('result' in message) && !('error' in message))) return undefined;
     const record = this.awaiting.get(message.id as string | number);
-    if (!record) return;
+    if (!record) return undefined;
     this.awaiting.delete(message.id as string | number);
     // A superseded leg's late answer says nothing about the current one.
-    if (record.currentId !== message.id) return;
+    if (record.currentId !== message.id) return undefined;
     if ('error' in message) {
       record.answer = 'error';
       record.error = message.error as WireRecord['error'];
     } else {
       record.answer = 'result';
     }
+    return record;
   }
 }
 
@@ -190,10 +202,24 @@ class SpawnerStdioTransport implements Transport {
     const line = StdioTransport.spawn(this.config);
     this.line = line;
     line.on('line', (text: string) => {
+      // A line that isn't JSON is ignored, as the legacy engine ignores it.
+      // A line that is JSON but not a JSON-RPC message (`null`, an array, a
+      // bare value) is a diagnostic. It must never reach a handler that
+      // assumes the shape: thrown from this callback, it would end the host.
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        return;
+      }
       let message: JSONRPCMessage;
       try {
-        message = JSON.parse(text) as JSONRPCMessage;
-      } catch {
+        message = parseJSONRPCMessage(parsed);
+      } catch (error) {
+        this.onerror?.(new Error(
+          `MCP server "${this.config.id}" sent a malformed JSON-RPC message (${text.length > 200 ? `${text.slice(0, 200)}…` : text}): ` +
+            (error instanceof Error ? error.message.split('\n')[0] : String(error)),
+        ));
         return;
       }
       this.onmessage?.(message);
@@ -269,6 +295,10 @@ export class ModernMcpConnection extends EventEmitter {
   /** At most one pending reopen, and only ever for the current generation. */
   private relisten: { generation: number; timer: ReturnType<typeof setTimeout> } | null = null;
   private relistenAttempts = 0;
+  /** Child stderr from before anyone listens (the caller attaches only once
+   *  connect() returns), delivered to the first listener. Bounded: the
+   *  newest lines are kept. */
+  private stderrBacklog: string[] = [];
 
   private constructor(private readonly config: McplServerConfig) {
     super();
@@ -286,6 +316,22 @@ export class ModernMcpConnection extends EventEmitter {
     this.on('error', (error: Error) => {
       if (this.listenerCount('error') === 1) console.error(`[mcp] ${this.id}: ${error.message}`);
     });
+    this.on('newListener', (event: string | symbol) => {
+      if (event !== 'stderr' || this.stderrBacklog.length === 0) return;
+      const pending = this.stderrBacklog;
+      this.stderrBacklog = [];
+      // After the listener is added (newListener fires just before).
+      queueMicrotask(() => { for (const line of pending) this.emit('stderr', { line }); });
+    });
+  }
+
+  private deliverStderr(line: string): void {
+    if (this.listenerCount('stderr') > 0) {
+      this.emit('stderr', { line });
+      return;
+    }
+    this.stderrBacklog.push(line);
+    if (this.stderrBacklog.length > STDERR_BACKLOG_LINES) this.stderrBacklog.shift();
   }
 
   /** The per-call deadline: `requestTimeoutMs`, validated positive. */
@@ -332,7 +378,7 @@ export class ModernMcpConnection extends EventEmitter {
     const generation = ++this.generation;
     this.cancelRelisten();
     const inner: Transport = this.transportKind === 'stdio'
-      ? new SpawnerStdioTransport(this.config, (line) => { if (this.isCurrent(generation)) this.emit('stderr', { line }); })
+      ? new SpawnerStdioTransport(this.config, (line) => { if (this.isCurrent(generation)) this.deliverStderr(line); })
       : new StreamableHTTPClientTransport(new URL(this.config.url!), { authProvider: bearerAuth(this.config) });
     const wire = new ObservedTransport(inner);
 

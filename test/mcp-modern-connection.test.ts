@@ -72,7 +72,9 @@ test('connects once over Connectome\'s spawner and speaks 2026-07-28', async () 
   assert.deepEqual(echo.content, [{ type: 'text', text: 'echo:hi' }]);
   // In-place discovery: the SDK's sibling probe would have made this 2.
   assert.equal(lines(join(dir, 'starts.log')).length, 1);
-  // The child's stderr surfaces as lines, as a legacy child's does.
+  // The child's stderr surfaces as lines, as a legacy child's does,
+  // startup lines included: they came before anyone could listen.
+  await until(() => stderr.some((l) => /^modern fixture \d+ up$/.test(l)));
   await connection.callTool('shout', { text: 'hello' });
   await until(() => stderr.includes('shout: hello'));
 });

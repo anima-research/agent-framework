@@ -7,9 +7,13 @@
 //   invalid-schema       tools/list advertises an outputSchema that doesn't compile
 //   listen-fail-first    the first subscriptions/listen of each launch is refused
 //   hang-discover-later  launches after the first never answer server/discover
+//   ignore-sigterm       the process survives SIGTERM (only SIGKILL ends it)
 // Tools: op (outputSchema {value: integer}, answers with a string: invalid
 // structured content), plain (text), err (a JSON-RPC error), touch (announces
-// a tool list change on the open subscription), die (exits).
+// a tool list change on the open subscription), nullframe (writes JSON lines
+// that aren't JSON-RPC messages, then answers), cont (a state-only
+// input_required first leg; the second leg does what arguments.leg2 says:
+// 'error', 'hang' or 'ok'), die (exits).
 import { createInterface } from 'node:readline';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 
@@ -19,6 +23,7 @@ const prior = existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boo
 const launch = prior.filter((x) => x.event === 'start').length + 1;
 const note = (x) => appendFileSync(log, `${JSON.stringify({ ...x, launch })}\n`);
 note({ event: 'start', pid: process.pid });
+if (flags.has('ignore-sigterm')) process.on('SIGTERM', () => note({ event: 'sigterm-ignored' }));
 
 const send = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
 const result = (id, body) => send({ jsonrpc: '2.0', id, result: { resultType: 'complete', ...body } });
@@ -69,6 +74,8 @@ createInterface({ input: process.stdin }).on('line', (line) => {
           { name: 'plain', inputSchema: { type: 'object' } },
           { name: 'err', inputSchema: { type: 'object' } },
           { name: 'touch', inputSchema: { type: 'object' } },
+          { name: 'nullframe', inputSchema: { type: 'object' } },
+          { name: 'cont', inputSchema: { type: 'object' } },
           { name: 'die', inputSchema: { type: 'object' } },
         ],
       });
@@ -83,6 +90,19 @@ createInterface({ input: process.stdin }).on('line', (line) => {
         return result(m.id, { content: [{ type: 'text', text: subscription === null ? 'no subscription' : 'touched' }] });
       }
       if (name === 'die') { setTimeout(() => process.exit(5), 10); return result(m.id, { content: [{ type: 'text', text: 'bye' }] }); }
+      if (name === 'nullframe') {
+        process.stdout.write('null\n[1,2]\n"just a string"\n{"no":"jsonrpc"}\n');
+        return result(m.id, { content: [{ type: 'text', text: 'after the noise' }] });
+      }
+      if (name === 'cont') {
+        const leg2 = m.params?.arguments?.leg2;
+        if (m.params?.requestState === undefined) {
+          return send({ jsonrpc: '2.0', id: m.id, result: { resultType: 'input_required', requestState: `state-for-${leg2}` } });
+        }
+        if (leg2 === 'error') return error(m.id, -32603, 'second leg failed', { leg: 2, state: m.params.requestState });
+        if (leg2 === 'hang') return;
+        return result(m.id, { content: [{ type: 'text', text: `leg 2 done (${m.params.requestState})` }] });
+      }
       return result(m.id, { content: [{ type: 'text', text: 'plain' }] });
     }
     default:

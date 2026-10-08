@@ -144,3 +144,66 @@ test('close() during a reconnect handshake ends the launch it was waiting on, an
   assert.equal(wire(log).filter((e) => e.event === 'start').length, 2, 'no launch after close');
   assert.equal(connection.isConnected, false);
 });
+
+test('an input_required continuation keeps its evidence: the second leg decides the outcome', async () => {
+  const log = scratchLog();
+  const connection = await connect('', log, { requestTimeoutMs: 600 });
+  await connection.listTools();
+  await assert.rejects(connection.callTool('cont', { leg2: 'error' }), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'error-response');
+    assert.equal(err.code, -32603);
+    assert.deepEqual(err.data, { leg: 2, state: 'state-for-error' });
+    return true;
+  });
+  await assert.rejects(connection.callTool('cont', { leg2: 'hang' }), (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'no-response');
+    assert.match(err.message, /Cancellation was requested/);
+    return true;
+  });
+  assert.equal(calls(log, 'cont'), 4, 'two legs each');
+});
+
+test('concurrent continuations never cross their evidence', async () => {
+  const log = scratchLog();
+  const connection = await connect('', log, { requestTimeoutMs: 2000 });
+  await connection.listTools();
+  const [failing, passing, failingToo] = await Promise.allSettled([
+    connection.callTool('cont', { leg2: 'error' }),
+    connection.callTool('cont', { leg2: 'ok' }),
+    connection.callTool('cont', { leg2: 'error' }),
+  ]);
+  for (const settled of [failing, failingToo]) {
+    assert.equal(settled.status, 'rejected');
+    const err = (settled as PromiseRejectedResult).reason;
+    assert.ok(err instanceof McplRequestError);
+    assert.equal(err.outcome, 'error-response');
+    assert.deepEqual(err.data, { leg: 2, state: 'state-for-error' });
+  }
+  assert.equal(passing.status, 'fulfilled');
+  assert.deepEqual((passing as PromiseFulfilledResult<{ content: unknown }>).value.content, [{ type: 'text', text: 'leg 2 done (state-for-ok)' }]);
+});
+
+test('a JSON line that is not a JSON-RPC message is a diagnostic, never a crash', async () => {
+  const log = scratchLog();
+  const connection = await connect('', log);
+  const diagnostics: string[] = [];
+  connection.on('error', (e: Error) => diagnostics.push(e.message));
+  await connection.listTools();
+  assert.deepEqual((await connection.callTool('nullframe', {})).content, [{ type: 'text', text: 'after the noise' }]);
+  await until(() => diagnostics.length >= 4, 'four diagnostics');
+  assert.ok(diagnostics.every((d) => /sent a malformed JSON-RPC message/.test(d)), diagnostics.join(' | '));
+  assert.equal(connection.isConnected, true);
+  assert.deepEqual((await connection.callTool('plain', {})).content, [{ type: 'text', text: 'plain' }]);
+});
+
+test('close() reaps: a child that ignores SIGTERM is killed before close resolves', async () => {
+  const log = scratchLog();
+  const connection = await connect('ignore-sigterm', log);
+  const pid = wire(log).find((e) => e.event === 'start')!.pid!;
+  await connection.close();
+  const alive = (p: number) => { try { process.kill(p, 0); return true; } catch { return false; } };
+  assert.equal(alive(pid), false, 'dead when close() resolved');
+  assert.ok(wire(log).some((e) => e.event === 'sigterm-ignored'), 'it really did ignore SIGTERM');
+});
