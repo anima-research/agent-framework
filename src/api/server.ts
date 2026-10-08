@@ -1006,6 +1006,7 @@ export class ApiServer {
             respond(409, {
               error: error.message,
               verdicts: error.verdicts,
+              ...(error.unresolved.length > 0 ? { unresolved: error.unresolved } : {}),
               hostMode: this.framework.getHostModeStatus(),
             });
           } else {

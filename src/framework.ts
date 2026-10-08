@@ -860,16 +860,35 @@ export interface SafeBoundaryOptions {
   signal?: AbortSignal;
 }
 
+/** A cut whose latest attempt is unresolved (neither its switch nor its
+ *  failure recorded, and no operator verdict) and whose destination is the
+ *  active body: nobody can vouch for that body until an operator settles the
+ *  attempt (resolveOperatorChange, or agent-framework-recover
+ *  --operator-change resolve with the host stopped). */
+export interface UnresolvedActiveBody {
+  changeId: string;
+  agent: string;
+  kind: 'undo-turns' | 'undo-messages';
+  attempt: number;
+  /** The attempt's destination, which is the active branch. */
+  target: string;
+}
+
 /**
- * Thrown by `resume()` when the current runtime settings do not compile for
- * one or more agents — returning to service would OverBudget-wedge them on
- * the first wake. Drain quarantine / advance merges to lower the floor, or
- * pass `{ force: true }` after deciding the verdicts are acceptable.
+ * Thrown by `resume()` when returning to service isn't safe:
+ * - `verdicts`: the current runtime settings do not compile for one or more
+ *   agents, so returning would OverBudget-wedge them on the first wake. Drain
+ *   quarantine / advance merges to lower the floor, or pass `{ force: true }`
+ *   after deciding the verdicts are acceptable.
+ * - `unresolved`: the active body is the destination of a cut whose attempt
+ *   is unresolved. Resuming isn't an attestation and `force` doesn't
+ *   override it: settle each attempt first.
  */
 export class ResumeBlockedError extends Error {
   constructor(
     message: string,
     readonly verdicts: Array<{ agentName: string; preview: RuntimeSettingsPreview }>,
+    readonly unresolved: UnresolvedActiveBody[] = [],
   ) {
     super(message);
     this.name = 'ResumeBlockedError';
@@ -3626,6 +3645,13 @@ export class AgentFramework {
    * Throws ResumeBlockedError (with all failing verdicts) unless `force`.
    * Unavailable previews warn and pass — refusing to resume because the
    * strategy cannot preview would hold hosts hostage to a diagnostic.
+   *
+   * Also refuses, whatever `force` says, while the active body is the
+   * destination of a cut whose attempt is unresolved (the condition startup
+   * boots quiesced on): a resume isn't an operator's attestation about that
+   * body. The error's `unresolved` names each change and attempt; settle them
+   * with resolveOperatorChange, or offline. An unresolved attempt whose
+   * destination isn't the active body doesn't block.
    */
   async resume(opts?: { force?: boolean }): Promise<HostModeStatus> {
     if (!this.quiesced) return this.getHostModeStatus();
@@ -3655,20 +3681,37 @@ export class AgentFramework {
         );
       }
     }
-    if (failing.length > 0 && !opts?.force) {
-      const detail = failing.map(({ agentName, preview }) =>
-        `${agentName}: folded floor ${preview.effective!.finalTokens} > hard budget ` +
-        `${preview.effective!.budgetTokens}` +
-        (preview.transition === 'blocked'
-          ? ` (transition blocked: ${preview.transitionReason ?? 'unknown'})`
-          : ''),
-      ).join('; ');
-      throw new ResumeBlockedError(
-        `resume refused: returning to service would OverBudget-wedge — ${detail}. ` +
-        `Drain compression quarantine / advance the merge ladder to lower the floor ` +
-        `(maintenanceTick()), or resume({ force: true }).`,
-        failing,
-      );
+    // Read after every await above, with none between here and reopening: a
+    // settlement that landed meanwhile counts, and nothing lands after.
+    const unresolved = this.unresolvedActiveBodies();
+    const overBudget = failing.length > 0 && !opts?.force;
+    if (unresolved.length > 0 || overBudget) {
+      const reasons: string[] = [];
+      for (const u of unresolved) {
+        reasons.push(
+          `operator change ${u.changeId} (${u.kind} for ${u.agent}) is unresolved: its attempt ${u.attempt} left ` +
+          `${u.target} active with neither its switch nor its failure recorded. Resuming isn't an attestation, and ` +
+          `force doesn't override it: settle it first, live with resolveOperatorChange(${JSON.stringify(u.changeId)}, ` +
+          `${u.attempt}, 'committed' | 'not-committed', { lease, reason }), or with the host stopped, ` +
+          `agent-framework-recover --store <path> --operator-change resolve ${u.changeId} --attempt ${u.attempt} ` +
+          `--verdict <committed|not-committed> --reason <text>`,
+        );
+      }
+      if (overBudget) {
+        const detail = failing.map(({ agentName, preview }) =>
+          `${agentName}: folded floor ${preview.effective!.finalTokens} > hard budget ` +
+          `${preview.effective!.budgetTokens}` +
+          (preview.transition === 'blocked'
+            ? ` (transition blocked: ${preview.transitionReason ?? 'unknown'})`
+            : ''),
+        ).join('; ');
+        reasons.push(
+          `returning to service would OverBudget-wedge — ${detail}. ` +
+          `Drain compression quarantine / advance the merge ladder to lower the floor ` +
+          `(maintenanceTick()), or resume({ force: true })`,
+        );
+      }
+      throw new ResumeBlockedError(`resume refused: ${reasons.join('. Also: ')}.`, overBudget ? failing : [], unresolved);
     }
     if (failing.length > 0) {
       console.warn(
@@ -5701,7 +5744,12 @@ export class AgentFramework {
         return { ok: true, hostMode };
       } catch (error) {
         if (error instanceof ResumeBlockedError) {
-          return { ok: false, error: error.message, hostMode: this.getHostModeStatus() };
+          return {
+            ok: false,
+            error: error.message,
+            ...(error.unresolved.length > 0 ? { unresolved: error.unresolved } : {}),
+            hostMode: this.getHostModeStatus(),
+          };
         }
         throw error;
       }
@@ -7303,6 +7351,25 @@ export class AgentFramework {
     return copy;
   }
 
+  /** The unresolved cuts whose destination is the active body: what startup
+   *  boots quiesced on, and what resume() refuses until it is settled. */
+  private unresolvedActiveBodies(): UnresolvedActiveBody[] {
+    const active = this.store.currentBranch().name;
+    const found: UnresolvedActiveBody[] = [];
+    for (const record of this.changesLedger().records.values()) {
+      const unresolved = this.unresolvedAttempt(record);
+      if (!unresolved || unresolved.target !== active) continue;
+      found.push({
+        changeId: record.changeId,
+        agent: record.agent,
+        kind: record.kind as UnresolvedActiveBody['kind'],
+        attempt: unresolved.n,
+        target: unresolved.target,
+      });
+    }
+    return found;
+  }
+
   /** A cut whose latest attempt has neither its switch nor its failure
    *  recorded, and wasn't seen by this process: whether it applied is
    *  unknown, whatever its destination's state. */
@@ -8382,10 +8449,10 @@ export class AgentFramework {
    * cut's destination being active or written to proves nothing: a cut with
    * no recorded switch, failure or operator verdict is unresolved, never
    * certified, and if its destination is the active body, startup boots
-   * quiesced until an operator settles it. This runs before modules,
-   * connections or traffic, so a committed body never waits on its host to
-   * settle its marks. Anything else not provably committed is left for the
-   * host's retry.
+   * quiesced, and resume() refuses, until an operator settles it. This runs
+   * before modules, connections or traffic, so a committed body never waits
+   * on its host to settle its marks. Anything else not provably committed is
+   * left for the host's retry.
    */
   private async reconcileOperatorChanges(): Promise<void> {
     // Both journals were first read before the agents (an unreadable one

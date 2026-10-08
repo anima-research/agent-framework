@@ -18,7 +18,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { JsStore } from '@animalabs/chronicle';
 import { join } from 'node:path';
-import { AgentFramework, AutobiographicalStrategy, WorkspaceModule } from '../src/index.js';
+import { AgentFramework, AutobiographicalStrategy, ResumeBlockedError, WorkspaceModule } from '../src/index.js';
 import type {
   AgentSettingsExtension,
   InferenceRequest,
@@ -1267,6 +1267,59 @@ describe('operator-change gate: host/command undo by turns', () => {
     assert.deepEqual(receipt(applied), { status: 'queued', queued: 1, unmarked: 0, notRemoved: 0 });
     const record = framework.getOperatorChangeRecord(change.id)!;
     assert.deepEqual([record.switched, record.attempts[0]!.resolution!.verdict], [undefined, 'committed'], 'an attestation, not a framework-observed switch');
+  });
+
+  it('refuses resume(), forced or not and through host/command, while the active body is an unresolved cut\'s destination, until it is settled', async () => {
+    await say('a0'); await say('a1'); await say('a2');
+    await undoWithMarks(2, 'all');
+    const change = asked[0]!;
+    const undoRecord = failJournalOnce('switched');
+    try {
+      await assert.rejects(applyIt(change), /injected switched failure/);
+    } finally {
+      undoRecord();
+    }
+    await reopen();
+    assert.equal(quiesced(), true);
+    const held = [{ changeId: change.id, agent: 'scout', kind: 'undo-turns', attempt: 1, target: `undo/scout/op-${change.id}` }];
+    for (const opts of [undefined, { force: true }]) {
+      await assert.rejects(framework.resume(opts), (e: unknown) => {
+        assert.ok(e instanceof ResumeBlockedError);
+        assert.deepEqual([e.unresolved, e.verdicts], [held, []]);
+        assert.match(e.message, new RegExp(`operator change ${change.id} \\(undo-turns for scout\\) is unresolved: its attempt 1`));
+        assert.ok(e.message.includes(`resolveOperatorChange("${change.id}", 1, 'committed' | 'not-committed', { lease, reason })`));
+        assert.ok(e.message.includes(`--operator-change resolve ${change.id} --attempt 1 --verdict <committed|not-committed> --reason <text>`));
+        assert.match(e.message, /force doesn't override it/);
+        return true;
+      });
+      assert.equal(quiesced(), true, `still quiesced after resume(${JSON.stringify(opts ?? {})})`);
+    }
+    const viaCommand = await host().handleHostCommand('discord', { command: 'resume', force: true, requesterName: 'nissa' });
+    assert.deepEqual([viaCommand.ok, viaCommand.unresolved], [false, held], 'a refusal the host can read, not a throw');
+    assert.equal(quiesced(), true);
+
+    await resolve(change.id, 1, 'committed', 'the switch completed; its record was lost');
+    const status = await framework.resume();
+    assert.equal(status.quiesced, false, 'settled: resume proceeds');
+  });
+
+  it('lets resume() proceed while an unresolved attempt left its source, not its destination, active', async () => {
+    await say('m0'); await say('m1');
+    await host().handleHostCommand('discord', { command: 'undo', agentName: 'scout', messages: 2, marks: 'all', requesterName: 'nissa' });
+    const change = asked[0]!;
+    const undoCut = failCutAfterInitializerWrite();
+    const undoRecord = failJournalOnce('failed');
+    try {
+      await assert.rejects(applyIt(change), /injected strategy initialization failure/);
+    } finally {
+      undoCut(); undoRecord();
+    }
+    await reopen();
+    assert.equal(branch(), change.sourceBranch);
+    assert.ok(framework.getOperatorChangeRecord(change.id)!.unresolved, 'unresolved, on a branch that is not active');
+    await framework.quiesce({ reason: 'maintenance' });
+    const status = await framework.resume();
+    assert.equal(status.quiesced, false, 'a historical unresolved attempt does not hold the known body');
   });
 
   it("restores a recorded failure's source at startup, before any traffic, when the process died before restoring it", async () => {
