@@ -1012,6 +1012,10 @@ export class AgentFramework {
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
   private providerHoldHook: ProviderHoldHook | undefined;
   private providerAdmissionClosed = false;
+  /** Set when stop() begins, and never reset: a stopping or stopped
+   *  framework admits no new MCP/MCPL server connection, so nothing is
+   *  spawned or dialed after teardown has collected what it closes. */
+  private mcpServerAdmissionClosed = false;
   /** Last time we reported stale (busy-requeued) inference requests, per agent. */
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
@@ -1956,6 +1960,7 @@ export class AgentFramework {
    * Stop the event loop.
    */
   async stop(): Promise<void> {
+    this.mcpServerAdmissionClosed = true;
     this.pushCoalescer?.suspend();
     this.flushCoalescingSnapshot();
     this.running = false;
@@ -13771,6 +13776,9 @@ export class AgentFramework {
     config: import('./mcpl/types.js').McplServerConfig,
     deferAwareness = false,
   ): Promise<void> {
+    if (this.mcpServerAdmissionClosed) {
+      throw new Error(`MCP server "${config.id}" was not connected: the framework is stopping or stopped`);
+    }
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
       throw new Error('MCPL subsystem is not initialized');
     }
@@ -13838,6 +13846,12 @@ export class AgentFramework {
     }
 
     const connection = await this.mcplServerRegistry.addServer(config, this.mcplHostCapabilities);
+    // stop() began while the handshake ran: its teardown has already
+    // collected the registry, so this connection would outlive it. Close it.
+    if (this.mcpServerAdmissionClosed) {
+      await this.mcplServerRegistry.removeServer(config.id).catch(() => {});
+      throw new Error(`MCP server "${config.id}" was not connected: the framework stopped while it was connecting`);
+    }
 
     // Wire listeners before either startup staging or the runtime global gate
     // releases control traffic needed for registration and marker service.
@@ -14212,6 +14226,10 @@ export class AgentFramework {
   async connectMcplServer(
     config: import('./mcpl/types.js').McplServerConfig,
   ): Promise<void> {
+    // Refused before anything initializes, spawns or dials.
+    if (this.mcpServerAdmissionClosed) {
+      throw new Error(`MCP server "${config.id}" was not connected: the framework is stopping or stopped`);
+    }
     // Lazily bring up the MCPL subsystem — a framework that started with zero
     // configured servers can still deploy its first one at runtime.
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {

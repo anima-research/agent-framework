@@ -330,6 +330,14 @@ test('the framework owns a modern connect in flight: stop() ends it, and a secon
     assert.equal(alive(pid), false, 'the launch in flight was reaped by stop()');
     await pending.catch(() => {});
     assert.ok(!framework.listMcplServers().some((s) => s.id === 'hang' && s.connected), 'nothing installed after stop');
+    // A connect that arrives after stop() is refused before anything spawns.
+    const before = lines(log).length;
+    await assert.rejects(
+      framework.connectMcplServer({ ...config, id: 'late' }),
+      /was not connected: the framework is stopping or stopped/,
+    );
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(lines(log).length, before, 'no launch after stop');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
