@@ -564,6 +564,17 @@ interface ChannelRegistryOptions {
    */
   acceptInbound?: (event: McplChannelIncomingEvent) => InboundSource | undefined;
   /**
+   * A `channels/incoming` message carrying `coalesce`: its source envelope,
+   * built — not accepted — before it is gated. Its coalescer freezes and
+   * carries this same envelope, and observes the acceptance itself if it
+   * admits the occurrence.
+   */
+  coalescedSource?: (
+    serverId: string,
+    message: ChannelIncomingMessage,
+    event: McplChannelIncomingEvent,
+  ) => InboundSource | undefined;
+  /**
    * RFC-006: an admitted `channels/incoming` message carrying `coalesce`, with
    * the event the ordinary path would have queued. The handler decides
    * replace / append / withdraw and returns the per-message result. Throws a
@@ -751,6 +762,7 @@ export class ChannelRegistry {
   private migratedLegacyPolicies = new Set<string>();
   private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
   private acceptInbound?: ChannelRegistryOptions['acceptInbound'];
+  private coalescedSource?: ChannelRegistryOptions['coalescedSource'];
 
   constructor(
     serverRegistry: McplServerRegistry,
@@ -768,6 +780,7 @@ export class ChannelRegistry {
   ) {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
     this.acceptInbound = options?.acceptInbound;
+    this.coalescedSource = options?.coalescedSource;
     this.serverRegistry = serverRegistry;
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -1053,12 +1066,16 @@ export class ChannelRegistry {
         acceptedAt: Date.now(),
       };
 
-      // The source envelope of an ordinary message is frozen here, at
-      // admission, before it is gated, queued or acknowledged: a rename or
-      // rebind while it waits cannot change where it says it came from, and
-      // the gate reads the same envelope the direct path does. (A coalesced
-      // message's envelope is frozen by its coalescer when it is delivered.)
-      const inboundSource = coalesced ? undefined : this.acceptInbound?.(event);
+      // The source envelope is the host's, built here, at admission, before
+      // the message is gated, queued or acknowledged: a rename or rebind
+      // while it waits cannot change where it says it came from, and the
+      // gate reads the same envelope the direct path does. An ordinary
+      // message's acceptance is observed now; a coalesced one's envelope is
+      // only built here, and its coalescer freezes it and observes the
+      // acceptance if it admits the occurrence.
+      const inboundSource = coalesced
+        ? this.coalescedSource?.(serverId, message, event)
+        : this.acceptInbound?.(event);
       if (inboundSource) event.inboundSource = inboundSource;
 
       // Determine whether to trigger inference
@@ -1072,9 +1089,10 @@ export class ChannelRegistry {
           {
             // The adapter's own metadata first; the protocol's fields after
             // it, always present (even undefined), so an adapter metadata key
-            // can never stand in for them; and the frozen envelope last, which
-            // the gate's route candidates read first (a thread decides where a
-            // post lands, MCPL RFC-011).
+            // can never stand in for them; and the frozen envelope last —
+            // always present, even undefined, so an adapter key can't pose as
+            // it either — which the gate's route candidates read first (a
+            // thread decides where a post lands, MCPL RFC-011).
             ...message.metadata,
             eventType: 'mcpl:channel-incoming',
             serverId,
@@ -1083,7 +1101,7 @@ export class ChannelRegistry {
             threadId: message.threadId,
             author: message.author,
             ...(message.tags ? { tags: message.tags } : {}),
-            ...(inboundSource ? { [INBOUND_SOURCE_KEY]: inboundSource } : {}),
+            [INBOUND_SOURCE_KEY]: inboundSource,
           },
         );
       }

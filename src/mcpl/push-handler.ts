@@ -187,6 +187,10 @@ export class PushHandler {
      *  or acknowledged: return its source envelope, frozen now
      *  (mcpl/inbound-source.ts). Coalesced work is stamped by its own path. */
     private readonly acceptInbound?: (event: McplPushEvent) => InboundSource | undefined,
+    /** A coalesced push's source envelope, built — not accepted — before it
+     *  is gated: its coalescer freezes and carries this same envelope, and
+     *  observes the acceptance itself if it admits the occurrence. */
+    private readonly coalescedSource?: (serverId: string, params: PushEventParams, event: McplPushEvent) => InboundSource | undefined,
   ) {
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -280,12 +284,15 @@ export class PushHandler {
       triggerInference: true,
       acceptedAt: Date.now(),
     };
-    // The source envelope of an ordinary push is frozen at admission, before
-    // it is gated, queued or acknowledged: nothing that changes while it
-    // waits can rewrite where it came from, and the gate reads the same
-    // envelope the direct path does. (A coalesced push's envelope is frozen
-    // by its coalescer when it is delivered.)
-    const inboundSource = coalesced ? undefined : this.acceptInbound?.(pushEvent);
+    // The source envelope is the host's, built at admission, before the item
+    // is gated, queued or acknowledged: nothing that changes while it waits
+    // can rewrite where it came from, and the gate reads the same envelope
+    // the direct path does. An ordinary push's acceptance is observed now; a
+    // coalesced push's envelope is only built here, and its coalescer
+    // freezes it and observes the acceptance if it admits the occurrence.
+    const inboundSource = coalesced
+      ? this.coalescedSource?.(serverId, params, pushEvent)
+      : this.acceptInbound?.(pushEvent);
     if (inboundSource) pushEvent.inboundSource = inboundSource;
 
     // 6. Check shouldTriggerInference callback
@@ -296,8 +303,9 @@ export class PushHandler {
         .join('\n');
       // The server's origin first; the host's own fields after it, so an
       // origin key can never stand in for which server sent this or what
-      // kind of event it is; the frozen envelope last, which the gate's
-      // route candidates read first.
+      // kind of event it is; the frozen envelope last — always present, even
+      // undefined, so an origin key can't pose as it either — which the
+      // gate's route candidates read first.
       const metadata: Record<string, unknown> = {
         ...(params.origin ?? {}),
         serverId,
@@ -305,7 +313,7 @@ export class PushHandler {
         eventId: params.eventId,
         eventType: 'mcpl:push-event',
         ...(params.tags ? { tags: params.tags } : {}),
-        ...(inboundSource ? { [INBOUND_SOURCE_KEY]: inboundSource } : {}),
+        [INBOUND_SOURCE_KEY]: inboundSource,
       };
       pushEvent.triggerInference = this.shouldTriggerInference(textContent, metadata);
     }

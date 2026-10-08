@@ -8051,6 +8051,58 @@ export class AgentFramework {
     return run;
   }
 
+  /**
+   * The source envelope of a coalesced `channels/incoming` message, built at
+   * admission (before it is gated) and frozen by its coalescer. Building it
+   * observes no acceptance: the coalescer does that if it admits the
+   * occurrence.
+   */
+  private coalescedIncomingSource(
+    serverId: string,
+    message: ChannelIncomingMessage,
+    event: { acceptedAt?: number },
+  ): InboundSource {
+    return this.channelSource({
+      lane: 'channels/incoming',
+      coalesced: true,
+      serverId,
+      channelId: message.channelId,
+      threadId: message.threadId,
+      messageId: message.messageId,
+      eventId: message.eventId,
+      replyTo: message.metadata?.replyTo,
+      acceptedAt: event.acceptedAt,
+      sourceTimestamp: message.timestamp,
+    });
+  }
+
+  /**
+   * The source envelope of a coalesced push, built at admission (before it is
+   * gated) and frozen by its coalescer; like coalescedIncomingSource, it
+   * observes no acceptance. A channel-scoped push belongs to the channel its
+   * subject names — never one its `origin` names.
+   */
+  private coalescedPushSource(serverId: string, params: PushEventParams, event: McplPushEvent): InboundSource {
+    const c = params.coalesce;
+    const origin = params.origin ?? {};
+    const deferred = !!c?.deferred;
+    return c?.channelId
+      ? this.channelSource({
+          lane: 'push/event',
+          coalesced: true,
+          serverId,
+          channelId: c.channelId,
+          threadId: origin.threadId,
+          messageId: origin.messageId,
+          eventId: params.eventId,
+          replyTo: origin.replyTo,
+          acceptedAt: event.acceptedAt,
+          sourceTimestamp: params.timestamp,
+          deferred,
+        })
+      : this.pushSource(event, { deferred });
+  }
+
   private handleCoalescedIncoming(
     serverId: string,
     message: ChannelIncomingMessage,
@@ -8065,20 +8117,10 @@ export class AgentFramework {
       if (typeof message.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
       validateCoalescedContent(message.content);
       const c = message.coalesce;
-      // The inbound source envelope, frozen at acceptance: deferral, fan-out
-      // and replay deliver it unchanged (mcpl/inbound-source.ts).
-      const inboundSource = this.channelSource({
-        lane: 'channels/incoming',
-        coalesced: true,
-        serverId,
-        channelId: message.channelId,
-        threadId: message.threadId,
-        messageId: message.messageId,
-        eventId: message.eventId,
-        replyTo: message.metadata?.replyTo,
-        acceptedAt: event.acceptedAt,
-        sourceTimestamp: message.timestamp,
-      });
+      // The inbound source envelope the gate read, frozen at acceptance:
+      // deferral, fan-out and replay deliver it unchanged
+      // (mcpl/inbound-source.ts).
+      const inboundSource = event.inboundSource ?? this.coalescedIncomingSource(serverId, message, event);
       const result = await this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
@@ -8109,23 +8151,9 @@ export class AgentFramework {
       if (c.channelId) this.assertChannelScopedPush(serverId, c.channelId);
       const origin = params.origin ?? {};
       const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
-      // The inbound source envelope, frozen at acceptance (see the channel
-      // lane). A channel-scoped push belongs to the channel its subject names.
-      const inboundSource: InboundSource = c.channelId
-        ? this.channelSource({
-            lane: 'push/event',
-            coalesced: true,
-            serverId,
-            channelId: c.channelId,
-            threadId: origin.threadId,
-            messageId: origin.messageId,
-            eventId: params.eventId,
-            replyTo: origin.replyTo,
-            acceptedAt: event.acceptedAt,
-            sourceTimestamp: params.timestamp,
-            deferred: !!c.deferred,
-          })
-        : this.pushSource(event, { deferred: !!c.deferred });
+      // The inbound source envelope the gate read, frozen at acceptance (see
+      // the channel lane).
+      const inboundSource = event.inboundSource ?? this.coalescedPushSource(serverId, params, event);
       return this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
@@ -14578,6 +14606,9 @@ export class AgentFramework {
         this.noteInboundAccepted(source);
         return source;
       },
+      // A coalesced push: its envelope before it is gated; its coalescer
+      // observes the acceptance.
+      (serverId, params, event) => this.coalescedPushSource(serverId, params, event),
     );
 
     // Server-initiated inference router (Step 6)
@@ -14616,6 +14647,9 @@ export class AgentFramework {
           this.noteInboundAccepted(source);
           return source;
         },
+        // A coalesced message: its envelope before it is gated; its
+        // coalescer observes the acceptance.
+        coalescedSource: (serverId, message, event) => this.coalescedIncomingSource(serverId, message, event),
         sendTypingFn: (serverId, channelId, metadata, op) => {
           const server = this.mcplServerRegistry!.getServer(serverId);
           if (server) {

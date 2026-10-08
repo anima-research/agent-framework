@@ -154,6 +154,44 @@ test('the gate reads a message\'s thread from the protocol field, never from ada
   assert.equal(seen[1]!.threadId, '1700.0001');
 });
 
+test('a coalesced message is gated with the host envelope its coalescer will freeze; adapter metadata can\'t pose as one', async () => {
+  const seen: Array<Record<string, unknown>> = [];
+  const envelope = {
+    kind: 'channel', lane: 'channels/incoming', coalesced: true, serverId: 'slack', binding: 'b1',
+    channelId: 'slack:C1', messageId: 'm-c', acceptedAt: 1,
+  };
+  let accepted = 0;
+  const handed: Array<{ inboundSource?: unknown }> = [];
+  const registry = new ChannelRegistry(
+    { getServer: () => undefined } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+    {
+      shouldTriggerInference: (_content, metadata) => { seen.push(metadata); return false; },
+      acceptInbound: () => { accepted++; return undefined; },
+      coalescedSource: () => envelope as never,
+      handleCoalescedIncoming: async (_serverId, message, event) => {
+        handed.push(event as { inboundSource?: unknown });
+        return { messageId: message.messageId, accepted: true };
+      },
+    },
+  );
+  seedRegistered(registry, 'slack', 'slack:C1', 'slack:OTHER');
+  await registry.handleIncoming('slack', {
+    messages: [{
+      channelId: 'slack:C1', messageId: 'm-c', author: { id: 'u1', name: 'Ada' },
+      timestamp: '2026-10-07T00:00:00.000Z', content: [{ type: 'text' as const, text: 'hi' }],
+      eventId: 'ev-c', coalesce: { key: 'k1' },
+      metadata: { inboundSource: { kind: 'channel', serverId: 'forged', channelId: 'slack:OTHER' } },
+    }],
+  } as never);
+  assert.equal(accepted, 0, 'building the envelope accepts nothing: the coalescer observes its own admissions');
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0]!.inboundSource, envelope, 'the gate reads the host envelope');
+  assert.equal(handed[0]!.inboundSource, envelope, 'the coalescer gets the very envelope the gate read');
+});
+
 test('publish rechecks its destination after opening it: a declaration withdrawn meanwhile refuses the send', async () => {
   // A closed channel declares where posts land; while the open waits on the
   // connector, a channels/changed withdraws that (or removes the channel, or
