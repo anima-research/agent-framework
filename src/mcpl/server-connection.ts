@@ -63,6 +63,34 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 const MCP_PROTOCOL_VERSION = '2024-11-05';
 
 /**
+ * Why a request to an MCPL server produced no result, as far as the host can
+ * know it. Messages are unchanged from plain errors; the `outcome` makes the
+ * difference between "never left the host" and "left, and no answer came
+ * back" a fact a caller can act on instead of a string to match:
+ * - `not-sent`: the request was refused before anything was written (the
+ *   connection was already closed);
+ * - `error-response`: the server answered with a JSON-RPC error (it may have
+ *   acted before failing; the error alone does not say);
+ * - `no-response`: the request was handed to the transport and no answer
+ *   came back (timeout, or the connection closed while awaiting). It does
+ *   not prove the request reached the server — the transport can decline or
+ *   drop a write — only that the host can no longer say it didn't.
+ */
+export class McplRequestError extends Error {
+  constructor(
+    message: string,
+    readonly outcome: 'not-sent' | 'error-response' | 'no-response',
+    readonly code?: number,
+    /** The JSON-RPC error's `data`, verbatim, when the server supplied one
+     *  (e.g. which parts of a multi-part send were posted). */
+    readonly data?: unknown,
+  ) {
+    super(message);
+    this.name = 'McplRequestError';
+  }
+}
+
+/**
  * Represents a pending JSON-RPC request awaiting a response.
  */
 interface PendingRequest {
@@ -326,8 +354,8 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * Close the data plane synchronously while leaving an already-released
-   * control plane live. Used before reconnect adoption and list-change
-   * reconciliation so no new inference event can beat barrier installation.
+   * control plane live: quiesce holds wakes this way while operator traffic
+   * (host/command) still flows. A reconnect closes both planes instead.
    */
   pauseDataPlane(): void {
     this.dataPlaneReady = false;
@@ -335,8 +363,8 @@ export class McplServerConnection extends EventEmitter {
 
   /**
    * Override emit to buffer server→host events until the corresponding plane
-   * is ready. Lifecycle events always pass through so reconnect can install a
-   * new data-plane gate before the fresh transport is exposed.
+   * is ready. Lifecycle events always pass through so the reconnect listener
+   * runs before the fresh transport's buffered traffic is released.
    */
   override emit(event: string | symbol, ...args: unknown[]): boolean {
     const name = typeof event === 'string' ? event : '';
@@ -846,7 +874,7 @@ export class McplServerConnection extends EventEmitter {
     // Reject all pending requests
     for (const [id, pending] of this.pendingRequests) {
       if (pending.timer) clearTimeout(pending.timer);
-      pending.reject(new Error(`Connection to MCPL server "${this.id}" closed while awaiting response for ${pending.method} (id=${id})`));
+      pending.reject(new McplRequestError(`Connection to MCPL server "${this.id}" closed while awaiting response for ${pending.method} (id=${id})`, 'no-response'));
     }
     this.pendingRequests.clear();
     this.orphanedRequests.clear();
@@ -925,11 +953,15 @@ export class McplServerConnection extends EventEmitter {
         this.hostCapabilities,
       );
 
-      // Close the data plane before the new transport can emit. The reconnect
-      // lifecycle event bypasses buffering; its framework listener installs the
-      // awareness barrier synchronously, then releases control traffic needed
-      // to establish the server while data remains held.
-      this.pauseDataPlane();
+      // Close both planes before the new transport can emit, as at initial
+      // connect: its traffic is admitted against the grant, which this
+      // boundary resets, so control traffic too (a server's channels/register
+      // right after initialize) must wait for the new grant rather than be
+      // refused against the empty one. The reconnect lifecycle event bypasses
+      // buffering; its framework listener re-establishes the grant (§5.3
+      // policy responses are never buffered) and then opens the planes.
+      this.controlPlaneReady = false;
+      this.dataPlaneReady = false;
       this.resetPolicyForTransportBoundary();
       this.transport = transport;
       this.capabilities = capabilities;
@@ -973,7 +1005,7 @@ export class McplServerConnection extends EventEmitter {
     options: RequestOptions = {},
   ): Promise<unknown> {
     if (this.closed) {
-      return Promise.reject(new Error(`Cannot send request: connection to "${this.id}" is closed`));
+      return Promise.reject(new McplRequestError(`Cannot send request: connection to "${this.id}" is closed`, 'not-sent'));
     }
 
     const id = this.nextRequestId++;
@@ -994,13 +1026,14 @@ export class McplServerConnection extends EventEmitter {
             this.orphanedRequests.set(id, { method, ...(method === 'push/render' ? { renderParams: { featureSet: params.featureSet, key: params.key, eventId: params.eventId } } : {}) });
             if (this.orphanedRequests.size > 4096) this.orphanedRequests.delete(this.orphanedRequests.keys().next().value!);
           }
-          reject(new Error(
+          reject(new McplRequestError(
             `MCPL server "${this.id}" did not respond to ${method} (id=${id}) ` +
             `within ${timeoutMs}ms — the server may be hung. The response ` +
             `outcome is unknown: the request was abandoned locally but was not ` +
             `cancelled, so the tool may still have completed server-side; verify ` +
             `state before retrying; a blind retry of a stateful/side-effecting ` +
             `tool may duplicate it.`,
+            'no-response',
           ));
         }, timeoutMs);
         // Don't hold the event loop open for the watchdog alone.
@@ -1215,7 +1248,12 @@ export class McplServerConnection extends EventEmitter {
 
     if (response.error) {
       pending.reject(
-        new Error(`MCPL server "${this.id}" returned error for ${pending.method}: [${response.error.code}] ${response.error.message}`),
+        new McplRequestError(
+          `MCPL server "${this.id}" returned error for ${pending.method}: [${response.error.code}] ${response.error.message}`,
+          'error-response',
+          typeof response.error.code === 'number' ? response.error.code : undefined,
+          (response.error as { data?: unknown }).data,
+        ),
       );
     } else {
       pending.resolve(response.result);
@@ -1267,8 +1305,9 @@ export class McplServerConnection extends EventEmitter {
         for (const [id, pending] of this.pendingRequests) {
           if (pending.timer) clearTimeout(pending.timer);
           pending.reject(
-            new Error(
+            new McplRequestError(
               `MCPL server "${this.id}" disconnected unexpectedly (code=${info.code ?? 'n/a'}, signal=${info.signal ?? 'n/a'}, reason=${info.reason ?? 'unknown'}) while awaiting ${pending.method} (id=${id})`,
+              'no-response',
             ),
           );
         }

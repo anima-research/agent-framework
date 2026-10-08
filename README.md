@@ -161,15 +161,23 @@ agent-framework-recover \
 
 The specified Discord message is the last message the agent will still see;
 everything after it is left on the old branch. The command scans in bounded
-windows, never compiles message content, activates
-the new Chronicle branch, and writes only Discord `{serverId, channelId,
-messageId}` metadata to
-`<store>/recovery/discord-awareness-outbox.json`. When the host and that
-agent's `discord-mcpl` bot reconnect, each addressable discarded message is
-marked with 💤. Delivery state is recorded per message: retryable failures
-remain queued, permanent deleted/inaccessible-message failures remain in the
-audit ledger without blocking later markers. Portal and other non-Discord
-records are ignored.
+windows, never compiles message content, and activates the new Chronicle
+branch. By default the recovery is local to the resident: nothing is posted to
+Discord. To let the people involved see that the agent no longer has their
+messages, choose awareness marks explicitly with `--marks addressed` (removed
+messages that mentioned or replied to the bot, and DMs) or `--marks all`
+(every removed Discord message). The output counts what will be marked and
+what stays unmarked, and `--dry-run` shows exactly which addresses each choice
+covers. Only `{serverId, channelId, messageId}` metadata is written, to the
+awareness journal kept in the store itself, and the marks are delivered when
+the host and that agent's `discord-mcpl` bot next connect (see
+[Live surgery and Discord awareness marks](#live-surgery-and-discord-awareness-marks)).
+If the branch is made but the marks can't be recorded, the output's `markers`
+says so and the branch stands. Like a live surgery, the recovery (with its
+marks choice and receipt) is recorded in the store's operator log,
+`operator-actions.jsonl`, with the OS account that ran it; so is each
+`--awareness` cancel, retract and release. A dry run records nothing.
+Portal and other non-Discord records are ignored.
 
 When the safe point is an assistant/tool-side record rather than a Discord
 message, use its exact ContextManager message ID:
@@ -202,7 +210,7 @@ agent-framework-recover \
 `--suppress-range <first>..<last>` suppresses the inclusive context interval
 between two Discord messages, including intervening agent/tool entries. These
 removals exist only on the recovery branch; the source branch remains intact.
-Suppressed Discord messages are queued for the same 💤 awareness marker.
+Suppressed Discord messages follow the same `--marks` choice.
 Selections that split a sharded body group or a tool-use/tool-result exchange
 are rejected. The suppression plan is journaled before the branch switch; if
 the recovery process is interrupted between interval removals, framework
@@ -212,17 +220,10 @@ For old stores whose messages lack `metadata.serverId`, supply
 normal agent host must be stopped while this command has the Chronicle store
 open.
 
-The marker sidecar is a retained operation ledger, not a delete-on-success
-queue. Switching back to the source branch queues removal of the bot's marker;
-returning to the recovery branch queues it again. Initial MCPL events remain
-buffered until the ledger has been reconciled. Startup, reconnect, runtime
-list-change, and online undo use one framework-global generation: every MCPL
-data plane waits while all control planes remain live for registration and
-marker service. Awareness marker calls also have a mandatory deadline that is
-independent of `requestTimeoutMs` (including when that value is `0`); configure
-it with `discordAwarenessDeadlineMs` (default 10000ms, clamped to 50..60000ms).
-Configure the online marker with `discordAwarenessEmoji`; the offline CLI
-accepts `--emoji`.
+With the host stopped, the same command inspects and controls the awareness
+journal: `--awareness list`, `--awareness cancel <batch|retract-request>`,
+`--awareness retract <batch|all>` and `--awareness release <batch>` behave as
+the live controls described below.
 
 ### MCPL (MCP Live)
 
@@ -362,6 +363,100 @@ Also reachable over HTTP (`POST /quiesce`, `POST /resume`,
 servers granted `allowHostCommands`. The HTTP host verbs accept an optional
 shared secret (`ApiServerConfig.adminToken`, sent as `x-admin-token`) for
 deployments that front the port with a proxy.
+
+### Live surgery and Discord awareness marks
+
+`rollbackToMessage(agent, { messageId })` forks the agent's context at a
+message and switches to the fork; `suppressMessages(agent, { messageIds })`
+forks at the head and removes the chosen messages on the fork. The source
+branch stays intact either way. Removing Discord messages from an agent's
+context is local to that agent unless the operator also chooses to mark them:
+
+```typescript
+const preview = framework.previewSurgeryMarks('cairn', { rollbackTo: messageId });
+// preview.scopes.addressed / .all: count, per-channel counts and refs
+const result = await framework.rollbackToMessage('cairn', {
+  messageId,
+  marks: { scope: 'addressed', refs: preview.scopes.addressed.refs },
+});
+// result.markers: { status: 'none' | 'queued' | 'not-scheduled' | 'unresolved', ... }
+```
+
+- **`marks`** is `'none'` (the default), or `{ scope: 'addressed' | 'all', refs? }`.
+  `addressed` covers messages tagged `chat:addressed` (mentions, replies to
+  the bot, DMs). Passing a preview's `refs` binds the choice to exactly that
+  set: messages that arrive before the surgery applies are removed locally but
+  never marked. The choice is recorded in the operator log.
+- **The surgery returns once marks are scheduled**, never after Discord has
+  accepted them. `result.markers` says whether they were scheduled (`queued`
+  with a count and batch id), not chosen or not in scope (`none`), not to be
+  delivered because recording the batch failed after the body change and it
+  was retired or never recorded (`not-scheduled`), or `unresolved` (neither
+  activation nor retirement could be recorded, or the journal could not be
+  read back to say whether the batch was; it names a batch that may still be
+  delivered). Every receipt also counts the removed messages left unmarked.
+  Marker bookkeeping never fails or undoes an applied rollback or
+  suppression.
+- **Delivery runs in the background** and never holds MCPL traffic or turns.
+  A route that is not connected keeps its work queued until it connects.
+  Each reaction call has a mandatory deadline independent of
+  `requestTimeoutMs` (including `0`): `discordAwarenessDeadlineMs` (default
+  10000ms, clamped to 50..60000ms). The emoji is `discordAwarenessEmoji`
+  (offline: `--emoji`).
+- **Marks are one-shot.** Switching branches, undo/redo and restarts never add
+  or remove a mark. The journal is an append-only history of requests and
+  their attempts, kept as typed records in the Chronicle store: it survives
+  rollbacks, branch deletion and a killed process, and lives with its store.
+  Each request is written ahead of its dispatch, and a dispatch is admitted
+  from the journal as it is at that moment, so a cancel takes effect even
+  while an earlier request is on the wire. A request written and never
+  answered is recorded as `unknown`, and a later confirmation of a different
+  attempt never resolves it. Between opposite requests for one reaction,
+  the later *authorization* wins, whenever each request was created: a
+  surgery's adds carry the moment of its marks choice, even when activation
+  comes later, so a retract made in between prevails; a release is a new
+  act. A record that certifies a body change (an activation, a completed
+  suppression, a retirement, or the batch a hide or turn undo records after
+  its change) is written only after that change is synced.
+  A batch whose surgery was interrupted before its branch switch was
+  recorded is held at startup until an operator releases it; an interrupted
+  suppression's redactions are resumed whenever its branch is active at
+  startup, whatever its marks' state.
+- **Operator controls,** each recorded in the operator log:
+  - `listDiscordAwareness()` lists batches and retract requests;
+  - `cancelDiscordAwareness(batch | retractRequest)` stops all further sends
+    and retries of a batch's marks or a retract's removals, and never removes
+    or undoes anything. Its receipt counts requests in flight or unknown,
+    including earlier attempts later answered, any of which may still land;
+  - `retractDiscordAwareness(batch | 'all')` queues removal of this bot's
+    reaction, through each address's configured MCPL route, for every message
+    of the batch (or of every batch not retired by its own surgery, prepared,
+    held or active, and every message an imported ledger recorded), whatever
+    history says: removing an absent reaction does nothing. As the latest
+    authorization for those messages, it stops adds that haven't ended and
+    any an earlier choice would request later; cancelling it never revives
+    them. Its receipt discloses earlier requests whose outcome is unknown and
+    imported history that leaves outcomes unrecorded;
+  - `releaseDiscordAwareness(batch)` queues a held batch.
+- **Over `host/command`** (servers granted `allowHostCommands`): `undo` (by
+  messages or by turns) and `hide` take `marks: 'none' | 'addressed' | 'all'`
+  (default `none`; any other value is refused) and return `markers`. Each
+  holds the store like every surgery, so it is refused while any agent
+  sharing the store is mid-turn. The `marks` verb takes `action: 'list'
+  | 'cancel' | 'retract' | 'release'` with a `target` (a batch id; for cancel
+  also a retract request id; for retract also `all`).
+
+A pre-journal awareness ledger (`discord-awareness-outbox.json` under the
+store, or `discordAwarenessOutboxPath`) is imported once on first use and the
+file renamed `.migrated-v2`; a copy put back at that path later imports only
+batches the journal doesn't already hold. What it recorded about each message
+is kept as evidence (attempt count; the last action and the outcome its error field
+establishes; the old writer's delivery status, labelled as the
+reconciliation state it was; and how many attempt outcomes it leaves
+unrecorded), never as a claim about what is on Discord,
+and an imported `active` suppression is not taken as proof that its body
+completed: startup verifies and resumes its intervals on its branch. Its
+undelivered work is held for an explicit release.
 
 ## Observability
 

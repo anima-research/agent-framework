@@ -89,7 +89,8 @@ describe('live operator surgery', () => {
     assert.equal(entry.agent, 'scout');
     assert.deepEqual(entry.requester, { via: 'webui', name: 'antra' });
     assert.equal(entry.note, 'bad turn');
-    assert.deepEqual(entry.params, { messageId: ids[2] });
+    // The marks choice is recorded with the operator's other parameters.
+    assert.deepEqual(entry.params, { messageId: ids[2], marks: 'none' });
     assert.equal(entry.result?.messagesRemoved, 2);
     assert.equal(entry.result?.targetBranch, r.targetBranch);
     assert.ok(typeof entry.at === 'string' && !Number.isNaN(Date.parse(entry.at)));
@@ -297,7 +298,7 @@ describe('live operator surgery', () => {
 
     const entry = readLog(framework.getOperatorLogPath()!).find((e) => e.kind === 'suppress');
     assert.ok(entry);
-    assert.deepEqual(entry.params, { messageIds: [ids[1], ids[3]] });
+    assert.deepEqual(entry.params, { messageIds: [ids[1], ids[3]], marks: 'none' });
     assert.deepEqual(new Set(entry.result?.removedIds as string[]), new Set([ids[1], ids[3]]));
   });
 

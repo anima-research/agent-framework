@@ -118,6 +118,62 @@ export function capIds(ids: string[]): { ids: string[]; count: number; truncated
     : { ids, count: ids.length };
 }
 
+/**
+ * Facts every surgery marker receipt carries, whatever happened: the
+ * publication scope chosen (`none` unless the operator chose marks), how many
+ * removed addressable Discord messages the surgery left unmarked, and how
+ * many authorized refs it did not remove (a delayed application whose anchor
+ * no longer covered them; their marks are never widened to anything else).
+ */
+export interface SurgeryMarkerFacts {
+  scope: 'none' | 'addressed' | 'all';
+  unmarked: number;
+  notRemoved: number;
+}
+
+/**
+ * What a live surgery did about Discord awareness marks, reported apart from
+ * the body change itself. A surgery that returns has applied its body change;
+ * this says only whether marks were scheduled:
+ *
+ * - `none` — no marks were requested (the default), or none of the removed
+ *   messages fell within the chosen scope and authorized refs. It says
+ *   nothing about whether Discord messages were removed: `unmarked` counts
+ *   the addressable ones left unmarked, and the surgery's `removedRefs`
+ *   (`discordRefs` in the operator log) list every one.
+ * - `queued` — one add request per mark is durably recorded and delivery has
+ *   started. It is not a delivery claim: per-request outcomes stay in the
+ *   awareness journal.
+ * - `not-scheduled` — the body change landed, but the batch was never
+ *   recorded, or recording it as active failed and it was retired from the
+ *   journal: none of its marks will be delivered.
+ * - `unresolved` — the journal could record neither the activation nor the
+ *   retirement, or could not be read back to say whether the batch was
+ *   recorded at all. `batchId` names the batch, whose scheduling outcome is
+ *   unresolved: any later reconciliation or restart that can read it may
+ *   activate and deliver it, and nothing here promises otherwise.
+ */
+export type SurgeryMarkerReceipt = SurgeryMarkerFacts & (
+  | { status: 'none'; queued: 0 }
+  | { status: 'queued'; queued: number; batchId: string }
+  | { status: 'not-scheduled'; queued: 0; error: string }
+  | { status: 'unresolved'; queued: 0; batchId: string; error: string }
+);
+
+/** What a surgery would remove and which messages each marks scope covers. */
+export interface SurgeryMarksPreview {
+  messagesRemoved: number;
+  /** Removed messages that carry a Discord address at all. */
+  addressable: number;
+  emoji: string;
+  scopes: Record<'addressed' | 'all', {
+    count: number;
+    channels: Array<{ channelId: string; count: number }>;
+    /** Pass back as `marks.refs` to bind the choice to exactly these. */
+    refs: Array<{ serverId: string; channelId: string; messageId: string }>;
+  }>;
+}
+
 /** Thrown by live surgery methods when a request cannot be honored. `code`
  *  lets surfaces distinguish "agent busy — quiesce first" from bad input. */
 export class OperatorActionError extends Error {

@@ -1,11 +1,16 @@
 import { JsStore } from '@animalabs/chronicle';
+import type { SurgeryMarkerReceipt } from '../operator-log.js';
 import { ContextManager } from '@animalabs/context-manager';
 import {
   DEFAULT_DISCORD_AWARENESS_EMOJI,
   DiscordAwarenessOutbox,
+  boundDiscordAwarenessText,
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
+  selectDiscordAwarenessRefs,
+  type DiscordAwarenessMarks,
   type DiscordAwarenessRef,
+  type DiscordMessageMetadataCarrier,
 } from './discord-awareness-outbox.js';
 
 export interface OfflineRecoveryBranchOptions {
@@ -26,8 +31,14 @@ export interface OfflineRecoveryBranchOptions {
   namespace?: string;
   /** Use for old message records that do not carry metadata.serverId. */
   discordServerId?: string;
+  /** A pre-journal awareness ledger to import (default: under the store). */
   outboxPath?: string;
   emoji?: string;
+  /**
+   * Awareness marks on the removed Discord messages: an explicit publication
+   * choice, `none` by default. The recovery itself stays local either way.
+   */
+  marks?: DiscordAwarenessMarks;
   dryRun?: boolean;
 }
 
@@ -37,9 +48,21 @@ export interface OfflineRecoveryBranchResult {
   targetBranch: string;
   messagesRemoved: number;
   messagesSuppressed: number;
+  /** Removed messages that carry a Discord address. */
+  discordAddressable: number;
+  /** The publication scope recorded for this recovery. */
+  marksScope: 'none' | 'addressed' | 'all';
+  /** Marks queued for delivery (planned, for a dry run); not delivered. */
   discordMarkersQueued: number;
+  /** What became of the marks once the branch was made (absent on a dry
+   *  run): scheduling only, never Discord acceptance. */
+  markers?: SurgeryMarkerReceipt;
+  /** The refs that will be marked (empty unless marks were chosen). */
   refs: DiscordAwarenessRef[];
-  outboxPath: string;
+  /** Removed addressable messages left unmarked. */
+  unmarked: number;
+  /** Authorized refs (marks.refs) this recovery does not remove. */
+  notRemoved: number;
 }
 
 /**
@@ -81,7 +104,7 @@ export async function createOfflineRecoveryBranch(
     let target: StoredWindowMessage;
     let targetIndex: number;
     let removedCount: number;
-    let refs: DiscordAwarenessRef[];
+    let carriers: DiscordMessageMetadataCarrier[];
 
     if (options.messageId) {
       // Search backward in bounded windows: recovery anchors are normally near
@@ -98,12 +121,7 @@ export async function createOfflineRecoveryBranch(
       target = located.message;
       targetIndex = located.index;
       removedCount = total - located.index - 1;
-      refs = collectDiscordRefs(
-        contextManager,
-        located.index + 1,
-        total,
-        options.discordServerId,
-      );
+      carriers = collectDiscordCarriers(contextManager, located.index + 1, total);
     } else if (options.contextId) {
       const located = findInternalMessageFromTail(contextManager, total, options.contextId.trim());
       if (!located) {
@@ -112,12 +130,7 @@ export async function createOfflineRecoveryBranch(
       target = located.message;
       targetIndex = located.index;
       removedCount = total - located.index - 1;
-      refs = collectDiscordRefs(
-        contextManager,
-        located.index + 1,
-        total,
-        options.discordServerId,
-      );
+      carriers = collectDiscordCarriers(contextManager, located.index + 1, total);
     } else {
       // Count mode remains for compatibility. Read only the target plus suffix,
       // avoiding full-history materialization and attachment blob inflation.
@@ -132,7 +145,7 @@ export async function createOfflineRecoveryBranch(
       target = countTarget;
       targetIndex = total - count! - 1;
       removedCount = count!;
-      refs = extractDiscordAwarenessRefs(discarded, options.discordServerId);
+      carriers = discarded.map(addressingOnly);
     }
 
     validateAnchorBoundary(contextManager, targetIndex, total, target);
@@ -142,7 +155,6 @@ export async function createOfflineRecoveryBranch(
       targetIndex,
       options.suppressMessageIds ?? [],
       options.suppressRanges ?? [],
-      options.discordServerId,
     );
     validateRemovalIntegrity(
       contextManager,
@@ -157,7 +169,11 @@ export async function createOfflineRecoveryBranch(
         ...suppression.intervals,
       ],
     );
-    refs = dedupeDiscordRefs([...refs, ...suppression.refs]);
+    carriers = [...carriers, ...suppression.carriers];
+    const addressable = extractDiscordAwarenessRefs(carriers, options.discordServerId).length;
+    const marks = options.marks ?? 'none';
+    const selection = selectDiscordAwarenessRefs(carriers, marks, options.discordServerId);
+    const refs = selection.refs;
 
     const sourceBranch = store.currentBranch().name;
     const targetBranch = options.branchName
@@ -165,8 +181,11 @@ export async function createOfflineRecoveryBranch(
     if (targetBranch === sourceBranch) {
       throw new Error('Recovery branch name must differ from the active source branch');
     }
-    const outboxPath = options.outboxPath
-      ?? defaultDiscordAwarenessOutboxPath(options.storePath);
+    // A known collision is refused before anything is prepared: a batch
+    // whose target names an existing branch would be armed by starting it.
+    if (store.listBranches().some((branch) => branch.name === targetBranch)) {
+      throw new Error(`Recovery branch ${targetBranch} already exists; choose another --branch`);
+    }
 
     const result: OfflineRecoveryBranchResult = {
       dryRun: options.dryRun === true,
@@ -174,18 +193,28 @@ export async function createOfflineRecoveryBranch(
       targetBranch,
       messagesRemoved: removedCount,
       messagesSuppressed: suppression.messageCount,
+      discordAddressable: addressable,
+      marksScope: marks === 'none' ? 'none' : marks.scope,
       discordMarkersQueued: refs.length,
       refs,
-      outboxPath,
+      unmarked: selection.unmarked,
+      notRemoved: selection.notRemoved,
     };
     if (options.dryRun) return result;
 
-    const outbox = new DiscordAwarenessOutbox(outboxPath);
+    // The journal lives in this store; the host is stopped, so this process
+    // is its only writer.
+    const outbox = new DiscordAwarenessOutbox(store, {
+      legacyPath: options.outboxPath ?? defaultDiscordAwarenessOutboxPath(options.storePath),
+    });
     const batch = outbox.prepare({
       agentName: options.agentName,
       sourceBranch,
       targetBranch,
       refs,
+      scope: marks === 'none' ? 'none' : marks.scope,
+      unmarked: selection.unmarked,
+      notRemoved: selection.notRemoved,
       emoji: options.emoji ?? DEFAULT_DISCORD_AWARENESS_EMOJI,
       // Merely seeing targetBranch active does not prove branch-local
       // suppressions finished. Only the recovery operation may activate this
@@ -197,10 +226,12 @@ export async function createOfflineRecoveryBranch(
       })),
     });
 
-    // branchAt uses the target message's origin sequence. No message content is
-    // compiled or submitted to Membrane during this operation.
-    const createdBranch = contextManager.branchAt(target.id, targetBranch);
     try {
+      // branchAt uses the target message's origin sequence. No message
+      // content is compiled or submitted to Membrane during this operation.
+      // Creating the branch is part of the body: a failure here settles the
+      // batch like a failed switch or redaction.
+      const createdBranch = contextManager.branchAt(target.id, targetBranch);
       await contextManager.switchBranch(createdBranch);
       // Work from newest to oldest so earlier redactions never perturb the
       // live positions used by later range endpoints.
@@ -208,18 +239,60 @@ export async function createOfflineRecoveryBranch(
         if (interval.fromId === interval.toId) contextManager.removeMessage(interval.fromId);
         else contextManager.removeMessages(interval.fromId, interval.toId);
       }
-      if (batch) outbox.activate(batch.id);
     } catch (error) {
       // A partially suppressed branch is not safe to boot into. Preserve it
-      // for diagnosis, but leave Chronicle on the untouched source branch and
-      // keep the explicit outbox batch non-deliverable.
-      if (store.currentBranch().name === createdBranch) {
-        await contextManager.switchBranch(sourceBranch);
+      // for diagnosis, but put Chronicle back on the untouched source branch.
+      // Once the source is confirmed, the batch is retired (after the
+      // restored state is synced): its surgery never happened. If it can't
+      // be confirmed, the batch stays prepared as the unfinished body's
+      // record (startup holds its marks, and resumes the body only on its
+      // branch). The error says which.
+      const failure = error instanceof Error ? error.message : String(error);
+      let restore = '';
+      try {
+        if (store.currentBranch().name !== sourceBranch) await contextManager.switchBranch(sourceBranch);
+      } catch (restoreError) {
+        restore = `; restoring ${sourceBranch} failed: ${boundDiscordAwarenessText(
+          restoreError instanceof Error ? restoreError.message : String(restoreError),
+        )}`;
       }
-      throw error;
+      let retire = '';
+      if (batch) {
+        if (store.currentBranch().name !== sourceBranch) {
+          retire = `; awareness batch ${batch.id} kept, since the source branch could not be confirmed`;
+        } else {
+          try {
+            outbox.discard(batch.id);
+          } catch (discardError) {
+            retire = `; awareness batch ${batch.id} could not be retired (${boundDiscordAwarenessText(
+              discardError instanceof Error ? discardError.message : String(discardError),
+            )}); startup will hold it`;
+          }
+        }
+      }
+      if (!restore && !retire) throw error;
+      throw new Error(`${failure}${restore}${retire}`, { cause: error });
     }
 
-    return result;
+    // The body change landed. Marker bookkeeping is reported apart from it
+    // and never undoes it.
+    const facts = {
+      scope: (marks === 'none' ? 'none' : marks.scope) as SurgeryMarkerReceipt['scope'],
+      unmarked: selection.unmarked,
+      notRemoved: selection.notRemoved,
+    };
+    let markers: SurgeryMarkerReceipt = { ...facts, status: 'none', queued: 0 };
+    if (batch) {
+      const settled = outbox.settleActivation(batch.id);
+      if (batch.refs.length > 0) {
+        markers = settled.status === 'queued'
+          ? { ...facts, status: 'queued', queued: settled.queued, batchId: batch.id }
+          : settled.status === 'not-scheduled'
+            ? { ...facts, status: 'not-scheduled', queued: 0, error: settled.error }
+            : { ...facts, status: 'unresolved', queued: 0, batchId: batch.id, error: settled.error };
+      }
+    }
+    return { ...result, discordMarkersQueued: markers.queued, markers };
   } finally {
     contextManager?.close();
     store.close();
@@ -368,8 +441,7 @@ function buildSuppressionPlan(
   targetIndex: number,
   rawMessageIds: string[],
   rawRanges: Array<{ fromMessageId: string; toMessageId: string }>,
-  forcedServerId?: string,
-): { intervals: SuppressionInterval[]; refs: DiscordAwarenessRef[]; messageCount: number } {
+): { intervals: SuppressionInterval[]; carriers: DiscordMessageMetadataCarrier[]; messageCount: number } {
   const messageIds = rawMessageIds.map(normalizeDiscordMessageId);
   const ranges = rawRanges.map((range) => ({
     fromMessageId: normalizeDiscordMessageId(range.fromMessageId),
@@ -379,7 +451,7 @@ function buildSuppressionPlan(
     ...messageIds,
     ...ranges.flatMap((range) => [range.fromMessageId, range.toMessageId]),
   ]);
-  if (wanted.size === 0) return { intervals: [], refs: [], messageCount: 0 };
+  if (wanted.size === 0) return { intervals: [], carriers: [], messageCount: 0 };
 
   const locations = new Map<string, MessageLocation>();
   for (let offset = 0; offset <= targetIndex; offset += RECOVERY_SCAN_WINDOW) {
@@ -466,45 +538,48 @@ function buildSuppressionPlan(
     }
   }
 
-  const refs: DiscordAwarenessRef[] = [];
+  const carriers: DiscordMessageMetadataCarrier[] = [];
   for (const interval of merged) {
-    refs.push(...collectDiscordRefs(
-      contextManager,
-      interval.start,
-      interval.end + 1,
-      forcedServerId,
-    ));
+    carriers.push(...collectDiscordCarriers(contextManager, interval.start, interval.end + 1));
   }
   return {
     intervals: merged,
-    refs: dedupeDiscordRefs(refs),
+    carriers,
     messageCount: merged.reduce((sum, interval) => sum + interval.end - interval.start + 1, 0),
   };
 }
 
-function collectDiscordRefs(
+/**
+ * The addressing metadata of removed messages, read in bounded windows: only
+ * the Discord address and the MCPL tags (for `addressed` selection) are kept,
+ * never content. A sharded message may repeat its metadata across adjacent
+ * records; selection dedupes by address.
+ */
+function collectDiscordCarriers(
   contextManager: ContextManager,
   start: number,
   end: number,
-  forcedServerId?: string,
-): DiscordAwarenessRef[] {
-  const refs: DiscordAwarenessRef[] = [];
+): DiscordMessageMetadataCarrier[] {
+  const carriers: DiscordMessageMetadataCarrier[] = [];
   for (let offset = start; offset < end; offset += RECOVERY_SCAN_WINDOW) {
     const messages = contextManager.getMessageWindow(
       offset,
       Math.min(RECOVERY_SCAN_WINDOW, end - offset),
       { resolveBlobs: false },
     ).messages;
-    refs.push(...extractDiscordAwarenessRefs(messages, forcedServerId));
+    carriers.push(...messages.map(addressingOnly));
   }
-  // A sharded message may repeat Discord metadata across adjacent records.
-  return dedupeDiscordRefs(refs);
+  return carriers;
 }
 
-function dedupeDiscordRefs(refs: DiscordAwarenessRef[]): DiscordAwarenessRef[] {
-  const deduped = new Map<string, DiscordAwarenessRef>();
-  for (const ref of refs) {
-    deduped.set(`${ref.serverId}\0${ref.channelId}\0${ref.messageId}`, ref);
-  }
-  return [...deduped.values()];
+function addressingOnly(message: { metadata?: Record<string, unknown> }): DiscordMessageMetadataCarrier {
+  const metadata = message.metadata ?? {};
+  return {
+    metadata: {
+      serverId: metadata.serverId,
+      channelId: metadata.channelId,
+      messageId: metadata.messageId,
+      tags: metadata.tags,
+    },
+  };
 }
