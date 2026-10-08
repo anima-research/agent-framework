@@ -8484,8 +8484,10 @@ export class AgentFramework {
 
     const content = [...event.content];
     // The delivered body's version identity, before any host decoration
-    // (the closed-channel invitation below).
-    if (content.length > 0) metadata.sourceBodyDigest = sourceBodyDigest(content);
+    // (the closed-channel invitation below). Every push gets one, an empty
+    // body included, written over any value the adapter's origin carried.
+    // A silent heartbeat stores nothing, so its metadata is never kept.
+    metadata.sourceBodyDigest = sourceBodyDigest(content);
     if (triggerChannel) {
       const origin = (event.origin ?? {}) as Record<string, unknown>;
       const invitation = this.buildClosedChannelInvitation({

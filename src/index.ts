@@ -83,8 +83,10 @@ export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';
 
-// Where each accepted inbound item came from (`metadata.inboundSource`)
-export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey } from './mcpl/index.js';
+// Where each accepted inbound item came from (`metadata.inboundSource`), and
+// the digest its delivered and stored bodies are stamped with
+// (`metadata.sourceBodyDigest`, `metadata.storedBodyDigest`)
+export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey, sourceBodyDigest } from './mcpl/index.js';
 export type {
   InboundSource,
   InboundChannelSource,
