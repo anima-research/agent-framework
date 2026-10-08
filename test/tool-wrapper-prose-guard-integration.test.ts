@@ -231,7 +231,11 @@ describe('tool wrapper prose guard integration', () => {
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
       resolveLocus: () => 'world:test',
       routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
-      sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
+      // A chunk names whether its words had been published when it was sent.
+      sendOutgoingChunk: (_destination: unknown, _agent: string, _id: string, _index: number, delta: string) => {
+        outgoing.push(routed.includes(delta) ? delta : `unpublished: ${delta}`);
+        return true;
+      },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, publishTarget: () => 'root', getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
     (framework as unknown as Record<string, unknown>).channelEventModule = { getChannelId: () => 'world:test' };
@@ -240,7 +244,7 @@ describe('tool wrapper prose guard integration', () => {
     const all = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }>;
     await framework.stop();
     assert.deepEqual(routed, ['Ordinary answer.']);
-    assert.deepEqual(outgoing, [], 'guarded turns buffer ordinary prose until completion');
+    assert.deepEqual(outgoing, ['Ordinary answer.'], 'guarded turns stream ordinary prose only once it is published');
     assert.ok(all.some((m) => m.content.some((b) => b.type === 'text' && b.text === 'Ordinary answer.')));
     assert.ok(!all.some((m) => m.metadata?.kind === 'tool-wrapper-prose-contained'));
   });
@@ -452,7 +456,7 @@ describe('tool wrapper prose guard integration', () => {
   });
 
 
-  it('idle-disposed ephemeral stops typing and finalizes every started outgoing stream', async () => {
+  it('idle-disposed ephemeral stops typing, and the stalled stream\'s unpublished words never stream', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-idle-terminal-')); dirs.push(dir);
     const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: new LateCompletionAfterIdleMembrane().asMembrane(), agents: [], modules: [] });
     const events: string[] = [];
@@ -473,8 +477,9 @@ describe('tool wrapper prose guard integration', () => {
     await assert.rejects(run, /stalled/);
     await new Promise((resolve) => setTimeout(resolve, 180));
     assert.ok(events.includes('stop:(all)'), 'disposer-owned frame stops typing');
-    assert.ok(events.some((event) => event.startsWith('chunk:')), 'probe actually opened an outgoing stream');
-    assert.ok(events.some((event) => event.startsWith('complete:')), 'every started outgoing stream receives a terminal complete');
+    // Outgoing streams carry only published prose: the provider's partial
+    // tokens, and the late answer of a run already disposed, never were.
+    assert.ok(!events.some((event) => event.startsWith('chunk:') || event.startsWith('complete:')), JSON.stringify(events));
     await framework.stop();
   });
 

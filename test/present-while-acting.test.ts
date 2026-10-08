@@ -141,11 +141,13 @@ function stubChannelRegistry(framework: AgentFramework, opts: { home?: boolean }
       locusCalls++;
       return `chan-live-${locusCalls}`;
     },
-    routeSpeech: async (_agent: string, text: string, target?: string | null | { channelId: string }) => {
+    routeSpeech: async (_agent: string, text: string, target?: string | null | { channelId: string; threadId?: string | null }) => {
       const locus = target && typeof target === 'object' ? target.channelId : target ?? null;
+      const threadId = target && typeof target === 'object' ? target.threadId : undefined;
       routed.push({ text, locus });
-      // Mirror the real registry's outcome shape (delivery receipts read it).
-      return locus ? { delivered: true, channelId: locus } : null;
+      // Mirror the real registry's outcome shape (delivery receipts read it),
+      // the thread included when the publish was placed in one.
+      return locus ? { delivered: true, channelId: locus, ...(threadId ? { threadId } : {}) } : null;
     },
     getDefaultPublishChannel: () => null,
     // Hybrid `>>>#name` targets resolve to `chan-name` and deliver through
@@ -1108,6 +1110,23 @@ describe('speech follows the moment its words were written', () => {
     };
   }
 
+  /** Record the outgoing stream (MCPL §14.3): what each chunk and completion carried. */
+  function recordStreams(framework: AgentFramework, refuse: (channelId: string, delta: string) => boolean = () => false) {
+    const chunks: Array<{ channelId: string; delta: string; threadId: unknown }> = [];
+    const completes: Array<{ channelId: string; text: string; threadId: unknown }> = [];
+    const registry = registryOf(framework);
+    registry.sendOutgoingChunk = (destination: { channelId: string }, _c: string, _i: string, _n: number, delta: string) => {
+      if (refuse(destination.channelId, delta)) return false;
+      chunks.push({ channelId: destination.channelId, delta, threadId: null });
+      return true;
+    };
+    registry.sendOutgoingComplete = (destination: { channelId: string }, _c: string, _i: string, text: string) => {
+      completes.push({ channelId: destination.channelId, text, threadId: null });
+    };
+    const streamedTo = (channelId: string): string => chunks.filter((c) => c.channelId === channelId).map((c) => c.delta).join('');
+    return { chunks, completes, streamedTo };
+  }
+
   /** An addressed arrival from another conversation, at the next tool call: it holds an inferred route. */
   function addressedArrivalElsewhere(): void {
     module.toolDelayMs = 25;
@@ -1487,4 +1506,365 @@ describe('speech follows the moment its words were written', () => {
 
   // ---- outgoing streams (review finding 1) --------------------------------
 
+  it('a mid-turn hold stops the stream, and completion carries only what streamed', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Before the hold.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Held words.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework, { home: false });
+    const streams = recordStreams(framework);
+    addressedArrivalElsewhere();
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.equal(streams.streamedTo('chan-A'), 'Before the hold.');
+    assert.ok(streams.chunks.every((c) => !c.delta.includes('Held')), JSON.stringify(streams.chunks));
+    assert.deepEqual(streams.completes, [{ channelId: 'chan-A', text: 'Before the hold.', threadId: null }]);
+    assert.deepEqual(heldDrafts(framework).map((d) => [d.text, d.reason]), [['Held words.', 'ambiguous']]);
+
+    await framework.stop();
+  });
+
+  it('a thread placement is never streamed, held or not; root publication in the same channel streams alone', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Into the thread.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Held words.' },
+    ] as ContentBlock[]));
+    let framework = await createFramework();
+    let routed = stubChannelRegistry(framework, { home: false });
+    registryOf(framework).publishTarget = () => 'exact';
+    let streams = recordStreams(framework);
+    addressedArrivalElsewhere();
+    triggerFromThread(framework, 'chan-A', 't1');
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, [{ text: 'Into the thread.', locus: 'chan-A' }], 'published into the thread');
+    assert.deepEqual(streams.chunks, [], 'the thread placement and the held words: nothing streams');
+    assert.deepEqual(streams.completes, []);
+    await framework.stop();
+
+    // Hybrid: after the route moves on, a `>>>` envelope to that channel's
+    // root is a root publication, and its stream names the root alone.
+    rmSync(tempDir, { recursive: true, force: true });
+    tempDir = mkdtempSync(join(tmpdir(), 'pwa-moment-'));
+    membrane = new MockMembrane();
+    module = new RobotModule();
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Into the thread.' },
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>chan-A Root words for chan-A.' },
+    ] as ContentBlock[]));
+    framework = await createFramework('hybrid');
+    routed = stubChannelRegistry(framework, { home: false });
+    registryOf(framework).publishTarget = () => 'exact';
+    opensChannels(framework);
+    streams = recordStreams(framework);
+    triggerFromThread(framework, 'chan-A', 't1');
+    await framework.runUntilIdle();
+    assert.equal(streams.streamedTo('chan-A'), 'Root words for chan-A.');
+    assert.deepEqual(streams.completes, [{ channelId: 'chan-A', text: 'Root words for chan-A.', threadId: null }]);
+    await framework.stop();
+  });
+
+  it('a stream follows the route when channel_open moves it, and each channel completes with its own words', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'To A.' },
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'chan-B' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'To B.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework, { home: false });
+    opensChannels(framework);
+    const streams = recordStreams(framework);
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'To A.', locus: 'chan-A' }, { text: 'To B.', locus: 'chan-B' }]);
+    assert.equal(streams.streamedTo('chan-A'), 'To A.');
+    assert.equal(streams.streamedTo('chan-B'), 'To B.');
+    assert.deepEqual(streams.completes.map((c) => [c.channelId, c.text]).sort(), [['chan-A', 'To A.'], ['chan-B', 'To B.']]);
+
+    await framework.stop();
+  });
+
+  it('held words never resurface in a stream: a hold, then a channel_open, then speech', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Before the hold.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Held words.' },
+      { type: 'tool_use', id: 'c2', name: 'channel_open', input: { channelId: 'chan-B' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'After the open.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework, { home: false });
+    opensChannels(framework);
+    const streams = recordStreams(framework);
+    addressedArrivalElsewhere();
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'Before the hold.', locus: 'chan-A' }, { text: 'After the open.', locus: 'chan-B' }]);
+    assert.equal(streams.streamedTo('chan-A'), 'Before the hold.');
+    assert.equal(streams.streamedTo('chan-B'), 'After the open.');
+    assert.deepEqual(streams.completes.map((c) => [c.channelId, c.text]).sort(), [['chan-A', 'Before the hold.'], ['chan-B', 'After the open.']]);
+
+    await framework.stop();
+  });
+
+  it('each round is its own segment: a later round\'s prefix names its own destination, and a later skip_reply streams nothing', async () => {
+    // Mira-1782's probe: the router stayed in `body` across provider rounds,
+    // so round 2's `>>>#beta` streamed into #alpha as text.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#alpha First.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#beta Second.' },
+      { type: 'tool_use', id: 'c2', name: 'robot--move', input: { dir: 'south' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>skip_reply Private words.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework('hybrid');
+    const routed = stubChannelRegistry(framework, { home: false });
+    const streams = recordStreams(framework);
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'First.', locus: 'chan-alpha' }, { text: 'Second.', locus: 'chan-beta' }]);
+    assert.equal(streams.streamedTo('chan-alpha'), 'First.');
+    assert.equal(streams.streamedTo('chan-beta'), 'Second.');
+    assert.ok(streams.chunks.every((c) => !c.delta.includes('>>>') && !c.delta.includes('Private')), JSON.stringify(streams.chunks));
+
+    await framework.stop();
+  });
+
+  it('an envelope delivery couldn\'t make streams nothing, nor do the words held after it; a newer prefix\'s publication does', async () => {
+    // Mira-1782's probe: delivery held the words after a failed `>>>#alpha`
+    // as drafts, while the stream kept carrying them to #alpha.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#alpha First.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Later words.' },
+    ] as ContentBlock[]));
+    let framework = await createFramework('hybrid');
+    stubChannelRegistry(framework, { home: false });
+    // One bounce, and no bounce-wake turn after it.
+    (framework as unknown as { proseBounceStreaks: Map<string, number> }).proseBounceStreaks.set('assistant', 100);
+    registryOf(framework).deliverSpeech = async () => ({ status: 'failed', reason: 'refused', at: Date.now() });
+    module.toolDelayMs = 50; // the failure is known before round 2 is written
+    let streams = recordStreams(framework);
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+    assert.ok(heldDrafts(framework).some((d) => d.text === 'Later words.' && d.reason === 'no-destination'));
+    assert.equal(streams.streamedTo('chan-alpha'), '', 'only confirmed publication streams');
+    await framework.stop();
+
+    // A newer prefix, parsed before the older envelope's failure is known, stands.
+    rmSync(tempDir, { recursive: true, force: true });
+    tempDir = mkdtempSync(join(tmpdir(), 'pwa-moment-'));
+    membrane = new MockMembrane();
+    module = new RobotModule();
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#alpha First.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#beta Second.' },
+      { type: 'tool_use', id: 'c2', name: 'robot--move', input: { dir: 'south' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'More for beta.' },
+    ] as ContentBlock[]));
+    framework = await createFramework('hybrid');
+    const routed = stubChannelRegistry(framework, { home: false });
+    (framework as unknown as { proseBounceStreaks: Map<string, number> }).proseBounceStreaks.set('assistant', 100);
+    const registry = registryOf(framework);
+    const deliver = registry.deliverSpeech as (...args: unknown[]) => Promise<unknown>;
+    let calls = 0;
+    registry.deliverSpeech = async (...args: unknown[]) => {
+      if (calls++ === 0) {
+        await new Promise((r) => setTimeout(r, 100));
+        return { status: 'failed', reason: 'refused', at: Date.now() };
+      }
+      return deliver(...args);
+    };
+    streams = recordStreams(framework);
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, [{ text: 'Second.', locus: 'chan-beta' }, { text: 'More for beta.', locus: 'chan-beta' }]);
+    assert.equal(streams.streamedTo('chan-beta'), 'Second.More for beta.');
+    await framework.stop();
+  });
+
+  it('a send-silenced turn streams nothing of the later rounds it holds back', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Sending it now.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--send_message', input: { text: 'the note' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Postscript: sent it.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework, { home: false });
+    const streams = recordStreams(framework);
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, []);
+    assert.deepEqual(heldDrafts(framework).map((d) => d.reason), ['explicit-send', 'explicit-send']);
+    // Neither round was published, so neither streams — not even the words
+    // written before the round's own send made them held.
+    assert.deepEqual(streams.chunks, []);
+
+    await framework.stop();
+  });
+
+  it('a private-think round neither streams nor pins later speech', async () => {
+    // Mira-1782's probe: a later call in the same round (a private `think`)
+    // made words private that a speculative stream had already carried.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#alpha Private words.' },
+      { type: 'tool_use', id: 'think-1', name: 'think', input: { content: 'private reasoning' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Public words.' },
+    ] as ContentBlock[]));
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'private-think.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test', proseRouting: 'hybrid', sameRoundThinkTextPolicy: 'private' }],
+      modules: [module],
+    });
+    module.framework = framework;
+    const routed = stubChannelRegistry(framework, { home: false });
+    registryOf(framework).getChannelTools = () => [{ name: 'think', description: 'private reasoning', inputSchema: { type: 'object', properties: {} } }];
+    registryOf(framework).handleChannelToolCall = async () => ({ success: true, data: { noted: true } });
+    const streams = recordStreams(framework);
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'Public words.', locus: 'chan-A' }]);
+    assert.equal(streams.streamedTo('chan-alpha'), '');
+    assert.equal(streams.streamedTo('chan-A'), 'Public words.');
+
+    await framework.stop();
+  });
+
+  it('completion follows the stream\'s last speech, under the inference that wrote it', async () => {
+    // A trailing reply is published after the agent is idle: its chunk and
+    // the completion still come in that order, with one inference id.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Narrating.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Done.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework, { home: false });
+    slowFirst(framework, 'routeSpeech', 40);
+    const events: Array<[string, string, string]> = [];
+    const registry = registryOf(framework);
+    registry.sendOutgoingChunk = (d: { channelId: string }, _c: string, inferenceId: string, _n: number, delta: string) => {
+      events.push(['chunk', inferenceId, delta]);
+      return true;
+    };
+    registry.sendOutgoingComplete = (d: { channelId: string }, _c: string, inferenceId: string, text: string) => {
+      events.push(['complete', inferenceId, text]);
+    };
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+    await new Promise((r) => setTimeout(r, 80));
+
+    assert.deepEqual(events.map(([kind, , text]) => [kind, text]), [
+      ['chunk', 'Narrating.'],
+      ['chunk', 'Done.'],
+      ['complete', 'Narrating.Done.'],
+    ]);
+    assert.equal(new Set(events.map(([, id]) => id)).size, 1, 'one physical stream, one inference');
+
+    await framework.stop();
+  });
+
+  it('an aborted stream still completes what its published speech streamed', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Narrating.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Never written.' },
+    ] as ContentBlock[]));
+    module.toolDelayMs = 300;
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework, { home: false });
+    const streams = recordStreams(framework);
+
+    triggerFromChannel(framework, 'chan-A');
+    const idle = framework.runUntilIdle();
+    const deadline = Date.now() + 2000;
+    while (streams.chunks.length === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    assert.ok(streams.chunks.length > 0, 'the narration was published and streamed');
+    assert.ok(framework.abortInference('assistant', 'test abort'), 'the turn was still running');
+    await idle;
+    await new Promise((r) => setTimeout(r, 50));
+
+    assert.equal(streams.streamedTo('chan-A'), 'Narrating.');
+    assert.deepEqual(streams.completes, [{ channelId: 'chan-A', text: 'Narrating.', threadId: null }]);
+
+    await framework.stop();
+  });
+
+  it('completion never replays a chunk the registry refused to stream', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Refused.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Streamed.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework, { home: false });
+    // As when the channel's declaration or streaming grant is briefly absent.
+    const streams = recordStreams(framework, (_channelId, delta) => delta.startsWith('Refused'));
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.equal(streams.streamedTo('chan-A'), 'Streamed.');
+    assert.deepEqual(streams.completes, [{ channelId: 'chan-A', text: 'Streamed.', threadId: null }]);
+
+    await framework.stop();
+  });
 });

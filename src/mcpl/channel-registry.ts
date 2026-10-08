@@ -2985,62 +2985,62 @@ export class ChannelRegistry {
    *  process-global default). Public so a multi-segment caller can snapshot it
    *  ONCE and pin every segment to it via routeSpeech's `overrideChannelId`. */
   /**
-   * MCPL Spec 14.3 outgoing streaming: forward a moderated text delta to the
-   * server owning the channel, AS THE MODEL GENERATES. Emitted only when that
-   * server declared `channels.streaming` in its initialize capabilities —
-   * servers that never opted in (the whole existing fleet) receive nothing.
-   * Fire-and-forget and never throws: streaming is an observer surface; the
-   * authoritative delivery is the eventual channels/publish.
+   * MCPL Spec 14.3 outgoing streaming: forward prose the agent has published
+   * to the server owning the channel. Emitted only when that server declared
+   * `channels.streaming` in its initialize capabilities — servers that never
+   * opted in receive nothing. The framework streams only text a confirmed
+   * publish placed at the channel's root (never speculatively: §14.3), so
+   * every chunk names the root (`threadId: null`). `destination` is the
+   * publish outcome's own server and channel, never re-resolved from a bare
+   * channel id. Fire-and-forget and never throws: streaming is an observer
+   * surface; the authoritative delivery is channels/publish. Says whether the
+   * chunk went out, so a caller completes only what was streamed.
    */
   sendOutgoingChunk(
-    channelId: string,
+    destination: { serverId: string; channelId: string },
     conversationId: string,
     inferenceId: string,
     index: number,
     delta: string,
-    /** The final publish's place (RFC-011 §6): a thread, or null for the root. */
-    threadId: string | null = null,
-  ): void {
-    const server = this.streamingServerFor(channelId, threadId);
-    if (!server) return;
+  ): boolean {
+    const server = this.streamingServerFor(destination);
+    if (!server) return false;
     try {
-      server.sendChannelsOutgoingChunk({ inferenceId, conversationId, channelId, index, delta, threadId });
-    } catch { /* observer surface — never disturb the turn */ }
+      server.sendChannelsOutgoingChunk({ inferenceId, conversationId, channelId: destination.channelId, index, delta, threadId: null });
+      return true;
+    } catch {
+      /* observer surface — never disturb the turn */
+      return false;
+    }
   }
 
-  /** Spec 14.3 companion: final moderated content per channel at stream end. */
+  /** Spec 14.3 companion: the final content of one channel's stream, at its end. */
   sendOutgoingComplete(
-    channelId: string,
+    destination: { serverId: string; channelId: string },
     conversationId: string,
     inferenceId: string,
     text: string,
-    /** The final publish's place (RFC-011 §6): a thread, or null for the root. */
-    threadId: string | null = null,
   ): void {
-    const server = this.streamingServerFor(channelId, threadId);
+    const server = this.streamingServerFor(destination);
     if (!server) return;
     try {
       server.sendChannelsOutgoingComplete({
         inferenceId,
         conversationId,
-        channelId,
+        channelId: destination.channelId,
         content: [{ type: 'text', text }],
-        threadId,
+        threadId: null,
       });
     } catch { /* observer surface — never disturb the turn */ }
   }
 
-  private streamingServerFor(channelId: string, threadId: string | null) {
-    // The map is keyed `${serverId}:${channelId}`; stream targets arrive as
-    // bare descriptor ids (what resolveProseTarget returns). Scan like the
-    // resolver does, and fail closed on cross-server ambiguity — the same
-    // never-guess rule that governs delivery.
-    const matches = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
-    if (matches.length !== 1) return null;
+  private streamingServerFor(destination: { serverId: string; channelId: string }) {
+    const found = this.findExactEntry(destination);
+    if ('error' in found) return null;
     // §14.3 fail-closed: nothing streams that delivery would refuse — and
     // delivery publishes only where the place is declared (RFC-011 §6).
-    if (publishPlaceRefusal(declaredPublishTarget(matches[0]!.descriptor), threadId)) return null;
-    const server = this.serverRegistry.getServer(matches[0]!.serverId);
+    if (publishPlaceRefusal(declaredPublishTarget(found.entry.descriptor), null)) return null;
+    const server = this.serverRegistry.getServer(found.entry.serverId);
     // §5.4: the GRANT gates streaming, not the raw advertisement. The old
     // `capabilities?.channels?.streaming` check was doubly wrong: undefined
     // for the boolean `channels: true` shape (masking discord-mcpl's latent

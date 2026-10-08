@@ -284,36 +284,43 @@ describe('ChannelRegistry.publish outcomes', () => {
     assert.equal(published.length, 1);
   });
 
-  it('streams only where it would publish, carrying the same place (RFC-011 §6)', () => {
-    const chunks: Array<{ channelId: string; threadId?: unknown }> = [];
-    const completes: Array<{ channelId: string; threadId?: unknown }> = [];
-    const server = {
+  it('streams only to a declared channel, at its root, on the server the publish resolved (RFC-011 §6)', () => {
+    const chunks: Array<{ server: string; channelId: string; threadId?: unknown }> = [];
+    const completes: Array<{ server: string; channelId: string; threadId?: unknown }> = [];
+    const serverFor = (name: string) => ({
       grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
-      sendChannelsOutgoingChunk: (p: { channelId: string; threadId?: unknown }) => chunks.push({ channelId: p.channelId, threadId: p.threadId }),
-      sendChannelsOutgoingComplete: (p: { channelId: string; threadId?: unknown }) => completes.push({ channelId: p.channelId, threadId: p.threadId }),
-    };
+      sendChannelsOutgoingChunk: (p: { channelId: string; threadId?: unknown }) => chunks.push({ server: name, channelId: p.channelId, threadId: p.threadId }),
+      sendChannelsOutgoingComplete: (p: { channelId: string; threadId?: unknown }) => completes.push({ server: name, channelId: p.channelId, threadId: p.threadId }),
+    });
+    const servers: Record<string, ReturnType<typeof serverFor>> = { discord: serverFor('discord'), slack: serverFor('slack') };
     const registry = new ChannelRegistry(
-      { getServer: () => server } as unknown as McplServerRegistry,
+      { getServer: (id: string) => servers[id] } as unknown as McplServerRegistry,
       {} as FeatureSetManager,
       () => {},
       () => {},
       {},
     );
     const channels = (registry as unknown as { channels: Map<string, unknown> }).channels;
-    const seedIt = (id: string, target: 'exact' | 'root' | null) => channels.set(`discord:${id}`, {
-      serverId: 'discord',
-      descriptor: { id, type: 'discord', label: id, ...(target ? { capabilities: { publish: { target } } } : {}) },
+    const seedIt = (serverId: string, id: string, target: 'exact' | 'root' | null) => channels.set(`${serverId}:${id}`, {
+      serverId,
+      descriptor: { id, type: serverId, label: id, ...(target ? { capabilities: { publish: { target } } } : {}) },
       open: true,
     });
-    seedIt('exact', 'exact');
-    seedIt('root', 'root');
-    seedIt('none', null);
-    for (const [channelId, threadId] of [['exact', null], ['exact', 't-1'], ['root', null], ['root', 't-1'], ['none', null]] as const) {
-      registry.sendOutgoingChunk(channelId, 'agent', 'inf-1', 0, 'Hello', threadId);
-      registry.sendOutgoingComplete(channelId, 'agent', 'inf-1', 'Hello', threadId);
+    seedIt('discord', 'exact', 'exact');
+    seedIt('discord', 'root', 'root');
+    seedIt('discord', 'none', null);
+    // The same id on two servers: the destination's server decides, never a scan of bare ids.
+    seedIt('slack', 'root', 'root');
+    for (const [serverId, channelId] of [['discord', 'exact'], ['discord', 'root'], ['discord', 'none'], ['slack', 'root'], ['discord', 'missing']] as const) {
+      registry.sendOutgoingChunk({ serverId, channelId }, 'agent', 'inf-1', 0, 'Hello');
+      registry.sendOutgoingComplete({ serverId, channelId }, 'agent', 'inf-1', 'Hello');
     }
-    const expected = [{ channelId: 'exact', threadId: null }, { channelId: 'exact', threadId: 't-1' }, { channelId: 'root', threadId: null }];
-    assert.deepEqual(chunks, expected, 'no stream into a thread where there are none, nor to an undeclared channel');
+    const expected = [
+      { server: 'discord', channelId: 'exact', threadId: null },
+      { server: 'discord', channelId: 'root', threadId: null },
+      { server: 'slack', channelId: 'root', threadId: null },
+    ];
+    assert.deepEqual(chunks, expected, 'never to an undeclared or unregistered channel; always the root');
     assert.deepEqual(completes, expected);
   });
 

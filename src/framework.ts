@@ -78,7 +78,6 @@ import {
 } from './mcpl/push-coalescer.js';
 import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, PushEventResult } from './mcpl/types.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
-import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, publishPlaceRefusal, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SpeechRouteView } from './mcpl/channel-registry.js';
@@ -276,10 +275,12 @@ function estimateAppendedRoundTokens(
  * produced: the turn's route then. Speech is published later, in order, on
  * the agent's speech chain, and a tool result (a channel_open) or an arrival
  * (a hold) can land in between; neither may change where words already
- * written go.
+ * written go. `inferenceId` names the physical stream that wrote them: once
+ * published, they go to that inference's outgoing stream (MCPL §14.3).
  */
 interface SpeechMoment {
   turn: TurnRoute | undefined;
+  inferenceId?: string;
 }
 
 /**
@@ -324,9 +325,8 @@ const isAddressedMessage = (
   _metadata?: Record<string, unknown>,
 ): boolean => Array.isArray(tags) && tags.includes('chat:addressed');
 
-// parseProsePrefix moved to ./mcpl/prose-grammar.ts — ONE grammar shared with
-// the outgoing-stream router (Spec 14.3), so streamed chunks and delivered
-// envelopes can never disagree on what is a prefix.
+// parseProsePrefix lives in ./mcpl/prose-grammar.ts. Outgoing streams (Spec
+// 14.3) carry only what delivery published, so no second parser reads it.
 
 /** One-time primer appended when an agent's proseRouting mode changes. */
 function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus' | 'disabled'): string {
@@ -1177,6 +1177,15 @@ export class AgentFramework {
    *  completion that arrives after a newer turn has begun compares it, so it
    *  can't change that turn's speech (channel_open). */
   private logicalTurns: Map<string, number> = new Map();
+  /** Outgoing streams (MCPL §14.3) by inference id: what each physical
+   *  stream's published prose has sent to each channel so far, and the next
+   *  chunk index. Completed and removed after the stream's last speech
+   *  (completeOutgoingStreams). */
+  private outgoingStreams: Map<string, {
+    conversationId: string;
+    index: number;
+    channels: Map<string, { serverId: string; channelId: string; text: string }>;
+  }> = new Map();
   /** Per agent: the ordered chain of speech deliveries (chainSpeech). One
    *  chain for all of an agent's physical streams, so a restart's or
    *  retry's speech can never overtake words still being published from
@@ -9792,6 +9801,57 @@ export class AgentFramework {
     return this.logicalTurns?.get(agentName) ?? 0;
   }
 
+  /**
+   * Prose the resident's speech has just published, confirmed, at a channel
+   * root goes to that inference's outgoing stream too (MCPL §14.3): a voice
+   * surface speaks only what was published, where it was published —
+   * never held, private, failed or unconfirmed words. The chunk names the
+   * outcome's own server and channel, and the root; a thread placement isn't
+   * streamed, so a channel's stream names one place.
+   */
+  private streamPublished(
+    agentName: string,
+    moment: SpeechMoment,
+    published: { serverId: string; channelId: string; threadId?: string | null },
+    text: string,
+  ): void {
+    if (!moment.inferenceId || !this.channelRegistry || published.threadId || !text) return;
+    const streams = (this.outgoingStreams ??= new Map());
+    let stream = streams.get(moment.inferenceId);
+    if (!stream) {
+      stream = { conversationId: agentName, index: 0, channels: new Map() };
+      streams.set(moment.inferenceId, stream);
+    }
+    const sent = this.channelRegistry.sendOutgoingChunk(
+      { serverId: published.serverId, channelId: published.channelId },
+      agentName, moment.inferenceId, stream.index++, text,
+    );
+    if (!sent) return;
+    const key = `${published.serverId}\u0000${published.channelId}`;
+    const channel = stream.channels.get(key);
+    if (channel) channel.text += text;
+    else stream.channels.set(key, { serverId: published.serverId, channelId: published.channelId, text });
+  }
+
+  /**
+   * Close the outgoing streams of these inferences: each channel gets its
+   * one completion, with exactly the text its stream carried. Chained at the
+   * physical stream's end, so it follows that stream's last speech.
+   */
+  private completeOutgoingStreams(inferenceIds: Iterable<string>): void {
+    for (const inferenceId of inferenceIds) {
+      const stream = this.outgoingStreams?.get(inferenceId);
+      if (!stream) continue;
+      this.outgoingStreams.delete(inferenceId);
+      for (const channel of stream.channels.values()) {
+        this.channelRegistry?.sendOutgoingComplete(
+          { serverId: channel.serverId, channelId: channel.channelId },
+          stream.conversationId, inferenceId, channel.text,
+        );
+      }
+    }
+  }
+
   /** Append a link to the agent's speech chain (speechChains); it runs after every earlier one. */
   private chainSpeech(agentName: string, what: string, work: () => Promise<void> | void): void {
     const chains = (this.speechChains ??= new Map());
@@ -9964,7 +10024,7 @@ export class AgentFramework {
     agent: Agent,
     text: string,
     hold: { round?: number; notice: 'now' | 'later' },
-    /** When the words were produced: the route they were written under. */
+    /** When the words were produced: the route they were written under, and their stream. */
     moment: SpeechMoment = { turn: this.turnRoutes?.get(agent.name) },
   ): Promise<void> {
     const turn = moment.turn;
@@ -9997,6 +10057,7 @@ export class AgentFramework {
     const target = { ...(route.serverId ? { serverId: route.serverId } : {}), channelId: route.channelId, threadId: route.threadId ?? null };
     const outcome = await this.channelRegistry.routeSpeech(agent.name, text, target);
     this.recordProseDelivery(agent.name, outcome);
+    if (outcome?.delivered) this.streamPublished(agent.name, moment, outcome, text);
   }
 
   /** A turn route in words, for logs. */
@@ -10119,7 +10180,13 @@ export class AgentFramework {
    * nothing is ever sent to a destination the model did not name (directly
    * or via the turn's sticky target).
    */
-  private async deliverProse(agent: Agent, rawText: string, hold: { round?: number; notice: 'now' | 'later' } = { notice: 'later' }): Promise<void> {
+  private async deliverProse(
+    agent: Agent,
+    rawText: string,
+    hold: { round?: number; notice: 'now' | 'later' } = { notice: 'later' },
+    /** When the words were produced: their outgoing stream, once published. */
+    moment: SpeechMoment = { turn: undefined },
+  ): Promise<void> {
     // Multi-envelope: a single prose block may address SEVERAL destinations —
     // every line beginning with `>>` opens a new envelope, routed
     // independently (first live use: Tilde 2026-07-24, one block carrying a
@@ -10143,7 +10210,7 @@ export class AgentFramework {
 
     for (const envelope of envelopes) {
       if (!envelope.trim()) continue;
-      await this.deliverProseEnvelope(agent, envelope.replace(/^\s+(?=>>)/, ''), hold);
+      await this.deliverProseEnvelope(agent, envelope.replace(/^\s+(?=>>)/, ''), hold, moment);
     }
   }
 
@@ -10225,7 +10292,7 @@ export class AgentFramework {
     agent: Agent,
     rawText: string,
     hold: { round?: number; notice: 'now' | 'later' } = { notice: 'later' },
-    /** When the words were produced: the route they were written under. */
+    /** When the words were produced: the route they were written under, and their stream. */
     moment: SpeechMoment = { turn: this.turnRoutes?.get(agent.name) },
   ): Promise<void> {
     for (const envelope of splitHybridEnvelopes(rawText)) {
@@ -10268,6 +10335,7 @@ export class AgentFramework {
           const outcome = await this.deliverWithUnsent(agent, body, resolved.channelId, unsent.draft);
           this.recordProseDelivery(agent.name, outcome.status === 'delivered' ? { delivered: true, ...outcome.destination! } : null);
           if (outcome.status === 'delivered') {
+            this.streamPublished(agent.name, moment, outcome.destination!, body);
             this.proseBounceStreaks.delete(agent.name);
           } else {
             this.proseTargetPins.delete(agent.name);
@@ -10309,6 +10377,7 @@ export class AgentFramework {
         if (sticky) {
           const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, sticky);
           this.recordProseDelivery(agent.name, outcome);
+          if (outcome?.delivered) this.streamPublished(agent.name, moment, outcome, envelope);
         } else {
           await this.speakUnaddressed(agent, envelope, hold, moment);
         }
@@ -10330,7 +10399,12 @@ export class AgentFramework {
     }
   }
 
-  private async deliverProseEnvelope(agent: Agent, rawText: string, hold: { round?: number; notice: 'now' | 'later' }): Promise<void> {
+  private async deliverProseEnvelope(
+    agent: Agent,
+    rawText: string,
+    hold: { round?: number; notice: 'now' | 'later' },
+    moment: SpeechMoment,
+  ): Promise<void> {
     const name = agent.name;
     const parsed = parseProsePrefix(rawText);
     if (parsed.continueTurn) this.proseContinuations.add(name);
@@ -10379,7 +10453,10 @@ export class AgentFramework {
 
     try {
       const outcome = await this.deliverWithUnsent(agent, body, targetChannel, unsent.draft);
-      if (outcome.status === 'delivered') this.proseBounceStreaks.delete(name);
+      if (outcome.status === 'delivered') {
+        this.streamPublished(name, moment, outcome.destination!, body);
+        this.proseBounceStreaks.delete(name);
+      }
     } catch (err) {
       console.error(`[prose] ${name}: delivery to ${targetChannel} failed:`, err);
     }
@@ -11119,13 +11196,13 @@ export class AgentFramework {
       `inf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     // NOT const: a membrane refusal retry abandons everything streamed so
     // far, and the surface must not concatenate two attempts. Re-minting the
-    // id makes the discarded attempt's chunk buffer orphaned (never
-    // finalized) instead of being appended to — see the 'retrying' case.
+    // id makes the discarded attempt a separate inference instead of one
+    // appended to — see the 'retrying' case.
     let outgoingInferenceId = newOutgoingInferenceId();
     // RFC-007: every inference id THIS stream mints, so the stream's end
-    // aborts only its own open tool calls — never a successor's.
+    // aborts only its own open tool calls — never a successor's — and
+    // completes only its own outgoing streams.
     const lifecycleInferenceIds = new Set<string>([outgoingInferenceId]);
-    let outgoingIndex = 0;
 
     // §10.5 inference/lifecycle: `started` now, exactly one terminal in the
     // finally below (the one block every exit path shares). Which terminal
@@ -11140,55 +11217,24 @@ export class AgentFramework {
       turnIndex: 0,
       phase: 'started',
     });
-    // The wrapper guard needs the complete response before it can distinguish
-    // an exact invocation-shaped body from ordinary XML/prose. Buffer guarded
-    // turns until completion: otherwise speculative outgoing chunks could
-    // expose the wrapper before the fail-closed classifier runs.
-    const proseStream = this.channelRegistry &&
-      turnProseRouting !== 'disabled' &&
-      !agent.toolWrapperProseGuard
-      ? new ProseStreamRouter({
-          mode: turnProseRouting === 'explicit' ? 'explicit' : turnProseRouting === 'hybrid' ? 'hybrid' : 'locus',
-          initialTarget: typingChannel,
-          resolve: (spec) => {
-            const r = this.channelRegistry!.resolveProseTarget(spec);
-            return 'channelId' in r ? r.channelId : null;
-          },
-        })
-      : null;
-    // The place a stream's final publish targets (MCPL RFC-011 §6). A
-    // channel's stream can carry both the route's plain speech and envelope
-    // text sent to the channel's root, so a channel whose route is a thread
-    // isn't streamed at all (fail-closed: the stream could not name one
-    // place); every other stream names the root.
-    const streamPlace = (channelId: string): null | undefined => {
-      const target = this.routeTarget(agent.name);
-      return target && target.channelId === channelId && target.threadId !== null ? undefined : null;
-    };
-    const emitOutgoing = (deltas: { channelId: string; delta: string }[]): void => {
-      for (const rd of deltas) {
-        const place = streamPlace(rd.channelId);
-        if (place === undefined) continue;
-        this.channelRegistry!.sendOutgoingChunk(
-          rd.channelId, agent.name, outgoingInferenceId, outgoingIndex++, rd.delta, place,
-        );
-      }
-    };
+    // Outgoing streams (MCPL §14.3) carry only prose already published: the
+    // speech chain sends each confirmed publication at a channel root to the
+    // inference that wrote it (streamPublished), and this stream's teardown
+    // completes them after its last speech (completeOutgoingStreams). Nothing
+    // is streamed while it is generated, since a later call in the same
+    // round can still make the words private, held or unsent.
 
     // Tool-result-guard publication boundary. While a SUBMITTED batch is
     // pending (or a guard recovery is running), a refusal can still abandon
     // this physical round, so its streamed text must not reach any surface
-    // yet — neither the prose router nor the inference:tokens trace (TTS and
-    // other trace consumers voice it). Hold both; release in order on a clean
-    // round (tool-calls / non-guard completion), discard on a guard refusal.
-    let guardHeld: Array<{ trace: Parameters<AgentFramework['emitTrace']>[0]; text?: string }> = [];
+    // yet — the inference:tokens trace (TTS and other trace consumers voice
+    // it). Hold it; release in order on a clean round (tool-calls / non-guard
+    // completion), discard on a guard refusal.
+    let guardHeld: Array<Parameters<AgentFramework['emitTrace']>[0]> = [];
     const releaseGuardHeld = (): void => {
       const held = guardHeld;
       guardHeld = [];
-      for (const item of held) {
-        this.emitTrace(item.trace);
-        if (proseStream && item.text !== undefined) emitOutgoing(proseStream.feed(item.text));
-      }
+      for (const trace of held) this.emitTrace(trace);
     };
     const discardGuardHeld = (): void => { guardHeld = []; };
 
@@ -11227,12 +11273,10 @@ export class AgentFramework {
               // turn's prose is bound for, without re-deriving routing.
               channelId: typingChannel ?? undefined,
             };
-            const text = event.meta.type === 'text' ? event.content : undefined;
             if (agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering) {
-              guardHeld.push({ trace, text });
+              guardHeld.push(trace);
             } else {
               this.emitTrace(trace);
-              if (proseStream && text !== undefined) emitOutgoing(proseStream.feed(text));
             }
             break;
           }
@@ -11240,15 +11284,14 @@ export class AgentFramework {
           case 'retrying': {
             // Membrane is re-issuing after a content-policy refusal. Per the
             // RetryingEvent contract we must DISCARD everything this call has
-            // emitted: the tokens above were already streamed to the surface
-            // as outgoing chunks, and appending a second attempt to them
-            // would show the human two half-answers spliced together.
+            // emitted: the tokens above already reached trace consumers, and
+            // appending a second attempt to them would show the human two
+            // half-answers spliced together.
             //
-            // Re-mint the outgoing id so the partial buffer is orphaned
-            // rather than continued (delivery is authoritative via
-            // deliverProse and has not happened yet — nothing has been
-            // *sent*, only previewed), and reset the prose router so its
-            // destination bookkeeping starts clean for the new attempt.
+            // Re-mint the outgoing id so the attempt that stands is a new
+            // inference (the empty tokens trace below tells consumers to
+            // drop the partial one). Its words never reached the speech
+            // chain, so no outgoing channel stream carries them.
             console.error(
               `[refusal-retry] agent=${agent.name} membrane retry ` +
                 `${event.attempt}/${event.maxAttempts}` +
@@ -11257,9 +11300,7 @@ export class AgentFramework {
             );
             outgoingInferenceId = newOutgoingInferenceId();
             lifecycleInferenceIds.add(outgoingInferenceId);
-            outgoingIndex = 0;
             discardGuardHeld();
-            proseStream?.reset();
             this.emitTrace({
               type: 'inference:tokens',
               agentName: agent.name,
@@ -11362,7 +11403,7 @@ export class AgentFramework {
             // This round's words were written before any of its calls ran:
             // they go where the route stood then, whatever those calls (a
             // channel_open) or the arrivals at their results (a hold) change.
-            const roundMoment: SpeechMoment = { turn: this.turnRoutes.get(agent.name) };
+            const roundMoment: SpeechMoment = { turn: this.turnRoutes.get(agent.name), inferenceId: outgoingInferenceId };
 
             for (const call of event.calls) {
               // RFC-007: register at the one dispatch point for model-issued
@@ -11447,7 +11488,7 @@ export class AgentFramework {
                         `[prose] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway`,
                       );
                       for (const seg of roundSegments) {
-                        this.chainSpeech(agent.name, 'mid-turn prose delivery', () => this.deliverProse(agent, seg, holdOpts));
+                        this.chainSpeech(agent.name, 'mid-turn prose delivery', () => this.deliverProse(agent, seg, holdOpts, roundMoment));
                       }
                     }
                   } else if (turnSilenced) {
@@ -11481,7 +11522,7 @@ export class AgentFramework {
             // the route stood as they were, even though they are published
             // after the agent is idle, when a next turn may already have
             // decided its own (the 2026-07-22 Sol DM misroute's shape).
-            const finalMoment: SpeechMoment = { turn: this.turnRoutes.get(agent.name) };
+            const finalMoment: SpeechMoment = { turn: this.turnRoutes.get(agent.name), inferenceId: outgoingInferenceId };
             adoptInjectedRound();
             const durationMs = Date.now() - startTime;
             let response = event.response;
@@ -11501,7 +11542,6 @@ export class AgentFramework {
               // Nothing from the abandoned physical attempt is published or
               // persisted as assistant speech, including a terminal refusal
               // after the single recovery retry.
-              proseStream?.reset();
               if (withheld) {
                 const usage = response.details?.usage ?? response.usage;
                 const tokenUsage = usage ? {
@@ -11929,7 +11969,7 @@ export class AgentFramework {
                 } else if (turnProseRouting === 'explicit') {
                   console.error(`[prose] ${agent.name}: text-only turn -> prose gateway`);
                   for (const segment of speechSegments) {
-                    this.chainSpeech(agent.name, 'text-only prose delivery', () => this.deliverProse(agent, segment, textOnlyHold));
+                    this.chainSpeech(agent.name, 'text-only prose delivery', () => this.deliverProse(agent, segment, textOnlyHold, finalMoment));
                   }
                 } else {
                   // Route along the route the words were written under
@@ -12010,7 +12050,7 @@ export class AgentFramework {
                     `[prose] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> ${segments.length} trailing segment(s) via prose gateway`,
                   );
                   for (const seg of segments) {
-                    this.chainSpeech(agent.name, 'trailing prose delivery', () => this.deliverProse(agent, seg, trailingHold));
+                    this.chainSpeech(agent.name, 'trailing prose delivery', () => this.deliverProse(agent, seg, trailingHold, finalMoment));
                   }
                 }
               } else if (silenced || segments.length === 0) {
@@ -12484,17 +12524,12 @@ export class AgentFramework {
       // exhausted, abort) so it never sticks after the turn ends.
       if (frameReachedTerminal) this.channelRegistry?.stopTyping();
 
-      // Spec 14.3: flush any held line-start text, then close each streamed
-      // channel with its final moderated content — the consumer's signal to
-      // finalize (end the TTS utterance, settle the rendered message).
-      if (frameReachedTerminal && proseStream) {
-        emitOutgoing(proseStream.finish());
-        for (const [channelId, text] of proseStream.byChannel()) {
-          const place = streamPlace(channelId);
-          if (place === undefined) continue;
-          this.channelRegistry!.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text, place);
-        }
-      }
+      // Spec 14.3: close each channel this stream's published prose went to,
+      // with exactly what it carried — the consumer's signal to finalize (end
+      // the TTS utterance). Chained, so it follows the stream's last speech,
+      // which may still be publishing.
+      const inferenceIds = [...lifecycleInferenceIds];
+      this.chainSpeech(agent.name, 'outgoing stream completion', () => this.completeOutgoingStreams(inferenceIds));
       this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`);
       if (ownsPhysicalStream) {
         this.activeStreams.delete(agent.name);
