@@ -208,6 +208,23 @@ test('close() during a reconnect handshake ends that launch before resolving, an
   assert.equal(starts(log).length, 2, 'and no later launch');
 });
 
+test('a recycle during a reconnect in flight starts no second attempt, and close() still ends the one in flight', async () => {
+  // Iris-1827's interleaving (room-293 #55410): before, the recycle's attempt
+  // took close()'s ownership of the first, which outlived a successful close.
+  const log = scratchLog();
+  const connection = await McplServerConnection.connectWithReconnect(config('ok-then-hang', log, RECONNECT), HOST_CAPS);
+  connection.ready();
+  await assert.rejects(connection.sendToolsCall('die', {}));
+  await until(() => starts(log).length === 2, 'the reconnect launch, waiting on initialize');
+  await connection.reconnectAfterFailure();
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal(starts(log).length, 2, 'no second attempt beside the one in flight');
+  const began = Date.now();
+  await connection.close();
+  assert.ok(Date.now() - began < 5_000, 'promptly');
+  assert.deepEqual(starts(log).filter(alive), [], 'every launch reaped when close() resolved');
+});
+
 test('a reconnect never launches while the previous child may still be running', async () => {
   const log = scratchLog();
   const connection = await McplServerConnection.connectWithReconnect(

@@ -13422,10 +13422,15 @@ export class AgentFramework {
    * teardown is done, one owner at a time. So a connect is refused while
    * anything holds its id, and a teardown never removes what a later
    * connection registered. A disconnect takes the hold over, and waits for
-   * the operation it displaced (`previous`). Each release frees only its own
-   * hold.
+   * the operation it displaced (`previous`); a connect that finds itself
+   * `displaced` ends rather than setting up a server being removed. Each
+   * release frees only its own hold.
    */
-  private holdMcpServerId(id: string, kind: 'connect' | 'disconnect'): { previous: Promise<void> | undefined; release: () => void } {
+  private holdMcpServerId(id: string, kind: 'connect' | 'disconnect'): {
+    previous: Promise<void> | undefined;
+    displaced: () => boolean;
+    release: () => void;
+  } {
     const ops = (this.mcpServerOps ??= new Map());
     const previous = ops.get(id)?.settled;
     let settle!: () => void;
@@ -13433,6 +13438,7 @@ export class AgentFramework {
     ops.set(id, op);
     return {
       previous,
+      displaced: () => ops.get(id) !== op,
       release: () => {
         if (ops.get(id) === op) ops.delete(id);
         settle();
@@ -13853,17 +13859,19 @@ export class AgentFramework {
     }
     const hold = this.holdMcpServerId(config.id, 'connect');
     try {
-      await this.connectHeldMcplServer(config, family, deferAwareness);
+      await this.connectHeldMcplServer(config, family, deferAwareness, hold.displaced);
     } finally {
       hold.release();
     }
   }
 
-  /** The part of a connect that runs holding its id. */
+  /** The part of a connect that runs holding its id. `displaced`: a
+   *  disconnect has taken the id over and is waiting for this connect. */
   private async connectHeldMcplServer(
     config: import('./mcpl/types.js').McplServerConfig,
     family: 'legacy' | 'modern',
     deferAwareness: boolean,
+    displaced: () => boolean,
   ): Promise<void> {
     if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
       throw new Error('MCPL subsystem is not initialized');
@@ -13935,17 +13943,21 @@ export class AgentFramework {
       throw error;
     }
     // stop() began while the handshake ran: its teardown has already
-    // collected the registry, so this connection would outlive it. Close it.
-    if (this.mcpServerAdmissionClosed) {
+    // collected the registry, so this connection would outlive it. Or a
+    // disconnect took the id over and is waiting for this connect. Either
+    // way, close it rather than set up a server that is being removed.
+    if (this.mcpServerAdmissionClosed || displaced()) {
+      const why = this.mcpServerAdmissionClosed ? 'the framework stopped while it was connecting' : 'it was disconnected while connecting';
       // A cleanup that can't reap the child is reported with the refusal,
-      // not in place of it and not dropped.
+      // not in place of it and not dropped. The registry keeps such a
+      // connection, so the id stays held.
       let cleanup = '';
       try {
         await this.mcplServerRegistry.removeServer(config.id);
       } catch (error) {
         cleanup = `; its cleanup also failed: ${error instanceof Error ? error.message : String(error)}`;
       }
-      throw new Error(`MCP server "${config.id}" was not connected: the framework stopped while it was connecting${cleanup}`);
+      throw new Error(`MCP server "${config.id}" was not connected: ${why}${cleanup}`);
     }
 
     // Wire listeners before either startup staging or the runtime global gate
@@ -14360,11 +14372,12 @@ export class AgentFramework {
    * No-op-ish if the server is not connected (still clears routing state).
    *
    * It holds the id throughout (holdMcpServerId): a connect for it is
-   * refused meanwhile, and a connect already in flight settles first (a
-   * modern one is closed, which ends it). A close that can't confirm a child
-   * exited fails the disconnect before anything is removed: the server stays
-   * registered, closed, so nothing launches beside a child that may still be
-   * running, and disconnecting again retries the reap.
+   * refused meanwhile, and a connect already in flight is ended (closed, or
+   * displaced when its legacy handshake finishes) and settles before
+   * anything is removed. A close that can't confirm a child exited fails the
+   * disconnect before anything is removed: the server stays registered,
+   * closed, so nothing launches beside a child that may still be running,
+   * and disconnecting again retries the reap.
    */
   async disconnectMcplServer(id: string): Promise<void> {
     if (!this.mcplServerRegistry) {
@@ -14373,11 +14386,15 @@ export class AgentFramework {
     const registry = this.mcplServerRegistry;
     const hold = this.holdMcpServerId(id, 'disconnect');
     try {
-      // Closing a modern connection now ends a connect in flight, rather than
-      // waiting out its handshake.
+      // Close what the id has now, so a connect in flight ends rather than
+      // being waited out: a modern connect is ended by its close, and a
+      // legacy one already registered (setting up after its handshake)
+      // fails its requests. A legacy connect still handshaking ends when its
+      // handshake does, finding itself displaced. The registry's removal is
+      // the legacy close: a failed one stays registered.
       const modern = this.modernServers().get(id);
-      const modernClosed = modern?.close();
-      modernClosed?.catch(() => { /* its verdict is awaited below */ });
+      const closing = [modern?.close(), registry.removeServer(id)];
+      for (const pending of closing) pending?.catch(() => { /* its verdict is awaited below */ });
       // What held the id before (a connect still running, an earlier
       // disconnect) settles first, so what it registered is removed whole.
       await hold.previous;
@@ -14385,7 +14402,9 @@ export class AgentFramework {
       const oldToolNames = new Set(this.mcplTools.map(t => t.name));
 
       try {
-        await modernClosed;
+        for (const pending of closing) await pending;
+        // Whatever was registered since: a connect that was still
+        // handshaking, whose own removal couldn't reap, is re-checked here.
         await registry.removeServer(id);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

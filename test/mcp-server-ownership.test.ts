@@ -172,16 +172,32 @@ test('a modern connect is refused while a legacy connect for the same id is stil
   });
 });
 
-test('a disconnect during a legacy connect waits for it to land, then removes it whole', async () => {
+test('a disconnect during a legacy handshake ends that connect when the handshake finishes, and removes it whole', async () => {
   await withFramework(async ({ framework, dir }) => {
     const log = join(dir, 'legacy.log');
     const pending = framework.connectMcplServer(legacy('same', 'slow', log, { SLOW_INIT_MS: '600' }));
     await until(() => launches(log).length === 1, 'the legacy launch, handshaking');
     const disconnecting = framework.disconnectMcplServer('same');
     await assert.rejects(framework.connectMcplServer(legacy('same', 'ok', log)), /"same" is still being disconnected/);
-    await Promise.all([pending, disconnecting]);
+    await assert.rejects(pending, /MCP server "same" was not connected: it was disconnected while connecting/);
+    await disconnecting;
     assert.equal(status(framework, 'same'), undefined);
     assert.deepEqual(toolsOf(framework, 'same'), []);
+    assert.equal(alive(launches(log)[0]!), false, 'its child was reaped');
+    assert.equal(launches(log).length, 1, 'and nothing else launched');
+  });
+});
+
+test('a disconnect during a modern connect ends it at once', async () => {
+  await withFramework(async ({ framework, dir }) => {
+    const log = join(dir, 'raw.jsonl');
+    const pending = framework.connectMcplServer(modern('m', 'hang-discover', log));
+    await until(() => lines(log).some((l) => l.includes('server/discover')), 'the launch waiting on discover');
+    const began = Date.now();
+    await framework.disconnectMcplServer('m');
+    await assert.rejects(pending, /MCP server "m" was not connected: it was disconnected while connecting/);
+    assert.ok(Date.now() - began < 5_000, 'not after the 30 s connect timeout');
+    assert.equal(status(framework, 'm'), undefined);
     assert.equal(alive(launches(log)[0]!), false, 'its child was reaped');
   });
 });

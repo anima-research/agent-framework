@@ -41,8 +41,8 @@
     `connectWithReconnect()` returns that connection, halted
     (`connect-failed` with `permanent: true`, which raises the ops alert),
     and a reconnect attempt halts the loop the same way
-    (`reconnect-failed`, `permanent: true`). A reconnect attempt never
-    starts before the previous child has exited.
+    (`reconnect-failed`, `permanent: true`). Reconnect attempts run one at
+    a time, and never start before the previous child has exited.
   - `close()` during a reconnect handshake ends that launch before it
     resolves.
   - In the framework, a disconnect or failed connect whose cleanup can't
@@ -52,9 +52,11 @@
     and completes the removal.
 - One owner per server id, across both families: a connect is refused while
   another connect for that id is in flight (a legacy handshake included) or
-  a disconnect is still tearing it down, and a disconnect waits for a
-  connect in flight to settle before removing it, so a teardown never
-  removes what a later connection registered.
+  a disconnect is still tearing it down. A disconnect closes a registered
+  connection immediately, and a legacy connect still handshaking is cleaned
+  up when its handshake settles (a modern connect in flight, or such a
+  legacy one, fails with "was not connected"); then it removes what was
+  registered. A teardown never removes what a later connection registered.
 - A server configuration naming no usable transport is now an error before
   anything is spawned or dialed. That covers a `transport` that doesn't
   match the url's scheme, `transport: 'http'` without a url, and an

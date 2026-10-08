@@ -1230,9 +1230,13 @@ export class McplServerConnection extends EventEmitter {
    * approach this builds no throwaway connection instance, so there are no
    * leaked listeners on a dead object. The attempt is close()'s to abort,
    * and it settles only once its own launch is adopted, failed or cleaned up.
+   * One attempt at a time: a request that arrives while one is in flight (a
+   * recycle, say) starts nothing, since that attempt either adopts its
+   * launch or schedules the next retry itself. A second attempt would take
+   * close()'s ownership of the first (Iris-1827, room-293 #55410).
    */
   private async attemptReconnect(): Promise<void> {
-    if (!this.reconnectEnabled || !this.config || !this.hostCapabilities) return;
+    if (this.reconnecting || !this.reconnectEnabled || !this.config || !this.hostCapabilities) return;
     const abort = new AbortController();
     const done = this.reconnectOnce(this.config, this.hostCapabilities, abort.signal);
     this.reconnecting = { abort, done };
