@@ -154,6 +154,68 @@ test('the gate reads a message\'s thread from the protocol field, never from ada
   assert.equal(seen[1]!.threadId, '1700.0001');
 });
 
+test('publish rechecks its destination after opening it: a declaration withdrawn meanwhile refuses the send', async () => {
+  // A closed channel declares where posts land; while the open waits on the
+  // connector, a channels/changed withdraws that (or removes the channel, or
+  // moves the id to another server). The host refuses, rather than relying
+  // on the connector to.
+  const published: unknown[] = [];
+  let duringOpen: () => void = () => {};
+  const server = {
+    grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
+    sendChannelsOpen: async () => { duringOpen(); return {}; },
+    sendChannelsPublish: async (params: { threadId?: string | null }) => {
+      published.push(params);
+      return { delivered: true, threadId: params.threadId };
+    },
+  };
+  const registry = new ChannelRegistry(
+    { getServer: () => server } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+  );
+  const channels = (registry as unknown as {
+    channels: Map<string, { serverId: string; descriptor: Record<string, unknown>; open: boolean }>;
+  }).channels;
+  const seed = (): void => {
+    channels.clear();
+    seedRegistered(registry, 'discord', 'dm-alice');
+  };
+
+  seed();
+  duringOpen = () => { channels.get('discord:dm-alice')!.descriptor = { id: 'dm-alice', type: 'discord', label: 'dm-alice' }; };
+  const withdrawn = await registry.publish('sol', 'reply', { serverId: 'discord', channelId: 'dm-alice', threadId: null });
+  assert.equal(withdrawn.status, 'failed');
+  assert.match(withdrawn.reason ?? '', /declare/i);
+
+  seed();
+  duringOpen = () => { channels.delete('discord:dm-alice'); };
+  const removed = await registry.publish('sol', 'reply', { channelId: 'dm-alice', threadId: null });
+  assert.equal(removed.status, 'failed');
+  assert.match(removed.reason ?? '', /went away while it was being opened/);
+
+  // Removed from its server while another server registers the same id: the
+  // destination it resolved to is gone, and the send never moves to the other.
+  seed();
+  duringOpen = () => {
+    channels.delete('discord:dm-alice');
+    seedRegistered(registry, 'slack', 'dm-alice');
+  };
+  const moved = await registry.publish('sol', 'reply', { channelId: 'dm-alice', threadId: null });
+  assert.equal(moved.status, 'failed');
+  assert.equal(moved.destination?.serverId, 'discord');
+
+  assert.deepEqual(published, [], 'nothing was sent in any case');
+
+  // Unchanged across the open: it sends.
+  seed();
+  duringOpen = () => {};
+  const sent = await registry.publish('sol', 'reply', { channelId: 'dm-alice', threadId: null });
+  assert.equal(sent.status, 'delivered');
+  assert.equal(published.length, 1);
+});
+
 test('routeSpeech surfaces a failure when the server reports delivered:false', async () => {
   const { registry, failures, traces } = makeRegistry({ delivered: false });
   seedRegistered(registry, 'discord', 'ch-x');

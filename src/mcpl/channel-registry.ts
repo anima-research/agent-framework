@@ -3145,14 +3145,15 @@ export class ChannelRegistry {
     const at = (): number => Date.now();
     const found = this.findExactEntry(target);
     if ('error' in found) return { status: 'failed', reason: found.error, at: at() };
-    const entry = found.entry;
+    let entry = found.entry;
     const place = target.threadId === undefined ? null : target.threadId;
-    const destination: PublishDestination = {
-      serverId: entry.serverId,
-      channelId: entry.descriptor.id,
-      ...(entry.descriptor.label ? { label: entry.descriptor.label } : {}),
+    const destinationOf = (e: ChannelEntry): PublishDestination => ({
+      serverId: e.serverId,
+      channelId: e.descriptor.id,
+      ...(e.descriptor.label ? { label: e.descriptor.label } : {}),
       threadId: place,
-    };
+    });
+    let destination = destinationOf(entry);
     if (place !== null && (typeof place !== 'string' || place === '')) {
       return { status: 'failed', destination, reason: 'the thread to post in must be a non-empty thread id', at: at() };
     }
@@ -3188,6 +3189,21 @@ export class ChannelRegistry {
           reason: `channel is closed and open failed: ${(err as Error).message}`,
           at: at(),
         };
+      }
+      // The open waited on the connector, and a `channels/changed` meanwhile
+      // can have removed the channel or withdrawn its declaration. Recheck
+      // the entry the destination resolved to (its server and channel, never
+      // the original selector, which could now resolve to another server)
+      // immediately before sending.
+      const current = this.findExactEntry({ serverId: entry.serverId, channelId: entry.descriptor.id });
+      if ('error' in current) {
+        return { status: 'failed', destination, reason: `the channel went away while it was being opened: ${current.error}`, at: at() };
+      }
+      entry = current.entry;
+      destination = destinationOf(entry);
+      const withdrawn = publishPlaceRefusal(declaredPublishTarget(entry.descriptor), place);
+      if (withdrawn) {
+        return { status: 'failed', destination, reason: ChannelRegistry.placeRefusalText(withdrawn, entry.descriptor, place), at: at() };
       }
     }
 
