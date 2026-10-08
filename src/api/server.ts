@@ -426,6 +426,21 @@ export class ApiServer {
     }
   }
 
+  /**
+   * With an operator-change gate configured (FrameworkConfig.operatorChangeGate),
+   * a command that would change an agent's body here (undo, redo, a branch
+   * switch) is refused whole, before anything changes: this API can't stage
+   * the change, and an imposed change applies only through the gate. Without
+   * a gate, these commands work as they always have.
+   */
+  private refuseUnderGate(command: string): void {
+    if (!this.framework.hasOperatorChangeGate()) return;
+    throw new Error(
+      `${command} refused: an operator-change gate is configured, and this API can't stage the change; ` +
+        "use the host's command for it",
+    );
+  }
+
   /** WS-side admin gate for the mutating host verbs: no-op unless an
    *  adminToken is configured, then `params.adminToken` must match. */
   private requireAdminToken(params?: Record<string, unknown>): void {
@@ -512,6 +527,8 @@ export class ApiServer {
   }
 
   private async cmdBranchCreate(params: BranchCreateParams): Promise<{ name: string }> {
+    // Refused whole: never a created branch without the switch.
+    if (params.switchTo) this.refuseUnderGate('branch.create with switchTo');
     if (!params.name) {
       throw new Error('name is required');
     }
@@ -532,6 +549,7 @@ export class ApiServer {
   }
 
   private async cmdBranchSwitch(params: BranchSwitchParams): Promise<{ switched: boolean }> {
+    this.refuseUnderGate('branch.switch');
     if (!params.name) {
       throw new Error('name is required');
     }
@@ -588,6 +606,7 @@ export class ApiServer {
   // ==========================================================================
 
   private async cmdUndo(params: { agentName: string }): Promise<unknown> {
+    this.refuseUnderGate('undo');
     if (!params.agentName) {
       throw new Error('agentName is required');
     }
@@ -607,6 +626,7 @@ export class ApiServer {
   }
 
   private async cmdRedo(params: { agentName: string }): Promise<unknown> {
+    this.refuseUnderGate('redo');
     if (!params.agentName) {
       throw new Error('agentName is required');
     }

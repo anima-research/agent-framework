@@ -7107,6 +7107,14 @@ export class AgentFramework {
   // Operator-change admission (FrameworkConfig.operatorChangeGate)
   // ---------------------------------------------------------------------------
 
+  /** Whether the host configured an operator-change gate: then an imposed
+   *  body change applies only through it, and an operator surface that can't
+   *  stage a change (the API server's undo, redo and branch switches)
+   *  refuses it. */
+  hasOperatorChangeGate(): boolean {
+    return !!this.operatorChangeGate;
+  }
+
   /** Hand one resolved change to the host's gate, which stages it and
    *  answers with its receipt. A gate that throws, or answers without a
    *  receipt, refuses the change (fails closed). Both are logged. */

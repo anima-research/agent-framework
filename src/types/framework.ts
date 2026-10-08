@@ -202,6 +202,12 @@ export interface FrameworkConfig {
    * through applyResolvedOperatorChange under a held safe-boundary lease. A
    * gate that throws refuses the change. The agent's own model calls never
    * reach it. Absent: every operator path behaves as it always has.
+   *
+   * The API server can't stage a change, so while a gate is configured its
+   * body-changing commands (undo, redo, branch.switch, and branch.create with
+   * switchTo) are refused whole, before anything changes. The host's own
+   * direct calls (undoLastTurn, redo, a store branch switch) stay the host's
+   * responsibility: the gate never sees them.
    */
   operatorChangeGate?: (
     change: import('../operator-change.js').ResolvedOperatorChange,

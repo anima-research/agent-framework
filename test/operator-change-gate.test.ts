@@ -18,7 +18,8 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { JsStore } from '@animalabs/chronicle';
 import { join } from 'node:path';
-import { AgentFramework, AutobiographicalStrategy, ResumeBlockedError, WorkspaceModule } from '../src/index.js';
+import WebSocket from 'ws';
+import { AgentFramework, ApiServer, AutobiographicalStrategy, ResumeBlockedError, WorkspaceModule } from '../src/index.js';
 import type {
   AgentSettingsExtension,
   InferenceRequest,
@@ -2535,5 +2536,111 @@ describe('a hard kill between a body change and its outcome record', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('operator-change gate: the API server', () => {
+  type Host = { addMessage(participant: string, content: unknown[]): string; pendingRequests: InferenceRequest[] };
+  type Response = { success: boolean; data?: unknown; error?: string };
+
+  /** A framework, with or without a gate, behind an API server on an ephemeral port. */
+  async function withApi(gated: boolean, fn: (h: {
+    framework: AgentFramework;
+    send: (command: string, params: Record<string, unknown>) => Promise<Response>;
+    texts: () => string[];
+    asked: ResolvedOperatorChange[];
+  }) => Promise<void>): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'operator-gate-api-'));
+    const membrane = new MockMembrane();
+    const asked: ResolvedOperatorChange[] = [];
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'test', maxTokens: 1000 }],
+      modules: [],
+      ...(gated ? { operatorChangeGate: async (change: ResolvedOperatorChange) => { asked.push(change); return { id: 'rev', text: 'staged' }; } } : {}),
+    });
+    const quiet = { log: console.log, error: console.error };
+    console.log = () => {};
+    console.error = () => {};
+    const server = new ApiServer(framework, { port: 0, host: '127.0.0.1' });
+    await server.start();
+    const port = (server as unknown as { httpServer: { address(): { port: number } } }).httpServer.address().port;
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    await new Promise<void>((resolve, reject) => { ws.once('open', () => resolve()); ws.once('error', reject); });
+    let n = 0;
+    const send = (command: string, params: Record<string, unknown>) => new Promise<Response>((resolve) => {
+      const id = `c${++n}`;
+      const onMessage = (raw: WebSocket.RawData) => {
+        const msg = JSON.parse(raw.toString()) as Response & { type: string; id: string };
+        if (msg.type === 'response' && msg.id === id) { ws.off('message', onMessage); resolve(msg); }
+      };
+      ws.on('message', onMessage);
+      ws.send(JSON.stringify({ type: 'request', id, command, params }));
+    });
+    const texts = () => (framework.getAgent('scout')!.getContextManager().getAllMessages() as Array<{ content: Array<{ text?: string }> }>)
+      .map((m) => m.content[0]?.text ?? '');
+    try {
+      const host = framework as unknown as Host;
+      for (const t of ['one', 'two']) {
+        host.addMessage('user', [{ type: 'text', text: t }]);
+        membrane.pushResponse(createMockResponse([{ type: 'text', text: `reply to ${t}` }]));
+        host.pendingRequests.push({ agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'test', timestamp: Date.now() } as InferenceRequest);
+        await framework.runUntilIdle();
+      }
+      await fn({ framework, send, texts, asked });
+    } finally {
+      ws.close();
+      console.log = quiet.log;
+      console.error = quiet.error;
+      await server.stop();
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("refuses undo, redo and branch switches whole while a gate is configured, saying why; the host's own calls stay its own", async () => {
+    await withApi(true, async ({ framework, send, texts, asked }) => {
+      const store = framework.getStore();
+      const snapshot = () => ({ texts: texts(), branch: store.currentBranch().name, branches: store.listBranches().map((b) => b.name).sort() });
+      const before = snapshot();
+      const refusals = [
+        await send('undo', { agentName: 'scout' }),
+        await send('branch.create', { name: 'side', switchTo: true }),
+        await send('branch.switch', { name: before.branch }),
+      ];
+      for (const r of refusals) {
+        assert.equal(r.success, false);
+        assert.match(String(r.error), /refused: an operator-change gate is configured, and this API can't stage the change; use the host's command for it/);
+      }
+      assert.deepEqual(snapshot(), before, 'nothing changed, and branch.create made no branch');
+
+      // The host's own undo is the host's responsibility; the API's redo of it is refused too.
+      const undone = framework.undoLastTurn('scout');
+      assert.equal(undone.undone, true);
+      const afterHostUndo = snapshot();
+      const redo = await send('redo', { agentName: 'scout' });
+      assert.equal(redo.success, false);
+      assert.match(String(redo.error), /^redo refused: an operator-change gate is configured/);
+      assert.deepEqual(snapshot(), afterHostUndo);
+      assert.equal(asked.length, 0, 'the API never stages');
+
+      const created = await send('branch.create', { name: 'side' });
+      assert.equal(created.success, true, 'creating a branch without switching changes no body');
+    });
+  });
+
+  it('keeps undo, redo and branch switches without a gate', async () => {
+    await withApi(false, async ({ framework, send, texts }) => {
+      const undo = await send('undo', { agentName: 'scout' });
+      assert.equal(undo.success, true, String(undo.error));
+      assert.deepEqual(texts(), ['one', 'reply to one', 'two']);
+      const redo = await send('redo', { agentName: 'scout' });
+      assert.equal(redo.success, true, String(redo.error));
+      assert.deepEqual(texts(), ['one', 'reply to one', 'two', 'reply to two']);
+      const created = await send('branch.create', { name: 'side', switchTo: true });
+      assert.equal(created.success, true, String(created.error));
+      assert.equal(framework.getStore().currentBranch().name, 'side');
+    });
   });
 });
