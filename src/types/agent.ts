@@ -367,4 +367,6 @@ export interface InferenceRequest {
    * turn stores is stamped `metadata.silentHeartbeat` with it, and request
    * builds render a request-only separator before the tick's first row. */
   silentHeartbeat?: SilentHeartbeatTick;
+  /** True when a private non-channel surface requested this inference. */
+  nonChannelOrigin?: boolean;
 }

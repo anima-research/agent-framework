@@ -191,6 +191,7 @@ describe('present while acting', () => {
     framework.pushEvent({
       type: 'external-message',
       source: 'test',
+      channelId: 'test:channel',
       content: 'go',
       metadata: {},
     } as unknown as ProcessEvent);
@@ -728,6 +729,26 @@ describe('present while acting', () => {
       'routing note present in the channel_open tool result',
     );
 
+    await framework.stop();
+  });
+
+  it('channel_open deliberately lifts private-turn routing into the opened channel', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c-private', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Public after deliberate open.' }] as ContentBlock[]));
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework);
+    const registry = (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+    (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall = async () =>
+      ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
+    const agent = framework.getAgent('assistant')!;
+    await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
+      .startAgentStream(agent, {
+        agentName: 'assistant', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
+      });
+    await framework.runUntilIdle();
+    assert.deepEqual(routed, [{ text: 'Public after deliberate open.', locus: 'discord:guild:observatory' }]);
     await framework.stop();
   });
 
