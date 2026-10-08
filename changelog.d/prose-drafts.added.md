@@ -29,8 +29,12 @@
   `confirmDuplicate` its resend needs), and the turn-end `[delivered]` receipt
   names every draft held in the turn by its state at turn end: still held
   ("held as drafts d-… (not sent …)"), delivered by the resident's resend
-  (listed where it landed), unconfirmed, or dismissed. A draft no notice
-  reached (a crash, an aborted turn) is named at the next turn's start.
+  (listed where it landed), unconfirmed, or dismissed. A dismissed draft
+  whose own attempt may already have been posted is named with that risk,
+  and counts like an unconfirmed one: a receipt that names one, with nothing
+  confirmed delivered, reads "nothing confirmed", not "nothing". A draft no
+  notice reached (a crash, an aborted turn) is named at the next turn's
+  start.
 - A draft is never published except by its resident's explicit resend (or
   `{{unsent}}`), and only that resident can list or act on it. Its notices go
   into the resident's own history, which residents sharing one message slot
@@ -43,7 +47,11 @@
   instead of sending again; a draft with any attempt whose outcome is
   unknown (and none confirmed) needs `confirmDuplicate: true`, and a resend
   owns its drafts until it finishes, re-checking each before it is sent.
-  Unused fields may be passed as null.
+  Dismissing a draft (with the tool or `>>skip_reply {{unsent}}`) is
+  refused while that draft's attempt is out, since a dismissal can't call
+  back words already on their way; the resident is told to wait for that
+  result. A draft only queued in a resend can still be dismissed, and is
+  then not sent. Unused fields may be passed as null.
 - Prose segments also break at XML tool mode's refused attempts and their
   notices (`tool_attempt`, `tool_notice`): the words before an all-refused
   call and after its notice are two messages, routed or held separately.
