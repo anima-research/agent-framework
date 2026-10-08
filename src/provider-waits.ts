@@ -13,9 +13,11 @@
  * - A later, shorter wait for the same (agent, model) never shortens an
  *   outstanding longer one: the binding deadline is the maximum. Requests
  *   that finish at different times can carry different hints.
- * - A wait that cannot be represented as an instant (not a finite
- *   non-negative number, or past the last instant a Date can hold) becomes an
- *   indefinite wait rather than a shorter one, held until explicitly released.
+ * - A negative wait is already over (a provider's "retry now", or an HTTP
+ *   date already past): it binds nothing, the same as 0.
+ * - A wait that cannot be represented as an instant (not a finite number, or
+ *   past the last instant a Date can hold) becomes an indefinite wait rather
+ *   than a shorter one, held until explicitly released.
  * - A wait ends when its instant passes (nothing is written), or when an
  *   operator releases it (recorded). Selecting a different model is not a
  *   release: that model proceeds, and the old model's wait still applies if it
@@ -57,11 +59,12 @@ interface ProviderWaitSnapshot {
 
 /**
  * The instant a stated wait ends, or null when it cannot be represented:
- * the wait is then held until released, never shortened.
+ * the wait is then held until released, never shortened. A negative wait
+ * ends at `now`: it is already over, never indefinite.
  */
 export function waitDeadline(retryAfterMs: unknown, now: number): number | null {
-  if (typeof retryAfterMs !== 'number' || !Number.isFinite(retryAfterMs) || retryAfterMs < 0) return null;
-  const until = Math.ceil(now + retryAfterMs);
+  if (typeof retryAfterMs !== 'number' || !Number.isFinite(retryAfterMs)) return null;
+  const until = Math.ceil(now + Math.max(0, retryAfterMs));
   if (!Number.isSafeInteger(until) || until > MAX_DATE_MS) return null;
   return until;
 }
@@ -204,11 +207,22 @@ export class ProviderWaits {
   private readonly journal: RecordJournal<ProviderWaitEntry, ProviderWaitSnapshot> | null;
   private readonly now: () => number;
   private readonly log: (line: string) => void;
+  private readonly onUnreadable: (error: string) => void;
 
-  /** `store` null keeps waits in memory only (a framework without a store has no restart to survive). */
-  constructor(store: JsStore | null, opts: { now?: () => number; log?: (line: string) => void; retryReadMs?: number } = {}) {
+  /**
+   * `store` null keeps waits in memory only (a framework without a store has
+   * no restart to survive). `onUnreadable` hears each time the recorded waits
+   * become unreadable, once per episode (a restart that still cannot read them
+   * is a new one): every (agent, model) is then held until they read again or
+   * an operator releases, and a cause that persists (a malformed or newer
+   * record) never reads again, so a person has to hear of it.
+   */
+  constructor(store: JsStore | null, opts: {
+    now?: () => number; log?: (line: string) => void; retryReadMs?: number; onUnreadable?: (error: string) => void;
+  } = {}) {
     this.now = opts.now ?? Date.now;
     this.log = opts.log ?? ((line) => console.error(line));
+    this.onUnreadable = opts.onUnreadable ?? (() => {});
     this.retryReadMs = opts.retryReadMs ?? RETRY_READ_MS;
     this.store = store;
     this.journal = store ? new RecordJournal<ProviderWaitEntry, ProviderWaitSnapshot>(store, { type: PROVIDER_WAIT_RECORD_TYPE }) : null;
@@ -353,6 +367,7 @@ export class ProviderWaits {
         this.log(`[provider-wait] recorded provider waits could not be read (${this.unreadable.error}): ` +
           'no provider call is admitted until they can be read or an operator releases an agent\'s waits ' +
           '(release-provider-wait); inspection is unaffected');
+        try { this.onUnreadable(this.unreadable.error); } catch { /* reporting never changes the hold */ }
       }
       return false;
     }

@@ -833,6 +833,11 @@ const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
  *  a longer timer fires almost at once, so longer waits re-arm in steps. */
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+/** A stated wait recorded to hold a model longer than this, or until
+ *  released, raises an ops alert. It is honoured in full either way: a hold
+ *  that long is a quota-scale event or a provider's mistake, and a person
+ *  decides which (release-provider-wait). Shorter waits are pacing. */
+const PROVIDER_WAIT_ALERT_MS = 60 * 60_000;
 
 function isOrganizationAccelerationRateLimit(error: Error): error is MembraneError {
   if (!(error instanceof MembraneError) || error.type !== 'rate_limit') return false;
@@ -1433,7 +1438,15 @@ export class AgentFramework {
     this.operatorLog = operatorLog;
     this.store = store;
     this.ownsStore = ownsStore;
-    this.providerWaits = new ProviderWaits(store);
+    // Unreadable recorded waits hold every agent's provider calls, and a
+    // persistent cause never reads again: a person has to hear of it.
+    this.providerWaits = new ProviderWaits(store, {
+      onUnreadable: (error) => this.opsAlert('provider-wait', 'framework',
+        `recorded provider waits could not be read (${error}): no provider call is admitted for any agent ` +
+        'until they read again (re-read every 30 s) or an operator releases an agent\'s waits with ' +
+        'release-provider-wait; such a release lasts for this process only',
+        { data: { model: EVERY_MODEL, until: null } }),
+    });
     this.membrane = membrane;
     this.inferencePolicy = inferencePolicy;
     this.errorPolicy = errorPolicy;
@@ -2147,13 +2160,14 @@ export class AgentFramework {
   /** An acceleration hold's length: AF's own pacing (`ownMs`: its default
    *  plus jitter, capped), or the provider's stated wait in its place
    *  (`stated`). The stated wait is a lower bound: jitter only adds to it,
-   *  and the cap applies only to AF's own default. */
+   *  and the cap applies only to AF's own default. A negative stated wait is
+   *  a stated 0, as in ProviderWaits: the 1 s floor, plus jitter. */
   private accelerationCooldownMs(agentName: string, error: MembraneError): { delayMs: number; ownMs: number; stated: boolean } {
     let hash = 0; for (const ch of agentName) hash = ((hash * 31) + ch.charCodeAt(0)) >>> 0;
     const jitter = this.providerAccelerationJitterMs > 0 ? hash % (this.providerAccelerationJitterMs + 1) : 0;
     const ownMs = Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, this.providerAccelerationDefaultCooldownMs) + jitter);
     const stated = error.retryAfterMs;
-    if (typeof stated === 'number' && Number.isFinite(stated) && stated >= 0) {
+    if (typeof stated === 'number' && Number.isFinite(stated)) {
       return { delayMs: Math.max(1_000, stated) + jitter, ownMs, stated: true };
     }
     return { delayMs: ownMs, ownMs, stated: false };
@@ -2309,18 +2323,28 @@ export class AgentFramework {
   /**
    * Record a provider's stated wait (a classified error carrying
    * `retryAfterMs`) for (agent, model). Returns the wait that binds now,
-   * which is the longer of this one and any outstanding one.
+   * which is the longer of this one and any outstanding one. A wait that
+   * newly binds past PROVIDER_WAIT_ALERT_MS, or until released, raises an
+   * ops alert.
    */
   private recordProviderWait(agentName: string, model: string, error: Error): ProviderWait | undefined {
     if (!(error instanceof MembraneError) || error.retryAfterMs === undefined || !this.providerWaits) return undefined;
     const reason = safeSlice(error.message, 0, 300);
     const { wait, changed } = this.providerWaits.set(agentName, model, error.retryAfterMs, reason);
-    if (changed) {
+    // A wait already over (0, or a negative "retry now") holds nothing to report.
+    const remaining = wait.until === null ? Number.POSITIVE_INFINITY : wait.until - Date.now();
+    if (changed && remaining > 0) {
       const until = wait.until === null
         ? 'until an operator releases it (the stated wait cannot be represented as an instant)'
         : `until ${new Date(wait.until).toISOString()}`;
-      console.error(`[provider-wait] agent=${agentName} model=${model} holds ${until}: ` +
-        `${error.type}${error.httpStatus !== undefined ? ` HTTP ${error.httpStatus}` : ''}, retry-after ${String(error.retryAfterMs)}ms`);
+      const stated = `${error.type}${error.httpStatus !== undefined ? ` HTTP ${error.httpStatus}` : ''}, retry-after ${String(error.retryAfterMs)}ms`;
+      console.error(`[provider-wait] agent=${agentName} model=${model} holds ${until}: ${stated}`);
+      if (remaining > PROVIDER_WAIT_ALERT_MS) {
+        this.opsAlert('provider-wait', agentName,
+          `provider wait on ${model} holds ${until} (${stated}: ${reason}); ` +
+          'if the provider did not mean that, release it with release-provider-wait',
+          { data: { model, until: wait.until === null ? null : new Date(wait.until).toISOString() } });
+      }
     }
     return wait;
   }

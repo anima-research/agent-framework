@@ -40,11 +40,17 @@ describe('waitDeadline', () => {
   });
 
   it('is null (held until released) for a wait it cannot represent', () => {
-    for (const unusable of [Number.NaN, Number.POSITIVE_INFINITY, -1, 1e20, '60', undefined]) {
+    for (const unusable of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 1e20, '60', undefined]) {
       assert.equal(waitDeadline(unusable, 1_000), null, String(unusable));
     }
     assert.equal(waitDeadline(8.64e15 - 1_000, 1_000), 8.64e15, 'the last representable instant');
     assert.equal(waitDeadline(8.64e15, 1_000), null, 'one past it');
+  });
+
+  it('is the moment it was stated for a negative wait: already over, never held (PR #251 review)', () => {
+    for (const negative of [-1, -1_000, -0.4, -0, -1e20, -Number.MAX_VALUE]) {
+      assert.equal(waitDeadline(negative, 1_000), 1_000, String(negative));
+    }
   });
 });
 
@@ -139,6 +145,33 @@ describe('ProviderWaits', () => {
       assert.deepEqual(reopened.release('ada', undefined, 'operator').map((r) => r.wait.model), ['zz-b']);
       assert.ok(reopened.active('bo', 'zz-a'), "another agent's wait is untouched");
       assert.deepEqual(reopened.release('ada', undefined, 'operator'), [], 'nothing left to release');
+    } finally { if (!store.isClosed()) store.close(); }
+  }));
+
+  // A negative stated wait (a stream error frame's `retry_after_ms: -1000`, or
+  // an HTTP date already past) means "retry now". It used to fall into the
+  // indefinite case and hold the model until an operator released it, across
+  // reopens, and one arriving during a finite wait made that wait indefinite
+  // (PR #251 review, 2026-10-08).
+  it('a negative stated wait binds nothing, before or after a reopen, and leaves an outstanding wait as it was', () => withStoreDir((path) => {
+    const time = clock();
+    let store = JsStore.openOrCreate({ path });
+    try {
+      const waits = new ProviderWaits(store, { now: time.now, ...quiet });
+      for (const stated of [-1, -1_000]) {
+        waits.set('ada', 'zz-model', stated, `retry now (${stated})`);
+        assert.equal(waits.active('ada', 'zz-model'), undefined, `${stated} binds nothing`);
+      }
+      waits.set('ada', 'zz-held', 600_000, 'long');
+      const after = waits.set('ada', 'zz-held', -1, 'retry now');
+      assert.equal(after.changed, false);
+      assert.equal(waits.active('ada', 'zz-held')?.until, time.now() + 600_000, 'the outstanding wait stands, neither shortened nor made indefinite');
+      store.close();
+
+      store = JsStore.openOrCreate({ path });
+      const reopened = new ProviderWaits(store, { now: time.now, ...quiet });
+      assert.equal(reopened.active('ada', 'zz-model'), undefined, 'nothing binds after a reopen, at the same instant');
+      assert.deepEqual(reopened.list('ada').map((wait) => [wait.model, wait.until]), [['zz-held', time.now() + 600_000]]);
     } finally { if (!store.isClosed()) store.close(); }
   }));
 });
@@ -263,6 +296,31 @@ describe('ProviderWaits: unreadable history fails closed (room-225 #46189, #4644
       assert.equal(restarted.active('ada', 'zz-a'), undefined, 'omitting the model lifts every model of the agent');
       assert.equal(restarted.active('bo', 'zz-a')?.until, null);
     } finally { if (!store.isClosed()) store.close(); }
+  }));
+
+  it('reports each episode of unreadable records once, and a failing report leaves the hold standing (PR #251 review)', () => withStoreDir((path) => {
+    const time = clock();
+    const store = JsStore.openOrCreate({ path });
+    try {
+      const { surface, fail } = flaky(store);
+      fail.read = true;
+      const reported: string[] = [];
+      const onUnreadable = (error: string) => { reported.push(error); };
+      const waits = new ProviderWaits(surface, { now: time.now, ...quiet, onUnreadable });
+      assert.deepEqual(reported, ['zz unreadable record'], 'reported as the hold begins');
+      time.advance(30_000);
+      assert.equal(waits.active('ada', 'zz-a')?.until, null);
+      assert.equal(reported.length, 1, 'a re-read that fails again is the same episode');
+      fail.read = false;
+      time.advance(30_000);
+      assert.equal(waits.active('ada', 'zz-a'), undefined, 'readable again');
+
+      fail.read = true;
+      new ProviderWaits(surface, { now: time.now, ...quiet, onUnreadable });
+      assert.equal(reported.length, 2, 'a restart that still cannot read is a new episode');
+      const unreported = new ProviderWaits(surface, { now: time.now, ...quiet, onUnreadable: () => { throw new Error('zz alert sink down'); } });
+      assert.equal(unreported.active('ada', 'zz-a')?.until, null, 'a report that throws changes nothing');
+    } finally { store.close(); }
   }));
 });
 
@@ -984,5 +1042,129 @@ test('an explicit release reaches the compression lane with exactly its scope, e
       assert.deepEqual(asked, ['zz-other', 'zz-model', undefined], 'an omitted model reaches it as every model');
       assert.equal(paused.size, 0);
     } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #251 review (2026-10-08): a negative stated wait means "retry now", and
+// a hold a person has to judge is raised as an ops alert.
+// ---------------------------------------------------------------------------
+
+test('a primary 429 stating a negative retry-after is retried, not held until released', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(1, -1_000);
+    const { fw, internal } = await framework(path, membrane);
+    try {
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await fw.runUntilIdle();
+      assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'no hold');
+      assert.deepEqual(fw.providerWaitSnapshot('resident'), [], 'no wait binds');
+      assert.equal(membrane.primary, 2, 'the error policy retried, and the retry recovered');
+      assert.ok(!log.lines.some((line) => /\[provider-wait\].* holds /.test(line)), 'and nothing is logged as held');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("an organization-acceleration 429 stating a negative retry-after is paced as a stated 0, not by AF's default", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(0, undefined);
+    const stream = membrane.streamYielding.bind(membrane);
+    membrane.streamYielding = (request: NormalizedRequest) => {
+      if (membrane.primary === 0) { membrane.calls.push(request); membrane.primary++; return new ErrorStream(accelerationLimited(-1_000, request)); }
+      return stream(request);
+    };
+    const { fw, internal } = await framework(path, membrane);
+    internal.providerAccelerationDefaultCooldownMs = 60_000;
+    internal.providerAccelerationJitterMs = 0;
+    try {
+      const before = Date.now();
+      fw.pushEvent({ type: 'external-message', source: 'test', content: 'zz-first', metadata: {} });
+      await fw.runUntilIdle();
+      const armedBy = Date.now();
+      const hold = internal.providerAccelerationCooldowns.get('resident')!;
+      assert.ok(hold.until >= before + 1_000 && hold.until <= armedBy + 1_000, `held ${hold.until - before} ms: the 1 s floor, not the 60 s default`);
+      assert.deepEqual(fw.providerWaitSnapshot('resident'), [], 'no wait binds');
+      await sleep(Math.max(0, hold.until - Date.now()) + 150);
+      await fw.runUntilIdle();
+      assert.equal(membrane.primary, 2, 'the held turn runs once the hold passes');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test('a stated wait held until released, or for more than an hour, raises an ops alert when it is recorded', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new WaitingMembrane(0, undefined);
+    const { fw, internal } = await framework(path, membrane);
+    const alerts: Array<{ kind: string; agentName: string; message: string; data?: Record<string, unknown> }> = [];
+    fw.onTrace((event) => { if (event.type === 'ops:alert') alerts.push(event); });
+    const logged: Array<Record<string, unknown>> = [];
+    (fw as unknown as { logFailure(record: Record<string, unknown>): void }).logFailure = (record) => { logged.push(record); };
+    const aux = internal.auxiliaryMembraneFor('resident');
+    const stated = async (model: string, retryAfterMs: number) => {
+      membrane.auxiliaryFailure = rateLimited(retryAfterMs);
+      return aux.complete(auxRequest(model)).then(() => undefined, (error: unknown) => error);
+    };
+    try {
+      await stated('zz-minute', 60_000);
+      await stated('zz-hour', 3_600_000);
+      await stated('zz-retry-now', -1_000);
+      assert.equal(alerts.length, 0, 'a wait that passes within the hour is pacing: no alert');
+
+      const before = Date.now();
+      await stated('zz-day', 24 * 3_600_000);
+      await stated('zz-beyond-a-date', 1e20);
+      await stated('zz-nan', Number.NaN);
+      assert.deepEqual(alerts.map((alert) => [alert.kind, alert.agentName, alert.data?.model]), [
+        ['provider-wait', 'resident', 'zz-day'],
+        ['provider-wait', 'resident', 'zz-beyond-a-date'],
+        ['provider-wait', 'resident', 'zz-nan'],
+      ]);
+      assert.ok(Date.parse(String(alerts[0].data?.until)) >= before + 24 * 3_600_000, 'the day-long wait names its end');
+      assert.equal(alerts[1].data?.until, null, 'held until released');
+      assert.equal(alerts[2].data?.until, null, 'held until released');
+      assert.match(alerts[0].message, /release-provider-wait/);
+      assert.deepEqual(logged.map((record) => [record.kind, record.model]), [
+        ['provider-wait', 'zz-day'], ['provider-wait', 'zz-beyond-a-date'], ['provider-wait', 'zz-nan'],
+      ], 'each is also a failures.log record');
+
+      const refused = await stated('zz-day', 24 * 3_600_000);
+      assert.equal((refused as { providerAdmission?: string }).providerAdmission, 'deferred', 'a held model is not called again');
+      assert.equal(alerts.length, 3, 'so its alert is raised once');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test('unreadable recorded waits raise an ops alert for the whole framework as the hold begins', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    // A record from a reader this one does not know (a newer framework, say):
+    // re-reading never fixes it, so only a person can end the hold.
+    const store = JsStore.openOrCreate({ path });
+    store.appendJson(PROVIDER_WAIT_RECORD_TYPE, { kind: 'paused', agent: 'resident', model: 'zz-model', at: 1 });
+    store.close();
+    // Construction reads the records before any trace listener can attach:
+    // failures.log (and the webhook) carry it then.
+    const proto = AgentFramework.prototype as unknown as { logFailure(record: Record<string, unknown>): void };
+    const logFailure = proto.logFailure;
+    const logged: Array<Record<string, unknown>> = [];
+    proto.logFailure = (record) => { logged.push(record); };
+    let opened: Awaited<ReturnType<typeof framework>> | undefined;
+    try {
+      opened = await framework(path, new WaitingMembrane(0, undefined));
+      const alerts = logged.filter((record) => record.kind === 'provider-wait');
+      assert.equal(alerts.length, 1);
+      assert.equal(alerts[0].agent, 'framework');
+      assert.equal(alerts[0].model, '*');
+      assert.equal(alerts[0].until, null);
+      assert.match(String(alerts[0].reason), /could not be read \(provider-wait record .* is malformed\): no provider call is admitted for any agent/);
+      assert.deepEqual(opened.fw.providerWaitSnapshot('resident').map((wait) => [wait.model, wait.until]), [['*', null]], 'and the hold stands');
+    } finally {
+      proto.logFailure = logFailure;
+      await opened?.fw.stop();
+      log.restore();
+    }
   });
 });
