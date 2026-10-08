@@ -159,3 +159,9 @@ export type {
 } from './recovery/offline-branch.js';
 
 export * from "./tool-presentation.js";
+export {
+  SILENT_HEARTBEAT_SEPARATOR,
+  silentHeartbeatOf,
+  type SilentHeartbeatStamp,
+  type SilentHeartbeatTick,
+} from './silent-heartbeat.js';
