@@ -24,6 +24,7 @@ import type {
   TraceEventListener,
 } from './types/index.js';
 import type { Agent } from './agent.js';
+import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
 
 const MODULE_STATE_PREFIX = 'modules/';
 
@@ -61,6 +62,7 @@ interface SpeechHandler {
  */
 export class ModuleRegistry {
   private modules: Map<string, Module> = new Map();
+  private stopping = new Map<Module, Promise<void>>();
   private moduleContexts: Map<string, ModuleContextImpl> = new Map();
   private speechHandlers: SpeechHandler[] = [];
   private store: JsStore;
@@ -173,9 +175,7 @@ export class ModuleRegistry {
       throw new Error(`Module not found: ${name}`);
     }
 
-    await module.stop();
-    this.modules.delete(name);
-    this.moduleContexts.delete(name);
+    await this.stopModule(module);
   }
 
   /**
@@ -306,14 +306,32 @@ export class ModuleRegistry {
   }
 
   /**
-   * Stop all modules.
+   * Stop all modules. A caller may bound its wait without cancelling cleanup.
+   * The default waits for each module's own shutdown contract.
    */
-  async stopAll(): Promise<void> {
-    const stopPromises = Array.from(this.modules.values()).map((m) => m.stop());
-    await Promise.all(stopPromises);
-    this.modules.clear();
-    this.moduleContexts.clear();
-    this.speechHandlers = [];
+  async stopAll(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
+    validateShutdownTimeout(timeoutMs);
+    await waitForShutdown(Array.from(this.modules.values(), module => ({
+      label: `module:${module.name}`, promise: this.stopModule(module),
+    })), timeoutMs);
+  }
+
+  private stopModule(module: Module): Promise<void> {
+    const existing = this.stopping.get(module);
+    if (existing) return existing;
+    const attempt = Promise.resolve().then(() => module.stop()).then(() => {
+      if (this.modules.get(module.name) === module) {
+        this.modules.delete(module.name);
+        this.moduleContexts.delete(module.name);
+        this.speechHandlers = this.speechHandlers.filter(handler => handler.moduleName !== module.name);
+      }
+      this.stopping.delete(module);
+    }, error => {
+      this.stopping.delete(module);
+      throw error;
+    });
+    this.stopping.set(module, attempt);
+    return attempt;
   }
 
   /**
