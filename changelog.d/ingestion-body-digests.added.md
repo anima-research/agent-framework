@@ -4,8 +4,7 @@
     delivered, taken at ingestion, after MCPL conversion and before any host
     decoration or storage sharding. It is the SHA-256 (hex) of `[blocks]`
     as canonical JSON (keys sorted at every level, `undefined` dropped), the
-    framing an undecorated, unsharded stored copy already hashes to. An
-    empty body has one too.
+    framing an undecorated, unsharded stored copy already hashes to.
   - `metadata.storedBodyDigest` uses the same function over exactly the
     blocks handed to storage, decorations included, taken where each path
     stores.
