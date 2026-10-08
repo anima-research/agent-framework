@@ -10,7 +10,10 @@
  *
  * Reads go through one descriptor that is fstat'd, located inside the mount
  * and then read, so what is read and the fingerprint recorded with its hash
- * describe the same file, inside the mount.
+ * describe the same file, inside the mount. A hard link is a name inside the
+ * mount like any other, and reading through it shows what that path holds;
+ * only a write in place reaches a file's other names, so effects.ts refuses
+ * that instead.
  *
  * Directories are checked (CheckedDir): located inside the mount, with their
  * identity, and what they showed — a listing, an absence — is accepted only

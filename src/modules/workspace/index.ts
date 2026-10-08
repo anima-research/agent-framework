@@ -1155,8 +1155,10 @@ export class WorkspaceModule implements Module {
       {
         name: 'grep',
         description: 'Search stored file text with a regex pattern, checked against disk first. Each result says '
-          + 'which version matched: the workspace\'s (with its state) or a conflicting disk version kept with a '
-          + 'conflict. Disk-only files (binary or over the size limit) are listed as skipped.',
+          + 'which version matched: the workspace\'s (with its state); the disk version kept with a conflict '
+          + '(conflicting-disk); or, once disk has changed since the conflict was recorded, that recorded version '
+          + '(recorded-disk). Disk versions it could not search are listed as skipped: disk-only files (binary or '
+          + 'over the size limit), and a conflict\'s disk version that is binary, oversize, or newer than the one recorded.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1198,7 +1200,8 @@ export class WorkspaceModule implements Module {
         description: 'Bring disk changes into the workspace. Without a path, every mount (or the given one) is '
           + 'rechecked in full and nothing pending in the workspace is discarded. With a path (file or directory), '
           + 'the workspace takes disk\'s state there explicitly: it restores a workspace-deleted file, resolves '
-          + 'conflicts toward disk, and replaces a workspace draft.',
+          + 'conflicts toward disk, replaces a workspace draft, and removes a workspace file disk does not have. '
+          + 'Each workspace change it gives up is listed under `discarded`, with the state it had.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -2347,7 +2350,7 @@ export class WorkspaceModule implements Module {
       : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
 
     type GrepMatch = { line: number; text: string; context?: string[] };
-    const results: Array<{ file: string; state: string; version: 'workspace' | 'conflicting-disk'; matches: GrepMatch[] }> = [];
+    const results: Array<{ file: string; state: string; version: 'workspace' | 'conflicting-disk' | 'recorded-disk'; matches: GrepMatch[] }> = [];
     const skipped: Array<{ file: string; reason: string; size?: number; mimeType?: string }> = [];
     const incomplete: Array<{ path: string; reason: string }> = [];
 
@@ -2404,12 +2407,25 @@ export class WorkspaceModule implements Module {
             const found = search(blob.toString('utf-8'));
             if (found.length > 0) results.push({ file, state: report.state, version: 'workspace', matches: found });
           }
-          // A conflicting disk version kept with a conflict.
-          const stored = report.state === 'conflict' ? intents.get(report.path)?.conflict?.disk?.stored : undefined;
-          const diskBlob = stored ? store.getBlob(stored) : null;
+          if (report.state !== 'conflict') continue;
+          // A conflict's disk side. The version recorded with the conflict is
+          // disk's only while disk still holds it; once disk has changed
+          // since, it is labelled as recorded, and a file disk holds now
+          // (never stored) is listed as not searched. A binary or oversize
+          // disk version was never stored either.
+          const disk = intents.get(report.path)?.conflict?.disk;
+          const changed = report.conflict?.diskChangedSinceRecorded === true;
+          const diskBlob = disk?.stored ? store.getBlob(disk.stored) : null;
           if (diskBlob) {
             const found = search(diskBlob.toString('utf-8'));
-            if (found.length > 0) results.push({ file, state: report.state, version: 'conflicting-disk', matches: found });
+            if (found.length > 0) results.push({ file, state: report.state, version: changed ? 'recorded-disk' : 'conflicting-disk', matches: found });
+          }
+          if (changed) {
+            if (report.diskNow === 'file') {
+              skipped.push({ file, reason: 'conflict: disk changed since the conflict was recorded; grep searches stored text, so the file disk holds now was not searched' });
+            }
+          } else if (disk && !disk.stored) {
+            skipped.push({ file, reason: 'conflict: the disk version is binary or over the size limit, never stored', size: disk.size });
           }
         }
       });
@@ -2665,7 +2681,13 @@ export class WorkspaceModule implements Module {
 
   private async handleSync(input: SyncInput): Promise<ToolResult> {
     const store = this.getStore();
-    const allResults: Array<{ mount: string; synced: string[]; conflicts: Array<{ path: string; kind: string; diskCopy: string }> }> = [];
+    const allResults: Array<{
+      mount: string;
+      synced: string[];
+      conflicts: Array<{ path: string; kind: string; diskCopy: string }>;
+      /** A path sync's workspace changes given up for disk's state, each with the state it had. */
+      discarded?: Array<{ path: string; was: string; op: string }>;
+    }> = [];
     const allSkipped: Array<{ mount: string; path: string; reason: string }> = [];
     const allIncomplete: Array<{ mount: string; path: string; reason: string }> = [];
 
@@ -2707,7 +2729,12 @@ export class WorkspaceModule implements Module {
         .filter((r) => r.state === 'conflict')
         .map((r) => ({ path: r.path, kind: r.conflict?.kind ?? 'both-changed', diskCopy: r.conflict?.diskCopy ?? 'referenced' }));
       if (pass.ops.length > 0 || conflicts.length > 0) {
-        allResults.push({ mount: name, synced: pass.ops.map((o) => o.path), conflicts });
+        allResults.push({
+          mount: name,
+          synced: pass.ops.map((o) => o.path),
+          conflicts,
+          ...(pass.discarded.length > 0 ? { discarded: pass.discarded } : {}),
+        });
       }
       // Say why a path wasn't taken in, so "nothing synced" and "your file was
       // refused" don't look identical from the outside.

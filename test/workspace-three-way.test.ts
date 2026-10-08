@@ -12,7 +12,7 @@
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, constants as fsConstants, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -429,6 +429,31 @@ describe('workspace deletes', () => {
     const error = await refused(m, 'delete', { path: 'work/b.txt' });
     assert.match(error, /did not unlink/);
     assert.equal(env.readDisk('b.txt'), 'edited in the shell', 'the shell edit survives');
+  });
+});
+
+describe('a path sync', () => {
+  test('takes disk\'s state for a whole directory, and lists each workspace change it discarded', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'src/existing.txt', 'v1');
+    await call(m, 'write', { path: 'work/src/existing.txt', content: 'a draft' });
+    await call(m, 'write', { path: 'work/src/new.txt', content: 'never materialized' });
+    await seedSynced(env, m, 'src/gone.txt', 'v1');
+    await call(m, 'delete', { path: 'work/src/gone.txt' });
+    await seedSynced(env, m, 'src/shell.txt', 'v1');
+    env.writeDisk('src/shell.txt', 'edited in the shell');
+
+    const data = await call(m, 'sync', { path: 'work/src' });
+    const result = (data.results as Array<{ mount: string; synced: string[]; discarded?: Array<{ path: string; was: string; op: string }> }>)[0]!;
+    assert.deepEqual([...result.synced].sort(), ['src/existing.txt', 'src/gone.txt', 'src/new.txt', 'src/shell.txt']);
+    assert.deepEqual([...(result.discarded ?? [])].sort((a, b) => a.path.localeCompare(b.path)), [
+      { path: 'src/existing.txt', was: 'workspace-draft', op: 'modified' },
+      { path: 'src/gone.txt', was: 'workspace-deleted', op: 'created' },
+      { path: 'src/new.txt', was: 'workspace-draft', op: 'deleted' },
+    ], 'a shell edit taken in discards nothing; the rest were the workspace\'s own changes');
+    assert.equal(await contentOf(m, 'src/existing.txt'), 'v1');
+    assert.equal(await stateOf(m, 'src/new.txt'), 'not listed', 'disk has no such file, so neither does the workspace');
   });
 });
 
@@ -1304,6 +1329,43 @@ describe('the mount boundary', () => {
     assert.throws(() => readFileSync(join(env.root, 'outdir', 'inner.txt')), /ENOENT/);
   });
 
+  test('a file with other hard links is never written in place, forced or not: its other names keep their content', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    const outside = join(env.root, 'outside');
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'secret.txt'), 'outside original');
+    linkSync(join(outside, 'secret.txt'), env.disk('h.txt'));
+    assert.equal(await stateOf(m, 'h.txt'), 'synced', 'a listing takes it in: reading through the name in the mount');
+    await call(m, 'write', { path: 'work/h.txt', content: 'written by the workspace' });
+    const before = (m as any).agreement.get('work', 'h.txt');
+
+    for (const force of [false, true]) {
+      const res = await call(m, 'materialize', { force });
+      assert.deepEqual(res.materialized, [], `force: ${force}`);
+      const reasons = ((res.skipped ?? []) as Array<{ reason: string }>).map((s) => s.reason).join('\n');
+      assert.match(reasons, /h\.txt: not written: a file with other hard links/, `force: ${force}`);
+      assert.equal(readFileSync(join(outside, 'secret.txt'), 'utf8'), 'outside original', `force: ${force}`);
+      assert.deepEqual((m as any).agreement.get('work', 'h.txt'), before, 'its evidence is exactly as before the intent');
+    }
+    assert.equal(await stateOf(m, 'h.txt'), 'workspace-draft', 'the draft is kept, still owed');
+    assert.equal(await contentOf(m, 'h.txt'), 'written by the workspace');
+  });
+
+  test('an autoMaterialize write to a file linked elsewhere after it was taken in is refused, and the write says why', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ autoMaterialize: true });
+    env.writeDisk('h.txt', 'shared original');
+    assert.equal(await stateOf(m, 'h.txt'), 'synced');
+    const outside = join(env.root, 'outside.txt');
+    linkSync(env.disk('h.txt'), outside);
+
+    const error = await refused(m, 'write', { path: 'work/h.txt', content: 'written by the workspace' });
+    assert.match(error, /not written: a file with other hard links/);
+    assert.equal(readFileSync(outside, 'utf8'), 'shared original');
+    assert.equal(await contentOf(m, 'h.txt'), 'written by the workspace', 'the workspace keeps the write');
+  });
+
   /** A push of `paths` whose `beforeEffect` runs between planning and the effect. */
   async function pushWith(env: Env, m: WorkspaceModule, paths: string[], opts: Parameters<typeof pushPaths>[4]) {
     const mount = (m as any).mounts.get('work');
@@ -1376,6 +1438,21 @@ describe('the mount boundary', () => {
     assert.match(pushed.skipped[0]!.reason, /^not written: a file appeared at this path since it was checked$/);
     assert.equal((m as any).agreement.get('work', 'new.txt'), undefined, 'still unknown, as before the intent');
     assert.equal(await stateOf(m, 'new.txt'), 'conflict');
+  });
+
+  test('a hard link made after planning is caught where the write happens', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'v1');
+    await call(m, 'write', { path: 'work/a.txt', content: 'the workspace draft' });
+    const outside = join(env.root, 'outside.txt');
+    const before = (m as any).agreement.get('work', 'a.txt');
+
+    const pushed = await pushWith(env, m, ['a.txt'], { force: true, beforeEffect: () => linkSync(env.disk('a.txt'), outside) });
+    assert.deepEqual(pushed.written, []);
+    assert.match(pushed.skipped[0]!.reason, /^not written: a file with other hard links/);
+    assert.equal(readFileSync(outside, 'utf8'), 'v1', 'the other name keeps its content');
+    assert.deepEqual((m as any).agreement.get('work', 'a.txt'), before);
   });
 
   test('even a forced write never lands in a file renamed away after it was opened', async (t) => {
@@ -1602,21 +1679,62 @@ describe('grep', () => {
     await seedSynced(env, m, 'conflict.txt', 'nothing');
     env.writeDisk('conflict.txt', 'needle on disk');
     await call(m, 'write', { path: 'work/conflict.txt', content: 'needle in the workspace' });
+    await seedSynced(env, m, 'binary-conflict.dat', 'nothing');
+    env.writeDisk('binary-conflict.dat', Buffer.from([0x6e, 0, 0x65, 0]));
+    await call(m, 'write', { path: 'work/binary-conflict.dat', content: 'needle beside a binary disk version' });
     env.writeDisk('shot.png', ONE_PX_PNG);
 
     const data = await call(m, 'grep', { pattern: 'needle' });
     const hits = (data.results as Array<{ file: string; state: string; version: string; matches: Array<{ text: string }> }>)
       .map((r) => `${r.file} ${r.state} ${r.version}: ${r.matches[0]!.text}`);
     assert.deepEqual(hits, [
+      'work/binary-conflict.dat conflict workspace: needle beside a binary disk version',
       'work/conflict.txt conflict workspace: needle in the workspace',
       'work/conflict.txt conflict conflicting-disk: needle on disk',
       'work/draft.txt workspace-draft workspace: needle two',
       'work/synced.txt synced workspace: needle one',
     ]);
-    assert.deepEqual((data.skipped as Array<{ file: string }>).map((s) => s.file), ['work/shot.png']);
+    const skipped = data.skipped as Array<{ file: string; reason: string }>;
+    assert.deepEqual(skipped.map((s) => s.file), ['work/binary-conflict.dat', 'work/shot.png'],
+      "a conflict's binary disk version is no more searched than a disk-only file, and says so");
+    assert.match(skipped[0]!.reason, /^conflict: the disk version is binary or over the size limit/);
 
     const one = await call(m, 'grep', { pattern: 'needle', path: 'work/draft.txt' });
     assert.deepEqual((one.results as Array<{ file: string }>).map((r) => r.file), ['work/draft.txt']);
+  });
+
+  test("once disk changes again, a conflict's stored disk version is labelled as recorded, and what disk holds now as not searched", async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'v1');
+    env.writeDisk('a.txt', 'disk says ALPHA');
+    await call(m, 'write', { path: 'work/a.txt', content: 'workspace says GAMMA' });
+    const recorded = await entryOf(m, 'a.txt');
+    assert.equal(recorded?.conflict?.kind, 'both-changed');
+    assert.equal(recorded?.conflict?.diskCopy, 'stored');
+    type Grep = { results: Array<{ file: string; state: string; version: string; matches: Array<{ text: string }> }>; skipped?: Array<{ file: string; reason: string }> };
+    const hitsOf = (data: Grep) => data.results.map((r) => `${r.file} ${r.state} ${r.version}: ${r.matches[0]!.text}`);
+
+    const current: Grep = await call(m, 'grep', { pattern: 'ALPHA' });
+    assert.deepEqual(hitsOf(current), ['work/a.txt conflict conflicting-disk: disk says ALPHA'], 'while disk still holds it');
+    assert.equal(current.skipped, undefined);
+
+    env.writeDisk('a.txt', 'disk now says BETA');
+    assert.equal((await entryOf(m, 'a.txt'))?.conflict?.diskChangedSinceRecorded, true);
+    const alpha: Grep = await call(m, 'grep', { pattern: 'ALPHA' });
+    assert.deepEqual(hitsOf(alpha), ['work/a.txt conflict recorded-disk: disk says ALPHA'], 'no longer what disk says');
+    const beta: Grep = await call(m, 'grep', { pattern: 'BETA' });
+    assert.deepEqual(hitsOf(beta), []);
+    for (const data of [alpha, beta]) {
+      assert.deepEqual(data.skipped?.map((s) => s.file), ['work/a.txt'], 'what disk holds now is listed as not searched');
+      assert.match(data.skipped![0]!.reason, /^conflict: disk changed since the conflict was recorded/);
+    }
+
+    env.rmDisk('a.txt');
+    const gone: Grep = await call(m, 'grep', { pattern: 'ALPHA' });
+    assert.deepEqual(hitsOf(gone), ['work/a.txt conflict recorded-disk: disk says ALPHA'], 'disk now has no file at all');
+    assert.equal(gone.skipped, undefined, 'and no disk file went unsearched');
+    assert.equal(await contentOf(m, 'a.txt'), 'workspace says GAMMA', 'the draft is kept');
   });
 });
 

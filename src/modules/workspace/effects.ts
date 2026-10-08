@@ -8,7 +8,11 @@
  * it acts on what was decided on — a regular file inside the mount, at this
  * path, still holding the bytes planning saw (unless `force`, which overrides
  * that freshness but never the boundary). Content is written only through a
- * descriptor whose own location was confirmed inside the mount first.
+ * descriptor whose own location was confirmed inside the mount first, and
+ * only into a file with no other hard links: a write in place changes the
+ * file under every name it has, and the others may lie outside the mount (a
+ * package store's, say), so such a file is refused. Unlinking one name
+ * changes no other, so an unlink needs no such check.
  *
  * What an effect reports matters to the caller's evidence: a failure that
  * never touched the path's entry leaves disk as planning saw it, so the
@@ -19,8 +23,11 @@
  *
  * Node has no openat, so a create, mkdir or unlink still resolves its path by
  * name after the parent was checked: a parent replaced concurrently in that
- * window can redirect that one operation. Content writes stay bound to the
- * descriptor verified inside the mount before modification.
+ * window can redirect that one operation, leaving an empty file or directory
+ * outside the mount or unlinking a same-named file there. Content writes stay
+ * bound to the descriptor verified before modification: inside the mount,
+ * with no other hard links (a link another process makes to it after that
+ * check shares the write).
  */
 
 import { createHash } from 'node:crypto';
@@ -58,6 +65,9 @@ export class EffectFailed extends Error {
 
 const CHANGED = 'disk changed since it was checked';
 const MOVED = 'the directory changed since it was checked';
+const HARD_LINKED = 'a file with other hard links, which writing it in place would change too — force does not override '
+  + 'this; to write this path alone, give it a copy of its own first (copy it to a new name, then move that over it) '
+  + 'and materialize again';
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -148,8 +158,8 @@ export async function writeContained(view: MountView, rootReal: string, rel: str
   let stage = 'write the file';
   try {
     // Before any byte: a regular file, canonically inside the mount, the one
-    // this path names, in the directory still at its path, and — unless
-    // forced — still holding what was decided on.
+    // this path names, with no other names, in the directory still at its
+    // path, and — unless forced — still holding what was decided on.
     const info = await handle.stat({ bigint: true });
     if (!info.isFile()) throw new EffectFailed('not a regular file', touched);
     const real = await realpath(target).catch(() => null);
@@ -157,6 +167,7 @@ export async function writeContained(view: MountView, rootReal: string, rel: str
     if (!contained(rootReal, real)) throw new EffectFailed(view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT, touched);
     const named = await stat(real, { bigint: true }).catch(() => null);
     if (named === null || named.dev !== info.dev || named.ino !== info.ino) throw new EffectFailed(CHANGED, touched);
+    if (info.nlink > 1n) throw new EffectFailed(HARD_LINKED, touched);
     if (!(await parent.stillHere())) throw new EffectFailed(MOVED, touched);
     if (expect.kind === 'content' && (await hashAt(target, info, noFollow)) !== expect.hash) throw new EffectFailed(CHANGED, touched);
 

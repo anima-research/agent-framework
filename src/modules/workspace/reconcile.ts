@@ -87,6 +87,11 @@ export interface PathReport {
   mimeType?: string;
   conflict?: ConflictReport;
   note?: string;
+  /**
+   * For a conflict, what this pass found on disk at the path: grep's account
+   * of a conflict's disk side needs it. Listings don't show it.
+   */
+  diskNow?: 'file' | 'absent';
 }
 
 export type TreeOp = 'created' | 'modified' | 'deleted';
@@ -94,6 +99,11 @@ export type TreeOp = 'created' | 'modified' | 'deleted';
 export interface PassResult {
   /** Tree changes adopted from disk. */
   ops: Array<{ path: string; op: TreeOp }>;
+  /**
+   * A path sync's adoptions that gave up a change of the workspace's own,
+   * each with the state the rule would otherwise have kept (`was`).
+   */
+  discarded: Array<{ path: string; was: EntryState; op: TreeOp }>;
   /** Conflicts recorded by this pass, with the disk change behind each. */
   newConflicts: Array<{ path: string; op: TreeOp }>;
   /** Every path the pass decided, by path. */
@@ -229,7 +239,17 @@ interface Verdict {
    * is decided from it, and nothing at all is recorded (see module doc).
    */
   unconfirmed?: true;
+  /** A path sync's adoption gives up this workspace state (see decide). */
+  discards?: EntryState;
 }
+
+/** States in which the rule keeps a change of the workspace's own over disk. */
+const WORKSPACE_KEPT: ReadonlySet<EntryState> = new Set<EntryState>([
+  'workspace-draft',
+  'workspace-deleted',
+  'conflict',
+  'disk-missing-provenance-unknown',
+]);
 
 const UNCONFIRMED_NOTE = 'disk holds what a materialize that has not completed put here; materialize again to complete it';
 
@@ -331,6 +351,21 @@ function resolvePending(
   return { p, uncaptured: true };
 }
 
+/**
+ * An explicit path sync: the store takes disk's state, whatever the evidence
+ * — a pending push's included. That chooses disk; it doesn't certify the push.
+ */
+function adoptDisk(d: Extract<DiskFact, { kind: 'absent' | 'file' }>, s: { hash: string; size: number } | null): Verdict {
+  if (d.kind === 'absent') {
+    return { state: 'synced', ...(s ? { adopt: 'remove' as const, op: 'deleted' as const } : {}), p: { kind: 'absent' }, intent: {} };
+  }
+  if (d.ingestible) {
+    if (s && s.hash === d.hash) return { state: 'synced', p: agreedFromDisk(d), intent: {} };
+    return { state: 'synced', adopt: 'ingest', op: s ? 'modified' : 'created', p: agreedFromDisk(d), intent: {} };
+  }
+  return { state: 'disk-only', ...(s ? { adopt: 'drop' as const, op: 'deleted' as const } : {}), p: 'forget', intent: {} };
+}
+
 /** The rule (see module doc). Pure. */
 function decide(
   d: DiskFact,
@@ -358,17 +393,15 @@ function decide(
   const sc: Candidate = s ? { kind: 'content', hash: s.hash } : ABSENT;
 
   if (adopt) {
-    // An explicit path sync: the store takes disk's state, whatever the
-    // evidence — a pending push's included. That chooses disk; it doesn't
-    // certify the push.
-    if (d.kind === 'absent') {
-      return { state: 'synced', ...(s ? { adopt: 'remove' as const, op: 'deleted' as const } : {}), p: { kind: 'absent' }, intent: {} };
+    // What a path sync gives up is exactly what a sync without a path would
+    // have kept of the workspace's own (a draft, a deletion, a conflict's
+    // workspace side), and the verdict says which.
+    const taken = adoptDisk(d, s);
+    if (taken.adopt) {
+      const kept = decide(d, s, pIn, bi, branchId, false).state;
+      if (WORKSPACE_KEPT.has(kept)) taken.discards = kept;
     }
-    if (d.ingestible) {
-      if (s && s.hash === d.hash) return { state: 'synced', p: agreedFromDisk(d), intent: {} };
-      return { state: 'synced', adopt: 'ingest', op: s ? 'modified' : 'created', p: agreedFromDisk(d), intent: {} };
-    }
-    return { state: 'disk-only', ...(s ? { adopt: 'drop' as const, op: 'deleted' as const } : {}), p: 'forget', intent: {} };
+    return taken;
   }
 
   // A pending intent resolves first; its resolution is recorded unless the
@@ -557,7 +590,7 @@ export async function reconcilePass(
   // Evidence a failed barrier left unsynced is settled before anything is
   // decided from it; if the barrier fails again, so does the pass.
   if (agreement.needsBarrier) agreement.barrier();
-  const result: PassResult = { ops: [], newConflicts: [], reports: new Map(), incomplete: [], dirs: [] };
+  const result: PassResult = { ops: [], discarded: [], newConflicts: [], reports: new Map(), incomplete: [], dirs: [] };
 
   // Enumerate on one branch and observe disk (async). The decision below must
   // describe the same branch the candidates came from: a branch switch during
@@ -630,6 +663,7 @@ export async function reconcilePass(
       committed = true;
     }
     if (v.op && v.adopt) result.ops.push({ path: x.path, op: v.op });
+    if (v.op && v.adopt && v.discards) result.discarded.push({ path: x.path, was: v.discards, op: v.op });
   }
 
   // 4. Completions and agreements, after the commits they assert are synced —
@@ -662,7 +696,10 @@ export async function reconcilePass(
     if (entry) report.size = entry.size;
     else if (x.d.kind === 'file' || x.d.kind === 'unhashed') report.size = x.d.size;
     if (x.verdict.state === 'disk-only' && (x.d.kind === 'file' || x.d.kind === 'unhashed') && x.d.mimeType) report.mimeType = x.d.mimeType;
-    if (x.verdict.state === 'conflict' && after?.conflict) report.conflict = conflictReport(after.conflict, x.d);
+    if (x.verdict.state === 'conflict' && after?.conflict) {
+      report.conflict = conflictReport(after.conflict, x.d);
+      if (x.d.kind === 'file' || x.d.kind === 'absent') report.diskNow = x.d.kind;
+    }
     if (x.verdict.note) report.note = x.verdict.note;
     if (!(x.verdict.state === 'synced' && !entry)) result.reports.set(x.path, report);
   }

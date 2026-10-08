@@ -11,7 +11,9 @@
   the workspace both changed, the path becomes a conflict that stays until a `sync` of that path
   (take disk), a forced `materialize` (take the workspace) or convergence. A text disk version is
   kept in the store; a binary or oversize one is referenced, and the listing says if it changed
-  since.
+  since. `grep` labels a kept disk version `recorded-disk` once disk has changed since, and lists
+  a conflict's disk side it couldn't search as skipped. A `sync` of a path lists under
+  `discarded` each workspace change it gave up for disk's state.
 - **A workspace deletion stays deleted, and materialize never deletes from disk unasked.** Without
   `autoMaterialize`, a deleted file's disk copy is listed as `workspace-deleted` and no scan or
   lazy read brings it back. `materialize` lists the deletions it left on disk;
@@ -40,13 +42,16 @@
 - `materialize` and `autoMaterialize` check each write and unlink where it happens, not only when
   it is planned. A file is opened in its directory without truncating and located before any
   byte changes: never through a symlink the mount doesn't follow, or a directory that resolves
-  outside the mount, even with `force`. Unless `force`, it must also still hold what the
-  materialize decided on, so a disk edit or a new file that appears meanwhile is refused, not
-  overwritten. Refused paths are listed as skipped with the reason. Every directory from a
-  written file up to the mount root is synced before the write counts as done, directories it
-  had to create included. Listings likewise accept a directory's contents only while it is
-  still the directory at its path. Each check is made where the operation happens, against what
-  is there at that moment. Node has no `openat`, so a parent directory replaced concurrently in
-  the window between a check and a create, `mkdir`, unlink or listing can still redirect that
-  one operation. Content writes stay bound to the descriptor verified inside the mount before
-  modification.
+  outside the mount, and never into a file with other hard links, whose other names (a package
+  store's, say) a write in place would change too, even with `force`. Unless `force`, it must
+  also still hold what the materialize decided on, so a disk edit or a new file that appears
+  meanwhile is refused, not overwritten. Refused paths are listed as skipped with the reason.
+  Every directory from a written file up to the mount root is synced before the write counts as
+  done, directories it had to create included. Listings likewise accept a directory's contents
+  only while it is still the directory at its path. Each check is made where the operation
+  happens, against what is there at that moment. Node has no `openat`, so a parent directory
+  replaced concurrently in the window between a check and a create, `mkdir`, unlink or listing
+  can still redirect that one operation: an empty file or directory can appear outside the
+  mount, or a same-named file there can be unlinked. Content writes stay bound to the
+  descriptor verified, inside the mount and with no other hard links, before modification; a
+  hard link made to the file after that check shares the write.
