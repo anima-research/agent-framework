@@ -388,6 +388,11 @@ export interface McplServerConfig {
    * agent turn forever; with the timeout the pending request rejects with a
    * descriptive error, which the framework surfaces as a normal isError
    * tool_result. Set 0 to disable. Default: 60000 (60 seconds).
+   *
+   * For a modern server it is one deadline per tool call, across every leg
+   * of the call, and must be an integer from 1 to 2^31−1. It can't be
+   * disabled: the SDK reads 0 as "time out now". At the deadline
+   * cancellation is requested and the outcome is unknown.
    */
   requestTimeoutMs?: number;
 

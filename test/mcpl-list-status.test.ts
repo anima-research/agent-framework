@@ -42,6 +42,10 @@ test('listMcplServers exposes the live grant layers and host-owned authority', (
     id: 'discord',
     connected: true,
     retrying: false,
+    family: 'legacy',
+    // The stub never handshook, so no revision is established.
+    protocolVersion: null,
+    transport: 'stdio',
     toolPrefix: 'mcpl--discord',
     toolCount: 1,
     policyEstablished: true,

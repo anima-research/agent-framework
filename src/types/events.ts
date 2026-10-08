@@ -189,6 +189,14 @@ export interface ToolResult {
   /** Whether this was an error (for LLM) */
   isError?: boolean;
   /**
+   * An MCP tool's `structuredContent`: its machine-readable result, beside
+   * `data`, which is the content view. Present exactly when the server sent
+   * one, so `false`, `0` and `null` are values here, not absence. Programs
+   * read it (scripts get it in their result object); the model sees content,
+   * and sees this rendered as JSON only when the content carries no text.
+   */
+  structured?: unknown;
+  /**
    * When true, the framework saves tool_use + tool_result messages to context,
    * cancels the active stream, and resets the agent to idle.
    * This is a "sleep until next event" primitive — the LLM expects the call to block.
