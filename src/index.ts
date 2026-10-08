@@ -91,6 +91,8 @@ export type { McplServerConfig } from './mcpl/index.js';
 // health probes, protocol harnesses — can dial an MCPL server exactly the
 // way the framework host does, over stdio or WebSocket)
 export { McplServerConnection, McplRequestError, McplProtocolVersionError } from './mcpl/index.js';
+export { ModernMcpConnection } from './mcpl/index.js';
+export type { ModernToolCallResult } from './mcpl/index.js';
 export {
   LEGACY_MCP_PROTOCOL_VERSION,
   MODERN_MCP_PROTOCOL_VERSION,
