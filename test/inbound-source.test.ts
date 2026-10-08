@@ -18,6 +18,7 @@ import {
   conversationKey,
   // The package's public digest: consumers import it from the root.
   sourceBodyDigest,
+  PassthroughStrategy,
   type InboundSource,
   type Module,
   type ModuleContext,
@@ -28,6 +29,7 @@ import {
   type ToolCall,
   type ToolResult,
 } from '../src/index.js';
+import { ContextManager } from '@animalabs/context-manager';
 import { MockMembrane } from './helpers/mock-membrane.js';
 import { canonicalJson } from '../src/mcpl/inbound-source.js';
 import { createHash } from 'node:crypto';
@@ -36,6 +38,9 @@ import { fixture, eventually, TS } from './helpers/coalescing-fixture.js';
 const FIXTURE = join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs');
 const ROOM = 'discord:g1:room';
 const RAW_DM = '1548000000000000001';
+/** Bytes that open with PNG's signature, which is all the store reads of an
+ *  image. 14 bytes, so their base64 is padded and has a '/' in it. */
+const PNG = Buffer.from('89504e470d0a1a0afbefbeffffff', 'hex');
 
 async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -256,6 +261,29 @@ describe('inbound source envelope', () => {
     assert.notEqual(meta.storedBodyDigest, meta.sourceBodyDigest, 'the invitation decorates the stored copy');
   });
 
+  it('an image the store relabels or re-encodes still matches both its digests once read back', async () => {
+    // slimepriestess's review of #252: the store takes an image's media type
+    // from its bytes and re-encodes its base64, so a digest of the blocks as
+    // handed to storage failed against the untouched copy read back.
+    const png = PNG.toString('base64');
+    const pushes: Record<string, { type: 'image'; data: string; mimeType: string }> = {
+      'img-labeled': { type: 'image', data: png, mimeType: 'image/png' },
+      'img-mislabeled': { type: 'image', data: png, mimeType: 'image/jpeg' },
+      'img-wrapped': { type: 'image', data: `${png.slice(0, 11)}\n${png.slice(11)}`, mimeType: 'image/png' },
+    };
+    for (const [eventId, block] of Object.entries(pushes)) command({ op: 'push', eventId, content: [block] });
+    await waitFor(() => Object.keys(pushes).every((id) => !!storedWith((m) => m.eventId === id)), 'images stored');
+    for (const eventId of Object.keys(pushes)) {
+      const message = storedWith((m) => m.eventId === eventId)!;
+      const meta = message.metadata as Record<string, unknown>;
+      const image = message.content.find((b) => b.type === 'image');
+      assert.deepEqual(image, { type: 'image', source: { type: 'base64', data: png, mediaType: 'image/png' } },
+        `${eventId}: stored as the bytes' own type, in canonical base64`);
+      assert.equal(sourceBodyDigest(message.content), meta.storedBodyDigest, `${eventId}: the untouched copy matches its stored digest`);
+      assert.equal(meta.sourceBodyDigest, sourceBodyDigest([image]), `${eventId}: the delivered body hashes as the image stored for it`);
+    }
+  });
+
   it('keeps a stored envelope when the channel is renamed later', async () => {
     command({ op: 'incoming', channelId: ROOM, messageId: 'm-2', mode: 'ambient', text: 'before rename' });
     await waitFor(() => !!storedWith((m) => m.messageId === 'm-2'), 'first message stored');
@@ -441,5 +469,79 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     assert.equal(stored.eventId, 'e1');
     assert.equal(stored.sourceTimestamp, TS);
     assert.deepEqual(observed, [stored]);
+  });
+});
+
+describe('sourceBodyDigest hashes a body as the store keeps it', () => {
+  // Every agent stores through context-manager over chronicle. Whatever the
+  // store changes on the way in (an image's label, base64's spelling, fields
+  // it doesn't keep, a lone surrogate), the body read back must hash as it
+  // did when it was handed over, live and after the store is reopened.
+  const png = PNG.toString('base64');
+  const image = (data: string, mediaType = 'image/png', extra: Record<string, unknown> = {}) =>
+    ({ type: 'image', source: { type: 'base64', data, mediaType }, ...extra });
+  const media = (type: string, data: string, mediaType: string, extra: Record<string, unknown> = {}) =>
+    ({ type, source: { type: 'base64', data, mediaType }, ...extra });
+  /** Each body, and whether the store hands it back changed. */
+  const bodies: Record<string, { blocks: unknown[]; changed: boolean }> = {
+    'a labeled image': { blocks: [image(png)], changed: false },
+    'PNG bytes labeled image/jpeg': { blocks: [image(png, 'image/jpeg')], changed: true },
+    'JPEG bytes labeled image/png': { blocks: [image(Buffer.from('ffd8ffe000104a464946', 'hex').toString('base64'))], changed: true },
+    'base64 with a newline in it': { blocks: [image(`${png.slice(0, 11)}\n${png.slice(11)}`)], changed: true },
+    'base64 with whitespace around it': { blocks: [image(`  ${png}\n`)], changed: true },
+    'base64 without its padding': { blocks: [image(png.replace(/=+$/, ''))], changed: true },
+    'base64 with non-zero unused bits': { blocks: [image(png.replace(/8=$/, '9='))], changed: true },
+    'base64 in the URL-safe alphabet': { blocks: [image(png.replace(/\//g, '_'))], changed: true },
+    // Bytes the store has no signature for keep their label. Labeled
+    // image/png, so a context-manager that learns to sniff one fails here.
+    'SVG bytes labeled image/png': { blocks: [image(Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64'))], changed: false },
+    'BMP bytes labeled image/png': { blocks: [image(Buffer.from('424d3a0000000000000036000000', 'hex').toString('base64'))], changed: false },
+    'AVIF bytes labeled image/png': { blocks: [image(Buffer.from('0000001c6674797061766966000000006d696631', 'hex').toString('base64'))], changed: false },
+    'an image whose source is neither base64 nor a URL': { blocks: [{ type: 'image', source: { type: 'file', data: png, mediaType: 'image/png' } }], changed: true },
+    'an image with fields the store drops': { blocks: [image(png, 'image/png', { sourceUrl: 'https://cdn.example/a.png', tokenEstimate: 85 })], changed: true },
+    'an image by URL, its fields kept': { blocks: [{ type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png' }, sourceUrl: 'https://cdn.example/a.png' }], changed: false },
+    'audio, wrapped, with a duration': { blocks: [media('audio', 'SUQz\nAwAAAAAA', 'audio/mpeg', { duration: 3 })], changed: true },
+    'a document with a filename': { blocks: [media('document', 'JVBERi0xLjQ=', 'application/pdf', { filename: 'a.pdf' })], changed: true },
+    'text with lone surrogates': { blocks: [{ type: 'text', text: 'cut \ud83d here, \ude00 there, \ud83d\ud83d twice' }], changed: true },
+    'a key that is not well-formed': { blocks: [{ type: 'text', text: 'x', rawItem: { 'k\ud800': 1, kept: 2 } }], changed: true },
+    'a relabeled image with a text decoration': { blocks: [image(png, 'image/jpeg'), { type: 'text', text: '[invitation]' }], changed: true },
+  };
+
+  it('every body hashes alike as handed to the store and as read back, live and after reopening', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stored-digest-'));
+    const path = join(dir, 'store.chronicle');
+    try {
+      const strategy = () => new PassthroughStrategy();
+      const ids = new Map<string, string>();
+      let cm = await ContextManager.open({ path, strategy: strategy() });
+      for (const [name, { blocks }] of Object.entries(bodies)) {
+        ids.set(name, cm.addMessage('user', blocks as never, { storedBodyDigest: sourceBodyDigest(blocks) }));
+      }
+      const check = (when: string) => {
+        for (const [name, { blocks, changed }] of Object.entries(bodies)) {
+          const back = cm.getMessage(ids.get(name)!)!;
+          if (changed) assert.notDeepEqual(back.content, blocks, `${when}, ${name}: the store hands it back changed`);
+          else assert.deepEqual(back.content, blocks, `${when}, ${name}: the store hands it back as it was`);
+          assert.equal(sourceBodyDigest(back.content), (back.metadata as Record<string, unknown>).storedBodyDigest, `${when}, ${name}: it still hashes as handed over`);
+        }
+      };
+      check('live');
+      cm.close();
+      cm = await ContextManager.open({ path, strategy: strategy() });
+      check('reopened');
+      cm.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('what the store keeps still changes the digest', () => {
+    const digest = (blocks: unknown[]) => sourceBodyDigest(blocks);
+    assert.notEqual(digest([image(png)]), digest([image(Buffer.from([...PNG, 0]).toString('base64'))]), 'other bytes');
+    const svg = Buffer.from('<svg/>').toString('base64');
+    assert.notEqual(digest([image(svg, 'image/svg+xml')]), digest([image(svg, 'image/png')]), 'a label the store keeps');
+    assert.notEqual(digest([media('audio', 'SUQzAwAAAAAA', 'audio/mpeg')]), digest([media('audio', 'SUQzAwAAAAAA', 'audio/wav')]), 'an audio label');
+    assert.notEqual(digest([{ type: 'text', text: 'a' }]), digest([{ type: 'text', text: 'b' }]), 'other text');
+    assert.equal(digest([image(png, 'image/jpeg')]), digest([image(png)]), 'a label the store replaces is not part of the body');
   });
 });
