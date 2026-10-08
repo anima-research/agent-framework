@@ -1,6 +1,7 @@
 import type { ContentBlock, YieldingStream } from '@animalabs/membrane';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ToolCallId, ToolResult, ToolCall } from './events.js';
+import type { SilentHeartbeatTick } from '../silent-heartbeat.js';
 
 export type SameRoundThinkTextPolicy = 'public' | 'private';
 export type SameRoundThinkTextPolicySource =
@@ -12,6 +13,7 @@ export type SameRoundThinkTextPolicySource =
  * Configuration for an agent.
  */
 export interface AgentConfig {
+  toolPresentation?: import("../tool-presentation.js").ToolPresentationConfig;
   /** Unique name for this agent */
   name: string;
 
@@ -305,6 +307,14 @@ export interface InferenceRequest {
   /** Host-owned identity for withdrawal of an unconsumed coalesced wake. */
   coalescingSubject?: string;
   coalescingEventId?: string;
+  /** Host-owned: this wake's cause is an RFC-006 deferred batch, which has
+   *  no model-visible content until it renders at the turn's assembly. */
+  coalescingBatch?: boolean;
+  /** Host-owned, set on a turn's trigger when EVERY request batched into it
+   *  was a deferred-batch wake: these are their subjects. If assembly settles
+   *  all of them without materializing content, the turn has no cause left
+   *  and does not run. */
+  coalescingBatchSubjects?: string[];
   agentName: string;
   reason: string;
   source: string;
@@ -339,8 +349,10 @@ export interface InferenceRequest {
    * Where the wake came from, for telemetry ONLY — never a speech locus.
    * Set by the EventGate for batched wakes (composite channel id of the
    * chosen event when the event carried one; push-event raw ids are not
-   * used). Routing keeps reading `channelId`, which only the direct channel
-   * paths set from normalized ids — a gate wake leaves it unset, as before.
+   * used). Routing keeps reading `channelId`, set from registered ids: by
+   * the direct channel paths, and by a gate wake only when its chosen event
+   * addressed the agent and the host resolved that event's registered
+   * channel (ambient-only batches leave it unset).
    */
   wakeChannelId?: string;
   /** Timestamp of the event the wake provenance was taken from (ms). */
@@ -351,4 +363,8 @@ export interface InferenceRequest {
   /** Ephemeral system-position prompt for this turn only. Never written to
    * Chronicle; callers must supply bounded non-secret control text. */
   ephemeralSystemPrompt?: string;
+  /** The authenticated silent heartbeat tick this turn answers. Every row the
+   * turn stores is stamped `metadata.silentHeartbeat` with it, and request
+   * builds render a request-only separator before the tick's first row. */
+  silentHeartbeat?: SilentHeartbeatTick;
 }

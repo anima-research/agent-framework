@@ -102,6 +102,48 @@ describe('Turn trigger provenance', () => {
     await framework.stop();
   });
 
+  it('a gate wake queued after a NEWER addressed direct wake does not take the turn', async () => {
+    // The agent was busy: Alice's DM sat in the gate's buffer while Bob's
+    // newer mention queued a direct wake. The gate flushed at turn end, so its
+    // request is queued AFTER Bob's but describes an OLDER event.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi bob' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const captured = spy(framework);
+    const t = Date.now();
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t,
+        channelId: 'discord:g:bob-room', counterparty: 'discord:user:bob', addressed: true },
+      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t + 5_000,
+        channelId: 'discord:dm:alice', addressed: true, counterparty: 'discord:user:alice', wakeAt: t - 2_000 },
+    );
+    await i.processInferenceRequests();
+    await framework.runUntilIdle();
+    assert.equal(captured.handed?.channelId, 'discord:g:bob-room', 'the newer addressed EVENT wins, not the later-queued request');
+    assert.equal(captured.handed?.counterparty, 'discord:user:bob');
+    await framework.stop();
+  });
+
+  it('an addressed winner with no author never borrows another request\'s author', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi' }]));
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const captured = spy(framework);
+    const t = Date.now();
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t,
+        channelId: 'discord:g:general', counterparty: 'discord:user:carol', addressed: false },
+      // An addressed push routed by origin.mcplChannelId alone: no author id.
+      { agentName: 'scout', reason: 'gate:debounce', source: 'gate', timestamp: t + 1,
+        channelId: 'surface:dm:42', addressed: true, wakeAt: t + 1 },
+    );
+    await i.processInferenceRequests();
+    await framework.runUntilIdle();
+    assert.equal(captured.handed?.channelId, 'surface:dm:42');
+    assert.equal(captured.handed?.counterparty, undefined, 'carol did not address the agent');
+    await framework.stop();
+  });
+
   it('a context-budget restart keeps the channel for routing but names no author', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'continuing' }]));
     const framework = await makeFramework();

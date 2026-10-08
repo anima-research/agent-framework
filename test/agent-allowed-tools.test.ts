@@ -122,16 +122,18 @@ for (const allowedTools of [undefined, 'all', ['probe--denied', 'agent_settings'
   });
 }
 
-test('explicit prose helper remains advertised and executable with an empty list', async () => {
-  const h = await harness({ allowedTools: [], proseRouting: 'explicit' });
-  try {
-    assert.ok(h.framework.listToolClasses('assistant').some((t) => t.tool === 'prose_help'));
-    const [result] = await h.turn([{ id: 'help', name: 'prose_help', input: {} }]);
-    assert.equal(result.toolUseId, 'help');
-    assert.ok(!result.isError);
-    assert.match(result.content, />>/);
-  } finally { await h.close(); }
-});
+for (const permitted of [false, true]) {
+  test(`explicit prose helper follows current allowlist: ${permitted}`, async () => {
+    const h = await harness({ allowedTools: permitted ? ['prose_help'] : [], proseRouting: 'explicit' });
+    try {
+      assert.equal(h.framework.listToolClasses('assistant').some(t => t.tool === 'prose_help'), permitted);
+      const [result] = await h.turn([{ id: 'help', name: 'prose_help', input: {} }]);
+      assert.equal(result.toolUseId, 'help');
+      assert.equal(Boolean(result.isError), !permitted);
+      assert.match(result.content, permitted ? />>/ : /not permitted.*allowedTools/);
+    } finally { await h.close(); }
+  });
+}
 
 test('shared script dispatch enforces the resident list and resolves its real event waiter', async () => {
   const h = await harness({ allowedTools: ['probe--allowed'] });
@@ -282,4 +284,29 @@ for (const fallback of [false, true]) {
       });
     }
   }
+}
+
+for (const name of ['set_tool_visibility', 'set_tool_description']) {
+  test(`presentation tools obey allowlist on model, script and registered public routes: ${name}`, async () => {
+    const h = await harness({ allowedTools: ['probe--allowed'] });
+    try {
+      const input = name === 'set_tool_visibility'
+        ? { name: 'probe--allowed', visible: false }
+        : { name: 'probe--allowed', description: 'Changed' };
+      const call = { id: 'presentation-denied', name, input, callerAgentName: 'assistant' };
+      const [model] = await h.turn([call]);
+      assert.equal(model.isError, true);
+      assert.match(model.content, /not permitted.*allowedTools/);
+      const pending = h.internal.dispatchScriptToolCall('assistant', name, input);
+      await h.framework.runUntilIdle();
+      const script = await pending;
+      assert.equal(script.isError, true);
+      assert.match(script.error!, /not permitted.*allowedTools/);
+      const direct = await h.framework.executeToolCall(call);
+      assert.equal(direct.isError, true);
+      assert.match(direct.error!, /not permitted.*allowedTools/);
+      assert.deepEqual(h.lifecycle, [], 'denied presentation calls must not dispatch');
+      assert.equal(h.framework.inspectToolPresentation('assistant'), null);
+    } finally { await h.close(); }
+  });
 }
