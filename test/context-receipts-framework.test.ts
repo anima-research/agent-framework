@@ -46,13 +46,18 @@ async function waitFor(cond: () => boolean, what: string, timeoutMs = 15_000): P
  * much of the injected batch it carried (`carries`: 'all', or 0 as on
  * membrane's XML path).
  */
-type Script = 'fail' | 'ok' | { tool: true; carries: 'all' | 0 };
+type Script =
+  | 'fail'
+  | 'ok'
+  | { tool: true; carries: 'all' | 0 }
+  /** One round that stands, replying with `reply`, its report naming `altered(request)` altered. */
+  | { ok: true; reply?: unknown[]; altered?: (request: NormalizedRequest) => number[] };
 
 const usage = { inputTokens: 40, outputTokens: 3, cacheReadTokens: 0 };
 const roundEvent = (index: number, extra: Record<string, unknown> = {}) =>
   ({ type: 'usage', usage, round: { index, stopReason: 'end_turn', usage, altered: { messages: [], injected: [] }, fidelity: 'established', ...extra } }) as unknown as StreamEvent;
-const complete = () =>
-  ({ type: 'complete', response: createMockResponse([{ type: 'text', text: 'heard you' }]) }) as unknown as StreamEvent;
+const complete = (reply: unknown[] = [{ type: 'text', text: 'heard you' }]) =>
+  ({ type: 'complete', response: createMockResponse(reply as never) }) as unknown as StreamEvent;
 
 class ScriptedStream implements YieldingStream {
   private done = false;
@@ -102,6 +107,9 @@ class ScriptedMembrane {
       stream = new ScriptedStream([{ type: 'error', error: new Error('provider unavailable') } as unknown as StreamEvent]);
     } else if (script === 'ok') {
       stream = new ScriptedStream([roundEvent(0), complete()]);
+    } else if ('ok' in script) {
+      const altered = script.altered ? { altered: { messages: script.altered(request), injected: [] } } : {};
+      stream = new ScriptedStream([roundEvent(0, altered), complete(script.reply)]);
     } else {
       const toolUse = { type: 'tool_use', id: 'call-1', name: 'probe--wait', input: {} };
       stream = new ScriptedStream(
@@ -332,6 +340,42 @@ describe('receipt clocks through the framework', () => {
     assert.equal(deliveries.length, 1);
     assert.ok(membrane.startedAt.length >= 2);
     assert.ok(deliveries[0]!.at >= membrane.startedAt[1]!, 'delivered by a later request, not by the round that carried none of it');
+  });
+
+  it('names request positions after the separator a silent tick adds', async () => {
+    // A silent tick stores no prompt row, so each later request renders a
+    // request-only separator before the tick's reply (silent-heartbeat.ts).
+    // Every message after it moves by one, and the receipt evidence moves
+    // with them. Here the round reports the channel body's own request
+    // position altered, so the body is a partial exposure, never a delivery.
+    const SEPARATOR = '[heartbeat tick]';
+    const carries = (text: string) => (m: NormalizedRequest['messages'][number]) =>
+      m.content.some((b) => b.type === 'text' && (b as { text: string }).text === text);
+    let bodyAt = -1;
+    membrane.scripts = [
+      // The provider's signature is the tick reply's identity (silent-heartbeat.ts).
+      { ok: true, reply: [{ type: 'thinking', thinking: 'quiet', signature: 'sig-tick' }, { type: 'text', text: 'all quiet' }] },
+      { ok: true, altered: (request) => { bodyAt = request.messages.findIndex(carries('after the tick')); return [bodyAt]; } },
+    ];
+    (framework as unknown as { handleMcplPushEvent(event: unknown): unknown }).handleMcplPushEvent({
+      type: 'mcpl:push-event', serverId: 'heartbeat', featureSet: 'heartbeat', eventId: 'hb-1', content: [],
+      timestamp: new Date().toISOString(), tags: ['chat:addressed'],
+      origin: { source: 'heartbeat', reason: 'schedule', silent: true, scheduledAt: '2026-10-08 01:00:00 UTC' },
+      inferenceId: 'inf-hb-1', triggerInference: true,
+    });
+    await waitFor(() => membrane.requests.length >= 1, 'the tick wakes the resident');
+    await waitFor(idle, 'the tick settles');
+
+    command({ op: 'incoming', channelId: ROOM, messageId: 'm-after', mode: 'addressed', text: 'after the tick' });
+    await waitFor(() => membrane.requests.length >= 2, 'the channel item wakes the resident');
+    await waitFor(idle, 'its turn settles');
+
+    const separatorAt = membrane.requests[1]!.messages.findIndex(carries(SEPARATOR));
+    assert.ok(separatorAt >= 0 && separatorAt < bodyAt, `a separator (at ${separatorAt}) precedes the body (at ${bodyAt})`);
+    assert.equal(deliveredItem((m) => m.messageId === 'm-after'), false, 'the altered body is no delivery');
+    const clocks = (await roomClocks()) as { lastPartialAt?: number | null; lastDeliveredAt: number | null };
+    assert.ok(clocks.lastPartialAt, 'it is a partial exposure, recorded at its own position');
+    assert.equal(clocks.lastDeliveredAt, null);
   });
 
   it('keeps no receipt state for a stream whose agent was disposed while its request was prepared', async () => {

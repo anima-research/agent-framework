@@ -4,10 +4,23 @@ import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard, TOOL_RESULT_GUARD_NOTICE } from './tool-result-guard.js';
 import {
+  indexSilentTickRows,
+  separateSilentHeartbeatTicks,
+  silentHeartbeatSeparatorTurn,
+  type SilentHeartbeatTick,
+  type SilentTickIndex,
+  type StoredRowLike,
+} from './silent-heartbeat.js';
+import {
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
 } from './tool-result-history.js';
+
+export interface ActivationRequestOptions {
+  /** The silent heartbeat tick this request answers, if any. */
+  silentHeartbeat?: SilentHeartbeatTick;
+}
 
 export interface StartStreamResult {
   stream: YieldingStream;
@@ -26,6 +39,7 @@ import type {
   StoredMessage,
   HotContextSettingsStatus,
   HotContextSettingsUpdate,
+  MessageMetadata,
 } from '@animalabs/context-manager';
 import type {
   AgentConfig,
@@ -788,9 +802,10 @@ export class Agent {
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
     budget?: TokenBudget,
-    compressionTools: ToolDefinition[] = availableTools
+    compressionTools: ToolDefinition[] = availableTools,
+    options: ActivationRequestOptions = {},
   ): Promise<NormalizedRequest> {
-    return (await this.prepareActivationRequest(availableTools, injections, budget, compressionTools)).request;
+    return (await this.prepareActivationRequest(availableTools, injections, budget, compressionTools, options)).request;
   }
 
   /**
@@ -802,7 +817,8 @@ export class Agent {
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
     budget?: TokenBudget,
-    compressionTools: ToolDefinition[] = availableTools
+    compressionTools: ToolDefinition[] = availableTools,
+    options: ActivationRequestOptions = {},
   ): Promise<{ request: NormalizedRequest; evidence: RequestEvidence }> {
     // Compression may revisit hidden tools in recorded history. Keep its full
     // definition set separate from the resident's advertised tools: the
@@ -876,10 +892,40 @@ export class Agent {
     }
     messages = sanitized;
 
-    // Safety: ensure messages don't end with an assistant message.
-    // Some models reject trailing assistant messages ("prefill not supported"),
-    // and after context compression a stale assistant turn can end up last.
-    if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
+    // Silent heartbeat ticks store no prompt row. Render a request-only
+    // separator before each tick's first surviving row so the wire formatter
+    // cannot merge the tick into the previous assistant message (see
+    // silent-heartbeat.ts for what can and cannot be matched). This agent's
+    // own first request for a tick ends on that same turn, so the prefix it
+    // caches is the one every later compile renders. "First" is per agent: a
+    // broadcast tick shares its eventId with every resident.
+    const ticks = this.indexSilentHeartbeatTicks();
+    const separated = separateSilentHeartbeatTicks(messages, ticks.rows, this.name);
+    if (separated !== messages) {
+      // Each separator is a request-only turn that shifts every later message,
+      // so the receipt coordinates (each compiled message's request index, and
+      // the positions this preparation altered) move with them. Sanitizing made
+      // every message a fresh object, so identity locates each one.
+      const positionOf = new Map<NormalizedMessage, number>();
+      separated.forEach((message, index) => positionOf.set(message, index));
+      const moved = (at: number): number => positionOf.get(messages[at]!)!;
+      for (let i = 0; i < requestIndexOf.length; i++) {
+        if (requestIndexOf[i]! >= 0) requestIndexOf[i] = moved(requestIndexOf[i]!);
+      }
+      const altered = [...preparedAltered].map(moved);
+      preparedAltered.clear();
+      for (const at of altered) preparedAltered.add(at);
+    }
+    messages = separated;
+    const openingTick = options.silentHeartbeat !== undefined
+      && !ticks.started.has(options.silentHeartbeat.eventId);
+
+    if (openingTick) {
+      messages = [...messages, silentHeartbeatSeparatorTurn()];
+    } else if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
+      // Safety: ensure messages don't end with an assistant message.
+      // Some models reject trailing assistant messages ("prefill not supported"),
+      // and after context compression a stale assistant turn can end up last.
       messages = [...messages, {
         participant: 'user',
         content: [{ type: 'text', text: '[Continue]' }],
@@ -943,6 +989,26 @@ export class Agent {
     });
   }
 
+  /** Stored silent-tick rows, memoized on the store's cached message array
+   * (ContextManager returns the same array until the store changes). */
+  private silentTickIndex: { source: readonly unknown[]; index: SilentTickIndex } | null = null;
+
+  private indexSilentHeartbeatTicks(): SilentTickIndex {
+    const empty: SilentTickIndex = { rows: new Map(), started: new Set() };
+    const cm = this.contextManager as Partial<ContextManager>;
+    if (typeof cm.getAllMessages !== 'function') return empty;
+    try {
+      const stored = cm.getAllMessages() as unknown as readonly StoredRowLike[];
+      if (this.silentTickIndex?.source === stored) return this.silentTickIndex.index;
+      const index = indexSilentTickRows(stored, this.name);
+      this.silentTickIndex = { source: stored, index };
+      return index;
+    } catch (error) {
+      console.error(`[silent-heartbeat] ${this.name}: could not index tick rows; separators omitted:`, error);
+      return empty;
+    }
+  }
+
   /**
    * Start a yielding stream with context injections.
    * Same as startStream but passes injections through to compile.
@@ -951,7 +1017,8 @@ export class Agent {
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
     budget?: TokenBudget,
-    compressionTools: ToolDefinition[] = availableTools
+    compressionTools: ToolDefinition[] = availableTools,
+    options: ActivationRequestOptions = {},
   ): Promise<StartStreamResult> {
     if (this._state.status !== 'idle') {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
@@ -986,7 +1053,7 @@ export class Agent {
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
 
-    const prepared = await this.prepareActivationRequest(availableTools, injections, budget, compressionTools);
+    const prepared = await this.prepareActivationRequest(availableTools, injections, budget, compressionTools, options);
     const { request } = prepared;
     // One-to-one: prepareRequest swaps guarded tool results in place, so
     // the evidence's request indices still hold; a swap is a change this
@@ -1094,7 +1161,7 @@ export class Agent {
    * Add an assistant response to context.
    * Called by framework when stream completes.
    */
-  addAssistantResponse(content: ContentBlock[]): void {
+  addAssistantResponse(content: ContentBlock[], metadata?: MessageMetadata): void {
     // A turn whose entire output is thinking blocks produced NOTHING: no
     // speech, no tool call. That is what a refusal looks like on the wire —
     // the provider returns signed thinking (often with empty text, the
@@ -1120,7 +1187,7 @@ export class Agent {
       );
       return;
     }
-    this.contextManager.addMessage(this.name, content);
+    this.contextManager.addMessage(this.name, content, metadata);
   }
 
   /**

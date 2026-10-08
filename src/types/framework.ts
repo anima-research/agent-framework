@@ -237,6 +237,11 @@ export interface FrameworkConfig {
    * effective class (first matching pattern wins); replaces, never merges
    * with, what the providing server declared. Use it to correct or tighten a
    * misclassed tool.
+   *
+   * MCPL tools are named `<toolPrefix>--<tool>`, and toolPrefix defaults to
+   * `mcpl--<serverId>`: server `search` without a toolPrefix needs
+   * `mcpl--search--*`, not `search--*`. A pattern that matches no tool is
+   * reported once its servers have listed their tools.
    */
   toolClassOverrides?: Record<string, string[]>;
 

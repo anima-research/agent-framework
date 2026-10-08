@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import type { ContextManager, MessageId } from '@animalabs/context-manager';
+import type { ContextManager, MessageId, MessageMetadata } from '@animalabs/context-manager';
 import type { ContentBlock, NormalizedMessage, ToolResult } from '@animalabs/membrane';
 import type { CompletedToolCall } from './types/index.js';
 import { isStateExistsError } from './module-registry.js';
@@ -144,8 +144,13 @@ export class ToolResultGuard {
       : JSON.parse(json);
   }
 
-  storeResults(content: ContentBlock[], wireResults: ToolResult[], originals: CompletedToolCall[]): MessageId {
-    if (!this.enabled) return this.cm.addMessage('user', content);
+  storeResults(
+    content: ContentBlock[],
+    wireResults: ToolResult[],
+    originals: CompletedToolCall[],
+    metadata?: MessageMetadata,
+  ): MessageId {
+    if (!this.enabled) return this.cm.addMessage('user', content, metadata);
     if (this.pending) {
       // Idempotent for the same not-yet-submitted batch: a caller that
       // retries after a failure between staging and submission (e.g. a
@@ -175,7 +180,7 @@ export class ToolResultGuard {
     // chunk is ever summarized from the placeholder; released after the
     // settlement edit. Holds are in-memory only — a reopened manager has none,
     // which is correct since a reopened guard has no pending batch.
-    const messageId = this.cm.addMessage('user', withheld, undefined, undefined, { holdCompression: true });
+    const messageId = this.cm.addMessage('user', withheld, metadata, undefined, { holdCompression: true });
     this.pending = { id, messageId, content, withheld, wireResults,
       branch: this.cm.currentBranch().name, submitted: false, durable: false };
     // Durability barrier: the audit must reach Chronicle's chain heads before
