@@ -1815,6 +1815,12 @@ export class AgentFramework {
       }
     }
 
+    // Restore sleep suppression before MCPL startup can release buffered input.
+    // Recovery inference is only queued here: processInferenceRequests runs from
+    // start()/the event loop after create() finishes, so the recovered turn sees
+    // every MCPL tool registered by initializeMcpl below.
+    framework.eventGate?.recoverWakeIntents();
+
     // Initialize MCPL subsystems if configured
     if (config.mcplServers && config.mcplServers.length > 0) {
       // Validate tool prefixes: no collisions with module names or between servers
