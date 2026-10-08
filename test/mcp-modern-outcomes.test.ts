@@ -219,3 +219,40 @@ test('a child that cannot be reaped fails close() explicitly, never a claimed ex
   // Calls share the one attempt and its verdict.
   await assert.rejects(transport.close(), /could not be reaped/);
 });
+
+test('a failed launch that cannot be reaped halts reconnecting; close() settles it', async () => {
+  const log = scratchLog();
+  const realSpawn = StdioTransport.spawn;
+  const stuck: Array<{ pid: number; kill: (signal?: string) => boolean }> = [];
+  let launches = 0;
+  (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = (config) => {
+    const transport = realSpawn.call(StdioTransport, config);
+    if (++launches > 1) {
+      // From the second launch on, signals never arrive.
+      const child = (transport as unknown as { child: { pid: number; kill: (signal?: string) => boolean } }).child;
+      const realKill = child.kill.bind(child);
+      child.kill = () => true;
+      stuck.push({ pid: child.pid, kill: realKill });
+    }
+    return transport;
+  };
+  cleanups.push(() => {
+    (StdioTransport as unknown as { spawn: typeof StdioTransport.spawn }).spawn = realSpawn;
+    for (const s of stuck) s.kill('SIGKILL');
+  });
+  const connection = await connect('reject-discover-later', log, { reconnect: true, reconnectIntervalMs: 30, reconnectMaxIntervalMs: 60 });
+  const failures: Array<{ error: string; permanent?: boolean }> = [];
+  connection.on('reconnect-failed', (f) => failures.push(f));
+  connection.on('error', () => {});
+  await connection.callTool('die', {});
+  await until(() => failures.some((f) => f.permanent), 'a permanent reconnect failure', 9000);
+  const halted = failures.find((f) => f.permanent)!;
+  assert.match(halted.error, /the previous launch could not be reaped .*reconnecting is halted/);
+  assert.equal(connection.willReconnect, false);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(wire(log).filter((e) => e.event === 'start').length, 2, 'no third launch while the second is unreaped');
+  // The stuck child goes away; close() re-checks it and settles cleanly.
+  stuck[0]!.kill('SIGKILL');
+  await until(() => { try { process.kill(stuck[0]!.pid, 0); return false; } catch { return true; } }, 'the stuck child gone');
+  await connection.close();
+});

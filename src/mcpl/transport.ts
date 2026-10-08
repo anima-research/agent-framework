@@ -230,11 +230,20 @@ export class StdioTransport extends McplTransport {
    * child that outlives SIGTERM by {@link STDIO_EXIT_GRACE_MS} gets SIGKILL.
    * If it still hasn't exited after that bound again, close rejects: an
    * explicit cleanup failure, rather than waiting forever or claiming an
-   * exit that wasn't seen. Calls share one attempt.
+   * exit that wasn't seen. Calls share one attempt; a later call succeeds if
+   * the child has exited since.
    */
   close(): Promise<void> {
-    this.closing ??= this.reap();
-    return this.closing;
+    if (!this.closing) {
+      this.closing = this.reap();
+      return this.closing;
+    }
+    // A later call re-checks a failed verdict: a child that has exited since
+    // is reaped now. No new signals are sent.
+    return this.closing.catch((error: unknown) => {
+      if (this.child.exitCode !== null || this.child.signalCode !== null) return;
+      throw error;
+    });
   }
 
   private async reap(): Promise<void> {

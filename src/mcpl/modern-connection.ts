@@ -295,6 +295,12 @@ export class ModernMcpConnection extends EventEmitter {
   /** At most one pending reopen, and only ever for the current generation. */
   private relisten: { generation: number; timer: ReturnType<typeof setTimeout> } | null = null;
   private relistenAttempts = 0;
+  /**
+   * Generations whose cleanup could not confirm their child exited. While any
+   * is held, no replacement is started: launching another would orphan the
+   * first. close() retries them and reports what still fails.
+   */
+  private unreaped: Array<{ session: Session; failure: Error }> = [];
   /** Child stderr from before anyone listens (the caller attaches only once
    *  connect() returns), delivered to the first listener. Bounded: the
    *  newest lines are kept. */
@@ -345,7 +351,22 @@ export class ModernMcpConnection extends EventEmitter {
 
   /** Whether a lost connection will be re-established in the background. */
   get willReconnect(): boolean {
-    return this.reconnectEnabled && !this.closedByHost;
+    return this.reconnectEnabled && !this.closedByHost && this.unreaped.length === 0;
+  }
+
+  /** A failed generation's cleanup couldn't reap its child: keep owning it,
+   *  and halt reconnecting until close() settles it. */
+  private holdUnreaped(session: Session, failure: Error): void {
+    this.unreaped.push({ session, failure });
+    this.emit('error', new Error(
+      `MCP server "${this.id}": ${failure.message}. Not starting another launch while it may still be running; close the connection to retry the reap.`,
+    ));
+  }
+
+  /** The halt, as a permanent failure for the reconnect events. */
+  private unreapedFailure(): string | null {
+    const held = this.unreaped[0];
+    return held ? `the previous launch could not be reaped (${held.failure.message}); reconnecting is halted` : null;
   }
 
   /**
@@ -370,6 +391,11 @@ export class ModernMcpConnection extends EventEmitter {
     } catch (error) {
       if (this.closedByHost) return;
       if (!this.reconnectEnabled) throw error;
+      const halted = this.unreapedFailure();
+      if (halted) {
+        this.emit('connect-failed', { error: `${(error as Error).message}; ${halted}`, attempt: 0, permanent: true });
+        return;
+      }
       console.error(`MCP server "${this.id}" initial connect failed, will retry:`, (error as Error).message);
       this.reconnectAttempts = 1;
       this.emit('connect-failed', { error: (error as Error).message, attempt: 0 });
@@ -433,7 +459,7 @@ export class ModernMcpConnection extends EventEmitter {
       await done;
     } catch (error) {
       const failure = await ModernMcpConnection.closeSession(session);
-      if (failure) this.emit('error', failure);
+      if (failure) this.holdUnreaped(session, failure);
       throw error;
     } finally {
       if (this.opening?.session === session) this.opening = null;
@@ -441,7 +467,7 @@ export class ModernMcpConnection extends EventEmitter {
     if (!this.isCurrent(generation)) {
       // Superseded or closed while connecting: this generation never serves.
       const failure = await ModernMcpConnection.closeSession(session);
-      if (failure) this.emit('error', failure);
+      if (failure) this.holdUnreaped(session, failure);
       return;
     }
     this.session = session;
@@ -544,6 +570,11 @@ export class ModernMcpConnection extends EventEmitter {
     } catch (error) {
       if (this.closedByHost) return;
       this.reconnectAttempts = attempt + 1;
+      const halted = this.unreapedFailure();
+      if (halted) {
+        this.emit('reconnect-failed', { error: `${(error as Error).message}; ${halted}`, attempt, permanent: true });
+        return;
+      }
       this.emit('reconnect-failed', { error: (error as Error).message, attempt });
       this.scheduleReconnect();
     }
@@ -650,6 +681,13 @@ export class ModernMcpConnection extends EventEmitter {
       const failure = await ModernMcpConnection.closeSession(session);
       if (failure) failures.push(failure);
       this.emit('close', { reason: 'closed by host' });
+    }
+    // Generations a failed cleanup couldn't reap: try again, report the rest.
+    const held = this.unreaped;
+    this.unreaped = [];
+    for (const { session: stuck } of held) {
+      const failure = await ModernMcpConnection.closeSession(stuck);
+      if (failure) failures.push(failure);
     }
     if (failures.length > 0) {
       throw new Error(`MCP server "${this.id}" did not close cleanly: ${failures.map((f) => f.message).join('; ')}`);

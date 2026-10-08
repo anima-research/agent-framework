@@ -14746,7 +14746,7 @@ export class AgentFramework {
       this.emitTrace({ type: 'module:added', moduleName: `mcpl:${connection.id}` });
       this.handleToolsListChanged(connection.id);
     });
-    const failed = (params: { error: string; attempt: number }) => {
+    const failed = (params: { error: string; attempt: number; permanent?: boolean }) => {
       this.emitTrace({
         type: 'mcpl:server-connect-failed',
         serverId: connection.id,
@@ -14754,7 +14754,9 @@ export class AgentFramework {
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
-      if (params.attempt >= 5) {
+      // `permanent`: reconnecting halted on a launch that couldn't be reaped.
+      // No later attempt will come, so alert now.
+      if (params.permanent || params.attempt >= 5) {
         this.opsAlert('mcpl-down', connection.id, `MCP server unreachable (attempt ${params.attempt}): ${params.error}`);
       }
     };
