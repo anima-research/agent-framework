@@ -88,7 +88,7 @@ async function harness(scripts: NormalizedResponse[][], config: Partial<AgentCon
     agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', ...config }], modules: [module], syncIntervalMs: 0 };
   const framework = await AgentFramework.create(base);
   const run = async () => {
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: {} });
+    framework.pushEvent({ type: 'external-message', source: 'test', channelId: 'test:channel', content: 'read', metadata: {} } as never);
     await framework.runUntilIdle();
   };
   return { framework, membrane, module, base, run };
@@ -329,7 +329,7 @@ test('native Membrane observes the first refusal even when guard is enabled by a
     if (event.type === 'inference:tokens') tokenTraces.push(String((event as { content?: unknown }).content));
   });
   try {
-    framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: {} });
+    framework.pushEvent({ type: 'external-message', source: 'test', channelId: 'test:channel', content: 'read', metadata: {} } as never);
     await framework.runUntilIdle();
     assert.equal(requests.length, 3);
     assert.match(JSON.stringify(requests[1]), /payload-one/);

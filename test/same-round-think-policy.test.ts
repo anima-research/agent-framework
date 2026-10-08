@@ -168,6 +168,7 @@ function trigger(framework: AgentFramework): void {
   framework.pushEvent({
     type: 'external-message',
     source: 'test',
+    channelId: 'test:channel',
     content: 'go',
     metadata: {},
   } as unknown as ProcessEvent);
