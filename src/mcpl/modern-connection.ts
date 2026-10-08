@@ -354,6 +354,12 @@ export class ModernMcpConnection extends EventEmitter {
     return this.reconnectEnabled && !this.closedByHost && this.unreaped.length === 0;
   }
 
+  /** Whether close() has been called: closed for good, or closing. A
+   *  connection lost on its own is not closed in this sense. */
+  get isClosed(): boolean {
+    return this.closedByHost;
+  }
+
   /** A failed generation's cleanup couldn't reap its child: keep owning it,
    *  and halt reconnecting until close() settles it. */
   private holdUnreaped(session: Session, failure: Error): void {
@@ -380,13 +386,22 @@ export class ModernMcpConnection extends EventEmitter {
     return new ModernMcpConnection(config);
   }
 
+  /** The first connect, shared by every call to start(). */
+  private starting: Promise<void> | null = null;
+
   /**
    * The first connect. Without `reconnect` a failure throws. With it, the
    * connection keeps retrying in the background, as the legacy engine's
    * stub does, and reports `connect-failed`. A connection closed before or
-   * during its first connect resolves unconnected.
+   * during its first connect resolves unconnected. A connection starts once:
+   * later calls return the first call's promise, so a second session never
+   * opens beside the first.
    */
-  async start(): Promise<void> {
+  start(): Promise<void> {
+    return (this.starting ??= this.firstConnect());
+  }
+
+  private async firstConnect(): Promise<void> {
     try {
       await this.open();
     } catch (error) {

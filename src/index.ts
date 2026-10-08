@@ -90,7 +90,7 @@ export type { McplServerConfig } from './mcpl/index.js';
 // MCPL client connection (exposed so external tooling — server playtests,
 // health probes, protocol harnesses — can dial an MCPL server exactly the
 // way the framework host does, over stdio or WebSocket)
-export { McplServerConnection, McplRequestError, McplProtocolVersionError } from './mcpl/index.js';
+export { McplServerConnection, McplRequestError, McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/index.js';
 export { ModernMcpConnection } from './mcpl/index.js';
 export type { ModernToolCallResult } from './mcpl/index.js';
 export {

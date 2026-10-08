@@ -5,7 +5,7 @@
  */
 
 import type { McplServerConfig, McplHostCapabilities } from './types.js';
-import { McplServerConnection } from './server-connection.js';
+import { McplServerConnection, McplUnreapedLaunchError } from './server-connection.js';
 
 /**
  * Capability keys that can be queried via `getServersWithCapability`.
@@ -30,7 +30,10 @@ export class McplServerRegistry {
    * Connect to an MCPL server and register it.
    *
    * Throws if a server with the same id is already registered, or if
-   * the connection/handshake fails.
+   * the connection/handshake fails. A failed launch whose child couldn't be
+   * confirmed exited stays registered all the same, as the closed connection
+   * that owns it ({@link McplUnreapedLaunchError}), so the id stays held
+   * and removeServer can retry the reap.
    */
   async addServer(
     config: McplServerConfig,
@@ -40,14 +43,27 @@ export class McplServerRegistry {
       throw new Error(`MCPL server "${config.id}" is already registered`);
     }
 
-    const connection = config.reconnect
-      ? await McplServerConnection.connectWithReconnect(config, hostCapabilities)
-      : await McplServerConnection.connect(config, hostCapabilities);
+    let connection: McplServerConnection;
+    try {
+      connection = config.reconnect
+        ? await McplServerConnection.connectWithReconnect(config, hostCapabilities)
+        : await McplServerConnection.connect(config, hostCapabilities);
+    } catch (error) {
+      if (error instanceof McplUnreapedLaunchError && !this.servers.has(config.id)) {
+        this.register(config, error.connection);
+      }
+      throw error;
+    }
+    this.register(config, connection);
+    return connection;
+  }
+
+  private register(config: McplServerConfig, connection: McplServerConnection): void {
     this.servers.set(config.id, connection);
 
     // Auto-remove on unexpected close (unless reconnect will re-add)
     connection.on('close', () => {
-      if (!config.reconnect) {
+      if (!config.reconnect && this.servers.get(config.id) === connection) {
         this.servers.delete(config.id);
       }
     });
@@ -56,14 +72,14 @@ export class McplServerRegistry {
     connection.on('reconnect', () => {
       // Connection already in the map — capabilities may have changed
     });
-
-    return connection;
   }
 
   /**
    * Disconnect and remove a server by id.
    *
-   * No-op if the server is not registered.
+   * No-op if the server is not registered. If its close can't confirm the
+   * child exited, it stays registered and the failure is thrown: removing it
+   * again retries the reap.
    */
   async removeServer(id: string): Promise<void> {
     const connection = this.servers.get(id);
@@ -71,7 +87,12 @@ export class McplServerRegistry {
       return;
     }
     this.servers.delete(id);
-    await connection.close();
+    try {
+      await connection.close();
+    } catch (error) {
+      if (!this.servers.has(id)) this.servers.set(id, connection);
+      throw error;
+    }
   }
 
   /**

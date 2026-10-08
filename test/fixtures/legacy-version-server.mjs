@@ -7,7 +7,12 @@
 //   reject-nodata error -32022 without data
 //   mismatch      protocolVersion 2025-06-18
 //   missing       no protocolVersion at all
-//   ok-then-reject  `ok` on the first start recorded in startLog, `reject` after
+//   error         a JSON-RPC error (-32603), not a version verdict
+//   hang          never answers
+//   slow          `ok`, after SLOW_INIT_MS (default 600)
+//   ok-then-<mode>  `ok` on the first start recorded in startLog, <mode> after
+//
+// IGNORE_SIGTERM=1 makes the process survive SIGTERM (only SIGKILL ends it).
 //
 // tools/list pages: by default three pages (cursors p2, p3). MODE_LIST picks
 // an edge case: loop (always nextCursor "same"), empty (nextCursor "" then a
@@ -20,8 +25,9 @@ const startLog = process.argv[3];
 if (startLog) {
   const priorStarts = existsSync(startLog) ? readFileSync(startLog, 'utf8').split('\n').filter(Boolean).length : 0;
   appendFileSync(startLog, `start ${process.pid}\n`);
-  if (mode === 'ok-then-reject') mode = priorStarts === 0 ? 'ok' : 'reject';
+  if (mode.startsWith('ok-then-')) mode = priorStarts === 0 ? 'ok' : mode.slice('ok-then-'.length);
 }
+if (process.env.IGNORE_SIGTERM === '1') process.on('SIGTERM', () => {});
 const listMode = process.env.MODE_LIST ?? 'pages';
 
 const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
@@ -46,6 +52,9 @@ process.stdin.on('data', (chunk) => {
       else if (mode === 'reject-nodata') error(m.id, -32022, `Unsupported protocol version: ${requested}`);
       else if (mode === 'mismatch') reply(m.id, { protocolVersion: '2025-06-18', capabilities: { tools: {} } });
       else if (mode === 'missing') reply(m.id, { capabilities: { tools: {} } });
+      else if (mode === 'error') error(m.id, -32603, 'initialize failed on purpose');
+      else if (mode === 'hang') { /* never answers */ }
+      else if (mode === 'slow') setTimeout(() => reply(m.id, { protocolVersion: '2024-11-05', capabilities: { tools: {} } }), Number(process.env.SLOW_INIT_MS ?? 600));
       else reply(m.id, { protocolVersion: '2024-11-05', capabilities: { tools: {} } });
     } else if (m.method === 'tools/list') {
       const cursor = m.params?.cursor;

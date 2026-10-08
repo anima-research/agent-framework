@@ -23,6 +23,8 @@
   - **Lifetime:** reconnects use the legacy backoff settings. A tool-list
     change subscription is kept open, reopened if refused or lost, and its
     changes go through ordinary admission, so they park under quiesce like
-    any wake. `close()` and `stop()` end any connect in flight.
+    any wake. `close()` and `stop()` end any connect in flight. A
+    `ModernMcpConnection` starts once: a second `start()` returns the first
+    call's promise.
   - **Status:** `listMcplServers()` entries gain `family`, `protocolVersion`
     and `transport`.

@@ -391,7 +391,7 @@ import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
-import { McplProtocolVersionError } from './mcpl/server-connection.js';
+import { McplProtocolVersionError, McplUnreapedLaunchError } from './mcpl/server-connection.js';
 import { ModernMcpConnection } from './mcpl/modern-connection.js';
 import { resolveServerBinding, serverConfigProblems } from './mcpl/protocol-family.js';
 import { normalizeStandardToolResult } from './mcpl/tool-result-normalize.js';
@@ -1386,6 +1386,9 @@ export class AgentFramework {
    *  only through the tool paths, and their list changes reach agents
    *  through ordinary admission. */
   private modernMcpConnections: Map<string, ModernMcpConnection> | undefined;
+  /** Connects and disconnects in flight, by server id (holdMcpServerId);
+   *  created on first use, like modernMcpConnections. */
+  private mcpServerOps: Map<string, { kind: 'connect' | 'disconnect'; settled: Promise<void> }> | undefined;
   /** Host capabilities advertised during the MCP handshake — stored so servers
    *  can be connected at runtime (connectMcplServer) after initialization. */
   private mcplHostCapabilities: McplHostCapabilities | null = null;
@@ -13412,6 +13415,44 @@ export class AgentFramework {
     return (this.modernMcpConnections ??= new Map());
   }
 
+  /**
+   * Hold a server id for one connect or disconnect, until `release()`.
+   * Together with the live connections (the MCPL registry and the modern
+   * map) this is what holds an id: from a connect's admission until its
+   * teardown is done, one owner at a time. So a connect is refused while
+   * anything holds its id, and a teardown never removes what a later
+   * connection registered. A disconnect takes the hold over, and waits for
+   * the operation it displaced (`previous`). Each release frees only its own
+   * hold.
+   */
+  private holdMcpServerId(id: string, kind: 'connect' | 'disconnect'): { previous: Promise<void> | undefined; release: () => void } {
+    const ops = (this.mcpServerOps ??= new Map());
+    const previous = ops.get(id)?.settled;
+    let settle!: () => void;
+    const op = { kind, settled: new Promise<void>((resolve) => { settle = resolve; }) };
+    ops.set(id, op);
+    return {
+      previous,
+      release: () => {
+        if (ops.get(id) === op) ops.delete(id);
+        settle();
+      },
+    };
+  }
+
+  /**
+   * A connect whose failed launch couldn't be confirmed exited. Its
+   * connection stays registered, closed, and holds the id, so nothing
+   * launches beside a child that may still be running; a disconnect retries
+   * the reap, and completes once the exit is confirmed.
+   */
+  private static unreapedConnectFailure(id: string, failure: Error): Error {
+    return new Error(
+      `${failure.message}. MCP server "${id}" stays registered, closed, until its exit is confirmed: disconnect it to retry the reap`,
+      { cause: failure },
+    );
+  }
+
   /** Close every modern-MCP connection, including any connect still in
    *  flight, so none outlives a failed startup or stop(). */
   private async closeModernMcpConnections(): Promise<void> {
@@ -13798,8 +13839,34 @@ export class AgentFramework {
     if (problems.length > 0) {
       throw new Error(`MCP server "${config.id}" configuration: ${problems.join('; ')}`);
     }
-    if (this.modernServers().has(config.id) || this.mcplServerRegistry.getServer(config.id)) {
-      throw new Error(`MCPL server "${config.id}" is already registered`);
+    // One owner per id, across both engines (holdMcpServerId): a connect or
+    // disconnect in flight holds it, and so does a registered connection,
+    // including one kept because its launch couldn't be confirmed exited.
+    const op = this.mcpServerOps?.get(config.id);
+    if (op?.kind === 'disconnect') {
+      throw new Error(`MCP server "${config.id}" is still being disconnected; connect it once that has finished`);
+    }
+    const registered = this.modernServers().get(config.id) ?? this.mcplServerRegistry.getServer(config.id);
+    if (op || registered) {
+      const idle = !op && registered && !registered.isConnected && !registered.willReconnect;
+      throw new Error(`MCPL server "${config.id}" is already registered${idle ? ' (not connected and not reconnecting: disconnect it first)' : ''}`);
+    }
+    const hold = this.holdMcpServerId(config.id, 'connect');
+    try {
+      await this.connectHeldMcplServer(config, family, deferAwareness);
+    } finally {
+      hold.release();
+    }
+  }
+
+  /** The part of a connect that runs holding its id. */
+  private async connectHeldMcplServer(
+    config: import('./mcpl/types.js').McplServerConfig,
+    family: 'legacy' | 'modern',
+    deferAwareness: boolean,
+  ): Promise<void> {
+    if (!this.mcplServerRegistry || !this.mcplHostCapabilities) {
+      throw new Error('MCPL subsystem is not initialized');
     }
 
     // Register prefix + config for tool dispatch routing (idempotent with
@@ -13815,25 +13882,38 @@ export class AgentFramework {
       const modern = ModernMcpConnection.create(config);
       this.modernServers().set(config.id, modern);
       this.wireModernEvents(modern);
+      let failure: Error | null = null;
       try {
         await modern.start();
       } catch (error) {
-        if (this.modernServers().get(config.id) === modern) this.modernServers().delete(config.id);
-        // The connect error is the one to report; a cleanup failure beside
-        // it is reported too, never in its place.
-        await modern.close().catch((cleanup: unknown) => {
-          this.emitTrace({
-            type: 'mcpl:server-error',
-            serverId: config.id,
-            error: cleanup instanceof Error ? cleanup.message : String(cleanup),
-          });
-        });
-        throw error;
+        failure = error instanceof Error ? error : new Error(String(error));
       }
-      // Closed (stop, disconnect) while connecting: nothing more to set up.
-      if (this.modernServers().get(config.id) !== modern) return;
-      this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
-      return;
+      if (!failure && !modern.isClosed) {
+        this.emitTrace({ type: 'module:added', moduleName: `mcpl:${config.id}` });
+        return;
+      }
+      // It failed, or stop() or a disconnect closed it while connecting: it
+      // never serves. The connect error is the one to report.
+      const reason = failure ?? new Error(
+        `MCP server "${config.id}" was not connected: ` +
+          (this.mcpServerAdmissionClosed ? 'the framework stopped while it was connecting' : 'it was disconnected while connecting'),
+      );
+      try {
+        await modern.close();
+      } catch (cleanup) {
+        // A cleanup failure is reported beside it, never in its place. The
+        // launch may still be running, so the connection stays registered
+        // and holds the id: nothing launches beside it, and a disconnect
+        // retries the reap.
+        const message = cleanup instanceof Error ? cleanup.message : String(cleanup);
+        this.emitTrace({ type: 'mcpl:server-error', serverId: config.id, error: message });
+        if (this.modernServers().get(config.id) === modern) {
+          throw AgentFramework.unreapedConnectFailure(config.id, new Error(`${reason.message}; its cleanup also failed: ${message}`, { cause: reason }));
+        }
+        throw reason;
+      }
+      if (this.modernServers().get(config.id) === modern) this.modernServers().delete(config.id);
+      throw reason;
     }
 
     // Record per-server channel subscription policy before the server
@@ -13845,7 +13925,15 @@ export class AgentFramework {
       );
     }
 
-    const connection = await this.mcplServerRegistry.addServer(config, this.mcplHostCapabilities);
+    let connection: McplServerConnection;
+    try {
+      connection = await this.mcplServerRegistry.addServer(config, this.mcplHostCapabilities);
+    } catch (error) {
+      // The registry keeps a failed launch that may still be running, as the
+      // closed connection that owns it.
+      if (error instanceof McplUnreapedLaunchError) throw AgentFramework.unreapedConnectFailure(config.id, error);
+      throw error;
+    }
     // stop() began while the handshake ran: its teardown has already
     // collected the registry, so this connection would outlive it. Close it.
     if (this.mcpServerAdmissionClosed) {
@@ -14270,39 +14358,61 @@ export class AgentFramework {
    * transport close, which preserves checkpoints for the reconnect), remove
    * its channels from the registry, drop routing entries, and refresh tools.
    * No-op-ish if the server is not connected (still clears routing state).
+   *
+   * It holds the id throughout (holdMcpServerId): a connect for it is
+   * refused meanwhile, and a connect already in flight settles first (a
+   * modern one is closed, which ends it). A close that can't confirm a child
+   * exited fails the disconnect before anything is removed: the server stays
+   * registered, closed, so nothing launches beside a child that may still be
+   * running, and disconnecting again retries the reap.
    */
   async disconnectMcplServer(id: string): Promise<void> {
     if (!this.mcplServerRegistry) {
       throw new Error('MCPL subsystem is not initialized');
     }
-    const config = this.mcplServerConfigs.get(id);
-    const oldToolNames = new Set(this.mcplTools.map(t => t.name));
+    const registry = this.mcplServerRegistry;
+    const hold = this.holdMcpServerId(id, 'disconnect');
+    try {
+      // Closing a modern connection now ends a connect in flight, rather than
+      // waiting out its handshake.
+      const modern = this.modernServers().get(id);
+      const modernClosed = modern?.close();
+      modernClosed?.catch(() => { /* its verdict is awaited below */ });
+      // What held the id before (a connect still running, an earlier
+      // disconnect) settles first, so what it registered is removed whole.
+      await hold.previous;
+      const config = this.mcplServerConfigs.get(id);
+      const oldToolNames = new Set(this.mcplTools.map(t => t.name));
 
-    const modern = this.modernServers().get(id);
-    // A child that can't be reaped fails the disconnect, but only after the
-    // rest of the removal is done.
-    let closeFailure: unknown = null;
-    if (modern) {
-      this.modernServers().delete(id);
-      await modern.close().catch((error: unknown) => { closeFailure = error; });
+      try {
+        await modernClosed;
+        await registry.removeServer(id);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `${message}. MCP server "${id}" stays registered, closed, until its exit is confirmed: disconnect it again to retry the reap`,
+          { cause: error },
+        );
+      }
+      if (modern && this.modernServers().get(id) === modern) this.modernServers().delete(id);
+      this.channelRegistry?.removeServer(id);
+
+      // Permanent removal: also destroy feature-set and checkpoint state
+      // explicitly. The 'close' handler usually does this, but a connection that
+      // already transiently closed (reconnect pending) emits no second 'close'
+      // from close(), and the transient path deliberately preserves checkpoints.
+      this.featureSetManager?.removeServer(id);
+      this.checkpointManager?.removeServer(id);
+
+      const prefix = config?.toolPrefix ?? `mcpl--${id}`;
+      this.mcplPrefixMap.delete(prefix);
+      this.mcplServerConfigs.delete(id);
+
+      await this.refreshMcplTools();
+      this.emitMcplToolDiff(oldToolNames, id);
+    } finally {
+      hold.release();
     }
-    await this.mcplServerRegistry.removeServer(id);
-    this.channelRegistry?.removeServer(id);
-
-    // Permanent removal: also destroy feature-set and checkpoint state
-    // explicitly. The 'close' handler usually does this, but a connection that
-    // already transiently closed (reconnect pending) emits no second 'close'
-    // from close(), and the transient path deliberately preserves checkpoints.
-    this.featureSetManager?.removeServer(id);
-    this.checkpointManager?.removeServer(id);
-
-    const prefix = config?.toolPrefix ?? `mcpl--${id}`;
-    this.mcplPrefixMap.delete(prefix);
-    this.mcplServerConfigs.delete(id);
-
-    await this.refreshMcplTools();
-    this.emitMcplToolDiff(oldToolNames, id);
-    if (closeFailure) throw closeFailure;
   }
 
   /**
@@ -14661,7 +14771,7 @@ export class AgentFramework {
     // Surface connect/reconnect failures. Before these traces existed the
     // only receipt was a console.error on the host's own stderr — invisible
     // unless someone ssh'd in and read the process log.
-    connection.on('connect-failed', (params: { error: string; attempt: number }) => {
+    connection.on('connect-failed', (params: { error: string; attempt: number; permanent?: boolean }) => {
       this.emitTrace({
         type: 'mcpl:server-connect-failed',
         serverId: connection.id,
@@ -14669,6 +14779,11 @@ export class AgentFramework {
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
+      // `permanent`: the failed launch couldn't be reaped, so no retry will
+      // start beside it. Alert now, as for a permanent reconnect failure.
+      if (params.permanent) {
+        this.opsAlert('mcpl-down', connection.id, `MCPL server unreachable (attempt ${params.attempt}): ${params.error}`);
+      }
     });
     connection.on('reconnect-failed', (params: { error: string; attempt: number; permanent?: boolean }) => {
       this.emitTrace({
@@ -14678,12 +14793,13 @@ export class AgentFramework {
         attempt: params.attempt,
         willRetry: connection.willReconnect,
       });
-      // The reconnect loop gives up only on a protocol-version verdict
-      // (`permanent`), which no later attempt can change — alert at once,
-      // since no fifth attempt will come. Otherwise backoff caps at ~300s,
-      // so "the server is effectively down" is an attempt-count judgment:
-      // 5 failed attempts ≈ a few minutes of outage. Throttled per
-      // (serverId, kind), so a long outage re-posts every ~15 min.
+      // The reconnect loop gives up only on a protocol-version verdict or a
+      // launch that couldn't be reaped (`permanent`), which no later attempt
+      // changes — alert at once, since no fifth attempt will come. Otherwise
+      // backoff caps at ~300s, so "the server is effectively down" is an
+      // attempt-count judgment: 5 failed attempts ≈ a few minutes of outage.
+      // Throttled per (serverId, kind), so a long outage re-posts every
+      // ~15 min.
       if (params.permanent || params.attempt >= 5) {
         this.opsAlert(
           'mcpl-down',
@@ -14801,9 +14917,11 @@ export class AgentFramework {
         willReconnect: connection.willReconnect,
       });
       this.emitTrace({ type: 'module:removed', moduleName: `mcpl:${connection.id}` });
-      // Without reconnect a closed server is gone, as the MCPL registry
-      // drops one; its configuration stays listed as disconnected.
-      if (!connection.willReconnect && this.modernServers().get(connection.id) === connection) {
+      // Without reconnect a server lost on its own is gone, as the MCPL
+      // registry drops one; its configuration stays listed as disconnected.
+      // One the host is closing stays until that teardown is done: whoever
+      // closes it removes it, so the id stays held meanwhile.
+      if (!connection.isClosed && !connection.willReconnect && this.modernServers().get(connection.id) === connection) {
         this.modernServers().delete(connection.id);
       }
     });

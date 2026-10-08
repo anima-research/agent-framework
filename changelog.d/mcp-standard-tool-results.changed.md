@@ -32,8 +32,32 @@
   SIGKILL after 2 s. A child still alive 2 s after SIGKILL fails `close()`
   with an explicit error. Before, close returned as soon as a signal was
   sent. `stop()` reports such a failure and still finishes shutting
-  everything else down.
+  everything else down. Concurrent `close()` calls share one teardown, and a
+  later call re-checks a child that couldn't be reaped. A launch whose exit
+  can't be confirmed is never orphaned, and nothing launches beside it:
+  - `McplServerConnection.connect()` throws the new `McplUnreapedLaunchError`,
+    whose `connection` owns the launch; its `close()` retries the reap.
+    `connectWithReconnect()` returns that connection, halted
+    (`connect-failed` with `permanent: true`, which raises the ops alert),
+    and a reconnect attempt halts the loop the same way
+    (`reconnect-failed`, `permanent: true`). A reconnect attempt never
+    starts before the previous child has exited.
+  - `close()` during a reconnect handshake ends that launch before it
+    resolves.
+  - In the framework, a disconnect or failed connect whose cleanup can't
+    reap the child keeps the server registered, closed and listed as
+    disconnected, and its error says so. A connect for that id is refused
+    until a disconnect, retried once the child is gone, confirms the exit
+    and completes the removal.
+- One owner per server id, across both families: a connect is refused while
+  another connect for that id is in flight (a legacy handshake included) or
+  a disconnect is still tearing it down, and a disconnect waits for a
+  connect in flight to settle before removing it, so a teardown never
+  removes what a later connection registered.
 - A server configuration naming no usable transport is now an error before
   anything is spawned or dialed. That covers a `transport` that doesn't
   match the url's scheme, `transport: 'http'` without a url, and an
   unrecognized scheme. Every valid configuration resolves as before.
+  `McplServerConnection.connect()` and `connectWithReconnect()` apply the
+  framework's whole check (so `protocol` on a WebSocket url is refused too),
+  and a configuration error is never turned into a retry stub.

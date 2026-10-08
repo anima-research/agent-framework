@@ -9,6 +9,7 @@
 //   hang-discover-later  launches after the first never answer server/discover
 //   hang-discover        no launch ever answers server/discover
 //   reject-discover-later  launches after the first answer server/discover with an error
+//   reject-discover      every launch answers server/discover with an error
 //   ignore-sigterm       the process survives SIGTERM (only SIGKILL ends it)
 // Tools: op (outputSchema {value: integer}, answers with a string: invalid
 // structured content), plain (text), err (a JSON-RPC error), touch (announces
@@ -44,6 +45,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       if (flags.has('hang-discover-later') && launch > 1) return;
       if (flags.has('hang-discover')) return;
       if (flags.has('reject-discover-later') && launch > 1) return error(m.id, -32603, 'not today');
+      if (flags.has('reject-discover')) return error(m.id, -32603, 'not today');
       return result(m.id, {
         supportedVersions: ['2026-07-28'],
         capabilities: { tools: { listChanged: true } },

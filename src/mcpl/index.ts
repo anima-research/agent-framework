@@ -106,7 +106,7 @@ export {
 } from './errors.js';
 
 // Server connection and registry
-export { McplServerConnection, McplRequestError, McplProtocolVersionError } from './server-connection.js';
+export { McplServerConnection, McplRequestError, McplProtocolVersionError, McplUnreapedLaunchError } from './server-connection.js';
 export { ModernMcpConnection } from './modern-connection.js';
 export type { ModernToolCallResult } from './modern-connection.js';
 export {

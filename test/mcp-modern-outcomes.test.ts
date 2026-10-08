@@ -286,3 +286,20 @@ test('concurrent close() calls share one teardown and its verdict; a later close
   await until(() => { try { process.kill(stuck!.pid, 0); return false; } catch { return true; } }, 'the child gone');
   await connection.close();
 });
+
+test('start() runs once: a second call shares the first connect, and no second session opens beside it', async () => {
+  const log = scratchLog();
+  const connection = ModernMcpConnection.create({ id: 'raw', command: process.execPath, args: [SERVER, '', log], protocol: 'modern' });
+  cleanups.push(() => connection.close());
+  const first = connection.start();
+  assert.equal(connection.start(), first, 'the same promise while connecting');
+  await first;
+  assert.equal(connection.start(), first, 'and once connected');
+  await connection.start();
+  assert.equal(connection.isConnected, true);
+  const launches = wire(log).filter((e) => e.event === 'start');
+  assert.equal(launches.length, 1, 'one launch');
+  await connection.close();
+  const alive = (p: number) => { try { process.kill(p, 0); return true; } catch { return false; } };
+  assert.equal(alive(launches[0]!.pid!), false, 'close() reaped the only child');
+});
