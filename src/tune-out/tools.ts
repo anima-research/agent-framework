@@ -113,7 +113,12 @@ export interface SubconsciousConfig {
    * agent-prefixed identifier.
    */
   name?: string;
-  /** Model id; defaults to the primary agent's (same-model side-process). */
+  /**
+   * Model id; defaults to the primary agent's (same-model side-process).
+   * With `reader: 'forks'` a fork holds the resident's whole prefix, so it
+   * runs on the resident's weights: a different `model` is refused at
+   * `create`, never silently applied or silently ignored.
+   */
   model?: string;
   /**
    * The voice/criteria mode block — recipe-side and co-authored with the

@@ -7,6 +7,7 @@
   preserved), and lets it report through `deliver_summary` as attributed mail
   under the fork's name and incarnation. `subconscious.strategyFactory` supplies
   a fresh strategy instance for each fork (required for a folding resident);
-  `subconscious.forkIdleTimeoutMs` bounds one fork (default 10 minutes). New
-  trace `tune-out:reader-fork`. `reader: 'persistent'` remains the default and
+  `subconscious.forkIdleTimeoutMs` bounds one fork (default 10 minutes). A fork
+  runs on the resident's model: a different `subconscious.model` is refused at
+  `create`. New trace `tune-out:reader-fork`. `reader: 'persistent'` remains the default and
   is unchanged.

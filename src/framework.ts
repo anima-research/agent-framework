@@ -7589,6 +7589,13 @@ export class AgentFramework {
           'class and configuration to reuse its fold state and rendering',
       );
     }
+    if (cfg.model !== undefined && cfg.model !== primaryConfig.model) {
+      throw new Error(
+        `subconscious.reader "forks": a reader fork holds the resident's whole prefix and so runs on the ` +
+          `resident's weights ("${primaryConfig.model}"); \`model\` "${cfg.model}" would hand that prefix to ` +
+          'another model. Use the persistent reader for a different model, or omit `model`',
+      );
+    }
     this.readerForks = true;
     this.subconsciousConfig = cfg;
   }

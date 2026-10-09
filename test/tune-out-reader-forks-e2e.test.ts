@@ -257,6 +257,24 @@ describe('tune-out with reader forks', () => {
 });
 
 describe('tune-out reader forks: configuration', () => {
+  it('refuses a model other than the resident\'s: the prefix stays on its own weights', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tune-out-forks-cfg-'));
+    try {
+      await assert.rejects(
+        AgentFramework.create({
+          storePath: join(dir, 'test.chronicle'),
+          membrane: new MockMembrane().asMembrane(),
+          agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'x' }],
+          subconscious: { enabled: true, reader: 'forks', model: 'other-model', systemPrompt: 'read' },
+          modules: [],
+        }),
+        /runs on the resident's weights \("test-model"\); `model` "other-model"/,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('refuses forks for a folding resident without a strategy factory', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tune-out-forks-cfg-'));
     try {
