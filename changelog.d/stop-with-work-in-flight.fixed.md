@@ -9,6 +9,10 @@
     its push threw, the throw was reported as the tool's own failure, and
     that failure's push threw again, unhandled. tune-out's results now go
     through the same `pushEvent` as every other tool's.
+  - The drop's log line names the tool and whether it succeeded, which is
+    what decides whether anything needs reconciling (the resident may run
+    the tool again). For this, the framework's tool results carry the tool's
+    name (`ToolResultEvent.toolName`, optional).
   - A server's `push/event` or `channels/incoming` that arrives once the
     host is stopping is refused before its handler runs, with a JSON-RPC
     error (`-32603`, "the host is stopping"). It is never answered

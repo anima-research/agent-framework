@@ -92,6 +92,10 @@ export interface ToolResultEvent {
   agentName: string;
   /** Module that handled the call */
   moduleName: string;
+  /** The tool's name, as its call named it. The framework's own
+   *  producers set it, so a result nothing can take any more (one arriving
+   *  after stop()) is still logged by tool. */
+  toolName?: string;
   /** Result of the tool call */
   result: ToolResult;
 }

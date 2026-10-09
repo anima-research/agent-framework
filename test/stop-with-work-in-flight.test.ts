@@ -143,6 +143,10 @@ describe('stop() with work still in flight', () => {
     assert.deepEqual(rejections, []);
     assert.deepEqual(failed, [], 'the tool succeeded; nothing reports it as a failure');
     assert.equal(dropped().length, 1, logged.join('\n'));
+    // The drop names the tool and that it succeeded: what an operator needs
+    // to reconcile a result nothing could take.
+    assert.match(dropped()[0]!, /tool call c1 \(slow--work, slow\)/, dropped()[0]);
+    assert.match(dropped()[0]!, /the tool succeeded$/, dropped()[0]);
   });
 
   it('a tool that fails after stop() has its error result dropped, not thrown', async () => {
@@ -153,6 +157,7 @@ describe('stop() with work still in flight', () => {
     assert.deepEqual(rejections, []);
     assert.deepEqual(failed, [], 'the registry answers a module throw with an error result');
     assert.equal(dropped().length, 1, logged.join('\n'));
+    assert.match(dropped()[0]!, /the tool failed: /, dropped()[0]);
   });
 
   it('a dispatch that rejects after stop() is reported as failed, and its failure result dropped, not thrown', async () => {
@@ -163,6 +168,7 @@ describe('stop() with work still in flight', () => {
     assert.deepEqual(rejections, []);
     assert.equal(failed.length, 1, 'the host got no result: a dispatch failure');
     assert.equal(dropped().length, 1, logged.join('\n'));
+    assert.match(dropped()[0]!, /the tool failed: .*the dispatch was lost/, dropped()[0]);
   });
 
   it('fresh input to a stopped framework still throws to its caller', async () => {
