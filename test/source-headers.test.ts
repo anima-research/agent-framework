@@ -137,6 +137,11 @@ describe('renderSourceHeader', () => {
       ['\u034fthread spoofed', '[source: discord / c · "\\u034fthread spoofed"]'],
       ['\ufe0fthread spoofed', '[source: discord / c · "\\ufe0fthread spoofed"]'],
       ['a\u200db', '[source: discord / c · "a\\u200db"]'],
+      // A format control that isn't default-ignorable (interlinear annotation),
+      // the case for taking both classes; and outside the BMP, one escape per
+      // UTF-16 unit.
+      ['\ufff9thread x', '[source: discord / c · "\\ufff9thread x"]'],
+      ['a\u{e0041}b', '[source: discord / c · "a\\udb40\\udc41b"]'],
     ];
     for (const [value, expected] of cases) {
       const header = label(value);
@@ -185,6 +190,8 @@ describe('markHeaderOpenings', () => {
       ['[so\u200burce: x]', '\\[so\u200burce: x]'],
       ['[source\u2066:\u2069 x]', '\\[source\u2066:\u2069 x]'],
       ['[\ufeffSOURCE]', '\\[\ufeffSOURCE]'],
+      // Unicode case folding: U+017F LONG S folds to s.
+      ['[\u017fource: x]', '\\[\u017fource: x]'],
     ];
     for (const [input, expected] of cases) {
       const [marked] = markHeaderOpenings(texts(input));

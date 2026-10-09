@@ -416,9 +416,10 @@ export const SOURCE_HEADER_RULE =
  * already holds `\[source` keeps a backslash before its bracket either way.
  * Invisible characters (`INVISIBLE`: zero-width characters, bidi controls,
  * fillers, joiners) don't hide an opening wherever they stand in it, as the
- * header's own words are read through them (agent-framework#269). Visible
- * look-alike characters can still imitate the opening: no marking of exact
- * text closes that.
+ * header's own words are read through them (agent-framework#269). The match
+ * folds case by Unicode's rules, so `ſ` (U+017F LONG S), which folds to `s`,
+ * opens one too. Other visible look-alike characters can still imitate the
+ * opening: no marking of exact text closes that.
  */
 export function markHeaderOpenings<T extends object>(blocks: readonly T[]): T[] {
   const texts: Array<{ index: number; start: number; text: string }> = [];
