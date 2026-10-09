@@ -1,0 +1,9 @@
+- **API server and MCP clients:** while an operator-change gate is configured, the API server refuses `undo`, `redo`, `branch.switch` and `branch.create` with `switchTo` whole, saying why, since it can't stage them (#255). The MCP server's `branch_switch` and `branch_create` tools, which wrap those commands, are refused the same way. Use the host's gated command instead. Without a gate, nothing changes.
+- **Script authors (`code_execution`):** a script's tool call is served only while the exec that made it is running, as whoever started that exec (#255).
+  - A task a script leaves running past its exec has its later tool calls refused: its standing ended with its exec. They used to run, unrecorded, as the agent's own. A foreground script's result notes in its stderr how many of the tasks it started were still running when it ended.
+  - A call sent from a thread the script started (as with `run_coroutine_threadsafe`) is refused as untraceable.
+- **Module and host authors:** a caller-named origin is normalized (#255). Anything other than absent or `'puppet'` acts for the host, never as the agent's own. Likewise:
+  - a tool-call event that anything other than the framework's own dispatch queues (a module or the host) acts for the host, unless it names the operator;
+  - trace listeners are notified as the host's;
+  - a delegation to another agent acts for the host.
+- **Hosts:** `resume()` refuses, force or not, while the active body is the destination of an unresolved or abandoned cut, until it's resolved or its source restored (#255).

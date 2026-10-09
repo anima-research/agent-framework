@@ -1,0 +1,1 @@
+- `stop()` closes admission before its first await, and lets the store's current users finish before tearing anything down (#255).
