@@ -11,6 +11,7 @@ import type { CacheWireReceipt } from './kv-unified-wire.js';
 import {
   SUBCONSCIOUS_TOOLS,
   SUBCONSCIOUS_TOOL_NAMES,
+  defaultReaderFraming,
   type SubconsciousConfig,
   type PersistentReaderConfig,
   type ForkReaderConfig,
@@ -1041,6 +1042,25 @@ export interface DeriveAgentOptions {
   strategy?: ContextStrategy;
   /** Identity and settings overrides. Everything not named is the parent's. */
   config?: Partial<Omit<AgentConfig, 'name' | 'strategy'>>;
+  /**
+   * The parent's tool round in flight, if any. While a tool call runs, the
+   * assistant turn that made it is not in the parent's store yet. By
+   * default the child's branch gets that turn verbatim (as its own, like
+   * the rest of the inheritance) followed by a tool-result message: results
+   * the parent has already received as they are; the call that derived the
+   * child with `madeBy.result`, or a note saying it did; and any other call
+   * still running with a note that its result was not available. So a fork
+   * sees the call that made it and never meets a dangling `tool_use`.
+   * `madeBy` defaults to the only open call when there is exactly one.
+   * `include: false` leaves the round out, and the child starts from the
+   * last stored message before it.
+   */
+  pendingRound?: {
+    include?: boolean;
+    madeBy?: { toolUseId: string; result: string };
+    /** Results, from the child's side, for other calls still open, by tool-use id. */
+    results?: Record<string, string>;
+  };
   /** Ordinary messages appended to the child before it runs. */
   framing?: Array<{ participant: string; content: ContentBlock[]; metadata?: MessageMetadata }>;
   /** Who spawned it. Default: `from`. */
@@ -4452,10 +4472,51 @@ export class AgentFramework {
       }
       created.agent.markContextConsumed();
     }
+    await this.framePendingRound(parent, created.contextManager, options, shared);
     for (const message of options.framing ?? []) {
       created.contextManager.addMessage(message.participant, message.content, message.metadata);
     }
     return created;
+  }
+
+  /**
+   * The parent's in-flight tool round, reproduced on the child's branch so
+   * the child sees the call that made it (see `DeriveAgentOptions.pendingRound`).
+   */
+  private async framePendingRound(
+    parent: Agent,
+    child: ContextManager,
+    options: DeriveAgentOptions,
+    shared: boolean,
+  ): Promise<void> {
+    const round = options.pendingRound ?? {};
+    if (round.include === false) return;
+    const pending = this.pendingAssistantBlocks.get(parent.name);
+    if (!pending) return;
+    const calls = pending.filter((b): b is Extract<ContentBlock, { type: 'tool_use' }> => b.type === 'tool_use');
+    if (calls.length === 0) return;
+    const state = parent.state;
+    const completed = state.status === 'waiting_for_tools' ? state.completed : [];
+    const cap = this.resolveToolResultInlineCap(parent).cap;
+    const { blocks: received } = await this.buildStoredToolResultContent(options.name, completed, cap);
+    const byId = new Map(received.map((b) => [(b as { toolUseId: string }).toolUseId, b]));
+    const open = calls.filter((c) => !byId.has(c.id));
+    const madeBy = round.madeBy?.toolUseId ?? (open.length === 1 ? open[0]!.id : undefined);
+    const results: ContentBlock[] = calls.map((call) => {
+      const stored = byId.get(call.id);
+      if (stored) return stored;
+      const content =
+        call.id === madeBy
+          ? round.madeBy?.result ??
+            `[This call derived ${options.name}. You are ${options.name}, continuing from here on your own branch; ` +
+              `${parent.name} receives the call's result, not you.]`
+          : round.results?.[call.id] ??
+            `[No result yet: this call was still running in ${parent.name} when ${options.name} was derived.]`;
+      return { type: 'tool_result' as const, toolUseId: call.id, toolName: call.name, content, isError: false };
+    });
+    const metadata = { kind: 'dendrite-pending-round', from: parent.name } as unknown as MessageMetadata;
+    child.addMessage(shared ? parent.name : options.name, structuredClone(pending), metadata);
+    child.addMessage('user', results, metadata);
   }
 
   /**
@@ -7624,34 +7685,17 @@ export class AgentFramework {
     if (!primary || cfg?.reader !== 'forks' || !this.agents.has(primary)) return;
     const name = `reader/${primary}/${invocation.epochId.slice(0, 8)}/${++this.readerForkCounter}`;
 
-    const header =
-      `[Tune-out reader — ${invocation.channelId}, epoch ${invocation.epochId.slice(0, 8)}, ${invocation.trigger}]\n` +
-      `${invocation.notice}\n\n${cfg.voice}` +
-      (invocation.dispositions ? `\n\n[Standing dispositions]\n${invocation.dispositions}` : '');
-    const content: ContentBlock[] = [{ type: 'text', text: header }];
-    if (invocation.backlog.length > 0) {
-      const lines: string[] = [`\n[Held in ${invocation.channelId} since your last look: ${invocation.backlog.length} message${invocation.backlog.length === 1 ? '' : 's'}]`];
-      const flush = () => {
-        if (lines.length > 0) content.push({ type: 'text', text: lines.splice(0).join('\n') });
-      };
-      for (const message of invocation.backlog) {
-        const author = (message.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? message.participant;
-        const text = message.content
-          .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
-          .map((b) => b.text)
-          .join('\n');
-        lines.push(`${author}: ${text}`);
-        const media = message.content.filter((b) => b.type !== 'text');
-        if (media.length > 0) {
-          flush();
-          content.push(...media); // media preserved as the source supplied it
-        }
-      }
-      flush();
-    } else {
-      content.push({ type: 'text', text: '\n[Nothing new has been held since your last look.]' });
-    }
-
+    const content = (cfg.framing ?? defaultReaderFraming)({
+      resident: primary,
+      fork: name,
+      voice: cfg.voice,
+      channelId: invocation.channelId,
+      epochId: invocation.epochId,
+      trigger: invocation.trigger,
+      notice: invocation.notice,
+      dispositions: invocation.dispositions,
+      backlog: invocation.backlog,
+    });
     void (async () => {
       try {
         const fork = await this.deriveAgent({

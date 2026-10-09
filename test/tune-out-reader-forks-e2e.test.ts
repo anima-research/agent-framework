@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync, appendFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { NormalizedRequest } from '@animalabs/membrane';
-import { AgentFramework, AutobiographicalStrategy } from '../src/index.js';
+import { AgentFramework, AutobiographicalStrategy, defaultReaderFraming } from '../src/index.js';
 import type { TraceEvent } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import type { NormalizedResponse } from '@animalabs/membrane';
@@ -102,6 +102,11 @@ describe('tune-out with reader forks', () => {
         reader: 'forks',
         model: 'test-model',
         voice: 'You are reading for scout. Report in second person, briefly.',
+        // How a fork is prompted is the host's: here, the default plus a marker.
+        framing: (ctx) => [
+          ...defaultReaderFraming(ctx),
+          { type: 'text', text: `[custom framing: ${ctx.fork} reading for ${ctx.resident}, ${ctx.backlog.length} held]` },
+        ],
       },
       mcplServers: [{
         id: 'disc',
@@ -192,6 +197,7 @@ describe('tune-out with reader forks', () => {
     assert.match(framingText, /You are reading for scout/);
     assert.match(framingText, /antra: release chatter one/);
     assert.match(framingText, /hey scout, quick question/);
+    assert.match(framingText, /\[custom framing: reader\/scout\/\w+\/1 reading for scout, 4 held\]/, 'the host\'s framing hook ran');
     assert.deepEqual((framing.metadata as { heldMessageIds: string[] }).heldMessageIds.length, 4);
     // The held originals stay out of the resident's compiled view.
     const compiled = await framework.getAgent('scout')!.getContextManager().compile();

@@ -151,3 +151,12 @@ export type {
 } from './recovery/offline-branch.js';
 
 export * from "./tool-presentation.js";
+
+// Tune-out: the subconscious configuration and the default reader-fork framing.
+export {
+  defaultReaderFraming,
+  type SubconsciousConfig,
+  type PersistentReaderConfig,
+  type ForkReaderConfig,
+  type ReaderFramingContext,
+} from './tune-out/tools.js';

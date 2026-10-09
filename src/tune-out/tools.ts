@@ -1,3 +1,5 @@
+import type { ContentBlock } from '@animalabs/membrane';
+import type { StoredMessage } from '@animalabs/context-manager';
 /**
  * The subconscious's tool surface (issue #77).
  *
@@ -174,4 +176,70 @@ export interface ForkReaderConfig extends SubconsciousConfigBase {
   strategyFactory?: () => import('@animalabs/context-manager').ContextStrategy;
   /** Idle timeout for one reader fork (default 10 minutes). */
   forkIdleTimeoutMs?: number;
+  /**
+   * How a reader fork is prompted: the content of the one message it
+   * receives after the fork point. Default `defaultReaderFraming`. The
+   * framework stores whatever this returns as a user message with
+   * `metadata.kind = 'tune-out-reader-framing'`; the notice, voice,
+   * dispositions and held traffic are in the context, and nothing else
+   * about the fork's prompt is fixed by the path.
+   */
+  framing?: (context: ReaderFramingContext) => ContentBlock[];
+}
+
+/** What a reader fork's framing is built from. */
+export interface ReaderFramingContext {
+  /** The resident the fork was derived from. */
+  resident: string;
+  /** The fork's own name. */
+  fork: string;
+  /** `ForkReaderConfig.voice`. */
+  voice: string;
+  channelId: string;
+  epochId: string;
+  trigger: 'cadence' | 'wake' | 'cancel';
+  /** The coordinator's notice for this invocation (`[Tune-out wake: …]` etc.). */
+  notice: string;
+  /** Standing dispositions recorded on the epoch, or null. */
+  dispositions: string | null;
+  /** The traffic held since the last look, oldest first; empty when nothing arrived. */
+  backlog: StoredMessage[];
+}
+
+/**
+ * The default reader-fork framing: a header naming the channel, epoch and
+ * trigger; the notice; the voice block; standing dispositions if any; then
+ * the held traffic as `author: text` lines with non-text blocks (images,
+ * documents) preserved in order as the source supplied them.
+ */
+export function defaultReaderFraming(ctx: ReaderFramingContext): ContentBlock[] {
+  const header =
+    `[Tune-out reader — ${ctx.channelId}, epoch ${ctx.epochId.slice(0, 8)}, ${ctx.trigger}]\n` +
+    `${ctx.notice}\n\n${ctx.voice}` +
+    (ctx.dispositions ? `\n\n[Standing dispositions]\n${ctx.dispositions}` : '');
+  const content: ContentBlock[] = [{ type: 'text', text: header }];
+  if (ctx.backlog.length === 0) {
+    content.push({ type: 'text', text: '\n[Nothing new has been held since your last look.]' });
+    return content;
+  }
+  const n = ctx.backlog.length;
+  const lines: string[] = [`\n[Held in ${ctx.channelId} since your last look: ${n} message${n === 1 ? '' : 's'}]`];
+  const flush = () => {
+    if (lines.length > 0) content.push({ type: 'text', text: lines.splice(0).join('\n') });
+  };
+  for (const message of ctx.backlog) {
+    const author = (message.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? message.participant;
+    const text = message.content
+      .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n');
+    lines.push(`${author}: ${text}`);
+    const media = message.content.filter((b) => b.type !== 'text');
+    if (media.length > 0) {
+      flush();
+      content.push(...media);
+    }
+  }
+  flush();
+  return content;
 }

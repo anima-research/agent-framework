@@ -34,6 +34,13 @@ const skip = supported
   ? false
   : 'installed @animalabs/chronicle / context-manager lack branch-bound handles or ContextManager.derive';
 
+const textOf = (m: { content: Array<{ type: string; text?: string }> }): string =>
+  m.content.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('\n');
+
+/** A fork's messages after inheritance, leaving aside the parent's round in flight (tested on its own). */
+const own = <M extends { metadata?: unknown }>(messages: M[]): M[] =>
+  messages.filter((m) => (m.metadata as { kind?: string } | undefined)?.kind !== 'dendrite-pending-round');
+
 const FRAMING = '[FORK-FRAMING] You are the fork. Task: count the open issues.';
 
 function folding(): ContextStrategy {
@@ -156,7 +163,7 @@ describe('Dendrite deriveAgent', () => {
     const forkMessages = contextManager.getAllMessages();
     assert.deepEqual(forkMessages.slice(0, history.length).map((m) => m.id), history);
     assert.deepEqual(
-      forkMessages.slice(history.length).map((m) => [m.participant, (m.content[0] as { text: string }).text]),
+      own(forkMessages).slice(history.length).map((m) => [m.participant, (m.content[0] as { text: string }).text]),
       [['user', FRAMING], ['fork-1', 'there are 7 open issues']],
     );
     // Shared, not copied; and nothing of the child's reached the parent.
@@ -338,13 +345,13 @@ describe('Dendrite deriveAgent', () => {
     assert.deepEqual(record.selfParticipants, ['fork-1', 'mira'], 'both ancestors are its own voice');
     assert.equal(membrane.callsFor('fork-2')[0]!.assistantParticipant, 'mira');
 
-    const secondTexts = second.contextManager.getAllMessages().slice(history.length)
+    const secondTexts = own(second.contextManager.getAllMessages()).slice(history.length)
       .map((m) => (m.content[0] as { text?: string }).text ?? `<${m.content[0]!.type}>`);
     assert.deepEqual(secondTexts, [FRAMING, '[GRANDCHILD-FRAMING] go deeper', 'fork-2 done']);
 
     gates.release('g-fork');
     assert.equal((await firstRun).speech, 'fork-1 done');
-    const firstTexts = first.contextManager.getAllMessages().slice(history.length).map((m) => m.participant);
+    const firstTexts = own(first.contextManager.getAllMessages()).slice(history.length).map((m) => m.participant);
     assert.equal(firstTexts.includes('fork-2'), false, 'the grandchild\'s turns never reached its parent');
     assert.equal(framework.getAgent('mira')!.getContextManager().getAllMessages().length, history.length);
   });
@@ -381,6 +388,61 @@ describe('Dendrite deriveAgent', () => {
     );
   });
 
+  it('a fork made from inside a tool call sees the call that made it', { skip }, async () => {
+    await miraMidTurn(); // mira is blocked in test--wait, call id call-g-mira; that turn is not stored yet
+    membrane.script('fork-1', say('seen'));
+    const { result, contextManager } = await runFork({
+      name: 'fork-1',
+      from: 'mira',
+      framing: [{ participant: 'user', content: [{ type: 'text', text: FRAMING }] }],
+    });
+    assert.equal(result.speech, 'seen');
+    const messages = contextManager.getAllMessages();
+    const at = messages.findIndex((m) => m.content.some((b) => b.type === 'tool_use' && b.id === 'call-g-mira'));
+    assert.ok(at >= 0, 'the pending assistant turn is on the fork\'s branch');
+    assert.equal(messages[at]!.participant, 'mira', 'stored under the parent\'s name, presented as the fork\'s own');
+    assert.equal((messages[at]!.metadata as { kind?: string }).kind, 'dendrite-pending-round');
+    const results = messages[at + 1]!;
+    assert.equal(results.participant, 'user');
+    const toolResult = results.content.find((b) => b.type === 'tool_result') as { toolUseId: string; content: string };
+    assert.equal(toolResult.toolUseId, 'call-g-mira');
+    assert.match(toolResult.content, /This call derived fork-1\. You are fork-1/);
+    assert.equal(textOf(messages[at + 2]!), FRAMING, 'framing follows the round');
+    // The parent's own store still has nothing of the round: it lands there when the results are in.
+    const miraMessages = framework.getAgent('mira')!.getContextManager().getAllMessages();
+    assert.equal(miraMessages.some((m) => m.content.some((b) => b.type === 'tool_use')), false);
+    // On the wire: the fork's request pairs the tool_use with a tool_result, so no dangling call.
+    const request = membrane.callsFor('fork-1')[0]!;
+    const flat = JSON.stringify(request.messages);
+    assert.ok(flat.includes('"call-g-mira"') && flat.includes('This call derived fork-1'));
+  });
+
+  it('the pending round is the host\'s to word or leave out', async () => {
+    await miraMidTurn();
+    membrane.script('fork-1', say('ok'));
+    membrane.script('fork-2', say('ok'));
+    const worded = await runFork({
+      name: 'fork-1',
+      from: 'mira',
+      mode: 'copy',
+      pendingRound: { madeBy: { toolUseId: 'call-g-mira', result: 'You are the fork this call asked for.' } },
+    });
+    const wordedMessages = worded.contextManager.getAllMessages();
+    const round = wordedMessages.find((m) => m.content.some((b) => b.type === 'tool_use' && b.id === 'call-g-mira'))!;
+    assert.equal(round.participant, 'fork-1', 'copy inheritance: renamed like the rest of the copy');
+    const toolResult = wordedMessages
+      .flatMap((m) => m.content)
+      .find((b) => b.type === 'tool_result') as { content: string };
+    assert.equal(toolResult.content, 'You are the fork this call asked for.');
+
+    const without = await runFork({ name: 'fork-2', from: 'mira', mode: 'copy', pendingRound: { include: false } });
+    assert.equal(
+      without.contextManager.getAllMessages().some((m) => m.content.some((b) => b.type === 'tool_use')),
+      false,
+      'include: false — the fork starts from the last stored message before the round',
+    );
+  });
+
   it('denies a tool at dispatch without removing it from the request', async () => {
     const { parentRequest } = await miraMidTurn();
     const refused: Array<{ tool?: unknown; error?: unknown }> = [];
@@ -411,7 +473,7 @@ describe('Dendrite deriveAgent', () => {
     // The refusal reached the fork as that call's tool result.
     const toolResult = contextManager.getAllMessages()
       .flatMap((m) => m.content)
-      .find((block) => block.type === 'tool_result');
+      .find((block) => block.type === 'tool_result' && (block as { toolUseId: string }).toolUseId === 'call-denied');
     assert.ok(toolResult && JSON.stringify(toolResult).includes('not available to fork-1'));
   });
 
@@ -448,7 +510,7 @@ describe('Dendrite deriveAgent', () => {
     });
     // It starts from exactly what it had stored: its inheritance and its framing.
     assert.deepEqual(
-      resumed.contextManager.getAllMessages().slice(history.length).map((m) => (m.content[0] as { text: string }).text),
+      own(resumed.contextManager.getAllMessages()).slice(history.length).map((m) => (m.content[0] as { text: string }).text),
       [FRAMING],
     );
     const result = await framework.runEphemeralToCompletion(resumed.agent, resumed.contextManager);
@@ -497,7 +559,7 @@ describe('Dendrite deriveAgent', () => {
     });
     const left = await framework.inspectAgentContext('fork-1');
     assert.deepEqual(
-      left.getAllMessages().slice(history.length).map((m) => [m.participant, (m.content[0] as { text: string }).text]),
+      own(left.getAllMessages()).slice(history.length).map((m) => [m.participant, (m.content[0] as { text: string }).text]),
       [['user', FRAMING], ['fork-1', 'fork done']],
     );
     await assert.rejects(framework.inspectAgentContext('nobody'), /not a known agent/);

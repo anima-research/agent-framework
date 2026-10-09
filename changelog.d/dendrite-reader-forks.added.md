@@ -11,6 +11,8 @@
   and `subconscious.voice` is the reader's framing block in place of
   `systemPrompt`. `subconscious.strategyFactory` supplies a fresh strategy
   instance for each fork (required for a folding resident);
-  `subconscious.forkIdleTimeoutMs` bounds one fork (default 10 minutes). New
-  trace `tune-out:reader-fork`. `reader: 'persistent'` remains the default and
+  `subconscious.forkIdleTimeoutMs` bounds one fork (default 10 minutes);
+  `subconscious.framing(context)` decides how a fork is prompted, with
+  `defaultReaderFraming` exported as the default. New trace
+  `tune-out:reader-fork`. `reader: 'persistent'` remains the default and
   is unchanged.
