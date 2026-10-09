@@ -67,6 +67,23 @@ function plainIdForLog(id: unknown): string {
 }
 
 /**
+ * The other channel a channels/open answer names, if it names one: its
+ * `channel.id`, or else the `channelId` of a history item. Each is evidence of
+ * which channel the server opened. An answer that names no channel at all
+ * can't be checked, and gives undefined.
+ */
+function substitutedChannel(result: ChannelsOpenResult | undefined, requested: string): unknown {
+  const answered = result?.channel?.id;
+  if (answered !== undefined && answered !== requested) return answered;
+  const history: unknown[] = Array.isArray(result?.history) ? result.history : [];
+  for (const item of history) {
+    const from = (item as { channelId?: unknown } | null)?.channelId;
+    if (from !== undefined && from !== requested) return from;
+  }
+  return undefined;
+}
+
+/**
  * Durable "which label did this channelId have, each time we saw it" log.
  * `resolveProseTarget()` resolves a label to an id only for channels
  * currently in the live `channels` map — fine for normal addressing, but
@@ -2177,27 +2194,16 @@ export class ChannelRegistry {
         }
         // A server can answer for a channel other than the one named: one
         // that falls back to its first channel of the type for an id it no
-        // longer knows opens that channel and returns its history. That
-        // receipt confirms nothing about this channel, and the history is
-        // another channel's. So the open fails, nothing is marked open, the
-        // history goes nowhere, and this channel's open state is unconfirmed.
-        // A result that names no channel can't be checked and is taken as
-        // before.
-        const answeredFor = result?.channel?.id;
-        if (answeredFor !== undefined && answeredFor !== channelId) {
-          if (this.channels.get(channelKey) === entry) this.invalidateTransportConfirmation(entry);
-          const error = new ChannelOpenSubstitutionError(
-            `Server "${serverId}" answered channels/open for ${channelId} with a different channel; ` +
-            `${channelId} is not marked open, and nothing in the answer is used`,
-          );
+        // longer knows opens that channel and returns its history. Whatever
+        // becomes of this receipt, the server did that: say so, and undo the
+        // open it made if the host wants that channel closed.
+        const substitute = open ? substitutedChannel(result, channelId) : undefined;
+        if (substitute !== undefined) {
           console.error(
-            `[channel-open-substituted] server=${serverId} requested=${channelId} answered=${plainIdForLog(answeredFor)}`,
+            `[channel-open-substituted] server=${serverId} requested=${plainIdForLog(channelId)} answered=${plainIdForLog(substitute)}`,
           );
-          this.emitTraceFn({
-            type: 'mcpl:channel-open-substituted',
-            serverId, channelId, answeredFor, error: error.message,
-          });
-          throw error;
+          this.emitTraceFn({ type: 'mcpl:channel-open-substituted', serverId, channelId, answeredFor: substitute });
+          if (typeof substitute === 'string') this.closeSubstitutedChannel(serverId, substitute);
         }
         // Never apply an old receipt to the current target, even transiently:
         // a corrective open might fail before that stale bit is replaced.
@@ -2205,6 +2211,18 @@ export class ChannelRegistry {
         if (!sameTarget()) {
           this.invalidateTransportConfirmation(entry);
           continue;
+        }
+        // A current receipt for another channel confirms nothing about this
+        // one, and its history is another channel's. So the open fails,
+        // nothing in the answer is used, and this channel's open state is
+        // unconfirmed: a server that doesn't resolve this id may not resolve
+        // its sends either.
+        if (substitute !== undefined) {
+          this.invalidateTransportConfirmation(entry);
+          throw new ChannelOpenSubstitutionError(
+            `Server "${serverId}" answered channels/open for ${channelId} with a different channel; ` +
+            `${channelId} is not marked open, and nothing in the answer is used`,
+          );
         }
         if (open && !entry.open) opened = true;
         if (!open) opened = false;
@@ -2226,6 +2244,27 @@ export class ChannelRegistry {
     };
     void tail.then(cleanup, cleanup);
     return operation;
+  }
+
+  /**
+   * A server that answered an open with another channel really opened that
+   * one. When it's registered here and the host wants it closed, close it
+   * through its own lifecycle queue: otherwise its traffic would reach the
+   * resident, marked open by its first incoming message. A channel the host
+   * wants open is left alone, and a close can't be answered for another
+   * channel, so this never starts another substitution. An id the host
+   * doesn't know needs nothing: §14.5 refuses its traffic.
+   */
+  private closeSubstitutedChannel(serverId: string, channelId: string): void {
+    if (!this.channels.has(`${serverId}:${channelId}`)) return;
+    if (this.getDesiredState(serverId, channelId) !== 'closed') return;
+    this.applyDesiredChannelState(serverId, channelId).catch((err) => {
+      if (err instanceof ChannelLifecycleConvergenceError) return;
+      this.emitTraceFn({
+        type: 'mcpl:channel-reconcile-failed',
+        serverId, channelId, desired: 'closed', error: (err as Error).message,
+      });
+    });
   }
 
   /**
