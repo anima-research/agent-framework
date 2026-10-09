@@ -458,3 +458,14 @@ test('model-info: a throwing error write is traced without escaping or a second 
   assert.equal(failures.length, 1);
   assert.equal(failures[0].responseAttempted, true);
 });
+
+test('a method named after an Object.prototype member is not buffered while the planes are paused', () => {
+  const transport = new ResponseTransport();
+  const connection = new (McplServerConnection as any)('srv', null, transport) as McplServerConnection;
+  connection.establishGrant(new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []));
+  // Before ready(), inbound events wait in the buffer; an unknown method must not take a slot.
+  for (const method of ['constructor', '__proto__', 'toString', 'no/such-method']) {
+    transport.emit('line', JSON.stringify({ jsonrpc: '2.0', method }));
+  }
+  assert.equal((connection as any).bufferedEvents.length, 0);
+});
