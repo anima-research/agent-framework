@@ -487,6 +487,11 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     'a labeled image': { blocks: [image(png)], changed: false },
     'PNG bytes labeled image/jpeg': { blocks: [image(png, 'image/jpeg')], changed: true },
     'JPEG bytes labeled image/png': { blocks: [image(Buffer.from('ffd8ffe000104a464946', 'hex').toString('base64'))], changed: true },
+    // One fixture per branch of the copied sniffer, each labeled as something
+    // else, so a context-manager that stops sniffing one fails here.
+    'GIF87a bytes labeled image/png': { blocks: [image(Buffer.from('GIF87a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'))], changed: true },
+    'GIF89a bytes labeled image/jpeg': { blocks: [image(Buffer.from('GIF89a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'), 'image/jpeg')], changed: true },
+    'WebP bytes labeled image/png': { blocks: [image(Buffer.from('RIFF\x1a\x00\x00\x00WEBPVP8L\x0d\x00\x00\x00', 'latin1').toString('base64'))], changed: true },
     'base64 with a newline in it': { blocks: [image(`${png.slice(0, 11)}\n${png.slice(11)}`)], changed: true },
     'base64 with whitespace around it': { blocks: [image(`  ${png}\n`)], changed: true },
     'base64 without its padding': { blocks: [image(png.replace(/=+$/, ''))], changed: true },
