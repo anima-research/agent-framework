@@ -14,7 +14,7 @@ import { EventEmitter } from 'node:events';
 import { openTransport, type McplTransport, type TransportCloseInfo } from './transport.js';
 import { maskNegotiatedCapabilities } from './capability-mask.js';
 import { CapabilityGrant, expandAdvertisementShorthand } from './capability-grant.js';
-import { CAPABILITY_DISABLED } from './errors.js';
+import { CAPABILITY_DISABLED, McplResponseSerializationError } from './errors.js';
 
 import type {
   McplServerConfig,
@@ -292,7 +292,7 @@ export class McplServerConnection extends EventEmitter {
         // Re-enter the gate for every buffered item. A control handler (notably
         // tools/list_changed) may install a newer data-plane barrier while this
         // snapshot is being flushed; later data items must observe that pause.
-        this.emit(event, ...args);
+        this.dispatchInboundEvent(event, ...args);
       }
     } finally {
       this.flushDepth--;
@@ -317,7 +317,7 @@ export class McplServerConnection extends EventEmitter {
         // the old direct flush bypassed positive-grant enforcement entirely
         // (PR #79 review blocker 3). Data-plane items re-buffer in order via
         // the same call, since dataPlaneReady is still false.
-        this.emit(item.event, ...item.args);
+        this.dispatchInboundEvent(item.event, ...item.args);
       }
     } finally {
       this.flushDepth--;
@@ -533,6 +533,7 @@ export class McplServerConnection extends EventEmitter {
           } catch {
             return; // Ignore non-JSON lines (e.g. logback output from Java servers)
           }
+          if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) return;
           if (msg.id !== initId) return;
           cleanup();
           if (msg.error) {
@@ -1113,61 +1114,94 @@ export class McplServerConnection extends EventEmitter {
         return;
       }
 
-      // Is this a response to one of our outbound requests?
-      if ('id' in msg && msg.id != null && !('method' in msg)) {
-        this.handleResponse(msg as JsonRpcResponse);
-        return;
-      }
-
-      // It is an inbound request or notification from the server
-      const request = msg as JsonRpcRequest;
-      const eventName = McplServerConnection.METHOD_TO_EVENT[request.method];
-
-      // §7 is removed in 0.5.0: scope/elevate is no longer a method. Answer
-      // rather than hang (§6.6 — a method that will never be answered MUST
-      // return an error).
-      // featureSets/changed is REMOVED in 0.5.0 (§6.7 — it carried a
-      // server-authored change payload, the self-attestation defect; the
-      // need is met by §17's host-diffed manifest fetch). It was still
-      // routed, control-plane classified, and mutating declarations — a
-      // live ungated self-attestation path (PR #79 review blocker 4).
-      if (request.method === McplMethod.FeatureSetsChanged) {
-        if (request.id != null) {
-          this.sendErrorResponse(request.id, -32601, 'featureSets/changed removed in MCPL 0.5.0 (superseded by mcpl/manifestChanged, SPEC §17)');
-        } else {
-          console.error(`[mcpl] ${this.id}: discarded featureSets/changed — removed in 0.5.0 (§6.7/§17)`);
-        }
-        return;
-      }
-
-      if (request.method === McplMethod.ScopeElevate) {
-        if (request.id != null) {
-          this.sendErrorResponse(request.id, -32601, 'scope/elevate removed in MCPL 0.5.0 (SPEC §7)');
-        }
-        return;
-      }
-
-      // Positive-grant enforcement (§5.4, §14.1) happens at ADMISSION, in
-      // the emit() override below — the one choke-point that live routing
-      // and staged-buffer flushes share. See the comment there for why
-      // rejecting here, at line receipt, was wrong for staged connections.
-
-      if (eventName) {
-        // Emit the typed event with params and (for requests) a respond callback
-        if (request.id != null) {
-          // Server expects a response — provide a respond helper
-          this.emit(eventName, request.params, {
-            id: request.id,
-            respond: (result: unknown) => this.sendResponse(request.id!, result),
-            respondError: (code: number, message: string, data?: unknown) =>
-              this.sendErrorResponse(request.id!, code, message, data),
-          });
-        } else {
-          // Notification — no response expected
-          this.emit(eventName, request.params);
-        }
+      // JSON-RPC messages must be objects. Ignore unrelated stdout/log values
+      // before property access, just as malformed JSON lines are ignored.
+      if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) return;
+      try {
+        this.dispatchMessage(msg);
+      } catch (error) {
+        this.reportInboundFailure(error);
       }
     });
+  }
+
+  /** Contain synchronous dispatch failures; async RPC handlers own their promises. */
+  private dispatchMessage(msg: JsonRpcRequest | JsonRpcResponse): void {
+    // Is this a response to one of our outbound requests?
+    if ('id' in msg && msg.id != null && !('method' in msg)) {
+      this.handleResponse(msg as JsonRpcResponse);
+      return;
+    }
+
+    // It is an inbound request or notification from the server
+    const request = msg as JsonRpcRequest;
+    const eventName = typeof request.method === 'string' && Object.hasOwn(McplServerConnection.METHOD_TO_EVENT, request.method)
+      ? McplServerConnection.METHOD_TO_EVENT[request.method] : undefined;
+
+    // §7 is removed in 0.5.0: scope/elevate is no longer a method. Answer
+    // rather than hang (§6.6 — a method that will never be answered MUST
+    // return an error).
+    // featureSets/changed is REMOVED in 0.5.0 (§6.7 — it carried a
+    // server-authored change payload, the self-attestation defect; the
+    // need is met by §17's host-diffed manifest fetch). It was still
+    // routed, control-plane classified, and mutating declarations — a
+    // live ungated self-attestation path (PR #79 review blocker 4).
+    if (request.method === McplMethod.FeatureSetsChanged) {
+      if (request.id != null) {
+        this.sendErrorResponse(request.id, -32601, 'featureSets/changed removed in MCPL 0.5.0 (superseded by mcpl/manifestChanged, SPEC §17)');
+      } else {
+        console.error(`[mcpl] ${this.id}: discarded featureSets/changed — removed in 0.5.0 (§6.7/§17)`);
+      }
+      return;
+    }
+
+    if (request.method === McplMethod.ScopeElevate) {
+      if (request.id != null) {
+        this.sendErrorResponse(request.id, -32601, 'scope/elevate removed in MCPL 0.5.0 (SPEC §7)');
+      }
+      return;
+    }
+
+    // Positive-grant enforcement (§5.4, §14.1) happens at ADMISSION, in
+    // the emit() override below — the one choke-point that live routing
+    // and staged-buffer flushes share. See the comment there for why
+    // rejecting here, at line receipt, was wrong for staged connections.
+
+    if (eventName) {
+      // Emit the typed event with params and (for requests) a respond callback
+      if (request.id != null) {
+        // Server expects a response — provide a respond helper
+        this.dispatchInboundEvent(eventName, request.params, {
+          id: request.id,
+          respond: (result: unknown) => this.sendResponse(request.id!, result),
+          respondError: (code: number, message: string, data?: unknown) =>
+            this.sendErrorResponse(request.id!, code, message, data),
+        });
+      } else {
+        // Notification — no response expected
+        this.dispatchInboundEvent(eventName, request.params);
+      }
+    }
+  }
+
+  /** Live delivery and delayed plane flushes share the same containment boundary. */
+  private dispatchInboundEvent(event: string, ...args: unknown[]): void {
+    try {
+      this.emit(event, ...args);
+    } catch (error) {
+      this.reportInboundFailure(error);
+    }
+  }
+
+  private reportInboundFailure(cause: unknown): void {
+    const error = new Error(`MCPL server "${this.id}" inbound dispatch failed`, { cause });
+    console.error(error.message, cause);
+    // EventEmitter's unhandled 'error' behavior would defeat containment before
+    // framework wiring, so stderr remains the fallback when no listener exists.
+    if (this.listenerCount('error') > 0) {
+      try { this.emit('error', error); }
+      catch (reportError) { console.error('MCPL error listener failed:', reportError); }
+    }
   }
 
   /**
@@ -1222,13 +1256,22 @@ export class McplServerConnection extends EventEmitter {
     }
   }
 
+  /** Keep definite pre-write encoding failures distinct from transport errors. */
+  private serializeResponse(response: JsonRpcResponse): string {
+    try {
+      return JSON.stringify(response);
+    } catch (cause) {
+      throw new McplResponseSerializationError(cause);
+    }
+  }
+
   /**
    * Send a successful JSON-RPC response back to the server.
    */
   private sendResponse(id: string | number, result: unknown): void {
     if (this.closed) return;
     const response: JsonRpcResponse = { jsonrpc: '2.0', id, result };
-    this.transport?.writeLine(JSON.stringify(response));
+    this.transport?.writeLine(this.serializeResponse(response));
   }
 
   /**
@@ -1241,7 +1284,7 @@ export class McplServerConnection extends EventEmitter {
       id,
       error: { code, message, data },
     };
-    this.transport?.writeLine(JSON.stringify(response));
+    this.transport?.writeLine(this.serializeResponse(response));
   }
 
   // ==========================================================================
