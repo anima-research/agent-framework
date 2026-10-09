@@ -5,9 +5,12 @@
   its tools and system prompt, ending with it — hands it the traffic held since
   the last look as ordinary framing (each held message to exactly one fork, media
   preserved), and lets it report through `deliver_summary` as attributed mail
-  under the fork's name and incarnation. `subconscious.strategyFactory` supplies
-  a fresh strategy instance for each fork (required for a folding resident);
-  `subconscious.forkIdleTimeoutMs` bounds one fork (default 10 minutes). A fork
-  runs on the resident's model: a different `subconscious.model` is refused at
-  `create`. New trace `tune-out:reader-fork`. `reader: 'persistent'` remains the default and
+  under the fork's name and incarnation. In this mode `subconscious.model` is
+  required (whose weights read the resident's prefix is never defaulted; the
+  resident's own model makes the fork a copy, another model by name is allowed)
+  and `subconscious.voice` is the reader's framing block in place of
+  `systemPrompt`. `subconscious.strategyFactory` supplies a fresh strategy
+  instance for each fork (required for a folding resident);
+  `subconscious.forkIdleTimeoutMs` bounds one fork (default 10 minutes). New
+  trace `tune-out:reader-fork`. `reader: 'persistent'` remains the default and
   is unchanged.

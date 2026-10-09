@@ -102,23 +102,42 @@ export const SUBCONSCIOUS_TOOLS: ToolDefinition[] = [
 ];
 
 /**
- * Configuration for the subconscious resident (FrameworkConfig.subconscious).
+ * Configuration for the subconscious (FrameworkConfig.subconscious). Two
+ * shapes, by `reader`:
+ *
+ * - `'persistent'` (default): one persistent side-agent with an isolated
+ *   slot and a windowed read-only view of the residents' timeline, as
+ *   issue #77 built it. Its `systemPrompt` is a system prompt.
+ * - `'forks'`: a succession of forks of the resident (Dendrite). Each
+ *   cadence tick, coalesced wake and cancel derives a short-lived fork at
+ *   the resident's head — the resident's whole prefix, its refusals
+ *   included, ending with it — hands it the traffic held since the last
+ *   look as the first message after the fork point, and lets it report
+ *   back as attributed mail. No agent persists between invocations;
+ *   dispositions do, in the coordinator's state. Its `voice` is framing,
+ *   not a system prompt, and residents are shown the reader's four tools
+ *   in their tool block (refused at dispatch), so the fork's request is
+ *   the resident's up to the fork point.
  */
-export interface SubconsciousConfig {
+export type SubconsciousConfig = PersistentReaderConfig | ForkReaderConfig;
+
+interface SubconsciousConfigBase {
   /** Master switch. */
   enabled: boolean;
+  /** Allow speak_in_channel. Default false until the voice block has
+   *  passed its canary round. */
+  allowChannelSpeech?: boolean;
+}
+
+export interface PersistentReaderConfig extends SubconsciousConfigBase {
+  reader?: 'persistent';
   /**
    * Registry + participant name. Default 'Subconscious' — following the
    * Context Manager precedent: a title-case functional voice, not an
    * agent-prefixed identifier.
    */
   name?: string;
-  /**
-   * Model id; defaults to the primary agent's (same-model side-process).
-   * With `reader: 'forks'` a fork holds the resident's whole prefix, so it
-   * runs on the resident's weights: a different `model` is refused at
-   * `create`, never silently applied or silently ignored.
-   */
+  /** Model id; defaults to the primary agent's (same-model side-process). */
   model?: string;
   /**
    * The voice/criteria mode block — recipe-side and co-authored with the
@@ -126,36 +145,33 @@ export interface SubconsciousConfig {
    * person toward the resident. Canary before fleet use (issue #77).
    */
   systemPrompt: string;
-  /** Allow speak_in_channel. Default false until the voice block has
-   *  passed its canary round. */
-  allowChannelSpeech?: boolean;
   /** WindowedPassthroughStrategy re-anchor fraction (default 0.5). */
   reAnchorFraction?: number;
+}
+
+export interface ForkReaderConfig extends SubconsciousConfigBase {
+  reader: 'forks';
   /**
-   * How the reader is realised.
-   *
-   * - `'persistent'` (default): one persistent side-agent with an isolated
-   *   slot and a windowed read-only view of the residents' timeline, as
-   *   issue #77 built it.
-   * - `'forks'`: a succession of forks of the resident (Dendrite). Each
-   *   cadence tick, coalesced wake and cancel derives a short-lived fork at
-   *   the resident's head — same prefix, the resident's refusals included,
-   *   ending with the resident — hands it the traffic held since the last
-   *   look as ordinary framing, and lets it report back as attributed
-   *   mail. No agent persists between invocations; dispositions do, in the
-   *   coordinator's state. `systemPrompt` becomes the first framing message
-   *   rather than the system prompt, so the resident's provider prefix is
-   *   shared. Residents are shown the reader's four tools in their tool
-   *   block (refused at dispatch) for the same reason.
+   * Whose weights run the fork. Required, never defaulted: a fork holds the
+   * resident's whole prefix, and which model reads it is the one fact the
+   * resident's consent names. The resident's own model is the copy; another
+   * model is allowed when stated here. `create` refuses the omission.
    */
-  reader?: 'persistent' | 'forks';
+  model: string;
   /**
-   * `reader: 'forks'`: a fresh context strategy instance for each fork,
-   * same class and configuration as the resident's, so the fork reuses the
-   * resident's fold state and rendering. Required unless the resident runs
-   * a passthrough strategy.
+   * The reader's voice block — report-shaped, second person toward the
+   * resident, co-authored with them. Delivered as the first message after
+   * the fork point, with the notice, the standing dispositions and the held
+   * traffic; never a system prompt.
+   */
+  voice: string;
+  /**
+   * A fresh context strategy instance for each fork, same class and
+   * configuration as the resident's, so the fork reuses the resident's fold
+   * state and rendering. Required unless the resident runs a passthrough
+   * strategy.
    */
   strategyFactory?: () => import('@animalabs/context-manager').ContextStrategy;
-  /** `reader: 'forks'`: idle timeout for one reader fork (default 10 minutes). */
+  /** Idle timeout for one reader fork (default 10 minutes). */
   forkIdleTimeoutMs?: number;
 }

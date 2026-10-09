@@ -8,7 +8,13 @@ import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolRes
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
-import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
+import {
+  SUBCONSCIOUS_TOOLS,
+  SUBCONSCIOUS_TOOL_NAMES,
+  type SubconsciousConfig,
+  type PersistentReaderConfig,
+  type ForkReaderConfig,
+} from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, type ReaderInvocation } from './tune-out/coordinator.js';
 import type {
   MessageId,
@@ -7506,7 +7512,7 @@ export class AgentFramework {
    * passthrough, no memory pyramid: its durable output is what it delivers
    * into the resident's window, which accumulates there.
    */
-  private async createSubconsciousAgent(cfg: SubconsciousConfig): Promise<Agent> {
+  private async createSubconsciousAgent(cfg: PersistentReaderConfig): Promise<Agent> {
     const primaryName = this.primaryAgentName;
     const primaryConfig = primaryName ? this.agentConfigs.get(primaryName) : undefined;
     if (!primaryName || !primaryConfig) {
@@ -7575,7 +7581,7 @@ export class AgentFramework {
    * asks for a fork per invocation (see invokeReaderFork); the config is
    * kept for the voice block, the speech switch and the strategy factory.
    */
-  private configureReaderForks(cfg: SubconsciousConfig): void {
+  private configureReaderForks(cfg: ForkReaderConfig): void {
     const primaryName = this.primaryAgentName;
     const primaryConfig = primaryName ? this.agentConfigs.get(primaryName) : undefined;
     if (!primaryName || !primaryConfig) {
@@ -7589,12 +7595,18 @@ export class AgentFramework {
           'class and configuration to reuse its fold state and rendering',
       );
     }
-    if (cfg.model !== undefined && cfg.model !== primaryConfig.model) {
+    // Whose weights read the resident's prefix is never defaulted. The
+    // resident's own model is the copy; another is allowed when stated, so
+    // the resident's consent can name it (architecture channel, 10-09).
+    if (typeof cfg.model !== 'string' || cfg.model.length === 0) {
       throw new Error(
-        `subconscious.reader "forks": a reader fork holds the resident's whole prefix and so runs on the ` +
-          `resident's weights ("${primaryConfig.model}"); \`model\` "${cfg.model}" would hand that prefix to ` +
-          'another model. Use the persistent reader for a different model, or omit `model`',
+        `subconscious.reader "forks": a reader fork holds the whole prefix of "${primaryName}", so \`model\` ` +
+          `must say whose weights run it — "${primaryConfig.model}" for a copy of the resident, or another model ` +
+          'by name. It is not defaulted',
       );
+    }
+    if (typeof cfg.voice !== 'string' || cfg.voice.length === 0) {
+      throw new Error('subconscious.reader "forks": `voice` (the reader\'s framing block) is required');
     }
     this.readerForks = true;
     this.subconsciousConfig = cfg;
@@ -7609,12 +7621,12 @@ export class AgentFramework {
   private invokeReaderFork(invocation: ReaderInvocation): void {
     const primary = this.primaryAgentName;
     const cfg = this.subconsciousConfig;
-    if (!primary || !cfg || !this.agents.has(primary)) return;
+    if (!primary || cfg?.reader !== 'forks' || !this.agents.has(primary)) return;
     const name = `reader/${primary}/${invocation.epochId.slice(0, 8)}/${++this.readerForkCounter}`;
 
     const header =
       `[Tune-out reader — ${invocation.channelId}, epoch ${invocation.epochId.slice(0, 8)}, ${invocation.trigger}]\n` +
-      `${invocation.notice}\n\n${cfg.systemPrompt}` +
+      `${invocation.notice}\n\n${cfg.voice}` +
       (invocation.dispositions ? `\n\n[Standing dispositions]\n${invocation.dispositions}` : '');
     const content: ContentBlock[] = [{ type: 'text', text: header }];
     if (invocation.backlog.length > 0) {
@@ -7647,8 +7659,9 @@ export class AgentFramework {
           from: primary,
           kind: 'subconscious-fork',
           ...(cfg.strategyFactory ? { strategy: cfg.strategyFactory() } : {}),
-          // Its report is a tool call; bare prose never routes anywhere.
-          config: { proseRouting: 'disabled' },
+          // Whose weights, as the configuration states it; its report is a
+          // tool call, so bare prose never routes anywhere.
+          config: { model: cfg.model, proseRouting: 'disabled' },
           inheritRefusals: true,
           onParentEnd: 'end',
           resultTo: { to: primary, as: 'message' },

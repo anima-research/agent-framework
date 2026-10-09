@@ -100,7 +100,8 @@ describe('tune-out with reader forks', () => {
       subconscious: {
         enabled: true,
         reader: 'forks',
-        systemPrompt: 'You are reading for scout. Report in second person, briefly.',
+        model: 'test-model',
+        voice: 'You are reading for scout. Report in second person, briefly.',
       },
       mcplServers: [{
         id: 'disc',
@@ -257,7 +258,7 @@ describe('tune-out with reader forks', () => {
 });
 
 describe('tune-out reader forks: configuration', () => {
-  it('refuses a model other than the resident\'s: the prefix stays on its own weights', async () => {
+  it('refuses an unstated model: whose weights read the prefix is never defaulted', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'tune-out-forks-cfg-'));
     try {
       await assert.rejects(
@@ -265,11 +266,27 @@ describe('tune-out reader forks: configuration', () => {
           storePath: join(dir, 'test.chronicle'),
           membrane: new MockMembrane().asMembrane(),
           agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'x' }],
-          subconscious: { enabled: true, reader: 'forks', model: 'other-model', systemPrompt: 'read' },
+          subconscious: { enabled: true, reader: 'forks', voice: 'read' } as never,
           modules: [],
         }),
-        /runs on the resident's weights \("test-model"\); `model` "other-model"/,
+        /`model` must say whose weights run it — "test-model" for a copy of the resident, or another model/,
       );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('allows another model when stated: every configuration stays reachable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'tune-out-forks-cfg-'));
+    try {
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'test.chronicle'),
+        membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'x' }],
+        subconscious: { enabled: true, reader: 'forks', model: 'other-model', voice: 'read' },
+        modules: [],
+      });
+      await framework.stop();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -286,7 +303,7 @@ describe('tune-out reader forks: configuration', () => {
             name: 'scout', model: 'test-model', systemPrompt: 'x',
             strategy: new AutobiographicalStrategy({ compressionModel: 'mock' }) as never,
           }],
-          subconscious: { enabled: true, reader: 'forks', systemPrompt: 'read' },
+          subconscious: { enabled: true, reader: 'forks', model: 'test-model', voice: 'read' },
           modules: [],
         }),
         /needs `subconscious.strategyFactory`/,
