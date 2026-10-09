@@ -853,15 +853,17 @@ export class ChannelRegistry {
    * in its per-message result, and until now the host said nothing, so a
    * dropped message (agent-framework#266: every Discord message with a
    * screenshot) left no trace where operators look. `coalesce-invalid` for a
-   * malformed item (-32602, with the failing field), `coalesce-failed` when
-   * the coalescer itself failed.
+   * malformed item (-32602, with the failing field), `coalesce-failed` for
+   * any other error, as the wire answers it: the coalescer itself failed.
    */
   private traceCoalesceRejection(
     serverId: string,
     message: { channelId?: unknown; messageId?: unknown } | null | undefined,
     error: { code?: number; field?: string; message: string },
   ): void {
-    const reason = typeof error.code !== 'number' || error.code === -32602 ? 'coalesce-invalid' : 'coalesce-failed';
+    // As the wire answers it: only a -32602 is the sender's malformed item;
+    // anything else (a plain Error the coalescer threw) is the host's failure.
+    const reason = error.code === -32602 ? 'coalesce-invalid' : 'coalesce-failed';
     const channelId = typeof message?.channelId === 'string' ? message.channelId : '';
     const messageId = typeof message?.messageId === 'string' && message.messageId ? message.messageId : undefined;
     console.error(
@@ -897,6 +899,7 @@ export class ChannelRegistry {
         || typeof message.messageId !== 'string' || !message.messageId) {
         if (message?.coalesce !== undefined) {
           this.traceCoalesceRejection(serverId, message, {
+            code: -32602,
             field: typeof message.channelId !== 'string' || !message.channelId ? 'channelId' : 'messageId',
             message: 'a coalesced message needs a channelId and a messageId',
           });

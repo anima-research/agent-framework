@@ -80,13 +80,15 @@ test('#266: a malformed coalesced channel item is refused on the wire and named 
   f.framework.onTrace((e) => { if (e.type === 'mcpl:channel-incoming-rejected') rejected.push(e); });
   const badBlock = { ...f.channel('e1', '', { initial: true }, 'chat', 'bad'), content: [{ type: 'image', mimeType: 'image/png' }] };
   const noEventId = { ...f.channel('e2', 'no_event_id', { initial: true }, 'chat', 'noid'), eventId: undefined };
-  const r = await f.send('channels/incoming', { messages: [badBlock, noEventId] });
-  assert.deepEqual(r.result.results.map((x: { reason?: string }) => x.reason), ['coalesce_invalid', 'coalesce_invalid'], 'the wire is unchanged');
+  const noMessageId = { ...f.channel('e3', 'no_message_id', { initial: true }, 'chat', 'x'), messageId: undefined };
+  const r = await f.send('channels/incoming', { messages: [badBlock, noEventId, noMessageId] });
+  assert.deepEqual(r.result.results.map((x: { reason?: string }) => x.reason), ['coalesce_invalid', 'coalesce_invalid', 'coalesce_invalid'], 'the wire is unchanged');
   assert.deepEqual(
     rejected.map(({ reason, field, messageId }) => ({ reason, field, messageId })),
     [
       { reason: 'coalesce-invalid', field: 'payload.content', messageId: 'bad' },
       { reason: 'coalesce-invalid', field: 'eventId', messageId: 'noid' },
+      { reason: 'coalesce-invalid', field: 'messageId', messageId: undefined },
     ],
   );
   assert(rejected.every((e) => typeof e.detail === 'string' && e.detail.length > 0), 'each says why');
@@ -114,4 +116,29 @@ test('#266: a malformed coalesced push is a -32602 on the wire and named on the 
   );
   assert(lines.some((l) => l.includes('[push-event-rejected]') && l.includes('eventId=b1') && l.includes('reason=coalesce-invalid') && l.includes('field=payload.content')));
   assert(lines.some((l) => l.includes('[push-event-rejected]') && l.includes('eventId=b2') && l.includes('field=coalesce.key')));
+});
+
+test('#266: a coalescer failure is traced as the host\'s (coalesce-failed), as the wire answers it, not as the sender\'s malformed item', async (t) => {
+  const f = await fixture(); t.after(f.close); await f.register();
+  const lines = captureConsoleError(t);
+  const rejected: Rejection[] = [];
+  f.framework.onTrace((e) => {
+    if (e.type === 'mcpl:channel-incoming-rejected' || e.type === 'mcpl:push-event-rejected') rejected.push(e);
+  });
+  // The coalescer itself throws a plain Error (no code) for well-formed items.
+  (f.framework as unknown as { pushCoalescer: { accept: () => Promise<never> } }).pushCoalescer.accept =
+    async () => { throw new Error('coalescer_broke'); };
+  const channel = await f.send('channels/incoming', { messages: [f.channel('c1', 'fine_text', { initial: true }, 'chat', 'fine')] });
+  assert.deepEqual(channel.result.results[0], { messageId: 'fine', accepted: false, reason: 'coalescer_broke' }, 'the wire calls it a failure');
+  const push = await f.send('push/event', f.params('p1', 'fine_push', { initial: true }));
+  assert.equal(push.error?.code, -32603, 'the wire calls it a failure');
+  assert.deepEqual(
+    rejected.map(({ type, reason, detail }) => ({ type, reason, detail })),
+    [
+      { type: 'mcpl:channel-incoming-rejected', reason: 'coalesce-failed', detail: 'coalescer_broke' },
+      { type: 'mcpl:push-event-rejected', reason: 'coalesce-failed', detail: 'coalescer_broke' },
+    ],
+  );
+  assert(lines.some((l) => l.includes('[channel-incoming-rejected]') && l.includes('reason=coalesce-failed')));
+  assert(lines.some((l) => l.includes('[push-event-rejected]') && l.includes('reason=coalesce-failed')));
 });

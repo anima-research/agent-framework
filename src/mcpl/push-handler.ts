@@ -340,11 +340,13 @@ export class PushHandler {
    * rejection: its producer is told on the wire, and until now the host said
    * nothing, so a dropped message left no trace where operators look
    * (agent-framework#266). `coalesce-invalid` for a malformed occurrence
-   * (-32602, with the failing field), `coalesce-failed` when the coalescer
-   * itself failed.
+   * (-32602, with the failing field), `coalesce-failed` for any other error,
+   * as the wire answers it: the coalescer itself failed.
    */
   private traceCoalesceRejection(serverId: string, params: PushEventParams, error: { code?: number; field?: string; message: string }): void {
-    const reason = typeof error.code !== 'number' || error.code === -32602 ? 'coalesce-invalid' : 'coalesce-failed';
+    // As the wire answers it: only a -32602 is the producer's malformed
+    // occurrence; anything else (-32603 for a plain Error) is the host's.
+    const reason = error.code === -32602 ? 'coalesce-invalid' : 'coalesce-failed';
     console.error(
       `[push-event-rejected] server=${serverId} featureSet=${params.featureSet} eventId=${params.eventId} ` +
       `reason=${reason}${error.field ? ` field=${error.field}` : ''}: ${error.message}`,
