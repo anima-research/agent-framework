@@ -204,9 +204,13 @@ export interface EvidenceInputs {
   provenance: CompileProvenance | null;
   /** For each compiled message, its index in the request, or -1 when dropped. */
   requestIndexOf: readonly number[];
+  /**
+   * A raw body's head as the compile read it. A sharded copy's other shards
+   * aren't needed: its fidelity rests on the size its group declared (CM
+   * checks every declared shard is stored and carried) and its version on
+   * the recorded source digest, so neither reads the shards' content.
+   */
   getMessage: (id: string) => StoredMessage | null;
-  /** Every stored message of a body group, in shard order (sharded bodies only). */
-  groupMembers: (head: StoredMessage) => StoredMessage[];
 }
 
 /** Evidence for a compiled request: its channel bodies, frozen now. */
@@ -232,8 +236,7 @@ export function requestEvidence(inputs: EvidenceInputs): RequestEvidence {
         if (!stored) continue;
         const source = readInboundSource(stored.metadata);
         if (!source || source.kind !== 'channel' || !isBody(stored, source)) continue;
-        const members = stored.bodyGroupId ? inputs.groupMembers(stored) : [stored];
-        const contents = members.map((m) => m.content);
+        const contents = [stored.content];
         const facts = copyFacts(stored);
         const lostFragment = droppedFragments.has(body.messageId);
         const fidelity = copyFidelity(contents, facts);

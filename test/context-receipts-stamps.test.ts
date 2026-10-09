@@ -61,12 +61,15 @@ const textOf = (blocks: readonly ContentBlock[]) =>
 /**
  * Passthrough, except: a body mentioning SHARD-ME is stored as one shard per
  * block (lossless), and a body mentioning CUT-ME is rendered as its first
- * block alone.
+ * block alone. A sharded body mentioning SAME-CONTENT takes one fixed group
+ * id, as the real chunker's content hash gives every copy of one text.
  */
 class FixtureStrategy extends PassthroughStrategy {
   chunkIngressMessage(_participant: string, content: ContentBlock[]): { bodyGroupId: string; shards: Array<{ content: ContentBlock[]; shardIndex: number }> } | null {
-    if (!textOf(content).includes('SHARD-ME')) return null;
-    return { bodyGroupId: `group-${Math.random().toString(36).slice(2)}`, shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })) };
+    const text = textOf(content);
+    if (!text.includes('SHARD-ME')) return null;
+    const bodyGroupId = text.includes('SAME-CONTENT') ? 'group-same-content' : `group-${Math.random().toString(36).slice(2)}`;
+    return { bodyGroupId, shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })) };
   }
   override select(...args: Parameters<PassthroughStrategy['select']>): ReturnType<PassthroughStrategy['select']> {
     return super.select(...args).map((entry) =>
@@ -207,6 +210,26 @@ describe('receipts through the ingestion stamps', () => {
     await waitFor(() => p.entries('dlv', 's-next').length === 1 && p.idle(), 'the next compile, carrying the shards');
     assert.equal(p.entries('dlv', 's-mid').length, 1, 'the sharded compile is the same version');
     assert.equal(p.entries('part', 's-mid').length, 0);
+  });
+
+  it('end to end through CM\'s body identity: the same text posted twice, under one group id, is two whole deliveries', async () => {
+    // What makes the repost its own delivery is context-manager judging each
+    // ingestion as its own body (a group id names content, not an ingestion).
+    // With one body per group id, the repost's shards join the first copy's
+    // body, whose head is the first copy's, and the repost is never
+    // delivered on its own.
+    const h = await open();
+    const p = probes(h);
+    const content = [{ type: 'text', text: 'SHARD-ME SAME-CONTENT first part' }, { type: 'text', text: 'second part' }];
+    h.command({ op: 'incoming', channelId: ROOM, messageId: 'twice-1', mode: 'addressed', content });
+    await waitFor(() => p.entries('dlv', 'twice-1').length === 1 && p.idle(), 'the first copy delivered');
+    h.command({ op: 'incoming', channelId: ROOM, messageId: 'twice-2', mode: 'addressed', content });
+    await waitFor(() => p.entries('dlv', 'twice-2').length === 1 && p.idle(), 'the repost delivered on its own');
+    const [first] = p.copies('twice-1');
+    const [second] = p.copies('twice-2');
+    assert.ok(first!.bodyGroupId && first!.bodyGroupId === second!.bodyGroupId, 'one group id names both copies');
+    assert.equal(p.entries('part', 'twice-2').length, 0, 'the repost was carried whole, not short of shards');
+    assert.equal(p.entries('dlv', 'twice-1').length, 1, 'and the first copy is still one delivery');
   });
 
   it('a copy rendered short is never a delivery', async () => {

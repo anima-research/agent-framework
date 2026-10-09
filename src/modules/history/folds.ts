@@ -9,6 +9,7 @@ import type { ContextManager, FoldChange, FoldForm, FoldLayoutRun, FoldReceipt }
 import type { ToolDefinition, ToolResult } from '../../types/events.js';
 
 export interface FoldsInput {
+  afterId?: string;
   since?: string;
   limit?: number;
   branch?: string;
@@ -30,11 +31,15 @@ export const FOLDS_TOOL: ToolDefinition = {
     '`unknown`. Messages that arrived since the previous round are arrivals, not folds. The first ' +
     'receipt on a branch is a baseline: the layout as rendered then, with history before it unknown. ' +
     'Each receipt describes the spans as rendered when it was written, even if messages were edited or ' +
-    'removed since. Newest first.',
+    'removed since. Newest first; with `afterId`, oldest first from just after that receipt, so you can ' +
+    'read on: pass the last id an `afterId` page returned (`next` names it), `latestReceiptId` to see only ' +
+    'new ones, or "0" to read the record from its start. `more` says whether the query matched more than ' +
+    'it returned.',
   inputSchema: {
     type: 'object' as const,
     properties: {
-      since: { type: 'string', description: 'A receipt id (only receipts after it) or an ISO 8601 time (receipts accepted at or after it).' },
+      afterId: { type: 'string', description: 'A receipt id: only receipts after it, oldest first, to read on from the last one you got. "0" starts from the first receipt.' },
+      since: { type: 'string', description: 'An ISO 8601 time, such as 2026-10-09T14:00:00Z: only receipts accepted at or after it. A bare number is refused; a receipt id goes in afterId.' },
       limit: { type: 'number', description: 'Max receipts (default 10, cap 100).' },
       branch: { type: 'string', description: 'Branch name; your current branch when omitted. Any branch the journal has seen, including a deleted one.' },
     },
@@ -78,6 +83,7 @@ export function foldingSentence(strategy: string, forms: ReadonlyArray<'raw' | '
 export function handleFolds(cm: ContextManager, input: FoldsInput, exportStatus?: unknown): ToolResult {
   const forms = cm.describeRenderedForms();
   const result = cm.listFoldReceipts({
+    ...(input.afterId !== undefined ? { afterId: input.afterId } : {}),
     ...(input.since !== undefined ? { since: input.since } : {}),
     ...(input.limit !== undefined ? { limit: input.limit } : {}),
     ...(input.branch !== undefined ? { branch: input.branch } : {}),
@@ -98,17 +104,29 @@ export function handleFolds(cm: ContextManager, input: FoldsInput, exportStatus?
       : { changes: (r.changes ?? []).map(changeLine) }),
     ...(source && JSON.stringify(r.source) !== JSON.stringify(source) ? { source: r.source } : {}),
   }));
+  const filtered = input.afterId !== undefined || input.since !== undefined;
+  const last = receipts[receipts.length - 1];
   return {
     success: true,
     data: {
       branch: result.branch,
       latestReceiptId: result.latestId,
+      more: result.more,
+      ...(result.more
+        ? {
+          next: input.afterId !== undefined && last
+            ? `more after this page: call again with afterId ${last.id}`
+            : 'older receipts were left out: to read the record from its start, call with afterId "0"',
+        }
+        : {}),
       folding: foldingSentence(forms.strategy, forms.forms),
       ...(source ? { source } : {}),
       receipts,
       ...(exportStatus !== undefined ? { export: exportStatus } : {}),
       ...(result.note ? { note: result.note } : {}),
-      ...(receipts.length === 0 && !result.note ? { note: 'No receipts on this branch yet (none since `since`, if given).' } : {}),
+      ...(receipts.length === 0 && !result.note
+        ? { note: result.latestId === null ? 'No receipts on this branch yet.' : filtered ? 'No receipts match: none after `afterId` or since `since`.' : 'No receipts.' }
+        : {}),
     },
   };
 }

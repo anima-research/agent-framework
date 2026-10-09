@@ -694,7 +694,6 @@ describe('receipt evidence', () => {
       provenance: { messages: [{ kind: 'raw', bodies: [{ messageId: 'h8', sequence: 8, complete: false, missing: ['shards'] }] }] } as unknown as CompileProvenance,
       requestIndexOf: [0],
       getMessage: (id) => (id === 'h8' ? head as never : null),
-      groupMembers: () => [head] as never,
     });
     assert.equal(ev.bodies[0]!.ver.basis, 'stored-copy');
     assert.equal(ev.bodies[0]!.complete, false);
@@ -711,7 +710,6 @@ describe('receipt evidence', () => {
       provenance: { messages: [{ kind: 'raw', bodies: [{ messageId: 's9', sequence: 9, complete: true }] }] } as unknown as CompileProvenance,
       requestIndexOf: [0],
       getMessage: (id) => ([head, tail].find((m) => m.id === id) as never) ?? null,
-      groupMembers: () => [head, tail] as never,
     });
     assert.equal(compiled.bodies[0]!.ver.key, injected.ver.key);
   });
@@ -730,14 +728,12 @@ describe('receipt evidence', () => {
       agent: 'r', storeId: 'store-1', provenance,
       requestIndexOf: [-1, 0],
       getMessage: (id) => (stored.get(id) as never) ?? null,
-      groupMembers: (head) => [head],
     });
     assert.deepEqual(ev.bodies.map((b) => [b.index, b.complete, b.missing]), [[0, false, ['preparation']]]);
     const whollyDropped = requestEvidence({
       agent: 'r', storeId: 'store-1', provenance,
       requestIndexOf: [-1, -1],
       getMessage: (id) => (stored.get(id) as never) ?? null,
-      groupMembers: (head) => [head],
     });
     assert.equal(whollyDropped.bodies.length, 0, 'a copy dropped entirely is no exposure');
   });
@@ -760,7 +756,6 @@ describe('receipt evidence', () => {
       agent: 'r', storeId: 'store-1', provenance,
       requestIndexOf: [0, 1, 2, -1],
       getMessage: (id) => (stored.get(id) as never) ?? null,
-      groupMembers: (head) => [head],
     });
     assert.deepEqual(ev.bodies.map((b) => [b.index, b.storeMessageId, b.complete]), [[0, 's1', true]]);
     assert.ok(Object.isFrozen(ev) && Object.isFrozen(ev.bodies));
@@ -914,6 +909,41 @@ describe('history--folds folding sentence', () => {
     assert.match(foldingSentence('windowed-passthrough', ['raw', 'omitted']), /never summarizes/);
     assert.match(foldingSentence('custom', null), /does not report its rendered layout/);
     assert.match(foldingSentence('autobiographical', ['raw', 'summary', 'omitted']), /folds history into summaries/);
+  });
+});
+
+describe('history--folds reads on with afterId', () => {
+  it('passes afterId through, says when there is more and where to continue, and tells an empty page from an empty record', async () => {
+    const { handleFolds } = await import('../src/modules/history/folds.js');
+    const branch = { id: 'b', name: 'main', created: 1 };
+    const receipt = (id: string) => ({
+      v: 1, id, kind: 'change', acceptedAt: '2026-10-09T00:00:00.000Z', strategy: 's', cause: 'unknown',
+      renderedTokens: { before: 1, after: 1 }, presentation: 'unknown', estimate: { calibration: 1 },
+      usage: { input: 'unknown', cacheRead: 'unknown', cacheWrite: 'unknown', scope: 'round' },
+      source: { runtime: 'r', storeId: 'st', agent: 'a', namespace: 'n', dataDirectory: 'd', branch },
+      compileId: `c${id}`, changes: [],
+    });
+    let asked: unknown;
+    const cm = (receipts: unknown[], latestId: string | null, more: boolean) => ({
+      describeRenderedForms: () => ({ strategy: 's', forms: ['raw', 'summary', 'omitted'] }),
+      listFoldReceipts: (query: unknown) => { asked = query; return { branch, receipts, latestId, more }; },
+    }) as never;
+
+    const page = handleFolds(cm([receipt('7'), receipt('9')], '12', true), { afterId: '5', limit: 2 });
+    assert.deepEqual(asked, { afterId: '5', limit: 2 });
+    const data = page.data as { more: boolean; next?: string; receipts: Array<{ id: string }> };
+    assert.equal(data.more, true);
+    assert.deepEqual(data.receipts.map((r) => r.id), ['7', '9']);
+    assert.match(data.next!, /afterId 9/);
+
+    const newest = handleFolds(cm([receipt('12'), receipt('11')], '12', true), { limit: 2 }).data as { next?: string };
+    assert.match(newest.next!, /afterId "0"/, 'a newest-first page with more points to the start');
+
+    const caughtUp = handleFolds(cm([], '12', false), { afterId: '12' }).data as { note: string; more: boolean };
+    assert.equal(caughtUp.more, false);
+    assert.match(caughtUp.note, /No receipts match/);
+    const empty = handleFolds(cm([], null, false), {}).data as { note: string };
+    assert.match(empty.note, /No receipts on this branch yet/);
   });
 });
 

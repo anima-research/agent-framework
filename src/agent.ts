@@ -959,33 +959,21 @@ export class Agent {
 
   /**
    * Evidence of the channel bodies a compiled request carries, resolved from
-   * the compile's own view (`rawSources`): that covers bodies merged in from
+   * the compile's own view (`rawBodies`): that covers bodies merged in from
    * auxiliary slots, which `getMessage` cannot see, and binds the evidence to
-   * what this compile held rather than to a later edit.
+   * what this compile held rather than to a later edit. A body is one
+   * ingestion: two copies of the same text are two bodies, though one group
+   * id (a content hash) names both, and CM judges each on its own.
    */
   private receiptEvidence(compiled: CompileResult, requestIndexOf: number[]): RequestEvidence {
     const cm = this.contextManager as ContextManager & { getStoreId?: () => string };
-    const sources = compiled.rawSources;
-    let groups: Map<string, StoredMessage[]> | null = null;
+    const bodies = compiled.rawBodies;
     return requestEvidence({
       agent: this.name,
       storeId: cm.getStoreId?.() ?? 'unknown',
       provenance: compiled.provenance ?? null,
       requestIndexOf,
-      getMessage: (id) => sources?.get(id) ?? null,
-      groupMembers: (head) => {
-        if (!groups) {
-          groups = new Map();
-          for (const m of sources?.values() ?? []) {
-            if (!m.bodyGroupId) continue;
-            const list = groups.get(m.bodyGroupId) ?? [];
-            list.push(m);
-            groups.set(m.bodyGroupId, list);
-          }
-          for (const list of groups.values()) list.sort((a, b) => (a.shardIndex ?? 0) - (b.shardIndex ?? 0));
-        }
-        return groups.get(head.bodyGroupId!) ?? [head];
-      },
+      getMessage: (id) => bodies?.get(id)?.[0] ?? null,
     });
   }
 

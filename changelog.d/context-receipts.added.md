@@ -41,7 +41,8 @@
     unreadable interval recorded as a gap.
   - Request preparation captures immutable evidence of the bodies each request
     carries (`Agent.prepareActivationRequest`; `StartStreamResult.evidence`).
-- `history--folds {since?, limit?, branch?}`: the calling agent's fold record,
+- `history--folds {afterId?, since?, limit?, branch?}`: the calling agent's
+  fold record (`afterId` a receipt id, `since` an ISO 8601 time),
   from its own context manager's journal (shelf-381), resolved through the new
   `ModuleContext.getAgentContextManager(agentName)`; a conversation fork or a
   second resident sees its own record, not the bound resident's. Receipts come
