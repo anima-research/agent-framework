@@ -308,16 +308,51 @@ export function renderSourceHeader(
  * A header field, rendered so it can't become structure: every value in a
  * header (ids and labels alike) comes from an adapter, and a label holding
  * `]`, a newline and `[source: …` must not read as a second attribution. A
- * value with any character the grammar uses (brackets, the `·` and ` / `
- * separators, quotes, backslashes) or any control or line-separator
- * character is rendered as a quoted, escaped string literal; every other
- * value as is. A header is always one line.
+ * value is rendered as a quoted, escaped string literal when it holds any
+ * character the grammar uses (brackets, the `·` separator, quotes,
+ * backslashes, or a `/` with whitespace on both sides, which reads as the
+ * ` / ` separator whatever the space), any control or line-separator
+ * character, or any character a reader can't see or tell from a plain space
+ * (an invisible character, `INVISIBLE`: zero-width characters, bidi
+ * overrides and isolates, fillers, joiners and variation selectors; or a
+ * space other than U+0020) (agent-framework#269). Every other
+ * value is rendered as is, so ordinary names in any script read as they are.
+ * A header is always one line. discord-mcpl's `source-header.ts` renders
+ * the same header and keeps this rule byte for byte.
  */
 function headerValue(value: string): string {
-  // eslint-disable-next-line no-control-regex
-  const structural = /[[\]\u00b7"\\\u0000-\u001f\u007f-\u009f\u2028\u2029]| \/ /;
-  return structural.test(value) ? quoted(value) : value;
+  return STRUCTURAL.test(value) || UNSEEN_OUTSIDE_EMOJI.test(value.replace(EMOJI_SEQUENCE, '')) ? quoted(value) : value;
 }
+
+/**
+ * Characters a reader can't see: every format character (`\p{Cf}`: zero-width
+ * characters, bidi overrides and isolates) and every default-ignorable code
+ * point, which adds fillers that are letters (U+3164, U+115F, U+1160, U+FFA0),
+ * the combining grapheme joiner and the variation selectors
+ * (agent-framework#269). A visible look-alike, such as U+2800 BRAILLE PATTERN
+ * BLANK or a Cyrillic letter, is not invisible and stays as it is.
+ *
+ * Except inside a well-formed emoji sequence (`EMOJI_SEQUENCE`): the ZWJ and
+ * variation selectors there are part of the emoji, and a name is also what a
+ * resident types back, so `❤️ cats` must read as it is, not as `"❤\ufe0f cats"`.
+ * A selector or joiner outside a sequence (bare, or after a letter) is still
+ * invisible. Tag sequences (subdivision flags) and keycaps aren't covered, so
+ * a name holding one is quoted.
+ */
+const INVISIBLE = '\\p{Cf}\\p{Default_Ignorable_Code_Point}';
+// eslint-disable-next-line no-control-regex
+const STRUCTURAL = /[[\]\u00b7"\\\u0000-\u001f\u007f-\u009f\u2028\u2029]|\s\/\s/u;
+/** An invisible character or a non-ASCII space; tested with emoji sequences taken out. */
+const UNSEEN_OUTSIDE_EMOJI = new RegExp(`[${INVISIBLE}]|(?! )\\p{Zs}`, 'u');
+const UNSEEN = new RegExp(`[\\u007f-\\u009f\\u2028\\u2029${INVISIBLE}]|(?! )\\p{Zs}`, 'gu');
+const INVISIBLE_RUN = new RegExp(`[${INVISIBLE}]`, 'gu');
+/** A well-formed emoji sequence: an emoji with an optional skin tone or presentation selector, joined to more by ZWJ. */
+const EMOJI_SEQUENCE = /\p{Extended_Pictographic}(?:\p{Emoji_Modifier}|[\u{FE0E}\u{FE0F}])?(?:\u{200D}\p{Extended_Pictographic}(?:\p{Emoji_Modifier}|[\u{FE0E}\u{FE0F}])?)*/gu;
+/** In a quoted value: an emoji sequence, kept as it is, or a character to escape. */
+const QUOTED_ESCAPES = new RegExp(`(${EMOJI_SEQUENCE.source})|${UNSEEN.source}`, 'gu');
+/** `[source:` or `[source]`, in any case, with whitespace or invisible characters anywhere inside. */
+const HEADER_OPENING = new RegExp(
+  `\\[(?=[\\s${INVISIBLE}]*${[...'source'].join(`[${INVISIBLE}]*`)}[\\s${INVISIBLE}]*[:\\]])`, 'giu');
 
 /**
  * The label, rendered so it can't read as another field. It stands right
@@ -328,17 +363,23 @@ function headerValue(value: string): string {
  * readers are models rather than a parser, and quoting loses nothing.
  */
 function labelValue(label: string): string {
-  return /^\s*(?:thread|reply\s+to|unscoped)(?:\s|$)/i.test(label) ? quoted(label) : headerValue(label);
+  // Invisible characters don't stop a header word reading as one, so the
+  // words are looked for with them taken out (agent-framework#269).
+  return /^\s*(?:thread|reply\s+to|unscoped)(?:\s|$)/i.test(label.replace(INVISIBLE_RUN, '')) ? quoted(label) : headerValue(label);
 }
 
 /** A value as a quoted, escaped string literal that always stays on one line. */
 function quoted(value: string): string {
   // JSON.stringify escapes the C0 controls, quotes and backslashes, but
-  // leaves DEL, the C1 controls (U+0085 NEL breaks a line) and U+2028 /
-  // U+2029 (line and paragraph separators) literal: escape those visibly too.
+  // leaves DEL, the C1 controls (U+0085 NEL breaks a line), U+2028 / U+2029
+  // (line and paragraph separators), invisible characters and non-ASCII
+  // spaces literal: escape those visibly too, per UTF-16 unit, so a quoted
+  // bidi override can't reorder what follows it and the reader sees what came
+  // (agent-framework#269). An emoji sequence stays as it is, its joiners and
+  // selectors included. JSON.parse still gives the value back.
   return JSON.stringify(value).replace(
-    /[\u007f-\u009f\u2028\u2029]/g,
-    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`,
+    QUOTED_ESCAPES,
+    (c, emoji?: string) => emoji ?? [...Array(c.length).keys()].map((i) => `\\u${c.charCodeAt(i).toString(16).padStart(4, '0')}`).join(''),
   );
 }
 
@@ -373,8 +414,11 @@ export const SOURCE_HEADER_RULE =
  * the backslash goes into the block that holds the bracket, so an opening
  * split across blocks is marked too. Every opening gets one, so a body that
  * already holds `\[source` keeps a backslash before its bracket either way.
- * Look-alike or invisible characters can still imitate the opening: no
- * marking of exact text closes that.
+ * Invisible characters (`INVISIBLE`: zero-width characters, bidi controls,
+ * fillers, joiners) don't hide an opening wherever they stand in it, as the
+ * header's own words are read through them (agent-framework#269). Visible
+ * look-alike characters can still imitate the opening: no marking of exact
+ * text closes that.
  */
 export function markHeaderOpenings<T extends object>(blocks: readonly T[]): T[] {
   const texts: Array<{ index: number; start: number; text: string }> = [];
@@ -386,7 +430,8 @@ export function markHeaderOpenings<T extends object>(blocks: readonly T[]): T[] 
     joined += text;
   });
   const marks = new Map<number, number[]>();
-  const opening = /\[(?=\s*source\s*[:\]])/gi;
+  const opening = HEADER_OPENING;
+  opening.lastIndex = 0;
   for (let match = opening.exec(joined); match; match = opening.exec(joined)) {
     const at = match.index;
     const holder = texts.find((t) => at >= t.start && at < t.start + t.text.length)!;

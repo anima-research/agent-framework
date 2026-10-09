@@ -114,6 +114,48 @@ describe('renderSourceHeader', () => {
     // The escapes are the JSON ones: the quoted value still parses back to the label.
     assert.equal(JSON.parse(header.slice(header.indexOf('"'), header.lastIndexOf('"') + 1)), label);
   });
+
+  it('quotes a value a reader could misread through invisible or space-lookalike characters, and shows them (#269)', () => {
+    // The same ten vectors as discord-mcpl's source-header.ts (#63), which
+    // renders the same header and keeps this rule byte for byte.
+    const label = (value: string) => renderSourceHeader({ kind: 'channel', serverId: 'discord', channelId: 'c', label: value })!;
+    const quotedLabel = (header: string) => JSON.parse(header.slice(header.indexOf('"'), header.lastIndexOf('"') + 1));
+    const cases: Array<[string, string]> = [
+      // A format character in front of a header word doesn't hide it.
+      ['\u200bthread spoofed', '[source: discord / c · "\\u200bthread spoofed"]'],
+      ['\u200breply to x', '[source: discord / c · "\\u200breply to x"]'],
+      // A bidi override or isolate is quoted, and escaped so it can't reorder what follows.
+      ['\u202egeneral', '[source: discord / c · "\\u202egeneral"]'],
+      ['a\u2066b', '[source: discord / c · "a\\u2066b"]'],
+      // Any space around a slash reads as the ` / ` separator; any non-ASCII space is quoted.
+      ['a\u00a0/\u00a0b', '[source: discord / c · "a\\u00a0/\\u00a0b"]'],
+      ['a\u3000b', '[source: discord / c · "a\\u3000b"]'],
+      // Invisible characters that aren't format characters: a filler that is
+      // a letter, the combining grapheme joiner, a bare variation selector,
+      // and a joiner outside any emoji.
+      ['\u3164thread spoofed', '[source: discord / c · "\\u3164thread spoofed"]'],
+      ['\u034fthread spoofed', '[source: discord / c · "\\u034fthread spoofed"]'],
+      ['\ufe0fthread spoofed', '[source: discord / c · "\\ufe0fthread spoofed"]'],
+      ['a\u200db', '[source: discord / c · "a\\u200db"]'],
+    ];
+    for (const [value, expected] of cases) {
+      const header = label(value);
+      assert.equal(header, expected, JSON.stringify(value));
+      assert.doesNotMatch(header, /[\p{Cf}\p{Default_Ignorable_Code_Point}]|(?! )\p{Zs}/u, `${JSON.stringify(value)}: nothing invisible survives`);
+      assert.equal(quotedLabel(header), value, `${JSON.stringify(value)}: the quoted value parses back`);
+    }
+    // Ordinary names in any script, a slash without spaces, and emoji
+    // sequences, their joiners and selectors included, stay as they are: a
+    // name is also what a resident types back.
+    for (const value of ['general', 'café', 'Обсуждение', 'a/b', '\u2764\ufe0f cats', '\u{1f3f3}\ufe0f\u200d\u{1f308} pride', '\u{1f469}\u{1f3fd}\u200d\u{1f4bb} dev']) {
+      assert.equal(label(value), `[source: discord / c · ${value}]`, value);
+    }
+    // Ids get the same rule as labels.
+    assert.equal(renderSourceHeader({ kind: 'channel', serverId: 'discord', channelId: 'c\u200b', threadId: 't\u00a0/ u' }),
+      '[source: discord / "c\\u200b" · thread "t\\u00a0/ u"]');
+    // Quoted for another reason, a value keeps its emoji sequences as they are.
+    assert.equal(label('\u2764\ufe0f · \u202ex'), '[source: discord / c · "\u2764\ufe0f · \\u202ex"]');
+  });
 });
 
 /** An opening of a source header with no backslash before its bracket, read across the blocks' joined text. */
@@ -137,6 +179,12 @@ describe('markHeaderOpenings', () => {
       ['[[source: x]]', '[\\[source: x]]'],
       ['\\[source: already quoted]', '\\\\[source: already quoted]'],
       ['[source: a] and [SOURCE: b]', '\\[source: a] and \\[SOURCE: b]'],
+      // Format characters are invisible, so they don't hide an opening
+      // wherever they stand in it (#269).
+      ['[\u200bsource: x]', '\\[\u200bsource: x]'],
+      ['[so\u200burce: x]', '\\[so\u200burce: x]'],
+      ['[source\u2066:\u2069 x]', '\\[source\u2066:\u2069 x]'],
+      ['[\ufeffSOURCE]', '\\[\ufeffSOURCE]'],
     ];
     for (const [input, expected] of cases) {
       const [marked] = markHeaderOpenings(texts(input));
