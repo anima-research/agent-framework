@@ -7749,7 +7749,7 @@ export class AgentFramework {
         throw new CoalesceError('eventId', 'eventId is required with coalesce');
       }
       if (typeof message.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
-      validateCoalescedContent(message.content, undefined, { allowEmpty: message.coalesce.retract === true });
+      validateCoalescedContent(message.content, { allowEmpty: message.coalesce.retract === true });
       const c = message.coalesce;
       const result = await this.pushCoalescer.accept({
         serverId,
@@ -7776,7 +7776,7 @@ export class AgentFramework {
       validateCoalesceMember(params.coalesce, 'push');
       if (typeof params.eventId !== 'string' || !params.eventId) throw new CoalesceError('eventId', 'eventId is required');
       if (typeof params.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
-      validateCoalescedContent(params.payload?.content, undefined, {
+      validateCoalescedContent(params.payload?.content, {
         allowEmpty: params.coalesce.retract === true || isSilentHeartbeatMarker({
           serverId, featureSet: params.featureSet, origin: params.origin, content: params.payload?.content,
         }),

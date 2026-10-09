@@ -217,22 +217,31 @@ export type TraceEvent =
       messageId: string;
       source: string;
     })
-  /** A push/event refused at the MCPL boundary (today: visibly-empty content). */
+  /** A push/event refused at the MCPL boundary: visibly-empty content, or a
+   *  coalesced occurrence the host refused (`coalesce-invalid`, with the
+   *  failing `field` and why in `detail`; `coalesce-failed` when the
+   *  coalescer itself failed). */
   | (TraceEventBase & {
       type: 'mcpl:push-event-rejected';
       serverId: string;
       eventId: string;
       featureSet: string;
       reason: string;
+      field?: string;
+      detail?: string;
     })
   /** A channels/incoming message refused at the MCPL boundary: unregistered
-   *  channel (§14.5), or visibly-empty content (then `messageId` is set). */
+   *  channel (§14.5), visibly-empty content, or a coalesced item the host
+   *  refused (`coalesce-invalid` / `coalesce-failed`, with `field` and
+   *  `detail` as for a push). `messageId` is set once the message has one. */
   | (TraceEventBase & {
       type: 'mcpl:channel-incoming-rejected';
       serverId: string;
       channelId: string;
       messageId?: string;
       reason: string;
+      field?: string;
+      detail?: string;
     })
   /** MCPL content with nothing model-visible reached the store/wake site
    *  (module-emitted or coalescer-delivered) and was dropped: no row, no wake. */
