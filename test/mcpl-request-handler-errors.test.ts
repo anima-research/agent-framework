@@ -399,3 +399,62 @@ for (const release of ['live', 'ready', 'readyControlPlane'] as const) {
     assert.equal(errors.length, 1);
   });
 }
+
+for (const value of [null, 42, 'hi', true]) {
+  test('non-object inbound ' + JSON.stringify(value) + ' is ignored like a non-JSON line, with no failure report', (t) => {
+    const { connection, transport } = wireHarness();
+    const errors: unknown[][] = [];
+    t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args); });
+    const reported: unknown[] = [];
+    connection.on('error', (error: unknown) => { reported.push(error); });
+    transport.emit('line', JSON.stringify(value));
+    assert.deepEqual(errors, []);
+    assert.deepEqual(reported, []);
+  });
+}
+
+test('a throwing orphaned-response listener is contained, and later messages still arrive', (t) => {
+  const { connection, transport, traces } = wireHarness();
+  t.mock.method(console, 'error', () => {});
+  connection.prependListener('orphaned-response', () => { throw new Error('orphan listener failed'); });
+  let received = false;
+  connection.removeAllListeners('tools-list-changed');
+  connection.on('tools-list-changed', () => { received = true; });
+  // A response to no pending request, carrying state, is surfaced as orphaned.
+  assert.doesNotThrow(() => transport.emit('line', JSON.stringify({ jsonrpc: '2.0', id: 999, result: { state: {} } })));
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }));
+  assert.equal(received, true);
+  assert.equal(traces.filter((e) => e.type === 'mcpl:server-error').length, 1);
+});
+
+test('a method that is not a string is not dispatched, even if it stringifies to a known method', () => {
+  const { connection, transport } = wireHarness();
+  let received = false;
+  connection.removeAllListeners('tools-list-changed');
+  connection.on('tools-list-changed', () => { received = true; });
+  transport.emit('line', JSON.stringify({ jsonrpc: '2.0', method: ['notifications/tools/list_changed'] }));
+  assert.equal(received, false);
+});
+
+test('tools-observe: a synchronous failure is answered with one internal error', async () => {
+  const { connection, traces } = harness();
+  Object.defineProperty(connection, 'toolObserveFilter', { set() { throw new Error('filter store failed'); } });
+  const reply = responder();
+  assert.doesNotThrow(() => connection.emit('tools-observe', { rules: [] }, reply));
+  await settle();
+  assert.deepEqual(reply.errors, [{ code: -32603, message: 'filter store failed', data: undefined }]);
+  assert.equal(failureTraces(traces).length, 1);
+});
+
+test('model-info: a throwing error write is traced without escaping or a second write', async () => {
+  const { connection, traces } = harness();
+  const reply = responder();
+  let writes = 0;
+  reply.respondError = () => { writes++; throw new Error('response transport failed'); };
+  assert.doesNotThrow(() => connection.emit('model-info', {}, reply));
+  await settle();
+  assert.equal(writes, 1);
+  const failures = failureTraces(traces);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].responseAttempted, true);
+});
