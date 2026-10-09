@@ -484,6 +484,18 @@ function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
 }
+
+function isConsoleAttendedEvent(event: ProcessEvent): boolean {
+  const channelId = (event as unknown as { channelId?: unknown }).channelId;
+  return !event.type.startsWith('mcpl:')
+    && (event.type === 'external-message' || event.type === 'api:message'
+      || event.type === 'api:inference-request')
+    && channelId === undefined;
+}
+
+function isConsoleAttendedTurn(trigger: InferenceRequest | undefined): boolean {
+  return trigger?.consoleAttendedOrigin === true;
+}
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';
@@ -6908,6 +6920,7 @@ export class AgentFramework {
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
               ephemeralSystemPrompt: this.activeTurnTriggers.get(agent.name)?.ephemeralSystemPrompt,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
+              consoleAttendedOrigin: this.activeTurnTriggers.get(agent.name)?.consoleAttendedOrigin,
             });
           } else if (currentState.stream) {
             // Streaming path: convert results and resume the stream.
@@ -7064,6 +7077,7 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
+            consoleAttendedOrigin: isConsoleAttendedEvent(event),
           });
         }
       }
@@ -8500,6 +8514,12 @@ export class AgentFramework {
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
+        // Fresh batches are console-attended if ANY cause is shown on an
+        // operator surface. Continuations keep the original logical turn's
+        // provenance rather than adopting a newly-batched request.
+        consoleAttendedOrigin: budgetRestart
+          ? trigger?.consoleAttendedOrigin
+          : requests.some((request) => request.consoleAttendedOrigin === true) || undefined,
         channelId: channelReq?.channelId,
         addressed: addressedReq !== undefined,
         // A context-budget restart continues the same logical turn: it keeps
@@ -8563,7 +8583,7 @@ export class AgentFramework {
    * delivered nothing. Failures are already marked separately
    * ([discord-send-failed]); this is the success half.
    */
-  private appendProseDeliveryReceipt(agent: Agent): void {
+  private appendProseDeliveryReceipt(agent: Agent, consoleAttended = false): void {
     const list = this.turnProseDeliveries.get(agent.name);
     const suppressed = this.turnProseSuppressed.get(agent.name) ?? 0;
     if ((!list || list.length === 0) && suppressed === 0) return;
@@ -8590,7 +8610,9 @@ export class AgentFramework {
     const text =
       shown.length > 0
         ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}`
-        : `[delivered] nothing — ${suppressedNote}`;
+        : consoleAttended && agent.proseRouting === 'disabled'
+          ? `[delivered] shown on the attending surface; no automatic prose publish attempted — ${suppressedNote}`
+          : `[delivered] nothing — ${suppressedNote}`;
     try {
       const mid = agent.getContextManager().addMessage(
         'user',
@@ -10463,7 +10485,7 @@ export class AgentFramework {
             // segments were awaited in-loop. Locus mode only; explicit-mode
             // envelopes acknowledge themselves through the prose gateway.
             if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
-              this.appendProseDeliveryReceipt(agent);
+              this.appendProseDeliveryReceipt(agent, isConsoleAttendedTurn(trigger));
             }
 
             // Explicit-prose `!` continuation: a prose segment this turn asked
@@ -10633,7 +10655,7 @@ export class AgentFramework {
                 // receipt for the whole turn.
                 if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
                   await turnSpeechChain;
-                  this.appendProseDeliveryReceipt(agent);
+                  this.appendProseDeliveryReceipt(agent, isConsoleAttendedTurn(trigger));
                 }
                 return;
               }

@@ -1,0 +1,1 @@
+- Disabled prose routing now reports that suppressed prose was shown on an attending non-channel surface and that no channel publish was attempted, instead of claiming nothing was delivered.

@@ -319,6 +319,8 @@ export interface InferenceRequest {
   reason: string;
   source: string;
   timestamp: number;
+  /** True when an operator-facing non-channel surface receives this turn's stream. */
+  consoleAttendedOrigin?: boolean;
   /**
    * The MCPL channel whose message triggered this inference, if any (composite
    * id, e.g. `discord:guild:channel` / `discord:dm:id`). The framework routes
