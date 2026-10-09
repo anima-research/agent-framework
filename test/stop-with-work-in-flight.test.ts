@@ -168,6 +168,7 @@ describe('stop() with work still in flight', () => {
     assert.deepEqual(rejections, []);
     assert.equal(failed.length, 1, 'the host got no result: a dispatch failure');
     assert.equal(dropped().length, 1, logged.join('\n'));
+    assert.match(dropped()[0]!, /tool call c1 \(slow--work, slow\)/, dropped()[0]);
     assert.match(dropped()[0]!, /the tool failed: .*the dispatch was lost/, dropped()[0]);
   });
 
