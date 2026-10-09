@@ -8514,6 +8514,12 @@ export class AgentFramework {
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
         ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
+        // Fresh batches are console-attended if ANY cause is shown on an
+        // operator surface. Continuations keep the original logical turn's
+        // provenance rather than adopting a newly-batched request.
+        consoleAttendedOrigin: budgetRestart
+          ? trigger?.consoleAttendedOrigin
+          : requests.some((request) => request.consoleAttendedOrigin === true) || undefined,
         channelId: channelReq?.channelId,
         addressed: addressedReq !== undefined,
         // A context-budget restart continues the same logical turn: it keeps
