@@ -39,6 +39,7 @@ import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js
 import { expandCoreTags } from './tags.js';
 import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { isVisiblyEmptyContent } from './visible-content.js';
+import { logValue } from './log-value.js';
 import { CapabilityGrant } from './capability-grant.js';
 
 // ============================================================================
@@ -867,8 +868,8 @@ export class ChannelRegistry {
     const channelId = typeof message?.channelId === 'string' ? message.channelId : '';
     const messageId = typeof message?.messageId === 'string' && message.messageId ? message.messageId : undefined;
     console.error(
-      `[channel-incoming-rejected] server=${serverId} channel=${channelId} messageId=${messageId ?? ''} ` +
-      `reason=${reason}${error.field ? ` field=${error.field}` : ''}: ${error.message}`,
+      `[channel-incoming-rejected] server=${serverId} channel=${logValue(channelId)} messageId=${logValue(messageId ?? '')} ` +
+      `reason=${reason}${error.field ? ` field=${error.field}` : ''}: ${logValue(error.message)}`,
     );
     this.emitTraceFn({
       type: 'mcpl:channel-incoming-rejected',
@@ -961,7 +962,7 @@ export class ChannelRegistry {
       // shows the model nothing would wake it with no visible cause.
       const emptyAllowed = coalesced && (message.coalesce as { retract?: unknown } | null)?.retract === true;
       const rejectEmpty = () => {
-        console.error(`[channel-incoming-rejected] server=${serverId} channel=${message.channelId} messageId=${message.messageId} reason=empty-content`);
+        console.error(`[channel-incoming-rejected] server=${serverId} channel=${logValue(message.channelId)} messageId=${logValue(message.messageId)} reason=empty-content`);
         this.emitTraceFn({
           type: 'mcpl:channel-incoming-rejected',
           serverId,

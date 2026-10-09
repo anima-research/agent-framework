@@ -23,6 +23,19 @@ const BIG_IMAGE = { type: 'image', data: 'A'.repeat(1_600_000), mimeType: 'image
 
 type Rejection = { type: string; reason?: string; field?: string; detail?: string; messageId?: string; eventId?: string };
 
+type Fixture = Awaited<ReturnType<typeof fixture>>;
+
+/** The agent's context keeps `count` images, each BIG_IMAGE with its data whole: stored, not only accepted. */
+function assertKeepsBigImage(f: Fixture, count: number): void {
+  const images = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+    .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+    .filter((b) => (b as { type?: string }).type === 'image') as Array<{ source?: unknown }>;
+  assert.equal(images.length, count, `${count} image(s) stored`);
+  for (const image of images) {
+    assert.deepEqual(image.source, { type: 'base64', data: BIG_IMAGE.data, mediaType: BIG_IMAGE.mimeType }, 'the image data arrives whole');
+  }
+}
+
 function captureConsoleError(t: { after: (fn: () => void) => void }): string[] {
   const lines: string[] = [];
   const original = console.error;
@@ -45,10 +58,7 @@ test('#266 repro: a coalesced channel message with a >1 MiB inline image is admi
   const context = f.context();
   assert(context.includes('look_at_this'), 'the coalesced message is stored');
   assert(context.includes('plain_with_image'), 'the uncoalesced one too');
-  const images = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
-    .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
-    .filter((b) => (b as { type?: string }).type === 'image');
-  assert.equal(images.length, 2, 'both messages keep their image');
+  assertKeepsBigImage(f, 2);
 });
 
 test('#266: a coalesced push/event with a >1 MiB inline image is admitted and stored', async (t) => {
@@ -60,6 +70,7 @@ test('#266: a coalesced push/event with a >1 MiB inline image is admitted and st
   assert.equal(r.result.coalesce.outcome, 'first');
   await f.framework.runUntilIdle();
   assert(f.context().includes('pushed_with_image'));
+  assertKeepsBigImage(f, 1);
 });
 
 test('#266: a render result carrying a >1 MiB image is delivered, not replaced by the fallback (RFC-006 §5.2)', async (t) => {
@@ -71,6 +82,7 @@ test('#266: a render result carrying a >1 MiB image is delivered, not replaced b
   const context = f.context();
   assert(context.includes('rendered_with_image'), 'the rendered content is delivered');
   assert(!context.includes('render_fallback'), 'not the fallback');
+  assertKeepsBigImage(f, 1);
 });
 
 test('#266: a malformed coalesced channel item is refused on the wire and named on the host', async (t) => {

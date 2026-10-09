@@ -20,6 +20,7 @@ import { McplFeatureSetError } from './feature-set-manager.js';
 import { expandCoreTags } from './tags.js';
 import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyContent } from './visible-content.js';
+import { logValue } from './log-value.js';
 
 // ============================================================================
 // McplPushEvent (the ProcessEvent shape pushed to the queue)
@@ -221,7 +222,7 @@ export class PushHandler {
         : 'Feature set validation failed';
       // Loud rejection — a rejected push event is an agent that silently
       // never hears the message. (2026-07-09 diagnosability pass.)
-      console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=${reason}`);
+      console.error(`[push-event-rejected] server=${serverId} eventId=${logValue(params.eventId)} reason=${logValue(reason)}`);
       if (err instanceof McplFeatureSetError && responder?.respondError) {
         responder.respondError(err.code, reason, { featureSet: err.featureSet });
       } else {
@@ -266,7 +267,7 @@ export class PushHandler {
     // coalescer's receipts instead (RFC-006 §3.1: a retry within the window
     // gets its original result, which this set could not return).
     if (!coalesced && this.dedup.checkAndAdd(params.eventId)) {
-      console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=duplicate`);
+      console.error(`[push-event-rejected] server=${serverId} eventId=${logValue(params.eventId)} reason=duplicate`);
       responder?.respond({ accepted: false, reason: 'duplicate' });
       return;
     }
@@ -348,8 +349,8 @@ export class PushHandler {
     // occurrence; anything else (-32603 for a plain Error) is the host's.
     const reason = error.code === -32602 ? 'coalesce-invalid' : 'coalesce-failed';
     console.error(
-      `[push-event-rejected] server=${serverId} featureSet=${params.featureSet} eventId=${params.eventId} ` +
-      `reason=${reason}${error.field ? ` field=${error.field}` : ''}: ${error.message}`,
+      `[push-event-rejected] server=${serverId} featureSet=${logValue(params.featureSet)} eventId=${logValue(params.eventId)} ` +
+      `reason=${reason}${error.field ? ` field=${error.field}` : ''}: ${logValue(error.message)}`,
     );
     this.emitTraceFn({
       type: 'mcpl:push-event-rejected',
@@ -364,7 +365,7 @@ export class PushHandler {
 
   /** Loud, like every other push rejection: the producer's wake went nowhere. */
   private traceEmptyRejection(serverId: string, params: PushEventParams): void {
-    console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=empty-content`);
+    console.error(`[push-event-rejected] server=${serverId} eventId=${logValue(params.eventId)} reason=empty-content`);
     this.emitTraceFn({
       type: 'mcpl:push-event-rejected',
       serverId,
