@@ -240,10 +240,11 @@ export class PushHandler {
     if (coalesced) {
       // RFC-006 §13: malformed content is a -32602, checked before conversion.
       try {
-        validateCoalescedContent(params.payload?.content, undefined, { allowEmpty: emptyAllowed });
+        validateCoalescedContent(params.payload?.content, { allowEmpty: emptyAllowed });
       } catch (error) {
         const err = error as Error & { code?: number; field?: string };
         if (err instanceof EmptyContentError) this.traceEmptyRejection(serverId, params);
+        else this.traceCoalesceRejection(serverId, params, err);
         if (responder?.respondError) responder.respondError(err.code ?? -32602, err.message, { field: err.field });
         else responder?.respond({ accepted: false, reason: err instanceof EmptyContentError ? err.reason : err.message });
         return;
@@ -314,7 +315,7 @@ export class PushHandler {
         responder?.respond(result);
       } catch (error) {
         const err = error as Error & { code?: number; field?: string };
-        console.error(`[push-event-rejected] server=${serverId} eventId=${params.eventId} reason=${err.message}`);
+        this.traceCoalesceRejection(serverId, params, err);
         if (responder?.respondError) responder.respondError(typeof err.code === 'number' ? err.code : -32603, err.message, { field: err.field });
         else responder?.respond({ accepted: false, reason: err.message });
       }
@@ -332,6 +333,31 @@ export class PushHandler {
 
     // 8. Respond
     responder?.respond({ accepted: true, inferenceId });
+  }
+
+  /**
+   * A coalesced occurrence the host refused, as loud as every other push
+   * rejection: its producer is told on the wire, and until now the host said
+   * nothing, so a dropped message left no trace where operators look
+   * (agent-framework#266). `coalesce-invalid` for a malformed occurrence
+   * (-32602, with the failing field), `coalesce-failed` when the coalescer
+   * itself failed.
+   */
+  private traceCoalesceRejection(serverId: string, params: PushEventParams, error: { code?: number; field?: string; message: string }): void {
+    const reason = typeof error.code !== 'number' || error.code === -32602 ? 'coalesce-invalid' : 'coalesce-failed';
+    console.error(
+      `[push-event-rejected] server=${serverId} featureSet=${params.featureSet} eventId=${params.eventId} ` +
+      `reason=${reason}${error.field ? ` field=${error.field}` : ''}: ${error.message}`,
+    );
+    this.emitTraceFn({
+      type: 'mcpl:push-event-rejected',
+      serverId,
+      eventId: params.eventId,
+      featureSet: params.featureSet,
+      reason,
+      ...(error.field ? { field: error.field } : {}),
+      detail: error.message,
+    });
   }
 
   /** Loud, like every other push rejection: the producer's wake went nowhere. */

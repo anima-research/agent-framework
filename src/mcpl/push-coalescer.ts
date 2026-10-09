@@ -212,7 +212,6 @@ export interface CoalescerOptions {
   recoveryBackoffMs?: number;
   maxSubjects?: number;
   maxNotices?: number;
-  maxContentBytes?: number;
   maxDataBytes?: number;
 }
 
@@ -232,6 +231,14 @@ function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOc
 /**
  * Validate wire content before it is stored, rendered or converted.
  *
+ * Its shape only: an array of well-formed blocks. A coalesced occurrence is
+ * delivered into context exactly as an uncoalesced message is (the coalescer
+ * only remembers where it landed), so it meets the same rules, and the
+ * uncoalesced path sets no byte budget on content. An inline image is admitted
+ * here as it is there (agent-framework#266: a 1 MiB serialized-content budget
+ * here dropped every coalesced message carrying a screenshot). A render result
+ * gets the same checks, as RFC-006 §5.2 asks.
+ *
  * Visibly-empty content is refused unless `allowEmpty`: an admitted
  * occurrence with nothing to show would wake the model with no visible cause.
  * Empty is legitimate only where the RFC gives it a meaning — a retraction
@@ -240,7 +247,6 @@ function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOc
  */
 export function validateCoalescedContent(
   content: unknown,
-  maxBytes = 1024 * 1024,
   options: { allowEmpty?: boolean } = {},
 ): asserts content is McplContentBlock[] {
   if (!Array.isArray(content)) throw new CoalesceError('payload.content', 'content must be an array');
@@ -252,7 +258,6 @@ export function validateCoalescedContent(
       && (typeof b.uri === 'string' || (typeof b.data === 'string' && typeof b.mimeType === 'string'))) continue;
     throw new CoalesceError('payload.content', 'invalid content block');
   }
-  if (Buffer.byteLength(JSON.stringify(content)) > maxBytes) throw new CoalesceError('payload.content', 'content exceeds host byte limit');
   if (!options.allowEmpty && isVisiblyEmptyContent(content)) throw new EmptyContentError();
 }
 
@@ -701,7 +706,7 @@ export class PushCoalescer<E = unknown> {
         const result = await this.host.render(occurrence, params);
         if (rendering.cancelled) { this.host.audit({ kind: 'late-render', subject, eventId: occurrence.eventId, discarded: true }); }
         // §5.2: an empty result is legitimate ("nothing happened").
-        else validateCoalescedContent(result?.content, this.options.maxContentBytes, { allowEmpty: true });
+        else validateCoalescedContent(result?.content, { allowEmpty: true });
         if (rendering.cancelled) throw new CancelledRender();
         content = result.content;
         timestamp = typeof result.timestamp === 'string' ? result.timestamp : new Date().toISOString();

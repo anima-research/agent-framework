@@ -849,6 +849,37 @@ export class ChannelRegistry {
   }
 
   /**
+   * A coalesced message the host refused. Its sender gets `coalesce_invalid`
+   * in its per-message result, and until now the host said nothing, so a
+   * dropped message (agent-framework#266: every Discord message with a
+   * screenshot) left no trace where operators look. `coalesce-invalid` for a
+   * malformed item (-32602, with the failing field), `coalesce-failed` when
+   * the coalescer itself failed.
+   */
+  private traceCoalesceRejection(
+    serverId: string,
+    message: { channelId?: unknown; messageId?: unknown } | null | undefined,
+    error: { code?: number; field?: string; message: string },
+  ): void {
+    const reason = typeof error.code !== 'number' || error.code === -32602 ? 'coalesce-invalid' : 'coalesce-failed';
+    const channelId = typeof message?.channelId === 'string' ? message.channelId : '';
+    const messageId = typeof message?.messageId === 'string' && message.messageId ? message.messageId : undefined;
+    console.error(
+      `[channel-incoming-rejected] server=${serverId} channel=${channelId} messageId=${messageId ?? ''} ` +
+      `reason=${reason}${error.field ? ` field=${error.field}` : ''}: ${error.message}`,
+    );
+    this.emitTraceFn({
+      type: 'mcpl:channel-incoming-rejected',
+      serverId,
+      channelId,
+      ...(messageId ? { messageId } : {}),
+      reason,
+      ...(error.field ? { field: error.field } : {}),
+      detail: error.message,
+    });
+  }
+
+  /**
    * Handle `channels/incoming` from a server.
    *
    * Converts each message's content, pushes McplChannelIncomingEvent to the
@@ -864,6 +895,12 @@ export class ChannelRegistry {
     for (const message of params.messages) {
       if (!message || typeof message.channelId !== 'string' || !message.channelId
         || typeof message.messageId !== 'string' || !message.messageId) {
+        if (message?.coalesce !== undefined) {
+          this.traceCoalesceRejection(serverId, message, {
+            field: typeof message.channelId !== 'string' || !message.channelId ? 'channelId' : 'messageId',
+            message: 'a coalesced message needs a channelId and a messageId',
+          });
+        }
         results.push({
           messageId: typeof message?.messageId === 'string' ? message.messageId : '',
           accepted: false,
@@ -935,10 +972,13 @@ export class ChannelRegistry {
         // RFC-006 §13: malformed content on a coalesced item is that item's
         // failure, not the batch's — check the shape before converting.
         try {
-          validateCoalescedContent(message.content, undefined, { allowEmpty: emptyAllowed });
+          validateCoalescedContent(message.content, { allowEmpty: emptyAllowed });
         } catch (error) {
           if (error instanceof EmptyContentError) rejectEmpty();
-          else results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+          else {
+            this.traceCoalesceRejection(serverId, message, error as Error & { code?: number; field?: string });
+            results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+          }
           continue;
         }
       }
@@ -1014,7 +1054,8 @@ export class ChannelRegistry {
           if (result.accepted) markAccepted();
           results.push(result);
         } catch (error) {
-          const err = error as Error & { code?: number };
+          const err = error as Error & { code?: number; field?: string };
+          this.traceCoalesceRejection(serverId, message, err);
           results.push({
             messageId: message.messageId,
             accepted: false,
