@@ -5,3 +5,5 @@
 - Open receipts confirm only the current registration, connection, type, and address. Retargeting invalidates an older open flag; failed corrective opens leave the new target unconfirmed and fail joined delivery, while same-target backscroll failures retain known-open state. Explicit close retries an unconfirmed target instead of reporting it already closed.
 
 - Lifecycle convergence makes at most five transport attempts per operation. Continued descriptor/intent supersession fails with a diagnostic, releases the queue, and gives joined speech or reply preparation a visible failure instead of hanging. Later stable operations can retry.
+
+- A `channels/open` answered for a different channel than the one requested fails the open. The requested channel isn't marked open (its open state becomes unconfirmed), nothing in the answer is used, its history included, and the host logs `[channel-open-substituted]` and emits an `mcpl:channel-open-substituted` trace. An answer that names no channel is accepted as before.

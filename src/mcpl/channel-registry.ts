@@ -50,7 +50,21 @@ const MAX_CHANNEL_LIFECYCLE_ATTEMPTS = 5;
 
 /** A successful RPC can still fail to establish the latest channel target. */
 class ChannelLifecycleConvergenceError extends Error {}
+/** A channels/open answered for a channel other than the one it named. */
+class ChannelOpenSubstitutionError extends Error {}
 const CHANNEL_LIFECYCLE_LOG_ID = 'mcpl/channel-lifecycle';
+
+/**
+ * A server-chosen channel id for a host log line: as it is when it's a short
+ * token of visible ASCII, as composite ids such as `discord:g1:c1` are, and
+ * otherwise only described, so an odd id can't add a line or a field.
+ */
+function plainIdForLog(id: unknown): string {
+  if (typeof id === 'string' && /^[\x21-\x7e]{1,200}$/.test(id)) return id;
+  return typeof id === 'string'
+    ? `(not a plain id: a ${id.length}-character string)`
+    : `(not a plain id: ${id === null ? 'null' : typeof id})`;
+}
 
 /**
  * Durable "which label did this channelId have, each time we saw it" log.
@@ -2161,6 +2175,30 @@ export class ChannelRegistry {
           if (this.channels.get(channelKey) === entry && !sameTarget()) this.invalidateTransportConfirmation(entry);
           throw error;
         }
+        // A server can answer for a channel other than the one named: one
+        // that falls back to its first channel of the type for an id it no
+        // longer knows opens that channel and returns its history. That
+        // receipt confirms nothing about this channel, and the history is
+        // another channel's. So the open fails, nothing is marked open, the
+        // history goes nowhere, and this channel's open state is unconfirmed.
+        // A result that names no channel can't be checked and is taken as
+        // before.
+        const answeredFor = result?.channel?.id;
+        if (answeredFor !== undefined && answeredFor !== channelId) {
+          if (this.channels.get(channelKey) === entry) this.invalidateTransportConfirmation(entry);
+          const error = new ChannelOpenSubstitutionError(
+            `Server "${serverId}" answered channels/open for ${channelId} with a different channel; ` +
+            `${channelId} is not marked open, and nothing in the answer is used`,
+          );
+          console.error(
+            `[channel-open-substituted] server=${serverId} requested=${channelId} answered=${plainIdForLog(answeredFor)}`,
+          );
+          this.emitTraceFn({
+            type: 'mcpl:channel-open-substituted',
+            serverId, channelId, answeredFor, error: error.message,
+          });
+          throw error;
+        }
         // Never apply an old receipt to the current target, even transiently:
         // a corrective open might fail before that stale bit is replaced.
         if (this.channels.get(channelKey) !== entry) continue;
@@ -2279,9 +2317,11 @@ export class ChannelRegistry {
         await this.applyDesiredChannelState(serverId, channel.id);
       } catch (err) {
         // Removal while queued is cancellation, not a failed subscription.
-        // Exhausted convergence already emitted its diagnostic at the bound.
+        // Exhausted convergence and a substituted answer already emitted
+        // their own diagnostics.
         if (!this.channels.has(`${serverId}:${channel.id}`) ||
-            err instanceof ChannelLifecycleConvergenceError) continue;
+            err instanceof ChannelLifecycleConvergenceError ||
+            err instanceof ChannelOpenSubstitutionError) continue;
         this.emitTraceFn({
           type: 'mcpl:channel-reconcile-failed',
           serverId,
