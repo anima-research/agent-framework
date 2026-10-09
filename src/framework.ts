@@ -2357,9 +2357,62 @@ export class AgentFramework {
   }
 
   /**
+   * A server's push or incoming message the host couldn't handle, answered
+   * with a JSON-RPC error when it is a request (a notification has no one to
+   * answer, and is logged), rather than thrown out of the connection's
+   * listener, where it was an unhandled rejection and the server's request
+   * waited for its timeout.
+   * - `refused`: the listener turned it away before its handler ran; the
+   *   host is stopping, and none of it was taken.
+   * - `failed`: the handler threw (the host stopped while it ran, or a
+   *   fault; whatever it threw, `undefined` included). The request failed,
+   *   but the handler may have admitted part of it first (an earlier message
+   *   of a batch), so nothing here claims that none of it was taken.
+   */
+  private refuseServerItem(
+    method: string,
+    serverId: string,
+    responder: { respondError?: (code: number, message: string) => void } | undefined,
+    outcome: { kind: 'refused' } | { kind: 'failed'; error: unknown },
+  ): void {
+    // Optional chaining: prototype-built harnesses leave the queue unset.
+    const reason = outcome.kind === 'refused'
+      ? 'the host is stopping'
+      : this.queue?.isClosed
+        ? 'the host stopped while handling this request'
+        : outcome.error instanceof Error
+          ? outcome.error.message
+          : `the handler failed${outcome.error === undefined ? '' : `: ${String(outcome.error)}`}`;
+    console.error(outcome.kind === 'refused'
+      ? `[mcpl] ${method} from ${serverId} refused: ${reason}`
+      : `[mcpl] ${method} from ${serverId} failed: ${reason} (part of it may already have been admitted)`);
+    try {
+      responder?.respondError?.(-32603, reason);
+    } catch {
+      // The connection is going too; there is no one left to tell.
+    }
+  }
+
+  /**
    * Push a process event to the queue.
+   *
+   * After stop() the queue is closed and this throws, so a direct caller
+   * learns the framework is stopped — except for a tool's result. A call
+   * still running at stop() completes later, into a callback with nothing
+   * to catch the throw (an unhandled rejection), and nothing could take its
+   * result anyway: the stream that asked is gone, and the tool has already
+   * run. That result is dropped, and the drop is logged.
    */
   pushEvent(event: ProcessEvent): void {
+    if (event.type === 'tool-result' && this.queue?.isClosed) {
+      // What an operator reconciling a dropped result needs (the resident
+      // may run the tool again): which tool, and whether it succeeded.
+      const outcome = event.result.success && !event.result.isError
+        ? 'succeeded'
+        : `failed${event.result.error ? `: ${event.result.error}` : ''}`;
+      console.error(`[framework] ${event.agentName}: result of tool call ${event.callId} (${event.toolName ? `${event.toolName}, ` : ''}${event.moduleName}) arrived after stop — dropped; the tool ${outcome}`);
+      return;
+    }
     this.queue.push(event);
     this.emitTrace({ type: 'process:received', processEvent: event });
   }
@@ -11258,6 +11311,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'code_execution',
           result,
@@ -12264,7 +12318,7 @@ export class AgentFramework {
     const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
     if (isPresentationTool(call.name)) {
       const result = this.editToolPresentation(agentName, enrichedCall);
-      this.pushEvent({type:'tool-result',callId:call.id,agentName,moduleName:'tool-presentation',result});
+      this.pushEvent({type:'tool-result',callId:call.id,toolName:call.name,agentName,moduleName:'tool-presentation',result});
       return;
     }
 
@@ -12327,9 +12381,12 @@ export class AgentFramework {
       void this.tuneOutCoordinator
         .handleSubconsciousTool(enrichedCall.name, enrichedCall.input as Record<string, unknown>)
         .then((result) => {
-          this.queue.push({
+          // Through pushEvent, like every other tool's result, so one that
+          // arrives after stop() is dropped rather than rejected unhandled.
+          this.pushEvent({
             type: 'tool-result',
             callId: enrichedCall.id,
+            toolName: enrichedCall.name,
             agentName,
             moduleName: 'tune-out',
             result,
@@ -12400,6 +12457,7 @@ export class AgentFramework {
       this.pushEvent({
         type: 'tool-result',
         callId: enrichedCall.id,
+        toolName: enrichedCall.name,
         agentName,
         moduleName: 'framework',
         result: { success: true, data: PROSE_ROUTING_HELP },
@@ -12449,6 +12507,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName,
           result,
@@ -12470,6 +12529,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName,
           result: {
@@ -14280,9 +14340,19 @@ export class AgentFramework {
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
-      const barrier = this.discordAwarenessBarrier;
-      if (barrier) await barrier.promise;
-      await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+      try {
+        const barrier = this.discordAwarenessBarrier;
+        if (barrier) await barrier.promise;
+        // Checked here, after the barrier and before anything records the
+        // push as accepted: a stopped host refuses it.
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('push/event', connection.id, responder, { kind: 'refused' });
+          return;
+        }
+        await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+      } catch (error) {
+        this.refuseServerItem('push/event', connection.id, responder, { kind: 'failed', error });
+      }
     });
 
     // Handle server-initiated inference requests (Step 6)
@@ -14381,11 +14451,19 @@ export class AgentFramework {
     // Handle incoming channel messages (Step 7)
     connection.on('channels-incoming', async (
       params: ChannelsIncomingParams,
-      responder?: { respond: (result: unknown) => void },
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      const barrier = this.discordAwarenessBarrier;
-      if (barrier) await barrier.promise;
-      await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
+      try {
+        const barrier = this.discordAwarenessBarrier;
+        if (barrier) await barrier.promise;
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('channels/incoming', connection.id, responder, { kind: 'refused' });
+          return;
+        }
+        await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
+      } catch (error) {
+        this.refuseServerItem('channels/incoming', connection.id, responder, { kind: 'failed', error });
+      }
     });
 
     // Handle host-level admin commands from a surface (e.g. Discord /undo)
@@ -14779,6 +14857,7 @@ export class AgentFramework {
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
+        toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
         result: { success: false, error: `MCPL server not found: ${serverId}`, isError: true },
@@ -14793,6 +14872,7 @@ export class AgentFramework {
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
+        toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
         result: {
@@ -14952,6 +15032,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: `mcpl:${serverId}`,
           result: {
@@ -14971,6 +15052,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: `mcpl:${serverId}`,
           result: { success: false, error: err.message, isError: true },
@@ -15002,6 +15084,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'channels',
           result: { success: false, error, isError: true },
@@ -15070,6 +15153,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'channels',
           result,
@@ -15082,6 +15166,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'channels',
           result: { success: false, error: err.message, isError: true },
@@ -15103,7 +15188,7 @@ export class AgentFramework {
         module: 'gate', tool: call.name, callId: call.id, durationMs: 0,
         ...(result.isError ? { error: result.error } : {}),
       });
-      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
     };
 
     try {
@@ -15273,9 +15358,10 @@ export class AgentFramework {
           }
         : { success: false, error: r.error, isError: false };
     }
-    this.queue.push({
+    this.pushEvent({
       type: 'tool-result',
       callId: call.id,
+      toolName: call.name,
       agentName,
       moduleName: 'tune-out',
       result,
@@ -15289,7 +15375,7 @@ export class AgentFramework {
 
     const finish = (result: ToolResult) => {
       this.emitTrace({ type: 'tool:completed', module: 'gate', tool: call.name, callId: call.id, durationMs: 0 });
-      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
     };
 
     if (call.name === 'wake') {
@@ -15392,7 +15478,7 @@ export class AgentFramework {
         ...(result.isError ? { error: result.error } : {}),
       });
       this.pushEvent({
-        type: 'tool-result', callId: call.id, agentName, moduleName: 'workspace',
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace',
         result: { ...result, isError: result.isError ?? false },
       });
     })();
@@ -15409,7 +15495,7 @@ export class AgentFramework {
         durationMs: 0,
         ...(result.isError ? { error: result.error } : {}),
       });
-      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'workspace', result });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace', result });
     };
     void (async (): Promise<void> => {
       try {
@@ -15548,7 +15634,7 @@ export class AgentFramework {
         durationMs: 0,
         ...(result.isError ? { error: result.error } : {}),
       });
-      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'workspace', result });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace', result });
     };
     type Candidate =
       | { kind: 'attachment'; data: string | null; mediaType: string; messagesBack: number }
@@ -15952,6 +16038,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'framework',
           result,
@@ -16125,6 +16212,7 @@ export class AgentFramework {
     this.pushEvent({
       type: 'tool-result',
       callId: call.id,
+      toolName: call.name,
       agentName,
       moduleName: 'agent',
       result,
@@ -16165,7 +16253,7 @@ export class AgentFramework {
       this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
       result = { success: false, error: err.message, isError: true };
     }
-    this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
+    this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
   }
 
   private dispatchGateToolCall(agentName: string, call: ToolCall): void {
@@ -16179,6 +16267,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'gate',
           result,
@@ -16191,6 +16280,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'gate',
           result: { success: false, error: err.message, isError: true },
