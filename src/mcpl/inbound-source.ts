@@ -309,13 +309,13 @@ export function renderSourceHeader(
  * header (ids and labels alike) comes from an adapter, and a label holding
  * `]`, a newline and `[source: …` must not read as a second attribution. A
  * value is rendered as a quoted, escaped string literal when it holds any
- * character the grammar uses (brackets, the `·` separator, quotes,
- * backslashes, or a `/` with whitespace on both sides, which reads as the
- * ` / ` separator whatever the space), any control or line-separator
+ * character the grammar uses (brackets, the `·` and ` / ` separators, quotes,
+ * backslashes), any control or line-separator
  * character, or any character a reader can't see or tell from a plain space
  * (an invisible character, `INVISIBLE`: zero-width characters, bidi
  * overrides and isolates, fillers, joiners and variation selectors; or a
- * space other than U+0020) (agent-framework#269). Every other
+ * space other than U+0020) (agent-framework#269). Any other space around a
+ * slash is one of those, so a look-alike ` / ` is quoted too. Every other
  * value is rendered as is, so ordinary names in any script read as they are.
  * A header is always one line. discord-mcpl's `source-header.ts` renders
  * the same header and keeps this rule byte for byte.
@@ -341,11 +341,10 @@ function headerValue(value: string): string {
  */
 const INVISIBLE = '\\p{Cf}\\p{Default_Ignorable_Code_Point}';
 // eslint-disable-next-line no-control-regex
-const STRUCTURAL = /[[\]\u00b7"\\\u0000-\u001f\u007f-\u009f\u2028\u2029]|\s\/\s/u;
+const STRUCTURAL = /[[\]\u00b7"\\\u0000-\u001f\u007f-\u009f\u2028\u2029]| \/ /u;
 /** An invisible character or a non-ASCII space; tested with emoji sequences taken out. */
 const UNSEEN_OUTSIDE_EMOJI = new RegExp(`[${INVISIBLE}]|(?! )\\p{Zs}`, 'u');
 const UNSEEN = new RegExp(`[\\u007f-\\u009f\\u2028\\u2029${INVISIBLE}]|(?! )\\p{Zs}`, 'gu');
-const INVISIBLE_RUN = new RegExp(`[${INVISIBLE}]`, 'gu');
 /** A well-formed emoji sequence: an emoji with an optional skin tone or presentation selector, joined to more by ZWJ. */
 const EMOJI_SEQUENCE = /\p{Extended_Pictographic}(?:\p{Emoji_Modifier}|[\u{FE0E}\u{FE0F}])?(?:\u{200D}\p{Extended_Pictographic}(?:\p{Emoji_Modifier}|[\u{FE0E}\u{FE0F}])?)*/gu;
 /** In a quoted value: an emoji sequence, kept as it is, or a character to escape. */
@@ -360,12 +359,12 @@ const HEADER_OPENING = new RegExp(
  * would, so a label beginning with one of the header's own words (`thread`,
  * `reply to`, `unscoped`) is quoted too: `· "thread topic-a"` is a label,
  * `· thread topic-a` a thread. Case and spacing are ignored, because the
- * readers are models rather than a parser, and quoting loses nothing.
+ * readers are models rather than a parser, and quoting loses nothing. A label
+ * that starts with an invisible character is quoted by `headerValue` anyway,
+ * so a header word behind one can't read as a field (agent-framework#269).
  */
 function labelValue(label: string): string {
-  // Invisible characters don't stop a header word reading as one, so the
-  // words are looked for with them taken out (agent-framework#269).
-  return /^\s*(?:thread|reply\s+to|unscoped)(?:\s|$)/i.test(label.replace(INVISIBLE_RUN, '')) ? quoted(label) : headerValue(label);
+  return /^\s*(?:thread|reply\s+to|unscoped)(?:\s|$)/i.test(label) ? quoted(label) : headerValue(label);
 }
 
 /** A value as a quoted, escaped string literal that always stays on one line. */
