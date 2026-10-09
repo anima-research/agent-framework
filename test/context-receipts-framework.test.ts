@@ -50,8 +50,8 @@ type Script =
   | 'fail'
   | 'ok'
   | { tool: true; carries: 'all' | 0 }
-  /** One round that stands, replying with `reply`, its report naming `altered(request)` altered. */
-  | { ok: true; reply?: unknown[]; altered?: (request: NormalizedRequest) => number[] };
+  /** One round that stands, replying with `reply`, its report naming `altered(request)` altered, at `fidelity` (established by default). */
+  | { ok: true; reply?: unknown[]; altered?: (request: NormalizedRequest) => number[]; fidelity?: 'established' | 'unknown' };
 
 const usage = { inputTokens: 40, outputTokens: 3, cacheReadTokens: 0 };
 const roundEvent = (index: number, extra: Record<string, unknown> = {}) =>
@@ -109,7 +109,8 @@ class ScriptedMembrane {
       stream = new ScriptedStream([roundEvent(0), complete()]);
     } else if ('ok' in script) {
       const altered = script.altered ? { altered: { messages: script.altered(request), injected: [] } } : {};
-      stream = new ScriptedStream([roundEvent(0, altered), complete(script.reply)]);
+      const fidelity = script.fidelity ? { fidelity: script.fidelity } : {};
+      stream = new ScriptedStream([roundEvent(0, { ...altered, ...fidelity }), complete(script.reply)]);
     } else {
       const toolUse = { type: 'tool_use', id: 'call-1', name: 'probe--wait', input: {} };
       stream = new ScriptedStream(
@@ -255,6 +256,7 @@ describe('receipt clocks through the framework', () => {
     assert.match(scope.storeId, /^[0-9a-f-]{36}$/);
     assert.ok(scope.trackingSince > 0);
     assert.equal(scope.degraded, false);
+    assert.equal((scope as Record<string, unknown>).roundFidelity, undefined, 'every round established its fidelity');
 
     // The same round accepted the compile: history--folds has a baseline.
     const folds = await framework.executeToolCall({ id: 'f1', name: 'history--folds', input: {}, callerAgentName: 'scout' } as never);
@@ -262,6 +264,18 @@ describe('receipt clocks through the framework', () => {
     const data = folds.data as { receipts: Array<{ kind: string }>; folding: string };
     assert.equal(data.receipts[0]?.kind, 'baseline');
     assert.match(data.folding, /passthrough|strategy/);
+  });
+
+  it('says in its scope when rounds stand but cannot establish fidelity, so silence and an unconfirmable path differ', async () => {
+    membrane.scripts = [{ ok: true, fidelity: 'unknown' }];
+    command({ op: 'incoming', channelId: ROOM, messageId: 'u-1', mode: 'addressed', text: 'anyone?' });
+    await waitFor(() => membrane.requests.length >= 1, 'provider request');
+    await waitFor(idle, 'turn settles');
+    const clocks = await roomClocks();
+    assert.equal(clocks.lastDeliveredAt, null, 'an unknown round confirms nothing');
+    const scope = (await channelList()).receiptClocks as { degraded: boolean; roundFidelity?: string };
+    assert.equal(scope.degraded, false, 'and degrades nothing');
+    assert.match(scope.roundFidelity ?? '', /^unknown on 1 of 1 provider rounds since \d{4}-\d\d-\d\dT[\d:.]+Z \(this process\): those rounds can't confirm what they carried, so a delivery there is unconfirmed, not absent$/);
   });
 
   it('receives an item that wakes nobody without delivering it, until a round carries it', async () => {

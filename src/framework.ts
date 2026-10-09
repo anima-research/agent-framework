@@ -7838,11 +7838,22 @@ export class AgentFramework {
         : { lastReceivedAt: value.lastReceivedAt, ...(value.received ? { received: value.received } : {}) });
     }
     const scope = agentName ? this.clockLedger.scope(agentName) : { ...this.clockLedger.scope(''), agent: null };
+    // Rounds that report but can't establish fidelity confirm nothing and
+    // degrade nothing; without this line a resident on such a path would
+    // read 'never delivered' as silence.
+    const fidelity = agentName ? this.contextReceipts.roundFidelity(agentName) : undefined;
     return {
       scope: {
         ...scope,
         ...(this.contextReceipts.roundReportsMissing
           ? { roundReports: 'unavailable: this membrane does not report provider rounds, so nothing is confirmed delivered' }
+          : {}),
+        ...(fidelity && fidelity.unestablished > 0
+          ? {
+            roundFidelity: `unknown on ${fidelity.unestablished} of ${fidelity.reported} provider rounds since ` +
+              `${new Date(fidelity.since).toISOString()} (this process): those rounds can't confirm what they carried, ` +
+              'so a delivery there is unconfirmed, not absent',
+          }
           : {}),
       },
       clocks,

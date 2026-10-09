@@ -62,10 +62,21 @@ interface CopyCarriage {
   missing: Set<string>;
 }
 
+/** A resident's provider rounds since this process began, and how many could not establish fidelity. */
+export interface RoundFidelity {
+  /** When this process counted the resident's first reported round. */
+  since: number;
+  /** Rounds that stood and reported, refusals aside. */
+  reported: number;
+  /** Of those, rounds whose fidelity was 'unknown': they can't confirm what they carried, so a delivery there is unconfirmed, not absent. */
+  unestablished: number;
+}
+
 export class ContextReceipts {
   private readonly streams = new Map<string, StreamState>();
   /** Set when membrane emitted usage without a round report. */
   private missingRoundReports = false;
+  private readonly fidelity = new Map<string, RoundFidelity>();
 
   constructor(
     readonly ledger: ChannelClockLedger,
@@ -76,6 +87,18 @@ export class ContextReceipts {
   /** True once a usage event arrived without a round report (older membrane). */
   get roundReportsMissing(): boolean {
     return this.missingRoundReports;
+  }
+
+  /**
+   * The resident's rounds since this process began, and how many could not
+   * establish fidelity. Under a producer that can't confirm what it carried,
+   * every round is unknown, so nothing is ever delivered and nothing is
+   * degraded either; this count is what tells that path apart from silence.
+   * Undefined before the resident's first reported round.
+   */
+  roundFidelity(agent: string): RoundFidelity | undefined {
+    const counted = this.fidelity.get(agent);
+    return counted ? { ...counted } : undefined;
   }
 
   beginStream(agent: string, streamId: number, evidence: RequestEvidence | undefined): void {
@@ -104,6 +127,11 @@ export class ContextReceipts {
     }
     if (round.stopReason === 'refusal') return;
     const at = this.now();
+    const established = round.fidelity === 'established';
+    const counted = this.fidelity.get(agent) ?? { since: at, reported: 0, unestablished: 0 };
+    counted.reported++;
+    if (!established) counted.unestablished++;
+    this.fidelity.set(agent, counted);
 
     if (round.injectedBatch) {
       const { batch, applied } = round.injectedBatch;
@@ -112,7 +140,6 @@ export class ContextReceipts {
     }
 
     const evidence = state.evidence;
-    const established = round.fidelity === 'established';
     const alteredMessages = new Set(round.altered?.messages ?? []);
     if (established && evidence) {
       const branch = branchOf(evidence);

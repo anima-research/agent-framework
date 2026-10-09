@@ -621,6 +621,26 @@ describe('ContextReceipts', () => {
     assert.equal(dlv.length, 1);
   });
 
+  it('counts the rounds that could not establish fidelity, refusals aside, so a path that never confirms is visible', () => {
+    assert.equal(receipts.roundFidelity('r'), undefined, 'nothing counted before a round reports');
+    receipts.beginStream('r', 1, evidence([body(0, 'm1')]));
+    receipts.usage('r', 1, round({ fidelity: 'unknown' }));
+    receipts.usage('r', 1, round({ index: 1, stopReason: 'refusal', fidelity: 'unknown' }));
+    receipts.usage('r', 1, round({ index: 2, fidelity: 'unknown' }));
+    assert.ok(!delivered('m1'), 'unknown rounds confirm nothing');
+    assert.deepEqual(
+      { reported: receipts.roundFidelity('r')!.reported, unestablished: receipts.roundFidelity('r')!.unestablished },
+      { reported: 2, unestablished: 2 },
+    );
+    receipts.usage('r', 1, round({ index: 3 }));
+    assert.ok(delivered('m1'));
+    const counted = receipts.roundFidelity('r')!;
+    assert.equal(counted.reported, 3);
+    assert.equal(counted.unestablished, 2);
+    assert.ok(counted.since > 0);
+    assert.equal(receipts.roundFidelity('someone-else'), undefined);
+  });
+
   it('notices a membrane that does not report rounds', () => {
     receipts.beginStream('r', 1, evidence([body(0, 'm1')]));
     receipts.usage('r', 1, undefined);
