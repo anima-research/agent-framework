@@ -487,6 +487,17 @@ export type TraceEvent =
       since?: number;
     })
 
+  /** A tune-out reader fork was derived for one invocation (subconscious.reader: 'forks'). */
+  | (TraceEventBase & {
+      type: 'tune-out:reader-fork';
+      agentName: string;
+      serverId: string;
+      channelId: string;
+      epochId: string;
+      trigger: 'cadence' | 'wake' | 'cancel';
+      held: number;
+    })
+
   // Dendrite: agent registry and lifecycle.
   // `agent-created` is the consent event: it names the kind of agent, what
   // ends it, and what happens to it when its spawner ends.

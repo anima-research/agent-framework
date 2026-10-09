@@ -9,7 +9,7 @@ import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
-import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
+import { TuneOutCoordinator, TUNE_OUT_DEFAULTS, type ReaderInvocation } from './tune-out/coordinator.js';
 import type {
   MessageId,
   MessageMetadata,
@@ -1303,8 +1303,11 @@ export class AgentFramework {
   private subconsciousStrategy: WindowedPassthroughStrategy | null = null;
   /** Its config (speak_in_channel gate, voice block provenance). */
   private subconsciousConfig: SubconsciousConfig | null = null;
-  /** Tune-out coordinator (issue #77); non-null iff subconscious + channels. */
+  /** Tune-out coordinator (issue #77); non-null iff a reader is configured + channels. */
   private tuneOutCoordinator: TuneOutCoordinator | null = null;
+  /** `subconscious.reader: 'forks'`: the reader is a succession of forks (Dendrite). */
+  private readerForks = false;
+  private readerForkCounter = 0;
 
   /** Agents an abandon could not cancel (token held, no stream) — surfaced
    *  in HostModeStatus until the next quiesce/resume. */
@@ -1749,7 +1752,11 @@ export class AgentFramework {
     // it can never become primary; it is excluded from every broadcast
     // fan-out and woken only by the tune-out coordinator's explicit pushes.
     if (config.subconscious?.enabled) {
-      await framework.createSubconsciousAgent(config.subconscious);
+      if (config.subconscious.reader === 'forks') {
+        framework.configureReaderForks(config.subconscious);
+      } else {
+        await framework.createSubconsciousAgent(config.subconscious);
+      }
     }
 
     // Configuration has now declared its agents: settle what the previous
@@ -1956,7 +1963,7 @@ export class AgentFramework {
 
     // Tune-out coordinator (issue #77): needs both the subconscious resident
     // and the MCPL channel subsystem; created after both exist.
-    if (framework.subconsciousAgentName && framework.channelRegistry) {
+    if ((framework.subconsciousAgentName || framework.readerForks) && framework.channelRegistry) {
       framework.tuneOutCoordinator = new TuneOutCoordinator(
         framework.channelRegistry,
         framework.mcplServerRegistry!,
@@ -1968,6 +1975,13 @@ export class AgentFramework {
             framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
           },
           subconsciousName: () => framework.subconsciousAgentName,
+          ...(framework.readerForks
+            ? {
+                invokeReader: (invocation: ReaderInvocation) => framework.invokeReaderFork(invocation),
+                deliverFromReader: (reader: string, content: ContentBlock[], metadata: Record<string, unknown>) =>
+                  framework.deliverFromReader(reader, content, metadata),
+              }
+            : {}),
           primaryName: () => framework.primaryAgentName,
           getStoredMessages: () => {
             const primary = framework.primaryAgentName
@@ -2897,7 +2911,12 @@ export class AgentFramework {
       return [...SUBCONSCIOUS_TOOLS, ...basics];
     }
     const surfaceOwner = this.toolSurfaceOwners.get(agentName) ?? agentName;
-    return [...this.getAllTools(), ...(this.toolPresentations.has(surfaceOwner) ? presentationTools(this.toolPresentations.get(surfaceOwner)!.config.cataloguePath) : [])].map((tool) => {
+    // Reader forks (subconscious.reader: 'forks') share the resident's
+    // provider prefix, and the tool block is the front of it: the reader's
+    // four tools are therefore in every agent's block and refused at
+    // dispatch for everyone but a reader (see dispatchToolCall).
+    const readerTools = this.readerForks ? SUBCONSCIOUS_TOOLS : [];
+    return [...this.getAllTools(), ...readerTools, ...(this.toolPresentations.has(surfaceOwner) ? presentationTools(this.toolPresentations.get(surfaceOwner)!.config.cataloguePath) : [])].map((tool) => {
       if (tool.name === 'think') {
         return this.buildThinkTool(
           snapshot?.sameRoundThinkTextPolicy
@@ -7549,6 +7568,128 @@ export class AgentFramework {
     this.subconsciousStrategy = strategy;
     this.subconsciousConfig = cfg;
     return agent;
+  }
+
+  /**
+   * `subconscious.reader: 'forks'`: no persistent agent. The coordinator
+   * asks for a fork per invocation (see invokeReaderFork); the config is
+   * kept for the voice block, the speech switch and the strategy factory.
+   */
+  private configureReaderForks(cfg: SubconsciousConfig): void {
+    const primaryName = this.primaryAgentName;
+    const primaryConfig = primaryName ? this.agentConfigs.get(primaryName) : undefined;
+    if (!primaryName || !primaryConfig) {
+      throw new Error('subconscious requires a primary agent to attend to');
+    }
+    const strategy = primaryConfig.strategy;
+    if (!cfg.strategyFactory && strategy && !(strategy instanceof PassthroughStrategy)) {
+      throw new Error(
+        `subconscious.reader "forks": the primary agent "${primaryName}" runs a ${strategy.name} strategy, ` +
+          'so a reader fork needs `subconscious.strategyFactory` returning a fresh instance of the same ' +
+          'class and configuration to reuse its fold state and rendering',
+      );
+    }
+    this.readerForks = true;
+    this.subconsciousConfig = cfg;
+  }
+
+  /**
+   * One reader invocation: derive a fork of the resident at its head with
+   * the resident's refusals, hand it the held traffic since the last look
+   * as ordinary framing, and run it. It reports through `deliver_summary`
+   * (attributed mail), may cancel the hold, and ends when its turn ends.
+   */
+  private invokeReaderFork(invocation: ReaderInvocation): void {
+    const primary = this.primaryAgentName;
+    const cfg = this.subconsciousConfig;
+    if (!primary || !cfg || !this.agents.has(primary)) return;
+    const name = `reader/${primary}/${invocation.epochId.slice(0, 8)}/${++this.readerForkCounter}`;
+
+    const header =
+      `[Tune-out reader — ${invocation.channelId}, epoch ${invocation.epochId.slice(0, 8)}, ${invocation.trigger}]\n` +
+      `${invocation.notice}\n\n${cfg.systemPrompt}` +
+      (invocation.dispositions ? `\n\n[Standing dispositions]\n${invocation.dispositions}` : '');
+    const content: ContentBlock[] = [{ type: 'text', text: header }];
+    if (invocation.backlog.length > 0) {
+      const lines: string[] = [`\n[Held in ${invocation.channelId} since your last look: ${invocation.backlog.length} message${invocation.backlog.length === 1 ? '' : 's'}]`];
+      const flush = () => {
+        if (lines.length > 0) content.push({ type: 'text', text: lines.splice(0).join('\n') });
+      };
+      for (const message of invocation.backlog) {
+        const author = (message.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? message.participant;
+        const text = message.content
+          .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+          .map((b) => b.text)
+          .join('\n');
+        lines.push(`${author}: ${text}`);
+        const media = message.content.filter((b) => b.type !== 'text');
+        if (media.length > 0) {
+          flush();
+          content.push(...media); // media preserved as the source supplied it
+        }
+      }
+      flush();
+    } else {
+      content.push({ type: 'text', text: '\n[Nothing new has been held since your last look.]' });
+    }
+
+    void (async () => {
+      try {
+        const fork = await this.deriveAgent({
+          name,
+          from: primary,
+          kind: 'subconscious-fork',
+          ...(cfg.strategyFactory ? { strategy: cfg.strategyFactory() } : {}),
+          // Its report is a tool call; bare prose never routes anywhere.
+          config: { proseRouting: 'disabled' },
+          inheritRefusals: true,
+          onParentEnd: 'end',
+          resultTo: { to: primary, as: 'message' },
+          idleTimeoutMs: cfg.forkIdleTimeoutMs ?? 10 * 60_000,
+          framing: [{
+            participant: 'user',
+            content,
+            metadata: {
+              system: true,
+              kind: 'tune-out-reader-framing',
+              channelId: invocation.channelId,
+              epochId: invocation.epochId,
+              trigger: invocation.trigger,
+              heldMessageIds: invocation.backlog.map((m) => m.id),
+            } as MessageMetadata,
+          }],
+          metadata: { epochId: invocation.epochId, channelId: invocation.channelId, trigger: invocation.trigger },
+        });
+        this.emitTrace({
+          type: 'tune-out:reader-fork',
+          agentName: name,
+          serverId: invocation.serverId,
+          channelId: invocation.channelId,
+          epochId: invocation.epochId,
+          trigger: invocation.trigger,
+          held: invocation.backlog.length,
+        });
+        await this.runEphemeralToCompletion(fork.agent, fork.contextManager);
+      } catch (error) {
+        console.error(`[tune-out] reader fork ${name} failed:`, error instanceof Error ? error.message : error);
+      }
+    })();
+  }
+
+  /** A reader fork's own words to the resident: attributed mail when it has a route, else under its name. */
+  private deliverFromReader(reader: string, content: ContentBlock[], metadata: Record<string, unknown>): void {
+    const route = this.registry.inspect(reader)?.relationships.resultTo;
+    if (route?.as === 'message') {
+      const mail = this.registry.holdMail({
+        kind: 'result',
+        from: this.registry.ref(reader),
+        to: route.to,
+        content,
+      });
+      this.attemptMailDelivery(mail);
+      return;
+    }
+    this.addMessage(reader, content, metadata as MessageMetadata);
   }
 
   private async runLoop(): Promise<void> {
@@ -13181,13 +13322,24 @@ export class AgentFramework {
       this.dispatchTuneOutToolCall(agentName, enrichedCall);
       return;
     }
-    if (
-      this.tuneOutCoordinator &&
-      agentName === this.subconsciousAgentName &&
-      (SUBCONSCIOUS_TOOL_NAMES as readonly string[]).includes(enrichedCall.name)
-    ) {
+    if ((SUBCONSCIOUS_TOOL_NAMES as readonly string[]).includes(enrichedCall.name)) {
+      const isReader =
+        agentName === this.subconsciousAgentName ||
+        this.registry.get(agentName)?.kind === 'subconscious-fork';
+      if (!this.tuneOutCoordinator || !isReader) {
+        // Advertised to residents so reader forks share their prefix;
+        // usable only by a reader.
+        const error = `${enrichedCall.name} is available to the resident's reader, not to ${agentName}`;
+        this.toolLifecycleEmitter?.refuse(agentName, call.id);
+        this.emitTrace({ type: 'tool:failed', module: 'tune-out', tool: call.name, callId: call.id, error });
+        this.pushEvent({
+          type: 'tool-result', callId: call.id, agentName, moduleName: 'tune-out',
+          result: { success: false, error, isError: true },
+        });
+        return;
+      }
       void this.tuneOutCoordinator
-        .handleSubconsciousTool(enrichedCall.name, enrichedCall.input as Record<string, unknown>)
+        .handleSubconsciousTool(enrichedCall.name, enrichedCall.input as Record<string, unknown>, agentName)
         .then((result) => {
           this.queue.push({
             type: 'tool-result',

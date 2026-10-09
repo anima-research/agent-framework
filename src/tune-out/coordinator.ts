@@ -33,6 +33,20 @@ export const TUNE_OUT_DEFAULTS = {
  *  subconscious turn, and max-wakes counts invocations, not messages. */
 const WAKE_COALESCE_MS = 2_000;
 
+/** One reader invocation under `reader: 'forks'` (see SubconsciousConfig). */
+export interface ReaderInvocation {
+  serverId: string;
+  channelId: string;
+  epochId: string;
+  trigger: 'cadence' | 'wake' | 'cancel';
+  /** The host-framed notice for this invocation (bracket style). */
+  notice: string;
+  /** Held messages not yet handed to any reader fork, oldest first. */
+  backlog: StoredMessage[];
+  /** Standing dispositions, as text, or null when there are none. */
+  dispositions: string | null;
+}
+
 export interface TuneOutFrameworkHooks {
   /** Deliver a message into an agent's window (per-agent seam). */
   addMessage: (
@@ -43,8 +57,20 @@ export interface TuneOutFrameworkHooks {
   ) => string;
   /** Queue an inference request for an agent. */
   requestInference: (agentName: string, reason: string, source: string) => void;
-  /** The subconscious's registry/participant name. */
+  /** The persistent subconscious's registry/participant name, or null. */
   subconsciousName: () => string | null;
+  /**
+   * `reader: 'forks'`: derive and run one reader fork. Absent in persistent
+   * mode. The framework owns the fork's lifecycle; the coordinator owns the
+   * epoch.
+   */
+  invokeReader?: (invocation: ReaderInvocation) => void;
+  /**
+   * `reader: 'forks'`: deliver a reader fork's own words to the resident
+   * as attributed mail (its name, its incarnation). Absent in persistent
+   * mode, where the subconscious writes under its own name directly.
+   */
+  deliverFromReader?: (reader: string, content: ContentBlock[], metadata: Record<string, unknown>) => void;
   /** The primary resident's registry name. */
   primaryName: () => string | null;
   /** Read the primary's stored messages (shared slot, unfiltered). */
@@ -70,6 +96,14 @@ export class TuneOutCoordinator {
   private pendingWakes = new Map<string, { count: number; timer: ReturnType<typeof setTimeout> }>();
   /** Diverted-message tallies since the last subconscious invocation, per channel key. */
   private divertedSinceInvocation = new Map<string, number>();
+  /**
+   * `reader: 'forks'`: the highest sequence of a held message already
+   * handed to a reader fork, per channel key. Each held message is
+   * delivered to exactly one fork. In-memory: after a restart the first
+   * fork of an epoch is handed everything the epoch has held, which is
+   * the right side to err on.
+   */
+  private readerCursor = new Map<string, number>();
 
   constructor(
     private readonly channelRegistry: ChannelRegistry,
@@ -79,6 +113,16 @@ export class TuneOutCoordinator {
 
   private key(serverId: string, channelId: string): string {
     return `${serverId}\0${channelId}`;
+  }
+
+  /** A reader exists: the persistent subconscious, or forks on demand. */
+  private readerAvailable(): boolean {
+    return this.hooks.subconsciousName() !== null || typeof this.hooks.invokeReader === 'function';
+  }
+
+  /** Reader forks are the configured reader. */
+  private get forkReader(): boolean {
+    return this.hooks.subconsciousName() === null && typeof this.hooks.invokeReader === 'function';
   }
 
   /** Restart cadence + expiry timers and re-anchor after a process restart. */
@@ -136,7 +180,7 @@ export class TuneOutCoordinator {
     opts: { cadenceSeconds?: number; backlogCap?: number; maxWakes?: number; durationSeconds?: number },
     source: string,
   ): { ok: true; params: TuneOutParams } | { ok: false; error: string } {
-    if (!this.hooks.subconsciousName()) {
+    if (!this.readerAvailable()) {
       return { ok: false, error: 'tune-out requires the subconscious resident (framework config `subconscious`)' };
     }
     if (this.hooks.isForkBound(channelId)) {
@@ -185,6 +229,8 @@ export class TuneOutCoordinator {
     source: string,
     reason: string,
     subconsciousNote?: string,
+    /** `reader: 'forks'`: the reader fork whose note this is. */
+    noteAuthor?: string,
   ): { ok: true } | { ok: false; error: string } {
     const ended = this.channelRegistry.cancelTuneOut(serverId, channelId, 'open', source);
     if (!ended) {
@@ -242,6 +288,14 @@ export class TuneOutCoordinator {
         [{ type: 'text', text: subconsciousNote }],
         { kind: 'subconscious-note', channelId, epochId },
       );
+    } else if (subconsciousNote && noteAuthor && this.hooks.deliverFromReader) {
+      // A reader fork's note: attributed mail, under the fork's name and
+      // incarnation, never the resident's voice.
+      this.hooks.deliverFromReader(
+        noteAuthor,
+        [{ type: 'text', text: subconsciousNote }],
+        { kind: 'subconscious-note', channelId, epochId },
+      );
     }
     const primary = this.hooks.primaryName();
     if (primary) {
@@ -251,18 +305,26 @@ export class TuneOutCoordinator {
     // the cancel — its note already carries its words): the issue's cancel
     // shape is dump + a report from the subconscious, and when the cap
     // truncated the raw dump, its summary is what covers the tail.
-    if (source !== 'subconscious' && subName) {
+    if (source !== 'subconscious') {
       const truncNote = truncated > 0
         ? ` ${truncated} of ${backlog.length} diverted messages were above the cap and not delivered raw.`
         : '';
-      this.hooks.addMessage(
-        'user',
-        [{ type: 'text', text: `[Tune-out cancelled: ${channelId} — ${reason}.${truncNote}]` }],
-        { system: true, kind: 'tune-out-cancel-report', channelId },
-        subName,
-      );
-      this.hooks.requestInference(subName, `tune-out cancelled: ${channelId}`, 'tune-out');
+      const notice = `[Tune-out cancelled: ${channelId} — ${reason}.${truncNote}]`;
+      if (subName) {
+        this.hooks.addMessage(
+          'user',
+          [{ type: 'text', text: notice }],
+          { system: true, kind: 'tune-out-cancel-report', channelId },
+          subName,
+        );
+        this.hooks.requestInference(subName, `tune-out cancelled: ${channelId}`, 'tune-out');
+      } else if (this.forkReader) {
+        // One last fork for the epoch: whatever was held since the last
+        // look, plus the cancel notice; its report follows the dump.
+        this.invokeReaderFork(serverId, channelId, epochId, 'cancel', notice, backlog);
+      }
     }
+    this.readerCursor.delete(this.key(serverId, channelId));
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ended.wakeCount });
     return { ok: true };
   }
@@ -401,13 +463,28 @@ export class TuneOutCoordinator {
     count: number,
   ): void {
     const subName = this.hooks.subconsciousName();
-    if (!subName) return;
+    if (!subName && !this.forkReader) return;
     const key = this.key(serverId, channelId);
     this.divertedSinceInvocation.set(key, 0);
 
     const notice = trigger === 'wake'
       ? `[Tune-out wake: ${channelId} — ${count} addressed message${count === 1 ? '' : 's'}]`
       : `[Tune-out cadence: ${channelId} — ${count} diverted message${count === 1 ? '' : 's'} since your last look]`;
+    if (!subName) {
+      const state = this.channelRegistry.getTuneOutState(serverId, channelId);
+      if (!state) return;
+      this.invokeReaderFork(
+        serverId,
+        channelId,
+        state.params.epochId,
+        trigger,
+        notice,
+        this.hooks.getStoredMessages().filter(
+          (m) => (m.metadata as { tuneOut?: { epochId?: string } } | undefined)?.tuneOut?.epochId === state.params.epochId,
+        ),
+      );
+      return;
+    }
     this.hooks.addMessage(
       'user',
       [{ type: 'text', text: notice }],
@@ -415,6 +492,36 @@ export class TuneOutCoordinator {
       subName,
     );
     this.hooks.requestInference(subName, `tune-out ${trigger}: ${channelId}`, 'tune-out');
+  }
+
+  /**
+   * `reader: 'forks'`: hand the framework one invocation. The backlog is
+   * the epoch's held messages not yet handed to any fork — each is
+   * delivered to exactly one reader — plus the standing dispositions.
+   */
+  private invokeReaderFork(
+    serverId: string,
+    channelId: string,
+    epochId: string,
+    trigger: ReaderInvocation['trigger'],
+    notice: string,
+    epochBacklog: StoredMessage[],
+  ): void {
+    if (!this.hooks.invokeReader) return;
+    const key = this.key(serverId, channelId);
+    const cursor = this.readerCursor.get(key) ?? -1;
+    const backlog = epochBacklog.filter((m) => m.sequence > cursor).sort((a, b) => a.sequence - b.sequence);
+    if (backlog.length > 0) this.readerCursor.set(key, backlog[backlog.length - 1]!.sequence);
+    const entries = Object.entries(this.readDispositions());
+    this.hooks.invokeReader({
+      serverId,
+      channelId,
+      epochId,
+      trigger,
+      notice,
+      backlog,
+      dispositions: entries.length > 0 ? entries.map(([k, v]) => `- ${k}: ${v}`).join('\n') : null,
+    });
   }
 
   // ==========================================================================
@@ -480,6 +587,8 @@ export class TuneOutCoordinator {
   async handleSubconsciousTool(
     name: string,
     input: Record<string, unknown>,
+    /** The calling agent: the persistent subconscious, or a reader fork. */
+    caller?: string,
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
     switch (name) {
       case 'deliver_summary': {
@@ -487,20 +596,30 @@ export class TuneOutCoordinator {
         const channelId = String(input.channelId ?? '');
         if (!text) return { success: false, error: 'empty summary', isError: false };
         const subName = this.hooks.subconsciousName();
-        if (!subName) return { success: false, error: 'subconscious not configured', isError: true };
-        // Verbatim, under its own participant name, into the resident's window.
-        this.hooks.addMessage(subName, [{ type: 'text', text }], {
-          kind: 'subconscious-summary',
-          channelId,
-        });
-        return { success: true, data: { delivered: true } };
+        if (subName) {
+          // Verbatim, under its own participant name, into the resident's window.
+          this.hooks.addMessage(subName, [{ type: 'text', text }], {
+            kind: 'subconscious-summary',
+            channelId,
+          });
+          return { success: true, data: { delivered: true } };
+        }
+        if (caller && this.hooks.deliverFromReader) {
+          // A reader fork's report: attributed mail under its own name.
+          this.hooks.deliverFromReader(caller, [{ type: 'text', text }], {
+            kind: 'subconscious-summary',
+            channelId,
+          });
+          return { success: true, data: { delivered: true } };
+        }
+        return { success: false, error: 'subconscious not configured', isError: true };
       }
       case 'cancel_tuneout': {
         const channelId = String(input.channelId ?? '');
         const located = this.findByChannel(channelId);
         if (!located) return { success: false, error: `channel ${channelId} is not tuned out`, isError: false };
         const note = typeof input.text === 'string' && input.text.trim() ? input.text.trim() : undefined;
-        const result = this.cancel(located.serverId, channelId, 'subconscious', 'subconscious judgment', note);
+        const result = this.cancel(located.serverId, channelId, 'subconscious', 'subconscious judgment', note, caller);
         return result.ok
           ? { success: true, data: { cancelled: true } }
           : { success: false, error: result.error, isError: false };
@@ -522,7 +641,7 @@ export class TuneOutCoordinator {
         const channelId = String(input.channelId ?? '');
         const text = String(input.text ?? '').trim();
         if (!text) return { success: false, error: 'empty message', isError: false };
-        return this.channelRegistry.publishForAgent(channelId, text, this.hooks.subconsciousName() ?? 'Subconscious');
+        return this.channelRegistry.publishForAgent(channelId, text, this.hooks.subconsciousName() ?? caller ?? 'Subconscious');
       }
       default:
         return { success: false, error: `unknown subconscious tool: ${name}`, isError: true };

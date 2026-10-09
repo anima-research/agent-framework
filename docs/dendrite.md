@@ -56,6 +56,8 @@ Spawning an agent does not make you its only observer or the recipient of its re
 | `workerSpec` | task | none | optional spawner and result route |
 | `taskForkSpec` | task | none | spawned by its parent; inherits its context |
 
+With `subconscious.reader: 'forks'` the subconscious preset is not registered at all; the reader is a succession of `subconscious-fork` agents derived from the resident (see [The subconscious as forks](#the-subconscious-as-forks)).
+
 The four existing creation paths register these presets. Their behaviour is unchanged, with one exception: an ephemeral agent that is mid-run is no longer queued for untargeted broadcasts or gate wakes. Those requests used to wait in the queue and were dropped when the run ended.
 
 ## Discovery
@@ -187,6 +189,48 @@ Stored authorship and the role a model sees are different things. `AgentConfig` 
 
 Removing a tool from `allowedTools` changes the tool block at the front of the request, which changes the prefix. `AgentConfig.denyToolsAtDispatch` leaves the tool advertised and refuses the call when it is made.
 
+## The subconscious as forks
+
+`subconscious.reader: 'forks'` replaces the persistent reader with a succession of forks of the resident. Nothing persists between invocations except what the tune-out coordinator already keeps: the epoch, its held traffic, the wake count, and the standing dispositions.
+
+```ts
+await AgentFramework.create({
+  agents: [{ name: 'scout', strategy: new AutobiographicalStrategy(opts), ... }],
+  subconscious: {
+    enabled: true,
+    reader: 'forks',
+    systemPrompt: 'You are reading for scout. Report in second person, briefly.',
+    strategyFactory: () => new AutobiographicalStrategy(opts),
+    forkIdleTimeoutMs: 10 * 60_000,
+  },
+});
+```
+
+Each cadence tick, each coalesced wake and the cancel derive one fork at the resident's head:
+
+```ts
+deriveAgent({
+  name: 'reader/scout/<epoch>/<n>',
+  from: 'scout', kind: 'subconscious-fork',
+  inheritRefusals: true, onParentEnd: 'end',
+  resultTo: { to: 'scout', as: 'message' },
+  config: { proseRouting: 'disabled' },
+  framing: [/* the notice, the reader's voice block, the dispositions, the held traffic */],
+})
+```
+
+The fork has the resident's history as its own turns, the resident's refusal ledger, the resident's tool block and system prompt, and runs under the resident's model. It ends when its turn ends (`runEphemeralToCompletion`), or with the resident. It reports through `deliver_summary`, which becomes attributed mail: the report lands in the resident's context under the fork's name and incarnation, with `producedAt`. `cancel_tune_out` works as before (the resident gets the dump; the fork's note arrives as its own mail). `speak_in_channel` speaks under the fork's name. `set_disposition` records to the epoch; later forks see the text in their framing.
+
+**What the fork is handed.** The held traffic is delivered as ordinary framing, each held message to exactly one fork: the coordinator keeps a per-channel cursor over the diverted backlog and each invocation gets what arrived since the last look (`[Held in <channel> since your last look: n messages]`, one `author: text` line per message, media blocks preserved as the source supplied them), or `[Nothing new has been held since your last look.]`. The notice (`[Tune-out wake: …]`, `[Tune-out cadence: …]`, `[Tune-out cancelled: …]`), the `systemPrompt` and `[Standing dispositions]` go in the same framing message, stored with `metadata.kind = 'tune-out-reader-framing'` and the held message ids. The resident never sees any of it; the held originals stay out of its compiled view as before.
+
+**Sharing the prefix.** For the fork's request to share the resident's provider-cached prefix, nothing ahead of the framing may differ. Hence: the reader's voice block is framing rather than a system prompt, and residents are shown the reader's four tools (`deliver_summary`, `cancel_tune_out`, `speak_in_channel`, `set_disposition`) in their own tool block. A resident that calls one is refused at dispatch (`… is available to the resident's reader, not to <name>`), in the tune-out module's voice, so the refusal is a tool result and not a provider error. The persistent mode advertises nothing extra.
+
+**Strategy.** A fork reuses the resident's fold state and rendering (shared inheritance), which needs a strategy instance of the same class and configuration. `strategyFactory` supplies it; `create` refuses `reader: 'forks'` for a non-passthrough resident without one rather than letting a fork fold with the wrong strategy.
+
+**Trace.** `tune-out:reader-fork` fires per invocation with the fork's name, the channel, the epoch, the trigger (`cadence` | `wake` | `cancel`) and how many held messages it was given. `dendrite:agent-created` and `dendrite:agent-ended` fire as for any derived agent; `listAgents({ includeEnded: true })` lists the forks.
+
+Costs are those of [Cost](#cost): one Chronicle branch and one context manager per invocation, nothing copied. A fork over a 200k-message resident derives in under a millisecond and reads its first context in about ten.
+
 ## The rendering contract
 
 For a child with shared inheritance, reused solve and no overrides, the test `test/dendrite-derive.test.ts` compares **provider-formatted** requests (membrane's native formatter) up to the fork boundary, which is the end of the parent's last request:
@@ -271,8 +315,8 @@ The framework detects these at run time. The registry, lifecycle, attributed mai
 ## What is not implemented
 
 - **The admission stage.** The proposal asks for one path that decides, per recipient, whether an inbound event is captured, announced, delivered and allowed to wake, before any side effect. Only recipient selection is centralised here (`untargetedRecipients`, `gateRecipients`). The gate, the speech locus and the tune-out divert are unchanged, so the tune-out gaps listed in issue #232 remain.
-- **Tune-out and focus as policies over this machinery.** The tune-out coordinator is unchanged.
-- **The subconscious as a succession of forks.** It is still one persistent agent with a live view of the shared slot. Shared inheritance takes a snapshot; it has no live-follow mode.
+- **Tune-out and focus as policies over this machinery.** The tune-out coordinator still owns epochs, the divert and the wake budget; Dendrite supplies only the reader (below) and the result route.
+- **Live-follow inheritance.** Shared inheritance takes a snapshot. The persistent reader (`reader: 'persistent'`, the default) keeps its live view of the shared slot; the fork reader does not need one, since each fork is derived at the head and handed what arrived since the last look.
 - **Conversation forks on shared inheritance.** They still copy. Moving them needs a decision about their existing stores.
 - **Retiring multi-residency.** Residents still share one message slot.
 - **Diagnostic replay** in an isolated environment.
@@ -294,3 +338,4 @@ The proposal left these open. Each is a decision of this implementation and can 
 7. **The rendering contract compares content and the boundary marker, not interior marker positions** (see above).
 8. **A fork presents its turns under its parent's name**, so formatters that render participant names produce the same prefix as formatters that only assign roles.
 9. **Activations and policy epochs are derived from live state**, not recorded a second time.
+10. **A reader fork is handed the held traffic as framing, not as a view.** Delivering each held message to exactly one fork keeps the fork's request a pure extension of the resident's and leaves the coordinator as the only holder of the backlog; the alternative, a per-fork view filter over the shared slot, would have put tune-out state into the context manager. The reader's tools sit in the resident's tool block, refused at dispatch, for the same prefix.

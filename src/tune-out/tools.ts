@@ -126,4 +126,31 @@ export interface SubconsciousConfig {
   allowChannelSpeech?: boolean;
   /** WindowedPassthroughStrategy re-anchor fraction (default 0.5). */
   reAnchorFraction?: number;
+  /**
+   * How the reader is realised.
+   *
+   * - `'persistent'` (default): one persistent side-agent with an isolated
+   *   slot and a windowed read-only view of the residents' timeline, as
+   *   issue #77 built it.
+   * - `'forks'`: a succession of forks of the resident (Dendrite). Each
+   *   cadence tick, coalesced wake and cancel derives a short-lived fork at
+   *   the resident's head — same prefix, the resident's refusals included,
+   *   ending with the resident — hands it the traffic held since the last
+   *   look as ordinary framing, and lets it report back as attributed
+   *   mail. No agent persists between invocations; dispositions do, in the
+   *   coordinator's state. `systemPrompt` becomes the first framing message
+   *   rather than the system prompt, so the resident's provider prefix is
+   *   shared. Residents are shown the reader's four tools in their tool
+   *   block (refused at dispatch) for the same reason.
+   */
+  reader?: 'persistent' | 'forks';
+  /**
+   * `reader: 'forks'`: a fresh context strategy instance for each fork,
+   * same class and configuration as the resident's, so the fork reuses the
+   * resident's fold state and rendering. Required unless the resident runs
+   * a passthrough strategy.
+   */
+  strategyFactory?: () => import('@animalabs/context-manager').ContextStrategy;
+  /** `reader: 'forks'`: idle timeout for one reader fork (default 10 minutes). */
+  forkIdleTimeoutMs?: number;
 }
