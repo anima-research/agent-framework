@@ -32,9 +32,9 @@ export const FOLDS_TOOL: ToolDefinition = {
     'receipt on a branch is a baseline: the layout as rendered then, with history before it unknown. ' +
     'Each receipt describes the spans as rendered when it was written, even if messages were edited or ' +
     'removed since. Newest first; with `afterId`, oldest first from just after that receipt, so you can ' +
-    'read on: pass the last id an `afterId` page returned (`next` names it), `latestReceiptId` to see only ' +
-    'new ones, or "0" to read the record from its start. `more` says whether the query matched more than ' +
-    'it returned.',
+    'read on: pass the last id an `afterId` page returned, `latestReceiptId` to see only new ones, or "0" ' +
+    'to read the record from its start. `more` says whether the query matched more than it returned; when ' +
+    'it did, `next` is the input for the call that reads on, with this call\'s filters kept.',
   inputSchema: {
     type: 'object' as const,
     properties: {
@@ -114,10 +114,13 @@ export function handleFolds(cm: ContextManager, input: FoldsInput, exportStatus?
       more: result.more,
       ...(result.more
         ? {
-          next: (input.afterId !== undefined && last
-            ? `more after this page: call again with afterId ${last.id}`
-            : 'older receipts were left out: to read the record from its start, call with afterId "0"')
-            + (input.since !== undefined ? `, keeping since ${input.since}` : ''),
+          // The next call's input itself, so every filter is carried over by
+          // construction: after an afterId page, read on from its last
+          // receipt; after a newest-first page, read the record from its start.
+          next: { ...input, afterId: input.afterId !== undefined && last ? last.id : '0' },
+          nextNote: input.afterId !== undefined
+            ? 'more after this page: call again with `next` as the input'
+            : 'older receipts were left out: `next` reads the record from its start',
         }
         : {}),
       folding: foldingSentence(forms.strategy, forms.forms),

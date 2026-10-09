@@ -931,18 +931,19 @@ describe('history--folds reads on with afterId', () => {
 
     const page = handleFolds(cm([receipt('7'), receipt('9')], '12', true), { afterId: '5', limit: 2 });
     assert.deepEqual(asked, { afterId: '5', limit: 2 });
-    const data = page.data as { more: boolean; next?: string; receipts: Array<{ id: string }> };
+    const data = page.data as { more: boolean; next?: unknown; receipts: Array<{ id: string }> };
     assert.equal(data.more, true);
     assert.deepEqual(data.receipts.map((r) => r.id), ['7', '9']);
-    assert.match(data.next!, /afterId 9/);
+    assert.deepEqual(data.next, { afterId: '9', limit: 2 }, 'the next call\'s input');
 
-    const newest = handleFolds(cm([receipt('12'), receipt('11')], '12', true), { limit: 2 }).data as { next?: string };
-    assert.match(newest.next!, /afterId "0"/, 'a newest-first page with more points to the start');
+    const newest = handleFolds(cm([receipt('12'), receipt('11')], '12', true), { limit: 2 }).data as { next?: unknown };
+    assert.deepEqual(newest.next, { afterId: '0', limit: 2 }, 'a newest-first page with more reads on from the start');
+    // Every filter is carried over: since and branch alike.
     const since = '2026-10-09T00:00:00Z';
-    const sincePage = handleFolds(cm([receipt('7')], '12', true), { afterId: '5', since, limit: 1 }).data as { next?: string };
-    assert.match(sincePage.next!, /afterId 7, keeping since 2026-10-09T00:00:00Z/, 'a filtered page says to keep its filter');
-    const sinceNewest = handleFolds(cm([receipt('12')], '12', true), { since, limit: 1 }).data as { next?: string };
-    assert.match(sinceNewest.next!, /afterId "0", keeping since/);
+    const filtered = handleFolds(cm([receipt('7')], '12', true), { afterId: '5', since, branch: 'side', limit: 1 }).data as { next?: unknown };
+    assert.deepEqual(filtered.next, { afterId: '7', since, branch: 'side', limit: 1 });
+    const filteredNewest = handleFolds(cm([receipt('12')], '12', true), { since, branch: 'side' }).data as { next?: unknown };
+    assert.deepEqual(filteredNewest.next, { afterId: '0', since, branch: 'side' });
 
     const caughtUp = handleFolds(cm([], '12', false), { afterId: '12' }).data as { note: string; more: boolean };
     assert.equal(caughtUp.more, false);
