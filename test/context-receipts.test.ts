@@ -938,6 +938,11 @@ describe('history--folds reads on with afterId', () => {
 
     const newest = handleFolds(cm([receipt('12'), receipt('11')], '12', true), { limit: 2 }).data as { next?: string };
     assert.match(newest.next!, /afterId "0"/, 'a newest-first page with more points to the start');
+    const since = '2026-10-09T00:00:00Z';
+    const sincePage = handleFolds(cm([receipt('7')], '12', true), { afterId: '5', since, limit: 1 }).data as { next?: string };
+    assert.match(sincePage.next!, /afterId 7, keeping since 2026-10-09T00:00:00Z/, 'a filtered page says to keep its filter');
+    const sinceNewest = handleFolds(cm([receipt('12')], '12', true), { since, limit: 1 }).data as { next?: string };
+    assert.match(sinceNewest.next!, /afterId "0", keeping since/);
 
     const caughtUp = handleFolds(cm([], '12', false), { afterId: '12' }).data as { note: string; more: boolean };
     assert.equal(caughtUp.more, false);

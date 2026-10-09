@@ -114,9 +114,10 @@ export function handleFolds(cm: ContextManager, input: FoldsInput, exportStatus?
       more: result.more,
       ...(result.more
         ? {
-          next: input.afterId !== undefined && last
+          next: (input.afterId !== undefined && last
             ? `more after this page: call again with afterId ${last.id}`
-            : 'older receipts were left out: to read the record from its start, call with afterId "0"',
+            : 'older receipts were left out: to read the record from its start, call with afterId "0"')
+            + (input.since !== undefined ? `, keeping since ${input.since}` : ''),
         }
         : {}),
       folding: foldingSentence(forms.strategy, forms.forms),
