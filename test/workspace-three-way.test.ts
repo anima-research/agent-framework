@@ -457,6 +457,62 @@ describe('a path sync', () => {
   });
 });
 
+describe('a sync says what it passed over (agent-framework #276)', () => {
+  test('a sync without a path counts what the mount ignores, by mount and reason', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ ignore: ['*.md', 'node_modules'] });
+    env.writeDisk('LOG.md', 'an append-heavy log\n');
+    env.writeDisk('node_modules/a/index.js', 'one');
+    env.writeDisk('node_modules/b/index.js', 'two');
+    env.writeDisk('kept.txt', 'taken in');
+
+    const data = await call(m, 'sync', {});
+    assert.equal(data.totalSynced, 1, 'only kept.txt is looked at');
+    assert.deepEqual(data.passedOver, [{ mount: 'work', reason: 'ignored by the mount', count: 2 }],
+      'LOG.md and node_modules, the directory counted once');
+    assert.equal(data.ignored, undefined, 'nothing was named, so nothing is listed as ignored');
+
+    const quiet = await call(m, 'sync', {});
+    assert.equal(quiet.totalSynced, 0);
+    assert.deepEqual(quiet.passedOver, [{ mount: 'work', reason: 'ignored by the mount', count: 2 }],
+      'a 0 still says what it did not look at');
+  });
+
+  test('a symlink the mount follows was looked at, so it is not counted as passed over', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ followSymlinks: true });
+    env.writeDisk('real.txt', 'the target');
+    symlinkSync(env.disk('real.txt'), env.disk('link.txt'));
+
+    const data = await call(m, 'sync', {});
+    assert.equal(data.totalSynced, 2, 'the link is followed and taken in, beside its target');
+    assert.equal(data.passedOver, undefined);
+  });
+
+  test('a path the mount ignores is taken when named, and the result says a bare sync will not maintain it', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ ignore: ['*.md', 'vendor'] });
+    env.writeDisk('LOG.md', 'an append-heavy log\n');
+    env.writeDisk('vendor/lib/notes.txt', 'beneath an ignored directory');
+
+    const named = await call(m, 'sync', { path: 'work/LOG.md' });
+    assert.equal(named.totalSynced, 1);
+    assert.deepEqual(named.ignored, [{ mount: 'work', path: 'LOG.md',
+      note: "this mount's ignore list covers it, so a sync without a path won't maintain it" }]);
+    assert.equal(await contentOf(m, 'LOG.md'), 'an append-heavy log\n');
+
+    const nested = await call(m, 'sync', { path: 'work/vendor/lib/notes.txt' });
+    assert.equal(nested.totalSynced, 1);
+    assert.deepEqual(nested.ignored?.map((i: { path: string }) => i.path), ['vendor/lib/notes.txt'],
+      'covered through the directory above it, which the list names');
+
+    env.writeDisk('plain.txt', 'not ignored');
+    const control = await call(m, 'sync', { path: 'work/plain.txt' });
+    assert.equal(control.totalSynced, 1);
+    assert.equal(control.ignored, undefined, 'a path the ignore list does not cover gets no note');
+  });
+});
+
 describe('disk counterparts that are not stored', () => {
   test('a binary counterpart keeps the draft and a disk reference that reports a later change', async (t) => {
     const env = new Env(t);

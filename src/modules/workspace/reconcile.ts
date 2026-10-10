@@ -111,6 +111,13 @@ export interface PassResult {
   reports: Map<string, PathReport>;
   /** Regions the pass couldn't observe that matter to its scope. */
   incomplete: Array<{ path: string; reason: string }>;
+  /**
+   * What the walk passed over by design and reported nowhere else, counted by
+   * reason: names the mount's ignore list covers, when nothing beneath them is
+   * tracked (a tracked one is reported under `incomplete`). An ignored
+   * directory counts once, everything in it included.
+   */
+  passedOver: Map<string, number>;
   /** For a directory scope: the subdirectories disk shows directly beneath it. */
   dirs: string[];
 }
@@ -603,7 +610,7 @@ export async function reconcilePass(
   // Evidence a failed barrier left unsynced is settled before anything is
   // decided from it; if the barrier fails again, so does the pass.
   if (agreement.needsBarrier) agreement.barrier();
-  const result: PassResult = { ops: [], discarded: [], newConflicts: [], reports: new Map(), incomplete: [], dirs: [] };
+  const result: PassResult = { ops: [], discarded: [], newConflicts: [], reports: new Map(), incomplete: [], passedOver: new Map(), dirs: [] };
 
   // Enumerate on one branch and observe disk (async). The decision below must
   // describe the same branch the candidates came from: a branch switch during
@@ -728,6 +735,11 @@ export async function reconcilePass(
     for (const region of walk.incomplete) {
       const hides = tracked.some((p) => p === region.path || p.startsWith(region.path + '/'));
       if (region.kind === 'error' || region.kind === 'cap' || hides) result.incomplete.push({ path: region.path, reason: region.reason });
+      // An ignored name that hides nothing tracked is reported nowhere else:
+      // counted, so a sync that says 0 also says what it didn't look at
+      // (agent-framework #276). A symlink region that hides nothing was read
+      // through the link (a mount that follows symlinks), so it isn't one.
+      else if (region.kind === 'ignored') result.passedOver.set(region.reason, (result.passedOver.get(region.reason) ?? 0) + 1);
     }
   }
   return result;
