@@ -609,3 +609,64 @@ test('a newer tune-out decision keeps transport open when an older close complet
   assert.equal(f.isOpen(), true);
   assert.equal((await close).success, false, 'superseded close must not report current state as closed');
 });
+
+test('a reply into a channel whose close failed opens it again, and says so', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  f.calls.length = 0;
+  f.held.add('x');
+  const closing = f.tool('close');
+  await tick();
+  f.pending.shift()!.fail();
+  assert.equal((await closing).success, false);
+  await tick();
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'closed');
+  assert.equal(f.isOpen(), true, 'a failed same-target close leaves the transport known open');
+  f.held.delete('x');
+  const reply = await f.registry.openIfClosedForSend('x', 'test');
+  assert.equal(reply.status, 'opened', 'the reply turned a channel decided closed open again');
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'open');
+  assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-opened-by-send').length, 1);
+  assert.deepEqual(f.calls.map((c) => c.kind), ['close', 'open'], 'the transport is confirmed again after the failed close');
+});
+
+for (const delivery of ['speech', 'reply'] as const) {
+  test(delivery + ' into a channel decided open whose transport lost confirmation is not announced as opening it', async () => {
+    const f = fixture();
+    await f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+    await f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+    assert.equal(f.isOpen(), false, 'retargeting leaves the new target unconfirmed');
+    f.calls.length = 0;
+    if (delivery === 'speech') {
+      assert.equal((await f.registry.routeSpeech('resident', 'hello', 'x'))?.delivered, true);
+      assert.deepEqual(f.publishedWhileOpen, [true]);
+    } else {
+      assert.equal((await f.registry.openIfClosedForSend('x', 'test')).status, 'already-open');
+    }
+    assert.deepEqual(f.calls.map((c) => [c.kind, c.address]), [['open', { value: 'B' }]], 'the new target is confirmed first');
+    assert.equal(f.notices.length, 0, 'the channel was never closed');
+    assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-opened-by-send').length, 0);
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'open');
+  });
+
+  test(delivery + ' into a tuned-out channel whose transport lost confirmation keeps the tune-out, unannounced', async () => {
+    const f = fixture();
+    await f.registry.handleChanged('test', { added: [descriptor('x', true, 'A')] });
+    f.registry.enterTuneOut('test', 'x', {
+      epochId: 'kept-epoch', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+    }, 'agent-tool');
+    await f.registry.handleChanged('test', { updated: [descriptor('x', true, 'B')] });
+    assert.equal(f.isOpen(), false);
+    if (delivery === 'speech') {
+      assert.equal((await f.registry.routeSpeech('resident', 'hello', 'x'))?.delivered, true);
+      assert.deepEqual(f.publishedWhileOpen, [true]);
+    } else {
+      assert.equal((await f.registry.openIfClosedForSend('x', 'test')).status, 'already-open');
+    }
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'tuned-out');
+    assert.equal(f.registry.getTuneOutState('test', 'x')?.params.epochId, 'kept-epoch');
+    assert.equal(f.isOpen(), true);
+    assert.equal(f.notices.length, 0, 'its traffic is still diverted, so nothing new reaches the resident');
+    assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-opened-by-send').length, 0);
+  });
+}

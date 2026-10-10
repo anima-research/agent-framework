@@ -1,4 +1,4 @@
-- Failed backscroll requests preserve the registry's known-open state rather than claiming a close. Automatic delivery joins pending lifecycle work without reopening a channel closed during the wait, and reports only actual delivery-forced opens using the current registration label.
+- Failed backscroll requests preserve the registry's known-open state rather than claiming a close. Automatic delivery joins pending lifecycle work without reopening a channel closed during the wait. A delivery or reply is announced as opening a channel only when it turned a channel decided closed open, using the current registration label; reconfirming the transport of a channel already decided open or tuned out isn't announced.
 
 - Channel lifecycle operations now run in order per channel and reconcile the latest desired state and registration after an in-flight operation completes. Successful reconciliation confirms the current target and desired state at its receipt boundary; a superseded tool request reports that its requested state no longer applies. Automatic delivery preserves active tune-out attention state while opening or awaiting transport.
 

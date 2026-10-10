@@ -526,8 +526,10 @@ interface ChannelRegistryOptions {
   }) => void;
   /**
    * Announces either a durable subscription-policy admission (before its
-   * transport RPC; not an open confirmation), or a confirmed delivery-forced
-   * closed-to-open transition. The host records a durable, non-waking notice.
+   * transport RPC; not an open confirmation), or a delivery that turned a
+   * closed channel open, once its transport is confirmed. Reconfirming the
+   * transport of a channel already decided open or tuned out isn't one.
+   * The host records a durable, non-waking notice.
    * Policy admissions fire once per channel: the persisted desired-state
    * decision prevents re-announcement on retry or reboot. channel_close
    * supersedes policy; a fresh delivery into a closed locus engages it again.
@@ -2135,14 +2137,13 @@ export class ChannelRegistry {
   private applyDesiredChannelState(
     serverId: string,
     channelId: string,
-    options?: { history?: ChannelHistoryRequest; onlyIfClosed?: boolean },
-  ): Promise<{ open: boolean; opened: boolean; result?: ChannelsOpenResult }> {
+    options?: { history?: ChannelHistoryRequest },
+  ): Promise<{ open: boolean; result?: ChannelsOpenResult }> {
     const lifecycleKey = this.lifecycleKey(serverId, channelId);
     const channelKey = `${serverId}:${channelId}`;
     const previous = this.channelLifecycleTails.get(lifecycleKey) ?? Promise.resolve();
     const operation = previous.catch(() => {}).then(async () => {
       let attempts = 0;
-      let opened = false;
       for (;;) {
         const entry = this.channels.get(channelKey);
         if (!entry) throw new Error(`Channel is no longer registered: ${channelId}`);
@@ -2154,16 +2155,13 @@ export class ChannelRegistry {
         const descriptor = entry.descriptor;
         const desired = this.getDesiredState(serverId, channelId);
         const open = desired === 'open' || desired === 'tuned-out';
-        if (attempts === 0 && options?.onlyIfClosed && open && entry.open) {
-          return { open: true, opened: false };
-        }
         // Per-RPC timeouts do not bound a stream of promptly successful but
         // continually superseded receipts. Bound this whole operation, then
         // release its queue slot and surface the failure to delivery joiners.
+        // Its open flag needs no change here: every retry follows a replaced
+        // registration, a retarget (already invalidated), or a receipt for
+        // this very target.
         if (attempts >= MAX_CHANNEL_LIFECYCLE_ATTEMPTS) {
-          // No receipt confirmed the current target/intent. A later delivery
-          // must reconcile it rather than reuse an earlier target's open flag.
-          this.invalidateTransportConfirmation(entry);
           const error = new ChannelLifecycleConvergenceError(
             `Channel ${channelId} did not converge after ${attempts} lifecycle attempts; its target or desired state kept changing`,
           );
@@ -2224,13 +2222,11 @@ export class ChannelRegistry {
             `${channelId} is not marked open, and nothing in the answer is used`,
           );
         }
-        if (open && !entry.open) opened = true;
-        if (!open) opened = false;
         entry.open = open;
         this.unconfirmedChannelTargets.delete(entry);
         const now = this.getDesiredState(serverId, channelId);
         if (open !== (now === 'open' || now === 'tuned-out')) continue;
-        return { open, opened, result };
+        return { open, result };
       }
     });
     // Keep the rejection visible to existing joiners, while observing it
@@ -2332,18 +2328,12 @@ export class ChannelRegistry {
     // Announce the durable admission decision before awaiting transport.
     // This is intent, not confirmation that an open RPC succeeded. It stays
     // truthful if the first attempt fails, and a retry needs no new admission.
-    // channel_close supersedes policy; use current entries at this boundary.
-    const currentAdmissions = policyOpened.flatMap(({ channelId }) => {
-      const entry = this.channels.get(`${serverId}:${channelId}`);
-      if (!entry || this.getDesiredState(serverId, channelId) !== 'open') return [];
-      return [{ channelId, label: entry.descriptor.label }];
-    });
-    if (currentAdmissions.length > 0) {
+    if (policyOpened.length > 0) {
       try {
         this.onChannelAutoOpened?.({
           serverId,
           source: 'subscription-policy',
-          channels: currentAdmissions,
+          channels: policyOpened,
         });
       } catch (err) {
         console.error('onChannelAutoOpened (policy) failed:', err);
@@ -2500,6 +2490,10 @@ export class ChannelRegistry {
    * even if the subscribe fails, and reconciliation retries later.
    * Automatic delivery needs open transport, not a change of attention:
    * preserve tune-out epochs both before and during the round-trip.
+   *
+   * `opened` says whether this call turned a closed channel open, which is
+   * what the delivery and reply notices tell the resident. Reconfirming the
+   * transport of a channel already decided open or tuned out isn't one.
    */
   private async openChannelNow(
     entry: ChannelEntry,
@@ -2507,15 +2501,17 @@ export class ChannelRegistry {
     history?: ChannelHistoryRequest,
   ): Promise<{ result: ChannelsOpenResult; opened: boolean }> {
     const transportOnly = source !== 'agent-tool';
-    if (!transportOnly || this.getDesiredState(entry.serverId, entry.descriptor.id) !== 'tuned-out') {
+    const before = this.getDesiredState(entry.serverId, entry.descriptor.id);
+    const opened = before !== 'open' && before !== 'tuned-out';
+    if (!transportOnly || before !== 'tuned-out') {
       this.setDesiredState(entry.serverId, entry.descriptor.id, 'open', source);
     }
-    const applied = await this.applyDesiredChannelState(entry.serverId, entry.descriptor.id, { history, onlyIfClosed: transportOnly });
+    const applied = await this.applyDesiredChannelState(entry.serverId, entry.descriptor.id, { history });
     const desired = this.getDesiredState(entry.serverId, entry.descriptor.id);
     if (!applied.open || (desired !== 'open' && !(transportOnly && desired === 'tuned-out'))) {
       throw new Error('Channel open was superseded by a newer lifecycle decision');
     }
-    return { result: applied.result!, opened: applied.opened };
+    return { result: applied.result!, opened };
   }
 
   /**
