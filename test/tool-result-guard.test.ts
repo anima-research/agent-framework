@@ -1001,7 +1001,7 @@ async function workspaceHarness(scripts: NormalizedResponse[][], mount: { maxFil
     framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: {} });
     await framework.runUntilIdle();
   };
-  return { framework, membrane, workspace, run };
+  return { framework, membrane, module, workspace, run };
 }
 
 /** Delay the framework's tool-results writer (no workspace: it then reports
@@ -1013,7 +1013,7 @@ function slowSpill(framework: AgentFramework, wait: () => Promise<unknown>) {
   };
 }
 
-const SPILLED_STUB = /^Tool result withheld by the guard\. The tool has already executed\. Its full result is in workspace file (work\/tool-results\/\d{4}-\d{2}-\d{2}-withheld-one\.txt)\.$/;
+const SPILLED_STUB = /^Tool result withheld by the guard\. The tool has already executed\. Its full result is in workspace file (work\/tool-results\/\d{4}-\d{2}-\d{2}-withheld-[0-9a-f]{12}-0-one\.txt)\.$/;
 
 test('#277: a withheld original is written to the workspace, and its stub names the file', async () => {
   const h = await workspaceHarness([[calls('one'), refused()], [answer()]]);
@@ -1042,7 +1042,7 @@ test('#277: a failed workspace write says so, and the audit record still keeps t
   try {
     await h.run();
     const stub = String(toolResults(h.framework)[0].content);
-    assert.match(stub, /^Tool result withheld by the guard\. The tool has already executed\. Writing its full result to workspace file work\/tool-results\/\d{4}-\d{2}-\d{2}-withheld-one\.txt failed \(.+\), so it is kept only in the guard's audit record \(framework\/tool-result-guard\), for an operator\.$/);
+    assert.match(stub, /^Tool result withheld by the guard\. The tool has already executed\. Writing its full result to workspace file work\/tool-results\/\d{4}-\d{2}-\d{2}-withheld-[0-9a-f]{12}-0-one\.txt failed \(.+\), so it is kept only in the guard's audit record \(framework\/tool-result-guard\), for an operator\.$/);
     const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
     const annotated = audit.at(-1) as { type: string; results: Array<{ toolUseId: string; path?: string; error?: string }> };
     assert.equal(annotated.type, 'annotated');
@@ -1180,4 +1180,130 @@ test('#277: stop waits for an annotation started by an ephemeral run it has alre
         'the annotation finished before the store closed');
     } finally { await restarted.stop(); }
   } finally { release(); if (!stopped) await h.framework.stop(); }
+});
+
+// ---------------------------------------------------------------------------
+// #281's review: each withheld result's file is its own, a branch change stops
+// the annotation's writes, and the direct API's refusal retry fits the budget.
+// ---------------------------------------------------------------------------
+
+/** The file a written stub names, whatever the naming. */
+const stubPath = (stub: string) => /workspace file (\S+\.txt)\.$/.exec(stub)?.[1];
+
+test('#277: a tool use id seen again gets a file of its own, and each stub reads back its own original', async () => {
+  const h = await workspaceHarness([[calls('one'), refused()], [answer()], [calls('one'), refused()], [answer()]]);
+  try {
+    h.module.results.one = { success: true, data: 'first-original' };
+    await h.run();
+    h.module.results.one = { success: true, data: 'second-original' };
+    await h.run();
+    const stubs = toolResults(h.framework).map((block) => String(block.content));
+    const paths = stubs.map(stubPath);
+    assert.equal(paths.length, 2);
+    assert.ok(paths[0] && paths[1] && paths[0] !== paths[1], `each stub names a file of its own: ${JSON.stringify(stubs)}`);
+    for (const [index, expected] of ['first-original', 'second-original'].entries()) {
+      const file = await h.workspace.readBinary(paths[index]!);
+      assert.ok('data' in file, `the file is readable: ${JSON.stringify(file)}`);
+      assert.match((file as { data: Buffer }).data.toString('utf8'), new RegExp(expected), `stub ${index} reads back its own original`);
+    }
+  } finally { await h.framework.stop(); }
+});
+
+test("#277: results whose ids the writer's cut makes alike still get a file each", async () => {
+  // The writer keeps 80 characters of a label; these ids agree in their first 75.
+  const shared = 'call_' + 'a'.repeat(70);
+  const ids = [`${shared}-1`, `${shared}-2`];
+  const h = await workspaceHarness([[calls(...ids), refused()], [answer()]]);
+  try {
+    await h.run();
+    const stubs = toolResults(h.framework).map((block) => String(block.content));
+    const paths = stubs.map(stubPath);
+    assert.ok(paths[0] && paths[1] && paths[0] !== paths[1], `each stub names a file of its own: ${JSON.stringify(stubs)}`);
+    for (const [index, id] of ids.entries()) {
+      const file = await h.workspace.readBinary(paths[index]!);
+      assert.ok('data' in file, `the file is readable: ${JSON.stringify(file)}`);
+      assert.match((file as { data: Buffer }).data.toString('utf8'), new RegExp(`payload-${id}`), `stub ${index} reads back its own original`);
+    }
+  } finally { await h.framework.stop(); }
+});
+
+test('#277: a rollback while an aborted batch is being annotated gets none of its files, and its stub stays as it was', async () => {
+  const h = await harness([[calls('one', 'two')]], { toolResultGuard: true });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const labels: string[] = [];
+  // The writer commits a file before it first yields, so the annotation is
+  // held after its first file, where a rollback can land between two writes.
+  (h.framework as unknown as { writeToolResultFile: (label: string) => Promise<null> }).writeToolResultFile = async (label) => {
+    labels.push(label);
+    if (labels.length === 1) await gate;
+    return null;
+  };
+  h.membrane.onSubmit = () => {
+    const stream = h.membrane.streams.at(-1)!;
+    queueMicrotask(() => stream.cancel());
+  };
+  try {
+    await h.run().catch(() => {});
+    for (let i = 0; i < 100 && labels.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(labels.length, 1, "the aborted batch's first original is being written");
+    const agent = h.framework.getAgent('assistant')!;
+    const cm = agent.getContextManager();
+    const source = cm.currentBranch().name;
+    const batch = cm.getAllMessages().find((m) => m.content.some((b) => b.type === 'tool_result'))!;
+    const read = cm.getAllMessages().find((m) => m.content.some((b) => b.type === 'text' && b.text === 'read'))!;
+    const rolled = await h.framework.rollbackToMessage('assistant', { messageId: read.id });
+    release();
+    await agent.toolResultGuard.whenAnnotated();
+    assert.equal(labels.length, 1, 'nothing more is written once the branch has changed');
+    const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    const annotated = audit.find((record) => record.type === 'annotated');
+    assert.ok(annotated, `the annotation is recorded on ${rolled.targetBranch}: ${JSON.stringify(audit)}`);
+    assert.deepEqual(annotated.results, [{ toolUseId: 'one' }, { toolUseId: 'two', skipped: 'branch_changed' }]);
+    assert.equal(annotated.historyUpdate, 'superseded');
+    await cm.switchBranch(source);
+    const kept = cm.getMessage(batch.id)!.content.filter((b) => b.type === 'tool_result');
+    assert.deepEqual(kept.map((b) => (b as { content: unknown }).content), [TOOL_RESULT_GUARD_NOTICE, TOOL_RESULT_GUARD_NOTICE],
+      'the source branch keeps the plain notice');
+  } finally { release(); await h.framework.stop(); }
+});
+
+class BudgetProbe extends PassthroughStrategy {
+  store?: { estimateTokens(message: { content: ContentBlock[] }): number };
+  select(...args: Parameters<PassthroughStrategy['select']>) {
+    this.store = args[0] as unknown as BudgetProbe['store'];
+    return super.select(...args);
+  }
+}
+
+test('#277: direct API: the refusal retry fits the budget, though its stubs are longer than the originals', async () => {
+  const probe = new BudgetProbe();
+  const budget = 3_000;
+  const h = await harness([], { toolResultGuard: true, strategy: probe, contextBudgetTokens: budget, maxTokens: 1_000 });
+  const ids = Array.from({ length: 20 }, (_, i) => `t${i}`);
+  const responses = [calls(...ids), refused(), answer()];
+  const requests: NormalizedRequest[] = [];
+  (h.membrane as unknown as { stream: (request: NormalizedRequest) => Promise<NormalizedResponse> }).stream = async (request) => {
+    requests.push(structuredClone(request));
+    const response = responses.shift();
+    assert.ok(response);
+    return response;
+  };
+  try {
+    const agent = h.framework.getAgent('assistant')!;
+    const cm = agent.getContextManager();
+    for (let i = 0; i < 200; i++) cm.addMessage('user', [{ type: 'text', text: `filler-${i} ` + 'y'.repeat(200) }]);
+    cm.addMessage('user', [{ type: 'text', text: 'read' }]);
+    await agent.runInference(h.framework.getAllTools());
+    for (const id of ids) agent.provideToolResult(id, { success: true, data: 'x' });
+    await agent.runInference(h.framework.getAllTools());
+    assert.equal(requests.length, 3);
+    const tokens = (request: NormalizedRequest) =>
+      request.messages.reduce((n, message) => n + probe.store!.estimateTokens({ content: message.content }), 0);
+    const limit = budget - 1_000;
+    assert.ok(tokens(requests[1]) <= limit, `the refused attempt fits: ${tokens(requests[1])} <= ${limit}`);
+    const retried = requests[2].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    assert.deepEqual(retried.map((b) => b.content), ids.map(() => AUDIT_STUB), 'the retry carries every stub');
+    assert.ok(tokens(requests[2]) <= limit, `the retry fits: ${tokens(requests[2])} <= ${limit}`);
+  } finally { await h.framework.stop(); }
 });

@@ -13,7 +13,10 @@ export const TOOL_RESULT_GUARD_AUDIT_STATE = 'framework/tool-result-guard';
 export type WithheldSpill = { path: string; error?: string } | null;
 
 /** Writes one withheld original as a workspace file (the framework's
- *  tool-results spill). It reports a failed write rather than throwing. */
+ *  tool-results spill). It reports a failed write rather than throwing. It
+ *  commits the file to the workspace before it first yields
+ *  (WorkspaceModule.writeBinary sets the tree entry, then materializes), so a
+ *  branch check made just before the call holds where the file lands. */
 export type WithheldSpiller = (label: string, text: string) => Promise<WithheldSpill>;
 
 /** What a host gives a guard for its withheld results: where originals are
@@ -370,24 +373,36 @@ export class ToolResultGuard {
     const run = previous.then(async () => {
       try {
         const date = new Date().toISOString().slice(0, 10);
-        const spills = new Map<string, WithheldSpill>();
-        for (const block of pending.content) {
+        // A file is named by its batch and its place in the batch, ahead of
+        // anything the writer may cut or substitute: results of one batch
+        // never share a file, and results of two batches share one only if 48
+        // random bits of their batch ids agree. The tool use id after them is
+        // for whoever lists the directory.
+        const batch = pending.id.replace(/-/g, '').slice(0, 12);
+        // Keyed by the result's index in the batch, which the stub and the
+        // original share.
+        const spills = new Map<number, WithheldSpill>();
+        for (const [index, block] of pending.content.entries()) {
           if (block.type !== 'tool_result') continue;
+          // Once the store has left the batch's branch (a rollback, an undo, a
+          // host's switch), the stub below stays as it is, and a file written
+          // now would land in the other branch's workspace. Write no more.
+          if (this.cm.currentBranch().name !== pending.branch) break;
           const original = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
           let spill: WithheldSpill = null;
           if (this.host) {
             try {
-              spill = await this.host.spill(`${date}-withheld-${block.toolUseId}`, original);
+              spill = await this.host.spill(`${date}-withheld-${batch}-${index}-${block.toolUseId}`, original);
             } catch (error) {
               console.error(`[tool-result-guard] agent=${this.agentName} could not spill withheld result ` +
                 `${block.toolUseId}:`, error);
             }
           }
-          spills.set(block.toolUseId, spill);
+          spills.set(index, spill);
         }
-        const annotated: ContentBlock[] = pending.withheld.map((block) => block.type === 'tool_result'
-          && spills.has(block.toolUseId)
-          ? { ...block, content: withheldResultNotice(spills.get(block.toolUseId)!, pending.durable) }
+        const annotated: ContentBlock[] = pending.withheld.map((block, index) => block.type === 'tool_result'
+          && spills.has(index)
+          ? { ...block, content: withheldResultNotice(spills.get(index)!, pending.durable) }
           : block);
         const sameBranch = this.cm.currentBranch().name === pending.branch;
         const current = sameBranch ? this.cm.getMessage(pending.messageId) : null;
@@ -396,9 +411,13 @@ export class ToolResultGuard {
         if (unedited) this.cm.editMessage(pending.messageId, annotated);
         this.append({
           type: 'annotated', batchId: pending.id, messageId: pending.messageId,
-          results: [...spills].map(([toolUseId, spill]) => ({
-            toolUseId, ...(spill ? { path: spill.path } : {}), ...(spill?.error !== undefined ? { error: spill.error } : {}),
-          })),
+          results: pending.content.flatMap((block, index): Array<Record<string, string>> => {
+            if (block.type !== 'tool_result') return [];
+            if (!spills.has(index)) return [{ toolUseId: block.toolUseId, skipped: 'branch_changed' }];
+            const spill = spills.get(index);
+            return [{ toolUseId: block.toolUseId, ...(spill ? { path: spill.path } : {}),
+              ...(spill?.error !== undefined ? { error: spill.error } : {}) }];
+          }),
           ...(unedited ? {} : { historyUpdate: 'superseded' }),
         });
       } catch (error) {
