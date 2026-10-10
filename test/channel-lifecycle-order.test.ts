@@ -27,13 +27,16 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore) {
   const publishedWhileOpen: boolean[] = [];
   const notices: Array<{ source: string; channels: Array<{ channelId: string; label?: string }> }> = [];
   const routeFailures: Array<{ reason: string }> = [];
+  // A server that answers an open for another channel, by requested id.
+  const answeredFor = new Map<string, string>();
   const serve = (kind: 'open' | 'close', params: { channelId?: string; address?: unknown }) => {
     const id = params.channelId!;
     calls.push({ kind, id, address: params.address });
     return new Promise<any>((resolve, reject) => {
       const finish = () => {
-        actual.set(id, kind === 'open');
-        resolve(kind === 'open' ? { channel: descriptor(id) } : { closed: true });
+        const target = kind === 'open' ? answeredFor.get(id) ?? id : id;
+        actual.set(target, kind === 'open');
+        resolve(kind === 'open' ? { channel: descriptor(target) } : { closed: true });
       };
       if (held.has(id)) pending.push({ finish, fail: () => reject(new Error('fixture lifecycle failure')) });
       else finish();
@@ -71,7 +74,7 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore) {
     assert.equal(settled, true, 'lifecycle operations must settle');
     await result;
   };
-  return { registry, actual, calls, pending, held, traces, isOpen, tool, drain, publishedWhileOpen, notices, routeFailures, replaceServer };
+  return { registry, actual, calls, pending, held, traces, isOpen, tool, drain, publishedWhileOpen, notices, routeFailures, replaceServer, answeredFor };
 }
 
 test('remove/re-add during reconcile converges on the replacement desired state, with ACK first (#185)', async () => {
@@ -115,6 +118,8 @@ for (const firstKind of ['open', 'close'] as const) {
     const lastKind = firstKind === 'open' ? 'close' : 'open';
     const last = f.tool(lastKind);
     await f.drain(first, last);
+    assert.equal((await first).success, false);
+    assert.match(String((await first).error), /superseded by a newer lifecycle decision/);
     assert.equal((await last).success, true);
     const desired = lastKind === 'open';
     assert.equal(f.registry.getDesiredState('test', 'x'), lastKind === 'open' ? 'open' : 'closed');
@@ -149,6 +154,8 @@ test('removal cancels queued work rather than recreating or mutating an unregist
   assert.equal((await open).success, false);
   assert.equal(f.registry.listChannelsRaw().length, 0);
   assert.equal(f.calls.filter((c) => c.kind === 'open').length, 0);
+  assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-reconcile-failed').length, 0,
+    'removal while queued is cancellation, not a failed subscription');
 });
 
 test('a failed operation releases the queue for a later decision', async () => {
@@ -610,6 +617,39 @@ test('a newer tune-out decision keeps transport open when an older close complet
   assert.equal((await close).success, false, 'superseded close must not report current state as closed');
 });
 
+test('an explicit open answers only once the current registration is open', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor()] });
+  f.held.add('x');
+  let openWhenAnswered: boolean | undefined;
+  const opening = f.tool('open').then((result) => { openWhenAnswered = f.isOpen(); return result; });
+  await tick();
+  assert.equal(f.pending.length, 1);
+  // The server registers the channel again while the open is in flight.
+  const reRegistered = f.registry.handleChanged('test', { added: [descriptor()] });
+  await f.drain(opening, reRegistered);
+  assert.equal((await opening).success, true);
+  assert.equal(openWhenAnswered, true, 'a receipt for the replaced registration confirms nothing about the new one');
+  assert.equal(f.isOpen(), true);
+});
+
+test('an explicit open waits for a close in flight rather than answering already open', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  f.held.add('x');
+  const closing = f.tool('close');
+  await tick();
+  const reopening = f.tool('open');
+  let settled = false;
+  const again = f.tool('open').then((result) => { settled = true; return result; });
+  await tick();
+  assert.equal(settled, false, 'entry.open is provisional while the close is in flight');
+  await f.drain(closing, reopening, again);
+  assert.equal((await again).success, true);
+  assert.equal(f.actual.get('x'), true);
+  assert.equal(f.isOpen(), true);
+});
+
 test('a reply into a channel whose close failed opens it again, and says so', async () => {
   const f = fixture();
   await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
@@ -670,3 +710,31 @@ for (const delivery of ['speech', 'reply'] as const) {
     assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-opened-by-send').length, 0);
   });
 }
+
+test('a corrective close that cannot converge reports its exhaustion once', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x'), descriptor('y')] });
+  f.calls.length = 0;
+  // Asked to open x, the server opens y instead, and y's corrective close is
+  // retargeted before each receipt.
+  f.answeredFor.set('x', 'y');
+  f.held.add('y');
+  assert.equal((await f.tool('open')).success, false);
+  await tick();
+  assert.equal(f.pending.length, 1, 'the corrective close for y is in flight');
+  try {
+    for (let i = 0; i < 12 && f.pending.length > 0; i++) {
+      await f.registry.handleChanged('test', { updated: [descriptor('y', false, 'churn-' + i)] });
+      f.pending.shift()!.finish();
+      await tick();
+    }
+    assert.equal(f.pending.length, 0, 'the corrective close is bounded');
+    assert.equal(f.calls.filter((c) => c.id === 'y' && c.kind === 'close').length, 5);
+    const failures = f.traces.filter((e) => e.type === 'mcpl:channel-reconcile-failed' && e.channelId === 'y');
+    assert.equal(failures.length, 1);
+    assert.match(String(failures[0].error), /did not converge/);
+  } finally {
+    f.held.delete('y');
+    while (f.pending.length > 0) f.pending.shift()!.finish();
+  }
+});

@@ -120,6 +120,19 @@ test('the channel opened instead is left alone when the host wants it open', asy
   assert.equal(f.isOpen('y'), true);
 });
 
+test('the channel opened instead needs nothing once it is no longer registered', async () => {
+  const f = fixture(() => ({ channel: descriptor('y') }));
+  await f.registry.handleChanged('test', { added: [descriptor('x'), descriptor('y')] });
+  await f.registry.handleChanged('test', { removed: ['y'] });
+  f.calls.length = 0;
+  await capturingErrors(() => f.openX());
+  await tick();
+  assert.equal(f.substituted().length, 1, 'the substitution is still reported');
+  assert.deepEqual(f.calls, [{ kind: 'open', id: 'x' }], 'nothing is sent for y');
+  assert.equal(f.traces.filter((t) => t.type === 'mcpl:channel-reconcile-failed').length, 0,
+    'an unregistered channel has no lifecycle to fail');
+});
+
 test('a channel admitted open stays closed on a substituted answer, reports it once, and speech into it fails loudly', async () => {
   const f = fixture(() => ({ channel: descriptor('y') }));
   await capturingErrors(() => f.registry.handleChanged('test', { added: [descriptor('x', true), descriptor('y')] }));
