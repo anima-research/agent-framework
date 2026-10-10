@@ -787,3 +787,74 @@ test('a corrective close that cannot converge reports its exhaustion once', asyn
     while (f.pending.length > 0) f.pending.shift()!.finish();
   }
 });
+
+test('speech joined to a failed backscroll still reaches a channel that stayed open', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  f.held.add('x');
+  const backscroll = f.registry.handleChannelToolCall('channel_open', { serverId: 'test', channelId: 'x', backscroll: 5 });
+  await tick();
+  const speech = f.registry.routeSpeech('resident', 'joined', 'x');
+  f.pending.shift()!.fail();
+  assert.equal((await backscroll).success, false);
+  assert.equal((await speech)?.delivered, true, 'a failed redundant open leaves the channel usable for a joined delivery');
+  assert.deepEqual(f.publishedWhileOpen, [true]);
+});
+
+test('a reply into a tuned-out channel whose transport is open needs no lifecycle RPC', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  f.registry.enterTuneOut('test', 'x', {
+    epochId: 'quiet', cadenceSeconds: 60, backlogCap: 20, maxWakes: 3, startedAtSequence: 1,
+  }, 'agent-tool');
+  f.calls.length = 0;
+  assert.equal((await f.registry.openIfClosedForSend('x', 'test')).status, 'already-open');
+  assert.deepEqual(f.calls, []);
+  assert.equal(f.registry.getTuneOutState('test', 'x')?.params.epochId, 'quiet');
+});
+
+test('a failed reply open reports the label of the registration that replaced it', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor()] });
+  f.held.add('x');
+  const reply = f.registry.openIfClosedForSend('x', 'test');
+  await tick();
+  const replacement = f.registry.handleChanged('test', {
+    removed: ['x'], added: [{ ...descriptor('x', false, 'replacement'), label: 'Replacement label' }],
+  });
+  f.pending.shift()!.fail();
+  const result = await reply;
+  assert.equal(result.status, 'open-failed');
+  assert.equal(result.label, 'Replacement label');
+  await f.drain(replacement);
+});
+
+test('a channel removed earlier in its batch does not hold up the rest of the batch', async () => {
+  const f = fixture();
+  f.held.add('x');
+  const first = f.registry.handleChanged('test', { added: [descriptor('x')] });
+  await tick();
+  assert.equal(f.pending.length, 1, "x's first operation is in flight");
+  f.held.add('y');
+  let batchSettled = false;
+  const batch = f.registry.handleChanged('test', { added: [descriptor('y'), descriptor('x')] })
+    .then(() => { batchSettled = true; });
+  await tick();
+  assert.equal(f.pending.length, 2, "y's operation is in flight too");
+  await f.registry.handleChanged('test', { removed: ['x'] });
+  f.pending.pop()!.finish(); // y's receipt; x's first operation stays in flight
+  for (let i = 0; i < 5; i++) await tick();
+  assert.equal(batchSettled, true, "the batch skips x rather than queueing behind x's operation in flight");
+  await f.drain(first, batch);
+  assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-reconcile-failed').length, 0);
+});
+
+test('a descriptor the registration rejected is neither admitted nor announced', async () => {
+  const f = fixture();
+  f.registry.setSubscriptionPolicy('test', 'auto');
+  // The first registration migrates the legacy policy; the second is admitted by it.
+  await f.registry.handleRegister('test', { channels: [descriptor('x')] });
+  await f.registry.handleRegister('test', { channels: [descriptor('y'), { ...descriptor('rejected'), id: '' }] });
+  assert.deepEqual(f.notices.map((n) => n.channels.map((c) => c.channelId)), [['y']]);
+  assert.equal(f.registry.getDesiredState('test', ''), undefined);
+});
