@@ -1,0 +1,6 @@
+- Notices about an agent's own action now reach the window that agent reads (#188):
+  - A conversation fork's or an ephemeral run's failed-reply notice (`[discord-send-failed]`), bounced-prose notice and background-script wake land in its own window, deferred against its own turn, instead of the primary's. In connectome-host this moves a subagent's notices from its parent to the subagent.
+  - Residents share one message slot, so a resident's notices stay on the default path, unchanged.
+  - When a fork or an ephemeral run has ended without reading that its reply to a channel failed, the primary is told by name instead: "A reply by `<name>` (N chars) could not be delivered to … (…). `<name>` has ended, and the human did not receive it." That notice's metadata carries `speaker`, and every failed-reply notice's metadata now carries `textLen`.
+  - Writes still queued for a fork or an ephemeral run when it is released land in its own window first, which Chronicle keeps. While the host is quiesced they are dropped instead, logged.
+  - A background-script wake for an agent that is no longer registered is dropped, logged, rather than given to the primary.
