@@ -645,6 +645,7 @@ test('an explicit open waits for a close in flight rather than answering already
   const closing = f.tool('close');
   await tick();
   const reopening = f.tool('open');
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'open', 'the next open meets an open decision and a pending close');
   let settled = false;
   const again = f.tool('open').then((result) => { settled = true; return result; });
   await tick();
