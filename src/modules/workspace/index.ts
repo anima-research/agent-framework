@@ -2613,7 +2613,10 @@ export class WorkspaceModule implements Module {
       // What disk still owes is kept by its evidence, so the watermark and
       // the pin only feed the branch guard. Both are the push's own: what it
       // planned from is what disk now reflects, whatever branch was selected
-      // while it wrote.
+      // while it wrote. A push that planned nothing (the selected branch
+      // changed after its paths were chosen) left disk as it was, so it
+      // leaves both as they were too.
+      if (pushed.branchId === undefined || pushed.sequence === undefined) continue;
       mount.lastMaterializedSeq = pushed.sequence;
       // Track which branch we materialized on. Re-pin on a clean empty
       // materialize too (previously-pinned mount, nothing pending): disk
@@ -2674,9 +2677,12 @@ export class WorkspaceModule implements Module {
       const branchId = store.currentBranch().id;
       return this.pushUnlocked(mount, store.treeList(mount.treeStateId).map((e) => e.path), { force: true, named: true, branchId });
     });
-    mount.lastMaterializedSeq = pushed.sequence;
-    if (pushed.written.length > 0 || pushed.unchanged.length > 0) {
-      mount.lastMaterializedBranchId = pushed.branchId;
+    // A push that planned nothing leaves the reset tracking as it is.
+    if (pushed.branchId !== undefined && pushed.sequence !== undefined) {
+      mount.lastMaterializedSeq = pushed.sequence;
+      if (pushed.written.length > 0 || pushed.unchanged.length > 0) {
+        mount.lastMaterializedBranchId = pushed.branchId;
+      }
     }
     return pushed.written;
   }

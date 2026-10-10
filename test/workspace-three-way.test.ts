@@ -1949,6 +1949,68 @@ describe('materialize, status and shutdown', () => {
     assert.equal(existsSync(env.disk('div.txt')), false, 'nothing written');
   });
 
+  test('a materialize whose push is refused on a branch change leaves the pin, so the next one there is still guarded', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'base.txt', 'base');
+    const forkAt = env.store.currentSequence();
+    await seedSynced(env, m, 'newer.txt', 'newer on main'); // pinned past the fork
+    const main = env.store.currentBranch();
+    env.store.createBranchAt('divergent', main.name, forkAt);
+    env.store.switchBranch('divergent');
+    await call(m, 'write', { path: 'work/div.txt', content: 'divergent' });
+    env.store.switchBranch(main.name);
+    await call(m, 'write', { path: 'work/base.txt', content: 'base v2' }); // owed on main
+    const mount = (m as any).mounts.get('work');
+    const before = { pin: mount.lastMaterializedBranchId, seq: mount.lastMaterializedSeq };
+    assert.equal(before.pin, main.id);
+
+    // The selection is made on main; the branch changes while the push reads disk.
+    let switched = false;
+    const data = await withFsPromises('lstat', (lstat) => async (...args: any[]) => {
+      if (!switched && String(args[0]).endsWith('base.txt')) {
+        switched = true;
+        env.store.switchBranch('divergent');
+      }
+      return lstat(...args);
+    }, () => call(m, 'materialize', {}));
+    assert.equal(switched, true, 'the branch changed while the push read disk');
+    assert.deepEqual(data.materialized, []);
+    assert.match(JSON.stringify(data.skipped), /selected branch changed/);
+    assert.deepEqual({ pin: mount.lastMaterializedBranchId, seq: mount.lastMaterializedSeq }, before, 'pin and watermark as they were');
+    assert.equal(env.readDisk('base.txt'), 'base');
+
+    // So the next materialize, on the divergent branch, is still refused.
+    assert.match(await refused(m, 'materialize', {}), /diverged/);
+    assert.equal(existsSync(env.disk('div.txt')), false, 'nothing of the divergent branch written');
+  });
+
+  test('a first materialize refused on a branch change leaves an unpinned mount unpinned, though entries were in place', async (t) => {
+    const env = new Env(t);
+    const m = await env.open({ watch: 'on-agent-action' });
+    env.writeDisk('a.txt', 'A');
+    await m.onToolBatchComplete('agent'); // adopted: in place on main, never materialized
+    const mount = (m as any).mounts.get('work');
+    assert.equal(mount.lastMaterializedBranchId, null, 'never pinned');
+    const main = env.store.currentBranch().name;
+    env.store.createBranch('other', main);
+    await call(m, 'write', { path: 'work/b.txt', content: 'B' }); // owed on main
+    const seq = mount.lastMaterializedSeq;
+
+    let switched = false;
+    const data = await withFsPromises('lstat', (lstat) => async (...args: any[]) => {
+      if (!switched && String(args[0]).endsWith('b.txt')) {
+        switched = true;
+        env.store.switchBranch('other');
+      }
+      return lstat(...args);
+    }, () => call(m, 'materialize', {}));
+    assert.equal(switched, true, 'the branch changed while the push read disk');
+    assert.deepEqual(data.materialized, []);
+    assert.equal(mount.lastMaterializedBranchId, null, 'still unpinned');
+    assert.equal(mount.lastMaterializedSeq, seq, 'watermark as it was');
+  });
+
   test('status counts a workspace deletion as pending until a push applies it', async (t) => {
     const env = new Env(t);
     const m = await env.open();

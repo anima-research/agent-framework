@@ -751,9 +751,12 @@ export interface PushResult {
   skipped: Array<{ path: string; reason: string }>;
   /** Workspace deletions left on disk because applyDeletions wasn't given. */
   pendingDeletions: string[];
-  /** The branch and sequence the push planned on: what disk now reflects. */
-  branchId: string;
-  sequence: number;
+  /** The branch and sequence the push planned on: what disk now reflects.
+   *  Absent when it planned nothing (a read-only mount, or the selected
+   *  branch changed after its paths were chosen): disk then still reflects
+   *  whatever it did before. */
+  branchId?: string;
+  sequence?: number;
 }
 
 /**
@@ -784,10 +787,7 @@ export async function pushPaths(
 ): Promise<PushResult> {
   agreement.ensureReconciled();
   if (agreement.needsBarrier) agreement.barrier(); // as a pass does: nothing decided from unsynced evidence
-  const result: PushResult = {
-    written: [], unchanged: [], deleted: [], skipped: [], pendingDeletions: [],
-    branchId: store.currentBranch().id, sequence: store.currentSequence(),
-  };
+  const result: PushResult = { written: [], unchanged: [], deleted: [], skipped: [], pendingDeletions: [] };
   if (mount.readOnly) return result;
 
   type Plan = {
@@ -809,14 +809,14 @@ export async function pushPaths(
 
   // Decide synchronously what to push.
   const branchId = store.currentBranch().id;
-  result.branchId = branchId;
-  result.sequence = store.currentSequence();
   if (opts.branchId !== undefined && opts.branchId !== branchId) {
     for (const path of paths) {
       result.skipped.push({ path, reason: 'the selected branch changed after these paths were chosen; nothing was written — materialize again' });
     }
     return result;
   }
+  result.branchId = branchId;
+  result.sequence = store.currentSequence();
   let recorded = false;
   for (const [path, d] of facts) {
     const entry = store.treeGet(mount.treeStateId, path);
