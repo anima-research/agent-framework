@@ -14,7 +14,10 @@
     Without one, nothing is confirmed, and `receiptClocks.roundReports` says
     so. A round whose fidelity isn't established (an adapter that doesn't
     report what it leaves out, an opaque request hook) confirms neither a
-    delivery nor a partial exposure.
+    delivery nor a partial exposure. `receiptClocks.roundFidelity` then
+    counts such rounds for the calling resident since this process began
+    ("unknown on N of M provider rounds since …"), so a path that can never
+    confirm a delivery reads differently from one where nothing arrived.
   - Versions are identified by the producer event id where the lane
     guarantees one. Otherwise they use platform message id plus the digest
     ingestion recorded for the body as delivered, before any source header or
