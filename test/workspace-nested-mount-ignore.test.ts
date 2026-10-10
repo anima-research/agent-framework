@@ -96,8 +96,9 @@ test("a watched mount's changes pass over what it ignores, a nested mount includ
   const root = mkdtempSync(join(tmpdir(), 'af-nested-mount-watch-'));
   const outerDir = join(root, 'outer');
   mkdirSync(join(outerDir, 'a', 'b'), { recursive: true });
+  mkdirSync(join(outerDir, 'a', 'c'));
   const outer: MountConfig = {
-    name: 'outer', path: outerDir, mode: 'read-write', watch: 'always', ignore: ['node_modules'],
+    name: 'outer', path: outerDir, mode: 'read-write', watch: 'always', ignore: ['node_modules', '*.log'],
     watchDebounceMs: 50, watchRootPollMs: 50,
   };
   const warn = console.warn;
@@ -108,7 +109,7 @@ test("a watched mount's changes pass over what it ignores, a nested mount includ
       { name: 'inner', path: join(outerDir, 'a', 'b'), mode: 'read-write', watch: 'never' },
     ] });
   } finally { console.warn = warn; }
-  assert.deepEqual(outer.ignore, ['node_modules', 'a/b/**']);
+  assert.deepEqual(outer.ignore, ['node_modules', '*.log', 'a/b/**']);
 
   const seen: FsChange[] = [];
   let ready!: () => void;
@@ -121,17 +122,28 @@ test("a watched mount's changes pass over what it ignores, a nested mount includ
   });
   await isReady;
 
+  // Each ignored write has a twin the mount reports, written after it and
+  // reported by the same machinery, though not strictly after it: the same
+  // directory for the name pattern, and the same depth for the two ignored
+  // directories. Each directory has its own watch, and each file's report
+  // waits for its size to settle, so reported writes can arrive in any order;
+  // waiting for every twin gives each ignored write the time it would take to
+  // be reported.
   mkdirSync(join(outerDir, 'node_modules', 'pkg'), { recursive: true });
   writeFileSync(join(outerDir, 'node_modules', 'pkg', 'index.js'), 'ignored');
+  mkdirSync(join(outerDir, 'pkgs', 'pkg'), { recursive: true });
+  writeFileSync(join(outerDir, 'pkgs', 'pkg', 'index.js'), 'its twin');
   writeFileSync(join(outerDir, 'a', 'b', 'x.txt'), 'the inner mount\'s');
-  writeFileSync(join(outerDir, 'a', 'other.txt'), 'the outer mount\'s');
+  writeFileSync(join(outerDir, 'a', 'c', 'y.txt'), 'its twin');
+  writeFileSync(join(outerDir, 'a', 'x.log'), 'ignored by its name');
+  writeFileSync(join(outerDir, 'a', 'other.txt'), 'its twin');
   writeFileSync(join(outerDir, 'later.txt'), 'last');
-  for (let i = 0; i < 200 && !seen.some((c) => c.path === 'later.txt'); i++) {
+  const reported = ['pkgs/pkg/index.js', 'a/c/y.txt', 'a/other.txt', 'later.txt'];
+  for (let i = 0; i < 200 && !reported.every((path) => seen.some((c) => c.path === path)); i++) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   const paths = seen.map((c) => c.path).sort();
-  assert.ok(paths.includes('later.txt'), `the last write was seen: ${JSON.stringify(paths)}`);
-  assert.ok(paths.includes('a/other.txt'), 'a sibling of the nested mount is still watched');
-  assert.deepEqual(paths.filter((p) => p.startsWith('a/b') || p.startsWith('node_modules')), [],
+  for (const path of reported) assert.ok(paths.includes(path), `${path} was seen: ${JSON.stringify(paths)}`);
+  assert.deepEqual(paths.filter((p) => p.startsWith('a/b') || p.startsWith('node_modules') || p.endsWith('.log')), [],
     'nothing the mount ignores was reported');
 });
