@@ -53,6 +53,7 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore) {
   };
   let currentServer = server;
   const replaceServer = () => { currentServer = { ...server }; };
+  const setGrant = (paths: readonly string[]) => { currentServer.grant = new CapabilityGrant(new Set(paths), []); };
   const traces: Array<{ type: string; [key: string]: unknown }> = [];
   const registry = new ChannelRegistry(
     { getServer: () => currentServer } as unknown as McplServerRegistry,
@@ -74,7 +75,7 @@ function fixture(onNotice?: NoticeHandler, store?: JsStore) {
     assert.equal(settled, true, 'lifecycle operations must settle');
     await result;
   };
-  return { registry, actual, calls, pending, held, traces, isOpen, tool, drain, publishedWhileOpen, notices, routeFailures, replaceServer, answeredFor };
+  return { registry, actual, calls, pending, held, traces, isOpen, tool, drain, publishedWhileOpen, notices, routeFailures, replaceServer, answeredFor, setGrant };
 }
 
 test('remove/re-add during reconcile converges on the replacement desired state, with ACK first (#185)', async () => {
@@ -681,6 +682,22 @@ for (const delivery of ['reply', 'speech'] as const) {
     assert.deepEqual(f.calls.map((c) => c.kind), ['close', 'open'], 'the transport is confirmed again after the failed close');
   });
 }
+
+test('speech into a channel decided closed keeps publishing where no open can succeed, without the lifecycle grant', async () => {
+  const f = fixture();
+  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  assert.equal(f.isOpen(), true);
+  f.setGrant(ALL_CAPABILITY_PATHS.filter((path) => path !== 'channels.lifecycle'));
+  const closing = await f.tool('close');
+  assert.equal(closing.success, false);
+  assert.match(String(closing.error), /channels\.lifecycle/);
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'closed', 'the refused close is still recorded as a decision');
+  f.calls.length = 0;
+  assert.equal((await f.registry.routeSpeech('resident', 'hello', 'x'))?.delivered, true);
+  assert.deepEqual(f.publishedWhileOpen, [true]);
+  assert.deepEqual(f.calls, [], 'no open is attempted where it could not succeed');
+  assert.equal(f.notices.length, 0);
+});
 
 test('a failed explicit open says the channel stays selected for opening, and a later delivery opens it quietly', async () => {
   const f = fixture();

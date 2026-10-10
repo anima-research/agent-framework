@@ -3194,11 +3194,12 @@ export class ChannelRegistry {
     // alive with the reply. If the open fails, the speech does NOT go out:
     // a half-alive delivery is worse than a loud marker. A channel decided
     // closed is engaged even while its transport is still open (a close that
-    // failed), as a reply would engage it. A channel with no decision at all
-    // (a server without the lifecycle grant records none) keeps publishing
-    // while its transport is open: speech opens before it sends, and that
-    // open could never succeed there.
-    if (!entry.open || this.getDesiredState(entry.serverId, entry.descriptor.id) === 'closed') {
+    // failed), as a reply would engage it, wherever an open can succeed.
+    // Without the lifecycle grant it can't, and speech opens before it
+    // sends, so there a channel whose transport is open keeps publishing.
+    const engagesDecidedClosed = this.getDesiredState(entry.serverId, entry.descriptor.id) === 'closed' &&
+      CapabilityGrant.of(this.serverRegistry.getServer(entry.serverId)).has('channels.lifecycle');
+    if (!entry.open || engagesDecidedClosed) {
       try {
         const { opened } = await this.openChannelNow(entry, 'opened-by-delivery');
         entry = await this.waitForOpenChannel(entry);
