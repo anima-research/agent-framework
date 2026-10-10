@@ -47,6 +47,15 @@ export function isStateExistsError(err: unknown): boolean {
 const MAX_CONTEXT_TIMEOUT_MS = 30_000;
 
 /**
+ * Bound on each module's onToolBatchComplete. The hook runs inside the
+ * framework's sequential event loop, so a wedged module would stall every
+ * agent's events, not just its own round; past this the round goes on without
+ * it. A module with its own semantic deadline (the workspace scan's) sets it
+ * below this one, so it can record the miss itself.
+ */
+const TOOL_BATCH_HOOK_TIMEOUT_MS = 30_000;
+
+/**
  * Registered speech handler.
  */
 interface SpeechHandler {
@@ -395,6 +404,44 @@ export class ModuleRegistry {
 
     await Promise.all(promises);
     return injections;
+  }
+
+  /**
+   * Tell modules an agent's tool batch completed (see
+   * Module.onToolBatchComplete). Hooks run in parallel, each awaited up to
+   * `timeoutMs`; a hook that throws or times out is logged and skipped, so a
+   * wedged module can't hold the round. Returns the modules that didn't
+   * finish, for the caller's trace.
+   */
+  async notifyToolBatchComplete(
+    agentName: string,
+    timeoutMs = TOOL_BATCH_HOOK_TIMEOUT_MS,
+  ): Promise<Array<{ module: string; error: string }>> {
+    const failures: Array<{ module: string; error: string }> = [];
+    const promises: Promise<void>[] = [];
+    for (const module of this.modules.values()) {
+      if (!module.onToolBatchComplete) continue;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      promises.push(
+        Promise.race([
+          // Called from a promise, so a hook that throws synchronously, before
+          // returning its promise, is caught below like any other failure
+          // instead of escaping the round (the result would never be provided).
+          Promise.resolve().then(() => module.onToolBatchComplete!(agentName)),
+          new Promise<void>((_, rej) => {
+            timer = setTimeout(() => rej(new Error(`onToolBatchComplete timed out after ${timeoutMs}ms`)), timeoutMs);
+          }),
+        ])
+          .catch((err: unknown) => {
+            const error = err instanceof Error ? err.message : String(err);
+            failures.push({ module: module.name, error });
+            console.error(`[${module.name}] onToolBatchComplete:`, err);
+          })
+          .finally(() => clearTimeout(timer)),
+      );
+    }
+    await Promise.all(promises);
+    return failures;
   }
 
   /**

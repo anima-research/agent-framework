@@ -9,6 +9,7 @@ import { watch, type FSWatcher } from 'chokidar';
 import { mkdirSync, statSync } from 'node:fs';
 import { basename, sep } from 'node:path';
 import { type MountConfig } from './types.js';
+import { coveredByIgnore } from './observe.js';
 
 export type FsOp = 'created' | 'modified' | 'deleted';
 
@@ -101,10 +102,20 @@ export class MountWatcher {
       }
     }
 
-    const ignored = this.config.ignore ?? [];
+    // Chokidar reads a string as one exact path, so the mount's patterns
+    // never matched here and every ignored path was synced on change. They
+    // go in as the walk's own rule instead: the path, or a directory above
+    // it, matches (agent-framework #280). Chokidar then also doesn't descend
+    // into an ignored directory.
+    const patterns = this.config.ignore ?? [];
 
     this.watcher = watch(this.config.path, {
-      ignored: ignored.length > 0 ? ignored : undefined,
+      ignored: patterns.length > 0
+        ? (path: string) => {
+          const relative = this.toRelative(path);
+          return relative !== null && coveredByIgnore(relative, patterns);
+        }
+        : undefined,
       persistent: true,
       ignoreInitial: true,
       followSymlinks: this.config.followSymlinks ?? false,
