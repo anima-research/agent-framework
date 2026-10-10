@@ -36,6 +36,10 @@ import type {
 import { WORKSPACE_FS_EVENT_TYPES, opToEventType } from './types.js';
 import { MountWatcher, type FsChange } from './watcher.js';
 import { syncFromFs, materializeToFs, hashContent, isBinary, DEFAULT_MAX_FILE_SIZE, type ConflictInfo } from './sync.js';
+import {
+  DirectFsError, directReadText, directWrite, directEdit, directDelete,
+  directWalk, directListDir, directGrep, type ContainedOpener,
+} from './direct.js';
 
 export type {
   WorkspaceConfig,
@@ -606,6 +610,8 @@ export class WorkspaceModule implements Module {
   private config: WorkspaceConfig;
   private mounts = new Map<string, MountState>();
   private watchers = new Map<string, MountWatcher>();
+  /** Chronicle mounts whose saved state says they last ran as direct: sync disk→store before the first materialize. */
+  private resyncBeforeMaterialize = new Set<string>();
   /** Persisted state decoded in start(), held until mounts exist to apply it
    *  to — in the Host ordering start() runs before initStore() creates the
    *  mounts, so restoration must be second-callback-safe like watcher
@@ -654,15 +660,18 @@ export class WorkspaceModule implements Module {
     // Register tree states for each mount
     for (const mount of this.config.mounts) {
       const treeStateId = `workspace/${mount.name}/tree`;
-      try {
-        store.registerState({
-          id: treeStateId,
-          strategy: 'tree',
-          deltaSnapshotEvery: this.config.deltaSnapshotEvery ?? 50,
-          fullSnapshotEvery: this.config.fullSnapshotEvery ?? 10,
-        });
-      } catch {
-        // State already registered (restart scenario)
+      // A direct mount keeps no tree state: disk is the only copy.
+      if (mount.backend !== 'direct') {
+        try {
+          store.registerState({
+            id: treeStateId,
+            strategy: 'tree',
+            deltaSnapshotEvery: this.config.deltaSnapshotEvery ?? 50,
+            fullSnapshotEvery: this.config.fullSnapshotEvery ?? 10,
+          });
+        } catch {
+          // State already registered (restart scenario)
+        }
       }
 
       const mountState: MountState = {
@@ -712,6 +721,13 @@ export class WorkspaceModule implements Module {
       if (mount) {
         mount.lastMaterializedSeq = meta.lastMaterializedSeq;
         mount.lastMaterializedBranchId = meta.lastMaterializedBranchId ?? null;
+        // Switched back from direct to chronicle: the tree state is whatever
+        // it held before the direct stint, disk has moved on without it. A
+        // materialize from that tree would revert disk, so the first one
+        // waits for a full disk→store sync.
+        if (meta.backend === 'direct' && !this.isDirect(mount)) {
+          this.resyncBeforeMaterialize.add(name);
+        }
         // watcherReadyAt intentionally not restored — each session must
         // observe its own watcher attach, otherwise a stale timestamp
         // would hide a new-session attach failure.
@@ -855,6 +871,9 @@ export class WorkspaceModule implements Module {
         watcher.start();
         this.watchers.set(name, watcher);
 
+        // A direct mount has no tree to seed; its listings read disk live.
+        if (this.isDirect(mount)) continue;
+
         // Chokidar is started with ignoreInitial:true, so files already on
         // disk at session start would be invisible. Trigger one syncFromFs
         // pass — syncFromFs diffs disk against the tree state, so only files
@@ -875,7 +894,7 @@ export class WorkspaceModule implements Module {
   private async initialScan(mountName: string): Promise<void> {
     const store = this.store;
     const mount = this.mounts.get(mountName);
-    if (!store || !mount) return;
+    if (!store || !mount || this.isDirect(mount)) return;
 
     try {
       const result = await syncFromFs(store, mount);
@@ -902,6 +921,7 @@ export class WorkspaceModule implements Module {
           lastMaterializedBranchId: mount.lastMaterializedBranchId ?? undefined,
           watcherReadyAt: mount.watcherReadyAt,
           watcherError: mount.watcherError,
+          backend: this.isDirect(mount) ? 'direct' : 'chronicle',
         };
       }
       this.ctx.setState(state);
@@ -962,12 +982,15 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'write',
-        description: 'Create or overwrite a file in the workspace.',
+        description: 'Create or overwrite a file in the workspace. With append: true, adds to the end of the file instead '
+          + '(creating it if missing). On a direct-backend mount the write lands on disk immediately; on a chronicle mount '
+          + 'it lands in the workspace store and reaches disk on materialize (or immediately if the mount auto-materializes).',
         inputSchema: {
           type: 'object' as const,
           properties: {
             path: { type: 'string', description: 'File path (mount-prefixed)' },
             content: { type: 'string', description: 'Content to write' },
+            append: { type: 'boolean', description: 'Append instead of replacing (default: false)' },
           },
           required: ['path', 'content'],
         },
@@ -999,7 +1022,8 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'ls',
-        description: 'List directory contents from the workspace tree.',
+        description: 'List directory contents. Without a path, lists the mounts and their backends. Chronicle mounts list the '
+          + 'workspace tree; direct mounts list the disk.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1047,7 +1071,9 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'materialize',
-        description: 'Write workspace files to the real filesystem. Use after writing/editing to push changes to disk.',
+        description: 'Write workspace files to the real filesystem (chronicle mounts only — a direct mount is already on disk '
+          + 'and is reported as skipped). Use after writing/editing to push changes to disk. Prefer naming a path: without one, '
+          + 'every file changed in the store since the last materialize is written.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1059,7 +1085,8 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'sync',
-        description: 'Pull filesystem state into the workspace. Detects user changes on disk.',
+        description: 'Pull filesystem state into the workspace (chronicle mounts only — a direct mount always reads disk and '
+          + 'is reported as skipped). Detects user changes on disk.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1296,6 +1323,10 @@ export class WorkspaceModule implements Module {
     } catch (error) {
       return { error: error instanceof Error ? error.message : String(error) };
     }
+    if (this.isDirect(mount)) {
+      const fromDisk = await this.readBinaryFromDisk(mountPrefixedPath);
+      return 'error' in fromDisk ? fromDisk : { data: fromDisk.data };
+    }
     const store = this.getStore();
     await this.ensureSynced(mount, relativePath);
     const entry = store.treeGet(mount.treeStateId, relativePath);
@@ -1369,6 +1400,22 @@ export class WorkspaceModule implements Module {
     }
 
     return { mount, relativePath };
+  }
+
+  private isDirect(mount: MountState): boolean {
+    return mount.config.backend === 'direct';
+  }
+
+  /** The containment-checked opener, bound to a mount, for the direct backend. */
+  private opener(mount: MountState): ContainedOpener {
+    return (relativePath, mountPrefixedPath) => this.openContainedFile(mount, relativePath, mountPrefixedPath);
+  }
+
+  private directFailure(err: unknown): ToolResult {
+    if (err instanceof DirectFsError || err instanceof WorkspaceReadError) {
+      return { success: false, error: err.message, isError: true };
+    }
+    throw err;
   }
 
   private getStore(): JsStore {
@@ -1751,6 +1798,7 @@ export class WorkspaceModule implements Module {
    * Ensure a file is synced from filesystem if not yet in tree (lazy sync).
    */
   private async ensureSynced(mount: MountState, relativePath: string): Promise<void> {
+    if (this.isDirect(mount)) return;
     const store = this.getStore();
     const existing = store.treeGet(mount.treeStateId, relativePath);
     if (existing) return; // Already in tree
@@ -1801,22 +1849,30 @@ export class WorkspaceModule implements Module {
     }
     let content = generatedContent;
     if (content === undefined) {
-    const { mount, relativePath } = this.parsePath(input.path);
-    const store = this.getStore();
+      const { mount, relativePath } = this.parsePath(input.path);
+      if (this.isDirect(mount)) {
+        try {
+          content = (await directReadText(mount, relativePath, input.path, this.opener(mount))).content;
+        } catch (err) {
+          return this.directFailure(err);
+        }
+      } else {
+        const store = this.getStore();
 
-    await this.ensureSynced(mount, relativePath);
+        await this.ensureSynced(mount, relativePath);
 
-    const entry = store.treeGet(mount.treeStateId, relativePath);
-    if (!entry) {
-      return { success: false, error: `File not found: ${input.path}`, isError: true };
-    }
+        const entry = store.treeGet(mount.treeStateId, relativePath);
+        if (!entry) {
+          return { success: false, error: `File not found: ${input.path}`, isError: true };
+        }
 
-    const blob = store.getBlob(entry.blobHash);
-    if (!blob) {
-      return { success: false, error: `Blob not found for: ${input.path}`, isError: true };
-    }
+        const blob = store.getBlob(entry.blobHash);
+        if (!blob) {
+          return { success: false, error: `Blob not found for: ${input.path}`, isError: true };
+        }
 
-    content = blob.toString('utf-8');
+        content = blob.toString('utf-8');
+      }
     }
     if (characterPaging) {
       const start = Math.min(offsetChars, content.length);
@@ -1893,7 +1949,7 @@ export class WorkspaceModule implements Module {
     let treeError: WorkspaceImageReadError | null = null;
 
     try {
-      const image = this.tryReadImageFromTree(mount, relativePath, input.path, maxSize);
+      const image = this.isDirect(mount) ? null : this.tryReadImageFromTree(mount, relativePath, input.path, maxSize);
       if (image) {
         return {
           success: true,
@@ -1951,17 +2007,37 @@ export class WorkspaceModule implements Module {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
     }
 
+    if (this.isDirect(mount)) {
+      try {
+        const written = await directWrite(mount, relativePath, input.path, Buffer.from(input.content, 'utf-8'), { append: input.append === true });
+        return {
+          success: true,
+          data: { path: input.path, size: written.size, hash: written.hash, ...(written.appended ? { appended: true } : {}) },
+        };
+      } catch (err) {
+        return this.directFailure(err);
+      }
+    }
+
     const store = this.getStore();
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
-    if (Buffer.byteLength(input.content) > maxSize) {
+
+    let text = input.content;
+    if (input.append === true) {
+      await this.ensureSynced(mount, relativePath);
+      const existing = store.treeGet(mount.treeStateId, relativePath);
+      const prior = existing ? store.getBlob(existing.blobHash) : null;
+      if (prior) text = prior.toString('utf-8') + input.content;
+    }
+    if (Buffer.byteLength(text) > maxSize) {
       return { success: false, error: `Content exceeds max file size (${maxSize} bytes)`, isError: true };
     }
 
-    const buffer = Buffer.from(input.content, 'utf-8');
+    const buffer = Buffer.from(text, 'utf-8');
     const blobHash = store.storeBlob(buffer, 'text/plain');
     store.treeSet(mount.treeStateId, relativePath, {
       blobHash,
-      size: Buffer.byteLength(input.content),
+      size: buffer.length,
       mode: 0o644,
     });
     const materializeError = await this.autoMaterialize(mount, relativePath, 'write', buffer);
@@ -1977,8 +2053,9 @@ export class WorkspaceModule implements Module {
       success: true,
       data: {
         path: input.path,
-        size: Buffer.byteLength(input.content),
-        hash: hashContent(input.content),
+        size: buffer.length,
+        hash: hashContent(text),
+        ...(input.append === true ? { appended: true } : {}),
       },
     };
   }
@@ -1987,6 +2064,17 @@ export class WorkspaceModule implements Module {
     const { mount, relativePath } = this.parsePath(input.path);
     if (mount.config.mode === 'read-only') {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
+    }
+
+    if (this.isDirect(mount)) {
+      try {
+        const edited = await directEdit(mount, relativePath, input.path, this.opener(mount), {
+          oldString: input.oldString, newString: input.newString, replaceAll: input.replaceAll,
+        });
+        return { success: true, data: { path: input.path, size: edited.size } };
+      } catch (err) {
+        return this.directFailure(err);
+      }
     }
 
     const store = this.getStore();
@@ -2054,6 +2142,15 @@ export class WorkspaceModule implements Module {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
     }
 
+    if (this.isDirect(mount)) {
+      try {
+        await directDelete(mount, relativePath, input.path);
+        return { success: true, data: { path: input.path, deleted: true } };
+      } catch (err) {
+        return this.directFailure(err);
+      }
+    }
+
     const store = this.getStore();
     const entry = store.treeGet(mount.treeStateId, relativePath);
     if (!entry) {
@@ -2082,11 +2179,34 @@ export class WorkspaceModule implements Module {
         name,
         path: m.config.path,
         mode: m.config.mode,
+        backend: this.isDirect(m) ? 'direct' : 'chronicle',
       }));
       return { success: true, data: { mounts } };
     }
 
     const { mount, relativePath } = this.parsePath(input.path);
+
+    if (this.isDirect(mount)) {
+      try {
+        if (input.recursive) {
+          const walk = await directWalk(mount, relativePath, { recursive: true });
+          return {
+            success: true,
+            data: {
+              path: input.path,
+              entries: walk.files,
+              count: walk.files.length,
+              ...(walk.truncated ? { truncated: true, note: `Listing stopped at ${walk.files.length} files; narrow the path or add ignore patterns.` } : {}),
+              ...(walk.unreadable.length > 0 ? { unreadable: walk.unreadable } : {}),
+            },
+          };
+        }
+        const entries = await directListDir(mount, relativePath);
+        return { success: true, data: { path: input.path, entries, count: entries.length } };
+      } catch (err) {
+        return this.directFailure(err);
+      }
+    }
 
     // Ensure initial sync — always sync on first access regardless of watch mode,
     // so that ls/glob/grep see filesystem contents even for unwatched mounts
@@ -2150,7 +2270,24 @@ export class WorkspaceModule implements Module {
       ? [this.parsePath(input.path)]
       : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
 
+    let truncated = false;
     for (const { mount, relativePath } of mountsToSearch) {
+      if (this.isDirect(mount)) {
+        let walk;
+        try {
+          walk = await directWalk(mount, relativePath, { recursive: true });
+        } catch (err) {
+          if (mountsToSearch.length === 1) return this.directFailure(err);
+          continue;
+        }
+        truncated ||= walk.truncated;
+        for (const file of walk.files) {
+          const testPath = relativePath ? file.path.slice(relativePath.length + 1) : file.path;
+          if (regex.test(testPath)) matches.push(`${mount.config.name}/${file.path}`);
+        }
+        continue;
+      }
+
       if (!mount.initialSyncDone) {
         await syncFromFs(store, mount);
         mount.initialSyncDone = true;
@@ -2173,6 +2310,7 @@ export class WorkspaceModule implements Module {
         pattern: input.pattern,
         matches,
         count: matches.length,
+        ...(truncated ? { truncated: true, note: 'A direct mount hit the file cap; some files were not visited.' } : {}),
       },
     };
   }
@@ -2195,8 +2333,26 @@ export class WorkspaceModule implements Module {
       : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
 
     const results: Array<{ file: string; matches: Array<{ line: number; text: string; context?: string[] }> }> = [];
+    let truncated = false;
+    const skipped = { binary: 0, tooLarge: 0, unreadable: 0 };
 
     for (const { mount, relativePath } of mountsToSearch) {
+      if (this.isDirect(mount)) {
+        try {
+          const found = await directGrep(mount, relativePath, this.opener(mount), {
+            regex, fileGlob, contextBefore, contextAfter,
+          });
+          results.push(...found.results);
+          truncated ||= found.truncated;
+          skipped.binary += found.skipped.binary;
+          skipped.tooLarge += found.skipped.tooLarge;
+          skipped.unreadable += found.skipped.unreadable;
+        } catch (err) {
+          if (mountsToSearch.length === 1) return this.directFailure(err);
+        }
+        continue;
+      }
+
       if (!mount.initialSyncDone) {
         await syncFromFs(store, mount);
         mount.initialSyncDone = true;
@@ -2251,12 +2407,15 @@ export class WorkspaceModule implements Module {
       }
     }
 
+    const skippedTotal = skipped.binary + skipped.tooLarge + skipped.unreadable;
     return {
       success: true,
       data: {
         pattern: input.pattern,
         results,
         totalMatches: results.reduce((sum, r) => sum + r.matches.length, 0),
+        ...(skippedTotal > 0 ? { skipped } : {}),
+        ...(truncated ? { truncated: true, note: 'A direct mount hit the file cap; some files were not searched.' } : {}),
       },
     };
   }
@@ -2266,6 +2425,16 @@ export class WorkspaceModule implements Module {
     const status: Record<string, unknown> = {};
 
     for (const [name, mount] of this.mounts) {
+      if (this.isDirect(mount)) {
+        status[name] = {
+          path: mount.config.path,
+          mode: mount.config.mode,
+          backend: 'direct',
+          watch: mount.config.watch ?? 'always',
+          note: 'Direct backend: tools read and write disk; materialize and sync do not apply.',
+        };
+        continue;
+      }
       const entries = store.treeList(mount.treeStateId);
       const currentSeq = store.currentSequence();
       const changes = mount.lastMaterializedSeq > 0
@@ -2276,6 +2445,7 @@ export class WorkspaceModule implements Module {
       status[name] = {
         path: mount.config.path,
         mode: mount.config.mode,
+        backend: 'chronicle',
         watch: mount.config.watch ?? 'always',
         fileCount: entries.length,
         lastMaterializedSeq: mount.lastMaterializedSeq,
@@ -2303,10 +2473,32 @@ export class WorkspaceModule implements Module {
         return { success: false, error: `Unknown mount: ${input.mount}`, isError: true };
       }
       mountsToMaterialize = [{ name: input.mount, mount: m }];
+    } else if (input.path) {
+      const { mount } = this.parsePath(input.path);
+      mountsToMaterialize = [{ name: mount.config.name, mount }];
     } else {
       mountsToMaterialize = [...this.mounts.entries()]
         .filter(([, m]) => m.config.mode === 'read-write')
         .map(([name, mount]) => ({ name, mount }));
+    }
+
+    // Direct mounts have nothing to materialize: every write already landed.
+    const notApplicable = mountsToMaterialize
+      .filter(({ mount }) => this.isDirect(mount))
+      .map(({ name }) => ({ mount: name, reason: 'direct backend — files are already on disk' }));
+    mountsToMaterialize = mountsToMaterialize.filter(({ mount }) => !this.isDirect(mount));
+    if (mountsToMaterialize.length === 0) {
+      return { success: true, data: { materialized: [], count: 0, skipped: notApplicable } };
+    }
+
+    // A mount that just came back from the direct backend syncs disk into the
+    // store before its first materialize, so the stale tree never wins.
+    for (const { name, mount } of mountsToMaterialize) {
+      if (!this.resyncBeforeMaterialize.has(name)) continue;
+      const result = await syncFromFs(store, mount);
+      mount.initialSyncDone = true;
+      this.emitFsEvents(name, result.synced, result.conflicts);
+      this.resyncBeforeMaterialize.delete(name);
     }
 
     // Branch guard, scoped to the mounts actually being materialized: a
@@ -2366,12 +2558,13 @@ export class WorkspaceModule implements Module {
       }
     }
 
+    const skipped = [...blocked, ...notApplicable];
     return {
       success: true,
       data: {
         materialized: allWritten,
         count: allWritten.length,
-        ...(blocked.length > 0 ? { skipped: blocked } : {}),
+        ...(skipped.length > 0 ? { skipped } : {}),
       },
     };
   }
@@ -2413,11 +2606,18 @@ export class WorkspaceModule implements Module {
         return { success: false, error: `Unknown mount: ${input.mount}`, isError: true };
       }
       mountsToSync = [{ name: input.mount, mount: m }];
+    } else if (input.path) {
+      const { mount } = this.parsePath(input.path);
+      mountsToSync = [{ name: mount.config.name, mount }];
     } else {
       mountsToSync = [...this.mounts.entries()].map(([name, mount]) => ({ name, mount }));
     }
 
     for (const { name, mount } of mountsToSync) {
+      if (this.isDirect(mount)) {
+        allSkipped.push({ mount: name, path: '*', reason: 'direct backend — reads always come from disk' });
+        continue;
+      }
 
       let paths: string[] | undefined;
       if (input.path) {
@@ -2471,6 +2671,12 @@ export class WorkspaceModule implements Module {
     const store = this.store;
     const mount = this.mounts.get(mountName);
     if (!store || !mount) return;
+
+    if (this.isDirect(mount)) {
+      // Nothing to ingest — the watcher's op is the event.
+      this.emitFsEvents(mountName, changes.map(c => ({ path: c.path, op: c.op })), []);
+      return;
+    }
 
     const touchedPaths = changes.filter(c => c.op !== 'deleted').map(c => c.path);
     const deletedPaths = changes.filter(c => c.op === 'deleted').map(c => c.path);
