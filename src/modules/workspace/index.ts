@@ -8,7 +8,7 @@
 import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { open, readFile, stat, lstat, realpath } from 'node:fs/promises';
-import { join, resolve, relative, sep } from 'node:path';
+import { isAbsolute, join, resolve, relative, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
@@ -38,7 +38,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { filesystemTrustsCtime, isIgnored, locateRoot } from './observe.js';
+import { coveredByIgnore, filesystemTrustsCtime, locateRoot } from './observe.js';
 import {
   type MountRuntime,
   type PassOptions,
@@ -617,20 +617,6 @@ function detectImageMimeType(bytes: Buffer, mountPrefixedPath: string): Supporte
   throw new WorkspaceImageReadError('unsupported', `Unsupported image format: ${mountPrefixedPath}`);
 }
 
-/**
- * Whether the mount's ignore list covers a mount-relative path: the path
- * itself or any directory above it, as the walk's own test reads each entry
- * by its path and name.
- */
-function coveredByIgnore(relativePath: string, patterns: string[]): boolean {
-  if (patterns.length === 0) return false;
-  const segments = relativePath.split('/').filter(Boolean);
-  for (let i = 0; i < segments.length; i++) {
-    if (isIgnored(segments.slice(0, i + 1).join('/'), segments[i]!, patterns)) return true;
-  }
-  return false;
-}
-
 export class WorkspaceModule implements Module {
   readonly name = 'workspace';
 
@@ -663,12 +649,18 @@ export class WorkspaceModule implements Module {
         const outerPath = resolve(outer.path);
         const innerPath = resolve(inner.path);
         const rel = relative(outerPath, innerPath);
-        if (rel && !rel.startsWith('..') && !rel.startsWith('/')) {
-          // inner is nested under outer — add ignore rule
+        // Nested: a relative path that doesn't climb out (`..` exactly, or
+        // `../…`; a name like `..cache` is a child) and isn't another root
+        // (`relative()` returns `D:\…` across Windows drives).
+        if (rel && rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel)) {
+          // inner is nested under outer — add ignore rule. Only the `/**`
+          // form matches a path at any depth, and only that path: a bare
+          // `a/b` never matches, and a bare `sub` matches every directory
+          // named sub (agent-framework #280).
           outer.ignore = outer.ignore ?? [];
-          const pattern = rel + '/**';
-          if (!outer.ignore.includes(pattern) && !outer.ignore.includes(rel)) {
-            outer.ignore.push(rel);
+          const pattern = rel.split(sep).join('/') + '/**';
+          if (!outer.ignore.includes(pattern)) {
+            outer.ignore.push(pattern);
             console.warn(
               `[workspace] Mount "${outer.name}" contains mount "${inner.name}" ` +
               `(${rel}/) — auto-ignoring to prevent overlap`,

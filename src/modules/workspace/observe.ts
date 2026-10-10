@@ -647,7 +647,7 @@ export interface Walk {
   incomplete: Array<{ path: string; reason: string; kind: 'error' | 'cap' | 'ignored' | 'symlink' }>;
 }
 
-/** Simple ignore patterns, as the watcher and the old walk read them. */
+/** Simple ignore patterns, as the walk and the watcher read them. */
 export function isIgnored(relativePath: string, name: string, patterns: string[]): boolean {
   for (const pattern of patterns) {
     if (pattern === name) return true;
@@ -657,6 +657,21 @@ export function isIgnored(relativePath: string, name: string, patterns: string[]
     }
     if (!pattern.includes('/') && relativePath === pattern) return true;
     if (pattern.startsWith('*.') && name.endsWith(pattern.slice(1))) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether the mount's ignore list covers a mount-relative path: the path
+ * itself or any directory above it, as the walk's own test reads each entry
+ * by its path and name on the way down. The watcher reads it the same way
+ * (agent-framework #280).
+ */
+export function coveredByIgnore(relativePath: string, patterns: string[]): boolean {
+  if (patterns.length === 0) return false;
+  const segments = relativePath.split('/').filter(Boolean);
+  for (let i = 0; i < segments.length; i++) {
+    if (isIgnored(segments.slice(0, i + 1).join('/'), segments[i]!, patterns)) return true;
   }
   return false;
 }
