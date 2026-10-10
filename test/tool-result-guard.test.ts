@@ -1417,7 +1417,7 @@ test('#277: a write for a branch that waits for its mount while the branch chang
 // delete mark theirs; nothing else does.
 // ---------------------------------------------------------------------------
 
-const LISTS = ' The file lists from its result: ';
+const LISTS = ' Kept from its result: ';
 /** The file lists a stub kept, parsed; undefined when it kept none. */
 const keptLists = (stub: string) => stub.includes(LISTS) ? JSON.parse(stub.slice(stub.indexOf(LISTS) + LISTS.length)) : undefined;
 const toolUse = (id: string, name: string, input: Record<string, unknown> = {}) =>
@@ -1427,13 +1427,13 @@ test('#277: a stub keeps the file lists after where the original is, for each pl
   const notice = 'Tool result withheld by the guard. The tool has already executed.';
   const lists = '{"materialized":[{"mount":"work","path":"LOG.md"}]}';
   assert.equal(withheldResultNotice({ path: 'work/tool-results/x.txt' }, true, lists),
-    `${notice} Its full result is in workspace file work/tool-results/x.txt. The file lists from its result: ${lists}`);
+    `${notice} Its full result is in workspace file work/tool-results/x.txt. Kept from its result: ${lists}`);
   assert.equal(withheldResultNotice({ path: 'work/tool-results/x.txt', error: 'disk full' }, true, lists),
     `${notice} Writing its full result to workspace file work/tool-results/x.txt failed (disk full), ` +
-    `so it is kept only in the guard's audit record (framework/tool-result-guard), for an operator. The file lists from its result: ${lists}`);
+    `so it is kept only in the guard's audit record (framework/tool-result-guard), for an operator. Kept from its result: ${lists}`);
   assert.equal(withheldResultNotice(null, false, lists),
     `${notice} Its full result is kept in the guard's audit record (framework/tool-result-guard), for an operator, ` +
-    `though saving that record had failed when this was written. The file lists from its result: ${lists}`);
+    `though saving that record had failed when this was written. Kept from its result: ${lists}`);
   assert.equal(withheldResultNotice(null, true, undefined), AUDIT_STUB, 'nothing kept: the stub is as before');
 });
 
@@ -1467,7 +1467,7 @@ test('#277: a withheld batch keeps what each marked result listed; an unmarked o
     const [marked, plain] = toolResults(h.framework).map((block) => String(block.content));
     assert.deepEqual(keptLists(marked), { written: ['LOG.md'] });
     assert.doesNotMatch(marked, /payload-marked/, 'only the marked field is kept');
-    assert.match(marked, /^Tool result withheld by the guard\. The tool has already executed\. Its full result is in workspace file work\/tool-results\/\S+-0-marked\.txt\. The file lists from its result: /);
+    assert.match(marked, /^Tool result withheld by the guard\. The tool has already executed\. Its full result is in workspace file work\/tool-results\/\S+-0-marked\.txt\. Kept from its result: /);
     assert.equal(keptLists(plain), undefined);
     assert.match(plain, /Its full result is in workspace file work\/tool-results\/\S+-1-plain\.txt\.$/);
     const file = await h.workspace.readBinary(/workspace file (\S+\.txt)\./.exec(marked)![1]);

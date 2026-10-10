@@ -30,7 +30,7 @@ export interface WithheldHost {
 
 /**
  * The stub a withheld result settles to: #159's neutral notice, then where
- * the original is, then, when its tool marked them, the file lists from its
+ * the original is, then, when its tool marked any, the fields kept from its
  * result (`kept`, from keptWhenWithheld). It names no refusal and no
  * category (#159 keeps those in operational logs), so reading the rest back
  * is the agent's deliberate choice (agent-framework #277).
@@ -44,8 +44,8 @@ export function withheldResultNotice(spill: WithheldSpill, auditDurable: boolean
     : spill
       ? `Writing its full result to workspace file ${spill.path} failed (${spill.error}), so it is kept only in ${audit}.`
       : `Its full result is kept in ${audit}.`;
-  const lists = kept === undefined ? '' : ` The file lists from its result: ${kept}`;
-  return `${TOOL_RESULT_GUARD_NOTICE} ${place}${lists}`;
+  const fields = kept === undefined ? '' : ` Kept from its result: ${kept}`;
+  return `${TOOL_RESULT_GUARD_NOTICE} ${place}${fields}`;
 }
 
 /**

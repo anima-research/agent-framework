@@ -1,6 +1,6 @@
 - A result of the workspace's `materialize`, `sync` or `delete` that the
   tool-result guard withholds now keeps its file lists in its stub, after
-  where the original is ("The file lists from its result: {…}"): what
+  where the original is ("Kept from its result: {…}"): what
   `materialize` removed from disk and wrote to it, what `sync` took from disk,
   gave up or holds as a conflict, per mount, with any root it accepted, and
   the path `delete` removed. The full result still goes where every withheld
