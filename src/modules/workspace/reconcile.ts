@@ -359,10 +359,10 @@ function adoptDisk(d: Extract<DiskFact, { kind: 'absent' | 'file' }>, s: { hash:
   if (d.kind === 'absent') {
     return { state: 'synced', ...(s ? { adopt: 'remove' as const, op: 'deleted' as const } : {}), p: { kind: 'absent' }, intent: {} };
   }
-  if (d.ingestible) {
-    if (s && s.hash === d.hash) return { state: 'synced', p: agreedFromDisk(d), intent: {} };
-    return { state: 'synced', adopt: 'ingest', op: s ? 'modified' : 'created', p: agreedFromDisk(d), intent: {} };
-  }
+  // Disk agreeing with the store is disk's state already, whatever the file
+  // is: a binary or oversize file the workspace holds stays held.
+  if (s && s.hash === d.hash) return { state: 'synced', p: agreedFromDisk(d), intent: {} };
+  if (d.ingestible) return { state: 'synced', adopt: 'ingest', op: s ? 'modified' : 'created', p: agreedFromDisk(d), intent: {} };
   return { state: 'disk-only', ...(s ? { adopt: 'drop' as const, op: 'deleted' as const } : {}), p: 'forget', intent: {} };
 }
 

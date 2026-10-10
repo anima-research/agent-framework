@@ -731,6 +731,22 @@ describe('restarts and faults', () => {
     assert.equal(env.readDisk('a.txt'), 'C');
   });
 
+  test('a path sync keeps a stored binary file that disk agrees with', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    const res = await m.writeBinary('work/img/shot.png', ONE_PX_PNG, 'image/png');
+    assert.equal(res.success, true, String(res.error));
+    await call(m, 'materialize', { path: 'work/img/shot.png' });
+    assert.deepEqual(readFileSync(env.disk('img/shot.png')), ONE_PX_PNG);
+    const stored = env.store.treeGet(TREE, 'img/shot.png');
+    assert.notEqual(stored, null);
+
+    const synced = await call(m, 'sync', { path: 'work/img' });
+    assert.deepEqual(synced.results ?? [], [], 'nothing to take from disk');
+    assert.deepEqual(env.store.treeGet(TREE, 'img/shot.png'), stored, 'still held, unchanged');
+    assert.equal(await stateOf(m, 'img/shot.png'), 'synced');
+  });
+
   test('writeBinary settles the pending adoption first too', async (t) => {
     const env = new Env(t);
     const m = await pendingAdoption(env);
