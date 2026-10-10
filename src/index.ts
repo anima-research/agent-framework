@@ -83,6 +83,15 @@ export type { GateConfig, GateOptions, GatePolicy, GatePolicyMatch, GateBehavior
 // MCPL channel registry (exposed for modules that need channel-level operations)
 export { ChannelRegistry } from './mcpl/index.js';
 
+// Where each accepted inbound item came from (`metadata.inboundSource`)
+export { INBOUND_SOURCE_KEY, readInboundSource, conversationKey } from './mcpl/index.js';
+export type {
+  InboundSource,
+  InboundChannelSource,
+  InboundUnscopedSource,
+  InboundSurfaceSource,
+} from './mcpl/index.js';
+
 // MCPL server config (exposed for hosts that manage servers at runtime via
 // connectMcplServer / disconnectMcplServer / restartMcplServer)
 export type { McplServerConfig } from './mcpl/index.js';
@@ -90,7 +99,7 @@ export type { McplServerConfig } from './mcpl/index.js';
 // MCPL client connection (exposed so external tooling — server playtests,
 // health probes, protocol harnesses — can dial an MCPL server exactly the
 // way the framework host does, over stdio or WebSocket)
-export { McplServerConnection } from './mcpl/index.js';
+export { McplServerConnection, McplRequestError } from './mcpl/index.js';
 export type { McplHostCapabilities } from './mcpl/index.js';
 
 // MCPL tool lifecycle (RFC-007) and tool classes (RFC-008): the types a host
