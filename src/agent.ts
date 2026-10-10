@@ -655,6 +655,8 @@ export class Agent {
     }
 
     this.toolResultGuard.flushUnrecorded();
+    // A withheld stub is compiled only once it says where its original went.
+    await this.toolResultGuard.whenAnnotated();
 
     // Filter tools to only allowed ones
     const tools = availableTools.filter((t) => this.canUseTool(t.name));
@@ -935,6 +937,8 @@ export class Agent {
     // Retry accepted history edits before assembling a real request. Pure
     // preview/compile entry points must not perform these writes.
     this.toolResultGuard.flushUnrecorded();
+    // A withheld stub is compiled only once it says where its original went.
+    await this.toolResultGuard.whenAnnotated();
 
     // A new activation supersedes every receipt flight the previous one left
     // open. Membrane fires the kv-unified wire receipt per provider attempt,
@@ -1192,9 +1196,19 @@ export class Agent {
       if (ids) {
         abandonedUsage = response.usage;
         const withheld = new Set(ids);
+        // The retry carries the stubs as stored: each says where its original
+        // went (agent-framework #277), once the guard has written that.
+        await this.toolResultGuard.whenAnnotated();
+        const stubs = new Map<string, Extract<ContentBlock, { type: 'tool_result' }>['content']>();
+        for (const message of this.contextManager.getAllMessages()) {
+          for (const block of message.content) {
+            if (block.type === 'tool_result' && withheld.has(block.toolUseId)) stubs.set(block.toolUseId, block.content);
+          }
+        }
         request = { ...request, messages: request.messages.map((message) => ({
           ...message, content: message.content.map((block) => block.type === 'tool_result' && withheld.has(block.toolUseId)
-            ? { type: 'tool_result', toolUseId: block.toolUseId, content: TOOL_RESULT_GUARD_NOTICE, isError: block.isError } : block),
+            ? { type: 'tool_result', toolUseId: block.toolUseId,
+              content: stubs.get(block.toolUseId) ?? TOOL_RESULT_GUARD_NOTICE, isError: block.isError } : block),
         })) };
         response = await this.membrane.stream(request, { signal });
       }

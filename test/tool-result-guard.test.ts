@@ -1,6 +1,6 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassthroughStrategy, type StoredMessage, type StrategyContext } from '@animalabs/context-manager';
@@ -9,8 +9,14 @@ import { Membrane as RealMembrane, NativeFormatter, type ProviderAdapter, type P
   type ProviderResponse, type StreamCallbacks } from '@animalabs/membrane';
 import { AgentFramework, type AgentConfig, type AgentSettingsExtension, type Module, type ModuleContext,
   type ToolCall, type ToolResult, type ProcessEvent, type ProcessState } from '../src/index.js';
-import { TOOL_RESULT_GUARD_AUDIT_STATE, TOOL_RESULT_GUARD_NOTICE } from '../src/tool-result-guard.js';
+import { TOOL_RESULT_GUARD_AUDIT_STATE, TOOL_RESULT_GUARD_NOTICE, withheldResultNotice } from '../src/tool-result-guard.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
+import { WorkspaceModule } from '../src/modules/workspace/index.js';
+
+// What a withheld result settles to with no writable workspace (#277): the
+// neutral notice, then where the original is kept.
+const AUDIT_STUB = withheldResultNotice(null, true);
+const UNSAVED_STUB = withheldResultNotice(null, false);
 
 const dirs: string[] = [];
 afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
@@ -138,9 +144,12 @@ test('withholds the entire latest batch, retries inference once, and keeps origi
     assert.doesNotMatch(JSON.stringify(retry), /original-text-payload|original-error-payload|discard-this-partial-output|test-category/);
     assert.ok(!JSON.stringify(retry).includes(image));
     assert.equal(retry.messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_use').length, 3);
+    const retried = retry.messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    assert.ok(retried.length === 3 && retried.every((b) => b.content === AUDIT_STUB),
+      'the retry already says where each original is');
     const guarded = toolResults(h.framework);
     assert.equal(guarded.length, 3);
-    assert.ok(guarded.every((block) => block.content === TOOL_RESULT_GUARD_NOTICE));
+    assert.ok(guarded.every((block) => block.content === AUDIT_STUB));
     assert.equal(guarded.find((b) => b.toolUseId === 'error')?.isError, true);
     assert.deepEqual(h.module.speeches, ['continued']);
     assert.ok(strategy.snapshots.every((s) => !s.includes('original-text-payload') && !s.includes(image)),
@@ -150,18 +159,18 @@ test('withholds the entire latest batch, retries inference once, and keeps origi
     const audit = store.getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
     assert.match(JSON.stringify(audit[0]), /original-text-payload|original-error-payload/);
     assert.ok(JSON.stringify(audit[0]).includes(image));
-    assert.equal(audit.at(-1)?.type, 'withheld');
+    assert.deepEqual(audit.slice(-2).map((r) => r.type), ['withheld', 'annotated']);
     const historical = store.getStateJsonAt(TOOL_RESULT_GUARD_AUDIT_STATE, stagedSequence) as unknown[];
     assert.deepEqual(audit[0], historical[0], 'redaction only appends; original Chronicle record is unchanged');
     const original = structuredClone(audit[0]);
     extension(h.framework).update('assistant', { tool_result_guard: false });
-    assert.ok(toolResults(h.framework).every((block) => block.content === TOOL_RESULT_GUARD_NOTICE));
+    assert.ok(toolResults(h.framework).every((block) => block.content === AUDIT_STUB));
     await h.framework.stop();
     originalStopped = true;
     const restarted = await AgentFramework.create(h.base);
     try {
       assert.equal(extension(restarted).get('assistant').tool_result_guard, false, 'explicit disable persists');
-      assert.ok(toolResults(restarted).every((block) => block.content === TOOL_RESULT_GUARD_NOTICE));
+      assert.ok(toolResults(restarted).every((block) => block.content === AUDIT_STUB));
       assert.deepEqual((restarted.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as unknown[])[0], original);
       const preview = await restarted.previewActivation('assistant');
       assert.doesNotMatch(JSON.stringify(preview), /original-text-payload|original-error-payload/);
@@ -175,7 +184,7 @@ test('successful physical rounds admit results; refusal affects only the newest 
     await h.run();
     const results = toolResults(h.framework);
     assert.match(String(results.find((b) => b.toolUseId === 'accepted')?.content), /payload-accepted/);
-    assert.equal(results.find((b) => b.toolUseId === 'withheld')?.content, TOOL_RESULT_GUARD_NOTICE);
+    assert.equal(results.find((b) => b.toolUseId === 'withheld')?.content, AUDIT_STUB);
     assert.deepEqual(h.module.calls, ['accepted', 'withheld']);
     assert.equal(h.framework.getAgent('assistant')!.toolResultGuard.enabled, true);
   } finally { await h.framework.stop(); }
@@ -192,7 +201,7 @@ test('a second refusal stops recovery without auto-rewinding older or human mess
     const messages = h.framework.getAgent('assistant')!.getContextManager().getAllMessages();
     assert.ok(messages.some((m) => m.content.some((b) => b.type === 'text' && b.text === 'read')));
     assert.doesNotMatch(JSON.stringify(messages), /discard-this-partial-output|refusal-rewind/);
-    assert.equal(toolResults(h.framework)[0].content, TOOL_RESULT_GUARD_NOTICE);
+    assert.equal(toolResults(h.framework)[0].content, AUDIT_STUB);
   } finally { await h.framework.stop(); }
 });
 
@@ -248,7 +257,7 @@ test('budget restart submits staged originals, then recovers without re-executin
     assert.match(JSON.stringify(h.membrane.requests[1]), /payload-one/);
     assert.doesNotMatch(JSON.stringify(h.membrane.requests[2]), /payload-one/);
     assert.deepEqual(h.module.calls, ['one']);
-    assert.equal(toolResults(h.framework)[0].content, TOOL_RESULT_GUARD_NOTICE);
+    assert.equal(toolResults(h.framework)[0].content, AUDIT_STUB);
   } finally { await h.framework.stop(); }
 });
 
@@ -368,7 +377,9 @@ test('backward-compatible direct Agent inference also guards tool results', asyn
     assert.equal(final.usage?.inputTokens, 20, 'abandoned refused attempt usage is included');
     assert.match(JSON.stringify(requests[1]), /direct-original/);
     assert.doesNotMatch(JSON.stringify(requests[2]), /direct-original|discard-this/);
-    assert.equal(toolResults(h.framework)[0].content, TOOL_RESULT_GUARD_NOTICE);
+    const retried = requests[2].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    assert.deepEqual(retried.map((b) => b.content), [AUDIT_STUB], 'the direct retry says where the original is too');
+    assert.equal(toolResults(h.framework)[0].content, AUDIT_STUB);
   } finally { await h.framework.stop(); }
 });
 
@@ -391,7 +402,7 @@ test('full oversized output survives withholding and reopening as a Chronicle bl
     const restarted = await AgentFramework.create(h.base);
     try {
       assert.deepEqual(restarted.getStore().getBlob(blobId), blob);
-      assert.equal(toolResults(restarted)[0].content, TOOL_RESULT_GUARD_NOTICE);
+      assert.equal(toolResults(restarted)[0].content, AUDIT_STUB);
     } finally { await restarted.stop(); }
   } finally { if (!originalStopped) await h.framework.stop(); }
 });
@@ -558,7 +569,7 @@ test('failed audit sync fails closed: originals are never submitted', async () =
     const provided = JSON.stringify(h.membrane.streams[0].receivedToolResults);
     assert.doesNotMatch(provided, /payload-one/, 'non-durable audit must not release originals');
     assert.match(provided, /Tool result withheld by the guard/);
-    assert.equal(toolResults(h.framework)[0].content, TOOL_RESULT_GUARD_NOTICE);
+    assert.equal(toolResults(h.framework)[0].content, UNSAVED_STUB);
     const guard = h.framework.getAgent('assistant')!.toolResultGuard;
     assert.equal(guard.hasPending, false);
   } finally { (store as { sync: () => void }).sync = sync; await h.framework.stop(); }
@@ -739,7 +750,9 @@ test('real compression: a withheld batch releases its hold and the placeholder c
     await r.drain();
     r.guard.submissionResults([{ toolUseId: 'tu-1', content: r.REAL }]);
     assert.ok(r.guard.withhold('test-category'));
-    assert.equal(r.cm.getCompressionHolds().size, 0, 'withhold releases the hold');
+    assert.deepEqual([...r.cm.getCompressionHolds()], [r.messageId], 'held until the stub says where the original is');
+    await r.guard.whenAnnotated();
+    assert.equal(r.cm.getCompressionHolds().size, 0, 'withhold releases the hold once annotated');
     await r.drain();
     assert.ok(r.prompts.some((p) => p.includes(TOOL_RESULT_GUARD_NOTICE)), 'placeholder compresses after release');
     assert.ok(!r.prompts.some((p) => p.includes(r.REAL)), 'withheld output never reaches memory');
@@ -761,6 +774,7 @@ test('every settlement path releases the hold, even when the audit write fails',
       const store = r.cm.getStore();
       (store as { appendToStateJson: unknown }).appendToStateJson = () => { throw new Error('storage down'); };
       try { settle(r.guard); } catch { /* audit failure surfaces; hold must still go */ }
+      await r.guard.whenAnnotated();
       assert.equal(r.guard.hasPending, false, `${name}: batch cleared`);
       assert.equal(r.cm.getCompressionHolds().size, 0, `${name}: hold released`);
     } finally { r.cm.close(); }
@@ -790,7 +804,7 @@ for (const failedType of ['staged', 'linked']) {
       failing = false;
       await h.run(); // A normal activation, with no new tool call, retries the audit.
       const records = store.getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
-      assert.deepEqual(records.map((r) => r.type), ['staged', 'linked', 'withheld']);
+      assert.deepEqual(records.map((r) => r.type), ['staged', 'linked', 'withheld', 'annotated']);
       assert.match(JSON.stringify(records[0]), /payload-one/, 'the original is recoverable after storage returns');
       assert.doesNotMatch(JSON.stringify(h.membrane.requests[1]), /payload-one/);
       assert.deepEqual(h.module.calls, ['one']);
@@ -883,14 +897,14 @@ test('storage recovery: endTurn never admits a batch whose audit sync failed', a
   };
   try {
     await h.run();
-    assert.equal(toolResults(h.framework)[0].content, TOOL_RESULT_GUARD_NOTICE);
+    assert.equal(toolResults(h.framework)[0].content, UNSAVED_STUB);
     assert.equal(agent.getContextManager().getCompressionHolds().size, 0);
     assert.equal(agent.toolResultGuard.hasPending, false);
     store.sync = sync;
     await h.run();
     assert.doesNotMatch(JSON.stringify(h.membrane.requests[1]), /payload-one/);
     const records = store.getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
-    assert.equal(records.at(-1)?.type, 'withheld');
+    assert.deepEqual(records.slice(-2).map((r) => r.type), ['withheld', 'annotated']);
     assert.match(JSON.stringify(records[0]), /payload-one/, 'the original is still archived');
   } finally { store.sync = sync; await h.framework.stop(); }
 });
@@ -961,4 +975,209 @@ test('storage recovery: shutdown retries edits queued by its terminating stream'
       assert.equal(records.at(-1)?.type, 'accepted');
     } finally { await restarted.stop(); }
   } finally { cm.editMessage = edit; if (stopping) await stopping; else await h.framework.stop(); }
+});
+
+// ---------------------------------------------------------------------------
+// agent-framework #277: a withheld result says where its original is. The
+// guard's neutral notice stays (#159), followed by the place: a workspace
+// file when a writable mount takes it, else the guard's audit record.
+// ---------------------------------------------------------------------------
+
+async function workspaceHarness(scripts: NormalizedResponse[][], mount: { maxFileSize?: number } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'af-tool-result-guard-ws-')); dirs.push(dir);
+  const mountDir = join(dir, 'mount');
+  mkdirSync(mountDir, { recursive: true });
+  const membrane = new ScriptMembrane(scripts);
+  const module = new ReadModule();
+  const workspace = new WorkspaceModule({ mounts: [{
+    name: 'work', path: mountDir, mode: 'read-write', watch: 'never',
+    ...(mount.maxFileSize !== undefined ? { maxFileSize: mount.maxFileSize } : {}),
+  }] });
+  const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: membrane.asMembrane(),
+    agents: [{ name: 'assistant', model: 'test', systemPrompt: 'system', toolResultGuard: true }],
+    modules: [module, workspace as unknown as Module], syncIntervalMs: 0 });
+  workspace.initStore(framework.getStore());
+  const run = async () => {
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'read', metadata: {} });
+    await framework.runUntilIdle();
+  };
+  return { framework, membrane, workspace, run };
+}
+
+/** Delay the framework's tool-results writer (no workspace: it then reports
+ *  none), keeping the framework's own wiring and tracking in place. */
+function slowSpill(framework: AgentFramework, wait: () => Promise<unknown>) {
+  (framework as unknown as { writeToolResultFile: () => Promise<null> }).writeToolResultFile = async () => {
+    await wait();
+    return null;
+  };
+}
+
+const SPILLED_STUB = /^Tool result withheld by the guard\. The tool has already executed\. Its full result is in workspace file (work\/tool-results\/\d{4}-\d{2}-\d{2}-withheld-one\.txt)\.$/;
+
+test('#277: a withheld original is written to the workspace, and its stub names the file', async () => {
+  const h = await workspaceHarness([[calls('one'), refused()], [answer()]]);
+  try {
+    await h.run();
+    const stub = String(toolResults(h.framework)[0].content);
+    const path = SPILLED_STUB.exec(stub)?.[1];
+    assert.ok(path, `stub names the file: ${stub}`);
+    const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    const staged = (audit[0] as { content: Array<{ toolUseId?: string; content?: unknown }> }).content;
+    const admitted = staged.find((b) => b.toolUseId === 'one')?.content;
+    assert.match(String(admitted), /payload-one/);
+    const file = await h.workspace.readBinary(path);
+    assert.ok('data' in file, `the file is readable: ${JSON.stringify(file)}`);
+    assert.equal((file as { data: Buffer }).data.toString('utf8'), admitted,
+      'the file holds exactly what acceptance would have admitted');
+    const retried = h.membrane.requests[1].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    assert.deepEqual(retried.map((b) => b.content), [stub], 'the retry already says where the original is');
+    assert.doesNotMatch(stub, /refus|test-category/, "#159's line: no refusal or category in the context");
+    assert.deepEqual(audit.at(-1), { ...audit.at(-1), type: 'annotated', results: [{ toolUseId: 'one', path }] });
+  } finally { await h.framework.stop(); }
+});
+
+test('#277: a failed workspace write says so, and the audit record still keeps the original', async () => {
+  const h = await workspaceHarness([[calls('one'), refused()], [answer()]], { maxFileSize: 4 });
+  try {
+    await h.run();
+    const stub = String(toolResults(h.framework)[0].content);
+    assert.match(stub, /^Tool result withheld by the guard\. The tool has already executed\. Writing its full result to workspace file work\/tool-results\/\d{4}-\d{2}-\d{2}-withheld-one\.txt failed \(.+\), so it is kept only in the guard's audit record \(framework\/tool-result-guard\), for an operator\.$/);
+    const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    const annotated = audit.at(-1) as { type: string; results: Array<{ toolUseId: string; path?: string; error?: string }> };
+    assert.equal(annotated.type, 'annotated');
+    assert.equal(annotated.results[0].toolUseId, 'one');
+    assert.equal(typeof annotated.results[0].error, 'string');
+    assert.match(JSON.stringify(audit[0]), /payload-one/, 'the original is in the staged record');
+  } finally { await h.framework.stop(); }
+});
+
+test('#277: the refusal retry is compiled only once the stub says where the original is', async () => {
+  const h = await harness([[calls('one'), refused()], [answer()]], { toolResultGuard: true });
+  slowSpill(h.framework, () => new Promise((resolve) => setTimeout(resolve, 100)));
+  try {
+    await h.run();
+    const retried = h.membrane.requests[1].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    assert.deepEqual(retried.map((b) => b.content), [AUDIT_STUB]);
+  } finally { await h.framework.stop(); }
+});
+
+test("#277: an operator's edit made before the stub is annotated stands, and the hold waits for it", async () => {
+  const r = await compressionRig();
+  try {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered = false;
+    r.guard.setHost({ spill: async () => { entered = true; await gate; return null; }, track: () => {} });
+    r.guard.submissionResults([{ toolUseId: 'tu-1', content: r.REAL }]);
+    assert.ok(r.guard.withhold('test-category'));
+    for (let i = 0; i < 100 && !entered; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.ok(entered, 'the original is being written');
+    assert.deepEqual([...r.cm.getCompressionHolds()], [r.messageId], 'held while the original is being written');
+    r.cm.editMessage(r.messageId, [{ type: 'tool_result', toolUseId: 'tu-1', content: 'operator replacement' }]);
+    release();
+    await r.guard.whenAnnotated();
+    assert.equal((r.cm.getMessage(r.messageId)!.content[0] as { content: unknown }).content, 'operator replacement');
+    assert.equal(r.cm.getCompressionHolds().size, 0);
+    const audit = r.cm.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    assert.equal(audit.at(-1)?.type, 'annotated');
+    assert.equal(audit.at(-1)?.historyUpdate, 'superseded');
+  } finally { r.cm.close(); }
+});
+
+test('#277: stop lets an aborted batch\'s stub be annotated before the store closes', async () => {
+  const h = await harness([[calls('one')]], { toolResultGuard: true });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let spills = 0;
+  slowSpill(h.framework, () => { spills++; return gate; });
+  h.membrane.onSubmit = () => {
+    const stream = h.membrane.streams.at(-1)!;
+    queueMicrotask(() => stream.cancel());
+  };
+  let stopped = false;
+  try {
+    await h.run().catch(() => {});
+    for (let i = 0; i < 100 && spills === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(spills, 1, 'the aborted batch is being annotated');
+    const stopping = h.framework.stop().then(() => { stopped = true; });
+    setTimeout(release, 50);
+    await stopping;
+    const restarted = await AgentFramework.create(h.base);
+    try {
+      assert.equal(toolResults(restarted)[0].content, AUDIT_STUB, 'the annotated stub was saved before close');
+    } finally { await restarted.stop(); }
+  } finally { release(); if (!stopped) await h.framework.stop(); }
+});
+
+test('#277: the stub has the same text for each place the original can be', () => {
+  const notice = 'Tool result withheld by the guard. The tool has already executed.';
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/2026-10-10-withheld-a.txt' }, true),
+    `${notice} Its full result is in workspace file work/tool-results/2026-10-10-withheld-a.txt.`);
+  assert.equal(withheldResultNotice({ path: 'work/tool-results/x.txt', error: 'disk full' }, true),
+    `${notice} Writing its full result to workspace file work/tool-results/x.txt failed (disk full), ` +
+    "so it is kept only in the guard's audit record (framework/tool-result-guard), for an operator.");
+  assert.equal(withheldResultNotice(null, true),
+    `${notice} Its full result is kept in the guard's audit record (framework/tool-result-guard), for an operator.`);
+  assert.equal(withheldResultNotice(null, false),
+    `${notice} Its full result is kept in the guard's audit record (framework/tool-result-guard), for an operator, ` +
+    'though saving that record had failed when this was written.');
+});
+
+test('#277: direct API: a request after an aborted batch is compiled once its stub is annotated', async () => {
+  const h = await harness([], { toolResultGuard: true });
+  const responses: unknown[] = [calls('one'), { aborted: true, reason: 'test-abort' }, answer()];
+  const requests: NormalizedRequest[] = [];
+  (h.membrane as unknown as { stream: (request: NormalizedRequest) => Promise<unknown> }).stream = async (request) => {
+    requests.push(structuredClone(request));
+    const response = responses.shift();
+    assert.ok(response);
+    return response;
+  };
+  try {
+    const agent = h.framework.getAgent('assistant')!;
+    slowSpill(h.framework, () => new Promise((resolve) => setTimeout(resolve, 100)));
+    agent.getContextManager().addMessage('user', [{ type: 'text', text: 'read' }]);
+    await agent.runInference(h.framework.getAllTools());
+    agent.provideToolResult('one', { success: true, data: 'direct-original' });
+    const aborted = await agent.runInference(h.framework.getAllTools());
+    assert.equal(aborted.aborted, true);
+    await agent.runInference(h.framework.getAllTools());
+    const next = requests[2].messages.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+    assert.deepEqual(next.map((b) => b.content), [AUDIT_STUB]);
+  } finally { await h.framework.stop(); }
+});
+
+test('#277: stop waits for an annotation started by an ephemeral run it has already disposed', async () => {
+  const h = await harness([[calls('one')]]);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let spills = 0;
+  slowSpill(h.framework, () => { spills++; return gate; });
+  h.membrane.onSubmit = () => {
+    const stream = h.membrane.streams.at(-1)!;
+    queueMicrotask(() => stream.cancel());
+  };
+  let stopped = false;
+  try {
+    const created = await h.framework.createEphemeralAgent({
+      name: 'ephemeral', model: 'test', systemPrompt: 'system', toolResultGuard: true,
+    });
+    created.contextManager.addMessage('user', [{ type: 'text', text: 'read' }]);
+    const completion = h.framework.runEphemeralToCompletion(created.agent, created.contextManager);
+    h.framework.start();
+    await completion.catch(() => {});
+    for (let i = 0; i < 100 && spills === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(spills, 1, "the ephemeral's aborted batch is being annotated");
+    assert.equal(h.framework.getAgent('ephemeral') ?? null, null, 'the run was disposed');
+    const stopping = h.framework.stop().then(() => { stopped = true; });
+    setTimeout(release, 50);
+    await stopping;
+    const restarted = await AgentFramework.create(h.base);
+    try {
+      const audit = restarted.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+      assert.ok(audit.some((r) => r.type === 'annotated' && r.agentName === 'ephemeral'),
+        'the annotation finished before the store closed');
+    } finally { await restarted.stop(); }
+  } finally { release(); if (!stopped) await h.framework.stop(); }
 });
