@@ -169,6 +169,27 @@ describe('tool-ended turn usage accounting', () => {
     }
   });
 
+  it('counts the rounds\' samples when a final response carries no usage', async () => {
+    const f = await fixture();
+    try {
+      f.membrane.pushResponse(toolResponse('echo', 'echo-1', firstUsage));
+      const response = createMockResponse([{ type: 'text', text: 'Done.' }]);
+      response.usage = totalUsage; // the last round's cumulative sample; no details.usage
+      f.membrane.pushResponse(response);
+      await run(f.framework, 'ordinary');
+      const completed = f.traces.filter((e) => e.type === 'inference:completed');
+      assert.equal(completed.length, 1);
+      assert.deepEqual(completed[0].tokenUsage, expectedTokens(totalUsage));
+      assert.equal(f.traces.filter((e) => e.type === 'usage:updated').length, 1);
+      assert.deepEqual(f.framework.getSessionUsage().totals, expectedTotals(totalUsage));
+      const logs = f.framework.queryInferenceLogs({ agentName: 'ordinary' });
+      assert.deepEqual(logs.entries[0].entry.tokenUsage, expectedTokens(totalUsage), 'the trace, the totals and the log agree');
+    } finally {
+      await f.framework.stop();
+      rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+
   it('attributes successive streams separately and persists their totals through store reopen', async () => {
     const f = await fixture();
     let stopped = false;

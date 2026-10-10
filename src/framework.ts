@@ -9537,16 +9537,18 @@ export class AgentFramework {
         }
       : undefined;
     // The stream's billed usage reaches the session totals once, however the
-    // stream ends: a final response's usage where there is one (completion,
-    // or the guard's abandoned round), else the rounds it finished (the
-    // boundary ends below, or `finally` for every other end).
+    // stream ends: a final response's usage where it carries one (completion,
+    // or the guard's abandoned round), else the rounds it finished (a final
+    // response without usage, the boundary ends below, or `finally` for
+    // every other end).
     let usageCounted = false;
     const countUsage = (usage: DetailedUsage | undefined): void => {
       if (usageCounted) return;
       usageCounted = true;
-      if (!usage) return;
-      this.usageTracker.onInferenceCompleted(agent.name, usage, usage.estimatedCost
-        ? { total: usage.estimatedCost.total, currency: usage.estimatedCost.currency }
+      const counted = usage ?? latestUsage;
+      if (!counted) return;
+      this.usageTracker.onInferenceCompleted(agent.name, counted, counted.estimatedCost
+        ? { total: counted.estimatedCost.total, currency: counted.estimatedCost.currency }
         : undefined);
       this.persistUsageState();
     };
@@ -9564,14 +9566,16 @@ export class AgentFramework {
     // A turn that ended successfully: with its final response (natural
     // completion), or without one, when a tool result with endTurn ended it.
     const completeTurn = (usage: DetailedUsage | undefined, durationMs: number, response?: NormalizedResponse): void => {
-      const tokenUsage = tokenUsageOf(usage);
+      // The trace, the session totals and the log entry all say the same.
+      const used = usage ?? latestUsage;
+      const tokenUsage = tokenUsageOf(used);
       this.emitTrace({
         type: 'inference:completed',
         agentName: agent.name,
         durationMs,
         tokenUsage,
       });
-      countUsage(usage);
+      countUsage(used);
       logStream(response
         ? {
             success: true,

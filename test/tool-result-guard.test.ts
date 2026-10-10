@@ -527,6 +527,17 @@ test('usage of an abandoned guarded round is counted in session totals', async (
   } finally { await h.framework.stop(); }
 });
 
+test('an abandoned guarded round whose response carries no usage still counts its rounds', async () => {
+  // Each scripted response emits a usage sample of 10 input tokens; neither
+  // final response carries details.usage, so both streams count their samples.
+  const h = await harness([[calls('one'), refused()], [answer()]], { toolResultGuard: true });
+  try {
+    await h.run();
+    const totals = h.framework.getSessionUsage().totals as unknown as Record<string, number>;
+    assert.equal(totals.inputTokens, 20, `each stream is counted once, from its samples: ${JSON.stringify(totals)}`);
+  } finally { await h.framework.stop(); }
+});
+
 // ---------------------------------------------------------------------------
 // Greptile review regressions (PR #159, head 647f081).
 // ---------------------------------------------------------------------------
