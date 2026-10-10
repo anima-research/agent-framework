@@ -108,7 +108,7 @@ async function make(opts: {
     modules: [mod],
   });
   (framework as any).channelRegistry = new Proxy({
-    resolveLocus: () => 'world:commons', getDefaultPublishChannel: () => 'world:commons',
+    resolveLocus: () => 'world:commons',
     routeSpeech: async () => ({ delivered: opts.deliver ?? true, channelId: 'world:commons' }),
     startTyping: () => {}, stopTyping: () => {},
     getChannelTools: () => [], getDescriptor: () => undefined,

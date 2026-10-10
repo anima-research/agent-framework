@@ -4,7 +4,9 @@
     `activeChannelResolver` option. The new `speechRouteResolver(agentName)`
     option replaces that option, and the framework supplies it.
   - **Changed:** `resolveLocus(agent)` returns only a conversation fork's
-    home channel, or null. `buildChannelContext(agent)` advertises the
+    home channel, or null. `getChannelServerId(id)` names a server only when
+    exactly one registered the id, and returns null for an id several
+    servers share, where it used to return the first registrant. `buildChannelContext(agent)` advertises the
     agent's own route and reply edge, and nothing for a held, surface-only or
     absent route.
   - **Migration:** read a route from the framework's turn rather than the

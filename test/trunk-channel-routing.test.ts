@@ -1,19 +1,22 @@
 /**
  * Item-3 redux: single-TRUNK output routing.
  *
- * These tests cover the FRAMEWORK-side plumbing that feeds the ChannelRegistry's
- * `activeChannelResolver` (the routing DECISION itself is covered in
- * channel-registry-routing.test.ts):
+ * These tests cover the FRAMEWORK-side plumbing that gives a trunk turn its
+ * speech route (shelf-355; the route DECISION itself is unit-tested in
+ * speech-routes.test.ts):
  *   - derivePushEventChannel() reconstructs the MCPL composite channel for a
  *     push event (Discord DMs arrive this way), preferring an explicit
  *     origin.mcplChannelId.
- *   - a channel-incoming turn records its triggering channel per-agent.
- *   - a DM push-event turn records the reconstructed DM channel per-agent.
- *   - a batched wake picks the MOST-RECENT triggering channel.
+ *   - a channel-incoming turn, and a DM push-event turn, take their
+ *     triggering conversation as the turn's route; a reaction is no candidate.
+ *   - the route belongs to the current turn, and a no-trigger turn has none.
+ *   - threads are routes only where the channel's connector posts into named
+ *     threads (MCPL RFC-011 exact), and a channel that declares no publish
+ *     target is no route at all.
  *
  * connectome-host runs every agent as a single trunk (it never sets
- * `conversations`), so no fork/home exists — the active triggering channel is
- * the only thing that keeps a reply in the channel it is answering.
+ * `conversations`), so no fork/home exists: the turn's triggering
+ * conversation is what keeps a reply in the channel it is answering.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -47,6 +50,9 @@ function declaringRegistry(target: 'exact' | 'root' | undefined) {
   const published: Array<{ text: string; to: unknown }> = [];
   const registry = new Proxy({
     publishTarget: () => target,
+    // Every channel it is asked about is one registration.
+    resolveDestination: (c: { serverId?: string; channelId: string }) =>
+      ({ destination: { serverId: c.serverId ?? 'discord', channelId: c.channelId } }),
     resolveLocus: () => null,
     routeSpeech: async (_a: string, text: string, to: unknown) => {
       published.push({ text, to });

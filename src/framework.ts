@@ -1813,7 +1813,7 @@ export class AgentFramework {
             // route applies to a fork only when it IS that home, and never to
             // another agent when a fork owns that channel. Otherwise a fork
             // bound elsewhere would show typing where it isn't replying.
-            ...(provenance?.routeChannelId && framework.mayTakeGateRoute(agentName, provenance.routeChannelId)
+            ...(provenance?.routeChannelId && framework.mayTakeRoute(agentName, provenance.routeChannelId)
               ? { channelId: provenance.routeChannelId, addressed: true }
               : {}),
             // The batch's conversations as speech-route candidates, under the
@@ -1822,7 +1822,7 @@ export class AgentFramework {
             ...(provenance?.routeCandidates?.length
               ? {
                   routeCandidates: provenance.routeCandidates
-                    .filter((c) => c.kind === 'surface' || c.unroutable || framework.mayTakeGateRoute(agentName, c.channelId))
+                    .filter((c) => c.kind === 'surface' || c.unroutable || framework.mayTakeRoute(agentName, c.channelId))
                     .map((c): RouteCandidate => c.kind === 'surface'
                       ? { conversation: { kind: 'surface', surface: c.surface }, addressed: true, at: c.at }
                       : c.unroutable
@@ -7512,17 +7512,20 @@ export class AgentFramework {
       const candidate = isConversational(event.tags, event.metadata) ? this.candidateFromSource(source, addressed) : undefined;
       for (const agentName of targetAgents) {
         if (!this.agents.has(agentName)) continue;
+        // The broadcast reaches forks too: the fork rule keeps each agent's
+        // typing and route candidate to a channel it may take.
+        const takesChannel = this.mayTakeRoute(agentName, event.channelId);
         this.pendingRequests.push({
           agentName,
           reason: 'mcpl:channel-incoming',
           source: event.serverId,
           timestamp: Date.now(),
-          channelId: event.channelId,
+          ...(takesChannel ? { channelId: event.channelId } : {}),
           counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
           addressed,
           // This message's conversation, as a speech-route candidate: the
           // turn's route is inferred from every candidate of its batch.
-          ...(candidate ? { routeCandidates: [candidate] } : {}),
+          ...(candidate && this.mayTakeCandidate(agentName, candidate) ? { routeCandidates: [candidate] } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
         });
       }
@@ -8479,15 +8482,16 @@ export class AgentFramework {
       ? this.candidateFromSource(occ.event.event.inboundSource, addressedHere)
       : undefined;
     for (const agentName of await this.coalescedAudience(occ)) {
+      const takes = candidate && this.mayTakeCandidate(agentName, candidate) ? candidate : undefined;
       this.pendingRequests.push({
         agentName,
         reason: 'mcpl:push-event',
         source: occ.serverId,
         timestamp: Date.now(),
-        channelId,
+        channelId: channelId && this.mayTakeRoute(agentName, channelId) ? channelId : undefined,
         counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
         addressed: addressedHere,
-        ...(candidate ? { routeCandidates: [candidate] } : {}),
+        ...(takes ? { routeCandidates: [takes] } : {}),
         coalescingSubject: subject,
         coalescingBatch: true,
       });
@@ -8715,14 +8719,20 @@ export class AgentFramework {
         ? undefined
         : this.candidateFromSource(source, pushAddressed);
       for (const agentName of targetAgents) {
+        // The fork rule, as for a gate batch: no agent takes a channel a fork
+        // owns, and a fork takes only its home.
+        const typingChannel = triggerChannel?.channelId && this.mayTakeRoute(agentName, triggerChannel.channelId)
+          ? triggerChannel.channelId
+          : undefined;
+        const candidate = pushCandidate && this.mayTakeCandidate(agentName, pushCandidate) ? pushCandidate : undefined;
         this.pendingRequests.push({
           agentName,
           reason: 'mcpl:push-event',
           source: event.serverId,
           timestamp: Date.now(),
-          channelId: triggerChannel?.channelId,
+          channelId: typingChannel,
           addressed: pushAddressed,
-          ...(pushCandidate ? { routeCandidates: [pushCandidate] } : {}),
+          ...(candidate ? { routeCandidates: [candidate] } : {}),
           ...(silentHeartbeat ? {
             suppressProse: true,
             ephemeralSystemPrompt:
@@ -8738,18 +8748,23 @@ export class AgentFramework {
   }
 
   /**
-   * Whether a batched gate wake's addressed route may become `agentName`'s
-   * speech locus. The gate broadcasts to every agent, conversation forks
-   * included. A fork speaks only in its home channel, and a channel bound to
-   * a fork is that fork's conversation, so no other agent takes it.
+   * Whether a wake's channel may become `agentName`'s speech route or typing
+   * channel: for a gate batch, a push event or a coalesced push alike. A
+   * fork speaks only in its home channel, and a channel bound to a fork is
+   * that fork's conversation, so no other agent takes it.
    */
-  private mayTakeGateRoute(agentName: string, routeChannelId: string): boolean {
+  private mayTakeRoute(agentName: string, routeChannelId: string): boolean {
     const home = this.conversationAgentHomes.get(agentName);
     if (home !== undefined) return home === routeChannelId;
     for (const boundChannel of this.conversationAgentHomes.values()) {
       if (boundChannel === routeChannelId) return false;
     }
     return true;
+  }
+
+  /** mayTakeRoute for a route candidate: a local surface is never a fork's. */
+  private mayTakeCandidate(agentName: string, candidate: RouteCandidate): boolean {
+    return candidate.conversation.kind === 'surface' || this.mayTakeRoute(agentName, candidate.conversation.channelId);
   }
 
   /**
@@ -10007,7 +10022,12 @@ export class AgentFramework {
     }
   }
 
-  /** A route candidate for a registered channel id (gate and coalesced wakes). */
+  /**
+   * A route candidate for a registered channel id (gate and coalesced wakes).
+   * The server is the event's own, else the id's sole registrant. An id no
+   * single server holds (shared across servers, or withdrawn since) gets no
+   * guessed server: the candidate competes for the turn but is unroutable.
+   */
   private candidateForChannel(
     channelId: string,
     addressed: boolean,
@@ -10029,10 +10049,15 @@ export class AgentFramework {
       addressed,
       ...(messageId ? { messageId } : {}),
       at,
+      ...(server ? {} : { unroutable: true as const }),
     };
   }
 
-  /** A conversation fork's home as its standing route (it always wins). */
+  /**
+   * A conversation fork's home as its standing route (it always wins). Homes
+   * are bare channel ids: the server is the id's sole registrant, and a
+   * shared id gets none, so the route is unresolved rather than guessed.
+   */
   private homeRoute(agentName: string): SpeechRoute | null {
     const home = this.conversationAgentHomes.get(agentName) ?? this.channelRegistry?.resolveLocus(agentName) ?? null;
     if (!home) return null;
@@ -10198,8 +10223,15 @@ export class AgentFramework {
   }
 
   /** A channel's declared publish target (MCPL RFC-011), read live from the registry. */
-  private publishTargetOf(channel: { serverId?: string; channelId: string }): 'exact' | 'root' | undefined {
-    return this.channelRegistry?.publishTarget(channel);
+  private publishTargetOf(channel: { serverId?: string; channelId: string }): 'exact' | 'root' | 'unresolved' | undefined {
+    const registry = this.channelRegistry;
+    if (!registry) return undefined;
+    const declared = registry.publishTarget(channel);
+    if (declared) return declared;
+    // No declaration read: a registered channel that declares none, or a
+    // channel that isn't exactly one registration (unknown, withdrawn, or a
+    // shared id named without its server). Only the second is unresolved.
+    return 'error' in registry.resolveDestination(channel) ? 'unresolved' : undefined;
   }
 
   /**
@@ -10247,7 +10279,7 @@ export class AgentFramework {
         return `${where} is a thread, but its connector declares the channel has no threads, so publication from ` +
           `here can't target it.${tail}`;
       case 'unresolved':
-        return `${where} couldn't be resolved to a registered channel.${tail || ' Use an explicit send tool to reach it.'}`;
+        return `${where} doesn't resolve to exactly one registered channel.${tail || ' Use an explicit send tool to reach it.'}`;
     }
   }
 
@@ -15197,7 +15229,7 @@ export class AgentFramework {
         // addMessage() alone does not request inference, so this never wakes
         // her (matching the `discord-send-failed-skip` gate intent: context
         // yes, wake no).
-        onRouteFailure: ({ channelId, reason, textLen, outcome }) => {
+        onRouteFailure: ({ channelId, threadId, reason, textLen, outcome }) => {
           try {
             // Render a human-readable channel name when we can — a bare
             // snowflake in the marker is unresolvable for the agent (the
@@ -15207,11 +15239,14 @@ export class AgentFramework {
             const label = channelId
               ? this.channelRegistry?.getDescriptor(channelId)?.label
               : undefined;
-            const where = channelId
+            const channel = channelId
               ? label && label !== channelId
                 ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
                 : channelId
               : 'the channel';
+            // A thread route failed in its thread: say so, so a check or a
+            // resend looks there rather than at the channel's root.
+            const where = threadId ? `thread ${threadId} in ${channel}` : channel;
             this.addMessage(
               'user',
               [{
@@ -15219,10 +15254,10 @@ export class AgentFramework {
                 text: outcome === 'unknown'
                   // A request went out and no valid receipt came back: it may
                   // have been posted (in part or whole). Never claim it wasn't.
-                  ? `[discord-send-failed] Delivery of your previous reply (${textLen} chars) to ${where} was not confirmed (${reason}). It may or may not have been posted; check the channel before sending it again. It is saved in your archive.`
+                  ? `[discord-send-failed] Delivery of your previous reply (${textLen} chars) to ${where} was not confirmed (${reason}). It may or may not have been posted; check the ${threadId ? 'thread' : 'channel'} before sending it again. It is saved in your archive.`
                   : `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). Nothing was posted; it is saved in your archive.`,
               }],
-              { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason, ...(outcome ? { outcome } : {}) },
+              { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', ...(threadId ? { threadId } : {}), reason, ...(outcome ? { outcome } : {}) },
             );
           } catch (err) {
             console.error('onRouteFailure: failed to record send-failure marker:', err);
@@ -17025,7 +17060,7 @@ export class AgentFramework {
         return;
       }
       if (call.name === 'channel_publish' || call.name === 'channel_close') {
-        const input = (call.input ?? {}) as { channelId?: unknown };
+        const input = (call.input ?? {}) as { channelId?: unknown; serverId?: unknown };
         if (!supplied(input.channelId)) {
           call = { ...call, input: { ...input, channelId: home } };
         } else if (!named(input.channelId)) {
@@ -17035,6 +17070,22 @@ export class AgentFramework {
           const verb = call.name === 'channel_publish' ? 'publishing to' : 'closing';
           reject(`This conversation is bound to channel ${home}; ${verb} ${input.channelId as string} is not allowed.`, who);
           return;
+        }
+        // The home is a bare channel id, so a server named with it must be
+        // the one server that registered it: the same id on another server
+        // is another conversation, and a shared id names no server at all.
+        if (supplied(input.serverId)) {
+          const homeServer = this.channelRegistry?.getChannelServerId(home) ?? null;
+          if (input.serverId !== homeServer) {
+            const verb = call.name === 'channel_publish' ? 'publishing to' : 'closing';
+            reject(
+              homeServer
+                ? `This conversation is bound to channel ${home} on server ${homeServer}; ${verb} it on server ${String(input.serverId)} is not allowed.`
+                : `This conversation is bound to channel ${home}, which isn't registered by exactly one server, so it can't be named with a server. Nothing was ${call.name === 'channel_publish' ? 'sent' : 'closed'}.`,
+              who,
+            );
+            return;
+          }
         }
       }
     }

@@ -126,7 +126,6 @@ function makeChannelRegistry(framework: AgentFramework) {
     routeSpeech: async (_agent: string, text: string) => {
       routed.push(text);
     },
-    getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
     getDescriptor: () => undefined, publishTarget: () => 'root',
   };

@@ -133,7 +133,8 @@ describe('targeted publish (MCPL RFC-011)', () => {
     assert.deepEqual(publishes(), []);
     assert.deepEqual(drafts().map((d) => [d.text, d.reason]), [['hello legacy', 'no-destination']]);
     const notice = texts().find((t) => t.startsWith('[routing]')) ?? '';
-    assert.match(notice, /#legacy \(Guild One\) \(discord:g1:legacy\): its connector doesn't declare where a post lands \(MCPL RFC-011\)/);
+    assert.match(notice, /(?:^|[^#])#legacy \(Guild One\) \(discord:g1:legacy\): its connector doesn't declare where a post lands \(MCPL RFC-011\)/,
+      'the label once, with its own # and no second one');
     assert.match(notice, /publication from here is unavailable until it does/);
     assert.match(notice, /may reach it; consult them: `mcpl--discord--reply_message`\./, 'a send-named tool, not the unrelated one');
     assert.doesNotMatch(notice, /ring/);

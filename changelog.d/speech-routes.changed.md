@@ -48,7 +48,9 @@
   Without `channelId` it goes to the caller's current route. With no route
   (held, a local surface, or none) it is refused with the reason, and it no
   longer uses the most recent inbound channel. A new optional `serverId`
-  disambiguates a channel id that several servers register. Its receipt
+  disambiguates a channel id that several servers register; a conversation
+  fork may name a server only as its home's sole registrant, since the same
+  id on another server is another conversation. Its receipt
   names `serverId`, `channelId` and `channelLabel`. A failed or unknown
   outcome is an error that keeps its `status` and the attempted destination;
   `unknown` warns that the message may already have been posted.
@@ -64,3 +66,17 @@
   host's source envelope too, the one its coalescer then freezes, and an
   `inboundSource` key in a connector's origin or metadata is never read as
   one.
+- **A channel id no single server registers is never given a server by
+  guess.** A fork's home, or a wake candidate whose event named no server,
+  takes the server only from the id's sole registrant. On an id that several
+  servers share, the turn records the conversation as `unresolved`, and its
+  speech is held as drafts rather than published to whichever server
+  registered first. `unresolved` also now covers a route whose channel was
+  withdrawn, which used to read as undeclared (`untargetable`).
+- **A fork's channel is its own on every wake path.** A push event, a
+  coalesced push and a `channels/incoming` broadcast now give no other agent
+  a speech route or a typing indicator in a channel a conversation fork owns,
+  and a fork takes neither in a channel other than its home. Batched gate
+  wakes already worked this way.
+- The `[discord-send-failed]` marker for a reply on a thread route names the
+  thread with its channel, and an unconfirmed one says to check the thread.

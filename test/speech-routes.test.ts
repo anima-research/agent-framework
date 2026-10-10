@@ -9,6 +9,7 @@ import {
   describeConversation,
   inferTurnRoute,
   isConversational,
+  routeRefusal,
   suspendsRoute,
   type ConversationRef,
   type RouteCandidate,
@@ -96,6 +97,31 @@ describe('inferTurnRoute', () => {
       'the addressed pool decides, so its newest message is the reply edge');
   });
 
+  it('candidates of one conversation at the same moment: the later one is the reply edge', () => {
+    const turn = inferTurnRoute([
+      candidate(channel('room'), true, 4, 'first'),
+      candidate(channel('room'), true, 4, 'second'),
+    ], undefined, rootEverywhere);
+    assert.equal(turn.route?.kind === 'channel' ? turn.route.replyTo : undefined, 'second',
+      'a tie goes to the candidate that arrived later in the wake');
+    const home: SpeechRoute = { kind: 'channel', serverId: 'discord', channelId: 'room', origin: 'home' };
+    const atHome = inferTurnRoute([
+      candidate(channel('room'), true, 4, 'first'),
+      candidate(channel('room'), true, 4, 'second'),
+    ], home, rootEverywhere);
+    assert.equal(atHome.route?.kind === 'channel' ? atHome.route.replyTo : undefined, 'second', 'and so for a home');
+  });
+
+  it('a channel that resolves to no single registration is unresolved, not undeclared', () => {
+    const turn = inferTurnRoute([candidate(channel('shared'), true, 1)], undefined, () => 'unresolved');
+    assert.equal(turn.route, null);
+    assert.equal(turn.unroutable?.reason, 'unresolved');
+    const home: SpeechRoute = { kind: 'channel', channelId: 'shared', origin: 'home' };
+    assert.equal(inferTurnRoute([], home, () => 'unresolved').unroutable?.reason, 'unresolved',
+      'a fork home on a shared id is held as unresolved');
+    assert.equal(routeRefusal(channel('room'), declaredNowhere), 'untargetable');
+  });
+
   it('the same channel id on two servers, or two threads of one channel, are different conversations', () => {
     const servers = inferTurnRoute([
       candidate({ kind: 'channel', serverId: 'a', channelId: 'shared' }, true, 1),
@@ -175,6 +201,14 @@ describe('suspendsRoute', () => {
     assert.equal(suspendsRoute(routeA, { conversation: channel('A'), addressed: true }, notEngaged), false);
   });
 
+  it('a thread route is its thread: the same thread never suspends it, the channel root does', () => {
+    const inThread: TurnRoute = {
+      route: { kind: 'channel', serverId: 'discord', channelId: 'forum', threadId: 't1', replyTo: 'm1', origin: 'trigger' },
+    };
+    assert.equal(suspendsRoute(inThread, { conversation: channel('forum', { threadId: 't1' }), addressed: true }, notEngaged), false);
+    assert.equal(suspendsRoute(inThread, { conversation: channel('forum'), addressed: true }, notEngaged), true);
+  });
+
   it('ambient chatter does only in a conversation the resident engaged this turn', () => {
     const arrival = { conversation: channel('lounge'), addressed: false };
     assert.equal(suspendsRoute(routeA, arrival, notEngaged), false);
@@ -211,6 +245,8 @@ describe('conversation identity and wording', () => {
   it('describes a conversation by a usable address', () => {
     assert.equal(describeConversation(channel('discord:g1:room', { label: 'room' })), '#room (discord:g1:room)');
     assert.equal(describeConversation(channel('discord:dm:7')), 'discord:dm:7');
+    assert.equal(describeConversation(channel('discord:dm:7', { label: 'discord:dm:7' })), 'discord:dm:7',
+      'a label that is only the id adds nothing');
     assert.equal(describeConversation(channel('forum', { threadId: 't1' })), 'forum (thread t1)');
     assert.equal(describeConversation({ kind: 'surface', surface: 'tui' }), 'tui (the local surface that messaged you)');
   });
