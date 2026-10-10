@@ -12,7 +12,7 @@
  */
 
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
-import { isConversational } from '../speech-routes.js';
+import { describeConversation, isConversational } from '../speech-routes.js';
 import { readInboundSource } from '../mcpl/inbound-source.js';
 import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
@@ -1644,22 +1644,29 @@ export class EventGate {
 
     const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
     if (referenced.length > 0) {
-      const byChannel = new Map<string, { count: number; oldest: number; label?: string }>();
+      const byChannel = new Map<string, { serverId?: string; channelId?: string; count: number; oldest: number; label?: string }>();
       for (const e of referenced) {
-        // The registered id when known, so this line names the channel the
-        // same way routing notices and send tools do (a push event's own
-        // channelId is the adapter's raw id).
-        const key = e.routeChannelId ?? e.channelId ?? '(unknown channel)';
-        const entry = byChannel.get(key) ?? { count: 0, oldest: e.timestamp, label: e.channelLabel };
+        // The registered id when known (a push event's own channelId is the
+        // adapter's raw id), counted per server: the same id on another
+        // server is another conversation.
+        const channelId = e.routeChannelId ?? e.channelId;
+        const key = `${e.serverId ?? ''}\u0000${channelId ?? ''}`;
+        const entry = byChannel.get(key) ?? {
+          ...(e.serverId ? { serverId: e.serverId } : {}),
+          ...(channelId ? { channelId } : {}),
+          count: 0, oldest: e.timestamp, label: e.channelLabel,
+        };
         entry.count += 1;
         entry.oldest = Math.min(entry.oldest, e.timestamp);
         entry.label = entry.label ?? e.channelLabel;
         byChannel.set(key, entry);
       }
-      for (const [channelId, { count, oldest, label }] of byChannel) {
-        // Prefer the human-readable name; keep the id parenthesized so the
-        // agent can still address tools that want the composite id.
-        const channel = label ? `#${label} (${channelId})` : channelId;
+      for (const { serverId, channelId, count, oldest, label } of byChannel.values()) {
+        // Named the way routing notices and send tools name a conversation
+        // (describeConversation): its label, then `server / channel-id`.
+        const channel = channelId
+          ? describeConversation({ kind: 'channel', ...(serverId ? { serverId } : {}), channelId, ...(label ? { label } : {}) })
+          : '(unknown channel)';
         const age = Math.round((Date.now() - oldest) / 1000);
         lines.push(
           `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +

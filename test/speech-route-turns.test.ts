@@ -146,7 +146,10 @@ describe('speech route across a logical turn', () => {
       // As the registry reads it: a declaration only for exactly one registration.
       publishTarget: (c: { serverId?: string; channelId: string }) =>
         (c.serverId || registrants[c.channelId]?.length === 1 ? 'root' : undefined),
-      getDescriptor: () => undefined,
+      // The first registrant's label, as a bare-id lookup finds it: never the
+      // label of a conversation whose server is another one.
+      getDescriptor: () => ({ label: '#alpha-room' }),
+      getChannelLabel: (serverId: string, id: string) => (registrants[id]?.includes(serverId) ? `#${serverId}-room` : undefined),
     } as Record<string, unknown>, { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
     const f = framework as unknown as {
       candidateForChannel(channelId: string, addressed: boolean, at: number, serverId?: string): RouteCandidate;
@@ -160,14 +163,48 @@ describe('speech route across a logical turn', () => {
     const shared = f.candidateForChannel('shared', true, 1);
     assert.equal(shared.conversation.kind === 'channel' ? shared.conversation.serverId : '', undefined, 'never the first registrant');
     assert.equal(shared.unroutable, true, 'it competes, but is no route');
+    assert.equal(shared.conversation.kind === 'channel' ? shared.conversation.label : '', undefined,
+      'and no label: with no server, any label would be a guess');
     const named = f.candidateForChannel('shared', true, 1, 'beta');
     assert.equal(named.conversation.kind === 'channel' ? named.conversation.serverId : '', 'beta', "the event's own server stands");
+    assert.equal(named.conversation.kind === 'channel' ? named.conversation.label : '', '#beta-room', 'with its own label, not the first registrant\'s');
     assert.equal(named.unroutable, undefined);
+    assert.equal(solo.conversation.kind === 'channel' ? solo.conversation.label : '', '#alpha-room');
     f.conversationAgentHomes.set('scout', 'shared');
     const home = f.homeRoute('scout');
     assert.equal(home?.kind === 'channel' ? home.serverId : '', undefined, 'a shared home gets no server');
+    assert.equal(home?.kind === 'channel' ? home.label : '', undefined, 'nor a label');
     assert.equal(f.publishTargetOf({ channelId: 'shared' }), 'unresolved', 'and is unresolved, not undeclared');
     assert.equal(f.publishTargetOf({ channelId: 'solo' }), 'root');
+    await framework.stop();
+  });
+
+  it('a hold between two servers\' conversations with one channel id and label names each server', async () => {
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const scout = framework.getAgent('scout')!;
+    i.channelRegistry = new Proxy({
+      publishTarget: () => 'root',
+      resolveLocus: () => null,
+      getDescriptor: () => ({ label: '#general' }),
+      getChannelTools: () => [],
+    } as Record<string, unknown>, { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
+    const from = (serverId: string, messageId: string, at: number): RouteCandidate => ({
+      conversation: { kind: 'channel', serverId, channelId: 'general', label: '#general' }, addressed: true, messageId, at,
+    });
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'which general?' }]));
+    await i.startAgentStream(scout, {
+      agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(),
+      routeCandidates: [from('alpha', 'm1', 1), from('beta', 'm2', 2)],
+    });
+    await framework.runUntilIdle();
+    const notice = scout.getContextManager().getAllMessages()
+      .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
+      .find((t) => t.startsWith('[routing]'));
+    assert.match(notice ?? '', /^\[routing\] More than one conversation is waiting for you: /);
+    for (const address of ['#general (alpha / general)', '#general (beta / general)']) {
+      assert.ok(notice?.includes(address), `${address} is an address the resident can send to, server included: ${notice}`);
+    }
     await framework.stop();
   });
 

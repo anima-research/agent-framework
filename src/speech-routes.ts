@@ -146,13 +146,24 @@ export function routeConversation(route: SpeechRoute): ConversationRef {
       };
 }
 
-/** A usable address for a conversation, as a resident would write it. */
+/**
+ * A conversation as the framework names it to a resident, self-contained: its
+ * label, then the server and channel id, written `server / channel-id` as the
+ * source headers write them, and its thread. The server is named whenever it
+ * is known, never left to what else is on screen: the same channel id (and
+ * label) can exist on another server, and a bare id is then no address a
+ * resident can send to. Notices, holds and the [delivered] receipt all name
+ * conversations this one way.
+ */
 export function describeConversation(c: ConversationRef): string {
   if (c.kind === 'surface') return `${c.surface} (the local surface that messaged you)`;
-  const where = `${c.channelId}${c.threadId ? `, thread ${c.threadId}` : ''}`;
-  if (!c.label || c.label === c.channelId) return c.threadId ? `${c.channelId} (thread ${c.threadId})` : c.channelId;
-  const label = c.label.startsWith('#') || c.label.startsWith('DM') ? c.label : `#${c.label}`;
-  return `${label} (${where})`;
+  const id = c.serverId ? `${c.serverId} / ${c.channelId}` : c.channelId;
+  const where = c.threadId ? `${id}, thread ${c.threadId}` : id;
+  if (c.label && c.label !== c.channelId) {
+    const label = c.label.startsWith('#') || c.label.startsWith('DM') ? c.label : `#${c.label}`;
+    return `${label} (${where})`;
+  }
+  return c.serverId || c.threadId ? `(${where})` : c.channelId;
 }
 
 /**
