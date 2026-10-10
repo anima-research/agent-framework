@@ -524,6 +524,20 @@ function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
   );
 }
 
+/** Messages copied into another conversation (a fork's seed) without their
+ *  `thinking` and `redacted_thinking` blocks, which are signed under the
+ *  prefix they were minted with. A message left with nothing is dropped;
+ *  any other message is kept as it was. */
+function withoutThinking<M extends { content: ContentBlock[] }>(messages: readonly M[]): M[] {
+  const out: M[] = [];
+  for (const message of messages) {
+    const content = message.content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
+    if (content.length === 0) continue;
+    out.push(content.length === message.content.length ? message : { ...message, content });
+  }
+  return out;
+}
+
 class DiscordAwarenessAccountingError extends Error {
   constructor(operation: string, cause: unknown) {
     const detail = cause instanceof Error ? cause.message : String(cause);
@@ -3647,12 +3661,18 @@ export class AgentFramework {
    * mutating agent state. Intended for debug/preview tooling.
    *
    * Transparency contract (default): the preview is side-effect-free and
-   * leaves no trace on the system. It does only read-only work —
-   * `ContextManager.compile` (which never triggers compression itself;
-   * compression runs in the background out-of-band), tool filtering, and
-   * system-prompt assembly — then delegates to `Agent.buildActivationRequest`.
-   * No tokens are spent, nothing is written to Chronicle, and no external
-   * MCPL server is contacted.
+   * leaves no trace on the system. It does only read-only work — a dry-run
+   * compile (`dryRun`: no fold resolutions committed, no compression work
+   * queued, the consumed watermark and any prepared budget change left
+   * alone, and with context-manager's thinking binding no stamps and no
+   * compile awaiting acceptance), tool filtering, and system-prompt assembly
+   * — then delegates to `Agent.buildActivationRequest`. No tokens are spent,
+   * nothing is written to Chronicle, and no external MCPL server is
+   * contacted. Two things it still touches, as a real activation would: it
+   * hands the context manager the compression tool definitions, and
+   * context-manager 0.13's adaptive select records its estimate and arms
+   * calibration even on a dry run, so a preview between a real compile and
+   * its first usage report replaces that estimate.
    *
    * The trade-off is fidelity: the dynamically-gathered ContextInjection[]
    * (module `gatherContext` + MCPL `beforeInference` hooks) are NOT included
@@ -3683,13 +3703,14 @@ export class AgentFramework {
     };
 
     // An explicit budget compiles against a HYPOTHETICAL window instead of the
-    // agent's live one. That also suppresses transition-settling in
-    // compileWithInjections (which only settles when no budget is passed), so
-    // previewing a smaller window cannot advance a converging descent.
+    // agent's live one. Every preview is a dry run, so none of them settles
+    // a converging descent or commits anything (see the doc comment above).
     // Default: no dynamic injection gathering → fully transparent (no
     // inference, no Chronicle writes, no external RPC). Opt in explicitly.
     if (!opts?.injections) {
-      return capture(await agent.buildActivationRequest(tools, undefined, opts?.budget, presentation?.available ?? tools));
+      return capture(await agent.buildActivationRequest(
+        tools, undefined, opts?.budget, presentation?.available ?? tools, { dryRun: true },
+      ));
     }
 
     // Full-fidelity path: mirrors startAgentStream's injection gathering.
@@ -3724,7 +3745,9 @@ export class AgentFramework {
       }
     }
 
-    return capture(await agent.buildActivationRequest(tools, injections, opts?.budget, presentation?.available ?? tools));
+    return capture(await agent.buildActivationRequest(
+      tools, injections, opts?.budget, presentation?.available ?? tools, { dryRun: true },
+    ));
   }
 
   /**
@@ -7375,10 +7398,19 @@ export class AgentFramework {
       // persisted precisely so names aren't reused, but if this namespace has
       // history anyway (counter state lost, crash between spawn and persist),
       // seeding again would stack another template copy on top of it.
-      const { messages: existing } = await contextManager.compile();
+      //
+      // Both compiles are dry runs: neither is sent, and the template's runs
+      // while the template may be mid-stream, where a committing compile
+      // would commit fold resolutions and queue compression work for it (and
+      // with context-manager's thinking binding, fence its stream's replies).
+      // The seed leaves out the template's thinking: a signed block verifies
+      // only while everything before it is what it was minted under, and a
+      // fork's system, tools and scoped injections don't promise that, while
+      // its own namespace holds no stamps that could vouch for the copies.
+      const { messages: existing } = await contextManager.compile(undefined, undefined, { dryRun: true });
       if (existing.length === 0) {
-        const { messages: compiled } = await template.getContextManager().compile();
-        for (const msg of compiled) {
+        const { messages: compiled } = await template.getContextManager().compile(undefined, undefined, { dryRun: true });
+        for (const msg of withoutThinking(compiled)) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
         }

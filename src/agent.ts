@@ -20,6 +20,9 @@ import {
 export interface ActivationRequestOptions {
   /** The silent heartbeat tick this request answers, if any. */
   silentHeartbeat?: SilentHeartbeatTick;
+  /** A request that will never be sent (a preview): compile it as a dry
+   *  run, which commits nothing (see `compileWithInjections`). */
+  dryRun?: boolean;
 }
 
 export interface StartStreamResult {
@@ -591,6 +594,11 @@ export class Agent {
     }
   }
 
+  /** A committing compile, as for a request that is sent: the context
+   * manager commits what it commits for one, the consumed watermark moves,
+   * and a prepared budget change settles. To inspect what the agent would
+   * see, use the framework's `previewActivation`, which compiles as a dry
+   * run. */
   async compileContext(budget?: TokenBudget): Promise<CompileResult> {
     // RFC-006 §3.3: consumption is determined at assembly — a compile that
     // fails assembled nothing, so the watermark moves only on success.
@@ -609,14 +617,20 @@ export class Agent {
   async compileWithInjections(
     budget?: TokenBudget,
     injections?: ContextInjection[],
-    opts?: { kvUnifiedImmutablePrefixHash?: string },
+    opts?: { kvUnifiedImmutablePrefixHash?: string; dryRun?: boolean },
   ): Promise<CompileResult> {
-    const watermark = this.pendingWatermark();
+    // A dry run is a compile that will never be sent: the context manager
+    // commits nothing for it (no fold resolutions, no compression work, and
+    // with thinking binding no stamps and no compile awaiting acceptance),
+    // and nothing here moves either. Nobody read what it assembled, so the
+    // consumed watermark stays, and a prepared budget change waits for the
+    // compile that is sent.
+    const watermark = opts?.dryRun ? null : this.pendingWatermark();
     const result = await this.contextManager.compile(
       this.compileBudget(budget), injections, opts as never,
     );
     if (watermark) this.consumedWatermark = watermark;
-    if (!budget) this.settleRuntimeSettingsTransition();
+    if (!budget && !opts?.dryRun) this.settleRuntimeSettingsTransition();
     return result;
   }
 
@@ -789,10 +803,13 @@ export class Agent {
    *
    * This is the single source of truth for request assembly, shared by the
    * real activation path (`startStreamWithInjections`) and debug/preview
-   * tooling (`Framework.previewActivation`). It is pure and non-mutating:
-   * it does not touch agent state and does not call the membrane, and
-   * `ContextManager.compile` is itself side-effect-free (compression runs in
-   * the background). Safe to call regardless of the agent's current status.
+   * tooling (`Framework.previewActivation`). It does not call the membrane.
+   * A compile that is sent commits what the context manager commits for it
+   * (fold resolutions, compression work, the consumed watermark); a preview
+   * passes `options.dryRun`, so its compile commits none of that (see
+   * `compileWithInjections`). Either way the context manager is handed the
+   * compression tool definitions. Safe to call regardless of the agent's
+   * current status.
    */
   async buildActivationRequest(
     availableTools: ToolDefinition[],
@@ -829,7 +846,12 @@ export class Agent {
     let { messages, systemInjections } = await this.compileWithInjections(
       budget,
       injections,
-      immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : undefined,
+      immutablePrefixHash || options.dryRun
+        ? {
+            ...(immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : {}),
+            ...(options.dryRun ? { dryRun: true } : {}),
+          }
+        : undefined,
     );
 
     // Sanitize: strip empty/whitespace text blocks and drop messages left with
