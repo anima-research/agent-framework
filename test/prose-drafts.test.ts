@@ -956,6 +956,36 @@ describe('drafts resend ownership', () => {
     }
   });
 
+  it("a draft whose own result is in isn't being sent any more, though the rest of its batch is", async () => {
+    const t = await setup();
+    try {
+      const batch = t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id, t.b.id], destination: 'chan' });
+      await t.tick();
+      t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-a' });
+      await t.tick();
+      assert.deepEqual(t.pending.map((p) => p.text), ['B words'], 'A is in; B is out');
+      assert.match(t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.a.id] })),
+        new RegExp(`${t.a.id}: already delivered — nothing to dismiss`));
+      t.pending.shift()!.resolve({ status: 'delivered', messageId: 'm-b' });
+      await batch;
+    } finally {
+      await t.close();
+    }
+  });
+
+  it('a publish that throws leaves its draft dismissable, not marked as being sent', async () => {
+    const t = await setup();
+    try {
+      const registry = (t.framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry;
+      registry.publish = async () => { throw new Error('transport gone'); };
+      await t.internals.handleDraftsTool('scout', { action: 'resend', draftIds: [t.a.id], destination: 'chan' }).catch(() => undefined);
+      assert.match(t.say(await t.internals.handleDraftsTool('scout', { action: 'dismiss', draftIds: [t.a.id] })),
+        new RegExp(`${t.a.id}: dismissed`));
+    } finally {
+      await t.close();
+    }
+  });
+
   it('>>skip_reply {{unsent}} leaves the latest bounce alone while it is being sent, and tells the resident', async () => {
     const t = await setup();
     try {
