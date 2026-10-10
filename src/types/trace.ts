@@ -41,9 +41,10 @@ export type TraceEvent =
       type: 'inference:started';
       agentName: string;
       /**
-       * The turn-frozen outbound locus (see turnLocusPins) — the channel this
-       * turn's plain prose will be routed to. Omitted for turns with no locus
-       * (heartbeats with no default channel). Observability only, like every
+       * The channel of the turn's speech route (src/speech-routes.ts) — where
+       * this turn's plain prose will be routed. Omitted when the turn has no
+       * channel route: no route at all (such as a heartbeat's turn), a held
+       * turn, or a local surface. Observability only, like every
        * trace field; lets external taps (e.g. a TTS relay) tag the whole
        * activation with its channel without re-deriving routing.
        */
@@ -396,6 +397,9 @@ export type TraceEvent =
       channelId: string;
       reason: string;
       textLen: number;
+      /** `failed`: nothing was posted; `unknown`: the request was dispatched
+       *  and no valid receipt came back, so it may have been. */
+      outcome?: 'failed' | 'unknown';
     })
 
   // Admin puppet: an operator executed a tool AS an agent and stored the
@@ -555,6 +559,40 @@ export type TraceEvent =
       type: 'host:quiesced_boot';
       reason?: string;
       since?: number;
+    })
+
+  // Inbound acceptance observation (mcpl/inbound-source.ts): an installed
+  // InboundAcceptanceObserver threw. Delivery is unaffected; the observer's
+  // own coverage is interrupted for that acceptance.
+  | (TraceEventBase & {
+      type: 'inbound:observer-failed';
+      /** Envelope kind of the acceptance the observer failed on. */
+      kind: 'channel' | 'unscoped' | 'surface';
+      error: string;
+    })
+
+  // Held prose drafts (src/prose-drafts.ts): plain speech kept privately
+  // instead of sent; a resident's explicit resend; a deliberate dismissal.
+  | (TraceEventBase & {
+      type: 'prose:drafts-held';
+      agentName: string;
+      reason: 'explicit-send' | 'no-destination' | 'ambiguous' | 'bounced';
+      draftIds: string[];
+      textLen: number;
+    })
+  | (TraceEventBase & {
+      type: 'prose:draft-resent';
+      agentName: string;
+      draftId: string;
+      status: 'delivered' | 'failed' | 'unknown';
+      serverId: string;
+      channelId: string;
+      messageId?: string;
+    })
+  | (TraceEventBase & {
+      type: 'prose:drafts-dismissed';
+      agentName: string;
+      draftIds: string[];
     });
 
 /**

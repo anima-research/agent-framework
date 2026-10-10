@@ -986,6 +986,17 @@ export interface ChannelCapabilities {
     kind?: string;
     supportsValue?: boolean;
   };
+  /**
+   * MCPL RFC-011: where a `channels/publish` to this channel lands — a
+   * per-channel behavioral declaration, not a capability path. `exact`: a
+   * publish carrying `threadId` lands exactly there (that thread, or the root
+   * for null) or is refused with nothing posted. `root`: the channel has no
+   * threads; a string `threadId` is refused. Absent: no guarantee, and the
+   * framework does not publish there.
+   */
+  publish?: {
+    target: 'exact' | 'root';
+  };
 }
 
 export interface ChannelHistoryRequest {
@@ -1116,6 +1127,8 @@ export interface ChannelsOutgoingChunkParams {
   channelId: string;
   index: number;
   delta: string;
+  /** MCPL RFC-011 §6: the place the stream's final publish targets. */
+  threadId?: string | null;
 }
 
 /**
@@ -1128,6 +1141,8 @@ export interface ChannelsOutgoingCompleteParams {
   conversationId: string;
   channelId: string;
   content: McplContentBlock[];
+  /** MCPL RFC-011 §6: the place the stream's final publish targets. */
+  threadId?: string | null;
 }
 
 /**
@@ -1140,6 +1155,13 @@ export interface ChannelsPublishParams {
   channelId: string;
   stream?: boolean;
   content: McplContentBlock[];
+  /**
+   * MCPL RFC-011: where in the channel to post — a non-empty string for that
+   * thread, null for the channel root; absent is legacy (the server
+   * chooses). Sent only to a channel that declares
+   * `capabilities.publish.target`, and only in the Request form.
+   */
+  threadId?: string | null;
 }
 
 /**
@@ -1148,6 +1170,10 @@ export interface ChannelsPublishParams {
 export interface ChannelsPublishResult {
   delivered: boolean;
   messageId?: string;
+  /** MCPL RFC-011: where the post landed (null: the channel root). */
+  threadId?: string | null;
+  /** MCPL RFC-011: why a publish was refused, or a note on the outcome. */
+  reason?: string;
 }
 
 /**
