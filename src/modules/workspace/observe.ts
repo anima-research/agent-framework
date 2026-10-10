@@ -668,7 +668,8 @@ export interface Walk {
 /**
  * Whether a mount's ignore list covers a mount-relative path: the path itself
  * or any directory above it, as the walk's own test reads each entry by its
- * path and name.
+ * path and name on the way down. The watcher reads it the same way
+ * (agent-framework #280).
  */
 export function coveredByIgnore(relativePath: string, patterns: string[]): boolean {
   const segments = relativePath.split('/').filter(Boolean);
@@ -678,7 +679,7 @@ export function coveredByIgnore(relativePath: string, patterns: string[]): boole
   return false;
 }
 
-/** Simple ignore patterns, as the watcher and the old walk read them. */
+/** Simple ignore patterns, as the walk and the watcher read them. */
 export function isIgnored(relativePath: string, name: string, patterns: string[]): boolean {
   for (const pattern of patterns) {
     if (pattern === name) return true;
