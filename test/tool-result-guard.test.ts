@@ -321,7 +321,7 @@ test('native Membrane observes the first refusal even when guard is enabled by a
       routed.push(speech); return { delivered: true, channelId: 'world:test' };
     },
     sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
-    getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+    isChannelOpen: () => true,
     getDescriptor: () => undefined, publishTarget: () => 'root', getChannelTools: () => [],
   }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   const tokenTraces: string[] = [];
@@ -539,7 +539,7 @@ function fakeRegistry(framework: AgentFramework) {
       routed.push(speech); return { delivered: true, channelId: 'world:test' };
     },
     sendOutgoingChunk: () => {},
-    getDefaultPublishChannel: () => null, isChannelOpen: () => true,
+    isChannelOpen: () => true,
     getDescriptor: () => undefined, publishTarget: () => 'root', getChannelTools: () => [],
   }, { get: (target, key: string) => key in target ? (target as Record<string, unknown>)[key] : () => undefined });
   return routed;

@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { InferenceRequest, ProcessEvent, Module, ModuleContext, ProcessState, EventResponse, ToolDefinition, ToolCall, ToolResult } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import type { RouteCandidate, SpeechRoute } from '../src/speech-routes.js';
 
 type Route = { route: { kind: string; channelId?: string; surface?: string; origin?: string } | null; hold?: unknown };
 
@@ -130,6 +131,43 @@ describe('speech route across a logical turn', () => {
       .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text);
     assert.ok(texts.includes('[delivered] plain speech → tui (the local surface that messaged you; not published to any channel)'));
     assert.ok(texts.some((t) => t.startsWith('[routing] Your plain speech now goes to tui (the local surface that messaged you)')));
+    await framework.stop();
+  });
+
+  it('a channel id no single server registers gets no guessed server: unroutable as a candidate, unresolved as a home', async () => {
+    const framework = await makeFramework();
+    const registrants: Record<string, string[]> = { solo: ['alpha'], shared: ['alpha', 'beta'] };
+    (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
+      getChannelServerId: (id: string) => (registrants[id]?.length === 1 ? registrants[id]![0] : null),
+      resolveDestination: (c: { serverId?: string; channelId: string }) =>
+        (c.serverId || registrants[c.channelId]?.length === 1)
+          ? { destination: { serverId: c.serverId ?? registrants[c.channelId]![0], channelId: c.channelId } }
+          : { error: 'shared or unknown' },
+      // As the registry reads it: a declaration only for exactly one registration.
+      publishTarget: (c: { serverId?: string; channelId: string }) =>
+        (c.serverId || registrants[c.channelId]?.length === 1 ? 'root' : undefined),
+      getDescriptor: () => undefined,
+    } as Record<string, unknown>, { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
+    const f = framework as unknown as {
+      candidateForChannel(channelId: string, addressed: boolean, at: number, serverId?: string): RouteCandidate;
+      homeRoute(agentName: string): SpeechRoute | null;
+      publishTargetOf(c: { serverId?: string; channelId: string }): string | undefined;
+      conversationAgentHomes: Map<string, string>;
+    };
+    const solo = f.candidateForChannel('solo', true, 1);
+    assert.equal(solo.conversation.kind === 'channel' ? solo.conversation.serverId : '', 'alpha', 'a sole registrant is the server');
+    assert.equal(solo.unroutable, undefined);
+    const shared = f.candidateForChannel('shared', true, 1);
+    assert.equal(shared.conversation.kind === 'channel' ? shared.conversation.serverId : '', undefined, 'never the first registrant');
+    assert.equal(shared.unroutable, true, 'it competes, but is no route');
+    const named = f.candidateForChannel('shared', true, 1, 'beta');
+    assert.equal(named.conversation.kind === 'channel' ? named.conversation.serverId : '', 'beta', "the event's own server stands");
+    assert.equal(named.unroutable, undefined);
+    f.conversationAgentHomes.set('scout', 'shared');
+    const home = f.homeRoute('scout');
+    assert.equal(home?.kind === 'channel' ? home.serverId : '', undefined, 'a shared home gets no server');
+    assert.equal(f.publishTargetOf({ channelId: 'shared' }), 'unresolved', 'and is unresolved, not undeclared');
+    assert.equal(f.publishTargetOf({ channelId: 'solo' }), 'root');
     await framework.stop();
   });
 

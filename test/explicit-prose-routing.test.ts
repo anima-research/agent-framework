@@ -94,7 +94,6 @@ function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'fals
     },
     resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
     resolveLocus: () => 'world:commons',
-    getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
     getDescriptor: () => undefined, publishTarget: () => 'root',
     getChannelTools: () => [],

@@ -110,13 +110,17 @@ export interface TurnRoute {
 
 export type UnroutableReason = 'untargetable' | 'thread' | 'unresolved';
 
-/** A channel's declared publish target (RFC-011), as the framework reads it. */
-export type PublishTargetOf = (channel: { serverId?: string; channelId: string }) => 'exact' | 'root' | undefined;
+/** A channel's declared publish target (RFC-011), as the framework reads it;
+ *  `unresolved` when the channel doesn't resolve to exactly one registered
+ *  channel (none, or an id more than one server registers, named without
+ *  its server). */
+export type PublishTargetOf = (channel: { serverId?: string; channelId: string }) => 'exact' | 'root' | 'unresolved' | undefined;
 
 /** Why a channel conversation can't be a route, or undefined when it can. */
 export function routeRefusal(c: ConversationRef, targetOf: PublishTargetOf): UnroutableReason | undefined {
   if (c.kind !== 'channel') return undefined;
   const declared = targetOf(c);
+  if (declared === 'unresolved') return 'unresolved';
   if (!declared) return 'untargetable';
   if (c.threadId && declared !== 'exact') return 'thread';
   return undefined;
@@ -246,10 +250,12 @@ export function isConversational(tags: readonly string[] | undefined, metadata?:
 
 /**
  * Whether a mid-turn arrival suspends the turn's route: only an inferred
- * route (origin 'trigger') not already held, and only for a conversational
- * message from a DIFFERENT conversation that addressed the resident, or that
- * continues a conversation the resident explicitly sent into this turn.
- * Ambient chatter never does; deliberate routes never are.
+ * route (origin 'trigger') not already held, and only for an arrival from a
+ * DIFFERENT conversation that addressed the resident, or that continues a
+ * conversation the resident explicitly sent into this turn. Ambient chatter
+ * never does; deliberate routes never are. It sees no tags: the caller passes
+ * only conversational arrivals (isConversational), so a reaction or a system
+ * marker never reaches it.
  */
 export function suspendsRoute(
   turn: TurnRoute,

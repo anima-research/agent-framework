@@ -601,6 +601,8 @@ interface ChannelRegistryOptions {
   onRouteFailure?: (info: {
     conversationId: string;
     channelId: string | null;
+    /** The thread the speech was for, when its route was a thread. */
+    threadId?: string;
     reason: string;
     textLen: number;
     /** `failed`: nothing was posted; `unknown`: the request was dispatched
@@ -2312,9 +2314,12 @@ export class ChannelRegistry {
       .map((e) => e.descriptor);
   }
 
-  /** Server id owning a registered channel (by descriptor id), or null. */
+  /** The server that registered a channel id, or null when none did or more
+   *  than one did. A shared id names no server: resolveDestination refuses it
+   *  too, so a caller never fills one in by registration order. */
   getChannelServerId(channelId: string): string | null {
-    return this.findChannelEntry(channelId)?.serverId ?? null;
+    const found = this.findExactEntry({ channelId });
+    return 'error' in found ? null : found.entry.serverId;
   }
 
   /**
@@ -3363,7 +3368,7 @@ export class ChannelRegistry {
      *  "this turn is pinned to no locus": fail loudly rather than guess. */
     locusChannelId: string | null | { serverId?: string; channelId: string; threadId?: string | null },
   ): Promise<PublishOutcome> {
-    const fail = (channelId: string | null, reason: string, outcome: PublishOutcome): PublishOutcome => {
+    const fail = (channelId: string | null, reason: string, outcome: PublishOutcome, threadId?: string | null): PublishOutcome => {
       const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
       console.error(`[routeSpeech] ${conversationId}: ${reason} — speech ${status === 'unknown' ? 'delivery NOT confirmed' : 'NOT routed'} (${text.length} chars stay in chronicle)`);
       this.emitTraceFn({
@@ -3374,7 +3379,7 @@ export class ChannelRegistry {
         textLen: text.length,
         outcome: status,
       });
-      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length, outcome: status });
+      this.onRouteFailure?.({ conversationId, channelId, ...(threadId ? { threadId } : {}), reason, textLen: text.length, outcome: status });
       return outcome;
     };
 
@@ -3395,11 +3400,12 @@ export class ChannelRegistry {
 
     // A route that knows its server publishes exactly there: the same
     // channel id on another server is a different conversation.
-    const target = typeof locusChannelId === 'string' ? { channelId: locusChannelId } : locusChannelId;
+    const target: { serverId?: string; channelId: string; threadId?: string | null } =
+      typeof locusChannelId === 'string' ? { channelId: locusChannelId } : locusChannelId;
     const outcome = await this.publish(conversationId, text, target);
     const channelId = outcome.destination?.channelId ?? target.channelId;
     if (outcome.status !== 'delivered') {
-      return fail(channelId, outcome.reason ?? 'delivery not confirmed', outcome);
+      return fail(channelId, outcome.reason ?? 'delivery not confirmed', outcome, outcome.destination?.threadId ?? target.threadId);
     }
 
     console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${channelId} (server=${outcome.destination!.serverId}, delivered=true)`);

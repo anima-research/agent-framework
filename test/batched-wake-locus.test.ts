@@ -235,4 +235,85 @@ describe('batched wake routing with conversation forks', () => {
     // Telemetry provenance still reaches every agent.
     assert.equal(byAgent.get('fork-other')?.counterparty, 'discord:user:5');
   });
+
+  type Wake = { agentName: string; channelId?: string; routeCandidates?: Array<{ conversation: { channelId?: string } }> };
+  const pushInto = (channelId: string, eventId: string) => ({
+    type: 'mcpl:push-event', serverId: 'discord', featureSet: 'chat', eventId,
+    content: [{ type: 'text', text: 'are you there?' }], timestamp: new Date().toISOString(),
+    triggerInference: true, tags: ['chat:addressed'],
+    origin: { mcplChannelId: channelId, messageId: `${eventId}-m`, authorId: '5' },
+  });
+
+  it('a push event follows the fork rule: no agent takes a fork-owned channel as its route or typing', async () => {
+    const internals = framework as unknown as {
+      conversationAgentHomes: Map<string, string>;
+      pendingRequests: Wake[];
+      handleMcplPushEvent(event: unknown): unknown;
+    };
+    internals.conversationAgentHomes.set('fork-room', ROOM);
+    internals.handleMcplPushEvent(pushInto(ROOM, 'e1'));
+    const trunk = internals.pendingRequests.find((r) => r.agentName === 'trunk');
+    assert.ok(trunk, 'the trunk is still woken');
+    assert.equal(trunk!.channelId, undefined, 'no typing in a fork-owned channel');
+    assert.equal(trunk!.routeCandidates, undefined, 'and no route into it');
+    // Control: the same push into a channel no fork owns.
+    internals.pendingRequests.length = 0;
+    internals.handleMcplPushEvent(pushInto(GENERAL, 'e2'));
+    const free = internals.pendingRequests.find((r) => r.agentName === 'trunk');
+    assert.equal(free?.channelId, GENERAL);
+    assert.deepEqual(free?.routeCandidates?.map((c) => c.conversation.channelId), [GENERAL]);
+  });
+
+  it('a coalesced push batch follows the fork rule for its typing channel and route candidate', async () => {
+    const internals = framework as unknown as {
+      conversationAgentHomes: Map<string, string>;
+      pendingRequests: Wake[];
+      wakeForCoalescedBatch(occ: unknown): Promise<void>;
+    };
+    internals.conversationAgentHomes.set('fork-room', ROOM);
+    const batch = (channelId: string, eventId: string) => ({
+      serverId: 'discord', binding: 'discord', scope: { kind: 'channel', id: channelId }, key: 'k', eventId,
+      timestamp: new Date().toISOString(), retract: false, deferred: false, initial: false, tags: ['chat:addressed'],
+      event: {
+        lane: 'push',
+        event: {
+          ...pushInto(channelId, eventId),
+          // The envelope the host froze at acceptance: the batch's conversation.
+          inboundSource: { kind: 'channel', serverId: 'discord', channelId, messageId: `${eventId}-m`, acceptedAt: Date.now() },
+        },
+      },
+    });
+    await internals.wakeForCoalescedBatch(batch(ROOM, 'c1'));
+    const trunk = internals.pendingRequests.find((r) => r.agentName === 'trunk');
+    assert.ok(trunk, 'the trunk is still woken');
+    assert.equal(trunk!.channelId, undefined, 'no typing in a fork-owned channel');
+    assert.equal(trunk!.routeCandidates, undefined, 'and no route into it');
+    internals.pendingRequests.length = 0;
+    await internals.wakeForCoalescedBatch(batch(GENERAL, 'c2'));
+    const free = internals.pendingRequests.find((r) => r.agentName === 'trunk');
+    assert.equal(free?.channelId, GENERAL, 'a free channel is taken');
+    assert.deepEqual(free?.routeCandidates?.map((c) => c.conversation.channelId), [GENERAL], 'as a route candidate too');
+  });
+
+  it('a channel-incoming broadcast follows the fork rule for every agent it wakes', async () => {
+    const internals = framework as unknown as {
+      conversationAgentHomes: Map<string, string>;
+      pendingRequests: Wake[];
+      handleMcplChannelIncoming(event: unknown): Promise<unknown>;
+    };
+    internals.conversationAgentHomes.set('fork-room', ROOM);
+    internals.conversationAgentHomes.set('fork-other', GENERAL);
+    await internals.handleMcplChannelIncoming({
+      type: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM, messageId: 'm-1',
+      author: { id: '5', name: 'Five' }, content: [{ type: 'text', text: '@agent hi' }],
+      timestamp: new Date().toISOString(), triggerInference: true, tags: ['chat:addressed'],
+    });
+    const byAgent = new Map(internals.pendingRequests.map((r) => [r.agentName, r]));
+    assert.equal(byAgent.get('fork-room')?.channelId, ROOM, 'the fork that owns the channel takes it');
+    assert.deepEqual(byAgent.get('fork-room')?.routeCandidates?.map((c) => c.conversation.channelId), [ROOM]);
+    for (const other of ['fork-other', 'trunk']) {
+      assert.equal(byAgent.get(other)?.channelId, undefined, `${other} gets no typing there`);
+      assert.equal(byAgent.get(other)?.routeCandidates, undefined, `${other} gets no route there`);
+    }
+  });
 });

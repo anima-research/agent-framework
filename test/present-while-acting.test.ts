@@ -149,7 +149,6 @@ function stubChannelRegistry(framework: AgentFramework, opts: { home?: boolean }
       // the thread included when the publish was placed in one.
       return locus ? { delivered: true, channelId: locus, ...(threadId ? { threadId } : {}) } : null;
     },
-    getDefaultPublishChannel: () => null,
     // Hybrid `>>>#name` targets resolve to `chan-name` and deliver through
     // the registry's outcome-returning form, recorded like routeSpeech.
     resolveProseTarget: (spec: string) => ({ channelId: spec.startsWith('#') ? `chan-${spec.slice(1)}` : spec, label: spec }),

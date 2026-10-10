@@ -66,6 +66,33 @@ function registryWith(servers: Record<string, { publish: Publish; grant?: boolea
 /** A conforming delivery: it echoes the place it was asked for. */
 const ok: Publish = async (params) => ({ delivered: true, messageId: 'posted-1', threadId: params.threadId });
 
+describe('ChannelRegistry server lookup and route failures', () => {
+  it('names the server of an id only one server registered; a shared or unknown id names none', () => {
+    const { registry, seed } = registryWith({ alpha: { publish: ok }, beta: { publish: ok } });
+    seed('alpha', 'solo', '#solo');
+    seed('alpha', 'shared', '#shared');
+    seed('beta', 'shared', '#shared');
+    assert.equal(registry.getChannelServerId('solo'), 'alpha');
+    assert.equal(registry.getChannelServerId('shared'), null, 'never whichever server registered it first');
+    assert.equal(registry.getChannelServerId('nowhere'), null);
+  });
+
+  it('a failed delivery into a thread reports the thread with its channel', async () => {
+    const failures: Array<Record<string, unknown>> = [];
+    const { registry, seed } = registryWith(
+      { discord: { publish: async () => ({ delivered: false, reason: 'thread t-1 is archived' }) } },
+      failures,
+    );
+    seed('discord', 'forum', '#forum', 'exact');
+    await registry.deliverSpeech('agent', 'hello', { serverId: 'discord', channelId: 'forum', threadId: 't-1' });
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0]!.channelId, 'forum');
+    assert.equal(failures[0]!.threadId, 't-1');
+    await registry.deliverSpeech('agent', 'hello', { serverId: 'discord', channelId: 'forum' });
+    assert.equal('threadId' in failures[1]!, false, 'a root delivery names no thread');
+  });
+});
+
 describe('ChannelRegistry.publish outcomes', () => {
   it('confirms only delivered:true, naming the destination from the registry', async () => {
     const { registry, seed } = registryWith({ discord: { publish: ok } });
@@ -378,6 +405,55 @@ test('the resident\'s failure marker never claims an uncertain delivery did not 
     assert.doesNotMatch(uncertain!, /did not receive|Nothing was posted/);
     assert.match(failed!, /could not be delivered/);
     assert.match(failed!, /Nothing was posted/);
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a failure marker for a thread route names the thread, and says to check it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'publish-outcome-thread-'));
+  const commandPath = join(dir, 'commands.jsonl');
+  writeFileSync(commandPath, '');
+  const membrane = new MockMembrane();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+    mcplServers: [{
+      id: 'discord',
+      command: process.execPath,
+      args: [join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs')],
+      env: {
+        STATUS_PATH: join(dir, 'status.jsonl'),
+        COMMAND_PATH: commandPath,
+        CHANNELS: JSON.stringify([{ id: 'discord:g1:forum', label: '#forum (Guild One)', publishTarget: 'exact' }]),
+      },
+    }],
+    modules: [],
+  });
+  try {
+    await framework.start();
+    const registry = (framework as unknown as { channelRegistry: { listChannelsRaw(): unknown[] } }).channelRegistry;
+    const until = async (cond: () => boolean, what: string) => {
+      const deadline = Date.now() + 15_000;
+      while (!cond()) { if (Date.now() > deadline) throw new Error(`timed out: ${what}`); await new Promise((r) => setTimeout(r, 20)); }
+    };
+    await until(() => registry.listChannelsRaw().length >= 1, 'registration');
+    const markers = () => framework.getAgent('scout')!.getContextManager().getAllMessages()
+      .filter((m) => (m.metadata as { kind?: string } | undefined)?.kind === 'discord-send-failed');
+    appendFileSync(commandPath, JSON.stringify({ op: 'publish-mode', mode: 'no-receipt' }) + '\n');
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'reply in the thread' }]));
+    appendFileSync(commandPath, JSON.stringify({
+      op: 'incoming', channelId: 'discord:g1:forum', threadId: 't1', messageId: 'm-1', mode: 'addressed', text: 'hello?',
+    }) + '\n');
+    await until(() => markers().length === 1, 'marker');
+    await framework.runUntilIdle();
+    const [marker] = markers();
+    const text = (marker!.content[0] as { text: string }).text;
+    assert.match(text, /to thread t1 in #forum \(Guild One\) \(discord:g1:forum\) was not confirmed/);
+    assert.match(text, /check the thread before sending it again/);
+    assert.equal((marker!.metadata as { threadId?: string }).threadId, 't1');
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });
