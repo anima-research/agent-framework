@@ -120,14 +120,19 @@ export class Agent {
    * closure) so the next activation can close whatever its predecessor left
    * open — see failOpenKvSubmissions. */
   private kvOpenQueue: Array<{ submissionId: string; wireReceipt: CacheWireReceipt }> | null = null;
+  /** The current stream's fresh input so far, as membrane's usage event
+   *  reports it (cumulative across the tool loop): what the maxStreamTokens
+   *  budget checks. */
   lastStreamInputTokens = 0;
-  /** Real prefix size of the last usage event: fresh + cache creation +
-   *  cache read. THE window-shaped number — `lastStreamInputTokens` alone
-   *  omits cached tokens, which are most of a warm stream's window. */
+  /** Real prefix size of the stream's latest provider call: fresh + cache
+   *  creation + cache read, the difference between its last two usage
+   *  events, since membrane's are cumulative. THE window-shaped number —
+   *  `lastStreamInputTokens` alone omits cached tokens, which are most of a
+   *  warm stream's window. */
   lastStreamRealInputTokens = 0;
-  /** Output tokens of the last usage event — the prior round's generated
-   *  thinking/text/tool_use, which becomes part of the NEXT round's input
-   *  and so belongs in the physical-window projection. */
+  /** Output tokens of the stream's latest provider call — the prior round's
+   *  generated thinking/text/tool_use, which becomes part of the NEXT
+   *  round's input and so belongs in the physical-window projection. */
   lastStreamOutputTokens = 0;
   maxStreamTokens: number;
   /** Provider hard context cap (see AgentConfig.physicalWindowTokens). */

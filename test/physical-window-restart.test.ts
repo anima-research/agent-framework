@@ -229,6 +229,71 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     }
   });
 
+  it("projects from the latest call, not the stream's running total", async () => {
+    // Membrane's usage event is cumulative across the tool loop. Each call
+    // here fits: the second call's prompt is 118k (38k fresh + 80k cache
+    // read), and with its 30k output and the 32k reserve the next request
+    // projects to about 180k of the 200k window. Read as the prior call's,
+    // the second sample (198k of prompt and 60k of output across both calls)
+    // projects to about 290k and restarts a stream whose next request fits.
+    // Taking only one of the two terms from the sample crosses too.
+    const tempDir = mkdtempSync(join(tmpdir(), 'phys-window-'));
+    const round = (id: string | null, usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number }) => {
+      const r = id === null
+        ? createMockResponse([{ type: 'text', text: 'Answered on the first stream' }])
+        : createMockResponse([
+          { type: 'text', text: 'Working…' },
+          { type: 'tool_use', id, name: 'canned--fetch', input: {} },
+        ], 'tool_use');
+      (r as { usage: unknown }).usage = usage;
+      return r;
+    };
+    const membrane = new QueuedStreamsMembrane([
+      [
+        round('call_1', { inputTokens: 5_000, outputTokens: 30_000, cacheReadTokens: 75_000 }),
+        round('call_2', { inputTokens: 43_000, outputTokens: 60_000, cacheReadTokens: 155_000 }),
+        round(null, { inputTokens: 45_000, outputTokens: 60_500, cacheReadTokens: 273_000 }),
+      ],
+      [createMockResponse([{ type: 'text', text: 'Answered after a restart' }])],
+    ]);
+
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{
+        name: 'prime',
+        model: 'test-model',
+        systemPrompt: 'You are prime.',
+        allowedTools: 'all',
+        maxTokens: 32_000,
+        physicalWindowTokens: 200_000,
+      }],
+      modules: [new BlobToolModule()],
+      syncIntervalMs: 0,
+    });
+    const traces: TraceEvent[] = [];
+    framework.onTrace((e) => traces.push(e));
+    framework.start();
+    framework.pushEvent({
+      type: 'external-message',
+      source: 'test',
+      content: [{ type: 'text', text: 'fetch it twice' }],
+      metadata: {},
+      triggerInference: true,
+    } as unknown as ProcessEvent);
+    try {
+      const done = await pollUntil(() => /Answered (on the first stream|after a restart)/.test(storedTexts(framework)));
+      assert.ok(done, 'the turn should finish');
+      const restarts = traces.filter((e) => e.type === 'inference:stream_restarted');
+      assert.deepStrictEqual(restarts, [], 'every call fits the window, so the stream must not restart');
+      assert.strictEqual(membrane.calls.length, 1);
+      assert.ok(storedTexts(framework).includes('Answered on the first stream'));
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('leaves behavior unchanged when physicalWindowTokens is unset', async () => {
     const h = await runTurn(undefined, new MockMembrane());
     try {

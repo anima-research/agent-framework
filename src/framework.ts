@@ -10676,12 +10676,9 @@ export class AgentFramework {
           }
 
           case 'usage': {
+            // The stream's accumulated fresh input, which is what the
+            // maxStreamTokens budget checks.
             agent.lastStreamInputTokens = event.usage.inputTokens;
-            agent.lastStreamRealInputTokens =
-              (event.usage.inputTokens ?? 0) +
-              (event.usage.cacheCreationTokens ?? 0) +
-              (event.usage.cacheReadTokens ?? 0);
-            agent.lastStreamOutputTokens = event.usage.outputTokens ?? 0;
 
             // Closed-loop estimator calibration (2026-07-12). Sample the REAL
             // prefix size of THIS API call (fresh + cache write + cache read)
@@ -10712,6 +10709,17 @@ export class AgentFramework {
             };
             previousUsage = cumulativeUsage;
             outputTokensSinceStamp += perCallUsage.outputTokens;
+            const realTotal =
+              perCallUsage.inputTokens +
+              perCallUsage.cacheCreationTokens +
+              perCallUsage.cacheReadTokens;
+            // The physical-window projection adds these as the prior round's
+            // real input and output, so they are this call's. The sample is
+            // the stream's running total: after k calls it holds k prompts,
+            // and the projection would restart a stream whose next request
+            // still fits.
+            agent.lastStreamRealInputTokens = realTotal;
+            agent.lastStreamOutputTokens = perCallUsage.outputTokens;
             const strat = (agent as unknown as {
               getContextManager?: () => { getStrategy?: () => unknown };
             }).getContextManager?.()?.getStrategy?.() as
@@ -10726,10 +10734,6 @@ export class AgentFramework {
                 }
               | undefined;
             try {
-              const realTotal =
-                perCallUsage.inputTokens +
-                perCallUsage.cacheCreationTokens +
-                perCallUsage.cacheReadTokens;
               strat?.reportRealInputTokens?.(realTotal);
             } catch { /* calibration is best-effort */ }
 
