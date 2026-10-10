@@ -126,9 +126,8 @@ function makeChannelRegistry(framework: AgentFramework) {
     routeSpeech: async (_agent: string, text: string) => {
       routed.push(text);
     },
-    getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
-    getDescriptor: () => undefined,
+    getDescriptor: () => undefined, publishTarget: () => 'root',
   };
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(explicit, {
     get: (target, prop: string) => (prop in target ? target[prop as keyof typeof target] : () => undefined),

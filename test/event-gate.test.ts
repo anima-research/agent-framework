@@ -33,7 +33,7 @@ function makeGate(configPath: string, opts?: {
 }) {
   const traces: TraceEntry[] = [];
   const messages: Array<{ participant: string; content: unknown; metadata?: unknown }> = [];
-  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string }> = [];
+  const inferenceRequests: Array<{ agentName: string; reason: string; source: string; channelId?: string; counterparty?: string; addressed?: boolean; at?: number; routeChannelId?: string; routeCandidates?: Array<Record<string, unknown>> }> = [];
 
   const gate = new EventGate({
     configPath,
@@ -347,6 +347,24 @@ describe('debounce', () => {
     assert.deepStrictEqual(d.behavior, { debounce: 100 });
   });
 
+  it('a batched wake counts each server\'s channel apart and names its server', async () => {
+    const path = writeConfig('debounce-servers.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, messages } = makeGate(path);
+    // The same channel id and name on two servers: two conversations.
+    gate.evaluate(event({ serverId: 'alpha', channelId: 'C1', metadata: { channelName: 'general' } }));
+    gate.evaluate(event({ serverId: 'beta', channelId: 'C1', metadata: { channelName: 'general' } }));
+    gate.evaluate(event({ serverId: 'beta', channelId: 'C1', metadata: { channelName: 'general' } }));
+    await new Promise(r => setTimeout(r, 160));
+    const text = (messages[0].content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes('- 1 message in #general (alpha / C1) '), text);
+    assert.ok(text.includes('- 2 messages in #general (beta / C1) '), text);
+  });
+
   it('batches events and fires after delay', async () => {
     const path = writeConfig('debounce-fire.json', {
       policies: [
@@ -582,6 +600,96 @@ describe('debounce', () => {
     await new Promise(r => setTimeout(r, 150));
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].routeChannelId, undefined);
+  });
+
+  it('a batched wake reports every conversation in its batch as a route candidate (shelf-355)', async () => {
+    const path = writeConfig('debounce-route-candidates.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const resolveRouteChannel = (info: GateEventInfo) =>
+      info.eventType === 'mcpl:channel-incoming' ? info.channelId : undefined;
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: '@agent hi',
+      tags: ['chat:addressed'], metadata: { authorId: '1', messageId: 'm-room' } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:general', content: 'chatter',
+      metadata: { authorId: '7', messageId: 'm-gen' } }));
+    // An addressed push whose channel the host could not resolve still competes.
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', channelId: '1548', content: 'dm',
+      tags: ['chat:dm', 'chat:addressed'], metadata: { authorId: '42', channelId: '1548' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    const candidates = (inferenceRequests[0].routeCandidates ?? []).map(({ at: _at, ...rest }) => rest);
+    assert.deepStrictEqual(candidates, [
+      { kind: 'channel', channelId: 'discord:g:room', serverId: 'discord', messageId: 'm-room', addressed: true },
+      { kind: 'channel', channelId: 'discord:g:general', serverId: 'discord', messageId: 'm-gen', addressed: false },
+      { kind: 'channel', channelId: '1548', serverId: 'discord', addressed: true, unroutable: true },
+    ]);
+  });
+
+  it('a batched candidate keeps its thread: a thread and its channel root are different conversations', async () => {
+    const path = writeConfig('debounce-route-thread.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const resolveRouteChannel = (info: GateEventInfo) => info.channelId;
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel });
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'slack', channelId: 'slack:C1', content: '@agent in thread',
+      tags: ['chat:addressed'], metadata: { authorId: '1', messageId: 'm-t', threadId: '1700.0001' } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'slack', channelId: 'slack:C1', content: '@agent at root',
+      tags: ['chat:addressed'], metadata: { authorId: '2', messageId: 'm-r' } }));
+    await new Promise(r => setTimeout(r, 150));
+    const candidates = (inferenceRequests[0].routeCandidates ?? []).map(({ at: _at, ...rest }) => rest);
+    assert.deepStrictEqual(candidates, [
+      { kind: 'channel', channelId: 'slack:C1', serverId: 'slack', threadId: '1700.0001', messageId: 'm-t', addressed: true },
+      { kind: 'channel', channelId: 'slack:C1', serverId: 'slack', messageId: 'm-r', addressed: true },
+    ]);
+  });
+
+  it('a candidate takes its conversation from the frozen envelope, ahead of free-form metadata', async () => {
+    const path = writeConfig('debounce-route-envelope.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    // The route resolver would read the forged origin; the envelope wins.
+    const { gate, inferenceRequests } = makeGate(path, { resolveRouteChannel: () => 'slack:FORGED' });
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'forged-server', channelId: 'C1', content: '@agent in a thread',
+      tags: ['chat:addressed'],
+      metadata: {
+        authorId: '1', messageId: 'forged-m', threadId: 'forged-t',
+        inboundSource: {
+          kind: 'channel', lane: 'push/event', serverId: 'slack', binding: 'b1', channelId: 'slack:C1',
+          threadId: '1700.0001', messageId: 'm-env', acceptedAt: 1,
+        },
+      } }));
+    await new Promise(r => setTimeout(r, 150));
+    const candidates = (inferenceRequests[0].routeCandidates ?? []).map(({ at: _at, ...rest }) => rest);
+    assert.deepStrictEqual(candidates, [
+      { kind: 'channel', channelId: 'slack:C1', serverId: 'slack', threadId: '1700.0001', messageId: 'm-env', addressed: true },
+    ]);
+  });
+
+  it('a reaction in the batch is never a route candidate (the same predicate as mid-turn)', async () => {
+    const path = writeConfig('debounce-route-reaction.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: '👍',
+      tags: ['chat:reaction', 'chat:addressed'], metadata: { authorId: '1', messageId: 'r-1' } }));
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:general', content: 'hi',
+      metadata: { authorId: '2', messageId: 'm-2' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.deepStrictEqual((inferenceRequests[0].routeCandidates ?? []).map((c) => c.channelId), ['discord:g:general']);
   });
 
   it('a batched wake with no channel-bearing event carries no provenance', async () => {

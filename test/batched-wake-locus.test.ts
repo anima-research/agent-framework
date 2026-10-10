@@ -8,8 +8,10 @@
  * that; a DM push event never does. Either order misrouted the DM reply:
  *   - ambient AFTER the DM: the ambient channel became the fallback;
  *   - ambient BEFORE the DM: the DM never displaced it.
- * Now a batch containing an addressed message routes to that message's
- * registered channel; an ambient-only batch keeps the legacy fallback.
+ * Now the turn's speech route is inferred from the whole batch
+ * (shelf-355): its addressed messages if any, else all of it; one
+ * conversation routes there, several hold the reply as a draft. Nothing
+ * falls back to the most recent inbound channel.
  */
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -118,15 +120,68 @@ describe('batched wake routing', () => {
     incoming(GENERAL, 'ambient', 'unrelated chatter');
     await waitFor(() => publishes().length >= 1, 'reply published');
     assert.deepEqual(publishes(), [ROOM]);
+    // What the agent is told is where its speech went: the channel context
+    // advertises the same route, answering the mention.
+    const registry = (framework as unknown as {
+      channelRegistry: { buildChannelContext(agent: string): { defaultOutgoing?: { channelId: string }; incoming?: { channelId: string; messageId: string } } | undefined };
+    }).channelRegistry;
+    const context = registry.buildChannelContext('scout');
+    assert.equal(context?.defaultOutgoing?.channelId, ROOM);
+    assert.equal(context?.incoming?.channelId, ROOM);
+    assert.match(context?.incoming?.messageId ?? '', /^m-\d+$/);
   });
 
-  it('an ambient-only batch keeps the legacy fallback (most recent inbound)', async () => {
+  const drafts = (): Array<{ id: string; text: string; reason: string; note?: string }> =>
+    (framework as unknown as { proseDrafts: { open(agent: string): Array<{ id: string; text: string; reason: string; note?: string }> } })
+      .proseDrafts.open('scout');
+  const turnDone = async (): Promise<void> => {
+    await waitFor(() => membrane.calls.length >= 1, 'the turn ran');
+    await waitFor(() => framework.getAgent('scout')!.state.status === 'idle', 'the turn ended');
+    await framework.runUntilIdle();
+  };
+
+  it('an ambient-only batch in ONE conversation takes that conversation as its route', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
+    incoming(ROOM, 'ambient', 'first');
+    await waitFor(() => sent('incoming-sent') === 1, 'first sent');
+    incoming(ROOM, 'ambient', 'second');
+    await waitFor(() => publishes().length >= 1, 'reply published');
+    assert.deepEqual(publishes(), [ROOM]);
+  });
+
+  it('an ambient-only batch across two conversations holds the reply as a draft, never the newest channel', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'joining in' }]));
     incoming(ROOM, 'ambient', 'first');
     await waitFor(() => sent('incoming-sent') === 1, 'first sent');
     incoming(GENERAL, 'ambient', 'second');
-    await waitFor(() => publishes().length >= 1, 'reply published');
-    assert.deepEqual(publishes(), [GENERAL]);
+    await turnDone();
+    assert.deepEqual(publishes(), [], 'nothing is guessed');
+    const [held] = drafts();
+    assert.equal(held?.text, 'joining in');
+    assert.equal(held?.reason, 'ambiguous');
+    assert.match(held?.note ?? '', /discord:g1:room/);
+    assert.match(held?.note ?? '', /discord:g1:general/);
+  });
+
+  it('two conversations that addressed the agent in one batch: held, never guessed', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'which of you?' }]));
+    incoming(ROOM, 'addressed', '@scout hello');
+    await waitFor(() => sent('incoming-sent') === 1, 'mention sent');
+    dm('are you there?');
+    await waitFor(() => sent('dm-sent') === 1, 'dm sent');
+    await turnDone();
+    assert.deepEqual(publishes(), []);
+    const [held] = drafts();
+    assert.equal(held?.reason, 'ambiguous');
+    assert.match(held?.note ?? '', new RegExp(`${DM}|${RAW_DM}`));
+    assert.match(held?.note ?? '', /discord:g1:room/);
+    // The resident decides: the held words go to whichever conversation it
+    // names, verbatim.
+    const result = await (framework as unknown as {
+      handleDraftsTool(agent: string, input: Record<string, unknown>): Promise<{ success?: boolean; content?: unknown; data?: unknown }>;
+    }).handleDraftsTool('scout', { action: 'resend', draftIds: [held!.id], destination: DM });
+    assert.match(JSON.stringify(result), /delivered to/);
+    assert.deepEqual(publishes(), [DM]);
   });
 });
 
@@ -179,5 +234,86 @@ describe('batched wake routing with conversation forks', () => {
     assert.equal(byAgent.get('trunk')?.channelId, undefined, 'the trunk never takes a fork-bound channel');
     // Telemetry provenance still reaches every agent.
     assert.equal(byAgent.get('fork-other')?.counterparty, 'discord:user:5');
+  });
+
+  type Wake = { agentName: string; channelId?: string; routeCandidates?: Array<{ conversation: { channelId?: string } }> };
+  const pushInto = (channelId: string, eventId: string) => ({
+    type: 'mcpl:push-event', serverId: 'discord', featureSet: 'chat', eventId,
+    content: [{ type: 'text', text: 'are you there?' }], timestamp: new Date().toISOString(),
+    triggerInference: true, tags: ['chat:addressed'],
+    origin: { mcplChannelId: channelId, messageId: `${eventId}-m`, authorId: '5' },
+  });
+
+  it('a push event follows the fork rule: no agent takes a fork-owned channel as its route or typing', async () => {
+    const internals = framework as unknown as {
+      conversationAgentHomes: Map<string, string>;
+      pendingRequests: Wake[];
+      handleMcplPushEvent(event: unknown): unknown;
+    };
+    internals.conversationAgentHomes.set('fork-room', ROOM);
+    internals.handleMcplPushEvent(pushInto(ROOM, 'e1'));
+    const trunk = internals.pendingRequests.find((r) => r.agentName === 'trunk');
+    assert.ok(trunk, 'the trunk is still woken');
+    assert.equal(trunk!.channelId, undefined, 'no typing in a fork-owned channel');
+    assert.equal(trunk!.routeCandidates, undefined, 'and no route into it');
+    // Control: the same push into a channel no fork owns.
+    internals.pendingRequests.length = 0;
+    internals.handleMcplPushEvent(pushInto(GENERAL, 'e2'));
+    const free = internals.pendingRequests.find((r) => r.agentName === 'trunk');
+    assert.equal(free?.channelId, GENERAL);
+    assert.deepEqual(free?.routeCandidates?.map((c) => c.conversation.channelId), [GENERAL]);
+  });
+
+  it('a coalesced push batch follows the fork rule for its typing channel and route candidate', async () => {
+    const internals = framework as unknown as {
+      conversationAgentHomes: Map<string, string>;
+      pendingRequests: Wake[];
+      wakeForCoalescedBatch(occ: unknown): Promise<void>;
+    };
+    internals.conversationAgentHomes.set('fork-room', ROOM);
+    const batch = (channelId: string, eventId: string) => ({
+      serverId: 'discord', binding: 'discord', scope: { kind: 'channel', id: channelId }, key: 'k', eventId,
+      timestamp: new Date().toISOString(), retract: false, deferred: false, initial: false, tags: ['chat:addressed'],
+      event: {
+        lane: 'push',
+        event: {
+          ...pushInto(channelId, eventId),
+          // The envelope the host froze at acceptance: the batch's conversation.
+          inboundSource: { kind: 'channel', serverId: 'discord', channelId, messageId: `${eventId}-m`, acceptedAt: Date.now() },
+        },
+      },
+    });
+    await internals.wakeForCoalescedBatch(batch(ROOM, 'c1'));
+    const trunk = internals.pendingRequests.find((r) => r.agentName === 'trunk');
+    assert.ok(trunk, 'the trunk is still woken');
+    assert.equal(trunk!.channelId, undefined, 'no typing in a fork-owned channel');
+    assert.equal(trunk!.routeCandidates, undefined, 'and no route into it');
+    internals.pendingRequests.length = 0;
+    await internals.wakeForCoalescedBatch(batch(GENERAL, 'c2'));
+    const free = internals.pendingRequests.find((r) => r.agentName === 'trunk');
+    assert.equal(free?.channelId, GENERAL, 'a free channel is taken');
+    assert.deepEqual(free?.routeCandidates?.map((c) => c.conversation.channelId), [GENERAL], 'as a route candidate too');
+  });
+
+  it('a channel-incoming broadcast follows the fork rule for every agent it wakes', async () => {
+    const internals = framework as unknown as {
+      conversationAgentHomes: Map<string, string>;
+      pendingRequests: Wake[];
+      handleMcplChannelIncoming(event: unknown): Promise<unknown>;
+    };
+    internals.conversationAgentHomes.set('fork-room', ROOM);
+    internals.conversationAgentHomes.set('fork-other', GENERAL);
+    await internals.handleMcplChannelIncoming({
+      type: 'mcpl:channel-incoming', serverId: 'discord', channelId: ROOM, messageId: 'm-1',
+      author: { id: '5', name: 'Five' }, content: [{ type: 'text', text: '@agent hi' }],
+      timestamp: new Date().toISOString(), triggerInference: true, tags: ['chat:addressed'],
+    });
+    const byAgent = new Map(internals.pendingRequests.map((r) => [r.agentName, r]));
+    assert.equal(byAgent.get('fork-room')?.channelId, ROOM, 'the fork that owns the channel takes it');
+    assert.deepEqual(byAgent.get('fork-room')?.routeCandidates?.map((c) => c.conversation.channelId), [ROOM]);
+    for (const other of ['fork-other', 'trunk']) {
+      assert.equal(byAgent.get(other)?.channelId, undefined, `${other} gets no typing there`);
+      assert.equal(byAgent.get(other)?.routeCandidates, undefined, `${other} gets no route there`);
+    }
   });
 });

@@ -1,10 +1,10 @@
 # Hybrid prose routing (`>>>destination`)
 
-Hybrid routing preserves ordinary frozen-locus speech while allowing a resident
-to explicitly publish one or more prose envelopes elsewhere.
+Hybrid routing preserves ordinary speech on the turn's speech route while
+allowing a resident to explicitly publish one or more prose envelopes elsewhere.
 
 ```text
-ordinary prose                         # current frozen locus
+ordinary prose                         # the turn's speech route (held as a draft without one)
 >>>#cafe prose for the café            # unique authorized channel by name
 >>> world:commons prose for the world  # canonical channel id
 ```
@@ -23,7 +23,9 @@ Two views are intentionally preserved:
 At logical turn end, a `[delivered]` receipt names canonical destinations (or a
 bounce explains failure), so authored intent cannot impersonate delivery.
 Unprefixed prose after a successful envelope follows that explicit destination
-for the remainder of the turn; a fresh turn begins at its ordinary locus.
+for the remainder of the turn — a deliberate target, which a mid-turn ambiguity
+hold never suspends, and which a later `channel_open` replaces; a fresh turn
+begins at its own speech route.
 
 This is publication routing only. It creates no privacy meaning for `<think>`
 or other prose tags, and grants no channel authority beyond the existing

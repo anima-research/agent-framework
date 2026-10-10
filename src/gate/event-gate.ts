@@ -12,6 +12,8 @@
  */
 
 import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
+import { describeConversation, isConversational } from '../speech-routes.js';
+import { readInboundSource } from '../mcpl/inbound-source.js';
 import { dirname, join } from 'node:path';
 import { GateScript } from './gate-script.js';
 
@@ -93,7 +95,37 @@ interface PendingEvent {
    *  whose `channelId` is the adapter's raw id (a bare Discord snowflake for a
    *  DM) — unroutable. Absent when the host could not resolve one. */
   routeChannelId?: string;
+  /** The triggering message's id, when the metadata carries one: the reply
+   *  edge of a speech route inferred from this event. */
+  messageId?: string;
+  /** The thread the event belongs to, when the metadata carries one: part
+   *  of its conversation's identity (a thread is not its channel's root). */
+  threadId?: string;
+  /** Conversational input rather than machinery (a reaction, a system
+   *  marker): only conversational events are route candidates. */
+  conversational: boolean;
 }
+
+/** One conversation a batched gate wake carries, for the framework's
+ *  speech-route inference (src/speech-routes.ts). */
+export type GateRouteCandidate =
+  | {
+      kind: 'channel';
+      /** The registered channel; for an unroutable candidate, the raw id
+       *  the event named (or `user:<author>` when it named only an author). */
+      channelId: string;
+      serverId?: string;
+      /** The thread the conversation is, when it is one. */
+      threadId?: string;
+      messageId?: string;
+      addressed: boolean;
+      at: number;
+      /** The host could not resolve the event's registered channel: it still
+       *  competes for the turn (replying to an older conversation instead
+       *  would answer the wrong person), but can never be the route. */
+      unroutable?: true;
+    }
+  | { kind: 'surface'; surface: string; at: number };
 
 /**
  * Where a gate-requested wake came from, handed to the framework alongside the
@@ -111,18 +143,25 @@ export interface WakeProvenance {
   counterparty?: string;
   /** True when the chosen event was `chat:addressed`. */
   addressed?: boolean;
-  /** Speech locus for the wake: the routable channel of the chosen event,
-   *  set ONLY when that event addressed the agent (mention / reply / DM) and
-   *  the host resolved its registered channel. A batched wake used to carry
-   *  no locus at all, so its reply fell back to the process-global
-   *  most-recent-inbound channel — which any ambient message elsewhere,
-   *  arriving a second after the DM that caused the wake, could retarget
-   *  (2026-09-30: a DM reply published into a guild channel). Ambient-only
-   *  batches still set nothing and keep the legacy fallback. */
+  /** The routable channel of the chosen event, set ONLY when that event
+   *  addressed the agent (mention / reply / DM) and the host resolved its
+   *  registered channel: the framework marks the wake addressed there.
+   *  Ambient-only batches set nothing. It is not the speech route, which the
+   *  framework infers from `routeCandidates` (shelf-355); no wake falls back
+   *  to the most recent inbound channel any more. */
   routeChannelId?: string;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
   at?: number;
+  /**
+   * Every conversation in the batch, addressed or not: each event whose
+   * registered channel the host resolved, and each local-surface message
+   * (console/API input, addressed by nature). The framework infers the
+   * turn's speech route from all of them — the addressed ones if any, else
+   * all; one conversation only, else the turn starts held — instead of
+   * trusting a single pick.
+   */
+  routeCandidates?: GateRouteCandidate[];
 }
 
 interface DebounceState {
@@ -207,7 +246,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     // A resolved route counts as naming a channel only for an ADDRESSED
     // event: a push whose origin declares only `mcplChannelId` (no raw
     // channel id, no author) is still a routable addressed message, and
-    // skipping it would leave its wake on the most-recent-inbound fallback.
+    // skipping it would hide that the wake was addressed there.
     // An ambient one stays out: the route is never reported for it, so as
     // the pick it would carry no telemetry at all and hide an earlier event
     // that names its channel and author.
@@ -215,8 +254,41 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     if (!newest || e.timestamp >= newest.timestamp) newest = e;
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }
+  const routeCandidates: GateRouteCandidate[] = [];
+  for (const e of events) {
+    // A reaction or system marker answers nothing: never a route candidate
+    // (the framework's mid-turn rule, applied at turn start too).
+    if (!e.conversational) continue;
+    if (e.routeChannelId) {
+      routeCandidates.push({
+        kind: 'channel',
+        channelId: e.routeChannelId,
+        ...(e.serverId ? { serverId: e.serverId } : {}),
+        ...(e.threadId ? { threadId: e.threadId } : {}),
+        ...(e.messageId ? { messageId: e.messageId } : {}),
+        addressed: e.addressed,
+        at: e.timestamp,
+      });
+    } else if (e.eventType === 'external-message' || e.eventType === 'api:message') {
+      routeCandidates.push({
+        kind: 'surface',
+        surface: e.serverId || (e.eventType === 'api:message' ? 'api' : 'external'),
+        at: e.timestamp,
+      });
+    } else if (e.channelId || e.authorId) {
+      routeCandidates.push({
+        kind: 'channel',
+        channelId: e.channelId || `user:${e.authorId}`,
+        ...(e.serverId ? { serverId: e.serverId } : {}),
+        ...(e.threadId ? { threadId: e.threadId } : {}),
+        addressed: e.addressed,
+        at: e.timestamp,
+        unroutable: true,
+      });
+    }
+  }
   const pick = newestAddressed ?? newest;
-  if (!pick) return undefined;
+  if (!pick) return routeCandidates.length > 0 ? { routeCandidates } : undefined;
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one
   const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
@@ -227,6 +299,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     ...(pick.addressed ? { addressed: true } : {}),
     ...(pick.addressed && pick.routeChannelId ? { routeChannelId: pick.routeChannelId } : {}),
     at: pick.timestamp,
+    ...(routeCandidates.length > 0 ? { routeCandidates } : {}),
   };
 }
 
@@ -1480,6 +1553,15 @@ export class EventGate {
 
   private handleDebounce(policy: GatePolicy, info: GateEventInfo): void {
     const debounceMs = (policy.behavior as { debounce: number }).debounce;
+    // The item's frozen source envelope, when its lane supplies one, names
+    // its conversation — server, registered channel, thread, message — ahead
+    // of anything in free-form metadata (the direct path reads the same
+    // envelope, so both paths agree on where a reply goes).
+    const envelope = readInboundSource(info.metadata);
+    const conversation = envelope?.kind === 'channel' ? envelope : undefined;
+    const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+    const messageId = conversation ? conversation.messageId : str(info.metadata?.messageId);
+    const threadId = conversation ? conversation.threadId : str(info.metadata?.threadId);
 
     const event: PendingEvent = {
       policyName: policy.name,
@@ -1495,9 +1577,12 @@ export class EventGate {
           ? (info.metadata.channelName as string)
           : undefined,
       authorId: this.extractAuthorId(info.metadata) ?? undefined,
-      serverId: info.serverId || undefined,
+      serverId: conversation?.serverId ?? (info.serverId || undefined),
       addressed: Array.isArray(info.tags) && info.tags.includes('chat:addressed'),
-      routeChannelId: this.routeChannelFor(info),
+      routeChannelId: conversation?.channelId ?? this.routeChannelFor(info),
+      ...(messageId ? { messageId } : {}),
+      ...(threadId ? { threadId } : {}),
+      conversational: isConversational(info.tags, info.metadata),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1559,22 +1644,29 @@ export class EventGate {
 
     const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
     if (referenced.length > 0) {
-      const byChannel = new Map<string, { count: number; oldest: number; label?: string }>();
+      const byChannel = new Map<string, { serverId?: string; channelId?: string; count: number; oldest: number; label?: string }>();
       for (const e of referenced) {
-        // The registered id when known, so this line names the channel the
-        // same way routing notices and send tools do (a push event's own
-        // channelId is the adapter's raw id).
-        const key = e.routeChannelId ?? e.channelId ?? '(unknown channel)';
-        const entry = byChannel.get(key) ?? { count: 0, oldest: e.timestamp, label: e.channelLabel };
+        // The registered id when known (a push event's own channelId is the
+        // adapter's raw id), counted per server: the same id on another
+        // server is another conversation.
+        const channelId = e.routeChannelId ?? e.channelId;
+        const key = `${e.serverId ?? ''}\u0000${channelId ?? ''}`;
+        const entry = byChannel.get(key) ?? {
+          ...(e.serverId ? { serverId: e.serverId } : {}),
+          ...(channelId ? { channelId } : {}),
+          count: 0, oldest: e.timestamp, label: e.channelLabel,
+        };
         entry.count += 1;
         entry.oldest = Math.min(entry.oldest, e.timestamp);
         entry.label = entry.label ?? e.channelLabel;
         byChannel.set(key, entry);
       }
-      for (const [channelId, { count, oldest, label }] of byChannel) {
-        // Prefer the human-readable name; keep the id parenthesized so the
-        // agent can still address tools that want the composite id.
-        const channel = label ? `#${label} (${channelId})` : channelId;
+      for (const { serverId, channelId, count, oldest, label } of byChannel.values()) {
+        // Named the way routing notices and send tools name a conversation
+        // (describeConversation): its label, then `server / channel-id`.
+        const channel = channelId
+          ? describeConversation({ kind: 'channel', ...(serverId ? { serverId } : {}), channelId, ...(label ? { label } : {}) })
+          : '(unknown channel)';
         const age = Math.round((Date.now() - oldest) / 1000);
         lines.push(
           `- ${count} message${count > 1 ? 's' : ''} in ${channel} ` +
@@ -1595,9 +1687,9 @@ export class EventGate {
     // ADDRESSED event first, else the newest event naming a channel or an
     // author; channel + author + addressed from that ONE event. When that
     // event addressed the agent and its registered channel is known,
-    // `routeChannelId` names the turn's speech locus too — the reply goes
-    // back to whoever addressed the agent, not to whichever channel last saw
-    // any traffic. Ambient-only batches carry telemetry only.
+    // `routeChannelId` marks the wake addressed there. The turn's speech
+    // route comes from `routeCandidates`, every conversation in the batch
+    // (shelf-355), never from whichever channel last saw any traffic.
     const provenance = wakeProvenance(events);
     for (const agentName of this.getAgentNamesFn()) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);

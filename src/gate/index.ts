@@ -1,4 +1,4 @@
-export { EventGate, wakeProvenance, type WakeProvenance } from './event-gate.js';
+export { EventGate, wakeProvenance, type WakeProvenance, type GateRouteCandidate } from './event-gate.js';
 export type {
   GateConfig,
   GateOptions,

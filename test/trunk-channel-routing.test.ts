@@ -1,19 +1,22 @@
 /**
  * Item-3 redux: single-TRUNK output routing.
  *
- * These tests cover the FRAMEWORK-side plumbing that feeds the ChannelRegistry's
- * `activeChannelResolver` (the routing DECISION itself is covered in
- * channel-registry-routing.test.ts):
+ * These tests cover the FRAMEWORK-side plumbing that gives a trunk turn its
+ * speech route (shelf-355; the route DECISION itself is unit-tested in
+ * speech-routes.test.ts):
  *   - derivePushEventChannel() reconstructs the MCPL composite channel for a
  *     push event (Discord DMs arrive this way), preferring an explicit
  *     origin.mcplChannelId.
- *   - a channel-incoming turn records its triggering channel per-agent.
- *   - a DM push-event turn records the reconstructed DM channel per-agent.
- *   - a batched wake picks the MOST-RECENT triggering channel.
+ *   - a channel-incoming turn, and a DM push-event turn, take their
+ *     triggering conversation as the turn's route; a reaction is no candidate.
+ *   - the route belongs to the current turn, and a no-trigger turn has none.
+ *   - threads are routes only where the channel's connector posts into named
+ *     threads (MCPL RFC-011 exact), and a channel that declares no publish
+ *     target is no route at all.
  *
  * connectome-host runs every agent as a single trunk (it never sets
- * `conversations`), so no fork/home exists — the active triggering channel is
- * the only thing that keeps a reply in the channel it is answering.
+ * `conversations`), so no fork/home exists: the turn's triggering
+ * conversation is what keeps a reply in the channel it is answering.
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -25,10 +28,10 @@ import { AgentFramework } from '../src/index.js';
 import type { ProcessEvent } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
-/** Reach the private per-turn triggering-channel map + the pure channel-deriver. */
+/** Reach the private per-turn speech routes + the pure channel-deriver. */
 function internals(framework: AgentFramework) {
   return framework as unknown as {
-    activeTriggerChannels: Map<string, string>;
+    turnRoutes: Map<string, { route: { kind: string; channelId?: string; replyTo?: string; origin: string } | null; hold?: unknown }>;
     pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number; channelId?: string }>;
     derivePushEventChannel(
       origin: Record<string, unknown> | undefined,
@@ -36,6 +39,31 @@ function internals(framework: AgentFramework) {
     channelRegistry: unknown;
     handleMcplPushEvent(event: unknown): void;
   };
+}
+
+/**
+ * A channel subsystem stand-in whose channels all declare `target` as their
+ * MCPL RFC-011 publish target: a route is only ever a place the framework
+ * can publish to exactly. Plain speech it is asked to publish is recorded.
+ */
+function declaringRegistry(target: 'exact' | 'root' | undefined) {
+  const published: Array<{ text: string; to: unknown }> = [];
+  const registry = new Proxy({
+    publishTarget: () => target,
+    // Every channel it is asked about is one registration.
+    resolveDestination: (c: { serverId?: string; channelId: string }) =>
+      ({ destination: { serverId: c.serverId ?? 'discord', channelId: c.channelId } }),
+    resolveLocus: () => null,
+    routeSpeech: async (_a: string, text: string, to: unknown) => {
+      published.push({ text, to });
+      // As the real registry reports a delivery: where it went, its thread included.
+      const dest = (to ?? {}) as { serverId?: string; channelId?: string; threadId?: string | null };
+      return { delivered: true, serverId: dest.serverId ?? 'x', channelId: dest.channelId ?? 'x', ...(dest.threadId ? { threadId: dest.threadId } : {}) };
+    },
+    getDescriptor: () => undefined,
+    getChannelTools: () => [],
+  } as Record<string, unknown>, { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
+  return { registry, published };
 }
 
 function channelIncoming(channelId: string, text: string): ProcessEvent {
@@ -146,6 +174,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
       stopAll: () => {},
     };
@@ -197,6 +226,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
       stopAll: () => {},
     };
@@ -262,6 +292,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: (id: string, serverId?: string) => { asked.push(`${serverId}/${id}`); return '@_reim0n'; },
       stopAll: () => {},
@@ -280,6 +311,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i2.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
       proseTargetFor: () => undefined,
       stopAll: () => {},
@@ -297,6 +329,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i3.channelRegistry = {
       ensureChannelRegistered: () => {},
       isChannelOpen: () => false,
+      getChannelLabel: () => undefined,
       getDescriptor: () => undefined,
       stopAll: () => {},
     };
@@ -305,73 +338,180 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await fw3.stop();
   });
 
-  it('a channel-incoming trunk turn records its triggering channel', async () => {
+  it('a channel-incoming trunk turn takes its triggering conversation as its speech route', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the date is ...' }]));
     const framework = await makeFramework();
+    internals(framework).channelRegistry = declaringRegistry('root').registry;
 
-    framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: sleep && date'));
+    const event = channelIncoming('discord:guild:chanA', 'A: sleep && date');
+    framework.pushEvent(event);
     await framework.runUntilIdle();
 
     assert.equal(membrane.calls.length, 1, 'the trunk should have run one turn');
-    assert.equal(
-      internals(framework).activeTriggerChannels.get('scout'),
-      'discord:guild:chanA',
-      'the turn must be routed to the channel that triggered it',
-    );
+    const route = internals(framework).turnRoutes.get('scout')?.route;
+    assert.equal(route?.channelId, 'discord:guild:chanA', 'the turn must be routed to the channel that triggered it');
+    assert.equal(route?.replyTo, (event as unknown as { messageId: string }).messageId, 'its message is the reply edge');
+    assert.equal(route?.origin, 'trigger');
     await framework.stop();
   });
 
-  it('a DM push-event turn records the reconstructed DM channel (item-3 redux DM sub-case)', async () => {
+  it('a DM push-event turn takes the reconstructed DM channel as its route (item-3 redux DM sub-case)', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi in the DM' }]));
     const framework = await makeFramework();
+    internals(framework).channelRegistry = declaringRegistry('root').registry;
 
     framework.pushEvent(dmPushEvent('42', 'hey scout, ping'));
     await framework.runUntilIdle();
 
     assert.equal(membrane.calls.length, 1, 'the trunk should wake for the DM');
     assert.equal(
-      internals(framework).activeTriggerChannels.get('scout'),
+      internals(framework).turnRoutes.get('scout')?.route?.channelId,
       'discord:dm:42',
-      'the DM reply must route to the DM channel, not the global locus',
+      'the DM reply must route to the DM channel',
     );
     await framework.stop();
   });
 
-  it('the triggering channel tracks the CURRENT turn, never a stale one', async () => {
+  it('the route belongs to the CURRENT turn, never a stale one', async () => {
     const framework = await makeFramework();
     const i = internals(framework);
+    i.channelRegistry = declaringRegistry('root').registry;
 
-    // A channel-A turn sets the active channel... (push the response right before
-    // each turn: MockMembrane's stream consumes ALL queued responses at once.)
+    // (Push the response right before each turn: MockMembrane's stream
+    // consumes ALL queued responses at once.)
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ans A' }]));
     framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: hi'));
     await framework.runUntilIdle();
-    assert.equal(i.activeTriggerChannels.get('scout'), 'discord:guild:chanA');
+    assert.equal(i.turnRoutes.get('scout')?.route?.channelId, 'discord:guild:chanA');
 
-    // ...then a DM turn OVERWRITES it — the next turn's reply must never inherit
-    // the previous turn's channel (the concurrency hazard this fix removes).
+    // A DM turn decides its own route — never inherits the previous turn's.
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ans DM' }]));
     framework.pushEvent(dmPushEvent('42', 'now in a DM'));
     await framework.runUntilIdle();
     assert.equal(membrane.calls.length, 2, 'both turns should have run');
-    assert.equal(
-      i.activeTriggerChannels.get('scout'),
-      'discord:dm:42',
-      'the map must reflect the CURRENT turn’s channel, not chanA',
-    );
+    assert.equal(i.turnRoutes.get('scout')?.route?.channelId, 'discord:dm:42', 'the CURRENT turn’s channel, not chanA');
     await framework.stop();
   });
 
-  it('startAgentStream clears the triggering channel for a no-channel (heartbeat) turn', async () => {
+  it('a reaction that wakes a turn answers nothing: no route candidate', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noticed' }]));
+    const framework = await makeFramework();
+    framework.pushEvent({
+      ...(channelIncoming('discord:guild:chanA', '👍') as unknown as Record<string, unknown>),
+      tags: ['chat:reaction', 'chat:addressed'],
+    } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 1);
+    assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null });
+    await framework.stop();
+  });
+
+  it('a thread is a route where its channel posts into named threads (MCPL RFC-011 exact)', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering the topic' }]));
+    const framework = await makeFramework();
+    const { registry, published } = declaringRegistry('exact');
+    internals(framework).channelRegistry = registry;
+    framework.pushEvent({
+      ...(channelIncoming('zulip:stream:7', 'on topic') as unknown as Record<string, unknown>),
+      serverId: 'zulip',
+      threadId: 'topic-a',
+    } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    const turn = internals(framework).turnRoutes.get('scout') as { route: { channelId?: string; threadId?: string } | null };
+    assert.equal(turn.route?.channelId, 'zulip:stream:7');
+    assert.equal(turn.route?.threadId, 'topic-a');
+    assert.deepEqual(published, [{ text: 'answering the topic', to: { serverId: 'zulip', channelId: 'zulip:stream:7', threadId: 'topic-a' } }],
+      'into the thread, never the channel root');
+    await framework.stop();
+  });
+
+  it('a thread placement is not streamed; a root publication streams after it is confirmed, at the root (RFC-011 §6)', async () => {
+    const framework = await makeFramework();
+    const { registry, published } = declaringRegistry('exact');
+    const streamed: Array<{ kind: string; serverId: string; channelId: string; text: string; published: number }> = [];
+    Object.assign(registry as Record<string, unknown>, {
+      sendOutgoingChunk: (d: { serverId: string; channelId: string }, _a: string, _i: string, _n: number, delta: string) =>
+        streamed.push({ kind: 'chunk', serverId: d.serverId, channelId: d.channelId, text: delta, published: published.length }),
+      sendOutgoingComplete: (d: { serverId: string; channelId: string }, _a: string, _i: string, text: string) =>
+        streamed.push({ kind: 'complete', serverId: d.serverId, channelId: d.channelId, text, published: published.length }),
+    });
+    internals(framework).channelRegistry = registry;
+
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'into the thread' }]));
+    framework.pushEvent({
+      ...(channelIncoming('zulip:stream:7', 'on topic') as unknown as Record<string, unknown>),
+      serverId: 'zulip',
+      threadId: 'topic-a',
+    } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    assert.equal(streamed.length, 0, 'one channel stream could carry thread speech and root envelopes alike: none at all');
+    assert.equal(published.length, 1, 'the speech itself was still published, into the thread');
+
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'at the root' }]));
+    framework.pushEvent({ ...(channelIncoming('zulip:stream:7', 'at root') as unknown as Record<string, unknown>), serverId: 'zulip' } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    assert.deepEqual(streamed, [
+      { kind: 'chunk', serverId: 'zulip', channelId: 'zulip:stream:7', text: 'at the root', published: 2 },
+      { kind: 'complete', serverId: 'zulip', channelId: 'zulip:stream:7', text: 'at the root', published: 2 },
+    ], 'after its confirmed publish, on the server it resolved to');
+    await framework.stop();
+  });
+
+  it('a thread on a channel that declares no threads wakes the turn but plain speech is held, never sent to the root', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'answering the topic' }]));
+    const framework = await makeFramework();
+    const { registry, published } = declaringRegistry('root');
+    internals(framework).channelRegistry = registry;
+    framework.pushEvent({
+      ...(channelIncoming('zulip:stream:7', 'on topic') as unknown as Record<string, unknown>),
+      serverId: 'zulip',
+      threadId: 'topic-a',
+    } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    const turn = internals(framework).turnRoutes.get('scout') as { route: unknown; unroutable?: { reason: string } };
+    assert.equal(turn.route, null);
+    assert.equal(turn.unroutable?.reason, 'thread');
+    const texts = framework.getAgent('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text);
+    assert.ok(texts.some((t) => t.startsWith('[routing] Your plain speech can\'t go to the conversation in front of you') &&
+      /is a thread, but its connector declares the channel has no threads/.test(t)));
+    const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string; reason: string; note?: string }> } })
+      .proseDrafts.open('scout');
+    assert.deepEqual(drafts.map((d) => [d.text, d.reason]), [['answering the topic', 'no-destination']]);
+    assert.match(drafts[0]!.note ?? '', /is a thread, but its connector declares the channel has no threads/);
+    assert.deepEqual(published, [], 'nothing went to the channel root');
+    await framework.stop();
+  });
+
+  it('a channel whose connector declares no publish target is no route: speech is held, nothing published', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hello there' }]));
+    const framework = await makeFramework();
+    const { registry, published } = declaringRegistry(undefined);
+    internals(framework).channelRegistry = registry;
+    framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: hi'));
+    await framework.runUntilIdle();
+    const turn = internals(framework).turnRoutes.get('scout') as { route: unknown; unroutable?: { reason: string } };
+    assert.equal(turn.route, null);
+    assert.equal(turn.unroutable?.reason, 'untargetable');
+    const texts = framework.getAgent('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text);
+    const notice = texts.find((t) => t.startsWith('[routing]'));
+    assert.match(notice ?? '', /its connector doesn't declare where a post lands \(MCPL RFC-011\)/);
+    assert.match(notice ?? '', /publication from here is unavailable until it does/);
+    assert.doesNotMatch(notice ?? '', /consult/, 'no connector tools are claimed when the connector lists none');
+    assert.deepEqual(published, []);
+    await framework.stop();
+  });
+
+  it('a no-trigger (heartbeat) turn has no speech route, whatever the previous turn had', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tick' }]));
     const framework = await makeFramework();
     const i = internals(framework);
 
-    // Simulate a stale channel left by a prior turn, then run a heartbeat/timer
-    // turn (an InferenceRequest with no channelId). startAgentStream must clear
-    // the entry up front so routeSpeech falls back to the global locus rather
-    // than replaying the stale channel.
-    i.activeTriggerChannels.set('scout', 'discord:guild:stale');
+    // A stale route left by a prior turn must not carry over: a turn with no
+    // route candidates (a heartbeat/timer) has no destination, so its plain
+    // speech is held as a draft rather than sent anywhere.
+    i.turnRoutes.set('scout', { route: { kind: 'channel', channelId: 'discord:guild:stale', origin: 'trigger' } });
     const scout = framework.getAgent('scout')!;
     await (framework as unknown as {
       startAgentStream(agent: unknown, trigger?: unknown): Promise<void>;
@@ -380,11 +520,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     });
     await framework.runUntilIdle();
 
-    assert.equal(
-      i.activeTriggerChannels.has('scout'),
-      false,
-      'a no-trigger turn must clear any stale triggering channel',
-    );
+    assert.deepEqual(i.turnRoutes.get('scout'), { route: null }, 'a no-trigger turn has no route');
     await framework.stop();
   });
 });

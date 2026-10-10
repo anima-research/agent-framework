@@ -175,7 +175,17 @@ test('vector 43: a mixed-lane edit keeps the stable reply target', async (t) => 
   await f.framework.runUntilIdle();
   await f.send('push/event', { ...f.params('e', 'second_version', { channelId: 'chat', key: 'message:m' }), origin: { messageId: 'm', authorId: 'u', authorName: 'User', threadId: 'thread' } });
   await f.turn();
+  // Both lanes name one conversation — the same channel, thread and message —
+  // so the turn has a single reply target, never a hold between "two"; and
+  // the channel posts into a named thread (RFC-011 exact), so the reply goes
+  // into that thread, not the channel root.
+  const sources = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+    .map((m) => m.metadata?.inboundSource as { channelId?: string; threadId?: string; messageId?: string } | undefined)
+    .filter((s) => s !== undefined)
+    .map((s) => [s!.channelId, s!.threadId, s!.messageId]);
+  assert.deepEqual(sources, [['chat', 'thread', 'm'], ['chat', 'thread', 'm']]);
   assert.equal(f.published.at(-1)?.channelId, 'chat');
+  assert.equal((f.published.at(-1) as { threadId?: unknown } | undefined)?.threadId, 'thread');
 });
 
 test('vectors 13/15: a channel-scoped push needs current channel authority and a declared channel', async (t) => {

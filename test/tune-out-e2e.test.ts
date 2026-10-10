@@ -197,6 +197,10 @@ describe('tune-out end to end', () => {
     assert.match(dump, /\[Tune-out: disc:guild:noisy cancelled — wake budget exhausted \(1\), 2 wakes\]/);
     assert.match(dump, /truncated=/, 'backlogCap=2 with 5 diverted messages truncates');
     assert.match(dump, /antra: /, 'dump lines carry author attribution');
+    // Each entry is `author: body`: the stored source header stays out, since
+    // the backlog names its channel itself (shelf-356).
+    assert.match(dump, /\nantra: scout are you there\?\n/);
+    assert.doesNotMatch(dump, /\[source:/);
 
     // The stamped originals stay excluded even after cancel; the dump is
     // the delivery (KV-prefix-stable append, not retro-insertion).

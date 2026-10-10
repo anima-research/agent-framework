@@ -85,10 +85,17 @@ function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'fals
       if (behavior === 'throw') throw new Error('synthetic publication failure');
       return { delivered: behavior === 'delivered', channelId: locus ?? '' };
     },
+    // The registry's outcome-returning form of routeSpeech, over the same plan.
+    deliverSpeech: async (agent: string, text: string, locus?: string | null) => {
+      const result = await (explicit.routeSpeech as (a: string, t: string, l?: string | null) => Promise<{ delivered: boolean; channelId: string }>)(agent, text, locus);
+      return result.delivered
+        ? { status: 'delivered', destination: { serverId: 'stub', channelId: result.channelId }, at: Date.now() }
+        : { status: 'failed', destination: { serverId: 'stub', channelId: result.channelId }, reason: 'stub reported delivered:false', at: Date.now() };
+    },
+    resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
     resolveLocus: () => 'world:commons',
-    getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
-    getDescriptor: () => undefined,
+    getDescriptor: () => undefined, publishTarget: () => 'root',
     getChannelTools: () => [],
   };
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(explicit, {
@@ -328,7 +335,7 @@ describe('explicit prose routing', () => {
     const texts = cm.getAllMessages().flatMap(m => m.content)
       .filter(b => b.type === 'text').map(b => (b as { text: string }).text);
     assert.ok(texts.includes(authored), 'source/author view retains exact envelope');
-    assert.ok(texts.includes('[delivered] plain speech → discord:g:cafe'), 'canonical destination receipt enters context');
+    assert.ok(texts.includes('[delivered] plain speech → (stub / discord:g:cafe)'), 'canonical destination receipt enters context, server named');
     await framework.stop();
   });
 
@@ -338,7 +345,8 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     trigger(framework);
     await framework.runUntilIdle();
-    assert.deepEqual(routed, [{ text: 'Ordinary field speech.', locus: 'world:commons' }]);
+    // The route's exact place: its channel, at the root (MCPL RFC-011).
+    assert.deepEqual(routed, [{ text: 'Ordinary field speech.', locus: { channelId: 'world:commons', threadId: null } }]);
     await framework.stop();
   });
 
@@ -443,7 +451,15 @@ describe('explicit prose routing', () => {
     const cm = framework.getAgent('assistant')!.getContextManager();
     const texts = cm.getAllMessages().flatMap(m => m.content).filter(b => b.type === 'text').map(b => (b as { text: string }).text);
     assert.ok(texts.includes(authored));
-    assert.ok(texts.some(t => t.startsWith('[delivered] nothing') && t.includes('suppressed')));
+    assert.ok(texts.some(t => t.startsWith('[delivered] nothing') && /2 plain-speech segment\(s\) held as drafts d-[a-z2-9]{5}, d-[a-z2-9]{5}/.test(t)));
+    // The held words are the envelope's body, not its routing syntax; the
+    // destination the resident wrote stays with the draft as a note.
+    const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string; note?: string; reason: string }> } })
+      .proseDrafts.open('assistant').reverse();
+    assert.deepEqual(drafts.map(d => [d.text, d.note, d.reason]), [
+      ['wrong-locus duplicate', 'written for >>>#cafe', 'explicit-send'],
+      ['tool completed', undefined, 'explicit-send'],
+    ]);
     await framework.stop();
   });
 

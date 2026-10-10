@@ -49,6 +49,7 @@ import type { ToolDefinition, ToolCall, ToolResult, ProcessEvent } from '../../t
 import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
+import { withoutSourceHeader } from '../../mcpl/inbound-source.js';
 import { SemanticIndexClient, SemanticIndexer, messageIndexText, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
 
 // ============================================================================
@@ -1368,7 +1369,7 @@ export class HistoryModule implements Module {
       // the limit. Same fix mirrored in search-regex-worker.ts's loop.
       if (matches.length >= limit) break;
       scanned++;
-      const text = flattenContent(msg.content);
+      const text = searchText(msg);
       const hit = matchSubstring(text, needle, caseSensitive, input.wholeWord ?? false);
       if (!hit) continue;
       matches.push({
@@ -1407,7 +1408,7 @@ export class HistoryModule implements Module {
     flags: string,
     limit: number,
   ): Promise<{ matches: SearchMatch[]; scanned: number }> {
-    const texts = candidates.map((msg) => flattenContent(msg.content));
+    const texts = candidates.map(searchText);
     let worker: Worker | undefined;
     try {
       const { matches: rawMatches, scanned } = await new Promise<{ matches: SearchWorkerMatch[]; scanned: number }>(
@@ -2145,8 +2146,18 @@ function projectMessage(msg: StoredMessage, format: 'text' | 'raw'): Record<stri
  *  blocks verbatim; everything else (tool_use/tool_result/thinking/media) as
  *  a short bracketed label — this is for agent readability and search
  *  matching, not byte-faithful reconstruction. */
-function flattenContent(content: ContentBlock[]): string {
+function flattenContent(content: readonly ContentBlock[]): string {
   return content.map(blockLabel).join(' ').trim();
+}
+
+/** What `search` matches and snips: the message without the source header
+ *  the host stored first (shelf-356), so a match is on what was said — `^`
+ *  anchors at the body's start, and a channel's name matches where it was
+ *  written rather than every item from that channel. Where it was said is
+ *  the `channelId` filter, and every match carries it. `extract` still
+ *  shows the header: it presents the message itself. */
+function searchText(msg: StoredMessage): string {
+  return flattenContent(withoutSourceHeader(msg.content, msg.metadata));
 }
 
 function blockLabel(block: ContentBlock): string {
