@@ -21,6 +21,19 @@
   `force` too removes those changed since. A `sync` of the path restores the file.
   `autoMaterialize` writes and deletes follow materialize's freshness rule: a disk copy changed
   by another writer since it last agreed is refused, not overwritten or unlinked.
+- **A `materialize` without a path takes up only what disk still owes:** workspace edits,
+  entries never checked against disk, conflicts and workspace deletions. It no longer depends on
+  the sequence the mount was last materialized at (`status.lastMaterializedSeq`), which is saved
+  only at a clean stop: after a restart that lost it, a bare `materialize` took up the whole tree.
+  A file the workspace hasn't changed is left as disk has it, with or without `force`, unless its
+  path is given. A path the evidence says nothing about is treated the same way. Where disk holds
+  a different copy (`unknown-provenance`, or `store-origin-collision` for a file the workspace
+  created), only a `materialize` that names the path with `force` overwrites it. Where an entry
+  from before the evidence has no disk copy, only one that names the path writes it, and a `sync`
+  of the path drops it from the workspace instead. A bare `materialize` trusts the evidence: if
+  disk was replaced behind the workspace, a `sync` takes disk's copies, and naming the paths with
+  `force` writes the workspace's. `status.pendingChanges` counts what disk owes by the evidence;
+  an entry never checked against disk isn't counted until a listing or a `materialize` checks it.
 - **Undo and branch switches are not mistaken for disk edits.** What disk last agreed with is kept
   in global chronicle records rather than branch state, so selecting an earlier state keeps that
   state as a draft over the later disk version, and a file present only in another branch's
