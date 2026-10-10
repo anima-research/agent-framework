@@ -326,6 +326,33 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     }
   });
 
+  it("restarts at a later boundary on that call's own figures", async () => {
+    // The first call fits easily (an 80k prompt with 30k of output); the
+    // second alone crosses the window (a 190k prompt with 10k of output, so
+    // with the appended tool result and the 32k reserve, about 238k). The
+    // second boundary must project from the second call: figures kept from
+    // the first would project about 148k and dispatch past the cap. Every
+    // other restart test here crosses at the first boundary.
+    const t = await windowTurn([
+      [
+        round('call_1', { inputTokens: 20_000, cacheReadTokens: 60_000, outputTokens: 30_000 }),
+        round('call_2', { inputTokens: 30_000, cacheReadTokens: 240_000, outputTokens: 40_000 }),
+        round(null, { inputTokens: 31_000, cacheReadTokens: 480_000, outputTokens: 40_500 }),
+      ],
+      afterRestart,
+    ]);
+    try {
+      assert.ok(t.done, 'the turn should finish');
+      assert.strictEqual(t.restarts.length, 1, 'the second boundary must restart');
+      assert.strictEqual(t.restarts[0]!.reason, 'physical_window');
+      assert.ok((t.restarts[0]!.inputTokens ?? 0) > 200_000);
+      assert.strictEqual(t.membrane.calls.length, 2, 'the first stream, then the restart');
+      assert.ok(storedTexts(t.framework).includes('Answered after a restart'));
+    } finally {
+      await t.close();
+    }
+  });
+
   it("keeps the last call's numbers when a call reports no prompt", async () => {
     // After the first call, the usage events repeat its running total (an
     // adapter that left its counts at 0). Every real call has a prompt, so
