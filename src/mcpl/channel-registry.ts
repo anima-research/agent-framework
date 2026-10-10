@@ -2774,9 +2774,18 @@ export class ChannelRegistry {
         },
       };
     } catch (err) {
+      // The decision was recorded before the round-trip and outlives its
+      // failure. Say so: otherwise a later delivery that opens the channel
+      // would be the resident's first sign that it was still wanted open.
+      const current = this.channels.get(`${entry.serverId}:${input.channelId}`);
+      const stillSelected = current !== undefined && !current.open &&
+        this.getDesiredState(entry.serverId, input.channelId) === 'open';
       return {
         success: false,
-        error: `Failed to open channel: ${(err as Error).message}`,
+        error: `Failed to open channel: ${(err as Error).message}` +
+          (stillSelected
+            ? ' (it stays selected for opening: a later delivery or reconnect tries again, and channel_close withdraws that)'
+            : ''),
         isError: true,
       };
     }
@@ -3183,8 +3192,13 @@ export class ChannelRegistry {
     // that woke the agent — DMs register closed) OPENS the channel first,
     // so typing indicators, reaction machinery, and inbound forwarding come
     // alive with the reply. If the open fails, the speech does NOT go out:
-    // a half-alive delivery is worse than a loud marker.
-    if (!entry.open) {
+    // a half-alive delivery is worse than a loud marker. A channel decided
+    // closed is engaged even while its transport is still open (a close that
+    // failed), as a reply would engage it. A channel with no decision at all
+    // (a server without the lifecycle grant records none) keeps publishing
+    // while its transport is open: speech opens before it sends, and that
+    // open could never succeed there.
+    if (!entry.open || this.getDesiredState(entry.serverId, entry.descriptor.id) === 'closed') {
       try {
         const { opened } = await this.openChannelNow(entry, 'opened-by-delivery');
         entry = await this.waitForOpenChannel(entry);

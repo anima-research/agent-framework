@@ -88,6 +88,8 @@ test('remove/re-add during reconcile converges on the replacement desired state,
     removed: ['x'], added: [descriptor('x', true, 'replacement')],
   }, { respond: () => { acknowledged = true; } });
   assert.equal(acknowledged, true, 'registration ACK must not wait for the lifecycle queue');
+  await tick();
+  assert.equal(f.pending.length, 1, 'the replacement waits for the operation in flight: one RPC per channel at a time');
   await f.drain(first, replacement);
   assert.equal(f.registry.getDesiredState('test', 'x'), 'open');
   assert.equal(f.isOpen(), true);
@@ -120,6 +122,7 @@ for (const firstKind of ['open', 'close'] as const) {
     await f.drain(first, last);
     assert.equal((await first).success, false);
     assert.match(String((await first).error), /superseded by a newer lifecycle decision/);
+    assert.doesNotMatch(String((await first).error), /stays selected/, 'a newer decision replaced it');
     assert.equal((await last).success, true);
     const desired = lastKind === 'open';
     assert.equal(f.registry.getDesiredState('test', 'x'), lastKind === 'open' ? 'open' : 'closed');
@@ -252,6 +255,7 @@ test('a failed backscroll open preserves an already-live subscription', async ()
   await tick();
   f.pending.shift()!.fail();
   assert.equal((await backscroll).success, false);
+  assert.doesNotMatch(String((await backscroll).error), /stays selected/, 'the channel is still open');
   assert.equal(f.isOpen(), true, 'a failed redundant open is not a confirmed close');
   const speech = f.registry.routeSpeech('resident', 'hello', 'x');
   await f.drain(speech);
@@ -650,24 +654,51 @@ test('an explicit open waits for a close in flight rather than answering already
   assert.equal(f.isOpen(), true);
 });
 
-test('a reply into a channel whose close failed opens it again, and says so', async () => {
+for (const delivery of ['reply', 'speech'] as const) {
+  test('a ' + delivery + ' into a channel whose close failed opens it again, and says so', async () => {
+    const f = fixture();
+    await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+    f.calls.length = 0;
+    f.held.add('x');
+    const closing = f.tool('close');
+    await tick();
+    f.pending.shift()!.fail();
+    assert.equal((await closing).success, false);
+    await tick();
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'closed');
+    assert.equal(f.isOpen(), true, 'a failed same-target close leaves the transport known open');
+    f.held.delete('x');
+    if (delivery === 'reply') {
+      const reply = await f.registry.openIfClosedForSend('x', 'test');
+      assert.equal(reply.status, 'opened', 'the reply turned a channel decided closed open again');
+    } else {
+      assert.equal((await f.registry.routeSpeech('resident', 'hello', 'x'))?.delivered, true);
+      assert.equal(f.notices.length, 1, 'the speech turned a channel decided closed open again');
+      assert.deepEqual(f.publishedWhileOpen, [true]);
+    }
+    assert.equal(f.registry.getDesiredState('test', 'x'), 'open');
+    assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-opened-by-send').length, 1);
+    assert.deepEqual(f.calls.map((c) => c.kind), ['close', 'open'], 'the transport is confirmed again after the failed close');
+  });
+}
+
+test('a failed explicit open says the channel stays selected for opening, and a later delivery opens it quietly', async () => {
   const f = fixture();
-  await f.registry.handleChanged('test', { added: [descriptor('x', true)] });
+  await f.registry.handleChanged('test', { added: [descriptor()] });
   f.calls.length = 0;
   f.held.add('x');
-  const closing = f.tool('close');
+  const opening = f.tool('open');
   await tick();
   f.pending.shift()!.fail();
-  assert.equal((await closing).success, false);
-  await tick();
-  assert.equal(f.registry.getDesiredState('test', 'x'), 'closed');
-  assert.equal(f.isOpen(), true, 'a failed same-target close leaves the transport known open');
+  const result = await opening;
+  assert.equal(result.success, false);
+  assert.match(String(result.error), /stays selected for opening/);
+  assert.equal(f.registry.getDesiredState('test', 'x'), 'open', 'the decision outlives a failed round-trip');
   f.held.delete('x');
-  const reply = await f.registry.openIfClosedForSend('x', 'test');
-  assert.equal(reply.status, 'opened', 'the reply turned a channel decided closed open again');
-  assert.equal(f.registry.getDesiredState('test', 'x'), 'open');
-  assert.equal(f.traces.filter((e) => e.type === 'mcpl:channel-opened-by-send').length, 1);
-  assert.deepEqual(f.calls.map((c) => c.kind), ['close', 'open'], 'the transport is confirmed again after the failed close');
+  await tick();
+  assert.equal((await f.registry.routeSpeech('resident', 'hello', 'x'))?.delivered, true);
+  assert.equal(f.notices.length, 0, 'the resident was already told the channel stays selected for opening');
+  assert.deepEqual(f.calls.map((c) => c.kind), ['open', 'open']);
 });
 
 for (const delivery of ['speech', 'reply'] as const) {
