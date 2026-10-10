@@ -1261,6 +1261,10 @@ export class WorkspaceModule implements Module {
       return { success: false, error: `Content exceeds max file size (${maxSize} bytes)`, isError: true };
     }
     const store = this.getStore();
+    // The tree entry is set before the first await, on the branch that is
+    // current when this is called. The tool-result guard relies on that: its
+    // branch check just before the call holds where the entry lands
+    // (agent-framework #277; pinned in tool-result-guard.test.ts).
     const blobHash = store.storeBlob(data, mimeType);
     store.treeSet(mount.treeStateId, relativePath, {
       blobHash,

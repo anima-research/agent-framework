@@ -12,6 +12,7 @@ import { AgentFramework, type AgentConfig, type AgentSettingsExtension, type Mod
 import { TOOL_RESULT_GUARD_AUDIT_STATE, TOOL_RESULT_GUARD_NOTICE, withheldResultNotice } from '../src/tool-result-guard.js';
 import { MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
+import { JsStore } from '@animalabs/chronicle';
 
 // What a withheld result settles to with no writable workspace (#277): the
 // neutral notice, then where the original is kept.
@@ -1306,4 +1307,28 @@ test('#277: direct API: the refusal retry fits the budget, though its stubs are 
     assert.deepEqual(retried.map((b) => b.content), ids.map(() => AUDIT_STUB), 'the retry carries every stub');
     assert.ok(tokens(requests[2]) <= limit, `the retry fits: ${tokens(requests[2])} <= ${limit}`);
   } finally { await h.framework.stop(); }
+});
+
+test("#277: writeBinary sets its tree entry before it first yields, as the guard's branch check relies on", async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-guard-write-binary-')); dirs.push(dir);
+  mkdirSync(join(dir, 'mount'));
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  const workspace = new WorkspaceModule({ mounts: [{ name: 'work', path: join(dir, 'mount'), mode: 'read-write', watch: 'never' }] });
+  workspace.initStore(store);
+  try {
+    const tree = 'workspace/work/tree';
+    const path = 'tool-results/original.txt';
+    const source = store.currentBranch().name;
+    const before = store.currentSequence();
+    const writing = workspace.writeBinary(`work/${path}`, Buffer.from('original'), 'text/plain');
+    assert.ok(store.treeGet(tree, path), 'the entry is in the tree before the call has yielded');
+    // A branch switch can only come once the call has yielded: the entry
+    // stays where it was written, and the switched-to branch never gets it.
+    store.createBranchAt('elsewhere', source, before);
+    store.switchBranch('elsewhere');
+    assert.equal((await writing).success, true);
+    assert.equal(store.treeGet(tree, path), null, 'nothing lands on the branch switched to');
+    store.switchBranch(source);
+    assert.ok(store.treeGet(tree, path), 'the entry is on the branch it was written on');
+  } finally { store.close(); }
 });

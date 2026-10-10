@@ -387,6 +387,8 @@ export class ToolResultGuard {
           // Once the store has left the batch's branch (a rollback, an undo, a
           // host's switch), the stub below stays as it is, and a file written
           // now would land in the other branch's workspace. Write no more.
+          // Nothing yields between this break and the edit's own branch check,
+          // so a batch whose writes stopped is never edited.
           if (this.cm.currentBranch().name !== pending.branch) break;
           const original = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
           let spill: WithheldSpill = null;
