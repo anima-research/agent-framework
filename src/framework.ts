@@ -4480,6 +4480,31 @@ export class AgentFramework {
   }
 
   /**
+   * The default wording for the call that derived a child: who it is, what
+   * kind, and how long — the fields the consent event names, so the fork
+   * never has to infer its own lifetime from context (Linn, 10-09).
+   */
+  private derivedNote(parentName: string, options: DeriveAgentOptions): string {
+    const record = this.registry.inspect(options.name);
+    const kind = record?.kind ?? options.kind ?? 'task-fork';
+    const onParentEnd = record?.onParentEnd ?? options.onParentEnd ?? 'orphan';
+    const route = record?.relationships.resultTo ?? options.resultTo;
+    const returns = route
+      ? route.as === 'message'
+        ? `your report returns to ${route.to} as mail under your own name`
+        : `your result returns to ${route.to} as this call's result`
+      : null;
+    const lifetime =
+      onParentEnd === 'end'
+        ? `You end when ${parentName} does${returns ? `; ${returns}` : ''}; nothing you do speaks as ${parentName}.`
+        : `You finish your task and then end${returns ? `; ${returns}` : ''}; if ${parentName} ends first you keep running, as an orphan with the same return address.`;
+    return (
+      `[This call derived ${options.name}. You are ${options.name}, a ${kind}, continuing from here on your own branch. ` +
+      `${lifetime} ${parentName} receives this call's result, not you.]`
+    );
+  }
+
+  /**
    * The parent's in-flight tool round, reproduced on the child's branch so
    * the child sees the call that made it (see `DeriveAgentOptions.pendingRound`).
    */
@@ -4507,9 +4532,7 @@ export class AgentFramework {
       if (stored) return stored;
       const content =
         call.id === madeBy
-          ? round.madeBy?.result ??
-            `[This call derived ${options.name}. You are ${options.name}, continuing from here on your own branch; ` +
-              `${parent.name} receives the call's result, not you.]`
+          ? round.madeBy?.result ?? this.derivedNote(parent.name, options)
           : round.results?.[call.id] ??
             `[No result yet: this call was still running in ${parent.name} when ${options.name} was derived.]`;
       return { type: 'tool_result' as const, toolUseId: call.id, toolName: call.name, content, isError: false };

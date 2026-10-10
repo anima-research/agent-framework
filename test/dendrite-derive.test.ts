@@ -406,7 +406,11 @@ describe('Dendrite deriveAgent', () => {
     assert.equal(results.participant, 'user');
     const toolResult = results.content.find((b) => b.type === 'tool_result') as { toolUseId: string; content: string };
     assert.equal(toolResult.toolUseId, 'call-g-mira');
-    assert.match(toolResult.content, /This call derived fork-1\. You are fork-1/);
+    assert.match(
+      toolResult.content,
+      /This call derived fork-1\. You are fork-1, a task-fork, continuing from here on your own branch\. You finish your task and then end; if mira ends first you keep running/,
+      'who, what kind, and how long — the consent event\'s fields, in the note',
+    );
     assert.equal(textOf(messages[at + 2]!), FRAMING, 'framing follows the round');
     // The parent's own store still has nothing of the round: it lands there when the results are in.
     const miraMessages = framework.getAgent('mira')!.getContextManager().getAllMessages();
