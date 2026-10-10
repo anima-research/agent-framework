@@ -12,9 +12,9 @@
  *   first of the tick's rows that survives compilation.
  * - A compile that ends on the agent's own message gets a trailing
  *   `[Continue]` turn (some models reject a trailing assistant message). The
- *   reply it prompts is stored straight after that message, so the reply's
- *   first stored row is stamped `metadata.promptedBy: 'continue'`, and the
- *   `[Continue]` turn is rendered before it.
+ *   reply it prompts is stored straight after that message, so every row the
+ *   reply's turn stores is stamped `metadata.promptedBy` (`RequestOnlyPrompt`),
+ *   and the turn is rendered before the first of them that survives.
  *
  * Without the row, the wire formatter merges consecutive same-role messages:
  * the reply would read as an unprompted continuation of the earlier response,
@@ -23,12 +23,14 @@
  * `Agent.addAssistantResponse`). And the request that minted the reply held
  * the row: a provider that binds signed thinking to the prefix it was minted
  * under (context-manager #155) refuses that thinking once a later request
- * drops it. Each row's text is constant and its position is a function of the
- * stamped rows alone, so every compile renders it in the same place (the
- * request that minted the reply ends on that same turn), which keeps the
- * prompt-cache prefix and the binding stable — unlike a per-compile injection
- * that re-anchors to the newest user message, or a system prompt that changes
- * for one turn.
+ * drops it. Each row's text is read from the stamp (what the request that
+ * minted the reply rendered, so a later change to the constant changes no
+ * stored reply's prefix) and its position is a function of the stamped rows
+ * alone, so every compile renders it in the same place (the request that
+ * minted the reply ends on that same turn), which keeps the prompt-cache
+ * prefix and the binding stable — unlike a per-compile injection that
+ * re-anchors to the newest user message, or a system prompt that changes for
+ * one turn.
  *
  * Known limit: compiled messages carry no store provenance, so a stored row
  * is recognised only by structural identity the provider made unique
@@ -42,21 +44,22 @@
  */
 import type { ContentBlock, NormalizedMessage } from '@animalabs/membrane';
 
-/** Request-only separator before a silent tick's first surviving row. It
- * carries the tick's instruction, so the tick's own request reads it as its
- * prompt and every later compile shows it at each past tick. Constant on
- * purpose: it carries no time or id, so it is byte-identical on every
- * compile. */
+/** Request-only separator a silent tick's request ends on. It carries the
+ * tick's instruction, so the tick's own request reads it as its prompt, and
+ * every later compile renders it again before the tick's first surviving row.
+ * Constant on purpose: it carries no time or id. Each tick's rows record the
+ * text their request rendered (`SilentHeartbeatStamp.separator`), so changing
+ * this constant changes only ticks that open afterwards. */
 export const SILENT_HEARTBEAT_SEPARATOR =
   '[silent heartbeat] Scheduled private self-check. Review pending matters privately. ' +
   'Do not narrate or publish plain prose; use an explicit send tool only if you deliberately choose to contact someone.';
 
+/** The separator ticks rendered before their rows recorded its text: rows
+ * stamped without `separator` still render it, byte for byte. */
+const LEGACY_SILENT_HEARTBEAT_SEPARATOR = '[heartbeat tick]';
+
 /** Request-only turn a compile that ends on the agent's own message gets. */
 export const CONTINUE_ROW = '[Continue]';
-
-/** `metadata.promptedBy` on the first row a reply to a `[Continue]` turn
- * stores. */
-export const PROMPTED_BY_CONTINUE = 'continue';
 
 /** Identity of one authenticated silent heartbeat tick. */
 export interface SilentHeartbeatTick {
@@ -72,16 +75,36 @@ export interface SilentHeartbeatTick {
  * (tool_result rows are stored as `user`). */
 export interface SilentHeartbeatStamp extends SilentHeartbeatTick {
   agentName: string;
+  /** The separator text the tick's request rendered, which later compiles
+   * render again. Absent on rows stamped before it was recorded; they render
+   * the bare marker those requests carried. */
+  separator?: string;
 }
 
 /** The tick stamp on a stored row's metadata, if any. */
 export function silentHeartbeatOf(metadata: unknown): SilentHeartbeatStamp | undefined {
   const stamp = (metadata as { silentHeartbeat?: unknown } | undefined)?.silentHeartbeat;
   if (!stamp || typeof stamp !== 'object') return undefined;
-  const { eventId, serverId, agentName } = stamp as Record<string, unknown>;
+  const { eventId, serverId, agentName, separator } = stamp as Record<string, unknown>;
   return typeof eventId === 'string' && typeof serverId === 'string' && typeof agentName === 'string'
-    ? { eventId, serverId, agentName }
+    ? { eventId, serverId, agentName, ...(typeof separator === 'string' ? { separator } : {}) }
     : undefined;
+}
+
+/** A request-only turn a request ended on before the agent's reply, as
+ * `metadata.promptedBy` on every row the reply's turn stores: `turn` names
+ * the one prompt, and `text` is what the request rendered. */
+export interface RequestOnlyPrompt {
+  turn: string;
+  text: string;
+}
+
+/** The request-only prompt a stored row replies to, if any. */
+export function promptedByOf(metadata: unknown): RequestOnlyPrompt | undefined {
+  const prompt = (metadata as { promptedBy?: unknown } | undefined)?.promptedBy;
+  if (!prompt || typeof prompt !== 'object') return undefined;
+  const { turn, text } = prompt as Record<string, unknown>;
+  return typeof turn === 'string' && typeof text === 'string' ? { turn, text } : undefined;
 }
 
 export function silentHeartbeatSeparatorTurn(): NormalizedMessage {
@@ -94,11 +117,6 @@ export function continueTurn(): NormalizedMessage {
 
 function requestOnlyTurn(text: string): NormalizedMessage {
   return { participant: 'user', content: [{ type: 'text', text }] };
-}
-
-/** Whether a stored row is a reply's first row after a `[Continue]` turn. */
-export function isPromptedByContinue(metadata: unknown): boolean {
-  return (metadata as { promptedBy?: unknown } | undefined)?.promptedBy === PROMPTED_BY_CONTINUE;
 }
 
 /**
@@ -129,63 +147,77 @@ export interface StoredRowLike {
 
 export interface RequestOnlyRowIndex {
   /** Identity key of every assistant row this agent stored during a silent
-   *  tick → the tick's event id. */
-  ticks: Map<string, string>;
-  /** Identity keys of the first row of each reply to a `[Continue]` turn. */
-  continued: Set<string>;
-  /** Ticks this agent has already stored rows for (its own, not another resident's). */
-  started: Set<string>;
+   *  tick → the tick, and the separator text to render before its first
+   *  surviving row. */
+  ticks: Map<string, { eventId: string; text: string }>;
+  /** Identity key of every assistant row this agent stored in reply to a
+   *  request-only prompt → that prompt. */
+  prompts: Map<string, RequestOnlyPrompt>;
 }
 
-/** Index the rows that follow request-only turns: every row this agent stored
- * during its silent ticks, and the first row of each reply to a `[Continue]`.
- * The two are independent, so a row can be both. */
+/** Index the agent's own rows that follow request-only turns: the rows of its
+ * silent ticks, and the rows of each reply to a `[Continue]`. The two are
+ * independent, so a row can be both. */
 export function indexRequestOnlyRows(stored: readonly StoredRowLike[], agentName: string): RequestOnlyRowIndex {
-  const ticks = new Map<string, string>();
-  const continued = new Set<string>();
-  const started = new Set<string>();
+  const ticks = new Map<string, { eventId: string; text: string }>();
+  const prompts = new Map<string, RequestOnlyPrompt>();
   for (const row of stored) {
+    if (row.participant !== agentName) continue;
+    const keys = identityKeys(row.content);
+    if (keys.length === 0) continue;
     const stamp = silentHeartbeatOf(row.metadata);
     if (stamp && stamp.agentName === agentName) {
-      started.add(stamp.eventId);
-      if (row.participant === agentName) {
-        for (const key of identityKeys(row.content)) ticks.set(key, stamp.eventId);
-      }
+      const tick = { eventId: stamp.eventId, text: stamp.separator ?? LEGACY_SILENT_HEARTBEAT_SEPARATOR };
+      for (const key of keys) ticks.set(key, tick);
     }
-    if (isPromptedByContinue(row.metadata)) {
-      for (const key of identityKeys(row.content)) continued.add(key);
-    }
+    const prompt = promptedByOf(row.metadata);
+    if (prompt) for (const key of keys) prompts.set(key, prompt);
   }
-  return { ticks, continued, started };
+  return { ticks, prompts };
+}
+
+export interface RenderedRequestOnlyRows {
+  messages: NormalizedMessage[];
+  /** The ticks whose separator this window renders. A tick none of whose
+   *  rows survive compilation renders none. */
+  separatedTicks: Set<string>;
+  /** The prompts (`RequestOnlyPrompt.turn`) this window renders, the same
+   *  way. */
+  promptedTurns: Set<string>;
 }
 
 /**
- * Insert the request-only turns into a compiled window: a tick's separator
- * immediately before the first of the tick's rows that survives compilation
- * (its first row when rendered, otherwise whichever later row a strategy
- * kept), and `[Continue]` immediately before each reply it prompted, after
- * any separator, as the reply's request had them. Rows folded into
- * summaries simply do not match; ordinary messages pass through untouched.
+ * Insert the request-only turns into a compiled window, each immediately
+ * before the first of its rows that survives compilation (the first row when
+ * it is rendered, otherwise whichever later row a strategy kept): a tick's
+ * separator, and the prompt each reply to `[Continue]` followed, after any
+ * separator, as the reply's request had them. Rows folded into summaries
+ * simply do not match; ordinary messages pass through untouched.
  */
 export function renderRequestOnlyRows(
   messages: NormalizedMessage[],
-  index: Pick<RequestOnlyRowIndex, 'ticks' | 'continued'>,
+  index: RequestOnlyRowIndex,
   agentName: string,
-): NormalizedMessage[] {
-  if (index.ticks.size === 0 && index.continued.size === 0) return messages;
-  const separated = new Set<string>();
+): RenderedRequestOnlyRows {
+  const separatedTicks = new Set<string>();
+  const promptedTurns = new Set<string>();
+  if (index.ticks.size === 0 && index.prompts.size === 0) return { messages, separatedTicks, promptedTurns };
   const out: NormalizedMessage[] = [];
   for (const message of messages) {
     if (message.participant === agentName) {
       const keys = identityKeys(message.content);
-      const tick = keys.map((key) => index.ticks.get(key)).find((id) => id !== undefined);
-      if (tick !== undefined && !separated.has(tick)) {
-        separated.add(tick);
-        out.push(silentHeartbeatSeparatorTurn());
+      const tick = keys.map((key) => index.ticks.get(key)).find((t) => t !== undefined);
+      if (tick !== undefined && !separatedTicks.has(tick.eventId)) {
+        separatedTicks.add(tick.eventId);
+        out.push(requestOnlyTurn(tick.text));
       }
-      if (keys.some((key) => index.continued.has(key))) out.push(continueTurn());
+      const prompt = keys.map((key) => index.prompts.get(key)).find((p) => p !== undefined);
+      if (prompt !== undefined && !promptedTurns.has(prompt.turn)) {
+        promptedTurns.add(prompt.turn);
+        out.push(requestOnlyTurn(prompt.text));
+      }
     }
     out.push(message);
   }
-  return out;
+  return { messages: out, separatedTicks, promptedTurns };
 }

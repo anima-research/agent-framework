@@ -4,15 +4,17 @@ import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
 import { ToolResultGuard, TOOL_RESULT_GUARD_NOTICE } from './tool-result-guard.js';
 import {
-  PROMPTED_BY_CONTINUE,
+  CONTINUE_ROW,
   continueTurn,
   indexRequestOnlyRows,
   renderRequestOnlyRows,
   silentHeartbeatSeparatorTurn,
+  type RequestOnlyPrompt,
   type RequestOnlyRowIndex,
   type SilentHeartbeatTick,
   type StoredRowLike,
 } from './silent-heartbeat.js';
+import { randomUUID } from 'node:crypto';
 import {
   toolResultDataToHistoryString,
   truncateForHistory,
@@ -20,6 +22,9 @@ import {
 } from './tool-result-history.js';
 
 export interface ActivationRequestOptions {
+  /** The `[Continue]` prompt this turn's earlier streams replied to, if any:
+   *  kept for this request's reply only while this request renders it. */
+  continuePrompt?: RequestOnlyPrompt;
   /** The silent heartbeat tick this request answers, if any. */
   silentHeartbeat?: SilentHeartbeatTick;
 }
@@ -27,6 +32,12 @@ export interface ActivationRequestOptions {
 export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
+  /** The request-only `[Continue]` prompt this request's reply follows, if
+   *  any: a new one when the request ends on `[Continue]`, else the turn's
+   *  prompt (`ActivationRequestOptions.continuePrompt`) only if this request
+   *  renders it. The framework stamps the reply's rows with it
+   *  (`metadata.promptedBy`), for later compiles to render it before them. */
+  continuePrompt?: RequestOnlyPrompt;
   takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined;
   drainKvSubmissionIds?: () => string[];
 }
@@ -802,7 +813,7 @@ export class Agent {
     budget?: TokenBudget,
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
-  ): Promise<{ request: NormalizedRequest; endsOnContinue: boolean }> {
+  ): Promise<{ request: NormalizedRequest; continuePrompt?: RequestOnlyPrompt }> {
     // Compression may revisit hidden tools in recorded history. Keep its full
     // definition set separate from the resident's advertised tools: the
     // autobiographical strategy must declare the same tools on its
@@ -865,12 +876,20 @@ export class Agent {
     // that same turn, so the prefix it caches is the one every later compile
     // renders. "First" is per agent: a broadcast tick shares its eventId with
     // every resident.
-    const requestOnly = this.indexRequestOnlyRows();
-    messages = renderRequestOnlyRows(messages, requestOnly, this.name);
+    const rendered = renderRequestOnlyRows(messages, this.indexRequestOnlyRows(), this.name);
+    messages = rendered.messages;
+    // A tick opens wherever its separator isn't already rendered: on its first
+    // request, and on a restart whose compile left none of the tick's rows,
+    // so the restart's reply follows the separator, where every later compile
+    // renders it.
     const openingTick = options.silentHeartbeat !== undefined
-      && !requestOnly.started.has(options.silentHeartbeat.eventId);
+      && !rendered.separatedTicks.has(options.silentHeartbeat.eventId);
 
-    let endsOnContinue = false;
+    // The [Continue] prompt this request's reply follows: a new one when it
+    // ends on [Continue]; else the turn's prompt only where this request
+    // renders it (a stream resumed after a cooldown, say, whose compile now
+    // ends on a message that arrived meanwhile, renders none); else none.
+    let continuePrompt: RequestOnlyPrompt | undefined;
     if (openingTick) {
       messages = [...messages, silentHeartbeatSeparatorTurn()];
     } else if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
@@ -878,7 +897,10 @@ export class Agent {
       // Some models reject trailing assistant messages ("prefill not supported"),
       // and after context compression a stale assistant turn can end up last.
       messages = [...messages, continueTurn()];
-      endsOnContinue = true;
+      continuePrompt = { turn: randomUUID(), text: CONTINUE_ROW };
+    }
+    if (!continuePrompt && options.continuePrompt && rendered.promptedTurns.has(options.continuePrompt.turn)) {
+      continuePrompt = options.continuePrompt;
     }
 
     const request: NormalizedRequest = {
@@ -898,7 +920,7 @@ export class Agent {
       ...(this.providerParams && { providerParams: this.providerParams }),
       assistantParticipant: this.name,
     };
-    return { request, endsOnContinue };
+    return { request, ...(continuePrompt ? { continuePrompt } : {}) };
   }
 
   /** The request `assembleActivationRequest` builds (see there), for preview
@@ -919,7 +941,7 @@ export class Agent {
   private requestOnlyIndex: { source: readonly unknown[]; index: RequestOnlyRowIndex } | null = null;
 
   private indexRequestOnlyRows(): RequestOnlyRowIndex {
-    const empty: RequestOnlyRowIndex = { ticks: new Map(), continued: new Set(), started: new Set() };
+    const empty: RequestOnlyRowIndex = { ticks: new Map(), prompts: new Map() };
     const cm = this.contextManager as Partial<ContextManager>;
     if (typeof cm.getAllMessages !== 'function') return empty;
     try {
@@ -933,11 +955,6 @@ export class Agent {
       return empty;
     }
   }
-
-  /** The current stream's request ended on a [Continue] turn, and the reply
-   * it prompted hasn't stored a row yet: its first row is stamped
-   * `promptedBy: 'continue'`, so later requests render the turn before it. */
-  private continuePromptPending = false;
 
   /**
    * Start a yielding stream with context injections.
@@ -983,11 +1000,10 @@ export class Agent {
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
 
-    const { request, endsOnContinue } = await this.assembleActivationRequest(
+    const { request, continuePrompt } = await this.assembleActivationRequest(
       availableTools, injections, budget, compressionTools, options,
     );
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
-    this.continuePromptPending = endsOnContinue;
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
       .getStrategy?.() as {
@@ -1035,6 +1051,7 @@ export class Agent {
     return {
       stream,
       request,
+      ...(continuePrompt ? { continuePrompt } : {}),
       ...(kvEnabled
         ? {
             takeKvSubmission: () => kvQueue.shift(),
@@ -1112,10 +1129,6 @@ export class Agent {
         `output. See the refusal/inference-failed record for why.`,
       );
       return;
-    }
-    if (this.continuePromptPending) {
-      this.continuePromptPending = false;
-      metadata = { ...metadata, promptedBy: PROMPTED_BY_CONTINUE } as MessageMetadata;
     }
     this.contextManager.addMessage(this.name, content, metadata);
   }
