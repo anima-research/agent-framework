@@ -13,11 +13,11 @@ export const TOOL_RESULT_GUARD_AUDIT_STATE = 'framework/tool-result-guard';
 export type WithheldSpill = { path: string; error?: string } | null;
 
 /** Writes one withheld original as a workspace file (the framework's
- *  tool-results spill). It reports a failed write rather than throwing. It
- *  commits the file to the workspace before it first yields
- *  (WorkspaceModule.writeBinary sets the tree entry, then materializes), so a
- *  branch check made just before the call holds where the file lands. */
-export type WithheldSpiller = (label: string, text: string) => Promise<WithheldSpill>;
+ *  tool-results spill). It reports a failed write rather than throwing. The
+ *  file lands on `branch`, the branch the stub is on, or isn't written: the
+ *  workspace checks the branch where it commits the file
+ *  (WorkspaceModule.writeBinary). */
+export type WithheldSpiller = (label: string, text: string, branch: string) => Promise<WithheldSpill>;
 
 /** What a host gives a guard for its withheld results: where originals are
  *  written, and where each annotation is registered, so the host's stop can
@@ -385,16 +385,17 @@ export class ToolResultGuard {
         for (const [index, block] of pending.content.entries()) {
           if (block.type !== 'tool_result') continue;
           // Once the store has left the batch's branch (a rollback, an undo, a
-          // host's switch), the stub below stays as it is, and a file written
-          // now would land in the other branch's workspace. Write no more.
+          // host's switch), the stub below stays as it is: write no more.
           // Nothing yields between this break and the edit's own branch check,
-          // so a batch whose writes stopped is never edited.
+          // so a batch whose writes stopped is never edited. A write already
+          // under way when the branch changes is refused where it commits,
+          // since it names the batch's branch, so no file lands elsewhere.
           if (this.cm.currentBranch().name !== pending.branch) break;
           const original = typeof block.content === 'string' ? block.content : JSON.stringify(block.content);
           let spill: WithheldSpill = null;
           if (this.host) {
             try {
-              spill = await this.host.spill(`${date}-withheld-${batch}-${index}-${block.toolUseId}`, original);
+              spill = await this.host.spill(`${date}-withheld-${batch}-${index}-${block.toolUseId}`, original, pending.branch);
             } catch (error) {
               console.error(`[tool-result-guard] agent=${this.agentName} could not spill withheld result ` +
                 `${block.toolUseId}:`, error);

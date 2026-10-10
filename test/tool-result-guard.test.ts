@@ -1233,8 +1233,8 @@ test('#277: a rollback while an aborted batch is being annotated gets none of it
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
   const labels: string[] = [];
-  // The writer commits a file before it first yields, so the annotation is
-  // held after its first file, where a rollback can land between two writes.
+  // The annotation is held after its first write, where a rollback can land
+  // between two writes. (A rollback during a write: the next test.)
   (h.framework as unknown as { writeToolResultFile: (label: string) => Promise<null> }).writeToolResultFile = async (label) => {
     labels.push(label);
     if (labels.length === 1) await gate;
@@ -1266,6 +1266,54 @@ test('#277: a rollback while an aborted batch is being annotated gets none of it
     const kept = cm.getMessage(batch.id)!.content.filter((b) => b.type === 'tool_result');
     assert.deepEqual(kept.map((b) => (b as { content: unknown }).content), [TOOL_RESULT_GUARD_NOTICE, TOOL_RESULT_GUARD_NOTICE],
       'the source branch keeps the plain notice');
+  } finally { release(); await h.framework.stop(); }
+});
+
+test('#277: a write under way when a rollback lands is refused where it commits, and neither branch gets its file', async () => {
+  const h = await workspaceHarness([[calls('one', 'two')]]);
+  type Writer = (label: string, text: string, branch?: string) => Promise<{ path: string; error?: string } | null>;
+  const framework = h.framework as unknown as { writeToolResultFile: Writer };
+  const write = framework.writeToolResultFile.bind(h.framework);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const branches: Array<string | undefined> = [];
+  // The first write is held after the guard's branch check and before the
+  // workspace commits the file: the rollback lands in between.
+  framework.writeToolResultFile = async (label, text, branch) => {
+    branches.push(branch);
+    if (branches.length === 1) await gate;
+    return write(label, text, branch);
+  };
+  h.membrane.onSubmit = () => {
+    const stream = h.membrane.streams.at(-1)!;
+    queueMicrotask(() => stream.cancel());
+  };
+  try {
+    await h.run().catch(() => {});
+    for (let i = 0; i < 100 && branches.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(branches.length, 1, "the aborted batch's first original is being written");
+    const agent = h.framework.getAgent('assistant')!;
+    const cm = agent.getContextManager();
+    const source = cm.currentBranch().name;
+    assert.equal(branches[0], source, "the write names the batch's branch");
+    const read = cm.getAllMessages().find((m) => m.content.some((b) => b.type === 'text' && b.text === 'read'))!;
+    await h.framework.rollbackToMessage('assistant', { messageId: read.id });
+    release();
+    await agent.toolResultGuard.whenAnnotated();
+    assert.equal(branches.length, 1, 'nothing more is written once the branch has changed');
+    const audit = h.framework.getStore().getStateJson(TOOL_RESULT_GUARD_AUDIT_STATE) as Array<Record<string, unknown>>;
+    const annotated = audit.find((record) => record.type === 'annotated') as
+      { results: Array<{ toolUseId: string; path?: string; error?: string; skipped?: string }> } | undefined;
+    assert.ok(annotated, `the annotation is recorded: ${JSON.stringify(audit)}`);
+    const [one, two] = annotated.results;
+    assert.equal(one.toolUseId, 'one');
+    assert.equal(one.error, 'the workspace had left the branch this file is for');
+    assert.deepEqual(two, { toolUseId: 'two', skipped: 'branch_changed' });
+    const relative = one.path!.replace(/^work\//, '');
+    const store = h.framework.getStore();
+    assert.equal(store.treeGet('workspace/work/tree', relative), null, 'the branch rolled back to has no file');
+    await cm.switchBranch(source);
+    assert.equal(store.treeGet('workspace/work/tree', relative), null, "nor does the batch's own branch");
   } finally { release(); await h.framework.stop(); }
 });
 
@@ -1309,7 +1357,7 @@ test('#277: direct API: the refusal retry fits the budget, though its stubs are 
   } finally { await h.framework.stop(); }
 });
 
-test("#277: writeBinary sets its tree entry before it first yields, as the guard's branch check relies on", async () => {
+test('#277: writeBinary for a branch writes there, and is refused once the workspace has left it', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'af-guard-write-binary-')); dirs.push(dir);
   mkdirSync(join(dir, 'mount'));
   const store = JsStore.openOrCreate({ path: join(dir, 'store') });
@@ -1317,18 +1365,17 @@ test("#277: writeBinary sets its tree entry before it first yields, as the guard
   workspace.initStore(store);
   try {
     const tree = 'workspace/work/tree';
-    const path = 'tool-results/original.txt';
     const source = store.currentBranch().name;
     const before = store.currentSequence();
-    const writing = workspace.writeBinary(`work/${path}`, Buffer.from('original'), 'text/plain');
-    assert.ok(store.treeGet(tree, path), 'the entry is in the tree before the call has yielded');
-    // A branch switch can only come once the call has yielded: the entry
-    // stays where it was written, and the switched-to branch never gets it.
+    const here = await workspace.writeBinary('work/tool-results/here.txt', Buffer.from('here'), 'text/plain', { branch: source });
+    assert.equal(here.success, true);
+    assert.ok(store.treeGet(tree, 'tool-results/here.txt'), 'a write for the current branch lands');
     store.createBranchAt('elsewhere', source, before);
     store.switchBranch('elsewhere');
-    assert.equal((await writing).success, true);
-    assert.equal(store.treeGet(tree, path), null, 'nothing lands on the branch switched to');
+    const there = await workspace.writeBinary('work/tool-results/there.txt', Buffer.from('there'), 'text/plain', { branch: source });
+    assert.deepEqual(there, { success: false, error: 'the workspace had left the branch this file is for', isError: true });
+    assert.equal(store.treeGet(tree, 'tool-results/there.txt'), null, 'nothing lands on the branch the workspace is on');
     store.switchBranch(source);
-    assert.ok(store.treeGet(tree, path), 'the entry is on the branch it was written on');
+    assert.equal(store.treeGet(tree, 'tool-results/there.txt'), null, 'nor on the branch the write named');
   } finally { store.close(); }
 });

@@ -2715,7 +2715,7 @@ export class AgentFramework {
     }
     agent.toolResultGuard.setOverride(enabled);
     agent.toolResultGuard.setHost({
-      spill: (label, text) => this.writeToolResultFile(label, text),
+      spill: (label, text, branch) => this.writeToolResultFile(label, text, branch),
       track: (annotation) => {
         this.guardAnnotations.add(annotation);
         void annotation.finally(() => this.guardAnnotations.delete(annotation));
@@ -11727,9 +11727,14 @@ export class AgentFramework {
    * Write one tool result's text to `<first writable mount>/tool-results/
    * <label>.txt`: the one place both the inline cap's spill and the guard's
    * withheld originals go. null when there is no writable workspace. A failed
-   * write is reported, traced and logged here, never thrown.
+   * write is reported, traced and logged here, never thrown. With a branch,
+   * the file lands on that branch or isn't written (see writeBinary).
    */
-  private async writeToolResultFile(label: string, content: string): Promise<{ path: string; error?: string } | null> {
+  private async writeToolResultFile(
+    label: string,
+    content: string,
+    branch?: string,
+  ): Promise<{ path: string; error?: string } | null> {
     const workspace = this.getWorkspaceModule();
     const mountName = workspace ? this.firstWritableMountName(workspace) : null;
     if (!workspace || !mountName) return null;
@@ -11737,7 +11742,7 @@ export class AgentFramework {
     const path = `${mountName}/tool-results/${safeLabel}.txt`;
     let failure: string;
     try {
-      const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain');
+      const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain', { branch });
       if (result.success) return { path };
       failure = result.error ?? 'write refused';
     } catch (err) {
