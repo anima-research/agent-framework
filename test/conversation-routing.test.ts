@@ -238,6 +238,50 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
+  it("a fork's seed is a dry run, and carries none of the template's thinking", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeFramework();
+    const trunk = framework.getAgent('trunk')!.getContextManager();
+    trunk.addMessage('user', [{ type: 'text', text: 'HANDBOOK: always check the logs first.' }]);
+    trunk.addMessage('trunk', [
+      { type: 'thinking', thinking: 'minted under the trunk\'s prefix', signature: 'sig-trunk' },
+      { type: 'text', text: 'Checked the logs.' },
+    ] as never);
+    trunk.addMessage('trunk', [{ type: 'redacted_thinking', data: 'opaque' }] as never);
+
+    // Every compile on any context manager during the spawn, by instance.
+    const proto = (trunk.constructor as { prototype: { compile: (...args: unknown[]) => unknown } }).prototype;
+    const original = proto.compile;
+    const compiles: Array<{ cm: unknown; dry: boolean }> = [];
+    proto.compile = function (this: unknown, ...args: unknown[]) {
+      compiles.push({ cm: this, dry: (args[2] as { dryRun?: boolean } | undefined)?.dryRun === true });
+      return original.apply(this, args);
+    };
+    try {
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D3', text: 'hi', channelType: 'im' }));
+      await framework.runUntilIdle();
+    } finally {
+      proto.compile = original;
+    }
+
+    const fork = framework.getAgent('conversation-slack-D3-g1')!.getContextManager();
+    const onTrunk = compiles.filter((c) => c.cm === trunk);
+    assert.ok(onTrunk.length >= 1, 'the seed compiled the template');
+    assert.ok(onTrunk.every((c) => c.dry), "the template's compiles during the spawn are dry runs");
+    assert.equal(compiles.find((c) => c.cm === fork)?.dry, true, "the new namespace's emptiness check is a dry run");
+
+    const seeded = fork.getAllMessages();
+    const types = seeded.flatMap((m) => m.content.map((b) => b.type));
+    assert.ok(!types.includes('thinking') && !types.includes('redacted_thinking'), `no thinking in the seed: ${types}`);
+    const texts = seeded.map((m) => JSON.stringify(m.content));
+    assert.ok(texts.some((t) => t.includes('HANDBOOK')) && texts.some((t) => t.includes('Checked the logs.')));
+    assert.ok(seeded.some((m) => m.participant === 'conversation-slack-D3-g1'
+      && JSON.stringify(m.content).includes('Checked the logs.')), "the reply keeps its text, under the fork's name");
+    assert.ok(seeded.every((m) => m.content.length > 0), 'the thinking-only message is left out, not stored empty');
+
+    await framework.stop();
+  });
+
   // Exercise the delivery boundary without scheduling inference. The same
   // handler receives ordinary channel traffic and coalesced fixed-audience notices.
   async function deliver(framework: AgentFramework, channelId: string, text: string, deliverTo?: string) {

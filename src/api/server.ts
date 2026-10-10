@@ -465,7 +465,9 @@ export class ApiServer {
     }
 
     const contextManager = agent.getContextManager();
-    const { messages } = await contextManager.compile();
+    // A dry run: listed, never sent, so it commits nothing (fold
+    // resolutions, compression work, thinking-binding stamps).
+    const { messages } = await contextManager.compile(undefined, undefined, { dryRun: true });
 
     const limit = params?.limit ?? 50;
     const offset = params?.offset ?? 0;
@@ -666,10 +668,15 @@ export class ApiServer {
     }
 
     const contextManager = agent.getContextManager();
+    // A dry run: shown, never sent, so it commits nothing (fold resolutions,
+    // compression work, thinking-binding stamps), at a hypothetical budget
+    // least of all.
     const { messages } = await contextManager.compile(
       params.maxTokens
         ? { maxTokens: params.maxTokens, reserveForResponse: 4096 }
-        : undefined
+        : undefined,
+      undefined,
+      { dryRun: true },
     );
 
     return { context: messages };
