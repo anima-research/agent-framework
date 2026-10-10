@@ -17,6 +17,16 @@ export interface MountConfig {
   /** Access mode */
   mode: 'read-write' | 'read-only';
   /**
+   * Storage backend for the mount (default: 'chronicle').
+   * - 'chronicle': files live in a Chronicle tree state; disk is a projection
+   *   kept current by `materialize` (store → disk) and `sync` (disk → store).
+   *   Edits are branch-scoped and undoable.
+   * - 'direct': every tool call reads and writes the directory itself. No
+   *   tree state, nothing to materialize or sync, no copy that can drift
+   *   from disk. Edits are not branch-scoped and not undoable.
+   */
+  backend?: 'chronicle' | 'direct';
+  /**
    * Watch mode for filesystem changes:
    * - 'always': chokidar watches continuously, syncs on debounce
    * - 'on-agent-action': sync from filesystem after each agent tool call
@@ -117,6 +127,8 @@ export interface WorkspaceModuleState {
     lastMaterializedBranchId?: string;
     watcherReadyAt?: number | null;
     watcherError?: string | null;
+    /** Backend the mount ran with when this state was saved. */
+    backend?: 'chronicle' | 'direct';
   }>;
   /** Branch ID considered "active" for materialization */
   activeBranchId?: string;
@@ -150,6 +162,8 @@ export interface WriteInput {
   path: string;
   /** Content to write */
   content: string;
+  /** Append to the file instead of replacing it (default: false). Creates the file if missing. */
+  append?: boolean;
 }
 
 export interface EditInput {
