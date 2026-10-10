@@ -523,7 +523,7 @@ test('usage of an abandoned guarded round is counted in session totals', async (
   try {
     await h.run();
     const totals = h.framework.getSessionUsage().totals as unknown as Record<string, number>;
-    assert.ok(totals.inputTokens >= 1_007, `refused round usage missing: ${JSON.stringify(totals)}`);
+    assert.equal(totals.inputTokens, 1_007, `the refused round is counted, once: ${JSON.stringify(totals)}`);
   } finally { await h.framework.stop(); }
 });
 

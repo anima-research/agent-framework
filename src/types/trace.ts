@@ -52,6 +52,12 @@ export type TraceEvent =
       silent?: boolean;
     })
   | (TraceEventBase & {
+      /**
+       * The model answered and the turn ended: with the stream's final
+       * response, or with a tool result carrying `endTurn`, which
+       * `inference:turn_ended` then follows. `tokenUsage` is the stream's
+       * usage, cumulative across its rounds.
+       */
       type: 'inference:completed';
       agentName: string;
       durationMs: number;
