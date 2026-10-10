@@ -1168,3 +1168,217 @@ test('unreadable recorded waits raise an ops alert for the whole framework as th
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// The paths that don't own provider admission (membrane #56 review, M3): a
+// conversation agent's turn and an ephemeral run never sleep a stated wait
+// for hours, silently. Each is reached at both retry sites: driveStream's
+// error case (a stream's error event) and beginAgentTurn's catch (a failure
+// before the stream exists, here thrown from streamYielding).
+// ---------------------------------------------------------------------------
+
+type Site = 'stream' | 'setup';
+
+/** Fails its first `failing` calls with `fail()` at `site`, then succeeds. */
+class FailingAt extends WaitingMembrane {
+  constructor(private readonly failing: number, private readonly site: Site, private readonly fail: () => Error) { super(0, undefined); }
+  override streamYielding(request: NormalizedRequest): YieldingStream {
+    this.calls.push(request);
+    this.primary++;
+    if (this.primary <= this.failing) {
+      if (this.site === 'setup') throw this.fail();
+      return new ErrorStream(this.fail());
+    }
+    return new MockYieldingStream([createMockResponse([{ type: 'text', text: 'zz-recovered' }])]);
+  }
+}
+
+type NonOwning = Internal & {
+  conversationAgentHomes: Map<string, string>;
+  pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
+  startAgentStream(agent: unknown, trigger: unknown): Promise<void>;
+  disposeConversationAgent(agentName: string): void;
+};
+
+/** The framework's one in-flight runUntilIdle, shared: two at once would
+ *  run its event loop concurrently. */
+const driving = new WeakMap<AgentFramework, Promise<void>>();
+function drive(fw: AgentFramework): Promise<void> {
+  let run = driving.get(fw);
+  if (!run) {
+    run = fw.runUntilIdle().catch(() => {}).finally(() => { driving.delete(fw); });
+    driving.set(fw, run);
+  }
+  return run;
+}
+
+/** Poll for `done`, driving the framework, with time only as an outer bound:
+ *  a turn asleep in a retry wait keeps the drive busy, and that must fail the
+ *  test, not hang it. */
+async function waitFor(fw: AgentFramework, done: () => boolean, what: string, boundMs = 5_000): Promise<void> {
+  const deadline = Date.now() + boundMs;
+  while (!done()) {
+    const left = deadline - Date.now();
+    if (left <= 0) throw new Error(`zz-timeout: ${what} did not happen within ${boundMs} ms`);
+    // Not awaited: the poll's own sleep lets timers run (a drive with nothing
+    // to do settles in microtasks, which would starve them).
+    void drive(fw);
+    await sleep(Math.min(20, left));
+  }
+}
+
+async function conversationTurn(fw: AgentFramework, internal: NonOwning, text: string): Promise<void> {
+  internal.conversationAgentHomes.set('resident', 'world:zz');
+  fw.getAgent('resident')!.getContextManager().addMessage('User', [{ type: 'text', text }]);
+  await internal.startAgentStream(fw.getAgent('resident'), { agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
+}
+
+for (const site of ['stream', 'setup'] as const) {
+  test(`a conversation agent treats a stated wait as a resident does (${site}): recorded, held without a retry in the turn, resumed once after it`, async () => {
+    await withStoreDir(async (path) => {
+      const log = silence();
+      const membrane = new FailingAt(1, site, () => rateLimited(400));
+      const { fw, internal } = await framework(path, membrane);
+      const nonOwning = internal as NonOwning;
+      try {
+        await conversationTurn(fw, nonOwning, 'zz-first');
+        await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the hold');
+        assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model');
+        assert.equal(membrane.primary, 1, 'no retry slept inside the turn');
+        assert.deepEqual(fw.providerWaitSnapshot('resident').map((wait) => wait.model), ['zz-model'], 'the wait is recorded');
+
+        await waitFor(fw, () => membrane.primary >= 2, 'the fresh compile after the wait');
+        assert.equal(membrane.primary, 2, 'exactly one');
+        assert.match(membrane.calls[1].messages.flatMap((m) => m.content).map((b) => (b as { text?: string }).text ?? '').join('\n'), /zz-first/);
+      } finally { await fw.stop(); log.restore(); }
+    });
+  });
+}
+
+test("a conversation agent's stated wait past an hour raises one ops alert and holds until an operator releases it", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new FailingAt(1, 'stream', () => rateLimited(2 * 3_600_000));
+    const { fw, internal } = await framework(path, membrane);
+    const alerts: Array<{ kind: string; agentName: string; message: string }> = [];
+    fw.onTrace((event) => { if (event.type === 'ops:alert') alerts.push(event as unknown as { kind: string; agentName: string; message: string }); });
+    try {
+      await conversationTurn(fw, internal as NonOwning, 'zz-first');
+      await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the hold');
+      assert.equal(membrane.primary, 1, 'two hours are not slept in the turn');
+      assert.deepEqual(alerts.map((alert) => [alert.kind, alert.agentName]), [['provider-wait', 'resident']]);
+      assert.match(alerts[0].message, /release-provider-wait/);
+
+      const released = await internal.handleHostCommand('zz-surface', { command: 'release-provider-wait', agentName: 'resident', model: 'zz-model', requesterName: 'zz-operator' });
+      assert.equal(released.ok, true);
+      await waitFor(fw, () => membrane.primary >= 2, 'the held turn after the release');
+      assert.equal(membrane.primary, 2);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test("a conversation agent's non-retryable failure that states a wait records it and isn't held; the wait holds the wake after it", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const refused = () => new MembraneError({
+      type: 'rate_limit', retryable: false, httpStatus: 429, retryAfterMs: 400,
+      message: 'zz refused, with a hint', rawError: { status: 429 },
+    });
+    const membrane = new FailingAt(1, 'stream', refused);
+    const { fw, internal } = await framework(path, membrane);
+    const nonOwning = internal as NonOwning;
+    try {
+      await conversationTurn(fw, nonOwning, 'zz-first');
+      await waitFor(fw, () => fw.providerWaitSnapshot('resident').length > 0, 'the recorded wait');
+      await drive(fw);
+      assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'a terminal failure is not held');
+      assert.equal(membrane.primary, 1, 'nor retried');
+
+      nonOwning.pendingRequests.push({ agentName: 'resident', reason: 'conversation', source: 'test', timestamp: Date.now() });
+      await drive(fw);
+      assert.equal(internal.providerAccelerationCooldowns.get('resident')?.waitModel, 'zz-model', 'the next wake is held by the recorded wait');
+      assert.equal(membrane.primary, 1);
+      await waitFor(fw, () => membrane.primary >= 2, 'the held wake after the wait');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test('a conversation agent closed during a stated-wait hold takes the hold with it: nothing is requeued for it past the deadline', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new FailingAt(1, 'stream', () => rateLimited(400));
+    const { fw, internal } = await framework(path, membrane);
+    const nonOwning = internal as NonOwning;
+    try {
+      await conversationTurn(fw, nonOwning, 'zz-first');
+      await waitFor(fw, () => internal.providerAccelerationCooldowns.has('resident'), 'the hold');
+      const until = internal.providerAccelerationCooldowns.get('resident')!.until;
+      nonOwning.disposeConversationAgent('resident');
+      assert.equal(internal.providerAccelerationCooldowns.has('resident'), false, 'the hold goes with the agent');
+
+      // Past the moment its timer would have released it, plus a few turns.
+      while (Date.now() <= until + 50) await sleep(25);
+      await sleep(50);
+      assert.deepEqual(nonOwning.pendingRequests.filter((r) => r.agentName === 'resident'), [], 'nothing requeued for an agent that is gone');
+      assert.equal(membrane.primary, 1);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+async function ephemeralRun(fw: AgentFramework, name: string) {
+  const created = await fw.createEphemeralAgent({ name, model: 'zz-model', systemPrompt: 'Do the task.' });
+  created.contextManager.addMessage('User', [{ type: 'text', text: 'zz-task' }]);
+  const run = fw.runEphemeralToCompletion(created.agent, created.contextManager);
+  const outcome = run.then((result) => ({ result }), (error: unknown) => ({ error: error as Error }));
+  // Not awaited: a turn asleep in a retry wait would hold it until the wait ends.
+  void drive(fw);
+  // A run still asleep after this long is the defect itself: fail, don't hang.
+  return Promise.race([outcome, sleep(5_000).then(() => ({ error: new Error('zz-unsettled: the run did not end within 5 s') }))]);
+}
+
+for (const site of ['stream', 'setup'] as const) {
+  test(`an ephemeral run whose stated wait is past the framework cap ends at once (${site}), saying why, and is never retried`, async () => {
+    await withStoreDir(async (path) => {
+      const log = silence();
+      const membrane = new FailingAt(1, site, () => rateLimited(20 * 60_000));
+      const { fw } = await framework(path, membrane);
+      try {
+        const outcome = await ephemeralRun(fw, `zz-ephemeral-long-${site}`);
+        assert.ok('error' in outcome, 'the run ends with an error');
+        assert.match(outcome.error.message, /zz rate limit reached/);
+        assert.match(outcome.error.message, /the provider asked to wait 1200 s; an ephemeral run doesn't sleep a stated wait longer than 600 s, so it ends now/);
+        await sleep(100);
+        assert.equal(membrane.primary, 1, 'no retry before the provider\'s time');
+        assert.deepEqual(fw.providerWaitSnapshot(`zz-ephemeral-long-${site}`), [], 'nothing recorded for a single-use name');
+      } finally { await fw.stop(); log.restore(); }
+    });
+  });
+}
+
+test("an ephemeral run whose stated wait can't be represented ends at once too", async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new FailingAt(1, 'stream', () => rateLimited(Number.NaN));
+    const { fw } = await framework(path, membrane);
+    try {
+      const outcome = await ephemeralRun(fw, 'zz-ephemeral-nan');
+      assert.ok('error' in outcome, 'the run ends with an error');
+      assert.match(outcome.error.message, /the provider asked to wait longer than can be represented/);
+      assert.equal(membrane.primary, 1);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
+
+test('an ephemeral run sleeps a stated wait within the framework cap and retries', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new FailingAt(1, 'stream', () => rateLimited(300));
+    const { fw } = await framework(path, membrane);
+    try {
+      const outcome = await ephemeralRun(fw, 'zz-ephemeral-short');
+      assert.ok('result' in outcome, `the run completes${'error' in outcome ? `: ${outcome.error.message}` : ''}`);
+      assert.match(outcome.result.speech, /zz-recovered/);
+      assert.equal(membrane.primary, 2, 'one retry, after the stated wait');
+    } finally { await fw.stop(); log.restore(); }
+  });
+});

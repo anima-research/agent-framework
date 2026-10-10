@@ -827,7 +827,9 @@ interface ProviderAccelerationReceipt {
 }
 const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
 /** Cap on waits the framework chooses itself. A provider's stated wait is
- *  never capped: it is a lower bound (see ProviderWaits). */
+ *  never capped: it is a lower bound (see ProviderWaits). It is also the
+ *  longest stated wait an ephemeral run sleeps in its turn: a longer one ends
+ *  the run instead (nonOwningProviderWait). */
 const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
 const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
 /** Longest delay one setTimeout can represent (2^31-1 ms, about 24.8 days);
@@ -2249,6 +2251,49 @@ export class AgentFramework {
       `${hostHold ? `host hold (${hostHold.reason})` : 'organization acceleration 429'} — ` +
       `holding primary/auxiliary for ${delayMs}ms; ${held.length} request(s) retained`);
     return true;
+  }
+  /**
+   * A provider's stated wait on a turn that doesn't own provider admission:
+   * a conversation agent's or an ephemeral run's. Left to the error policy,
+   * which returns a stated wait as it is, a 429 stating two hours would hold
+   * the turn asleep two hours, up to three times, with nothing recorded and
+   * nothing raised (membrane #56 review, M3). So:
+   * - A conversation agent's turns come through the scheduler as a resident's
+   *   do, so it treats the wait as a resident does: recorded for (agent,
+   *   model), alerted past PROVIDER_WAIT_ALERT_MS, and the turn held until the
+   *   wait passes or an operator releases it ('held'). A non-retryable failure
+   *   records the wait for the calls after it and keeps its own disposition.
+   * - An ephemeral run's name is single-use, so a wait recorded for it would
+   *   bind nothing, and its caller is waiting on it. A retryable stated wait
+   *   up to PROVIDER_ACCELERATION_MAX_COOLDOWN_MS is left to the error policy,
+   *   slept and retried. A longer one, or one that can't be represented, ends
+   *   the run now ('fail'): it is never retried before the provider's time,
+   *   and the caller hears why at once.
+   * Anything else is the error policy's.
+   */
+  private nonOwningProviderWait(agent: Agent, error: Error, trigger?: InferenceRequest): 'held' | 'fail' | undefined {
+    if (!(error instanceof MembraneError) || error.retryAfterMs === undefined) return undefined;
+    if (this.conversationAgentHomes.has(agent.name)) {
+      const wait = this.recordProviderWait(agent.name, agent.model, error);
+      return error.retryable === true && wait !== undefined && this.holdForProviderWait(agent, wait, trigger ? [trigger] : [])
+        ? 'held'
+        : undefined;
+    }
+    if (this.ephemeralRuns.has(agent.name) && error.retryable === true
+      && !(error.retryAfterMs <= PROVIDER_ACCELERATION_MAX_COOLDOWN_MS)) {
+      return 'fail';
+    }
+    return undefined;
+  }
+  /** Why an ephemeral run ended instead of sleeping a provider's stated wait,
+   *  for its caller. */
+  private statedWaitNotSlept(error: Error): string {
+    const stated = error instanceof MembraneError ? error.retryAfterMs : undefined;
+    const asked = typeof stated === 'number' && Number.isFinite(stated)
+      ? `${Math.ceil(stated / 1000)} s`
+      : 'longer than can be represented';
+    return `${error.message} (the provider asked to wait ${asked}; an ephemeral run doesn't sleep a stated wait ` +
+      `longer than ${PROVIDER_ACCELERATION_MAX_COOLDOWN_MS / 1000} s, so it ends now)`;
   }
   /** When a hold's timer next fires: at its deadline, stepped past what one
    *  timer can hold. A hold with no deadline (a wait held until released, or
@@ -7686,6 +7731,15 @@ export class AgentFramework {
     this.conversationAgentHomes.delete(agentName);
     this.evictTurnCheckpoints(agentName);
     if (agent) this.logicalTurnToolCalls.delete(agent);
+    // A provider-wait hold (nonOwningProviderWait) goes with the agent: left,
+    // its timer would requeue held wakes for an agent that is gone, and a wait
+    // held until released would re-arm for the name indefinitely. The recorded
+    // wait stays, and binds the name if its channel binds again.
+    const cooldown = this.providerAccelerationCooldowns.get(agentName);
+    if (cooldown) {
+      clearTimeout(cooldown.timer);
+      this.providerAccelerationCooldowns.delete(agentName);
+    }
     this.emitTrace({
       type: 'mcpl:conversation-disposed',
       agentName,
@@ -9631,8 +9685,15 @@ export class AgentFramework {
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
       }
+      const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+      if (statedWait === 'held') {
+        // A conversation agent held by the provider's stated wait, as a
+        // resident is: the hold's release owns the later compile.
+        this.eventGate?.onInferenceEnded(agent.name);
+        return false;
+      }
 
-      const action = this.errorPolicy.onInferenceError(err, agent.name, attempt);
+      const action: ErrorAction = statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
       if (action.retry) {
         // A policy's delay can be a provider's retry-after: wait all of it.
         await this.waitForRetry(action.delayMs);
@@ -9662,7 +9723,7 @@ export class AgentFramework {
         this.settleAgent(agent.name, {
           stopReason: 'exhausted',
           speech: '',
-          error: err.message,
+          error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
         });
         this.emitTrace({
           type: 'inference:exhausted',
@@ -10774,8 +10835,14 @@ export class AgentFramework {
               if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
               break;
             }
+            const statedWait = ownsProviderGate ? undefined : this.nonOwningProviderWait(agent, err, trigger);
+            if (statedWait === 'held') {
+              lifecyclePhase = 'failed';
+              if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
+              break;
+            }
 
-            const action = this.errorPolicy.onInferenceError(err, agent.name, attempt);
+            const action: ErrorAction = statedWait === 'fail' ? { retry: false } : this.errorPolicy.onInferenceError(err, agent.name, attempt);
             if (action.retry) {
               // A policy's delay can be a provider's retry-after: wait all of it.
               await this.waitForRetry(action.delayMs);
@@ -10786,7 +10853,7 @@ export class AgentFramework {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
                 speech: '',
-                error: err.message,
+                error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
               });
               this.emitTrace({
                 type: 'inference:exhausted',
