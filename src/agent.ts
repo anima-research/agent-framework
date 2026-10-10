@@ -25,14 +25,18 @@ export interface ActivationRequestOptions {
 export interface StartStreamResult {
   stream: YieldingStream;
   request: NormalizedRequest;
+  /** The channel bodies this request carries, frozen at preparation (receipt clocks). */
+  evidence?: RequestEvidence;
   takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined;
   drainKvSubmissionIds?: () => string[];
 }
+import { requestEvidence, withPreparation, type RequestEvidence } from './context-receipts/evidence.js';
 import type {
   ContextManager,
   TokenBudget,
   ContextInjection,
   CompileResult,
+  StoredMessage,
   HotContextSettingsStatus,
   HotContextSettingsUpdate,
   MessageMetadata,
@@ -801,6 +805,21 @@ export class Agent {
     compressionTools: ToolDefinition[] = availableTools,
     options: ActivationRequestOptions = {},
   ): Promise<NormalizedRequest> {
+    return (await this.prepareActivationRequest(availableTools, injections, budget, compressionTools, options)).request;
+  }
+
+  /**
+   * `buildActivationRequest` together with the request-owned evidence of
+   * which channel bodies it carries (context-receipts/evidence.ts), captured
+   * now so later edits are never attributed to what was sent.
+   */
+  async prepareActivationRequest(
+    availableTools: ToolDefinition[],
+    injections?: ContextInjection[],
+    budget?: TokenBudget,
+    compressionTools: ToolDefinition[] = availableTools,
+    options: ActivationRequestOptions = {},
+  ): Promise<{ request: NormalizedRequest; evidence: RequestEvidence }> {
     // Compression may revisit hidden tools in recorded history. Keep its full
     // definition set separate from the resident's advertised tools: the
     // autobiographical strategy must declare the same tools on its
@@ -826,11 +845,13 @@ export class Agent {
           system: this.buildSystemPrompt(prospectiveSystemInjections),
         })
       : undefined;
-    let { messages, systemInjections } = await this.compileWithInjections(
+    const compiled = await this.compileWithInjections(
       budget,
       injections,
       immutablePrefixHash ? { kvUnifiedImmutablePrefixHash: immutablePrefixHash } : undefined,
     );
+    let { messages } = compiled;
+    const { systemInjections } = compiled;
 
     // Sanitize: strip empty/whitespace text blocks and drop messages left with
     // no content. The Anthropic API rejects empty text blocks with 400
@@ -843,16 +864,33 @@ export class Agent {
     // 2026-07-10 on a resident agent: one empty block muted the agent's live
     // path entirely; twin of context-manager's stripEmptyTextBlocks on the
     // compression path.)
-    messages = messages
-      .map((m) => ({
-        ...m,
-        content: m.content.filter(
-          // typeof guard is deliberate runtime defense: history loaded from
-          // disk can carry a non-string `text` despite what the types claim.
-          (b: ContentBlock) => !(b.type === "text" && (typeof b.text !== "string" || b.text.trim() === "")),
-        ),
-      }))
-      .filter((m) => m.content.length > 0);
+    // Each compiled message's position in the request (-1 when dropped), so
+    // receipt evidence names request indices; and which messages this
+    // preparation did not carry verbatim (an empty '' block carries nothing,
+    // but whitespace-only text is content).
+    const requestIndexOf: number[] = [];
+    const preparedAltered = new Set<number>();
+    let compileAltered = false;
+    const sanitized: NormalizedMessage[] = [];
+    for (const m of messages) {
+      const content = m.content.filter(
+        // typeof guard is deliberate runtime defense: history loaded from
+        // disk can carry a non-string `text` despite what the types claim.
+        (b: ContentBlock) => !(b.type === "text" && (typeof b.text !== "string" || b.text.trim() === "")),
+      );
+      const removedContent = m.content.some(
+        (b: ContentBlock) => b.type === 'text' && !content.includes(b) && !(typeof b.text === 'string' && b.text === ''),
+      );
+      if (content.length === 0) {
+        requestIndexOf.push(-1);
+        if (removedContent) compileAltered = true;
+        continue;
+      }
+      if (removedContent) preparedAltered.add(sanitized.length);
+      requestIndexOf.push(sanitized.length);
+      sanitized.push({ ...m, content });
+    }
+    messages = sanitized;
 
     // Silent heartbeat ticks store no prompt row. Render a request-only
     // separator before each tick's first surviving row so the wire formatter
@@ -862,7 +900,23 @@ export class Agent {
     // caches is the one every later compile renders. "First" is per agent: a
     // broadcast tick shares its eventId with every resident.
     const ticks = this.indexSilentHeartbeatTicks();
-    messages = separateSilentHeartbeatTicks(messages, ticks.rows, this.name);
+    const separated = separateSilentHeartbeatTicks(messages, ticks.rows, this.name);
+    if (separated !== messages) {
+      // Each separator is a request-only turn that shifts every later message,
+      // so the receipt coordinates (each compiled message's request index, and
+      // the positions this preparation altered) move with them. Sanitizing made
+      // every message a fresh object, so identity locates each one.
+      const positionOf = new Map<NormalizedMessage, number>();
+      separated.forEach((message, index) => positionOf.set(message, index));
+      const moved = (at: number): number => positionOf.get(messages[at]!)!;
+      for (let i = 0; i < requestIndexOf.length; i++) {
+        if (requestIndexOf[i]! >= 0) requestIndexOf[i] = moved(requestIndexOf[i]!);
+      }
+      const altered = [...preparedAltered].map(moved);
+      preparedAltered.clear();
+      for (const at of altered) preparedAltered.add(at);
+    }
+    messages = separated;
     const openingTick = options.silentHeartbeat !== undefined
       && !ticks.started.has(options.silentHeartbeat.eventId);
 
@@ -878,8 +932,10 @@ export class Agent {
       }];
     }
 
-    return {
-      messages: this.toolResultGuard.prepareRequest(messages),
+    const guarded = this.toolResultGuard.prepareRequest(messages);
+    for (const index of substitutedIndices(messages, guarded)) preparedAltered.add(index);
+    const request: NormalizedRequest = {
+      messages: guarded,
       system: this.buildSystemPrompt(systemInjections),
       config: {
         model: this.model,
@@ -895,6 +951,30 @@ export class Agent {
       ...(this.providerParams && { providerParams: this.providerParams }),
       assistantParticipant: this.name,
     };
+    return {
+      request,
+      evidence: withPreparation(this.receiptEvidence(compiled, requestIndexOf), preparedAltered, compileAltered),
+    };
+  }
+
+  /**
+   * Evidence of the channel bodies a compiled request carries, resolved from
+   * the compile's own view (`rawBodies`): that covers bodies merged in from
+   * auxiliary slots, which `getMessage` cannot see, and binds the evidence to
+   * what this compile held rather than to a later edit. A body is one
+   * ingestion: two copies of the same text are two bodies, though one group
+   * id (a content hash) names both, and CM judges each on its own.
+   */
+  private receiptEvidence(compiled: CompileResult, requestIndexOf: number[]): RequestEvidence {
+    const cm = this.contextManager as ContextManager & { getStoreId?: () => string };
+    const bodies = compiled.rawBodies;
+    return requestEvidence({
+      agent: this.name,
+      storeId: cm.getStoreId?.() ?? 'unknown',
+      provenance: compiled.provenance ?? null,
+      requestIndexOf,
+      getMessage: (id) => bodies?.get(id)?.[0] ?? null,
+    });
   }
 
   /** Stored silent-tick rows, memoized on the store's cached message array
@@ -961,8 +1041,14 @@ export class Agent {
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
 
-    const request = await this.buildActivationRequest(availableTools, injections, budget, compressionTools, options);
+    const prepared = await this.prepareActivationRequest(availableTools, injections, budget, compressionTools, options);
+    const { request } = prepared;
+    // One-to-one: prepareRequest swaps guarded tool results in place, so
+    // the evidence's request indices still hold; a swap is a change this
+    // preparation made, so the evidence records it.
+    const beforeGuard = request.messages;
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
+    const evidence = withPreparation(prepared.evidence, new Set(substitutedIndices(beforeGuard, request.messages)), false);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
       .getStrategy?.() as {
@@ -1010,6 +1096,7 @@ export class Agent {
     return {
       stream,
       request,
+      evidence,
       ...(kvEnabled
         ? {
             takeKvSubmission: () => kvQueue.shift(),
@@ -1286,4 +1373,17 @@ export class Agent {
       content,
     }];
   }
+}
+
+/** Indices of messages whose content blocks a request-preparation pass replaced. */
+function substitutedIndices(before: readonly NormalizedMessage[], after: readonly NormalizedMessage[]): number[] {
+  const out: number[] = [];
+  after.forEach((message, i) => {
+    const original = before[i];
+    if (!original || original === message) return;
+    if (original.content.length !== message.content.length || original.content.some((block, j) => block !== message.content[j])) {
+      out.push(i);
+    }
+  });
+  return out;
 }

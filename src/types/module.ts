@@ -1,5 +1,6 @@
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
+  ContextManager,
   MessageId,
   MessageMetadata,
   StoredMessage,
@@ -257,6 +258,15 @@ export interface ModuleContext {
    * Get info about all agents.
    */
   getAgents(): AgentInfo[];
+
+  /**
+   * The context manager of one registered agent (a resident, a conversation
+   * fork, an ephemeral subagent), or null when no agent by that name is
+   * registered. Each agent's strategy and fold record belong to its own
+   * context manager, so a module answering for the agent that called it
+   * (history--folds) resolves `ToolCall.callerAgentName` here.
+   */
+  getAgentContextManager(agentName: string): ContextManager | null;
 
   /**
    * Get all currently available tools.

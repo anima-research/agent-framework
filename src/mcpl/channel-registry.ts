@@ -40,6 +40,8 @@ import { expandCoreTags } from './tags.js';
 import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { isVisiblyEmptyContent } from './visible-content.js';
 import { CapabilityGrant } from './capability-grant.js';
+import type { InboundSource } from './inbound-source.js';
+import { McplRequestError } from './server-connection.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -237,6 +239,10 @@ interface McplChannelIncomingEvent {
   tags?: string[];
   triggerInference?: boolean;
   targetAgents?: string[];
+  /** Host acceptance time (epoch ms), stamped where the message is admitted. */
+  acceptedAt?: number;
+  /** Source envelope frozen at admission (mcpl/inbound-source.ts). */
+  inboundSource?: InboundSource;
 }
 
 // ============================================================================
@@ -314,7 +320,40 @@ function convertBlock(block: McplContentBlock): ContentBlock {
 const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'channel_list',
-    description: 'List all available channels',
+    description:
+      'List all available channels. Each channel carries receipt clocks, which are ' +
+      'diagnostics about delivery, not a record of attention or a claim that you chose ' +
+      'to ignore anyone. lastReceivedAt: when this host last accepted an item from the ' +
+      'channel (any item, including notices and deferred work), with that item\'s source ' +
+      'message id and source timestamp, so a delayed message is distinguishable from a ' +
+      'fresh one. lastDeliveredAt: when a provider round that stood (not a refusal) last ' +
+      'carried a new raw body from the channel to you, complete: every part present, ' +
+      'nothing truncated, no image or block removed on the way. Summaries that mention a ' +
+      'message do not count, and showing an already-delivered version again never moves ' +
+      'the clock. lastPartialAt: the most recent time a body from the channel first reached ' +
+      'you only partially (cut, or altered on the way); it is history, and a later complete ' +
+      'arrival of that body shows in lastDeliveredAt, not here. A round whose provider path ' +
+      'could not establish what it carried (for example an adapter that does not report ' +
+      'content it leaves out, or a request hook whose changes cannot be seen) confirms ' +
+      'neither a delivery nor a partial exposure: its bodies stay unconfirmed. Null means no observation ' +
+      'since receiptClocks.trackingSince, ' +
+      'not silence before it. The clocks cover one store and one resident ' +
+      '(receiptClocks.storeId, agent): a session switch starts a separate history. ' +
+      'Versions are identified by the producer event id where its lane guarantees one, ' +
+      'otherwise by platform message id plus a digest of the body as it was delivered, ' +
+      'before any source header or splitting (a revision restoring earlier bytes counts as ' +
+      'that earlier version), otherwise by the stored copy, so a replay is then not ' +
+      'recognizable (that includes a split body stored before body digests were recorded, ' +
+      'even with a platform message id). A copy edited after it arrived is a partial ' +
+      'exposure, never a delivery; an item stored before body digests were recorded can\'t ' +
+      'be checked for such edits, so its delivery stays unconfirmed. Each delivery names ' +
+      'its basis. Every delivered version is ' +
+      'remembered, so one counts when it first reaches you, however long ago it was accepted. ' +
+      'receiptClocks.gaps lists intervals in which observations may be missing; one still ' +
+      'open ends "(ongoing)" and sets receiptClocks.degraded. Until the receipt ledger has ' +
+      'been read in this host\'s run, channels carry no clocks at all. A ' +
+      'missing inbound item is not evidence of upstream inactivity: a connector or ' +
+      'allowlist can keep it from reaching the host at all.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
   {
@@ -454,7 +493,59 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
 // Constructor Options
 // ============================================================================
 
+/** Where a publish was resolved to go — named by the registry, never by
+ *  the caller's spelling. */
+export interface PublishDestination {
+  serverId: string;
+  channelId: string;
+  /** The channel's registered label when the attempt was made. */
+  label?: string;
+}
+
+/**
+ * What one channels/publish attempt established (ChannelRegistry.publish).
+ * - `delivered`: the connector returned `delivered: true`. A historical
+ *   receipt (confirmed at `at`, to `destination`, message `messageId` when
+ *   the connector named one), not a claim the message still exists.
+ * - `failed`: nothing was posted: the request never left the host
+ *   (unresolvable or shared channel id, missing grant, failed open, closed
+ *   connection), or the connector answered `delivered: false`.
+ * - `unknown`: the request was dispatched and no valid receipt came back (an
+ *   error response, a timeout, a lost connection, or a missing or malformed
+ *   receipt). It may or may not have been posted.
+ */
+export interface PublishOutcome {
+  status: 'delivered' | 'failed' | 'unknown';
+  /** Absent only when no destination could be resolved. */
+  destination?: PublishDestination;
+  messageId?: string;
+  /** Why it failed, or why its outcome is unknown — for a connector error,
+   *  its message verbatim (which may say what was already posted). */
+  reason?: string;
+  /** The connector error's structured `data`, verbatim, when it sent one. */
+  detail?: unknown;
+  /** When the outcome was established (epoch ms). */
+  at: number;
+}
+
 interface ChannelRegistryOptions {
+  /**
+   * An ordinary (uncoalesced) `channels/incoming` message has just been
+   * admitted, before it is queued or acknowledged: return its source
+   * envelope, frozen now (mcpl/inbound-source.ts). The framework observes the
+   * acceptance here; coalesced work is stamped and observed by its own path.
+   */
+  acceptInbound?: (event: McplChannelIncomingEvent) => InboundSource | undefined;
+  /**
+   * Receipt clocks for channel_list (shelf-354): per listed channel, when the
+   * host last received from it and when a body from it last reached the
+   * calling resident, plus the scope those clocks cover. Keyed by
+   * `serverId\u0000channelId`.
+   */
+  describeChannelClocks?: (
+    agentName: string | undefined,
+    channels: Array<{ serverId: string; channelId: string }>,
+  ) => { scope: unknown; clocks: Map<string, unknown> };
   /**
    * RFC-006: an admitted `channels/incoming` message carrying `coalesce`, with
    * the event the ordinary path would have queued. The handler decides
@@ -483,6 +574,9 @@ interface ChannelRegistryOptions {
     channelId: string | null;
     reason: string;
     textLen: number;
+    /** `failed`: nothing was posted; `unknown`: the request was dispatched
+     *  and no valid receipt came back, so it may or may not have been. */
+    outcome?: 'failed' | 'unknown';
   }) => void;
   /**
    * Called when channels were opened WITHOUT the agent asking (subscription
@@ -558,12 +652,7 @@ export class ChannelRegistry {
     op?: 'start' | 'stop',
   ) => void;
   private shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean;
-  private onRouteFailure?: (info: {
-    conversationId: string;
-    channelId: string | null;
-    reason: string;
-    textLen: number;
-  }) => void;
+  private onRouteFailure?: ChannelRegistryOptions['onRouteFailure'];
   private onChannelAutoOpened?: (info: {
     conversationId?: string;
     serverId: string;
@@ -658,6 +747,8 @@ export class ChannelRegistry {
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
   private migratedLegacyPolicies = new Set<string>();
   private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
+  private acceptInbound?: ChannelRegistryOptions['acceptInbound'];
+  private describeChannelClocks?: ChannelRegistryOptions['describeChannelClocks'];
 
   constructor(
     serverRegistry: McplServerRegistry,
@@ -674,6 +765,8 @@ export class ChannelRegistry {
     },
   ) {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
+    this.acceptInbound = options?.acceptInbound;
+    this.describeChannelClocks = options?.describeChannelClocks;
     this.serverRegistry = serverRegistry;
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -1002,6 +1095,7 @@ export class ChannelRegistry {
         metadata: message.metadata,
         ...(message.tags ? { tags: message.tags } : {}),
         triggerInference,
+        acceptedAt: Date.now(),
       };
 
       if (coalesced) {
@@ -1023,6 +1117,12 @@ export class ChannelRegistry {
         }
         continue;
       }
+
+      // The source envelope is frozen here, at admission, before the message
+      // is queued or acknowledged: a rename or rebind while it waits in the
+      // queue cannot change where it says it came from.
+      const inboundSource = this.acceptInbound?.(event);
+      if (inboundSource) event.inboundSource = inboundSource;
 
       // Push to the processing queue
       // Cast through unknown because McplChannelIncomingEvent matches the
@@ -1250,6 +1350,13 @@ export class ChannelRegistry {
     return this.findChannelEntry(channelId)?.descriptor;
   }
 
+  /** The registered label of `channelId` on exactly `serverId` (no
+   *  cross-server first match), or undefined when it has none. */
+  getChannelLabel(serverId: string, channelId: string): string | undefined {
+    const label = this.channels.get(`${serverId}:${channelId}`)?.descriptor.label;
+    return typeof label === 'string' && label.length > 0 ? label : undefined;
+  }
+
   isChannelOpen(channelId: string): boolean {
     return this.findChannelEntry(channelId)?.open === true;
   }
@@ -1301,7 +1408,7 @@ export class ChannelRegistry {
   ): Promise<ToolResult> {
     switch (toolName) {
       case 'channel_list':
-        return this.handleToolList();
+        return this.handleToolList(origin);
 
       case 'channel_open':
         return this.handleToolOpen(input as {
@@ -2261,7 +2368,7 @@ export class ChannelRegistry {
   // Private: Tool Handlers
   // ==========================================================================
 
-  private handleToolList(): ToolResult {
+  private handleToolList(origin?: ChannelToolOrigin): ToolResult {
     const allChannels: Array<{
       id: string;
       type: string;
@@ -2270,6 +2377,7 @@ export class ChannelRegistry {
       open: boolean;
       desired: DesiredChannelState | 'unknown';
       serverId: string;
+      clocks?: unknown;
     }> = [];
 
     for (const entry of this.channels.values()) {
@@ -2284,10 +2392,18 @@ export class ChannelRegistry {
       });
     }
 
-    return {
-      success: true,
-      data: allChannels,
-    };
+    if (!this.describeChannelClocks) {
+      return { success: true, data: allChannels };
+    }
+    const agentName = origin?.kind === 'agent' ? origin.agentName : undefined;
+    const { scope, clocks } = this.describeChannelClocks(
+      agentName,
+      allChannels.map((c) => ({ serverId: c.serverId, channelId: c.id })),
+    );
+    for (const channel of allChannels) {
+      channel.clocks = clocks.get(`${channel.serverId}\u0000${channel.id}`);
+    }
+    return { success: true, data: { channels: allChannels, receiptClocks: scope } };
   }
 
   /**
@@ -2961,7 +3077,213 @@ export class ChannelRegistry {
     return home ?? this.activeChannelResolver?.(conversationId) ?? this.defaultPublishChannel ?? null;
   }
 
-  async routeSpeech(
+  /**
+   * Resolve a publish target to exactly one registered channel: `serverId`
+   * plus `channelId` when the caller has the server, otherwise a channel id
+   * registered by exactly one server. A shared id is refused, never resolved
+   * to whichever server registered it first.
+   */
+  resolveDestination(
+    target: { serverId?: string; channelId: string },
+  ): { destination: PublishDestination } | { error: string } {
+    const entry = this.findExactEntry(target);
+    if ('error' in entry) return entry;
+    return {
+      destination: {
+        serverId: entry.entry.serverId,
+        channelId: entry.entry.descriptor.id,
+        ...(entry.entry.descriptor.label ? { label: entry.entry.descriptor.label } : {}),
+      },
+    };
+  }
+
+  private findExactEntry(
+    target: { serverId?: string; channelId: string },
+  ): { entry: ChannelEntry } | { error: string } {
+    // A supplied selector is checked, never read as omission: an empty or
+    // non-string serverId would otherwise widen to "any server".
+    if (typeof target.channelId !== 'string' || !target.channelId) {
+      return { error: 'the destination names no channel id' };
+    }
+    if (target.serverId !== undefined && (typeof target.serverId !== 'string' || !target.serverId)) {
+      return { error: 'serverId must name a server (omit it to resolve the channel id alone)' };
+    }
+    const matches = [...this.channels.values()].filter(
+      (e) => e.descriptor.id === target.channelId && (!target.serverId || e.serverId === target.serverId),
+    );
+    if (matches.length === 0) {
+      return {
+        error: target.serverId
+          ? `no registered channel "${target.channelId}" on server "${target.serverId}"`
+          : `no registered channel "${target.channelId}"`,
+      };
+    }
+    if (matches.length > 1) {
+      return {
+        error: `channel id "${target.channelId}" is registered by more than one MCPL server; the destination must name its server`,
+      };
+    }
+    return { entry: matches[0]! };
+  }
+
+  /**
+   * Publish `text` to one registered channel and report what the attempt
+   * established (PublishOutcome). The delivery executor behind plain speech
+   * (deliverSpeech / routeSpeech) and resident resends of held drafts;
+   * channel_publish (and publishForAgent, which shares its handler) moves
+   * onto it with shelf-356 — until then that tool reads its own receipt.
+   *
+   * Resolution is exact (resolveDestination): `serverId` plus `channelId`
+   * when the caller has the server, otherwise the channel id must be
+   * registered by exactly one server (a shared id is refused, never routed
+   * through whichever server came first). An omitted `serverId` means "not
+   * in use"; a supplied one must be a non-empty server id, and an empty or
+   * non-string selector is refused rather than read as omission. It is not
+   * possible to send into a closed channel: a closed but registered
+   * destination is opened first (`openSource` names why), and a failed open
+   * sends nothing.
+   *
+   * Only the connector's `delivered: true` confirms a post. `failed` means
+   * nothing was posted: the attempt stopped before the request was written,
+   * or the connector answered `delivered: false` and named no message (no
+   * `messageId`, or null). Everything else is `unknown`: once the request
+   * has been handed to the transport, an error response, a timeout, a lost
+   * connection, or a missing, malformed or contradictory receipt (such as
+   * `delivered: false` beside a message id, valid or not) means the post may
+   * or may not exist, and the caller must not treat it as safe to retry
+   * blindly.
+   */
+  async publish(
+    conversationId: string,
+    text: string,
+    target: { serverId?: string; channelId: string },
+    openSource: 'opened-by-delivery' | 'opened-by-reply' = 'opened-by-delivery',
+  ): Promise<PublishOutcome> {
+    const at = (): number => Date.now();
+    const found = this.findExactEntry(target);
+    if ('error' in found) return { status: 'failed', reason: found.error, at: at() };
+    const entry = found.entry;
+    const destination: PublishDestination = {
+      serverId: entry.serverId,
+      channelId: entry.descriptor.id,
+      ...(entry.descriptor.label ? { label: entry.descriptor.label } : {}),
+    };
+
+    if (!entry.open) {
+      try {
+        await this.openChannelNow(entry, openSource);
+        this.emitTraceFn({
+          type: 'mcpl:channel-opened-by-send',
+          serverId: entry.serverId,
+          channelId: entry.descriptor.id,
+        });
+        if (openSource === 'opened-by-delivery') {
+          try {
+            this.onChannelAutoOpened?.({
+              conversationId,
+              serverId: entry.serverId,
+              source: 'opened-by-delivery',
+              channels: [{ channelId: entry.descriptor.id, label: entry.descriptor.label }],
+            });
+          } catch (err) {
+            console.error('onChannelAutoOpened (delivery) failed:', err);
+          }
+        }
+      } catch (err) {
+        return {
+          status: 'failed',
+          destination,
+          reason: `channel is closed and open failed: ${(err as Error).message}`,
+          at: at(),
+        };
+      }
+    }
+
+    const server = this.serverRegistry.getServer(entry.serverId);
+    if (!server) {
+      return { status: 'failed', destination, reason: `server "${entry.serverId}" not found`, at: at() };
+    }
+    // §14.1: channels/publish requires channels.publish in the grant. The
+    // host not sending is the enforcement.
+    if (!CapabilityGrant.of(server).has('channels.publish')) {
+      return {
+        status: 'failed',
+        destination,
+        reason: `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`,
+        at: at(),
+      };
+    }
+
+    let result: unknown;
+    try {
+      result = await server.sendChannelsPublish({
+        conversationId,
+        channelId: entry.descriptor.id,
+        content: [{ type: 'text', text }],
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Only a request that never left the host proves nothing was posted.
+      // An error response may follow a partial post (a multi-part send whose
+      // later part failed), so it is unknown, with the connector's own words
+      // (and data) kept for the resident to judge.
+      const notSent = err instanceof McplRequestError && err.outcome === 'not-sent';
+      const detail = err instanceof McplRequestError ? err.data : undefined;
+      return {
+        status: notSent ? 'failed' : 'unknown',
+        destination,
+        reason: notSent ? message : `${message} (delivery uncertain)`,
+        ...(detail !== undefined ? { detail } : {}),
+        at: at(),
+      };
+    }
+    const receipt = (result ?? {}) as { delivered?: unknown; messageId?: unknown };
+    const messageId = typeof receipt.messageId === 'string' && receipt.messageId ? receipt.messageId : undefined;
+    if (receipt.delivered === true) {
+      return { status: 'delivered', destination, ...(messageId ? { messageId } : {}), at: at() };
+    }
+    if (receipt.delivered === false) {
+      // `delivered: false` proves nothing went out only when the receipt
+      // names no message at all. A message id beside it — valid or
+      // malformed — contradicts it: something may have been posted.
+      if (receipt.messageId === undefined || receipt.messageId === null) {
+        return {
+          status: 'failed',
+          destination,
+          reason: `server "${entry.serverId}" reported delivered:false`,
+          at: at(),
+        };
+      }
+      return {
+        status: 'unknown',
+        destination,
+        ...(messageId ? { messageId } : {}),
+        reason: messageId
+          ? `server "${entry.serverId}" reported delivered:false but named posted message ${messageId} (delivery uncertain)`
+          : `server "${entry.serverId}" reported delivered:false beside a malformed message id ` +
+            `${JSON.stringify(receipt.messageId)} (contradictory receipt; delivery uncertain)`,
+        at: at(),
+      };
+    }
+    // Final publish is a request, so success requires an explicit receipt; a
+    // missing or malformed one leaves delivery uncertain (anima-research/
+    // agent-framework#163's rule).
+    return {
+      status: 'unknown',
+      destination,
+      ...(messageId ? { messageId } : {}),
+      reason: `server "${entry.serverId}" returned no valid delivery receipt (delivery uncertain)`,
+      at: at(),
+    };
+  }
+
+  /**
+   * Plain speech for one turn segment: publish `text` to the turn's frozen
+   * locus and report the PublishOutcome. A failure (or an uncertain outcome)
+   * is surfaced as a trace and through onRouteFailure, so the agent learns
+   * its words did not (or may not have) reached anyone.
+   */
+  async deliverSpeech(
     conversationId: string,
     text: string,
     /** The turn's FROZEN locus, snapshotted once by the caller (resolveLocus
@@ -2972,118 +3294,73 @@ export class ChannelRegistry {
      *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
      *  "this turn is pinned to no locus": fail loudly rather than guess. */
     locusChannelId: string | null,
-  ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
-    // Surface a routing failure: emit a trace AND notify the host (which drops
-    // a `[discord-send-failed]` marker into chronicle) so the agent learns her
-    // reply never reached the human, instead of it vanishing silently.
-    const fail = (channelId: string | null, reason: string): null => {
-      console.error(`[routeSpeech] ${conversationId}: ${reason} — speech NOT routed (${text.length} chars stay in chronicle)`);
+  ): Promise<PublishOutcome> {
+    const fail = (channelId: string | null, reason: string, outcome: PublishOutcome): PublishOutcome => {
+      const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
+      console.error(`[routeSpeech] ${conversationId}: ${reason} — speech ${status === 'unknown' ? 'delivery NOT confirmed' : 'NOT routed'} (${text.length} chars stay in chronicle)`);
       this.emitTraceFn({
         type: 'mcpl:speech-route-failed',
         conversationId,
         channelId: channelId ?? '',
         reason,
         textLen: text.length,
+        outcome: status,
       });
-      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length });
-      return null;
+      this.onRouteFailure?.({ conversationId, channelId, reason, textLen: text.length, outcome: status });
+      return outcome;
     };
 
     // Runtime backstop for JS callers the compiler can't see: an omitted
     // locus is a routing bug at the call site, never something to paper over
     // with a live re-resolution.
     if (locusChannelId === undefined) {
-      return fail(null, 'caller passed no locus (routing bug: every speech path must snapshot the turn locus)');
+      const reason = 'caller passed no locus (routing bug: every speech path must snapshot the turn locus)';
+      return fail(null, reason, { status: 'failed', reason, at: Date.now() });
     }
-    const channelId = locusChannelId;
-    if (!channelId) {
+    if (!locusChannelId) {
       // The turn froze with no locus (no home, no triggering channel, no
       // global inbound ever seen) — the agent was told its prose stays in
       // the archive; honor that.
-      return fail(null, 'turn has no locus (no home/trigger channel; nothing to deliver into)');
+      const reason = 'turn has no locus (no home/trigger channel; nothing to deliver into)';
+      return fail(null, reason, { status: 'failed', reason, at: Date.now() });
     }
 
-    const entry = this.findChannelEntry(channelId);
-    if (!entry) {
-      return fail(channelId, `no registered channel for locus "${channelId}"`);
+    const outcome = await this.publish(conversationId, text, { channelId: locusChannelId });
+    const channelId = outcome.destination?.channelId ?? locusChannelId;
+    if (outcome.status !== 'delivered') {
+      return fail(channelId, outcome.reason ?? 'delivery not confirmed', outcome);
     }
 
-    // INVARIANT: it is not possible to send into a closed channel. Speech
-    // routed into a closed-but-registered locus (the canonical case: a DM
-    // that woke the agent — DMs register closed) OPENS the channel first,
-    // so typing indicators, reaction machinery, and inbound forwarding come
-    // alive with the reply. If the open fails, the speech does NOT go out:
-    // a half-alive delivery is worse than a loud marker.
-    if (!entry.open) {
-      try {
-        await this.openChannelNow(entry, 'opened-by-delivery');
-        console.error(
-          `[routeSpeech] ${conversationId}: locus ${channelId} was closed — opened by delivery (speech implies engagement)`,
-        );
-        this.emitTraceFn({
-          type: 'mcpl:channel-opened-by-send',
-          serverId: entry.serverId,
-          channelId,
-        });
-        try {
-          this.onChannelAutoOpened?.({
-            conversationId,
-            serverId: entry.serverId,
-            source: 'opened-by-delivery',
-            channels: [{ channelId, label: entry.descriptor.label }],
-          });
-        } catch (err) {
-          console.error('onChannelAutoOpened (delivery) failed:', err);
-        }
-      } catch (err) {
-        return fail(channelId, `locus channel is closed and open failed: ${(err as Error).message}`);
-      }
-    }
-
-    const server = this.serverRegistry.getServer(entry.serverId);
-    if (!server) {
-      return fail(channelId, `server "${entry.serverId}" not found`);
-    }
-    // §14.1: channels/publish requires channels.publish in the grant. The
-    // host not sending is the enforcement — a send to an ungranted server
-    // would have it act on authority it was never told it has.
-    if (!CapabilityGrant.of(server).has('channels.publish')) {
-      return fail(channelId, `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`);
-    }
-
-    const publishParams: ChannelsPublishParams = {
-      conversationId,
-      channelId,
-      content: [{ type: 'text', text }],
-    };
-    const result = await server.sendChannelsPublish(publishParams);
-    const delivered = (result as { delivered?: boolean } | undefined)?.delivered ?? true;
-    // Surface the posted message's id (ChannelsPublishResult.messageId) so
-    // trace consumers can act on the just-posted message — e.g. a TTS-relay
-    // tap editing it down to the words actually voiced on interruption.
-    // Previously this was silently dropped here.
-    const messageId = (result as { messageId?: string } | undefined)?.messageId;
-
-    // The server accepted the publish RPC but reported the message was not
-    // actually delivered (e.g. missing Send Messages permission). Previously
-    // this returned `{ delivered: true }`, masking the failure. Surface it.
-    if (delivered === false) {
-      return fail(channelId, `server "${entry.serverId}" reported delivered:false for "${channelId}"`);
-    }
-
-    console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${channelId} (server=${entry.serverId}, delivered=${delivered})`);
+    console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${channelId} (server=${outcome.destination!.serverId}, delivered=true)`);
     this.emitTraceFn({
       type: 'mcpl:speech-routed',
       conversationId,
-      serverId: entry.serverId,
+      serverId: outcome.destination!.serverId,
       channelId,
-      delivered,
+      delivered: true,
       textLen: text.length,
       text,
-      ...(messageId !== undefined ? { messageId } : {}),
+      // Surface the posted message's id (ChannelsPublishResult.messageId) so
+      // trace consumers can act on the just-posted message — e.g. a TTS-relay
+      // tap editing it down to the words actually voiced on interruption.
+      ...(outcome.messageId !== undefined ? { messageId: outcome.messageId } : {}),
     });
+    return outcome;
+  }
 
-    return { delivered, channelId, ...(messageId !== undefined ? { messageId } : {}) };
+  /** deliverSpeech, reduced to the confirmed delivery (null when there was none). */
+  async routeSpeech(
+    conversationId: string,
+    text: string,
+    locusChannelId: string | null,
+  ): Promise<{ delivered: boolean; channelId: string; messageId?: string } | null> {
+    const outcome = await this.deliverSpeech(conversationId, text, locusChannelId);
+    if (outcome.status !== 'delivered') return null;
+    return {
+      delivered: true,
+      channelId: outcome.destination!.channelId,
+      ...(outcome.messageId !== undefined ? { messageId: outcome.messageId } : {}),
+    };
   }
 
   private async handleToolPublish(input: { channelId?: string; content?: string; text?: string }): Promise<ToolResult> {

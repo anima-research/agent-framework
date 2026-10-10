@@ -1,0 +1,1004 @@
+/**
+ * Receipt clocks (src/context-receipts): the ledger's semantics, round-by-round
+ * confirmation, and version identity, without a framework around them.
+ */
+import { describe, it, beforeEach, afterEach } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { JsStore } from '@animalabs/chronicle';
+import { ContextManager, PassthroughStrategy, type CompileProvenance } from '@animalabs/context-manager';
+import type { ContentBlock, Membrane } from '@animalabs/membrane';
+import { Agent } from '../src/agent.js';
+import {
+  ChannelClockLedger,
+  CLOCK_RECORD,
+  ContextReceipts,
+  channelKey,
+  requestEvidence,
+  injectedEvidence,
+  versionOf,
+  recordedBodyDigest,
+  sourceBodyDigest,
+  copyFidelity,
+  type BodyEvidence,
+  type RequestEvidence,
+  type RoundReport,
+} from '../src/context-receipts/index.js';
+import type { InboundChannelSource } from '../src/mcpl/inbound-source.js';
+
+const CH = { binding: 'b1', channelId: 'discord:g:room', serverId: 'discord' };
+const CH2 = { binding: 'b1', channelId: 'discord:g:other', serverId: 'discord' };
+const BRANCH = { id: 'br-main', name: 'main' };
+
+function src(messageId: string, acceptedAt: number) {
+  return { messageId, acceptedAt, sourceTimestamp: new Date(acceptedAt).toISOString() };
+}
+const ver = (key: string) => ({ basis: 'event' as const, key });
+
+describe('ChannelClockLedger', () => {
+  let dir: string;
+  let store: JsStore;
+  let clock: number;
+  const now = () => clock;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'clock-ledger-'));
+    store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    clock = 1_000;
+  });
+  afterEach(() => {
+    try { store.close(); } catch { /* already closed */ }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const open = (limits = {}) => {
+    const ledger = new ChannelClockLedger(store, 'store-1', now, limits);
+    ledger.start();
+    return ledger;
+  };
+  const clocks = (l: ChannelClockLedger, agent: string, ch = CH) => l.clocksFor(agent, [ch]).get(channelKey(ch))!;
+
+  it('advances received at acceptance while delivered waits for a round, then delivers once per version', () => {
+    const l = open();
+    l.received(CH, src('m1', 1_100), 'channels/incoming');
+    let c = clocks(l, 'resident');
+    assert.equal(c.lastReceivedAt, 1_100);
+    assert.equal(c.received?.messageId, 'm1');
+    assert.equal(c.lastDeliveredAt, null, 'nothing delivered yet');
+
+    clock = 2_000;
+    assert.equal(l.delivered('resident', CH, src('m1', 1_100), ver('e1'), BRANCH), true);
+    clock = 3_000;
+    assert.equal(l.delivered('resident', CH, src('m1', 1_100), ver('e1'), BRANCH), false, 'a re-presented version never refreshes');
+    c = clocks(l, 'resident');
+    assert.equal(c.lastDeliveredAt, 2_000);
+    assert.equal(c.delivered?.messageId, 'm1');
+    assert.equal(c.delivered?.basis, 'event');
+    assert.deepEqual(c.delivered?.branch, BRANCH);
+    assert.equal(l.scope('resident').degraded, false);
+    assert.deepEqual(l.scope('resident').gaps, []);
+  });
+
+  it('keeps residents and channels apart', () => {
+    const l = open();
+    l.delivered('a', CH, src('m1', 1_100), ver('e1'), BRANCH);
+    assert.equal(clocks(l, 'b').lastDeliveredAt, null);
+    assert.equal(clocks(l, 'a', CH2).lastDeliveredAt, null);
+    assert.equal(l.delivered('b', CH, src('m1', 1_100), ver('e1'), BRANCH), true, 'each resident gets its own first delivery');
+  });
+
+  it('records a partial exposure until the body arrives whole, and never after', () => {
+    const l = open();
+    clock = 1_500;
+    assert.equal(l.partial('r', CH, src('m1', 1_100), ver('e1'), BRANCH, ['content']), true);
+    assert.equal(l.partial('r', CH, src('m1', 1_100), ver('e1'), BRANCH, ['content']), false, 'first partial only');
+    assert.equal(clocks(l, 'r').lastPartialAt, 1_500);
+    assert.deepEqual(clocks(l, 'r').partial?.missing, ['content']);
+    assert.equal(clocks(l, 'r').lastDeliveredAt, null, 'a partial copy never advances delivered');
+    clock = 2_000;
+    assert.equal(l.delivered('r', CH, src('m1', 1_100), ver('e1'), BRANCH), true);
+    assert.equal(l.partial('r', CH, src('m1', 1_100), ver('e1'), BRANCH, ['content']), false);
+  });
+
+  it('survives restart, and reports an unclean previous run as a gap', () => {
+    let l = open();
+    l.received(CH, src('m1', 1_100), 'push/event');
+    l.delivered('r', CH, src('m1', 1_100), ver('e1'), BRANCH);
+    // No stop: the process died.
+    clock = 9_000;
+    l = open();
+    assert.equal(clocks(l, 'r').lastReceivedAt, 1_100);
+    assert.equal(clocks(l, 'r').lastDeliveredAt, 1_000);
+    const scope = l.scope('r');
+    assert.equal(scope.trackingSince, 1_000);
+    assert.equal(scope.gaps.length, 1);
+    assert.equal(scope.gaps[0]!.reason, 'unclean-stop');
+    assert.equal(scope.gaps[0]!.to, 9_000);
+    assert.equal(scope.storeId, 'store-1');
+    assert.equal(l.delivered('r', CH, src('m1', 1_100), ver('e1'), BRANCH), false, 'dedup survives restart');
+
+    l.stop();
+    clock = 10_000;
+    l = open();
+    assert.equal(l.scope('r').gaps.length, 1, 'a clean stop adds no gap');
+  });
+
+  it('opens a coverage gap on a failed write, reports it, and records it at the next write', () => {
+    let failing = false;
+    const flaky = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === 'appendJson' && failing) return () => { throw new Error('disk full'); };
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as JsStore;
+    const l = new ChannelClockLedger(flaky, 'store-1', now);
+    l.start();
+    failing = true;
+    clock = 2_000;
+    l.received(CH, src('m1', 2_000), 'channels/incoming'); // swallowed: delivery must not depend on bookkeeping
+    assert.equal(l.scope('r').degraded, true);
+    assert.match(l.scope('r').gaps.at(-1)!.reason, /ledger-write-failed \(ongoing\)/);
+    failing = false;
+    clock = 3_000;
+    l.received(CH, src('m2', 3_000), 'channels/incoming');
+    const scope = l.scope('r');
+    assert.equal(scope.degraded, false);
+    assert.deepEqual(scope.gaps.at(-1), { from: 2_000, to: 3_000, reason: 'ledger-write-failed' });
+    assert.equal(clocks(l, 'r').received?.messageId, 'm2');
+  });
+
+  it('never records a delivery twice after an append that landed but reported failure', () => {
+    let landThenThrow = false;
+    const flaky = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === 'appendJson') {
+          return (type: string, payload: unknown) => {
+            const written = target.appendJson(type, payload);
+            if (landThenThrow && (payload as { k?: string }).k === 'dlv') {
+              landThenThrow = false;
+              throw new Error('write reported failure after landing');
+            }
+            return written;
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as JsStore;
+    const l = new ChannelClockLedger(flaky, 'store-1', now);
+    l.start();
+    landThenThrow = true;
+    clock = 100;
+    assert.equal(l.delivered('r', CH, src('m1', 50), ver('e1'), BRANCH), false, 'the write reported failure');
+    clock = 200;
+    assert.equal(l.delivered('r', CH, src('m1', 50), ver('e1'), BRANCH), false, 'reconciled: it had landed');
+    const dlv = store.getRecordIdsByType(CLOCK_RECORD)
+      .map((id) => JSON.parse(store.getRecord(id)!.payload.toString('utf8')) as { k: string; at: number })
+      .filter((e) => e.k === 'dlv');
+    assert.deepEqual(dlv.map((e) => e.at), [100]);
+    assert.equal(clocks(l, 'r').lastDeliveredAt, 100);
+  });
+
+  it('writes no stop marker when the outstanding gap cannot be written, so the next start reports it', () => {
+    let failing = false;
+    const flaky = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === 'appendJson' && failing) return () => { throw new Error('disk full'); };
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as JsStore;
+    const l = new ChannelClockLedger(flaky, 'store-1', now);
+    l.start();
+    failing = true;
+    l.received(CH, src('m1', 1_000), 'channels/incoming');
+    l.stop();
+    failing = false;
+    clock = 5_000;
+    const next = open();
+    assert.ok(next.scope('r').gaps.some((g) => g.reason === 'unclean-stop'));
+  });
+
+  it('counts a version when it first arrives, however long ago it was accepted, and only once', () => {
+    let l = open({ checkpointEvery: 3 });
+    // Many newer versions reach the resident first...
+    for (let i = 0; i < 50; i++) l.delivered('r', CH, src(`m${i}`, 10_000 + i), ver(`e${i}`), BRANCH);
+    // ...then a body accepted long before all of them arrives at last: a genuine first delivery.
+    clock = 20_000;
+    assert.equal(l.delivered('r', CH, src('held', 1), ver('held'), BRANCH), true);
+    assert.equal(clocks(l, 'r').delivered?.messageId, 'held');
+    // Exactly once, across checkpoints and a restart.
+    l.stop();
+    l = open({ checkpointEvery: 3 });
+    for (let i = 0; i < 50; i++) assert.equal(l.delivered('r', CH, src(`m${i}`, 10_000 + i), ver(`e${i}`), BRANCH), false);
+    assert.equal(l.delivered('r', CH, src('held', 1), ver('held'), BRANCH), false);
+    assert.equal(l.isDelivered('r', ver('held')), true);
+    // Equal acceptance times are no collision.
+    assert.equal(l.delivered('r', CH, src('twin', 1), ver('twin'), BRANCH), true);
+  });
+
+  it('keeps a delivery across an /undo-style branch rewind (lived time)', () => {
+    const l = open();
+    const before = store.currentBranch();
+    l.delivered('r', CH, src('m1', 1_100), ver('e1'), { id: before.id, name: before.name });
+    // Rewind: a new branch from an earlier point, then switch to it.
+    store.createBranchAt('undo-1', before.name, 0);
+    store.switchBranch('undo-1');
+    const reopened = open();
+    const c = clocks(reopened, 'r');
+    assert.equal(c.delivered?.messageId, 'm1', 'the delivery happened and stays delivered');
+    assert.equal(c.delivered?.branch.name, before.name, 'naming the branch it happened on');
+  });
+
+  it('checkpoints and rebuilds from the checkpoint plus tail', () => {
+    let l = open({ checkpointEvery: 3 });
+    for (let i = 0; i < 7; i++) l.received(CH, src(`m${i}`, 1_000 + i), 'channels/incoming');
+    // Real version keys, as evidence.ts builds them.
+    const real = versionOf(
+      { kind: 'channel', lane: 'channels/incoming', serverId: 'discord', binding: 'b1', channelId: CH.channelId, messageId: 'm6', acceptedAt: 1_006 },
+      [[{ type: 'text', text: 'six' }]], 'store-1', 's6',
+    );
+    l.delivered('r', CH, src('m6', 1_006), real, BRANCH);
+    assert.equal(l.scope('r').degraded, false, 'every write landed');
+    l.stop();
+    assert.ok(store.getRecordIdsByType(`${CLOCK_RECORD}/checkpoint`).length >= 3, 'checkpoints were written');
+    l = open({ checkpointEvery: 3 });
+    assert.equal(l.scope('r').degraded, false);
+    assert.deepEqual(l.scope('r').gaps, []);
+    assert.equal(clocks(l, 'r').received?.messageId, 'm6');
+    assert.equal(l.delivered('r', CH, src('m6', 1_006), real, BRANCH), false);
+  });
+
+  /**
+   * The store with faults switched on by the test: reads that fail, one
+   * record read back damaged (a well-formed entry missing its fields), and
+   * an append that lands but reports failure (then `afterLanding` runs).
+   */
+  const faulty = () => {
+    const faults = {
+      failReads: false,
+      damaged: null as string | null,
+      landThenThrow: null as string | null,
+      afterLanding: null as (() => void) | null,
+    };
+    const view = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === 'getRecordIdsByType' && faults.failReads) return () => { throw new Error('read failed'); };
+        if (prop === 'getRecord') {
+          return (id: string) => {
+            const record = target.getRecord(id);
+            return record && id === faults.damaged ? { ...record, payload: Buffer.from('{"k":"dlv","at":3000}') } : record;
+          };
+        }
+        if (prop === 'appendJson') {
+          return (type: string, payload: unknown) => {
+            const written = target.appendJson(type, payload);
+            if (faults.landThenThrow !== null && (payload as { k?: string }).k === faults.landThenThrow) {
+              faults.landThenThrow = null;
+              faults.afterLanding?.();
+              throw new Error('write reported failure after landing');
+            }
+            return written;
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as JsStore;
+    return { view, faults };
+  };
+  /** Every record the ledger has written, entries and checkpoints. */
+  const recordCount = () => store.getRecordIdsByType(CLOCK_RECORD).length + store.getRecordIdsByType(`${CLOCK_RECORD}/checkpoint`).length;
+  const entries = () => store.getRecordIdsByType(CLOCK_RECORD)
+    .map((id) => JSON.parse(store.getRecord(id)!.payload.toString('utf8')) as { k: string; at: number; from?: number; to?: number; reason?: string });
+
+  it('stops nothing when its journal cannot be read at start, and resumes from the whole journal with the unread interval as a gap', () => {
+    let l = open();
+    l.received(CH, src('m1', 1_100), 'channels/incoming');
+    clock = 2_000;
+    l.delivered('r', CH, src('m1', 1_100), ver('e1'), BRANCH);
+    clock = 3_000;
+    l.stop();
+
+    const { view, faults } = faulty();
+    faults.failReads = true;
+    clock = 5_000;
+    l = new ChannelClockLedger(view, 'store-1', now);
+    l.start(); // returns: the host opens
+    const before = recordCount();
+    assert.deepEqual(l.scope('r').gaps, [{ from: 5_000, to: 5_000, reason: 'ledger-unreadable (ongoing)' }]);
+    assert.equal(l.scope('r').degraded, true);
+    assert.equal(l.clocksFor('r', [CH]).size, 0, 'no clocks: an unread journal is not an empty one');
+    l.received(CH, src('m2', 5_100), 'channels/incoming');
+    assert.equal(l.delivered('r', CH, src('m2', 5_100), ver('e2'), BRANCH), false);
+    faults.failReads = false;
+    clock = 20_000;
+    assert.equal(l.delivered('r', CH, src('m2', 5_100), ver('e2'), BRANCH), false, 'the next read waits until it is due');
+    assert.equal(recordCount(), before, 'nothing appended or checkpointed while unread');
+
+    clock = 35_000;
+    l.received(CH, src('m3', 35_000), 'channels/incoming'); // the due read succeeds
+    const scope = l.scope('r');
+    assert.equal(scope.degraded, false);
+    assert.equal(scope.trackingSince, 1_000, 'coverage read back');
+    assert.deepEqual(scope.gaps, [{ from: 5_000, to: 35_000, reason: 'ledger-unreadable' }]);
+    assert.equal(l.delivered('r', CH, src('m1', 1_100), ver('e1'), BRANCH), false, 'dedup read back');
+    assert.equal(clocks(l, 'r').lastDeliveredAt, 2_000);
+    assert.equal(clocks(l, 'r').received?.messageId, 'm3');
+    assert.equal(l.delivered('r', CH, src('m2', 5_100), ver('e2'), BRANCH), true, 'a version unconfirmed while unread counts when it next arrives');
+    assert.deepEqual(entries().filter((e) => e.at >= 5_000).map((e) => e.k), ['gap', 'start', 'recv', 'dlv'], 'the gap, then the run\'s start before its entries');
+
+    l.stop();
+    clock = 40_000;
+    l = open();
+    assert.deepEqual(l.scope('r').gaps, [{ from: 5_000, to: 35_000, reason: 'ledger-unreadable' }], 'stopped cleanly after recovering: no unclean gap');
+  });
+
+  it('keeps what memory held when a read fails part-way, and writes nothing until a whole read succeeds', () => {
+    const { view, faults } = faulty();
+    const l = new ChannelClockLedger(view, 'store-1', now);
+    l.start();
+    clock = 2_000;
+    l.delivered('r', CH, src('m1', 1_100), ver('e1'), BRANCH);
+    const delivery = store.getRecordIdsByType(CLOCK_RECORD).at(-1)!;
+    // An append lands but reports failure, so the next write reads the journal first...
+    faults.landThenThrow = 'recv';
+    clock = 3_000;
+    l.received(CH, src('m2', 3_000), 'channels/incoming');
+    // ...and that read meets a damaged entry after reducing the one before it.
+    faults.damaged = delivery;
+    const before = recordCount();
+    clock = 4_000;
+    assert.equal(l.delivered('r', CH, src('m3', 4_000), ver('e3'), BRANCH), false);
+    assert.equal(recordCount(), before, 'no append, and no checkpoint over entries never reduced');
+    assert.equal(clocks(l, 'r').lastDeliveredAt, 2_000, 'memory as it was, not a partial reduction');
+    assert.equal(l.isDelivered('r', ver('e1')), true, 'dedup as it was');
+    assert.equal(clocks(l, 'r').received, undefined);
+    assert.equal(l.scope('r').degraded, true);
+
+    faults.damaged = null;
+    clock = 34_000;
+    assert.equal(l.delivered('r', CH, src('m3', 4_000), ver('e3'), BRANCH), true, 'a whole read, then the write');
+    assert.equal(clocks(l, 'r').received?.messageId, 'm2', 'the entry that landed was read back');
+    assert.equal(l.delivered('r', CH, src('m1', 1_100), ver('e1'), BRANCH), false);
+    assert.equal(l.scope('r').degraded, false);
+    assert.deepEqual(l.scope('r').gaps, [{ from: 3_000, to: 34_000, reason: 'ledger-write-failed' }]);
+  });
+
+  it('recovers through a gap write that lands but reports failure: the gap once, the start before the run\'s entries', () => {
+    let l = open();
+    clock = 2_000;
+    l.stop();
+    const { view, faults } = faulty();
+    faults.failReads = true;
+    clock = 5_000;
+    l = new ChannelClockLedger(view, 'store-1', now);
+    l.start();
+    faults.failReads = false;
+    faults.landThenThrow = 'gap';
+    clock = 35_000;
+    l.received(CH, src('m1', 35_000), 'channels/incoming'); // recovers; the gap's write lands but reports failure
+    clock = 36_000;
+    l.received(CH, src('m2', 36_000), 'channels/incoming');
+    assert.deepEqual(
+      entries().filter((e) => e.at >= 5_000).map((e) => e.k === 'gap' ? `gap ${e.from}-${e.to} ${e.reason}` : `${e.k} ${e.at}`),
+      ['gap 5000-35000 ledger-unreadable', 'start 35000', 'recv 35000', 'recv 36000'],
+    );
+    assert.equal(l.scope('r').degraded, false);
+    l.stop();
+    clock = 40_000;
+    l = open();
+    assert.deepEqual(l.scope('r').gaps, [{ from: 5_000, to: 35_000, reason: 'ledger-unreadable' }]);
+  });
+
+  it('stays unreadable when the read that recovery\'s own writes call for fails, and writes nothing more until a later read succeeds (Hazel #50598)', () => {
+    let l = open();
+    clock = 2_000;
+    l.delivered('r', CH, src('old', 1_000), ver('old'), BRANCH);
+    const delivery = store.getRecordIdsByType(CLOCK_RECORD).at(-1)!;
+    // No stop: the run ended uncleanly. The next run can't read the journal at start.
+    const { view, faults } = faulty();
+    faults.failReads = true;
+    clock = 5_000;
+    l = new ChannelClockLedger(view, 'store-1', now);
+    l.start();
+    // At the first read that succeeds, the unclean-stop gap's write lands but
+    // reports failure, and the read that reconciles it meets a damaged entry.
+    faults.failReads = false;
+    faults.landThenThrow = 'gap';
+    faults.afterLanding = () => { faults.damaged = delivery; };
+    const after5s = () => entries().filter((e) => e.at >= 5_000).map((e) => e.k === 'gap' ? `gap ${e.from}-${e.to} ${e.reason}` : `${e.k} ${e.at}`);
+    clock = 35_000;
+    l.received(CH, src('new', 35_000), 'channels/incoming');
+    assert.deepEqual(after5s(), ['gap 2000-5000 unclean-stop'], 'only the write that landed; nothing after the failed read');
+    let scope = l.scope('r');
+    assert.equal(scope.degraded, true, 'still unreadable');
+    assert.equal(scope.gaps.at(-1)!.reason, 'ledger-unreadable (ongoing)');
+
+    faults.damaged = null;
+    clock = 65_000;
+    l.received(CH, src('later', 65_000), 'channels/incoming');
+    scope = l.scope('r');
+    assert.equal(scope.degraded, false);
+    assert.deepEqual(after5s(), ['gap 2000-5000 unclean-stop', 'gap 2000-65000 ledger-unreadable', 'start 65000', 'recv 65000']);
+    assert.equal(l.delivered('r', CH, src('old', 1_000), ver('old'), BRANCH), false, 'dedup read back');
+  });
+
+  it('treats a checkpoint this version does not write as unreadable, not as an empty start', () => {
+    let l = open();
+    clock = 2_000;
+    l.delivered('r', CH, src('m1', 1_000), ver('e1'), BRANCH);
+    l.stop();
+    // Another version's checkpoint covering every entry, as a downgrade would find it.
+    store.appendJson(`${CLOCK_RECORD}/checkpoint`, { through: store.getRecordIdsByType(CLOCK_RECORD).at(-1)!, snapshot: { v: 3 } });
+    const before = recordCount();
+    clock = 5_000;
+    l = open();
+    l.received(CH, src('m2', 5_000), 'channels/incoming');
+    assert.equal(l.delivered('r', CH, src('m1', 1_000), ver('e1'), BRANCH), false, 'not a first delivery of a forgotten version');
+    assert.equal(recordCount(), before, 'nothing written over it');
+    assert.equal(l.clocksFor('r', [CH]).size, 0);
+    assert.equal(l.scope('r').degraded, true);
+  });
+
+  it('treats a checkpoint whose dedup sets are missing or cut short as unreadable, never as forgetting (Hazel #50719)', () => {
+    let l = open();
+    clock = 2_000;
+    l.delivered('r', CH, src('m1', 1_000), ver('e1'), BRANCH);
+    l.stop();
+    const checkpoints = `${CLOCK_RECORD}/checkpoint`;
+    const real = JSON.parse(store.getRecord(store.getRecordIdsByType(checkpoints).at(-1)!)!.payload.toString('utf8')) as {
+      through: string; snapshot: { seen: Record<string, { delivered: string; partial: string }> };
+    };
+    assert.equal(Buffer.from(real.snapshot.seen.r!.delivered, 'base64').length, 32, 'the real checkpoint remembers e1');
+    const withoutSets = structuredClone(real) as { snapshot: Record<string, unknown> };
+    delete withoutSets.snapshot.seen;
+    const cutShort = structuredClone(real);
+    cutShort.snapshot.seen.r!.delivered = real.snapshot.seen.r!.delivered.slice(0, -4);
+    for (const [damage, checkpoint] of [['sets missing', withoutSets], ['a set cut short', cutShort]] as const) {
+      store.appendJson(checkpoints, checkpoint);
+      const before = recordCount();
+      clock += 1_000;
+      l = open();
+      assert.equal(l.delivered('r', CH, src('m1', 1_000), ver('e1'), BRANCH), false, `${damage}: e1 is not delivered again`);
+      assert.equal(recordCount(), before, `${damage}: nothing written over it`);
+      assert.equal(l.scope('r').degraded, true, damage);
+      l.stop();
+    }
+  });
+});
+
+describe('ContextReceipts', () => {
+  let dir: string;
+  let store: JsStore;
+  let ledger: ChannelClockLedger;
+  let accepted: Array<{ agent: string; usage: RoundReport['usage']; presentation: string }>;
+  let acceptFailures = 0;
+  let receipts: ContextReceipts;
+
+  const body = (index: number, id: string, extra: Partial<BodyEvidence> = {}): BodyEvidence => ({
+    index,
+    storeMessageId: `s-${id}`,
+    complete: true,
+    ch: CH,
+    src: src(id, 1_000 + index),
+    ver: ver(id),
+    ...extra,
+  });
+  const evidence = (bodies: BodyEvidence[]): RequestEvidence => ({
+    agent: 'r',
+    storeId: 'store-1',
+    provenance: { compileId: 'c1', namespace: 'agents/r', branch: { id: 'br', name: 'main', created: 1 }, messages: [], layout: null, strategy: 'passthrough' } as CompileProvenance,
+    bodies,
+    preparationAltered: false,
+  });
+  const round = (extra: Partial<RoundReport> = {}): RoundReport => ({
+    index: 0,
+    stopReason: 'end_turn',
+    usage: { inputTokens: 10, outputTokens: 1 },
+    altered: { messages: [], injected: [] },
+    fidelity: 'established',
+    ...extra,
+  });
+  const delivered = (id: string) => {
+    const c = ledger.clocksFor('r', [CH]).get(channelKey(CH))!;
+    return c.delivered?.messageId === id;
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'context-receipts-'));
+    store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    ledger = new ChannelClockLedger(store, 'store-1');
+    ledger.start();
+    accepted = [];
+    acceptFailures = 0;
+    receipts = new ContextReceipts(ledger, {
+      acceptRound: (agent, _p, usage, _at, presentation) => {
+        if (acceptFailures > 0) {
+          acceptFailures--;
+          throw new Error('journal write failed');
+        }
+        accepted.push({ agent, usage, presentation });
+      },
+    });
+  });
+  afterEach(() => {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('confirms complete bodies at a round that stood, and accepts the compile once', () => {
+    receipts.beginStream('r', 1, evidence([body(0, 'm1'), body(1, 'm2')]));
+    receipts.usage('r', 1, round());
+    assert.ok(delivered('m2'));
+    assert.equal(ledger.scope('r').degraded, false);
+    receipts.usage('r', 1, round({ index: 1 }));
+    assert.equal(accepted.length, 1);
+    assert.deepEqual(accepted[0]!.usage, { inputTokens: 10, outputTokens: 1 });
+    assert.equal(accepted[0]!.presentation, 'verbatim');
+  });
+
+  it('retries a failed acceptance at the next round, and records how the round presented the compile', () => {
+    acceptFailures = 1;
+    receipts.beginStream('r', 1, evidence([body(0, 'm1')]));
+    receipts.usage('r', 1, round());
+    assert.equal(accepted.length, 0, 'the first attempt failed');
+    receipts.usage('r', 1, round({ index: 1, altered: { messages: [0], injected: [] } }));
+    assert.deepEqual(accepted.map((a) => a.presentation), ['altered']);
+    receipts.beginStream('r', 2, evidence([body(0, 'm2')]));
+    receipts.usage('r', 2, round({ fidelity: 'unknown' }));
+    assert.deepEqual(accepted.map((a) => a.presentation), ['altered', 'unknown']);
+  });
+
+  it('delivers a version when any one copy arrived whole, even if another copy was partial', () => {
+    receipts.beginStream('r', 1, evidence([
+      body(0, 'old-copy', { storeMessageId: 's-old', ver: ver('v'), src: src('m1', 1_000), complete: false, missing: ['content'] }),
+      body(1, 'fresh-copy', { storeMessageId: 's-fresh', ver: ver('v'), src: src('m1', 1_000) }),
+    ]));
+    receipts.usage('r', 1, round());
+    const c = ledger.clocksFor('r', [CH]).get(channelKey(CH))!;
+    assert.ok(c.lastDeliveredAt, 'the complete copy establishes delivery');
+    assert.equal(c.lastPartialAt, null);
+  });
+
+  it('delivers a body only when every fragment carrying it arrived whole', () => {
+    // One version compiled into two request messages (a split message); the
+    // producer altered the second fragment.
+    receipts.beginStream('r', 1, evidence([body(0, 'm1'), body(1, 'm1-part2', { storeMessageId: 's-m1', ver: ver('m1'), src: src('m1', 1_000) })]));
+    receipts.usage('r', 1, round({ altered: { messages: [1], injected: [] } }));
+    const c = ledger.clocksFor('r', [CH]).get(channelKey(CH))!;
+    assert.equal(c.lastDeliveredAt, null, 'not delivered: one fragment was altered');
+    assert.ok(c.partial?.missing.includes('wire-alteration'));
+  });
+
+  it('confirms nothing for a refused round, a stream that never reports, or unknown fidelity', () => {
+    receipts.beginStream('r', 1, evidence([body(0, 'm1')]));
+    receipts.usage('r', 1, round({ stopReason: 'refusal' }));
+    assert.ok(!delivered('m1'));
+    assert.equal(accepted.length, 0, 'a refusal accepts nothing');
+    receipts.usage('r', 1, round({ fidelity: 'unknown' }));
+    assert.ok(!delivered('m1'), 'unknown fidelity is neither delivered nor partial');
+    assert.equal(ledger.clocksFor('r', [CH]).get(channelKey(CH))!.lastPartialAt, null);
+    receipts.usage('r', 1, round({ index: 2 }));
+    assert.ok(delivered('m1'), 'still eligible at a later round');
+  });
+
+  it('treats a body membrane altered as partial, and a partial compile copy as partial', () => {
+    receipts.beginStream('r', 1, evidence([body(0, 'm1'), body(1, 'm2', { complete: false, missing: ['content'] })]));
+    receipts.usage('r', 1, round({ altered: { messages: [0], injected: [] } }));
+    const c = ledger.clocksFor('r', [CH]).get(channelKey(CH))!;
+    assert.equal(c.lastDeliveredAt, null);
+    assert.ok(c.partial?.missing.includes('content') || c.partial?.missing.includes('wire-alteration'));
+  });
+
+  it('keeps the whole batch\'s coordinates when some injected messages are not bodies', () => {
+    receipts.beginStream('r', 1, evidence([]));
+    // Index 0 is a routing notice (no evidence); index 1 is the channel body.
+    receipts.injectedBatch('r', 1, 2, [body(1, 'i1')]);
+    receipts.usage('r', 1, round({ injectedBatch: { batch: 0, applied: 2 } }));
+    assert.ok(delivered('i1'));
+  });
+
+  it('delivers injected bodies only once a round carried them', () => {
+    receipts.beginStream('r', 1, evidence([]));
+    const batch = receipts.injectedBatch('r', 1, 2, [body(0, 'i0'), body(1, 'i1')]);
+    assert.equal(batch, 0);
+    receipts.usage('r', 1, round({ injectedBatch: { batch: 0, applied: 1 } }));
+    assert.ok(delivered('i0'));
+    receipts.usage('r', 1, round({ index: 1, injectedBatch: { batch: 0, applied: 2 } }));
+    assert.ok(delivered('i1'));
+  });
+
+  it('records a replayed copy of an already-delivered version once', () => {
+    receipts.beginStream('r', 1, evidence([body(0, 'm1'), body(1, 'm1-replay', { ver: ver('m1'), src: src('m1', 1_000) })]));
+    receipts.usage('r', 1, round());
+    const dlv = store.getRecordIdsByType(CLOCK_RECORD)
+      .map((id) => JSON.parse(store.getRecord(id)!.payload.toString('utf8')) as { k: string })
+      .filter((e) => e.k === 'dlv');
+    assert.equal(dlv.length, 1);
+  });
+
+  it('counts the rounds that could not establish fidelity, refusals aside, so a path that never confirms is visible', () => {
+    assert.equal(receipts.roundFidelity('r'), undefined, 'nothing counted before a round reports');
+    receipts.beginStream('r', 1, evidence([body(0, 'm1')]));
+    receipts.usage('r', 1, round({ fidelity: 'unknown' }));
+    receipts.usage('r', 1, round({ index: 1, stopReason: 'refusal', fidelity: 'unknown' }));
+    receipts.usage('r', 1, round({ index: 2, fidelity: 'unknown' }));
+    assert.ok(!delivered('m1'), 'unknown rounds confirm nothing');
+    assert.deepEqual(
+      { reported: receipts.roundFidelity('r')!.reported, unestablished: receipts.roundFidelity('r')!.unestablished },
+      { reported: 2, unestablished: 2 },
+    );
+    receipts.usage('r', 1, round({ index: 3 }));
+    assert.ok(delivered('m1'));
+    const counted = receipts.roundFidelity('r')!;
+    assert.equal(counted.reported, 3);
+    assert.equal(counted.unestablished, 2);
+    assert.ok(counted.since > 0);
+    assert.equal(receipts.roundFidelity('someone-else'), undefined);
+  });
+
+  it('notices a membrane that does not report rounds', () => {
+    receipts.beginStream('r', 1, evidence([body(0, 'm1')]));
+    receipts.usage('r', 1, undefined);
+    assert.equal(receipts.roundReportsMissing, true);
+    assert.ok(!delivered('m1'));
+  });
+});
+
+/** The producer's stamps for a body stored exactly as `blocks` (no header). */
+const stamp = (blocks: unknown[]) => ({ sourceBodyDigest: sourceBodyDigest(blocks as never), storedBodyDigest: sourceBodyDigest(blocks as never) });
+
+describe('receipt evidence', () => {
+  const base: InboundChannelSource = {
+    kind: 'channel', lane: 'channels/incoming', serverId: 'discord', binding: 'b1', channelId: 'discord:g:room', acceptedAt: 5,
+  };
+
+  it('chooses the version basis the lane guarantees', () => {
+    const text = [[{ type: 'text' as const, text: 'hi' }]];
+    assert.equal(versionOf({ ...base, lane: 'push/event', eventId: 'e1' }, text, 's', 'm').basis, 'event');
+    assert.equal(versionOf({ ...base, coalesced: true, eventId: 'e1' }, text, 's', 'm').basis, 'event');
+    const a = versionOf({ ...base, eventId: 'adapter', messageId: 'p1' }, text, 's', 'm');
+    assert.equal(a.basis, 'message-digest', 'an unguaranteed eventId is not a version key');
+    const edited = versionOf({ ...base, messageId: 'p1' }, [[{ type: 'text', text: 'hi!' }]], 's', 'm');
+    assert.notEqual(a.key, edited.key, 'an edited body is a new version');
+    const reordered = versionOf({ ...base, eventId: 'adapter', messageId: 'p1' }, [[{ text: 'hi', type: 'text' } as never]], 's', 'm');
+    assert.equal(a.key, reordered.key, 'key order (as the store reads content back) does not change the version');
+    assert.equal(versionOf(base, text, 's', 'm').basis, 'stored-copy');
+  });
+
+  it('keeps one source-body version through decoration and sharding, while the copy is what ingestion stored', () => {
+    const src = { ...base, messageId: 'p1' };
+    const body = { type: 'text' as const, text: 'unchanged body' };
+    const header = (label: string) => ({ type: 'text' as const, text: `[source: discord / discord:g:room · ${label}]` });
+    const stamped = (stored: ContentBlock[]) => ({ sharded: false, sourceDigest: sourceBodyDigest([body]), storedDigest: sourceBodyDigest(stored) });
+    // A rename between two acceptances changes the stored header, not the version.
+    const oldCopy = [header('Old room'), body];
+    const newCopy = [header('New room'), body];
+    const before = versionOf(src, [oldCopy], 's', 'copy-1', stamped(oldCopy));
+    const after = versionOf(src, [newCopy], 's', 'copy-2', stamped(newCopy));
+    assert.equal(before.basis, 'message-digest');
+    assert.equal(before.key, after.key);
+    // A stamped copy matches an undecorated, unsharded copy stored before the record.
+    assert.equal(before.key, versionOf(src, [[body]], 's', 'legacy').key);
+    // An edit after ingestion keeps the copy's identity (it is still a copy of
+    // that item); copyFidelity, which confirmed delivery requires, says it no
+    // longer presents the body.
+    const editedBlocks = [header('Old room'), { type: 'text' as const, text: 'edited body' }];
+    assert.equal(versionOf(src, [editedBlocks], 's', 'copy-1', stamped(oldCopy)).key, before.key);
+    assert.equal(copyFidelity([editedBlocks], stamped(oldCopy)), 'edited');
+    assert.equal(copyFidelity([oldCopy], stamped(oldCopy)), 'intact');
+    assert.equal(copyFidelity([oldCopy], { sharded: false, sourceDigest: 'x' }), 'unverifiable', 'a stamp without its stored digest cannot vouch');
+    assert.equal(copyFidelity([[body]], { sharded: false }), 'unverifiable', 'stored before stamping: hashable, but not shown unedited');
+    assert.equal(copyFidelity([[header('Old room')], [body]], { sharded: true, shardCount: 2 }), 'intact', 'a declared group: shards cannot be edited, and CM checks every declared shard');
+    assert.equal(copyFidelity([[header('Old room')], [body]], { sharded: true }), 'unverifiable', 'an undeclared group may have been written short');
+    // Shards can't be edited, so a stamped sharded copy keeps its version.
+    const shardedStamped = versionOf(src, [[header('Old room')], [body]], 's', 'head', { sharded: true, sourceDigest: sourceBodyDigest([body]) });
+    assert.equal(shardedStamped.key, before.key);
+    // Unstamped and sharded, by the copy's own sharding facts, even when only
+    // one shard is at hand: the source digest can't be recovered.
+    assert.equal(versionOf(src, [[header('Old room'), body]], 's', 'head', { sharded: true }).basis, 'stored-copy');
+    assert.equal(recordedBodyDigest({ sourceBodyDigest: 'abc' }), 'abc');
+    assert.equal(recordedBodyDigest({ sourceBodyDigest: '' }), undefined);
+    assert.equal(recordedBodyDigest(undefined), undefined);
+  });
+
+  it('a legacy sharded head with one shard available is a stored copy (Hugo #47005 control)', () => {
+    const source = { ...base, messageId: 'p8' };
+    const head = { id: 'h8', sequence: 8, participant: 'u', content: [{ type: 'text', text: 'first half' }], metadata: { inboundSource: source }, bodyGroupId: 'g8', shardIndex: 0 };
+    const ev = requestEvidence({
+      agent: 'r', storeId: 'store',
+      provenance: { messages: [{ kind: 'raw', bodies: [{ messageId: 'h8', sequence: 8, complete: false, missing: ['shards'] }] }] } as unknown as CompileProvenance,
+      requestIndexOf: [0],
+      getMessage: (id) => (id === 'h8' ? head as never : null),
+    });
+    assert.equal(ev.bodies[0]!.ver.basis, 'stored-copy');
+    assert.equal(ev.bodies[0]!.complete, false);
+  });
+
+  it('injected and compiled copies share the recorded version', () => {
+    const source = { ...base, messageId: 'p9' };
+    const metadata = { inboundSource: source, sourceBodyDigest: 'recorded' };
+    const head = { id: 's9', sequence: 9, participant: 'u', content: [{ type: 'text', text: '[source: x]' }], metadata, bodyGroupId: 'g', shardIndex: 0 };
+    const injected = injectedEvidence(0, 's9', { content: [{ type: 'text', text: '[source: x]' }, { type: 'text', text: 'body' }], metadata }, 'store', head)!;
+    const tail = { id: 's10', sequence: 10, participant: 'u', content: [{ type: 'text', text: 'body' }], metadata, bodyGroupId: 'g', shardIndex: 1 };
+    const compiled = requestEvidence({
+      agent: 'r', storeId: 'store',
+      provenance: { messages: [{ kind: 'raw', bodies: [{ messageId: 's9', sequence: 9, complete: true }] }] } as unknown as CompileProvenance,
+      requestIndexOf: [0],
+      getMessage: (id) => ([head, tail].find((m) => m.id === id) as never) ?? null,
+    });
+    assert.equal(compiled.bodies[0]!.ver.key, injected.ver.key);
+  });
+
+  it('marks a copy incomplete when preparation dropped one of its fragments', () => {
+    const stored = new Map([
+      ['s1', { id: 's1', sequence: 1, participant: 'u', content: [{ type: 'text', text: 'a' }], metadata: { inboundSource: { ...base, messageId: 'p1' }, ...stamp([{ type: 'text', text: 'a' }]) } }],
+    ]);
+    const provenance = {
+      messages: [
+        { kind: 'raw', bodies: [{ messageId: 's1', sequence: 1, complete: true }] },
+        { kind: 'raw', bodies: [{ messageId: 's1', sequence: 1, complete: true }] },
+      ],
+    } as unknown as CompileProvenance;
+    const ev = requestEvidence({
+      agent: 'r', storeId: 'store-1', provenance,
+      requestIndexOf: [-1, 0],
+      getMessage: (id) => (stored.get(id) as never) ?? null,
+    });
+    assert.deepEqual(ev.bodies.map((b) => [b.index, b.complete, b.missing]), [[0, false, ['preparation']]]);
+    const whollyDropped = requestEvidence({
+      agent: 'r', storeId: 'store-1', provenance,
+      requestIndexOf: [-1, -1],
+      getMessage: (id) => (stored.get(id) as never) ?? null,
+    });
+    assert.equal(whollyDropped.bodies.length, 0, 'a copy dropped entirely is no exposure');
+  });
+
+  it('maps compiled bodies to request indices, keeping only channel bodies', () => {
+    const stored = new Map([
+      ['s1', { id: 's1', sequence: 1, participant: 'u', content: [{ type: 'text', text: 'a' }], metadata: { inboundSource: { ...base, messageId: 'p1' }, ...stamp([{ type: 'text', text: 'a' }]) } }],
+      ['s2', { id: 's2', sequence: 2, participant: 'u', content: [{ type: 'text', text: 'b' }], metadata: {} }],
+      ['s3', { id: 's3', sequence: 3, participant: 'u', content: [{ type: 'text', text: 'x' }], metadata: { tags: ['chat:deleted'], inboundSource: { ...base, messageId: 'p3' } } }],
+    ]);
+    const provenance = {
+      messages: [
+        { kind: 'raw', bodies: [{ messageId: 's1', sequence: 1, complete: true }] },
+        { kind: 'raw', bodies: [{ messageId: 's2', sequence: 2, complete: true }] },
+        { kind: 'raw', bodies: [{ messageId: 's3', sequence: 3, complete: true }] },
+        { kind: 'raw', bodies: [{ messageId: 's4', sequence: 4, complete: true }] },
+      ],
+    } as unknown as CompileProvenance;
+    const ev = requestEvidence({
+      agent: 'r', storeId: 'store-1', provenance,
+      requestIndexOf: [0, 1, 2, -1],
+      getMessage: (id) => (stored.get(id) as never) ?? null,
+    });
+    assert.deepEqual(ev.bodies.map((b) => [b.index, b.storeMessageId, b.complete]), [[0, 's1', true]]);
+    assert.ok(Object.isFrozen(ev) && Object.isFrozen(ev.bodies));
+    assert.equal(injectedEvidence(0, 'x', { content: [], metadata: { inboundSource: { ...base, deferred: true } } }, 's'), null, 'a deferred notice is not a body');
+  });
+});
+
+describe('request-owned evidence', () => {
+  for (const lane of ['channels/incoming', 'push/event'] as const) {
+    it(`an inbound body edited before preparation is a partial exposure, not a delivery (${lane})`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'evidence-edit-'));
+      try {
+        const cm = await ContextManager.open({ path: join(dir, 'store'), strategy: new PassthroughStrategy(), namespace: 'agents/r' });
+        const source = {
+          kind: 'channel', lane, serverId: 'discord', binding: 'b1', channelId: 'discord:g:room', acceptedAt: 5,
+          ...(lane === 'push/event' ? { eventId: 'ev-7' } : { messageId: 'p7' }),
+        };
+        const header = { type: 'text' as const, text: '[source: discord / discord:g:room · #room]' };
+        const body = { type: 'text' as const, text: 'ORIGINAL text' };
+        const stored = [header, body];
+        const id = cm.addMessage('someone', stored, {
+          inboundSource: source, sourceBodyDigest: sourceBodyDigest([body]), storedBodyDigest: sourceBodyDigest(stored),
+        } as never);
+        cm.editMessage(id, [header, { type: 'text', text: 'EDITED text' }]);
+        const agent = new Agent({ name: 'r', model: 'test', systemPrompt: 's' }, cm, {} as Membrane);
+        const { request, evidence } = await agent.prepareActivationRequest([]);
+        assert.ok(JSON.stringify(request.messages).includes('EDITED text'));
+        assert.equal(evidence.bodies[0]!.complete, false);
+        assert.deepEqual(evidence.bodies[0]!.missing, ['edited']);
+        assert.equal(evidence.bodies[0]!.ver.basis, lane === 'push/event' ? 'event' : 'message-digest');
+
+        const ledger = new ChannelClockLedger(cm.getStore(), cm.getStoreId());
+        ledger.start();
+        const receipts = new ContextReceipts(ledger, { acceptRound: () => {} });
+        receipts.beginStream('r', 1, evidence);
+        receipts.usage('r', 1, { index: 0, stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, altered: { messages: [], injected: [] }, fidelity: 'established' });
+        const clocks = ledger.clocksFor('r', [{ binding: 'b1', channelId: 'discord:g:room' }]).get(channelKey({ binding: 'b1', channelId: 'discord:g:room' }))!;
+        assert.equal(clocks.lastDeliveredAt, null, 'the original body was never shown');
+        assert.ok(clocks.partial?.missing.includes('edited'));
+        ledger.stop();
+        cm.close();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it('composes request preparation\'s own changes: a compile it altered is never presented verbatim', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'evidence-prep-'));
+    try {
+      const cm = await ContextManager.open({ path: join(dir, 'store'), strategy: new PassthroughStrategy(), namespace: 'agents/r' });
+      const source = {
+        kind: 'channel', lane: 'push/event', serverId: 'discord', binding: 'b1',
+        channelId: 'discord:g:room', eventId: 'ev-1', messageId: 'p1', acceptedAt: 5,
+      };
+      cm.addMessage('someone', [{ type: 'text', text: '   ' }]); // whitespace only: preparation drops it
+      const content = [{ type: 'text' as const, text: '  ' }, { type: 'text' as const, text: 'hello' }];
+      cm.addMessage('someone', content, { inboundSource: source, ...stamp(content) } as never);
+      const agent = new Agent({ name: 'r', model: 'test', systemPrompt: 's' }, cm, {} as Membrane);
+      const { request, evidence } = await agent.prepareActivationRequest([]);
+      assert.equal(request.messages.length, 1);
+      assert.equal(evidence.preparationAltered, true);
+      assert.equal(evidence.bodies[0]!.complete, false, 'its whitespace block was not carried');
+      assert.deepEqual(evidence.bodies[0]!.missing, ['preparation']);
+
+      const store = cm.getStore();
+      const ledger = new ChannelClockLedger(store, cm.getStoreId());
+      ledger.start();
+      const presentations: string[] = [];
+      const receipts = new ContextReceipts(ledger, { acceptRound: (_a, _p, _u, _t, presentation) => { presentations.push(presentation); } });
+      receipts.beginStream('r', 1, evidence);
+      receipts.usage('r', 1, { index: 0, stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, altered: { messages: [], injected: [] }, fidelity: 'established' });
+      assert.deepEqual(presentations, ['altered'], 'the producer preserved what it was given, but the compile was already changed');
+      const key = channelKey({ binding: 'b1', channelId: 'discord:g:room' });
+      assert.equal(ledger.clocksFor('r', [{ binding: 'b1', channelId: 'discord:g:room' }]).get(key)!.lastDeliveredAt, null);
+      ledger.stop();
+      cm.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('names a body the reader compiled from an auxiliary slot, and delivers it to that reader only', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'evidence-aux-'));
+    try {
+      const main = await ContextManager.open({ path: join(dir, 'store'), strategy: new PassthroughStrategy() });
+      const reader = await ContextManager.open({
+        store: main.getStore(), namespace: 'subconscious/reader', isolate: true,
+        strategy: new PassthroughStrategy(), auxiliaryMessageViews: [{}],
+      });
+      const source = {
+        kind: 'channel', lane: 'push/event', serverId: 'discord', binding: 'b1',
+        channelId: 'discord:g:room', eventId: 'ev-aux', messageId: 'p-aux', acceptedAt: 7,
+      };
+      const heard = [{ type: 'text' as const, text: 'heard by the reader' }];
+      main.addMessage('alice', heard, { inboundSource: source, ...stamp(heard) } as never);
+      const agent = new Agent({ name: 'reader', model: 'test', systemPrompt: 's' }, reader, {} as Membrane);
+      const { evidence } = await agent.prepareActivationRequest([]);
+      assert.equal(evidence.bodies.length, 1, 'the auxiliary body is in the evidence');
+      assert.equal(evidence.bodies[0]!.ver.basis, 'event');
+
+      const store = main.getStore();
+      const ledger = new ChannelClockLedger(store, reader.getStoreId());
+      ledger.start();
+      const receipts = new ContextReceipts(ledger, { acceptRound: () => {} });
+      receipts.beginStream('reader', 1, evidence);
+      receipts.usage('reader', 1, { index: 0, stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, altered: { messages: [], injected: [] }, fidelity: 'established' });
+      const key = channelKey({ binding: 'b1', channelId: 'discord:g:room' });
+      const ref = [{ binding: 'b1', channelId: 'discord:g:room' }];
+      assert.equal(ledger.clocksFor('reader', ref).get(key)!.delivered?.messageId, 'p-aux');
+      assert.equal(ledger.clocksFor('main', ref).get(key)!.lastDeliveredAt, null, 'not the main resident');
+      ledger.stop();
+      reader.close();
+      main.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('names the body as prepared, even if it is edited before the round is confirmed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'evidence-edit-'));
+    try {
+      const cm = await ContextManager.open({ path: join(dir, 'store'), strategy: new PassthroughStrategy(), namespace: 'agents/r' });
+      const source = {
+        kind: 'channel', lane: 'channels/incoming', serverId: 'discord', binding: 'b1',
+        channelId: 'discord:g:room', messageId: 'p1', acceptedAt: 5,
+      };
+      const words = [{ type: 'text' as const, text: 'original words' }];
+      const id = cm.addMessage('someone', words, { inboundSource: source, ...stamp(words) } as never);
+      const agent = new Agent({ name: 'r', model: 'test', systemPrompt: 's' }, cm, {} as Membrane);
+      const { evidence } = await agent.prepareActivationRequest([]);
+      assert.equal(evidence.bodies.length, 1);
+      const sent = evidence.bodies[0]!;
+      assert.equal(sent.complete, true);
+      cm.editMessage(id, [{ type: 'text', text: 'edited during inference' }]);
+      const asSent = versionOf(source as never, [[{ type: 'text', text: 'original words' }]], cm.getStoreId(), id);
+      const asEdited = versionOf(source as never, [[{ type: 'text', text: 'edited during inference' }]], cm.getStoreId(), id);
+      assert.equal(sent.ver.key, asSent.key);
+      assert.notEqual(sent.ver.key, asEdited.key);
+      cm.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('history--folds folding sentence', () => {
+  it('names a strategy that never folds, never summarizes, or reports no layout', async () => {
+    const { foldingSentence } = await import('../src/modules/history/folds.js');
+    assert.match(foldingSentence('passthrough', ['raw']), /passthrough strategy never folds/);
+    assert.match(foldingSentence('windowed-passthrough', ['raw', 'omitted']), /never summarizes/);
+    assert.match(foldingSentence('custom', null), /does not report its rendered layout/);
+    assert.match(foldingSentence('autobiographical', ['raw', 'summary', 'omitted']), /folds history into summaries/);
+  });
+});
+
+describe('history--folds reads on with afterId', () => {
+  it('passes afterId through, says when there is more and where to continue, and tells an empty page from an empty record', async () => {
+    const { handleFolds } = await import('../src/modules/history/folds.js');
+    const branch = { id: 'b', name: 'main', created: 1 };
+    const receipt = (id: string) => ({
+      v: 1, id, kind: 'change', acceptedAt: '2026-10-09T00:00:00.000Z', strategy: 's', cause: 'unknown',
+      renderedTokens: { before: 1, after: 1 }, presentation: 'unknown', estimate: { calibration: 1 },
+      usage: { input: 'unknown', cacheRead: 'unknown', cacheWrite: 'unknown', scope: 'round' },
+      source: { runtime: 'r', storeId: 'st', agent: 'a', namespace: 'n', dataDirectory: 'd', branch },
+      compileId: `c${id}`, changes: [],
+    });
+    let asked: unknown;
+    const cm = (receipts: unknown[], latestId: string | null, more: boolean) => ({
+      describeRenderedForms: () => ({ strategy: 's', forms: ['raw', 'summary', 'omitted'] }),
+      listFoldReceipts: (query: unknown) => { asked = query; return { branch, receipts, latestId, more }; },
+    }) as never;
+
+    const page = handleFolds(cm([receipt('7'), receipt('9')], '12', true), { afterId: '5', limit: 2 });
+    assert.deepEqual(asked, { afterId: '5', limit: 2 });
+    const data = page.data as { more: boolean; next?: unknown; receipts: Array<{ id: string }> };
+    assert.equal(data.more, true);
+    assert.deepEqual(data.receipts.map((r) => r.id), ['7', '9']);
+    assert.deepEqual(data.next, { afterId: '9', limit: 2 }, 'the next call\'s input');
+
+    const newest = handleFolds(cm([receipt('12'), receipt('11')], '12', true), { limit: 2 }).data as { next?: unknown };
+    assert.deepEqual(newest.next, { afterId: '0', limit: 2 }, 'a newest-first page with more reads on from the start');
+    // Every filter is carried over: since and branch alike.
+    const since = '2026-10-09T00:00:00Z';
+    const filtered = handleFolds(cm([receipt('7')], '12', true), { afterId: '5', since, branch: 'side', limit: 1 }).data as { next?: unknown };
+    assert.deepEqual(filtered.next, { afterId: '7', since, branch: 'side', limit: 1 });
+    const filteredNewest = handleFolds(cm([receipt('12')], '12', true), { since, branch: 'side' }).data as { next?: unknown };
+    assert.deepEqual(filteredNewest.next, { afterId: '0', since, branch: 'side' });
+
+    const caughtUp = handleFolds(cm([], '12', false), { afterId: '12' }).data as { note: string; more: boolean };
+    assert.equal(caughtUp.more, false);
+    assert.match(caughtUp.note, /No receipts match/);
+    const empty = handleFolds(cm([], null, false), {}).data as { note: string };
+    assert.match(empty.note, /No receipts on this branch yet/);
+  });
+});
+
+describe('copies whose fidelity can\'t be checked', () => {
+  it('a body stored before stamping is never confirmed, and on its own records no loss (Hugo #47358)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'evidence-legacy-'));
+    try {
+      const cm = await ContextManager.open({ path: join(dir, 'store'), strategy: new PassthroughStrategy(), namespace: 'agents/r' });
+      const source = {
+        kind: 'channel', lane: 'channels/incoming', serverId: 'discord', binding: 'b1', channelId: 'discord:g:room', messageId: 'p-old', acceptedAt: 5,
+      };
+      cm.addMessage('someone', [{ type: 'text', text: 'stored long ago' }], { inboundSource: source } as never);
+      const agent = new Agent({ name: 'r', model: 'test', systemPrompt: 's' }, cm, {} as Membrane);
+      const { evidence } = await agent.prepareActivationRequest([]);
+      assert.equal(evidence.bodies[0]!.complete, false);
+      assert.deepEqual(evidence.bodies[0]!.missing, ['unverifiable']);
+      assert.equal(evidence.bodies[0]!.ver.basis, 'message-digest', 'its bytes still name a version');
+      const ledger = new ChannelClockLedger(cm.getStore(), cm.getStoreId());
+      ledger.start();
+      const receipts = new ContextReceipts(ledger, { acceptRound: () => {} });
+      receipts.beginStream('r', 1, evidence);
+      receipts.usage('r', 1, { index: 0, stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, altered: { messages: [], injected: [] }, fidelity: 'established' });
+      const clocks = ledger.clocksFor('r', [{ binding: 'b1', channelId: 'discord:g:room' }]).get(channelKey({ binding: 'b1', channelId: 'discord:g:room' }))!;
+      assert.equal(clocks.lastDeliveredAt, null, 'unconfirmed, not delivered');
+      assert.equal(clocks.lastPartialAt, null, 'and no loss is claimed either');
+      ledger.stop();
+      cm.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

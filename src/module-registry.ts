@@ -1,6 +1,7 @@
 import type { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
+  ContextManager,
   MessageId,
   MessageMetadata,
   MessageQuery,
@@ -639,6 +640,10 @@ class ModuleContextImpl implements ModuleContext {
 
   getAgents(): AgentInfo[] {
     return this.getAgentsFn().map((a) => a.info);
+  }
+
+  getAgentContextManager(agentName: string): ContextManager | null {
+    return this.getAgentsFn().find((a) => a.name === agentName)?.getContextManager() ?? null;
   }
 
   getActiveTools(): ToolDefinition[] {
