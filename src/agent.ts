@@ -2,12 +2,25 @@ import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, Yiel
 import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
-import { ToolResultGuard, TOOL_RESULT_GUARD_NOTICE } from './tool-result-guard.js';
+import { ToolResultGuard } from './tool-result-guard.js';
+import {
+  indexSilentTickRows,
+  separateSilentHeartbeatTicks,
+  silentHeartbeatSeparatorTurn,
+  type SilentHeartbeatTick,
+  type SilentTickIndex,
+  type StoredRowLike,
+} from './silent-heartbeat.js';
 import {
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
 } from './tool-result-history.js';
+
+export interface ActivationRequestOptions {
+  /** The silent heartbeat tick this request answers, if any. */
+  silentHeartbeat?: SilentHeartbeatTick;
+}
 
 export interface StartStreamResult {
   stream: YieldingStream;
@@ -22,6 +35,7 @@ import type {
   CompileResult,
   HotContextSettingsStatus,
   HotContextSettingsUpdate,
+  MessageMetadata,
 } from '@animalabs/context-manager';
 import type {
   AgentConfig,
@@ -641,6 +655,8 @@ export class Agent {
     }
 
     this.toolResultGuard.flushUnrecorded();
+    // A withheld stub is compiled only once it says where its original went.
+    await this.toolResultGuard.whenAnnotated();
 
     // Filter tools to only allowed ones
     const tools = availableTools.filter((t) => this.canUseTool(t.name));
@@ -656,28 +672,30 @@ export class Agent {
       this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults);
     }
 
-    // Compile context (with optional injections)
-    const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
+    // Pending tool results the guard isn't holding follow the compiled context.
+    const unguardedResults = this._state.status === 'ready' && !guardedResults
+      ? this.buildToolResultMessages(this._state.toolResults) : [];
 
-    // If we have pending tool results, add them
-    if (this._state.status === 'ready' && !guardedResults) {
-      const toolResultMessages = this.buildToolResultMessages(this._state.toolResults);
-      messages.push(...toolResultMessages);
-    }
-
-    const request: NormalizedRequest = {
-      messages: this.toolResultGuard.prepareRequest(messages, true),
-      system: this.buildSystemPrompt(systemInjections),
-      config: {
-        model: this.model,
-        maxTokens: this.maxTokens,
-        ...(this.temperature !== undefined && { temperature: this.temperature }),
-        ...(this.thinking !== undefined && { thinking: this.thinking }),
-      },
-      tools: tools.length > 0 ? tools : undefined,
-      ...(this.providerParams && { providerParams: this.providerParams }),
-      assistantParticipant: this.name,
+    // Compile the context (with optional injections) into a request. The
+    // guard's refusal retry is assembled the same way, afresh.
+    const assemble = async (): Promise<NormalizedRequest> => {
+      const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
+      messages.push(...unguardedResults);
+      return {
+        messages: this.toolResultGuard.prepareRequest(messages, true),
+        system: this.buildSystemPrompt(systemInjections),
+        config: {
+          model: this.model,
+          maxTokens: this.maxTokens,
+          ...(this.temperature !== undefined && { temperature: this.temperature }),
+          ...(this.thinking !== undefined && { thinking: this.thinking }),
+        },
+        tools: tools.length > 0 ? tools : undefined,
+        ...(this.providerParams && { providerParams: this.providerParams }),
+        assistantParticipant: this.name,
+      };
     };
+    const request = await assemble();
 
     const abortController = new AbortController();
     if (options?.signal) {
@@ -690,7 +708,7 @@ export class Agent {
 
     // Set state to inferring
     this._inferenceStartedAt = Date.now();
-    const inferencePromise = this.doInference(request, abortController.signal);
+    const inferencePromise = this.doInference(request, abortController.signal, assemble);
     this._state = { status: 'inferring', promise: inferencePromise, abortController };
 
     try {
@@ -784,7 +802,8 @@ export class Agent {
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
     budget?: TokenBudget,
-    compressionTools: ToolDefinition[] = availableTools
+    compressionTools: ToolDefinition[] = availableTools,
+    options: ActivationRequestOptions = {},
   ): Promise<NormalizedRequest> {
     // Compression may revisit hidden tools in recorded history. Keep its full
     // definition set separate from the resident's advertised tools: the
@@ -839,10 +858,24 @@ export class Agent {
       }))
       .filter((m) => m.content.length > 0);
 
-    // Safety: ensure messages don't end with an assistant message.
-    // Some models reject trailing assistant messages ("prefill not supported"),
-    // and after context compression a stale assistant turn can end up last.
-    if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
+    // Silent heartbeat ticks store no prompt row. Render a request-only
+    // separator before each tick's first surviving row so the wire formatter
+    // cannot merge the tick into the previous assistant message (see
+    // silent-heartbeat.ts for what can and cannot be matched). This agent's
+    // own first request for a tick ends on that same turn, so the prefix it
+    // caches is the one every later compile renders. "First" is per agent: a
+    // broadcast tick shares its eventId with every resident.
+    const ticks = this.indexSilentHeartbeatTicks();
+    messages = separateSilentHeartbeatTicks(messages, ticks.rows, this.name);
+    const openingTick = options.silentHeartbeat !== undefined
+      && !ticks.started.has(options.silentHeartbeat.eventId);
+
+    if (openingTick) {
+      messages = [...messages, silentHeartbeatSeparatorTurn()];
+    } else if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
+      // Safety: ensure messages don't end with an assistant message.
+      // Some models reject trailing assistant messages ("prefill not supported"),
+      // and after context compression a stale assistant turn can end up last.
       messages = [...messages, {
         participant: 'user',
         content: [{ type: 'text', text: '[Continue]' }],
@@ -868,6 +901,26 @@ export class Agent {
     };
   }
 
+  /** Stored silent-tick rows, memoized on the store's cached message array
+   * (ContextManager returns the same array until the store changes). */
+  private silentTickIndex: { source: readonly unknown[]; index: SilentTickIndex } | null = null;
+
+  private indexSilentHeartbeatTicks(): SilentTickIndex {
+    const empty: SilentTickIndex = { rows: new Map(), started: new Set() };
+    const cm = this.contextManager as Partial<ContextManager>;
+    if (typeof cm.getAllMessages !== 'function') return empty;
+    try {
+      const stored = cm.getAllMessages() as unknown as readonly StoredRowLike[];
+      if (this.silentTickIndex?.source === stored) return this.silentTickIndex.index;
+      const index = indexSilentTickRows(stored, this.name);
+      this.silentTickIndex = { source: stored, index };
+      return index;
+    } catch (error) {
+      console.error(`[silent-heartbeat] ${this.name}: could not index tick rows; separators omitted:`, error);
+      return empty;
+    }
+  }
+
   /**
    * Start a yielding stream with context injections.
    * Same as startStream but passes injections through to compile.
@@ -876,7 +929,8 @@ export class Agent {
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
     budget?: TokenBudget,
-    compressionTools: ToolDefinition[] = availableTools
+    compressionTools: ToolDefinition[] = availableTools,
+    options: ActivationRequestOptions = {},
   ): Promise<StartStreamResult> {
     if (this._state.status !== 'idle') {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
@@ -885,6 +939,8 @@ export class Agent {
     // Retry accepted history edits before assembling a real request. Pure
     // preview/compile entry points must not perform these writes.
     this.toolResultGuard.flushUnrecorded();
+    // A withheld stub is compiled only once it says where its original went.
+    await this.toolResultGuard.whenAnnotated();
 
     // A new activation supersedes every receipt flight the previous one left
     // open. Membrane fires the kv-unified wire receipt per provider attempt,
@@ -911,7 +967,7 @@ export class Agent {
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
 
-    const request = await this.buildActivationRequest(availableTools, injections, budget, compressionTools);
+    const request = await this.buildActivationRequest(availableTools, injections, budget, compressionTools, options);
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
@@ -1012,7 +1068,7 @@ export class Agent {
    * Add an assistant response to context.
    * Called by framework when stream completes.
    */
-  addAssistantResponse(content: ContentBlock[]): void {
+  addAssistantResponse(content: ContentBlock[], metadata?: MessageMetadata): void {
     // A turn whose entire output is thinking blocks produced NOTHING: no
     // speech, no tool call. That is what a refusal looks like on the wire —
     // the provider returns signed thinking (often with empty text, the
@@ -1038,7 +1094,7 @@ export class Agent {
       );
       return;
     }
-    this.contextManager.addMessage(this.name, content);
+    this.contextManager.addMessage(this.name, content, metadata);
   }
 
   /**
@@ -1129,7 +1185,9 @@ export class Agent {
 
   private async doInference(
     request: NormalizedRequest,
-    signal?: AbortSignal
+    signal: AbortSignal | undefined,
+    /** Compiles the context into a request again, for the guard's retry. */
+    reassemble: () => Promise<NormalizedRequest>,
   ): Promise<InferenceResult> {
     let response = await this.membrane.stream(request, { signal });
     // Usage of a refused attempt abandoned by the guard; it was billed and
@@ -1141,12 +1199,12 @@ export class Agent {
       const ids = this.toolResultGuard.withhold('unknown');
       if (ids) {
         abandonedUsage = response.usage;
-        const withheld = new Set(ids);
-        request = { ...request, messages: request.messages.map((message) => ({
-          ...message, content: message.content.map((block) => block.type === 'tool_result' && withheld.has(block.toolUseId)
-            ? { type: 'tool_result', toolUseId: block.toolUseId, content: TOOL_RESULT_GUARD_NOTICE, isError: block.isError } : block),
-        })) };
-        response = await this.membrane.stream(request, { signal });
+        // The retry is compiled afresh, like every request: once each stub
+        // says where its original went (agent-framework #277), and against the
+        // budget without the batch's reservation, so a stub longer than its
+        // original can't carry the request past the budget.
+        await this.toolResultGuard.whenAnnotated();
+        response = await this.membrane.stream(await reassemble(), { signal });
       }
     }
 

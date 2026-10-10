@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 
 import { CapabilityGrant, computeGrant } from '../src/mcpl/capability-grant.js';
 import {
+  SCRIPT_PARENT_META_KEY,
   ToolLifecycleEmitter,
   openingFor,
   parseToolObserveParams,
@@ -289,6 +290,123 @@ describe('ToolLifecycleEmitter', () => {
     assert.equal(started[1].input, undefined);
     assert.ok(!JSON.stringify(o.sent).includes('private words'));
     assert.ok(!JSON.stringify(o.sent).includes('import bpy'));
+  });
+});
+
+// ── Calls made by a code_execution script (issue #235 F4) ───────────────────
+
+describe('ToolLifecycleEmitter: script-inner calls', () => {
+  /**
+   * What the framework does: the code_execution call is dispatched like any
+   * model call, and while it is (between register and open) it reads the
+   * origin its script's calls inherit.
+   */
+  function runScript(emitter: ToolLifecycleEmitter, agent: string, inferenceId: string, id: string) {
+    emitter.register(agent, inferenceId, { id, name: 'code_execution', input: { code: '...' } });
+    const origin = emitter.scriptOrigin(agent, id);
+    emitter.open(agent, id);
+    return origin;
+  }
+  function scriptCall(
+    emitter: ToolLifecycleEmitter,
+    agent: string,
+    origin: ReturnType<ToolLifecycleEmitter['scriptOrigin']>,
+    call: { id: string; name: string; input: unknown },
+    refusedByHost = false,
+  ): void {
+    emitter.registerScriptCall(agent, origin!, call);
+    if (refusedByHost) emitter.refuse(agent, call.id);
+    emitter.open(agent, call.id);
+  }
+
+  test('reported under the inner tool, the parent inference, and the parent call in _meta', () => {
+    const o = observer('obs', [OBSERVE]);
+    const { emitter, tick } = harness({ observers: [o], classes: { code_execution: ['shell'], 'chat--send': ['comms'] } });
+    const origin = runScript(emitter, 'scout', 'inf_1', TOOLU(50));
+    assert.deepEqual(origin, { inferenceId: 'inf_1', parentToolCallId: TOOLU(50) });
+    scriptCall(emitter, 'scout', origin, { id: 'pytc-1', name: 'chat--send', input: { text: 'hi' } });
+    tick(120);
+    emitter.onResult('scout', 'pytc-1', { success: true });
+    emitter.onResult('scout', TOOLU(50), { success: true });
+
+    const inner = o.sent.filter((p) => p.tool === 'chat--send');
+    assert.deepEqual(inner.map((p) => p.phase), ['started', 'completed']);
+    for (const p of inner) {
+      assert.deepEqual(p.class, ['comms']);
+      assert.equal(p.serverTool, 'send');
+      assert.equal(p.inferenceId, 'inf_1');
+      assert.deepEqual(p._meta, { [SCRIPT_PARENT_META_KEY]: TOOLU(50) });
+    }
+    assert.equal(inner[0].toolCallId, inner[1].toolCallId);
+    assert.notEqual(inner[0].toolCallId, TOOLU(50));
+    assert.equal(inner[1].durationMs, 120);
+    // The model's own call carries no attribution.
+    for (const p of o.sent.filter((p) => p.tool === 'code_execution')) assert.equal('_meta' in p, false);
+  });
+
+  test("the inner tool's own class decides filters and the inputs class exclusion", () => {
+    const o = observer('obs', [OBSERVE, INPUTS], rules([{ match: { class: 'comms' }, input: true }]));
+    const { emitter } = harness({
+      observers: [o],
+      config: { obs: { observe: {}, inputs: { tools: ['*'] } } },
+      classes: { code_execution: ['shell'], 'chat--send': ['comms'], 'computer--click': ['computer'] },
+    });
+    const origin = runScript(emitter, 'scout', 'inf_1', TOOLU(51));
+    scriptCall(emitter, 'scout', origin, { id: 'pytc-2', name: 'computer--click', input: { x: 1 } });
+    scriptCall(emitter, 'scout', origin, { id: 'pytc-3', name: 'chat--send', input: { text: 'private words' } });
+    emitter.onResult('scout', 'pytc-2', { success: true });
+    emitter.onResult('scout', 'pytc-3', { success: true });
+    assert.deepEqual(o.sent.map((p) => `${p.tool}:${p.phase}`), ['chat--send:started', 'chat--send:completed']);
+    assert.equal(o.sent[0].inputWithheld, true, 'comms never carries arguments, from a script either');
+    assert.ok(!JSON.stringify(o.sent).includes('private words'));
+  });
+
+  test('an error result is completed+isError; a refusal produces nothing; a lost result is failed', () => {
+    const o = observer('obs', [OBSERVE]);
+    const { emitter } = harness({ observers: [o] });
+    const origin = runScript(emitter, 'scout', 'inf_1', TOOLU(52));
+    scriptCall(emitter, 'scout', origin, { id: 'pytc-4', name: 'prov--run', input: {} });
+    emitter.onResult('scout', 'pytc-4', { success: false, isError: true });
+    scriptCall(emitter, 'scout', origin, { id: 'pytc-5', name: 'gone--run', input: {} }, true);
+    emitter.onResult('scout', 'pytc-5', { success: false, isError: true });
+    scriptCall(emitter, 'scout', origin, { id: 'pytc-6', name: 'prov--hang', input: {} });
+    emitter.markDispatchFailure('scout', 'pytc-6'); // the host gave up waiting
+    emitter.onResult('scout', 'pytc-6', undefined);
+    const inner = o.sent.filter((p) => p.tool !== 'code_execution');
+    assert.deepEqual(inner.map((p) => `${p.tool}:${p.phase}:${p.isError}`), [
+      'prov--run:started:undefined', 'prov--run:completed:true',
+      'prov--hang:started:undefined', 'prov--hang:failed:undefined',
+    ]);
+  });
+
+  test("a stream's end does not abort a script's calls: an orphaned call ends with its own result", () => {
+    const o = observer('obs', [OBSERVE]);
+    const { emitter } = harness({ observers: [o] });
+    const origin = runScript(emitter, 'scout', 'inf_1', TOOLU(53));
+    scriptCall(emitter, 'scout', origin, { id: 'pytc-7', name: 'prov--slow', input: {} });
+    dispatch(emitter, 'scout', 'inf_1', { id: TOOLU(54), name: 'prov--model', input: {} });
+    emitter.abortOpen('scout', ['inf_1']); // turn over; the script and the code_execution call are gone
+    emitter.onResult('scout', 'pytc-7', { success: true });
+    const phases = (tool: string) => o.sent.filter((p) => p.tool === tool).map((p) => p.phase);
+    assert.deepEqual(phases('code_execution'), ['started', 'aborted']);
+    assert.deepEqual(phases('prov--model'), ['started', 'aborted'], 'model calls are aborted as before');
+    assert.deepEqual(phases('prov--slow'), ['started', 'completed']);
+    assert.equal(emitter.openCount, 0);
+  });
+
+  test('a parent nothing observed: its inner calls keep its inference, without a parent id', () => {
+    const o = observer('obs', []);
+    const { emitter } = harness({ observers: [o] });
+    const origin = runScript(emitter, 'scout', 'inf_9', TOOLU(55));
+    assert.deepEqual(origin, { inferenceId: 'inf_9' });
+    o.grant = new CapabilityGrant(new Set([OBSERVE]), []); // granted while the script runs
+    scriptCall(emitter, 'scout', origin, { id: 'pytc-8', name: 'prov--a', input: {} });
+    emitter.onResult('scout', 'pytc-8', { success: true });
+    assert.deepEqual(o.sent.map((p) => `${p.tool}:${p.phase}:${p.inferenceId}`), [
+      'prov--a:started:inf_9', 'prov--a:completed:inf_9',
+    ]);
+    assert.equal('_meta' in o.sent[0], false);
+    assert.equal(emitter.scriptOrigin('scout', 'not-dispatching'), undefined, 'only the call being dispatched');
   });
 });
 

@@ -1391,11 +1391,18 @@ export class WorkspaceModule implements Module {
    * mount, through the same Chronicle-tree + auto-materialize path as the
    * `write` tool. Public API for the framework's synthesized `save_image`
    * tool and other peer callers that hold bytes rather than text.
+   *
+   * `branch`, when given, ties the write to that branch: the store's current
+   * branch is checked where the tree entry is set, nothing yielding between
+   * the check and the entry, so the file lands on that branch or the write is
+   * refused. The tool-result guard writes a withheld original this way, for
+   * the branch its stub is on (agent-framework #277).
    */
   async writeBinary(
     mountPrefixedPath: string,
     data: Buffer,
     mimeType: string,
+    options: { branch?: string } = {},
   ): Promise<ToolResult> {
     let mount: MountState;
     let relativePath: string;
@@ -1418,6 +1425,11 @@ export class WorkspaceModule implements Module {
     const store = this.getStore();
     return this.withMount(mount, async () => {
       await this.settleBeforeMutation(mount, relativePath);
+      // Checked inside the mount's turn, after anything the write waited on:
+      // commitToolChange sets the tree entry before it first yields.
+      if (options.branch !== undefined && store.currentBranch().name !== options.branch) {
+        return { success: false, error: 'the workspace had left the branch this file is for', isError: true };
+      }
       const blobHash = store.storeBlob(data, mimeType);
       const materializeError = await this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: data.byteLength });
       if (materializeError) {
