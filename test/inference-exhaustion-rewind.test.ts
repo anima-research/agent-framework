@@ -13,7 +13,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { AgentFramework } from '../src/framework.js';
+import { AgentFramework, rejectsHistory } from '../src/framework.js';
 
 function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   const messages: any[] = opts?.messages ?? [
@@ -174,4 +174,56 @@ test('nothing left to shed: the breaker degrades to logging, no crash, no loop',
   assert.equal(removed.length, 0);
   assert.equal(fw.pendingRequests.length, 0, 'no retry queued when nothing was repaired');
   assert.ok(errs.some((e) => e.includes('nothing left to shed')));
+});
+
+// Anarchid's review of membrane #56 (M3): from #56 on, membrane's boundary
+// classifies every status, so `invalid_request` also reaches agent-framework
+// for a 404 (a model that doesn't exist), which no shed can fix. The breaker
+// runs only for a 400 or 422, the statuses membrane reads as rejected
+// content; an error without a status keeps the type-only rule.
+test('the breaker reads the status: a 404 invalid_request never sheds, a 400 does', () => {
+  const missingModel = makeHarness();
+  try {
+    for (let i = 0; i < 5; i++) {
+      missingModel.fw.noteInferenceExhausted('cairn', '404 model: claude-typo not found', false, 'invalid_request',
+        { httpStatus: 404, providerErrorCode: 'not_found_error' });
+    }
+  } finally { missingModel.restore(); }
+  assert.deepEqual(missingModel.removed, [], 'past the threshold, and nothing was shed');
+  assert.ok(!missingModel.added.some((m) => m.meta.kind === 'refusal-rewind'));
+  assert.equal(missingModel.fw.pendingRequests.length, 0);
+  assert.ok(missingModel.errs.some((e) => e.includes('[inference-hard-down]')), 'it is still reported hard-down');
+
+  const rejected = makeHarness();
+  try {
+    for (let i = 0; i < 3; i++) {
+      rejected.fw.noteInferenceExhausted('cairn', REASON, false, 'invalid_request',
+        { httpStatus: 400, providerErrorCode: 'invalid_request_error' });
+    }
+  } finally { rejected.restore(); }
+  assert.deepEqual([...rejected.removed].sort(), ['a1', 'r1'], 'a 400 at the threshold sheds, as before');
+});
+
+test('the status reaches the breaker from the inference:exhausted trace', () => {
+  const h = makeHarness();
+  try {
+    for (let i = 0; i < 4; i++) {
+      h.fw.emitTrace({ type: 'inference:exhausted', agentName: 'cairn', error: '404 model: claude-typo not found',
+        retryable: false, errorType: 'invalid_request', httpStatus: 404, providerErrorCode: 'not_found_error' });
+    }
+  } finally { h.restore(); }
+  assert.deepEqual(h.removed, [], 'the trace carried the 404 to the gate');
+  assert.ok(h.errs.some((e) => e.includes('[inference-hard-down]')));
+});
+
+test('rejectsHistory: an invalid_request at 400 or 422, or with no status, and nothing else', () => {
+  assert.equal(rejectsHistory('invalid_request', 400), true);
+  assert.equal(rejectsHistory('invalid_request', 422), true, 'a validation server rejects content with 422');
+  assert.equal(rejectsHistory('invalid_request', undefined), true, 'an older membrane reports no status');
+  for (const status of [401, 403, 404, 405, 409, 410, 413, 429, 500]) {
+    assert.equal(rejectsHistory('invalid_request', status), false, `status ${status}`);
+  }
+  for (const type of ['auth', 'context_length', 'rate_limit', 'server', 'abort', undefined]) {
+    assert.equal(rejectsHistory(type, 400), false, `type ${String(type)}`);
+  }
 });

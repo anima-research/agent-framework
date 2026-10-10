@@ -1024,6 +1024,20 @@ function describeFailure(error: unknown): string {
   }
 }
 
+/**
+ * Whether a failure says the provider rejected the history itself, the one
+ * case the poison-history breaker sheds the newest exchange for: an
+ * `invalid_request` that came back as HTTP 400 or 422, the statuses membrane
+ * reads as "the request's content was rejected" (it checks both for auth and
+ * context overflow first). From membrane #56, the boundary classifies every
+ * status, so an `invalid_request` can also be a 404 for a model that doesn't
+ * exist, which no shed fixes. An error that reports no status (an older
+ * membrane) keeps the rule it had before: the type alone.
+ */
+export function rejectsHistory(errorType: string | undefined, httpStatus: number | undefined): boolean {
+  return errorType === 'invalid_request' && (httpStatus === undefined || httpStatus === 400 || httpStatus === 422);
+}
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -13029,7 +13043,7 @@ export class AgentFramework {
       // otherwise shed good exchanges and stamp a false "the API kept
       // rejecting your history" marker. `retryable` is kept only for the trace.
       void retryable;
-      if (errorType === 'invalid_request' && agent) {
+      if (agent && rejectsHistory(errorType, httpStatus)) {
         this.quarantinePoisonedHistory(agent, reason);
       }
     }
