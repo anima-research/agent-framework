@@ -457,7 +457,7 @@ test('channel_publish reports failed and unknown outcomes with the attempted des
   seedRegistered(refused.registry, 'discord', 'chanA');
   const failed = await refused.registry.handleChannelToolCall('channel_publish', { channelId: 'chanA', content: 'x' }, { kind: 'agent', agentName: 'scout' });
   assert.equal(failed.success, false);
-  assert.match(failed.error!, /^Not sent to chanA \(chanA\): .*Nothing was posted\.$/);
+  assert.match(failed.error!, /^Not sent to \(discord \/ chanA\): .*Nothing was posted\.$/);
   assert.deepEqual(
     { status: (failed.data as { status: string }).status, serverId: (failed.data as { serverId: string }).serverId, channelId: (failed.data as { channelId: string }).channelId },
     { status: 'failed', serverId: 'discord', channelId: 'chanA' },
@@ -467,7 +467,7 @@ test('channel_publish reports failed and unknown outcomes with the attempted des
   seedRegistered(silent.registry, 'discord', 'chanA');
   const unknown = await silent.registry.handleChannelToolCall('channel_publish', { channelId: 'chanA', content: 'x' }, { kind: 'agent', agentName: 'scout' });
   assert.equal(unknown.success, false);
-  assert.match(unknown.error!, /^Delivery to chanA \(chanA\) was not confirmed — it may or may not have been posted: .*Check the channel before sending again\.$/);
+  assert.match(unknown.error!, /^Delivery to \(discord \/ chanA\) was not confirmed — it may or may not have been posted: .*Check the channel before sending again\.$/);
   assert.equal((unknown.data as { status: string }).status, 'unknown');
 });
 

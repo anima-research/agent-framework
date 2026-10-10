@@ -80,3 +80,13 @@
   wakes already worked this way.
 - The `[discord-send-failed]` marker for a reply on a thread route names the
   thread with its channel, and an unconfirmed one says to check the thread.
+- **Routing names each conversation with its server.** Routing notices,
+  holds, the route announcement, `channel_publish`'s refusals and failures,
+  the `[discord-send-failed]` marker, the `[channels] Now open` notice, the
+  gate's batched-wake lines and the `[delivered]` receipt all write a
+  conversation one way: its label, then `server / channel-id`, then its
+  thread. The label is that server's own for the channel, never another
+  server's for the same id, and a batched wake counts each server's channel
+  apart. Two servers' channels with the same id and label no longer read
+  alike. A refusal for a channel id that several servers register lists
+  those servers, so the sender has a `serverId` to give.

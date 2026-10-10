@@ -347,6 +347,24 @@ describe('debounce', () => {
     assert.deepStrictEqual(d.behavior, { debounce: 100 });
   });
 
+  it('a batched wake counts each server\'s channel apart and names its server', async () => {
+    const path = writeConfig('debounce-servers.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:push-event'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, messages } = makeGate(path);
+    // The same channel id and name on two servers: two conversations.
+    gate.evaluate(event({ serverId: 'alpha', channelId: 'C1', metadata: { channelName: 'general' } }));
+    gate.evaluate(event({ serverId: 'beta', channelId: 'C1', metadata: { channelName: 'general' } }));
+    gate.evaluate(event({ serverId: 'beta', channelId: 'C1', metadata: { channelName: 'general' } }));
+    await new Promise(r => setTimeout(r, 160));
+    const text = (messages[0].content as Array<{ text: string }>)[0].text;
+    assert.ok(text.includes('- 1 message in #general (alpha / C1) '), text);
+    assert.ok(text.includes('- 2 messages in #general (beta / C1) '), text);
+  });
+
   it('batches events and fires after delay', async () => {
     const path = writeConfig('debounce-fire.json', {
       policies: [

@@ -119,7 +119,7 @@ describe('targeted publish (MCPL RFC-011)', () => {
   it('plain speech answering a thread goes into that thread, and its receipt says so', async () => {
     await turn([say('answering the thread')], ROOM, { threadId: 't-1' });
     assert.deepEqual(publishes().map((p) => [p.event, p.channelId, p.threadId, p.text]), [['publish', ROOM, 't-1', 'answering the thread']]);
-    assert.ok(texts().some((t) => t.startsWith('[routing] Your plain speech now lands in #room (Guild One) (discord:g1:room, thread t-1)')));
+    assert.ok(texts().some((t) => t.startsWith('[routing] Your plain speech now lands in #room (Guild One) (discord / discord:g1:room, thread t-1)')));
     assert.ok(texts().some((t) => t.startsWith('[delivered]') && t.includes('thread t-1')), texts().filter((t) => t.startsWith('[delivered]')).join(' | '));
   });
 
@@ -133,7 +133,7 @@ describe('targeted publish (MCPL RFC-011)', () => {
     assert.deepEqual(publishes(), []);
     assert.deepEqual(drafts().map((d) => [d.text, d.reason]), [['hello legacy', 'no-destination']]);
     const notice = texts().find((t) => t.startsWith('[routing]')) ?? '';
-    assert.match(notice, /(?:^|[^#])#legacy \(Guild One\) \(discord:g1:legacy\): its connector doesn't declare where a post lands \(MCPL RFC-011\)/,
+    assert.match(notice, /(?:^|[^#])#legacy \(Guild One\) \(discord \/ discord:g1:legacy\): its connector doesn't declare where a post lands \(MCPL RFC-011\)/,
       'the label once, with its own # and no second one');
     assert.match(notice, /publication from here is unavailable until it does/);
     assert.match(notice, /may reach it; consult them: `mcpl--discord--reply_message`\./, 'a send-named tool, not the unrelated one');

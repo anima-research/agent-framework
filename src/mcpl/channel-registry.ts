@@ -42,6 +42,7 @@ import { isVisiblyEmptyContent } from './visible-content.js';
 import { CapabilityGrant } from './capability-grant.js';
 import { INBOUND_SOURCE_KEY, markHeaderOpenings, renderSourceHeader, SOURCE_HEADER_RULE, type InboundSource } from './inbound-source.js';
 import { McplRequestError } from './server-connection.js';
+import { describeConversation } from '../speech-routes.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -602,6 +603,10 @@ interface ChannelRegistryOptions {
   onRouteFailure?: (info: {
     conversationId: string;
     channelId: string | null;
+    /** The server the speech was for, when its route named or resolved one. */
+    serverId?: string;
+    /** That server's label for the channel, as the destination resolved. */
+    label?: string;
     /** The thread the speech was for, when its route was a thread. */
     threadId?: string;
     reason: string;
@@ -3165,8 +3170,12 @@ export class ChannelRegistry {
       };
     }
     if (matches.length > 1) {
+      // Name the servers: a resident told only that the id is shared would
+      // have nothing to put in serverId.
+      const servers = matches.map((e) => e.serverId).sort();
       return {
-        error: `channel id "${target.channelId}" is registered by more than one MCPL server; the destination must name its server`,
+        error: `channel id "${target.channelId}" is registered by more than one MCPL server (${servers.join(', ')}); ` +
+          'the destination must name its server',
       };
     }
     return { entry: matches[0]! };
@@ -3229,7 +3238,7 @@ export class ChannelRegistry {
     }
     const refusal = publishPlaceRefusal(declaredPublishTarget(entry.descriptor), place);
     if (refusal) {
-      return { status: 'failed', destination, reason: ChannelRegistry.placeRefusalText(refusal, entry.descriptor, place), at: at() };
+      return { status: 'failed', destination, reason: ChannelRegistry.placeRefusalText(refusal, ChannelRegistry.entryPlace(entry), place), at: at() };
     }
 
     if (!entry.open) {
@@ -3273,7 +3282,7 @@ export class ChannelRegistry {
       destination = destinationOf(entry);
       const withdrawn = publishPlaceRefusal(declaredPublishTarget(entry.descriptor), place);
       if (withdrawn) {
-        return { status: 'failed', destination, reason: ChannelRegistry.placeRefusalText(withdrawn, entry.descriptor, place), at: at() };
+        return { status: 'failed', destination, reason: ChannelRegistry.placeRefusalText(withdrawn, ChannelRegistry.entryPlace(entry), place), at: at() };
       }
     }
 
@@ -3375,17 +3384,27 @@ export class ChannelRegistry {
     };
   }
 
-  /** Why a publish's place was refused, in words a resident can act on. */
+  /** Why a publish's place was refused, in words a resident can act on. The
+   *  channel is named as every conversation is (describeConversation), its
+   *  server included. */
   static placeRefusalText(
     refusal: 'undeclared' | 'no-threads',
-    descriptor: ChannelDescriptor,
+    place: { serverId: string; channelId: string; label?: string },
     threadId: string | null,
   ): string {
-    const where = descriptor.label && descriptor.label !== descriptor.id ? `${descriptor.label} (${descriptor.id})` : descriptor.id;
+    const where = describeConversation({
+      kind: 'channel', serverId: place.serverId, channelId: place.channelId, ...(place.label ? { label: place.label } : {}),
+    });
     return refusal === 'undeclared'
       ? `${where}'s connector doesn't declare where a post lands (MCPL RFC-011), so it may choose a thread itself; ` +
         'the framework doesn\'t publish there'
       : `${where} has no threads (its connector declares root), so a post into thread ${threadId} is refused`;
+  }
+
+  /** A registered channel's place: its own server, id and label. */
+  private static entryPlace(entry: ChannelEntry): { serverId: string; channelId: string; label?: string } {
+    const label = entry.descriptor.label;
+    return { serverId: entry.serverId, channelId: entry.descriptor.id, ...(typeof label === 'string' && label ? { label } : {}) };
   }
 
   /**
@@ -3406,18 +3425,30 @@ export class ChannelRegistry {
      *  "this turn is pinned to no locus": fail loudly rather than guess. */
     locusChannelId: string | null | { serverId?: string; channelId: string; threadId?: string | null },
   ): Promise<PublishOutcome> {
-    const fail = (channelId: string | null, reason: string, outcome: PublishOutcome, threadId?: string | null): PublishOutcome => {
+    const fail = (
+      where: { serverId?: string; channelId: string | null; label?: string; threadId?: string | null },
+      reason: string,
+      outcome: PublishOutcome,
+    ): PublishOutcome => {
       const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
+      const { serverId, channelId, label, threadId } = where;
       console.error(`[routeSpeech] ${conversationId}: ${reason} — speech ${status === 'unknown' ? 'delivery NOT confirmed' : 'NOT routed'} (${text.length} chars stay in chronicle)`);
       this.emitTraceFn({
         type: 'mcpl:speech-route-failed',
         conversationId,
+        ...(serverId ? { serverId } : {}),
         channelId: channelId ?? '',
         reason,
         textLen: text.length,
         outcome: status,
       });
-      this.onRouteFailure?.({ conversationId, channelId, ...(threadId ? { threadId } : {}), reason, textLen: text.length, outcome: status });
+      this.onRouteFailure?.({
+        conversationId, channelId,
+        ...(serverId ? { serverId } : {}),
+        ...(label ? { label } : {}),
+        ...(threadId ? { threadId } : {}),
+        reason, textLen: text.length, outcome: status,
+      });
       return outcome;
     };
 
@@ -3426,14 +3457,14 @@ export class ChannelRegistry {
     // with a live re-resolution.
     if (locusChannelId === undefined) {
       const reason = 'caller passed no locus (routing bug: every speech path must snapshot the turn locus)';
-      return fail(null, reason, { status: 'failed', reason, at: Date.now() });
+      return fail({ channelId: null }, reason, { status: 'failed', reason, at: Date.now() });
     }
     if (!locusChannelId) {
       // The turn froze with no locus (no home, no triggering channel, no
       // global inbound ever seen) — the agent was told its prose stays in
       // the archive; honor that.
       const reason = 'turn has no locus (no home/trigger channel; nothing to deliver into)';
-      return fail(null, reason, { status: 'failed', reason, at: Date.now() });
+      return fail({ channelId: null }, reason, { status: 'failed', reason, at: Date.now() });
     }
 
     // A route that knows its server publishes exactly there: the same
@@ -3443,7 +3474,16 @@ export class ChannelRegistry {
     const outcome = await this.publish(conversationId, text, target);
     const channelId = outcome.destination?.channelId ?? target.channelId;
     if (outcome.status !== 'delivered') {
-      return fail(channelId, outcome.reason ?? 'delivery not confirmed', outcome, outcome.destination?.threadId ?? target.threadId);
+      // The server and label are the destination's own when it resolved, so
+      // the marker names the conversation the words were bound for.
+      const serverId = outcome.destination?.serverId ?? target.serverId;
+      const label = outcome.destination?.label;
+      return fail({
+        ...(serverId ? { serverId } : {}),
+        channelId,
+        ...(label ? { label } : {}),
+        threadId: outcome.destination?.threadId ?? target.threadId,
+      }, outcome.reason ?? 'delivery not confirmed', outcome);
     }
 
     console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${channelId} (server=${outcome.destination!.serverId}, delivered=true)`);
@@ -3580,8 +3620,15 @@ export class ChannelRegistry {
     // Not confirmed: say which, and where it was attempted. `unknown` may
     // already be posted (a partial multi-part send, a timeout): never invite
     // a blind retry.
-    const shown = `${where.channelId}${'channelLabel' in where && where.channelLabel ? ` (${where.channelLabel})` : ''}` +
-      `${where.threadId ? `, thread ${where.threadId}` : ''}`;
+    // Named as every conversation is (describeConversation): label, then
+    // `server / channel-id`, then thread.
+    const shown = describeConversation({
+      kind: 'channel',
+      ...(where.serverId ? { serverId: where.serverId } : {}),
+      channelId: where.channelId,
+      ...(where.threadId ? { threadId: where.threadId } : {}),
+      ...('channelLabel' in where && where.channelLabel ? { label: where.channelLabel } : {}),
+    });
     return {
       success: false,
       error: outcome.status === 'unknown'

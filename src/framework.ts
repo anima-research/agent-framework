@@ -9341,21 +9341,17 @@ export class AgentFramework {
     return AgentFramework.placeText(d);
   }
 
-  /**
-   * A destination in words, self-contained: its label as recorded, then the
-   * server and channel it resolved to — written `server / channel-id`, as
-   * the source headers write them — and its thread. The server is always
-   * named, never inferred from what else is on screen: the same channel id
-   * (and label) can exist on another server.
-   */
+  /** A destination in words, as every conversation is named to a resident
+   *  (describeConversation): its label as recorded, then `server / channel-id`
+   *  and its thread. */
   private static placeText(d: { serverId?: string; channelId: string; label?: string; threadId?: string | null }): string {
-    const id = d.serverId ? `${d.serverId} / ${d.channelId}` : d.channelId;
-    const where = d.threadId ? `${id}, thread ${d.threadId}` : id;
-    if (d.label && d.label !== d.channelId) {
-      const label = d.label.startsWith('#') || d.label.startsWith('DM') ? d.label : `#${d.label}`;
-      return `${label} (${where})`;
-    }
-    return d.serverId || d.threadId ? `(${where})` : d.channelId;
+    return describeConversation({
+      kind: 'channel',
+      ...(d.serverId ? { serverId: d.serverId } : {}),
+      channelId: d.channelId,
+      ...(d.threadId ? { threadId: d.threadId } : {}),
+      ...(d.label ? { label: d.label } : {}),
+    });
   }
 
   /** One line per draft: id, state, when, why, size, preview. */
@@ -9659,10 +9655,7 @@ export class AgentFramework {
     };
     const placeRefusal = publishPlaceRefusal(registry.publishTarget(destination), destination.threadId ?? null);
     if (placeRefusal) {
-      const descriptor = registry.getDescriptor(destination.channelId);
-      const why = descriptor
-        ? ChannelRegistry.placeRefusalText(placeRefusal, descriptor, destination.threadId ?? null)
-        : `${destination.channelId} can't be published to exactly`;
+      const why = ChannelRegistry.placeRefusalText(placeRefusal, destination, destination.threadId ?? null);
       const consult = this.connectorToolsText(destination.serverId);
       return refuse(`${why}.${consult ? ` ${consult}` : ''} Nothing was sent.`);
     }
@@ -10037,7 +10030,10 @@ export class AgentFramework {
     threadId?: string,
   ): RouteCandidate {
     const server = serverId || this.channelRegistry?.getChannelServerId(channelId) || undefined;
-    const label = this.channelRegistry?.getDescriptor(channelId)?.label;
+    // The label is the server's own for the id: another server's channel
+    // with the same id may carry another. With no server, any label would be
+    // a guess, so there is none.
+    const label = server ? this.channelRegistry?.getChannelLabel(server, channelId) : undefined;
     return {
       conversation: {
         kind: 'channel',
@@ -10061,8 +10057,8 @@ export class AgentFramework {
   private homeRoute(agentName: string): SpeechRoute | null {
     const home = this.conversationAgentHomes.get(agentName) ?? this.channelRegistry?.resolveLocus(agentName) ?? null;
     if (!home) return null;
-    const label = this.channelRegistry?.getDescriptor(home)?.label;
     const serverId = this.channelRegistry?.getChannelServerId(home) ?? undefined;
+    const label = serverId ? this.channelRegistry?.getChannelLabel(serverId, home) : undefined;
     return {
       kind: 'channel',
       ...(serverId ? { serverId } : {}),
@@ -10432,12 +10428,18 @@ export class AgentFramework {
    */
   private recordChannelAutoOpenNotice(
     agentName: string | undefined,
-    channels: Array<{ channelId: string; label?: string }>,
+    channels: Array<{ serverId?: string; channelId: string; label?: string }>,
     cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply',
   ): void {
     if (channels.length === 0) return;
+    // Named as every conversation is (describeConversation), server included.
     const shown = channels
-      .map((c) => (c.label && c.label !== c.channelId ? `${c.label} (${c.channelId})` : c.channelId))
+      .map((c) => describeConversation({
+        kind: 'channel',
+        ...(c.serverId ? { serverId: c.serverId } : {}),
+        channelId: c.channelId,
+        ...(c.label ? { label: c.label } : {}),
+      }))
       .join(', ');
     const plural = channels.length > 1;
     const causeText =
@@ -15229,24 +15231,27 @@ export class AgentFramework {
         // addMessage() alone does not request inference, so this never wakes
         // her (matching the `discord-send-failed-skip` gate intent: context
         // yes, wake no).
-        onRouteFailure: ({ channelId, threadId, reason, textLen, outcome }) => {
+        onRouteFailure: ({ serverId, channelId, label, threadId, reason, textLen, outcome }) => {
           try {
-            // Render a human-readable channel name when we can — a bare
-            // snowflake in the marker is unresolvable for the agent (the
-            // 2026-07-21 incident read as "a stale artifact", not a live
-            // failure). The marker is `system: true`, so it is never
-            // conversational and never influences routing.
-            const label = channelId
-              ? this.channelRegistry?.getDescriptor(channelId)?.label
-              : undefined;
-            const channel = channelId
-              ? label && label !== channelId
-                ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
-                : channelId
+            // Name the conversation the words were bound for as every
+            // conversation is named (describeConversation): its label, its
+            // server and channel, and its thread, so a check or a resend
+            // looks in the right place. A bare snowflake in the marker is
+            // unresolvable for the agent (the 2026-07-21 incident read as "a
+            // stale artifact", not a live failure); the label is the
+            // destination's own, or else its server's, never another
+            // server's by first match. The marker is `system: true`, so it is
+            // never conversational and never influences routing.
+            const ownLabel = label ?? (serverId && channelId ? this.channelRegistry?.getChannelLabel(serverId, channelId) : undefined);
+            const where = channelId
+              ? describeConversation({
+                kind: 'channel',
+                ...(serverId ? { serverId } : {}),
+                channelId,
+                ...(threadId ? { threadId } : {}),
+                ...(ownLabel ? { label: ownLabel } : {}),
+              })
               : 'the channel';
-            // A thread route failed in its thread: say so, so a check or a
-            // resend looks there rather than at the channel's root.
-            const where = threadId ? `thread ${threadId} in ${channel}` : channel;
             this.addMessage(
               'user',
               [{
@@ -15257,7 +15262,7 @@ export class AgentFramework {
                   ? `[discord-send-failed] Delivery of your previous reply (${textLen} chars) to ${where} was not confirmed (${reason}). It may or may not have been posted; check the ${threadId ? 'thread' : 'channel'} before sending it again. It is saved in your archive.`
                   : `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). Nothing was posted; it is saved in your archive.`,
               }],
-              { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', ...(threadId ? { threadId } : {}), reason, ...(outcome ? { outcome } : {}) },
+              { system: true, kind: 'discord-send-failed', ...(serverId ? { serverId } : {}), channelId: channelId ?? '', ...(threadId ? { threadId } : {}), reason, ...(outcome ? { outcome } : {}) },
             );
           } catch (err) {
             console.error('onRouteFailure: failed to record send-failure marker:', err);
@@ -15267,8 +15272,8 @@ export class AgentFramework {
         // open forced by delivery) must be announced in the window, with the
         // opt-out named. Routed here so registry-driven opens and framework-
         // driven opens produce the same durable notice.
-        onChannelAutoOpened: ({ conversationId, source, channels }) => {
-          this.recordChannelAutoOpenNotice(conversationId, channels, source);
+        onChannelAutoOpened: ({ conversationId, serverId, source, channels }) => {
+          this.recordChannelAutoOpenNotice(conversationId, channels.map((c) => ({ serverId, ...c })), source);
         },
       },
     );
@@ -16959,7 +16964,7 @@ export class AgentFramework {
                   );
                   this.recordChannelAutoOpenNotice(
                     agentName,
-                    [{ channelId: channelId ?? target, label }],
+                    [{ ...(serverId ? { serverId } : {}), channelId: channelId ?? target, label }],
                     'opened-by-reply',
                   );
                 } else if (status === 'open-failed') {

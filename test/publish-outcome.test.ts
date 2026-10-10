@@ -210,7 +210,8 @@ describe('ChannelRegistry.publish outcomes', () => {
     seed('beta', 'discord:g1:room', '#room (Beta)');
     const shared = await registry.publish('agent', 'x', { channelId: 'discord:g1:room' });
     assert.equal(shared.status, 'failed');
-    assert.match(shared.reason ?? '', /more than one MCPL server/);
+    assert.match(shared.reason ?? '', /more than one MCPL server \(alpha, beta\); the destination must name its server/,
+      'the refusal names the servers, so the sender has a serverId to give');
     assert.equal(published.length, 0, 'never routed through whichever server came first');
     const exact = await registry.publish('agent', 'x', { serverId: 'beta', channelId: 'discord:g1:room' });
     assert.equal(exact.status, 'delivered');
@@ -255,7 +256,8 @@ describe('ChannelRegistry.publish outcomes', () => {
     (registry as unknown as { openChannelNow: (e: unknown) => Promise<void> }).openChannelNow = async () => { opened.push('legacy'); };
     const outcome = await registry.publish('agent', 'x', { channelId: 'legacy' });
     assert.equal(outcome.status, 'failed');
-    assert.match(outcome.reason ?? '', /doesn't declare where a post lands/);
+    assert.match(outcome.reason ?? '', /^#legacy \(discord \/ legacy\)'s connector doesn't declare where a post lands/,
+      'the refusal names the channel as every conversation is named, its server included');
     assert.equal(outcome.destination?.channelId, 'legacy');
     assert.deepEqual(published, [], 'the connector would choose the place itself');
     assert.deepEqual(opened, [], 'refused before any side effect');
@@ -411,7 +413,43 @@ test('the resident\'s failure marker never claims an uncertain delivery did not 
   }
 });
 
-test('a failure marker for a thread route names the thread, and says to check it', async () => {
+test('a channel opened without the agent asking is announced by its server too', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'publish-outcome-open-'));
+  const commandPath = join(dir, 'commands.jsonl');
+  writeFileSync(commandPath, '');
+  const membrane = new MockMembrane();
+  const framework = await AgentFramework.create({
+    storePath: join(dir, 'store'),
+    membrane: membrane.asMembrane(),
+    agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+    mcplServers: [{
+      id: 'discord',
+      command: process.execPath,
+      args: [join(import.meta.dirname, 'fixtures/speech-route-mcpl-server.mjs')],
+      env: { STATUS_PATH: join(dir, 'status.jsonl'), COMMAND_PATH: commandPath },
+    }],
+    modules: [],
+  });
+  try {
+    await framework.start();
+    // The real registry's callback, as a policy admission calls it: one
+    // server, its channels with their own labels.
+    const registry = (framework as unknown as { channelRegistry: {
+      onChannelAutoOpened(info: { serverId: string; source: 'subscription-policy'; channels: Array<{ channelId: string; label?: string }> }): void;
+    } }).channelRegistry;
+    registry.onChannelAutoOpened({ serverId: 'beta', source: 'subscription-policy', channels: [{ channelId: 'general', label: '#general' }] });
+    const notice = framework.getAgent('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
+      .find((t) => t.startsWith('[channels] Now open:'));
+    assert.match(notice ?? '', /^\[channels\] Now open: #general \(beta \/ general\) — your subscription policy just admitted it\./,
+      'named as every conversation is, its server included');
+  } finally {
+    await framework.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a failure marker for a thread route names its server and thread, and says to check the thread', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'publish-outcome-thread-'));
   const commandPath = join(dir, 'commands.jsonl');
   writeFileSync(commandPath, '');
@@ -451,9 +489,11 @@ test('a failure marker for a thread route names the thread, and says to check it
     await framework.runUntilIdle();
     const [marker] = markers();
     const text = (marker!.content[0] as { text: string }).text;
-    assert.match(text, /to thread t1 in #forum \(Guild One\) \(discord:g1:forum\) was not confirmed/);
+    assert.match(text, /to #forum \(Guild One\) \(discord \/ discord:g1:forum, thread t1\) was not confirmed/,
+      'named as every conversation is: label, server / channel, thread');
     assert.match(text, /check the thread before sending it again/);
     assert.equal((marker!.metadata as { threadId?: string }).threadId, 't1');
+    assert.equal((marker!.metadata as { serverId?: string }).serverId, 'discord');
   } finally {
     await framework.stop();
     rmSync(dir, { recursive: true, force: true });

@@ -242,12 +242,20 @@ describe('conversation identity and wording', () => {
     assert.notEqual(conversationKey({ kind: 'surface', surface: 'x' }), conversationKey(channel('x')));
   });
 
-  it('describes a conversation by a usable address', () => {
-    assert.equal(describeConversation(channel('discord:g1:room', { label: 'room' })), '#room (discord:g1:room)');
-    assert.equal(describeConversation(channel('discord:dm:7')), 'discord:dm:7');
-    assert.equal(describeConversation(channel('discord:dm:7', { label: 'discord:dm:7' })), 'discord:dm:7',
+  it('describes a conversation by a usable address: its label, then server / channel id, then its thread', () => {
+    assert.equal(describeConversation(channel('discord:g1:room', { label: 'room' })), '#room (discord / discord:g1:room)');
+    assert.equal(describeConversation(channel('discord:dm:7')), '(discord / discord:dm:7)');
+    assert.equal(describeConversation(channel('discord:dm:7', { label: 'discord:dm:7' })), '(discord / discord:dm:7)',
       'a label that is only the id adds nothing');
-    assert.equal(describeConversation(channel('forum', { threadId: 't1' })), 'forum (thread t1)');
+    assert.equal(describeConversation(channel('forum', { threadId: 't1' })), '(discord / forum, thread t1)');
+    assert.equal(describeConversation({ kind: 'channel', channelId: 'general', label: 'general' }), 'general',
+      'a conversation whose server is unknown is named by its id alone');
     assert.equal(describeConversation({ kind: 'surface', surface: 'tui' }), 'tui (the local surface that messaged you)');
+  });
+
+  it('the same channel id and label on two servers read as two addresses, each naming its server', () => {
+    const on = (serverId: string) => describeConversation({ kind: 'channel', serverId, channelId: 'general', label: '#general' });
+    assert.equal(on('alpha'), '#general (alpha / general)');
+    assert.equal(on('beta'), '#general (beta / general)');
   });
 });

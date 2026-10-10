@@ -424,14 +424,14 @@ describe('present while acting', () => {
     const [held] = heldDrafts(framework);
     assert.equal(held?.text, 'Answering the person who addressed me.');
     assert.equal(held?.reason, 'ambiguous');
-    assert.match(held?.note ?? '', /chan-A; discord:dm:antra/);
+    assert.match(held?.note ?? '', /\(srv \/ chan-A\); \(srv \/ discord:dm:antra\)/);
     // Turn-start announcement + the mid-turn hold notice.
     assert.equal(notices.length, 2, 'the hold produced exactly one routing notice');
     const wired = membrane.lastStream!.receivedToolResultOptions
       .map((o) => o?.injectedMessages ?? []).flat().map((m) => JSON.stringify(m.content));
     assert.ok(wired.some((t) => t.includes('quick question')), 'the addressed message itself was injected');
     assert.ok(
-      wired.some((t) => t.includes('[routing] discord:dm:antra addressed you mid-turn') && t.includes('instead of going to chan-A')),
+      wired.some((t) => t.includes('[routing] (srv / discord:dm:antra) addressed you mid-turn') && t.includes('instead of going to (srv / chan-A)')),
       'the hold notice was injected alongside it',
     );
 
@@ -476,7 +476,7 @@ describe('present while acting', () => {
     // The notice names the actual cause: a continued conversation, not an address.
     const wired = membrane.lastStream!.receivedToolResultOptions
       .map((o) => o?.injectedMessages ?? []).flat().map((m) => JSON.stringify(m.content));
-    assert.ok(wired.some((t) => t.includes('[routing] discord:guild:portables, where you sent a message this turn, continued mid-turn')));
+    assert.ok(wired.some((t) => t.includes('[routing] (srv / discord:guild:portables), where you sent a message this turn, continued mid-turn')));
     assert.ok(!wired.some((t) => t.includes('addressed you mid-turn')));
 
     await framework.stop();
@@ -868,7 +868,7 @@ describe('present while acting', () => {
 
     assert.deepEqual(routed, [{ text: 'Still talking to chan-A.', locus: 'chan-A' }]);
     const results = JSON.stringify(membrane.lastStream!.receivedToolResults.flat());
-    assert.ok(results.includes('Opened for reading. Your plain speech still goes to chan-A.'));
+    assert.ok(results.includes('Opened for reading. Your plain speech still goes to (srv / chan-A).'), results);
 
     await framework.stop();
   });
@@ -1357,19 +1357,19 @@ describe('speech follows the moment its words were written', () => {
         name: 'a delivered send, followed up in its own thread',
         record: (f) => engage(f).noteSendEngagement('assistant', 'delivered', { serverId: 'srv', channelId: 'chan-T', threadId: 't1' }),
         arrivalThread: 't1',
-        notice: 'chan-T (thread t1), where you sent a message this turn, continued mid-turn',
+        notice: '(srv / chan-T, thread t1), where you sent a message this turn, continued mid-turn',
       },
       {
         name: 'an unconfirmed send, followed up in its own thread',
         record: (f) => engage(f).noteSendEngagement('assistant', 'unknown', { serverId: 'srv', channelId: 'chan-T', threadId: 't1' }),
         arrivalThread: 't1',
-        notice: 'chan-T (thread t1), where you tried to send a message this turn (its delivery wasn\'t confirmed), continued mid-turn',
+        notice: '(srv / chan-T, thread t1), where you tried to send a message this turn (its delivery wasn\'t confirmed), continued mid-turn',
       },
       {
         name: 'a connector send tool, whose place in the channel the host can\'t know',
         record: (f) => engage(f).noteChannelEngagement('assistant', 'srv', 'chan-T'),
         arrivalThread: 't2',
-        notice: 'chan-T (thread t2) continued mid-turn, in a channel you sent something into this turn (where in the channel isn\'t known)',
+        notice: '(srv / chan-T, thread t2) continued mid-turn, in a channel you sent something into this turn (where in the channel isn\'t known)',
       },
     ];
     for (const c of cases) {
