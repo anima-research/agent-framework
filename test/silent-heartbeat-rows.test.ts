@@ -17,7 +17,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { AgentFramework } from '../src/index.js';
 import type { AgentConfig, Module, ModuleContext, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
-import { TOOL_RESULT_GUARD_NOTICE } from '../src/tool-result-guard.js';
+import { TOOL_RESULT_GUARD_NOTICE, withheldResultNotice } from '../src/tool-result-guard.js';
 import { PassthroughStrategy } from '@animalabs/context-manager';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import { NativeFormatter } from '@animalabs/membrane';
@@ -411,7 +411,7 @@ describe('silent heartbeat stored rows', () => {
       const tickRows = stored(x.framework).slice(before);
       assert.deepEqual(tickRows.map((m) => m.participant), ['assistant', 'user', 'assistant']);
       for (const row of tickRows) assert.equal(row.metadata?.silentHeartbeat?.eventId, tick.eventId);
-      assert.equal((tickRows[1]!.content[0] as { content?: unknown }).content, TOOL_RESULT_GUARD_NOTICE);
+      assert.equal((tickRows[1]!.content[0] as { content?: unknown }).content, withheldResultNotice(null, true));
       assert.doesNotMatch(JSON.stringify(tickRows), /discard-this-partial-output/);
 
       const opening = membrane.calls[1]!.messages;

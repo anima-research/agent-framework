@@ -7,8 +7,8 @@
 
 import { constants as fsConstants } from 'node:fs';
 import type { Stats } from 'node:fs';
-import { open, readFile, stat, access, writeFile, unlink, mkdir, lstat, realpath } from 'node:fs/promises';
-import { join, resolve, relative, dirname, sep } from 'node:path';
+import { open, readFile, stat, lstat, realpath } from 'node:fs/promises';
+import { join, resolve, relative, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
@@ -35,7 +35,26 @@ import type {
 } from './types.js';
 import { WORKSPACE_FS_EVENT_TYPES, opToEventType } from './types.js';
 import { MountWatcher, type FsChange } from './watcher.js';
-import { syncFromFs, materializeToFs, hashContent, isBinary, DEFAULT_MAX_FILE_SIZE, type ConflictInfo } from './sync.js';
+import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
+import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
+import { BranchIntents } from './branch-intent.js';
+import { filesystemTrustsCtime, locateRoot } from './observe.js';
+import {
+  type MountRuntime,
+  type PassOptions,
+  type PassResult,
+  type PathReport,
+  type PushOptions,
+  type PushResult,
+  type Scope,
+  type TreeOp,
+  pushPaths,
+  reconcilePass,
+  settleAdoptionBeforeMutation,
+} from './reconcile.js';
+
+/** Default for how long the after-batch scan may hold the agent's next inference. */
+const AGENT_ACTION_SCAN_DEADLINE_MS = 20_000;
 
 export type {
   WorkspaceConfig,
@@ -606,6 +625,14 @@ export class WorkspaceModule implements Module {
   private config: WorkspaceConfig;
   private mounts = new Map<string, MountState>();
   private watchers = new Map<string, MountWatcher>();
+  /** What disk last agreed with (global records); created with the store. */
+  private agreement: DiskAgreement | null = null;
+  /** Branch-local intent per mount. */
+  private intents = new Map<string, BranchIntents>();
+  /** Each mount's turn: the tail of its serialized passes and writes. */
+  private mountTurns = new Map<string, Promise<void>>();
+  /** Whether a mount root's filesystem maintains ctime, by canonical root. */
+  private ctimeTrust = new Map<string, boolean>();
   /** Persisted state decoded in start(), held until mounts exist to apply it
    *  to — in the Host ordering start() runs before initStore() creates the
    *  mounts, so restoration must be second-callback-safe like watcher
@@ -651,36 +678,113 @@ export class WorkspaceModule implements Module {
   initStore(store: JsStore): void {
     this.store = store;
 
-    // Register tree states for each mount
+    // Register tree states for each mount: the workspace tree, and the
+    // branch-local intent that qualifies it.
     for (const mount of this.config.mounts) {
       const treeStateId = `workspace/${mount.name}/tree`;
-      try {
-        store.registerState({
-          id: treeStateId,
-          strategy: 'tree',
-          deltaSnapshotEvery: this.config.deltaSnapshotEvery ?? 50,
-          fullSnapshotEvery: this.config.fullSnapshotEvery ?? 10,
-        });
-      } catch {
-        // State already registered (restart scenario)
+      const intentTreeStateId = `workspace/${mount.name}/intent`;
+      for (const id of [treeStateId, intentTreeStateId]) {
+        try {
+          store.registerState({
+            id,
+            strategy: 'tree',
+            deltaSnapshotEvery: this.config.deltaSnapshotEvery ?? 50,
+            fullSnapshotEvery: this.config.fullSnapshotEvery ?? 10,
+          });
+        } catch {
+          // State already registered (restart scenario)
+        }
       }
 
       const mountState: MountState = {
         config: mount,
         treeStateId,
+        intentTreeStateId,
         lastMaterializedSeq: 0,
         suppressedPaths: new Set(),
         initialSyncDone: false,
         lastMaterializedBranchId: null,
-        materializedHashes: new Map(),
         watcherReadyAt: null,
         watcherError: null,
       };
       this.mounts.set(mount.name, mountState);
+      this.intents.set(mount.name, new BranchIntents(store, intentTreeStateId));
     }
+
+    // What disk last agreed with, per mount and path: global records, so a
+    // branch switch never rewinds it.
+    this.agreement = new DiskAgreement(store);
+    this.agreement.open(this.config.mounts.map((m) => ({ name: m.name, root: resolve(m.path) })));
 
     this.applySavedState();
     this.ensureRunning();
+  }
+
+  // ==========================================================================
+  // Reconciliation plumbing
+  // ==========================================================================
+
+  /**
+   * Run `fn` with the mount to itself: observation, decision and effect never
+   * interleave with another pass or a tool write on the same mount (a disk
+   * observation taken before an autoMaterialize write and applied after it
+   * would ingest old bytes over the new entry). Not re-entrant: code holding
+   * a mount's turn calls the unlocked helpers.
+   */
+  private withMount<T>(mount: MountState, fn: () => Promise<T>): Promise<T> {
+    const name = mount.config.name;
+    const previous = this.mountTurns.get(name) ?? Promise.resolve();
+    const run = previous.then(fn, fn);
+    this.mountTurns.set(name, run.then(() => undefined, () => undefined));
+    return run;
+  }
+
+  private agreementOrThrow(): DiskAgreement {
+    if (!this.agreement) throw new Error('Workspace store not initialized');
+    return this.agreement;
+  }
+
+  /** The view reconciliation needs of a mount, refreshed per pass. */
+  private async runtime(mount: MountState): Promise<MountRuntime> {
+    const root = resolve(mount.config.path);
+    const rootReal = await realpath(root).catch(() => root);
+    let trusts = this.ctimeTrust.get(rootReal);
+    if (trusts === undefined) {
+      trusts = await filesystemTrustsCtime(rootReal);
+      this.ctimeTrust.set(rootReal, trusts);
+    }
+    return {
+      name: mount.config.name,
+      view: {
+        root,
+        rootIdentity: this.agreementOrThrow().rootIdentity(mount.config.name),
+        followSymlinks: mount.config.followSymlinks === true,
+        maxFileSize: mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
+        ignore: mount.config.ignore ?? [],
+      },
+      rootReal,
+      trustsCtime: trusts,
+      treeStateId: mount.treeStateId,
+      intents: this.intents.get(mount.config.name)!,
+      readOnly: mount.config.mode === 'read-only',
+    };
+  }
+
+  /** One disk→store pass; the caller holds the mount's turn. Emits its events. */
+  private async passUnlocked(mount: MountState, scope: Scope, opts: PassOptions = {}): Promise<PassResult> {
+    const result = await reconcilePass(this.getStore(), this.agreementOrThrow(), await this.runtime(mount), scope, opts);
+    if (scope.kind === 'dir' && scope.dir === '' && scope.recursive) mount.initialSyncDone = true;
+    this.emitFsEvents(mount.config.name, result.ops, result.newConflicts);
+    return result;
+  }
+
+  /** One store→disk push; the caller holds the mount's turn. */
+  private async pushUnlocked(mount: MountState, paths: string[], opts: PushOptions = {}): Promise<PushResult> {
+    const watcher = this.watchers.get(mount.config.name);
+    return pushPaths(this.getStore(), this.agreementOrThrow(), await this.runtime(mount), paths, {
+      ...opts,
+      beforeEffect: (p) => watcher?.suppress(p),
+    });
   }
 
   async start(ctx: ModuleContext): Promise<void> {
@@ -712,6 +816,20 @@ export class WorkspaceModule implements Module {
       if (mount) {
         mount.lastMaterializedSeq = meta.lastMaterializedSeq;
         mount.lastMaterializedBranchId = meta.lastMaterializedBranchId ?? null;
+        // A store that ran the stop-time freshness baselines (#109): carry
+        // them over as disk-agreement evidence wherever the journal has none.
+        // Its refused paths need nothing — they are re-observed as conflicts.
+        if (this.agreement && meta.materializedHashes) {
+          let imported = false;
+          for (const [path, hash] of Object.entries(meta.materializedHashes)) {
+            if (this.agreement.get(name, path) === undefined) {
+              this.agreement.set(name, path, { kind: 'content', hash, size: -1 });
+              imported = true;
+            }
+          }
+          // The next stop() saves module state without them: durable first.
+          if (imported) this.agreement.barrier();
+        }
         // watcherReadyAt intentionally not restored — each session must
         // observe its own watcher attach, otherwise a stale timestamp
         // would hide a new-session attach failure.
@@ -855,12 +973,10 @@ export class WorkspaceModule implements Module {
         watcher.start();
         this.watchers.set(name, watcher);
 
-        // Chokidar is started with ignoreInitial:true, so files already on
-        // disk at session start would be invisible. Trigger one syncFromFs
-        // pass — syncFromFs diffs disk against the tree state, so only files
-        // new-to-this-session's-tree fire workspace:created events. Fresh
-        // sessions see the existing catalog; restarts only see what appeared
-        // while the session was down.
+        // Chokidar is started with ignoreInitial:true, so changes made while
+        // the session was down would be invisible. One full pass catches up
+        // under the three-way rule: only real differences produce tree
+        // changes and events.
         void this.initialScan(name);
       }
 
@@ -878,9 +994,9 @@ export class WorkspaceModule implements Module {
     if (!store || !mount) return;
 
     try {
-      const result = await syncFromFs(store, mount);
-      mount.initialSyncDone = true;
-      this.emitFsEvents(mountName, result.synced, result.conflicts);
+      // A full pass under the three-way rule: deletions on disk are confirmed
+      // where nothing newer is pending, and nothing unvisited is touched.
+      await this.withMount(mount, () => this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true }));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.ctx?.pushEvent({
@@ -892,6 +1008,21 @@ export class WorkspaceModule implements Module {
   }
 
   async stop(): Promise<void> {
+    // No new watcher-driven passes, then let every pass and write finish
+    // before the store goes away — including any queued behind the ones in
+    // flight (a tool call, a scan continuing past its deadline): drained
+    // until no new tail appears.
+    for (const watcher of this.watchers.values()) {
+      await watcher.stop();
+    }
+    this.watchers.clear();
+    for (;;) {
+      const tails = [...this.mountTurns.values()];
+      await Promise.all(tails);
+      const now = [...this.mountTurns.values()];
+      if (now.length === tails.length && now.every((tail, i) => tail === tails[i])) break;
+    }
+
     // Persist state
     if (this.ctx) {
       const activeBranchId = this.store ? this.store.currentBranch().id : undefined;
@@ -906,12 +1037,6 @@ export class WorkspaceModule implements Module {
       }
       this.ctx.setState(state);
     }
-
-    // Stop watchers
-    for (const watcher of this.watchers.values()) {
-      await watcher.stop();
-    }
-    this.watchers.clear();
     this.ctx = null;
   }
 
@@ -988,7 +1113,9 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'delete',
-        description: 'Delete a file from the workspace.',
+        description: 'Delete a file from the workspace. On a mount without autoMaterialize the disk copy stays, '
+          + 'listed as workspace-deleted (no scan brings it back), until materialize with applyDeletions removes it '
+          + 'or a sync of the path restores it.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -999,7 +1126,13 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'ls',
-        description: 'List directory contents from the workspace tree.',
+        description: 'List a directory, checked against disk first. Each file has a state: synced; '
+          + 'workspace-draft (the workspace has changes disk lacks); workspace-deleted (deleted in the workspace, '
+          + 'still on disk); not-in-branch (on disk, absent from this branch\'s workspace); disk-only (binary or over '
+          + 'the size limit, never stored — shown with size and image type); conflict (disk and workspace both '
+          + 'changed — sync the path to take disk, or materialize with force to take the workspace); '
+          + 'disk-missing-provenance-unknown; unverified (disk could not be checked). `incomplete` names regions '
+          + 'the listing could not see.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1010,7 +1143,7 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'glob',
-        description: 'Find files matching a glob pattern in the workspace.',
+        description: 'Find files matching a glob pattern, checked against disk first; each match carries its state, as ls describes.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1022,7 +1155,11 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'grep',
-        description: 'Search file contents with a regex pattern.',
+        description: 'Search stored file text with a regex pattern, checked against disk first. Each result says '
+          + 'which version matched: the workspace\'s (with its state); the disk version kept with a conflict '
+          + '(conflicting-disk); or, once disk has changed since the conflict was recorded, that recorded version '
+          + '(recorded-disk). Disk versions it could not search are listed as skipped: disk-only files (binary or '
+          + 'over the size limit), and a conflict\'s disk version that is binary, oversize, or newer than the one recorded.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1047,24 +1184,42 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'materialize',
-        description: 'Write workspace files to the real filesystem. Use after writing/editing to push changes to disk.',
+        description: 'Write workspace files to the real filesystem. Use after writing/editing to push changes to disk. '
+          + 'Never deletes disk files unless applyDeletions is given; lists workspace deletions it left on disk.',
         inputSchema: {
           type: 'object' as const,
           properties: {
-            path: { type: 'string', description: 'Specific path to materialize (optional — defaults to all changed)' },
+            path: { type: 'string', description: 'Specific path to materialize (optional — defaults to what disk still owes: workspace edits, conflicts, workspace deletions, and files never checked against disk)' },
             mount: { type: 'string', description: 'Specific mount (optional)' },
-            force: { type: 'boolean', description: 'Materialize even if the current branch has diverged from the branch last written to disk (default false). Only needed for genuine divergence — descendant branches pass automatically.' },
+            force: { type: 'boolean', description: 'Overwrite files whose disk copy changed since it last agreed with the workspace (another writer, or a conflict), and materialize even if the current branch has diverged from the branch last written to disk (default false). Without it, divergent files are skipped and listed. A file the workspace has not changed is left as disk has it unless you name its path.' },
+            applyDeletions: { type: 'boolean', description: 'Also delete from disk the files deleted in the workspace whose disk copy is one the workspace holds (default false). With force, also those whose disk copy changed since.' },
           },
         },
       },
       {
         name: 'sync',
-        description: 'Pull filesystem state into the workspace. Detects user changes on disk.',
+        description: 'Bring disk changes into the workspace. Without a path, every mount (or the given one) is '
+          + 'rechecked in full and nothing pending in the workspace is discarded. With a path (file or directory), '
+          + 'the workspace takes disk\'s state there explicitly: it restores a workspace-deleted file, resolves '
+          + 'conflicts toward disk, replaces a workspace draft, and removes a workspace file disk does not have. '
+          + 'Each workspace change it gives up is listed under `discarded`, with the state it had. '
+          + 'A mount whose root is not the directory disk last agreed with (an unmounted drive, a replaced '
+          + 'directory) is unavailable and listed under `incomplete`: reconnect it, or take the root as it is '
+          + 'now with acceptRoot.',
         inputSchema: {
           type: 'object' as const,
           properties: {
-            path: { type: 'string', description: 'Specific path to sync (optional — defaults to all)' },
+            path: { type: 'string', description: 'Specific path to take from disk (optional — defaults to a full recheck)' },
             mount: { type: 'string', description: 'Specific mount (optional)' },
+            acceptRoot: {
+              type: 'boolean',
+              description: 'Take each mount\'s root as it is now when it is not the directory disk last agreed with: '
+                + 'a directory replaced on purpose, or a drive that came back under a new device number (default false). '
+                + 'What was recorded about the old one is set aside, so every file is compared afresh: a file disk '
+                + 'and the workspace agree on agrees again, a differing one is a conflict, and a workspace file the '
+                + 'root lacks stays in the workspace. Not with path. Leave it off while a drive is merely unplugged: '
+                + 'its empty mountpoint would become the root.',
+            },
           },
         },
       },
@@ -1236,11 +1391,18 @@ export class WorkspaceModule implements Module {
    * mount, through the same Chronicle-tree + auto-materialize path as the
    * `write` tool. Public API for the framework's synthesized `save_image`
    * tool and other peer callers that hold bytes rather than text.
+   *
+   * `branch`, when given, ties the write to that branch: the store's current
+   * branch is checked where the tree entry is set, nothing yielding between
+   * the check and the entry, so the file lands on that branch or the write is
+   * refused. The tool-result guard writes a withheld original this way, for
+   * the branch its stub is on (agent-framework #277).
    */
   async writeBinary(
     mountPrefixedPath: string,
     data: Buffer,
     mimeType: string,
+    options: { branch?: string } = {},
   ): Promise<ToolResult> {
     let mount: MountState;
     let relativePath: string;
@@ -1261,24 +1423,27 @@ export class WorkspaceModule implements Module {
       return { success: false, error: `Content exceeds max file size (${maxSize} bytes)`, isError: true };
     }
     const store = this.getStore();
-    const blobHash = store.storeBlob(data, mimeType);
-    store.treeSet(mount.treeStateId, relativePath, {
-      blobHash,
-      size: data.byteLength,
-      mode: 0o644,
-    });
-    const materializeError = await this.autoMaterialize(mount, relativePath, 'write', data);
-    if (materializeError) {
+    return this.withMount(mount, async () => {
+      await this.settleBeforeMutation(mount, relativePath);
+      // Checked inside the mount's turn, after anything the write waited on:
+      // commitToolChange sets the tree entry before it first yields.
+      if (options.branch !== undefined && store.currentBranch().name !== options.branch) {
+        return { success: false, error: 'the workspace had left the branch this file is for', isError: true };
+      }
+      const blobHash = store.storeBlob(data, mimeType);
+      const materializeError = await this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: data.byteLength });
+      if (materializeError) {
+        return {
+          success: false,
+          error: `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${materializeError}.`,
+          isError: true,
+        };
+      }
       return {
-        success: false,
-        error: `Wrote to Chronicle but failed to materialize "${mountPrefixedPath}" to disk: ${materializeError}.`,
-        isError: true,
+        success: true,
+        data: { path: mountPrefixedPath, size: data.byteLength, mimeType },
       };
-    }
-    return {
-      success: true,
-      data: { path: mountPrefixedPath, size: data.byteLength, mimeType },
-    };
+    });
   }
 
   /**
@@ -1297,12 +1462,14 @@ export class WorkspaceModule implements Module {
       return { error: error instanceof Error ? error.message : String(error) };
     }
     const store = this.getStore();
-    await this.ensureSynced(mount, relativePath);
-    const entry = store.treeGet(mount.treeStateId, relativePath);
-    if (!entry) return { error: `File not found: ${mountPrefixedPath}` };
-    const blob = store.getBlob(entry.blobHash);
-    if (!blob) return { error: `Blob not found for: ${mountPrefixedPath}` };
-    return { data: blob };
+    return this.withMount(mount, async () => {
+      await this.ensureSynced(mount, relativePath);
+      const entry = store.treeGet(mount.treeStateId, relativePath);
+      if (!entry) return { error: `File not found: ${mountPrefixedPath}` };
+      const blob = store.getBlob(entry.blobHash);
+      if (!blob) return { error: `Blob not found for: ${mountPrefixedPath}` };
+      return { data: blob };
+    });
   }
 
   /**
@@ -1692,55 +1859,64 @@ export class WorkspaceModule implements Module {
   }
 
   /**
-   * Persist a single write/edit/delete to disk when the mount opts in via
-   * `autoMaterialize`. Required for cross-agent pipelines — another agent's
-   * chokidar watcher on the same directory only sees real filesystem events.
-   * The local watcher's `suppress()` absorbs the echo so we don't self-wake.
+   * Commit a tool's write or delete to the workspace tree, with the branch
+   * intent it implies (store origin for a path disk never agreed with; a
+   * tombstone for a deletion), and push it to disk when the mount opts in via
+   * `autoMaterialize` — required for cross-agent pipelines, since another
+   * agent's watcher on the same directory only sees real filesystem events.
+   * The push follows materialize's rule: a disk copy that changed since it
+   * last agreed is not overwritten or unlinked, and the refusal says why.
    *
-   * Returns an error string on failure so callers can surface it in the tool
-   * result. The autoMaterialize contract is specifically "disk is the source
-   * of truth for downstream agents", so a silent disk-write failure with a
-   * Chronicle commit would defeat the whole purpose. No-op cases (flag off,
-   * read-only mount) return null (success).
+   * Returns the reason when the change reached the workspace but not disk, so
+   * callers surface it in the tool result: the autoMaterialize contract is
+   * that disk is the source of truth for downstream agents. The caller holds
+   * the mount's turn and has settled the path first (settleBeforeMutation).
    */
-  private async autoMaterialize(
+  private async commitToolChange(
     mount: MountState,
     relativePath: string,
-    op: 'write' | 'delete',
-    content?: Buffer,
+    change: { kind: 'set'; blobHash: string; size: number; mode?: number } | { kind: 'remove'; previousHash: string },
   ): Promise<string | null> {
-    if (!mount.config.autoMaterialize) return null;
-    if (mount.config.mode === 'read-only') return null;
-
-    const absolutePath = join(mount.config.path, relativePath);
-    const watcher = this.watchers.get(mount.config.name);
-    watcher?.suppress(relativePath);
-
-    try {
-      if (op === 'write' && content) {
-        await mkdir(dirname(absolutePath), { recursive: true });
-        await writeFile(absolutePath, content);
-        mount.materializedHashes.set(relativePath, hashContent(content));
-      } else if (op === 'delete') {
-        try {
-          await unlink(absolutePath);
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-        }
-        mount.materializedHashes.delete(relativePath);
-      }
-      return null;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.ctx?.pushEvent({
-        type: 'workspace:materialize-failed',
-        mount: mount.config.name,
-        path: relativePath,
-        op,
-        error: msg,
-      } as ProcessEvent);
-      return msg;
+    const store = this.getStore();
+    const intents = this.intents.get(mount.config.name)!;
+    // The mutation's precondition, enforced here, synchronously with the
+    // commit: whatever settleBeforeMutation's pass could or couldn't settle.
+    settleAdoptionBeforeMutation(store, this.agreementOrThrow(), { name: mount.config.name, treeStateId: mount.treeStateId }, relativePath);
+    const known = this.agreementOrThrow().get(mount.config.name, relativePath) !== undefined;
+    if (change.kind === 'set') {
+      store.treeSet(mount.treeStateId, relativePath, { blobHash: change.blobHash, size: change.size, mode: change.mode ?? 0o644 });
+      intents.update(relativePath, (cur) => {
+        const next = { ...cur };
+        delete next.tombstone;
+        // Disk has never agreed with this path: a missing disk copy is a draft
+        // not yet materialized, not a deletion.
+        if (!known) next.origin = 'store';
+        return next;
+      });
+    } else {
+      store.treeRemove(mount.treeStateId, relativePath);
+      intents.update(relativePath, (cur) => {
+        const next = { ...cur, tombstone: { hash: change.previousHash } };
+        delete next.origin;
+        return next;
+      });
     }
+    if (!mount.config.autoMaterialize || mount.config.mode === 'read-only') return null;
+
+    const pushed = await this.pushUnlocked(mount, [relativePath], {
+      applyDeletions: change.kind === 'remove',
+      branchId: store.currentBranch().id,
+    });
+    const refused = pushed.skipped.find((s) => s.path === relativePath);
+    if (!refused) return null;
+    this.ctx?.pushEvent({
+      type: 'workspace:materialize-failed',
+      mount: mount.config.name,
+      path: relativePath,
+      op: change.kind === 'set' ? 'write' : 'delete',
+      error: refused.reason,
+    } as ProcessEvent);
+    return refused.reason;
   }
 
   // ==========================================================================
@@ -1748,36 +1924,49 @@ export class WorkspaceModule implements Module {
   // ==========================================================================
 
   /**
-   * Ensure a file is synced from filesystem if not yet in tree (lazy sync).
+   * Before a tool reads or changes a path's workspace entry, a pending intent
+   * on that path is settled by a pass over it, so the tool works from what
+   * disk now holds (an edit sees a disk change the settled adoption took in).
+   * The pass may not settle it (a branch that keeps changing, an unreadable
+   * disk copy); the precondition that matters is enforced again,
+   * synchronously, where the change commits (commitToolChange). The caller
+   * holds the mount's turn.
    */
-  private async ensureSynced(mount: MountState, relativePath: string): Promise<void> {
+  private async settleBeforeMutation(mount: MountState, relativePath: string): Promise<void> {
+    if (this.agreementOrThrow().get(mount.config.name, relativePath)?.kind !== 'pending') return;
+    await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
+  }
+
+  /**
+   * Before a read: a path the workspace doesn't hold is observed under the
+   * three-way rule, which ingests a new disk file but never brings back a
+   * workspace deletion or a file absent from this branch. The caller holds
+   * the mount's turn.
+   */
+  private async ensureSynced(mount: MountState, relativePath: string): Promise<PathReport | undefined> {
     const store = this.getStore();
-    const existing = store.treeGet(mount.treeStateId, relativePath);
-    if (existing) return; // Already in tree
+    if (store.treeGet(mount.treeStateId, relativePath)) return undefined;
+    const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
+    return pass.reports.get(relativePath);
+  }
 
-    // Try to read from filesystem
-    const absolutePath = join(mount.config.path, relativePath);
-    try {
-      const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
-      const fileStat = await stat(absolutePath);
-      if (!fileStat.isFile() || fileStat.size > maxSize) return;
-
-      const buffer = await readFile(absolutePath);
-      // Binaries are never synced into the tree (mirrors syncFromFs): the old
-      // utf-8 round-trip here silently replaced non-UTF-8 bytes with U+FFFD,
-      // permanently mangling images in the blob store. Binary reads are served
-      // straight from disk (readImageFromFilesystem / read_image fallback).
-      if (isBinary(buffer)) return;
-      const content = buffer.toString('utf-8');
-      const blobHash = store.storeBlob(Buffer.from(content, 'utf-8'), 'text/plain');
-
-      store.treeSet(mount.treeStateId, relativePath, {
-        blobHash,
-        size: buffer.length,
-        mode: 0o644,
-      });
-    } catch {
-      // File doesn't exist on disk — that's fine
+  /** Why the workspace holds no entry at a path, when disk explains it. */
+  private notInWorkspace(path: string, report: PathReport | undefined): string {
+    switch (report?.state) {
+      case 'workspace-deleted':
+        return `${path} was deleted in the workspace; disk still has a copy. Sync this path to restore it.`;
+      case 'not-in-branch':
+        return `${path} is not in this branch's workspace; disk has a copy. Sync this path to add it.`;
+      case 'disk-only':
+        return `${path} is on disk but not stored in the workspace (binary or over the size limit)` +
+          (report.mimeType?.startsWith('image/') ? '; read it with read_image.' : '.');
+      case 'conflict':
+        return `${path} is in conflict: the workspace deleted it and disk changed it since. ` +
+          'Sync this path to take the disk version.';
+      case 'unverified':
+        return `${path} is not in the workspace, and disk could not be checked (${report.note ?? 'not observed'}).`;
+      default:
+        return `File not found: ${path}`;
     }
   }
 
@@ -1801,22 +1990,18 @@ export class WorkspaceModule implements Module {
     }
     let content = generatedContent;
     if (content === undefined) {
-    const { mount, relativePath } = this.parsePath(input.path);
-    const store = this.getStore();
-
-    await this.ensureSynced(mount, relativePath);
-
-    const entry = store.treeGet(mount.treeStateId, relativePath);
-    if (!entry) {
-      return { success: false, error: `File not found: ${input.path}`, isError: true };
-    }
-
-    const blob = store.getBlob(entry.blobHash);
-    if (!blob) {
-      return { success: false, error: `Blob not found for: ${input.path}`, isError: true };
-    }
-
-    content = blob.toString('utf-8');
+      const { mount, relativePath } = this.parsePath(input.path);
+      const store = this.getStore();
+      const found = await this.withMount(mount, async (): Promise<{ text: string } | { error: string }> => {
+        const report = await this.ensureSynced(mount, relativePath);
+        const entry = store.treeGet(mount.treeStateId, relativePath);
+        if (!entry) return { error: this.notInWorkspace(input.path, report) };
+        const blob = store.getBlob(entry.blobHash);
+        if (!blob) return { error: `Blob not found for: ${input.path}` };
+        return { text: blob.toString('utf-8') };
+      });
+      if ('error' in found) return { success: false, error: found.error, isError: true };
+      content = found.text;
     }
     if (characterPaging) {
       const start = Math.min(offsetChars, content.length);
@@ -1958,13 +2143,11 @@ export class WorkspaceModule implements Module {
     }
 
     const buffer = Buffer.from(input.content, 'utf-8');
-    const blobHash = store.storeBlob(buffer, 'text/plain');
-    store.treeSet(mount.treeStateId, relativePath, {
-      blobHash,
-      size: Buffer.byteLength(input.content),
-      mode: 0o644,
+    const materializeError = await this.withMount(mount, async () => {
+      await this.settleBeforeMutation(mount, relativePath);
+      const blobHash = store.storeBlob(buffer, 'text/plain');
+      return this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: buffer.byteLength });
     });
-    const materializeError = await this.autoMaterialize(mount, relativePath, 'write', buffer);
     if (materializeError) {
       return {
         success: false,
@@ -1990,62 +2173,65 @@ export class WorkspaceModule implements Module {
     }
 
     const store = this.getStore();
-    await this.ensureSynced(mount, relativePath);
+    return this.withMount(mount, async (): Promise<ToolResult> => {
+      const report = await this.ensureSynced(mount, relativePath);
+      await this.settleBeforeMutation(mount, relativePath); // before the edit reads the entry
 
-    const entry = store.treeGet(mount.treeStateId, relativePath);
-    if (!entry) {
-      return { success: false, error: `File not found: ${input.path}`, isError: true };
-    }
-
-    const blob = store.getBlob(entry.blobHash);
-    if (!blob) {
-      return { success: false, error: `Blob not found for: ${input.path}`, isError: true };
-    }
-
-    let content = blob.toString('utf-8');
-
-    // Validate uniqueness
-    if (!input.replaceAll) {
-      const count = content.split(input.oldString).length - 1;
-      if (count === 0) {
-        return { success: false, error: `String not found in ${input.path}`, isError: true };
+      const entry = store.treeGet(mount.treeStateId, relativePath);
+      if (!entry) {
+        return { success: false, error: this.notInWorkspace(input.path, report), isError: true };
       }
-      if (count > 1) {
+
+      const blob = store.getBlob(entry.blobHash);
+      if (!blob) {
+        return { success: false, error: `Blob not found for: ${input.path}`, isError: true };
+      }
+
+      let content = blob.toString('utf-8');
+
+      // Validate uniqueness
+      if (!input.replaceAll) {
+        const count = content.split(input.oldString).length - 1;
+        if (count === 0) {
+          return { success: false, error: `String not found in ${input.path}`, isError: true };
+        }
+        if (count > 1) {
+          return {
+            success: false,
+            error: `String found ${count} times in ${input.path}. Use replaceAll: true or provide more context.`,
+            isError: true,
+          };
+        }
+      }
+
+      content = input.replaceAll
+        ? content.replaceAll(input.oldString, input.newString)
+        : content.replace(input.oldString, input.newString);
+
+      const newBuffer = Buffer.from(content, 'utf-8');
+      const newBlobHash = store.storeBlob(newBuffer, 'text/plain');
+      const materializeError = await this.commitToolChange(mount, relativePath, {
+        kind: 'set',
+        blobHash: newBlobHash,
+        size: newBuffer.byteLength,
+        mode: entry.mode,
+      });
+      if (materializeError) {
         return {
           success: false,
-          error: `String found ${count} times in ${input.path}. Use replaceAll: true or provide more context.`,
+          error: `Edited Chronicle but failed to materialize "${input.path}" to disk: ${materializeError}. Downstream agents will not see this change until the next materialize call.`,
           isError: true,
         };
       }
-    }
 
-    content = input.replaceAll
-      ? content.replaceAll(input.oldString, input.newString)
-      : content.replace(input.oldString, input.newString);
-
-    const newBuffer = Buffer.from(content, 'utf-8');
-    const newBlobHash = store.storeBlob(newBuffer, 'text/plain');
-    store.treeSet(mount.treeStateId, relativePath, {
-      blobHash: newBlobHash,
-      size: Buffer.byteLength(content),
-      mode: entry.mode,
-    });
-    const materializeError = await this.autoMaterialize(mount, relativePath, 'write', newBuffer);
-    if (materializeError) {
       return {
-        success: false,
-        error: `Edited Chronicle but failed to materialize "${input.path}" to disk: ${materializeError}. Downstream agents will not see this change until the next materialize call.`,
-        isError: true,
+        success: true,
+        data: {
+          path: input.path,
+          size: newBuffer.byteLength,
+        },
       };
-    }
-
-    return {
-      success: true,
-      data: {
-        path: input.path,
-        size: Buffer.byteLength(content),
-      },
-    };
+    });
   }
 
   private async handleDelete(input: DeleteInput): Promise<ToolResult> {
@@ -2055,22 +2241,28 @@ export class WorkspaceModule implements Module {
     }
 
     const store = this.getStore();
-    const entry = store.treeGet(mount.treeStateId, relativePath);
-    if (!entry) {
-      return { success: false, error: `File not found: ${input.path}`, isError: true };
-    }
+    return this.withMount(mount, async (): Promise<ToolResult> => {
+      const report = await this.ensureSynced(mount, relativePath);
+      await this.settleBeforeMutation(mount, relativePath);
+      const entry = store.treeGet(mount.treeStateId, relativePath);
+      if (!entry) {
+        return { success: false, error: this.notInWorkspace(input.path, report), isError: true };
+      }
 
-    store.treeRemove(mount.treeStateId, relativePath);
-    const materializeError = await this.autoMaterialize(mount, relativePath, 'delete');
-    if (materializeError) {
-      return {
-        success: false,
-        error: `Removed from Chronicle but failed to unlink "${input.path}" from disk: ${materializeError}. Downstream agents will still see the stale file until manual cleanup.`,
-        isError: true,
-      };
-    }
+      const materializeError = await this.commitToolChange(mount, relativePath, { kind: 'remove', previousHash: entry.blobHash });
+      if (materializeError) {
+        return {
+          success: false,
+          error: `Removed from Chronicle but did not unlink "${input.path}" from disk: ${materializeError}. ` +
+            'The disk copy stays (ls shows its state) until materialize with applyDeletions removes it.',
+          isError: true,
+        };
+      }
 
-    return { success: true, data: { path: input.path, deleted: true } };
+      // Its whole receipt is what it changed: kept in the stub if the guard
+      // withholds the result (agent-framework #277).
+      return { success: true, data: { path: input.path, deleted: true }, keepWhenWithheld: ['path', 'deleted'] };
+    });
   }
 
   private async handleLs(input: LsInput): Promise<ToolResult> {
@@ -2087,63 +2279,55 @@ export class WorkspaceModule implements Module {
     }
 
     const { mount, relativePath } = this.parsePath(input.path);
+    const recursive = input.recursive === true;
 
-    // Ensure initial sync — always sync on first access regardless of watch mode,
-    // so that ls/glob/grep see filesystem contents even for unwatched mounts
-    if (!mount.initialSyncDone) {
-      await syncFromFs(store, mount);
-      mount.initialSyncDone = true;
-    }
+    // Every listing checks the paths it shows against disk first, under the
+    // three-way rule, whatever the mount's watch mode.
+    return this.withMount(mount, async (): Promise<ToolResult> => {
+      const pass = await this.passUnlocked(mount, { kind: 'dir', dir: relativePath, recursive });
+      const reports = [...pass.reports.values()].sort((a, b) => a.path.localeCompare(b.path));
+      const incomplete = pass.incomplete.length > 0 ? { incomplete: pass.incomplete } : {};
 
-    const prefix = relativePath ? relativePath + '/' : '';
-    const entries = store.treeList(mount.treeStateId, prefix || undefined);
+      if (recursive) {
+        return {
+          success: true,
+          data: {
+            path: input.path,
+            entries: reports.map((r) => ({ path: r.path, ...stateView(r) })),
+            count: reports.length,
+            ...incomplete,
+          },
+        };
+      }
 
-    if (input.recursive) {
+      // Non-recursive: the scope's files, and the directories beneath it that
+      // disk or the workspace has.
+      const prefix = relativePath ? relativePath + '/' : '';
+      const dirNames = new Set(pass.dirs.map((d) => d.slice(prefix.length)));
+      for (const entry of store.treeList(mount.treeStateId, prefix || undefined)) {
+        const slash = entry.path.indexOf('/', prefix.length);
+        if (slash >= 0) dirNames.add(entry.path.slice(prefix.length, slash));
+      }
+      const children: Array<Record<string, unknown>> = [
+        ...[...dirNames].sort().map((name) => ({ name, type: 'directory' })),
+        ...reports.map((r) => ({ name: r.path.slice(prefix.length), type: 'file', ...stateView(r) })),
+      ];
       return {
         success: true,
         data: {
           path: input.path,
-          entries: entries.map(e => ({
-            path: e.path,
-            size: e.size,
-          })),
-          count: entries.length,
+          entries: children,
+          count: children.length,
+          ...incomplete,
         },
       };
-    }
-
-    // Non-recursive: deduplicate to show immediate children only
-    const seen = new Set<string>();
-    const children: Array<{ name: string; type: 'file' | 'directory' }> = [];
-
-    for (const entry of entries) {
-      const rest = entry.path.slice(prefix.length);
-      const slashIdx = rest.indexOf('/');
-      if (slashIdx >= 0) {
-        const dirName = rest.slice(0, slashIdx);
-        if (!seen.has(dirName)) {
-          seen.add(dirName);
-          children.push({ name: dirName, type: 'directory' });
-        }
-      } else {
-        children.push({ name: rest, type: 'file' });
-      }
-    }
-
-    return {
-      success: true,
-      data: {
-        path: input.path,
-        entries: children,
-        count: children.length,
-      },
-    };
+    });
   }
 
   private async handleGlob(input: GlobInput): Promise<ToolResult> {
-    const store = this.getStore();
     const regex = globToRegex(input.pattern);
-    const matches: string[] = [];
+    const matches: Array<Record<string, unknown>> = [];
+    const incomplete: Array<{ path: string; reason: string }> = [];
 
     // Search across mounts
     const mountsToSearch = input.path
@@ -2151,19 +2335,16 @@ export class WorkspaceModule implements Module {
       : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
 
     for (const { mount, relativePath } of mountsToSearch) {
-      if (!mount.initialSyncDone) {
-        await syncFromFs(store, mount);
-        mount.initialSyncDone = true;
-      }
-
-      const prefix = relativePath ? relativePath + '/' : undefined;
-      const entries = store.treeList(mount.treeStateId, prefix);
-
-      for (const entry of entries) {
-        const testPath = relativePath ? entry.path.slice(relativePath.length + 1) : entry.path;
+      const pass = await this.withMount(mount, () =>
+        this.passUnlocked(mount, { kind: 'dir', dir: relativePath, recursive: true }));
+      for (const report of [...pass.reports.values()].sort((a, b) => a.path.localeCompare(b.path))) {
+        const testPath = relativePath ? report.path.slice(relativePath.length + 1) : report.path;
         if (regex.test(testPath)) {
-          matches.push(`${mount.config.name}/${entry.path}`);
+          matches.push({ path: `${mount.config.name}/${report.path}`, ...stateView(report) });
         }
+      }
+      for (const region of pass.incomplete) {
+        incomplete.push({ path: `${mount.config.name}/${region.path}`, reason: region.reason });
       }
     }
 
@@ -2173,6 +2354,7 @@ export class WorkspaceModule implements Module {
         pattern: input.pattern,
         matches,
         count: matches.length,
+        ...(incomplete.length > 0 ? { incomplete } : {}),
       },
     };
   }
@@ -2194,61 +2376,86 @@ export class WorkspaceModule implements Module {
       ? [this.parsePath(input.path)]
       : [...this.mounts.values()].map(m => ({ mount: m, relativePath: '' }));
 
-    const results: Array<{ file: string; matches: Array<{ line: number; text: string; context?: string[] }> }> = [];
+    type GrepMatch = { line: number; text: string; context?: string[] };
+    const results: Array<{ file: string; state: string; version: 'workspace' | 'conflicting-disk' | 'recorded-disk'; matches: GrepMatch[] }> = [];
+    const skipped: Array<{ file: string; reason: string; size?: number; mimeType?: string }> = [];
+    const incomplete: Array<{ path: string; reason: string }> = [];
+
+    const search = (content: string): GrepMatch[] => {
+      const lines = content.split('\n');
+      const found: GrepMatch[] = [];
+      for (let i = 0; i < lines.length; i++) {
+        if (regex.test(lines[i])) {
+          const match: GrepMatch = { line: i + 1, text: lines[i] };
+          if (contextBefore > 0 || contextAfter > 0) {
+            const start = Math.max(0, i - contextBefore);
+            const end = Math.min(lines.length, i + contextAfter + 1);
+            match.context = lines.slice(start, end);
+          }
+          found.push(match);
+        }
+      }
+      return found;
+    };
 
     for (const { mount, relativePath } of mountsToSearch) {
-      if (!mount.initialSyncDone) {
-        await syncFromFs(store, mount);
-        mount.initialSyncDone = true;
-      }
+      await this.withMount(mount, async () => {
+        // A `path` naming a single file greps just that file; otherwise it is a
+        // directory prefix. (A file path once produced the prefix "notes.md/"
+        // and silently matched nothing.)
+        const fileScope = relativePath !== '' && (
+          store.treeGet(mount.treeStateId, relativePath) !== null ||
+          await lstat(join(mount.config.path, relativePath)).then((s) => !s.isDirectory(), () => false)
+        );
+        const pass = await this.passUnlocked(mount, fileScope
+          ? { kind: 'paths', paths: [relativePath] }
+          : { kind: 'dir', dir: relativePath, recursive: true });
+        for (const region of pass.incomplete) {
+          incomplete.push({ path: `${mount.config.name}/${region.path}`, reason: region.reason });
+        }
 
-      // If `path` points at a single FILE, grep just that file. Otherwise treat
-      // `path` as a directory prefix (the original behaviour). Previously a file
-      // path produced an empty prefix like "notes.md/" and matched nothing, so
-      // grepping a specific file silently returned zero results.
-      let entries: Array<{ path: string; blobHash: string }>;
-      const fileNode = relativePath
-        ? (store.treeGet(mount.treeStateId, relativePath) as { blobHash?: string } | null)
-        : null;
-      if (fileNode && fileNode.blobHash) {
-        entries = [{ path: relativePath, blobHash: fileNode.blobHash }];
-      } else {
-        const prefix = relativePath ? relativePath + '/' : undefined;
-        entries = store.treeList(mount.treeStateId, prefix);
-      }
-
-      for (const entry of entries) {
-        if (fileGlob && !fileGlob.test(entry.path)) continue;
-
-        const blob = store.getBlob(entry.blobHash);
-        if (!blob) continue;
-
-        const content = blob.toString('utf-8');
-        const lines = content.split('\n');
-        const fileMatches: Array<{ line: number; text: string; context?: string[] }> = [];
-
-        for (let i = 0; i < lines.length; i++) {
-          if (regex.test(lines[i])) {
-            const match: { line: number; text: string; context?: string[] } = {
-              line: i + 1,
-              text: lines[i],
-            };
-            if (contextBefore > 0 || contextAfter > 0) {
-              const start = Math.max(0, i - contextBefore);
-              const end = Math.min(lines.length, i + contextAfter + 1);
-              match.context = lines.slice(start, end);
+        const intents = this.intents.get(mount.config.name)!;
+        for (const report of [...pass.reports.values()].sort((a, b) => a.path.localeCompare(b.path))) {
+          if (fileGlob && !fileGlob.test(report.path)) continue;
+          const file = `${mount.config.name}/${report.path}`;
+          if (report.state === 'disk-only') {
+            skipped.push({
+              file,
+              reason: 'disk-only: binary or over the size limit, never stored',
+              ...(report.size !== undefined ? { size: report.size } : {}),
+              ...(report.mimeType ? { mimeType: report.mimeType } : {}),
+            });
+            continue;
+          }
+          // The workspace's version, labelled with the path's state.
+          const entry = store.treeGet(mount.treeStateId, report.path);
+          const blob = entry ? store.getBlob(entry.blobHash) : null;
+          if (blob) {
+            const found = search(blob.toString('utf-8'));
+            if (found.length > 0) results.push({ file, state: report.state, version: 'workspace', matches: found });
+          }
+          if (report.state !== 'conflict') continue;
+          // A conflict's disk side. The version recorded with the conflict is
+          // disk's only while disk still holds it; once disk has changed
+          // since, it is labelled as recorded, and a file disk holds now
+          // (never stored) is listed as not searched. A binary or oversize
+          // disk version was never stored either.
+          const disk = intents.get(report.path)?.conflict?.disk;
+          const changed = report.conflict?.diskChangedSinceRecorded === true;
+          const diskBlob = disk?.stored ? store.getBlob(disk.stored) : null;
+          if (diskBlob) {
+            const found = search(diskBlob.toString('utf-8'));
+            if (found.length > 0) results.push({ file, state: report.state, version: changed ? 'recorded-disk' : 'conflicting-disk', matches: found });
+          }
+          if (changed) {
+            if (report.diskNow === 'file') {
+              skipped.push({ file, reason: 'conflict: disk changed since the conflict was recorded; grep searches stored text, so the file disk holds now was not searched' });
             }
-            fileMatches.push(match);
+          } else if (disk && !disk.stored) {
+            skipped.push({ file, reason: 'conflict: the disk version is binary or over the size limit, never stored', size: disk.size });
           }
         }
-
-        if (fileMatches.length > 0) {
-          results.push({
-            file: `${mount.config.name}/${entry.path}`,
-            matches: fileMatches,
-          });
-        }
-      }
+      });
     }
 
     return {
@@ -2257,6 +2464,8 @@ export class WorkspaceModule implements Module {
         pattern: input.pattern,
         results,
         totalMatches: results.reduce((sum, r) => sum + r.matches.length, 0),
+        ...(skipped.length > 0 ? { skipped } : {}),
+        ...(incomplete.length > 0 ? { incomplete } : {}),
       },
     };
   }
@@ -2268,9 +2477,16 @@ export class WorkspaceModule implements Module {
     for (const [name, mount] of this.mounts) {
       const entries = store.treeList(mount.treeStateId);
       const currentSeq = store.currentSequence();
-      const changes = mount.lastMaterializedSeq > 0
-        ? store.treeDiff(mount.treeStateId, mount.lastMaterializedSeq, currentSeq)
-        : [];
+      const intents = this.intents.get(name)!.list();
+      const conflictPaths = intents.filter(([, bi]) => bi.conflict).map(([p]) => p);
+      // A workspace deletion is pending until a push confirms it on disk:
+      // left there without applyDeletions, or unlinked but unconfirmed.
+      const deletionPaths = intents.filter(([, bi]) => bi.tombstone).map(([p]) => p);
+      // Pending is what disk owes by the evidence: every entry it doesn't
+      // show on disk (a refused or failed push stays owed), conflicts and
+      // deletions. An entry from before the evidence isn't counted until a
+      // listing or a materialize checks it: unchecked isn't unpushed.
+      const pending = new Set([...conflictPaths, ...deletionPaths, ...this.entriesByEvidence(mount).owed]);
 
       const currentBranch = store.currentBranch();
       status[name] = {
@@ -2280,24 +2496,90 @@ export class WorkspaceModule implements Module {
         fileCount: entries.length,
         lastMaterializedSeq: mount.lastMaterializedSeq,
         currentSeq,
-        pendingChanges: changes.length,
+        pendingChanges: pending.size,
+        conflicts: conflictPaths.length,
+        pendingWorkspaceDeletions: deletionPaths.length,
         initialSyncDone: mount.initialSyncDone,
         currentBranch: currentBranch.name,
         lastMaterializedBranch: mount.lastMaterializedBranchId,
         canMaterialize: this.mountMaterializeBlockReason(store, mount) === null,
+        ...(mount.lastAgentActionScan ? { lastAgentActionScan: mount.lastAgentActionScan } : {}),
       };
     }
 
     return { success: true, data: status };
   }
 
+  /**
+   * What a materialize of `mount` should consider: a named file, or every
+   * tracked path beneath a named directory; otherwise what the evidence says
+   * disk still owes, the entries never checked against disk, recorded
+   * conflicts, and workspace deletions still on disk (applied with
+   * `applyDeletions`, listed without it). The watermark plays no part: it is
+   * lost at an unclean restart, and an entry the evidence shows on disk has
+   * nothing to push. If disk changed since, a sync adopts that; a bare
+   * materialize, forced or not, never reverts it (naming the path with force
+   * does). `inPlace` says whether any tree entry was left out for that reason.
+   */
+  private materializeSelection(mount: MountState, explicitPath: string): { paths: string[]; inPlace: boolean } {
+    const store = this.getStore();
+    const intents = new Map(this.intents.get(mount.config.name)!.list(explicitPath));
+    const selected = new Set<string>();
+
+    if (explicitPath !== '') {
+      if (store.treeGet(mount.treeStateId, explicitPath)) selected.add(explicitPath);
+      for (const e of store.treeList(mount.treeStateId, explicitPath + '/')) selected.add(e.path);
+      for (const [p, bi] of intents) if (bi.tombstone || bi.conflict) selected.add(p);
+      return { paths: [...selected], inPlace: false };
+    }
+
+    const { owed, unchecked, agreed } = this.entriesByEvidence(mount);
+    for (const path of [...owed, ...unchecked]) selected.add(path);
+    for (const [p, bi] of intents) if (bi.conflict || bi.tombstone) selected.add(p);
+    return { paths: [...selected], inPlace: agreed > 0 };
+  }
+
+  /**
+   * The workspace entries by what the evidence says of disk. `owed`: P
+   * differs from the entry (a draft, or a push still pending), or there is no
+   * P and the entry came from the workspace (a draft disk never had).
+   * `unchecked`: no P and no workspace origin, an entry from before the
+   * evidence; a push agrees it, writes it where disk lacks it, or refuses it
+   * as a conflict. `agreed`: how many have P = S, so disk holds them. Status
+   * counts the owed as pending; a materialize without a path takes up the
+   * owed and the unchecked.
+   */
+  private entriesByEvidence(mount: MountState): { owed: string[]; unchecked: string[]; agreed: number } {
+    const store = this.getStore();
+    const agreement = this.agreementOrThrow();
+    const name = mount.config.name;
+    const intents = this.intents.get(name)!;
+    const owed: string[] = [];
+    const unchecked: string[] = [];
+    let agreed = 0;
+    for (const e of store.treeList(mount.treeStateId)) {
+      const p = agreement.get(name, e.path);
+      if (p === undefined) (intents.get(e.path)?.origin === 'store' ? owed : unchecked).push(e.path);
+      else if (p.kind !== 'content' || p.hash !== e.blobHash) owed.push(e.path);
+      else agreed++;
+    }
+    return { owed, unchecked, agreed };
+  }
+
   private async handleMaterialize(input: MaterializeInput): Promise<ToolResult> {
     const store = this.getStore();
 
     const allWritten: Array<{ mount: string; path: string }> = [];
+    const allDeleted: Array<{ mount: string; path: string }> = [];
+    const pendingDeletions: Array<{ mount: string; path: string }> = [];
+
+    let explicit: { mount: MountState; relativePath: string } | null = null;
+    if (input.path) explicit = this.parsePath(input.path);
 
     let mountsToMaterialize: Array<{ name: string; mount: MountState }>;
-    if (input.mount) {
+    if (explicit) {
+      mountsToMaterialize = [{ name: explicit.mount.config.name, mount: explicit.mount }];
+    } else if (input.mount) {
       const m = this.mounts.get(input.mount);
       if (!m) {
         return { success: false, error: `Unknown mount: ${input.mount}`, isError: true };
@@ -2312,26 +2594,70 @@ export class WorkspaceModule implements Module {
     // Branch guard, scoped to the mounts actually being materialized: a
     // linear continuation (current branch descends from the pinned branch at
     // or after the pinned seq) passes; genuine divergence refuses unless
-    // force. One mount's stale pin must never block another mount.
+    // force. One mount's stale pin must never block another mount. It is
+    // judged inside the mount's turn, on the same branch the selection is
+    // made on: a materialize queued behind a pass would otherwise select on
+    // whatever branch is current when its turn comes, unguarded. The push
+    // then writes nothing if the branch changes after that.
     const blocked: Array<{ mount: string; reason: string }> = [];
+    const guarded: string[] = [];
+    let proceeded = 0;
+
     for (const { name, mount } of mountsToMaterialize) {
-      const reason = this.mountMaterializeBlockReason(store, mount);
-      if (!reason) continue;
-      if (input.force) {
-        // Disk reflects another line of history, so an incremental diff from
-        // the pinned seq is meaningless — reset tracking and re-materialize
-        // the full tree, exactly like materializeMount() after a deliberate
-        // branch switch.
-        mount.lastMaterializedSeq = 0;
-        mount.lastMaterializedBranchId = null;
-      } else {
-        blocked.push({ mount: name, reason });
+      if (mount.config.mode === 'read-only') continue;
+      const turn = await this.withMount(mount, async (): Promise<{ blocked: string } | { pushed: PushResult; inPlace: boolean }> => {
+        const branchId = store.currentBranch().id;
+        const reason = this.mountMaterializeBlockReason(store, mount);
+        // Force passes a divergence. The selection follows the evidence, which
+        // is per path and kept across branches, so nothing needs resetting:
+        // the push re-pins to this branch.
+        if (reason && !input.force) return { blocked: reason };
+        const { paths, inPlace } = this.materializeSelection(mount, explicit?.relativePath ?? '');
+        return {
+          inPlace,
+          pushed: await this.pushUnlocked(mount, paths, {
+            force: input.force, named: explicit !== null, applyDeletions: input.applyDeletions, branchId,
+          }),
+        };
+      });
+      if ('blocked' in turn) {
+        blocked.push({ mount: name, reason: turn.blocked });
+        guarded.push(name);
+        continue;
+      }
+      proceeded++;
+      const pushed = turn.pushed;
+
+      for (const p of pushed.written) allWritten.push({ mount: name, path: p });
+      for (const p of pushed.deleted) allDeleted.push({ mount: name, path: p });
+      for (const p of pushed.pendingDeletions) pendingDeletions.push({ mount: name, path: p });
+      // Refusals ride the same skipped list as branch blocks: divergence must
+      // be visible, not resolved silently either way.
+      for (const s of pushed.skipped) {
+        blocked.push({ mount: name, reason: `${s.path}: ${s.reason}` });
+      }
+
+      // What disk still owes is kept by its evidence, so the watermark and
+      // the pin only feed the branch guard. Both are the push's own: what it
+      // planned from is what disk now reflects, whatever branch was selected
+      // while it wrote. A push that planned nothing (the selected branch
+      // changed after its paths were chosen) left disk as it was, so it
+      // leaves both as they were too.
+      if (pushed.branchId === undefined || pushed.sequence === undefined) continue;
+      mount.lastMaterializedSeq = pushed.sequence;
+      // Track which branch we materialized on. Re-pin on a clean empty
+      // materialize too (previously-pinned mount, nothing pending): disk
+      // already reflects the current branch's tree, and leaving the old pin
+      // would keep force required forever after a cross-branch materialize
+      // that happened to write nothing. A first materialize pins once files
+      // of this branch are in place, whether it found them on disk or the
+      // evidence shows them there: disk holds this branch's tree.
+      if (pushed.written.length > 0 || pushed.unchanged.length > 0 || turn.inPlace || mount.lastMaterializedBranchId !== null) {
+        mount.lastMaterializedBranchId = pushed.branchId;
       }
     }
-    mountsToMaterialize = mountsToMaterialize.filter(
-      ({ name }) => !blocked.some((b) => b.mount === name),
-    );
-    if (mountsToMaterialize.length === 0 && blocked.length > 0) {
+
+    if (proceeded === 0 && guarded.length > 0 && guarded.length === mountsToMaterialize.length) {
       return {
         success: false,
         error: `Cannot materialize: ${blocked.map((b) => `[${b.mount}] ${b.reason}`).join('; ')}`,
@@ -2339,40 +2665,24 @@ export class WorkspaceModule implements Module {
       };
     }
 
-    for (const { name, mount } of mountsToMaterialize) {
-
-      let paths: string[] | undefined;
-      if (input.path) {
-        const { relativePath } = this.parsePath(input.path);
-        paths = relativePath ? [relativePath] : undefined;
-      }
-
-      // Suppress watcher for paths we're about to write
-      const watcher = this.watchers.get(name);
-      const written = await materializeToFs(store, mount, paths);
-
-      for (const p of written) {
-        watcher?.suppress(p);
-        allWritten.push({ mount: name, path: p });
-      }
-
-      // Track which branch we materialized on. Re-pin on a clean empty
-      // materialize too (previously-pinned mount, nothing pending): disk
-      // already reflects the current branch's tree, and leaving the old pin
-      // would keep force required forever after a cross-branch materialize
-      // that happened to write nothing.
-      if (written.length > 0 || mount.lastMaterializedBranchId !== null) {
-        mount.lastMaterializedBranchId = store.currentBranch().id;
-      }
-    }
-
     return {
       success: true,
       data: {
         materialized: allWritten,
         count: allWritten.length,
+        ...(allDeleted.length > 0 ? { deleted: allDeleted } : {}),
+        ...(pendingDeletions.length > 0
+          ? {
+            workspaceDeletionsLeftOnDisk: pendingDeletions,
+            note: 'Files deleted in the workspace were left on disk; materialize with applyDeletions to remove them.',
+          }
+          : {}),
         ...(blocked.length > 0 ? { skipped: blocked } : {}),
       },
+      // What disk lost, then what it was written: kept in the stub if the
+      // guard withholds the result (agent-framework #277). What was left or
+      // skipped, and why, is in the full result.
+      keepWhenWithheld: ['deleted', 'materialized'],
     };
   }
 
@@ -2390,58 +2700,96 @@ export class WorkspaceModule implements Module {
     mount.lastMaterializedBranchId = null;
     mount.lastMaterializedSeq = 0;
 
-    const watcher = this.watchers.get(mountName);
-    const written = await materializeToFs(store, mount);
-    for (const p of written) {
-      watcher?.suppress(p);
+    // force: this path only runs after a deliberate undo/redo/branch switch
+    // on the framework's own _config mount — restoring disk to the branch
+    // state IS the operator intent, so the freshness guard yields. named:
+    // the whole tree is that deliberate scope, entries without evidence too.
+    const pushed = await this.withMount(mount, () => {
+      const branchId = store.currentBranch().id;
+      return this.pushUnlocked(mount, store.treeList(mount.treeStateId).map((e) => e.path), { force: true, named: true, branchId });
+    });
+    // A push that planned nothing leaves the reset tracking as it is.
+    if (pushed.branchId !== undefined && pushed.sequence !== undefined) {
+      mount.lastMaterializedSeq = pushed.sequence;
+      if (pushed.written.length > 0 || pushed.unchanged.length > 0) {
+        mount.lastMaterializedBranchId = pushed.branchId;
+      }
     }
-    if (written.length > 0) {
-      mount.lastMaterializedBranchId = store.currentBranch().id;
-    }
-    return written;
+    return pushed.written;
   }
 
   private async handleSync(input: SyncInput): Promise<ToolResult> {
     const store = this.getStore();
-    const allResults: Array<{ mount: string; synced: string[]; conflicts: ConflictInfo[] }> = [];
+    const allResults: Array<{
+      mount: string;
+      synced: string[];
+      conflicts: Array<{ path: string; kind: string; diskCopy: string }>;
+      /** A path sync's workspace changes given up for disk's state, each with the state it had. */
+      discarded?: Array<{ path: string; was: string; op: string }>;
+    }> = [];
     const allSkipped: Array<{ mount: string; path: string; reason: string }> = [];
+    const allIncomplete: Array<{ mount: string; path: string; reason: string }> = [];
+    const rootsAccepted: string[] = [];
+    if (input.acceptRoot && input.path) {
+      return { success: false, error: 'acceptRoot takes a whole mount\'s root: give mount, or nothing, not path', isError: true };
+    }
 
-    let mountsToSync: Array<{ name: string; mount: MountState }>;
-    if (input.mount) {
+    // A path names its own mount; otherwise the given mount, or every mount.
+    let targets: Array<{ name: string; mount: MountState; relativePath: string }>;
+    if (input.path) {
+      const { mount, relativePath } = this.parsePath(input.path);
+      targets = [{ name: mount.config.name, mount, relativePath }];
+    } else if (input.mount) {
       const m = this.mounts.get(input.mount);
       if (!m) {
         return { success: false, error: `Unknown mount: ${input.mount}`, isError: true };
       }
-      mountsToSync = [{ name: input.mount, mount: m }];
+      targets = [{ name: input.mount, mount: m, relativePath: '' }];
     } else {
-      mountsToSync = [...this.mounts.entries()].map(([name, mount]) => ({ name, mount }));
+      targets = [...this.mounts.entries()].map(([name, mount]) => ({ name, mount, relativePath: '' }));
     }
 
-    for (const { name, mount } of mountsToSync) {
+    for (const { name, mount, relativePath } of targets) {
+      const pass = await this.withMount(mount, async () => {
+        if (input.acceptRoot && await this.acceptRootUnlocked(mount)) rootsAccepted.push(name);
+        if (!relativePath) {
+          // A full recheck: every file rehashed, nothing pending discarded.
+          return this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true }, { rehash: true });
+        }
+        // An explicit path: the workspace takes disk's state there.
+        const prefix = relativePath + '/';
+        const isDir =
+          await lstat(join(mount.config.path, relativePath)).then((s) => s.isDirectory(), () => false) ||
+          store.treeList(mount.treeStateId, prefix).length > 0 ||
+          this.agreementOrThrow().paths(name, relativePath).some(([p]) => p.startsWith(prefix)) ||
+          this.intents.get(name)!.list(relativePath).some(([p]) => p.startsWith(prefix));
+        const scope: Scope = isDir
+          ? { kind: 'dir', dir: relativePath, recursive: true }
+          : { kind: 'paths', paths: [relativePath] };
+        return this.passUnlocked(mount, scope, { rehash: true, adopt: () => true });
+      });
 
-      let paths: string[] | undefined;
-      if (input.path) {
-        const { relativePath } = this.parsePath(input.path);
-        // Empty relativePath means mount root — sync entire mount, not a single path
-        paths = relativePath ? [relativePath] : undefined;
-      }
-
-      const result = await syncFromFs(store, mount, paths);
-      mount.initialSyncDone = true;
-
-      if (result.synced.length > 0 || result.conflicts.length > 0) {
+      const conflicts = [...pass.reports.values()]
+        .filter((r) => r.state === 'conflict')
+        .map((r) => ({ path: r.path, kind: r.conflict?.kind ?? 'both-changed', diskCopy: r.conflict?.diskCopy ?? 'referenced' }));
+      if (pass.ops.length > 0 || conflicts.length > 0) {
         allResults.push({
           mount: name,
-          synced: result.synced.map(s => s.path),
-          conflicts: result.conflicts,
+          synced: pass.ops.map((o) => o.path),
+          conflicts,
+          ...(pass.discarded.length > 0 ? { discarded: pass.discarded } : {}),
         });
-        this.emitFsEvents(name, result.synced, result.conflicts);
       }
-      // Skips were previously computed and dropped, so "nothing synced" and
-      // "your file was refused" looked identical from the outside. Say which.
-      for (const s of result.skipped) {
-        allSkipped.push({ mount: name, path: s.path, reason: s.reason });
+      // Say why a path wasn't taken in, so "nothing synced" and "your file was
+      // refused" don't look identical from the outside.
+      for (const r of pass.reports.values()) {
+        if (r.state === 'unverified') {
+          allSkipped.push({ mount: name, path: r.path, reason: `disk could not be checked: ${r.note ?? 'not observed'}` });
+        } else if (r.state === 'disk-only') {
+          allSkipped.push({ mount: name, path: r.path, reason: 'disk-only: binary or over the size limit, never stored' });
+        }
       }
+      for (const region of pass.incomplete) allIncomplete.push({ mount: name, ...region });
     }
 
     return {
@@ -2451,8 +2799,33 @@ export class WorkspaceModule implements Module {
         totalSynced: allResults.reduce((sum, r) => sum + r.synced.length, 0),
         totalConflicts: allResults.reduce((sum, r) => sum + r.conflicts.length, 0),
         ...(allSkipped.length > 0 ? { skipped: allSkipped } : {}),
+        ...(allIncomplete.length > 0 ? { incomplete: allIncomplete } : {}),
+        ...(rootsAccepted.length > 0 ? { rootsAccepted } : {}),
       },
+      // What the workspace took from disk, gave up, or now holds as a
+      // conflict, per mount, and any root it accepted: kept in the stub if
+      // the guard withholds the result (agent-framework #277). What the scan
+      // skipped or couldn't see is in the full result.
+      keepWhenWithheld: ['results', 'rootsAccepted'],
     };
+  }
+
+  /**
+   * Take the mount's root as it is now (acceptRoot), when it is a directory
+   * other than the one disk last agreed under. Its evidence is set aside:
+   * it described another directory. Returns whether a root was accepted.
+   */
+  private async acceptRootUnlocked(mount: MountState): Promise<boolean> {
+    const runtime = await this.runtime(mount);
+    const found = await locateRoot({ ...runtime.view, rootIdentity: undefined }, runtime.rootReal);
+    if ('reason' in found) return false; // still missing: the pass says so
+    const agreement = this.agreementOrThrow();
+    const recorded = agreement.rootIdentity(mount.config.name);
+    if (recorded && sameRootIdentity(recorded, found.identity)) return false;
+    if (recorded) agreement.acceptRoot(mount.config.name, found.identity);
+    else agreement.recordRootIdentity(mount.config.name, found.identity);
+    agreement.barrier();
+    return true;
   }
 
   // ==========================================================================
@@ -2462,79 +2835,117 @@ export class WorkspaceModule implements Module {
   /**
    * Handle filesystem changes detected by watcher (watch: 'always' mode).
    *
-   * The watcher carries the op per path. For created/modified we call
-   * syncFromFs to pull content into the tree; for deleted we strip the tree
-   * entry directly (the file is gone, nothing to read). We emit one event per
-   * op type.
+   * The watcher's ops only choose which paths to look at: each path is
+   * observed again and decided under the three-way rule, so an event that
+   * arrives late or out of order can't delete or revert anything by itself.
    */
   private async handleFsChanges(mountName: string, changes: FsChange[]): Promise<void> {
-    const store = this.store;
     const mount = this.mounts.get(mountName);
-    if (!store || !mount) return;
-
-    const touchedPaths = changes.filter(c => c.op !== 'deleted').map(c => c.path);
-    const deletedPaths = changes.filter(c => c.op === 'deleted').map(c => c.path);
-
-    const syncResult = touchedPaths.length > 0
-      ? await syncFromFs(store, mount, touchedPaths)
-      : { synced: [], conflicts: [], skipped: [] };
-
-    // Strip deleted entries from the tree so downstream consumers see a
-    // coherent state. syncFromFs would also do this if we passed the paths in,
-    // but the op from the watcher is authoritative — skip the access() probe.
-    for (const p of deletedPaths) {
-      const existing = store.treeGet(mount.treeStateId, p);
-      if (existing) {
-        store.treeRemove(mount.treeStateId, p);
-        syncResult.synced.push({ path: p, op: 'deleted' });
-      }
-    }
-
-    this.emitFsEvents(mountName, syncResult.synced, syncResult.conflicts);
+    if (!this.store || !mount) return;
+    const paths = [...new Set(changes.map((c) => c.path))];
+    if (paths.length === 0) return;
+    await this.withMount(mount, () => this.passUnlocked(mount, { kind: 'paths', paths }));
   }
 
   /**
-   * Group synced paths by op and push one ProcessEvent per non-empty op.
+   * After an agent's completed tool batch, before anything continues its turn:
+   * scan every `watch: 'on-agent-action'` mount, so what the batch's tools did
+   * on disk (a shell command's files, a deletion) is in the workspace when the
+   * agent next looks. A scan that outlasts the deadline stops holding the
+   * round: the miss is recorded on the mount's status and pushed as a
+   * `workspace:agent-action-scan-incomplete` event, and the scan continues,
+   * deciding on the branch selected when it applies.
+   */
+  async onToolBatchComplete(_agentName?: string): Promise<void> {
+    const mounts = [...this.mounts.values()].filter((m) => m.config.watch === 'on-agent-action');
+    if (mounts.length === 0 || !this.store) return;
+    const deadlineMs = this.config.agentActionScanDeadlineMs ?? AGENT_ACTION_SCAN_DEADLINE_MS;
+    await Promise.all(mounts.map(async (mount) => {
+      let late = false;
+      const scan = this.withMount(mount, () => this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true })).then(
+        (pass) => {
+          // Finished — but a scan that couldn't see everything (the file cap,
+          // an unreadable or changing region, a branch that kept changing)
+          // says where, on status and as an event, like a missed deadline.
+          const incomplete = pass.incomplete.length > 0 ? { incomplete: pass.incomplete } : {};
+          mount.lastAgentActionScan = late
+            ? { at: Date.now(), complete: true, withinDeadline: false, reason: 'finished after the deadline', ...incomplete }
+            : { at: Date.now(), complete: true, withinDeadline: true, ...incomplete };
+          if (pass.incomplete.length > 0) {
+            this.ctx?.pushEvent({
+              type: 'workspace:agent-action-scan-incomplete',
+              mount: mount.config.name,
+              reason: 'the scan finished, but some regions could not be observed',
+              incomplete: pass.incomplete,
+            } as ProcessEvent);
+          }
+        },
+        (err: unknown) => {
+          const reason = `scan failed: ${err instanceof Error ? err.message : String(err)}`;
+          mount.lastAgentActionScan = { at: Date.now(), complete: false, withinDeadline: false, reason };
+          this.ctx?.pushEvent({ type: 'workspace:agent-action-scan-incomplete', mount: mount.config.name, reason } as ProcessEvent);
+        },
+      );
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<'late'>((resolveDeadline) => {
+        timer = setTimeout(() => resolveDeadline('late'), deadlineMs);
+      });
+      const outcome = await Promise.race([scan.then(() => 'done' as const), deadline]);
+      clearTimeout(timer);
+      if (outcome === 'late') {
+        late = true;
+        const reason = `deadline exceeded (${deadlineMs} ms); the scan continues`;
+        mount.lastAgentActionScan = { at: Date.now(), complete: false, withinDeadline: false, reason };
+        this.ctx?.pushEvent({ type: 'workspace:agent-action-scan-incomplete', mount: mount.config.name, reason } as ProcessEvent);
+      }
+    }));
+  }
+
+  /**
+   * Push one ProcessEvent per op for a pass's tree changes and new conflicts.
+   * A conflict rides the event for the disk change behind it (modified, or
+   * deleted for a disk deletion of a file with newer workspace changes).
    */
   private emitFsEvents(
     mountName: string,
-    synced: Array<{ path: string; op: WorkspaceFsOp }>,
-    conflicts: ConflictInfo[],
+    ops: Array<{ path: string; op: TreeOp }>,
+    newConflicts: Array<{ path: string; op: TreeOp }> = [],
   ): void {
-    if (!this.ctx || synced.length === 0) return;
+    if (!this.ctx || (ops.length === 0 && newConflicts.length === 0)) return;
 
-    const byOp = new Map<WorkspaceFsOp, string[]>();
-    for (const { path, op } of synced) {
-      const list = byOp.get(op) ?? [];
-      list.push(`${mountName}/${path}`);
-      byOp.set(op, list);
-    }
+    const byOp = new Map<WorkspaceFsOp, { paths: string[]; conflicts: string[] }>();
+    const add = (op: TreeOp, path: string, conflict: boolean): void => {
+      const group = byOp.get(op) ?? { paths: [], conflicts: [] };
+      const full = `${mountName}/${path}`;
+      if (!group.paths.includes(full)) group.paths.push(full);
+      if (conflict) group.conflicts.push(full);
+      byOp.set(op, group);
+    };
+    for (const { path, op } of ops) add(op, path, false);
+    for (const { path, op } of newConflicts) add(op, path, true);
 
-    // Conflicts by definition require a prior tree entry (sync detected that
-    // the agent-side version diverged from the filesystem baseline), which
-    // means the path is being re-synced as a modification. Attach conflicts
-    // only to the workspace:modified event, intersected with its paths — a
-    // created/deleted batch can't carry a meaningful conflict.
-    const conflictsByPath = new Map<string, ConflictInfo>();
-    for (const c of conflicts) conflictsByPath.set(c.path, c);
-
-    for (const [op, paths] of byOp) {
-      const type = opToEventType(op);
-      let eventConflicts: string[] | undefined;
-      if (op === 'modified' && conflictsByPath.size > 0) {
-        const matched = paths.filter(p => conflictsByPath.has(p.slice(mountName.length + 1)));
-        if (matched.length > 0) eventConflicts = matched;
-      }
+    for (const [op, { paths, conflicts }] of byOp) {
       const event = {
-        type,
+        type: opToEventType(op),
         paths,
         mount: mountName,
-        ...(eventConflicts ? { conflicts: eventConflicts } : {}),
+        ...(conflicts.length > 0 ? { conflicts } : {}),
       } as WorkspaceCreatedEvent | WorkspaceModifiedEvent | WorkspaceDeletedEvent;
       this.ctx.pushEvent(event as ProcessEvent);
     }
   }
 
+}
+
+/** What a listing shows of a path beyond its name. */
+function stateView(report: PathReport): Record<string, unknown> {
+  return {
+    state: report.state,
+    ...(report.size !== undefined ? { size: report.size } : {}),
+    ...(report.mimeType ? { mimeType: report.mimeType } : {}),
+    ...(report.conflict ? { conflict: report.conflict } : {}),
+    ...(report.note ? { note: report.note } : {}),
+  };
 }
 
 // ==========================================================================

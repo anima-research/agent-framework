@@ -195,6 +195,16 @@ export interface ToolResult {
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
    */
   endTurn?: boolean;
+  /**
+   * Fields of `data` that list the files the tool acted on, such as the paths
+   * a write wrote, removed or took from disk, in the order they should be
+   * kept. When the tool-result guard withholds this result, these fields stay
+   * in its stub, so the agent still sees what the tool did; the full result
+   * goes where every withheld original goes (agent-framework #277). They are
+   * cut at the inline cap, as any tool result is. Only data's own fields can
+   * be kept: an error result keeps nothing.
+   */
+  keepWhenWithheld?: string[];
 }
 
 /**
