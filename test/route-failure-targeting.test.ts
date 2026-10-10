@@ -197,19 +197,32 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(state.pendingRequests.length, 0);
     });
 
-    it('drops a notice for a speaker that is no longer registered, logged, rather than give it to the primary', async (t) => {
+    it('tells the primary, by name, when the speaker ended before its delivery failed', async (t) => {
       const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
       const secondary = t.mock.method(framework.getAgent('secondary')!.getContextManager(), 'addMessage');
+
+      await internals(framework).channelRegistry.routeSpeech('released-conversation', 'hello', 'missing-channel');
+
+      assert.equal(secondary.mock.callCount(), 0);
+      assert.equal(primary.mock.callCount(), 1);
+      const [, content, metadata] = primary.mock.calls[0]!.arguments;
+      assert.match(JSON.stringify(content),
+        /\[discord-send-failed\] A reply by released-conversation \(5 chars\) could not be delivered to missing-channel \(no registered channel[^)]*\)\. released-conversation has ended, and the human did not receive it\./);
+      assert.equal(metadata?.speaker, 'released-conversation');
+      assert.equal(metadata?.textLen, 5);
+      assert.equal(internals(framework).pendingRequests.length, 0, 'context only: the primary is not woken');
+    });
+
+    it('tells no one, logged, when an ended speaker\'s reply had no channel to reach', async (t) => {
+      const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
 
       await internals(framework).channelRegistry.routeSpeech('released-conversation', 'hello', null);
 
       assert.equal(primary.mock.callCount(), 0);
-      assert.equal(secondary.mock.callCount(), 0);
-      assert.ok(errors.some((e) => /"released-conversation" is not a registered agent — message dropped/.test(e)));
       assert.equal(internals(framework).deferredMessages.length, 0);
-      assert.equal(internals(framework).pendingRequests.length, 0);
+      assert.ok(errors.some((e) => e.includes('[route-failure] released-conversation has ended, and its reply had no channel to reach')));
     });
 
     it('lands an ephemeral run\'s last failure notice in its own window before releasing it', async (t) => {
@@ -227,16 +240,46 @@ describe('notices about an agent\'s own action', () => {
       const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
       assert.equal(count(messages, SEND_FAILED), 0, 'the primary did not write that reply');
       assert.ok(!errors.some((e) => /not a registered agent/.test(e)));
+      assert.ok(errors.some((e) => e.includes('[route-failure] worker has ended, and its reply had no channel to reach')));
       assert.equal(internals(framework).deferredMessages.length, 0);
     });
 
-    it('sends an ephemeral run\'s bounced prose notice to its own window, beside its clipboard', async () => {
+    it('passes an ephemeral run\'s failed delivery to a channel on to the primary, by name', async () => {
+      (internals(framework).channelRegistry as unknown as { defaultPublishChannel: string | null }).defaultPublishChannel = 'missing-channel';
+      const speech = 'Worker speech for a channel that is not registered.';
+
+      const archived = await runEphemeral('locus', speech);
+
+      assert.equal(count(archived, '[discord-send-failed] Your previous reply'), 1, 'the run keeps its own record');
+      const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
+      const named = messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
+      assert.equal(named.length, 1);
+      assert.match(JSON.stringify(named[0]!.content), /A reply by worker \(\d+ chars\) could not be delivered to missing-channel .*worker has ended/);
+      assert.equal(internals(framework).deferredMessages.length, 0);
+    });
+
+    it('sends an ephemeral run\'s bounced prose notice to its own window, beside its clipboard', async (t) => {
+      const errors: string[] = [];
+      t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+
       const archived = await runEphemeral('explicit', 'Worker prose with no destination.');
 
       assert.equal(count(archived, BOUNCED), 1, 'the speaker reads why its text did not go out');
       const { messages } = await framework.getAgent('primary')!.getContextManager().compile();
-      assert.equal(count(messages, BOUNCED), 0, 'the primary wrote no such text');
+      assert.equal(count(messages, BOUNCED), 0, 'the primary wrote no such text, and is not told of it');
+      assert.ok(!errors.some((e) => e.includes('[route-failure]')), 'a bounce is not a failed reply');
       assert.equal(internals(framework).deferredMessages.length, 0);
+    });
+
+    it('drops, logged, a background-script wake for an agent no longer registered', async (t) => {
+      const primary = t.mock.method(framework.getAgent('primary')!.getContextManager(), 'addMessage');
+      const errors: string[] = [];
+      t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+
+      internals(framework).injectScriptWake({ id: 's-2', agentName: 'released-run' }, '[background script s-2] Your background script DIED.');
+
+      assert.equal(primary.mock.callCount(), 0, 'the primary started no such script');
+      assert.ok(errors.some((e) => /"released-run" is not a registered agent — message dropped/.test(e)));
     });
 
     it('wakes a fork\'s background script into the fork\'s own window', async () => {
@@ -305,7 +348,20 @@ describe('notices about an agent\'s own action', () => {
         state.pendingAssistantBlocks.clear();
 
         assert.equal(framework.getAgent(fork.name), null, 'the fork is disposed when its closure turn ends');
-        assert.equal(state.deferredMessages.length, 0, 'nothing is left queued for a disposed fork');
+        if (condition === 'quiesced') {
+          // A write while quiesced could land mid-surgery: the archive write
+          // is dropped, logged, and the primary's notice waits for resume.
+          assert.ok(errors.some((e) => e.includes(`[deferred-flush] ${fork.name}: released while quiesced, so a queued write for its window is dropped`)));
+          assert.equal(state.deferredMessages.length, 1);
+          state.quiesced = false;
+          await state.flushDeferredWrites('closure test resume');
+        }
+        if (condition === 'other-tool-cycle') {
+          // The primary's notice waits for the shared slot's tool cycle.
+          assert.equal(state.deferredMessages.length, 1);
+          await state.flushDeferredWrites('the primary\'s next boundary');
+        }
+        assert.equal(state.deferredMessages.length, 0, 'nothing is left queued');
         assert.equal(state.unackedDeferredWrites.length, 0, 'nor waiting in the recovery queue');
         // Open a fresh manager over the retained fork namespace, rather than
         // relying only on the disposed Agent's in-memory context manager.
@@ -317,10 +373,7 @@ describe('notices about an agent\'s own action', () => {
         const replyIndex = messages.findIndex((m) => m.participant === fork.name && JSON.stringify(m.content).includes(finalReply));
         assert.ok(replyIndex >= 0, 'the failed closure reply remains archived');
         if (condition === 'quiesced') {
-          // A write while quiesced could land mid-surgery: the notice is not
-          // written, and the flush that finds its target gone says so.
           assert.equal(count(messages, SEND_FAILED), 0);
-          assert.ok(errors.some((e) => new RegExp(`"${fork.name}" is not a registered agent — message dropped`).test(e)));
         } else if (condition === 'write-fails') {
           // A write the store refuses is logged; disposal still completes.
           assert.equal(count(messages, SEND_FAILED), 0);
@@ -329,13 +382,17 @@ describe('notices about an agent\'s own action', () => {
           const noticeIndex = messages.findIndex((m) => JSON.stringify(m.content).includes(SEND_FAILED));
           assert.ok(noticeIndex > replyIndex, 'the archived failure notice follows the closure reply');
           assert.equal(count(messages, SEND_FAILED), 1);
-          assert.match(JSON.stringify(messages[noticeIndex]!.content), /delivered:false/);
+          assert.match(JSON.stringify(messages[noticeIndex]!.content), /Your previous reply.*delivered:false/);
           // Every write of a drained entry carries its durable id (drainDeferredFor).
           const stored = archive.getAllMessages().find((m) => JSON.stringify(m.content).includes(SEND_FAILED));
           assert.equal(typeof (stored?.metadata as { deferredWriteId?: unknown } | undefined)?.deferredWriteId, 'string');
         }
+        // The fork never reads its notice again, so the primary is told, by name.
         const primary = await framework.getAgent('primary')!.getContextManager().compile();
-        assert.equal(count(primary.messages, SEND_FAILED), 0);
+        const told = primary.messages.filter((m) => JSON.stringify(m.content).includes(SEND_FAILED));
+        assert.equal(told.length, 1);
+        assert.match(JSON.stringify(told[0]!.content),
+          new RegExp(`A reply by ${fork.name} \\(${finalReply.length} chars\\) could not be delivered to #closure test \\(closure-channel\\) \\(.*delivered:false.*\\)\\. ${fork.name} has ended, and the human did not receive it\\.`));
         assert.equal(membrane.calls.length, 2, 'only the initial and closure turns ran');
         assert.equal(state.pendingRequests.length, 0, 'a failed closure reply does not wake another turn');
       });

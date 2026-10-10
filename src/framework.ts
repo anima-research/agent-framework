@@ -11961,9 +11961,10 @@ export class AgentFramework {
    * to it. Residents share one message slot, which the default path already
    * writes, under the guard that waits for any agent's tool cycle and the
    * primary's turn; addressing a resident would narrow that guard to its own
-   * turn and cycle. A name no longer registered (a fork or run released before
-   * its failure was known) is addressed too, so addMessage drops the notice,
-   * logged, rather than give it to the primary, which did nothing.
+   * turn and cycle. A name no longer registered (a fork or run already
+   * released) is addressed too, so addMessage drops the notice, logged, rather
+   * than give it to the primary as if it were the primary's; a failed reply is
+   * passed on by name instead (passFailedReplyToPrimary).
    */
   private noticeTargetFor(agentName: string): { forAgent: string } | undefined {
     const agent = this.agents.get(agentName);
@@ -11973,27 +11974,76 @@ export class AgentFramework {
   /**
    * A conversation fork or an ephemeral run is about to be deregistered.
    * Writes still queued for its window would wait for a boundary it never
-   * reaches, and the flush that finds it gone would drop them; land them in
-   * its own window now, which stays in Chronicle for investigation. Its
-   * stream is over or cancelled, so nothing it compiles can diverge from
-   * them. While quiesced a write could land mid-surgery, so they stay
-   * queued, and the next flush to find their target gone drops them, logged.
+   * reaches, and the flush that finds it gone would drop them. Land them in
+   * its own window now, which Chronicle keeps for investigation; its stream
+   * is over or cancelled, so nothing it compiles can diverge from them. A
+   * failed reply among them is also passed to the primary, because the
+   * speaker will never read it. While quiesced, a write could land
+   * mid-surgery, so the writes are dropped instead, logged.
    */
   private landQueuedWritesBeforeRelease(agent: Agent): void {
-    if (this.quiesced) return;
+    const queued = this.drainDeferredFor(agent.name);
+    if (queued.length === 0) return;
     const cm = agent.getContextManager();
-    for (const msg of this.drainDeferredFor(agent.name)) {
-      try {
-        cm.addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
-      } catch (err) {
+    for (const msg of queued) {
+      if (this.quiesced) {
         console.error(
-          `[deferred-flush] ${agent.name}: failed to store a queued write before release ` +
-          `(participant=${msg.participant}):`,
-          err,
+          `[deferred-flush] ${agent.name}: released while quiesced, so a queued write for its window ` +
+          `is dropped (participant=${msg.participant})`,
         );
+      } else {
+        try {
+          cm.addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
+        } catch (err) {
+          console.error(
+            `[deferred-flush] ${agent.name}: failed to store a queued write before release ` +
+            `(participant=${msg.participant}):`,
+            err,
+          );
+        }
       }
+      this.passFailedReplyToPrimary(agent.name, msg.metadata);
     }
     this.ackDeferredWrites();
+  }
+
+  /**
+   * A fork or an ephemeral run ended before reading that its reply never
+   * reached the human: it was released with the notice still queued, or its
+   * delivery failed after release. Tell the primary instead, naming the
+   * speaker, so an agent who can still act learns of it: to resend, or to
+   * tell the human. Only for a delivery to a channel; a reply that had no
+   * channel to go to (no locus) had no human waiting for it.
+   */
+  private passFailedReplyToPrimary(speaker: string, metadata: MessageMetadata | undefined): void {
+    const failure = metadata as { kind?: unknown; channelId?: unknown; reason?: unknown; textLen?: unknown } | undefined;
+    if (failure?.kind !== 'discord-send-failed') return;
+    if (typeof failure.channelId !== 'string' || failure.channelId === '') {
+      console.error(`[route-failure] ${speaker} has ended, and its reply had no channel to reach: no one else is told`);
+      return;
+    }
+    this.addMessage(
+      'user',
+      [{
+        type: 'text',
+        text: `[discord-send-failed] A reply by ${speaker} (${String(failure.textLen)} chars) could not be delivered to ` +
+          `${this.channelForNotice(failure.channelId)} (${String(failure.reason)}). ${speaker} has ended, and the human did not receive it.`,
+      }],
+      { system: true, kind: 'discord-send-failed', channelId: failure.channelId, reason: failure.reason, textLen: failure.textLen, speaker } as MessageMetadata,
+    );
+  }
+
+  /**
+   * A channel as a notice names it: the label when the registry has one, since
+   * a bare snowflake is unresolvable for the agent (the 2026-07-21 incident
+   * read as "a stale artifact", not a live failure).
+   */
+  private channelForNotice(channelId: string | null): string {
+    if (!channelId) return 'the channel';
+    const label = this.channelRegistry?.getDescriptor(channelId)?.label;
+    return label && label !== channelId
+      ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
+      : channelId;
   }
 
   private editMessage(id: MessageId, content: ContentBlock[]): void {
@@ -12588,26 +12638,21 @@ export class AgentFramework {
         // yes, wake no).
         onRouteFailure: ({ conversationId, channelId, reason, textLen }) => {
           try {
-            // Render a human-readable channel name when we can — a bare
-            // snowflake in the marker is unresolvable for the agent (the
-            // 2026-07-21 incident read as "a stale artifact", not a live
-            // failure). The marker is `system: true`, so it is never
-            // conversational and never influences routing.
-            const label = channelId
-              ? this.channelRegistry?.getDescriptor(channelId)?.label
-              : undefined;
-            const where = channelId
-              ? label && label !== channelId
-                ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
-                : channelId
-              : 'the channel';
+            // The marker is `system: true`, so it is never conversational and
+            // never influences routing.
+            const metadata: MessageMetadata = { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason, textLen };
+            if (!this.agents.has(conversationId)) {
+              // Released before its delivery failed: no window left to read it.
+              this.passFailedReplyToPrimary(conversationId, metadata);
+              return;
+            }
             this.addMessage(
               'user',
               [{
                 type: 'text',
-                text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
+                text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${this.channelForNotice(channelId)} (${reason}). It was saved to your archive but the human did not receive it.`,
               }],
-              { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason },
+              metadata,
               this.noticeTargetFor(conversationId),
             );
           } catch (err) {
