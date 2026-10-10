@@ -718,8 +718,19 @@ export async function reconcilePass(
 // ===========================================================================
 
 export interface PushOptions {
-  /** Overwrite (or unlink) a disk copy in conflict, or one that can't be verified. */
+  /**
+   * Overwrite (or unlink) a disk copy in conflict, or one that can't be
+   * verified. A disk copy nothing has evidence about is overwritten only when
+   * `named` too: a bare push can't tell it from a newer copy.
+   */
   force?: boolean;
+  /**
+   * The caller named these paths (a path given to materialize), rather than
+   * the evidence selecting them. Only such a push writes a path nothing has
+   * evidence about: over a differing disk copy with `force`, or where disk
+   * has no copy at all.
+   */
+  named?: boolean;
   /** Unlink workspace-deleted files whose disk copy is one the store holds. */
   applyDeletions?: boolean;
   /** Called before each disk write/unlink, so the caller can suppress the watcher echo. */
@@ -750,6 +761,7 @@ export interface PushResult {
  * drafts are written, agreement is left alone, conflicts and unverifiable
  * disk copies are refused unless `force`, and a workspace deletion reaches
  * disk only with `applyDeletions` (with `force` too when disk changed since).
+ * A path nothing has evidence about is written only when `named`.
  * A path whose earlier push shows on disk unconfirmed is pushed again, so its
  * completion rests on barriers that succeeded.
  *
@@ -861,16 +873,35 @@ export async function pushPaths(
     // A file merely absent from this branch is left alone, an unconfirmed
     // push of another branch's bytes included: nothing replays or unlinks it.
     if (v.state === 'not-in-branch' || v.state === 'disk-only') continue;
-    if (v.state === 'conflict' && !opts.force) {
-      const kind = bi?.conflict?.kind ?? v.conflict ?? 'both-changed';
+    const kind = bi?.conflict?.kind ?? v.conflict ?? 'both-changed';
+    // Without evidence there was no agreement for disk to change since, and
+    // nothing tells a newer disk copy from an older one: only a push of the
+    // named path overwrites it, forced.
+    const noEvidence = kind === 'unknown-provenance' || kind === 'store-origin-collision';
+    if (v.state === 'conflict' && (!opts.force || (noEvidence && !opts.named))) {
       if (v.conflict) {
         mount.intents.update(path, (cur) => ({ ...cur, conflict: { kind: v.conflict!, at: Date.now(), disk: counterpartOf(store, d) } }));
         recorded = true;
       }
       result.skipped.push({
         path,
-        reason: `stale copy: disk changed since it last agreed with the workspace (conflict: ${kind}) — ` +
-          'sync this path to adopt the disk version, or pass force to overwrite it',
+        reason: noEvidence
+          ? `disk holds a different copy, and nothing records which is newer (conflict: ${kind}) — ` +
+            'sync this path to adopt the disk version, or materialize this path with force to overwrite it'
+          : `stale copy: disk changed since it last agreed with the workspace (conflict: ${kind}) — ` +
+            'sync this path to adopt the disk version, or pass force to overwrite it',
+      });
+      continue;
+    }
+    // An entry from before the evidence that disk lacks: nothing records
+    // whether disk deleted it or never had it, and most such entries came
+    // from disk. Writing it back could undo a deliberate deletion, so only a
+    // push of the named path writes it.
+    if (v.state === 'disk-missing-provenance-unknown' && !opts.named) {
+      result.skipped.push({
+        path,
+        reason: 'disk has no copy, and nothing records whether it was deleted there or never written — ' +
+          'sync this path to drop it from the workspace, or materialize this path to write it',
       });
       continue;
     }

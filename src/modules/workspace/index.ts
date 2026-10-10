@@ -1188,9 +1188,9 @@ export class WorkspaceModule implements Module {
         inputSchema: {
           type: 'object' as const,
           properties: {
-            path: { type: 'string', description: 'Specific path to materialize (optional — defaults to all changed)' },
+            path: { type: 'string', description: 'Specific path to materialize (optional — defaults to what disk still owes: workspace edits, conflicts, workspace deletions, and files never checked against disk)' },
             mount: { type: 'string', description: 'Specific mount (optional)' },
-            force: { type: 'boolean', description: 'Overwrite files whose disk copy changed since it last agreed with the workspace (another writer, or a conflict), and materialize even if the current branch has diverged from the branch last written to disk (default false). Without it, divergent files are skipped and listed.' },
+            force: { type: 'boolean', description: 'Overwrite files whose disk copy changed since it last agreed with the workspace (another writer, or a conflict), and materialize even if the current branch has diverged from the branch last written to disk (default false). Without it, divergent files are skipped and listed. A file the workspace has not changed is left as disk has it unless you name its path.' },
             applyDeletions: { type: 'boolean', description: 'Also delete from disk the files deleted in the workspace whose disk copy is one the workspace holds (default false). With force, also those whose disk copy changed since.' },
           },
         },
@@ -2450,19 +2450,16 @@ export class WorkspaceModule implements Module {
     for (const [name, mount] of this.mounts) {
       const entries = store.treeList(mount.treeStateId);
       const currentSeq = store.currentSequence();
-      const changes = mount.lastMaterializedSeq > 0
-        ? store.treeDiff(mount.treeStateId, mount.lastMaterializedSeq, currentSeq)
-        : [];
       const intents = this.intents.get(name)!.list();
       const conflictPaths = intents.filter(([, bi]) => bi.conflict).map(([p]) => p);
       // A workspace deletion is pending until a push confirms it on disk:
       // left there without applyDeletions, or unlinked but unconfirmed.
       const deletionPaths = intents.filter(([, bi]) => bi.tombstone).map(([p]) => p);
-      // Conflicts and deletions are pending too, past the watermark or not,
-      // and so is every entry whose evidence says disk doesn't hold it yet —
-      // a refused or failed push stays owed whatever the watermark does,
-      // exactly as the materialize selection counts it.
-      const pending = new Set([...changes.map((c) => c.path), ...conflictPaths, ...deletionPaths, ...this.owedEntries(mount)]);
+      // Pending is what disk owes by the evidence: every entry it doesn't
+      // show on disk (a refused or failed push stays owed), conflicts and
+      // deletions. An entry from before the evidence isn't counted until a
+      // listing or a materialize checks it: unchecked isn't unpushed.
+      const pending = new Set([...conflictPaths, ...deletionPaths, ...this.entriesByEvidence(mount).owed]);
 
       const currentBranch = store.currentBranch();
       status[name] = {
@@ -2488,14 +2485,16 @@ export class WorkspaceModule implements Module {
 
   /**
    * What a materialize of `mount` should consider: a named file, or every
-   * tracked path beneath a named directory; otherwise what changed since the
-   * last materialize, plus everything the evidence says disk still owes —
-   * entries whose disk agreement differs (a refused or failed write stays
-   * owed whatever the watermark does), drafts disk has never seen, recorded
+   * tracked path beneath a named directory; otherwise what the evidence says
+   * disk still owes, the entries never checked against disk, recorded
    * conflicts, and workspace deletions still on disk (applied with
-   * `applyDeletions`, listed without it).
+   * `applyDeletions`, listed without it). The watermark plays no part: it is
+   * lost at an unclean restart, and an entry the evidence shows on disk has
+   * nothing to push. If disk changed since, a sync adopts that; a bare
+   * materialize, forced or not, never reverts it (naming the path with force
+   * does). `inPlace` says whether any tree entry was left out for that reason.
    */
-  private materializeSelection(mount: MountState, explicitPath: string): string[] {
+  private materializeSelection(mount: MountState, explicitPath: string): { paths: string[]; inPlace: boolean } {
     const store = this.getStore();
     const intents = new Map(this.intents.get(mount.config.name)!.list(explicitPath));
     const selected = new Set<string>();
@@ -2504,39 +2503,40 @@ export class WorkspaceModule implements Module {
       if (store.treeGet(mount.treeStateId, explicitPath)) selected.add(explicitPath);
       for (const e of store.treeList(mount.treeStateId, explicitPath + '/')) selected.add(e.path);
       for (const [p, bi] of intents) if (bi.tombstone || bi.conflict) selected.add(p);
-      return [...selected];
+      return { paths: [...selected], inPlace: false };
     }
 
-    const entries = store.treeList(mount.treeStateId);
-    if (mount.lastMaterializedSeq === 0) {
-      for (const e of entries) selected.add(e.path);
-    } else {
-      for (const c of store.treeDiff(mount.treeStateId, mount.lastMaterializedSeq, store.currentSequence())) selected.add(c.path);
-    }
-    for (const path of this.owedEntries(mount)) selected.add(path);
+    const { owed, unchecked, agreed } = this.entriesByEvidence(mount);
+    for (const path of [...owed, ...unchecked]) selected.add(path);
     for (const [p, bi] of intents) if (bi.conflict || bi.tombstone) selected.add(p);
-    return [...selected];
+    return { paths: [...selected], inPlace: agreed > 0 };
   }
 
   /**
-   * The workspace entries whose evidence says disk doesn't hold them yet: P
+   * The workspace entries by what the evidence says of disk. `owed`: P
    * differs from the entry (a draft, or a push still pending), or there is no
-   * P and the entry came from the workspace (a draft disk never had). What
-   * materialize considers owed, and what status counts as pending.
+   * P and the entry came from the workspace (a draft disk never had).
+   * `unchecked`: no P and no workspace origin, an entry from before the
+   * evidence; a push agrees it, writes it where disk lacks it, or refuses it
+   * as a conflict. `agreed`: how many have P = S, so disk holds them. Status
+   * counts the owed as pending; a materialize without a path takes up the
+   * owed and the unchecked.
    */
-  private owedEntries(mount: MountState): string[] {
+  private entriesByEvidence(mount: MountState): { owed: string[]; unchecked: string[]; agreed: number } {
     const store = this.getStore();
     const agreement = this.agreementOrThrow();
     const name = mount.config.name;
     const intents = this.intents.get(name)!;
     const owed: string[] = [];
+    const unchecked: string[] = [];
+    let agreed = 0;
     for (const e of store.treeList(mount.treeStateId)) {
       const p = agreement.get(name, e.path);
-      if (p === undefined ? intents.get(e.path)?.origin === 'store' : p.kind !== 'content' || p.hash !== e.blobHash) {
-        owed.push(e.path);
-      }
+      if (p === undefined) (intents.get(e.path)?.origin === 'store' ? owed : unchecked).push(e.path);
+      else if (p.kind !== 'content' || p.hash !== e.blobHash) owed.push(e.path);
+      else agreed++;
     }
-    return owed;
+    return { owed, unchecked, agreed };
   }
 
   private async handleMaterialize(input: MaterializeInput): Promise<ToolResult> {
@@ -2578,20 +2578,20 @@ export class WorkspaceModule implements Module {
 
     for (const { name, mount } of mountsToMaterialize) {
       if (mount.config.mode === 'read-only') continue;
-      const turn = await this.withMount(mount, async (): Promise<{ blocked: string } | { pushed: PushResult }> => {
+      const turn = await this.withMount(mount, async (): Promise<{ blocked: string } | { pushed: PushResult; inPlace: boolean }> => {
         const branchId = store.currentBranch().id;
         const reason = this.mountMaterializeBlockReason(store, mount);
-        if (reason) {
-          if (!input.force) return { blocked: reason };
-          // Disk reflects another line of history, so an incremental diff from
-          // the pinned seq is meaningless — reset tracking and re-materialize
-          // the full tree, exactly like materializeMount() after a deliberate
-          // branch switch.
-          mount.lastMaterializedSeq = 0;
-          mount.lastMaterializedBranchId = null;
-        }
-        const paths = this.materializeSelection(mount, explicit?.relativePath ?? '');
-        return { pushed: await this.pushUnlocked(mount, paths, { force: input.force, applyDeletions: input.applyDeletions, branchId }) };
+        // Force passes a divergence. The selection follows the evidence, which
+        // is per path and kept across branches, so nothing needs resetting:
+        // the push re-pins to this branch.
+        if (reason && !input.force) return { blocked: reason };
+        const { paths, inPlace } = this.materializeSelection(mount, explicit?.relativePath ?? '');
+        return {
+          inPlace,
+          pushed: await this.pushUnlocked(mount, paths, {
+            force: input.force, named: explicit !== null, applyDeletions: input.applyDeletions, branchId,
+          }),
+        };
       });
       if ('blocked' in turn) {
         blocked.push({ mount: name, reason: turn.blocked });
@@ -2610,18 +2610,19 @@ export class WorkspaceModule implements Module {
         blocked.push({ mount: name, reason: `${s.path}: ${s.reason}` });
       }
 
-      // What disk still owes is kept by its evidence, so the watermark only
-      // marks where the next "changed since" diff starts. Both it and the pin
-      // are the push's own: what it planned from is what disk now reflects,
-      // whatever branch was selected while it wrote.
+      // What disk still owes is kept by its evidence, so the watermark and
+      // the pin only feed the branch guard. Both are the push's own: what it
+      // planned from is what disk now reflects, whatever branch was selected
+      // while it wrote.
       mount.lastMaterializedSeq = pushed.sequence;
       // Track which branch we materialized on. Re-pin on a clean empty
       // materialize too (previously-pinned mount, nothing pending): disk
       // already reflects the current branch's tree, and leaving the old pin
       // would keep force required forever after a cross-branch materialize
-      // that happened to write nothing. A first materialize that found every
-      // file already in place pins too: disk holds this branch's tree.
-      if (pushed.written.length > 0 || pushed.unchanged.length > 0 || mount.lastMaterializedBranchId !== null) {
+      // that happened to write nothing. A first materialize pins once files
+      // of this branch are in place, whether it found them on disk or the
+      // evidence shows them there: disk holds this branch's tree.
+      if (pushed.written.length > 0 || pushed.unchanged.length > 0 || turn.inPlace || mount.lastMaterializedBranchId !== null) {
         mount.lastMaterializedBranchId = pushed.branchId;
       }
     }
@@ -2667,10 +2668,11 @@ export class WorkspaceModule implements Module {
 
     // force: this path only runs after a deliberate undo/redo/branch switch
     // on the framework's own _config mount — restoring disk to the branch
-    // state IS the operator intent, so the freshness guard yields.
+    // state IS the operator intent, so the freshness guard yields. named:
+    // the whole tree is that deliberate scope, entries without evidence too.
     const pushed = await this.withMount(mount, () => {
       const branchId = store.currentBranch().id;
-      return this.pushUnlocked(mount, store.treeList(mount.treeStateId).map((e) => e.path), { force: true, branchId });
+      return this.pushUnlocked(mount, store.treeList(mount.treeStateId).map((e) => e.path), { force: true, named: true, branchId });
     });
     mount.lastMaterializedSeq = pushed.sequence;
     if (pushed.written.length > 0 || pushed.unchanged.length > 0) {

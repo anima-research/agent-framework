@@ -603,7 +603,29 @@ describe('provenance', () => {
 
     const materialized = await call(m, 'materialize', {});
     const written = (materialized.materialized as Array<{ path: string }>).map((w) => w.path).sort();
-    assert.deepEqual(written, ['draft.txt', 'legacy-missing.txt'], 'drafts and missing legacy copies are written; conflicts refused');
+    assert.deepEqual(written, ['draft.txt'], 'drafts are written; what has no evidence is left for a named call');
+    assert.equal(existsSync(env.disk('legacy-missing.txt')), false, 'a shell rm of a pre-evidence file is not undone');
+    // With no evidence there was no agreement for disk to have changed since,
+    // and nothing says whether a missing copy was deleted or never written.
+    const reasons = (materialized.skipped as Array<{ reason: string }>).map((s) => s.reason).sort();
+    assert.deepEqual(reasons, [
+      'collide.txt: disk holds a different copy, and nothing records which is newer (conflict: store-origin-collision) — ' +
+        'sync this path to adopt the disk version, or materialize this path with force to overwrite it',
+      'legacy-diff.txt: disk holds a different copy, and nothing records which is newer (conflict: unknown-provenance) — ' +
+        'sync this path to adopt the disk version, or materialize this path with force to overwrite it',
+      'legacy-missing.txt: disk has no copy, and nothing records whether it was deleted there or never written — ' +
+        'sync this path to drop it from the workspace, or materialize this path to write it',
+    ]);
+
+    // Both remedies do what they say.
+    const named = await call(m, 'materialize', { path: 'work/legacy-missing.txt' });
+    assert.deepEqual(named.materialized.map((w: { path: string }) => w.path), ['legacy-missing.txt']);
+    assert.equal(env.readDisk('legacy-missing.txt'), 'store only');
+    env.legacyEntry('legacy-gone.txt', 'deleted in a shell');
+    const synced = await call(m, 'sync', { path: 'work/legacy-gone.txt' });
+    assert.deepEqual(synced.results[0].discarded,
+      [{ path: 'legacy-gone.txt', was: 'disk-missing-provenance-unknown', op: 'deleted' }]);
+    assert.equal(env.store.treeGet(TREE, 'legacy-gone.txt'), null, 'the path sync dropped it from the workspace');
   });
 });
 
@@ -1990,5 +2012,128 @@ describe("Mythos's shape", () => {
       assert.equal(entries.some((e) => e.name === `log-${String(i).padStart(3, '0')}.txt`), false, `log ${i} is gone`);
     }
     assert.equal(entries.filter((e) => e.state === 'synced').length, 347);
+  });
+});
+
+// A field report from a host on main: after a restart lost the watermark, a
+// bare `materialize` pushing one new file wrote the whole tree, a stale entry
+// over its newer disk copy included.
+describe('a bare materialize after a restart', () => {
+  /** The paths each push of `m` was asked to take up, sorted. */
+  function recordPushes(m: WorkspaceModule): string[][] {
+    const seen: string[][] = [];
+    const push = (m as any).pushUnlocked.bind(m);
+    (m as any).pushUnlocked = (mount: unknown, paths: string[], opts: unknown) => {
+      seen.push([...paths].sort());
+      return push(mount, paths, opts);
+    };
+    return seen;
+  }
+
+  test('refuses a path with no evidence whose disk copy differs, and writes a new file', async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    await seedSynced(env, m, 'old.txt', 'materialized before the restart');
+    await call(m, 'materialize', {});
+    // A tree entry from before the evidence (no P, no #169 baseline), stale:
+    // its disk copy was appended in a shell, and no pass has observed it.
+    env.legacyEntry('notes.txt', 'line 1\n');
+    env.writeDisk('notes.txt', 'line 1\nline 2, appended in a shell\n');
+    m = await env.restart(m);
+    assert.equal((await call(m, 'status', {})).work.lastMaterializedSeq, 0, 'the restart lost the watermark');
+
+    await call(m, 'write', { path: 'work/new.txt', content: 'one small new file' });
+    const refusal = {
+      mount: 'work',
+      reason: 'notes.txt: disk holds a different copy, and nothing records which is newer (conflict: unknown-provenance) — ' +
+        'sync this path to adopt the disk version, or materialize this path with force to overwrite it',
+    };
+    const res = await call(m, 'materialize', {});
+    assert.deepEqual(res.materialized.map((w: { path: string }) => w.path), ['new.txt']);
+    assert.equal(env.readDisk('new.txt'), 'one small new file');
+    assert.equal(env.readDisk('notes.txt'), 'line 1\nline 2, appended in a shell\n', 'the disk copy is untouched');
+    assert.deepEqual(res.skipped, [refusal]);
+    assert.equal((await entryOf(m, 'notes.txt'))?.conflict?.kind, 'unknown-provenance');
+
+    // Nothing tells that disk copy from an older one, so force alone doesn't overwrite it either.
+    const forced = await call(m, 'materialize', { force: true });
+    assert.equal(forced.count, 0);
+    assert.deepEqual(forced.skipped, [refusal]);
+    assert.equal(env.readDisk('notes.txt'), 'line 1\nline 2, appended in a shell\n');
+    await call(m, 'materialize', { path: 'work/notes.txt', force: true });
+    assert.equal(env.readDisk('notes.txt'), 'line 1\n', 'naming the path with force does');
+  });
+
+  test('a whole-mount restore after a branch switch still overwrites a path with no evidence', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    env.legacyEntry('settings.json', '{"restored": true}');
+    env.writeDisk('settings.json', '{"restored": false}');
+    // materializeMount is the deliberate restore that follows an undo or branch switch: its scope is named.
+    assert.deepEqual(await m.materializeMount('work'), ['settings.json']);
+    assert.equal(env.readDisk('settings.json'), '{"restored": true}');
+  });
+
+  test('takes up only what the evidence says disk owes, and never reverts a newer disk copy', async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    for (const name of ['a.txt', 'b.txt', 'c.txt']) await seedSynced(env, m, name, `${name} v1`);
+    await call(m, 'materialize', {});
+    // Disk moves on after it agreed; the tree hasn't seen it.
+    env.writeDisk('b.txt', 'b.txt v1, appended in a shell');
+    m = await env.restart(m);
+
+    await call(m, 'write', { path: 'work/new.txt', content: 'new' });
+    const pushes = recordPushes(m);
+    const forced = await call(m, 'materialize', { force: true });
+    assert.deepEqual(pushes, [['new.txt']], 'only the new file is taken up, even with force');
+    assert.deepEqual(forced.materialized.map((w: { path: string }) => w.path), ['new.txt']);
+    assert.equal(env.readDisk('b.txt'), 'b.txt v1, appended in a shell', 'force without a path does not revert it');
+
+    const bare = await call(m, 'materialize', {});
+    assert.deepEqual(pushes[1], [], 'nothing is owed');
+    assert.equal(bare.count, 0);
+    assert.equal(bare.skipped, undefined);
+
+    await call(m, 'materialize', { path: 'work/b.txt', force: true });
+    assert.equal(env.readDisk('b.txt'), 'b.txt v1', 'naming the path with force does');
+  });
+
+  test('pins the branch from the evidence when nothing is owed', async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'a');
+    const forkAt = env.store.currentSequence();
+    await seedSynced(env, m, 'b.txt', 'b');
+    m = await env.restart(m);
+    assert.equal((await call(m, 'status', {})).work.lastMaterializedBranch, null, 'the restart lost the pin');
+
+    const first = await call(m, 'materialize', {});
+    assert.equal(first.count, 0, 'nothing is owed');
+    const main = env.store.currentBranch();
+    assert.equal((await call(m, 'status', {})).work.lastMaterializedBranch, main.id, 'disk holds this branch: pinned');
+
+    // A branch that diverged before b.txt is refused, not let through.
+    env.store.createBranchAt('child', main.name, forkAt);
+    env.store.switchBranch('child');
+    await call(m, 'write', { path: 'work/a.txt', content: 'a from child' });
+    assert.match(await refused(m, 'materialize', {}), /diverged/);
+    assert.equal(env.readDisk('a.txt'), 'a');
+  });
+
+  test('status counts what disk owes by the evidence, not every tree change since the watermark', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'v1');
+    await call(m, 'materialize', {});
+    env.writeDisk('a.txt', 'v2 from a shell');
+    await call(m, 'sync', {});
+    assert.equal(await contentOf(m, 'a.txt'), 'v2 from a shell', 'disk adopted: a tree change disk already holds');
+    // An entry from before the evidence is unchecked, not unpushed.
+    env.legacyEntry('legacy.txt', 'never checked');
+    assert.equal((await call(m, 'status', {})).work.pendingChanges, 0);
+
+    await call(m, 'write', { path: 'work/a.txt', content: 'v3' });
+    assert.equal((await call(m, 'status', {})).work.pendingChanges, 1);
   });
 });
