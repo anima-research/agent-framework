@@ -360,11 +360,9 @@ export interface InferenceRequest {
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
   suppressProse?: boolean;
-  /** Ephemeral system-position prompt for this turn only. Never written to
-   * Chronicle; callers must supply bounded non-secret control text. */
-  ephemeralSystemPrompt?: string;
   /** The authenticated silent heartbeat tick this turn answers. Every row the
    * turn stores is stamped `metadata.silentHeartbeat` with it, and request
-   * builds render a request-only separator before the tick's first row. */
+   * builds render a request-only separator carrying the tick's instruction
+   * before the tick's first row (`SILENT_HEARTBEAT_SEPARATOR`). */
   silentHeartbeat?: SilentHeartbeatTick;
 }

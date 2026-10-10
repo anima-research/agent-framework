@@ -6906,7 +6906,6 @@ export class AgentFramework {
               source: 'framework',
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
-              ephemeralSystemPrompt: this.activeTurnTriggers.get(agent.name)?.ephemeralSystemPrompt,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
             });
           } else if (currentState.stream) {
@@ -8159,9 +8158,11 @@ export class AgentFramework {
           addressed: isAddressedMessage(event.tags, event.origin),
           ...(silentHeartbeat ? {
             suppressProse: true,
-            ephemeralSystemPrompt:
-              '[silent heartbeat] Scheduled private self-check. Review pending matters privately. ' +
-              'Do not narrate or publish plain prose; use an explicit send tool only if you deliberately choose to contact someone.',
+            // The tick's instruction rides its request-only separator
+            // (SILENT_HEARTBEAT_SEPARATOR), never the system prompt: a
+            // per-turn system change would cost the heartbeat's request
+            // its prompt cache from the system on, and fail the binding of
+            // every retained thinking block (context-manager #155).
             silentHeartbeat: { eventId: event.eventId, serverId: event.serverId },
           } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
@@ -8498,7 +8499,6 @@ export class AgentFramework {
           ? [...new Set(requests.flatMap((r) => r.coalescingBatchSubjects ?? [r.coalescingSubject!]))]
           : undefined,
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
-        ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
         channelId: channelReq?.channelId,
         addressed: addressedReq !== undefined,
@@ -9334,15 +9334,6 @@ export class AgentFramework {
         } catch (error) {
           console.error('beforeInference hook error:', error);
         }
-      }
-
-      if (trigger?.ephemeralSystemPrompt) {
-        const silentInjection: ContextInjection = {
-          namespace: 'framework:silent-heartbeat',
-          position: 'system',
-          content: [{ type: 'text', text: trigger.ephemeralSystemPrompt }],
-        };
-        injections = injections ? [...injections, silentInjection] : [silentInjection];
       }
 
       // An ephemeral watchdog may dispose this Agent while hooks/compile await.
