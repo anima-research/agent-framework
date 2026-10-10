@@ -2043,6 +2043,29 @@ export class AgentFramework {
       }
     }
 
+    // Every turn is over, so nothing else will deliver what is still
+    // deferred: a message held for a turn's end whose flush found the write
+    // still deferred (a primary-bound write waits out any agent's tool
+    // cycle), or one that arrived for an idle agent during another's cycle.
+    // Land each at its target now, while the store is open; a memory-only
+    // queue would otherwise lose it. One addMessage still defers (quiesced)
+    // stays in the persisted queue for boot recovery.
+    if (this.deferredMessages.length > 0) {
+      for (const name of this.agents.keys()) {
+        for (const msg of this.drainDeferredFor(name)) {
+          try {
+            this.addMessage(msg.participant, msg.content, msg.metadata, {
+              deferredWriteId: msg.id,
+              ...(msg.forAgent ? { forAgent: msg.forAgent } : {}),
+            });
+          } catch (error) {
+            console.error(`[stop] deferred write for ${name} could not be stored: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      }
+      this.ackDeferredWrites();
+    }
+
     // Final sync before closing
     try {
       this.store.sync();
@@ -10953,8 +10976,13 @@ export class AgentFramework {
       // Flush any deferred messages (e.g. if stream failed while tools were
       // pending). Only THIS agent's messages: other targets' entries wait
       // for their own boundaries (re-adding via addMessage re-defers if the
-      // target has meanwhile started a turn).
-      if (frameReachedTerminal && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
+      // target has meanwhile started a turn). Gated on this agent's own tool
+      // cycle, not every agent's: messages held for this turn's end depend on
+      // this flush, and another agent's pending tools say nothing about this
+      // window. A write addMessage still defers (a primary-bound write waits
+      // out any agent's cycle) goes back into the queue under its id, for the
+      // target's next turn start or stop().
+      if (frameReachedTerminal && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
         const deferred = this.drainDeferredFor(agent.name);
         for (const msg of deferred) {
           this.addMessage(msg.participant, msg.content, msg.metadata, {

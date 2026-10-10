@@ -46,6 +46,8 @@ class InterjectingModule implements Module {
   framework: AgentFramework | null = null;
   /** Delivered, in order, by the next tool call before it returns. */
   interjections: Interjection[] = [];
+  /** Run inside the next tool call, after the interjections are delivered. */
+  duringTool: (() => void) | null = null;
 
   async start(_ctx: ModuleContext): Promise<void> {}
   async stop(): Promise<void> {}
@@ -66,6 +68,9 @@ class InterjectingModule implements Module {
     // Let the run loop handle them while this round's tools are pending, so
     // they land in the deferred queue before the tool-result boundary.
     if (pending.length > 0) await new Promise((r) => setTimeout(r, 30));
+    const during = this.duringTool;
+    this.duringTool = null;
+    during?.();
     return call.name.endsWith('halt')
       ? { success: true, data: { halted: true }, endTurn: true }
       : { success: true, data: { ok: true } };
@@ -219,6 +224,53 @@ describe('mid-turn deliveries keep the window what the stream carried', () => {
     }).isUnreadStoredMessage.bind(framework);
     assert.equal(isUnread(agent, late.id), true);
     await framework.stop();
+  });
+
+  /** The framework's own queue and its record of pending tool cycles. */
+  function internalsOf(framework: AgentFramework) {
+    return framework as unknown as {
+      pendingAssistantBlocks: Map<string, ContentBlock[]>;
+      deferredMessages: Array<{ id: string }>;
+      addMessage(participant: string, content: ContentBlock[], metadata?: undefined, opts?: { forAgent?: string }): string;
+    };
+  }
+
+  it('a message held for the turn\'s end lands then, while another agent\'s tool cycle is pending', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Moving.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: {} },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse(text('Done.')));
+    const framework = await createFramework();
+    const internals = internalsOf(framework);
+    module.duringTool = () => {
+      // Another agent is mid tool cycle when this turn ends, and a write
+      // named as this agent (held: it can't join the live stream) waits.
+      internals.pendingAssistantBlocks.set('builder', [{ type: 'tool_use', id: 'b1', name: 'robot--move', input: {} } as ContentBlock]);
+      assert.equal(internals.addMessage('assistant', text('my own words'), undefined, { forAgent: 'assistant' }), '', 'deferred');
+    };
+    framework.pushEvent({ type: 'external-message', source: 'test', content: 'go' } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    assert.ok(internals.pendingAssistantBlocks.has('builder'), 'the other cycle was still pending at the flush');
+    assert.deepEqual(windowOf(framework).slice(-2), ['assistant: Done.', 'assistant: my own words']);
+    internals.pendingAssistantBlocks.delete('builder');
+    await framework.stop();
+  });
+
+  it('a message still deferred when the framework stops lands before the store closes', async () => {
+    const framework = await createFramework();
+    const internals = internalsOf(framework);
+    // A primary-bound write waits out any agent's tool cycle, even with this
+    // agent idle; that cycle's stream then ends without delivering it.
+    internals.pendingAssistantBlocks.set('builder', [{ type: 'tool_use', id: 'b1', name: 'robot--move', input: {} } as ContentBlock]);
+    assert.equal(internals.addMessage('Antra', text('late word')), '', 'deferred');
+    internals.pendingAssistantBlocks.delete('builder');
+    assert.equal(internals.deferredMessages.length, 1);
+    await framework.stop();
+
+    const reopened = await createFramework();
+    assert.ok(windowOf(reopened).includes('Antra: late word'), 'stored before the store closed');
+    await reopened.stop();
   });
 
   it('a write coming back from the deferred queue re-defers while a turn is alive, tool_result or not', async () => {

@@ -16,3 +16,11 @@
 - A deferred write that goes back into the queue because a turn is alive now
   does so whatever its content. A `tool_result` used to land regardless,
   apart from the `tool_use` it answers, which went back into the queue.
+- A turn's end now delivers the agent's deferred messages even while another
+  agent's tool cycle is pending; only the agent's own cycle holds them. A
+  write still deferred then (a primary-bound write waits out any agent's
+  cycle) lands at the agent's next turn start, and `stop()` now stores
+  whatever is still deferred before the store closes. Before, a message
+  deferred for an agent whose turn ended during another agent's tool cycle
+  stayed queued until that agent's next turn, and a memory-only queue lost it
+  at `stop()`.
