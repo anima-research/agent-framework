@@ -189,6 +189,13 @@ export interface ToolResult {
   /** Whether this was an error (for LLM) */
   isError?: boolean;
   /**
+   * When true, the framework saves tool_use + tool_result messages to context,
+   * cancels the active stream, and resets the agent to idle.
+   * This is a "sleep until next event" primitive — the LLM expects the call to block.
+   * Adapted from Anarchid/agent-framework@mcpl-module-proto.
+   */
+  endTurn?: boolean;
+  /**
    * Fields of `data` that list the files the tool acted on, such as the paths
    * a write wrote, removed or took from disk, in the order they should be
    * kept. When the tool-result guard withholds this result, these fields stay
@@ -198,13 +205,6 @@ export interface ToolResult {
    * be kept: an error result keeps nothing.
    */
   keepWhenWithheld?: string[];
-  /**
-   * When true, the framework saves tool_use + tool_result messages to context,
-   * cancels the active stream, and resets the agent to idle.
-   * This is a "sleep until next event" primitive — the LLM expects the call to block.
-   * Adapted from Anarchid/agent-framework@mcpl-module-proto.
-   */
-  endTurn?: boolean;
 }
 
 /**
