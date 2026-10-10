@@ -1379,3 +1379,33 @@ test('#277: writeBinary for a branch writes there, and is refused once the works
     assert.equal(store.treeGet(tree, 'tool-results/there.txt'), null, 'nor on the branch the write named');
   } finally { store.close(); }
 });
+
+test('#277: a write for a branch that waits for its mount while the branch changes is refused, and neither branch gets it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'af-guard-write-binary-')); dirs.push(dir);
+  mkdirSync(join(dir, 'mount'));
+  const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+  const workspace = new WorkspaceModule({ mounts: [{ name: 'work', path: join(dir, 'mount'), mode: 'read-write', watch: 'never' }] });
+  workspace.initStore(store);
+  try {
+    const tree = 'workspace/work/tree';
+    const source = store.currentBranch().name;
+    const before = store.currentSequence();
+    // Hold the mount's turn, as a pass on it would: the write queues behind it.
+    const internals = workspace as unknown as {
+      mounts: Map<string, unknown>;
+      withMount: (mount: unknown, fn: () => Promise<void>) => Promise<void>;
+    };
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const held = internals.withMount(internals.mounts.get('work'), () => gate);
+    const writing = workspace.writeBinary('work/tool-results/late.txt', Buffer.from('late'), 'text/plain', { branch: source });
+    store.createBranchAt('elsewhere', source, before);
+    store.switchBranch('elsewhere');
+    release();
+    await held;
+    assert.deepEqual(await writing, { success: false, error: 'the workspace had left the branch this file is for', isError: true });
+    assert.equal(store.treeGet(tree, 'tool-results/late.txt'), null, 'nothing lands on the branch switched to');
+    store.switchBranch(source);
+    assert.equal(store.treeGet(tree, 'tool-results/late.txt'), null, 'nor on the branch the write named');
+  } finally { store.close(); }
+});
