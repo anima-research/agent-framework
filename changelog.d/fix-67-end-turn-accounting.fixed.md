@@ -1,0 +1,1 @@
+- Tool-ended turns now emit `inference:completed`, record a successful inference-log entry, and record cumulative token, cache, and estimated-cost usage exactly once, including turns ended by `skip_reply` or other `endTurn` tools. Log-backed health totals now include these turns.
