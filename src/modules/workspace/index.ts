@@ -1075,9 +1075,48 @@ export class WorkspaceModule implements Module {
   // Tool Dispatch
   // ==========================================================================
 
+  private generatedTextFiles = new Map<string, {read: () => string; agentName: string}>();
+
+  /** Compare the same normalized physical path for registration and tool access. */
+  private generatedFileKey(path: string): string {
+    const slash = path.indexOf('/');
+    const mountName = slash < 0 ? path : path.slice(0, slash);
+    const mount = this.config.mounts.find(m => m.name === mountName);
+    if (!mount) throw new Error(`Unknown mount: "${mountName}"`);
+    const resolved = resolve(mount.path, slash < 0 ? '' : path.slice(slash + 1));
+    if (!isContainedPath(mount.path, resolved)) throw new Error(`Path traversal detected: "${path}"`);
+    return resolved;
+  }
+
+  private findGeneratedTextFile(path: string) {
+    if (!this.generatedTextFiles.size) return undefined;
+    try { return this.generatedTextFiles.get(this.generatedFileKey(path)); }
+    catch {
+      // Not an alias of a valid generated file. Let the selected tool return
+      // its established validation error (including image-specific errors).
+      return undefined;
+    }
+  }
+
+  /** Generated files bypass stored blobs so every read reflects current definitions. */
+  registerGeneratedTextFile(path: string, read: () => string, agentName: string): void {
+    const [mount, ...parts] = path.split('/');
+    if (!this.config.mounts.some(m => m.name === mount) || !parts.length
+      || parts.some(p => !p || p === '.' || p === '..') || this.generatedTextFiles.has(this.generatedFileKey(path)))
+      throw new Error(`Duplicate/invalid generated path: ${path}`);
+    this.generatedTextFiles.set(this.generatedFileKey(path), {read, agentName});
+  }
+
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     try {
       const input = call.input as Record<string, unknown>;
+      const generated = typeof input?.path === 'string' ? this.findGeneratedTextFile(input.path) : undefined;
+      if (generated) {
+        if (call.callerAgentName !== generated.agentName) return {success:false,isError:true,error:'Generated file belongs to another agent'};
+        if (call.name !== 'read') return {success:false,isError:true,error:'Generated file is read-only; edit the presentation configuration instead'};
+        return await this.handleRead(input as unknown as ReadInput, generated.read());
+      }
+
       switch (call.name) {
         case 'read': return await this.handleRead(input as unknown as ReadInput);
         case 'read_image': return await this.handleReadImage(input as unknown as ReadImageInput);
@@ -1746,7 +1785,7 @@ export class WorkspaceModule implements Module {
   // Tool Handlers
   // ==========================================================================
 
-  private async handleRead(input: ReadInput): Promise<ToolResult> {
+  private async handleRead(input: ReadInput, generatedContent?: string): Promise<ToolResult> {
     const characterPaging = input.offsetChars !== undefined || input.limitChars !== undefined;
     const offsetChars = input.offsetChars ?? 0;
     const limitChars = input.limitChars ?? 2000;
@@ -1760,6 +1799,8 @@ export class WorkspaceModule implements Module {
         return { success: false, isError: true, error: 'offsetChars must be a non-negative safe integer and limitChars a positive safe integer.' };
       }
     }
+    let content = generatedContent;
+    if (content === undefined) {
     const { mount, relativePath } = this.parsePath(input.path);
     const store = this.getStore();
 
@@ -1775,7 +1816,8 @@ export class WorkspaceModule implements Module {
       return { success: false, error: `Blob not found for: ${input.path}`, isError: true };
     }
 
-    const content = blob.toString('utf-8');
+    content = blob.toString('utf-8');
+    }
     if (characterPaging) {
       const start = Math.min(offsetChars, content.length);
       const splitsPair = (at: number): boolean =>

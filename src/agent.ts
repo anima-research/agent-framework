@@ -2,11 +2,25 @@ import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, Yiel
 import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
+import { ToolResultGuard, TOOL_RESULT_GUARD_NOTICE } from './tool-result-guard.js';
+import {
+  indexSilentTickRows,
+  separateSilentHeartbeatTicks,
+  silentHeartbeatSeparatorTurn,
+  type SilentHeartbeatTick,
+  type SilentTickIndex,
+  type StoredRowLike,
+} from './silent-heartbeat.js';
 import {
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
 } from './tool-result-history.js';
+
+export interface ActivationRequestOptions {
+  /** The silent heartbeat tick this request answers, if any. */
+  silentHeartbeat?: SilentHeartbeatTick;
+}
 
 export interface StartStreamResult {
   stream: YieldingStream;
@@ -21,6 +35,7 @@ import type {
   CompileResult,
   HotContextSettingsStatus,
   HotContextSettingsUpdate,
+  MessageMetadata,
 } from '@animalabs/context-manager';
 import type {
   AgentConfig,
@@ -82,6 +97,7 @@ export class Agent {
   readonly thinking: AgentConfig['thinking'];
   /** Refusal auto-rewind policy (see AgentConfig.refusalHandling). */
   readonly refusalHandling: AgentConfig['refusalHandling'];
+  readonly toolResultGuard: ToolResultGuard;
   /** Prose delivery mode (see AgentConfig.proseRouting). Default 'locus'. */
   readonly proseRouting: 'locus' | 'explicit' | 'hybrid' | 'disabled';
   /** Exact whole-response known-tool wrapper containment (default off). */
@@ -143,6 +159,7 @@ export class Agent {
     this.temperature = config.temperature;
     this.thinking = config.thinking;
     this.refusalHandling = config.refusalHandling;
+    this.toolResultGuard = new ToolResultGuard(config.name, contextManager, config.toolResultGuard);
     this.proseRouting = config.proseRouting ?? 'locus';
     this.toolWrapperProseGuard = config.toolWrapperProseGuard ?? false;
     this.cacheTtl = config.cacheTtl ?? '1h';
@@ -223,6 +240,20 @@ export class Agent {
     if (budget) return budget;
     if (this.contextBudgetTokens === undefined) return undefined;
     return { maxTokens: this.contextBudgetTokens, reserveForResponse: this.maxTokens };
+  }
+
+  /** Compile budget with the tool-result guard's reservation applied. While
+   * a batch is pending the strategy selects against short placeholders, but
+   * prepareRequest substitutes the originals on the wire; reserve their real
+   * cost so the final request still fits (a budget restart that recompiles
+   * small must not re-inflate past the same window). */
+  private compileBudget(budget?: TokenBudget): TokenBudget | undefined {
+    const resolved = this.resolveBudget(budget);
+    const reserve = this.toolResultGuard.pendingWireReserveTokens;
+    if (reserve === 0) return resolved;
+    // Mirrors ContextManager.compile's own default when no budget is set.
+    const base = resolved ?? { maxTokens: 100_000, reserveForResponse: 4_000 };
+    return { ...base, reserveForResponse: base.reserveForResponse + reserve };
   }
 
   /** Structural compatibility keeps lightweight test/host ContextManager
@@ -564,7 +595,7 @@ export class Agent {
     // RFC-006 §3.3: consumption is determined at assembly — a compile that
     // fails assembled nothing, so the watermark moves only on success.
     const watermark = this.pendingWatermark();
-    const result = await this.contextManager.compile(this.resolveBudget(budget));
+    const result = await this.contextManager.compile(this.compileBudget(budget));
     if (watermark) this.consumedWatermark = watermark;
     if (!budget) this.settleRuntimeSettingsTransition();
     return result;
@@ -582,7 +613,7 @@ export class Agent {
   ): Promise<CompileResult> {
     const watermark = this.pendingWatermark();
     const result = await this.contextManager.compile(
-      this.resolveBudget(budget), injections, opts as never,
+      this.compileBudget(budget), injections, opts as never,
     );
     if (watermark) this.consumedWatermark = watermark;
     if (!budget) this.settleRuntimeSettingsTransition();
@@ -623,20 +654,33 @@ export class Agent {
       throw new Error(`Agent ${this.name} is waiting for tool results`);
     }
 
+    this.toolResultGuard.flushUnrecorded();
+
     // Filter tools to only allowed ones
     const tools = availableTools.filter((t) => this.canUseTool(t.name));
+
+    // The direct Agent API uses the same admission rules as framework-driven
+    // streams. Stage before compiling so compression only sees placeholders.
+    const guardedResults = this._state.status === 'ready' && this.toolResultGuard.enabled;
+    if (guardedResults && this._state.status === 'ready') {
+      const content = this.buildToolResultMessages(this._state.toolResults)[0].content;
+      const wireResults = content.flatMap((block) => block.type === 'tool_result'
+        // buildToolResultMessages serializes every payload to a string.
+        ? [{ toolUseId: block.toolUseId, content: block.content as string, isError: block.isError }] : []);
+      this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults);
+    }
 
     // Compile context (with optional injections)
     const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
 
     // If we have pending tool results, add them
-    if (this._state.status === 'ready') {
+    if (this._state.status === 'ready' && !guardedResults) {
       const toolResultMessages = this.buildToolResultMessages(this._state.toolResults);
       messages.push(...toolResultMessages);
     }
 
     const request: NormalizedRequest = {
-      messages,
+      messages: this.toolResultGuard.prepareRequest(messages, true),
       system: this.buildSystemPrompt(systemInjections),
       config: {
         model: this.model,
@@ -692,6 +736,7 @@ export class Agent {
     } catch (error) {
       // On error, go back to idle
       this._state = { status: 'idle' };
+      this.toolResultGuard.recovering = false;
       throw error;
     }
   }
@@ -752,16 +797,19 @@ export class Agent {
   async buildActivationRequest(
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
-    budget?: TokenBudget
+    budget?: TokenBudget,
+    compressionTools: ToolDefinition[] = availableTools,
+    options: ActivationRequestOptions = {},
   ): Promise<NormalizedRequest> {
-    // Keep the context manager's view of the live tool surface current: the
+    // Compression may revisit hidden tools in recorded history. Keep its full
+    // definition set separate from the resident's advertised tools: the
     // autobiographical strategy must declare the same tools on its
     // summarizer/compression requests, or transcripts containing tool blocks
     // are refused by Anthropic's reasoning_extraction classifier (labclaude
     // incident, 2026-07-09). Optional chaining: older context-manager
     // versions don't have the hook.
     (this.contextManager as unknown as { setToolDefinitions?: (t: ToolDefinition[]) => void })
-      .setToolDefinitions?.(availableTools);
+      .setToolDefinitions?.(compressionTools);
 
     const strategy = (this.contextManager as unknown as { getStrategy?: () => unknown })
       .getStrategy?.() as {
@@ -806,10 +854,24 @@ export class Agent {
       }))
       .filter((m) => m.content.length > 0);
 
-    // Safety: ensure messages don't end with an assistant message.
-    // Some models reject trailing assistant messages ("prefill not supported"),
-    // and after context compression a stale assistant turn can end up last.
-    if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
+    // Silent heartbeat ticks store no prompt row. Render a request-only
+    // separator before each tick's first surviving row so the wire formatter
+    // cannot merge the tick into the previous assistant message (see
+    // silent-heartbeat.ts for what can and cannot be matched). This agent's
+    // own first request for a tick ends on that same turn, so the prefix it
+    // caches is the one every later compile renders. "First" is per agent: a
+    // broadcast tick shares its eventId with every resident.
+    const ticks = this.indexSilentHeartbeatTicks();
+    messages = separateSilentHeartbeatTicks(messages, ticks.rows, this.name);
+    const openingTick = options.silentHeartbeat !== undefined
+      && !ticks.started.has(options.silentHeartbeat.eventId);
+
+    if (openingTick) {
+      messages = [...messages, silentHeartbeatSeparatorTurn()];
+    } else if (messages.length > 0 && messages[messages.length - 1]!.participant === this.name) {
+      // Safety: ensure messages don't end with an assistant message.
+      // Some models reject trailing assistant messages ("prefill not supported"),
+      // and after context compression a stale assistant turn can end up last.
       messages = [...messages, {
         participant: 'user',
         content: [{ type: 'text', text: '[Continue]' }],
@@ -817,7 +879,7 @@ export class Agent {
     }
 
     return {
-      messages,
+      messages: this.toolResultGuard.prepareRequest(messages),
       system: this.buildSystemPrompt(systemInjections),
       config: {
         model: this.model,
@@ -835,6 +897,26 @@ export class Agent {
     };
   }
 
+  /** Stored silent-tick rows, memoized on the store's cached message array
+   * (ContextManager returns the same array until the store changes). */
+  private silentTickIndex: { source: readonly unknown[]; index: SilentTickIndex } | null = null;
+
+  private indexSilentHeartbeatTicks(): SilentTickIndex {
+    const empty: SilentTickIndex = { rows: new Map(), started: new Set() };
+    const cm = this.contextManager as Partial<ContextManager>;
+    if (typeof cm.getAllMessages !== 'function') return empty;
+    try {
+      const stored = cm.getAllMessages() as unknown as readonly StoredRowLike[];
+      if (this.silentTickIndex?.source === stored) return this.silentTickIndex.index;
+      const index = indexSilentTickRows(stored, this.name);
+      this.silentTickIndex = { source: stored, index };
+      return index;
+    } catch (error) {
+      console.error(`[silent-heartbeat] ${this.name}: could not index tick rows; separators omitted:`, error);
+      return empty;
+    }
+  }
+
   /**
    * Start a yielding stream with context injections.
    * Same as startStream but passes injections through to compile.
@@ -842,11 +924,17 @@ export class Agent {
   async startStreamWithInjections(
     availableTools: ToolDefinition[],
     injections?: ContextInjection[],
-    budget?: TokenBudget
+    budget?: TokenBudget,
+    compressionTools: ToolDefinition[] = availableTools,
+    options: ActivationRequestOptions = {},
   ): Promise<StartStreamResult> {
     if (this._state.status !== 'idle') {
       throw new Error(`Agent ${this.name} cannot start stream in state ${this._state.status}`);
     }
+
+    // Retry accepted history edits before assembling a real request. Pure
+    // preview/compile entry points must not perform these writes.
+    this.toolResultGuard.flushUnrecorded();
 
     // A new activation supersedes every receipt flight the previous one left
     // open. Membrane fires the kv-unified wire receipt per provider attempt,
@@ -873,7 +961,8 @@ export class Agent {
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
 
-    const request = await this.buildActivationRequest(availableTools, injections, budget);
+    const request = await this.buildActivationRequest(availableTools, injections, budget, compressionTools, options);
+    request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
       .getStrategy?.() as {
@@ -898,6 +987,7 @@ export class Agent {
       };
     }
 
+    const agent = this;
     const stream = this.membrane.streamYielding(request, {
       emitTokens: true,
       emitBlocks: false,
@@ -907,7 +997,13 @@ export class Agent {
       // (cache-warm), where a framework-level requeue would recompile and
       // land a different window. The framework's driveStream handles the
       // resulting `retrying` event by discarding the abandoned attempt.
-      ...(this.refusalHandling?.retries ? { refusalRetries: this.refusalHandling.retries } : {}),
+      // Membrane reads this per physical round, including after settings
+      // tools run. A guarded result must reach the host on its FIRST refusal;
+      // never spend retries resubmitting unchanged guarded content.
+      get refusalRetries() {
+        return agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering
+          ? 0 : agent.refusalHandling?.retries ?? 0;
+      },
     });
 
     this._state = { status: 'streaming', stream };
@@ -966,7 +1062,7 @@ export class Agent {
    * Add an assistant response to context.
    * Called by framework when stream completes.
    */
-  addAssistantResponse(content: ContentBlock[]): void {
+  addAssistantResponse(content: ContentBlock[], metadata?: MessageMetadata): void {
     // A turn whose entire output is thinking blocks produced NOTHING: no
     // speech, no tool call. That is what a refusal looks like on the wire —
     // the provider returns signed thinking (often with empty text, the
@@ -992,7 +1088,7 @@ export class Agent {
       );
       return;
     }
-    this.contextManager.addMessage(this.name, content);
+    this.contextManager.addMessage(this.name, content, metadata);
   }
 
   /**
@@ -1085,9 +1181,32 @@ export class Agent {
     request: NormalizedRequest,
     signal?: AbortSignal
   ): Promise<InferenceResult> {
-    const response = await this.membrane.stream(request, { signal });
+    let response = await this.membrane.stream(request, { signal });
+    // Usage of a refused attempt abandoned by the guard; it was billed and
+    // is added to the retry's usage below rather than overwritten.
+    let abandonedUsage: { inputTokens: number; outputTokens: number } | undefined;
+    if (!isAbortedResponse(response) && response.stopReason === 'refusal') {
+      // A staged batch never on the wire cannot have caused the refusal.
+      this.toolResultGuard.settleUnsubmitted('unknown');
+      const ids = this.toolResultGuard.withhold('unknown');
+      if (ids) {
+        abandonedUsage = response.usage;
+        const withheld = new Set(ids);
+        request = { ...request, messages: request.messages.map((message) => ({
+          ...message, content: message.content.map((block) => block.type === 'tool_result' && withheld.has(block.toolUseId)
+            ? { type: 'tool_result', toolUseId: block.toolUseId, content: TOOL_RESULT_GUARD_NOTICE, isError: block.isError } : block),
+        })) };
+        response = await this.membrane.stream(request, { signal });
+      }
+    }
 
     if (isAbortedResponse(response)) {
+      // Interrupted before a clean response: settle, never leave pending.
+      try {
+        this.toolResultGuard.abandon('aborted');
+      } catch (error) {
+        console.error(`[tool-result-guard] agent=${this.name} failed to record aborted batch:`, error);
+      }
       const partialContent = response.partialContent ?? [];
       const { toolCalls, speechContent } = this.extractToolCallsAndSpeech(partialContent);
       return {
@@ -1100,16 +1219,24 @@ export class Agent {
       };
     }
 
-    const { toolCalls, speechContent } = this.extractToolCallsAndSpeech(response.content);
+    const guardedRefusal = response.stopReason === 'refusal' && this.toolResultGuard.recovering;
+    if (response.stopReason !== 'refusal') this.toolResultGuard.accept();
+    this.toolResultGuard.recovering = false;
+    const content = guardedRefusal ? [] : response.content;
+    const { toolCalls, speechContent } = this.extractToolCallsAndSpeech(content);
 
     // Add assistant response to context
-    this.contextManager.addMessage(this.name, response.content);
+    if (!guardedRefusal) this.contextManager.addMessage(this.name, content);
 
     return {
       toolCalls,
       speechContent,
       raw: response.raw,
-      usage: response.usage,
+      usage: abandonedUsage && response.usage ? {
+        ...response.usage,
+        inputTokens: response.usage.inputTokens + abandonedUsage.inputTokens,
+        outputTokens: response.usage.outputTokens + abandonedUsage.outputTokens,
+      } : response.usage,
       stopReason: response.stopReason,
     };
   }

@@ -53,6 +53,12 @@ export interface CodeExecutionConfig {
   /** Whole-script deadline: cancel → grace → SIGKILL (default 600_000 ms). */
   scriptTimeoutMs?: number;
   /**
+   * Longest deadline an agent may ask for on one call with `time_limit_ms`
+   * (default: `scriptTimeoutMs`, so agents can only shorten it until this is
+   * raised). Longer requests are capped, and the result says so.
+   */
+  maxScriptTimeoutMs?: number;
+  /**
    * Idle interpreter reclaim — script globals are lost after this much
    * inactivity (default 300_000 ms, mirroring ~5-minute container reclaim).
    * 0 disables reclaim.
@@ -231,6 +237,11 @@ export interface FrameworkConfig {
    * effective class (first matching pattern wins); replaces, never merges
    * with, what the providing server declared. Use it to correct or tighten a
    * misclassed tool.
+   *
+   * MCPL tools are named `<toolPrefix>--<tool>`, and toolPrefix defaults to
+   * `mcpl--<serverId>`: server `search` without a toolPrefix needs
+   * `mcpl--search--*`, not `search--*`. A pattern that matches no tool is
+   * reported once its servers have listed their tools.
    */
   toolClassOverrides?: Record<string, string[]>;
 
@@ -268,6 +279,13 @@ export interface FrameworkConfig {
    * messages route to per-channel fork agents spawned from the template
    * agent instead of the primary conversation. If omitted, behavior is
    * unchanged (all messages go to the primary agent).
+   *
+   * @deprecated Per-channel conversation routing is deprecated and will be
+   * removed (anima-research/agent-framework#235). Its 'mention' bind/trigger
+   * rule reads `metadata.mentioned`, which not every channel server sets
+   * (discord-mcpl does not), so on those channels an @-mention neither binds
+   * a fork nor triggers a bound one. Routing still works for now; the
+   * framework logs one `[deprecated]` line at creation when this is set.
    */
   conversations?: ConversationRouterConfig;
 }

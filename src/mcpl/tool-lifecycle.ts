@@ -50,7 +50,19 @@ export interface ToolLifecycleParams {
   inputWithheld?: boolean;
   isError?: boolean;
   durationMs?: number;
+  /**
+   * MCP's extension slot. Carries only SCRIPT_PARENT_META_KEY, on calls a
+   * code_execution script made: RFC-007 has no field for a call's origin,
+   * and the `mcpl/` prefix is reserved for keys MCPL defines (RFC-008 §3).
+   */
+  _meta?: Record<string, unknown>;
 }
+
+/**
+ * `_meta` key naming the `toolCallId` of the code_execution call whose script
+ * made this call. Host-specific: not defined by RFC-007.
+ */
+export const SCRIPT_PARENT_META_KEY = 'agent-framework/parentToolCallId';
 
 export interface ToolObserveMatch {
   tool?: string;
@@ -78,7 +90,8 @@ export interface ToolObserveRule {
  * RFC-007 §6.2 grammar.
  */
 export interface ToolLifecycleNarrowing {
-  /** Patterns over the model-facing tool name (`computer--*`). */
+  /** Patterns over the model-facing tool name (`computer--*`): for an MCPL
+   *  tool `<toolPrefix>--<tool>`, toolPrefix defaulting to `mcpl--<serverId>`. */
   tools?: string[];
   /** The tool's effective class must intersect this set. `'default'` is
    *  DEFAULT_INPUT_CLASSES (computer, shell, files, web, media, body). */
@@ -106,7 +119,7 @@ export interface ToolLifecycleConfig {
 export const DEFAULT_MAX_INPUT_BYTES = 16 * 1024;
 
 /** Accepted sizes for a `tools/observe` request (RFC-007 §6.6 asks hosts to
- *  accept at least 64 rules, 64 paths per rule, 256-character strings). */
+ *  accept at least 64 rules, 64 paths per rule, 256-code-point strings). */
 export const TOOL_OBSERVE_LIMITS = {
   rules: 256,
   pathsPerRule: 256,
@@ -128,6 +141,16 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** JSON Schema maxLength counts code points, not UTF-16 code units.
+ *  Stop at the limit rather than allocating a copy of an oversized input. */
+function exceedsCodePointLimit(value: string, limit: number): boolean {
+  let count = 0;
+  for (const _point of value) {
+    if (++count > limit) return true;
+  }
+  return false;
+}
+
 /**
  * Validate `tools/observe` params. `rules` absent or null clears the filter
  * (`{ok, rules: null}`); `[]` is a valid filter that reports nothing. Unknown
@@ -135,7 +158,9 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * make a rule match more than its author wrote.
  */
 export function parseToolObserveParams(params: unknown): ToolObserveParseResult {
-  if (params === undefined || params === null) return { ok: true, rules: null };
+  // Omitted transport params normalize to {}, but explicit JSON null is
+  // not an object and must not clear an existing restrictive filter.
+  if (params === undefined) return { ok: true, rules: null };
   if (!isPlainObject(params)) return { ok: false, message: 'tools/observe params must be an object' };
   // Unknown members are rejected here too (MCP's own `_meta` excepted): a
   // misspelled `rules` must not read as "no rules" and silently clear a
@@ -144,6 +169,9 @@ export function parseToolObserveParams(params: unknown): ToolObserveParseResult 
     if (key !== 'rules' && key !== '_meta') {
       return { ok: false, message: `tools/observe: unknown params member "${key}"` };
     }
+  }
+  if (params._meta !== undefined && !isPlainObject(params._meta)) {
+    return { ok: false, message: 'tools/observe: _meta must be an object' };
   }
   const raw = params.rules;
   if (raw === undefined || raw === null) return { ok: true, rules: null };
@@ -173,7 +201,7 @@ export function parseToolObserveParams(params: unknown): ToolObserveParseResult 
         continue;
       }
       if (typeof value !== 'string') return { ok: false, message: `tools/observe: ${at}.match.${key} must be a string` };
-      if (value.length > TOOL_OBSERVE_LIMITS.stringLength) {
+      if (exceedsCodePointLimit(value, TOOL_OBSERVE_LIMITS.stringLength)) {
         return { ok: false, message: `tools/observe: ${at}.match.${key} is too long`, data: { limit: 'stringLength' } };
       }
       (match as Record<string, string>)[key] = value;
@@ -196,7 +224,7 @@ export function parseToolObserveParams(params: unknown): ToolObserveParseResult 
           if (typeof path !== 'string' || path.length === 0) {
             return { ok: false, message: `tools/observe: ${at}.input must hold non-empty strings` };
           }
-          if (path.length > TOOL_OBSERVE_LIMITS.stringLength) {
+          if (exceedsCodePointLimit(path, TOOL_OBSERVE_LIMITS.stringLength)) {
             return { ok: false, message: `tools/observe: ${at}.input path is too long`, data: { limit: 'stringLength' } };
           }
           paths.push(path);
@@ -227,6 +255,8 @@ export interface ToolCallDescriptor {
   serverId?: string;
   serverTool?: string;
   input: unknown;
+  /** Script-inner calls: the code_execution call's `toolCallId`, when it had one. */
+  parentToolCallId?: string;
 }
 
 function anyGlob(patterns: readonly string[], subject: string): boolean {
@@ -451,6 +481,7 @@ function baseParams(call: ToolCallDescriptor, phase: ToolPhase): ToolLifecyclePa
     class: [...call.class],
     ...(call.serverId !== undefined ? { serverId: call.serverId, serverTool: call.serverTool } : {}),
     phase,
+    ...(call.parentToolCallId !== undefined ? { _meta: { [SCRIPT_PARENT_META_KEY]: call.parentToolCallId } } : {}),
   };
 }
 
@@ -522,10 +553,23 @@ export interface ToolLifecycleHost {
   describe(tool: string): { class: ToolClass[]; serverId?: string; serverTool?: string };
 }
 
+/**
+ * What a call made from inside a code_execution script inherits from the
+ * code_execution call that ran the script (scriptOrigin()).
+ */
+export interface ScriptCallOrigin {
+  /** The inference whose output requested the code_execution call. */
+  inferenceId: string;
+  /** That call's `toolCallId`. Absent when nothing observed it, so it has none. */
+  parentToolCallId?: string;
+}
+
 interface TrackedCall {
   agentName: string;
   modelCallId: string;
   call: ToolCallDescriptor;
+  /** Made by a code_execution script, not by the model (registerScriptCall). */
+  scriptInner: boolean;
   /** Connection id → transport epoch the opening went to. */
   openedTo: Map<string, number>;
   /** `started` has been sent (open() ran and the call was not refused). */
@@ -554,6 +598,9 @@ export class ToolLifecycleEmitter {
   private readonly recentIds = new Set<string>();
   private readonly recentOrder: string[] = [];
   private mintSeq = 0;
+  /** The call between register() and open(), kept even when nothing observes,
+   *  so a code_execution dispatch can learn its inference (scriptOrigin()). */
+  private dispatching: { agentName: string; callId: string; inferenceId: string } | null = null;
 
   constructor(host: ToolLifecycleHost, now: () => number = Date.now) {
     this.host = host;
@@ -593,6 +640,44 @@ export class ToolLifecycleEmitter {
    * host may still refuse it (refuse()) before it executes.
    */
   register(agentName: string, inferenceId: string, call: { id: string; name: string; input: unknown }): void {
+    this.dispatching = { agentName, callId: call.id, inferenceId };
+    this.track(agentName, inferenceId, call, false);
+  }
+
+  /**
+   * A call a code_execution script made, about to go through the same
+   * dispatch as a model call (then refuse() / open() / onResult() as for
+   * one). Its class, provider, grant narrowing and filter matching are the
+   * INNER tool's own; its inference is the one that issued the
+   * code_execution call. Unlike a model call it is not aborted when its
+   * stream ends: the tool keeps running after the turn or the script is
+   * gone, so its terminal is the result's, or `failed` when the host gives
+   * up waiting for one.
+   */
+  registerScriptCall(agentName: string, origin: ScriptCallOrigin, call: { id: string; name: string; input: unknown }): void {
+    this.track(agentName, origin.inferenceId, call, true, origin.parentToolCallId);
+  }
+
+  /**
+   * The origin a code_execution call passes to the calls its script makes.
+   * Valid only while that call is being dispatched (between register() and
+   * open()), which is where the framework asks.
+   */
+  scriptOrigin(agentName: string, callId: string): ScriptCallOrigin | undefined {
+    const tracked = this.calls.get(callKey(agentName, callId));
+    if (tracked) return { inferenceId: tracked.call.inferenceId, parentToolCallId: tracked.call.toolCallId };
+    const d = this.dispatching;
+    if (d && d.agentName === agentName && d.callId === callId) return { inferenceId: d.inferenceId };
+    return undefined;
+  }
+
+  private track(
+    agentName: string,
+    inferenceId: string,
+    call: { id: string; name: string; input: unknown },
+    scriptInner: boolean,
+    parentToolCallId?: string,
+  ): void {
     if (!this.anyObserver()) return;
     const described = this.host.describe(call.name);
     this.calls.set(callKey(agentName, call.id), {
@@ -608,7 +693,9 @@ export class ToolLifecycleEmitter {
           ? { serverId: described.serverId, serverTool: described.serverTool }
           : {}),
         input: call.input,
+        ...(parentToolCallId !== undefined ? { parentToolCallId } : {}),
       },
+      scriptInner,
       openedTo: new Map(),
       opened: false,
       // Taken before dispatch, so durationMs includes work a synchronous
@@ -637,6 +724,7 @@ export class ToolLifecycleEmitter {
    * run synchronously inside dispatch, before this.
    */
   open(agentName: string, callId: string): void {
+    this.dispatching = null;
     const key = callKey(agentName, callId);
     const tracked = this.calls.get(key);
     if (!tracked || tracked.opened) return;
@@ -710,12 +798,14 @@ export class ToolLifecycleEmitter {
    * A stream ended: its calls still open were cancelled before a result.
    * Scoped to the inference ids that stream minted, so a successor stream
    * for the same agent (a budget restart overlapping this one's teardown)
-   * keeps its live calls. A result arriving later finds nothing.
+   * keeps its live calls. A result arriving later finds nothing. Calls a
+   * script made are left open: they end with their own result.
    */
   abortOpen(agentName: string, inferenceIds: Iterable<string>): void {
     if (this.calls.size === 0) return;
     const ids = new Set(inferenceIds);
     for (const tracked of [...this.calls.values()]) {
+      if (tracked.scriptInner) continue;
       if (tracked.agentName === agentName && ids.has(tracked.call.inferenceId)) {
         if (tracked.opened) this.terminate(tracked, 'aborted');
         else this.calls.delete(callKey(tracked.agentName, tracked.modelCallId));

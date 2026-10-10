@@ -37,7 +37,8 @@ import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
-import { validateCoalescedContent } from './push-coalescer.js';
+import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
+import { isVisiblyEmptyContent } from './visible-content.js';
 import { CapabilityGrant } from './capability-grant.js';
 
 // ============================================================================
@@ -915,18 +916,38 @@ export class ChannelRegistry {
       // ACCEPTED from here down: semantic processing only for admitted
       // messages. §16.3 core-tag closure, then content conversion.
       const coalesced = message.coalesce !== undefined && !!this.handleCoalescedIncoming;
+      // Only a coalescing retraction may be empty (pure withdrawal, RFC-006
+      // §6; the coalescer appends nothing for it). Any other message that
+      // shows the model nothing would wake it with no visible cause.
+      const emptyAllowed = coalesced && (message.coalesce as { retract?: unknown } | null)?.retract === true;
+      const rejectEmpty = () => {
+        console.error(`[channel-incoming-rejected] server=${serverId} channel=${message.channelId} messageId=${message.messageId} reason=empty-content`);
+        this.emitTraceFn({
+          type: 'mcpl:channel-incoming-rejected',
+          serverId,
+          channelId: message.channelId,
+          messageId: message.messageId,
+          reason: 'empty-content',
+        });
+        results.push({ messageId: message.messageId, accepted: false, reason: 'empty_content' });
+      };
       if (coalesced) {
         // RFC-006 §13: malformed content on a coalesced item is that item's
         // failure, not the batch's — check the shape before converting.
         try {
-          validateCoalescedContent(message.content);
+          validateCoalescedContent(message.content, undefined, { allowEmpty: emptyAllowed });
         } catch (error) {
-          results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+          if (error instanceof EmptyContentError) rejectEmpty();
+          else results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
           continue;
         }
       }
       if (message.tags) message.tags = expandCoreTags(message.tags);
       const convertedContent: ContentBlock[] = message.content.map(convertBlock);
+      if (!emptyAllowed && isVisiblyEmptyContent(convertedContent)) {
+        rejectEmpty();
+        continue;
+      }
 
       // Track default publish channel (most recent ACCEPTED incoming) —
       // deliberately after §14.5 validation: a rejected message from an
@@ -2443,6 +2464,44 @@ export class ChannelRegistry {
       .slice(0, 5)
       .map((e) => `${e.descriptor.label} = ${e.descriptor.id}`);
     return { error: `no channel matches "${trimmed}"`, ...(near.length ? { candidates: near } : {}) };
+  }
+
+  /**
+   * The `>>` target to show an agent for a channel: one whitespace-free token
+   * that `resolveProseTarget()` maps back to this same channel. The prefix
+   * grammar takes the target as the first non-whitespace run, so a label with
+   * a space can't be quoted verbatim: `>>#DM: alice` parses as target `#DM:`
+   * plus body `alice …`, and `>>#fable (antra's server)` delivers
+   * `(antra's server)` as text. Tried in order: `@name` for a DM, `#label`,
+   * `#name` (label without its server suffix), the descriptor id.
+   *
+   * Undefined when there is no safe token: the channel isn't registered (on
+   * `serverId`, when given), no candidate is whitespace-free and resolves back,
+   * or the id is registered by more than one server. A resolved target names a
+   * channel by id alone, and ids are unique only within a connection, so a
+   * shared id could route the reply through the wrong server.
+   */
+  proseTargetFor(channelId: string, serverId?: string): string | undefined {
+    const sameId = [...this.channels.values()].filter((e) => e.descriptor.id === channelId);
+    const entry = serverId ? sameId.find((e) => e.serverId === serverId) : sameId[0];
+    if (!entry || sameId.length > 1) return undefined;
+    const d = entry.descriptor;
+    const label = d.label ?? '';
+    const meta = d.metadata as { channelType?: string; recipientName?: string } | undefined;
+    const isDm = meta?.channelType === 'dm' || label.toLowerCase().startsWith('dm: ') || d.id.includes(':dm:');
+    const dmName = meta?.recipientName ?? (label.toLowerCase().startsWith('dm: ') ? label.slice(4) : undefined);
+    const bare = label.replace(/^#/, '');
+    const candidates = [
+      ...(isDm && dmName ? [`@${dmName}`] : []),
+      ...(bare ? [`#${bare}`, `#${bare.replace(/\s*\([^)]*\)\s*$/, '')}`] : []),
+      d.id,
+    ];
+    for (const c of candidates) {
+      if (/\s/.test(c) || c === '#') continue;
+      const r = this.resolveProseTarget(c);
+      if ('channelId' in r && r.channelId === d.id) return c;
+    }
+    return undefined;
   }
 
   /**

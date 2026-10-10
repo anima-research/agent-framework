@@ -4,7 +4,7 @@
  * conversation when FrameworkConfig.conversations is set.
  */
 
-import { describe, it, beforeEach, afterEach } from 'node:test';
+import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -84,6 +84,63 @@ describe('Conversation routing', () => {
       }),
       /templateAgent "nope"/,
     );
+  });
+
+  // Deprecation (agent-framework#235): behavior unchanged, one stderr line.
+  function deprecationWarnings(warn: { mock: { calls: Array<{ arguments: unknown[] }> } }): string[] {
+    return warn.mock.calls
+      .map((c) => String(c.arguments[0]))
+      .filter((line) => line.startsWith('[deprecated]') && line.includes('conversation routing'));
+  }
+
+  it('configured: logs one [deprecated] line per framework and still routes', async () => {
+    const warn = mock.method(console, 'warn', () => {});
+    let framework: AgentFramework | undefined;
+    try {
+      framework = await makeFramework();
+      assert.equal(deprecationWarnings(warn).length, 1, 'warned once at creation');
+      assert.match(deprecationWarnings(warn)[0]!, /agent-framework#235/);
+
+      // Routing is unchanged: a DM and a channel mention each spawn a fork.
+      // (One queued response per stream: MockMembrane hands a stream every
+      // response still queued.)
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi alice!' }]));
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D1', text: 'hello there', channelType: 'im' }));
+      await framework.runUntilIdle();
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'On it.' }]));
+      framework.pushEvent(incomingEvent({ channelId: 'slack:C1', text: 'bot, help', mentioned: true }));
+      await framework.runUntilIdle();
+      assert.ok(framework.getAgent('conversation-slack-D1-g1'), 'DM fork spawned');
+      assert.ok(framework.getAgent('conversation-slack-C1-g1'), 'channel-mention fork spawned');
+      assert.equal(membrane.calls.length, 2, 'both forks ran inference');
+
+      assert.equal(deprecationWarnings(warn).length, 1, 'spawning forks does not warn again');
+    } finally {
+      warn.mock.restore();
+      await framework?.stop();
+    }
+  });
+
+  it('not configured: no [deprecated] line', async () => {
+    const warn = mock.method(console, 'warn', () => {});
+    let framework: AgentFramework | undefined;
+    try {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi alice!' }]));
+      framework = await AgentFramework.create({
+        storePath: join(tempDir, 'test.chronicle'),
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'trunk', model: 'test-model', systemPrompt: 'You are the trunk.' }],
+        modules: [],
+      });
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D1', text: 'hello there', channelType: 'im' }));
+      await framework.runUntilIdle();
+
+      assert.equal(framework.getConversationRouter(), null);
+      assert.deepEqual(deprecationWarnings(warn), []);
+    } finally {
+      warn.mock.restore();
+      await framework?.stop();
+    }
   });
 
   it('DM message spawns a fork, routes the message there, and triggers inference', async () => {
@@ -179,6 +236,99 @@ describe('Conversation routing', () => {
     );
 
     await framework.stop();
+  });
+
+  // Exercise the delivery boundary without scheduling inference. The same
+  // handler receives ordinary channel traffic and coalesced fixed-audience notices.
+  async function deliver(framework: AgentFramework, channelId: string, text: string, deliverTo?: string) {
+    const internals = framework as unknown as {
+      handleMcplChannelIncoming(event: unknown): Promise<unknown>;
+    };
+    return internals.handleMcplChannelIncoming({
+      ...incomingEvent({ channelId, text, mentioned: true }),
+      triggerInference: false,
+      ...(deliverTo ? { deliverTo } : {}),
+    });
+  }
+
+  it('successful ambient delivery refreshes the bound fork idle clock', async () => {
+    const framework = await makeFramework();
+    try {
+      await deliver(framework, 'slack:C1', 'first');
+      const router = framework.getConversationRouter()!;
+      const binding = router.getBinding('slack:C1')!;
+      binding.lastActivity = 1;
+      const before = Date.now();
+      framework.pushEvent({
+        ...incomingEvent({ channelId: 'slack:C1', text: 'ambient detail' }),
+        triggerInference: false,
+      } as ProcessEvent);
+      await framework.runUntilIdle();
+
+      assert.ok(binding.lastActivity >= before, 'successful delivery records activity');
+      assert.equal(membrane.calls.length, 0, 'ambient delivery needs no inference');
+      assert.deepEqual(router.expired(before), []);
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('failed delivery leaves the bound fork idle clock unchanged', async () => {
+    const framework = await makeFramework();
+    try {
+      await deliver(framework, 'slack:C1', 'first');
+      const router = framework.getConversationRouter()!;
+      const binding = router.getBinding('slack:C1')!;
+      binding.lastActivity = 1;
+      const context = framework.getAgent(binding.agentName)!.getContextManager();
+      const addMessage = context.addMessage;
+      context.addMessage = () => { throw new Error('injected context write failure'); };
+      try {
+        await assert.rejects(deliver(framework, 'slack:C1', 'lost'), /injected context write failure/);
+        assert.equal(binding.lastActivity, 1, 'a routing decision is not delivered activity');
+      } finally {
+        context.addMessage = addMessage;
+      }
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('fixed-audience coalesced delivery refreshes the current fork idle clock', async () => {
+    const framework = await makeFramework();
+    try {
+      await deliver(framework, 'slack:C1', 'first');
+      const router = framework.getConversationRouter()!;
+      const binding = router.getBinding('slack:C1')!;
+      binding.lastActivity = 1;
+      const before = Date.now();
+      await deliver(framework, 'slack:C1', 'updated detail', binding.agentName);
+      assert.ok(binding.lastActivity >= before, 'delivery bypassing fresh routing still records activity');
+      const { messages } = await framework.getAgent(binding.agentName)!.getContextManager().compile();
+      assert.ok(JSON.stringify(messages).includes('updated detail'));
+    } finally {
+      await framework.stop();
+    }
+  });
+
+  it('delivery to an older fork does not refresh a newer binding on the same channel', async () => {
+    const framework = await makeFramework();
+    try {
+      await deliver(framework, 'slack:C1', 'first');
+      const router = framework.getConversationRouter()!;
+      const oldName = router.getBinding('slack:C1')!.agentName;
+      router.unbind('slack:C1');
+      await deliver(framework, 'slack:C1', 'new engagement');
+      const binding = router.getBinding('slack:C1')!;
+      binding.lastActivity = 1;
+      await deliver(framework, 'slack:C1', 'old engagement correction', oldName);
+
+      assert.equal(binding.lastActivity, 1, 'the correction belongs to the old engagement');
+      const { messages } = await framework.getAgent(oldName)!.getContextManager().compile();
+      assert.ok(JSON.stringify(messages).includes('old engagement correction'));
+    } finally {
+      await framework.stop();
+    }
   });
 
   it('idle TTL runs a closure turn, unbinds, disposes the fork, and the next message spawns g2', async () => {

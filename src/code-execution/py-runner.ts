@@ -10,7 +10,7 @@
  * This is a ROBUSTNESS boundary, not a security sandbox — same doctrine as
  * GateScript: the agent already has broader host access through its tools.
  * What this class guarantees is liveness: a wedged or runaway script cannot
- * hang the agent turn (cancel -> grace -> SIGKILL -> respawn) and a crashed
+ * hang the agent turn (cancel + SIGINT -> grace -> SIGKILL -> respawn) and a crashed
  * interpreter surfaces as a tool result, never as an unhandled rejection.
  */
 
@@ -65,6 +65,8 @@ export interface PyRunnerOptions {
   toolCallTimeoutMs?: number;
   /** Whole-script deadline; exceeded -> cancel, grace, kill. */
   scriptTimeoutMs?: number;
+  /** How long a script gets to stop after its deadline before the interpreter is killed (default 10s). */
+  cancelGraceMs?: number;
   /** Idle interpreter reclaim (state lost), mirroring container reclaim. */
   idleReclaimMs?: number;
   onToolCall: ScriptToolCallHandler;
@@ -76,19 +78,36 @@ const DEFAULT_TOOL_CALL_TIMEOUT_MS = 270_000;
 const DEFAULT_SCRIPT_TIMEOUT_MS = 600_000;
 const DEFAULT_IDLE_RECLAIM_MS = 300_000;
 const CANCEL_GRACE_MS = 10_000;
+/** After the deadline, SIGINT is repeated at this interval until the script reports or is killed. */
+const INTERRUPT_REPEAT_MS = 200;
+
+/** The longest delay Node's timers honour (~24.8 days); a longer one fires after ~1 ms. */
+export const MAX_TIMER_MS = 2_147_483_647;
+
+/** A time limit for a message: "45s", "10 min", "2.5 h". */
+export function formatLimit(ms: number): string {
+  if (ms < 120_000) return `${Math.round(ms / 1000)}s`;
+  if (ms < 7_200_000) return `${Math.round(ms / 6_000) / 10} min`;
+  return `${Math.round(ms / 360_000) / 10} h`;
+}
 
 interface PendingExec {
   id: string;
   resolve: (result: ExecResult) => void;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
   killTimer: ReturnType<typeof setTimeout> | null;
+  /** Repeats the deadline SIGINT (see interruptChild). */
+  interruptTimer?: ReturnType<typeof setInterval>;
   settled: boolean;
+  /** Set once the deadline fired: the result then says the script ran out of time. */
+  deadlineMs: number | null;
 }
 
 export class PyRunner {
   private readonly pythonPath: string;
   private readonly toolCallTimeoutMs: number;
   private readonly scriptTimeoutMs: number;
+  private readonly cancelGraceMs: number;
   private readonly idleReclaimMs: number;
   private readonly onToolCall: ScriptToolCallHandler;
   private readonly label: string;
@@ -102,18 +121,21 @@ export class PyRunner {
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private execCounter = 0;
   private disposed = false;
+  /** An exec has passed the busy check but is still awaiting the interpreter. */
+  private starting = false;
 
   constructor(options: PyRunnerOptions) {
     this.pythonPath = options.pythonPath ?? 'python3';
     this.toolCallTimeoutMs = options.toolCallTimeoutMs ?? DEFAULT_TOOL_CALL_TIMEOUT_MS;
     this.scriptTimeoutMs = options.scriptTimeoutMs ?? DEFAULT_SCRIPT_TIMEOUT_MS;
+    this.cancelGraceMs = options.cancelGraceMs ?? CANCEL_GRACE_MS;
     this.idleReclaimMs = options.idleReclaimMs ?? DEFAULT_IDLE_RECLAIM_MS;
     this.onToolCall = options.onToolCall;
     this.label = options.label ?? 'pytc';
   }
 
   get busy(): boolean {
-    return this.pending !== null;
+    return this.pending !== null || this.starting;
   }
 
   /**
@@ -125,12 +147,20 @@ export class PyRunner {
    * log file, wake_agent() is available in-script, and the deadline is the
    * background lifetime. A background runner should be DEDICATED to that one
    * script (the framework creates one per background script).
+   *
+   * `opts.deadlineMs` replaces the runner's scriptTimeoutMs for this exec (a
+   * per-call time limit); a background exec uses its `lifetimeMs` instead.
    */
-  async exec(code: string, tools: InjectedTool[], background?: BackgroundExecOptions): Promise<ExecResult> {
+  async exec(
+    code: string,
+    tools: InjectedTool[],
+    background?: BackgroundExecOptions,
+    opts?: { deadlineMs?: number },
+  ): Promise<ExecResult> {
     if (this.disposed) {
       return { stdout: '', stderr: 'code_execution runner disposed', returnCode: 1, aborted: true };
     }
-    if (this.pending) {
+    if (this.busy) {
       return {
         stdout: '',
         stderr: 'RuntimeError: another code_execution script is already running for this agent',
@@ -140,6 +170,7 @@ export class PyRunner {
     }
     this.clearIdleTimer();
 
+    this.starting = true; // claimed before the await: a same-tick second exec must see it
     try {
       await this.ensureChild();
     } catch (err) {
@@ -151,10 +182,13 @@ export class PyRunner {
         returnCode: 1,
         aborted: true,
       };
+    } finally {
+      this.starting = false; // `pending` is set below, with no await in between
     }
 
     const execId = `e${++this.execCounter}`;
-    const deadlineMs = background?.lifetimeMs ?? this.scriptTimeoutMs;
+    // Clamped: a deadline past Node's timer range would fire at once instead of never.
+    const deadlineMs = Math.min(MAX_TIMER_MS, background?.lifetimeMs ?? opts?.deadlineMs ?? this.scriptTimeoutMs);
     this.onWake = background?.onWake ?? null;
     const result = await new Promise<ExecResult>((resolve) => {
       const pending: PendingExec = {
@@ -163,22 +197,35 @@ export class PyRunner {
         deadlineTimer: null,
         killTimer: null,
         settled: false,
+        deadlineMs: null,
       };
       this.pending = pending;
 
       pending.deadlineTimer = setTimeout(() => {
+        pending.deadlineMs = deadlineMs;
         // Deadline: ask politely first (script sees CancelledError and its
         // exec_result still flows back), then kill on unresponsiveness.
         this.send({ op: 'cancel', id: execId, reason: 'deadline' });
+        // The cancel lands only when the script awaits. Blocking code (time.sleep, a
+        // busy loop, a blocking read) never does, so interrupt it as well: the runtime
+        // raises KeyboardInterrupt in the script's own code, or schedules the
+        // cancellation of a script that is waiting. Repeated, because a waiting script
+        // can resume into blocking code before that cancellation runs; the runtime
+        // ignores the repeats once the script was interrupted or cancelled.
+        this.interruptChild();
+        pending.interruptTimer = setInterval(() => this.interruptChild(), INTERRUPT_REPEAT_MS);
         pending.killTimer = setTimeout(() => {
+          pending.deadlineMs = null; // this message already says why
           this.settlePending({
             stdout: '',
-            stderr: `script killed after exceeding ${Math.round(deadlineMs / 1000)}s deadline`,
+            stderr:
+              `script stopped: it reached its ${formatLimit(deadlineMs)} time limit and did not respond, ` +
+              'so it was killed and the interpreter restarted (variables from earlier scripts are gone)',
             returnCode: 1,
             aborted: true,
           });
           this.reclaim('deadline-kill');
-        }, CANCEL_GRACE_MS);
+        }, this.cancelGraceMs);
       }, deadlineMs);
       // A day-scale background deadline must not hold the process open.
       if (background) pending.deadlineTimer.unref?.();
@@ -275,7 +322,7 @@ export class PyRunner {
     });
 
     this.reader = createInterface({ input: child.stdout });
-    this.reader.on('line', (line) => this.handleLine(line));
+    this.reader.on('line', (line) => this.handleLine(line, child));
 
     this.childReady = new Promise<void>((resolve, reject) => {
       const onReady = () => {
@@ -309,7 +356,7 @@ export class PyRunner {
 
   private readyResolver: (() => void) | null = null;
 
-  private handleLine(line: string): void {
+  private handleLine(line: string, child: ChildProcessWithoutNullStreams): void {
     let msg: { op?: string; id?: string; name?: string; args?: unknown; stdout?: string; stderr?: string; return_code?: number };
     try {
       msg = JSON.parse(line);
@@ -334,7 +381,7 @@ export class PyRunner {
         this.onToolCall(toolName, args)
           .catch((err) => `Error: ${err instanceof Error ? err.message : String(err)}`)
           .then((result) => {
-            this.send({ op: 'tool_result', id: callId, result });
+            this.reply(child, { op: 'tool_result', id: callId, result }, `result of ${toolName} call ${callId}`);
           });
         return;
       }
@@ -352,7 +399,7 @@ export class PyRunner {
               `wake handler failed: ${err instanceof Error ? err.message : String(err)}`)
           : Promise.resolve('this script is not allowed to wake the agent');
         void refuse.then((error) => {
-          this.send({ op: 'wake_ack', id: wakeId, ...(error ? { error } : {}) });
+          this.reply(child, { op: 'wake_ack', id: wakeId, ...(error ? { error } : {}) }, `ack of wake ${wakeId}`);
         });
         return;
       }
@@ -380,10 +427,33 @@ export class PyRunner {
     const pending = this.pending;
     if (!pending || pending.settled) return;
     pending.settled = true;
+    // Say why the script stopped: the in-script cancellation only reads "cancelled by host".
+    // Only a script that ended unsuccessfully was stopped: one that caught the cancellation
+    // and finished its work returns 0, and must not read as stopped.
+    if (pending.deadlineMs !== null && result.returnCode !== 0) {
+      const note = `script stopped: it reached its ${formatLimit(pending.deadlineMs)} time limit\n`;
+      // A background script reports its output tail, so the note goes there too.
+      result = { ...result, stderr: result.stderr + note, ...(result.tail !== undefined ? { tail: result.tail + note } : {}) };
+    }
     if (pending.deadlineTimer) clearTimeout(pending.deadlineTimer);
     if (pending.killTimer) clearTimeout(pending.killTimer);
+    if (pending.interruptTimer) clearInterval(pending.interruptTimer);
     this.pending = null;
     pending.resolve(result);
+  }
+
+  /**
+   * Answer the interpreter that asked. Call and wake ids restart in every
+   * interpreter, so an answer that outlives its interpreter (the script was
+   * aborted, killed or crashed, or the interpreter reclaimed) would resolve
+   * the same id in the one that replaced it, inside another script: drop it.
+   */
+  private reply(child: ChildProcessWithoutNullStreams, msg: unknown, what: string): void {
+    if (child !== this.child) {
+      console.error(`[pytc:${this.label}] dropped late ${what}: the interpreter that asked for it is gone`);
+      return;
+    }
+    this.send(msg);
   }
 
   private send(obj: unknown): void {
@@ -395,6 +465,25 @@ export class PyRunner {
       console.error(
         `[pytc:${this.label}] protocol write failed: ${err instanceof Error ? err.message : String(err)}`,
       );
+    }
+  }
+
+  /**
+   * SIGINT the interpreter: blocking code in the running script raises
+   * KeyboardInterrupt. Not on Windows, where Node's kill() ends the process
+   * outright; there the cancel op and the kill grace remain.
+   * process.kill rather than child.kill, which would mark the child `killed`:
+   * a killed child gets no more protocol messages and is respawned on the
+   * next exec, losing the interpreter state this keeps.
+   */
+  private interruptChild(): void {
+    const child = this.child;
+    if (process.platform === 'win32' || !child || child.exitCode !== null || child.killed) return;
+    if (child.pid === undefined) return;
+    try {
+      process.kill(child.pid, 'SIGINT');
+    } catch {
+      // already gone: the exit handler settles the exec
     }
   }
 

@@ -77,6 +77,25 @@ function buildStub(messages: StoredMessage[], opts: StubOptions = {}): { cm: Con
       const limit = args.limit ?? filtered.length;
       return { messages: filtered.slice(offset, offset + limit), matchedCount };
     },
+    // Time-only native query (search's candidate window and extract's
+    // aroundId use it for timestamp-ordered edges). Real contract:
+    // timestamp-ordered, `reverse` supported, matchedCount = PAGE size.
+    queryMessagesByTime(args: { fromMs?: number; toMs?: number; limit?: number; offset?: number; reverse?: boolean }): IndexedMessageQueryResult {
+      calls.push({ method: 'queryMessagesByTime', args });
+      if (opts.throwUnsupported) return unsupported();
+      let filtered = messages
+        .filter((m) => {
+          const ts = m.timestamp.getTime();
+          if (args.fromMs !== undefined && ts < args.fromMs) return false;
+          if (args.toMs !== undefined && ts > args.toMs) return false;
+          return true;
+        })
+        .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+      if (args.reverse) filtered = filtered.reverse();
+      const offset = args.offset ?? 0;
+      const page = filtered.slice(offset, args.limit === undefined ? undefined : offset + args.limit);
+      return { messages: page, matchedCount: page.length };
+    },
     getChannelMessageCounts(): ChannelCount[] {
       calls.push({ method: 'getChannelMessageCounts', args: undefined });
       if (opts.throwUnsupported) return unsupported();
@@ -238,7 +257,8 @@ describe('HistoryModule', () => {
 
       await h.handleToolCall(call('extract', { limit: 999999 }));
       const queryCall = calls.find((c) => c.method === 'queryMessagesByTimeAndChannel');
-      assert.equal((queryCall?.args as { limit?: number }).limit, 200);
+      // 200 = the hard cap; +1 is extract's own "is there another page" probe row.
+      assert.equal((queryCall?.args as { limit?: number }).limit, 201);
     });
 
     it('clamps an out-of-u32-range offset to the native ceiling instead of passing it through to wrap (reviewer repro)', async () => {

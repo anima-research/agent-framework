@@ -12,6 +12,161 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.21.0 — 2026-10-03
+
+### Breaking
+
+- **Direct ConversationRouter callers:** `route()` is now a pure query and no longer refreshes idle activity (#46). After successfully delivering a message to the bound fork, call `touch(channelId)`; deterministic clocks move from `route({ now })` to `touch(channelId, now)`. Framework-managed delivery performs this step automatically, including ambient messages and coalesced fixed-audience delivery to the current binding. Queries, failed writes, and delivery to an older engagement leave the current binding's clock unchanged. Bind rules, trigger rules, generation counters, and fork names are unchanged. No store migration or sibling dependency upgrade is required.
+
+### Changed
+
+- Depend on `@animalabs/context-manager` ^0.13.0: optional compression-hold timeouts, branch-ID cache keys, Bedrock summarizer recognition, tool pairing before pruning in both renderers, and fuller refusal diagnostics.
+
+### Fixed
+
+- Stdio MCPL children inherit `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and uppercase/lowercase `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` so Python/curl CA trust and proxy-based egress survive the child environment allowlist (#191). Declared server `env` still overrides host values, including differently cased keys and empty values on Windows; POSIX names stay case-sensitive. Duplicate Windows spellings within one source use Node's first lexicographic spelling before declared values override host values. Proxy URLs can carry credentials; the allowlist limits accidental inheritance rather than isolating a hostile child.
+
+- RFC-005 references now drop overlong optional `name`, `mimeType`, and `expiresAt` fields instead of retaining truncated testimony. Their schema limits count Unicode code points. Reference blocks and subtractive disposition remain valid; admitted display labels retain independent sanitization and truncation.
+
+- `tools/observe` rejects explicit null params and non-object `_meta` before changing the existing filter. Omitted params and `rules: null` still clear the filter. Pattern and field-path limits count Unicode code points, matching the RFC-007 schema and accepting valid 256-code-point astral strings; rule and path-count limits are unchanged.
+
+## 0.20.0 — 2026-10-03
+
+### Breaking
+
+- **Operators of stdio MCPL servers:** children no longer inherit the whole
+  host environment. They get a small allowlist (`PATH`, `HOME`, locale/`LC_*`,
+  `TMPDIR`, TLS roots, …; see `CHILD_ENV_ALLOWLIST`) plus the server's own
+  `env`, so one server's credentials (provider API keys, other bots' tokens)
+  are no longer readable by another. A server that relied on an inherited
+  variable must declare it in its `env` (recipes can `${VAR}`-substitute), or
+  set `inheritEnv: true` to restore full inheritance.
+
+- **Resident scripts parsing history `extract`:** without a `channelId`,
+  `extract` no longer returns `matchedCount` (a time-only native query only
+  ever reported the page size there, not a total). It returns `hasMore`
+  instead; channel-scoped `extract` keeps its exact `matchedCount`.
+
+### Added
+
+- `code_execution` takes an optional per-call `time_limit_ms`: the time limit for
+  that script, the way Claude Code's Bash tool takes a per-call timeout. It
+  defaults to `codeExecution.scriptTimeoutMs` (10 min) and may go up to the new
+  `codeExecution.maxScriptTimeoutMs`, which defaults to the same value, so
+  agents can only shorten the limit until a deployment raises the ceiling.
+  Longer requests are capped and the result says so (`time_limit_note`). For a
+  background script it shortens the lifetime, capped at
+  `backgroundMaxLifetimeMs`. The tool description now states the limit, and a
+  script stopped at its limit says so instead of only "cancelled by host".
+
+- MCPL tool lifecycle (mcpl RFC-007): servers granted `toolLifecycle.observe`
+  receive `tools/lifecycle` notifications for the agent's calls to OTHER
+  servers' tools and to host tools — `started`, then exactly one of
+  `completed` (with `isError`) / `failed` / `aborted`, paired by a host-unique
+  `toolCallId`. Metadata only by default; tool results are never sent.
+  - `toolLifecycle.inputs` adds the call's arguments, but only the fields a
+    server asks for with `tools/observe`, bounded (16 KiB default,
+    `toolLifecycle.maxInputBytes`), and never for `comms` or unclassed tools.
+  - `tools/observe` (server → host request) sets an ordered first-match
+    filter on which calls are reported and which argument fields are sent;
+    it only narrows what the grant allows.
+  - Both paths are denied by default. Grant them with a
+    `McplServerConfig.toolLifecycle` policy block (`observe`, `inputs` with a
+    `tools`/`classes`/`conversations` narrowing; `classes: 'default'` admits
+    computer, shell, files, web, media and body) or via `enabledCapabilities`.
+    `inputs` with no tools/classes term delivers no arguments.
+  - `listMcplServers()` shows each connection's current filter.
+- MCPL tool classes (mcpl RFC-008): a tool's class is read from
+  `_meta["mcpl/class"]` on its MCP definition, from the framework's table of
+  its own tools, or from `FrameworkConfig.toolClassOverrides` /
+  `hostToolClasses`. Classes are policy hints only: they never change what
+  the model sees.
+
+- History tools, from a resident's diary-work feedback: `search` and `extract`
+  take `author` / `excludeAuthor` (exact, case-insensitive match on
+  `metadata.author` name or id; messages without author metadata, such as
+  the agent's own turns, match on their stored participant). Results now carry `author`.
+  `extract({aroundId, before, after})` returns the conversation around a
+  message id from `search` (its own channel by default, `allChannels` to
+  interleave). `search` adds `wholeWord` (Unicode-aware) and
+  `order: "newest"`, and when it stops early (at `limit` or `maxScan`) it
+  reports `scannedThrough` and `resume: {from|to, skipSequences}` to repeat
+  the call with (`skipSequences` names the messages at that exact instant
+  already scanned by sequence range, so a message added or removed there
+  between calls is neither lost nor shifts the skip). `search` rejects
+  `maxScan: 0`.
+  An author-filtered `extract` that stops early returns
+  `resume: {windowOffset, offset, afterId}` to repeat the call with (position,
+  not timestamp, so late-appended backfill in a channel is not skipped). On
+  resume, `afterId` pins the position: if messages were removed or inserted
+  before it since the previous call, the scan re-anchors and reports
+  `windowChanged: {shift}`; if the anchor itself is gone, it fails loudly
+  instead of silently skipping. Without a channel (a time-ordered window) the
+  resume also carries `seqMark`, and messages appended since then that landed
+  behind the cursor are reported in `windowChanged.missedIds` even when a
+  removal balanced them out (shift 0). Unrelated appends don't count; past
+  200,000 appends since the mark the check is reported as
+  `windowChanged.unverified` instead of failing. A resumed call reports
+  `matchedSinceWindowOffset` rather than a total.
+  `aroundId` also accepts a `semantic_search` `msg:<id>` hit id.
+
+- `HistoryModule` gains an optional `semantic_search` tool: meaning-based search
+  over the agent's raw messages (text plus its own think/journal/skip_reply
+  notes) and every compression summary, backed by a shared remote
+  embed-service whose vector index lives server-side, one namespace per store
+  (`new HistoryModule({ semantic: { url, token, namespace } })`). The module
+  keeps the index in sync itself — a background tick every 60 s and a bounded
+  catch-up before each search, messages watermarked by timestamp with an
+  overlap re-scan and summaries by `createdMs` — and backs off cleanly when
+  the service is unreachable, so the other four history tools are unaffected.
+
+- Operators can see each tool's effective MCPL class (RFC-008 §6):
+  `listMcplServers()` entries gain `toolClasses` (every tool of that server,
+  with its class and whether it came from an operator override, the
+  server's own `_meta["mcpl/class"]`, or nowhere — unclassed), and the new
+  `listToolClasses()` lists every tool the framework offers, host built-ins
+  and agent-only tools (the subconscious's, `prose_help`) included, with
+  the same source and the MCPL server where there is one.
+  `listToolClasses(agentName)` lists exactly what that agent is shown.
+
+- MCPL event coalescing (RFC-006, mcpl PR #5 revision 7): `coalesce` on `push/event` and `channels/incoming` — replace-if-unread, atomic retraction with a conditional deletion notice, `initial` birth marker, deferred batches rendered through `push/render` at assembly, channel-scoped pushes delivered as messages of their channel. Content stays in context; "unread" is above the agent's consumed watermark and not folded by compression. Advertised as `eventCoalescing` with a one-hour retry window.
+
+- Silent heartbeat wakes: an authenticated empty push from the `heartbeat` MCPL server can start one private inference without adding a Chronicle message, resolving or announcing a publication locus, starting typing, or routing automatic prose. The tick carries a bounded ephemeral self-check prompt; explicit tools remain available, and context-budget restarts preserve the silent-turn contract.
+
+- Add the opt-in, durable `agent_settings.tool_result_guard` setting
+  (programmatic `AgentConfig.toolResultGuard`; hosts must forward it from
+  recipes). On a provider refusal after tool output, withhold the
+  latest result batch and retry inference once without rerunning tools or
+  automatically rewinding older messages. Full originals remain in an
+  append-only Chronicle audit log (synced before submission); pending output
+  stays out of speculative compression and the placeholder is held from
+  compression until settled (requires context-manager ^0.12.0), guard effects apply only to a batch
+  actually submitted in the current turn, and disabling the guard does not restore withheld results.
+- Recover from failed staging/link audit appends and accepted-result history
+  edits without stranding streams or compression holds. Retry storage work
+  before activation, during maintenance, and at shutdown; preserve later
+  operator edits and branch changes. End-turn output remains withheld when
+  its audit was not made durable.
+
+### Fixed
+
+- The closed-channel invitation's "reply without joining" prefix is now always one
+  whitespace-free token that resolves back to the channel on the server the message came
+  from (`@name` for a DM, else `#label`, `#name` without the server suffix, or the channel
+  id), from the new `ChannelRegistry.proseTargetFor(channelId, serverId)`. It used to quote
+  the label verbatim, and the prefix grammar reads the target as the first non-whitespace
+  run: a DM labelled `DM: alice` gave `>>#DM: alice` (target `#DM:`, body `alice …`, so the
+  reply bounced and the retained text went out with a stray `alice` line), and a suffixed
+  label like `#fable (antra's server)` delivered `(antra's server)` as text. When no token is
+  safe (the channel id is registered by more than one server, or every option contains
+  whitespace) the invitation offers no prefix and points to joining the channel instead.
+
+- MCPL tool calls under nested tool prefixes (one server's prefix `foo`,
+  another's `foo--bar`) went to whichever prefix was registered first. A
+  call now goes to the server whose `tools/list` produced the name; a name
+  no live server listed goes to the longest matching prefix.
+  `listMcplServers()` counts and lists each tool under that one server.
+
 ## 0.19.0 — 2026-09-28
 
 ### Added

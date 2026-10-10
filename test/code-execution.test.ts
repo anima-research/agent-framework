@@ -10,7 +10,8 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -23,8 +24,9 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { AgentFramework, PyRunner, buildInjectedTools } from '../src/index.js';
+import { AgentFramework, PYTHON_RUNTIME_SOURCE, PyRunner, buildInjectedTools } from '../src/index.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
+import { PYTC_STOP_ROWS_DRIVER } from './helpers/pytc-stop-rows.js';
 
 const ECHO_TOOLS: { pyName: string; toolName: string }[] = [
   { pyName: 'test__echo', toolName: 'test--echo' },
@@ -261,6 +263,29 @@ describe('PyRunner (real python3)', () => {
     }
   });
 
+  it('rejects a second exec issued before the first has started (same tick)', async () => {
+    // exec() awaits the interpreter before it records the running script, so
+    // a check made only after that await let two execs in at once.
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      for (const warm of [false, true]) {
+        const first = runner.exec('import asyncio\nawait asyncio.sleep(0.2)\nprint("first ran")', []);
+        const second = runner.exec('print("second ran")', []);
+        const [a, b] = await Promise.race([
+          Promise.all([first, second]),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`warm=${warm}: an exec never settled`)), 10_000)),
+        ]);
+        assert.strictEqual(b.returnCode, 1, `warm=${warm}`);
+        assert.match(b.stderr, /already running/);
+        assert.strictEqual(a.returnCode, 0, `warm=${warm}: ${a.stderr}`);
+        assert.match(a.stdout, /first ran/);
+        assert.ok(!a.stdout.includes('second ran') && !b.stdout.includes('second ran'));
+      }
+    } finally {
+      runner.dispose();
+    }
+  });
+
   it('fails gracefully when the python binary is missing', async () => {
     const runner = new PyRunner({
       pythonPath: '/definitely/not/a/python',
@@ -274,6 +299,64 @@ describe('PyRunner (real python3)', () => {
       runner.dispose();
     }
   });
+});
+
+// Inner-call ids restart in every interpreter: a result that outlives its
+// interpreter must not resolve a call of the one that replaced it.
+describe('code_execution inner-call results after the interpreter is replaced (real python3)', () => {
+  const until = async (cond: () => boolean, what: string) => {
+    const deadline = Date.now() + 10_000;
+    while (!cond()) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  };
+
+  const stops: Record<string, { code: string; stop?: (runner: PyRunner) => void }> = {
+    aborted: { code: 'print(await test__echo({}))', stop: (runner) => runner.abort('turn abandoned') },
+    crashed: {
+      code: 'import asyncio, os\nasyncio.get_running_loop().call_later(0.2, os._exit, 1)\nprint(await test__echo({}))',
+    },
+  };
+
+  for (const [how, { code, stop }] of Object.entries(stops)) {
+    it(`a late result from a script whose interpreter ${how} does not reach the next script`, async () => {
+      const calls: Array<(result: string) => void> = [];
+      const runner = new PyRunner({
+        onToolCall: () => new Promise<string>((resolve) => calls.push(resolve)),
+      });
+      const logged: string[] = [];
+      const consoleError = console.error;
+      console.error = (...args: unknown[]) => {
+        logged.push(args.map(String).join(' '));
+        consoleError(...args);
+      };
+      try {
+        const first = runner.exec(code, ECHO_TOOLS);
+        await until(() => calls.length === 1, 'the first script to call its tool');
+        stop?.(runner);
+        const stopped = await first;
+        assert.strictEqual(stopped.aborted, true, stopped.stderr);
+
+        const second = runner.exec('print(await test__echo({}))', ECHO_TOOLS);
+        await until(() => calls.length === 2, 'the second script to call its tool');
+        // Both calls are the first of their interpreter.
+        calls[0]('stale result of the stopped script');
+        await new Promise((r) => setTimeout(r, 300));
+        calls[1]('result of this script');
+        const result = await second;
+        assert.strictEqual(result.returnCode, 0, result.stderr);
+        assert.strictEqual(result.stdout, 'result of this script\n');
+        assert.ok(
+          logged.some((l) => /dropped late result of test--echo call t1: the interpreter that asked for it is gone/.test(l)),
+          'the dropped result is logged',
+        );
+      } finally {
+        console.error = consoleError;
+        runner.dispose();
+      }
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -438,6 +521,53 @@ describe('framework code_execution integration (real python3)', () => {
     }
   });
 
+  it('two code_execution calls in one response: one runs, the other is refused, the turn completes', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-two-');
+    const membrane = new MockMembrane();
+    const module = new ScriptToolModule();
+    const code = (label: string) => [
+      'import asyncio, json',
+      `r = json.loads(await test__echo({"message": "${label}"}))`,
+      'await asyncio.sleep(0.2)',
+      `print("ran:", r["echoed"]["message"])`,
+    ].join('\n');
+
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'call_two_a', name: 'code_execution', input: { code: code('a') } },
+      { type: 'tool_use', id: 'call_two_b', name: 'code_execution', input: { code: code('b') } },
+    ], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Both answered.' }]));
+
+    const framework = await createFrameworkWithCodeExecution(storePath, membrane, module);
+    try {
+      const created = await framework.createEphemeralAgent({
+        name: 'pair',
+        model: 'test-model',
+        systemPrompt: 'Run both.',
+        allowedTools: 'all',
+      });
+      created.contextManager.addMessage('user', [{ type: 'text', text: 'Go.' }]);
+      const promise = framework.runEphemeralToCompletion(created.agent, created.contextManager);
+      framework.start();
+      const result = await Promise.race([
+        promise,
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('the turn never completed')), 15_000)),
+      ]);
+      assert.strictEqual(result.speech, 'Both answered.');
+
+      const [results] = membrane.lastStream!.receivedToolResults as Array<Array<{ toolUseId: string; content: string }>>;
+      const byId = new Map(results.map((r) => [r.toolUseId, r.content]));
+      assert.match(byId.get('call_two_a') ?? '', /ran: a/, 'the first script ran');
+      assert.match(byId.get('call_two_b') ?? '', /already running/, 'the second was refused');
+      assert.ok(!(byId.get('call_two_b') ?? '').includes('ran: b'));
+      const echoed = module.calls.filter((c) => c.name.endsWith('--echo') || c.name === 'echo').map((c) => (c.input as { message: string }).message);
+      assert.deepStrictEqual(echoed, ['a']);
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('defers endTurn from inner calls to the code_execution result', async () => {
     const { tempDir, storePath } = tempStorePath('pytc-endturn-');
     const membrane = new MockMembrane();
@@ -472,6 +602,44 @@ describe('framework code_execution integration (real python3)', () => {
       const finishCalls = module.calls.filter((c) => c.name.endsWith('--finish') || c.name === 'finish');
       assert.strictEqual(finishCalls.length, 1);
       assert.strictEqual(result.toolCallsCount, 1); // one model-visible call: code_execution
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("a stopped script's late end-turn request does not end the next script's turn", async () => {
+    let releaseFinish: () => void = () => {};
+    const finishReleased = new Promise<void>((resolve) => { releaseFinish = resolve; });
+    let finishStarted = false;
+    class SlowFinishModule extends ScriptToolModule {
+      override async handleToolCall(call: ToolCall): Promise<ToolResult> {
+        if (call.name.endsWith('finish')) {
+          finishStarted = true;
+          await finishReleased;
+        }
+        return super.handleToolCall(call);
+      }
+    }
+    const { tempDir, storePath } = tempStorePath('pytc-stale-endturn-');
+    const framework = await createFrameworkWithCodeExecution(storePath, new MockMembrane(), new SlowFinishModule());
+    const run = (input: Record<string, unknown>) =>
+      framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input });
+    framework.start();
+    try {
+      // The first script is stopped at its time limit while its call that ends the turn is running.
+      const stopped = await run({ code: 'await test__finish({})', time_limit_ms: 1000 });
+      assert.ok(finishStarted);
+      assert.match((stopped.data as { stderr: string }).stderr, /reached its 1s time limit/);
+      assert.ok(!stopped.endTurn);
+
+      // The call finishes while the next script runs; its request belonged to the stopped script.
+      const next = run({ code: 'import asyncio\nawait asyncio.sleep(1)\nprint("next done")' });
+      await new Promise((r) => setTimeout(r, 300));
+      releaseFinish();
+      const result = await next;
+      assert.strictEqual((result.data as { stdout: string }).stdout, 'next done\n');
+      assert.ok(!result.endTurn, "the stopped script's request ended the next script's turn");
     } finally {
       await framework.stop();
       rmSync(tempDir, { recursive: true, force: true });
@@ -815,3 +983,390 @@ import { PassthroughStrategy } from '../src/index.js';
 class CappedPassthroughStrategy extends PassthroughStrategy {
   readonly maxMessageTokens = 1000;
 }
+
+describe('code_execution per-call time limit (time_limit_ms)', () => {
+  it('PyRunner: a per-exec deadline replaces scriptTimeoutMs, and the result says the time ran out', async () => {
+    const runner = new PyRunner({ scriptTimeoutMs: 600_000, onToolCall: async () => '' });
+    try {
+      const started = Date.now();
+      const result = await runner.exec('import asyncio\nawait asyncio.sleep(60)', [], undefined, { deadlineMs: 1000 });
+      assert.strictEqual(result.returnCode, 1);
+      assert.match(result.stderr, /script stopped: it reached its 1s time limit/);
+      assert.ok(Date.now() - started < 15_000, 'the per-exec deadline was not applied');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('PyRunner: a script that catches the cancellation and finishes is not reported as stopped', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const code = 'import asyncio\ntry:\n    await asyncio.sleep(60)\nexcept asyncio.CancelledError:\n    print("cleaned up")';
+      const result = await runner.exec(code, [], undefined, { deadlineMs: 1000 });
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.match(result.stdout, /cleaned up/);
+      assert.doesNotMatch(result.stderr, /script stopped/);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('PyRunner: a deadline beyond Node timers (~24.8 days) is clamped, not fired at once', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const result = await runner.exec('import asyncio\nawait asyncio.sleep(0.3)\nprint("done")', [], undefined, { deadlineMs: 30 * 86_400_000 });
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.match(result.stdout, /done/);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('a ceiling below the default is refused when the framework is created', async () => {
+    const { tempDir, storePath } = tempStorePath('pytc-badcfg-');
+    try {
+      await assert.rejects(
+        AgentFramework.create({
+          storePath,
+          membrane: new MockMembrane().asMembrane(),
+          agents: [],
+          modules: [],
+          syncIntervalMs: 0,
+          codeExecution: { enabled: true, scriptTimeoutMs: 600_000, maxScriptTimeoutMs: 60_000 },
+        }),
+        /maxScriptTimeoutMs \(60000\) must be at least scriptTimeoutMs \(600000\)/,
+      );
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  async function withFramework(
+    codeExecution: Record<string, unknown>,
+    body: (framework: AgentFramework) => Promise<void>,
+  ): Promise<void> {
+    const { tempDir, storePath } = tempStorePath('pytc-timeout-');
+    const framework = await AgentFramework.create({
+      storePath,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [],
+      modules: [new ScriptToolModule()],
+      syncIntervalMs: 0,
+      codeExecution: { enabled: true, ...codeExecution },
+    });
+    try {
+      await body(framework);
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  const run = (framework: AgentFramework, input: Record<string, unknown>) =>
+    framework.executeToolCall({ id: `ce-${Math.random()}`, name: 'code_execution', input });
+  const dataOf = (r: ToolResult) => r.data as { stdout: string; stderr: string; return_code: number; time_limit_note?: string };
+
+  it('the tool tells the agent its time limit and offers time_limit_ms', async () => {
+    await withFramework({ scriptTimeoutMs: 300_000, maxScriptTimeoutMs: 1_800_000 }, async (framework) => {
+      const tool = framework.getAllTools().find((t) => t.name === 'code_execution')!;
+      assert.match(tool.description, /A foreground script is stopped after 5 min; pass time_limit_ms to set this call's limit \(at most 30 min; a background script runs up to 24 h\)/);
+      const props = (tool.inputSchema as { properties: Record<string, { description: string }> }).properties;
+      assert.match(props.time_limit_ms.description, /Default 300000, at most 1800000/);
+    });
+  });
+
+  it('time_limit_ms shortens one call; the deployment default is unchanged for the next', async () => {
+    await withFramework({ scriptTimeoutMs: 600_000 }, async (framework) => {
+      const short = dataOf(await run(framework, { code: 'import asyncio\nawait asyncio.sleep(60)', time_limit_ms: 1000 }));
+      assert.strictEqual(short.return_code, 1);
+      assert.match(short.stderr, /reached its 1s time limit/);
+      const normal = dataOf(await run(framework, { code: 'import asyncio\nawait asyncio.sleep(1.5)\nprint("done")' }));
+      assert.strictEqual(normal.return_code, 0);
+      assert.match(normal.stdout, /done/);
+    });
+  });
+
+  it('a request above the ceiling is capped, and the result says so', async () => {
+    await withFramework({ scriptTimeoutMs: 1000 }, async (framework) => {
+      const started = Date.now();
+      const r = dataOf(await run(framework, { code: 'import asyncio\nawait asyncio.sleep(60)', time_limit_ms: 60_000 }));
+      assert.strictEqual(r.return_code, 1);
+      assert.strictEqual(r.time_limit_note, "time_limit_ms 60000 was capped at 1000, this deployment's maximum");
+      assert.ok(Date.now() - started < 15_000, 'the cap was not applied');
+    });
+  });
+
+  it('maxScriptTimeoutMs lets an agent ask for longer than the default', async () => {
+    await withFramework({ scriptTimeoutMs: 1000, maxScriptTimeoutMs: 10_000 }, async (framework) => {
+      const code = 'import asyncio\nawait asyncio.sleep(2)\nprint("long done")';
+      const defaulted = dataOf(await run(framework, { code }));
+      assert.strictEqual(defaulted.return_code, 1, 'without time_limit_ms the 1s default applies');
+      const longer = dataOf(await run(framework, { code, time_limit_ms: 5000 }));
+      assert.strictEqual(longer.return_code, 0);
+      assert.match(longer.stdout, /long done/);
+      assert.strictEqual(longer.time_limit_note, undefined);
+    });
+  });
+
+  it('an invalid time_limit_ms is refused before anything runs', async () => {
+    await withFramework({}, async (framework) => {
+      for (const time_limit_ms of ['soon', 10, -5, Number.NaN]) {
+        const r = await run(framework, { code: 'print("ran")', time_limit_ms });
+        assert.strictEqual(r.success, false, String(time_limit_ms));
+        assert.match(String(r.error), /time_limit_ms/);
+      }
+    });
+  });
+
+  it('a background script: time_limit_ms shortens its lifetime, capped at the lifetime ceiling', async () => {
+    await withFramework({ backgroundMaxLifetimeMs: 1500 }, async (framework) => {
+      const r = await run(framework, { code: 'import asyncio\nawait asyncio.sleep(60)', background: true, time_limit_ms: 60_000 });
+      assert.strictEqual(r.success, true);
+      const data = r.data as { script_id: string; time_limit_note?: string; lifetime: string };
+      assert.strictEqual(data.time_limit_note, "time_limit_ms 60000 was capped at 1500, this deployment's maximum");
+      assert.strictEqual(data.lifetime, '2s', 'a short lifetime is reported exactly, not rounded to 0 hours');
+      let status = 'running';
+      const until = Date.now() + 15_000;
+      while (status === 'running' && Date.now() < until) {
+        await new Promise((res) => setTimeout(res, 200));
+        const listed = (await run(framework, { action: 'list' })).data as { background_scripts: Array<{ script_id: string; status: string }> };
+        status = listed.background_scripts.find((s) => s.script_id === data.script_id)?.status ?? 'gone';
+      }
+      assert.strictEqual(status, 'died', 'the script was stopped at its capped lifetime');
+    });
+  });
+});
+
+// The deadline's cancel op is an asyncio cancellation, which lands only when a
+// script awaits; the SIGINT that follows it stops blocking code (#235 F3).
+describe('code_execution time limit vs blocking code (real python3)', { skip: process.platform === 'win32' }, () => {
+  const pidOf = (stdout: string) => /pid=(\d+)/.exec(stdout)?.[1];
+
+  it('blocking code stops at the time limit, keeping its output, and the interpreter survives', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const first = await runner.exec('import os\nprint(f"pid={os.getpid()}")', []);
+      const pid = pidOf(first.stdout);
+      assert.ok(pid, first.stdout);
+      const blocking: Record<string, string> = {
+        sleep: 'import time\nprint("before")\ntime.sleep(60)\nprint("after")',
+        'busy loop': 'print("before")\nn = 0\nwhile True:\n    n += 1\nprint("after")',
+        'blocking read': 'import socket\nprint("before")\na, b = socket.socketpair()\na.recv(1)\nprint("after")',
+      };
+      for (const [shape, code] of Object.entries(blocking)) {
+        const started = Date.now();
+        const result = await runner.exec(code, [], undefined, { deadlineMs: 1000 });
+        const elapsed = Date.now() - started;
+        assert.strictEqual(result.returnCode, 1, shape);
+        assert.strictEqual(result.aborted, undefined, `${shape}: interrupted, not killed`);
+        assert.strictEqual(result.stdout, 'before\n', `${shape}: output before the limit is kept`);
+        assert.match(result.stderr, /KeyboardInterrupt: script interrupted by host/, shape);
+        assert.match(result.stderr, /script stopped: it reached its 1s time limit/, shape);
+        assert.match(result.stderr, /File "<script>", line \d+/, `${shape}: says where the script was`);
+        assert.doesNotMatch(result.stderr, /runtime\.py/, `${shape}: no runtime frames`);
+        assert.ok(elapsed < 5000, `${shape}: stopped at the limit, not the kill grace (${elapsed}ms)`);
+      }
+      const last = await runner.exec('import os\nprint(f"pid={os.getpid()}")', []);
+      assert.strictEqual(pidOf(last.stdout), pid, 'same interpreter: nothing was killed');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('variables survive an interrupted script', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const set = await runner.exec('x = 41', []);
+      assert.strictEqual(set.returnCode, 0, set.stderr);
+      const stopped = await runner.exec('import time\ny = 1\ntime.sleep(60)', [], undefined, { deadlineMs: 1000 });
+      assert.match(stopped.stderr, /reached its 1s time limit/);
+      const after = await runner.exec('print(x + y)', []);
+      assert.strictEqual(after.returnCode, 0, after.stderr);
+      assert.strictEqual(after.stdout, '42\n');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('a script waiting on an await is still stopped by the cancel', async () => {
+    const runner = new PyRunner({
+      onToolCall: () => new Promise((resolve) => setTimeout(() => resolve('late'), 5000)),
+    });
+    try {
+      const started = Date.now();
+      const result = await runner.exec('print("before")\nawait test__echo({})\nprint("after")', ECHO_TOOLS, undefined, { deadlineMs: 1000 });
+      assert.strictEqual(result.returnCode, 1);
+      assert.strictEqual(result.stdout, 'before\n');
+      assert.match(result.stderr, /KeyboardInterrupt: script cancelled by host/);
+      assert.doesNotMatch(result.stderr, /interrupted by host/);
+      assert.match(result.stderr, /script stopped: it reached its 1s time limit/);
+      assert.ok(Date.now() - started < 5000, 'stopped at the limit');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('SIGINT between scripts does nothing', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      const first = await runner.exec('import os\nx = 1\nprint(f"pid={os.getpid()}")', []);
+      const pid = Number(pidOf(first.stdout));
+      assert.ok(pid > 0, first.stdout);
+      process.kill(pid, 'SIGINT');
+      await new Promise((r) => setTimeout(r, 200));
+      const result = await runner.exec('print(x)\nprint(f"pid={os.getpid()}")', []);
+      assert.strictEqual(result.returnCode, 0, result.stderr);
+      assert.strictEqual(result.stdout, `1\npid=${pid}\n`);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('SIGINT while a script waits cancels it before it can resume into blocking code', async () => {
+    let pid = 0;
+    const runner = new PyRunner({
+      onToolCall: async () => {
+        // The script is suspended on this call. The signal arrives with no cancel op behind it;
+        // the result does, and the script would then block.
+        process.kill(pid, 'SIGINT');
+        await new Promise((r) => setTimeout(r, 200));
+        return 'tool ok';
+      },
+    });
+    try {
+      const first = await runner.exec('import os\nprint(f"pid={os.getpid()}")', []);
+      pid = Number(pidOf(first.stdout));
+      assert.ok(pid > 0, first.stdout);
+      const started = Date.now();
+      const result = await runner.exec('import time\nprint(await test__echo({}))\ntime.sleep(30)', ECHO_TOOLS);
+      assert.strictEqual(result.returnCode, 1);
+      assert.strictEqual(result.stdout, '');
+      // Cancelled at its await (or, if the signal beat the script to it, interrupted there).
+      assert.match(result.stderr, /KeyboardInterrupt: script (cancelled|interrupted) by host/);
+      assert.ok(Date.now() - started < 5000, 'stopped at once, not after the blocking call');
+      const after = await runner.exec('print(f"pid={os.getpid()}")', []);
+      assert.strictEqual(after.stdout, `pid=${pid}\n`, 'same interpreter');
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('a script that resumes from an await into blocking code at its limit is stopped', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      for (let i = 0; i < 3; i++) {
+        const started = Date.now();
+        const result = await runner.exec('import asyncio, time\nawait asyncio.sleep(1)\ntime.sleep(5)\nprint("after")', [], undefined, { deadlineMs: 1000 });
+        assert.strictEqual(result.returnCode, 1, result.stderr);
+        assert.strictEqual(result.stdout, '');
+        assert.match(result.stderr, /script stopped: it reached its 1s time limit/);
+        assert.ok(Date.now() - started < 3000, `stopped at the limit (${Date.now() - started}ms)`);
+      }
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it("the runtime's stop table: each place a signal or cancel op can land stops the script once", () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pytc-stop-rows-'));
+    try {
+      writeFileSync(join(dir, 'runtime.py'), PYTHON_RUNTIME_SOURCE);
+      writeFileSync(join(dir, 'driver.py'), PYTC_STOP_ROWS_DRIVER);
+      type Row = { rc: number | null; tail: string; secs: number; ops: string[] };
+      const rows = JSON.parse(
+        execFileSync('python3', [join(dir, 'driver.py'), join(dir, 'runtime.py')], { encoding: 'utf8', timeout: 60_000 }),
+      ) as Record<string, Row>;
+      const printed = (row: Row, line: string) => row.tail.split('\n').includes(line);
+      const interrupted = /KeyboardInterrupt: script interrupted by host/;
+      const cancelled = /KeyboardInterrupt: script cancelled by host/;
+      const stopped = (name: string, how: RegExp, has: string[] = [], hasNot: string[] = []) => {
+        const row = rows[name];
+        assert.ok(row, name);
+        assert.strictEqual(row.rc, 1, `${name}: ${row.tail}`);
+        assert.match(row.tail, how, name);
+        for (const w of has) assert.ok(printed(row, w), `${name}: printed ${w}`);
+        for (const w of hasNot) assert.ok(!printed(row, w), `${name}: did not print ${w}`);
+        assert.ok(row.secs < 2, `${name}: stopped at once (${row.secs}s)`);
+      };
+      const finished = (name: string, has: string[]) => {
+        const row = rows[name];
+        assert.ok(row, name);
+        assert.strictEqual(row.rc, 0, `${name}: ${row.tail}`);
+        for (const w of has) assert.ok(printed(row, w), `${name}: printed ${w}`);
+        assert.doesNotMatch(row.tail, /by host/, `${name}: never stopped (again) by us`);
+      };
+
+      stopped('1 own code', interrupted, ['a'], ['b']);
+      stopped('2 waiting on an await', cancelled, [], ['b']);
+      // Cancelling inside the handler here raised InvalidStateError out of main().
+      stopped('3 mid-dispatch, reply behind', cancelled, [], ['woke']);
+      stopped('4 protocol write', cancelled, [], ['b']);
+      assert.ok(rows['4 protocol write'].ops.includes('tool_call'), 'the protocol line stayed whole');
+      stopped('5 reply ahead, then await', cancelled, ['woke'], ['b']);
+      // Interrupted in its blocking code; the queued cancellation must not cut its cleanup short.
+      finished('6 reply ahead, then block', ['woke', 'cleaned']);
+      finished('7 reply ahead, then finish', ['woke']);
+      finished('7 next script', ['ok']);
+      stopped('8 before start, signal', cancelled, [], ['ran']);
+      // The cancel op before the script started used to leave it reporting nothing.
+      stopped('8 before start, cancel op', cancelled, [], ['ran']);
+      finished('9 cancel op first', ['cleaned']);
+      finished('10 after delivery', ['cleaned']);
+      finished('11 reporting', ['done']);
+      finished('12 between scripts', ['ok']);
+      if (rows['13 next script blocks']) {
+        // Python 3.12+: an eager task factory left installed by an earlier script.
+        finished('13 eager task factory installed', ['installed']);
+        stopped('13 next script blocks', interrupted, ['a'], ['b']);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('an eager task factory installed by an earlier script does not hide the next one from the deadline', async (t) => {
+    const runner = new PyRunner({ onToolCall: async () => '', cancelGraceMs: 3000 });
+    try {
+      const install = await runner.exec(
+        'import asyncio, sys\nif sys.version_info >= (3, 12):\n    asyncio.get_running_loop().set_task_factory(asyncio.eager_task_factory)\n    print("installed")',
+        [],
+      );
+      assert.strictEqual(install.returnCode, 0, install.stderr);
+      if (install.stdout !== 'installed\n') {
+        t.skip('asyncio.eager_task_factory needs Python 3.12+');
+        return;
+      }
+      const started = Date.now();
+      const result = await runner.exec('import time\nprint("before")\ntime.sleep(30)', [], undefined, { deadlineMs: 1000 });
+      assert.strictEqual(result.aborted, undefined, 'interrupted, not killed');
+      assert.strictEqual(result.stdout, 'before\n');
+      assert.match(result.stderr, /KeyboardInterrupt: script interrupted by host/);
+      assert.match(result.stderr, /script stopped: it reached its 1s time limit/);
+      assert.ok(Date.now() - started < 2500, `stopped at the limit (${Date.now() - started}ms)`);
+    } finally {
+      runner.dispose();
+    }
+  });
+
+  it('a script that ignores the interrupt is killed after the grace, and its interpreter state is gone', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '', cancelGraceMs: 500 });
+    try {
+      assert.strictEqual((await runner.exec('x = 41', [])).returnCode, 0);
+      const code = 'import time\ntry:\n    time.sleep(60)\nexcept KeyboardInterrupt:\n    time.sleep(60)';
+      const started = Date.now();
+      const killed = await runner.exec(code, [], undefined, { deadlineMs: 1000 });
+      assert.strictEqual(killed.aborted, true);
+      assert.strictEqual(killed.returnCode, 1);
+      assert.match(
+        killed.stderr,
+        /script stopped: it reached its 1s time limit and did not respond, so it was killed and the interpreter restarted \(variables from earlier scripts are gone\)/,
+      );
+      assert.ok(Date.now() - started < 5000, `killed after the grace (${Date.now() - started}ms)`);
+      const after = await runner.exec('print(x)', []);
+      assert.strictEqual(after.returnCode, 1);
+      assert.match(after.stderr, /NameError: name 'x' is not defined/);
+    } finally {
+      runner.dispose();
+    }
+  });
+});

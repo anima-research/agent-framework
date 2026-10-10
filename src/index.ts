@@ -99,6 +99,7 @@ export type { McplHostCapabilities } from './mcpl/index.js';
 export { TOOL_CLASSES, DEFAULT_INPUT_CLASSES, globMatch } from './mcpl/index.js';
 export type {
   ToolClass,
+  ToolClassSource,
   ToolLifecycleConfig,
   ToolLifecycleNarrowing,
   ToolLifecycleParams,
@@ -106,7 +107,9 @@ export type {
 } from './mcpl/index.js';
 
 // Per-channel conversation routing
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export { ConversationRouter, DEFAULT_CLOSURE_PROMPT } from './mcpl/index.js';
+/** @deprecated Per-channel conversation routing is deprecated and will be removed (anima-research/agent-framework#235). */
 export type {
   ConversationRouterConfig,
   ConversationBinding,
@@ -145,3 +148,11 @@ export type {
   OfflineRecoveryBranchOptions,
   OfflineRecoveryBranchResult,
 } from './recovery/offline-branch.js';
+
+export * from "./tool-presentation.js";
+export {
+  SILENT_HEARTBEAT_SEPARATOR,
+  silentHeartbeatOf,
+  type SilentHeartbeatStamp,
+  type SilentHeartbeatTick,
+} from './silent-heartbeat.js';
