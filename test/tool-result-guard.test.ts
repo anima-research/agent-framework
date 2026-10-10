@@ -535,6 +535,10 @@ test('an abandoned guarded round whose response carries no usage still counts it
     await h.run();
     const totals = h.framework.getSessionUsage().totals as unknown as Record<string, number>;
     assert.equal(totals.inputTokens, 20, `each stream is counted once, from its samples: ${JSON.stringify(totals)}`);
+    // The log says what the totals count: the withheld stream, then the retry.
+    const logs = h.framework.queryInferenceLogs({ agentName: 'assistant' }).entries.map((e) => e.entry).reverse();
+    assert.deepEqual(logs.map((e) => [e.success, e.tokenUsage]),
+      [[false, { input: 10, output: 5 }], [true, { input: 10, output: 5 }]]);
   } finally { await h.framework.stop(); }
 });
 

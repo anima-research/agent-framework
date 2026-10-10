@@ -9540,15 +9540,14 @@ export class AgentFramework {
     // stream ends: a final response's usage where it carries one (completion,
     // or the guard's abandoned round), else the rounds it finished (a final
     // response without usage, the boundary ends below, or `finally` for
-    // every other end).
+    // every other end). Each caller passes the one value it also reports.
     let usageCounted = false;
     const countUsage = (usage: DetailedUsage | undefined): void => {
       if (usageCounted) return;
       usageCounted = true;
-      const counted = usage ?? latestUsage;
-      if (!counted) return;
-      this.usageTracker.onInferenceCompleted(agent.name, counted, counted.estimatedCost
-        ? { total: counted.estimatedCost.total, currency: counted.estimatedCost.currency }
+      if (!usage) return;
+      this.usageTracker.onInferenceCompleted(agent.name, usage, usage.estimatedCost
+        ? { total: usage.estimatedCost.total, currency: usage.estimatedCost.currency }
         : undefined);
       this.persistUsageState();
     };
@@ -9559,8 +9558,8 @@ export class AgentFramework {
         timestamp: startTime,
         agentName: agent.name,
         requestId,
-        tokenUsage: tokenUsageOf(latestUsage),
         ...entry,
+        tokenUsage: entry.tokenUsage ?? tokenUsageOf(latestUsage),
       });
     };
     // A turn that ended successfully: with its final response (natural
@@ -10049,16 +10048,14 @@ export class AgentFramework {
               // after the single recovery retry.
               proseStream?.reset();
               if (withheld) {
-                const usage = response.details?.usage ?? response.usage;
-                const tokenUsage = usage ? {
-                  input: usage.inputTokens, output: usage.outputTokens,
-                  cacheCreation: usage.cacheCreationTokens, cacheRead: usage.cacheReadTokens,
-                } : undefined;
-                this.noteRefusal(agent.name, category, tokenUsage);
                 // The abandoned stream was billed (membrane usage here is
                 // cumulative across this physical tool loop): count it before
-                // the retry opens a fresh stream with its own usage.
-                countUsage(response.details?.usage);
+                // the retry opens a fresh stream with its own usage. One value
+                // for the count, the log entry and the refusal note.
+                const abandoned = response.details?.usage ?? latestUsage;
+                const tokenUsage = tokenUsageOf(abandoned);
+                this.noteRefusal(agent.name, category, tokenUsage);
+                countUsage(abandoned);
                 logStream({
                   success: false, error: 'Tool output withheld by the guard',
                   request: compiledRequest ?? {}, response, durationMs, tokenUsage, stopReason: 'refusal',
