@@ -173,6 +173,16 @@ export type TraceEvent =
     })
   | (TraceEventBase & {
       /**
+       * A module's onToolBatchComplete threw or outlasted its bound; the
+       * round went on without it.
+       */
+      type: 'module:batch_hook_failed';
+      agentName: string;
+      module: string;
+      error: string;
+    })
+  | (TraceEventBase & {
+      /**
        * A writable workspace existed but the oversized-result spill write
        * failed (size cap, storeBlob failure, …) — the over-cap tail was NOT
        * retained. Distinct from the no-workspace fallback, which is silent

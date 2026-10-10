@@ -110,6 +110,17 @@ export interface Module {
   gatherContext?(agentName: string): Promise<ContextInjection[]>;
 
   /**
+   * Called once an agent's tool batch has completed — when the round's last
+   * pending result arrives, before it is provided to the agent and before
+   * anything that continues the turn (re-inference, stream resume). The
+   * framework awaits it, bounded by a timeout and fail-open, so a module can
+   * bring its state up to date with what the batch's tools did (the
+   * workspace's `watch: 'on-agent-action'` mounts scan disk here) before the
+   * agent's next inference. Script-inner tool calls don't trigger it.
+   */
+  onToolBatchComplete?(agentName: string): Promise<void>;
+
+  /**
    * Declare extra settings for the synthesized `agent_settings` tool.
    * Modules owning hot-tunable runtime state (e.g. a host settings module
    * managing extended-thinking toggles) expose it here instead of registering
