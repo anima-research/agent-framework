@@ -58,7 +58,7 @@
     "@types/ws": "^8.5.13",
     "discord.js": "^14.25.1",
     "tsx": "^4.21.0",
-    "typescript": "^5.7.0"
+    "typescript": "^7.0.2"
   },
   "engines": {
     "node": ">=20.0.0"
