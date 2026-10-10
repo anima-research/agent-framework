@@ -1,1 +1,5 @@
-- Speech-route failure notices now target the speaking agent, including conversation forks, and respect that agent's mid-turn deferral. Unregistered conversation IDs retain the primary-agent fallback; notices remain context-only and do not trigger inference. A fork's final closure notice is flushed before disposal, and deferred writes retain their target through quiesce until they can be stored (#188).
+- Notices about an agent's own action now reach the window that agent reads (#188):
+  - A conversation fork's or an ephemeral run's failed-reply notice (`[discord-send-failed]`), bounced-prose notice and background-script wake land in its own window, deferred against its own turn, instead of the primary's. In connectome-host this moves a subagent's notices from its parent to the subagent.
+  - Residents share one message slot, so a resident's notices stay on the default path, unchanged.
+  - A notice for a speaker that is no longer registered is dropped and logged, rather than given to the primary.
+  - Writes still queued for a fork or an ephemeral run when it is released land in its own window first, which Chronicle keeps. While the host is quiesced they are dropped instead, logged.

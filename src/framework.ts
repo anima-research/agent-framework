@@ -4137,6 +4137,7 @@ export class AgentFramework {
         // The late stream finalizer intentionally refuses name-keyed cleanup once
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
+        this.landQueuedWritesBeforeRelease(agent);
         this.agents.delete(agent.name);
       }
       this.toolImageLedgers.delete(agent.name);
@@ -7169,21 +7170,10 @@ export class AgentFramework {
    * forever. The fork's context stays in Chronicle for investigation.
    */
   private disposeConversationAgent(agentName: string): void {
-    // A closure can finish while writes are still deferred (e.g. quiesce),
-    // or while a successor owns the turn token. Keep the target registered
-    // until those writes land; the fallback reaper can dispose it afterward.
-    const belongsToAgent = (msg: { forAgent?: string }) =>
-      (msg.forAgent ?? this.primaryAgentName) === agentName;
-    if (
-      this.activeTurnTokens.has(agentName) ||
-      this.activeStreams.has(agentName) ||
-      this.pendingAssistantBlocks.has(agentName) ||
-      this.deferredMessages.some(belongsToAgent) ||
-      this.unackedDeferredWrites.some(belongsToAgent)
-    ) return;
     this.closingConversationAgents.delete(agentName);
     const channelId = this.conversationAgentHomes.get(agentName);
     const agent = this.agents.get(agentName);
+    if (agent) this.landQueuedWritesBeforeRelease(agent);
     this.agents.delete(agentName);
     this.toolImageLedgers.delete(agentName);
     this.agentConfigs.delete(agentName);
@@ -8568,6 +8558,7 @@ export class AgentFramework {
         'user',
         [{ type: 'text', text: notice }],
         { system: true, kind: 'prose-bounce' },
+        this.noticeTargetFor(name),
       );
       if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-bounce' });
       else this.emitTrace({ type: 'message:added', messageId: 'deferred', source: 'prose-bounce' });
@@ -10378,6 +10369,12 @@ export class AgentFramework {
         this.pendingAssistantBlocks.delete(agent.name);
       }
 
+      // A conversation fork whose TTL closure turn just finished is done for
+      // good — dispose it so the agent map doesn't grow monotonically.
+      if (ownsPhysicalStream && this.closingConversationAgents.has(agent.name)) {
+        this.disposeConversationAgent(agent.name);
+      }
+
       // The turn is torn down — release the turn-alive marker BEFORE the
       // deferred flush below, so the flush appends at the settled tail.
       // Token-matched: if a successor turn already owns the agent (endTurn
@@ -10394,7 +10391,7 @@ export class AgentFramework {
       // pending). Only THIS agent's messages: other targets' entries wait
       // for their own boundaries (re-adding via addMessage re-defers if the
       // target has meanwhile started a turn).
-      if (frameReachedTerminal && this.deferredMessages.length > 0 && !this.pendingAssistantBlocks.has(agent.name)) {
+      if (frameReachedTerminal && this.deferredMessages.length > 0 && this.pendingAssistantBlocks.size === 0) {
         const deferred = this.drainDeferredFor(agent.name);
         for (const msg of deferred) {
           this.addMessage(msg.participant, msg.content, msg.metadata, {
@@ -10403,13 +10400,6 @@ export class AgentFramework {
           });
         }
         this.ackDeferredWrites();
-      }
-
-      // Flush the closure turn's notices while its owner is still registered.
-      // If quiesce or a successor re-deferred them, disposal waits for the
-      // fallback reaper after their eventual safe write boundary.
-      if (frameReachedTerminal && ownsPhysicalStream && this.closingConversationAgents.has(agent.name)) {
-        this.disposeConversationAgent(agent.name);
       }
     }
   }
@@ -11046,7 +11036,7 @@ export class AgentFramework {
         source: 'background-script',
         scriptId: record.id,
         tags: ['script:wake'],
-      });
+      }, this.noticeTargetFor(record.agentName));
       this.pendingRequests.push({
         agentName: record.agentName,
         reason: 'script:wake',
@@ -11964,6 +11954,48 @@ export class AgentFramework {
     return mine;
   }
 
+  /**
+   * Where a notice about an agent's own action belongs: its failed reply, its
+   * bounced prose, its background script's wake. A conversation fork or an
+   * ephemeral run reads only its own isolated slot, so the notice is addressed
+   * to it. Residents share one message slot, which the default path already
+   * writes, under the guard that waits for any agent's tool cycle and the
+   * primary's turn; addressing a resident would narrow that guard to its own
+   * turn and cycle. A name no longer registered (a fork or run released before
+   * its failure was known) is addressed too, so addMessage drops the notice,
+   * logged, rather than give it to the primary, which did nothing.
+   */
+  private noticeTargetFor(agentName: string): { forAgent: string } | undefined {
+    const agent = this.agents.get(agentName);
+    return agent && this.sharedSlotAgents.has(agent) ? undefined : { forAgent: agentName };
+  }
+
+  /**
+   * A conversation fork or an ephemeral run is about to be deregistered.
+   * Writes still queued for its window would wait for a boundary it never
+   * reaches, and the flush that finds it gone would drop them; land them in
+   * its own window now, which stays in Chronicle for investigation. Its
+   * stream is over or cancelled, so nothing it compiles can diverge from
+   * them. While quiesced a write could land mid-surgery, so they stay
+   * queued, and the next flush to find their target gone drops them, logged.
+   */
+  private landQueuedWritesBeforeRelease(agent: Agent): void {
+    if (this.quiesced) return;
+    const cm = agent.getContextManager();
+    for (const msg of this.drainDeferredFor(agent.name)) {
+      try {
+        cm.addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
+      } catch (err) {
+        console.error(
+          `[deferred-flush] ${agent.name}: failed to store a queued write before release ` +
+          `(participant=${msg.participant}):`,
+          err,
+        );
+      }
+    }
+    this.ackDeferredWrites();
+  }
+
   private editMessage(id: MessageId, content: ContentBlock[]): void {
     const agent = this.primaryAgentName
       ? this.agents.get(this.primaryAgentName)
@@ -12576,9 +12608,7 @@ export class AgentFramework {
                 text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
               }],
               { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason },
-              // Keep the notice with its speaker, including mid-turn deferral.
-              // Unknown conversation IDs retain the primary-agent fallback.
-              this.agents.has(conversationId) ? { forAgent: conversationId } : undefined,
+              this.noticeTargetFor(conversationId),
             );
           } catch (err) {
             console.error('onRouteFailure: failed to record send-failure marker:', err);
