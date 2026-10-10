@@ -2,7 +2,7 @@ import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, Yiel
 import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
-import { ToolResultGuard, TOOL_RESULT_GUARD_NOTICE } from './tool-result-guard.js';
+import { ToolResultGuard } from './tool-result-guard.js';
 import {
   indexSilentTickRows,
   separateSilentHeartbeatTicks,
@@ -655,6 +655,8 @@ export class Agent {
     }
 
     this.toolResultGuard.flushUnrecorded();
+    // A withheld stub is compiled only once it says where its original went.
+    await this.toolResultGuard.whenAnnotated();
 
     // Filter tools to only allowed ones
     const tools = availableTools.filter((t) => this.canUseTool(t.name));
@@ -670,28 +672,30 @@ export class Agent {
       this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults);
     }
 
-    // Compile context (with optional injections)
-    const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
+    // Pending tool results the guard isn't holding follow the compiled context.
+    const unguardedResults = this._state.status === 'ready' && !guardedResults
+      ? this.buildToolResultMessages(this._state.toolResults) : [];
 
-    // If we have pending tool results, add them
-    if (this._state.status === 'ready' && !guardedResults) {
-      const toolResultMessages = this.buildToolResultMessages(this._state.toolResults);
-      messages.push(...toolResultMessages);
-    }
-
-    const request: NormalizedRequest = {
-      messages: this.toolResultGuard.prepareRequest(messages, true),
-      system: this.buildSystemPrompt(systemInjections),
-      config: {
-        model: this.model,
-        maxTokens: this.maxTokens,
-        ...(this.temperature !== undefined && { temperature: this.temperature }),
-        ...(this.thinking !== undefined && { thinking: this.thinking }),
-      },
-      tools: tools.length > 0 ? tools : undefined,
-      ...(this.providerParams && { providerParams: this.providerParams }),
-      assistantParticipant: this.name,
+    // Compile the context (with optional injections) into a request. The
+    // guard's refusal retry is assembled the same way, afresh.
+    const assemble = async (): Promise<NormalizedRequest> => {
+      const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
+      messages.push(...unguardedResults);
+      return {
+        messages: this.toolResultGuard.prepareRequest(messages, true),
+        system: this.buildSystemPrompt(systemInjections),
+        config: {
+          model: this.model,
+          maxTokens: this.maxTokens,
+          ...(this.temperature !== undefined && { temperature: this.temperature }),
+          ...(this.thinking !== undefined && { thinking: this.thinking }),
+        },
+        tools: tools.length > 0 ? tools : undefined,
+        ...(this.providerParams && { providerParams: this.providerParams }),
+        assistantParticipant: this.name,
+      };
     };
+    const request = await assemble();
 
     const abortController = new AbortController();
     if (options?.signal) {
@@ -704,7 +708,7 @@ export class Agent {
 
     // Set state to inferring
     this._inferenceStartedAt = Date.now();
-    const inferencePromise = this.doInference(request, abortController.signal);
+    const inferencePromise = this.doInference(request, abortController.signal, assemble);
     this._state = { status: 'inferring', promise: inferencePromise, abortController };
 
     try {
@@ -935,6 +939,8 @@ export class Agent {
     // Retry accepted history edits before assembling a real request. Pure
     // preview/compile entry points must not perform these writes.
     this.toolResultGuard.flushUnrecorded();
+    // A withheld stub is compiled only once it says where its original went.
+    await this.toolResultGuard.whenAnnotated();
 
     // A new activation supersedes every receipt flight the previous one left
     // open. Membrane fires the kv-unified wire receipt per provider attempt,
@@ -1179,7 +1185,9 @@ export class Agent {
 
   private async doInference(
     request: NormalizedRequest,
-    signal?: AbortSignal
+    signal: AbortSignal | undefined,
+    /** Compiles the context into a request again, for the guard's retry. */
+    reassemble: () => Promise<NormalizedRequest>,
   ): Promise<InferenceResult> {
     let response = await this.membrane.stream(request, { signal });
     // Usage of a refused attempt abandoned by the guard; it was billed and
@@ -1191,12 +1199,12 @@ export class Agent {
       const ids = this.toolResultGuard.withhold('unknown');
       if (ids) {
         abandonedUsage = response.usage;
-        const withheld = new Set(ids);
-        request = { ...request, messages: request.messages.map((message) => ({
-          ...message, content: message.content.map((block) => block.type === 'tool_result' && withheld.has(block.toolUseId)
-            ? { type: 'tool_result', toolUseId: block.toolUseId, content: TOOL_RESULT_GUARD_NOTICE, isError: block.isError } : block),
-        })) };
-        response = await this.membrane.stream(request, { signal });
+        // The retry is compiled afresh, like every request: once each stub
+        // says where its original went (agent-framework #277), and against the
+        // budget without the batch's reservation, so a stub longer than its
+        // original can't carry the request past the budget.
+        await this.toolResultGuard.whenAnnotated();
+        response = await this.membrane.stream(await reassemble(), { signal });
       }
     }
 
