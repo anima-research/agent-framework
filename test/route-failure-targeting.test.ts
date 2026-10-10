@@ -258,6 +258,57 @@ describe('notices about an agent\'s own action', () => {
       assert.equal(internals(framework).deferredMessages.length, 0);
     });
 
+    it('still releases an ephemeral run when the primary cannot be told, logged', async (t) => {
+      (internals(framework).channelRegistry as unknown as { defaultPublishChannel: string | null }).defaultPublishChannel = 'missing-channel';
+      const primaryCm = framework.getAgent('primary')!.getContextManager();
+      const store = primaryCm.addMessage.bind(primaryCm);
+      t.mock.method(primaryCm, 'addMessage', (...args: Parameters<typeof primaryCm.addMessage>) => {
+        if (JSON.stringify(args[1]).includes('A reply by worker')) throw new Error('store refused the write');
+        return store(...args);
+      });
+      const errors: string[] = [];
+      t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+
+      const archived = await runEphemeral('locus', 'Worker speech for a channel that is not registered.');
+
+      assert.equal(framework.getAgent('worker'), null, 'the run is released');
+      assert.equal(count(archived, '[discord-send-failed] Your previous reply'), 1);
+      assert.ok(errors.some((e) => e.includes('[route-failure] failed to tell the primary that worker\'s reply to missing-channel failed')));
+    });
+
+    it('tells no one, logged, when there is no primary to tell', async (t) => {
+      const dir = mkdtempSync(join(tmpdir(), 'route-failure-no-primary-'));
+      const bare = await AgentFramework.create({
+        storePath: join(dir, 'test.chronicle'), membrane: membrane.asMembrane(), agents: [], modules: [],
+      });
+      try {
+        await internals(bare).initializeMcpl([]);
+        (internals(bare).channelRegistry as unknown as { defaultPublishChannel: string | null }).defaultPublishChannel = 'missing-channel';
+        const errors: string[] = [];
+        t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });
+        const created = await bare.createEphemeralAgent({
+          name: 'worker', model: 'test-model', systemPrompt: 'Do the task.', allowedTools: 'all', proseRouting: 'locus',
+        });
+        created.contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
+        membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Worker speech with nobody to tell.' }]));
+        const run = bare.runEphemeralToCompletion(created.agent, created.contextManager);
+        bare.start();
+        await run;
+        await bare.runUntilIdle();
+
+        const archive = await ContextManager.open({
+          store: bare.getStore(), namespace: 'subagent/worker', isolate: true, strategy: new PassthroughStrategy(),
+        });
+        const { messages } = await archive.compile();
+        assert.equal(count(messages, 'A reply by worker'), 0, 'the run is not told about itself');
+        assert.equal(count(messages, '[discord-send-failed] Your previous reply'), 1);
+        assert.ok(errors.some((e) => e.includes('[route-failure] worker has ended, and there is no primary to tell that its reply to missing-channel failed')));
+      } finally {
+        await bare.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it('sends an ephemeral run\'s bounced prose notice to its own window, beside its clipboard', async (t) => {
       const errors: string[] = [];
       t.mock.method(console, 'error', (...args: unknown[]) => { errors.push(args.map(String).join(' ')); });

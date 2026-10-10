@@ -12013,7 +12013,8 @@ export class AgentFramework {
    * delivery failed after release. Tell the primary instead, naming the
    * speaker, so an agent who can still act learns of it: to resend, or to
    * tell the human. Only for a delivery to a channel; a reply that had no
-   * channel to go to (no locus) had no human waiting for it.
+   * channel to go to (no locus) had no human waiting for it. Never throws:
+   * it runs inside a release, which must complete whatever this write meets.
    */
   private passFailedReplyToPrimary(speaker: string, metadata: MessageMetadata | undefined): void {
     const failure = metadata as { kind?: unknown; channelId?: unknown; reason?: unknown; textLen?: unknown } | undefined;
@@ -12022,15 +12023,25 @@ export class AgentFramework {
       console.error(`[route-failure] ${speaker} has ended, and its reply had no channel to reach: no one else is told`);
       return;
     }
-    this.addMessage(
-      'user',
-      [{
-        type: 'text',
-        text: `[discord-send-failed] A reply by ${speaker} (${String(failure.textLen)} chars) could not be delivered to ` +
-          `${this.channelForNotice(failure.channelId)} (${String(failure.reason)}). ${speaker} has ended, and the human did not receive it.`,
-      }],
-      { system: true, kind: 'discord-send-failed', channelId: failure.channelId, reason: failure.reason, textLen: failure.textLen, speaker } as MessageMetadata,
-    );
+    // The default path falls back to the first registered agent when there
+    // is no primary, which could be the speaker being released.
+    if (!this.primaryAgentName || !this.agents.has(this.primaryAgentName)) {
+      console.error(`[route-failure] ${speaker} has ended, and there is no primary to tell that its reply to ${failure.channelId} failed`);
+      return;
+    }
+    try {
+      this.addMessage(
+        'user',
+        [{
+          type: 'text',
+          text: `[discord-send-failed] A reply by ${speaker} (${String(failure.textLen)} chars) could not be delivered to ` +
+            `${this.channelForNotice(failure.channelId)} (${String(failure.reason)}). ${speaker} has ended, and the human did not receive it.`,
+        }],
+        { system: true, kind: 'discord-send-failed', channelId: failure.channelId, reason: failure.reason, textLen: failure.textLen, speaker } as MessageMetadata,
+      );
+    } catch (err) {
+      console.error(`[route-failure] failed to tell the primary that ${speaker}'s reply to ${failure.channelId} failed:`, err);
+    }
   }
 
   /**
