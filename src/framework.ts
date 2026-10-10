@@ -8,7 +8,7 @@ import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolRes
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
-import type { SilentHeartbeatStamp } from './silent-heartbeat.js';
+import { SILENT_HEARTBEAT_SEPARATOR, type SilentHeartbeatStamp } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
 import type {
@@ -6905,8 +6905,8 @@ export class AgentFramework {
               reason: 'context_budget_restart',
               source: 'framework',
               timestamp: Date.now(),
+              continuePrompt: this.activeTurnTriggers.get(agent.name)?.continuePrompt,
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
-              ephemeralSystemPrompt: this.activeTurnTriggers.get(agent.name)?.ephemeralSystemPrompt,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
             });
           } else if (currentState.stream) {
@@ -8159,9 +8159,11 @@ export class AgentFramework {
           addressed: isAddressedMessage(event.tags, event.origin),
           ...(silentHeartbeat ? {
             suppressProse: true,
-            ephemeralSystemPrompt:
-              '[silent heartbeat] Scheduled private self-check. Review pending matters privately. ' +
-              'Do not narrate or publish plain prose; use an explicit send tool only if you deliberately choose to contact someone.',
+            // The tick's instruction rides its request-only separator
+            // (SILENT_HEARTBEAT_SEPARATOR), never the system prompt: a
+            // per-turn system change would cost the heartbeat's request
+            // its prompt cache from the system on, and fail the binding of
+            // every retained thinking block (context-manager #155).
             silentHeartbeat: { eventId: event.eventId, serverId: event.serverId },
           } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
@@ -8498,7 +8500,6 @@ export class AgentFramework {
           ? [...new Set(requests.flatMap((r) => r.coalescingBatchSubjects ?? [r.coalescingSubject!]))]
           : undefined,
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
-        ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
         channelId: channelReq?.channelId,
         addressed: addressedReq !== undefined,
@@ -8514,20 +8515,32 @@ export class AgentFramework {
   }
 
   /**
-   * Metadata for rows the agent's current turn stores: a silent heartbeat
-   * tick stamps each of them (assistant responses, tool_result rows) so they
-   * stay identifiable after the turn — request builds key the tick separator
-   * on it, and a later retention policy can find or collapse them. The stamp
-   * names the agent: residents share one message slot and a broadcast tick
-   * reaches each of them with the same eventId. Undefined for ordinary
-   * turns, whose rows are stored exactly as before.
+   * Metadata for rows the agent's current turn stores (assistant responses,
+   * tool_result rows), for the request-only turns that came before them:
+   * - a silent heartbeat tick stamps each row, with the separator text its
+   *   request rendered, so they stay identifiable after the turn — request
+   *   builds render the separator before the first that survives, and a later
+   *   retention policy can find or collapse them. The stamp names the agent:
+   *   residents share one message slot and a broadcast tick reaches each of
+   *   them with the same eventId;
+   * - a turn whose stream opened on `[Continue]` stamps each row from then on
+   *   with that prompt (`promptedBy`), so request builds render it before the
+   *   first that survives.
+   * Undefined for ordinary turns, whose rows are stored exactly as before.
+   * (Named for its first use, the silent tick.)
    */
   private silentTurnRowMetadata(agentName: string): MessageMetadata | undefined {
-    const tick = this.activeTurnTriggers.get(agentName)?.silentHeartbeat;
+    const trigger = this.activeTurnTriggers.get(agentName);
+    const tick = trigger?.silentHeartbeat;
     const stamp: SilentHeartbeatStamp | undefined = tick
-      ? { eventId: tick.eventId, serverId: tick.serverId, agentName }
+      ? { eventId: tick.eventId, serverId: tick.serverId, agentName, separator: SILENT_HEARTBEAT_SEPARATOR }
       : undefined;
-    return stamp ? { silentHeartbeat: stamp } : undefined;
+    const prompt = trigger?.continuePrompt;
+    if (!stamp && !prompt) return undefined;
+    return {
+      ...(stamp ? { silentHeartbeat: stamp } : {}),
+      ...(prompt ? { promptedBy: prompt } : {}),
+    } as MessageMetadata;
   }
 
   /** Record prose segments suppressed by explicit-send silencing. */
@@ -9336,15 +9349,6 @@ export class AgentFramework {
         }
       }
 
-      if (trigger?.ephemeralSystemPrompt) {
-        const silentInjection: ContextInjection = {
-          namespace: 'framework:silent-heartbeat',
-          position: 'system',
-          content: [{ type: 'text', text: trigger.ephemeralSystemPrompt }],
-        };
-        injections = injections ? [...injections, silentInjection] : [silentInjection];
-      }
-
       // An ephemeral watchdog may dispose this Agent while hooks/compile await.
       // Do not create a provider stream after its generation lost ownership.
       if (this.agents.get(agent.name) !== agent) {
@@ -9369,9 +9373,16 @@ export class AgentFramework {
         request: compiledRequest,
         takeKvSubmission,
         drainKvSubmissionIds,
+        continuePrompt,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
+        continuePrompt: trigger?.continuePrompt,
       });
+      // The [Continue] prompt this stream's reply follows, if any: every row
+      // the turn stores from here on carries it (silentTurnRowMetadata), and the
+      // turn's restarts and retries carry it in the trigger to the next
+      // stream start, which keeps it only if its request renders it.
+      if (trigger) trigger.continuePrompt = continuePrompt;
       if (this.agents.get(agent.name) !== agent) {
         stream.cancel();
         agent.cancelStream();

@@ -1,7 +1,7 @@
 import type { ContentBlock, YieldingStream } from '@animalabs/membrane';
 import type { ContextStrategy } from '@animalabs/context-manager';
 import type { ToolCallId, ToolResult, ToolCall } from './events.js';
-import type { SilentHeartbeatTick } from '../silent-heartbeat.js';
+import type { RequestOnlyPrompt, SilentHeartbeatTick } from '../silent-heartbeat.js';
 
 export type SameRoundThinkTextPolicy = 'public' | 'private';
 export type SameRoundThinkTextPolicySource =
@@ -360,11 +360,16 @@ export interface InferenceRequest {
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
   suppressProse?: boolean;
-  /** Ephemeral system-position prompt for this turn only. Never written to
-   * Chronicle; callers must supply bounded non-secret control text. */
-  ephemeralSystemPrompt?: string;
+  /** Set by the framework at each stream start of this turn: the request-only
+   * `[Continue]` prompt the stream's reply follows (`StartStreamResult.
+   * continuePrompt`), or none. Every row the turn stores is stamped
+   * `metadata.promptedBy` with it, so request builds render the turn before
+   * the first that survives. Carried into the turn's restarts and retries,
+   * whose stream start keeps it only if its own request renders it. */
+  continuePrompt?: RequestOnlyPrompt;
   /** The authenticated silent heartbeat tick this turn answers. Every row the
    * turn stores is stamped `metadata.silentHeartbeat` with it, and request
-   * builds render a request-only separator before the tick's first row. */
+   * builds render a request-only separator carrying the tick's instruction
+   * before the tick's first row (`SILENT_HEARTBEAT_SEPARATOR`). */
   silentHeartbeat?: SilentHeartbeatTick;
 }
