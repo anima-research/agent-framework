@@ -189,6 +189,16 @@ export interface ToolResult {
   /** Whether this was an error (for LLM) */
   isError?: boolean;
   /**
+   * Fields of `data` that list the files the tool acted on, such as the paths
+   * a write wrote, removed or took from disk, in the order they should be
+   * kept. When the tool-result guard withholds this result, these fields stay
+   * in its stub, so the agent still sees what the tool did; the full result
+   * goes where every withheld original goes (agent-framework #277). They are
+   * cut at the inline cap, as any tool result is. Only data's own fields can
+   * be kept: an error result keeps nothing.
+   */
+  keepWhenWithheld?: string[];
+  /**
    * When true, the framework saves tool_use + tool_result messages to context,
    * cancels the active stream, and resets the agent to idle.
    * This is a "sleep until next event" primitive — the LLM expects the call to block.

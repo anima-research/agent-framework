@@ -2259,7 +2259,9 @@ export class WorkspaceModule implements Module {
         };
       }
 
-      return { success: true, data: { path: input.path, deleted: true } };
+      // Its whole receipt is what it changed: kept in the stub if the guard
+      // withholds the result (agent-framework #277).
+      return { success: true, data: { path: input.path, deleted: true }, keepWhenWithheld: ['path', 'deleted'] };
     });
   }
 
@@ -2677,6 +2679,10 @@ export class WorkspaceModule implements Module {
           : {}),
         ...(blocked.length > 0 ? { skipped: blocked } : {}),
       },
+      // What disk lost, then what it was written: kept in the stub if the
+      // guard withholds the result (agent-framework #277). What was left or
+      // skipped, and why, is in the full result.
+      keepWhenWithheld: ['deleted', 'materialized'],
     };
   }
 
@@ -2796,6 +2802,11 @@ export class WorkspaceModule implements Module {
         ...(allIncomplete.length > 0 ? { incomplete: allIncomplete } : {}),
         ...(rootsAccepted.length > 0 ? { rootsAccepted } : {}),
       },
+      // What the workspace took from disk, gave up, or now holds as a
+      // conflict, per mount, and any root it accepted: kept in the stub if
+      // the guard withholds the result (agent-framework #277). What the scan
+      // skipped or couldn't see is in the full result.
+      keepWhenWithheld: ['results', 'rootsAccepted'],
     };
   }
 

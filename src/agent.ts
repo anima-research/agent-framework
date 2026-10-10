@@ -669,7 +669,10 @@ export class Agent {
       const wireResults = content.flatMap((block) => block.type === 'tool_result'
         // buildToolResultMessages serializes every payload to a string.
         ? [{ toolUseId: block.toolUseId, content: block.content as string, isError: block.isError }] : []);
-      this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults);
+      // Stored under the house default cap (buildToolResultMessages), as what a
+      // stub keeps is too.
+      this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults, undefined,
+        DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS);
     }
 
     // Pending tool results the guard isn't holding follow the compiled context.

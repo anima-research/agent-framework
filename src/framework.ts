@@ -6712,7 +6712,7 @@ export class AgentFramework {
           const membraneResults = currentState.toolResults.map(tc =>
             this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
           );
-          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata);
+          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, maxChars);
 
           // Flush any messages that were deferred while this turn was in
           // flight. Route to the PRIMARY agent — deferred messages are
@@ -10058,7 +10058,7 @@ export class AgentFramework {
                 );
                 agent.toolResultGuard.storeResults(toolResultContent, readyState.toolResults.map((tc) =>
                   this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id))), readyState.toolResults,
-                  this.silentTurnRowMetadata(agent.name));
+                  this.silentTurnRowMetadata(agent.name), cap);
                 // The response is already complete: this batch is never
                 // submitted in this turn, so it cannot be refused. Admit it.
                 agent.toolResultGuard.settleTurnEnded();
