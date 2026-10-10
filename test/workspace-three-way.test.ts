@@ -510,6 +510,14 @@ describe('a sync says what it passed over (agent-framework #276)', () => {
     const control = await call(m, 'sync', { path: 'work/plain.txt' });
     assert.equal(control.totalSynced, 1);
     assert.equal(control.ignored, undefined, 'a path the ignore list does not cover gets no note');
+
+    // Now tracked, both ignored regions hide something the workspace holds:
+    // a bare sync reports them under `incomplete`, and never counts them too.
+    const bare = await call(m, 'sync', {});
+    const regions = (bare.incomplete as Array<{ mount: string; path: string; reason: string }>)
+      .filter((r) => r.reason === 'ignored by the mount').map((r) => r.path).sort();
+    assert.deepEqual(regions, ['LOG.md', 'vendor']);
+    assert.equal(bare.passedOver, undefined, 'a region reported as incomplete is not also passed over');
   });
 });
 
