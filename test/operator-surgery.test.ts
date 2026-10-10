@@ -228,6 +228,35 @@ describe('live operator surgery', () => {
     }
   });
 
+  it('a write deferred behind the surgery lands with its durable id, as every flush from the queue does', async () => {
+    const c = cm() as unknown as { switchBranch: (name: string) => Promise<void> };
+    const originalSwitch = c.switchBranch;
+    let releaseSwitch!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseSwitch = resolve; });
+    c.switchBranch = async (name: string) => { await gate; return originalSwitch.call(c, name); };
+    const internals = framework as unknown as {
+      surgeryHold: unknown;
+      deferredMessages: Array<{ id: string }>;
+      addMessage(participant: string, content: unknown[], metadata?: Record<string, unknown>): string;
+    };
+    try {
+      const rollback = framework.rollbackToMessage('scout', { messageId: ids[2] });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.ok(internals.surgeryHold, 'store hold is up while the switch is awaited');
+      assert.equal(internals.addMessage('user', [{ type: 'text', text: 'arrived mid-surgery' }]), '', 'deferred');
+      const queuedId = internals.deferredMessages.at(-1)!.id;
+      releaseSwitch();
+      await rollback;
+      const landed = cm().getAllMessages().find((m) => (m.content[0] as { text?: string }).text === 'arrived mid-surgery');
+      assert.ok(landed, 'flushed when the hold released');
+      // The id makes a queued pair's tool_result re-defer with its tool_use
+      // rather than land alone, and lets boot recovery skip a replay.
+      assert.equal((landed!.metadata as { deferredWriteId?: string } | undefined)?.deferredWriteId, queuedId);
+    } finally {
+      c.switchBranch = originalSwitch;
+    }
+  });
+
   // --- strategy-initialization failure -----------------------------------------
   // switchBranch()/fork() move the chronicle branch BEFORE awaiting strategy
   // initialization, so a rejection there leaves the store on the new branch.

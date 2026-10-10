@@ -555,7 +555,8 @@ export class Agent {
 
   /**
    * RFC-006 consumed watermark: the newest stored message at the last compile
-   * of a model request, per branch. Everything above it has never been in a
+   * of a model request, or at the last tool boundary that injected messages
+   * into a live one, per branch. Everything above it has never been in a
    * request and may still be replaced or withdrawn in place by its sender.
    */
   private consumedWatermark: { branch: string; sequence: number } | null = null;
@@ -564,7 +565,8 @@ export class Agent {
     return this.consumedWatermark;
   }
 
-  /** Mark everything currently stored as consumed (boot, branch switch). */
+  /** Mark everything currently stored as consumed (boot, branch switch, and a
+   *  tool boundary that injected messages into the live stream). */
   markContextConsumed(): void {
     // Tolerates partial context-manager doubles (tests build Agents over
     // stubs): without a watermark nothing is ever treated as unread.
