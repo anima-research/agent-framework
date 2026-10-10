@@ -10,6 +10,13 @@
  * intent — tombstones, store origin, conflicts — lives in BranchIntents and
  * rewinds with the tree.
  *
+ * P is evidence about one directory, so each mount also records the identity
+ * (device and inode) of the root that evidence was gathered under. A root
+ * that isn't that directory any more (an unmounted drive whose mountpoint is
+ * now empty, a replaced directory) is an unavailable mount, never a disk on
+ * which every file was deleted; only an explicit acceptance takes it, and
+ * that starts its evidence afresh.
+ *
  * Every transition is write-ahead (see reconcile.ts): an `intent` entry
  * (`pending`, with the prior value and the expected one) is durable before the
  * disk effect or tree adoption it announces, and the completion `set` is
@@ -60,13 +67,31 @@ export interface Interrupted {
 
 export type Physical = Agreed | Pending | Interrupted;
 
+/** Which directory a mount root is: its device and inode, as decimal strings. */
+export interface RootIdentity {
+  dev: string;
+  ino: string;
+}
+
+export function sameRootIdentity(a: RootIdentity, b: RootIdentity): boolean {
+  return a.dev === b.dev && a.ino === b.ino;
+}
+
 type JournalEntry =
   | { t: 'mount'; mount: string; root: string }
+  /** The root's identity; with `reset`, an accepted new root, whose evidence starts empty. */
+  | { t: 'root'; mount: string; identity: RootIdentity; reset?: true }
   | { t: 'set'; mount: string; path: string; value: Physical }
   | { t: 'forget'; mount: string; path: string };
 
+interface MountEvidence {
+  root: string;
+  identity?: RootIdentity;
+  paths: Map<string, Physical>;
+}
+
 interface Snapshot {
-  mounts: Record<string, { root: string; paths: Record<string, Physical> }>;
+  mounts: Record<string, { root: string; identity?: RootIdentity; paths: Record<string, Physical> }>;
 }
 
 export const DISK_AGREEMENT_RECORD_TYPE = 'workspace/disk-agreement';
@@ -85,7 +110,7 @@ export function sameCandidate(a: Candidate, b: Candidate): boolean {
 export class DiskAgreement {
   private readonly store: JsStore;
   private readonly journal: RecordJournal<JournalEntry, Snapshot>;
-  private readonly mounts = new Map<string, { root: string; paths: Map<string, Physical> }>();
+  private readonly mounts = new Map<string, MountEvidence>();
   private configured: Array<{ name: string; root: string }> = [];
   /**
    * An append (or a rebuild) not yet made durable. Cleared only by a
@@ -128,9 +153,13 @@ export class DiskAgreement {
   private rebuild(): void {
     this.unsynced = true;
     const { snapshot, entries } = this.journal.load();
-    const replayed = new Map<string, { root: string; paths: Map<string, Physical> }>();
+    const replayed = new Map<string, MountEvidence>();
     for (const [name, mount] of Object.entries(snapshot?.mounts ?? {})) {
-      replayed.set(name, { root: mount.root, paths: new Map(Object.entries(mount.paths)) });
+      replayed.set(name, {
+        root: mount.root,
+        ...(mount.identity ? { identity: mount.identity } : {}),
+        paths: new Map(Object.entries(mount.paths)),
+      });
     }
     for (const { entry } of entries) {
       if (entry.t === 'mount') {
@@ -140,7 +169,8 @@ export class DiskAgreement {
       }
       const mount = replayed.get(entry.mount);
       if (!mount) continue;
-      if (entry.t === 'set') mount.paths.set(entry.path, entry.value);
+      if (entry.t === 'root') applyRoot(mount, entry);
+      else if (entry.t === 'set') mount.paths.set(entry.path, entry.value);
       else mount.paths.delete(entry.path);
     }
     this.mounts.clear();
@@ -153,6 +183,30 @@ export class DiskAgreement {
         this.journal.append({ t: 'mount', mount: name, root });
       }
     }
+  }
+
+  /** The identity of the root this mount's evidence was gathered under, once any was. */
+  rootIdentity(mount: string): RootIdentity | undefined {
+    this.ensureReconciled();
+    return this.mounts.get(mount)?.identity;
+  }
+
+  /**
+   * Record the root's identity just before the first evidence a mount gains:
+   * the caller saw it as the root while gathering that evidence. A no-op once
+   * one is recorded; changing it is acceptRoot's alone.
+   */
+  recordRootIdentity(mount: string, identity: RootIdentity): void {
+    if (this.rootIdentity(mount) !== undefined) return;
+    this.write({ t: 'root', mount, identity }, {});
+  }
+
+  /**
+   * Take the root as it is now, at the operator's word: record its identity
+   * and forget every path's evidence, which described another directory.
+   */
+  acceptRoot(mount: string, identity: RootIdentity): void {
+    this.write({ t: 'root', mount, identity, reset: true }, {});
   }
 
   get(mount: string, path: string): Physical | undefined {
@@ -211,7 +265,8 @@ export class DiskAgreement {
     if (opts.durable) this.unsynced = false; // synced after this append, and so everything before it
     const mount = this.mounts.get((entry as { mount: string }).mount);
     if (!mount) return;
-    if (entry.t === 'set') mount.paths.set(entry.path, entry.value);
+    if (entry.t === 'root') applyRoot(mount, entry);
+    else if (entry.t === 'set') mount.paths.set(entry.path, entry.value);
     else if (entry.t === 'forget') mount.paths.delete(entry.path);
   }
 
@@ -222,7 +277,11 @@ export class DiskAgreement {
     if (this.journal.entriesSinceCheckpoint < Math.max(MIN_CHECKPOINT_TAIL, live)) return;
     const snapshot: Snapshot = { mounts: {} };
     for (const [name, mount] of this.mounts) {
-      snapshot.mounts[name] = { root: mount.root, paths: Object.fromEntries(mount.paths) };
+      snapshot.mounts[name] = {
+        root: mount.root,
+        ...(mount.identity ? { identity: mount.identity } : {}),
+        paths: Object.fromEntries(mount.paths),
+      };
     }
     this.journal.checkpoint(snapshot);
   }
@@ -232,4 +291,9 @@ export class DiskAgreement {
     this.store.sync();
     this.unsynced = false;
   }
+}
+
+function applyRoot(mount: MountEvidence, entry: Extract<JournalEntry, { t: 'root' }>): void {
+  mount.identity = entry.identity;
+  if (entry.reset) mount.paths.clear();
 }

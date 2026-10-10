@@ -42,11 +42,16 @@ import type { BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, readdir, realpath, stat, statfs } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { dirname, join, sep } from 'node:path';
-import type { Fingerprint } from './disk-agreement.js';
+import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
 
 export interface MountView {
   /** Mount root as configured. */
   root: string;
+  /**
+   * The root directory disk last agreed under, once the mount has evidence.
+   * A root that resolves to any other directory is unavailable.
+   */
+  rootIdentity?: RootIdentity;
   followSymlinks: boolean;
   /** Text above this size is not ingested. */
   maxFileSize: number;
@@ -90,6 +95,9 @@ export const RACY_WINDOW_MS = 2000;
 export const OUTSIDE_PARENT = 'a parent directory resolves outside the mount';
 export const NOT_FOLLOWED = 'a symlink, which this mount does not follow';
 export const ROOT_UNAVAILABLE = 'the mount root is unavailable';
+export const ROOT_REPLACED =
+  'the mount root is not the directory disk last agreed with (an unmounted drive, or a replaced directory): ' +
+  'reconnect it; if it was replaced on purpose, sync the mount with acceptRoot to take it as it is now';
 const CHANGED = 'it changed while it was observed';
 const CHANGED_WALK = 'the directory changed while the walk ran';
 const BENEATH_SYMLINK = 'beneath a symlink that does not lead to a directory inside the mount';
@@ -151,6 +159,11 @@ export class CheckedDir {
     private readonly dev: bigint,
     private readonly ino: bigint,
   ) {}
+
+  /** Which directory it is. */
+  identity(): RootIdentity {
+    return { dev: String(this.dev), ino: String(this.ino) };
+  }
 
   /** A path that reaches `name` in this directory. */
   at(name: string): string {
@@ -216,8 +229,26 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
     return { kind: 'unobserved', reason: OUTSIDE_PARENT, outside: true };
   }
   const checked = await checkedAt(view, rel, real);
-  if (checked) return { kind: 'checked', dir: checked };
+  if (checked) {
+    // A root that isn't the directory disk last agreed under proves nothing
+    // about the files that agreed: an empty mountpoint where a drive was
+    // would otherwise read as every file deleted.
+    if (rel === '' && view.rootIdentity && !sameRootIdentity(checked.identity(), view.rootIdentity)) {
+      return { kind: 'unobserved', reason: ROOT_REPLACED };
+    }
+    return { kind: 'checked', dir: checked };
+  }
   return rel === '' ? { kind: 'unobserved', reason: ROOT_UNAVAILABLE } : { kind: 'missing' };
+}
+
+/**
+ * The mount root as it is now: its identity if it is available (a directory,
+ * the one the pass was given, and the one disk last agreed under), else why not.
+ */
+export async function locateRoot(view: MountView, rootReal: string): Promise<{ identity: RootIdentity } | { reason: string }> {
+  const found = await locateDir(view, rootReal, '');
+  if (found.kind === 'checked') return { identity: found.dir.identity() };
+  return { reason: found.kind === 'unobserved' ? found.reason : ROOT_UNAVAILABLE };
 }
 
 /**

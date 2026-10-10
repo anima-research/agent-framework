@@ -36,9 +36,9 @@ import type {
 import { WORKSPACE_FS_EVENT_TYPES, opToEventType } from './types.js';
 import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
-import { DiskAgreement } from './disk-agreement.js';
+import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { filesystemTrustsCtime } from './observe.js';
+import { filesystemTrustsCtime, locateRoot } from './observe.js';
 import {
   type MountRuntime,
   type PassOptions,
@@ -757,6 +757,7 @@ export class WorkspaceModule implements Module {
       name: mount.config.name,
       view: {
         root,
+        rootIdentity: this.agreementOrThrow().rootIdentity(mount.config.name),
         followSymlinks: mount.config.followSymlinks === true,
         maxFileSize: mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
         ignore: mount.config.ignore ?? [],
@@ -1201,12 +1202,24 @@ export class WorkspaceModule implements Module {
           + 'rechecked in full and nothing pending in the workspace is discarded. With a path (file or directory), '
           + 'the workspace takes disk\'s state there explicitly: it restores a workspace-deleted file, resolves '
           + 'conflicts toward disk, replaces a workspace draft, and removes a workspace file disk does not have. '
-          + 'Each workspace change it gives up is listed under `discarded`, with the state it had.',
+          + 'Each workspace change it gives up is listed under `discarded`, with the state it had. '
+          + 'A mount whose root is not the directory disk last agreed with (an unmounted drive, a replaced '
+          + 'directory) is unavailable and listed under `incomplete`: reconnect it, or take the root as it is '
+          + 'now with acceptRoot.',
         inputSchema: {
           type: 'object' as const,
           properties: {
             path: { type: 'string', description: 'Specific path to take from disk (optional — defaults to a full recheck)' },
             mount: { type: 'string', description: 'Specific mount (optional)' },
+            acceptRoot: {
+              type: 'boolean',
+              description: 'Take each mount\'s root as it is now when it is not the directory disk last agreed with: '
+                + 'a directory replaced on purpose, or a drive that came back under a new device number (default false). '
+                + 'What was recorded about the old one is set aside, so every file is compared afresh: a file disk '
+                + 'and the workspace agree on agrees again, a differing one is a conflict, and a workspace file the '
+                + 'root lacks stays in the workspace. Not with path. Leave it off while a drive is merely unplugged: '
+                + 'its empty mountpoint would become the root.',
+            },
           },
         },
       },
@@ -2698,6 +2711,10 @@ export class WorkspaceModule implements Module {
     }> = [];
     const allSkipped: Array<{ mount: string; path: string; reason: string }> = [];
     const allIncomplete: Array<{ mount: string; path: string; reason: string }> = [];
+    const rootsAccepted: string[] = [];
+    if (input.acceptRoot && input.path) {
+      return { success: false, error: 'acceptRoot takes a whole mount\'s root: give mount, or nothing, not path', isError: true };
+    }
 
     // A path names its own mount; otherwise the given mount, or every mount.
     let targets: Array<{ name: string; mount: MountState; relativePath: string }>;
@@ -2716,6 +2733,7 @@ export class WorkspaceModule implements Module {
 
     for (const { name, mount, relativePath } of targets) {
       const pass = await this.withMount(mount, async () => {
+        if (input.acceptRoot && await this.acceptRootUnlocked(mount)) rootsAccepted.push(name);
         if (!relativePath) {
           // A full recheck: every file rehashed, nothing pending discarded.
           return this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true }, { rehash: true });
@@ -2764,8 +2782,27 @@ export class WorkspaceModule implements Module {
         totalConflicts: allResults.reduce((sum, r) => sum + r.conflicts.length, 0),
         ...(allSkipped.length > 0 ? { skipped: allSkipped } : {}),
         ...(allIncomplete.length > 0 ? { incomplete: allIncomplete } : {}),
+        ...(rootsAccepted.length > 0 ? { rootsAccepted } : {}),
       },
     };
+  }
+
+  /**
+   * Take the mount's root as it is now (acceptRoot), when it is a directory
+   * other than the one disk last agreed under. Its evidence is set aside:
+   * it described another directory. Returns whether a root was accepted.
+   */
+  private async acceptRootUnlocked(mount: MountState): Promise<boolean> {
+    const runtime = await this.runtime(mount);
+    const found = await locateRoot({ ...runtime.view, rootIdentity: undefined }, runtime.rootReal);
+    if ('reason' in found) return false; // still missing: the pass says so
+    const agreement = this.agreementOrThrow();
+    const recorded = agreement.rootIdentity(mount.config.name);
+    if (recorded && sameRootIdentity(recorded, found.identity)) return false;
+    if (recorded) agreement.acceptRoot(mount.config.name, found.identity);
+    else agreement.recordRootIdentity(mount.config.name, found.identity);
+    agreement.barrier();
+    return true;
   }
 
   // ==========================================================================

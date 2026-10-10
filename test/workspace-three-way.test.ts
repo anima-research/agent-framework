@@ -12,7 +12,7 @@
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, constants as fsConstants, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
+import { chmodSync, constants as fsConstants, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -1884,12 +1884,14 @@ describe('on-agent-action', () => {
     env.store.createBranch('other', main);
     await call(m, 'write', { path: 'work/only-main.txt', content: 'a draft on main' });
 
-    const fsp = createRequire(import.meta.url)('node:fs/promises') as { stat: (...args: unknown[]) => Promise<unknown> };
-    const stat = fsp.stat;
+    // The root check locates the root and reads its identity (lstat of its real path).
+    const fsp = createRequire(import.meta.url)('node:fs/promises') as { lstat: (...args: unknown[]) => Promise<unknown> };
+    const lstat = fsp.lstat;
+    const rootReal = realpathSync(env.dir);
     let first = true;
-    fsp.stat = async function (path: unknown, ...rest: unknown[]) {
-      const result = await stat(path, ...rest);
-      if (first && path === env.dir) {
+    fsp.lstat = async function (path: unknown, ...rest: unknown[]) {
+      const result = await lstat(path, ...rest);
+      if (first && path === rootReal) {
         first = false;
         env.store.switchBranch('other'); // A -> B before the candidates are read
       }
@@ -1904,7 +1906,7 @@ describe('on-agent-action', () => {
       const states = new Map((data.entries as Entry[]).map((e) => [e.path, e.state]));
       assert.equal(states.get('only-main.txt'), 'workspace-draft', "main's draft is in main's listing");
     } finally {
-      fsp.stat = stat;
+      fsp.lstat = lstat;
       syncBuiltinESMExports();
     }
   });
@@ -2213,5 +2215,175 @@ describe('a bare materialize after a restart', () => {
 
     await call(m, 'write', { path: 'work/a.txt', content: 'v3' });
     assert.equal((await call(m, 'status', {})).work.pendingChanges, 1);
+  });
+});
+
+describe('the mount root', () => {
+  /** What a drive's unmount looks like from the mount: the root goes, and the watcher makes an empty one. */
+  function unmount(env: Env): string {
+    const away = `${env.dir}-away`;
+    renameSync(env.dir, away); // kept, so the new root can't reuse its inode
+    mkdirSync(env.dir);
+    return away;
+  }
+  function remount(env: Env, away: string): void {
+    rmSync(env.dir, { recursive: true });
+    renameSync(away, env.dir);
+  }
+  const identityOf = (path: string) => {
+    const s = statSync(path, { bigint: true });
+    return { dev: String(s.dev), ino: String(s.ino) };
+  };
+
+  test('the root disk agreed under is recorded with the first evidence', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    assert.equal((m as any).agreement.rootIdentity('work'), undefined, 'nothing recorded before any evidence');
+    await seedSynced(env, m, 'a.txt', 'A');
+    assert.deepEqual((m as any).agreement.rootIdentity('work'), identityOf(env.dir));
+    await seedSynced(env, m, 'b.txt', 'B');
+    await call(m, 'sync', {});
+    const rootEntries = (m as any).agreement.journal.load().entries.filter((e: any) => e.entry.t === 'root');
+    assert.equal(rootEntries.length, 1, 'recorded once, not with every piece of evidence');
+  });
+
+  test('a root replaced by an empty directory is unavailable, and the tree keeps every entry', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    await seedSynced(env, m, 'sub/b.txt', 'B');
+    const away = unmount(env);
+
+    await (m as any).initialScan('work'); // the reattach
+    assert.notEqual(env.store.treeGet(TREE, 'a.txt'), null, 'a.txt is still in the tree');
+    assert.notEqual(env.store.treeGet(TREE, 'sub/b.txt'), null, 'sub/b.txt is still in the tree');
+    assert.equal(env.eventsOf('workspace:deleted').length, 0, 'no deletion was announced');
+    const synced = await call(m, 'sync', {});
+    assert.equal(synced.totalSynced, 0, 'a plain sync adopts nothing either');
+    assert.match(synced.incomplete?.[0]?.reason ?? '', /not the directory disk last agreed with/);
+    assert.match(synced.incomplete[0].reason, /acceptRoot/, 'the reason names the remedy');
+    assert.notEqual(env.store.treeGet(TREE, 'a.txt'), null, 'still in the tree after the sync');
+
+    remount(env, away);
+    await (m as any).initialScan('work');
+    assert.equal(await stateOf(m, 'a.txt'), 'synced', 'back, and agreed as before');
+    assert.equal(await stateOf(m, 'sub/b.txt'), 'synced');
+  });
+
+  test('the recorded root survives a restart', async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    await env.shutdown(m);
+    unmount(env); // a host that starts while the drive is away
+    env.store = JsStore.openOrCreate({ path: env.storePath });
+    m = await env.open();
+    await (m as any).initialScan('work');
+    assert.notEqual(env.store.treeGet(TREE, 'a.txt'), null, 'still in the tree');
+    assert.equal(env.eventsOf('workspace:deleted').length, 0, 'no deletion was announced');
+  });
+
+  test('a replaced root takes no writes, forced or not', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    await call(m, 'write', { path: 'work/c.txt', content: 'C, a draft' });
+    await call(m, 'write', { path: 'work/sub/d.txt', content: 'D, a draft' });
+    unmount(env);
+    mkdirSync(env.disk('sub')); // a mountpoint with leftovers of its own: a directory a write could reach
+
+    for (const input of [{}, { force: true }, { path: 'work/c.txt', force: true }, { path: 'work/sub/d.txt', force: true }]) {
+      const res = await m.handleToolCall({ id: 't', name: 'materialize', input });
+      assert.equal(existsSync(env.disk('c.txt')), false, `${JSON.stringify(input)} wrote nothing`);
+      assert.equal(existsSync(env.disk('sub/d.txt')), false, `${JSON.stringify(input)} wrote nothing beneath the root`);
+      assert.equal(existsSync(env.disk('a.txt')), false, `${JSON.stringify(input)} restored nothing`);
+      assert.match(JSON.stringify(res), /not the directory disk last agreed with/, `${JSON.stringify(input)} says why`);
+    }
+  });
+
+  for (const op of ['materialize', 'sync'] as const) {
+    test(`the root is recorded before the first evidence, so a ${op} killed after its intent leaves both`, async (t) => {
+      const env = new Env(t);
+      if (op === 'sync') env.writeDisk('a.txt', 'A, a shell file to adopt');
+      let m = await env.open();
+      if (op === 'materialize') await call(m, 'write', { path: 'work/a.txt', content: 'A, a draft' });
+      assert.equal((m as any).agreement.paths('work').length, 0, 'no evidence before the operation');
+      m = await env.fault(m, op, 'after-intent');
+      assert.equal((m as any).agreement.get('work', 'a.txt')?.kind, 'pending', 'the intent is durable');
+      assert.deepEqual((m as any).agreement.rootIdentity('work'), identityOf(env.dir), 'and so is the root it was made under');
+    });
+  }
+
+  test('a push that only learns an agreement records the root too', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    env.legacyEntry('a.txt', 'A'); // in the tree, and the same on disk, with no evidence yet
+    env.writeDisk('a.txt', 'A');
+    await call(m, 'materialize', { path: 'work/a.txt' });
+    assert.equal((m as any).agreement.get('work', 'a.txt')?.kind, 'content', 'the push learned the agreement');
+    assert.equal(statSync(env.disk('a.txt')).size, 1);
+    assert.deepEqual((m as any).agreement.rootIdentity('work'), identityOf(env.dir), 'and recorded the root it was learned under');
+  });
+
+  test("a pass records the root with the evidence it gathers", async (t) => {
+    const env = new Env(t);
+    env.writeDisk('a.txt', 'A'); // on disk before the workspace knows anything
+    const m = await env.open();
+    await call(m, 'sync', {});
+    assert.deepEqual((m as any).agreement.rootIdentity('work'), identityOf(env.dir));
+    unmount(env);
+    await (m as any).initialScan('work');
+    assert.notEqual(env.store.treeGet(TREE, 'a.txt'), null, 'still in the tree');
+  });
+
+  test('a checkpoint keeps the recorded root', async (t) => {
+    const env = new Env(t);
+    const agreement = new DiskAgreement(env.store);
+    agreement.open([{ name: 'work', root: env.dir }]);
+    agreement.recordRootIdentity('work', { dev: '1', ino: '2' });
+    for (let i = 0; i < 1100; i++) agreement.set('work', `f${i}.txt`, { kind: 'absent' });
+    agreement.maybeCheckpoint();
+    agreement.barrier();
+    const reopened = new DiskAgreement(env.store);
+    reopened.open([{ name: 'work', root: env.dir }]);
+    assert.deepEqual(reopened.rootIdentity('work'), { dev: '1', ino: '2' });
+    assert.equal(reopened.paths('work').length, 1100);
+  });
+
+  test('a mount configured at another path starts with no recorded root', async (t) => {
+    const env = new Env(t);
+    let m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    const elsewhere = join(env.root, 'elsewhere');
+    mkdirSync(elsewhere);
+    m = await env.restart(m, { path: elsewhere });
+    assert.equal((m as any).agreement.rootIdentity('work'), undefined, 'evidence about another directory is not carried over');
+  });
+
+  test('acceptRoot takes a replaced root, with its evidence set aside', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    await seedSynced(env, m, 'a.txt', 'A');
+    await seedSynced(env, m, 'sub/b.txt', 'B');
+    unmount(env);
+    env.writeDisk('a.txt', 'A'); // the new root holds the same a.txt, no sub/b.txt, and a new c.txt
+    env.writeDisk('c.txt', 'C');
+
+    const synced = await call(m, 'sync', { mount: 'work', acceptRoot: true });
+    assert.deepEqual(synced.rootsAccepted, ['work']);
+    assert.deepEqual((m as any).agreement.rootIdentity('work'), identityOf(env.dir), 'the new root is recorded');
+    assert.equal(await stateOf(m, 'a.txt'), 'synced', 'agreed again');
+    assert.equal(await contentOf(m, 'c.txt'), 'C', "the new root's own file is taken in");
+    assert.notEqual(env.store.treeGet(TREE, 'sub/b.txt'), null, 'a file the new root lacks stays in the workspace');
+    assert.equal(env.eventsOf('workspace:deleted').length, 0, 'nothing was taken as deleted');
+
+    const again = await call(m, 'sync', { mount: 'work', acceptRoot: true });
+    assert.equal(again.rootsAccepted, undefined, 'the recorded root is not accepted twice');
+  });
+
+  test('acceptRoot takes a whole mount, not a path', async (t) => {
+    const env = new Env(t);
+    const m = await env.open();
+    assert.match(await refused(m, 'sync', { path: 'work/a.txt', acceptRoot: true }), /whole mount/);
   });
 });

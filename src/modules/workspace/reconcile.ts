@@ -32,7 +32,6 @@
  * (after `store.sync()`). The caller serializes passes per mount.
  */
 
-import { stat } from 'node:fs/promises';
 import type { JsStore } from '@animalabs/chronicle';
 import {
   type Agreed,
@@ -42,6 +41,7 @@ import {
   type Interrupted,
   type Pending,
   type Physical,
+  type RootIdentity,
   candidateOf,
   sameCandidate,
 } from './disk-agreement.js';
@@ -50,6 +50,7 @@ import {
   type MountView,
   type Walk,
   fingerprintVouches,
+  locateRoot,
   looksBinary,
   observePath,
   provenAbsent,
@@ -500,6 +501,8 @@ function conflictReport(record: ConflictRecord, d: DiskFact): ConflictReport {
 /** A pass's view of its scope: candidates enumerated on one branch, and what disk showed for each. */
 interface Gathered {
   branchId: string;
+  /** The root the facts were gathered under, when it was available. */
+  rootIdentity: RootIdentity | null;
   walk: Walk | null;
   facts: Map<string, DiskFact>;
   dirs: string[];
@@ -511,19 +514,29 @@ const GATHER_ATTEMPTS = 3;
 
 async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRuntime, scope: Scope, opts: PassOptions): Promise<Gathered> {
   // A missing mount root is an unavailable mount (an unmounted drive, a root
-  // being replaced), not proof that every file in it was deleted. The root is
+  // being replaced), not proof that every file in it was deleted, and so is a
+  // root that isn't the directory disk last agreed under: the empty
+  // directory a watcher makes where a drive's mountpoint was. The root is
   // the operator's choice and may itself be a symlink to a directory, so it
   // is followed, as `rootReal` is: `followSymlinks` governs links within it.
-  const rootAvailable = await stat(mount.view.root).then((s) => s.isDirectory(), () => false);
+  const root = await locateRoot(mount.view, mount.rootReal);
+  const rootUnavailable = 'reason' in root ? root.reason : null;
 
   // The branch is labelled where the tracked candidates are read, with no
   // await between: the decision is checked against this label.
   const branchId = store.currentBranch().id;
-  const gathered: Gathered = { branchId, walk: null, facts: new Map(), dirs: [], incomplete: [] };
-  if (!rootAvailable) {
+  const gathered: Gathered = {
+    branchId,
+    rootIdentity: 'identity' in root ? root.identity : null,
+    walk: null,
+    facts: new Map(),
+    dirs: [],
+    incomplete: [],
+  };
+  if (rootUnavailable !== null) {
     // Said whether or not anything is tracked: an unavailable mount must not
     // read as a verified empty directory.
-    gathered.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason: 'the mount root is unavailable' });
+    gathered.incomplete.push({ path: scope.kind === 'dir' ? scope.dir : '', reason: rootUnavailable });
   }
 
   // Which paths to decide: what disk shows, and what the store, P and intent
@@ -537,7 +550,7 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
     for (const e of store.treeList(mount.treeStateId, prefix)) if (inScope(e.path, scope)) candidates.add(e.path);
     for (const [p] of agreement.paths(mount.name, scope.dir)) if (inScope(p, scope)) candidates.add(p);
     for (const [p] of mount.intents.list(scope.dir)) if (inScope(p, scope)) candidates.add(p);
-    if (rootAvailable) {
+    if (rootUnavailable === null) {
       walk = await walkScope(mount.view, mount.rootReal, scope.dir, scope.recursive, opts.cap ?? WALK_CAP);
       for (const f of walk.files) if (inScope(f, scope)) candidates.add(f);
       // Ignored names are listed only when something tracks them (above).
@@ -549,8 +562,8 @@ async function gather(store: JsStore, agreement: DiskAgreement, mount: MountRunt
 
   // Observe. Tracked facts are read again, synchronously, when deciding.
   for (const path of candidates) {
-    if (!rootAvailable) {
-      gathered.facts.set(path, { kind: 'unobserved', reason: 'the mount root is unavailable' });
+    if (rootUnavailable !== null) {
+      gathered.facts.set(path, { kind: 'unobserved', reason: rootUnavailable });
       continue;
     }
     if (walk && provenAbsent(walk, path)) {
@@ -624,6 +637,13 @@ export async function reconcilePass(
     const bi = mount.intents.get(path);
     const verdict = decide(d, s, p, bi, branchId, opts.adopt?.(path) === true);
     planned.push({ path, verdict, d, s, p, bi });
+  }
+
+  // The evidence about to be recorded describes the root it was gathered
+  // under, which is recorded first (once per mount), so no crash can leave
+  // evidence without its root.
+  if (gathered.rootIdentity && planned.some((x) => x.verdict.adopt !== undefined || x.verdict.p !== undefined)) {
+    agreement.recordRootIdentity(mount.name, gathered.rootIdentity);
   }
 
   // 1. Intents for adoptions, durable before any tree commit.
@@ -789,6 +809,14 @@ export async function pushPaths(
   if (agreement.needsBarrier) agreement.barrier(); // as a pass does: nothing decided from unsynced evidence
   const result: PushResult = { written: [], unchanged: [], deleted: [], skipped: [], pendingDeletions: [] };
   if (mount.readOnly) return result;
+  // A root that isn't available takes no writes, forced or not: restoring the
+  // store's files into an empty mountpoint would fill the disk the drive was
+  // unmounted from. The push plans nothing, so it reports no branch.
+  const root = await locateRoot(mount.view, mount.rootReal);
+  if ('reason' in root) {
+    for (const path of paths) result.skipped.push({ path, reason: root.reason });
+    return result;
+  }
 
   type Plan = {
     path: string;
@@ -847,7 +875,9 @@ export async function pushPaths(
       continue;
     }
     // Whatever the verdict learned about disk (an agreement, a resolved
-    // intent) is recorded before anything is pushed over it.
+    // intent) is recorded before anything is pushed over it, and the root it
+    // was learned under before that (once per mount), as a pass does.
+    if (v.p !== undefined) agreement.recordRootIdentity(mount.name, root.identity);
     if (v.p === 'forget') agreement.forget(mount.name, path);
     else if (v.p !== undefined) agreement.set(mount.name, path, v.p, { afterCommittedState: true });
     if (v.p !== undefined) recorded = true;
@@ -933,7 +963,8 @@ export async function pushPaths(
     plans.push({ path, kind: 'write', blob, hash: s.hash, prior, before: p, expect });
   }
 
-  // 1. Durable intents before any disk effect.
+  // 1. Durable intents before any disk effect, the root they write under first.
+  if (plans.length > 0) agreement.recordRootIdentity(mount.name, root.identity);
   plans.forEach((step, i) => {
     agreement.intend(mount.name, step.path, {
       effect: 'disk',

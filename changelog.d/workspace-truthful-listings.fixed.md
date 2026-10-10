@@ -14,6 +14,16 @@
   since. `grep` labels a kept disk version `recorded-disk` once disk has changed since, and lists
   a conflict's disk side it couldn't search as skipped. A `sync` of a path lists under
   `discarded` each workspace change it gave up for disk's state.
+- **A mount root that isn't the directory disk last agreed with is unavailable, not empty.** The
+  workspace records the root's identity (its device and inode) with the first evidence it
+  gathers there. When the drive under a read-write mount is unmounted, the watcher recreates its
+  mountpoint as an empty directory; that root is listed as unavailable (`incomplete`, saying what
+  to do), so no scan reads its emptiness as every file deleted, and no `materialize`, forced or
+  not, writes into it. When the drive comes back at the same path, the mount is available again;
+  one that comes back elsewhere leaves it unavailable until it is back at that path. If the
+  directory was replaced on purpose, or a drive came back under a new device number, `sync` with
+  `acceptRoot: true` takes the root as it is now: what was recorded about the old one is set
+  aside, and every file is compared afresh.
 - **A workspace deletion stays deleted, and materialize never deletes from disk unasked.** Without
   `autoMaterialize`, a deleted file's disk copy is listed as `workspace-deleted` and no scan or
   lazy read brings it back. `materialize` lists the deletions it left on disk;

@@ -261,6 +261,8 @@ export interface SyncInput {
   path?: string;
   /** Specific mount (optional — defaults to all) */
   mount?: string;
+  /** Take each mount's root as it is now, when it isn't the directory disk last agreed with. */
+  acceptRoot?: boolean;
 }
 
 // ============================================================================
