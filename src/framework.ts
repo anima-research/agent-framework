@@ -7047,43 +7047,58 @@ export class AgentFramework {
           ) {
             const turn = this.turnRoutes.get(agent.name);
             const isEngaged = (c: ConversationRef): boolean => this.engagementOf(agent.name, c) !== undefined;
-            const competing = turn ? [...midTurnInjections].reverse().find((inj) => {
-              if (!isConversationalInjection(inj.metadata)) return false;
-              const m = inj.metadata as Record<string, unknown> | undefined;
-              const candidate = this.candidateFromSource(
-                readInboundSource(m),
-                isAddressedMessage(m?.tags as string[] | undefined, m),
-              );
-              return candidate !== undefined && suspendsRoute(turn, candidate, isEngaged);
-            }) : undefined;
-            if (turn?.route && competing) {
-              const m = competing.metadata as Record<string, unknown> | undefined;
-              const arrival = this.candidateFromSource(readInboundSource(m), true)!.conversation;
-              const addressedArrival = isAddressedMessage(m?.tags as string[] | undefined, m);
+            // Every arrival in this round that suspends the route, each
+            // conversation once (its newest arrival), oldest first.
+            const competing: RouteCandidate[] = [];
+            if (turn) {
+              const seen = new Set<string>();
+              for (const inj of [...midTurnInjections].reverse()) {
+                if (!isConversationalInjection(inj.metadata)) continue;
+                const m = inj.metadata as Record<string, unknown> | undefined;
+                const candidate = this.candidateFromSource(
+                  readInboundSource(m),
+                  isAddressedMessage(m?.tags as string[] | undefined, m),
+                );
+                if (!candidate || !suspendsRoute(turn, candidate, isEngaged)) continue;
+                const key = conversationKey(candidate.conversation);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                competing.unshift(candidate);
+              }
+            }
+            if (turn?.route && competing.length > 0) {
               const current = routeConversation(turn.route);
-              const held: TurnRoute = { route: turn.route, hold: { conversations: [current, arrival], since: 'mid-turn' } };
+              const arrivals = competing.map((c) => c.conversation);
+              const held: TurnRoute = { route: turn.route, hold: { conversations: [current, ...arrivals], since: 'mid-turn' } };
               this.turnRoutes.set(agent.name, held);
               this.lastAnnouncedRoute.set(agent.name, AgentFramework.routeKey(held));
-              // Name the actual cause, as certain as the host is of it:
-              // someone addressed the resident, or a conversation continued
-              // where it sent this turn — there exactly, there maybe (the
-              // send's delivery is unconfirmed), or somewhere in the channel
-              // (a connector's own tool chose where).
-              const engagement = this.engagementOf(agent.name, arrival);
-              const cause = addressedArrival
-                ? `${describeConversation(arrival)} addressed you mid-turn`
-                : engagement === 'delivered'
-                  ? `${describeConversation(arrival)}, where you sent a message this turn, continued mid-turn`
-                  : engagement === 'unknown'
-                    ? `${describeConversation(arrival)}, where you tried to send a message this turn (its delivery wasn't confirmed), continued mid-turn`
-                    : `${describeConversation(arrival)} continued mid-turn, in a channel you sent something into this turn (where in the channel isn't known)`;
+              // Name each actual cause, as certain as the host is of it:
+              // someone addressed the resident (the arrival's own addressed
+              // flag: a local surface's message always addresses it), or a
+              // conversation continued where it sent this turn — there
+              // exactly, there maybe (the send's delivery is unconfirmed), or
+              // somewhere in the channel (a connector's own tool chose where).
+              const causeOf = (candidate: RouteCandidate): string => {
+                const arrival = candidate.conversation;
+                const engagement = this.engagementOf(agent.name, arrival);
+                return candidate.addressed
+                  ? `${describeConversation(arrival)} addressed you mid-turn`
+                  : engagement === 'delivered'
+                    ? `${describeConversation(arrival)}, where you sent a message this turn, continued mid-turn`
+                    : engagement === 'unknown'
+                      ? `${describeConversation(arrival)}, where you tried to send a message this turn (its delivery wasn't confirmed), continued mid-turn`
+                      : `${describeConversation(arrival)} continued mid-turn, in a channel you sent something into this turn (where in the channel isn't known)`;
+              };
+              const causes = competing.map(causeOf);
+              const cause = causes.length === 1 ? causes[0]! : `${causes.slice(0, -1).join('; ')}; and ${causes.at(-1)}`;
               const noticeContent: ContentBlock[] = [{
                 type: 'text',
                 text:
-                  `[routing] ${cause}, so your unaddressed plain speech could now answer either conversation. ` +
+                  `[routing] ${cause}, so your unaddressed plain speech could now answer ` +
+                  `${competing.length === 1 ? 'either conversation' : 'any of these conversations'}. ` +
                   'For the rest of this turn it is held as drafts ' +
-                  `instead of going to ${describeConversation(current)}. Answer either one with an explicit send ` +
-                  '(or a channel_open); held words can be resent from your drafts.',
+                  `instead of going to ${describeConversation(current)}. Answer ${competing.length === 1 ? 'either one' : 'any of them'} ` +
+                  'with an explicit send (or a channel_open); held words can be resent from your drafts.',
               }];
               const noticeMeta = { system: true, kind: 'routing-notice' } as MessageMetadata;
               try {
@@ -7091,7 +7106,7 @@ export class AgentFramework {
                 this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
                 midTurnInjections.push({ participant: 'user', content: noticeContent, metadata: noticeMeta });
                 console.error(
-                  `[routing] ${agent.name}: mid-turn ambiguity hold — ${describeConversation(current)} vs ${describeConversation(arrival)}`,
+                  `[routing] ${agent.name}: mid-turn ambiguity hold — ${[current, ...arrivals].map(describeConversation).join(' vs ')}`,
                 );
               } catch (err) {
                 console.error('mid-turn ambiguity hold: failed to record routing notice:', err);

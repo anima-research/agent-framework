@@ -747,6 +747,34 @@ describe('debounce', () => {
     ]);
   });
 
+  it('an event the inference buffer evicts keeps its route candidate: the flush routes as if nothing had been evicted', async () => {
+    const path = writeConfig('buffer-evict.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    gate.onInferenceStarted('agent');
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:dm:1', content: 'are you there?',
+      tags: ['chat:addressed'], metadata: { authorId: '1', messageId: 'dm-1' } }));
+    for (let n = 0; n < 100; n++) {
+      gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:general', content: `chatter ${n}`,
+        metadata: { authorId: '2', messageId: `g-${n}` } }));
+    }
+    const deadline = Date.now() + 5000;
+    while (gate.inferenceDiagnostics().bufferedEvents < 100) {
+      if (Date.now() > deadline) throw new Error('the batch never reached the buffer');
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.equal(gate.inferenceDiagnostics().droppedBufferedEvents, 1, 'the DM, oldest, was evicted');
+    gate.onInferenceEnded('agent');
+    await waitForRequests(inferenceRequests, 1);
+    const addressed = (inferenceRequests[0].routeCandidates ?? []).filter((c) => c.addressed).map((c) => c.channelId);
+    assert.deepEqual(addressed, ['discord:dm:1'], 'the addressed conversation still competes, and wins');
+    assert.equal(inferenceRequests[0].routeChannelId, 'discord:dm:1', 'and the wake is addressed there');
+  });
+
   it('a reaction in the batch is never a route candidate (the same predicate as mid-turn)', async () => {
     const path = writeConfig('debounce-route-reaction.json', {
       policies: [

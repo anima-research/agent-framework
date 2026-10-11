@@ -51,6 +51,8 @@ class RobotModule implements Module {
   /** Full metadata override for the interjected message (wins over
    *  interjectionChannelId when set) — e.g. reaction tags. */
   interjectionMetadata: Record<string, unknown> | null = null;
+  /** More arrivals pushed in the same round, after the interjection. */
+  moreInterjections: Array<{ text: string; metadata: Record<string, unknown> }> = [];
   /** Delay tool completion so live routing deterministically precedes it. */
   toolDelayMs = 0;
 
@@ -89,23 +91,47 @@ class RobotModule implements Module {
       await new Promise((r) => setTimeout(r, this.toolDelayMs));
     }
     if (this.interjection) {
-      const text = this.interjection;
+      const arrivals = [
+        {
+          text: this.interjection,
+          metadata: this.interjectionMetadata ?? (this.interjectionChannelId ? { channelId: this.interjectionChannelId } : {}),
+        },
+        ...this.moreInterjections,
+      ];
       this.interjection = null;
-      this.framework!.pushEvent({
-        type: 'external-message',
-        source: 'test',
-        content: text,
-        metadata: this.interjectionMetadata
-          ?? (this.interjectionChannelId
-            ? { channelId: this.interjectionChannelId }
-            : {}),
-      } as unknown as ProcessEvent);
+      this.moreInterjections = [];
+      for (const arrival of arrivals) this.pushArrival(arrival.text, arrival.metadata);
       // Give the run loop a beat to process the queued message while this
       // tool round is still pending (pendingAssistantBlocks non-empty), so
       // it lands in deferredMessages before the tool-result event.
       await new Promise((r) => setTimeout(r, 30));
     }
     return { success: true, data: { ok: true, tool: call.name } };
+  }
+
+  /** One arrival: a channel's message on the MCPL lane, which carries its
+   *  envelope (only the framework writes one, so a module's metadata
+   *  can't), else an external message from the local surface. */
+  private pushArrival(text: string, metadata: Record<string, unknown>): void {
+    const { inboundSource, ...rest } = metadata as { inboundSource?: Record<string, unknown> } & Record<string, unknown>;
+    if (inboundSource?.kind === 'channel') {
+      this.framework!.pushEvent({
+        type: 'mcpl:channel-incoming',
+        serverId: inboundSource.serverId,
+        channelId: inboundSource.channelId,
+        messageId: inboundSource.messageId ?? 'm-arrival',
+        ...(inboundSource.threadId ? { threadId: inboundSource.threadId } : {}),
+        author: { id: 'antra', name: 'Antra' },
+        content: [{ type: 'text', text }],
+        timestamp: new Date().toISOString(),
+        metadata: rest,
+        ...(Array.isArray(rest.tags) ? { tags: rest.tags } : {}),
+        triggerInference: false,
+        inboundSource,
+      } as unknown as ProcessEvent);
+      return;
+    }
+    this.framework!.pushEvent({ type: 'external-message', source: 'test', content: text, metadata } as unknown as ProcessEvent);
   }
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -434,6 +460,62 @@ describe('present while acting', () => {
       wired.some((t) => t.includes('[routing] (srv / discord:dm:antra) addressed you mid-turn') && t.includes('instead of going to (srv / chan-A)')),
       'the hold notice was injected alongside it',
     );
+
+    await framework.stop();
+  });
+
+  it('a mid-turn hold names every conversation that suspends the route in that round', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answering someone.' }] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework, { home: false });
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, over here?';
+    module.interjectionMetadata = { channelId: 'discord:dm:antra', tags: ['chat:addressed'], inboundSource: envelope('discord:dm:antra') };
+    module.moreInterjections = [{
+      text: 'and here too?',
+      metadata: { channelId: 'discord:dm:ada', tags: ['chat:addressed'], inboundSource: envelope('discord:dm:ada', 'm-ada') },
+    }];
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    const [held] = heldDrafts(framework);
+    assert.equal(held?.reason, 'ambiguous');
+    assert.match(held?.note ?? '', /\(srv \/ chan-A\); \(srv \/ discord:dm:antra\); \(srv \/ discord:dm:ada\)/, 'all three conversations');
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .map((o) => o?.injectedMessages ?? []).flat().map((m) => JSON.stringify(m.content));
+    assert.ok(wired.some((t) => t.includes('(srv / discord:dm:antra) addressed you mid-turn; and (srv / discord:dm:ada) addressed you mid-turn')
+      && t.includes('any of these conversations')), wired.join('\n'));
+
+    await framework.stop();
+  });
+
+  it('a mid-turn arrival from the local surface reads as addressing the resident, tagged or not', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answering the console.' }] as ContentBlock[]));
+
+    const framework = await createFramework();
+    stubChannelRegistry(framework, { home: false });
+    module.toolDelayMs = 25;
+    module.interjection = 'a word from the console';
+    module.interjectionMetadata = {};
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .map((o) => o?.injectedMessages ?? []).flat().map((m) => JSON.stringify(m.content));
+    assert.ok(wired.some((t) => t.includes('[routing] test (the local surface that messaged you) addressed you mid-turn')), wired.join('\n'));
+    const [held] = heldDrafts(framework);
+    assert.equal(held?.text, 'Answering the console.');
 
     await framework.stop();
   });
