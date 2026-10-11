@@ -511,6 +511,13 @@ interface DiscordAwarenessBarrier {
   promise: Promise<DiscordAwarenessDrainOutcome>;
 }
 
+/** A JSON Schema type that also admits null (`[type, 'null']`), typed as the
+ *  one string membrane's ToolParameter declares. The native, XML and Responses
+ *  paths pass or render the array through. */
+function nullableType(type: string): string {
+  return [type, 'null'] as unknown as string;
+}
+
 function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
   if (value === undefined || !Number.isFinite(value) || value <= 0) {
     return DEFAULT_DISCORD_AWARENESS_DEADLINE_MS;
@@ -4589,11 +4596,11 @@ export class AgentFramework {
   /** Synthesized save_image tool — present when a workspace module is
    *  registered. Lets the agent persist an image it has already seen in its
    *  own context (Discord attachments arrive inlined as base64 and are
-   *  otherwise unreachable as files). Cast like tool-presentation's tools:
-   *  membrane's ToolParameter types `type` as one string, but the nullable
-   *  selectors need JSON Schema's type array, which the native, XML and
-   *  Responses paths all pass or render through. */
-  private static readonly SAVE_IMAGE_TOOL = {
+   *  otherwise unreachable as files). The three nullable selectors need JSON
+   *  Schema's type array, which membrane's ToolParameter (`type: string`)
+   *  can't express, so only those `type` fields are cast (`nullableType`);
+   *  the rest of the definition is checked as a ToolDefinition. */
+  private static readonly SAVE_IMAGE_TOOL: import('./types/index.js').ToolDefinition = {
     name: 'save_recent_image',
     description:
       'Save one or more recent images from your own context to workspace files. ' +
@@ -4621,19 +4628,19 @@ export class AgentFramework {
         // as required must still be able to say "not this selector". null and
         // omission mean the same thing; any other supplied value is checked.
         index: {
-          type: ['integer', 'null'],
+          type: nullableType('integer'),
           description:
             'Which image, counting back from the most recent (0 = most recent). Default 0. ' +
             'null, like omitting it, means the default.',
         },
         count: {
-          type: ['integer', 'null'],
+          type: nullableType('integer'),
           description:
             'How many images to save, starting at `index` and going further back. Default 1. ' +
             'null, like omitting it, means the default.',
         },
         ref: {
-          type: ['string', 'null'],
+          type: nullableType('string'),
           description:
             'Save a specific tool-result image by its history ref (e.g. "img_k7x3q2_7", as shown in its placeholder in your context) instead of by position. ' +
             'Mutually exclusive with a non-null `index`/`count`. null, like omitting it, means no ref.',
@@ -4641,7 +4648,7 @@ export class AgentFramework {
       },
       required: ['path'],
     },
-  } as unknown as import('./types/index.js').ToolDefinition;
+  };
 
   /** Synthesized fetch_reference tool — RFC-005 on-demand dereference.
    *  Present when a workspace module is registered (storage target). */
@@ -15404,16 +15411,19 @@ export class AgentFramework {
         let count = 1;
         /** Direct-ref mode: the one ref to find in the scannable context. */
         let wantedRef: string | null = null;
-        // A selector is in use only when it carries a value: null and omission
-        // both mean "not this selector", so callers whose provider presents
-        // every property as required can still choose one. A SUPPLIED value is
-        // never read as absent — an empty or malformed ref, or an index that
-        // isn't an integer, is refused rather than turned into a different
-        // image than the one the caller named.
-        const supplied = (value: unknown): boolean => value !== undefined && value !== null;
-        /** An integer number, or a string of decimal digits (the compatibility
-         *  form for paths that deliver numbers as text); NaN for anything else.
-         *  Number() would read "", " ", false and [] as 0 — the newest image. */
+        // A selector is in use only when it carries a value. Omission, null and
+        // the empty string all mean "not this selector", so a caller whose
+        // provider presents every property as required can still choose one,
+        // whichever of the two it fills the other selector with. Any other
+        // value is supplied and checked, never read as absent: a whitespace
+        // or malformed ref, or an index that isn't an integer, is refused
+        // rather than turned into a different image than the one the caller
+        // named.
+        const supplied = (value: unknown): boolean => value !== undefined && value !== null && value !== '';
+        const unusedHint = ' (pass null, or leave it out, for a selector you are not using)';
+        /** An integer number, or a string of decimal digits (a model may write
+         *  an integer as a string); NaN for anything else. Number() would read
+         *  " ", false and [] as 0, the newest image, and "2.0" or "+2" as 2. */
         const selectorInteger = (value: unknown): number => {
           if (typeof value === 'number') return Number.isInteger(value) ? value : Number.NaN;
           if (typeof value === 'string' && /^[0-9]+$/.test(value)) return Number(value);
@@ -15421,7 +15431,10 @@ export class AgentFramework {
         };
         if (supplied(input.ref)) {
           if (typeof input.ref !== 'string' || !TOOL_IMAGE_REF_RE.test(input.ref)) {
-            throw new Error('save_recent_image: `ref` must look like "img_k7x3q2_7" (copy it from the image placeholder in your context)');
+            throw new Error(
+              'save_recent_image: `ref` must look like "img_k7x3q2_7" (copy it from the image placeholder in your context)' +
+              unusedHint,
+            );
           }
           if (supplied(input.index) || supplied(input.count)) {
             throw new Error(
@@ -15433,12 +15446,12 @@ export class AgentFramework {
         } else {
           index = supplied(input.index) ? selectorInteger(input.index) : 0;
           if (!Number.isInteger(index) || index < 0) {
-            throw new Error('save_recent_image: `index` must be a non-negative integer');
+            throw new Error(`save_recent_image: \`index\` must be a non-negative integer${unusedHint}`);
           }
           count = supplied(input.count) ? selectorInteger(input.count) : 1;
           const MAX_COUNT = 20;
           if (!Number.isInteger(count) || count < 1 || count > MAX_COUNT) {
-            throw new Error(`save_recent_image: \`count\` must be an integer in 1..${MAX_COUNT}`);
+            throw new Error(`save_recent_image: \`count\` must be an integer in 1..${MAX_COUNT}${unusedHint}`);
           }
         }
         const lastWanted = index + count - 1;
