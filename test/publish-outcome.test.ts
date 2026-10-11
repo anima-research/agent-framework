@@ -25,6 +25,7 @@ import { McplRequestError } from '../src/mcpl/server-connection.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
 import { AgentFramework } from '../src/index.js';
+import { McplServerConnection } from '../src/mcpl/server-connection.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 type Publish = (params: { channelId: string; threadId?: string | null }) => Promise<unknown>;
@@ -139,6 +140,32 @@ describe('ChannelRegistry.publish outcomes', () => {
     assert.match(outcome.reason!, /channels\.publish not in "discord"'s effective grant/);
     assert.deepEqual(opened, [], 'a refused send opens nothing');
     assert.deepEqual(published, []);
+  });
+
+  it('a root publish whose receipt says nothing of where it posted is unknown, keeping its message id', async () => {
+    const { registry, seed } = registryWith({ discord: { publish: async () => ({ delivered: true, messageId: 'posted-1' }) } });
+    seed('discord', 'c', '#c');
+    const outcome = await registry.publish('agent', 'x', { channelId: 'c' });
+    assert.equal(outcome.status, 'unknown');
+    assert.equal(outcome.messageId, 'posted-1');
+    assert.match(outcome.reason!, /did not say where it posted/);
+    assert.doesNotMatch(outcome.reason!, /posted (at|in) the channel root/, 'not a claim that it landed at the root');
+  });
+
+  it('a streamed publish is a Notification only when it names no place; a thread, or the root by null, is a Request', () => {
+    const sent: Array<['request' | 'notification', Record<string, unknown>]> = [];
+    const connection = Object.create(McplServerConnection.prototype) as McplServerConnection;
+    Object.assign(connection, {
+      requestTimeoutMs: 0,
+      publishDeadlineMs: 60_000,
+      sendRequest: (_method: string, params: Record<string, unknown>) => { sent.push(['request', params]); return Promise.resolve({}); },
+      sendNotification: (_method: string, params: Record<string, unknown>) => { sent.push(['notification', params]); },
+    });
+    const base = { conversationId: 'c', channelId: 'ch', content: [{ type: 'text' as const, text: 'x' }], stream: true };
+    void connection.sendChannelsPublish({ ...base, threadId: 't-1' });
+    void connection.sendChannelsPublish({ ...base, threadId: null });
+    void connection.sendChannelsPublish(base);
+    assert.deepEqual(sent.map(([kind, params]) => [kind, params.threadId]), [['request', 't-1'], ['request', null], ['notification', undefined]]);
   });
 
   it('treats delivered:false with no posted message as failed', async () => {

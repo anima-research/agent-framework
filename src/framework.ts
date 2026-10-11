@@ -90,6 +90,7 @@ import {
   describeConversation,
   inferTurnRoute,
   isConversational,
+  readThreadId,
   routeConversation,
   routeRefusal,
   suspendsRoute,
@@ -9740,13 +9741,9 @@ export class AgentFramework {
     }
     // The place inside the channel (MCPL RFC-011): the thread named with it,
     // else the root — never a thread borrowed from where the words were held.
-    if (present(input.threadId) && (typeof input.threadId !== 'string' || !input.threadId.trim())) {
-      return refuse('threadId must be a thread id of the destination channel, or null for its root.');
-    }
-    const destination: PublishDestination = {
-      ...target.destination,
-      threadId: present(input.threadId) ? (input.threadId as string).trim() : null,
-    };
+    const thread = readThreadId(input.threadId);
+    if ('error' in thread) return refuse(`${thread.error} Nothing was sent.`);
+    const destination: PublishDestination = { ...target.destination, threadId: thread.threadId };
     const placeRefusal = publishPlaceRefusal(registry.publishTarget(destination), destination.threadId ?? null);
     if (placeRefusal) {
       const why = ChannelRegistry.placeRefusalText(placeRefusal, destination, destination.threadId ?? null);
@@ -9823,6 +9820,7 @@ export class AgentFramework {
           status: outcome.status,
           serverId: outcome.destination?.serverId ?? destination.serverId,
           channelId: outcome.destination?.channelId ?? destination.channelId,
+          threadId: outcome.destination?.threadId ?? destination.threadId ?? null,
           ...(outcome.messageId ? { messageId: outcome.messageId } : {}),
         });
         const where = AgentFramework.destinationText(outcome.destination ?? destination);
@@ -15260,16 +15258,14 @@ export class AgentFramework {
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       triggerFilter,
       (serverId, params, event, decideTrigger) => this.handleCoalescedPush(serverId, params, event, decideTrigger),
-      // An ordinary push: freeze its envelope and observe the acceptance at
-      // admission, before it is queued.
-      (event) => {
-        const source = this.pushSource(event);
-        this.noteInboundAccepted(source);
-        return source;
-      },
+      // An ordinary push: freeze its envelope at admission; it is accepted
+      // (the last argument) once its trigger filter returns, before it is
+      // queued.
+      (event) => this.pushSource(event),
       // A coalesced push: its envelope before it is gated; its coalescer
       // observes the acceptance.
       (serverId, params, event) => this.coalescedPushSource(serverId, params, event),
+      (source) => this.noteInboundAccepted(source),
     );
 
     // Server-initiated inference router (Step 6)
@@ -15301,13 +15297,11 @@ export class AgentFramework {
         store: this.store,
         handleCoalescedIncoming: (serverId, message, event, decideTrigger) =>
           this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent, decideTrigger),
-        // An ordinary channels/incoming message: freeze its envelope and
-        // observe the acceptance at admission, before it is queued.
-        acceptInbound: (event) => {
-          const source = this.channelEventSource(event, 'channels/incoming');
-          this.noteInboundAccepted(source);
-          return source;
-        },
+        // An ordinary channels/incoming message: freeze its envelope at
+        // admission; accepted once its trigger filter returns, before it is
+        // queued.
+        inboundSource: (event) => this.channelEventSource(event, 'channels/incoming'),
+        inboundAccepted: (source) => this.noteInboundAccepted(source),
         // A coalesced message: its envelope before it is gated; its
         // coalescer observes the acceptance.
         coalescedSource: (serverId, message, event) => this.coalescedIncomingSource(serverId, message, event),
@@ -17215,10 +17209,11 @@ export class AgentFramework {
     // opened, so an invalid choice can't open a channel or become a route.
     if (call.name === 'channel_open') {
       const input = (call.input ?? {}) as { serverId?: unknown; threadId?: unknown; setSpeechTarget?: unknown };
+      const thread = readThreadId(input.threadId);
       const invalid = supplied(input.serverId) && !named(input.serverId)
         ? 'serverId must name a server (leave it out to resolve the channel id alone).'
-        : supplied(input.threadId) && !named(input.threadId)
-          ? 'threadId must be a thread id (or left out for the channel root).'
+        : 'error' in thread
+          ? thread.error
           : supplied(input.setSpeechTarget) && typeof input.setSpeechTarget !== 'boolean'
             ? 'setSpeechTarget must be true or false (left out, it is true).'
             : undefined;
@@ -17293,7 +17288,8 @@ export class AgentFramework {
               const openedServer = destination?.serverId ?? openInput?.serverId;
               // A channel named alone means its root — never a thread
               // borrowed from an earlier route; a thread is named with it.
-              const threadId = typeof openInput?.threadId === 'string' && openInput.threadId ? openInput.threadId : undefined;
+              const read = readThreadId(openInput?.threadId);
+              const threadId = 'threadId' in read && read.threadId ? read.threadId : undefined;
               const route: SpeechRoute = {
                 kind: 'channel',
                 ...(openedServer ? { serverId: openedServer } : {}),
@@ -17333,8 +17329,9 @@ export class AgentFramework {
                 console.error(`[routing] ${agentName}: channel_open -> speech route ${opened}${threadId ? ` thread ${threadId}` : ''} (announced in tool result)`);
               }
             } else {
-              const ignored = typeof openInput?.threadId === 'string' && openInput.threadId
-                ? ` threadId ${openInput.threadId} chooses where speech goes, so with setSpeechTarget: false it was not used.`
+              const read = readThreadId(openInput?.threadId);
+              const ignored = 'threadId' in read && read.threadId
+                ? ` threadId ${read.threadId} chooses where speech goes, so with setSpeechTarget: false it was not used.`
                 : '';
               routing = `Opened for reading.${ignored} ${unchanged()}`;
             }

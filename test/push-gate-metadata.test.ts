@@ -113,3 +113,31 @@ test('with no host envelope, an origin key can\'t pose as one', async () => {
   assert.ok(INBOUND_SOURCE_KEY in seen[0]!, 'the key is the host\'s, present even when it has no envelope');
   assert.equal(seen[0]![INBOUND_SOURCE_KEY], undefined);
 });
+
+test('an ordinary push is accepted only once its trigger filter returns: a filter that throws accepts nothing', async () => {
+  const envelope: InboundSource = {
+    kind: 'channel', lane: 'push/event', serverId: 'slack', binding: 'b1', channelId: 'slack:C1', eventId: 'ev-3', acceptedAt: 1,
+  };
+  const observed: InboundSource[] = [];
+  const queued: unknown[] = [];
+  const handlerWith = (filter: () => boolean) => new PushHandler(
+    { validateInbound: () => {} } as unknown as FeatureSetManager,
+    (event) => queued.push(event),
+    () => {},
+    filter,
+    undefined,
+    () => envelope,
+    undefined,
+    (source) => observed.push(source),
+  );
+  const push = (eventId: string) => ({
+    featureSet: 'chat', eventId, timestamp: '2026-10-07T00:00:00.000Z',
+    origin: { channelId: 'C1' }, payload: { content: [{ type: 'text', text: 'hi' }] },
+  });
+  await assert.rejects(handlerWith(() => { throw new Error('filter broke'); }).handlePushEvent('slack', push('ev-3') as never), /filter broke/);
+  assert.deepEqual(observed, [], 'nothing accepted');
+  assert.deepEqual(queued, [], 'nothing queued');
+  await handlerWith(() => false).handlePushEvent('slack', push('ev-4') as never);
+  assert.deepEqual(observed, [envelope], 'accepted once the filter returned, as it is queued');
+  assert.equal(queued.length, 1);
+});

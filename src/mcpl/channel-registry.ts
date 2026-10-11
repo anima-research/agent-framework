@@ -42,7 +42,7 @@ import { isVisiblyEmptyContent } from './visible-content.js';
 import { CapabilityGrant } from './capability-grant.js';
 import { INBOUND_SOURCE_KEY, type InboundSource } from './inbound-source.js';
 import { McplRequestError } from './server-connection.js';
-import { describeConversation } from '../speech-routes.js';
+import { describeConversation, readThreadId } from '../speech-routes.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -560,11 +560,18 @@ export interface PublishOutcome {
 interface ChannelRegistryOptions {
   /**
    * An ordinary (uncoalesced) `channels/incoming` message has just been
-   * admitted, before it is queued or acknowledged: return its source
-   * envelope, frozen now (mcpl/inbound-source.ts). The framework observes the
-   * acceptance here; coalesced work is stamped and observed by its own path.
+   * admitted: return its source envelope, frozen now
+   * (mcpl/inbound-source.ts), before the trigger filter reads it. Building
+   * it accepts nothing (inboundAccepted); coalesced work is stamped and
+   * observed by its own path.
    */
-  acceptInbound?: (event: McplChannelIncomingEvent) => InboundSource | undefined;
+  inboundSource?: (event: McplChannelIncomingEvent) => InboundSource | undefined;
+  /**
+   * An ordinary message is accepted: once its trigger filter has returned,
+   * right before it is queued, as a coalesced one is on admission. A filter
+   * that throws leaves nothing accepted.
+   */
+  inboundAccepted?: (source: InboundSource) => void;
   /**
    * A `channels/incoming` message carrying `coalesce`: its source envelope,
    * built — not accepted — before it is gated. Its coalescer freezes and
@@ -778,7 +785,8 @@ export class ChannelRegistry {
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
   private migratedLegacyPolicies = new Set<string>();
   private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
-  private acceptInbound?: ChannelRegistryOptions['acceptInbound'];
+  private inboundSource?: ChannelRegistryOptions['inboundSource'];
+  private inboundAccepted?: ChannelRegistryOptions['inboundAccepted'];
   private coalescedSource?: ChannelRegistryOptions['coalescedSource'];
 
   constructor(
@@ -796,7 +804,8 @@ export class ChannelRegistry {
     },
   ) {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
-    this.acceptInbound = options?.acceptInbound;
+    this.inboundSource = options?.inboundSource;
+    this.inboundAccepted = options?.inboundAccepted;
     this.coalescedSource = options?.coalescedSource;
     this.serverRegistry = serverRegistry;
     this.featureSetManager = featureSetManager;
@@ -1020,7 +1029,7 @@ export class ChannelRegistry {
       // channels/register authorization). A server whose channel genuinely
       // exists registers it first; discord's DM case goes through
       // ensureChannelRegistered on push/event, which creates a CLOSED
-      // routable entry rather than an open self-attested one.
+      // placeholder that names the channel, not an open self-attested one.
       const incomingKey = `${serverId}:${message.channelId}`;
       if (!this.channels.has(incomingKey)) {
         this.emitTraceFn({
@@ -1106,13 +1115,13 @@ export class ChannelRegistry {
       // The source envelope is the host's, built here, at admission, before
       // the message is gated, queued or acknowledged: a rename or rebind
       // while it waits cannot change where it says it came from, and the
-      // gate reads the same envelope the direct path does. An ordinary
-      // message's acceptance is observed now; a coalesced one's envelope is
-      // only built here, and its coalescer freezes it and observes the
-      // acceptance if it admits the occurrence.
+      // gate reads the same envelope the direct path does. Building it
+      // accepts nothing: an ordinary message is accepted once its trigger
+      // filter returns (below), a coalesced one by its coalescer if it
+      // admits the occurrence.
       const inboundSource = coalesced
         ? this.coalescedSource?.(serverId, message, event)
-        : this.acceptInbound?.(event);
+        : this.inboundSource?.(event);
       if (inboundSource) event.inboundSource = inboundSource;
 
       // Whether to trigger inference: decided now for an ordinary message,
@@ -1167,9 +1176,11 @@ export class ChannelRegistry {
         continue;
       }
 
-      // Push to the processing queue
+      // Push to the processing queue, accepted now that its trigger filter
+      // has returned.
       // Cast through unknown because McplChannelIncomingEvent matches the
       // CustomEvent `${string}:${string}` type pattern but lacks an index signature.
+      if (inboundSource) this.inboundAccepted?.(inboundSource);
       this.pushEventFn(event as unknown as ProcessEvent);
 
       // Collect per-message result
@@ -1191,19 +1202,18 @@ export class ChannelRegistry {
   }
 
   /**
-   * Ensure a channel is registered so it can serve as an outbound routing
-   * locus. A push event from a closed channel must never mutate lifecycle
-   * state: direct-address events are intentionally usable without subscribing.
+   * Ensure a channel a push names has an entry: a CLOSED placeholder that
+   * names the channel (its id and label), so the push's envelope and its
+   * route candidate name a known conversation. A push event from a closed
+   * channel must never mutate lifecycle state: direct-address events are
+   * intentionally usable without subscribing.
    *
-   * Mirrors the lazy-registration inside handleIncoming(), but for channels
-   * that only ever arrive as push/events rather than channels/incoming — the
-   * motivating case is Discord DMs, which discord-mcpl forwards via push/event
-   * with the channel closed (`channelIsOpen:false`). Such a channel is never
-   * registered, so routeSpeech() can't resolve it and the agent's reply is
-   * silently dropped even though the inbound message proves the channel is
-   * reachable (item-3 redux, DM sub-case). Idempotent: a later authoritative
-   * channels/register or channels/changed overwrites this descriptor with the
-   * richer one.
+   * The placeholder declares no publish target (MCPL RFC-011), so nothing
+   * is published to it: a reply to it is held as a draft until the server
+   * registers the channel with a declaration (channels/register or
+   * channels/changed), which overwrites this descriptor with the richer
+   * one. The motivating case is Discord DMs, which discord-mcpl forwards via
+   * push/event with the channel closed (`channelIsOpen:false`). Idempotent.
    */
   ensureChannelRegistered(
     serverId: string,
@@ -2119,15 +2129,43 @@ export class ChannelRegistry {
    * Publish into a channel on behalf of a named non-resident agent (the
    * subconscious's speak_in_channel). Same delivery path as the
    * channel_publish tool — the publish executor, with the same receipt —
-   * attributed to that agent; its name also rides the speech-routed trace.
+   * attributed to that agent. Traced once the outcome is in, as plain
+   * speech is: speech-routed for a confirmed delivery, with the server,
+   * channel and thread it resolved to; speech-route-failed otherwise, with
+   * its outcome (unknown: it may have been posted; failed: it wasn't).
    */
   async publishForAgent(
     channelId: string,
     text: string,
     agentName: string,
   ): Promise<{ success: boolean; data?: unknown; error?: string; isError?: boolean }> {
-    this.emitTraceFn({ type: 'mcpl:speech-routed', conversationId: agentName, channelId, text });
-    return this.handleToolPublish({ channelId, content: text }, { kind: 'agent', agentName });
+    const result = await this.handleToolPublish({ channelId, content: text }, { kind: 'agent', agentName });
+    const at = (result.data ?? {}) as { status?: string; serverId?: string; channelId?: string; threadId?: string | null; messageId?: string };
+    if (at.status === 'delivered') {
+      this.emitTraceFn({
+        type: 'mcpl:speech-routed',
+        conversationId: agentName,
+        serverId: at.serverId,
+        channelId: at.channelId ?? channelId,
+        threadId: at.threadId ?? null,
+        delivered: true,
+        textLen: text.length,
+        text,
+        ...(at.messageId ? { messageId: at.messageId } : {}),
+      });
+    } else {
+      this.emitTraceFn({
+        type: 'mcpl:speech-route-failed',
+        conversationId: agentName,
+        ...(at.serverId ? { serverId: at.serverId } : {}),
+        channelId: at.channelId ?? channelId,
+        threadId: at.threadId ?? null,
+        reason: result.error ?? 'refused',
+        textLen: text.length,
+        outcome: at.status === 'unknown' ? 'unknown' : 'failed',
+      });
+    }
+    return result;
   }
 
   /**
@@ -3023,10 +3061,10 @@ export class ChannelRegistry {
 
   /**
    * MCPL Spec 14.3 outgoing streaming: forward prose the agent has published
-   * to the server owning the channel. Emitted only when that server declared
-   * `channels.streaming` in its initialize capabilities — servers that never
-   * opted in receive nothing. The framework streams only text a confirmed
-   * publish placed at the channel's root (never speculatively: §14.3), so
+   * to the server owning the channel. Emitted only to a server whose
+   * effective grant includes `channels.streaming` (§5.4; streamingServerFor),
+   * and only for text a confirmed publish placed at the root of a channel
+   * that declares where its posts land (never speculatively: §14.3), so
    * every chunk names the root (`threadId: null`). `destination` is the
    * publish outcome's own server and channel, never re-resolved from a bare
    * channel id. Fire-and-forget and never throws: streaming is an observer
@@ -3224,7 +3262,7 @@ export class ChannelRegistry {
 
     // A send that would be refused is refused before anything opens: a
     // closed channel opens only for words that can go out.
-    const server = this.serverRegistry.getServer(entry.serverId);
+    let server = this.serverRegistry.getServer(entry.serverId);
     if (!server) {
       return { status: 'failed', destination, reason: `server "${entry.serverId}" not found`, at: at() };
     }
@@ -3282,6 +3320,19 @@ export class ChannelRegistry {
       if (withdrawn) {
         return { status: 'failed', destination, reason: ChannelRegistry.placeRefusalText(withdrawn, ChannelRegistry.entryPlace(entry), place), at: at() };
       }
+      // So can a grant reduced (or a server gone) while the open waited.
+      const now = this.serverRegistry.getServer(entry.serverId);
+      if (!now || !CapabilityGrant.of(now).has('channels.publish')) {
+        return {
+          status: 'failed',
+          destination,
+          reason: now
+            ? `channels.publish was withdrawn from "${entry.serverId}"'s effective grant while the channel was being opened (§14.1)`
+            : `server "${entry.serverId}" went away while the channel was being opened`,
+          at: at(),
+        };
+      }
+      server = now;
     }
 
     let result: unknown;
@@ -3436,6 +3487,7 @@ export class ChannelRegistry {
         conversationId,
         ...(serverId ? { serverId } : {}),
         channelId: channelId ?? '',
+        threadId: threadId ?? null,
         reason,
         textLen: text.length,
         outcome: status,
@@ -3491,6 +3543,7 @@ export class ChannelRegistry {
       conversationId,
       serverId: outcome.destination!.serverId,
       channelId,
+      threadId: outcome.destination!.threadId ?? null,
       delivered: true,
       textLen: text.length,
       text,
@@ -3553,9 +3606,8 @@ export class ChannelRegistry {
     if (supplied(input.serverId) && (typeof input.serverId !== 'string' || !input.serverId)) {
       return refuse('serverId must name a server (leave it out to resolve the channel id alone).');
     }
-    if (supplied(input.threadId) && (typeof input.threadId !== 'string' || !input.threadId)) {
-      return refuse('threadId must be a thread id (or left out for the channel root).');
-    }
+    const thread = readThreadId(input.threadId);
+    if ('error' in thread) return refuse(thread.error);
     if (supplied(input.serverId) && !supplied(input.channelId)) {
       return refuse('serverId needs the channelId it belongs to.');
     }
@@ -3567,7 +3619,7 @@ export class ChannelRegistry {
       target = {
         channelId: input.channelId as string,
         ...(supplied(input.serverId) ? { serverId: input.serverId as string } : {}),
-        threadId: supplied(input.threadId) ? (input.threadId as string) : null,
+        threadId: thread.threadId,
       };
     } else {
       const route = origin?.kind === 'agent' ? this.speechRouteResolver?.(origin.agentName) : undefined;

@@ -188,14 +188,19 @@ export class PushHandler {
      *  occurrence for delivery: a refused one, a retry or a retraction is
      *  never gated (so never a route candidate). */
     private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent, decideTrigger?: () => boolean) => Promise<PushEventResult>,
-    /** An ordinary (uncoalesced) push was just admitted, before it is queued
-     *  or acknowledged: return its source envelope, frozen now
-     *  (mcpl/inbound-source.ts). Coalesced work is stamped by its own path. */
-    private readonly acceptInbound?: (event: McplPushEvent) => InboundSource | undefined,
+    /** An ordinary (uncoalesced) push was just admitted: return its source
+     *  envelope, frozen now (mcpl/inbound-source.ts), before the trigger
+     *  filter reads it. Building it accepts nothing (inboundAccepted).
+     *  Coalesced work is stamped by its own path. */
+    private readonly inboundSource?: (event: McplPushEvent) => InboundSource | undefined,
     /** A coalesced push's source envelope, built — not accepted — before it
      *  is gated: its coalescer freezes and carries this same envelope, and
      *  observes the acceptance itself if it admits the occurrence. */
     private readonly coalescedSource?: (serverId: string, params: PushEventParams, event: McplPushEvent) => InboundSource | undefined,
+    /** An ordinary push is accepted: once its trigger filter has returned,
+     *  right before it is queued, as a coalesced one is on admission. A
+     *  filter that throws leaves nothing accepted. */
+    private readonly inboundAccepted?: (source: InboundSource) => void,
   ) {
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -312,12 +317,12 @@ export class PushHandler {
     // The source envelope is the host's, built at admission, before the item
     // is gated, queued or acknowledged: nothing that changes while it waits
     // can rewrite where it came from, and the gate reads the same envelope
-    // the direct path does. An ordinary push's acceptance is observed now; a
-    // coalesced push's envelope is only built here, and its coalescer
-    // freezes it and observes the acceptance if it admits the occurrence.
+    // the direct path does. Building it accepts nothing: an ordinary push is
+    // accepted once its trigger filter returns (below), a coalesced one by
+    // its coalescer if it admits the occurrence.
     const inboundSource = coalesced
       ? this.coalescedSource?.(serverId, params, pushEvent)
-      : this.acceptInbound?.(pushEvent);
+      : this.inboundSource?.(pushEvent);
     if (inboundSource) pushEvent.inboundSource = inboundSource;
 
     // 6. The shouldTriggerInference callback: decided now for an ordinary
@@ -363,6 +368,7 @@ export class PushHandler {
       }
       return;
     }
+    if (inboundSource) this.inboundAccepted?.(inboundSource);
     this.pushEventFn(pushEvent);
 
     // 7. Emit trace

@@ -138,6 +138,19 @@ export function conversationKey(c: ConversationRef): string {
     : JSON.stringify(['channel', c.serverId ?? null, c.channelId, c.threadId ?? null]);
 }
 
+/**
+ * An agent-supplied thread id, read one way by every tool that takes one
+ * (channel_publish, channel_open, drafts resend): absent or null is the
+ * channel root; a string is trimmed of surrounding whitespace; a blank one,
+ * or anything else, is refused, so a blank thread never becomes a place.
+ */
+export function readThreadId(value: unknown): { threadId: string | null } | { error: string } {
+  if (value === undefined || value === null) return { threadId: null };
+  if (typeof value !== 'string') return { error: 'threadId must be a thread id (a string), or null for the channel root.' };
+  const threadId = value.trim();
+  return threadId ? { threadId } : { error: 'threadId must be a thread id, not blank: leave it out, or null, for the channel root.' };
+}
+
 /** The conversation a route speaks into. */
 export function routeConversation(route: SpeechRoute): ConversationRef {
   return route.kind === 'surface'
