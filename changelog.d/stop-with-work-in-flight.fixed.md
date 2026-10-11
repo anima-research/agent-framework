@@ -17,3 +17,9 @@
     already have been admitted. The error is never thrown out of the
     connection's listener. A notification is logged.
   - Direct input to `pushEvent` after `stop()` still throws to its caller.
+- **`stop()` lets speech already written publish.** It waits for every
+  agent's speech chain before the MCPL connections close, so words a turn
+  wrote still go out, and again before the store closes, so what became of
+  each is recorded (a publish that sent nothing keeps its words as a
+  draft). Each wait is bounded at 10 s, and a chain still busy then is
+  logged and left.

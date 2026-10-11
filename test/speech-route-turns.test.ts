@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { InferenceRequest, ProcessEvent, Module, ModuleContext, ProcessState, EventResponse, ToolDefinition, ToolCall, ToolResult } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import type { ContentBlock } from '@animalabs/membrane';
 import type { RouteCandidate, SpeechRoute } from '../src/speech-routes.js';
 
 type Route = { route: { kind: string; channelId?: string; surface?: string; origin?: string } | null; hold?: unknown };
@@ -60,6 +61,23 @@ describe('speech route across a logical turn', () => {
     modules,
   });
 
+  /** A channel subsystem whose channels declare an MCPL RFC-011 publish
+   *  target (a route is only ever a place the framework publishes to
+   *  exactly), and whose channel_open succeeds, recording what it opened. */
+  const channelsThatOpen = (opens: string[] = []) => new Proxy({
+    publishTarget: () => 'root',
+    resolveLocus: () => null,
+    routeSpeech: async () => ({ delivered: true, channelId: 'x' }),
+    resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'discord', channelId } }),
+    handleChannelToolCall: async (name: string, input: { channelId?: string }) => {
+      if (name !== 'channel_open') return { success: true };
+      opens.push(input.channelId!);
+      return { success: true, data: { channelId: input.channelId, opened: true } };
+    },
+    getDescriptor: () => undefined,
+    getChannelTools: () => [],
+  } as Record<string, unknown>, { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
+
   const fromChannel = (channelId: string): InferenceRequest => ({
     agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(),
     routeCandidates: [{ conversation: { kind: 'channel', serverId: 'discord', channelId }, addressed: true, messageId: 'm1', at: Date.now() }],
@@ -71,22 +89,20 @@ describe('speech route across a logical turn', () => {
     const scout = framework.getAgent('scout')!;
     // A channel subsystem whose channels declare an MCPL RFC-011 publish
     // target: a route is only ever a place the framework publishes to exactly.
-    i.channelRegistry = new Proxy({
-      publishTarget: () => 'root',
-      resolveLocus: () => null,
-      routeSpeech: async () => ({ delivered: true, channelId: 'x' }),
-      getDescriptor: () => undefined,
-      getChannelTools: () => [],
-    } as Record<string, unknown>, { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
+    i.channelRegistry = channelsThatOpen();
 
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'one' }]));
+    // The turn starts routed to its wake, and the resident opens another
+    // channel during it, through the tool.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'one' },
+      { type: 'tool_use', id: 'o1', name: 'channel_open', input: { channelId: 'chan-open' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'opened' }]));
     await i.startAgentStream(scout, fromChannel('chan-A'));
     await framework.runUntilIdle();
-    assert.equal(i.turnRoutes.get('scout')?.route?.channelId, 'chan-A');
-
-    // The resident opened another channel during this logical turn.
-    const opened: Route = { route: { kind: 'channel', channelId: 'chan-open', origin: 'open' } };
-    i.turnRoutes.set('scout', opened);
+    const opened = i.turnRoutes.get('scout')!;
+    assert.equal(opened.route?.channelId, 'chan-open');
+    assert.equal(opened.route?.origin, 'open', 'channel_open set the route');
 
     // A context-budget restart, a guard retry and a framework retry continue
     // the same logical turn: none of them re-decides the route, even with
@@ -102,11 +118,31 @@ describe('speech route across a logical turn', () => {
       assert.equal(i.turnRoutes.get('scout'), opened, `${trigger.reason} (attempt ${attempt}) kept the route`);
     }
 
-    // A true new turn decides from its own wake: none here, so no route.
+    // A true new turn decides from its own wake: another conversation's.
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tick' }]));
-    await i.startAgentStream(scout, { agentName: 'scout', reason: 'heartbeat', source: 'timer', timestamp: Date.now() });
+    await i.startAgentStream(scout, fromChannel('chan-C'));
     await framework.runUntilIdle();
-    assert.deepEqual(i.turnRoutes.get('scout'), { route: null });
+    assert.equal(i.turnRoutes.get('scout')?.route?.channelId, 'chan-C', 'the new turn routes to its own wake');
+    assert.equal(i.turnRoutes.get('scout')?.route?.origin, 'trigger');
+    await framework.stop();
+  });
+
+  it("a silent wake's channel_open opens the channel and sets no route, and its result says so", async () => {
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const scout = framework.getAgent('scout')!;
+    const opens: string[] = [];
+    i.channelRegistry = channelsThatOpen(opens);
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'o1', name: 'channel_open', input: { channelId: 'chan-open' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([]));
+    await i.startAgentStream(scout, { agentName: 'scout', reason: 'heartbeat', source: 'timer', timestamp: Date.now(), suppressProse: true });
+    await framework.runUntilIdle();
+    assert.deepEqual(opens, ['chan-open'], 'the channel was opened');
+    assert.deepEqual(i.turnRoutes.get('scout'), { route: null }, 'and no route set');
+    const result = JSON.stringify(membrane.lastStream?.receivedToolResults ?? []);
+    assert.match(result, /This is a silent wake, so your plain speech stays private this turn; to post there, use a send tool\./);
     await framework.stop();
   });
 
@@ -239,6 +275,47 @@ describe('speech route across a logical turn', () => {
       .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text)
       .filter((t) => t.startsWith('[delivered]')).at(-1);
     assert.equal(second, '[delivered] plain speech → #Beta (beta / shared, thread topic)');
+    await framework.stop();
+  });
+
+  it('the sleep announcement is unaddressed speech: a held, a routeless and a surface turn each keep it as such, publishing nothing', async () => {
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+      gate: { config: { policies: [], default: 'always' } },
+    });
+    const i = framework as unknown as {
+      turnRoutes: Map<string, Route>;
+      channelRegistry: unknown;
+      speechChains?: Map<string, Promise<void>>;
+      dispatchSleepToolCall(agent: string, call: unknown): void;
+      proseDrafts: { open(agent: string): Array<{ reason: string; text: string }> };
+    };
+    const published: unknown[] = [];
+    i.channelRegistry = new Proxy({
+      publishTarget: () => 'root',
+      resolveLocus: () => null,
+      routeSpeech: async (...args: unknown[]) => { published.push(args); return null; },
+      getDescriptor: () => undefined,
+      getChannelTools: () => [],
+    } as Record<string, unknown>, { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
+    const sleepUnder = async (turn: Route, id: string) => {
+      i.turnRoutes.set('scout', turn);
+      i.dispatchSleepToolCall('scout', { id, name: 'sleep', input: { seconds: 60 } });
+      await (i.speechChains?.get('scout') ?? Promise.resolve());
+    };
+    await sleepUnder({ route: null, hold: { conversations: [
+      { kind: 'channel', serverId: 'discord', channelId: 'a' },
+      { kind: 'channel', serverId: 'discord', channelId: 'b' },
+    ], since: 'turn-start' } }, 's1');
+    await sleepUnder({ route: null }, 's2');
+    await sleepUnder({ route: { kind: 'surface', surface: 'tui', origin: 'trigger' } }, 's3');
+    assert.deepEqual(published, [], 'nothing was published, so no failure can be reported');
+    const held = i.proseDrafts.open('scout');
+    assert.deepEqual(held.map((d) => d.reason).sort(), ['ambiguous', 'no-destination'], 'held, then routeless; the surface shows it');
+    assert.ok(held.every((d) => d.text.startsWith('💤 Going quiet for 1m')));
     await framework.stop();
   });
 });

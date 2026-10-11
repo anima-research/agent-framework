@@ -90,3 +90,50 @@
   apart. Two servers' channels with the same id and label no longer read
   alike. A refusal for a channel id that several servers register lists
   those servers, so the sender has a `serverId` to give.
+- **More of routing keeps the server and the thread.** A `>>` or `>>>` pin
+  keeps the server its target resolved to, so the same id registered by a
+  second server later changes nothing. Typing shows on the route's own
+  server's channel, and an id two servers share, named alone, shows no
+  indicator rather than one on a guessed server. `inference:started` and
+  the failure log name the route's server beside its channel. The gate's
+  batched-wake notice counts a thread apart from its channel's root, and
+  the beforeInference context's `defaultOutgoing` names the route's thread
+  (an extension of §14.4's shape). The `mcpl:speech-routed`,
+  `mcpl:speech-route-failed` and `prose:draft-resent` traces carry
+  `threadId` (null for the root).
+- **A thread id is read one way** by `channel_publish`, `channel_open` and
+  `drafts` resend: surrounding whitespace is trimmed, and a blank or
+  non-string id is refused with nothing sent, opened or set.
+- **Unaddressed speech that provably wasn't posted is kept.** A publish
+  that fails with nothing posted keeps its words as a bounce draft, on the
+  route, a sticky `>>>` pin or the sleep announcement, and the one
+  `[discord-send-failed]` notice names the draft and how to resend it. An
+  unconfirmed publish keeps none, so as not to invite a duplicate.
+- **The sleep announcement is unaddressed speech.** It follows a hybrid
+  `>>>` pin, else the turn's route, after the words written before it. A
+  held or routeless turn keeps it as a draft, and a surface shows it.
+- **A mid-turn hold names every arrival that suspends the route** in that
+  round, each with its own cause. A local surface's message reads as
+  addressing the resident, tagged or not.
+- **In a silent wake, `channel_open` opens the channel and sets no route.**
+  Its result says the wake's plain speech stays private and that a send
+  tool posts there.
+- **Only the host marks machinery.** `system: true` in a push's origin or
+  an incoming message's metadata is dropped at ingestion and never makes
+  the item non-conversational, so it is still a route candidate.
+- **A route candidate isn't lost or invented on the way to a wake.** An
+  unroutable candidate in a fork's channel follows the fork rule, so it
+  holds no other agent's turn. A module event that names a channel is that
+  channel's conversation, unroutable, never a local surface's. An event the
+  gate's inference buffer evicts keeps its route candidate, so an
+  addressed conversation still competes. A coalesced item is gated (and so
+  becomes a candidate) only once its coalescer admits it for delivery,
+  never for a retry, a retraction or a refused occurrence.
+- **An ordinary push or incoming message is accepted** (the acceptance
+  observer is told) only once its trigger filter returns, right before it
+  is queued; a filter that throws leaves nothing accepted.
+- `publishForAgent` traces `mcpl:speech-routed` only for a confirmed
+  delivery, once the outcome is in, and a failed or unconfirmed one as
+  `mcpl:speech-route-failed`. `publish()` rechecks the server and its
+  `channels.publish` grant after opening a closed channel, as well as
+  before. A label shows as its connector gave it: no `#` is added.

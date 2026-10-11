@@ -36,6 +36,15 @@ import type {
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
+/** Until `cond` holds, bounded: wait for the event a check stands for. */
+async function until(cond: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for: ${what}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
 /** A tool that settles only when the test says so, so the test owns the work it started. */
 class SlowModule implements Module {
   readonly name = 'slow';
@@ -61,11 +70,10 @@ class SlowModule implements Module {
     });
   }
 
-  /** Settle the running call; resolves once its completion callbacks have run. */
-  async finish(outcome: 'success' | 'failure'): Promise<void> {
+  /** Settle the running call. What its completion does is the test's to wait for. */
+  finish(outcome: 'success' | 'failure'): void {
     if (outcome === 'success') this.settle!.resolve({ success: true, data: { done: true } });
     else this.settle!.reject(new Error('the work failed'));
-    await new Promise((r) => setTimeout(r, 20));
   }
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -138,7 +146,8 @@ describe('stop() with work still in flight', () => {
   it('a tool that succeeds after stop() has its result dropped, not thrown or misreported as a failure', async () => {
     const { framework, module, failed } = await frameworkWithRunningTool();
     await framework.stop();
-    await module.finish('success');
+    module.finish('success');
+    await until(() => dropped().length > 0, 'the late result is dropped');
 
     assert.deepEqual(rejections, []);
     assert.deepEqual(failed, [], 'the tool succeeded; nothing reports it as a failure');
@@ -148,7 +157,8 @@ describe('stop() with work still in flight', () => {
   it('a tool that fails after stop() has its error result dropped, not thrown', async () => {
     const { framework, module, failed } = await frameworkWithRunningTool();
     await framework.stop();
-    await module.finish('failure');
+    module.finish('failure');
+    await until(() => dropped().length > 0, 'the late error result is dropped');
 
     assert.deepEqual(rejections, []);
     assert.deepEqual(failed, [], 'the registry answers a module throw with an error result');
@@ -158,7 +168,8 @@ describe('stop() with work still in flight', () => {
   it('a dispatch that rejects after stop() is reported as failed, and its failure result dropped, not thrown', async () => {
     const { framework, module, failed } = await frameworkWithRunningTool({ dispatch: 'rejects' });
     await framework.stop();
-    await module.finish('success');
+    module.finish('success');
+    await until(() => dropped().length > 0, 'the failure result is dropped');
 
     assert.deepEqual(rejections, []);
     assert.equal(failed.length, 1, 'the host got no result: a dispatch failure');
@@ -172,8 +183,67 @@ describe('stop() with work still in flight', () => {
       () => framework.pushEvent({ type: 'external-message', source: 'test', content: 'too late', metadata: {} } as unknown as ProcessEvent),
       /Queue is closed/,
     );
-    await module.finish('success');
+    module.finish('success');
+    await until(() => dropped().length > 0, 'the late result is dropped');
     assert.deepEqual(rejections, []);
+  });
+
+  it('stop() lets speech already on a speech chain publish before the connections close, and is bounded', async () => {
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+      modules: [],
+    });
+    const internals = framework as unknown as {
+      channelRegistry: unknown;
+      chainSpeech(agent: string, what: string, work: () => Promise<void>): void;
+    };
+    const statics = AgentFramework as unknown as { SPEECH_DRAIN_MS: number };
+    const drain = statics.SPEECH_DRAIN_MS;
+    statics.SPEECH_DRAIN_MS = 300;
+    const events: string[] = [];
+    let release: (() => void) | undefined;
+    internals.channelRegistry = new Proxy({
+      routeSpeech: async (_agent: string, text: string) => {
+        await new Promise<void>((r) => { release = r; });
+        events.push(`published ${text}`);
+        return { delivered: true, serverId: 'srv', channelId: 'c' };
+      },
+      stopAll: () => { events.push('connections closing'); },
+    } as Record<string, unknown>, { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
+    try {
+      const registry = internals.channelRegistry as { routeSpeech(a: string, t: string, l: string): Promise<unknown> };
+      internals.chainSpeech('assistant', 'last words', async () => { await registry.routeSpeech('assistant', 'last words', 'c'); });
+      await until(() => release !== undefined, 'the publish is in flight');
+      let stopped = false;
+      const stopping = framework.stop().then(() => { stopped = true; });
+      await new Promise((r) => setTimeout(r, 100));
+      assert.equal(stopped, false, 'stop() waits for the speech in flight');
+      release!();
+      await stopping;
+      assert.deepEqual(events, ['published last words', 'connections closing'], 'published before the connections closed');
+
+      // A publish that never answers holds stop() only for the bound.
+      const second = await AgentFramework.create({
+        storePath: join(tempDir, 'store2'),
+        membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'test' }],
+        modules: [],
+      });
+      const s = second as unknown as typeof internals;
+      s.channelRegistry = new Proxy({ routeSpeech: () => new Promise(() => {}) } as Record<string, unknown>,
+        { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
+      s.chainSpeech('assistant', 'stuck words', async () => {
+        await (s.channelRegistry as { routeSpeech(): Promise<unknown> }).routeSpeech();
+      });
+      const started = Date.now();
+      await second.stop();
+      assert.ok(Date.now() - started >= 2 * 300, 'it waited the bound at each point');
+      assert.ok(logged.some((line) => line.includes('[stop] speech of assistant still settling after 300 ms')), logged.join('\n'));
+    } finally {
+      statics.SPEECH_DRAIN_MS = drain;
+    }
   });
 
   describe('a server sending while the host stops', () => {
@@ -198,7 +268,6 @@ describe('stop() with work still in flight', () => {
       };
     }
 
-    const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 10));
 
     it('a push or incoming message after stop() is answered with an error, never accepted', async () => {
       const { framework, connection } = await wiredFramework();
@@ -210,7 +279,7 @@ describe('stop() with work still in flight', () => {
       connection.emit('push-event', { featureSet: 'chat', eventId: 'e1', payload: { content: [{ type: 'text', text: 'late' }] } }, push);
       const incoming = responder();
       connection.emit('channels-incoming', { messages: [{ channelId: 'c', messageId: 'm', content: [] }] }, incoming);
-      await settle();
+      await until(() => push.answers.length > 0 && incoming.answers.length > 0, 'both are answered');
 
       assert.equal(handled, 0, 'never handed to the push handler, which would record it as accepted');
       assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'the host is stopping' } }]);
@@ -231,7 +300,7 @@ describe('stop() with work still in flight', () => {
       connection.emit('push-event', { featureSet: 'chat', eventId: 'e2', payload: { content: [{ type: 'text', text: 'waiting' }] } }, push);
       await framework.stop();
       lift();
-      await settle();
+      await until(() => push.answers.length > 0, 'the push is answered');
 
       assert.equal(handled, 0);
       assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'the host is stopping' } }]);
@@ -247,7 +316,10 @@ describe('stop() with work still in flight', () => {
       const push = responder();
       connection.emit('push-event', { featureSet: 'chat', eventId: 'e3', payload: { content: [{ type: 'text', text: 'x' }] } }, push);
       connection.emit('push-event', { featureSet: 'chat', eventId: 'e4', payload: { content: [{ type: 'text', text: 'y' }] } });
-      await settle();
+      await until(
+        () => push.answers.length > 0 && logged.filter((line) => line.includes('the handler broke')).length >= 2,
+        'the request is answered, and both failures are logged',
+      );
 
       assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'the handler broke' } }]);
       assert.deepEqual(rejections, []);
@@ -268,7 +340,7 @@ describe('stop() with work still in flight', () => {
       connection.emit('push-event', { featureSet: 'chat', eventId: 'e5', payload: { content: [{ type: 'text', text: 'x' }] } }, push);
       const incoming = responder();
       connection.emit('channels-incoming', { messages: [{ channelId: 'c', messageId: 'm', content: [] }] }, incoming);
-      await settle();
+      await until(() => push.answers.length > 0 && incoming.answers.length > 0, 'both are answered');
 
       assert.deepEqual(push.answers, [{ error: { code: -32603, message: 'the handler failed' } }]);
       assert.deepEqual(incoming.answers, [{ error: { code: -32603, message: 'the handler failed' } }]);

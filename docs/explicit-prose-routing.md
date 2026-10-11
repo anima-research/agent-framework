@@ -45,12 +45,25 @@ breaking any loop).
 
 `{{unsent}}` means the latest bounce while that draft is open (latest-wins, as
 the clipboard it replaced was), and `>>skip_reply {{unsent}}` dismisses it.
-Earlier bounces stay in the agent's drafts, by id, until resent or dismissed;
-drafts survive restarts and branch moves, and a delivery through `{{unsent}}`
-is recorded on the draft like any resend. When the latest bounce's last
-delivery attempt may already have been posted (an unknown outcome),
-`{{unsent}}` is not substituted: the agent is told, and can resend it with the
-`drafts` tool's `confirmDuplicate`.
+Earlier bounces stay in the agent's drafts, by id, until resent, dismissed or
+let go (an agent's 100 newest drafts are always kept, and an older one for 7
+days after anything last happened to it); drafts survive restarts and branch
+moves, and a delivery through `{{unsent}}` is recorded on the draft like any
+resend.
+
+When the latest bounce may already have been posted (an attempt's outcome is
+unknown), or is being sent or queued in a resend right now, what happens
+depends on the route:
+- **Delivery** (`>>#channel … {{unsent}} …`): nothing is sent. The agent is
+  told, and can resend the bounce with the `drafts` tool's `confirmDuplicate`
+  after checking the channel. The envelope's own words are held as a new
+  bounce draft, with `{{unsent}}` written out and the risk carried, so that
+  draft too can be resent only with `confirmDuplicate`. A bare `{{unsent}}`
+  holds nothing new: its words already are the bounce.
+- **Hold** (an envelope that bounces, or one an explicit send held back): the
+  bounce's words are copied into the new draft with `{{unsent}}` written out,
+  and the draft carries the same risk (`inheritedRisk`), so it reads
+  unconfirmed until a confirmed delivery.
 
 ## What explicit mode retires (for that agent)
 

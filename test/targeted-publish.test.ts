@@ -164,6 +164,31 @@ describe('targeted publish (MCPL RFC-011)', () => {
     assert.match(results, /doesn't declare where a post lands \(MCPL RFC-011\)/);
   });
 
+  it('every tool reads a thread id one way: a blank one is refused with nothing sent or set, and a padded one is trimmed', async () => {
+    await turn([say('kept for later')], LEGACY);
+    const [held] = drafts();
+    await turn([
+      call('channel_publish', { channelId: ROOM, threadId: '   ', content: 'blank' }, 'p1'),
+      call('channel_publish', { channelId: ROOM, threadId: ' t-10 ', content: 'padded' }, 'p2'),
+      call('drafts', { action: 'resend', draftIds: [held!.id], destination: ROOM, threadId: ' ' }, 'r1'),
+      createMockResponse([]),
+    ], GENERAL);
+    const sends = toolResults();
+    assert.equal(sends.match(/threadId must be a thread id, not blank/g)?.length, 2, 'publish and resend each refused the blank one');
+    // A turn with no explicit send, so its plain speech follows the route.
+    await turn([
+      call('channel_open', { channelId: ROOM, threadId: '\t' }, 'o1'),
+      call('channel_open', { channelId: ROOM, threadId: ' t-11 ' }, 'o2'),
+      say('in t-11'),
+    ], GENERAL);
+    assert.deepEqual(publishes().map((p) => [p.channelId, p.threadId, p.text]), [
+      [ROOM, 't-10', 'padded'],
+      [ROOM, 't-11', 'in t-11'],
+    ], 'nothing went out for a blank thread; padded ones were trimmed');
+    assert.match(toolResults(), /threadId must be a thread id, not blank: leave it out, or null, for the channel root\. Nothing was opened\./);
+    assert.equal(drafts()[0]!.attempts.length, 0, 'the refused resend recorded no attempt');
+  });
+
   it('channel_publish without a channel follows the route, thread included', async () => {
     await turn([call('channel_publish', { content: 'explicitly here' }), createMockResponse([])], ROOM, { threadId: 't-4' });
     assert.deepEqual(publishes().map((p) => [p.channelId, p.threadId, p.text]), [[ROOM, 't-4', 'explicitly here']]);

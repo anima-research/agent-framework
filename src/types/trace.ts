@@ -49,6 +49,9 @@ export type TraceEvent =
        * activation with its channel without re-deriving routing.
        */
       channelId?: string;
+      /** The server of that channel route, when known: the same channel id
+       *  on another server is another channel. */
+      serverId?: string;
       /** True for a control-plane wake that must not surface typing/prose. */
       silent?: boolean;
     })
@@ -382,6 +385,8 @@ export type TraceEvent =
       conversationId: string;
       serverId: string;
       channelId: string;
+      /** The thread it was posted in; null for the channel root. */
+      threadId: string | null;
       delivered: boolean;
       textLen: number;
       /** The routed prose segment, verbatim. */
@@ -395,6 +400,8 @@ export type TraceEvent =
       conversationId: string;
       /** Empty string when the failure was "no locus at all". */
       channelId: string;
+      /** The thread it was bound for; null for the channel root (or no locus). */
+      threadId: string | null;
       reason: string;
       textLen: number;
       /** `failed`: nothing was posted; `unknown`: the request was dispatched
@@ -587,6 +594,8 @@ export type TraceEvent =
       status: 'delivered' | 'failed' | 'unknown';
       serverId: string;
       channelId: string;
+      /** The thread it was sent to; null for the channel root. */
+      threadId: string | null;
       messageId?: string;
     })
   | (TraceEventBase & {

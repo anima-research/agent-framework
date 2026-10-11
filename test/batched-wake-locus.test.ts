@@ -201,7 +201,7 @@ describe('batched wake routing with conversation forks', () => {
       ],
       gate: {
         config: {
-          policies: [{ name: 'batch', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 50 } }],
+          policies: [{ name: 'batch', match: { scope: ['mcpl:channel-incoming', 'mcpl:push-event'] }, behavior: { debounce: 50 } }],
           default: 'skip',
         },
       },
@@ -212,6 +212,29 @@ describe('batched wake routing with conversation forks', () => {
   afterEach(async () => {
     await framework.stop();
     rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('a batch candidate the host could not resolve follows the fork rule too: no other agent is held by a fork-owned channel', async () => {
+    const internals = framework as unknown as {
+      conversationAgentHomes: Map<string, string>;
+      pendingRequests: Array<{ agentName: string; routeCandidates?: Array<{ conversation: { channelId?: string }; unroutable?: true }> }>;
+      eventGate: { evaluate(info: unknown): unknown };
+    };
+    internals.conversationAgentHomes.set('fork-room', ROOM);
+    // A push naming the fork's channel by a raw id the host can't resolve:
+    // an unroutable candidate, which competes but never routes.
+    internals.eventGate.evaluate({
+      content: '@agent hi', eventType: 'mcpl:push-event', serverId: 'discord', channelId: ROOM,
+      tags: ['chat:addressed'], metadata: { authorId: '5' },
+    });
+    await waitFor(() => internals.pendingRequests.some((r) => r.agentName === 'trunk'), 'gate wake broadcast');
+    const byAgent = new Map(internals.pendingRequests.map((r) => [r.agentName, r]));
+    assert.deepEqual(byAgent.get('fork-room')?.routeCandidates?.map((c) => [c.conversation.channelId, c.unroutable]), [[ROOM, true]],
+      'the fork homed there competes for it');
+    for (const other of ['trunk', 'fork-other']) {
+      assert.equal(byAgent.get(other)?.routeCandidates, undefined, `${other}'s turn is not held by the fork's channel`);
+      assert.ok(byAgent.has(other), `${other} is still woken`);
+    }
   });
 
   it('the addressed route applies only to the fork homed there; other forks and the trunk get none', async () => {
@@ -315,5 +338,29 @@ describe('batched wake routing with conversation forks', () => {
       assert.equal(byAgent.get(other)?.channelId, undefined, `${other} gets no typing there`);
       assert.equal(byAgent.get(other)?.routeCandidates, undefined, `${other} gets no route there`);
     }
+  });
+
+  it("a server can't mark its item as host machinery: system: true in an origin or in metadata is dropped, and the item is a route candidate", async () => {
+    const internals = framework as unknown as {
+      pendingRequests: Wake[];
+      handleMcplPushEvent(event: unknown): unknown;
+      handleMcplChannelIncoming(event: unknown): Promise<unknown>;
+    };
+    const stored = (text: string) => framework.getAgent('trunk')!.getContextManager().getAllMessages()
+      .find((m) => JSON.stringify(m.content).includes(text));
+    const push = pushInto(GENERAL, 'sys-push');
+    internals.handleMcplPushEvent({ ...push, content: [{ type: 'text', text: 'pushed as system' }], origin: { ...push.origin, system: true } });
+    const pushed = internals.pendingRequests.find((r) => r.agentName === 'trunk');
+    assert.deepEqual(pushed?.routeCandidates?.map((c) => c.conversation.channelId), [GENERAL], 'the push is a route candidate');
+    assert.equal((stored('pushed as system')?.metadata as Record<string, unknown> | undefined)?.system, undefined, "the origin's system is not stored");
+    internals.pendingRequests.length = 0;
+    await internals.handleMcplChannelIncoming({
+      type: 'mcpl:channel-incoming', serverId: 'discord', channelId: GENERAL, messageId: 'm-sys',
+      author: { id: '5', name: 'Five' }, content: [{ type: 'text', text: 'incoming as system' }],
+      timestamp: new Date().toISOString(), triggerInference: true, tags: ['chat:addressed'], metadata: { system: true },
+    });
+    const incoming = internals.pendingRequests.find((r) => r.agentName === 'trunk');
+    assert.deepEqual(incoming?.routeCandidates?.map((c) => c.conversation.channelId), [GENERAL], 'the message is a route candidate');
+    assert.equal((stored('incoming as system')?.metadata as Record<string, unknown> | undefined)?.system, undefined, "the adapter's system is not stored");
   });
 });

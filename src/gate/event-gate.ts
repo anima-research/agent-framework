@@ -269,7 +269,10 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
         addressed: e.addressed,
         at: e.timestamp,
       });
-    } else if (e.eventType === 'external-message' || e.eventType === 'api:message') {
+    } else if ((e.eventType === 'external-message' || e.eventType === 'api:message') && !e.channelId) {
+      // A local surface only when it names no channel, as surfaceSourceFor
+      // decides: one that names a channel no registry holds is that
+      // channel's conversation, unroutable (below), never answered locally.
       routeCandidates.push({
         kind: 'surface',
         surface: e.serverId || (e.eventType === 'api:message' ? 'api' : 'external'),
@@ -640,6 +643,11 @@ export class EventGate {
   private quiesced = false;
   /** Lifetime count of buffer-cap evictions (see bufferForInference). */
   private droppedBufferedEvents = 0;
+  /** The route candidates of events the buffer evicted, per conversation:
+   *  its newest event and its newest addressed one. Eviction bounds what
+   *  the buffer holds of each event, never which conversations the flush
+   *  can route to: the flush's candidates are as if nothing was evicted. */
+  private evictedRouteEvents = new Map<string, { newest: PendingEvent; addressed?: PendingEvent }>();
 
   // Per-policy stats
   private stats = new Map<string, PolicyStats>();
@@ -1582,7 +1590,13 @@ export class EventGate {
       routeChannelId: conversation?.channelId ?? this.routeChannelFor(info),
       ...(messageId ? { messageId } : {}),
       ...(threadId ? { threadId } : {}),
-      conversational: isConversational(info.tags, info.metadata),
+      // An MCPL item's metadata is its server's (an origin, an incoming
+      // message's metadata): only the host marks machinery, so its tags
+      // alone decide. A host module's event metadata is the host's.
+      conversational: isConversational(
+        info.tags,
+        info.eventType === 'mcpl:channel-incoming' || info.eventType === 'mcpl:push-event' ? undefined : info.metadata,
+      ),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1629,7 +1643,13 @@ export class EventGate {
   // Event delivery
   // =========================================================================
 
-  private deliverEvents(events: PendingEvent[]): void {
+  /**
+   * @param evicted The newest event, and newest addressed one, of each
+   *   conversation the inference buffer evicted: they count toward the
+   *   wake's route candidates and provenance, as if they had stayed, but not
+   *   toward the notice, which names what is still held.
+   */
+  private deliverEvents(events: PendingEvent[], evicted: PendingEvent[] = []): void {
     if (events.length === 0) return;
 
     const policyNames = [...new Set(events.map(e => e.policyName))];
@@ -1644,28 +1664,37 @@ export class EventGate {
 
     const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
     if (referenced.length > 0) {
-      const byChannel = new Map<string, { serverId?: string; channelId?: string; count: number; oldest: number; label?: string }>();
+      const byConversation = new Map<string, { serverId?: string; channelId?: string; threadId?: string; count: number; oldest: number; label?: string }>();
       for (const e of referenced) {
         // The registered id when known (a push event's own channelId is the
-        // adapter's raw id), counted per server: the same id on another
-        // server is another conversation.
+        // adapter's raw id), counted per server and thread: the same id on
+        // another server, or a thread and its channel's root, is another
+        // conversation.
         const channelId = e.routeChannelId ?? e.channelId;
-        const key = `${e.serverId ?? ''}\u0000${channelId ?? ''}`;
-        const entry = byChannel.get(key) ?? {
+        const key = JSON.stringify([e.serverId ?? null, channelId ?? null, e.threadId ?? null]);
+        const entry = byConversation.get(key) ?? {
           ...(e.serverId ? { serverId: e.serverId } : {}),
           ...(channelId ? { channelId } : {}),
+          ...(e.threadId ? { threadId: e.threadId } : {}),
           count: 0, oldest: e.timestamp, label: e.channelLabel,
         };
         entry.count += 1;
         entry.oldest = Math.min(entry.oldest, e.timestamp);
         entry.label = entry.label ?? e.channelLabel;
-        byChannel.set(key, entry);
+        byConversation.set(key, entry);
       }
-      for (const { serverId, channelId, count, oldest, label } of byChannel.values()) {
+      for (const { serverId, channelId, threadId, count, oldest, label } of byConversation.values()) {
         // Named the way routing notices and send tools name a conversation
-        // (describeConversation): its label, then `server / channel-id`.
+        // (describeConversation): its label, then `server / channel-id`,
+        // then its thread.
         const channel = channelId
-          ? describeConversation({ kind: 'channel', ...(serverId ? { serverId } : {}), channelId, ...(label ? { label } : {}) })
+          ? describeConversation({
+            kind: 'channel',
+            ...(serverId ? { serverId } : {}),
+            channelId,
+            ...(threadId ? { threadId } : {}),
+            ...(label ? { label } : {}),
+          })
           : '(unknown channel)';
         const age = Math.round((Date.now() - oldest) / 1000);
         lines.push(
@@ -1690,7 +1719,7 @@ export class EventGate {
     // `routeChannelId` marks the wake addressed there. The turn's speech
     // route comes from `routeCandidates`, every conversation in the batch
     // (shelf-355), never from whichever channel last saw any traffic.
-    const provenance = wakeProvenance(events);
+    const provenance = wakeProvenance([...evicted, ...events]);
     for (const agentName of this.getAgentNamesFn()) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);
     }
@@ -1736,8 +1765,11 @@ export class EventGate {
     if (this.quiesced) return;
     if (this.inferring.size === 0 && this.inferenceBuffer.length > 0) {
       const events = this.inferenceBuffer.splice(0);
+      const evicted = [...this.evictedRouteEvents.values()]
+        .flatMap(({ newest, addressed }) => (addressed && addressed !== newest ? [addressed, newest] : [newest]));
+      this.evictedRouteEvents.clear();
       // Defer to avoid re-entrancy inside trace callbacks
-      queueMicrotask(() => this.deliverEvents(events));
+      queueMicrotask(() => this.deliverEvents(events, evicted));
     }
   }
 
@@ -1763,11 +1795,31 @@ export class EventGate {
   // Inference buffer cap
   // =========================================================================
 
+  /** Keep an evicted event's route candidate (wakeProvenance's identity of
+   *  it): the conversation's newest, and its newest addressed. */
+  private keepEvictedRoute(event: PendingEvent): void {
+    if (!event.conversational) return;
+    const surface = !event.routeChannelId && !event.channelId
+      && (event.eventType === 'external-message' || event.eventType === 'api:message');
+    const channel = event.routeChannelId ?? event.channelId ?? (event.authorId ? `user:${event.authorId}` : undefined);
+    if (!surface && !channel) return;
+    const key = JSON.stringify(surface ? ['surface', event.serverId ?? null] : [event.serverId ?? null, channel, event.threadId ?? null]);
+    const kept = { ...event, content: '' };
+    const seen = this.evictedRouteEvents.get(key);
+    this.evictedRouteEvents.set(key, {
+      newest: !seen || kept.timestamp >= seen.newest.timestamp ? kept : seen.newest,
+      ...(kept.addressed && (!seen?.addressed || kept.timestamp >= seen.addressed.timestamp)
+        ? { addressed: kept }
+        : seen?.addressed ? { addressed: seen.addressed } : {}),
+    });
+  }
+
   /** Called internally when debounce fires during inference. */
   private bufferForInference(events: PendingEvent[]): void {
     for (const event of events) {
       if (this.inferenceBuffer.length >= MAX_INFERENCE_BUFFER) {
-        this.inferenceBuffer.shift(); // Drop oldest
+        // Drop the oldest, keeping its route candidate.
+        this.keepEvictedRoute(this.inferenceBuffer.shift()!);
         // Telemetry (issue #122): quiesce stretches buffering from
         // single-inference minutes to operator-length windows, so silent
         // eviction is no longer a corner case — count and log it, or the
@@ -2075,5 +2127,6 @@ export class EventGate {
     this.rateLimitDenied.clear();
     this.passiveSampleFires.clear();
     this.inferenceBuffer = [];
+    this.evictedRouteEvents.clear();
   }
 }
