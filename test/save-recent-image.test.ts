@@ -659,11 +659,11 @@ describe('save_recent_image provenance (issue #104)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Nullable selectors (shelf-375). A caller whose provider presents every
-// property as required sends all three selectors; null (like omission) must
-// mean "not this selector", while any SUPPLIED value is checked and never
-// read as absent — "" or false read as 0 would save the newest image instead
-// of the one the caller named.
+// Nullable selectors. A caller whose provider presents every property as
+// required sends all three selectors; null or an empty string (like
+// omission) must mean "not this selector", while any other SUPPLIED value is
+// checked and never read as absent: " ", false or [] read as 0 would save
+// the newest image instead of the one the caller named.
 // ---------------------------------------------------------------------------
 
 /** One XML tool call as a model on the XML path writes it. Tags are assembled
@@ -693,7 +693,7 @@ const failed = (result: { content: string; isError: boolean }): string => {
   return result.content;
 };
 
-describe('save_recent_image selectors: null and omission both mean unused (shelf-375)', () => {
+describe('save_recent_image selectors: omission, null and the empty string all mean unused', () => {
   it('sparse and every-property calls each save the image they name', async () => {
     const ledger = new ToolImageLedger();
     const ref1 = `img_${ledger.nonce}_1`;
@@ -714,6 +714,10 @@ describe('save_recent_image selectors: null and omission both mean unused (shelf
           saveCall('call_every_pos', { path: 'files/every-pos.gif', ref: null, index: 1, count: null }),
           saveCall('call_every_ref', { path: 'files/every-ref.png', ref: ref1, index: null, count: null }),
           saveCall('call_every_range', { path: 'files/range.png', ref: null, index: null, count: 2 }),
+          // Every-property callers that fill the unused selector with an empty string.
+          saveCall('call_empty_pos', { path: 'files/empty-pos.gif', ref: '', index: 1, count: '' }),
+          saveCall('call_empty_ref', { path: 'files/empty-ref.png', ref: ref1, index: '', count: '' }),
+          saveCall('call_empty_all', { path: 'files/empty-all.png', ref: '', index: '', count: '' }),
           // The narrow compatibility form: decimal-digit strings.
           saveCall('call_digits', { path: 'files/digits.gif', ref: null, index: '1', count: '1' }),
           // What the XML path delivers for an every-property call.
@@ -744,6 +748,9 @@ describe('save_recent_image selectors: null and omission both mean unused (shelf
       await expectGif('call_every_pos', 'files/every-pos.gif');
       await expectPng('call_every_ref', 'files/every-ref.png', 0);
       await expectGif('call_digits', 'files/digits.gif');
+      await expectGif('call_empty_pos', 'files/empty-pos.gif');
+      await expectPng('call_empty_ref', 'files/empty-ref.png', 0);
+      await expectPng('call_empty_all', 'files/empty-all.png', 0);
       await expectGif('call_xml', 'files/xml.gif');
 
       const range = saved(await waitForToolResult(h.framework, 'call_every_range'));
@@ -764,25 +771,26 @@ describe('save_recent_image selectors: null and omission both mean unused (shelf
     const COUNT = /`count` must be an integer in 1\.\.20/;
     const CONFLICT = /`ref` is mutually exclusive with `index`\/`count` — pass null \(or omit\) for the selector you are not using/;
     const cases: Array<{ id: string; input: Record<string, unknown>; refusal: RegExp }> = [
-      { id: 'ref_empty', input: { ref: '' }, refusal: REF_FORMAT },
       { id: 'ref_blank', input: { ref: '   ' }, refusal: REF_FORMAT },
-      { id: 'ref_empty_every', input: { ref: '', index: null, count: null }, refusal: REF_FORMAT },
       { id: 'ref_malformed', input: { ref: 'img_1' }, refusal: REF_FORMAT },
-      { id: 'index_empty', input: { index: '' }, refusal: INDEX },
+      { id: 'ref_number', input: { ref: 5 }, refusal: REF_FORMAT },
+      { id: 'ref_false', input: { ref: false, index: null, count: null }, refusal: REF_FORMAT },
+      { id: 'ref_array', input: { ref: [] }, refusal: REF_FORMAT },
+      // An array holding a valid ref reads as that ref to a regex test.
+      { id: 'ref_in_array', input: { ref: [ref1] }, refusal: REF_FORMAT },
       { id: 'index_blank', input: { ref: null, index: ' ', count: null }, refusal: INDEX },
       { id: 'index_false', input: { index: false }, refusal: INDEX },
+      { id: 'index_true', input: { index: true }, refusal: INDEX },
       { id: 'index_array', input: { index: [] }, refusal: INDEX },
       { id: 'index_decimal_text', input: { index: '1.0' }, refusal: INDEX },
       { id: 'index_negative', input: { index: -1 }, refusal: INDEX },
       { id: 'index_fraction', input: { index: 1.5 }, refusal: INDEX },
-      { id: 'count_empty', input: { count: '' }, refusal: COUNT },
       { id: 'count_true', input: { ref: null, index: null, count: true }, refusal: COUNT },
       { id: 'count_array', input: { count: [2] }, refusal: COUNT },
       { id: 'count_zero', input: { count: 0 }, refusal: COUNT },
       { id: 'count_over', input: { count: 21 }, refusal: COUNT },
       { id: 'conflict_count', input: { ref: ref1, count: 2 }, refusal: CONFLICT },
       { id: 'conflict_index', input: { ref: ref1, index: 0, count: null }, refusal: CONFLICT },
-      { id: 'conflict_supplied_empty', input: { ref: ref1, index: '' }, refusal: CONFLICT },
     ];
     const h = await startTurn({
       prefix: 'sri-supplied-',
@@ -855,7 +863,7 @@ function schemaErrors(schema: Record<string, unknown>, value: Record<string, unk
   return errors;
 }
 
-describe('save_recent_image schema as each provider path is sent it (shelf-375; installed membrane)', () => {
+describe('save_recent_image schema as each provider path is sent it (installed membrane)', () => {
   it('the checker itself rejects a schema whose root does not describe an object', () => {
     const properties = { path: { type: 'string' } };
     assert.deepStrictEqual(schemaErrors({ type: 'object', properties }, { path: 'files/a.png' }), []);
@@ -940,9 +948,10 @@ describe('save_recent_image schema as each provider path is sent it (shelf-375; 
       return match[0];
     };
     for (const name of ['ref', 'index', 'count']) {
-      // Published membrane renders a type list ("string,null"); newer source
-      // renders nullable="true". Either marks the selector nullable.
-      assert.match(parameter(name), /type=\\"[^"\\]*\bnull\b|nullable=\\"true\\"/, `${name} is marked nullable`);
+      // Published membrane (0.5.86) renders the type list as written
+      // (type="string,null"); membrane's main renders nullable="true". Each
+      // tells the model null is allowed; nothing else is accepted here.
+      assert.match(parameter(name), /type=\\"(?:string|integer),null\\"|nullable=\\"true\\"/, `${name} is marked nullable`);
       assert.doesNotMatch(parameter(name), /required=/, `${name} is not required`);
     }
     assert.match(parameter('path'), /required=\\"true\\"/, 'path is required');
