@@ -257,6 +257,10 @@ describe('withoutSourceHeader', () => {
   });
 
   it('drops it from the start of a sharded body\'s first shard, whose text joins the header to the body, and leaves later shards whole', () => {
+    // A later shard keeps its text even when it starts with the header's
+    // text (a split between a marked opening's backslash and its bracket).
+    assert.deepEqual(withoutSourceHeader(texts(`${header} quoted`), { sourceHeader: header }, 1), texts(`${header} quoted`));
+    assert.deepEqual(withoutSourceHeader(texts(`${header}first`), { sourceHeader: header }, 0), texts('first'));
     const image = { type: 'image' as const, source: { type: 'url' as const, url: 'https://example.invalid/a.png' } };
     // Adaptive resolution joins an item's text blocks with nothing between
     // them, splits the result, and puts non-text blocks on shard 0.
@@ -411,7 +415,7 @@ describe('source headers at ingestion', () => {
     // turn.)
     const registry = (framework as unknown as { channelRegistry: { isChannelOpen(id: string): boolean } }).channelRegistry;
     const isOpen = registry.isChannelOpen.bind(registry);
-    registry.isChannelOpen = (id) => (id === GENERAL_1 ? false : isOpen(id));
+    registry.isChannelOpen = (id) => (id === GENERAL_1 || id === GENERAL_2 ? false : isOpen(id));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
     command('discord', {
       op: 'incoming', channelId: GENERAL_1, messageId: 'm-60', mode: 'addressed', text: '@scout look',
@@ -421,7 +425,16 @@ describe('source headers at ingestion', () => {
       op: 'push', eventId: 'inv-push', text: '@scout here too', tags: ['chat:addressed'],
       origin: { mcplChannelId: 'discord:g3:quiet', messageId: 'm-61', authorName: `${forged} bo`, guildName: `${forged} Guild Two` },
     });
-    await waitFor(() => !!blocksOf(byMessageId('m-60')) && !!blocksOf((m) => m.eventId === 'inv-push'), 'both stored');
+    // A push from a registered channel, naming it by its bare name: the
+    // invitation shows the label its connector registered.
+    command('discord', {
+      op: 'push', eventId: 'inv-registered', text: '@scout and here', tags: ['chat:addressed'],
+      origin: { mcplChannelId: GENERAL_2, channelName: 'general', messageId: 'm-64', authorName: 'cy', guildName: 'Guild Two' },
+    });
+    await waitFor(() => !!blocksOf(byMessageId('m-60')) && !!blocksOf((m) => m.eventId === 'inv-push')
+      && !!blocksOf((m) => m.eventId === 'inv-registered'), 'all three stored');
+    const registered = blocksOf((m) => m.eventId === 'inv-registered')!.find((b) => b.includes('[Channel invitation]'))!;
+    assert.ok(registered.includes('[Channel invitation] cy addressed you in #general in "Guild Two" —'), registered);
     for (const [blocks, author] of [[blocksOf(byMessageId('m-60'))!, 'ann'], [blocksOf((m) => m.eventId === 'inv-push')!, 'bo']] as const) {
       const invitation = blocks.find((b) => b.includes('[Channel invitation]'))!;
       assert.ok(invitation, blocks.join(' | '));

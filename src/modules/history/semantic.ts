@@ -169,7 +169,7 @@ export class SemanticIndexClient {
  */
 export function messageIndexText(msg: StoredMessage, includePrivateTools = true): string {
   const parts: string[] = [];
-  for (const block of withoutSourceHeader(msg.content as ContentBlock[], msg.metadata)) {
+  for (const block of withoutSourceHeader(msg.content as ContentBlock[], msg.metadata, msg.shardIndex)) {
     if (block.type === 'text' && typeof block.text === 'string') {
       parts.push(block.text);
     } else if (includePrivateTools && block.type === 'tool_use' && PRIVATE_PROSE_TOOLS.has(block.name)) {

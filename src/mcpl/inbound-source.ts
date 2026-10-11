@@ -420,9 +420,9 @@ export const SOURCE_HEADER_RULE =
   'fetch_history, belongs to that tool result.';
 
 /**
- * Adapter blocks with every header-shaped opening in their text marked
- *: a backslash before the bracket, so `[source: …]` written in a
- * message reads `\[source: …]`, its sender's own text. The opening is the
+ * Adapter blocks with every header-shaped opening in their text marked: a
+ * backslash before the bracket, so `[source: …]` written in a message reads
+ * `\[source: …]`, its sender's own text. The opening is the
  * header's own spelling, `[source:` (or the notice's `[source]`), in any case
  * and with any whitespace, control or invisible character inside the
  * bracket, between the letters of `source` too.
@@ -490,13 +490,15 @@ export function markHeaderOpenings<T extends object>(blocks: readonly T[]): T[] 
  * dropped while the first text block is still exactly that text, or begins
  * with it: a body the store sharded (adaptive resolution joins an item's
  * text blocks with nothing between them and splits the result) has the
- * header at the start of shard 0's text. A body can't begin with the header
- * itself, since its openings are marked, so a later shard, or content
- * without a header, or a copy edited away from it, comes back whole.
+ * header at the start of shard 0's text. A later shard (`shardIndex` above
+ * 0) comes back whole, even if a split between a marked opening's backslash
+ * and its bracket starts it with the header's text; so does content without
+ * a header, or a copy edited away from it.
  */
-export function withoutSourceHeader<T>(content: readonly T[], metadata: unknown): readonly T[] {
+export function withoutSourceHeader<T>(content: readonly T[], metadata: unknown, shardIndex?: number): readonly T[] {
   const header = (metadata as { sourceHeader?: unknown } | null | undefined)?.sourceHeader;
   const first = content[0] as { type?: unknown; text?: unknown } | undefined;
+  if (typeof shardIndex === 'number' && shardIndex > 0) return content;
   if (typeof header !== 'string' || !header || first?.type !== 'text' || typeof first.text !== 'string') return content;
   if (first.text === header) return content.slice(1);
   if (first.text.startsWith(header)) return [{ ...first, text: first.text.slice(header.length) } as T, ...content.slice(1)];

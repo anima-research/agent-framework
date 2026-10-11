@@ -2157,7 +2157,7 @@ function flattenContent(content: readonly ContentBlock[]): string {
  *  the `channelId` filter, and every match carries it. `extract` still
  *  shows the header: it presents the message itself. */
 function searchText(msg: StoredMessage): string {
-  return flattenContent(withoutSourceHeader(msg.content, msg.metadata));
+  return flattenContent(withoutSourceHeader(msg.content, msg.metadata, msg.shardIndex));
 }
 
 function blockLabel(block: ContentBlock): string {

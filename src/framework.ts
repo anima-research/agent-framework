@@ -7922,10 +7922,16 @@ export class AgentFramework {
     if (this.channelRegistry.isChannelOpen(opts.channelId)) return null;
     const descriptor = this.channelRegistry.getDescriptor(opts.channelId);
     const maxBackscroll = descriptor?.capabilities?.history?.maxMessages ?? 0;
-    const label = opts.channelLabel ?? descriptor?.label;
+    // The registry's label for the channel on its own server first (a
+    // channel registered at start keeps the label its connector gave it),
+    // else the one this event carries.
+    const label = this.channelRegistry.getChannelLabel?.(opts.serverId, opts.channelId) ?? opts.channelLabel;
     // Every name here is the connector's, shown by the source header's rule
     // (headerValue, labelValue), and the ids the options quote are JSON
-    // string literals, so none can imitate host text or break the line.
+    // string literals, so none can imitate host text or break the line. The
+    // block is then marked as the body it follows is, so a quoted name that
+    // holds an opening reads `"\[source: …"`: safe, though no longer exactly
+    // the literal JSON.parse gives back.
     const channelLabel = label ? labelValue(label) : quoted(opts.channelId);
     const place = opts.guildName ? `${channelLabel} in ${quoted(opts.guildName)}` : channelLabel;
     const author = headerValue(opts.authorName);

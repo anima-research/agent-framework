@@ -218,7 +218,7 @@ export class TuneOutCoordinator {
       // The body without its source header: the backlog names
       // its channel itself, and each entry reads `author: body` rather than
       // opening on the header.
-      const text = withoutSourceHeader(m.content, m.metadata)
+      const text = withoutSourceHeader(m.content, m.metadata, m.shardIndex)
         .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
         .map((b) => b.text)
         .join('\n');

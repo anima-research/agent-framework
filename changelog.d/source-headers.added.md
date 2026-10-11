@@ -37,6 +37,8 @@
   unmarked. A closed-channel invitation, `channel_open` backscroll item
   text (an item's string content included), a local surface's input and the
   legacy Discord module's stored and edited text are marked the same way.
+  At the Discord module's first history sync after upgrading, a stored
+  message that holds an opening is edited once, to its marked text.
   `sourceBodyDigest` is still taken from the body as delivered, before the
   marking. `storedBodyDigest` is of the blocks as handed to storage, the
   header and the marking included. The copy check applies to an unsharded
