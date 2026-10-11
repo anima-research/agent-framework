@@ -1815,6 +1815,10 @@ export class AgentFramework {
   /** Admissions applyResolvedOperatorChange is carrying out, by admission id:
    *  each lets exactly its change's tool call through the gate. */
   private activeAdmissions: Map<string, ResolvedOperatorChange> = new Map();
+  /** Conversation forks parked behind a store hold (admitConversationCreation),
+   *  woken whenever a hold clears and when admission closes, whatever leases
+   *  wait. */
+  private conversationCreationWaiters: Array<() => void> = [];
   /** Module edits and removals held while a reservation holds the store,
    *  applied at its release (flushDeferredMessageOps). */
   private deferredMessageOps: Array<{ op: 'edit'; id: MessageId; content: ContentBlock[] } | { op: 'remove'; id: MessageId }> = [];
@@ -6895,6 +6899,7 @@ export class AgentFramework {
       queueMicrotask(() => {
         this.tryGrantSafeBoundary();
         this.notifyBoundaryCleared();
+        this.wakeConversationCreations();
       });
       for (const [name, token] of reserved) {
         if (this.activeTurnTokens.get(name) === token) this.activeTurnTokens.delete(name);
@@ -6931,7 +6936,10 @@ export class AgentFramework {
 
   /** Apply the module edits and removals held while a reservation held the
    *  store (editMessage, removeMessage). One that no longer applies, such as
-   *  an edit of a message the holder's change removed, is logged. */
+   *  an edit of a message the holder's change removed, is logged. Runs after
+   *  the release's deferred-write flush, and must stay after it: a coalesced
+   *  replacement held across the hold then lands its new message before the
+   *  old one is removed, which ends as it would have with nothing held. */
   private flushDeferredMessageOps(): void {
     // Optional chaining: prototype-built harnesses leave fields undefined.
     for (const op of this.deferredMessageOps?.splice(0) ?? []) {
@@ -6952,8 +6960,10 @@ export class AgentFramework {
     this.stopping = true;
     for (const waiter of this.boundaryWaiters?.splice(0) ?? []) waiter.refuse(stoppingRefusal(waiter.verb));
     // Creations parked behind a lease or surgery wake now and are refused
-    // (tryAdmitEphemeralCreation): none enters the store once stopping.
+    // (tryAdmitEphemeralCreation, admitConversationCreation): none enters
+    // the store once stopping.
     for (const resume of this.boundaryClearedWaiters?.splice(0) ?? []) resume();
+    this.wakeConversationCreations();
   }
 
   /**
@@ -7115,8 +7125,17 @@ export class AgentFramework {
         this.ephemeralPending.add(ticket);
         return ticket;
       }
-      await new Promise<void>((resolve) => this.boundaryClearedWaiters.push(resolve));
+      // Woken when the hold clears, whether or not a lease waits by then
+      // (unlike the ephemeral creations' wake, notifyBoundaryCleared): a
+      // fork that waited for a waiting lease would wait for the loop it's
+      // blocking. Woken, it takes its ticket, or parks behind a newer hold.
+      await new Promise<void>((resolve) => (this.conversationCreationWaiters ??= []).push(resolve));
     }
+  }
+
+  /** Wake the conversation forks parked behind a store hold. */
+  private wakeConversationCreations(): void {
+    for (const resume of this.conversationCreationWaiters?.splice(0) ?? []) resume();
   }
 
   /** Admit a creation now, returning its pending ticket, or null when it has
@@ -12644,12 +12663,18 @@ export class AgentFramework {
    *  queued request (a requeue, or a budget restart), or a request a provider
    *  hold keeps. Another turn carries it only if it is bound to the same
    *  operation and step. */
-  private unstickRunCarried(agentName: string, binding: { operationId: string; step: number }, endingToken?: number): boolean {
+  private unstickRunCarried(
+    agentName: string,
+    binding: { operationId: string; step: number },
+    ending?: { token: number | undefined },
+  ): boolean {
     const carries = (r: InferenceRequest | undefined) =>
       r?.unstick?.operationId === binding.operationId && r.unstick.step === binding.step;
-    // A stream that is ending still holds the agent's turn until its own
-    // teardown: only a successor's turn (another token) carries it on.
-    const live = endingToken === undefined || this.activeTurnTokens.get(agentName) !== endingToken;
+    // From an ending stream's teardown (`ending`), the agent's turn is still
+    // that stream's own until the teardown clears it: only a successor's
+    // turn, under another token, carries the re-run on. Compared as given,
+    // so a stream that never had a token can't count its own trigger.
+    const live = ending === undefined || this.activeTurnTokens.get(agentName) !== ending.token;
     return (live && carries(this.activeTurnTriggers.get(agentName)))
       || this.pendingRequests.some((r) => r.agentName === agentName && carries(r))
       || (this.providerAccelerationCooldowns.get(agentName)?.heldRequests.some(carries) ?? false);
@@ -14387,7 +14412,7 @@ export class AgentFramework {
       // An unstick re-run that ended without an outcome (aborted, cancelled)
       // failed, unless another turn carries it on: a retry that started its
       // stream, a requeue or budget restart, or a provider hold.
-      if (trigger?.unstick && !this.unstickRunCarried(agent.name, trigger.unstick, myTurnToken)) {
+      if (trigger?.unstick && !this.unstickRunCarried(agent.name, trigger.unstick, { token: myTurnToken })) {
         this.settleUnstickAttempt(trigger.unstick, 'failed', { error: 'the re-run ended without a response' });
       }
       const unsettledKvSubmissions = drainKvSubmissionIds?.() ?? [];

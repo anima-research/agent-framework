@@ -178,6 +178,27 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
+  /** Wait, with a bound, until something is parked behind a store hold: a
+   *  fork's creation, so an assertion that no fork exists yet means it
+   *  waited, not that its event hadn't been processed. */
+  async function parked(framework: AgentFramework) {
+    const waiting = () => {
+      const f = framework as unknown as { conversationCreationWaiters?: unknown[]; boundaryClearedWaiters?: unknown[] };
+      return (f.conversationCreationWaiters?.length ?? 0) + (f.boundaryClearedWaiters?.length ?? 0);
+    };
+    for (const deadline = Date.now() + 10_000; waiting() === 0;) {
+      if (Date.now() > deadline) throw new Error('no creation parked behind the hold');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+  /** Wait, with a bound, until `ready` holds. */
+  async function until(ready: () => boolean, what: string) {
+    for (const deadline = Date.now() + 10_000; !ready();) {
+      if (Date.now() > deadline) throw new Error(`not within 10 s: ${what}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
   it('opens a fork only once a held lease releases, so its holder never sees the store change under it', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi alice!' }]));
     const framework = await makeFramework();
@@ -189,7 +210,7 @@ describe('Conversation routing', () => {
       await granted;
       framework.pushEvent(incomingEvent({ channelId: 'slack:D1', text: 'hello there', channelType: 'im' }));
       const routing = framework.runUntilIdle();
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await parked(framework);
       assert.equal(framework.getAgent('conversation-slack-D1-g1'), null, 'no fork while the lease is held');
       release!();
       await holding;
@@ -198,6 +219,36 @@ describe('Conversation routing', () => {
     } finally {
       release?.();
       await holding;
+      await framework.stop();
+    }
+  });
+
+  it('wakes a fork parked behind a hold when the hold clears, though a lease waits by then; the lease waits for the fork', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi alice!' }]));
+    const framework = await makeFramework();
+    const internals = framework as unknown as {
+      reserveStoreForSurgery(verb: string, agentName: string): () => void;
+      activeTurnTokens: Map<string, number>;
+    };
+    try {
+      const releaseHold = internals.reserveStoreForSurgery('rollback', 'trunk');
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D1', text: 'hello there', channelType: 'im' }));
+      const routing = framework.runUntilIdle();
+      await parked(framework);
+      assert.equal(framework.getAgent('conversation-slack-D1-g1'), null, 'parked behind the hold');
+      // A lease arrives, and when the hold clears an agent is busy, so the
+      // lease is still waiting then.
+      let leaseRan = false;
+      const leasing = framework.runAtSafeBoundary({ verb: 'later' }, async () => { leaseRan = true; });
+      releaseHold();
+      internals.activeTurnTokens.set('trunk', 9_999);
+      await until(() => framework.getAgent('conversation-slack-D1-g1') !== null, 'the fork proceeds though a lease waits');
+      assert.equal(leaseRan, false, 'the lease still waits');
+      internals.activeTurnTokens.delete('trunk');
+      await leasing;
+      assert.equal(leaseRan, true, 'granted after the fork');
+      await routing;
+    } finally {
       await framework.stop();
     }
   });
@@ -214,7 +265,7 @@ describe('Conversation routing', () => {
       await granted;
       framework.pushEvent(incomingEvent({ channelId: 'slack:D1', text: 'hello there', channelType: 'im' }));
       const routing = framework.runUntilIdle().catch(() => {});
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await parked(framework);
       const stopping = framework.stop();
       release();
       await holding;
