@@ -235,6 +235,7 @@ function setupWorkspace(
         name: 'work',
         path: mountDir,
         mode: options?.mode ?? 'read-write',
+        backend: 'chronicle',
         watch: 'never',
         followSymlinks: options?.followSymlinks,
         maxFileSize: options?.maxFileSize,
@@ -292,6 +293,7 @@ test('tool inventory/schema includes workspace--read_image', async (t) => {
         path: join(frameworkRoot, 'mount'),
         mode: 'read-write',
         watch: 'never',
+        backend: 'chronicle',
       },
     ],
   });
@@ -498,6 +500,7 @@ test('process logging persists a redacted image receipt while the live round kee
         path: mountDir,
         mode: 'read-write',
         watch: 'never',
+        backend: 'chronicle',
       },
     ],
   });
@@ -631,7 +634,7 @@ test('bare read_image dispatch falls back to disk when the tree blob is utf-8 ma
 
   const membrane = new MockMembrane();
   const workspaceModule = new WorkspaceModule({
-    mounts: [{ name: 'work', path: mountDir, mode: 'read-write', watch: 'never' }],
+    mounts: [{ name: 'work', path: mountDir, mode: 'read-write', watch: 'never', backend: 'chronicle' }],
   });
   // BARE tool name — the framework-synthesized surface Fable actually called.
   membrane.pushResponse(createStreamResponse([

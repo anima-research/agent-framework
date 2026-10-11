@@ -43,7 +43,7 @@ function setup(t: TestContext) {
   });
   const makeModule = () =>
     new WorkspaceModule({
-      mounts: [{ name: 'work', path: mountDir, mode: 'read-write', watch: 'never' }],
+      mounts: [{ name: 'work', path: mountDir, mode: 'read-write', watch: 'never', backend: 'chronicle' }],
     });
   return { store, mountDir, makeModule };
 }

@@ -46,7 +46,7 @@ function setup(t: TestContext, mountNames: string[] = ['work']) {
   const makeModule = () =>
     new WorkspaceModule({
       mounts: mountNames.map((name) => ({
-        name, path: dirs[name], mode: 'read-write' as const, watch: 'never' as const,
+        name, path: dirs[name], mode: 'read-write' as const, watch: 'never' as const, backend: 'chronicle' as const,
       })),
     });
   return { store, dirs, makeModule };

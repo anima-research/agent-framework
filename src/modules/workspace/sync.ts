@@ -325,7 +325,7 @@ async function walkDirectory(
 /**
  * Simple ignore pattern matching.
  */
-function shouldIgnore(
+export function shouldIgnore(
   relativePath: string,
   name: string,
   patterns: string[],
