@@ -617,6 +617,9 @@ interface ChannelRegistryOptions {
     /** `failed`: nothing was posted; `unknown`: the request was dispatched
      *  and no valid receipt came back, so it may or may not have been. */
     outcome?: 'failed' | 'unknown';
+    /** The draft the words were kept as (deliverSpeech's holdFailed), for
+     *  a failure where nothing was posted. */
+    draftId?: string;
   }) => void;
   /**
    * Called when channels were opened WITHOUT the agent asking (subscription
@@ -749,11 +752,13 @@ export class ChannelRegistry {
    */
   private dmClassified = new Map<string, true>();
 
-  /** Per-channel typing indicator timers. */
-  private typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
+  /** Typing indicator timers, per channel on its server (typingKey): the
+   *  same channel id on another server is another channel. */
+  private typingIntervals = new Map<string, { serverId: string; channelId: string; interval: ReturnType<typeof setInterval> }>();
 
-  /** Per-channel typing metadata — carried on the 7s refresh so the target
-   *  server keeps getting the same routing hints (e.g. Zulip topic). */
+  /** Typing metadata, keyed like the timers — carried on the 7s refresh so
+   *  the target server keeps getting the same routing hints (e.g. Zulip
+   *  topic). */
   private typingMetadata = new Map<string, Record<string, unknown>>();
 
   /** Chronicle-projected desired lifecycle state, keyed by server + channel.
@@ -897,7 +902,7 @@ export class ChannelRegistry {
       for (const channelId of params.removed) {
         const key = `${serverId}:${channelId}`;
         const existed = this.channels.delete(key);
-        this.stopTyping(channelId);
+        this.stopTyping({ serverId, channelId });
         addedResults.push({ id: channelId, accepted: existed, reason: existed ? undefined : 'not registered' });
       }
     }
@@ -1266,93 +1271,90 @@ export class ChannelRegistry {
   // Typing Indicator Management
   // ==========================================================================
 
+  /** The typing state's key for a channel on its server. */
+  private static typingKey(serverId: string, channelId: string): string {
+    return JSON.stringify([serverId, channelId]);
+  }
+
   /**
    * Start sending typing indicators for a channel.
    *
    * Sends a typing notification immediately and every 7 seconds thereafter.
    * Discord typing indicators last ~10s, so 7s keeps them alive.
    *
+   * `target` names the channel and, when known, its server: the indicator
+   * shows only on that server's channel. A bare id resolves only when one
+   * server registers it, so an id two servers share, named alone, shows no
+   * indicator rather than one on a guessed server.
+   *
    * No-op if already typing on this channel.
    */
-  startTyping(channelId: string, metadata?: Record<string, unknown>): void {
+  startTyping(target: string | { serverId?: string; channelId: string }, metadata?: Record<string, unknown>): void {
+    const { serverId, channelId } = typeof target === 'string' ? { serverId: undefined, channelId: target } : target;
+    const found = this.findExactEntry({ ...(serverId ? { serverId } : {}), channelId });
+    if ('error' in found) return;
+    const entry = found.entry;
+    const key = ChannelRegistry.typingKey(entry.serverId, entry.descriptor.id);
     const metadataChanged =
       metadata !== undefined &&
-      !shallowEqualRecord(this.typingMetadata.get(channelId), metadata);
+      !shallowEqualRecord(this.typingMetadata.get(key), metadata);
     if (metadata) {
-      this.typingMetadata.set(channelId, metadata);
+      this.typingMetadata.set(key, metadata);
     }
 
-    if (this.typingIntervals.has(channelId)) {
+    if (this.typingIntervals.has(key)) {
       // Already typing. If the caller supplied new routing metadata (e.g. the
       // relevant Zulip topic just moved because a newer message arrived),
       // dispatch an immediate refresh so the server sees the new routing
       // within this request instead of waiting up to TYPING_INTERVAL_MS for
       // the next tick.
-      if (metadataChanged) {
-        const entry = this.findChannelEntry(channelId);
-        if (entry) {
-          this.sendTypingNotification(entry.serverId, channelId);
-        }
-      }
-      return;
-    }
-
-    // Find the channel entry and its server
-    const entry = this.findChannelEntry(channelId);
-    if (!entry) {
+      if (metadataChanged) this.sendTypingNotification(entry.serverId, entry.descriptor.id);
       return;
     }
 
     // Send typing immediately
-    this.sendTypingNotification(entry.serverId, channelId);
+    this.sendTypingNotification(entry.serverId, entry.descriptor.id);
 
     // Set up interval — pulls the latest metadata on each tick so mid-stream
     // updates (e.g. a newer incoming message switching the relevant topic)
     // take effect on the next refresh.
     const interval = setInterval(() => {
-      this.sendTypingNotification(entry.serverId, channelId);
+      this.sendTypingNotification(entry.serverId, entry.descriptor.id);
     }, TYPING_INTERVAL_MS);
 
-    this.typingIntervals.set(channelId, interval);
+    this.typingIntervals.set(key, { serverId: entry.serverId, channelId: entry.descriptor.id, interval });
   }
 
   /**
    * Stop sending typing indicators.
    *
-   * If channelId is specified, stops typing on that channel only.
-   * If no channelId, stops all typing indicators.
+   * With a target, stops typing on that channel: on its server when named,
+   * else on every server where that channel id is typing. With none, stops
+   * all typing indicators.
    */
-  stopTyping(channelId?: string): void {
-    if (channelId !== undefined) {
-      const interval = this.typingIntervals.get(channelId);
-      if (interval) {
-        clearInterval(interval);
-        this.typingIntervals.delete(channelId);
-        // Dispatch an explicit 'stop' so servers that support it (e.g. Zulip)
-        // clear the indicator immediately rather than waiting for auto-expire.
-        // Metadata still carries the routing hint so the stop hits the same
-        // topic/thread as the start. Guarded by `interval`: matches the
-        // global-clear branch's semantics, and keeps defensive stopTyping(ch)
-        // calls from spamming stops at a server that never saw a start.
-        const entry = this.findChannelEntry(channelId);
-        if (entry && this.sendTypingFn) {
-          this.sendTypingFn(entry.serverId, channelId, this.typingMetadata.get(channelId), 'stop');
-        }
+  stopTyping(target?: string | { serverId?: string; channelId: string }): void {
+    const named = target === undefined
+      ? undefined
+      : typeof target === 'string' ? { serverId: undefined, channelId: target } : target;
+    for (const [key, typing] of [...this.typingIntervals]) {
+      if (named && (typing.channelId !== named.channelId || (named.serverId && typing.serverId !== named.serverId))) continue;
+      clearInterval(typing.interval);
+      this.typingIntervals.delete(key);
+      // Dispatch an explicit 'stop' so servers that support it (e.g. Zulip)
+      // clear the indicator immediately rather than waiting for auto-expire.
+      // Metadata still carries the routing hint so the stop hits the same
+      // topic/thread as the start. Only where typing was started: a
+      // defensive stopTyping(ch) never sends a stop to a server that never
+      // saw a start.
+      this.sendTypingFn?.(typing.serverId, typing.channelId, this.typingMetadata.get(key), 'stop');
+      this.typingMetadata.delete(key);
+    }
+    if (named) {
+      for (const key of [...this.typingMetadata.keys()]) {
+        const [serverId, channelId] = JSON.parse(key) as [string, string];
+        if (channelId === named.channelId && (!named.serverId || serverId === named.serverId)) this.typingMetadata.delete(key);
       }
-      this.typingMetadata.delete(channelId);
     } else {
-      // Clear all typing intervals and dispatch stop for each known channel
-      const channels = Array.from(this.typingIntervals.keys());
-      for (const interval of this.typingIntervals.values()) {
-        clearInterval(interval);
-      }
-      this.typingIntervals.clear();
-      if (this.sendTypingFn) {
-        for (const id of channels) {
-          const entry = this.findChannelEntry(id);
-          if (entry) this.sendTypingFn(entry.serverId, id, this.typingMetadata.get(id), 'stop');
-        }
-      }
       this.typingMetadata.clear();
     }
   }
@@ -1548,7 +1550,7 @@ export class ChannelRegistry {
     for (const [key, entry] of this.channels) {
       if (entry.serverId !== serverId) continue;
       this.channels.delete(key);
-      this.stopTyping(entry.descriptor.id);
+      this.stopTyping({ serverId: entry.serverId, channelId: entry.descriptor.id });
     }
     // Desired state and migration markers deliberately survive disconnects.
   }
@@ -1558,10 +1560,11 @@ export class ChannelRegistry {
    */
   stopAll(): void {
     // Clear all typing intervals
-    for (const interval of this.typingIntervals.values()) {
-      clearInterval(interval);
+    for (const typing of this.typingIntervals.values()) {
+      clearInterval(typing.interval);
     }
     this.typingIntervals.clear();
+    this.typingMetadata.clear();
 
     // Clear channels map
     this.channels.clear();
@@ -2313,7 +2316,7 @@ export class ChannelRegistry {
     // tick would be noise.
     if (!CapabilityGrant.of(this.serverRegistry.getServer(serverId)).has('channels.typing')) return;
     if (this.sendTypingFn) {
-      this.sendTypingFn(serverId, channelId, this.typingMetadata.get(channelId));
+      this.sendTypingFn(serverId, channelId, this.typingMetadata.get(ChannelRegistry.typingKey(serverId, channelId)));
     }
     // TODO: When server-connection exposes a public sendNotification or
     // sendTyping method, wire it here directly instead of using a callback.
@@ -2834,7 +2837,7 @@ export class ChannelRegistry {
     }
 
     this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
-    this.stopTyping(input.channelId);
+    this.stopTyping({ serverId: entry.serverId, channelId: input.channelId });
 
     const server = this.serverRegistry.getServer(entry.serverId);
     if (!server) {
@@ -3404,6 +3407,13 @@ export class ChannelRegistry {
      *  PR #32, and the 2026-07-22 Sol DM misroute). Explicit `null` means
      *  "this turn is pinned to no locus": fail loudly rather than guess. */
     locusChannelId: string | null | { serverId?: string; channelId: string; threadId?: string | null },
+    opts: {
+      /** Keep words that provably weren't posted (a failed outcome) and
+       *  return the draft's id, which the failure notice then names. Not
+       *  called for an unknown outcome: those words may have been posted,
+       *  and a draft would invite a duplicate. */
+      holdFailed?: (reason: string) => string | undefined;
+    } = {},
   ): Promise<PublishOutcome> {
     const fail = (
       where: { serverId?: string; channelId: string | null; label?: string; threadId?: string | null },
@@ -3412,6 +3422,14 @@ export class ChannelRegistry {
     ): PublishOutcome => {
       const status = outcome.status === 'unknown' ? 'unknown' : 'failed';
       const { serverId, channelId, label, threadId } = where;
+      let draftId: string | undefined;
+      if (status === 'failed' && opts.holdFailed) {
+        try {
+          draftId = opts.holdFailed(reason);
+        } catch (err) {
+          console.error(`[routeSpeech] ${conversationId}: could not keep the undelivered words as a draft:`, err);
+        }
+      }
       console.error(`[routeSpeech] ${conversationId}: ${reason} — speech ${status === 'unknown' ? 'delivery NOT confirmed' : 'NOT routed'} (${text.length} chars stay in chronicle)`);
       this.emitTraceFn({
         type: 'mcpl:speech-route-failed',
@@ -3428,6 +3446,7 @@ export class ChannelRegistry {
         ...(label ? { label } : {}),
         ...(threadId ? { threadId } : {}),
         reason, textLen: text.length, outcome: status,
+        ...(draftId ? { draftId } : {}),
       });
       return outcome;
     };
@@ -3488,8 +3507,9 @@ export class ChannelRegistry {
     conversationId: string,
     text: string,
     locusChannelId: string | null | { serverId?: string; channelId: string; threadId?: string | null },
+    opts: { holdFailed?: (reason: string) => string | undefined } = {},
   ): Promise<{ delivered: boolean; serverId: string; channelId: string; label?: string; threadId?: string; messageId?: string } | null> {
-    const outcome = await this.deliverSpeech(conversationId, text, locusChannelId);
+    const outcome = await this.deliverSpeech(conversationId, text, locusChannelId, opts);
     if (outcome.status !== 'delivered') return null;
     // The destination as resolved at delivery — server, channel, the label it
     // had then, and the thread — so a receipt names exactly where it went.

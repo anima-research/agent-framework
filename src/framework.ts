@@ -10231,6 +10231,14 @@ export class AgentFramework {
     return turn && !turn.hold && turn.route?.kind === 'channel' ? turn.route.channelId : null;
   }
 
+  /** The channel route's channel with its server, where typing shows and
+   *  logs name it: the same id on another server is another channel. */
+  private routeChannel(agentName: string): { serverId?: string; channelId: string } | null {
+    const turn = this.turnRoutes?.get(agentName);
+    if (!turn || turn.hold || turn.route?.kind !== 'channel') return null;
+    return { ...(turn.route.serverId ? { serverId: turn.route.serverId } : {}), channelId: turn.route.channelId };
+  }
+
   /**
    * The exact place the agent's unaddressed speech is published to now — its
    * channel route's server, channel and thread (null: the channel root) — or
@@ -10366,9 +10374,17 @@ export class AgentFramework {
     }
     // The route's exact place: its server, channel and thread (or root).
     const target = { ...(route.serverId ? { serverId: route.serverId } : {}), channelId: route.channelId, threadId: route.threadId ?? null };
-    const outcome = await this.channelRegistry.routeSpeech(agent.name, text, target);
+    const outcome = await this.channelRegistry.routeSpeech(agent.name, text, target, { holdFailed: this.holdUndelivered(agent, text, hold) });
     this.recordProseDelivery(agent.name, outcome);
     if (outcome?.delivered) this.streamPublished(agent.name, moment, outcome, text);
+  }
+
+  /** deliverSpeech's holdFailed for unaddressed speech: words that provably
+   *  weren't posted are kept as a bounce draft (as a failed `>>>` delivery's
+   *  are), named by the one failure notice. An unknown outcome keeps none,
+   *  so as not to invite a duplicate. */
+  private holdUndelivered(agent: Agent, text: string, hold: { round?: number; notice: 'now' | 'later' }): (reason: string) => string | undefined {
+    return (reason) => this.holdProseDrafts(agent, [text], 'bounced', { round: hold.round, note: `delivery failed: ${reason}`, notice: 'later' })[0]?.id;
   }
 
   /** A turn route in words, for logs. */
@@ -10744,7 +10760,7 @@ export class AgentFramework {
       const sticky = this.proseTargetPins.get(agent.name);
       try {
         if (sticky) {
-          const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, sticky);
+          const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, sticky, { holdFailed: this.holdUndelivered(agent, envelope, hold) });
           this.recordProseDelivery(agent.name, outcome);
           if (outcome?.delivered) this.streamPublished(agent.name, moment, outcome, envelope);
         } else {
@@ -11304,9 +11320,9 @@ export class AgentFramework {
       }
     }
 
-    // A context-budget restart normally preserves the turn route, but a
-    // silent control-plane wake must remain routeless even if an explicit
-    // tool opened a channel mid-turn.
+    // A context-budget restart normally preserves the turn route. A silent
+    // control-plane wake has none: its channel_open sets none (the result
+    // says so), so this resets only what a restart could carry over.
     if (trigger?.suppressProse) {
       this.turnRoutes.set(agent.name, { route: null });
       this.proseTargetPins.delete(agent.name);
@@ -11317,9 +11333,11 @@ export class AgentFramework {
     this.emitTrace({
       type: 'inference:started',
       agentName: agent.name,
-      // The turn's route channel, decided just above (kept across a
-      // context-budget restart, which skips the decision but re-emits this).
+      // The turn's route channel and its server, decided just above (kept
+      // across a context-budget restart, which skips the decision but
+      // re-emits this).
       channelId: this.routeChannelId(agent.name) ?? undefined,
+      ...(this.routeChannel(agent.name)?.serverId ? { serverId: this.routeChannel(agent.name)!.serverId } : {}),
       ...(trigger?.suppressProse ? { silent: true } : {}),
     });
     // A budget restart continues the same logical inference window. The
@@ -11341,7 +11359,7 @@ export class AgentFramework {
     const earlyTypingChannel =
       turnProseRouting === 'explicit'
         ? trigger?.channelId ?? null
-        : this.routeChannelId(agent.name);
+        : this.routeChannel(agent.name);
     if (earlyTypingChannel) this.channelRegistry?.startTyping(earlyTypingChannel);
 
     try {
@@ -11617,7 +11635,7 @@ export class AgentFramework {
         ? null
         : turnProseRouting === 'explicit'
           ? trigger?.channelId ?? null
-          : this.routeChannelId(agent.name);
+          : this.routeChannel(agent.name);
     if (typingChannel) this.channelRegistry?.startTyping(typingChannel);
 
     // MCPL Spec 14.3 outgoing streaming: route text deltas to their
@@ -14967,6 +14985,7 @@ export class AgentFramework {
       category,
       streak,
       locus: this.routeChannelId(agentName),
+      locusServer: this.routeChannel(agentName)?.serverId ?? null,
       tokens: tokens ?? null,
     });
     if (streak >= 2) {
@@ -15318,7 +15337,7 @@ export class AgentFramework {
         // addMessage() alone does not request inference, so this never wakes
         // her (matching the `discord-send-failed-skip` gate intent: context
         // yes, wake no).
-        onRouteFailure: ({ serverId, channelId, label, threadId, reason, textLen, outcome }) => {
+        onRouteFailure: ({ conversationId, serverId, channelId, label, threadId, reason, textLen, outcome, draftId }) => {
           try {
             // Name the conversation the words were bound for as every
             // conversation is named (describeConversation): its label, its
@@ -15347,9 +15366,18 @@ export class AgentFramework {
                   // A request went out and no valid receipt came back: it may
                   // have been posted (in part or whole). Never claim it wasn't.
                   ? `[discord-send-failed] Delivery of your previous reply (${textLen} chars) to ${where} was not confirmed (${reason}). It may or may not have been posted; check the ${threadId ? 'thread' : 'channel'} before sending it again. It is saved in your archive.`
-                  : `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). Nothing was posted; it is saved in your archive.`,
+                  : draftId
+                    ? `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). ` +
+                      `Nothing was posted; it is held as draft ${draftId}, and drafts(action: "resend", draftIds: ["${draftId}"], ` +
+                      'destination: "#channel") sends it.'
+                    : `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). Nothing was posted; it is saved in your archive.`,
               }],
-              { system: true, kind: 'discord-send-failed', ...(serverId ? { serverId } : {}), channelId: channelId ?? '', ...(threadId ? { threadId } : {}), reason, ...(outcome ? { outcome } : {}) },
+              {
+                system: true, kind: 'discord-send-failed', ...(serverId ? { serverId } : {}), channelId: channelId ?? '',
+                ...(threadId ? { threadId } : {}), reason, ...(outcome ? { outcome } : {}),
+                // The draft it names counts as named (settleTurnDrafts).
+                ...(draftId ? { draftOwner: conversationId, draftIds: [draftId] } : {}),
+              } as MessageMetadata,
             );
           } catch (err) {
             console.error('onRouteFailure: failed to record send-failure marker:', err);
@@ -17251,6 +17279,11 @@ export class AgentFramework {
               // speech is its own to decide: the open stands, the route and
               // prose choices don't move.
               routing = 'Opened. A newer turn has begun since this call, so its speech route is unchanged.';
+            } else if (this.activeTurnTriggers.get(agentName)?.suppressProse === true) {
+              // A silent control-plane wake keeps its plain speech private:
+              // the open stands, and no route is set.
+              routing = 'Opened. This is a silent wake, so your plain speech stays private this turn; ' +
+                'to post there, use a send tool.';
             } else if (openInput?.setSpeechTarget !== false) {
               const resolved = this.channelRegistry!.resolveDestination({
                 channelId: opened,
@@ -17587,7 +17620,7 @@ export class AgentFramework {
         this.chainSpeech(agentName, '[sleep] announcement', async () => {
           const pin = agent.proseRouting === 'hybrid' ? this.proseTargetPins.get(agentName) : undefined;
           if (pin) {
-            const outcome = await this.channelRegistry!.routeSpeech(agentName, text, pin);
+            const outcome = await this.channelRegistry!.routeSpeech(agentName, text, pin, { holdFailed: this.holdUndelivered(agent, text, { notice: 'later' }) });
             this.recordProseDelivery(agentName, outcome);
             if (outcome?.delivered) this.streamPublished(agentName, moment, outcome, text);
             return;

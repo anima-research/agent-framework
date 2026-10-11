@@ -612,6 +612,28 @@ describe('held prose drafts, end to end', () => {
     }
   });
 
+  it('unaddressed speech that provably was not posted is kept as a draft, named by its one failure notice; an unconfirmed one is not', async () => {
+    const h = await harness();
+    try {
+      h.command({ op: 'publish-mode', mode: 'not-delivered' });
+      await h.turn([createMockResponse([text('words that could not go')])]);
+      const [kept] = h.drafts();
+      assert.equal(kept?.text, 'words that could not go');
+      assert.equal(kept?.reason, 'bounced');
+      assert.match(kept?.note ?? '', /^delivery failed: /);
+      const markers = () => h.texts().filter((t) => t.startsWith('[discord-send-failed]'));
+      assert.equal(markers().length, 1);
+      assert.match(markers()[0]!, new RegExp(`Nothing was posted; it is held as draft ${kept!.id}, and drafts\\(action: "resend"`));
+
+      h.command({ op: 'publish-mode', mode: 'no-receipt' });
+      await h.turn([createMockResponse([text('words that may have gone')])]);
+      assert.deepEqual(h.drafts().map((d) => d.id), [kept!.id], 'an unconfirmed delivery keeps no draft, so as not to invite a duplicate');
+      assert.match(markers().at(-1)!, /was not confirmed .* It may or may not have been posted/);
+    } finally {
+      await h.close();
+    }
+  });
+
   it('an unknown outcome is not cleared by a later failure: the draft stays unconfirmed', async () => {
     const h = await harness();
     try {
@@ -1426,8 +1448,8 @@ describe('held drafts: exact runs, hybrid envelopes beside a send, and turn-end 
         ['words for the room', `written for >>>${ROOM}`],
         ['more for the room', undefined],
       ]);
-      assert.equal((h.framework as unknown as { proseTargetPins: Map<string, string> }).proseTargetPins.get('scout'), ROOM,
-        'the named destination is the sticky target again, as live routing would leave it');
+      assert.deepEqual((h.framework as unknown as { proseTargetPins: Map<string, unknown> }).proseTargetPins.get('scout'), { serverId: 'discord', channelId: ROOM },
+        'the named destination, on its server, is the sticky target again, as live routing would leave it');
       assert.match(h.texts().find((t) => t.startsWith('[delivered]'))!, / · 3 plain-speech segment\(s\) kept private \(skip_reply\)$/);
 
       // A live `>>>skip_reply` in an earlier round binds a later silenced one.

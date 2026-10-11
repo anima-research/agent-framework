@@ -49,6 +49,9 @@ export type TraceEvent =
        * activation with its channel without re-deriving routing.
        */
       channelId?: string;
+      /** The server of that channel route, when known: the same channel id
+       *  on another server is another channel. */
+      serverId?: string;
       /** True for a control-plane wake that must not surface typing/prose. */
       silent?: boolean;
     })

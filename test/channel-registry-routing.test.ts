@@ -375,6 +375,36 @@ test('a route that names its server publishes there, even when another server re
   assert.equal(published.length, 1);
 });
 
+test('typing shows on the route\'s own server when another server registers the same channel id, and nowhere for the id alone', () => {
+  const typed: Array<[string, string, string]> = [];
+  const servers: Record<string, unknown> = {
+    a: { grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []) },
+    b: { grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []) },
+  };
+  const registry = new ChannelRegistry(
+    { getServer: (id: string) => servers[id] } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+    { sendTypingFn: (serverId, channelId, _metadata, op) => { typed.push([serverId, channelId, op ?? 'start']); } },
+  );
+  seedRegistered(registry, 'a', 'shared');
+  seedRegistered(registry, 'b', 'shared');
+  try {
+    registry.startTyping('shared');
+    assert.deepEqual(typed, [], 'an id two servers share, named alone, shows no indicator');
+    registry.startTyping({ serverId: 'b', channelId: 'shared' });
+    registry.startTyping({ serverId: 'b', channelId: 'shared' });
+    assert.deepEqual(typed, [['b', 'shared', 'start']], "only the route's server, once");
+    registry.stopTyping({ serverId: 'a', channelId: 'shared' });
+    assert.equal(typed.length, 1, 'no stop to a server that never saw a start');
+    registry.stopTyping({ serverId: 'b', channelId: 'shared' });
+    assert.deepEqual(typed.at(-1), ['b', 'shared', 'stop']);
+  } finally {
+    registry.stopTyping();
+  }
+});
+
 test('routeSpeech surfaces a failure when there is no locus at all', async () => {
   const { registry, failures } = makeRegistry({ delivered: true });
   const res = await registry.routeSpeech('cairn', 'into the void', registry.resolveLocus('cairn'));
