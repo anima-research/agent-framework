@@ -1019,9 +1019,12 @@ export interface ChannelContext {
     threadId?: string;
   };
 
-  /** Default channel for outgoing messages */
+  /** Default channel for outgoing messages, and the thread in it that the
+   *  agent's plain speech posts into, when it has one (an extension of
+   *  §14.4's shape: a server that doesn't read it loses nothing). */
   defaultOutgoing?: {
     channelId: string;
+    threadId?: string;
   };
 
   /** All candidate channels for this inference */

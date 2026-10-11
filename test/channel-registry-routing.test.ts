@@ -161,6 +161,7 @@ test('a coalesced message is gated with the host envelope its coalescer will fre
     channelId: 'slack:C1', messageId: 'm-c', acceptedAt: 1,
   };
   let accepted = 0;
+  let gatedBeforeAdmission = -1;
   const handed: Array<{ inboundSource?: unknown }> = [];
   const registry = new ChannelRegistry(
     { getServer: () => undefined } as unknown as McplServerRegistry,
@@ -171,8 +172,11 @@ test('a coalesced message is gated with the host envelope its coalescer will fre
       shouldTriggerInference: (_content, metadata) => { seen.push(metadata); return false; },
       acceptInbound: () => { accepted++; return undefined; },
       coalescedSource: () => envelope as never,
-      handleCoalescedIncoming: async (_serverId, message, event) => {
+      // The coalescer admits the occurrence, and only then decides its trigger.
+      handleCoalescedIncoming: async (_serverId, message, event, decideTrigger) => {
+        gatedBeforeAdmission = seen.length;
         handed.push(event as { inboundSource?: unknown });
+        decideTrigger?.();
         return { messageId: message.messageId, accepted: true };
       },
     },
@@ -187,6 +191,7 @@ test('a coalesced message is gated with the host envelope its coalescer will fre
     }],
   } as never);
   assert.equal(accepted, 0, 'building the envelope accepts nothing: the coalescer observes its own admissions');
+  assert.equal(gatedBeforeAdmission, 0, 'the gate is not consulted before the coalescer admits the occurrence');
   assert.equal(seen.length, 1);
   assert.equal(seen[0]!.inboundSource, envelope, 'the gate reads the host envelope');
   assert.equal(handed[0]!.inboundSource, envelope, 'the coalescer gets the very envelope the gate read');
@@ -315,6 +320,8 @@ test('buildChannelContext advertises the agent\'s own route and its reply edge, 
   const routes: Record<string, SpeechRouteView> = {
     'conversation-chanA-g1': { kind: 'channel', serverId: 'discord', channelId: 'chanA' },
     scout: { kind: 'channel', serverId: 'discord', channelId: 'chanB', replyTo: 'm-7', threadId: 't-1' },
+    // A thread route with no reply edge (a channel_open of a thread, say).
+    opener: { kind: 'channel', serverId: 'discord', channelId: 'chanB', threadId: 't-2' },
     held: { kind: 'held', conversations: ['#chanA (chanA)', '#chanB (chanB)'] },
     tui: { kind: 'surface', surface: 'tui' },
   };
@@ -328,6 +335,10 @@ test('buildChannelContext advertises the agent\'s own route and its reply edge, 
   assert.equal(scout?.defaultOutgoing?.channelId, 'chanB');
   assert.deepEqual(scout?.incoming, { channelId: 'chanB', messageId: 'm-7', threadId: 't-1' },
     'the reply edge is the route\'s own triggering message');
+  assert.deepEqual(scout?.defaultOutgoing, { channelId: 'chanB', threadId: 't-1' });
+  const opener = registry.buildChannelContext('opener');
+  assert.deepEqual(opener?.defaultOutgoing, { channelId: 'chanB', threadId: 't-2' }, 'the thread is named without a reply edge too');
+  assert.equal(opener?.incoming, undefined);
   for (const agent of ['held', 'tui', 'nobody']) {
     const ctx = registry.buildChannelContext(agent);
     assert.equal(ctx?.defaultOutgoing, undefined, `${agent}: no outgoing channel`);

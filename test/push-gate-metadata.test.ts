@@ -53,12 +53,19 @@ test('a coalesced push is gated with the host envelope its coalescer will freeze
   let accepted = 0;
   let built = 0;
   const coalescedEvents: Array<{ inboundSource?: InboundSource }> = [];
+  let gatedBeforeAdmission = -1;
   const handler = new PushHandler(
     { validateInbound: () => {} } as unknown as FeatureSetManager,
     () => {},
     () => {},
     (_content, metadata) => { seen.push(metadata); return false; },
-    async (_serverId, _params, event) => { coalescedEvents.push(event); return { accepted: true } as never; },
+    // The coalescer admits the occurrence, and only then decides its trigger.
+    async (_serverId, _params, event, decideTrigger) => {
+      gatedBeforeAdmission = seen.length;
+      coalescedEvents.push(event);
+      decideTrigger?.();
+      return { accepted: true } as never;
+    },
     () => { accepted++; return undefined; },
     (_serverId, params) => {
       built++;
@@ -77,6 +84,7 @@ test('a coalesced push is gated with the host envelope its coalescer will freeze
   } as never);
   assert.equal(built, 1);
   assert.equal(accepted, 0, 'building a coalesced envelope accepts nothing: the coalescer observes its own admissions');
+  assert.equal(gatedBeforeAdmission, 0, 'the gate is not consulted before the coalescer admits the occurrence');
   assert.equal(seen.length, 1);
   assert.deepEqual(seen[0]![INBOUND_SOURCE_KEY], envelope, 'the gate reads the host envelope, not the origin\'s channel or key');
   assert.equal(coalescedEvents.length, 1);

@@ -1170,7 +1170,7 @@ export class AgentFramework {
    *  (hybrid) prefix. Written and read on the speech chain, in the order the
    *  words were written. Cleared at a true new turn; a context restart or
    *  framework retry continues the turn and keeps it. */
-  private proseTargetPins: Map<string, string> = new Map();
+  private proseTargetPins: Map<string, { serverId: string; channelId: string }> = new Map();
   /** Hybrid router is fail-closed after a `>>>skip_reply` envelope (the
    *  rest is private) or a malformed/unresolved/undelivered one (the rest is
    *  held as drafts, having no destination) until a new valid target. On the
@@ -1795,6 +1795,28 @@ export class AgentFramework {
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
         addMessage: (p, c, m, forAgent) => framework.addMessage(p, c, m as MessageMetadata, forAgent ? { forAgent } : undefined),
         requestInference: (agentName, reason, source, provenance) => {
+          // The batch's conversations as speech-route candidates, under the
+          // same fork rule: a fork takes only its home's, and no other agent
+          // takes a channel a fork owns. That includes an unroutable
+          // candidate: it never routes, but it competes, so a fork's
+          // channel would otherwise hold another agent's turn.
+          const routeCandidates = (provenance?.routeCandidates ?? [])
+            .filter((c) => c.kind === 'surface' || framework.mayTakeRoute(agentName, c.channelId))
+            .map((c): RouteCandidate => c.kind === 'surface'
+              ? { conversation: { kind: 'surface', surface: c.surface }, addressed: true, at: c.at }
+              : c.unroutable
+                ? {
+                    conversation: {
+                      kind: 'channel',
+                      ...(c.serverId ? { serverId: c.serverId } : {}),
+                      channelId: c.channelId,
+                      ...(c.threadId ? { threadId: c.threadId } : {}),
+                    },
+                    addressed: c.addressed,
+                    at: c.at,
+                    unroutable: true,
+                  }
+                : framework.candidateForChannel(c.channelId, c.addressed, c.at, c.serverId, c.messageId, c.threadId));
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
@@ -1817,30 +1839,8 @@ export class AgentFramework {
             ...(provenance?.routeChannelId && framework.mayTakeRoute(agentName, provenance.routeChannelId)
               ? { channelId: provenance.routeChannelId, addressed: true }
               : {}),
-            // The batch's conversations as speech-route candidates, under the
-            // same fork rule: a fork takes only its home's, and no other agent
-            // takes a channel a fork owns.
-            ...(provenance?.routeCandidates?.length
-              ? {
-                  routeCandidates: provenance.routeCandidates
-                    .filter((c) => c.kind === 'surface' || c.unroutable || framework.mayTakeRoute(agentName, c.channelId))
-                    .map((c): RouteCandidate => c.kind === 'surface'
-                      ? { conversation: { kind: 'surface', surface: c.surface }, addressed: true, at: c.at }
-                      : c.unroutable
-                        ? {
-                            conversation: {
-                              kind: 'channel',
-                              ...(c.serverId ? { serverId: c.serverId } : {}),
-                              channelId: c.channelId,
-                              ...(c.threadId ? { threadId: c.threadId } : {}),
-                            },
-                            addressed: c.addressed,
-                            at: c.at,
-                            unroutable: true,
-                          }
-                        : framework.candidateForChannel(c.channelId, c.addressed, c.at, c.serverId, c.messageId, c.threadId)),
-                }
-              : {}),
+            // None left, as for an agent the fork rule leaves out, is none.
+            ...(routeCandidates.length > 0 ? { routeCandidates } : {}),
           });
         },
         getAgentNames: () => [...framework.agents.keys()].filter(
@@ -7303,11 +7303,16 @@ export class AgentFramework {
 
       // Gate non-MCPL events (MCPL events are already gated in PushHandler/ChannelRegistry)
       if (this.eventGate && event.type !== 'mcpl:push-event' && event.type !== 'mcpl:channel-incoming') {
+        const fields = extractGateFields(event);
+        const named = fields.metadata.channelId;
         const decision = this.eventGate.evaluate({
-          ...extractGateFields(event),
+          ...fields,
           eventType: event.type,
           serverId: source,
-          channelId: '',
+          // A module event that names a channel isn't a local surface's
+          // conversation (surfaceSourceFor): the gate's wake carries that
+          // channel, unroutable, never a surface candidate.
+          channelId: !surface && typeof named === 'string' ? named : '',
         });
         if (!decision.trigger) return;
       }
@@ -8263,10 +8268,32 @@ export class AgentFramework {
       : this.pushSource(event, { deferred });
   }
 
+  /** A coalesced item's trigger decision, keyed by the delivery event its
+   *  occurrence carries, until the coalescer first acts on it
+   *  (settleCoalescedTrigger). Not on the event itself: the coalescer
+   *  persists occurrences, and a function can't be. */
+  private readonly coalescedTriggers = new WeakMap<object, () => boolean>();
+
+  /**
+   * Make a coalesced item's trigger decision (the gate's, which records the
+   * item in its batch as a route candidate), once: when the coalescer first
+   * delivers or wakes for an occurrence it admitted. A refused occurrence, a
+   * retry it deduplicates, or a retraction is never delivered or woken for,
+   * so it never reaches the gate. The decision is written onto the event,
+   * so a persisted occurrence keeps it.
+   */
+  private settleCoalescedTrigger(event: { triggerInference?: boolean }): void {
+    const decide = this.coalescedTriggers.get(event);
+    if (!decide) return;
+    this.coalescedTriggers.delete(event);
+    event.triggerInference = decide();
+  }
+
   private handleCoalescedIncoming(
     serverId: string,
     message: ChannelIncomingMessage,
     event: CoalescedChannelEvent,
+    decideTrigger?: () => boolean,
   ): Promise<ChannelIncomingMessageResult> {
     return this.admitCoalesced(async () => {
       if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
@@ -8281,6 +8308,8 @@ export class AgentFramework {
       // deferral, fan-out and replay deliver it unchanged
       // (mcpl/inbound-source.ts).
       const inboundSource = event.inboundSource ?? this.coalescedIncomingSource(serverId, message, event);
+      const delivery = { ...event, eventId: message.eventId, inboundSource };
+      if (decideTrigger) this.coalescedTriggers.set(delivery, decideTrigger);
       const result = await this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
@@ -8294,13 +8323,13 @@ export class AgentFramework {
         tags: event.tags,
         content: message.content,
         identity: { messageId: message.messageId, author: message.author, threadId: message.threadId },
-        event: { lane: 'channel', event: { ...event, eventId: message.eventId, inboundSource } },
+        event: { lane: 'channel', event: delivery },
       });
       return { messageId: message.messageId, accepted: true, coalesce: result.coalesce };
     });
   }
 
-  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent): Promise<PushEventResult> {
+  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent, decideTrigger?: () => boolean): Promise<PushEventResult> {
     return this.admitCoalesced(async () => {
       if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
       validateCoalesceMember(params.coalesce, 'push');
@@ -8318,6 +8347,8 @@ export class AgentFramework {
       // The inbound source envelope the gate read, frozen at acceptance (see
       // the channel lane).
       const inboundSource = event.inboundSource ?? this.coalescedPushSource(serverId, params, event);
+      const delivery = { ...event, inboundSource };
+      if (decideTrigger) this.coalescedTriggers.set(delivery, decideTrigger);
       return this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
@@ -8339,7 +8370,7 @@ export class AgentFramework {
             ...(str(origin.authorId) ? { author: { id: str(origin.authorId)!, name: str(origin.authorName) ?? str(origin.authorId)! } } : {}),
           },
         } : {}),
-        event: { lane: 'push', event: { ...event, inboundSource } },
+        event: { lane: 'push', event: delivery },
       });
     });
   }
@@ -8411,6 +8442,7 @@ export class AgentFramework {
     materialized?: McplContentBlock[],
     assemblingFor?: string,
   ): Promise<CoalescingPlacement | undefined> {
+    this.settleCoalescedTrigger(occ.event.event);
     const coalescingSubject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     const narrowing = occ.deliverTo ? { deliverTo: occ.deliverTo } : {};
     // The envelope frozen at acceptance travels unchanged; this delivery only
@@ -8477,6 +8509,7 @@ export class AgentFramework {
   private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     this.cancelCoalescedWakes(subject);
+    this.settleCoalescedTrigger(occ.event.event);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
     const origin = occ.event.event.origin;
     // The wake carries the batch's channel so the turn freezes its reply
@@ -9176,7 +9209,7 @@ export class AgentFramework {
         } else if (parsed.kind === 'target') {
           const resolved = this.channelRegistry?.resolveProseTarget(parsed.target!);
           if (resolved && !('error' in resolved)) {
-            this.proseTargetPins.set(agent.name, resolved.channelId);
+            this.proseTargetPins.set(agent.name, { serverId: resolved.serverId, channelId: resolved.channelId });
             this.proseHybridSuppressed.delete(agent.name);
           } else {
             this.proseTargetPins.delete(agent.name);
@@ -10550,13 +10583,14 @@ export class AgentFramework {
   private async deliverWithUnsent(
     agent: Agent,
     body: string,
-    channelId: string,
+    /** The envelope's destination, on the server its target resolved to. */
+    destination: { serverId: string; channelId: string },
     unsent: Draft | undefined,
   ): Promise<PublishOutcome> {
     const registry = this.channelRegistry!;
     let attemptId: string | undefined;
     if (unsent) {
-      const target = registry.resolveDestination({ channelId });
+      const target = registry.resolveDestination(destination);
       if (!('error' in target)) {
         try {
           attemptId = this.proseDrafts.beginAttempt(agent.name, unsent.id, target.destination, 'unsent-token', false);
@@ -10574,7 +10608,7 @@ export class AgentFramework {
     }
     let outcome: PublishOutcome;
     try {
-      outcome = await registry.deliverSpeech(agent.name, body, channelId);
+      outcome = await registry.deliverSpeech(agent.name, body, destination);
     } finally {
       if (flight) {
         this.draftsInFlight.delete(flight);
@@ -10644,14 +10678,15 @@ export class AgentFramework {
           continue;
         }
         if (usedClipboard) body = body.replaceAll('{{unsent}}', unsent.draft?.text ?? '');
-        this.proseTargetPins.set(agent.name, resolved.channelId);
+        const pin = { serverId: resolved.serverId, channelId: resolved.channelId };
+        this.proseTargetPins.set(agent.name, pin);
         this.proseHybridSuppressed.delete(agent.name);
         if (!body.trim()) {
           console.error(`[prose] ${agent.name}: >>>${parsed.target} established target; empty body — nothing sent yet`);
           continue;
         }
         try {
-          const outcome = await this.deliverWithUnsent(agent, body, resolved.channelId, unsent.draft);
+          const outcome = await this.deliverWithUnsent(agent, body, pin, unsent.draft);
           this.recordProseDelivery(agent.name, outcome.status === 'delivered' ? { delivered: true, ...outcome.destination! } : null);
           if (outcome.status === 'delivered') {
             this.streamPublished(agent.name, moment, outcome.destination!, body);
@@ -10758,7 +10793,7 @@ export class AgentFramework {
       return;
     }
 
-    let targetChannel: string;
+    let target: { serverId: string; channelId: string };
     let body: string;
     if (parsed.kind === 'target') {
       const res = this.channelRegistry!.resolveProseTarget(parsed.target!);
@@ -10766,9 +10801,10 @@ export class AgentFramework {
         this.bounceProse(agent, parsed.body, res.error, res.candidates, '>>', hold);
         return;
       }
-      targetChannel = res.channelId;
-      // Sticky within the turn: later unprefixed segments follow this target.
-      this.proseTargetPins.set(name, targetChannel);
+      target = { serverId: res.serverId, channelId: res.channelId };
+      // Sticky within the turn: later unprefixed segments follow this
+      // target, on its server.
+      this.proseTargetPins.set(name, target);
       body = parsed.body;
     } else {
       const sticky = this.proseTargetPins.get(name);
@@ -10776,7 +10812,7 @@ export class AgentFramework {
         this.bounceProse(agent, rawText, 'no destination prefix and no destination set yet this turn', undefined, '>>', hold);
         return;
       }
-      targetChannel = sticky;
+      target = sticky;
       body = rawText;
     }
 
@@ -10792,13 +10828,13 @@ export class AgentFramework {
     }
 
     try {
-      const outcome = await this.deliverWithUnsent(agent, body, targetChannel, unsent.draft);
+      const outcome = await this.deliverWithUnsent(agent, body, target, unsent.draft);
       if (outcome.status === 'delivered') {
         this.streamPublished(name, moment, outcome.destination!, body);
         this.proseBounceStreaks.delete(name);
       }
     } catch (err) {
-      console.error(`[prose] ${name}: delivery to ${targetChannel} failed:`, err);
+      console.error(`[prose] ${name}: delivery to ${target.channelId} failed:`, err);
     }
   }
 
@@ -15189,7 +15225,7 @@ export class AgentFramework {
       (event) => this.pushEvent(event as unknown as ProcessEvent),
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       triggerFilter,
-      (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
+      (serverId, params, event, decideTrigger) => this.handleCoalescedPush(serverId, params, event, decideTrigger),
       // An ordinary push: freeze its envelope and observe the acceptance at
       // admission, before it is queued.
       (event) => {
@@ -15229,8 +15265,8 @@ export class AgentFramework {
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       {
         store: this.store,
-        handleCoalescedIncoming: (serverId, message, event) =>
-          this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent),
+        handleCoalescedIncoming: (serverId, message, event, decideTrigger) =>
+          this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent, decideTrigger),
         // An ordinary channels/incoming message: freeze its envelope and
         // observe the acceptance at admission, before it is queued.
         acceptInbound: (event) => {
@@ -17504,9 +17540,10 @@ export class AgentFramework {
       : seconds >= 60 ? `${Math.round(seconds / 60)}m`
       : `${Math.round(seconds)}s`;
 
-    // Announce in the TURN's frozen locus (best-effort; never blocks the
-    // result). The sleep tool runs mid-turn, so the pin is live — same
-    // authority as every other speech path, no live re-resolution.
+    // Announce as the turn's speech goes (best-effort; never blocks the
+    // result): an explicit-mode resident's pinned target, a hybrid one's
+    // `>>>` pin when it set one, else the turn's route, exactly as other
+    // unaddressed speech, with no live re-resolution.
     if (announce && this.channelRegistry) {
       const text = input.message ?? `💤 Going quiet for ${human}. I'll still see messages, but won't respond until I wake.`;
       const agent = this.agents.get(agentName);
@@ -17524,10 +17561,23 @@ export class AgentFramework {
         } else {
           console.error(`[sleep] ${agentName}: no prose target this turn — sleep announcement not posted (explicit mode never guesses)`);
         }
-      } else {
-        const locus = this.routeTarget(agentName);
-        this.channelRegistry.routeSpeech(agentName, text, locus).catch((err) => {
-          console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
+      } else if (agent) {
+        // Unaddressed speech like any other, after the words written before
+        // it. A hybrid `>>>` pin set this turn wins, as for an unprefixed
+        // envelope; else the route as it stands when the tool runs: a held
+        // turn keeps the words as a draft, a surface shows them, no route
+        // keeps them with no destination, and only a publish that was tried
+        // can fail.
+        const moment: SpeechMoment = { turn: this.turnRoutes.get(agentName) };
+        this.chainSpeech(agentName, '[sleep] announcement', async () => {
+          const pin = agent.proseRouting === 'hybrid' ? this.proseTargetPins.get(agentName) : undefined;
+          if (pin) {
+            const outcome = await this.channelRegistry!.routeSpeech(agentName, text, pin);
+            this.recordProseDelivery(agentName, outcome);
+            if (outcome?.delivered) this.streamPublished(agentName, moment, outcome, text);
+            return;
+          }
+          await this.speakUnaddressed(agent, text, { notice: 'later' }, moment);
         });
       }
     }

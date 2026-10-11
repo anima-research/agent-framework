@@ -586,6 +586,10 @@ interface ChannelRegistryOptions {
     serverId: string,
     message: ChannelIncomingMessage,
     event: McplChannelIncomingEvent,
+    /** The trigger decision, made only once the coalescer admits the
+     *  occurrence for delivery: a refused one, a retry or a retraction is
+     *  never gated (so never a route candidate). */
+    decideTrigger?: () => boolean,
   ) => Promise<ChannelIncomingMessageResult>;
   /** Chronicle store used for durable desired channel lifecycle state. */
   store?: JsStore;
@@ -1106,13 +1110,16 @@ export class ChannelRegistry {
         : this.acceptInbound?.(event);
       if (inboundSource) event.inboundSource = inboundSource;
 
-      // Determine whether to trigger inference
+      // Whether to trigger inference: decided now for an ordinary message,
+      // and for a coalesced one only once its coalescer admits it.
+      let decideTrigger: (() => boolean) | undefined;
       if (this.shouldTriggerInference) {
+        const shouldTrigger = this.shouldTriggerInference;
         const textContent = message.content
           .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
           .map((b) => b.text)
           .join('\n');
-        event.triggerInference = this.shouldTriggerInference(
+        decideTrigger = () => shouldTrigger(
           textContent,
           {
             // The adapter's own metadata first; the protocol's fields after
@@ -1132,6 +1139,7 @@ export class ChannelRegistry {
             [INBOUND_SOURCE_KEY]: inboundSource,
           },
         );
+        if (!coalesced) event.triggerInference = decideTrigger();
       }
 
       if (coalesced) {
@@ -1140,7 +1148,7 @@ export class ChannelRegistry {
         // the coalescer, which replaces, appends or withdraws. Malformed
         // `coalesce` is a per-message failure; siblings are unaffected.
         try {
-          const result = await this.handleCoalescedIncoming!(serverId, message, event);
+          const result = await this.handleCoalescedIncoming!(serverId, message, event, decideTrigger);
           if (result.accepted) markAccepted();
           results.push(result);
         } catch (error) {
@@ -1511,8 +1519,11 @@ export class ChannelRegistry {
     }
 
     if (outgoing) {
+      // Where the speech lands, its thread included, whether or not the
+      // route has a reply edge.
       context.defaultOutgoing = {
         channelId: outgoing,
+        ...(route?.kind === 'channel' && route.threadId ? { threadId: route.threadId } : {}),
       };
     }
 
@@ -2457,14 +2468,18 @@ export class ChannelRegistry {
    */
   resolveProseTarget(
     spec: string,
-  ): { channelId: string; label?: string } | { error: string; candidates?: string[] } {
+  ): { serverId: string; channelId: string; label?: string } | { error: string; candidates?: string[] } {
     const entries = [...this.channels.values()];
+    // The conversation it resolved to, with its server: a pin keeps that
+    // server, so the same id registered by another server later changes
+    // nothing.
+    const found = (e: ChannelEntry) => ({ serverId: e.serverId, channelId: e.descriptor.id, label: e.descriptor.label });
     const trimmed = spec.trim();
     if (!trimmed) return { error: 'empty target' };
 
     const exact = entries.filter((e) => e.descriptor.id === trimmed);
     if (exact.length === 1) {
-      return { channelId: exact[0]!.descriptor.id, label: exact[0]!.descriptor.label };
+      return found(exact[0]!);
     }
     if (exact.length > 1) {
       return {
@@ -2477,7 +2492,7 @@ export class ChannelRegistry {
       (e) => (e.descriptor.address as { channelId?: string } | undefined)?.channelId === trimmed,
     );
     if (raw.length === 1) {
-      return { channelId: raw[0]!.descriptor.id, label: raw[0]!.descriptor.label };
+      return found(raw[0]!);
     }
     if (raw.length > 1) {
       return {
@@ -2513,7 +2528,7 @@ export class ChannelRegistry {
         const id = mention[1]!;
         const byId = dms.filter((e) => dmMeta(e)?.recipientId === id);
         if (byId.length === 1) {
-          return { channelId: byId[0]!.descriptor.id, label: byId[0]!.descriptor.label };
+          return found(byId[0]!);
         }
         return {
           error: `no registered DM matches the mention <@${id}>`,
@@ -2530,7 +2545,7 @@ export class ChannelRegistry {
             return n.length >= 3 && (n.startsWith(name) || name.startsWith(n) || n.includes(name));
           });
       if (pool.length === 1) {
-        return { channelId: pool[0]!.descriptor.id, label: pool[0]!.descriptor.label };
+        return found(pool[0]!);
       }
       if (pool.length > 1) {
         return {
@@ -2548,7 +2563,7 @@ export class ChannelRegistry {
       (e) => norm(e.descriptor.label ?? '') === norm(trimmed),
     );
     if (byLabel.length === 1) {
-      return { channelId: byLabel[0]!.descriptor.id, label: byLabel[0]!.descriptor.label };
+      return found(byLabel[0]!);
     }
     if (byLabel.length > 1) {
       return {
@@ -2565,7 +2580,7 @@ export class ChannelRegistry {
     const nameOf = normalizeChannelLabelName;
     const byName = entries.filter((e) => nameOf(e.descriptor.label ?? '') === norm(trimmed));
     if (byName.length === 1) {
-      return { channelId: byName[0]!.descriptor.id, label: byName[0]!.descriptor.label };
+      return found(byName[0]!);
     }
     if (byName.length > 1) {
       return {

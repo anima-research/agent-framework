@@ -269,7 +269,10 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
         addressed: e.addressed,
         at: e.timestamp,
       });
-    } else if (e.eventType === 'external-message' || e.eventType === 'api:message') {
+    } else if ((e.eventType === 'external-message' || e.eventType === 'api:message') && !e.channelId) {
+      // A local surface only when it names no channel, as surfaceSourceFor
+      // decides: one that names a channel no registry holds is that
+      // channel's conversation, unroutable (below), never answered locally.
       routeCandidates.push({
         kind: 'surface',
         surface: e.serverId || (e.eventType === 'api:message' ? 'api' : 'external'),
@@ -1582,7 +1585,13 @@ export class EventGate {
       routeChannelId: conversation?.channelId ?? this.routeChannelFor(info),
       ...(messageId ? { messageId } : {}),
       ...(threadId ? { threadId } : {}),
-      conversational: isConversational(info.tags, info.metadata),
+      // An MCPL item's metadata is its server's (an origin, an incoming
+      // message's metadata): only the host marks machinery, so its tags
+      // alone decide. A host module's event metadata is the host's.
+      conversational: isConversational(
+        info.tags,
+        info.eventType === 'mcpl:channel-incoming' || info.eventType === 'mcpl:push-event' ? undefined : info.metadata,
+      ),
     };
 
     const existing = this.debounceTimers.get(policy.name);
@@ -1644,28 +1653,37 @@ export class EventGate {
 
     const lines: string[] = quoted.map(e => `- [${e.policyName}] (${e.eventType}): ${e.content}`);
     if (referenced.length > 0) {
-      const byChannel = new Map<string, { serverId?: string; channelId?: string; count: number; oldest: number; label?: string }>();
+      const byConversation = new Map<string, { serverId?: string; channelId?: string; threadId?: string; count: number; oldest: number; label?: string }>();
       for (const e of referenced) {
         // The registered id when known (a push event's own channelId is the
-        // adapter's raw id), counted per server: the same id on another
-        // server is another conversation.
+        // adapter's raw id), counted per server and thread: the same id on
+        // another server, or a thread and its channel's root, is another
+        // conversation.
         const channelId = e.routeChannelId ?? e.channelId;
-        const key = `${e.serverId ?? ''}\u0000${channelId ?? ''}`;
-        const entry = byChannel.get(key) ?? {
+        const key = JSON.stringify([e.serverId ?? null, channelId ?? null, e.threadId ?? null]);
+        const entry = byConversation.get(key) ?? {
           ...(e.serverId ? { serverId: e.serverId } : {}),
           ...(channelId ? { channelId } : {}),
+          ...(e.threadId ? { threadId: e.threadId } : {}),
           count: 0, oldest: e.timestamp, label: e.channelLabel,
         };
         entry.count += 1;
         entry.oldest = Math.min(entry.oldest, e.timestamp);
         entry.label = entry.label ?? e.channelLabel;
-        byChannel.set(key, entry);
+        byConversation.set(key, entry);
       }
-      for (const { serverId, channelId, count, oldest, label } of byChannel.values()) {
+      for (const { serverId, channelId, threadId, count, oldest, label } of byConversation.values()) {
         // Named the way routing notices and send tools name a conversation
-        // (describeConversation): its label, then `server / channel-id`.
+        // (describeConversation): its label, then `server / channel-id`,
+        // then its thread.
         const channel = channelId
-          ? describeConversation({ kind: 'channel', ...(serverId ? { serverId } : {}), channelId, ...(label ? { label } : {}) })
+          ? describeConversation({
+            kind: 'channel',
+            ...(serverId ? { serverId } : {}),
+            channelId,
+            ...(threadId ? { threadId } : {}),
+            ...(label ? { label } : {}),
+          })
           : '(unknown channel)';
         const age = Math.round((Date.now() - oldest) / 1000);
         lines.push(

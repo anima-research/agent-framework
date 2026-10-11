@@ -241,4 +241,45 @@ describe('speech route across a logical turn', () => {
     assert.equal(second, '[delivered] plain speech → #Beta (beta / shared, thread topic)');
     await framework.stop();
   });
+
+  it('the sleep announcement is unaddressed speech: a held, a routeless and a surface turn each keep it as such, publishing nothing', async () => {
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+      gate: { config: { policies: [], default: 'always' } },
+    });
+    const i = framework as unknown as {
+      turnRoutes: Map<string, Route>;
+      channelRegistry: unknown;
+      speechChains?: Map<string, Promise<void>>;
+      dispatchSleepToolCall(agent: string, call: unknown): void;
+      proseDrafts: { open(agent: string): Array<{ reason: string; text: string }> };
+    };
+    const published: unknown[] = [];
+    i.channelRegistry = new Proxy({
+      publishTarget: () => 'root',
+      resolveLocus: () => null,
+      routeSpeech: async (...args: unknown[]) => { published.push(args); return null; },
+      getDescriptor: () => undefined,
+      getChannelTools: () => [],
+    } as Record<string, unknown>, { get: (t, p: string) => (p in t ? t[p] : () => undefined) });
+    const sleepUnder = async (turn: Route, id: string) => {
+      i.turnRoutes.set('scout', turn);
+      i.dispatchSleepToolCall('scout', { id, name: 'sleep', input: { seconds: 60 } });
+      await (i.speechChains?.get('scout') ?? Promise.resolve());
+    };
+    await sleepUnder({ route: null, hold: { conversations: [
+      { kind: 'channel', serverId: 'discord', channelId: 'a' },
+      { kind: 'channel', serverId: 'discord', channelId: 'b' },
+    ], since: 'turn-start' } }, 's1');
+    await sleepUnder({ route: null }, 's2');
+    await sleepUnder({ route: { kind: 'surface', surface: 'tui', origin: 'trigger' } }, 's3');
+    assert.deepEqual(published, [], 'nothing was published, so no failure can be reported');
+    const held = i.proseDrafts.open('scout');
+    assert.deepEqual(held.map((d) => d.reason).sort(), ['ambiguous', 'no-destination'], 'held, then routeless; the surface shows it');
+    assert.ok(held.every((d) => d.text.startsWith('💤 Going quiet for 1m')));
+    await framework.stop();
+  });
 });

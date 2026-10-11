@@ -1209,6 +1209,39 @@ describe('speech follows the moment its words were written', () => {
     await framework.stop();
   });
 
+  it('hybrid: a `>>>` pin keeps the server its target resolved to, and later speech publishes there by server', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: '>>>#alpha Pinned words.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'More for alpha.' }] as ContentBlock[]));
+
+    const framework = await createFramework('hybrid');
+    stubChannelRegistry(framework, { home: false });
+    const registry = registryOf(framework);
+    // The target resolves on one server; a pin that kept only the id would
+    // re-resolve it against any server that registers the same id later.
+    registry.resolveProseTarget = (spec: string) => ({ serverId: 'alpha-server', channelId: `chan-${spec.slice(1)}`, label: spec });
+    const targets: unknown[] = [];
+    for (const method of ['deliverSpeech', 'routeSpeech'] as const) {
+      const real = registry[method] as (...args: unknown[]) => Promise<unknown>;
+      registry[method] = async (agent: string, text: string, target: unknown) => {
+        targets.push(target);
+        return real(agent, text, target);
+      };
+    }
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(targets, [
+      { serverId: 'alpha-server', channelId: 'chan-alpha' },
+      { serverId: 'alpha-server', channelId: 'chan-alpha' },
+    ], 'the envelope and the speech after it both name the pinned server');
+
+    await framework.stop();
+  });
+
   it('hybrid: a channel_open that sets the speech route ends a `>>>skip_reply` suppression', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: '>>>skip_reply An aside to myself.' },

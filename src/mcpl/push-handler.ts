@@ -183,7 +183,11 @@ export class PushHandler {
     pushEventFn: (event: McplPushEvent) => void,
     emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
     shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean,
-    private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent) => Promise<PushEventResult>,
+    /** RFC-006: hand a coalesced push to its coalescer. `decideTrigger`
+     *  is the trigger decision, made only once the coalescer admits the
+     *  occurrence for delivery: a refused one, a retry or a retraction is
+     *  never gated (so never a route candidate). */
+    private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent, decideTrigger?: () => boolean) => Promise<PushEventResult>,
     /** An ordinary (uncoalesced) push was just admitted, before it is queued
      *  or acknowledged: return its source envelope, frozen now
      *  (mcpl/inbound-source.ts). Coalesced work is stamped by its own path. */
@@ -316,8 +320,11 @@ export class PushHandler {
       : this.acceptInbound?.(pushEvent);
     if (inboundSource) pushEvent.inboundSource = inboundSource;
 
-    // 6. Check shouldTriggerInference callback
+    // 6. The shouldTriggerInference callback: decided now for an ordinary
+    // push, and for a coalesced one only once its coalescer admits it.
+    let decideTrigger: (() => boolean) | undefined;
     if (this.shouldTriggerInference) {
+      const shouldTrigger = this.shouldTriggerInference;
       const textContent = content
         .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
         .map((b) => b.text)
@@ -336,7 +343,8 @@ export class PushHandler {
         ...(params.tags ? { tags: params.tags } : {}),
         [INBOUND_SOURCE_KEY]: inboundSource,
       };
-      pushEvent.triggerInference = this.shouldTriggerInference(textContent, metadata);
+      decideTrigger = () => shouldTrigger(textContent, metadata);
+      if (!coalesced) pushEvent.triggerInference = decideTrigger();
     }
 
     if (coalesced) {
@@ -344,7 +352,7 @@ export class PushHandler {
       // unread one, appends, or withdraws; it delivers through the same event
       // the ordinary path would have queued.
       try {
-        const result = await this.handleCoalesced!(serverId, params, pushEvent);
+        const result = await this.handleCoalesced!(serverId, params, pushEvent, decideTrigger);
         this.emitTraceFn({ type: 'mcpl:push_event', serverId, eventId: params.eventId, featureSet: params.featureSet, coalesce: result.coalesce });
         responder?.respond(result);
       } catch (error) {

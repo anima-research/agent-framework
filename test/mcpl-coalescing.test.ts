@@ -566,6 +566,24 @@ test('G1: malformed content on a coalesced channel item fails that item only', a
   assert.equal(badPush.error.code, -32602);
 });
 
+test('the trigger (the gate) is decided only for an occurrence the coalescer admits: never for a retry, a retraction or a refused one', async (t) => {
+  const decided: string[] = [];
+  const f = await fixture({ server: { shouldTriggerInference: (_content: string, metadata: Record<string, unknown>) => {
+    decided.push(String(metadata.eventId ?? metadata.messageId));
+    return false;
+  } } }); t.after(f.close);
+  await f.register();
+  await f.send('push/event', f.params('p1', 'first_words', { initial: true }));
+  await f.send('push/event', f.params('p1', 'first_words', { initial: true }));
+  await f.send('push/event', f.params('p2', '', { retract: true }));
+  const refused = await f.send('push/event', { ...f.params('p3', 'x'), coalesce: { key: 'document', channelId: 'nowhere' } });
+  assert.ok(refused.error, 'a channel-scoped push for an unknown channel is refused');
+  await f.send('channels/incoming', { messages: [f.channel('c1', 'channel_words', { initial: true })] });
+  await f.send('channels/incoming', { messages: [f.channel('c2', '', { retract: true })] });
+  // The channel message is named by its platform message id (m).
+  assert.deepEqual(decided, ['p1', 'm'], 'once for each admitted occurrence, at delivery');
+});
+
 test('G3/G5: a deferred channel-scoped push renders with its feature set and wakes with its channel', async (t) => {
   const f = await fixture({ server: { shouldTriggerInference: () => true } }); t.after(f.close); await f.register();
   await f.send('push/event', { ...f.params('1', 'fallback', { deferred: true, channelId: 'chat', key: 'activity' }), origin: { authorId: 'u', authorName: 'User' } });
