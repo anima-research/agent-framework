@@ -165,6 +165,24 @@ describe('ModuleContext.addMessage delivery options', () => {
     assert.deepEqual(texts(framework, 'other'), [], 'lost with the process, as memory-only deferrals always were');
   });
 
+  it("reports a deferral durable only when its caller asked, though the queue was persisted for another", async () => {
+    (framework as unknown as Internals).activeTurnTokens.set('other', 77);
+    const asked: MessagePlacement = {};
+    courier.ctx.addMessage('user', [{ type: 'text', text: 'asked' }], undefined, { forAgent: 'other', placement: asked, durable: true });
+    // The queue is persisted now, so the next deferral rides in it, but its
+    // caller didn't ask for durability, and isn't told it has it.
+    const plain: MessagePlacement = {};
+    courier.ctx.addMessage('user', [{ type: 'text', text: 'plain' }], undefined, { forAgent: 'other', placement: plain });
+    assert.deepEqual([asked.durable, plain.durable], [true, false]);
+  });
+
+  it('maps no external id to a deferred write, which has no id until it lands', async () => {
+    (framework as unknown as Internals).activeTurnTokens.set('scout', 77);
+    const id = courier.ctx.addMessage('user', [{ type: 'text', text: 'held' }], { external: { source: 'discord', id: 'd1' } });
+    assert.equal(id, '');
+    assert.equal(courier.ctx.findMessageByExternalId('discord', 'd1'), null, 'not found as the empty id');
+  });
+
   it('drops a message for an unknown agent, and the empty placement says so', async () => {
     const placement: MessagePlacement = {};
     const id = courier.ctx.addMessage('user', [{ type: 'text', text: 'to nobody' }], undefined, { forAgent: 'ghost', placement, durable: true });

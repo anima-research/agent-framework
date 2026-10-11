@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { existsSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { JsStore } from '@animalabs/chronicle';
 import { createOfflineRecoveryBranch } from './offline-branch.js';
@@ -19,6 +20,7 @@ import {
   cutAttemptDisposition,
   OPERATOR_CHANGES_JOURNAL,
   readOperatorChanges,
+  settledState,
   type OperatorChangeRecord,
   type OperatorChangeResolution,
   type OperatorChangeResolutionReceipt,
@@ -111,10 +113,10 @@ Gated operator changes (host stopped):
                               activates its staged marks before any traffic.
 
 Queued work is delivered when the host next connects to the Discord server.
-Each recovery, and each cancel, retract or release, is recorded in
-<store>/operator-actions.jsonl, the host's operator log, with the OS account
-that ran it, whether it was carried out or refused. A dry run and a list
-record nothing.
+Each recovery, each cancel, retract or release, and each operator-change
+resolve is recorded in <store>/operator-actions.jsonl, the host's operator
+log, with the OS account that ran it (or the --requester named), whether it
+was carried out or refused. A dry run and a list record nothing.
 The agent host must be stopped before running this command.`;
 }
 
@@ -266,18 +268,44 @@ function awareness(options: CliOptions): void {
  * writer, which stands in for the running framework's lease.
  */
 function operatorChange(options: CliOptions): void {
-  const store = JsStore.openOrCreate({ path: options.storePath! });
+  // An existing store only: a mistyped --store path must not create an empty
+  // one, which would list nothing held.
+  if (!existsSync(options.storePath!)) throw new Error(`No store at ${options.storePath}`);
+  const store = JsStore.open({ path: options.storePath! });
   try {
     const journal = new RecordJournal<OperatorChangesEntry, OperatorChangesSnapshot>(store, { type: OPERATOR_CHANGES_JOURNAL });
-    // A journal that can't be interpreted is refused, never read as empty.
-    const records = readOperatorChanges(journal.load());
+    const command = options.operatorChange!;
+    // Who settles it: --requester names them; otherwise the CLI's user, as
+    // this CLI's other acts record theirs. The same requester goes in the
+    // attestation and in the operator log.
+    const requester: OperatorRequester = options.requester ? { via: 'cli', name: options.requester } : cliRequester();
+    const logBase = (agent: string): OperatorLogInput => ({
+      kind: 'resolve-operator-change',
+      agent,
+      requester,
+      params: {
+        changeId: command.verb === 'resolve' ? command.changeId : '',
+        ...(options.attempt !== undefined ? { attempt: options.attempt } : {}),
+        ...(options.verdict ? { verdict: options.verdict } : {}),
+        ...(options.reason ? { reason: options.reason } : {}),
+        via: 'offline',
+      },
+    });
+    // A journal that can't be interpreted is refused, never read as empty;
+    // a resolve it refuses is recorded like any other (a list records nothing).
+    let records: ReturnType<typeof readOperatorChanges>;
+    try {
+      records = readOperatorChanges(journal.load());
+    } catch (error) {
+      if (command.verb === 'resolve') recordOperatorAction(options.storePath!, { ...logBase('*'), error: errorMessage(error) });
+      throw error;
+    }
     const active = store.currentBranch().name;
     const held = (record: OperatorChangeRecord) => {
       if (record.outcome || record.dropped || (record.kind !== 'undo-turns' && record.kind !== 'undo-messages')) return null;
       const last = record.attempts[record.attempts.length - 1];
       return last && cutAttemptDisposition(record, last) === 'unresolved' ? last : null;
     };
-    const command = options.operatorChange!;
     if (command.verb === 'list') {
       const unresolved = [...records.values()].flatMap((record) => {
         const attempt = held(record);
@@ -301,25 +329,10 @@ function operatorChange(options: CliOptions): void {
     }
     const record = records.get(command.changeId);
     const attempt = record ? held(record) : null;
-    // Who settles it: --requester names them; otherwise the CLI's user, as
-    // this CLI's other acts record theirs. The same requester goes in the
-    // attestation and in the operator log.
-    const requester: OperatorRequester = options.requester ? { via: 'cli', name: options.requester } : cliRequester();
-    const logBase: OperatorLogInput = {
-      kind: 'resolve-operator-change',
-      agent: record?.agent ?? '*',
-      requester,
-      params: {
-        changeId: command.changeId,
-        ...(options.attempt !== undefined ? { attempt: options.attempt } : {}),
-        ...(options.verdict ? { verdict: options.verdict } : {}),
-        ...(options.reason ? { reason: options.reason } : {}),
-        via: 'offline',
-      },
-    };
+    const logged = logBase(record?.agent ?? '*');
     let receipt: OperatorChangeResolutionReceipt;
     try {
-      if (!record || !attempt) throw new Error(`Operator change ${command.changeId} has no unresolved attempt to settle`);
+      if (!record || !attempt) throw new Error(`Operator change ${command.changeId} has no unresolved attempt to settle: ${settledState(record)}`);
       if (options.attempt !== attempt.n) throw new Error(`--attempt ${options.attempt} is not its unresolved attempt (${attempt.n} is)`);
       if (!options.verdict) throw new Error('--verdict committed|not-committed is required');
       if (!options.reason?.trim()) throw new Error('--reason is required');
@@ -337,7 +350,9 @@ function operatorChange(options: CliOptions): void {
       const restoresAtStart = options.verdict === 'not-committed' && active === attempt.evidence.target;
       const remaining = options.verdict === 'not-committed' && !restoresAtStart && active !== attempt.evidence.source
         ? `the active branch is ${active}, neither the source ${attempt.evidence.source} nor the attempt's destination`
-        : undefined;
+        : options.verdict === 'committed' && active !== attempt.evidence.target
+          ? `the active branch is ${active}, not this attempt's destination ${attempt.evidence.target}; startup will establish its outcome as applied all the same`
+          : undefined;
       receipt = {
         changeId: record.changeId,
         attempt: attempt.n,
@@ -348,11 +363,11 @@ function operatorChange(options: CliOptions): void {
         ...(remaining ? { remaining } : {}),
       };
     } catch (error) {
-      recordOperatorAction(options.storePath!, { ...logBase, error: errorMessage(error) });
+      recordOperatorAction(options.storePath!, { ...logged, error: errorMessage(error) });
       throw error;
     }
     recordOperatorAction(options.storePath!, {
-      ...logBase,
+      ...logged,
       result: { settlement: receipt.settlement, ...(receipt.remaining ? { remaining: receipt.remaining } : {}) },
     });
     console.log(JSON.stringify(receipt, null, 2));

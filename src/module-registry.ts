@@ -625,8 +625,9 @@ class ModuleContextImpl implements ModuleContext {
   ): MessageId {
     const id = this.addMessageFn(participant, content, metadata, options);
 
-    // Track external ID if provided
-    if (metadata?.external) {
+    // Track external ID if provided. A deferred write returns '' (it has no
+    // id until it lands), so it has nothing to map yet.
+    if (metadata?.external && id) {
       const key = `${metadata.external.source}:${metadata.external.id}`;
       this.externalIdMap.set(key, id);
       // Persist the mapping
@@ -654,7 +655,8 @@ class ModuleContextImpl implements ModuleContext {
 
   findMessageByExternalId(source: string, externalId: string): MessageId | null {
     const key = `${source}:${externalId}`;
-    return this.externalIdMap.get(key) ?? null;
+    // `||`: an empty id an earlier build mapped for a deferred write addresses nothing.
+    return this.externalIdMap.get(key) || null;
   }
 
   getMessage(id: MessageId): StoredMessage | null {

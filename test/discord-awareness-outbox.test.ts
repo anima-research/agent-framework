@@ -624,6 +624,14 @@ test('settleActivation says what the journal will do when activation cannot be r
   const settled = outbox.settleActivation(cancelled.id);
   assert.equal(settled.status, 'not-scheduled');
   assert.equal(outbox.batches().find((b) => b.id === cancelled.id)?.status, 'discarded');
+  // A retry replays the retirement, as a retry of an activation replays its count.
+  assert.equal(outbox.settleActivation(cancelled.id).status, 'not-scheduled');
+}));
+
+test('activating an active batch again returns what its activation queued', withJournal((outbox) => {
+  const batch = outbox.prepare({ agentName: 'cairn', sourceBranch: 'main', targetBranch: 't', refs: [ref('m1'), ref('m2')], scope: 'all' })!;
+  assert.equal(outbox.activate(batch.id), 2);
+  assert.equal(outbox.activate(batch.id), 2, 'the recorded count, not 0');
 }));
 
 test('outside error text is bounded before it is journaled', withJournal((outbox) => {
@@ -642,6 +650,16 @@ test('outside error text is bounded before it is journaled', withJournal((outbox
 test('a corrupt journal entry stops the reader rather than being skipped', withJournal((_outbox, h) => {
   h.store.appendJson(DISCORD_AWARENESS_RECORD_TYPE, { records: 'nope' });
   assert.throws(() => h.reopen().batches(), /Corrupt Discord awareness journal entry/);
+}));
+
+test('a checkpoint with no snapshot is refused, never read as an empty history', withJournal((outbox, h) => {
+  activeBatch(outbox, [ref('m1')]);
+  // A checkpoint covers the entries before it, so reading past one with no
+  // snapshot would lose them.
+  const journal = new RecordJournal<{ records: unknown[] }, unknown>(h.store, { type: DISCORD_AWARENESS_RECORD_TYPE });
+  journal.load();
+  journal.checkpoint(null);
+  assert.throws(() => h.reopen().batches(), /Corrupt Discord awareness journal: a checkpoint with no snapshot/);
 }));
 
 test('the journal writes no checkpoints: a long history is replayed whole', withJournal((_outbox, h) => {

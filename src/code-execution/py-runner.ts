@@ -95,6 +95,16 @@ function refusalFor(execId: unknown): string {
       'Tool calls are served only to the running script and the tasks it started.';
 }
 
+/** A wake's refusal when it isn't the running exec's own work, as
+ *  refusalFor words a tool call's. */
+function wakeRefusalFor(execId: unknown): string {
+  return typeof execId === 'string'
+    ? 'this wake came from a task that an earlier code_execution script left running; ' +
+      'wakes are served only to the running script and the tasks it started'
+    : 'this wake came from work that can\'t be traced to the running code_execution script; ' +
+      'wakes are served only to the running script and the tasks it started';
+}
+
 /** The longest delay Node's timers honour (~24.8 days); a longer one fires after ~1 ms. */
 export const MAX_TIMER_MS = 2_147_483_647;
 
@@ -401,11 +411,15 @@ export class PyRunner {
           ? (msg as { line: number }).line
           : -1;
         const payload = (msg as { payload?: unknown }).payload;
-        const handler = this.servingExec(msg.exec_id) ? this.onWake : null;
+        // A wake that isn't the running exec's own work is refused for that
+        // reason, as its tool calls are (refusalFor), before any rule about
+        // who may wake.
+        const serving = this.servingExec(msg.exec_id);
+        const handler = serving ? this.onWake : null;
         const refuse = handler
           ? handler(line, payload).catch((err: unknown) =>
               `wake handler failed: ${err instanceof Error ? err.message : String(err)}`)
-          : Promise.resolve('this script is not allowed to wake the agent');
+          : Promise.resolve(serving ? 'this script is not allowed to wake the agent' : wakeRefusalFor(msg.exec_id));
         void refuse.then((error) => {
           this.send({ op: 'wake_ack', id: wakeId, ...(error ? { error } : {}) });
         });

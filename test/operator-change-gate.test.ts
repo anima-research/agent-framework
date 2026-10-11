@@ -330,7 +330,10 @@ describe('operator-change gate: self-change tools', () => {
   });
 
   it('resolves a reset to the concrete values it restores, and refuses if those change', async () => {
-    framework.updateAgentRuntimeSettings('scout', { contextBudgetTokens: 120_000 });
+    // Below the configured budget, so the reset is a raise: this agent's
+    // strategy has no hot settings, and a reset that starts a descent is
+    // refused at staging, as it would be at apply.
+    framework.updateAgentRuntimeSettings('scout', { contextBudgetTokens: 80_000, immediate: true });
     await framework.puppetToolCall('scout', 'agent_settings', { action: 'reset', settings: ['context_budget_tokens'] });
     const change = asked[0]!;
     assert.equal(change.kind === 'agent-settings' && change.target.contextBudgetTokens, 100_000, 'the configured default, concretely');
@@ -346,7 +349,21 @@ describe('operator-change gate: self-change tools', () => {
     } finally {
       agent.previewRuntimeSettingsTarget = real;
     }
-    assert.equal(budget(), 120_000, 'nothing applied');
+    assert.equal(budget(), 80_000, 'nothing applied');
+  });
+
+  it("refuses at staging a descent this agent's strategy can't prepare, as applying it would", async () => {
+    // scout's strategy has no hot settings: a paced decrease, or a reset that
+    // starts one, would be refused when applied, so it's never staged.
+    const before = budget();
+    const lowered = await framework.puppetToolCall('scout', 'agent_settings', { action: 'update', context_budget_tokens: before - 10_000 });
+    assert.match(String(lowered.result.error), /couldn't be resolved \(The active context strategy cannot prepare a smaller window live\)/);
+    framework.updateAgentRuntimeSettings('scout', { contextBudgetTokens: before + 20_000 });
+    const reset = await framework.puppetToolCall('scout', 'agent_settings', { action: 'reset', settings: ['context_budget_tokens'] });
+    assert.match(String(reset.result.error), /cannot prepare a smaller window live/);
+    assert.equal(asked.length, 0, 'neither reached the gate');
+    const immediate = await framework.puppetToolCall('scout', 'agent_settings', { action: 'update', context_budget_tokens: before - 10_000, immediate: true });
+    assert.match(String(immediate.result.error), /staged agent-settings/, 'an immediate decrease needs no prepared window');
   });
 
   it("needs the held lease to apply, whether the change was an operator's or a module's", async () => {
@@ -1047,6 +1064,46 @@ describe('operator-change gate: host/command undo by turns', () => {
     await assert.rejects(applyIt(dropped), (e: Error & { code?: string }) => e.code === 'stale' && /dropped/.test(e.message));
   });
 
+  it('keeps a drop when its staged choice cannot be discarded, and never drops a change that began to apply', async () => {
+    await say('a0'); await say('a1'); await say('a2');
+    await undoWithMarks(2, 'all');
+    const change = asked[0]!;
+    const box = outbox() as unknown as { discard: (id: string) => boolean };
+    const realDiscard = box.discard.bind(box);
+    box.discard = () => { throw new Error('injected discard failure'); };
+    try {
+      framework.dropResolvedOperatorChange(change); // the drop is recorded first, and stands
+    } finally {
+      box.discard = realDiscard;
+    }
+    assert.ok(framework.getOperatorChangeRecord(change.id)!.dropped, 'dropped');
+    assert.equal(outbox().batches().find((x) => x.id === `op-${change.id}`)?.status, 'staged', 'its choice is left staged, and inert');
+    await assert.rejects(applyIt(change), (e: Error & { code?: string }) => e.code === 'stale' && /dropped/.test(e.message));
+
+    await undoWithMarks(1, 'all');
+    const begun = asked[1]!;
+    await applyIt(begun);
+    assert.throws(() => framework.dropResolvedOperatorChange(begun), (e: Error & { code?: string }) =>
+      e.code === 'invalid' && /has begun to apply; it can't be dropped/.test(e.message));
+  });
+
+  it('retires a staged choice whose record landed though staging could not tell', async () => {
+    await say('a0'); await say('a1'); await say('a2');
+    const box = outbox() as unknown as { prepare: (input: unknown) => unknown };
+    const realPrepare = box.prepare.bind(box);
+    box.prepare = (input) => { realPrepare(input); throw new Error('injected: its record landed, but the write threw'); };
+    let r: Record<string, unknown>;
+    try {
+      r = await undoWithMarks(2, 'all');
+    } finally {
+      box.prepare = realPrepare;
+    }
+    assert.match(String(r.error), /not staged: its marks choice could not be recorded/);
+    assert.equal(asked.length, 0, 'the gate was never asked');
+    const batches = outbox().batches();
+    assert.deepEqual(batches.map((x) => x.status), ['discarded'], 'retired, so no staged choice outlives a change never staged');
+  });
+
   it('stages a hide with its exact messages and frozen refs, applies it under the lease, and reports one receipt', async () => {
     await say('h0'); await say('h1'); await say('h2');
     const r = await host().handleHostCommand('discord', { command: 'hide', agentName: 'scout', fromMessageId: 'h1', toMessageId: 'h2', marks: 'all', requesterName: 'nissa' });
@@ -1268,6 +1325,95 @@ describe('operator-change gate: host/command undo by turns', () => {
     assert.deepEqual(receipt(applied), { status: 'queued', queued: 1, unmarked: 0, notRemoved: 0 });
     const record = framework.getOperatorChangeRecord(change.id)!;
     assert.deepEqual([record.switched, record.attempts[0]!.resolution!.verdict], [undefined, 'committed'], 'an attestation, not a framework-observed switch');
+  });
+
+  it('finishes at the next start the bookkeeping a crash cut off after its outcome', async () => {
+    await turn('one'); await turn('two');
+    await undo(1);
+    const change = asked[0]!;
+    const restore = failLogOnce('undo-turns');
+    try {
+      await assert.rejects(applyIt(change), /injected log failure/);
+    } finally {
+      restore();
+    }
+    const before = framework.getOperatorChangeRecord(change.id)!;
+    assert.deepEqual([!!before.outcome, before.completed], [true, undefined], 'its outcome stands; its bookkeeping does not');
+    await reopen();
+    assert.equal(framework.getOperatorChangeRecord(change.id)!.completed, true, 'finished at startup, before any retry');
+    const logged = framework.getOperatorLog().filter((e) => e.kind === 'undo-turns' && (e.params as { changeId?: string }).changeId === change.id);
+    assert.deepEqual(logged.map((e) => (e.params as { recovered?: string }).recovered), ['startup']);
+  });
+
+  it('says when an attestation contradicts the active body, and a repeated resolve names the settlement on record', async () => {
+    await say('m0'); await say('m1');
+    await host().handleHostCommand('discord', { command: 'undo', agentName: 'scout', messages: 2, marks: 'all', requesterName: 'nissa' });
+    const change = asked[0]!;
+    const undoCut = failCutAfterInitializerWrite();
+    const undoRecord = failJournalOnce('failed');
+    try {
+      await assert.rejects(applyIt(change), /injected strategy initialization failure/);
+    } finally {
+      undoCut(); undoRecord();
+    }
+    await reopen();
+    assert.equal(branch(), change.sourceBranch, 'the source is active, not the destination');
+    const settled = await resolve(change.id, 1, 'committed', 'the operator says it applied');
+    assert.match(String(settled.remaining),
+      new RegExp(`the active branch is ${change.sourceBranch}, not this attempt's destination undo-msgs/scout/op-${change.id}`));
+    await assert.rejects(resolve(change.id, 1, 'committed', 'once more'), (e: Error & { code?: string }) =>
+      e.code === 'invalid' && /has no unresolved attempt to settle: its attempt 1 was settled committed by nissa \(live\)/.test(e.message));
+  });
+
+  it("refuses to settle an attempt for an agent it can't restore, leaving it unresolved", async () => {
+    await say('a0'); await say('a1'); await say('a2');
+    await undoWithMarks(2, 'all');
+    const change = asked[0]!;
+    const undoRecord = failJournalOnce('switched');
+    try {
+      await assert.rejects(applyIt(change), /injected switched failure/);
+    } finally {
+      undoRecord();
+    }
+    await reopen();
+    assert.equal(branch(), `undo/scout/op-${change.id}`, 'its destination is active, so not-committed would restore');
+    const agents = (framework as unknown as { agents: Map<string, unknown> }).agents;
+    const scout = agents.get('scout')!;
+    await assert.rejects(
+      framework.runAtSafeBoundary({ verb: 'resolve' }, async (lease) => {
+        agents.delete('scout');
+        try {
+          return await framework.resolveOperatorChange(change.id, 1, 'not-committed', { lease, reason: 'nothing applied', requester: { via: 'test', name: 'nissa' } });
+        } finally {
+          agents.set('scout', scout);
+        }
+      }),
+      (e: Error & { code?: string }) => e.code === 'unknown-agent',
+    );
+    assert.deepEqual(framework.getOperatorChangeRecord(change.id)!.unresolved, { n: 1, target: `undo/scout/op-${change.id}` }, 'no verdict was journaled');
+  });
+
+  it('records the failure of an attempt whose record landed though its write threw, so a restart reads it as not committed', async () => {
+    await turn('one'); await turn('two');
+    await undo(1);
+    const change = asked[0]!;
+    const fw = framework as unknown as { journalChange: (entry: { kind: string }) => void };
+    const real = fw.journalChange.bind(fw);
+    let armed = true;
+    fw.journalChange = (entry) => {
+      real(entry);
+      if (armed && entry.kind === 'attempt') { armed = false; throw new Error('injected: the attempt landed, but its write threw'); }
+    };
+    try {
+      await assert.rejects(applyIt(change), /the attempt landed, but its write threw/);
+    } finally {
+      fw.journalChange = real;
+    }
+    assert.match(String(framework.getOperatorChangeRecord(change.id)!.attempts[0]!.failed), /its attempt's record failed before the cut ran/);
+    await reopen();
+    assert.equal(framework.getOperatorChangeRecord(change.id)!.unresolved, undefined, 'settled by its own record, not left for an operator');
+    const applied = await applyIt(change);
+    assert.equal(applied.kind === 'undo-turns' && applied.undone, 1, 'a fresh attempt applies');
   });
 
   it('refuses resume(), forced or not and through host/command, while the active body is an unresolved cut\'s destination, until it is settled', async () => {
@@ -1638,6 +1784,11 @@ describe('operator-change gate: host/command undo by turns', () => {
     [['scout', 2, 'offline', true, false], ['scout', 1, 'offline', false, true]], 'the refusal and the resolution, each logged');
     assert.deepEqual(logged[1].requester, { via: 'cli', name: 'nissa' });
     assert.match(settled.settlement, new RegExp(`abandoned; the next start restores ${change.sourceBranch} before any agent initializes`));
+    // A repeated resolve is refused, and says how the attempt was settled.
+    const again = spawnSync(process.execPath, [cli, '--store', storePath, '--operator-change', 'resolve', change.id,
+      '--attempt', '1', '--verdict', 'not-committed', '--reason', 'once more'], { encoding: 'utf8' });
+    assert.equal(again.status, 1);
+    assert.match(again.stderr, /has no unresolved attempt to settle: its attempt 1 was settled not-committed by nissa \(offline\)/);
     assert.deepEqual(start(), { started: true, branch: change.sourceBranch, quiesced: false }, 'normal readiness: restored before the agent initialized');
     await reopen().catch(() => {}); // the framework in this process was stopped above
   });
@@ -1670,6 +1821,10 @@ describe('operator-change gate: host/command undo by turns', () => {
     assert.deepEqual([record.outcome?.markers.status, record.outcome?.markers.queued], ['queued', 1], 'established at startup');
     assert.equal(outbox().batches().find((x) => x.id === `op-${change.id}`)?.status, 'active');
     assert.equal(quiesced(), false);
+    const logged = framework.getOperatorLog().find((e) => e.kind === 'undo-turns' && (e.params as { changeId?: string }).changeId === change.id)!;
+    const params = logged.params as { recovered?: string; attested?: { verdict: string; via: string } };
+    assert.deepEqual([params.recovered, params.attested?.verdict, params.attested?.via], ['startup', 'committed', 'offline'],
+      "the operator's attestation, not a switch the framework saw");
   });
 
   it('refuses an undo by messages whose tail changed since staging', async () => {
@@ -2387,6 +2542,52 @@ describe('operator journals that cannot be read', () => {
     await refuses([{ kind: 'switched', changeId: 'never-attempted', n: 1 }], /switched entry/);
   });
 
+  it("refuses, guard by guard, what recovery can't read as its ledger", async () => {
+    const cut = (ev: object) => ({ kind: 'attempt', changeId: 'c', changeKind: 'undo-turns', agent: 'scout', n: 1, at: 1, evidence: ev });
+    const resolution = { verdict: 'committed', reason: 'it applied', at: 2, via: 'live' };
+    const cases: Array<[string, object[], RegExp]> = [
+      ['a hide whose target is not its own branch', [hideAttempt({ ...hideEvidence, target: 'elsewhere' })], /a hide stays on its branch/],
+      ['a cut carrying a hide\'s ids', [cut({ ...evidence, ids: hideEvidence.ids })], /a cut records no hide ids/],
+      ['a sourceHead that is no count', [cut({ ...evidence, sourceHead: 'one' })], /evidence fields/],
+      ['marks with an unknown scope', [cut({ ...evidence, marks: { ...evidence.marks, scope: 'some' } })], /marks facts/],
+      ['a resolution with no verdict it knows', [cut(evidence), { kind: 'resolved', changeId: 'c', n: 1, resolution: { ...resolution, verdict: 'maybe' } }], /resolution/],
+      ['a resolution with no reason', [cut(evidence), { kind: 'resolved', changeId: 'c', n: 1, resolution: { ...resolution, reason: '' } }], /resolution/],
+      ['a resolution of a hide, which is never held', [hideAttempt(hideEvidence), { kind: 'resolved', changeId: 'h', n: 1, resolution }], /resolved entry|only a cut is resolved/],
+      ['a failure of an attempt never made', [cut(evidence), { kind: 'failed', changeId: 'c', n: 2, error: 'x' }], /failed entry/],
+      ['an attempt recorded twice', [cut(evidence), cut(evidence)], /attempt 1 is already recorded/],
+      ['a drop after the change began to apply', [cut(evidence), { kind: 'dropped', changeId: 'c', changeKind: 'undo-turns', agent: 'scout', at: 2 }], /its change began to apply/],
+      ['an attempt after its change was dropped', [{ kind: 'dropped', changeId: 'c', changeKind: 'undo-turns', agent: 'scout', at: 1 }, cut(evidence)], /its change was dropped/],
+      ['an attempt of a kind that records none', [{ ...cut(evidence), changeKind: 'agent-settings' }], /attempt entry/],
+    ];
+    for (const [what, entries, why] of cases) {
+      await refuses(entries, why).catch((error: Error) => { throw new Error(`${what}: ${error.message}`); });
+    }
+  });
+
+  it('reads the store identity from its first usable record, so an unusable one never mints a new identity at each start', async () => {
+    const storePath = join(dir, 'identity');
+    const seeded = JsStore.openOrCreate({ path: storePath });
+    seeded.appendJson('framework/store-identity', { id: 42 }); // the oldest record, and unusable
+    seeded.sync();
+    seeded.close();
+    const start = () => AgentFramework.create({
+      storePath,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', maxTokens: 1000 }],
+      modules: [],
+    });
+    const identities: string[] = [];
+    for (let n = 0; n < 2; n++) {
+      const fw = await start();
+      identities.push(fw.getStoreIdentity());
+      const records = fw.getStore().getRecordIdsByType('framework/store-identity').length;
+      await fw.stop();
+      assert.equal(records, 2, 'the unusable record and the one identity minted, never another');
+    }
+    assert.equal(identities[0], identities[1], 'stable across restarts');
+    assert.match(identities[0]!, /^[0-9a-f-]{36}$/);
+  });
+
   it('refuses a null-snapshot checkpoint in the unstick journal too', async () => {
     const store = JsStore.openOrCreate({ path: join(dir, 'store') });
     const launched = store.appendJson('operator/unstick', { kind: 'attempt-launched', operationId: 'op', agent: 'scout', step: 1 });
@@ -2644,6 +2845,27 @@ describe('operator-change gate: the API server', () => {
 
       const created = await send('branch.create', { name: 'side' });
       assert.equal(created.success, true, 'creating a branch without switching changes no body');
+    });
+  });
+
+  it('refuses to delete a branch an unsettled operator change reads, and deletes any other as before', async () => {
+    await withApi(true, async ({ framework, send }) => {
+      const store = framework.getStore();
+      store.createBranch('held-destination');
+      // A cut attempt with neither its switch nor its failure recorded: its
+      // recovery reads its destination by name.
+      const journal = (framework as unknown as { journalChange: (entry: object) => void });
+      journal.journalChange({
+        kind: 'attempt', changeId: 'held', changeKind: 'undo-turns', agent: 'scout', n: 1, at: Date.now(),
+        evidence: { target: 'held-destination', source: store.currentBranch().name, sourceHead: store.currentBranch().head, removed: 1, staged: false,
+          marks: { scope: 'none', refs: [], unmarked: 0, notRemoved: 0 } },
+      });
+      const refused = await send('branch.delete', { name: 'held-destination' });
+      assert.equal(refused.success, false);
+      assert.match(String(refused.error), /Cannot delete held-destination: operator change held isn't settled yet, and its recovery reads that branch/);
+      assert.ok(store.listBranches().some((b) => b.name === 'held-destination'), 'still there');
+      store.createBranch('free');
+      assert.equal((await send('branch.delete', { name: 'free' })).success, true, 'a branch no change reads is deleted as before');
     });
   });
 

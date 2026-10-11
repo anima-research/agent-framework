@@ -178,6 +178,55 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
+  it('opens a fork only once a held lease releases, so its holder never sees the store change under it', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Hi alice!' }]));
+    const framework = await makeFramework();
+    let release: (() => void) | undefined;
+    let held!: () => void;
+    const granted = new Promise<void>((resolve) => { held = resolve; });
+    const holding = framework.runAtSafeBoundary({ verb: 'hold' }, () => new Promise<void>((resolve) => { release = resolve; held(); }));
+    try {
+      await granted;
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D1', text: 'hello there', channelType: 'im' }));
+      const routing = framework.runUntilIdle();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(framework.getAgent('conversation-slack-D1-g1'), null, 'no fork while the lease is held');
+      release!();
+      await holding;
+      await routing;
+      assert.ok(framework.getAgent('conversation-slack-D1-g1'), 'opened once the lease released');
+    } finally {
+      release?.();
+      await holding;
+      await framework.stop();
+    }
+  });
+
+  it('refuses a fork waiting behind a lease once stop() begins, before it enters the store', async () => {
+    const framework = await makeFramework();
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      let release!: () => void;
+      let held!: () => void;
+      const granted = new Promise<void>((resolve) => { held = resolve; });
+      const holding = framework.runAtSafeBoundary({ verb: 'hold' }, () => new Promise<void>((resolve) => { release = resolve; held(); }));
+      await granted;
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D1', text: 'hello there', channelType: 'im' }));
+      const routing = framework.runUntilIdle().catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const stopping = framework.stop();
+      release();
+      await holding;
+      await routing;
+      await stopping;
+      assert.equal(framework.getAgent('conversation-slack-D1-g1'), null, 'never opened');
+      assert.equal(framework.getConversationRouter()!.getBinding('slack:D1'), undefined, 'and never bound');
+    } finally {
+      console.error = quiet;
+    }
+  });
+
   it('channel message without mention is dropped; mention spawns', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'On it.' }]));
     const framework = await makeFramework();

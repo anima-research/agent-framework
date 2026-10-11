@@ -665,13 +665,14 @@ export class DiscordAwarenessOutbox {
    * per ref, durable before this returns. Activation completes the surgery's
    * earlier choice; it is not a new one, so an add for a reaction that a
    * later act (a retract, or another batch's request) already decided is
-   * recorded superseded and never sent. Returns how many were queued.
+   * recorded superseded and never sent. Returns how many were queued; for a
+   * batch already active (a retry), how many its activation queued.
    */
   activate(batchId: string): number {
     const state = this.load();
     const batch = state.batches.get(batchId);
     if (!batch) throw new Error(`Discord awareness batch not found: ${batchId}`);
-    if (batch.status === 'active') return 0;
+    if (batch.status === 'active') return this.recordedQueued(batchId);
     if (batch.status !== 'prepared') {
       // A staged batch is activated by its change (activateStaged), never here.
       throw new Error(`Discord awareness batch ${batchId} is ${batch.status}, not prepared`);
@@ -712,6 +713,10 @@ export class DiscordAwarenessOutbox {
       if (before?.status === 'active') return { status: 'queued', queued: this.recordedQueued(batchId) };
       if (before?.status === 'staged') {
         return { status: 'unresolved', error: `Discord awareness batch ${batchId} is staged: its change activates it (activateStaged)` };
+      }
+      // Already retired (a retry of a call that retired it): replay that.
+      if (before?.status === 'discarded') {
+        return { status: 'not-scheduled', error: `Discord awareness batch ${batchId} was retired: none of its marks will be sent` };
       }
       return { status: 'queued', queued: this.activate(batchId) };
     } catch (error) {
@@ -1408,7 +1413,10 @@ export class DiscordAwarenessOutbox {
    */
   private load(): JournalState {
     if (this.state && !this.journal.needsReconcile) return this.state;
-    const { snapshot, entries } = this.journal.load();
+    const { snapshot, entries, checkpointed } = this.journal.load();
+    // A checkpoint covers (and skips) the entries before it, so one with no
+    // snapshot can't be read as an empty history: refused, like a corrupt entry.
+    if (checkpointed && !snapshot) throw new Error('Corrupt Discord awareness journal: a checkpoint with no snapshot');
     const state = snapshot ? restoreState(snapshot) : emptyState();
     for (const { id, entry } of entries) {
       if (!entry || !Array.isArray(entry.records)) {

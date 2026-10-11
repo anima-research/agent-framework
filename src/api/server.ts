@@ -593,6 +593,11 @@ export class ApiServer {
       throw new Error('Cannot delete main branch');
     }
 
+    const reading = this.framework.operatorChangeReadingBranch(params.name);
+    if (reading) {
+      throw new Error(`Cannot delete ${params.name}: operator change ${reading} isn't settled yet, and its recovery reads that branch`);
+    }
+
     const store = this.framework.getStore();
     store.deleteBranch(params.name);
 

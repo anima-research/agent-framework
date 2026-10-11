@@ -390,6 +390,66 @@ describe('runAtSafeBoundary', () => {
     c.cleanup();
   });
 
+  const withinSeconds = <T>(p: Promise<T>, seconds = 2) => Promise.race([
+    p,
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`not settled within ${seconds}s`)), seconds * 1000)),
+  ]);
+
+  it("grants a lease waiting behind a direct surgery when the surgery releases, with no scheduler pass", async () => {
+    const release = i.reserveStoreForSurgery('rollback', 'scout');
+    let granted = false;
+    const leasing = framework.runAtSafeBoundary({ verb: 'behind surgery' }, async () => { granted = true; });
+    await tick();
+    assert.equal(granted, false, 'waits while the surgery holds the store');
+    release();
+    await withinSeconds(leasing);
+    assert.equal(granted, true);
+  });
+
+  it("grants the next lease, and keeps the callback's result, when its release's deferred-write flush throws", async () => {
+    const internals = framework as unknown as { ackDeferredWrites: () => void };
+    const realAck = internals.ackDeferredWrites.bind(framework);
+    let armed = true;
+    internals.ackDeferredWrites = () => {
+      if (armed) { armed = false; throw new Error('injected flush failure'); }
+      return realAck();
+    };
+    try {
+      let next!: Promise<string>;
+      const result = await framework.runAtSafeBoundary({ verb: 'first' }, async () => {
+        i.addMessage('user', [{ type: 'text', text: 'deferred during the first' }], undefined, { forAgent: 'scout' });
+        next = framework.runAtSafeBoundary({ verb: 'second' }, async () => 'second ran');
+        return 'first ran';
+      });
+      assert.equal(result, 'first ran', "the callback's own outcome stands");
+      assert.equal(await withinSeconds(next), 'second ran', 'the waiting lease was granted');
+    } finally {
+      internals.ackDeferredWrites = realAck;
+    }
+  });
+
+  it('defers even a tool_result while a reservation holds the store: no turn is draining then', async () => {
+    await framework.runAtSafeBoundary({ verb: 'defer' }, async () => {
+      i.addMessage('user', [{ type: 'tool_result', toolUseId: 'late', content: 'a module answered' }] as unknown as ContentBlock[], undefined, { forAgent: 'scout' });
+      assert.equal(i.deferredMessages.length, 1, 'deferred behind the reservation');
+    });
+    assert.equal(i.deferredMessages.length, 0, 'flushed at release');
+  });
+
+  it("holds a module's edit and removal until the reservation releases, then applies them in order", async () => {
+    const cm = framework.getAgent('scout')!.getContextManager();
+    const first = cm.addMessage('user', [{ type: 'text', text: 'original' }]);
+    const second = cm.addMessage('user', [{ type: 'text', text: 'to remove' }]);
+    const ops = framework as unknown as { editMessage(id: string, c: ContentBlock[]): void; removeMessage(id: string): void };
+    const texts = () => (cm.getAllMessages() as Array<{ content: Array<{ text?: string }> }>).map((m) => m.content[0]?.text);
+    await framework.runAtSafeBoundary({ verb: 'change' }, async () => {
+      ops.editMessage(first, [{ type: 'text', text: 'edited' }]);
+      ops.removeMessage(second);
+      assert.deepEqual(texts(), ['original', 'to remove'], 'nothing moved under the holder');
+    });
+    assert.deepEqual(texts(), ['edited'], 'both applied at release');
+  });
+
   it('keeps no landed-write ids for memory-only deferrals', async () => {
     i.activeTurnTokens.set('other', 9_999);
     for (let n = 0; n < 4; n++) i.addMessage('user', [{ type: 'text', text: `ordinary ${n}` }], undefined, { forAgent: 'other' });

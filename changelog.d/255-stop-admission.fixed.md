@@ -1,1 +1,1 @@
-- `stop()` closes admission before its first await, and lets the store's current users finish before tearing anything down (#255).
+- `stop()` closes admission before its first await: no lease, direct surgery, ephemeral agent or conversation fork enters the store once it has begun. Before tearing anything down it waits for the holder of a store reservation and for agents and conversation forks still being created; live agent streams are cancelled, as before (#255).

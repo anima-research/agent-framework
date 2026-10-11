@@ -439,6 +439,24 @@ export interface OperatorChangeRestorationReceipt {
   remaining?: string;
 }
 
+/**
+ * Why a change has no unresolved attempt to settle, for the refusal of a
+ * second resolve: the settlement on record, so that a repeated resolve
+ * tells its operator the attempt is settled, and how.
+ */
+export function settledState(record: OperatorChangeRecord | undefined): string {
+  if (!record) return 'no such change is recorded';
+  const last = record.attempts[record.attempts.length - 1];
+  if (last?.resolution) {
+    const r = last.resolution;
+    const who = r.requester ? ` by ${r.requester.name ?? r.requester.id ?? r.requester.via}` : '';
+    return `its attempt ${last.n} was settled ${r.verdict}${who} (${r.via}) at ${new Date(r.at).toISOString()}`;
+  }
+  if (record.outcome) return 'its outcome is established';
+  if (record.dropped) return 'it was dropped';
+  return last ? `its attempt ${last.n} isn't unresolved` : 'it has no attempt';
+}
+
 const CHANGE_KINDS = new Set(['agent-settings', 'tool-presentation', 'undo-turns', 'unstick', 'hide', 'undo-messages']);
 /** The cuts: the kinds whose attempt can be unresolved and settled by an
  *  operator. A hide is journaled as attempts too, but its effect can be read
@@ -530,6 +548,10 @@ function checkRecord(r: unknown, id: string): asserts r is OperatorChangeRecord 
   }
   if (r.completed !== undefined && r.completed !== true) malformed(`${where}: completed`);
   if (r.dropped !== undefined && !(isObject(r.dropped) && isCount(r.dropped.at))) malformed(`${where}: dropped`);
+  // A change that began to apply is never dropped (dropResolvedOperatorChange
+  // refuses it), and a dropped one is skipped by recovery, so the two together
+  // would hide an attempt from it.
+  if (r.dropped !== undefined && r.attempts.length > 0) malformed(`${where}: dropped after it began to apply`);
 }
 
 /** One entry, checked before it's folded in: its own shape, and that it
@@ -543,6 +565,10 @@ function checkEntry(e: unknown, records: Map<string, OperatorChangeRecord>): ass
     case 'attempt':
       if (!(CUT_KINDS.has(e.changeKind as string) || e.changeKind === 'hide') || !isText(e.agent) || !isCount(e.n) || !isCount(e.at)) malformed(where);
       if (record && record.kind !== e.changeKind) malformed(`${where}: its kind differs from its change's`);
+      // Each attempt is journaled once; a second record of its number is
+      // refused, as a snapshot's is (checkRecord), not folded away.
+      if (hasAttempt(e.n)) malformed(`${where}: attempt ${String(e.n)} is already recorded`);
+      if (record?.dropped) malformed(`${where}: its change was dropped`);
       checkEvidence(e.evidence, where, e.changeKind as string);
       return;
     case 'switched':
@@ -553,6 +579,8 @@ function checkEntry(e: unknown, records: Map<string, OperatorChangeRecord>): ass
       return;
     case 'resolved':
       if (!isCount(e.n) || !hasAttempt(e.n)) malformed(where);
+      // As a snapshot's record is checked (checkRecord): a hide is never held.
+      if (!CUT_KINDS.has(record!.kind)) malformed(`${where}: only a cut is resolved`);
       checkResolution(e.resolution, where);
       return;
     case 'outcome':
@@ -565,6 +593,7 @@ function checkEntry(e: unknown, records: Map<string, OperatorChangeRecord>): ass
     case 'dropped':
       if (!CHANGE_KINDS.has(e.changeKind as string) || !isText(e.agent) || !isCount(e.at)) malformed(where);
       if (record && record.kind !== e.changeKind) malformed(`${where}: its kind differs from its change's`);
+      if (record && record.attempts.length > 0) malformed(`${where}: its change began to apply`);
       return;
     default:
       malformed(where);

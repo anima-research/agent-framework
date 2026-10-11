@@ -173,3 +173,39 @@ test('an offline recovery records its marks choice and receipt in the operator l
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('--operator-change opens only an existing store: a mistyped path is refused, and nothing is created', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'recover-cli-log-'));
+  try {
+    const missing = join(dir, 'no-such-store');
+    const listed = recover(missing, '--operator-change', 'list');
+    assert.equal(listed.status, 1);
+    assert.match(listed.stderr, new RegExp(`No store at ${missing.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    assert.equal(existsSync(missing), false, 'no empty store was created to list nothing from');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an operator-change resolve refused on a journal it cannot read is recorded like any other refusal', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'recover-cli-log-'));
+  const storePath = join(dir, 'store');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    store.appendJson('operator/changes', { kind: 'attempt', changeId: 'half' });
+    store.sync();
+    store.close();
+    const refused = recover(storePath, '--operator-change', 'resolve', 'half', '--attempt', '1', '--verdict', 'not-committed',
+      '--reason', 'checking', '--requester', 'nissa');
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, /malformed operator\/changes/);
+    const logged = operatorLog(storePath).filter((e) => e.kind === 'resolve-operator-change');
+    assert.equal(logged.length, 1);
+    assert.match(String(logged[0]!.error), /malformed operator\/changes/);
+    assert.deepEqual(logged[0]!.requester, { via: 'cli', name: 'nissa' });
+    assert.equal(recover(storePath, '--operator-change', 'list').status, 1, 'a list is refused too');
+    assert.equal(operatorLog(storePath).filter((e) => e.kind === 'resolve-operator-change').length, 1, 'and records nothing');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

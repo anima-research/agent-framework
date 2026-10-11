@@ -557,6 +557,8 @@ export class Agent {
     if (keys.has('contextBudgetTokens')) {
       const configured = this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
       startsDescent = configured < live;
+      // As resetRuntimeSettings refuses it: a descent needs hot settings.
+      if (startsDescent && !hot) throw new Error('The active context strategy cannot prepare a smaller window live');
       target.contextBudgetTokens = configured;
     }
     if (keys.has('tailTokens') && hot) {
@@ -604,6 +606,13 @@ export class Agent {
     if ((patch.tailTokens !== undefined || patch.transitionPaceTokens !== undefined) &&
         !this.getHotContextSettings()) {
       throw new Error('The active context strategy does not support live tail/transition settings');
+    }
+    // A paced decrease prepares a smaller window, which only a strategy with
+    // hot settings can (updateRuntimeSettings), so a preview refuses it too.
+    if (patch.contextBudgetTokens !== undefined && !patch.immediate &&
+        patch.contextBudgetTokens < (this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS) &&
+        !this.getHotContextSettings()) {
+      throw new Error('The active context strategy cannot prepare a smaller window live');
     }
   }
 

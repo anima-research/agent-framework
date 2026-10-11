@@ -38,6 +38,7 @@ import {
   type RuntimeSettingsValues,
   type UnstickAttemptOutcome,
   type UnstickOperationRecord,
+  settledState,
 } from './operator-change.js';
 import { RecordJournal } from './record-journal.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
@@ -1814,6 +1815,9 @@ export class AgentFramework {
   /** Admissions applyResolvedOperatorChange is carrying out, by admission id:
    *  each lets exactly its change's tool call through the gate. */
   private activeAdmissions: Map<string, ResolvedOperatorChange> = new Map();
+  /** Module edits and removals held while a reservation holds the store,
+   *  applied at its release (flushDeferredMessageOps). */
+  private deferredMessageOps: Array<{ op: 'edit'; id: MessageId; content: ContentBlock[] } | { op: 'remove'; id: MessageId }> = [];
   /** This store's identity (storeIdentity), once read or minted. */
   private storeIdentityValue: string | null = null;
   /** What this process saw of each cut attempt (change id -> attempt ->
@@ -6886,8 +6890,12 @@ export class AgentFramework {
       released = true;
       if (this.surgeryHold === hold) this.surgeryHold = null;
       markReleased();
-      // Creations held behind this hold may proceed (unless a lease waits).
-      queueMicrotask(() => this.notifyBoundaryCleared());
+      // A lease waiting behind this hold is granted now, and creations held
+      // behind it may proceed (unless a lease still waits).
+      queueMicrotask(() => {
+        this.tryGrantSafeBoundary();
+        this.notifyBoundaryCleared();
+      });
       for (const [name, token] of reserved) {
         if (this.activeTurnTokens.get(name) === token) this.activeTurnTokens.delete(name);
       }
@@ -6914,8 +6922,26 @@ export class AgentFramework {
         }
         this.ackDeferredWrites();
       }
+      // Edits and removals a module made meanwhile land now, in order, on
+      // what the holder left.
+      this.flushDeferredMessageOps();
     };
     return { tokens: reserved, release };
+  }
+
+  /** Apply the module edits and removals held while a reservation held the
+   *  store (editMessage, removeMessage). One that no longer applies, such as
+   *  an edit of a message the holder's change removed, is logged. */
+  private flushDeferredMessageOps(): void {
+    // Optional chaining: prototype-built harnesses leave fields undefined.
+    for (const op of this.deferredMessageOps?.splice(0) ?? []) {
+      try {
+        if (op.op === 'edit') this.editMessage(op.id, op.content);
+        else this.removeMessage(op.id);
+      } catch (error) {
+        console.error(`[operator] a module's ${op.op} of message ${op.id}, held during a reservation, failed at its release: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
   }
 
   /** stop()'s first step for the store: no lease, direct surgery or
@@ -7003,7 +7029,13 @@ export class AgentFramework {
     try {
       return await fn(held.lease);
     } finally {
-      held.release();
+      try {
+        held.release();
+      } catch (error) {
+        // The callback's own outcome stands. Writes the flush didn't land
+        // stay deferred, and land at their agent's next boundary.
+        console.error(`[safe-boundary] ${held.lease.verb}: its deferred-write flush failed at release:`, error instanceof Error ? error.message : error);
+      }
       console.log(`[safe-boundary] ${held.lease.verb}: released after ${Date.now() - held.lease.since}ms`);
     }
   }
@@ -7033,11 +7065,15 @@ export class AgentFramework {
       lease,
       release: () => {
         if (this.heldLease === entry) this.heldLease = null;
-        release();
-        // The next waiter may be grantable at once; if none is waiting,
-        // creations held behind the boundary proceed.
-        this.tryGrantSafeBoundary();
-        this.notifyBoundaryCleared();
+        try {
+          release();
+        } finally {
+          // The next waiter may be grantable at once; if none is waiting,
+          // creations held behind the boundary proceed. Even when the
+          // release's deferred-write flush threw: its tokens were freed first.
+          this.tryGrantSafeBoundary();
+          this.notifyBoundaryCleared();
+        }
       },
     });
   }
@@ -7063,6 +7099,26 @@ export class AgentFramework {
     return ticket;
   }
 
+  /**
+   * Admission for createConversationAgent, which the event loop awaits
+   * (channel traffic arrives as events). It parks only while a reservation
+   * holds the store. A lease that is only waiting is granted from that same
+   * loop, so a fork that waited for it would wait forever; instead its
+   * pending ticket makes the lease wait for the fork, which finishes on its
+   * own.
+   */
+  private async admitConversationCreation(): Promise<object> {
+    for (;;) {
+      if (this.stopping) throw new Error('Conversation agent creation refused: the framework is stopping');
+      if (!this.surgeryHold) {
+        const ticket = {};
+        this.ephemeralPending.add(ticket);
+        return ticket;
+      }
+      await new Promise<void>((resolve) => this.boundaryClearedWaiters.push(resolve));
+    }
+  }
+
   /** Admit a creation now, returning its pending ticket, or null when it has
    *  to wait. The store hold (surgeryHold) covers a held lease and a direct
    *  rollback or suppress alike: nothing initializes under either. */
@@ -7079,11 +7135,10 @@ export class AgentFramework {
   }
 
   /** A stream a waiting lease is draining: a registered ephemeral run, or an
-   *  agent with a real turn alive (not a lease's reservation token). */
+   *  agent with a turn alive. Asked only while nothing holds the store (no
+   *  lease or surgery reservation), so any turn token is a real turn's. */
   private isDrainingStream(name: string): boolean {
-    if (this.ephemeralRuns.has(name)) return true;
-    const token = this.activeTurnTokens.get(name);
-    return token !== undefined && this.heldLease?.tokens.get(name) !== token;
+    return this.ephemeralRuns.has(name) || this.activeTurnTokens.has(name);
   }
 
   /** Release creations held by admitEphemeralCreation once no lease is
@@ -7405,10 +7460,18 @@ export class AgentFramework {
     const ids = this.store.getRecordIdsByType('framework/store-identity')
       .map((id) => ({ id, value: BigInt(id) }))
       .sort((a, b) => (a.value < b.value ? -1 : a.value > b.value ? 1 : 0));
-    if (ids.length > 0) {
-      const record = this.store.getRecord(ids[0]!.id);
-      const parsed = record ? JSON.parse(Buffer.from(record.payload).toString('utf-8')) as { id?: unknown } : null;
-      if (typeof parsed?.id === 'string') return (this.storeIdentityValue = parsed.id);
+    // The oldest record that names an identity. One that can't be read is
+    // passed over, so the identity minted below is the one every later start
+    // finds, rather than a new one minted at each.
+    for (const { id } of ids) {
+      const record = this.store.getRecord(id);
+      let parsed: { id?: unknown } | null = null;
+      try {
+        parsed = record ? JSON.parse(Buffer.from(record.payload).toString('utf-8')) as { id?: unknown } : null;
+      } catch {
+        parsed = null;
+      }
+      if (typeof parsed?.id === 'string' && parsed.id.length > 0) return (this.storeIdentityValue = parsed.id);
     }
     const minted = randomUUID();
     this.store.appendJson('framework/store-identity', { id: minted, at: Date.now() });
@@ -7559,6 +7622,18 @@ export class AgentFramework {
         if (ledger.journal.needsReconcile) this.reloadChangesJournal();
       }
     }
+  }
+
+  /** The operator change whose recovery still reads `branch`, if any: one
+   *  with no established outcome, not dropped, whose attempt names it as its
+   *  source or destination. Deleting such a branch, or reusing its name,
+   *  would change what that recovery decides. */
+  operatorChangeReadingBranch(branch: string): string | null {
+    for (const record of this.changesLedger().records.values()) {
+      if (record.outcome || record.dropped) continue;
+      if (record.attempts.some((a) => a.evidence.source === branch || a.evidence.target === branch)) return record.changeId;
+    }
+    return null;
   }
 
   /** The durable body record of a gated operator change, or null if it never
@@ -7776,19 +7851,30 @@ export class AgentFramework {
     if (!opts.reason?.trim()) throw new OperatorActionError('invalid', 'Settling an operator change needs a reason');
     const record = this.changesLedger().records.get(changeId);
     const unresolved = record ? this.unresolvedAttempt(record) : null;
-    if (!record || !unresolved) throw new OperatorActionError('invalid', `Operator change ${changeId} has no unresolved attempt to settle`);
+    if (!record || !unresolved) {
+      throw new OperatorActionError('invalid', `Operator change ${changeId} has no unresolved attempt to settle: ${settledState(record)}`);
+    }
     if (unresolved.n !== attempt) {
       throw new OperatorActionError('stale', `Operator change ${changeId}: attempt ${attempt} is not its unresolved attempt (${unresolved.n} is)`);
+    }
+    const target = record.attempts.find((a) => a.n === attempt)!.evidence;
+    const active = this.store.currentBranch().name;
+    // Checked before the verdict is journaled: a refusal leaves the attempt
+    // unresolved, so it can be settled again.
+    if (verdict === 'not-committed' && active === target.target && !this.agents.has(record.agent)) {
+      throw new OperatorActionError('unknown-agent', `Unknown agent: ${record.agent}`);
     }
     const resolution: OperatorChangeResolution = {
       verdict, reason: opts.reason, ...(opts.requester ? { requester: opts.requester } : {}), at: Date.now(), via: 'live',
     };
     this.journalChange({ kind: 'resolved', changeId, n: attempt, resolution });
-    const target = record.attempts.find((a) => a.n === attempt)!.evidence;
     let restored: string | undefined;
-    let remaining: string | undefined;
-    if (verdict === 'not-committed' && this.store.currentBranch().name === target.target) {
-      if (!this.agents.has(record.agent)) throw new OperatorActionError('unknown-agent', `Unknown agent: ${record.agent}`);
+    // The attestation stands as the operator's, but one the active body
+    // contradicts is never silent.
+    let remaining: string | undefined = verdict === 'committed' && active !== target.target
+      ? `the active branch is ${active}, not this attempt's destination ${target.target}; its outcome will be established as applied all the same`
+      : undefined;
+    if (verdict === 'not-committed' && active === target.target) {
       const result = await this.restoreCutSource({ changeId, agent: record.agent, attempt, target: target.target, source: target.source });
       // The verdict stands either way. An incomplete restoration is what
       // remains, and holds traffic until one completes.
@@ -7826,8 +7912,18 @@ export class AgentFramework {
     if (record?.outcome || record?.switched !== undefined || (record?.attempts.length ?? 0) > 0) {
       throw new OperatorActionError('invalid', `Operator change ${change.id} has begun to apply; it can't be dropped`);
     }
-    if (this.hasStagedMarks(change)) this.discordAwarenessOutbox!.discard(this.changeBatchId(change.id));
+    // Dropped first: once that's durable the change never applies, so its
+    // staged choice can go. A batch a failure leaves staged behind it is
+    // inert, so the drop stands either way.
     this.journalChange({ kind: 'dropped', changeId: change.id, changeKind: change.kind, agent: change.agent, at: Date.now() });
+    if (this.hasStagedMarks(change)) {
+      try {
+        this.discordAwarenessOutbox!.discard(this.changeBatchId(change.id));
+      } catch (error) {
+        console.error(`[operator-change] dropped ${change.kind} ${change.id}, but its staged marks could not be discarded (nothing will activate them):`,
+          error instanceof Error ? error.message : error);
+      }
+    }
   }
 
   /** The durable record of an unstick operation, or null if it never ran a step. */
@@ -8178,6 +8274,13 @@ export class AgentFramework {
           emoji: this.discordAwarenessEmoji,
         });
       } catch (error) {
+        // The record may have landed all the same: retire it, so no staged
+        // choice outlives a change that was never staged.
+        try {
+          this.discordAwarenessOutbox!.discard(this.changeBatchId(change.id));
+        } catch {
+          // Nothing landed, or it can't be retired now: either way nothing activates it.
+        }
         return {
           ok: false,
           error: `Operator change not staged: its marks choice could not be recorded: ${error instanceof Error ? error.message : String(error)}`,
@@ -8375,6 +8478,12 @@ export class AgentFramework {
         markers = { ...facts, status: 'queued', queued: settled.queued, batchId };
         if (settled.queued > 0) this.deliverDiscordAwarenessInBackground(verb, change.agent);
       }
+    } else if (attempt.evidence.staged) {
+      // Staged by a process that had an outbox, applied by one that hasn't:
+      // the choice can't be carried out here, and says so.
+      const error = 'no Discord awareness outbox is configured, so its staged marks stay staged';
+      markers = { ...facts, status: 'not-scheduled', queued: 0, error };
+      this.opsAlert('operator-change-marks-unactivated', change.agent, `${change.kind} ${change.id}: ${error}`);
     }
     this.journalChange({
       kind: 'outcome',
@@ -8502,23 +8611,38 @@ export class AgentFramework {
     // If writing the attempt throws, it may still have landed; either way
     // this process knows its cut never ran.
     note('failed');
-    this.journalChange({
-      kind: 'attempt',
-      changeId: change.id,
-      changeKind: change.kind,
-      agent: change.agent,
-      n,
-      at: Date.now(),
-      evidence: {
-        target: destination,
-        source: change.sourceBranch,
-        sourceHead: this.store.currentBranch().head,
-        removed: removed.length,
-        marks: this.removalMarks(change, removed),
-        staged: this.hasStagedMarks(change),
-        ...(change.requester ? { requester: change.requester } : {}),
-      },
-    });
+    try {
+      this.journalChange({
+        kind: 'attempt',
+        changeId: change.id,
+        changeKind: change.kind,
+        agent: change.agent,
+        n,
+        at: Date.now(),
+        evidence: {
+          target: destination,
+          source: change.sourceBranch,
+          sourceHead: this.store.currentBranch().head,
+          removed: removed.length,
+          marks: this.removalMarks(change, removed),
+          staged: this.hasStagedMarks(change),
+          ...(change.requester ? { requester: change.requester } : {}),
+        },
+      });
+    } catch (error) {
+      // journalChange reloads the journal when it can't tell whether the
+      // write landed. If the attempt is there, its failure is recorded too,
+      // so a restart reads it as not committed rather than unresolved.
+      if (record()?.attempts.some((a) => a.n === n)) {
+        try {
+          const detail = error instanceof Error ? error.message : String(error);
+          this.journalChange({ kind: 'failed', changeId: change.id, n, error: `its attempt's record failed before the cut ran: ${detail}` });
+        } catch {
+          // Unrecorded: this process's own knowledge still says it never ran.
+        }
+      }
+      throw error;
+    }
     try {
       await steps.cut(destination);
     } catch (error) {
@@ -8840,7 +8964,40 @@ export class AgentFramework {
     // Both journals were first read before the agents (an unreadable one
     // stopped startup there, rather than reading as empty).
     const records = [...this.changesLedger().records.values()];
+    // A change's bookkeeping at startup: its operator-log action (recorded
+    // once, recordChangeAction) and its completed mark. An attested commit
+    // carries its attestation, which is the operator's, not something the
+    // framework observed.
+    const finish = (record: OperatorChangeRecord, attempt: OperatorChangeRecord['attempts'][number] | undefined, outcome: OperatorChangeOutcome) => {
+      const attestation = attempt?.resolution;
+      this.recordChangeAction({
+        kind: record.kind === 'undo-messages' ? 'rollback' : record.kind,
+        agent: record.agent,
+        ...(attempt?.evidence.requester ? { requester: attempt.evidence.requester } : {}),
+        params: {
+          changeId: record.changeId,
+          recovered: 'startup',
+          ...(attestation ? { attested: { verdict: attestation.verdict, via: attestation.via, ...(attestation.requester ? { requester: attestation.requester } : {}) } } : {}),
+        },
+        result: { target: attempt?.evidence.target, removed: outcome.removed, markers: outcome.markers },
+      });
+      this.journalChange({ kind: 'completed', changeId: record.changeId });
+    };
     for (const record of records) {
+      if (record.outcome && !record.completed && !record.dropped) {
+        // Its outcome was established, but the process stopped before its
+        // bookkeeping: finish it now, rather than wait for a host retry.
+        try {
+          finish(record, record.attempts.find((a) => a.n === record.outcome!.n), record.outcome);
+          console.error(`[operator-changes] ${record.kind} ${record.changeId} for ${record.agent}: its outcome was established before a crash; its bookkeeping finished at startup`);
+        } catch (error) {
+          console.error(
+            `[operator-changes] ${record.kind} ${record.changeId} for ${record.agent}: bookkeeping not finished at startup (left for the host's retry):`,
+            error instanceof Error ? error.message : error,
+          );
+        }
+        continue;
+      }
       if (record.outcome || record.dropped || record.attempts.length === 0) continue;
       const last = record.attempts[record.attempts.length - 1]!;
       const disposition = record.kind === 'hide' ? null : cutAttemptDisposition(record, last);
@@ -8874,15 +9031,10 @@ export class AgentFramework {
           last,
           record.kind === 'hide' ? 'hide' : 'undo',
         );
-        this.recordChangeAction({
-          kind: record.kind === 'undo-messages' ? 'rollback' : record.kind,
-          agent: record.agent,
-          ...(last.evidence.requester ? { requester: last.evidence.requester } : {}),
-          params: { changeId: record.changeId, recovered: 'startup' },
-          result: { target: last.evidence.target, removed: outcome.removed, markers: outcome.markers },
-        });
-        this.journalChange({ kind: 'completed', changeId: record.changeId });
-        console.error(`[operator-changes] ${record.kind} ${record.changeId} for ${record.agent}: committed before a crash recorded it; outcome established at startup`);
+        finish(record, last, outcome);
+        console.error(last.resolution
+          ? `[operator-changes] ${record.kind} ${record.changeId} for ${record.agent}: attested committed (${last.resolution.via}); outcome established at startup`
+          : `[operator-changes] ${record.kind} ${record.changeId} for ${record.agent}: committed before a crash recorded it; outcome established at startup`);
       } catch (error) {
         console.error(
           `[operator-changes] ${record.kind} ${record.changeId} for ${record.agent}: not recovered at startup (left for the host's retry):`,
@@ -10743,7 +10895,21 @@ export class AgentFramework {
     if (this.usedEphemeralAgentNames.has(name) || this.agents.has(name)) {
       throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
     }
+    // A fork enters the store under the creation admission (see
+    // admitConversationCreation): a waiting lease isn't granted while it
+    // opens, it's refused once stopping, and stop() waits for one already
+    // opening. Once registered, the next reservation holds its turn token
+    // like any agent's.
+    const pending = await this.admitConversationCreation();
+    if (this.usedEphemeralAgentNames.has(name) || this.agents.has(name)) {
+      this.ephemeralPending.delete(pending);
+      this.tryGrantSafeBoundary();
+      throw new Error(`Conversation agent name "${name}" is already registered or reserved`);
+    }
     this.usedEphemeralAgentNames.add(name);
+    let initialized!: () => void;
+    const initializing = new Promise<void>((resolve) => { initialized = resolve; });
+    this.ephemeralInitializations.add(initializing);
     try {
 
       const contextManager = await ContextManager.open({
@@ -10785,6 +10951,11 @@ export class AgentFramework {
     } catch (error) {
       this.usedEphemeralAgentNames.delete(name);
       throw error;
+    } finally {
+      this.ephemeralPending.delete(pending);
+      this.ephemeralInitializations.delete(initializing);
+      initialized();
+      this.tryGrantSafeBoundary();
     }
   }
 
@@ -16035,8 +16206,12 @@ export class AgentFramework {
     const midToolCycle = opts?.forAgent
       ? this.pendingAssistantBlocks.has(agent.name)
       : this.pendingAssistantBlocks.size > 0;
+    // The tool_result exemption is for a draining turn. While a reservation
+    // (a lease or a surgery) holds the store, no turn is running, so a
+    // tool_result waits like any write: the holder's body change must not
+    // move underneath it.
     if (
-      !hasToolResult &&
+      (!hasToolResult || this.surgeryHold) &&
       opts?.bypassDeferralFor !== agent.name &&
       (this.quiesced ||
         midToolCycle ||
@@ -16064,7 +16239,10 @@ export class AgentFramework {
       if (opts?.placement) {
         opts.placement.agent = agent.name;
         opts.placement.deferredId = id;
-        opts.placement.durable = persisted;
+        // Durable only as asked for (MessagePlacement.durable): a queue
+        // persisted for another reason (quiesce, an earlier durable write)
+        // doesn't make a delivery the caller didn't ask about durable.
+        opts.placement.durable = durable && persisted;
       }
       return '' as MessageId; // Deferred — flushed at the target's next boundary
     }
@@ -16165,6 +16343,13 @@ export class AgentFramework {
   }
 
   private editMessage(id: MessageId, content: ContentBlock[]): void {
+    // While a reservation (a lease or a surgery) holds the store, a module's
+    // edit waits for its release, so the holder's body change can't move
+    // underneath it (flushDeferredMessageOps).
+    if (this.surgeryHold) {
+      (this.deferredMessageOps ??= []).push({ op: 'edit', id, content });
+      return;
+    }
     const agent = this.primaryAgentName
       ? this.agents.get(this.primaryAgentName)
       : this.agents.values().next().value;
@@ -16175,6 +16360,10 @@ export class AgentFramework {
   }
 
   private removeMessage(id: MessageId): void {
+    if (this.surgeryHold) {
+      (this.deferredMessageOps ??= []).push({ op: 'remove', id });
+      return;
+    }
     const agent = this.primaryAgentName
       ? this.agents.get(this.primaryAgentName)
       : this.agents.values().next().value;
