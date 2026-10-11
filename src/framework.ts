@@ -2152,6 +2152,10 @@ export class AgentFramework {
       await this.loopPromise;
     }
 
+    // Speech the streams already wrote is still on its agents' speech
+    // chains: let it publish while the connections are open, bounded.
+    await this.settleSpeechChains('before the connections close');
+
     // Stop typing indicators
     this.channelRegistry?.stopAll();
 
@@ -2165,6 +2169,12 @@ export class AgentFramework {
       shutdownPromises.push(this.mcplServerRegistry.closeAll());
     }
     await Promise.all(shutdownPromises);
+
+    // A publish still waiting has its answer now that the connections are
+    // closed, and speech queued behind it can no longer go out: let the
+    // chains record what became of their words while the store is open (a
+    // publish that provably sent nothing keeps its words as a draft).
+    await this.settleSpeechChains('before the store closes');
 
     // Streams may queue storage repairs while being cancelled above. Retry
     // after their teardown, while the store is still open, before final sync.
@@ -10165,6 +10175,26 @@ export class AgentFramework {
   /** Settles once every link chained so far for the agent has. */
   private speechSettled(agentName: string): Promise<void> {
     return this.speechChains?.get(agentName) ?? Promise.resolve();
+  }
+
+  /** How long stop() waits, at each of its two points, for the speech
+   *  chains to settle. A chain still busy then is left, and logged. */
+  private static SPEECH_DRAIN_MS = 10_000;
+
+  /** stop(): wait for every agent's speech chain, bounded. */
+  private async settleSpeechChains(when: string): Promise<void> {
+    const chains = [...(this.speechChains?.entries() ?? [])];
+    if (chains.length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const settled = new Set<string>();
+    const all = Promise.all(chains.map(([agent, chain]) => chain.then(() => { settled.add(agent); })));
+    const bound = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), AgentFramework.SPEECH_DRAIN_MS); });
+    const outcome = await Promise.race([all.then(() => 'settled' as const), bound]);
+    clearTimeout(timer);
+    if (outcome === 'timeout') {
+      const busy = chains.map(([agent]) => agent).filter((agent) => !settled.has(agent));
+      console.error(`[stop] speech of ${busy.join(', ')} still settling after ${AgentFramework.SPEECH_DRAIN_MS} ms, ${when}; going on without it`);
+    }
   }
 
   /**

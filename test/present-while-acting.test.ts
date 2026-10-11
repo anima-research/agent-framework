@@ -31,13 +31,23 @@ import type {
   ToolCall,
   ToolResult,
 } from '../src/index.js';
-import { AgentFramework } from '../src/index.js';
+import { AgentFramework, readInboundSource } from '../src/index.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 import type { ContentBlock, StreamEvent } from '@animalabs/membrane';
 
 // ---------------------------------------------------------------------------
 // Test module: tools that optionally emit a mid-turn external message
 // ---------------------------------------------------------------------------
+
+/** Until `cond` holds, bounded: wait for the event a check stands for,
+ *  never a fixed pause a loaded machine can outrun. */
+async function until(cond: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for: ${what}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
 
 class RobotModule implements Module {
   readonly name = 'robot';
@@ -624,6 +634,18 @@ describe('present while acting', () => {
 
     assert.deepEqual(routed, [{ text: 'Continuing my report.', locus: 'chan-A' }], 'un-engaged ambient changed nothing');
     assert.deepEqual(heldDrafts(framework), []);
+    // It did reach the suspension check: injected into the turn, as a
+    // conversational item with its envelope (a route candidate), and the
+    // check left the route unheld.
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .map((o) => o?.injectedMessages ?? []).flat().map((m) => JSON.stringify(m.content));
+    assert.ok(wired.some((t) => t.includes('unrelated lounge chatter')), 'the chatter was injected into the turn');
+    const chatter = framework.getAgent('assistant')!.getContextManager().getAllMessages()
+      .find((m) => JSON.stringify(m.content).includes('unrelated lounge chatter'))!;
+    assert.equal(readInboundSource(chatter.metadata)?.kind, 'channel', 'with its envelope: a candidate the check weighs');
+    const turn = (framework as unknown as { turnRoutes: Map<string, { route: { channelId?: string } | null; hold?: unknown }> }).turnRoutes.get('assistant');
+    assert.equal(turn?.route?.channelId, 'chan-A');
+    assert.equal(turn?.hold, undefined, 'the check found nothing to suspend');
 
     await framework.stop();
   });
@@ -1177,6 +1199,42 @@ describe('speech follows the moment its words were written', () => {
       name === 'channel_open' ? { success: true, data: { channelId: input.channelId, opened: true } } : { success: true };
   }
 
+  /**
+   * The registry method's first call waits until the result of tool call
+   * `callId` (a channel_open, a hold) is in, so the words it publishes are
+   * certainly still pending when that change lands: the race always
+   * happens. `pendingWhenItLanded()` says it did.
+   */
+  function holdFirstUntil(framework: AgentFramework, method: 'routeSpeech' | 'deliverSpeech', callId: string): { pendingWhenItLanded: () => boolean | undefined } {
+    const registry = registryOf(framework);
+    const real = registry[method] as (...args: unknown[]) => Promise<unknown>;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let pending = false;
+    let first = true;
+    let pendingWhenItLanded: boolean | undefined;
+    registry[method] = async (...args: unknown[]) => {
+      if (first) {
+        first = false;
+        pending = true;
+        await gate;
+        pending = false;
+      }
+      return real(...args);
+    };
+    const f = framework as unknown as { pushEvent(e: unknown): void };
+    const push = f.pushEvent.bind(framework);
+    f.pushEvent = (e: unknown) => {
+      push(e);
+      const ev = e as { type?: string; callId?: string };
+      if (ev.type === 'tool-result' && ev.callId === callId) {
+        pendingWhenItLanded = pending;
+        release();
+      }
+    };
+    return { pendingWhenItLanded: () => pendingWhenItLanded };
+  }
+
   /** The registry method's first call waits `ms` first, so later speech queues behind it. */
   function slowFirst(framework: AgentFramework, method: 'routeSpeech' | 'deliverSpeech', ms = 60): void {
     const registry = registryOf(framework);
@@ -1247,11 +1305,12 @@ describe('speech follows the moment its words were written', () => {
     const framework = await createFramework();
     const routed = stubChannelRegistry(framework, { home: false });
     opensChannels(framework);
-    slowFirst(framework, 'routeSpeech');
+    const race = holdFirstUntil(framework, 'routeSpeech', 'c2');
 
     triggerFromChannel(framework, 'chan-A');
     await framework.runUntilIdle();
 
+    assert.equal(race.pendingWhenItLanded(), true, 'the first words were still waiting when the open landed');
     assert.deepEqual(routed, [
       { text: 'First words.', locus: 'chan-A' },
       { text: 'Second words, still for chan-A.', locus: 'chan-A' },
@@ -1277,11 +1336,12 @@ describe('speech follows the moment its words were written', () => {
     const framework = await createFramework('hybrid');
     const routed = stubChannelRegistry(framework, { home: false });
     opensChannels(framework);
-    slowFirst(framework, 'deliverSpeech');
+    const race = holdFirstUntil(framework, 'deliverSpeech', 'c2');
 
     triggerFromChannel(framework, 'chan-A');
     await framework.runUntilIdle();
 
+    assert.equal(race.pendingWhenItLanded(), true, 'the pinned words were still waiting when the open landed');
     assert.deepEqual(routed, [
       { text: 'Pinned words.', locus: 'chan-alpha' },
       { text: 'More for alpha.', locus: 'chan-alpha' },
@@ -1320,6 +1380,44 @@ describe('speech follows the moment its words were written', () => {
       { serverId: 'alpha-server', channelId: 'chan-alpha' },
       { serverId: 'alpha-server', channelId: 'chan-alpha' },
     ], 'the envelope and the speech after it both name the pinned server');
+
+    await framework.stop();
+  });
+
+  it('a route chosen with channel_open is never held by a mid-turn arrival, addressed or not', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c1', name: 'channel_open', input: { channelId: 'discord:guild:observatory' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'c2', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Still for the observatory.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework, { home: false });
+    opensChannels(framework);
+    // An addressed arrival from another conversation, during the move.
+    addressedArrivalElsewhere();
+    const notices: string[] = [];
+    framework.onTrace((event) => {
+      const e = event as { type: string; source?: string };
+      if (e.type === 'message:added' && e.source === 'routing-notice') notices.push(e.source!);
+    });
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .map((o) => o?.injectedMessages ?? []).flat().map((m) => JSON.stringify(m.content));
+    assert.ok(wired.some((t) => t.includes('hey, over here?')), 'the addressed arrival was injected');
+    assert.deepEqual(routed, [{ text: 'Still for the observatory.', locus: 'discord:guild:observatory' }]);
+    assert.deepEqual(heldDrafts(framework), [], 'nothing held');
+    assert.equal(notices.length, 1, 'only the turn-start announcement: no hold notice');
+    const turn = (framework as unknown as { turnRoutes: Map<string, { route: { origin?: string } | null; hold?: unknown }> }).turnRoutes.get('assistant');
+    assert.equal(turn?.route?.origin, 'open');
+    assert.equal(turn?.hold, undefined);
 
     await framework.stop();
   });
@@ -1526,7 +1624,14 @@ describe('speech follows the moment its words were written', () => {
   it('channel_publish engages the conversation its outcome names when delivered or unknown, and nothing when it fails', async () => {
     const framework = await createFramework();
     stubChannelRegistry(framework, { home: false });
-    const dispatch = (framework as unknown as { dispatchChannelToolCall(agent: string, call: unknown): void });
+    const dispatch = (framework as unknown as { dispatchChannelToolCall(agent: string, call: unknown): void; pushEvent(e: unknown): void });
+    const answered = new Set<string>();
+    const push = dispatch.pushEvent.bind(framework);
+    dispatch.pushEvent = (e: unknown) => {
+      const ev = e as { type?: string; callId?: string };
+      if (ev.type === 'tool-result') answered.add(ev.callId!);
+      else push(e);
+    };
     const outcomes: Array<[string, string, string | undefined]> = [
       ['delivered', 't1', 'delivered'],
       ['unknown', 't2', 'unknown'],
@@ -1538,7 +1643,7 @@ describe('speech follows the moment its words were written', () => {
         data: { delivered: status === 'delivered', status, serverId: 'srv', channelId: 'chan-T', threadId },
       });
       dispatch.dispatchChannelToolCall('assistant', { id: `p-${status}`, name: 'channel_publish', input: { channelId: 'chan-T', threadId, content: 'hi' } });
-      await new Promise((r) => setTimeout(r, 5));
+      await until(() => answered.has(`p-${status}`), `the ${status} publish's result`);
       assert.equal(engage(framework).engagementOf('assistant', { kind: 'channel', serverId: 'srv', channelId: 'chan-T', threadId }), expected, status);
     }
     await framework.stop();
@@ -1571,7 +1676,7 @@ describe('speech follows the moment its words were written', () => {
     for (const [i, [input, why]] of invalid.entries()) {
       f.dispatchChannelToolCall('assistant', { id: `o${i}`, name: 'channel_open', input });
     }
-    await new Promise((r) => setTimeout(r, 5));
+    await until(() => results.length === invalid.length, 'every refusal');
     assert.equal(opened, 0, 'nothing was opened');
     assert.equal(results.length, invalid.length);
     for (const [i, [, why]] of invalid.entries()) {
@@ -1582,7 +1687,7 @@ describe('speech follows the moment its words were written', () => {
     }
     // null means "not in use", as for channel_publish's selectors.
     f.dispatchChannelToolCall('assistant', { id: 'ok', name: 'channel_open', input: { channelId: 'chan-B', threadId: null, serverId: null, setSpeechTarget: null } });
-    await new Promise((r) => setTimeout(r, 5));
+    await until(() => results.some((r) => r.callId === 'ok'), 'the valid open');
     assert.equal(opened, 1);
     await framework.stop();
   });
@@ -1608,7 +1713,7 @@ describe('speech follows the moment its words were written', () => {
     f.dispatchChannelToolCall('assistant', { id: 'number', name: 'channel_close', input: { channelId: 5 } });
     f.dispatchChannelToolCall('assistant', { id: 'null', name: 'channel_publish', input: { channelId: null, content: 'hi' } });
     f.dispatchChannelToolCall('assistant', { id: 'absent', name: 'channel_publish', input: { content: 'hi' } });
-    await new Promise((r) => setTimeout(r, 5));
+    await until(() => results.length === 4, 'all four results');
     assert.match(results.find((r) => r.callId === 'empty')!.result.error ?? '', /channelId must name a channel .*Nothing was sent\./);
     assert.match(results.find((r) => r.callId === 'number')!.result.error ?? '', /channelId must name a channel .*Nothing was closed\./);
     assert.deepEqual(handled.map((h) => [h.name, h.input.channelId]), [
@@ -1827,17 +1932,33 @@ describe('speech follows the moment its words were written', () => {
       return outcome ? { ...outcome, serverId: 'stub' } : outcome;
     };
     const deliver = registry.deliverSpeech as (...args: unknown[]) => Promise<unknown>;
+    // The first envelope's delivery fails only once round 2 (and its newer
+    // prefix) has been written: the race always happens.
     let calls = 0;
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((r) => { releaseFirst = r; });
     registry.deliverSpeech = async (...args: unknown[]) => {
       if (calls++ === 0) {
-        await new Promise((r) => setTimeout(r, 100));
+        await firstGate;
         return { status: 'failed', reason: 'refused', at: Date.now() };
       }
       return deliver(...args);
     };
+    let pendingWhenRound2Landed: boolean | undefined;
+    const fw = framework as unknown as { pushEvent(e: unknown): void };
+    const push = fw.pushEvent.bind(framework);
+    fw.pushEvent = (e: unknown) => {
+      push(e);
+      const ev = e as { type?: string; callId?: string };
+      if (ev.type === 'tool-result' && ev.callId === 'c2') {
+        pendingWhenRound2Landed = calls === 1;
+        releaseFirst();
+      }
+    };
     streams = recordStreams(framework);
     triggerFromChannel(framework, 'chan-A');
     await framework.runUntilIdle();
+    assert.equal(pendingWhenRound2Landed, true, "the older envelope's delivery was still out when the newer prefix was written");
     assert.deepEqual(routed, [{ text: 'Second.', locus: 'chan-beta' }, { text: 'More for beta.', locus: 'chan-beta' }]);
     assert.equal(streams.streamedTo('chan-beta'), 'Second.\n\nMore for beta.');
     assert.deepEqual(streams.completes.filter((c) => c.channelId === 'chan-beta'),
@@ -1929,7 +2050,7 @@ describe('speech follows the moment its words were written', () => {
 
     triggerFromChannel(framework, 'chan-A');
     await framework.runUntilIdle();
-    await new Promise((r) => setTimeout(r, 80));
+    await until(() => events.some(([kind]) => kind === 'complete'), 'the completion, after the trailing reply is published');
 
     assert.deepEqual(events.map(([kind, , text]) => [kind, text]), [
       ['chunk', 'Narrating.'],
@@ -1999,7 +2120,7 @@ describe('speech follows the moment its words were written', () => {
     assert.ok(streams.chunks.length > 0, 'the narration was published and streamed');
     assert.ok(framework.abortInference('assistant', 'test abort'), 'the turn was still running');
     await idle;
-    await new Promise((r) => setTimeout(r, 50));
+    await until(() => streams.completes.length > 0, 'the completion the stream sends');
 
     assert.equal(streams.streamedTo('chan-A'), 'Narrating.');
     assert.deepEqual(streams.completes, [{ channelId: 'chan-A', text: 'Narrating.', threadId: null }]);
