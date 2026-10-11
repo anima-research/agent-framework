@@ -254,6 +254,20 @@ A second test in context-manager (`test/derive.test.ts`) checks the stronger sta
 
 Both tests fail when the mechanism they check is disabled.
 
+### Live acceptance
+
+The contract was checked against the provider on 10 October 2026 with `bench/dendrite/cache-acceptance.mjs` (Claude Sonnet 5.5 through the house inference gateway; a folding resident with ~10k tokens of history, summaries written by the same model; native formatter). Uncached input was 4 tokens on every request.
+
+| Request | cache_creation | cache_read |
+|---|---|---|
+| resident, first turn (writes the cache) | 10,173 | 0 |
+| resident, next turn (its own reuse, the control) | 20 | 10,173 |
+| **fork at the boundary, first request** | 29 | **10,193** |
+| resident, a turn that blocks in a tool call | 0 | 10,230 |
+| **fork derived mid-tool-call, first request** | 152 | **10,230** |
+
+A fork's first request reads everything its parent had cached, including what the parent's latest request added, and writes only its own framing (and, mid-round, the pending round). Message cache breakpoints come from the strategy's recall ladder, so a passthrough resident caches only its system prompt and tools — for resident and fork alike; the same script shows that (1,306 / 1,306) when run without a folding strategy. The script needs `ANTHROPIC_API_KEY`, or `GATE_TOKEN` and `GATE_URL` for a gateway, and prints neither.
+
 ## Resuming and inspecting
 
 ```ts
