@@ -2127,5 +2127,6 @@ export class EventGate {
     this.rateLimitDenied.clear();
     this.passiveSampleFires.clear();
     this.inferenceBuffer = [];
+    this.evictedRouteEvents.clear();
   }
 }

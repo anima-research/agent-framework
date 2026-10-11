@@ -623,7 +623,7 @@ describe('held prose drafts, end to end', () => {
       assert.match(kept?.note ?? '', /^delivery failed: /);
       const markers = () => h.texts().filter((t) => t.startsWith('[discord-send-failed]'));
       assert.equal(markers().length, 1);
-      assert.match(markers()[0]!, new RegExp(`Nothing was posted; it is held as draft ${kept!.id}, and drafts\\(action: "resend"`));
+      assert.ok(markers()[0]!.includes(`Nothing was posted; it is held as draft ${kept!.id}. drafts(action: "resend", draftIds: ["${kept!.id}"], destination: "${ROOM}") sends it there once that can work, or name another destination.`), markers()[0]);
 
       h.command({ op: 'publish-mode', mode: 'no-receipt' });
       await h.turn([createMockResponse([text('words that may have gone')])]);

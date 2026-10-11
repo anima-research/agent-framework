@@ -44,7 +44,7 @@ test('origin keys cannot override the host\'s fields, and the envelope rides las
   assert.deepEqual(m[INBOUND_SOURCE_KEY], envelope, 'the frozen envelope, not anything the origin carried under its key');
 });
 
-test('a coalesced push is gated with the host envelope its coalescer will freeze, and its acceptance is not observed at the gate', async () => {
+test('a coalesced push carries its gate inputs, with the host envelope its coalescer will freeze, and nothing is gated or accepted yet', async () => {
   const seen: Array<Record<string, unknown>> = [];
   const envelope: InboundSource = {
     kind: 'channel', lane: 'push/event', coalesced: true, serverId: 'slack', binding: 'b1', channelId: 'slack:C1',
@@ -52,20 +52,13 @@ test('a coalesced push is gated with the host envelope its coalescer will freeze
   };
   let accepted = 0;
   let built = 0;
-  const coalescedEvents: Array<{ inboundSource?: InboundSource }> = [];
-  let gatedBeforeAdmission = -1;
+  const coalescedEvents: Array<{ inboundSource?: InboundSource; triggerInputs?: { content: string; metadata: Record<string, unknown> } }> = [];
   const handler = new PushHandler(
     { validateInbound: () => {} } as unknown as FeatureSetManager,
     () => {},
     () => {},
     (_content, metadata) => { seen.push(metadata); return false; },
-    // The coalescer admits the occurrence, and only then decides its trigger.
-    async (_serverId, _params, event, decideTrigger) => {
-      gatedBeforeAdmission = seen.length;
-      coalescedEvents.push(event);
-      decideTrigger?.();
-      return { accepted: true } as never;
-    },
+    async (_serverId, _params, event) => { coalescedEvents.push(event); return { accepted: true } as never; },
     () => { accepted++; return undefined; },
     (_serverId, params) => {
       built++;
@@ -84,11 +77,13 @@ test('a coalesced push is gated with the host envelope its coalescer will freeze
   } as never);
   assert.equal(built, 1);
   assert.equal(accepted, 0, 'building a coalesced envelope accepts nothing: the coalescer observes its own admissions');
-  assert.equal(gatedBeforeAdmission, 0, 'the gate is not consulted before the coalescer admits the occurrence');
-  assert.equal(seen.length, 1);
-  assert.deepEqual(seen[0]![INBOUND_SOURCE_KEY], envelope, 'the gate reads the host envelope, not the origin\'s channel or key');
+  assert.equal(seen.length, 0, 'the gate is not consulted before the coalescer admits the occurrence');
   assert.equal(coalescedEvents.length, 1);
-  assert.equal(coalescedEvents[0]!.inboundSource, envelope, 'the coalescer gets the very envelope the gate read');
+  const inputs = coalescedEvents[0]!.triggerInputs!;
+  assert.deepEqual(inputs.metadata[INBOUND_SOURCE_KEY], envelope, 'the gate will read the host envelope, not the origin\'s channel or key');
+  assert.equal(inputs.content, 'hi');
+  assert.equal(coalescedEvents[0]!.inboundSource, envelope, 'the coalescer gets the very envelope the gate will read');
+  assert.deepEqual(structuredClone(inputs), inputs, 'the inputs are plain data, so a persisted occurrence keeps them');
 });
 
 test('with no host envelope, an origin key can\'t pose as one', async () => {

@@ -43,6 +43,7 @@ import { CapabilityGrant } from './capability-grant.js';
 import { INBOUND_SOURCE_KEY, type InboundSource } from './inbound-source.js';
 import { McplRequestError } from './server-connection.js';
 import { describeConversation, readThreadId } from '../speech-routes.js';
+import type { TriggerInputs } from './push-handler.js';
 
 // ============================================================================
 // Typing indicator interval (Discord typing lasts ~10s, so 7s keeps it alive)
@@ -244,6 +245,10 @@ interface McplChannelIncomingEvent {
   acceptedAt?: number;
   /** Source envelope frozen at admission (mcpl/inbound-source.ts). */
   inboundSource?: InboundSource;
+  /** A coalesced message's trigger-filter inputs, until the framework
+   *  decides its trigger when its coalescer first delivers an admitted
+   *  occurrence. Plain data, so a persisted occurrence keeps them. */
+  triggerInputs?: TriggerInputs;
 }
 
 // ============================================================================
@@ -318,6 +323,9 @@ function convertBlock(block: McplContentBlock): ContentBlock {
 // Channel Tool Definitions
 // ============================================================================
 
+// Nullable fields (a caller whose provider presents every property as
+// required can still say "not in use") are cast, as the drafts tool's are:
+// ToolDefinition's schema type admits one type name per property.
 const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'channel_list',
@@ -334,7 +342,10 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
       type: 'object' as const,
       properties: {
         channelId: { type: 'string', description: 'ID of the channel to open' },
-        serverId: { type: 'string', description: 'Owning MCPL server; required only when channelId is ambiguous.' },
+        serverId: {
+          type: ['string', 'null'],
+          description: 'Owning MCPL server; required only when channelId is ambiguous. null, like omitting it, names none.',
+        },
         backscroll: {
           type: 'number',
           description: 'Number of earlier messages to return while opening (0-500; default 0).',
@@ -344,22 +355,22 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
           description: 'Anchor message from the closed-channel notice; it is excluded from backscroll.',
         },
         setSpeechTarget: {
-          type: 'boolean',
+          type: ['boolean', 'null'],
           description:
             'Whether your unaddressed plain speech should go to this channel for the rest of this turn ' +
-            '(default true). false opens it for reading only; the result says where your speech goes.',
+            '(default true, as for null). false opens it for reading only; the result says where your speech goes.',
         },
         threadId: {
-          type: 'string',
+          type: ['string', 'null'],
           description:
             'With setSpeechTarget, a thread of this channel to speak into instead of its root (the thread ' +
             'id from a [source: … · thread <id>] line). Only where the channel\'s connector can post into ' +
-            'a named thread; without it, your speech goes to the channel root.',
+            'a named thread. null, like omitting it, means the channel root.',
         },
       },
       required: ['channelId'],
     },
-  },
+  } as unknown as ToolDefinition,
   {
     name: 'channel_decline',
     description:
@@ -387,11 +398,14 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
       type: 'object' as const,
       properties: {
         channelId: { type: 'string', description: 'ID of the channel to close' },
-        serverId: { type: 'string', description: 'Owning MCPL server; required only when channelId is ambiguous.' },
+        serverId: {
+          type: ['string', 'null'],
+          description: 'Owning MCPL server; required only when channelId is ambiguous. null, like omitting it, names none.',
+        },
       },
       required: ['channelId'],
     },
-  },
+  } as unknown as ToolDefinition,
   {
     name: 'channel_publish',
     description:
@@ -403,20 +417,26 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
     inputSchema: {
       type: 'object' as const,
       properties: {
-        channelId: { type: 'string', description: 'ID of the channel to publish to (defaults to your current speech route)' },
-        serverId: { type: 'string', description: 'Owning MCPL server; needed only when channelId is registered by more than one.' },
+        channelId: {
+          type: ['string', 'null'],
+          description: 'ID of the channel to publish to; null, like omitting it, means your current speech route',
+        },
+        serverId: {
+          type: ['string', 'null'],
+          description: 'Owning MCPL server; needed only when channelId is registered by more than one. null, like omitting it, names none.',
+        },
         threadId: {
-          type: 'string',
+          type: ['string', 'null'],
           description:
-            'A thread of channelId to post in (the id from a [source: … · thread <id>] line); omitted, the post ' +
-            'goes to the channel root. Only where the channel\'s connector can post into a named thread.',
+            'A thread of channelId to post in (the id from a [source: … · thread <id>] line); null, like omitting ' +
+            'it, means the channel root. Only where the channel\'s connector can post into a named thread.',
         },
         content: { type: 'string', description: 'Text content to publish' },
         text: { type: 'string', description: 'Alias for content' },
       },
       required: [],
     },
-  },
+  } as unknown as ToolDefinition,
   {
     name: 'think',
     description:
@@ -593,10 +613,6 @@ interface ChannelRegistryOptions {
     serverId: string,
     message: ChannelIncomingMessage,
     event: McplChannelIncomingEvent,
-    /** The trigger decision, made only once the coalescer admits the
-     *  occurrence for delivery: a refused one, a retry or a retraction is
-     *  never gated (so never a route candidate). */
-    decideTrigger?: () => boolean,
   ) => Promise<ChannelIncomingMessageResult>;
   /** Chronicle store used for durable desired channel lifecycle state. */
   store?: JsStore;
@@ -1124,18 +1140,18 @@ export class ChannelRegistry {
         : this.inboundSource?.(event);
       if (inboundSource) event.inboundSource = inboundSource;
 
-      // Whether to trigger inference: decided now for an ordinary message,
-      // and for a coalesced one only once its coalescer admits it.
-      let decideTrigger: (() => boolean) | undefined;
+      // Whether to trigger inference: decided now for an ordinary message;
+      // a coalesced one carries the filter's inputs (triggerInputs), decided
+      // once its coalescer admits it, so a refused occurrence, a retry or a
+      // retraction is never gated.
       if (this.shouldTriggerInference) {
-        const shouldTrigger = this.shouldTriggerInference;
         const textContent = message.content
           .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
           .map((b) => b.text)
           .join('\n');
-        decideTrigger = () => shouldTrigger(
-          textContent,
-          {
+        const inputs: TriggerInputs = {
+          content: textContent,
+          metadata: {
             // The adapter's own metadata first; the protocol's fields after
             // it, always present (even undefined), so an adapter metadata key
             // can never stand in for them; and the frozen envelope last —
@@ -1152,8 +1168,9 @@ export class ChannelRegistry {
             ...(message.tags ? { tags: message.tags } : {}),
             [INBOUND_SOURCE_KEY]: inboundSource,
           },
-        );
-        if (!coalesced) event.triggerInference = decideTrigger();
+        };
+        if (coalesced) event.triggerInputs = inputs;
+        else event.triggerInference = this.shouldTriggerInference(inputs.content, inputs.metadata);
       }
 
       if (coalesced) {
@@ -1162,7 +1179,7 @@ export class ChannelRegistry {
         // the coalescer, which replaces, appends or withdraws. Malformed
         // `coalesce` is a per-message failure; siblings are unaffected.
         try {
-          const result = await this.handleCoalescedIncoming!(serverId, message, event, decideTrigger);
+          const result = await this.handleCoalescedIncoming!(serverId, message, event);
           if (result.accepted) markAccepted();
           results.push(result);
         } catch (error) {

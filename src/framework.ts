@@ -8294,32 +8294,32 @@ export class AgentFramework {
       : this.pushSource(event, { deferred });
   }
 
-  /** A coalesced item's trigger decision, keyed by the delivery event its
-   *  occurrence carries, until the coalescer first acts on it
-   *  (settleCoalescedTrigger). Not on the event itself: the coalescer
-   *  persists occurrences, and a function can't be. */
-  private readonly coalescedTriggers = new WeakMap<object, () => boolean>();
+  /** The trigger filter both MCPL lanes use (a server's
+   *  shouldTriggerInference, else the event gate's), for coalesced items,
+   *  whose trigger is decided at their first delivery or wake. */
+  private coalescedTriggerFilter?: (content: string, metadata: Record<string, unknown>) => boolean;
 
   /**
    * Make a coalesced item's trigger decision (the gate's, which records the
    * item in its batch as a route candidate), once: when the coalescer first
-   * delivers or wakes for an occurrence it admitted. A refused occurrence, a
-   * retry it deduplicates, or a retraction is never delivered or woken for,
-   * so it never reaches the gate. The decision is written onto the event,
-   * so a persisted occurrence keeps it.
+   * delivers or wakes for an occurrence it admitted, from the filter inputs
+   * the event carries (triggerInputs). A refused occurrence, a retry it
+   * deduplicates, or a retraction is never delivered or woken for, so it
+   * never reaches the gate. The decision replaces the inputs on the event,
+   * which is plain data either way, so a persisted occurrence keeps
+   * whichever it has.
    */
-  private settleCoalescedTrigger(event: { triggerInference?: boolean }): void {
-    const decide = this.coalescedTriggers.get(event);
-    if (!decide) return;
-    this.coalescedTriggers.delete(event);
-    event.triggerInference = decide();
+  private settleCoalescedTrigger(event: { triggerInference?: boolean; triggerInputs?: { content: string; metadata: Record<string, unknown> } }): void {
+    const inputs = event.triggerInputs;
+    if (!inputs) return;
+    delete event.triggerInputs;
+    if (this.coalescedTriggerFilter) event.triggerInference = this.coalescedTriggerFilter(inputs.content, inputs.metadata);
   }
 
   private handleCoalescedIncoming(
     serverId: string,
     message: ChannelIncomingMessage,
     event: CoalescedChannelEvent,
-    decideTrigger?: () => boolean,
   ): Promise<ChannelIncomingMessageResult> {
     return this.admitCoalesced(async () => {
       if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
@@ -8335,7 +8335,6 @@ export class AgentFramework {
       // (mcpl/inbound-source.ts).
       const inboundSource = event.inboundSource ?? this.coalescedIncomingSource(serverId, message, event);
       const delivery = { ...event, eventId: message.eventId, inboundSource };
-      if (decideTrigger) this.coalescedTriggers.set(delivery, decideTrigger);
       const result = await this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
@@ -8355,7 +8354,7 @@ export class AgentFramework {
     });
   }
 
-  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent, decideTrigger?: () => boolean): Promise<PushEventResult> {
+  private handleCoalescedPush(serverId: string, params: PushEventParams, event: McplPushEvent): Promise<PushEventResult> {
     return this.admitCoalesced(async () => {
       if (!this.pushCoalescer) throw new CoalesceError('coalesce', 'coalescing unavailable', -32000);
       validateCoalesceMember(params.coalesce, 'push');
@@ -8374,7 +8373,6 @@ export class AgentFramework {
       // the channel lane).
       const inboundSource = event.inboundSource ?? this.coalescedPushSource(serverId, params, event);
       const delivery = { ...event, inboundSource };
-      if (decideTrigger) this.coalescedTriggers.set(delivery, decideTrigger);
       return this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
@@ -10411,7 +10409,7 @@ export class AgentFramework {
    *  weren't posted are kept as a bounce draft (as a failed `>>>` delivery's
    *  are), named by the one failure notice. An unknown outcome keeps none,
    *  so as not to invite a duplicate. */
-  private holdUndelivered(agent: Agent, text: string, hold: { round?: number; notice: 'now' | 'later' }): (reason: string) => string | undefined {
+  private holdUndelivered(agent: Agent, text: string, hold: { round?: number }): (reason: string) => string | undefined {
     return (reason) => this.holdProseDrafts(agent, [text], 'bounced', { round: hold.round, note: `delivery failed: ${reason}`, notice: 'later' })[0]?.id;
   }
 
@@ -15279,6 +15277,7 @@ export class AgentFramework {
     // Per-server callback takes precedence; fall back to EventGate; fall back to no filter.
     const triggerFilter = serverConfigs.find(c => c.shouldTriggerInference)?.shouldTriggerInference
       ?? (this.eventGate ? this.eventGate.asShouldTriggerCallback() : undefined);
+    this.coalescedTriggerFilter = triggerFilter;
 
     // Push events handler (Step 6)
     this.initializePushCoalescer();
@@ -15287,7 +15286,7 @@ export class AgentFramework {
       (event) => this.pushEvent(event as unknown as ProcessEvent),
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       triggerFilter,
-      (serverId, params, event, decideTrigger) => this.handleCoalescedPush(serverId, params, event, decideTrigger),
+      (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
       // An ordinary push: freeze its envelope at admission; it is accepted
       // (the last argument) once its trigger filter returns, before it is
       // queued.
@@ -15325,8 +15324,8 @@ export class AgentFramework {
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       {
         store: this.store,
-        handleCoalescedIncoming: (serverId, message, event, decideTrigger) =>
-          this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent, decideTrigger),
+        handleCoalescedIncoming: (serverId, message, event) =>
+          this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent),
         // An ordinary channels/incoming message: freeze its envelope at
         // admission; accepted once its trigger filter returns, before it is
         // queued.
@@ -15392,8 +15391,9 @@ export class AgentFramework {
                   ? `[discord-send-failed] Delivery of your previous reply (${textLen} chars) to ${where} was not confirmed (${reason}). It may or may not have been posted; check the ${threadId ? 'thread' : 'channel'} before sending it again. It is saved in your archive.`
                   : draftId
                     ? `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). ` +
-                      `Nothing was posted; it is held as draft ${draftId}, and drafts(action: "resend", draftIds: ["${draftId}"], ` +
-                      'destination: "#channel") sends it.'
+                      `Nothing was posted; it is held as draft ${draftId}. drafts(action: "resend", draftIds: ["${draftId}"]` +
+                      (channelId ? `, destination: "${channelId}"${threadId ? `, threadId: "${threadId}"` : ''}` : '') +
+                      ') sends it there once that can work, or name another destination.'
                     : `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). Nothing was posted; it is saved in your archive.`,
               }],
               {
@@ -17647,7 +17647,7 @@ export class AgentFramework {
         this.chainSpeech(agentName, '[sleep] announcement', async () => {
           const pin = agent.proseRouting === 'hybrid' ? this.proseTargetPins.get(agentName) : undefined;
           if (pin) {
-            const outcome = await this.channelRegistry!.routeSpeech(agentName, text, pin, { holdFailed: this.holdUndelivered(agent, text, { notice: 'later' }) });
+            const outcome = await this.channelRegistry!.routeSpeech(agentName, text, pin, { holdFailed: this.holdUndelivered(agent, text, {}) });
             this.recordProseDelivery(agentName, outcome);
             if (outcome?.delivered) this.streamPublished(agentName, moment, outcome, text);
             return;

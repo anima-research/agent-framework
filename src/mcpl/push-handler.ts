@@ -54,6 +54,16 @@ export interface McplPushEvent {
   /** Framework-owned source envelope, frozen at a coalesced occurrence's
    *  acceptance so its later delivery cannot restamp it (inbound-source.ts). */
   inboundSource?: InboundSource;
+  /** A coalesced push's trigger-filter inputs, until the framework decides
+   *  its trigger when its coalescer first delivers or wakes for an admitted
+   *  occurrence. Plain data, so a persisted occurrence keeps them. */
+  triggerInputs?: TriggerInputs;
+}
+
+/** What a trigger filter (shouldTriggerInference) is called with. */
+export interface TriggerInputs {
+  content: string;
+  metadata: Record<string, unknown>;
 }
 
 // ============================================================================
@@ -183,11 +193,12 @@ export class PushHandler {
     pushEventFn: (event: McplPushEvent) => void,
     emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
     shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean,
-    /** RFC-006: hand a coalesced push to its coalescer. `decideTrigger`
-     *  is the trigger decision, made only once the coalescer admits the
-     *  occurrence for delivery: a refused one, a retry or a retraction is
-     *  never gated (so never a route candidate). */
-    private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent, decideTrigger?: () => boolean) => Promise<PushEventResult>,
+    /** RFC-006: hand a coalesced push to its coalescer. Its trigger isn't
+     *  decided here: the event carries the filter's inputs
+     *  (triggerInputs), and the framework decides only once the coalescer
+     *  admits the occurrence for delivery, so a refused one, a retry or a
+     *  retraction is never gated (never a route candidate). */
+    private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent) => Promise<PushEventResult>,
     /** An ordinary (uncoalesced) push was just admitted: return its source
      *  envelope, frozen now (mcpl/inbound-source.ts), before the trigger
      *  filter reads it. Building it accepts nothing (inboundAccepted).
@@ -326,10 +337,9 @@ export class PushHandler {
     if (inboundSource) pushEvent.inboundSource = inboundSource;
 
     // 6. The shouldTriggerInference callback: decided now for an ordinary
-    // push, and for a coalesced one only once its coalescer admits it.
-    let decideTrigger: (() => boolean) | undefined;
+    // push; a coalesced one carries the inputs, decided once its coalescer
+    // admits it.
     if (this.shouldTriggerInference) {
-      const shouldTrigger = this.shouldTriggerInference;
       const textContent = content
         .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
         .map((b) => b.text)
@@ -348,8 +358,8 @@ export class PushHandler {
         ...(params.tags ? { tags: params.tags } : {}),
         [INBOUND_SOURCE_KEY]: inboundSource,
       };
-      decideTrigger = () => shouldTrigger(textContent, metadata);
-      if (!coalesced) pushEvent.triggerInference = decideTrigger();
+      if (coalesced) pushEvent.triggerInputs = { content: textContent, metadata };
+      else pushEvent.triggerInference = this.shouldTriggerInference(textContent, metadata);
     }
 
     if (coalesced) {
@@ -357,7 +367,7 @@ export class PushHandler {
       // unread one, appends, or withdraws; it delivers through the same event
       // the ordinary path would have queued.
       try {
-        const result = await this.handleCoalesced!(serverId, params, pushEvent, decideTrigger);
+        const result = await this.handleCoalesced!(serverId, params, pushEvent);
         this.emitTraceFn({ type: 'mcpl:push_event', serverId, eventId: params.eventId, featureSet: params.featureSet, coalesce: result.coalesce });
         responder?.respond(result);
       } catch (error) {

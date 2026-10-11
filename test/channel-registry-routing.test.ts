@@ -154,15 +154,14 @@ test('the gate reads a message\'s thread from the protocol field, never from ada
   assert.equal(seen[1]!.threadId, '1700.0001');
 });
 
-test('a coalesced message is gated with the host envelope its coalescer will freeze; adapter metadata can\'t pose as one', async () => {
+test('a coalesced message carries its gate inputs, with the host envelope its coalescer will freeze; adapter metadata can\'t pose as one', async () => {
   const seen: Array<Record<string, unknown>> = [];
   const envelope = {
     kind: 'channel', lane: 'channels/incoming', coalesced: true, serverId: 'slack', binding: 'b1',
     channelId: 'slack:C1', messageId: 'm-c', acceptedAt: 1,
   };
   let accepted = 0;
-  let gatedBeforeAdmission = -1;
-  const handed: Array<{ inboundSource?: unknown }> = [];
+  const handed: Array<{ inboundSource?: unknown; triggerInputs?: { content: string; metadata: Record<string, unknown> } }> = [];
   const registry = new ChannelRegistry(
     { getServer: () => undefined } as unknown as McplServerRegistry,
     {} as FeatureSetManager,
@@ -173,11 +172,8 @@ test('a coalesced message is gated with the host envelope its coalescer will fre
       inboundSource: () => undefined,
       inboundAccepted: () => { accepted++; },
       coalescedSource: () => envelope as never,
-      // The coalescer admits the occurrence, and only then decides its trigger.
-      handleCoalescedIncoming: async (_serverId, message, event, decideTrigger) => {
-        gatedBeforeAdmission = seen.length;
-        handed.push(event as { inboundSource?: unknown });
-        decideTrigger?.();
+      handleCoalescedIncoming: async (_serverId, message, event) => {
+        handed.push(event as (typeof handed)[number]);
         return { messageId: message.messageId, accepted: true };
       },
     },
@@ -192,10 +188,9 @@ test('a coalesced message is gated with the host envelope its coalescer will fre
     }],
   } as never);
   assert.equal(accepted, 0, 'building the envelope accepts nothing: the coalescer observes its own admissions');
-  assert.equal(gatedBeforeAdmission, 0, 'the gate is not consulted before the coalescer admits the occurrence');
-  assert.equal(seen.length, 1);
-  assert.equal(seen[0]!.inboundSource, envelope, 'the gate reads the host envelope');
-  assert.equal(handed[0]!.inboundSource, envelope, 'the coalescer gets the very envelope the gate read');
+  assert.equal(seen.length, 0, 'the gate is not consulted before the coalescer admits the occurrence');
+  assert.equal(handed[0]!.triggerInputs!.metadata.inboundSource, envelope, 'the gate will read the host envelope');
+  assert.equal(handed[0]!.inboundSource, envelope, 'the coalescer gets the very envelope the gate will read');
 });
 
 test('an ordinary channels/incoming message is accepted only once its trigger filter returns: a filter that throws accepts nothing', async () => {
