@@ -346,8 +346,10 @@ async def _run_script(exec_id, code):
         if t is not asyncio.current_task() and not t.done() and _started_by(t, exec_id, started)
     ]
     if left and not BACKGROUND:
+        # Before 3.12 the count is of tasks created while it ran (_started_by).
+        counted = "this script started" if hasattr(asyncio.Task, "get_context") else "created while this script ran"
         err.write(
-            "\n[code_execution] " + str(len(left)) + " task(s) this script started were still running "
+            "\n[code_execution] " + str(len(left)) + " task(s) " + counted + " were still running "
             "when it ended. Their tool calls are refused from now on: await them before the script "
             "ends, or use a background script.\n"
         )

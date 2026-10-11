@@ -172,9 +172,6 @@ export interface AgentSettingsExtension {
   ): Record<string, unknown>;
 }
 
-/**
- * Context provided to modules for interacting with the framework.
- */
 /** Delivery options for ModuleContext.addMessage. */
 export interface ModuleMessageOptions {
   /**
@@ -216,6 +213,9 @@ export interface MessagePlacement {
   durable?: boolean;
 }
 
+/**
+ * Context provided to modules for interacting with the framework.
+ */
 export interface ModuleContext {
   /**
    * Get persistent state for this module.

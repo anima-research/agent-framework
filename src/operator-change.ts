@@ -440,7 +440,10 @@ export interface OperatorChangeRestorationReceipt {
 }
 
 const CHANGE_KINDS = new Set(['agent-settings', 'tool-presentation', 'undo-turns', 'unstick', 'hide', 'undo-messages']);
-/** The kinds whose application is journaled as attempts: the cuts and hide. */
+/** The cuts: the kinds whose attempt can be unresolved and settled by an
+ *  operator. A hide is journaled as attempts too, but its effect can be read
+ *  back (its staged messages are present or not), so recovery re-runs it,
+ *  removing only what is still present and unchanged. */
 const CUT_KINDS = new Set(['undo-turns', 'undo-messages']);
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isText = (v: unknown): v is string => typeof v === 'string' && v.length > 0;

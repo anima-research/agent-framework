@@ -1904,8 +1904,9 @@ export class AgentFramework {
       onTrace: (listener) => this.onTrace(listener),
       // The ONLY entry that confers module origin — a private closure the
       // framework hands to its own module registry. The public
-      // executeToolCall() is shared with model/ephemeral callers and always
-      // stamps agent origin (see there).
+      // executeToolCall() is shared with model/ephemeral callers: it never
+      // confers module trust, and an origin it isn't given is the agent's
+      // own (see there).
       // Who asked travels with a delegated call: inside a module tool
       // handler (or work it started) the initiator of that call, the
       // agent's own only for that same agent; with no call behind it (a
@@ -7107,10 +7108,14 @@ export class AgentFramework {
   // Operator-change admission (FrameworkConfig.operatorChangeGate)
   // ---------------------------------------------------------------------------
 
-  /** Whether the host configured an operator-change gate: then an imposed
-   *  body change applies only through it, and an operator surface that can't
-   *  stage a change (the API server's undo, redo and branch switches)
-   *  refuses it. */
+  /** Whether the host configured an operator-change gate. Then the
+   *  framework's own operator mutations (a host/command undo, hide or
+   *  unstick, and a named operator's or module's self-change) are staged
+   *  through it, and an operator surface that can't stage a change (the API
+   *  server's undo, redo and branch switches) refuses it. The framework's
+   *  public body-change methods (undoLastTurn, redo, rollbackToMessage,
+   *  suppressMessages) are the host's own and aren't gated: a host routes
+   *  its own imposed changes through the gate. */
   hasOperatorChangeGate(): boolean {
     return !!this.operatorChangeGate;
   }
@@ -14343,17 +14348,18 @@ export class AgentFramework {
   /**
    * Execute a tool call and return the result.
    * Routes to the appropriate handler (module registry or MCPL).
-   * Used by SubagentModule to dispatch tool calls for ephemeral agents.
+   * Used by SubagentModule to dispatch tool calls for ephemeral agents, by
+   * code_execution scripts, and by puppetToolCall.
    *
-   * This public entry always carries AGENT origin. Ephemeral/promise-based
-   * callers are models, and provenance must identify which internal path a
-   * call entered through — a public method shared with model callers can
-   * never confer module trust, whatever the input claims. Module origin
-   * exists only through the private closure handed to ModuleRegistry
-   * (ctx.callTool → executeToolCallFrom with {kind:'module'}). Callers that
-   * don't identify themselves fail safe to agent semantics too. An origin the
-   * caller names is normalized (normalizeOrigin): a value other than
-   * 'puppet' or 'host' is the host's, never the agent's own.
+   * This public entry is shared with model callers, so it never confers
+   * module trust, whatever the input claims: module origin exists only
+   * through the private closure handed to ModuleRegistry (ctx.callTool →
+   * executeToolCallFrom with {kind:'module'}). A call that names no origin is
+   * taken as the agent's own, since its callers here are models. A host or an
+   * operator must name its origin for an operator-change gate to see it: an
+   * unnamed self-change runs as the agent's own, ungated. An origin the
+   * caller names is normalized (normalizeOrigin): 'puppet' is the
+   * operator's, and any other value is the host's, never the agent's own.
    */
   async executeToolCall(call: ToolCall): Promise<ToolResult> {
     const { origin: named, ...rest } = call;

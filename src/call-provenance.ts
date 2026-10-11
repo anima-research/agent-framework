@@ -29,9 +29,10 @@ export const HOST_PROVENANCE: CallProvenance = Object.freeze({ origin: 'host' })
 
 /**
  * A caller-supplied origin as the framework reads it: absent (undefined or
- * null) stays absent, 'puppet' stays the operator's, and any other value is
- * the host's. Types forbid other values, but an untyped module or host can
- * pass anything, and a falsy one must never read as the agent's own.
+ * null) stays absent, which is the agent's own, 'puppet' stays the
+ * operator's, and any other value is the host's. Types forbid other values,
+ * but an untyped module or host can pass anything, and any other value, a
+ * falsy one such as '' or 0 included, is never the agent's own.
  */
 export function normalizeOrigin(origin: unknown): ToolCall['origin'] {
   if (origin === undefined || origin === null) return undefined;

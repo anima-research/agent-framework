@@ -243,12 +243,6 @@ export class ModuleRegistry {
     return tools;
   }
 
-  /**
-   * All utilities from all modules, namespaced exactly like tools
-   * (`module--name`). See Module.getUtilities — these are deliberately kept
-   * out of the model-facing tool list and surfaced through the framework's
-   * `utils` meta-tool; dispatch goes through the same handleToolCall.
-   */
   /** Every module's getSubconsciousTools(), prefixed `module--name`. */
   getAllSubconsciousTools(): ToolDefinition[] {
     const tools: ToolDefinition[] = [];
@@ -260,6 +254,12 @@ export class ModuleRegistry {
     return tools;
   }
 
+  /**
+   * All utilities from all modules, namespaced exactly like tools
+   * (`module--name`). See Module.getUtilities — these are deliberately kept
+   * out of the model-facing tool list and surfaced through the framework's
+   * `utils` meta-tool; dispatch goes through the same handleToolCall.
+   */
   getAllUtilities(): ToolDefinition[] {
     const utilities: ToolDefinition[] = [];
     for (const module of this.modules.values()) {

@@ -513,9 +513,10 @@ export class Agent {
    *
    * - update: the patch's values (a decrease reports its target at once).
    * - reset: the configured value each key returns to. A key with nothing
-   *   configured keeps its current value; transitionPaceTokens with nothing
-   *   configured reports unset (null) unless a descent it starts needs the
-   *   default pace.
+   *   configured returns to its default (contextBudgetTokens and
+   *   sameRoundThinkTextPolicy) or keeps its current value (tailTokens);
+   *   transitionPaceTokens with nothing configured reports unset (null)
+   *   unless a descent it starts needs the default pace.
    * - cancel: a converging budget stops at the live budget; nothing else
    *   changes.
    *

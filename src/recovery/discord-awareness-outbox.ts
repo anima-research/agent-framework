@@ -194,7 +194,9 @@ export interface DiscordAwarenessBatch extends DiscordAwarenessBatchRecord {
    *  requests the release queues. */
   releaseAuthorization?: number;
   /** What the activation recorded: when, and how many adds it requested (the
-   *  original scheduling fact a retry replays, never a recount). */
+   *  original scheduling fact a retry replays, never a recount). An older
+   *  build's activation, recorded without its count, is counted from its
+   *  requests still standing (recordedQueued). */
   activation?: { at: number; queued: number };
   held?: { reason: string; at: number; releaseActions: DiscordAwarenessReleaseAction[] };
   cancelled?: { at: number; by?: string };
@@ -744,9 +746,12 @@ export class DiscordAwarenessOutbox {
    * synced, holds the change's facts (refs narrowed to the staged choice's;
    * the publication audience only shrinks), the activation and the adds it
    * requested, under the staging-time authorization: a key retracted since
-   * staging is born superseded. Never throws for the batch's own state:
+   * staging is born superseded. Never throws for a staged batch's own state
+   * (an unknown id, or a batch prepared rather than staged, is the caller's
+   * error, and throws):
    * - `queued`: activated now, or already (a retry), with the facts and
-   *   count its activation recorded, never a recount;
+   *   count its activation recorded, never a recount (an older build's
+   *   activation without its count is counted from its standing requests);
    * - `not-scheduled`: cancelled while staged, or discarded; nothing written;
    * - `unresolved`: the record could not be written; the batch stays staged
    *   and a later call activates it.

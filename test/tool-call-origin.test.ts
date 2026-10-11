@@ -360,7 +360,8 @@ describe("tool-call origin: the agent's own, and nothing else, skips the gate", 
     assert.equal(first.result.success, true, String(first.result.error));
     const out = first.result.data as { stdout: string; stderr: string };
     assert.equal(out.stdout.trim(), 'scheduled');
-    assert.match(out.stderr, /1 task\(s\) this script started were still running when it ended/);
+    // Python 3.12+ reads who started a task; older interpreters count the tasks created while it ran.
+    assert.match(out.stderr, /1 task\(s\) (this script started|created while this script ran) were still running when it ended/);
 
     // The next one reads what that task got back, and leaves a task that
     // calls only once the agent's own script is running.
