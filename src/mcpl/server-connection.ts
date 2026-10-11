@@ -240,6 +240,9 @@ export class McplServerConnection extends EventEmitter {
 
   /** Per-request timeout in ms (0 disables). See McplServerConfig.requestTimeoutMs. */
   private requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS;
+  /** The deadline a channels/publish request keeps when requestTimeoutMs is 0
+   *  (see sendChannelsPublish). */
+  private publishDeadlineMs = DEFAULT_REQUEST_TIMEOUT_MS;
 
   // Event buffering: control-plane traffic can be released independently from
   // inference-bearing data-plane traffic. This lets a server finish its own
@@ -775,6 +778,12 @@ export class McplServerConnection extends EventEmitter {
    * Send `channels/publish`.
    * May be sent as a request (if an ACK is desired) or notification.
    * When `params.stream` is true, sends as a notification (no ACK).
+   *
+   * A request always has a deadline: the server's requestTimeoutMs, or
+   * publishDeadlineMs when that is 0 (disabled). A publish is a side effect
+   * whose outcome the resident is told and a held draft's attempt records,
+   * so one that is never answered would hold both open for good. Its expiry
+   * is a no-response, which the caller reads as unknown.
    */
   sendChannelsPublish(params: ChannelsPublishParams): Promise<ChannelsPublishResult | void> {
     // A targeted publish (MCPL RFC-011) is always a Request: a Notification
@@ -783,7 +792,8 @@ export class McplServerConnection extends EventEmitter {
       this.sendNotification(McplMethod.ChannelsPublish, params as unknown as Record<string, unknown>);
       return Promise.resolve();
     }
-    return this.sendRequest(McplMethod.ChannelsPublish, params as unknown as Record<string, unknown>) as Promise<ChannelsPublishResult>;
+    const timeoutMs = this.requestTimeoutMs > 0 ? this.requestTimeoutMs : this.publishDeadlineMs;
+    return this.sendRequest(McplMethod.ChannelsPublish, params as unknown as Record<string, unknown>, { timeoutMs }) as Promise<ChannelsPublishResult>;
   }
 
   /** Send `channels/outgoing/chunk` notification. */

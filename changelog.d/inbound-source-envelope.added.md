@@ -8,12 +8,15 @@
   ordinary and the RFC-006 coalesced paths; a coalesced occurrence freezes its
   envelope at acceptance, so deferral, fan-out and replay deliver it unchanged
   and a later rename never rewrites it. Adapter-supplied metadata cannot set
-  the field (an adapter's own `origin.source` string is untouched).
-  `readInboundSource`, `conversationKey` and `INBOUND_SOURCE_KEY` are exported.
+  the field, and one a module's messages carry is dropped (an adapter's own
+  `origin.source` string is untouched). `readInboundSource`,
+  `conversationKey` (a JSON-encoded key, so no server-chosen part can run
+  into another) and `INBOUND_SOURCE_KEY` are exported.
 - **Inbound source envelope: admission facts.** An ordinary `channels/incoming`
   message or `push/event` now has its envelope frozen at admission, before it
   is queued or acknowledged, so a rename or rebind while it waits cannot
   change it. Every channel and unscoped envelope names the admission `lane`
-  (`channels/incoming` or `push/event`) and whether it came through RFC-006
-  coalesced admission (`coalesced: true`): facts a consumer needs to know what
-  an `eventId` is worth. `readInboundSource` validates every field it returns.
+  (`channels/incoming` or `push/event`), and one that came through RFC-006
+  coalesced admission has `coalesced: true` (others have no `coalesced`
+  field): facts a consumer needs to know what an `eventId` is worth.
+  `readInboundSource` validates every field it returns.

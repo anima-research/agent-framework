@@ -3156,8 +3156,9 @@ export class ChannelRegistry {
    * in use"; a supplied one must be a non-empty server id, and an empty or
    * non-string selector is refused rather than read as omission. It is not
    * possible to send into a closed channel: a closed but registered
-   * destination is opened first (`openSource` names why), and a failed open
-   * sends nothing.
+   * destination is opened first (`openSource` names why), once its server
+   * and that server's channels.publish grant are known to take the send, so
+   * a refused send opens nothing; and a failed open sends nothing.
    *
    * Every publish names its place inside the channel (MCPL RFC-011): the
    * target's `threadId`, or the channel root (null) when it names none. It
@@ -3203,6 +3204,23 @@ export class ChannelRegistry {
       return { status: 'failed', destination, reason: ChannelRegistry.placeRefusalText(refusal, ChannelRegistry.entryPlace(entry), place), at: at() };
     }
 
+    // A send that would be refused is refused before anything opens: a
+    // closed channel opens only for words that can go out.
+    const server = this.serverRegistry.getServer(entry.serverId);
+    if (!server) {
+      return { status: 'failed', destination, reason: `server "${entry.serverId}" not found`, at: at() };
+    }
+    // §14.1: channels/publish requires channels.publish in the grant. The
+    // host not sending is the enforcement.
+    if (!CapabilityGrant.of(server).has('channels.publish')) {
+      return {
+        status: 'failed',
+        destination,
+        reason: `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`,
+        at: at(),
+      };
+    }
+
     if (!entry.open) {
       try {
         await this.openChannelNow(entry, openSource);
@@ -3246,21 +3264,6 @@ export class ChannelRegistry {
       if (withdrawn) {
         return { status: 'failed', destination, reason: ChannelRegistry.placeRefusalText(withdrawn, ChannelRegistry.entryPlace(entry), place), at: at() };
       }
-    }
-
-    const server = this.serverRegistry.getServer(entry.serverId);
-    if (!server) {
-      return { status: 'failed', destination, reason: `server "${entry.serverId}" not found`, at: at() };
-    }
-    // §14.1: channels/publish requires channels.publish in the grant. The
-    // host not sending is the enforcement.
-    if (!CapabilityGrant.of(server).has('channels.publish')) {
-      return {
-        status: 'failed',
-        destination,
-        reason: `channels.publish not in "${entry.serverId}"'s effective grant (§14.1)`,
-        at: at(),
-      };
     }
 
     let result: unknown;

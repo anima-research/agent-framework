@@ -22,7 +22,17 @@
  * rollback, suppression and branch moves never touch them. A draft written
  * in a turn that is later undone stays usable (the words were genuinely
  * written and held back), and a delivered draft stays delivered. Its
- * originating branch is recorded as provenance only.
+ * originating branch is recorded as provenance only. The notices that name
+ * a draft are conversation, so they do follow the branch: a draft counts as
+ * named while a message naming it is on the current branch, and one a
+ * rollback or branch move has left unnamed is named again.
+ *
+ * Drafts are kept, not hoarded. Each resident's KEEP_NEWEST newest drafts
+ * are always kept; an older one is let go once nothing has happened to it
+ * (held, named, attempted, answered, dismissed) for KEEP_IDLE_MS. The words
+ * stay in the resident's history either way. The journal checkpoints what
+ * it keeps every CHECKPOINT_EVERY entries, so opening it replays only what
+ * came after.
  *
  * A delivery attempt is journaled durably BEFORE its request leaves the
  * host, and its outcome after: an attempt with no recorded outcome (a crash
@@ -119,7 +129,10 @@ export interface Draft {
   source: DraftSource;
   attempts: DraftAttempt[];
   dismissedAt?: number;
-  /** When an in-band notice named this draft. */
+  /** The messages whose notices named this draft, by id. It counts as named
+   *  while one of them is on the current branch. */
+  noticedIn?: string[];
+  /** When a notice last named it. */
   noticedAt?: number;
 }
 
@@ -152,41 +165,126 @@ export function uncertainAttempt(draft: Draft): DraftAttempt | undefined {
 }
 
 type DraftEntry =
-  | { op: 'held'; draft: Omit<Draft, 'attempts' | 'dismissedAt' | 'noticedAt'> }
+  | { op: 'held'; draft: Omit<Draft, 'attempts' | 'dismissedAt' | 'noticedIn' | 'noticedAt'> }
   | { op: 'attempt'; agent: string; id: string; attemptId: string; at: number; destination: PublishDestination; via: DraftAttempt['via']; confirmedDuplicate?: true }
   | { op: 'outcome'; agent: string; id: string; attemptId: string; outcome: DraftAttemptOutcome }
   | { op: 'dismissed'; agent: string; id: string; at: number }
-  | { op: 'noticed'; agent: string; ids: string[]; at: number };
+  /** A notice naming these drafts is in the history as message `messageId`.
+   *  (A record without one names nowhere the drafts can be found again, so
+   *  they are named once more.) */
+  | { op: 'noticed'; agent: string; ids: string[]; at: number; messageId?: string };
+
+/** What a checkpoint keeps: every kept draft, in hold order, and each
+ *  resident's latest bounce, which `{{unsent}}` means whatever became of it. */
+interface DraftSnapshot {
+  v: 1;
+  drafts: Draft[];
+  latestBounces: Record<string, string>;
+}
 
 /** Unambiguous lowercase alphabet for short ids (no i/l/o/0/1). */
 const ID_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
 
+/** Each resident's newest drafts, by hold order, that are always kept. */
+export const KEEP_NEWEST = 100;
+/** How long an older draft is kept after the last thing that happened to it. */
+export const KEEP_IDLE_MS = 7 * 24 * 60 * 60 * 1000;
+/** Entries the journal takes between checkpoints. */
+export const CHECKPOINT_EVERY = 500;
+
+/** The store's retention, KEEP_NEWEST, KEEP_IDLE_MS and CHECKPOINT_EVERY
+ *  unless given (tests give smaller ones). */
+export interface DraftRetention {
+  keepNewest: number;
+  keepIdleMs: number;
+  checkpointEvery: number;
+}
+
+/** The last time anything happened to a draft: held, named, attempted,
+ *  answered or dismissed. */
+function lastActivity(draft: Draft): number {
+  let last = Math.max(draft.heldAt, draft.noticedAt ?? 0, draft.dismissedAt ?? 0);
+  for (const attempt of draft.attempts) last = Math.max(last, attempt.at, attempt.outcome?.at ?? 0);
+  return last;
+}
+
 export class ProseDraftStore {
-  private readonly journal: RecordJournal<DraftEntry>;
+  private readonly journal: RecordJournal<DraftEntry, DraftSnapshot>;
   /** agent → draft id → draft, in journal (hold) order. */
   private drafts = new Map<string, Map<string, Draft>>();
+  /** agent → the id of its latest bounce, kept or not. */
+  private latestBounces = new Map<string, string>();
+  private readonly retention: DraftRetention;
 
-  constructor(store: JsStore) {
-    this.journal = new RecordJournal<DraftEntry>(store, { type: PROSE_DRAFT_RECORD_TYPE });
+  constructor(store: JsStore, retention: Partial<DraftRetention> = {}) {
+    this.journal = new RecordJournal<DraftEntry, DraftSnapshot>(store, { type: PROSE_DRAFT_RECORD_TYPE });
+    this.retention = {
+      keepNewest: retention.keepNewest ?? KEEP_NEWEST,
+      keepIdleMs: retention.keepIdleMs ?? KEEP_IDLE_MS,
+      checkpointEvery: retention.checkpointEvery ?? CHECKPOINT_EVERY,
+    };
     this.reload();
+    this.checkpointIfDue();
   }
 
-  /** Rebuild the projection from the journal (at open, and to reconcile). */
+  /** Rebuild the projection from the journal (at open, and to reconcile):
+   *  the latest checkpoint's drafts, then the entries after it. */
   reload(): void {
-    const { entries } = this.journal.load();
+    const { snapshot, entries } = this.journal.load();
     this.drafts = new Map();
+    this.latestBounces = new Map(Object.entries(snapshot?.latestBounces ?? {}));
+    for (const draft of snapshot?.drafts ?? []) this.agentDrafts(draft.agent).set(draft.id, draft);
     for (const { entry } of entries) this.reduce(entry);
+  }
+
+  /**
+   * Write a checkpoint once CHECKPOINT_EVERY entries have been appended since
+   * the last one, letting go of the drafts that aren't kept (see the module
+   * header). The projection drops them only once the checkpoint is written,
+   * so a failed one changes nothing, and the next write tries again.
+   */
+  private checkpointIfDue(): void {
+    const { keepNewest, keepIdleMs, checkpointEvery } = this.retention;
+    if (this.journal.entriesSinceCheckpoint < checkpointEvery) return;
+    const now = Date.now();
+    const kept = new Map<string, Map<string, Draft>>();
+    for (const [agent, drafts] of this.drafts) {
+      const all = [...drafts.values()];
+      const keep = new Map<string, Draft>();
+      all.forEach((draft, i) => {
+        if (i >= all.length - keepNewest || now - lastActivity(draft) < keepIdleMs) keep.set(draft.id, draft);
+      });
+      if (keep.size > 0) kept.set(agent, keep);
+    }
+    const snapshot: DraftSnapshot = {
+      v: 1,
+      drafts: [...kept.values()].flatMap((m) => [...m.values()]),
+      latestBounces: Object.fromEntries(this.latestBounces),
+    };
+    try {
+      this.journal.checkpoint(snapshot);
+    } catch (err) {
+      console.error('[drafts] checkpoint failed; the next write tries again:', err);
+      if (this.journal.needsReconcile) this.reload();
+      return;
+    }
+    this.drafts = kept;
   }
 
   private reduce(entry: DraftEntry): void {
     if (entry.op === 'held') {
       this.agentDrafts(entry.draft.agent).set(entry.draft.id, { ...entry.draft, attempts: [] });
+      if (entry.draft.reason === 'bounced') this.latestBounces.set(entry.draft.agent, entry.draft.id);
       return;
     }
     if (entry.op === 'noticed') {
+      if (entry.messageId === undefined) return;
       for (const id of entry.ids) {
         const draft = this.drafts.get(entry.agent)?.get(id);
-        if (draft && draft.noticedAt === undefined) draft.noticedAt = entry.at;
+        if (!draft) continue;
+        draft.noticedIn ??= [];
+        if (!draft.noticedIn.includes(entry.messageId)) draft.noticedIn.push(entry.messageId);
+        draft.noticedAt = Math.max(draft.noticedAt ?? 0, entry.at);
       }
       return;
     }
@@ -221,6 +319,7 @@ export class ProseDraftStore {
       throw err;
     }
     this.reduce(entry);
+    this.checkpointIfDue();
   }
 
   private agentDrafts(agent: string): Map<string, Draft> {
@@ -232,12 +331,16 @@ export class ProseDraftStore {
     return map;
   }
 
+  /** A new id, unique among the resident's kept drafts and never its latest
+   *  bounce's. One let go can be given again: the notices that named it are
+   *  by then at least KEEP_IDLE_MS old and KEEP_NEWEST drafts back. */
   private newId(agent: string): string {
     const existing = this.agentDrafts(agent);
+    const latestBounce = this.latestBounces.get(agent);
     for (;;) {
       let id = 'd-';
       for (let i = 0; i < 5; i++) id += ID_ALPHABET[randomInt(ID_ALPHABET.length)];
-      if (!existing.has(id)) return id;
+      if (!existing.has(id) && id !== latestBounce) return id;
     }
   }
 
@@ -245,7 +348,9 @@ export class ProseDraftStore {
    * Hold words as drafts, in order, each journaled durably before this
    * returns. If the journal refuses a write (after reconciling), the drafts
    * already written stand and the rest are reported as not held: their words
-   * remain in the resident's history only.
+   * remain in the resident's history only. A draft whose record reached the
+   * store before its write failed (its sync did) is in the reconciled
+   * journal, so it is held, and counted so.
    */
   hold(
     agent: string,
@@ -270,7 +375,14 @@ export class ProseDraftStore {
       try {
         this.write({ op: 'held', draft }, true);
       } catch (err) {
-        return { held, notHeld: { count: segments.length - i, error: err instanceof Error ? err.message : String(err) } };
+        const error = err instanceof Error ? err.message : String(err);
+        const landed = this.get(agent, draft.id);
+        if (landed) {
+          console.error(`[drafts] ${agent}: ${landed.id} reached the journal, but its write then failed (${error}); it is held`);
+          held.push(landed);
+        }
+        const count = segments.length - i - (landed ? 1 : 0);
+        return { held, ...(count > 0 ? { notHeld: { count, error } } : {}) };
       }
       held.push(this.get(agent, draft.id)!);
     }
@@ -289,21 +401,26 @@ export class ProseDraftStore {
       .reverse();
   }
 
-  /** Open drafts no in-band notice has named yet (a crash before the notice). */
-  unnoticed(agent: string): Draft[] {
-    return this.open(agent).filter((d) => d.noticedAt === undefined).reverse();
+  /**
+   * Open drafts, newest first, that no notice on the current branch names:
+   * none was recorded (a crash before the notice), or a rollback or branch
+   * move took away every message that named them. `onBranch` says whether a
+   * message, by id, is on the current branch.
+   */
+  unnoticed(agent: string, onBranch: (messageId: string) => boolean): Draft[] {
+    return this.open(agent).filter((d) => !d.noticedIn?.some(onBranch));
   }
 
   /**
-   * Record that a notice naming these drafts is in the resident's history.
-   * The notice is conversation state, buffered until the store syncs, while
-   * this record reaches the OS at once: so the store is synced FIRST
-   * (afterCommittedState), and a notice that never became durable can't
-   * leave a record that suppresses the crash catch-up.
+   * Record that message `messageId`, a notice naming these drafts, is in the
+   * resident's history. The notice is conversation state, buffered until the
+   * store syncs, while this record reaches the OS at once: so the store is
+   * synced FIRST (afterCommittedState), and a notice that never became
+   * durable can't leave a record that suppresses the crash catch-up.
    */
-  markNoticed(agent: string, ids: string[]): void {
+  markNoticed(agent: string, ids: string[], messageId: string): void {
     if (ids.length === 0) return;
-    this.write({ op: 'noticed', agent, ids, at: Date.now() }, true, true);
+    this.write({ op: 'noticed', agent, ids, at: Date.now(), messageId }, true, true);
   }
 
   dismiss(agent: string, id: string): void {
@@ -349,14 +466,12 @@ export class ProseDraftStore {
    * that draft is still open (held or unconfirmed — the caller must not
    * resend an unconfirmed one without the resident's confirmation).
    * Latest-wins, like the clipboard it replaces: once the latest bounce is
-   * delivered or dismissed there is nothing to substitute, even if older
-   * bounces are still held (they stay in the collection, by id).
+   * delivered, dismissed or let go there is nothing to substitute, even if
+   * older bounces are still held (they stay in the collection, by id).
    */
   latestBounce(agent: string): Draft | undefined {
-    let latest: Draft | undefined;
-    for (const draft of this.drafts.get(agent)?.values() ?? []) {
-      if (draft.reason === 'bounced') latest = draft;
-    }
+    const id = this.latestBounces.get(agent);
+    const latest = id === undefined ? undefined : this.get(agent, id);
     if (!latest) return undefined;
     const state = draftState(latest);
     return state === 'held' || state === 'unconfirmed' ? latest : undefined;

@@ -29,18 +29,27 @@ import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 type Publish = (params: { channelId: string; threadId?: string | null }) => Promise<unknown>;
 
-function registryWith(servers: Record<string, { publish: Publish; grant?: boolean }>, failures: unknown[] = []) {
+function registryWith(
+  servers: Record<string, { publish: Publish; grant?: boolean | { without: string[] }; open?: () => Promise<unknown> }>,
+  failures: unknown[] = [],
+) {
   const published: Array<{ serverId: string; channelId: string; threadId?: string | null }> = [];
+  const opened: Array<{ serverId: string; channelId: string }> = [];
   const mocks = new Map<string, unknown>();
   for (const [id, s] of Object.entries(servers)) {
     mocks.set(id, {
       id,
-      grant: new CapabilityGrant(new Set(s.grant === false ? [] : ALL_CAPABILITY_PATHS), []),
+      grant: new CapabilityGrant(new Set(
+        s.grant === false ? [] : ALL_CAPABILITY_PATHS.filter((p) => !(typeof s.grant === 'object' && s.grant.without.includes(p))),
+      ), []),
       sendChannelsPublish: async (params: { channelId: string; threadId?: string | null }) => {
         published.push({ serverId: id, channelId: params.channelId, ...('threadId' in params ? { threadId: params.threadId } : {}) });
         return s.publish(params);
       },
-      sendChannelsOpen: async () => ({}),
+      sendChannelsOpen: async (params: { channelId: string }) => {
+        opened.push({ serverId: id, channelId: params.channelId });
+        return s.open ? s.open() : {};
+      },
     });
   }
   const registry = new ChannelRegistry(
@@ -53,14 +62,15 @@ function registryWith(servers: Record<string, { publish: Publish; grant?: boolea
   const channels = (registry as unknown as {
     channels: Map<string, { serverId: string; descriptor: Record<string, unknown>; open: boolean }>;
   }).channels;
-  /** A registered channel; it declares `target` (default root), or nothing for null. */
-  const seed = (serverId: string, id: string, label: string, target: 'exact' | 'root' | null = 'root') =>
+  /** A registered channel; it declares `target` (default root), or nothing
+   *  for null, and is open unless `open` is false. */
+  const seed = (serverId: string, id: string, label: string, target: 'exact' | 'root' | null = 'root', open = true) =>
     channels.set(`${serverId}:${id}`, {
       serverId,
       descriptor: { id, type: 'discord', label, ...(target ? { capabilities: { publish: { target } } } : {}) },
-      open: true,
+      open,
     });
-  return { registry, published, seed };
+  return { registry, published, opened, seed };
 }
 
 /** A conforming delivery: it echoes the place it was asked for. */
@@ -102,6 +112,33 @@ describe('ChannelRegistry.publish outcomes', () => {
     assert.equal(outcome.messageId, 'posted-1');
     assert.deepEqual(outcome.destination, { serverId: 'discord', channelId: 'discord:g1:room', label: '#room (Guild)', threadId: null });
     assert.equal(typeof outcome.at, 'number');
+  });
+
+  it('opens a closed destination first, and a failed open sends nothing', async () => {
+    const opens = registryWith({ discord: { publish: ok } });
+    opens.seed('discord', 'c', '#c', 'root', false);
+    assert.equal((await opens.registry.publish('agent', 'x', { channelId: 'c' })).status, 'delivered');
+    assert.deepEqual(opens.opened, [{ serverId: 'discord', channelId: 'c' }]);
+    assert.deepEqual(opens.published, [{ serverId: 'discord', channelId: 'c', threadId: null }]);
+
+    const fails = registryWith({ discord: { publish: ok, open: async () => { throw new Error('no such channel'); } } });
+    fails.seed('discord', 'c', '#c', 'root', false);
+    const outcome = await fails.registry.publish('agent', 'x', { channelId: 'c' });
+    assert.equal(outcome.status, 'failed');
+    assert.equal(outcome.reason, 'channel is closed and open failed: no such channel');
+    assert.deepEqual(fails.opened, [{ serverId: 'discord', channelId: 'c' }]);
+    assert.deepEqual(fails.published, [], 'nothing dispatched after a failed open');
+  });
+
+  it('refuses a send the grant forbids before opening anything', async () => {
+    // The grant could open the channel (channels.lifecycle), but not publish into it.
+    const { registry, seed, opened, published } = registryWith({ discord: { publish: ok, grant: { without: ['channels.publish'] } } });
+    seed('discord', 'c', '#c', 'root', false);
+    const outcome = await registry.publish('agent', 'x', { channelId: 'c' });
+    assert.equal(outcome.status, 'failed');
+    assert.match(outcome.reason!, /channels\.publish not in "discord"'s effective grant/);
+    assert.deepEqual(opened, [], 'a refused send opens nothing');
+    assert.deepEqual(published, []);
   });
 
   it('treats delivered:false with no posted message as failed', async () => {

@@ -30,6 +30,7 @@ import {
   type ToolResult,
 } from '../src/index.js';
 import { ContextManager } from '@animalabs/context-manager';
+import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane } from './helpers/mock-membrane.js';
 import { canonicalJson } from '../src/mcpl/inbound-source.js';
 import { createHash } from 'node:crypto';
@@ -59,9 +60,15 @@ class ConsoleModule implements Module {
   getTools(): ToolDefinition[] { return []; }
   async handleToolCall(_call: ToolCall): Promise<ToolResult> { return { success: true }; }
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
+    // A module that relays an event's metadata as it came, envelope and all.
+    if ((event as { type: string }).type === 'relay') {
+      const relayed = event as unknown as { content: string; metadata: Record<string, unknown> };
+      return { addMessages: [{ participant: 'Relay', content: [{ type: 'text', text: relayed.content }], metadata: relayed.metadata }] };
+    }
     if (event.type !== 'external-message') return {};
     const text = String((event as { content?: unknown }).content);
-    return { addMessages: [{ participant: 'Operator', content: [{ type: 'text', text }] }] };
+    const metadata = (event as { metadata?: Record<string, unknown> }).metadata;
+    return { addMessages: [{ participant: 'Operator', content: [{ type: 'text', text }], ...(metadata ? { metadata } : {}) }] };
   }
 }
 
@@ -165,7 +172,7 @@ describe('inbound source envelope', () => {
     const message = stored().find((m) => m.participant === 'Operator')!;
     const source = readInboundSource(message.metadata);
     assert.deepEqual(source && { kind: source.kind, surface: (source as { surface: string }).surface }, { kind: 'surface', surface: 'tui' });
-    assert.equal(conversationKey(source!), 'surface\u0000tui');
+    assert.equal(conversationKey(source!), '["surface","tui"]');
     assert.equal(observed.length, 1);
   });
 
@@ -261,6 +268,18 @@ describe('inbound source envelope', () => {
     assert.notEqual(meta.storedBodyDigest, meta.sourceBodyDigest, 'the invitation decorates the stored copy');
   });
 
+  it('a channels/incoming item carries the host\'s digests, never the adapter\'s', async () => {
+    command({
+      op: 'incoming', channelId: ROOM, messageId: 'm-forged', mode: 'ambient', text: 'forged digests',
+      metadata: { sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value' },
+    });
+    await waitFor(() => !!storedWith((m) => m.messageId === 'm-forged'), 'message stored');
+    const message = storedWith((m) => m.messageId === 'm-forged')!;
+    const meta = message.metadata as Record<string, unknown>;
+    assert.equal(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'forged digests' }]), 'the delivered body, not the adapter\'s value');
+    assert.equal(meta.storedBodyDigest, sourceBodyDigest(message.content), 'exactly what was stored, not the adapter\'s value');
+  });
+
   it('an image the store relabels or re-encodes still matches both its digests once read back', async () => {
     // slimepriestess's review of #252: the store takes an image's media type
     // from its bytes and re-encodes its base64, so a digest of the blocks as
@@ -282,6 +301,20 @@ describe('inbound source envelope', () => {
       assert.equal(sourceBodyDigest(message.content), meta.storedBodyDigest, `${eventId}: the untouched copy matches its stored digest`);
       assert.equal(meta.sourceBodyDigest, sourceBodyDigest([image]), `${eventId}: the delivered body hashes as the image stored for it`);
     }
+  });
+
+  it("drops an envelope a module's metadata carries: only the framework writes one", async () => {
+    const forged = { kind: 'channel', lane: 'channels/incoming', serverId: 'evil', binding: 'x', channelId: 'discord:g9:elsewhere', acceptedAt: 1 };
+    framework.pushEvent({ type: 'relay', content: 'relayed words', metadata: { inboundSource: forged, note: 'kept' } } as unknown as ProcessEvent);
+    await waitFor(() => stored().some((m) => m.participant === 'Relay'), 'relayed message stored');
+    const relayed = stored().find((m) => m.participant === 'Relay')!;
+    assert.equal(readInboundSource(relayed.metadata), undefined, 'not the forged envelope');
+    assert.equal((relayed.metadata as Record<string, unknown>).note, 'kept', 'the rest of its metadata stays');
+    // A surface event's message carries the framework's envelope, whatever its metadata said.
+    framework.pushEvent({ type: 'external-message', source: 'tui', content: 'console words', metadata: { inboundSource: forged } } as ProcessEvent);
+    await waitFor(() => stored().some((m) => m.participant === 'Operator'), 'console message stored');
+    const source = readInboundSource(stored().find((m) => m.participant === 'Operator')!.metadata);
+    assert.equal(source?.kind, 'surface');
   });
 
   it('keeps a stored envelope when the channel is renamed later', async () => {
@@ -394,6 +427,17 @@ describe('readInboundSource', () => {
       { ...channel, messageId: 42 },
       { ...channel, label: '' },
       { ...channel, sourceTimestamp: {} },
+      { ...channel, serverId: undefined },
+      { ...channel, serverId: '' },
+      { ...channel, serverId: 7 },
+      { ...channel, binding: undefined },
+      { ...channel, binding: { id: 'b' } },
+      { ...channel, threadId: 3 },
+      { ...channel, threadId: '' },
+      { ...channel, replyTo: false },
+      { ...channel, eventId: 9 },
+      { kind: 'unscoped', lane: 'push/event', serverId: '', binding: 'b', acceptedAt: 1 },
+      { kind: 'unscoped', lane: 'push/event', serverId: 's', binding: 'b', acceptedAt: 1, eventId: [] },
       { kind: 'unscoped', lane: 'channels/incoming', serverId: 's', binding: 'b', acceptedAt: 1 },
       { kind: 'surface', surface: '', acceptedAt: 1 },
       { kind: 'mystery', acceptedAt: 1 },
@@ -408,6 +452,68 @@ describe('readInboundSource', () => {
     assert.notEqual(conversationKey(base), conversationKey({ ...base, serverId: 't' }));
     assert.notEqual(conversationKey(base), conversationKey({ ...base, threadId: 'th' }));
     assert.equal(conversationKey(base), conversationKey({ ...base, messageId: 'other', acceptedAt: 2 }));
+    // The parts are server-chosen: a separator inside one can't make two
+    // conversations one.
+    assert.notEqual(
+      conversationKey({ ...base, channelId: 'c\u0000x', threadId: 'y' }),
+      conversationKey({ ...base, channelId: 'c', threadId: 'x\u0000y' }),
+    );
+    assert.notEqual(conversationKey({ ...base, threadId: '' }), conversationKey(base), 'an empty thread is not no thread');
+  });
+});
+
+describe('stored digests when the store shards a body', () => {
+  /** A strategy whose store splits a body of more than one block into one
+   *  shard per block, as adaptive ingress chunking does. */
+  class ShardingStrategy extends PassthroughStrategy {
+    chunkIngressMessage(_participant: string, content: ContentBlock[]) {
+      if (content.length < 2) return null;
+      return { bodyGroupId: `group-${content.length}-${Date.now()}`, shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })) };
+    }
+  }
+
+  it("every shard carries the whole body's digests, and no shard hashes to them; an unsharded copy matches its own", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'inbound-shards-'));
+    const commandPath = join(tempDir, 'commands.jsonl');
+    writeFileSync(commandPath, '');
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', strategy: new ShardingStrategy() }],
+      mcplServers: [{
+        id: 'discord',
+        command: process.execPath,
+        args: [FIXTURE],
+        env: { STATUS_PATH: join(tempDir, 'status.jsonl'), COMMAND_PATH: commandPath },
+      }],
+      modules: [],
+    });
+    try {
+      await framework.start();
+      const command = (c: Record<string, unknown>): void => appendFileSync(commandPath, JSON.stringify(c) + '\n');
+      const blocks = [{ type: 'text', text: 'first part' }, { type: 'text', text: 'second part' }];
+      command({ op: 'push', eventId: 'sharded', content: blocks });
+      command({ op: 'push', eventId: 'whole', text: 'one block' });
+      const stored = () => framework.getAgent('scout')!.getContextManager().getAllMessages();
+      await waitFor(() => stored().some((m) => (m.metadata as { eventId?: string } | undefined)?.eventId === 'whole'), 'both pushes stored');
+      const shards = stored().filter((m) => (m.metadata as { eventId?: string } | undefined)?.eventId === 'sharded');
+      assert.equal(shards.length, 2, 'stored as two shards');
+      assert.ok(shards[0]!.bodyGroupId && shards.every((m) => m.bodyGroupId === shards[0]!.bodyGroupId));
+      assert.deepEqual(shards.map((m) => m.shardIndex), [0, 1]);
+      const whole = sourceBodyDigest(blocks);
+      for (const shard of shards) {
+        const meta = shard.metadata as Record<string, unknown>;
+        assert.equal(meta.sourceBodyDigest, whole, 'the whole delivered body');
+        assert.equal(meta.storedBodyDigest, whole, 'the whole body handed to storage');
+        assert.notEqual(sourceBodyDigest(shard.content), whole, 'a shard alone is not the body');
+      }
+      const one = stored().find((m) => (m.metadata as { eventId?: string } | undefined)?.eventId === 'whole')!;
+      assert.equal(one.bodyGroupId, undefined, 'a one-block body is not sharded');
+      assert.equal(sourceBodyDigest(one.content), (one.metadata as Record<string, unknown>).storedBodyDigest, 'an unsharded copy matches');
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -452,6 +558,14 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     assert.equal(observed.length, 1, 'materialization is not a second acceptance');
     const stored = sourceOf(f, 'document_diff');
     assert.deepEqual(stored, { ...accepted, materialized: true });
+    // The materialized copy is its own storage site: both digests are the
+    // host's, over the rendered body, not the deferred placeholder.
+    const copy = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+      .find((m) => JSON.stringify(m.content).includes('document_diff'))!;
+    const meta = copy.metadata as Record<string, unknown>;
+    assert.equal(meta.storedBodyDigest, sourceBodyDigest(copy.content), 'exactly what was stored');
+    assert.equal(meta.sourceBodyDigest, sourceBodyDigest(copy.content), 'the rendered body, undecorated');
+    assert.notEqual(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'fallback_unavailable' }]), 'not the placeholder');
   });
 
   it('a channel-scoped coalesced message belongs to its channel, frozen at acceptance', async (t) => {
@@ -470,6 +584,46 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     assert.equal(stored.sourceTimestamp, TS);
     assert.deepEqual(observed, [stored]);
   });
+
+  it('a channel message deferred mid-turn and stored at the boundary still hashes to its stored digest', async (t) => {
+    const f = await fixture(); t.after(f.close);
+    await f.register('chat');
+    const internals = f.framework as unknown as { activeTurnTokens: Map<string, number>; flushDeferredWrites(label: string): Promise<void> };
+    internals.activeTurnTokens.set('agent', 100);
+    await f.send('channels/incoming', { messages: [f.channel('e1', 'deferred_words', { initial: true })] });
+    assert.ok(!f.context().includes('deferred_words'), 'held until the boundary');
+    internals.activeTurnTokens.delete('agent');
+    await internals.flushDeferredWrites('test');
+    const copy = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
+      .find((m) => JSON.stringify(m.content).includes('deferred_words'))!;
+    const meta = copy.metadata as Record<string, unknown>;
+    assert.equal(meta.storedBodyDigest, sourceBodyDigest(copy.content), 'the copy stored at the boundary matches');
+    assert.equal(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'deferred_words' }]), 'the delivered body, unchanged');
+  });
+
+  it("the conversation router's and a fork correction's storage sites carry the host's digests, never the adapter's", async (t) => {
+    const f = await fixture({ framework: { conversations: { templateAgent: 'agent', bind: { channel: 'always' }, trigger: { channel: 'always' } } } as never }); t.after(f.close);
+    await f.register();
+    const forged = { sourceBodyDigest: 'adapter-value', storedBodyDigest: 'adapter-value' };
+    const router = (f.framework as unknown as { conversationRouter: { getBinding(id: string): { agentName: string } | undefined; unbind(id: string): void } }).conversationRouter;
+    const check = (text: string, fork: string) => {
+      const copy = f.framework.getAgent(fork)!.getContextManager().getAllMessages().find((m) => JSON.stringify(m.content).includes(text));
+      assert.ok(copy, `${text} stored in ${fork}`);
+      const meta = copy.metadata as Record<string, unknown>;
+      assert.equal(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text }]), `${text}: the delivered body, not the adapter's value`);
+      assert.equal(meta.storedBodyDigest, sourceBodyDigest(copy.content), `${text}: exactly what was stored, not the adapter's value`);
+    };
+    // Routed into a fresh fork by the conversation router.
+    await f.send('channels/incoming', { messages: [{ ...f.channel('c1', 'routed_original', { initial: true }), metadata: forged }] });
+    const fork = router.getBinding('chat')!.agentName;
+    check('routed_original', fork);
+    // A correction follows the prior delivery into that fork, though the
+    // channel is no longer bound to it.
+    router.unbind('chat');
+    await f.send('channels/incoming', { messages: [{ ...f.channel('c2', 'fork_correction'), metadata: forged }] });
+    assert.equal(router.getBinding('chat'), undefined, 'no fresh fork was spawned for the correction');
+    check('fork_correction', fork);
+  });
 });
 
 describe('sourceBodyDigest hashes a body as the store keeps it', () => {
@@ -487,6 +641,11 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     'a labeled image': { blocks: [image(png)], changed: false },
     'PNG bytes labeled image/jpeg': { blocks: [image(png, 'image/jpeg')], changed: true },
     'JPEG bytes labeled image/png': { blocks: [image(Buffer.from('ffd8ffe000104a464946', 'hex').toString('base64'))], changed: true },
+    // One fixture per branch of the copied sniffer, each labeled as something
+    // else, so a context-manager that stops sniffing one fails here.
+    'GIF87a bytes labeled image/png': { blocks: [image(Buffer.from('GIF87a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'))], changed: true },
+    'GIF89a bytes labeled image/jpeg': { blocks: [image(Buffer.from('GIF89a\x01\x00\x01\x00\x00\x00\x00', 'latin1').toString('base64'), 'image/jpeg')], changed: true },
+    'WebP bytes labeled image/png': { blocks: [image(Buffer.from('RIFF\x1a\x00\x00\x00WEBPVP8L\x0d\x00\x00\x00', 'latin1').toString('base64'))], changed: true },
     'base64 with a newline in it': { blocks: [image(`${png.slice(0, 11)}\n${png.slice(11)}`)], changed: true },
     'base64 with whitespace around it': { blocks: [image(`  ${png}\n`)], changed: true },
     'base64 without its padding': { blocks: [image(png.replace(/=+$/, ''))], changed: true },
@@ -505,6 +664,15 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     'text with lone surrogates': { blocks: [{ type: 'text', text: 'cut \ud83d here, \ude00 there, \ud83d\ud83d twice' }], changed: true },
     'a key that is not well-formed': { blocks: [{ type: 'text', text: 'x', rawItem: { 'k\ud800': 1, kept: 2 } }], changed: true },
     'a relabeled image with a text decoration': { blocks: [image(png, 'image/jpeg'), { type: 'text', text: '[invitation]' }], changed: true },
+    'a video with a duration': { blocks: [media('video', 'AAAAGGZ0eXBtcDQy', 'video/mp4', { duration: 2 })], changed: true },
+    // No media type: an image takes its bytes' own (an image without a
+    // signature, or other media, is refused at write: see below).
+    'an image without a media type': { blocks: [{ type: 'image', source: { type: 'base64', data: png } }], changed: true },
+    'an image whose media type is undefined': { blocks: [{ type: 'image', source: { type: 'base64', data: png, mediaType: undefined } }], changed: true },
+    'a text block with an undefined field': { blocks: [{ type: 'text', text: 'x', note: undefined }], changed: true },
+    // Only a non-URL image is blobbed: a URL image keeps even a stray data
+    // string as given, and storedBlock must not re-encode it.
+    'an image by URL with a stray data string': { blocks: [{ type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png', data: 'not base64 at all' } }], changed: false },
   };
 
   it('every body hashes alike as handed to the store and as read back, live and after reopening', async () => {
@@ -533,6 +701,46 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('a block the store refuses is refused at write, and a blob_ref is digested as given, which its copy read back does not match', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stored-digest-refused-'));
+    try {
+      const cm = await ContextManager.open({ path: join(dir, 'store.chronicle'), strategy: new PassthroughStrategy() });
+      try {
+        const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64');
+        for (const [what, block] of [
+          ['a document without a media type', { type: 'document', source: { type: 'base64', data: 'JVBERi0xLjQ=' } }],
+          ['an image without a media type whose bytes have no signature', { type: 'image', source: { type: 'base64', data: svg } }],
+        ] as const) {
+          assert.throws(() => cm.addMessage('user', [block] as never), Error, `${what}: refused at write`);
+        }
+        // A blob_ref names media the store already holds; it is resolved to
+        // inline media on read, so the copy read back hashes differently.
+        const held = cm.addMessage('user', [image(png)] as never);
+        const ref = cm.getMessageWindow(0, cm.getMessageCount(), { resolveBlobs: false }).messages
+          .find((m) => m.id === held)!.content[0] as { type: string };
+        assert.equal(ref.type, 'blob_ref');
+        const given = [ref];
+        const id = cm.addMessage('user', given as never, { storedBodyDigest: sourceBodyDigest(given) });
+        const back = cm.getMessage(id)!;
+        assert.deepEqual(back.content, [image(png)], 'resolved on read');
+        assert.notEqual(sourceBodyDigest(back.content), (back.metadata as Record<string, unknown>).storedBodyDigest, 'the documented mismatch');
+      } finally {
+        cm.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('a block the store keeps as given is digested as given', () => {
+    const plain = (blocks: unknown[]) => createHash('sha256').update(canonicalJson([blocks])).digest('hex');
+    // Only a non-URL image is blobbed, so a URL image's stray data string is
+    // neither decoded nor re-encoded.
+    const urlImage = { type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png', data: 'not base64 at all' } };
+    assert.equal(sourceBodyDigest([urlImage]), plain([urlImage]));
+    assert.equal(sourceBodyDigest([{ type: 'text', text: 'x' }]), plain([{ type: 'text', text: 'x' }]));
   });
 
   it('what the store keeps still changes the digest', () => {

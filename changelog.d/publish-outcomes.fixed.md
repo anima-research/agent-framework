@@ -16,4 +16,8 @@
   `mcpl:speech-route-failed` trace carry `outcome`. A channel id registered
   by more than one MCPL server is refused rather than routed through
   whichever server registered it first, and a supplied but empty or
-  non-string server selector is refused rather than read as omitted.
+  non-string server selector is refused rather than read as omitted. A send
+  refused for its server or grant opens no closed channel. A
+  `channels/publish` request always has a deadline: with `requestTimeoutMs`
+  0 it keeps the 60 s default, since its outcome is told to the resident and
+  recorded for its draft; its expiry reads as unknown.

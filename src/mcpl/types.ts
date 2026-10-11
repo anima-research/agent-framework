@@ -374,7 +374,9 @@ export interface McplServerConfig {
    * accepts a request and never responds would otherwise freeze the awaiting
    * agent turn forever; with the timeout the pending request rejects with a
    * descriptive error, which the framework surfaces as a normal isError
-   * tool_result. Set 0 to disable. Default: 60000 (60 seconds).
+   * tool_result. Set 0 to disable, except for a channels/publish request,
+   * which keeps the 60 s default: its outcome is reported to the resident and
+   * recorded for its draft, so it must end. Default: 60000 (60 seconds).
    */
   requestTimeoutMs?: number;
 

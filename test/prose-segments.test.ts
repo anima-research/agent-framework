@@ -1,7 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContentBlock } from '@animalabs/membrane';
-import { splitProseRuns, splitProseSegments } from '../src/prose-segments.js';
+import { splitProseRuns } from '../src/prose-segments.js';
+
+/** The runs as speech routes them: each trimmed, as the framework does. */
+const splitProseSegments = (content: Parameters<typeof splitProseRuns>[0]): string[] =>
+  splitProseRuns(content).map((run) => run.trim());
 
 const textBlock = (text: string): ContentBlock => ({ type: 'text', text } as ContentBlock);
 const toolUse = (id: string): ContentBlock =>

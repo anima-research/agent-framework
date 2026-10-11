@@ -22,7 +22,12 @@
   re-bounce rule (a bare `{{unsent}}` leaves the bounce as the one draft).
 - Drafts live in typed Chronicle records (`RecordJournal`) that do not follow
   branch switches: undo, rollback and checkout never change them, and they
-  survive restarts. Nothing is ever sent from them on its own.
+  survive restarts. Nothing is ever sent from them on its own. Each
+  resident's 100 newest drafts are kept, and an older one for 7 days after
+  anything last happened to it (held, named, attempted, answered, dismissed);
+  the journal checkpoints what it keeps every 500 entries, so opening it
+  replays only what follows. A request naming a draft that was let go is
+  refused, and nothing is sent.
 - A private notice names held drafts at the next tool boundary when the live
   stream presents mid-turn messages (a draft holding words copied from one
   that may already have been posted is named with that risk and the
@@ -32,29 +37,42 @@
   (listed where it landed), unconfirmed, or dismissed. A dismissed draft
   whose own attempt may already have been posted is named with that risk,
   and counts like an unconfirmed one: a receipt that names one, with nothing
-  confirmed delivered, reads "nothing confirmed", not "nothing". A draft no
-  notice reached (a crash, an aborted turn) is named at the next turn's
-  start.
+  confirmed delivered, reads "nothing confirmed", not "nothing". A draft
+  counts as named while a message naming it is on the current branch, so one
+  no notice reached (a crash, an aborted turn), or whose notices a rollback
+  or branch move took away, is named at the next turn's start: every such
+  draft by id, the newest eight with a preview.
 - A draft is never published except by its resident's explicit resend (or
   `{{unsent}}`), and only that resident can list or act on it. Its notices go
   into the resident's own history, which residents sharing one message slot
   already share, as they share the assistant turn the words came from.
 - New `drafts` tool (whenever MCPL channels are configured): `list`, `read`,
-  `resend` and `dismiss`, scoped to the calling resident. `resend` publishes
+  `resend` and `dismiss`, scoped to the calling resident. Every such
+  resident's tool list gains it, so each one's first request after upgrading
+  misses the prompt cache once. `resend` publishes
   drafts verbatim, in order, to one destination through the normal publish
   path, journaling each attempt durably before the request leaves; it counts
   as an explicit send. A delivered draft returns its historical receipt
   instead of sending again; a draft with any attempt whose outcome is
   unknown (and none confirmed) needs `confirmDuplicate: true`, and a resend
-  owns its drafts until it finishes, re-checking each before it is sent.
-  Dismissing a draft (with the tool or `>>skip_reply {{unsent}}`) is
-  refused while that draft's attempt is out, since a dismissal can't call
-  back words already on their way; the resident is told to wait for that
-  result. A draft only queued in a resend can still be dismissed, and is
-  then not sent. Unused fields may be passed as null.
+  owns its drafts until it finishes, re-checking each before it is sent, and
+  a draft it doesn't attempt is told why the batch stopped. Dismissing a
+  draft (with the tool or `>>skip_reply {{unsent}}`) is refused while that
+  draft's attempt is out, since a dismissal can't call back words already on
+  their way; the resident is told to wait for that result. A draft only
+  queued in a resend can still be dismissed, and is then not sent. A
+  dismissal of a draft that may already have been posted names that risk.
+  Unused fields may be passed as null.
+- `{{unsent}}` whose draft is being sent, queued in a resend, or unconfirmed
+  sends nothing, and the envelope's own words are held as a bounce draft
+  with `{{unsent}}` written out and the risk carried, so nothing the
+  resident wrote has to be typed again.
 - Prose segments also break at XML tool mode's refused attempts and their
   notices (`tool_attempt`, `tool_notice`): the words before an all-refused
   call and after its notice are two messages, routed or held separately.
 - `ChannelRegistry.deliverSpeech` (routeSpeech with its `PublishOutcome`) and
-  `ChannelRegistry.resolveDestination` are new; routeSpeech is unchanged.
+  `ChannelRegistry.resolveDestination` are new. `routeSpeech` now delegates
+  to `deliverSpeech` and returns null unless delivery was confirmed, so a
+  missing receipt and a channel id two servers share now return null (see
+  the publish-outcomes entry).
 - The bounce notice now goes to the bouncing resident rather than the primary.

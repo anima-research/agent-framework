@@ -22,7 +22,7 @@ import type { ContentBlock } from '@animalabs/membrane';
  * The runs exactly as written: contiguous text blocks joined with a newline,
  * nothing trimmed. Whitespace-only runs are dropped. Held drafts keep these,
  * so a draft's words (indentation included) are the resident's own, byte for
- * byte.
+ * byte; speech routes each run trimmed of surrounding whitespace.
  */
 export function splitProseRuns(content: readonly ContentBlock[]): string[] {
   const runs: string[] = [];
@@ -53,9 +53,4 @@ export function splitProseRuns(content: readonly ContentBlock[]): string[] {
   flush();
 
   return runs;
-}
-
-/** The runs as speech is routed: each trimmed of surrounding whitespace. */
-export function splitProseSegments(content: readonly ContentBlock[]): string[] {
-  return splitProseRuns(content).map((run) => run.trim());
 }
