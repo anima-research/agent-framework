@@ -240,10 +240,17 @@ describe('conversation identity and wording', () => {
     assert.notEqual(conversationKey(channel('x')), conversationKey({ kind: 'channel', serverId: 'other', channelId: 'x' }));
     assert.notEqual(conversationKey(channel('x')), conversationKey(channel('x', { threadId: 't' })));
     assert.notEqual(conversationKey({ kind: 'surface', surface: 'x' }), conversationKey(channel('x')));
+    // Server-chosen parts can't run into each other, and an unknown server
+    // is not an empty one.
+    assert.notEqual(
+      conversationKey(channel('a\u0000b', { threadId: 'c' })),
+      conversationKey(channel('a', { threadId: 'b\u0000c' })),
+    );
+    assert.notEqual(conversationKey({ kind: 'channel', channelId: 'x' }), conversationKey({ kind: 'channel', serverId: '', channelId: 'x' }));
   });
 
   it('describes a conversation by a usable address: its label, then server / channel id, then its thread', () => {
-    assert.equal(describeConversation(channel('discord:g1:room', { label: 'room' })), '#room (discord / discord:g1:room)');
+    assert.equal(describeConversation(channel('discord:g1:room', { label: '#room' })), '#room (discord / discord:g1:room)');
     assert.equal(describeConversation(channel('discord:dm:7')), '(discord / discord:dm:7)');
     assert.equal(describeConversation(channel('discord:dm:7', { label: 'discord:dm:7' })), '(discord / discord:dm:7)',
       'a label that is only the id adds nothing');
@@ -251,6 +258,17 @@ describe('conversation identity and wording', () => {
     assert.equal(describeConversation({ kind: 'channel', channelId: 'general', label: 'general' }), 'general',
       'a conversation whose server is unknown is named by its id alone');
     assert.equal(describeConversation({ kind: 'surface', surface: 'tui' }), 'tui (the local surface that messaged you)');
+  });
+
+  it("shows a label as its connector gave it, adding or withholding nothing for how it's spelled", () => {
+    assert.equal(describeConversation(channel('telegram:42', { label: 'Ada Lovelace' })), 'Ada Lovelace (discord / telegram:42)',
+      'a DM named after a person');
+    assert.equal(describeConversation(channel('telegram:-100', { label: 'Book Club' })), 'Book Club (discord / telegram:-100)',
+      'a group named by its title');
+    assert.equal(describeConversation(channel('discord:dm:9', { label: 'DM with antra' })), 'DM with antra (discord / discord:dm:9)');
+    assert.equal(describeConversation(channel('discord:g1:room', { label: 'room' })), 'room (discord / discord:g1:room)', 'no # added');
+    assert.equal(describeConversation({ kind: 'channel', channelId: 'c-1', label: 'general' }), 'general (c-1)',
+      'a label with no server, beside its channel id');
   });
 
   it('the same channel id and label on two servers read as two addresses, each naming its server', () => {

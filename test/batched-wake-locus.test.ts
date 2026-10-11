@@ -316,4 +316,28 @@ describe('batched wake routing with conversation forks', () => {
       assert.equal(byAgent.get(other)?.routeCandidates, undefined, `${other} gets no route there`);
     }
   });
+
+  it("a server can't mark its item as host machinery: system: true in an origin or in metadata is dropped, and the item is a route candidate", async () => {
+    const internals = framework as unknown as {
+      pendingRequests: Wake[];
+      handleMcplPushEvent(event: unknown): unknown;
+      handleMcplChannelIncoming(event: unknown): Promise<unknown>;
+    };
+    const stored = (text: string) => framework.getAgent('trunk')!.getContextManager().getAllMessages()
+      .find((m) => JSON.stringify(m.content).includes(text));
+    const push = pushInto(GENERAL, 'sys-push');
+    internals.handleMcplPushEvent({ ...push, content: [{ type: 'text', text: 'pushed as system' }], origin: { ...push.origin, system: true } });
+    const pushed = internals.pendingRequests.find((r) => r.agentName === 'trunk');
+    assert.deepEqual(pushed?.routeCandidates?.map((c) => c.conversation.channelId), [GENERAL], 'the push is a route candidate');
+    assert.equal((stored('pushed as system')?.metadata as Record<string, unknown> | undefined)?.system, undefined, "the origin's system is not stored");
+    internals.pendingRequests.length = 0;
+    await internals.handleMcplChannelIncoming({
+      type: 'mcpl:channel-incoming', serverId: 'discord', channelId: GENERAL, messageId: 'm-sys',
+      author: { id: '5', name: 'Five' }, content: [{ type: 'text', text: 'incoming as system' }],
+      timestamp: new Date().toISOString(), triggerInference: true, tags: ['chat:addressed'], metadata: { system: true },
+    });
+    const incoming = internals.pendingRequests.find((r) => r.agentName === 'trunk');
+    assert.deepEqual(incoming?.routeCandidates?.map((c) => c.conversation.channelId), [GENERAL], 'the message is a route candidate');
+    assert.equal((stored('incoming as system')?.metadata as Record<string, unknown> | undefined)?.system, undefined, "the adapter's system is not stored");
+  });
 });

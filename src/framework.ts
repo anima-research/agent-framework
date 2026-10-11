@@ -7389,6 +7389,9 @@ export class AgentFramework {
       triggered: event.triggerInference ?? false,
       serverId: event.serverId,
     };
+    // `system` marks host machinery (isConversational): host-written only,
+    // so an adapter's is dropped.
+    delete metadata.system;
     if (event.threadId) metadata.threadId = event.threadId;
     if (event.tags) metadata.tags = event.tags;
     // The inbound source envelope (mcpl/inbound-source.ts): frozen at the
@@ -7431,7 +7434,7 @@ export class AgentFramework {
         this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
         if (event.triggerInference) {
           const addressedHere = isAddressedMessage(event.tags, event.metadata);
-          const candidate = isConversational(event.tags, event.metadata)
+          const candidate = isConversational(event.tags)
             ? this.candidateFromSource(source, addressedHere)
             : undefined;
           this.pendingRequests.push({
@@ -7510,7 +7513,7 @@ export class AgentFramework {
         ?? [...this.agents.keys()].filter((n) => n !== this.subconsciousAgentName);
       // A reaction or system marker can wake a turn, but answers nothing:
       // it is never a route candidate (the same predicate as mid-turn).
-      const candidate = isConversational(event.tags, event.metadata) ? this.candidateFromSource(source, addressed) : undefined;
+      const candidate = isConversational(event.tags) ? this.candidateFromSource(source, addressed) : undefined;
       for (const agentName of targetAgents) {
         if (!this.agents.has(agentName)) continue;
         // The broadcast reaches forks too: the fork rule keeps each agent's
@@ -7623,7 +7626,7 @@ export class AgentFramework {
     if (trigger) {
       const addressedHere = isAddressedMessage(event.tags, event.metadata);
       // A fork's home route always wins; the candidate is carried for parity.
-      const candidate = isConversational(event.tags, event.metadata)
+      const candidate = isConversational(event.tags)
         ? this.candidateFromSource(readInboundSource(messageMetadata), addressedHere)
         : undefined;
       this.pendingRequests.push({
@@ -8481,7 +8484,7 @@ export class AgentFramework {
     const channelId = occ.scope.kind === 'channel' ? occ.scope.id : this.derivePushEventChannel(origin)?.channelId;
     const authorId = occ.identity?.author?.id ?? (typeof origin?.authorId === 'string' ? origin.authorId : undefined);
     const addressedHere = isAddressedMessage(occ.tags, origin);
-    const candidate = isConversational(occ.tags, origin as Record<string, unknown> | undefined)
+    const candidate = isConversational(occ.tags)
       ? this.candidateFromSource(occ.event.event.inboundSource, addressedHere)
       : undefined;
     for (const agentName of await this.coalescedAudience(occ)) {
@@ -8640,6 +8643,9 @@ export class AgentFramework {
       ...(event.tags ? { tags: event.tags } : {}),
       ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
     };
+    // `system` marks host machinery (isConversational): host-written only,
+    // so an origin's is dropped.
+    delete metadata.system;
     // `origin.channelId` is the server-internal raw id (a bare Discord
     // snowflake) — unroutable as a locus and unresolvable by the agent. Store
     // the composite MCPL id instead wherever we can derive it, so anything
@@ -8710,7 +8716,7 @@ export class AgentFramework {
       // A push that names a conversation (a DM, an addressed-while-closed
       // message) is a route candidate like its channels/incoming
       // counterpart; an unscoped push names none.
-      const pushCandidate = silentHeartbeat || !isConversational(event.tags, event.origin as Record<string, unknown> | undefined)
+      const pushCandidate = silentHeartbeat || !isConversational(event.tags)
         ? undefined
         : this.candidateFromSource(source, pushAddressed);
       for (const agentName of targetAgents) {

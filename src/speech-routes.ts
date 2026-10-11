@@ -90,7 +90,9 @@ export type SpeechRoute =
 
 /** The turn's routing state. */
 export interface TurnRoute {
-  /** Where unaddressed speech goes; null when it has no destination. */
+  /** Where unaddressed speech goes when the turn isn't held; null when it
+   *  has no destination. A mid-turn hold keeps the route it suspended here,
+   *  alongside `hold`, which wins while it is set. */
   route: SpeechRoute | null;
   /** Unaddressed speech is held as drafts: these conversations compete. */
   hold?: {
@@ -126,11 +128,14 @@ export function routeRefusal(c: ConversationRef, targetOf: PublishTargetOf): Unr
   return undefined;
 }
 
-/** Identity of a conversation: server, channel and thread, or the surface. */
+/** Identity of a conversation: server, channel and thread, or the surface.
+ *  The parts are server-chosen strings, so they are encoded as a JSON array,
+ *  never joined with a separator one of them could contain: two keys are
+ *  equal only for the same parts (an unknown server is not an empty one). */
 export function conversationKey(c: ConversationRef): string {
   return c.kind === 'surface'
-    ? `surface:${c.surface}`
-    : `channel:${c.serverId ?? ''}\u0000${c.channelId}\u0000${c.threadId ?? ''}`;
+    ? JSON.stringify(['surface', c.surface])
+    : JSON.stringify(['channel', c.serverId ?? null, c.channelId, c.threadId ?? null]);
 }
 
 /** The conversation a route speaks into. */
@@ -148,21 +153,20 @@ export function routeConversation(route: SpeechRoute): ConversationRef {
 
 /**
  * A conversation as the framework names it to a resident, self-contained: its
- * label, then the server and channel id, written `server / channel-id` as the
- * source headers write them, and its thread. The server is named whenever it
- * is known, never left to what else is on screen: the same channel id (and
- * label) can exist on another server, and a bare id is then no address a
- * resident can send to. Notices, holds and the [delivered] receipt all name
- * conversations this one way.
+ * label as its connector gave it (nothing added or withheld for how it is
+ * spelled: a DM or a group may be named after a person or a title), then the
+ * server and channel id, written `server / channel-id` as the source headers
+ * write them, and its thread. The server is named whenever it is known,
+ * never left to what else is on screen: the same channel id (and label) can
+ * exist on another server, and a bare id is then no address a resident can
+ * send to. Notices, holds and the [delivered] receipt all name conversations
+ * this one way.
  */
 export function describeConversation(c: ConversationRef): string {
   if (c.kind === 'surface') return `${c.surface} (the local surface that messaged you)`;
   const id = c.serverId ? `${c.serverId} / ${c.channelId}` : c.channelId;
   const where = c.threadId ? `${id}, thread ${c.threadId}` : id;
-  if (c.label && c.label !== c.channelId) {
-    const label = c.label.startsWith('#') || c.label.startsWith('DM') ? c.label : `#${c.label}`;
-    return `${label} (${where})`;
-  }
+  if (c.label && c.label !== c.channelId) return `${c.label} (${where})`;
   return c.serverId || c.threadId ? `(${where})` : c.channelId;
 }
 
@@ -246,11 +250,13 @@ function newestOf(candidates: readonly RouteCandidate[]): RouteCandidate | undef
 
 /**
  * Whether an item is conversational input — something the resident might be
- * answering — rather than machinery: a system marker (send-failure notices,
- * routing notices) or a reaction or its removal (`chat:reaction`,
- * `chat:reaction-remove`, MCPL RFC-001) is not. One
- * predicate for every place that asks: turn-start route candidates, mid-turn
- * holds, and clearing send suppression.
+ * answering — rather than machinery: a host system marker (send-failure
+ * notices, routing notices) or a reaction or its removal (`chat:reaction`,
+ * `chat:reaction-remove`, MCPL RFC-001) is not. One predicate for every place
+ * that asks: turn-start route candidates, mid-turn holds, and clearing send
+ * suppression. `metadata.system` is host-written only: a caller passes an
+ * MCPL item's tags alone, and ingestion drops a `system` an adapter's
+ * metadata or origin carries, so no server can mark its item as machinery.
  */
 export function isConversational(tags: readonly string[] | undefined, metadata?: Record<string, unknown>): boolean {
   if (metadata?.system === true) return false;
