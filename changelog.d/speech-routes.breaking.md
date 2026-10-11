@@ -13,9 +13,15 @@
     registry, and pass `channelId` explicitly when publishing outside a turn.
     `routeSpeech`/`deliverSpeech` also accept `{ serverId, channelId }` to
     publish to an exact server.
+  - **Also changed:** `resolveProseTarget` returns the `serverId` its
+    target resolved to beside the channel id. `startTyping` and
+    `stopTyping` take `{ serverId, channelId }` (a bare id still works,
+    resolving only an id one server registers). `handleCoalescedIncoming`
+    receives a fourth argument, `decideTrigger`: the registry no longer
+    decides a coalesced message's trigger before handing it over, so a
+    handler that admits the occurrence calls it.
   - **Unchanged:** fork homes, explicit sends naming a channel, and
-    `resolveProseTarget`/`resolveDestination`. No sibling package version
-    changes.
+    `resolveDestination`. No sibling package version changes.
 - **Operators whose residents speak on scheduled wakes:** a turn woken only
   by events that name no conversation now has no speech route, unless the
   resident is a conversation fork, whose home is its route. That covers
