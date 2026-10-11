@@ -33,9 +33,13 @@ export interface MountConfig {
   watchRootPollMs?: number;
   /**
    * Simple ignore patterns (NOT full gitignore syntax). Supported forms:
-   * - Exact name match: ".git", "node_modules"
-   * - Directory glob: "node_modules/**" (anything under node_modules)
-   * - Extension glob: "*.pyc" (any file ending in .pyc)
+   * - A name: ".git", "node_modules" (an entry so named, at any depth)
+   * - A path from the mount root: "build/cache", or "build/cache/**" (that
+   *   path and anything under it)
+   * - An extension glob: "*.pyc" (any file ending in .pyc)
+   * A trailing slash is dropped: "node_modules/" reads as "node_modules", so
+   * a file so named is passed over too (gitignore would match only a
+   * directory). An ignored directory is passed over whole.
    */
   ignore?: string[];
   /** Whether to follow symlinks (default: false) */

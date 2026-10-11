@@ -41,7 +41,7 @@ import { constants as fsConstants } from 'node:fs';
 import type { BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, readdir, realpath, stat, statfs } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { dirname, join, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
 
 export interface MountView {
@@ -56,6 +56,13 @@ export interface MountView {
   /** Text above this size is not ingested. */
   maxFileSize: number;
   ignore: string[];
+  /**
+   * The canonical roots of the mounts nested in this one. A mount never
+   * reads or writes what lies in a mount nested in it, whatever path reaches
+   * it (agent-framework #280): every containment check refuses a canonical
+   * path inside one of these, as it refuses one outside the mount.
+   */
+  nested?: ReadonlyArray<{ name: string; real: string }>;
 }
 
 export type StatFingerprint = Omit<Fingerprint, 'hashedAt'>;
@@ -102,6 +109,12 @@ export const RACY_WINDOW_MS = 2000;
 
 export const OUTSIDE_PARENT = 'a parent directory resolves outside the mount';
 export const NOT_FOLLOWED = 'a symlink, which this mount does not follow';
+
+/** Why a canonical path inside the mount is still not the mount's: it lies in a mount nested in it. */
+export function insideNested(view: MountView, real: string): string | null {
+  const inner = view.nested?.find((n) => contained(n.real, real));
+  return inner ? `inside mount "${inner.name}", which is nested in this one` : null;
+}
 export const ROOT_UNAVAILABLE = 'the mount root is unavailable';
 export const ROOT_REPLACED =
   'the mount root is not the directory disk last agreed with (an unmounted drive, or a replaced directory): ' +
@@ -235,6 +248,9 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
     if (real !== rootReal) return { kind: 'unobserved', reason: ROOT_UNAVAILABLE };
   } else if (!contained(rootReal, real)) {
     return { kind: 'unobserved', reason: OUTSIDE_PARENT, outside: true };
+  } else {
+    const nested = insideNested(view, real);
+    if (nested) return { kind: 'unobserved', reason: nested };
   }
   const checked = await checkedAt(view, rel, real);
   if (checked) {
@@ -432,10 +448,12 @@ export async function filesystemTrustsCtime(root: string): Promise<boolean> {
  * (absence is then proven separately), or somewhere a no-follow open would
  * still reach through — O_NOFOLLOW guards only the final component.
  */
-async function parentPlacement(rootReal: string, lexical: string): Promise<'inside' | 'gone' | { reason: string }> {
+async function parentPlacement(view: MountView, rootReal: string, lexical: string): Promise<'inside' | 'gone' | { reason: string }> {
   try {
     const parent = await realpath(dirname(lexical));
-    return contained(rootReal, parent) ? 'inside' : { reason: OUTSIDE_PARENT };
+    if (!contained(rootReal, parent)) return { reason: OUTSIDE_PARENT };
+    const nested = insideNested(view, parent);
+    return nested ? { reason: nested } : 'inside';
   } catch (err) {
     const code = errno(err);
     if (code === 'ENOENT' || code === 'ENOTDIR') return 'gone';
@@ -451,7 +469,7 @@ async function parentPlacement(rootReal: string, lexical: string): Promise<'insi
  */
 export async function observePath(view: MountView, rootReal: string, relativePath: string): Promise<Observation> {
   const lexical = join(view.root, relativePath);
-  const placement = await parentPlacement(rootReal, lexical);
+  const placement = await parentPlacement(view, rootReal, lexical);
   if (placement === 'gone') return absence(view, rootReal, relativePath);
   if (placement !== 'inside') return { kind: 'unobserved', reason: placement.reason };
   let info;
@@ -477,6 +495,8 @@ export async function observePath(view: MountView, rootReal: string, relativePat
       return { kind: 'unobserved', reason: `a symlink that cannot be resolved (${errno(err) ?? String(err)})` };
     }
     if (!contained(rootReal, real)) return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
+    const nested = insideNested(view, real);
+    if (nested) return { kind: 'unobserved', reason: nested };
     if (!target.isFile()) {
       return { kind: 'unobserved', reason: target.isDirectory() ? 'a symlink to a directory, not walked' : 'not a regular file' };
     }
@@ -528,6 +548,8 @@ async function openContained(
     if (!contained(rootReal, real)) {
       return { kind: 'unobserved', reason: view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT };
     }
+    const nested = insideNested(view, real);
+    if (nested) return { kind: 'unobserved', reason: nested };
     const named = await stat(real, { bigint: true }).catch(() => null);
     if (named === null || named.dev !== info.dev || named.ino !== info.ino) {
       return { kind: 'unobserved', reason: 'the file changed while it was read' };
@@ -679,15 +701,44 @@ export function coveredByIgnore(relativePath: string, patterns: string[]): boole
   return false;
 }
 
-/** Simple ignore patterns, as the walk and the watcher read them. */
+/**
+ * Where `innerRoot` lies in `outerRoot`, '/'-joined, or null when it isn't
+ * nested in it: the same directory, outside it (`..`, or `../…`; a name like
+ * `..cache` is inside), or another root (`relative()` across Windows drives
+ * gives an absolute path). Both roots should be canonical, so a symlinked or
+ * differently cased spelling of the same directory still nests (#282's
+ * round). `path` is the platform's; tests pass path.win32.
+ */
+export function nestedAt(
+  outerRoot: string,
+  innerRoot: string,
+  path: Pick<typeof import('node:path'), 'relative' | 'isAbsolute' | 'sep'> = { relative, isAbsolute, sep },
+): string | null {
+  const rel = path.relative(outerRoot, innerRoot);
+  if (!rel || rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return null;
+  return rel.split(path.sep).join('/');
+}
+
+/**
+ * Simple ignore patterns, as the walk and the watcher read them (types.ts
+ * `MountConfig.ignore` lists the forms). A name matches an entry so named at
+ * any depth; a path (`a/b`, or `a/b/**`) matches that path from the mount
+ * root. A trailing slash is dropped, so `node_modules/` reads as
+ * `node_modules` (gitignore would match only a directory so named; here a
+ * file so named is passed over too). Before #282's round, a trailing-slash or
+ * bare slash-path pattern matched nothing.
+ */
 export function isIgnored(relativePath: string, name: string, patterns: string[]): boolean {
-  for (const pattern of patterns) {
+  for (const written of patterns) {
+    const pattern = written.length > 1 && written.endsWith('/') ? written.slice(0, -1) : written;
     if (pattern === name) return true;
     if (pattern.endsWith('/**')) {
       const prefix = pattern.slice(0, -3);
       if (relativePath === prefix || relativePath.startsWith(prefix + '/')) return true;
+    } else if (relativePath === pattern) {
+      // A name at the mount root, or a path, which is anchored there.
+      return true;
     }
-    if (!pattern.includes('/') && relativePath === pattern) return true;
     if (pattern.startsWith('*.') && name.endsWith(pattern.slice(1))) return true;
   }
   return false;

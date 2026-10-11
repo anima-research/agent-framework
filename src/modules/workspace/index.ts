@@ -5,10 +5,10 @@
  * auto-sync between real filesystem and Chronicle, and manual materialization.
  */
 
-import { constants as fsConstants } from 'node:fs';
+import { constants as fsConstants, realpathSync } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { open, readFile, stat, lstat, realpath } from 'node:fs/promises';
-import { isAbsolute, join, resolve, relative, sep } from 'node:path';
+import { join, resolve, relative, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
@@ -38,7 +38,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { coveredByIgnore, filesystemTrustsCtime, locateRoot } from './observe.js';
+import { contained, coveredByIgnore, filesystemTrustsCtime, locateRoot, nestedAt } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -202,6 +202,16 @@ function startsWithBytes(buffer: Buffer, prefix: Buffer): boolean {
 
 function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
   return buffer.length > 0 && prefix.subarray(0, buffer.length).equals(buffer);
+}
+
+/** A mount root as disk spells it: its canonical path, or as configured while it doesn't exist. */
+function canonicalRoot(path: string): string {
+  const configured = resolve(path);
+  try {
+    return realpathSync.native(configured);
+  } catch {
+    return configured;
+  }
 }
 
 function isContainedPath(root: string, candidate: string): boolean {
@@ -627,6 +637,8 @@ export class WorkspaceModule implements Module {
   private store: JsStore | null = null;
   private config: WorkspaceConfig;
   private mounts = new Map<string, MountState>();
+  /** Per mount, the mounts nested in it and where, '/'-joined (agent-framework #280). */
+  private nestedIn = new Map<string, Array<{ name: string; at: string }>>();
   private watchers = new Map<string, MountWatcher>();
   /** What disk last agreed with (global records); created with the store. */
   private agreement: DiskAgreement | null = null;
@@ -646,36 +658,42 @@ export class WorkspaceModule implements Module {
   private savedState: WorkspaceModuleState | null = null;
 
   constructor(config: WorkspaceConfig) {
-    // Detect overlapping mount paths: if mount A contains mount B,
-    // auto-add an ignore rule on A for B's path to prevent syncing
-    // the sub-mount's directory through the super-mount.
+    // A mount never takes in or writes out what lies in a mount nested in it
+    // (agent-framework #280). Nesting is read from canonical roots, so a
+    // symlinked or differently cased spelling of the same directory still
+    // nests, and the rule is spelled as disk spells the path. The outer
+    // mount's walk and watcher pass over the inner's directory by an ignore
+    // rule; its tools refuse paths there (parsePath), and every containment
+    // check refuses what reaches the inner's directory another way
+    // (MountView.nested).
+    const roots = new Map(config.mounts.map((m) => [m, canonicalRoot(m.path)]));
     for (const outer of config.mounts) {
       for (const inner of config.mounts) {
         if (outer === inner) continue;
-        const outerPath = resolve(outer.path);
-        const innerPath = resolve(inner.path);
-        const rel = relative(outerPath, innerPath);
-        // Nested: a relative path that doesn't climb out (`..` exactly, or
-        // `../…`; a name like `..cache` is a child) and isn't another root
-        // (`relative()` returns `D:\…` across Windows drives).
-        if (rel && rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel)) {
-          // inner is nested under outer — add ignore rule. Only the `/**`
-          // form matches a path at any depth, and only that path: a bare
-          // `a/b` never matches, and a bare `sub` matches every directory
-          // named sub (agent-framework #280).
-          outer.ignore = outer.ignore ?? [];
-          const pattern = rel.split(sep).join('/') + '/**';
-          if (!outer.ignore.includes(pattern)) {
-            outer.ignore.push(pattern);
-            console.warn(
-              `[workspace] Mount "${outer.name}" contains mount "${inner.name}" ` +
-              `(${rel}/) — auto-ignoring to prevent overlap`,
-            );
-          }
+        const at = nestedAt(roots.get(outer)!, roots.get(inner)!);
+        if (at === null) continue;
+        const nested = this.nestedIn.get(outer.name) ?? [];
+        nested.push({ name: inner.name, at });
+        this.nestedIn.set(outer.name, nested);
+        // The `/**` form matches that path and what is under it, and nothing
+        // else: a bare `sub` would match every entry named sub.
+        outer.ignore = outer.ignore ?? [];
+        const pattern = `${at}/**`;
+        if (!outer.ignore.includes(pattern)) {
+          outer.ignore.push(pattern);
+          console.warn(
+            `[workspace] Mount "${outer.name}" contains mount "${inner.name}" ` +
+            `(${at}/) — auto-ignoring to prevent overlap`,
+          );
         }
       }
     }
     this.config = config;
+  }
+
+  /** The mount nested in `mount` that a mount-relative path lies in, if any. */
+  private nestedMountAt(mount: MountState, relativePath: string): { name: string; at: string } | undefined {
+    return this.nestedIn.get(mount.config.name)?.find((n) => relativePath === n.at || relativePath.startsWith(n.at + '/'));
   }
 
   /**
@@ -766,6 +784,16 @@ export class WorkspaceModule implements Module {
       trustedDev = dev !== undefined && (await filesystemTrustsCtime(rootReal)) ? dev.toString() : null;
       this.ctimeTrust.set(rootReal, trustedDev);
     }
+    // Canonical now, whatever they were when the module was built: the
+    // containment checks compare canonical paths.
+    const nested: Array<{ name: string; real: string }> = [];
+    for (const n of this.nestedIn.get(mount.config.name) ?? []) {
+      const inner = this.mounts.get(n.name);
+      if (!inner) continue;
+      const innerRoot = resolve(inner.config.path);
+      const real = await realpath(innerRoot).catch(() => innerRoot);
+      if (real !== rootReal && contained(rootReal, real)) nested.push({ name: n.name, real });
+    }
     return {
       name: mount.config.name,
       view: {
@@ -774,6 +802,7 @@ export class WorkspaceModule implements Module {
         followSymlinks: mount.config.followSymlinks === true,
         maxFileSize: mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE,
         ignore: mount.config.ignore ?? [],
+        nested,
       },
       rootReal,
       ctimeTrustedDev: trustedDev,
@@ -1519,10 +1548,10 @@ export class WorkspaceModule implements Module {
   /**
    * Parse a mount-prefixed path into (mountName, relativePath).
    */
-  private parsePath(path: string): { mount: MountState; relativePath: string } {
+  private parsePath(path: string, opts: { nested?: 'allow' } = {}): { mount: MountState; relativePath: string } {
     const slashIdx = path.indexOf('/');
     const mountName = slashIdx >= 0 ? path.slice(0, slashIdx) : path;
-    const relativePath = slashIdx >= 0 ? path.slice(slashIdx + 1) : '';
+    const written = slashIdx >= 0 ? path.slice(slashIdx + 1) : '';
 
     const mount = this.mounts.get(mountName);
     if (!mount) {
@@ -1533,9 +1562,24 @@ export class WorkspaceModule implements Module {
     // Containment must compare with the PLATFORM separator (isContainedPath):
     // resolve() emits backslashes on Windows, so a '/'-suffixed root never
     // prefix-matches there and every in-mount path was rejected as traversal.
-    const resolved = resolve(mount.config.path, relativePath);
+    const root = resolve(mount.config.path);
+    const resolved = resolve(root, written);
     if (!isContainedPath(mount.config.path, resolved)) {
       throw new Error(`Path traversal detected: "${path}" resolves outside mount "${mountName}"`);
+    }
+    // One spelling per path: `a/./b`, `a//b` and `a/b/` are `a/b`, as the
+    // store, the evidence and the ignore list key it (#282's round).
+    const relativePath = relative(root, resolved).split(sep).join('/');
+
+    // What lies in a mount nested in this one is that mount's: its tools
+    // answer for it there (agent-framework #280).
+    const inner = this.nestedMountAt(mount, relativePath);
+    if (inner && opts.nested !== 'allow') {
+      const rest = relativePath.slice(inner.at.length + 1);
+      throw new Error(
+        `"${path}" is inside mount "${inner.name}", which is nested in "${mountName}" at ${inner.at}/: ` +
+        `use "${rest ? `${inner.name}/${rest}` : inner.name}"`,
+      );
     }
 
     return { mount, relativePath };
@@ -2238,12 +2282,41 @@ export class WorkspaceModule implements Module {
   }
 
   private async handleDelete(input: DeleteInput): Promise<ToolResult> {
-    const { mount, relativePath } = this.parsePath(input.path);
+    const { mount, relativePath } = this.parsePath(input.path, { nested: 'allow' });
     if (mount.config.mode === 'read-only') {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
     }
 
     const store = this.getStore();
+    const inner = this.nestedMountAt(mount, relativePath);
+    if (inner) {
+      // A copy the outer mount took in from a nested mount's directory before
+      // #280's fix: deleting it stops tracking it here, and never touches
+      // disk, where the file is the inner mount's. Anything else at such a
+      // path is refused, as every other tool refuses it.
+      return this.withMount(mount, async (): Promise<ToolResult> => {
+        if (!store.treeGet(mount.treeStateId, relativePath)) {
+          const rest = relativePath.slice(inner.at.length + 1);
+          return {
+            success: false,
+            error: `"${input.path}" is inside mount "${inner.name}", which is nested in "${mount.config.name}" at ${inner.at}/, ` +
+              `and "${mount.config.name}" doesn't hold it: use "${rest ? `${inner.name}/${rest}` : inner.name}"`,
+            isError: true,
+          };
+        }
+        store.treeRemove(mount.treeStateId, relativePath);
+        this.intents.get(mount.config.name)!.put(relativePath, null);
+        this.agreementOrThrow().forget(mount.config.name, relativePath);
+        return {
+          success: true,
+          data: {
+            path: input.path,
+            deleted: true,
+            note: `inside mount "${inner.name}": no longer tracked by "${mount.config.name}"; the file on disk is "${inner.name}"'s and was left as it is`,
+          },
+        };
+      });
+    }
     return this.withMount(mount, async (): Promise<ToolResult> => {
       const report = await this.ensureSynced(mount, relativePath);
       await this.settleBeforeMutation(mount, relativePath);
@@ -2606,16 +2679,22 @@ export class WorkspaceModule implements Module {
 
     for (const { name, mount } of mountsToMaterialize) {
       if (mount.config.mode === 'read-only') continue;
-      const turn = await this.withMount(mount, async (): Promise<{ blocked: string } | { pushed: PushResult; inPlace: boolean }> => {
+      const turn = await this.withMount(mount, async (): Promise<{ blocked: string } | { pushed: PushResult; inPlace: boolean; nested: string[] }> => {
         const branchId = store.currentBranch().id;
         const reason = this.mountMaterializeBlockReason(store, mount);
         // Force passes a divergence. The selection follows the evidence, which
         // is per path and kept across branches, so nothing needs resetting:
         // the push re-pins to this branch.
         if (reason && !input.force) return { blocked: reason };
-        const { paths, inPlace } = this.materializeSelection(mount, explicit?.relativePath ?? '');
+        const { paths: selected, inPlace } = this.materializeSelection(mount, explicit?.relativePath ?? '');
+        // What the outer mount still holds in a nested mount's directory (taken
+        // in before #280's fix) is never written there, nor deleted there:
+        // the files are the inner mount's (agent-framework #280).
+        const nested = selected.filter((path) => this.nestedMountAt(mount, path));
+        const paths = nested.length > 0 ? selected.filter((path) => !this.nestedMountAt(mount, path)) : selected;
         return {
           inPlace,
+          nested,
           pushed: await this.pushUnlocked(mount, paths, {
             force: input.force, named: explicit !== null, applyDeletions: input.applyDeletions, branchId,
           }),
@@ -2636,6 +2715,10 @@ export class WorkspaceModule implements Module {
       // be visible, not resolved silently either way.
       for (const s of pushed.skipped) {
         blocked.push({ mount: name, reason: `${s.path}: ${s.reason}` });
+      }
+      for (const path of turn.nested) {
+        const inner = this.nestedMountAt(mount, path)!;
+        blocked.push({ mount: name, reason: `${path}: inside mount "${inner.name}", which is nested in this one; delete it here to stop tracking it` });
       }
 
       // What disk still owes is kept by its evidence, so the watermark and
