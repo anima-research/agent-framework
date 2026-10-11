@@ -1518,6 +1518,15 @@ export class ChannelRegistry {
   // Channel Context for beforeInference
   // ==========================================================================
 
+  /** Whether a route's place is one a publish can still go to now: its
+   *  channel (on its server) still declares a target that allows the
+   *  route's thread or root. */
+  private routeStillPublishable(route: { serverId?: string; channelId: string; threadId?: string }): boolean {
+    const found = this.findExactEntry({ ...(route.serverId ? { serverId: route.serverId } : {}), channelId: route.channelId });
+    if ('error' in found) return false;
+    return !publishPlaceRefusal(declaredPublishTarget(found.entry.descriptor), route.threadId ?? null);
+  }
+
   /**
    * Build channel context for inclusion in beforeInference params.
    *
@@ -1531,7 +1540,11 @@ export class ChannelRegistry {
     // Without a channel route there is no outgoing channel to advertise —
     // never a latest-inbound guess.
     const route = agentName ? this.speechRouteResolver?.(agentName) : undefined;
-    const outgoing = route?.kind === 'channel' ? route.channelId : undefined;
+    // The outgoing channel, while its publish can still go there: a route
+    // lasts its turn, but a declaration withdrawn mid-turn refuses the
+    // publish, and the context never names a place no post will reach
+    // (MCPL RFC-011 §5).
+    const outgoing = route?.kind === 'channel' && this.routeStillPublishable(route) ? route.channelId : undefined;
 
     if (openChannels.length === 0 && !outgoing) {
       return undefined;
@@ -1548,11 +1561,13 @@ export class ChannelRegistry {
     }
 
     if (outgoing) {
-      // Where the speech lands, its thread included, whether or not the
-      // route has a reply edge.
+      // Where the speech lands, whether or not the route has a reply edge,
+      // with its place exactly as the publish will carry it (MCPL RFC-011
+      // §5): the thread, or null for the root. A route is only ever a place
+      // the framework publishes to exactly, so the place is always known.
       context.defaultOutgoing = {
         channelId: outgoing,
-        ...(route?.kind === 'channel' && route.threadId ? { threadId: route.threadId } : {}),
+        threadId: route?.kind === 'channel' ? route.threadId ?? null : null,
       };
     }
 

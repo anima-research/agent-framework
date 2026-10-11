@@ -378,10 +378,14 @@ test('buildChannelContext advertises the agent\'s own route and its reply edge, 
   };
   const { registry } = makeRegistry({ delivered: true }, () => undefined, (n) => routes[n] ?? { kind: 'none' });
   seedRegistered(registry, 'discord', 'chanA', 'chanB');
+  // chanB holds threads: a thread route is a place a publish goes to there.
+  const map = (registry as unknown as { channels: Map<string, { descriptor: Record<string, unknown> }> }).channels;
+  map.get('discord:chanB')!.descriptor.capabilities = { publish: { target: 'exact' } };
   registry.handleIncoming('discord', incoming('chanA', 'hi from A'));
   registry.handleIncoming('discord', incoming('chanB', 'hi from B'));
 
-  assert.equal(registry.buildChannelContext('conversation-chanA-g1')?.defaultOutgoing?.channelId, 'chanA');
+  assert.deepEqual(registry.buildChannelContext('conversation-chanA-g1')?.defaultOutgoing, { channelId: 'chanA', threadId: null },
+    "a root route names the root, as its publish's null does");
   const scout = registry.buildChannelContext('scout');
   assert.equal(scout?.defaultOutgoing?.channelId, 'chanB');
   assert.deepEqual(scout?.incoming, { channelId: 'chanB', messageId: 'm-7', threadId: 't-1' },
@@ -389,6 +393,10 @@ test('buildChannelContext advertises the agent\'s own route and its reply edge, 
   assert.deepEqual(scout?.defaultOutgoing, { channelId: 'chanB', threadId: 't-1' });
   const opener = registry.buildChannelContext('opener');
   assert.deepEqual(opener?.defaultOutgoing, { channelId: 'chanB', threadId: 't-2' }, 'the thread is named without a reply edge too');
+  // A declaration withdrawn while the route stands: the publish would be
+  // refused, so the context names no place.
+  delete map.get('discord:chanB')!.descriptor.capabilities;
+  assert.equal(registry.buildChannelContext('scout')?.defaultOutgoing, undefined, 'no place a post would not reach');
   assert.equal(opener?.incoming, undefined);
   for (const agent of ['held', 'tui', 'nobody']) {
     const ctx = registry.buildChannelContext(agent);
