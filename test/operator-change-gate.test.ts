@@ -31,7 +31,7 @@ import type {
   ToolDefinition,
   ToolResult,
 } from '../src/index.js';
-import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 class Mover implements Module {
   readonly name = 'mover';
@@ -1358,6 +1358,9 @@ describe('operator-change gate: host/command undo by turns', () => {
     }
     await reopen();
     assert.equal(branch(), change.sourceBranch, 'the source is active, not the destination');
+    await assert.rejects(resolve(change.id, 1, 'committed', '   '), (e: Error & { code?: string }) =>
+      e.code === 'invalid' && /needs a reason/.test(e.message));
+    assert.ok(framework.getOperatorChangeRecord(change.id)!.unresolved, 'a verdict with no reason is never recorded');
     const settled = await resolve(change.id, 1, 'committed', 'the operator says it applied');
     assert.match(String(settled.remaining),
       new RegExp(`the active branch is ${change.sourceBranch}, not this attempt's destination undo-msgs/scout/op-${change.id}`));
@@ -1865,6 +1868,9 @@ describe('operator-change gate: host/command undo by turns', () => {
     // The real outbox queues the marks; only delivery is stubbed: it fails
     // the first time and never finishes the second.
     fw.syncDiscordAwarenessMarkers = () => { calls++; return calls === 1 ? Promise.reject(new Error('delivery down')) : new Promise<void>(() => {}); };
+    const alerts: string[] = [];
+    const ops = framework as unknown as { opsAlert: (kind: string, agent: string, message: string) => void };
+    ops.opsAlert = (kind, _agent, message) => { alerts.push(`${kind}: ${message}`); };
     await say('a0'); await say('a1'); await say('a2'); await say('a3');
     for (const id of ['rev-a', 'rev-b']) {
       await undoWithMarks(2, 'all'); // two turns, so the cut removes addressed inputs to mark
@@ -1874,6 +1880,9 @@ describe('operator-change gate: host/command undo by turns', () => {
       assert.equal(applied.kind === 'undo-turns' && applied.markers?.status, 'queued', 'marks queued; the undo stands either way');
     }
     assert.equal(calls, 2, 'delivery started both times, and neither apply waited for it');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(alerts, ['discord-awareness-delivery: Awareness mark delivery after undo failed: delivery down'],
+      'the failed delivery is reported on its own, as an ops alert');
   });
 
   it('refuses a staged undo whose checkpoint is gone though the branch stayed', async () => {
@@ -2049,7 +2058,7 @@ describe('operator-change gate: host/command unstick, planned at staging', () =>
 
   // A re-run's outcome, or 'pending' if it hasn't settled while the framework
   // was driven for `ms`.
-  const outcomeWithin = async (outcome: Promise<unknown>, ms = 3_000) => {
+  const outcomeWithin = async (outcome: Promise<unknown>, ms = 10_000) => {
     let settled: unknown = 'pending';
     void outcome.then((o) => { settled = o; }, (e) => { settled = e; });
     const deadline = Date.now() + ms;
@@ -2059,13 +2068,20 @@ describe('operator-change gate: host/command unstick, planned at staging', () =>
     }
     return settled;
   };
-  // The provider refuses to set up the stream `times` times, then serves.
-  const failSetup = (times: number, message: string) => {
+  // The provider refuses to set up the stream `times` times, then serves. As
+  // membrane reports it ('event'): the stream comes back at once, and the
+  // refusal arrives on it as an error event (its runInference runs in the
+  // background). 'throw' is a failure before any stream, as a compile's is.
+  const failSetup = (times: number, message: string, how: 'event' | 'throw' = 'event') => {
     const real = membrane.streamYielding.bind(membrane);
     let left = times;
     membrane.streamYielding = (...args: Parameters<MockMembrane['streamYielding']>) => {
-      if (left-- > 0) throw new Error(message);
-      return real(...args);
+      if (left-- <= 0) return real(...args);
+      if (how === 'throw') throw new Error(message);
+      membrane.calls.push(args[0]);
+      const refused = new MockYieldingStream([]);
+      (refused as unknown as { events: unknown[] }).events.push({ type: 'error', error: new Error(message) });
+      return refused;
     };
     return () => { membrane.streamYielding = real; };
   };
@@ -2074,12 +2090,12 @@ describe('operator-change gate: host/command unstick, planned at staging', () =>
     providerHoldHook?: (e: Error) => { holdMs: number } | undefined;
   };
 
-  it('settles and releases a re-run whose turn fails before its stream starts: its caller hears, and the agent is not left busy', async () => {
+  for (const how of ['event', 'throw'] as const) it(`settles and releases a re-run whose turn fails ${how === 'event' ? 'on its stream, as membrane reports a provider refusal' : 'before its stream starts'}: its caller hears, and the agent is not left busy`, async () => {
     await unstick(3);
     const change = asked[0]!;
     await step(change, 1);
     (framework as unknown as Policies).errorPolicy = { onInferenceError: () => ({ retry: false }) };
-    const undoSetup = failSetup(1, 'provider setup refused the request');
+    const undoSetup = failSetup(1, 'provider setup refused the request', how);
     try {
       const outcome = await outcomeWithin(framework.rerunUnstick(change as never, { step: 1 }));
       assert.deepEqual(outcome, { step: 1, status: 'completed', outcome: 'failed', error: 'provider setup refused the request' });
@@ -2119,8 +2135,11 @@ describe('operator-change gate: host/command unstick, planned at staging', () =>
     undoSetup = failSetup(1, 'quota exhausted for now');
     try {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'back' }]));
-      const held = await outcomeWithin(framework.rerunUnstick(change as never, { step: 2 }), 6_000);
+      const started = Date.now();
+      const held = await outcomeWithin(framework.rerunUnstick(change as never, { step: 2 }), 10_000);
       assert.deepEqual(held, { step: 2, status: 'completed', outcome: 'responded' }, 'held, then run: not failed by the hold');
+      assert.ok(Date.now() - started >= 900, 'it waited out the hold before it ran');
+      assert.equal(holds, -1, 'the host was asked to hold, then asked again when the hold ended, and released it');
     } finally {
       undoSetup();
     }
@@ -2235,8 +2254,11 @@ describe('operator-change gate: host/command unstick, planned at staging', () =>
     await framework.runUntilIdle();
     assert.equal(framework.getUnstickOperation(change.id)!.attempts[0]!.status, 'completed', 'the outcome is recorded');
     const duplicate = framework.rerunUnstick(change as never, { step: 1 });
-    const early = await Promise.race([duplicate.then(() => 'resolved'), new Promise((r) => setTimeout(() => r('waiting'), 50))]);
-    assert.equal(early, 'waiting', 'not before settlement');
+    let duplicateSettled = false;
+    void duplicate.then(() => { duplicateSettled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual([...host().unstickAttemptWaiters.keys()], [`${change.id}#1`], 'the duplicate joined the first caller\'s waiter');
+    assert.equal(duplicateSettled, false, 'not before settlement');
     fw.releaseUnstickAttempt = realRelease;
     realRelease(held);
     assert.deepEqual(await duplicate, await first);

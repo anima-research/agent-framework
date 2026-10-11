@@ -12644,10 +12644,13 @@ export class AgentFramework {
    *  queued request (a requeue, or a budget restart), or a request a provider
    *  hold keeps. Another turn carries it only if it is bound to the same
    *  operation and step. */
-  private unstickRunCarried(agentName: string, binding: { operationId: string; step: number }): boolean {
+  private unstickRunCarried(agentName: string, binding: { operationId: string; step: number }, endingToken?: number): boolean {
     const carries = (r: InferenceRequest | undefined) =>
       r?.unstick?.operationId === binding.operationId && r.unstick.step === binding.step;
-    return carries(this.activeTurnTriggers.get(agentName))
+    // A stream that is ending still holds the agent's turn until its own
+    // teardown: only a successor's turn (another token) carries it on.
+    const live = endingToken === undefined || this.activeTurnTokens.get(agentName) !== endingToken;
+    return (live && carries(this.activeTurnTriggers.get(agentName)))
       || this.pendingRequests.some((r) => r.agentName === agentName && carries(r))
       || (this.providerAccelerationCooldowns.get(agentName)?.heldRequests.some(carries) ?? false);
   }
@@ -14118,6 +14121,10 @@ export class AgentFramework {
                 speech: '',
                 error: err.message,
               });
+              // A provider failure that membrane reports on the stream, as it
+              // reports a setup failure, ends an unstick re-run with the
+              // provider's error, as a failure thrown at setup does.
+              if (trigger?.unstick) this.settleUnstickAttempt(trigger.unstick, 'failed', { error: err.message });
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -14378,10 +14385,9 @@ export class AgentFramework {
       if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
     } finally {
       // An unstick re-run that ended without an outcome (aborted, cancelled)
-      // failed, unless a budget restart carries it on.
-      if (trigger?.unstick && !this.pendingRequests.some((r) =>
-        r.agentName === agent.name && r.unstick?.operationId === trigger.unstick!.operationId
-          && r.unstick.step === trigger.unstick!.step)) {
+      // failed, unless another turn carries it on: a retry that started its
+      // stream, a requeue or budget restart, or a provider hold.
+      if (trigger?.unstick && !this.unstickRunCarried(agent.name, trigger.unstick, myTurnToken)) {
         this.settleUnstickAttempt(trigger.unstick, 'failed', { error: 'the re-run ended without a response' });
       }
       const unsettledKvSubmissions = drainKvSubmissionIds?.() ?? [];

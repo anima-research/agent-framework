@@ -184,6 +184,35 @@ describe('runAtSafeBoundary', () => {
     await framework.runUntilIdle();
   });
 
+  it('refuses a request whose signal was already aborted, granting and queueing nothing', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    let ran = false;
+    await assert.rejects(
+      framework.runAtSafeBoundary({ verb: 'too late', signal: controller.signal }, async () => { ran = true; }),
+      { name: 'AbortError' },
+    );
+    assert.deepEqual([ran, i.boundaryWaiters.length, i.heldLease], [false, 0, null]);
+  });
+
+  it('lets a creation parked behind a waiting lease proceed once that lease is withdrawn', async () => {
+    i.activeTurnTokens.set('other', 9_999); // the lease waits for other's turn
+    const controller = new AbortController();
+    const leased = framework.runAtSafeBoundary({ verb: 'withdrawn', signal: controller.signal }, async () => {});
+    await tick();
+    let created = false;
+    const creating = framework.createEphemeralAgent({ name: 'parked', model: 'test-model', systemPrompt: 'test' })
+      .then((c) => { created = true; return c; });
+    await tick();
+    assert.equal(created, false, 'parked behind the waiting lease');
+    controller.abort();
+    await assert.rejects(leased, { name: 'AbortError' });
+    const c = await withinSeconds(creating);
+    assert.equal(created, true, 'woken by the withdrawal');
+    c.cleanup();
+    i.activeTurnTokens.delete('other');
+  });
+
   it('runs a granted callback to its end whatever the signal does after the grant', async () => {
     const controller = new AbortController();
     let finished = false;
@@ -237,6 +266,13 @@ describe('runAtSafeBoundary', () => {
       framework.puppetToolCall('scout', 'agent_settings', { action: 'get' }, { lease: kept! }),
       /not the lease currently held/,
     );
+    // Nor while another lease is held: its tokens are that lease's alone.
+    await framework.runAtSafeBoundary({ verb: 'another' }, async () => {
+      await assert.rejects(
+        framework.puppetToolCall('scout', 'agent_settings', { action: 'get' }, { lease: kept! }),
+        /not the lease currently held/,
+      );
+    });
   });
 
   it('lands writes deferred behind it at release, with their ids, and acknowledges them', async () => {

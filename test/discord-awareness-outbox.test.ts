@@ -647,6 +647,15 @@ test('outside error text is bounded before it is journaled', withJournal((outbox
   assert.ok((op.attempts[0].error ?? '').length <= 500);
 }));
 
+test('a bounded text never splits a surrogate pair, at the head cut or the tail cut', () => {
+  // The head keeps 360 units and the tail 100: each cut here falls inside a pair.
+  const text = `${'x'.repeat(359)}😀${'y'.repeat(1000)}😀${'z'.repeat(99)}`;
+  const bounded = boundDiscordAwarenessText(text);
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(bounded), 'no lone surrogate');
+  assert.ok(bounded.startsWith(`${'x'.repeat(359)} … [`), 'the head stops before the pair it would split');
+  assert.ok(bounded.endsWith(`] … ${'z'.repeat(99)}`), 'the tail starts after the pair it would split');
+});
+
 test('a corrupt journal entry stops the reader rather than being skipped', withJournal((_outbox, h) => {
   h.store.appendJson(DISCORD_AWARENESS_RECORD_TYPE, { records: 'nope' });
   assert.throws(() => h.reopen().batches(), /Corrupt Discord awareness journal entry/);

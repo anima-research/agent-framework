@@ -346,12 +346,15 @@ describe("tool-call origin: the agent's own, and nothing else, skips the gate", 
       `    if "${name}" in globals(): break`,
       `    await asyncio.sleep(0.01)`,
     ];
-    // The puppet's script leaves a task that calls after its exec has ended.
+    // The puppet's script leaves a task that calls after its exec has ended:
+    // it waits for the next script to let it go, so it's still running when
+    // this one ends, however slowly that comes.
     const first = await framework.puppetToolCall('scout', 'code_execution', {
       code: [
         'import asyncio',
         'async def _after():',
-        '    await asyncio.sleep(0.3)',
+        '    while not globals().get("release_late1"):',
+        '        await asyncio.sleep(0.01)',
         '    globals()["late1"] = await agent_settings({"action": "update", "context_budget_tokens": 134000})',
         'asyncio.ensure_future(_after())',
         'print("scheduled")',
@@ -368,6 +371,7 @@ describe("tool-call origin: the agent's own, and nothing else, skips the gate", 
     const second = await framework.puppetToolCall('scout', 'code_execution', {
       code: [
         'import asyncio',
+        'release_late1 = True',
         ...settle('late1'),
         'print(late1)',
         'async def _during():',

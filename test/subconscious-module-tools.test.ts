@@ -90,7 +90,8 @@ describe('Module.getSubconsciousTools', () => {
     // queued tool-call event (the event loop delivers it to the module).
     framework.start();
     (framework as unknown as Internals).dispatchToolCall(sub, { id: 'toolu_sub_1', name: 'body--answer', input: {} });
-    for (let n = 0; n < 50 && answers.calls.length === 0; n++) await new Promise((r) => setTimeout(r, 5));
+    // The event loop delivers it: bounded generously, for a loaded machine.
+    for (const deadline = Date.now() + 10_000; answers.calls.length === 0 && Date.now() < deadline;) await new Promise((r) => setTimeout(r, 5));
     assert.deepEqual(answers.calls.map((c) => ({ name: c.name, caller: c.callerAgentName, origin: c.origin })), [
       { name: 'answer', caller: sub, origin: undefined },
     ]);
