@@ -160,10 +160,11 @@ export function conversationKey(source: InboundSource): string | undefined {
 /**
  * JSON with object keys sorted at every level, written as the store's append
  * keeps a value (its native UTF-8 write, which the real-store digest table
- * checks): an `undefined` object entry is dropped and an `undefined` array
- * element is written as `null`, as JSON writes them; a string is
- * well-formed (each lone surrogate comes back as U+FFFD); and an entry whose
- * key isn't well-formed is dropped (the store doesn't keep it). So a value
+ * checks): an `undefined` object entry is dropped; a string is well-formed
+ * (each lone surrogate comes back as U+FFFD); and an entry whose key isn't
+ * well-formed is dropped (the store doesn't keep it). An `undefined` array
+ * element is written as `null`, as JSON writes it: the store's append
+ * refuses a body holding one, so no stored copy does. So a value
  * hashes alike however its keys were ordered (content read back from the
  * store has them in a different order than it was written), and alike
  * before and after the store. editMessage writes JSON instead, so an edited

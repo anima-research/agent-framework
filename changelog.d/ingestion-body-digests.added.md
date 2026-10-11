@@ -5,8 +5,9 @@
     delivered, taken at ingestion, after MCPL conversion and before any host
     decoration or storage sharding. It is the SHA-256 (hex) of `[blocks]`
     as canonical JSON (keys sorted at every level, `undefined` object entries
-    dropped and an `undefined` array element written as `null`, as JSON
-    writes them), with the blocks as the store keeps them: inline media as
+    dropped, and an `undefined` array element written as `null` as JSON
+    writes it, though the store refuses a body holding one), with the blocks
+    as the store keeps them: inline media as
     the store hands it back (base64 re-encoded from its bytes, an image's
     media type taken from its bytes' signature, only `type` and `source`
     kept), strings well-formed (a lone surrogate as U+FFFD) and an entry

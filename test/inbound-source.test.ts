@@ -712,6 +712,8 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
         for (const [what, block] of [
           ['a document without a media type', { type: 'document', source: { type: 'base64', data: 'JVBERi0xLjQ=' } }],
           ['an image without a media type whose bytes have no signature', { type: 'image', source: { type: 'base64', data: svg } }],
+          // The store's append can't represent an undefined array element.
+          ['an array with an undefined element', { type: 'text', text: 'x', parts: ['a', undefined] }],
         ] as const) {
           assert.throws(() => cm.addMessage('user', [block] as never), Error, `${what}: refused at write`);
         }
@@ -741,6 +743,12 @@ describe('sourceBodyDigest hashes a body as the store keeps it', () => {
     const urlImage = { type: 'image', source: { type: 'url', url: 'https://cdn.example/a.png', data: 'not base64 at all' } };
     assert.equal(sourceBodyDigest([urlImage]), plain([urlImage]));
     assert.equal(sourceBodyDigest([{ type: 'text', text: 'x' }]), plain([{ type: 'text', text: 'x' }]));
+    // An undefined array element is written as null, as JSON writes it (the
+    // store refuses such a body, above, so no stored copy holds one).
+    assert.equal(
+      sourceBodyDigest([{ type: 'text', text: 'x', parts: ['a', undefined] }]),
+      sourceBodyDigest([{ type: 'text', text: 'x', parts: ['a', null] }]),
+    );
   });
 
   it('what the store keeps still changes the digest', () => {
