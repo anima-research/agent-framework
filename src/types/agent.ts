@@ -53,8 +53,9 @@ export interface AgentConfig {
   /**
    * The model's PHYSICAL context window (provider hard cap, e.g. 200000).
    * When set, the framework projects each continuation round's real size
-   * (cache-inclusive input of the prior round + the blocks about to be
-   * appended + reserve for response) and restarts the stream through a fresh
+   * (cache-inclusive input of the prior round + that round's output + the
+   * blocks about to be appended + reserve for response) and restarts the
+   * stream through a fresh
    * compile instead of dispatching a request the provider will 400
    * (issue #92: a legal compile can walk past the physical window mid-turn).
    * Unset → no projection; only the maxStreamTokens restart applies.

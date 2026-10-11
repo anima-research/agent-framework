@@ -120,14 +120,22 @@ export class Agent {
    * closure) so the next activation can close whatever its predecessor left
    * open — see failOpenKvSubmissions. */
   private kvOpenQueue: Array<{ submissionId: string; wireReceipt: CacheWireReceipt }> | null = null;
+  /** The current stream's fresh input so far, as membrane's usage event
+   *  reports it (cumulative across the tool loop): what the maxStreamTokens
+   *  budget checks. */
   lastStreamInputTokens = 0;
-  /** Real prefix size of the last usage event: fresh + cache creation +
-   *  cache read. THE window-shaped number — `lastStreamInputTokens` alone
-   *  omits cached tokens, which are most of a warm stream's window. */
+  /** Real prefix size of the stream's latest provider call that reported
+   *  one: fresh + cache creation + cache read. Membrane's usage events are
+   *  cumulative, so this is the call's share of its event (cumulativeDelta):
+   *  the whole event for a stream's first call, and the event's own value
+   *  where a counter went back. THE window-shaped number —
+   *  `lastStreamInputTokens` alone omits cached tokens, which are most of a
+   *  warm stream's window. */
   lastStreamRealInputTokens = 0;
-  /** Output tokens of the last usage event — the prior round's generated
-   *  thinking/text/tool_use, which becomes part of the NEXT round's input
-   *  and so belongs in the physical-window projection. */
+  /** Output tokens of the same call as lastStreamRealInputTokens — the
+   *  prior round's generated thinking/text/tool_use, which becomes part of
+   *  the NEXT round's input and so belongs in the physical-window
+   *  projection. */
   lastStreamOutputTokens = 0;
   maxStreamTokens: number;
   /** Provider hard context cap (see AgentConfig.physicalWindowTokens). */
@@ -956,8 +964,9 @@ export class Agent {
     // the prior stream's window size — on the physical-window restart path
     // that inherited value IS the oversized number that caused the restart,
     // and projecting on it before this stream's first usage event would
-    // restart again (loop). The `> 0` guard downstream means "no usage
-    // observed on THIS stream yet" only because of this reset.
+    // restart again (loop). The `> 0` guard downstream means "no call on
+    // THIS stream has reported a prompt yet" only because of this reset (a
+    // call that reports none keeps the previous call's numbers).
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
 

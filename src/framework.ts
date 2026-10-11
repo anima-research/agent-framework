@@ -9483,8 +9483,9 @@ export class AgentFramework {
     const myStreamId = agent.streamId;
     // Membrane usage events are cumulative across the native/XML tool loop.
     // Keep the previous cumulative sample so consumers that operate at the
-    // physical provider-call boundary (estimator calibration and kv receipt
-    // acceptance) see this call only, not an ever-growing turn total.
+    // physical provider-call boundary (estimator calibration, kv receipt
+    // acceptance and the physical-window projection) see this call only, not
+    // an ever-growing turn total.
     let previousUsage = {
       inputTokens: 0,
       outputTokens: 0,
@@ -10676,12 +10677,9 @@ export class AgentFramework {
           }
 
           case 'usage': {
+            // The stream's accumulated fresh input, which is what the
+            // maxStreamTokens budget checks.
             agent.lastStreamInputTokens = event.usage.inputTokens;
-            agent.lastStreamRealInputTokens =
-              (event.usage.inputTokens ?? 0) +
-              (event.usage.cacheCreationTokens ?? 0) +
-              (event.usage.cacheReadTokens ?? 0);
-            agent.lastStreamOutputTokens = event.usage.outputTokens ?? 0;
 
             // Closed-loop estimator calibration (2026-07-12). Sample the REAL
             // prefix size of THIS API call (fresh + cache write + cache read)
@@ -10712,6 +10710,22 @@ export class AgentFramework {
             };
             previousUsage = cumulativeUsage;
             outputTokensSinceStamp += perCallUsage.outputTokens;
+            const realTotal =
+              perCallUsage.inputTokens +
+              perCallUsage.cacheCreationTokens +
+              perCallUsage.cacheReadTokens;
+            // The physical-window projection adds the next two fields as the
+            // prior round's real input and output, so they take this call's
+            // share, never the event's own figures: the event is the stream's
+            // running total, which after k calls holds k prompts and would
+            // restart a stream whose next request still fits. A call that
+            // reported no prompt (an adapter that left its counts at 0) keeps
+            // the last call's numbers: every real call has a prompt, and 0
+            // would switch the projection off at the next boundary.
+            if (realTotal > 0) {
+              agent.lastStreamRealInputTokens = realTotal;
+              agent.lastStreamOutputTokens = perCallUsage.outputTokens;
+            }
             const strat = (agent as unknown as {
               getContextManager?: () => { getStrategy?: () => unknown };
             }).getContextManager?.()?.getStrategy?.() as
@@ -10726,10 +10740,6 @@ export class AgentFramework {
                 }
               | undefined;
             try {
-              const realTotal =
-                perCallUsage.inputTokens +
-                perCallUsage.cacheCreationTokens +
-                perCallUsage.cacheReadTokens;
               strat?.reportRealInputTokens?.(realTotal);
             } catch { /* calibration is best-effort */ }
 

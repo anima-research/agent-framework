@@ -229,6 +229,151 @@ describe('physical-window mid-turn restart (issue #92)', () => {
     }
   });
 
+  /** A tool round (or, with id null, a final answer) whose usage is the
+   *  stream's running total so far, as membrane's usage events are. */
+  const round = (
+    id: string | null,
+    usage: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens?: number },
+  ) => {
+    const r = id === null
+      ? createMockResponse([{ type: 'text', text: 'Answered on the first stream' }])
+      : createMockResponse([
+        { type: 'text', text: 'Working…' },
+        { type: 'tool_use', id, name: 'canned--fetch', input: {} },
+      ], 'tool_use');
+    (r as { usage: unknown }).usage = usage;
+    return r;
+  };
+
+  /** One turn on a 200k window with a 32k response reserve. */
+  async function windowTurn(streams: NormalizedResponse[][], module: Module = new BlobToolModule()) {
+    const tempDir = mkdtempSync(join(tmpdir(), 'phys-window-'));
+    const membrane = new QueuedStreamsMembrane(streams);
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{
+        name: 'prime',
+        model: 'test-model',
+        systemPrompt: 'You are prime.',
+        allowedTools: 'all',
+        maxTokens: 32_000,
+        physicalWindowTokens: 200_000,
+      }],
+      modules: [module],
+      syncIntervalMs: 0,
+    });
+    const traces: TraceEvent[] = [];
+    framework.onTrace((e) => traces.push(e));
+    framework.start();
+    framework.pushEvent({
+      type: 'external-message',
+      source: 'test',
+      content: [{ type: 'text', text: 'fetch it' }],
+      metadata: {},
+      triggerInference: true,
+    } as unknown as ProcessEvent);
+    const done = await pollUntil(() => /Answered (on the first stream|after a restart)/.test(storedTexts(framework)));
+    const restarts = traces.filter((e) => e.type === 'inference:stream_restarted') as Array<{ reason?: string; inputTokens?: number }>;
+    return { framework, membrane, restarts, done, close: async () => { await framework.stop(); rmSync(tempDir, { recursive: true, force: true }); } };
+  }
+  const afterRestart = [createMockResponse([{ type: 'text', text: 'Answered after a restart' }])];
+
+  it("projects from the latest call, not the stream's running total", async () => {
+    // Membrane's usage event is cumulative across the tool loop. Each call
+    // here fits: the second call's prompt is 118k (20k fresh, 20k cache
+    // write, 78k cache read), and with its 30k output, the appended tool
+    // result and the 32k reserve the next request projects to about 186k of
+    // the 200k window. The first call put 20k or more into every count, so
+    // taking any one term from the running total instead crosses the window.
+    const t = await windowTurn([
+      [
+        round('call_1', { inputTokens: 20_000, cacheCreationTokens: 20_000, cacheReadTokens: 40_000, outputTokens: 20_000 }),
+        round('call_2', { inputTokens: 40_000, cacheCreationTokens: 40_000, cacheReadTokens: 118_000, outputTokens: 50_000 }),
+        round(null, { inputTokens: 42_000, cacheCreationTokens: 41_000, cacheReadTokens: 236_000, outputTokens: 50_500 }),
+      ],
+      afterRestart,
+    ]);
+    try {
+      assert.ok(t.done, 'the turn should finish');
+      assert.deepStrictEqual(t.restarts, [], 'every call fits the window, so the stream must not restart');
+      assert.strictEqual(t.membrane.calls.length, 1);
+      assert.ok(storedTexts(t.framework).includes('Answered on the first stream'));
+    } finally {
+      await t.close();
+    }
+  });
+
+  it("restarts when the latest call's output is what crosses the window", async () => {
+    // A 120k prompt with 45k of output: with the appended tool result and
+    // the 32k reserve the next request projects past 200k, though without
+    // the output it would fit.
+    const t = await windowTurn([
+      [
+        round('call_1', { inputTokens: 20_000, cacheReadTokens: 100_000, outputTokens: 45_000 }),
+        round(null, { inputTokens: 21_000, cacheReadTokens: 220_000, outputTokens: 45_500 }),
+      ],
+      afterRestart,
+    ]);
+    try {
+      assert.ok(t.done, 'the turn should finish');
+      assert.strictEqual(t.restarts.length, 1, 'the projection must count the output');
+      assert.strictEqual(t.restarts[0]!.reason, 'physical_window');
+      assert.ok((t.restarts[0]!.inputTokens ?? 0) > 200_000);
+      assert.ok(storedTexts(t.framework).includes('Answered after a restart'));
+    } finally {
+      await t.close();
+    }
+  });
+
+  it("restarts at a later boundary on that call's own figures", async () => {
+    // The first call fits easily (an 80k prompt with 30k of output); the
+    // second alone crosses the window (a 190k prompt with 10k of output, so
+    // with the appended tool result and the 32k reserve, about 238k). The
+    // second boundary must project from the second call: figures kept from
+    // the first would project about 148k and dispatch past the cap. Every
+    // other restart test here crosses at the first boundary.
+    const t = await windowTurn([
+      [
+        round('call_1', { inputTokens: 20_000, cacheReadTokens: 60_000, outputTokens: 30_000 }),
+        round('call_2', { inputTokens: 30_000, cacheReadTokens: 240_000, outputTokens: 40_000 }),
+        round(null, { inputTokens: 31_000, cacheReadTokens: 480_000, outputTokens: 40_500 }),
+      ],
+      afterRestart,
+    ]);
+    try {
+      assert.ok(t.done, 'the turn should finish');
+      assert.strictEqual(t.restarts.length, 1, 'the second boundary must restart');
+      assert.strictEqual(t.restarts[0]!.reason, 'physical_window');
+      assert.ok((t.restarts[0]!.inputTokens ?? 0) > 200_000);
+      assert.strictEqual(t.membrane.calls.length, 2, 'the first stream, then the restart');
+      assert.ok(storedTexts(t.framework).includes('Answered after a restart'));
+    } finally {
+      await t.close();
+    }
+  });
+
+  it("keeps the last call's numbers when a call reports no prompt", async () => {
+    // After the first call, the usage events repeat its running total (an
+    // adapter that left its counts at 0). Every real call has a prompt, so
+    // the first call's figures stay the latest known: a per-call 0 would
+    // switch the projection off at each later boundary (its `> 0` gate).
+    const first = { inputTokens: 20_000, cacheReadTokens: 100_000, outputTokens: 5_000 };
+    const t = await windowTurn([
+      [round('call_1', first), round('call_2', first), round(null, first)],
+      afterRestart,
+    ]);
+    try {
+      assert.ok(t.done, 'the turn should finish');
+      assert.deepStrictEqual(t.restarts, [], '158k projected each time: it fits');
+      const agent = t.framework.getAgent('prime')!;
+      assert.strictEqual(agent.lastStreamRealInputTokens, 120_000, "the first call's prompt, not 0");
+      assert.strictEqual(agent.lastStreamOutputTokens, 5_000);
+    } finally {
+      await t.close();
+    }
+  });
+
   it('leaves behavior unchanged when physicalWindowTokens is unset', async () => {
     const h = await runTurn(undefined, new MockMembrane());
     try {
