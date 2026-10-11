@@ -32,7 +32,7 @@ import {
 import { ContextManager } from '@animalabs/context-manager';
 import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane } from './helpers/mock-membrane.js';
-import { canonicalJson } from '../src/mcpl/inbound-source.js';
+import { canonicalJson, withoutSourceHeader } from '../src/mcpl/inbound-source.js';
 import { createHash } from 'node:crypto';
 import { fixture, eventually, TS } from './helpers/coalescing-fixture.js';
 
@@ -474,7 +474,9 @@ describe('stored digests when the store shards a body', () => {
    *  shard per block, as adaptive ingress chunking does. */
   class ShardingStrategy extends PassthroughStrategy {
     chunkIngressMessage(_participant: string, content: ContentBlock[]) {
-      if (content.length < 2) return null;
+      // A source header and at least two blocks of body: the header alone
+      // with one block stays whole.
+      if (content.length < 3) return null;
       return { bodyGroupId: `group-${content.length}-${Date.now()}`, shards: content.map((block, shardIndex) => ({ content: [block], shardIndex })) };
     }
   }
@@ -504,15 +506,18 @@ describe('stored digests when the store shards a body', () => {
       const stored = () => framework.getAgent('scout')!.getContextManager().getAllMessages();
       await waitFor(() => stored().some((m) => (m.metadata as { eventId?: string } | undefined)?.eventId === 'whole'), 'both pushes stored');
       const shards = stored().filter((m) => (m.metadata as { eventId?: string } | undefined)?.eventId === 'sharded');
-      assert.equal(shards.length, 2, 'stored as two shards');
+      // The store is handed the source header and the two parts, one shard each.
+      assert.equal(shards.length, 3, 'stored as three shards');
       assert.ok(shards[0]!.bodyGroupId && shards.every((m) => m.bodyGroupId === shards[0]!.bodyGroupId));
-      assert.deepEqual(shards.map((m) => m.shardIndex), [0, 1]);
+      assert.deepEqual(shards.map((m) => m.shardIndex), [0, 1, 2]);
       const whole = sourceBodyDigest(blocks);
+      const header = (shards[0]!.metadata as { sourceHeader?: string }).sourceHeader!;
+      const handed = sourceBodyDigest([{ type: 'text', text: header }, ...blocks]);
       for (const shard of shards) {
         const meta = shard.metadata as Record<string, unknown>;
         assert.equal(meta.sourceBodyDigest, whole, 'the whole delivered body');
-        assert.equal(meta.storedBodyDigest, whole, 'the whole body handed to storage');
-        assert.notEqual(sourceBodyDigest(shard.content), whole, 'a shard alone is not the body');
+        assert.equal(meta.storedBodyDigest, handed, 'the whole body handed to storage, its header included');
+        assert.notEqual(sourceBodyDigest(shard.content), handed, 'a shard alone is not the body');
       }
       const one = stored().find((m) => (m.metadata as { eventId?: string } | undefined)?.eventId === 'whole')!;
       assert.equal(one.bodyGroupId, undefined, 'a one-block body is not sharded');
@@ -570,8 +575,8 @@ describe('inbound source envelope under RFC-006 coalescing', () => {
     const copy = f.framework.getAgent('agent')!.getContextManager().getAllMessages()
       .find((m) => JSON.stringify(m.content).includes('document_diff'))!;
     const meta = copy.metadata as Record<string, unknown>;
-    assert.equal(meta.storedBodyDigest, sourceBodyDigest(copy.content), 'exactly what was stored');
-    assert.equal(meta.sourceBodyDigest, sourceBodyDigest(copy.content), 'the rendered body, undecorated');
+    assert.equal(meta.storedBodyDigest, sourceBodyDigest(copy.content), 'exactly what was stored, its source header included');
+    assert.equal(meta.sourceBodyDigest, sourceBodyDigest(withoutSourceHeader(copy.content, copy.metadata)), 'the rendered body, undecorated');
     assert.notEqual(meta.sourceBodyDigest, sourceBodyDigest([{ type: 'text', text: 'fallback_unavailable' }]), 'not the placeholder');
   });
 

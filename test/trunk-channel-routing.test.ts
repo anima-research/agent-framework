@@ -302,7 +302,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.deepEqual(asked, ['discord/discord:dm:1555'], 'asked for this channel on the server it came from');
     assert.match(text, /prefixed with ">>@_reim0n"/);
     assert.doesNotMatch(text, />>#DM:/);
-    assert.match(text, /#DM: _reim0n/, 'the readable label still names the place');
+    assert.match(text, /addressed you in DM: _reim0n —/, 'the readable label, as its connector gave it, still names the place');
     await framework.stop();
 
     // The registry finds no safe token (shared id, whitespace): no prefix is offered at all.

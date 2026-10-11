@@ -215,7 +215,7 @@ export class TuneOutCoordinator {
 
     const lines = shown.map((m) => {
       const author = (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
-      // The body without its source header (shelf-356): the backlog names
+      // The body without its source header: the backlog names
       // its channel itself, and each entry reads `author: body` rather than
       // opening on the header.
       const text = withoutSourceHeader(m.content, m.metadata)

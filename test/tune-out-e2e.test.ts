@@ -198,7 +198,7 @@ describe('tune-out end to end', () => {
     assert.match(dump, /truncated=/, 'backlogCap=2 with 5 diverted messages truncates');
     assert.match(dump, /antra: /, 'dump lines carry author attribution');
     // Each entry is `author: body`: the stored source header stays out, since
-    // the backlog names its channel itself (shelf-356).
+    // the backlog names its channel itself.
     assert.match(dump, /\nantra: scout are you there\?\n/);
     assert.doesNotMatch(dump, /\[source:/);
 

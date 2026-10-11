@@ -175,6 +175,7 @@ function pollCommands() {
       log('publish-mode', { mode: c.mode });
     } else if (c.op === 'history') {
       histories.set(c.channelId, c.history);
+      log('history-staged', { channelId: c.channelId, count: c.history?.length ?? 0 });
     }
   }
 }

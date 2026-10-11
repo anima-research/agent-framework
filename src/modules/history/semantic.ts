@@ -162,7 +162,7 @@ export class SemanticIndexClient {
 
 /**
  * Text to embed for one message, or '' when there is nothing worth indexing.
- * It leaves out the source header the host stored first (shelf-356): the
+ * It leaves out the source header the host stored first: the
  * index carries where an item was said as `channel`, and a header embedded
  * with every item would dominate a short message's vector. A hit's snippet
  * is rebuilt from this same text.

@@ -2151,7 +2151,7 @@ function flattenContent(content: readonly ContentBlock[]): string {
 }
 
 /** What `search` matches and snips: the message without the source header
- *  the host stored first (shelf-356), so a match is on what was said — `^`
+ *  the host stored first, so a match is on what was said — `^`
  *  anchors at the body's start, and a channel's name matches where it was
  *  written rather than every item from that channel. Where it was said is
  *  the `channelId` filter, and every match carries it. `extract` still

@@ -2814,7 +2814,7 @@ export class ChannelRegistry {
   }
 
   /**
-   * Each backscroll item with its own source header (shelf-356), rendered
+   * Each backscroll item with its own source header, rendered
    * from the ITEM's channelId — not the channel that was opened — so a
    * spliced item wears its true channel. The label is the registry's for that
    * id, else the adapter's item `channelLabel`. An item that names no channel
@@ -2829,11 +2829,21 @@ export class ChannelRegistry {
    */
   private stampHistory(serverId: string, items: ChannelIncomingMessage[]): Array<Record<string, unknown>> {
     const text = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+    // An item's text is marked whatever its content's shape: an array of
+    // blocks, or a string, marked as one text block's text would be.
+    const marked = (content: unknown): unknown => {
+      if (Array.isArray(content)) return markHeaderOpenings(content as object[]);
+      if (typeof content === 'string') return (markHeaderOpenings([{ type: 'text', text: content }])[0] as { text: string }).text;
+      return content;
+    };
     return items.map((item) => {
+      // A malformed entry (not an object) passes through untouched, so it
+      // can't fail an open that succeeded.
+      if (item === null || typeof item !== 'object' || Array.isArray(item)) return item as unknown as Record<string, unknown>;
       const { source: adapterSource, ...rest } = item as unknown as Record<string, unknown>;
       const kept = {
         ...rest,
-        ...(Array.isArray(rest.content) ? { content: markHeaderOpenings(rest.content as object[]) } : {}),
+        ...('content' in rest ? { content: marked(rest.content) } : {}),
         ...(adapterSource !== undefined ? { adapterSource } : {}),
       };
       const channelId = text(rest.channelId);

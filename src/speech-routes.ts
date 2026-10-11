@@ -26,6 +26,8 @@
  * the per-turn state.
  */
 
+import { headerValue, labelValue } from './mcpl/inbound-source.js';
+
 /** A conversation a reply could belong to. */
 export type ConversationRef =
   | {
@@ -174,13 +176,19 @@ export function routeConversation(route: SpeechRoute): ConversationRef {
  * exist on another server, and a bare id is then no address a resident can
  * send to. Notices, holds and the [delivered] receipt all name conversations
  * this one way.
+ *
+ * Every value is shown by the source header's rule (`headerValue`,
+ * `labelValue` in mcpl/inbound-source.ts), since each is a connector's
+ * choice: one holding structure, a line break or a character a reader can't
+ * see is quoted and escaped, so it can't imitate a host notice or another
+ * conversation. Ordinary names and ids read as they are.
  */
 export function describeConversation(c: ConversationRef): string {
-  if (c.kind === 'surface') return `${c.surface} (the local surface that messaged you)`;
-  const id = c.serverId ? `${c.serverId} / ${c.channelId}` : c.channelId;
-  const where = c.threadId ? `${id}, thread ${c.threadId}` : id;
-  if (c.label && c.label !== c.channelId) return `${c.label} (${where})`;
-  return c.serverId || c.threadId ? `(${where})` : c.channelId;
+  if (c.kind === 'surface') return `${headerValue(c.surface)} (the local surface that messaged you)`;
+  const id = c.serverId ? `${headerValue(c.serverId)} / ${headerValue(c.channelId)}` : headerValue(c.channelId);
+  const where = c.threadId ? `${id}, thread ${headerValue(c.threadId)}` : id;
+  if (c.label && c.label !== c.channelId) return `${labelValue(c.label)} (${where})`;
+  return c.serverId || c.threadId ? `(${where})` : headerValue(c.channelId);
 }
 
 /**

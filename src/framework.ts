@@ -100,7 +100,7 @@ import {
   type TurnRoute,
 } from './speech-routes.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
-import { INBOUND_SOURCE_KEY, markHeaderOpenings, readInboundSource, renderSourceHeader, SOURCE_HEADER_RULE, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
+import { INBOUND_SOURCE_KEY, headerValue, labelValue, markHeaderOpenings, quoted, readInboundSource, renderSourceHeader, SOURCE_HEADER_RULE, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import {
@@ -7298,8 +7298,12 @@ export class AgentFramework {
           const { [INBOUND_SOURCE_KEY]: _dropped, ...rest } = metadata;
           metadata = rest;
         }
+        // A local surface's input is what a sender wrote, so its
+        // header-shaped openings are marked as a channel body's are: only the
+        // host writes a [source: …] header.
+        const content = surface ? markHeaderOpenings(msg.content) : msg.content;
         if (surface) metadata = { ...metadata, [INBOUND_SOURCE_KEY]: surface };
-        const id = this.addMessage(msg.participant, msg.content, metadata);
+        const id = this.addMessage(msg.participant, content, metadata);
         this.emitTrace({ type: 'message:added', messageId: id, source: event.type });
       }
     }
@@ -7440,20 +7444,23 @@ export class AgentFramework {
     }
     metadata[INBOUND_SOURCE_KEY] = source;
     // The delivered body's version identity (mcpl/inbound-source.ts
-    // sourceBodyDigest; room-220 #46752–#47210), recorded first, from the
+    // sourceBodyDigest), recorded first, from the
     // body as delivered — before the header decorates it, its header-shaped
     // text is marked, or storage shards it. The header text is recorded
     // beside it. Neither proves later presence or completeness: they
     // describe this delivery at stamping. The stored copy's own digest is
     // taken at each storage site below, over exactly the blocks stored there.
     metadata.sourceBodyDigest = sourceBodyDigest(event.content);
-    // The visible source header (shelf-356): stamped once, here, from this
+    // The visible source header: stamped once, here, from this
     // item's own frozen envelope, and stored with the message — a later
     // rename, a recompile or a replay never rewrites it, and each message
     // names its conversation when read alone. Creates, coalesced deliveries
     // and RFC-006 corrections all pass through here.
     const header = renderSourceHeader(source);
+    // Always the host's: an adapter-supplied sourceHeader in the metadata
+    // never survives, rendered or not.
     if (header) metadata.sourceHeader = header;
+    else delete metadata.sourceHeader;
     event = { ...event, content: AgentFramework.withSourceHeader(header, event.content) };
 
     // Per-channel conversation routing: messages go to the channel's fork
@@ -7517,7 +7524,9 @@ export class AgentFramework {
           : undefined,
       });
       if (invitation) {
-        incomingContent.push(invitation.block);
+        // It interpolates adapter-supplied names (author, guild, label, id),
+        // so it is marked as the body it follows is.
+        incomingContent.push(...markHeaderOpenings([invitation.block]));
         Object.assign(metadata, invitation.metadataPatch);
       }
     }
@@ -7914,8 +7923,13 @@ export class AgentFramework {
     const descriptor = this.channelRegistry.getDescriptor(opts.channelId);
     const maxBackscroll = descriptor?.capabilities?.history?.maxMessages ?? 0;
     const label = opts.channelLabel ?? descriptor?.label;
-    const channelLabel = label ? `#${label}` : `"${opts.channelId}"`;
-    const place = opts.guildName ? `${channelLabel} in "${opts.guildName}"` : channelLabel;
+    // Every name here is the connector's, shown by the source header's rule
+    // (headerValue, labelValue), and the ids the options quote are JSON
+    // string literals, so none can imitate host text or break the line.
+    const channelLabel = label ? labelValue(label) : quoted(opts.channelId);
+    const place = opts.guildName ? `${channelLabel} in ${quoted(opts.guildName)}` : channelLabel;
+    const author = headerValue(opts.authorName);
+    const [channelArg, serverArg, messageArg] = [opts.channelId, opts.serverId, opts.messageId].map(quoted);
     // The label is for reading; the prefix must be ONE token that resolves back
     // here, on this server (a DM label "DM: alice" quoted verbatim parses as
     // target "#DM:"). A registry that can name targets is authoritative: no safe
@@ -7939,18 +7953,18 @@ export class AgentFramework {
     const block: ContentBlock = {
       type: 'text',
       text:
-        `\n[Channel invitation] ${opts.authorName} addressed you in ${place} — ` +
+        `\n[Channel invitation] ${author} addressed you in ${place} — ` +
         `a channel you haven't joined. Only messages that address you directly (an @-mention or ` +
         `a reply to one of your messages) reach you from it; the rest of its traffic is invisible to you. ` +
         missedNote +
         `Your options:\n` +
         replyOption +
-        `2. Join the channel — call channel_open with channelId "${opts.channelId}" and serverId "${opts.serverId}"` +
+        `2. Join the channel — call channel_open with channelId ${channelArg} and serverId ${serverArg}` +
         (maxBackscroll > 0
-          ? `; to also read recent history, add backscroll (a number up to ${maxBackscroll}) and beforeMessageId "${opts.messageId}".\n`
+          ? `; to also read recent history, add backscroll (a number up to ${maxBackscroll}) and beforeMessageId ${messageArg}.\n`
           : `.\n`) +
-        `3. Stay out — call channel_decline with channelId "${opts.channelId}", serverId "${opts.serverId}", ` +
-        `and messageId "${opts.messageId}" (optionally set acknowledge to an emoji like 👀 so ${opts.authorName} isn't left hanging).\n` +
+        `3. Stay out — call channel_decline with channelId ${channelArg}, serverId ${serverArg}, ` +
+        `and messageId ${messageArg} (optionally set acknowledge to an emoji like 👀 so ${author} isn't left hanging).\n` +
         `Doing nothing is also fine.`,
     };
     return {
@@ -8757,7 +8771,9 @@ export class AgentFramework {
           typeof origin.missedCharacters === 'number' ? origin.missedCharacters : undefined,
       });
       if (invitation) {
-        invitations.push(invitation.block);
+        // It interpolates adapter-supplied names (author, guild, label, id),
+        // so it is marked as the body it follows is.
+        invitations.push(...markHeaderOpenings([invitation.block]));
         Object.assign(metadata, invitation.metadataPatch);
       }
     }
@@ -8768,11 +8784,14 @@ export class AgentFramework {
     // content merely by setting `origin.silent`. It reads the blocks before
     // the header decorates them.
     const silentHeartbeat = isSilentHeartbeatMarker({ ...event, content: [...event.content, ...invitations] });
-    // The visible source header (shelf-356), from this item's own envelope:
+    // The visible source header, from this item's own envelope:
     // its registered channel, or `unscoped` — never a guessed channel. A
     // silent heartbeat stores no message, so it gets none.
     const header = silentHeartbeat ? undefined : renderSourceHeader(source);
+    // Always the host's: an adapter-supplied sourceHeader in the origin
+    // never survives, rendered or not.
     if (header) metadata.sourceHeader = header;
+    else delete metadata.sourceHeader;
     const content = [...AgentFramework.withSourceHeader(header, event.content), ...invitations];
 
     const placement: CoalescingPlacement = { agent: '' };
@@ -10066,12 +10085,13 @@ export class AgentFramework {
   }
 
   /**
-   * An adapter's blocks as stored under their source header (shelf-356): the
-   * header first, then the blocks with every header-shaped opening in their
-   * text marked (markHeaderOpenings), so beside it no other `[source:` can
-   * pass for the host's. Both MCPL lanes attach headers only through here.
-   * Without a header (a silent heartbeat stores nothing), the blocks as
-   * given.
+   * An adapter's blocks as stored under their source header: the header
+   * first, then the blocks with every header-shaped opening in their text
+   * marked (markHeaderOpenings). Outside the host's header line no unmarked
+   * opening remains; a header value that holds one is quoted inside the
+   * header (headerValue), where it reads as a literal. Both MCPL lanes
+   * attach headers only through here. Without a header (a silent heartbeat
+   * stores nothing), the blocks as given.
    */
   private static withSourceHeader(header: string | undefined, content: readonly ContentBlock[]): ContentBlock[] {
     return header ? [{ type: 'text', text: header }, ...markHeaderOpenings(content)] : [...content];
@@ -10102,8 +10122,19 @@ export class AgentFramework {
       // turn. getAllMessages is the store's cached view (each compile reads
       // the same one), so this is a pass over memory, and none runs once the
       // notice is recorded.
-      const sees = agent.getContextManager().getAllMessages()
-        .some((message) => typeof (message.metadata as { sourceHeader?: unknown } | undefined)?.sourceHeader === 'string');
+      let sees = false;
+      let given = false;
+      for (const message of agent.getContextManager().getAllMessages()) {
+        const meta = message.metadata as { sourceHeader?: unknown; kind?: unknown } | undefined;
+        if (typeof meta?.sourceHeader === 'string') sees = true;
+        if (meta?.kind === 'source-header-notice') given = true;
+      }
+      // A notice already in the context counts as given, though its record
+      // failed to write: record it now, and append nothing.
+      if (given) {
+        this.recordSourceHeadersExplained(state, explained, agent.name);
+        return;
+      }
       if (!sees) return;
     } catch (err) {
       console.error('maybeExplainSourceHeaders: state read failed:', err);
@@ -10129,11 +10160,17 @@ export class AgentFramework {
       console.error('maybeExplainSourceHeaders: failed to append notice:', err);
       return;
     }
+    this.recordSourceHeadersExplained(state, explained, agent.name);
+  }
+
+  /** Record that a resident has been given the source-header notice. A
+   *  failed write is logged: the notice in its context counts as given at
+   *  the next turn, so it isn't appended again. */
+  private recordSourceHeadersExplained(state: Record<string, unknown>, explained: unknown[], agentName: string): void {
     try {
-      state.sourceHeadersExplained = [...explained, agent.name];
+      state.sourceHeadersExplained = [...explained, agentName];
       this.store.setStateJson(FRAMEWORK_STATE_ID, state);
     } catch (err) {
-      // The notice stands; at worst it is given once more.
       console.error('maybeExplainSourceHeaders: failed to record the notice:', err);
     }
   }
