@@ -97,8 +97,9 @@
   indicator rather than one on a guessed server. `inference:started` and
   the failure log name the route's server beside its channel. The gate's
   batched-wake notice counts a thread apart from its channel's root, and
-  the beforeInference context's `defaultOutgoing` names the route's thread
-  (an extension of §14.4's shape). The `mcpl:speech-routed`,
+  the beforeInference context's `defaultOutgoing` carries the route's place
+  as its publish does: the thread, or `null` for the root (MCPL RFC-011
+  revision 5's amendment of §14.4). The `mcpl:speech-routed`,
   `mcpl:speech-route-failed` and `prose:draft-resent` traces carry
   `threadId` (null for the root).
 - **A thread id is read one way** by `channel_publish`, `channel_open` and

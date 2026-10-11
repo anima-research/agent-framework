@@ -1019,12 +1019,13 @@ export interface ChannelContext {
     threadId?: string;
   };
 
-  /** Default channel for outgoing messages, and the thread in it that the
-   *  agent's plain speech posts into, when it has one (an extension of
-   *  §14.4's shape: a server that doesn't read it loses nothing). */
+  /** Default channel for outgoing messages, and the place in it the agent's
+   *  plain speech is published to, exactly as that publish carries it (MCPL
+   *  RFC-011 §5, amending §14.4): a thread, or null for the root. A server
+   *  that doesn't read it loses nothing. */
   defaultOutgoing?: {
     channelId: string;
-    threadId?: string;
+    threadId?: string | null;
   };
 
   /** All candidate channels for this inference */
