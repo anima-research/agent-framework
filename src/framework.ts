@@ -10580,8 +10580,9 @@ export class AgentFramework {
       );
     }
     const notes: string[] = [];
-    if (routing.privateSuppressed > 0) notes.push(`${routing.privateSuppressed} plain-speech segment(s) kept private (non-channel turn — publish only with an explicit send tool)`);
-    const otherSuppressed = Math.max(0, suppressed - routing.privateSuppressed);
+    const privateSuppressed = routing.privateSuppressed ?? 0;
+    if (privateSuppressed > 0) notes.push(`${privateSuppressed} plain-speech segment(s) kept private (non-channel turn — publish only with an explicit send tool)`);
+    const otherSuppressed = Math.max(0, suppressed - privateSuppressed);
     if (otherSuppressed > 0) notes.push(agent.proseRouting === 'disabled' ? `${otherSuppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)` : `${otherSuppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`);
     routing.privateSuppressed = 0;
     const suppressedNote = notes.join(' · ');
