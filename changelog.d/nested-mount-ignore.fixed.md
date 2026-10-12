@@ -40,10 +40,12 @@
     filesystem, is still nested, and the rule is spelled as disk spells it.
     An inner mount in a directory whose name starts with `..` (such as
     `..cache`) is now recognized as nested.
-    A root that doesn't exist yet is read as the filesystem will read it:
-    through the directories that exist, a link on the way that leads to
-    nothing yet as what it names, and a `..` after any link before it is
-    followed. So a mount configured at `via/child`, where `via` links into
+    A root that doesn't exist yet is its configured path, resolved as
+    `path.resolve` resolves it, then read as the filesystem will read it:
+    through the directories that exist, with a link on the way that leads
+    to nothing yet read as what it names. A `..` in such a link's target
+    counts after any link before it in that target, as the filesystem
+    counts it. So a mount configured at `via/child`, where `via` links into
     another mount, or at a link to that mount's `child`, is nested there
     before `child` is made. Each pass also reads nesting afresh, so a
     mount that comes to lie inside another after startup (its root made
