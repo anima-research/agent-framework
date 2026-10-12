@@ -159,6 +159,20 @@ test("a watched mount's changes pass over what it ignores, a nested mount includ
   let bound: ReturnType<typeof setTimeout> | undefined;
   await Promise.race([isReady, new Promise((_, reject) => { bound = setTimeout(() => reject(new Error('the watcher was not ready within 10 s')), 10_000); })])
     .finally(() => clearTimeout(bound));
+  // Chokidar 4 reads a directory before it starts that directory's poller,
+  // and the poller takes its first reading later, so `ready` can come before
+  // a directory that existed before the watch has one. A write made then can
+  // fall inside that first reading and never be reported: about 1 run in 48
+  // on the VPS missed `a/c/y.txt`, on Node 20 and 24 alike. So each such
+  // directory gets a new file each round until one is reported there, which
+  // shows its poller is reading, before the checks begin.
+  const primedDirs = ['', 'a', 'a/c'];
+  const primedIn = (dir: string) => seen.some((c) => c.path.startsWith(dir ? `${dir}/primed-` : 'primed-'));
+  for (let round = 0; round < 25 && !primedDirs.every(primedIn); round++) {
+    for (const dir of primedDirs.filter((d) => !primedIn(d))) writeFileSync(join(outerDir, dir, `primed-${round}.txt`), 'primed');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  assert.ok(primedDirs.every(primedIn), `each directory that existed before the watch reported a write: ${JSON.stringify(seen.map((c) => c.path))}`);
 
   // Each ignored write has a twin the mount reports, written after it and
   // reported by the same machinery, though not strictly after it: the same
@@ -300,8 +314,12 @@ test("the outer mount's tools refuse a path in a nested mount, naming it; deleti
   const outer = (): MountConfig => ({ name: 'outer', path: outerDir, mode: 'read-write', watch: 'never' });
   const inner = (): MountConfig => ({ name: 'inner', path: join(outerDir, 'a', 'b'), mode: 'read-write', watch: 'never' });
 
-  // Before the inner mount existed, the outer one took the file in and drafted over it.
+  // Before the inner mount existed, the outer one took the file in, so disk
+  // agreed with it about that path, and then drafted over it.
   const before = await started(stops, storePath, [outer()]);
+  const tookIn = await before.workspace.handleToolCall({ id: 'took-in', name: 'sync', input: { mount: 'outer' } });
+  assert.equal(tookIn.success, true, String(tookIn.error));
+  assert.equal((tookIn.data as { totalSynced: number }).totalSynced, 1, 'the outer mount took in a/b/x.txt');
   assert.equal((await before.workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'outer/a/b/x.txt', content: 'an outer draft' } })).success, true);
   await before.stop();
 
@@ -334,6 +352,15 @@ test("the outer mount's tools refuse a path in a nested mount, naming it; deleti
   // Nothing of it is owed any more: a later materialize doesn't list it.
   const after = await call('materialize', {});
   assert.doesNotMatch(JSON.stringify(after), /a\/b\/x\.txt/, JSON.stringify(after));
+  // Nor is it remembered: what disk agreed with about it is gone too, so a
+  // sync without a path passes over the inner mount's directory as ignored,
+  // and has nothing of it to report.
+  const later = await call('sync', { mount: 'outer' });
+  assert.equal(later.success, true, String(later.error));
+  const laterData = later.data as { skipped?: unknown; incomplete?: unknown; passedOver?: unknown };
+  assert.equal(laterData.skipped, undefined, JSON.stringify(laterData));
+  assert.equal(laterData.incomplete, undefined, JSON.stringify(laterData));
+  assert.deepEqual(laterData.passedOver, [{ mount: 'outer', reason: 'ignored by the mount', count: 1 }]);
   // The inner mount answers for its own file.
   assert.equal((await call('read', { path: 'inner/x.txt' })).success, true);
 });
@@ -429,31 +456,44 @@ test("a nested mount whose root doesn't exist yet, configured through a symlinke
   assert.equal(readFileSync(join(outerDir, 'child', 'x.txt'), 'utf8'), "the inner mount's");
 });
 
-test('a mount that comes to lie in another after the module is built is refused there, whatever path reaches it', async (t) => {
-  const { root, stops } = scratch(t, 'af-nested-mount-later-');
-  const outerDir = join(root, 'outer');
-  mkdirSync(outerDir);
-  writeFileSync(join(outerDir, 'top.txt'), 'top');
-  // `via` doesn't exist when the module is built, so the inner root isn't inside the outer one then.
-  const { workspace } = await started(stops, join(root, 'workspace.chronicle'), [
-    { name: 'outer', path: outerDir, mode: 'read-write', watch: 'never', autoMaterialize: true },
-    { name: 'inner', path: join(root, 'via', 'child'), mode: 'read-write', watch: 'never' },
-  ]);
-  symlinkSync(outerDir, join(root, 'via'));
-  mkdirSync(join(outerDir, 'child'));
-  writeFileSync(join(outerDir, 'child', 'x.txt'), "the inner mount's");
-  const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
+for (const autoMaterialize of [true, false]) {
+  test(`a mount that comes to lie in another after the module is built is refused there, whatever path reaches it (autoMaterialize ${autoMaterialize})`, async (t) => {
+    const { root, stops } = scratch(t, 'af-nested-mount-later-');
+    const outerDir = join(root, 'outer');
+    mkdirSync(outerDir);
+    writeFileSync(join(outerDir, 'top.txt'), 'top');
+    // `via` doesn't exist when the module is built, so the inner root isn't inside the outer one then.
+    const { workspace } = await started(stops, join(root, 'workspace.chronicle'), [
+      { name: 'outer', path: outerDir, mode: 'read-write', watch: 'never', followSymlinks: true, autoMaterialize },
+      { name: 'inner', path: join(root, 'via', 'child'), mode: 'read-write', watch: 'never' },
+    ]);
+    symlinkSync(outerDir, join(root, 'via'));
+    mkdirSync(join(outerDir, 'child'));
+    writeFileSync(join(outerDir, 'child', 'x.txt'), "the inner mount's");
+    const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
 
-  const synced = await call('sync', { mount: 'outer' });
-  assert.equal(synced.success, true, String(synced.error));
-  assert.doesNotMatch(JSON.stringify((synced.data as { results: unknown[] }).results), /"synced":\[[^\]]*child\/x\.txt/, 'not taken in');
-  const written = await call('write', { path: 'outer/child/y.txt', content: 'an outer write' });
-  assert.match(JSON.stringify(written), /inside mount \\"inner\\", which is nested in this one/, JSON.stringify(written));
-  assert.throws(() => readFileSync(join(outerDir, 'child', 'y.txt')), "nothing was written into the inner mount's directory");
-  await assert.rejects(workspace.readFileFromDisk('outer/child/x.txt'), /inside mount "inner", which is nested in "outer": use "inner\/x\.txt"/);
-  const raw = await workspace.readBinaryFromDisk('outer/child/x.txt');
-  assert.ok('error' in raw && /inside mount "inner"/.test(raw.error), JSON.stringify(raw));
-});
+    const synced = await call('sync', { mount: 'outer' });
+    assert.equal(synced.success, true, String(synced.error));
+    assert.doesNotMatch(JSON.stringify((synced.data as { results: unknown[] }).results), /"synced":\[[^\]]*child\/x\.txt/, 'not taken in');
+    // The outer mount's tools refuse the path, naming the inner mount, as they
+    // do for a nesting found when the module was built. Without a materialize
+    // after the write, only that refusal can keep the write out of the outer
+    // mount's tree.
+    const written = await call('write', { path: 'outer/child/y.txt', content: 'an outer write' });
+    assert.equal(written.success, false, JSON.stringify(written));
+    assert.match(String(written.error), /"outer\/child\/y\.txt" is inside mount "inner", which is nested in "outer" at child\/: use "inner\/y\.txt"/);
+    const owed = await call('materialize', {});
+    assert.doesNotMatch(JSON.stringify(owed), /child\/y\.txt/, 'the outer mount holds nothing at that path');
+    assert.throws(() => readFileSync(join(outerDir, 'child', 'y.txt')), "nothing was written into the inner mount's directory");
+    // The disk readers refuse it by its name, and through an alias, which
+    // only the check of the path disk opens can see.
+    symlinkSync(join(outerDir, 'child'), join(outerDir, 'alias'));
+    await assert.rejects(workspace.readFileFromDisk('outer/child/x.txt'), /"outer\/child\/x\.txt" is inside mount "inner", which is nested in "outer" at child\/: use "inner\/x\.txt"/);
+    await assert.rejects(workspace.readFileFromDisk('outer/alias/x.txt'), /"outer\/alias\/x\.txt" is inside mount "inner", which is nested in "outer": use "inner\/x\.txt"/);
+    const raw = await workspace.readBinaryFromDisk('outer/alias/x.txt');
+    assert.ok('error' in raw && /"outer\/alias\/x\.txt" is inside mount "inner"/.test(raw.error), JSON.stringify(raw));
+  });
+}
 
 test("a path named with '.' segments is read as its one spelling, and the ignore note says so", async (t) => {
   const { workspace } = workspaceWith(t, ['node_modules/pkg.js', 'top.txt'], 'inner', ['node_modules']);

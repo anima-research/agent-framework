@@ -729,9 +729,30 @@ export class WorkspaceModule implements Module {
       `use "${rest ? `${inner.name}/${rest}` : inner.name}"`;
   }
 
+  /**
+   * The mounts nested in `mount`, each at its mount-relative directory: those
+   * found when the module was built, and any whose root has come to lie in
+   * this one since, read from disk now. The outer mount's tools refuse a path
+   * in a nesting that came about later as they refuse one found then, before
+   * anything reaches its tree.
+   */
+  private nestedAtsOf(mount: MountState): Array<{ name: string; at: string }> {
+    const ats = [...(this.nestedIn.get(mount.config.name) ?? [])];
+    const rootReal = canonicalRoot(mount.config.path);
+    for (const inner of this.nestedRootsOf(mount, rootReal)) {
+      const at = relative(rootReal, inner.real).split(sep).join('/');
+      if (!ats.some((n) => n.name === inner.name && n.at === at)) ats.push({ name: inner.name, at });
+    }
+    return ats;
+  }
+
   /** The mount nested in `mount` that a mount-relative path lies in, if any. */
-  private nestedMountAt(mount: MountState, relativePath: string): { name: string; at: string } | undefined {
-    return this.nestedIn.get(mount.config.name)?.find((n) => relativePath === n.at || relativePath.startsWith(n.at + '/'));
+  private nestedMountAt(
+    mount: MountState,
+    relativePath: string,
+    ats: Array<{ name: string; at: string }> = this.nestedAtsOf(mount),
+  ): { name: string; at: string } | undefined {
+    return ats.find((n) => relativePath === n.at || relativePath.startsWith(n.at + '/'));
   }
 
   /**
@@ -2737,7 +2758,7 @@ export class WorkspaceModule implements Module {
 
     for (const { name, mount } of mountsToMaterialize) {
       if (mount.config.mode === 'read-only') continue;
-      const turn = await this.withMount(mount, async (): Promise<{ blocked: string } | { pushed: PushResult; inPlace: boolean; nested: string[] }> => {
+      const turn = await this.withMount(mount, async (): Promise<{ blocked: string } | { pushed: PushResult; inPlace: boolean; nested: Array<{ path: string; inner: string }> }> => {
         const branchId = store.currentBranch().id;
         const reason = this.mountMaterializeBlockReason(store, mount);
         // Force passes a divergence. The selection follows the evidence, which
@@ -2748,8 +2769,12 @@ export class WorkspaceModule implements Module {
         // What the outer mount still holds in a nested mount's directory (taken
         // in before #280's fix) is never written there, nor deleted there:
         // the files are the inner mount's (agent-framework #280).
-        const nested = selected.filter((path) => this.nestedMountAt(mount, path));
-        const paths = nested.length > 0 ? selected.filter((path) => !this.nestedMountAt(mount, path)) : selected;
+        const ats = this.nestedAtsOf(mount);
+        const nested = selected.flatMap((path) => {
+          const inner = this.nestedMountAt(mount, path, ats);
+          return inner ? [{ path, inner: inner.name }] : [];
+        });
+        const paths = nested.length > 0 ? selected.filter((path) => !this.nestedMountAt(mount, path, ats)) : selected;
         return {
           inPlace,
           nested,
@@ -2774,9 +2799,8 @@ export class WorkspaceModule implements Module {
       for (const s of pushed.skipped) {
         blocked.push({ mount: name, reason: `${s.path}: ${s.reason}` });
       }
-      for (const path of turn.nested) {
-        const inner = this.nestedMountAt(mount, path)!;
-        blocked.push({ mount: name, reason: `${path}: inside mount "${inner.name}", which is nested in this one; delete it here to stop tracking it` });
+      for (const { path, inner } of turn.nested) {
+        blocked.push({ mount: name, reason: `${path}: inside mount "${inner}", which is nested in this one; delete it here to stop tracking it` });
       }
 
       // What disk still owes is kept by its evidence, so the watermark and
