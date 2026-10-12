@@ -47,6 +47,15 @@
  * recorded as a gap. A run whose journal never becomes readable writes
  * nothing, so a later run can't show that interval as a gap: recording it
  * would mean appending to a journal no one could read.
+ *
+ * A write's failure is recovered in this process when the store's view
+ * holds what landed: a failure before the record reached the store (the
+ * sync a delivery's write starts with) or after it (a durable barrier). An
+ * append that throws inside the store may have written a record this
+ * process can't read back, so the journal refuses every later write for the
+ * rest of the run (RecordJournal). The ledger then writes nothing more, its
+ * gap stays open, no stop marker or checkpoint is written, and the next start
+ * reads that record and reports the run as an unclean stop.
  */
 
 import { createHash } from 'node:crypto';
