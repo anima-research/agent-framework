@@ -642,6 +642,19 @@ function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
 }
+
+/** Positive classification for operator/local surfaces: future source names
+ * stay private without extending a fragile allow-list. MCPL events are never
+ * classified here, and any explicit channel id makes the event channel-bound. */
+export function isNonChannelSurfaceEvent(event: ProcessEvent): boolean {
+  const type = event.type;
+  const channelId = event.type === 'external-message'
+    ? event.metadata?.channelId
+    : (event as unknown as { channelId?: unknown }).channelId;
+  return !type.startsWith('mcpl:')
+    && (type === 'external-message' || type === 'api:message')
+    && channelId === undefined;
+}
 const CONVERSATION_ROUTER_STATE_ID = 'framework/conversation-router';
 const INFERENCE_LOG_ID = 'framework/inference-log';
 const PROCESS_LOG_ID = 'framework/process-log';

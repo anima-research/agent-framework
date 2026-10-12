@@ -29,9 +29,11 @@ describe('non-channel surface classification', () => {
       type: 'external-message', source: 'future-operator-console', content: 'hello', metadata: {},
     } as never), true);
     assert.equal(isNonChannelSurfaceEvent({
-      type: 'external-message', source: 'future-operator-console', content: 'hello', metadata: {},
-      channelId: 'discord:g:room',
+      type: 'external-message', source: 'future-operator-console', content: 'hello', metadata: { channelId: 'discord:g:room' },
     } as never), false);
+    assert.equal(isNonChannelSurfaceEvent({
+      type: 'external-message', source: 'bridge', content: 'hello', metadata: { channelId: 'discord:g:room' },
+    }), false);
     assert.equal(isNonChannelSurfaceEvent({ type: 'mcpl:channel-incoming', channelId: 'room' } as never), false);
   });
 });
