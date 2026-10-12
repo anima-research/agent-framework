@@ -5,7 +5,7 @@
  * auto-sync between real filesystem and Chronicle, and manual materialization.
  */
 
-import { constants as fsConstants, realpathSync } from 'node:fs';
+import { constants as fsConstants, lstatSync, readlinkSync, realpathSync } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { open, stat, lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, join, resolve, relative, sep } from 'node:path';
@@ -206,19 +206,30 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
 }
 
 /**
- * A mount root as disk spells it: the canonical path of its nearest existing
- * ancestor, joined with the rest as configured. A root that doesn't exist yet
- * still reads through a symlinked parent, so a mount configured at
- * `via/child`, where `via` links into another mount, is nested in it before
- * `child` is made.
+ * A mount root as disk will spell it: the canonical path of its nearest
+ * existing ancestor, joined with the rest as configured, where a symlink on
+ * the way that leads to nothing yet is read as what it names. So a root that
+ * doesn't exist yet still reads through a symlinked parent, or as a dangling
+ * link's target: a mount configured at `via/child`, where `via` links into
+ * another mount, or at a link to that mount's `child`, is nested in it before
+ * `child` is made. `hops` bounds the links followed, as the platform bounds a
+ * path's.
  */
-function canonicalRoot(path: string): string {
+function canonicalRoot(path: string, hops = 0): string {
   let existing = resolve(path);
   const rest: string[] = [];
   for (;;) {
     try {
       return join(realpathSync.native(existing), ...rest);
     } catch {
+      if (hops < 40) {
+        let target: string | null = null;
+        try {
+          // A relative target is read from the link's directory as disk spells it.
+          if (lstatSync(existing).isSymbolicLink()) target = resolve(canonicalRoot(dirname(existing), hops + 1), readlinkSync(existing));
+        } catch { /* not there, or unreadable: read its parent instead */ }
+        if (target !== null) return join(canonicalRoot(target, hops + 1), ...rest);
+      }
       const parent = dirname(existing);
       if (parent === existing) return resolve(path);
       rest.unshift(basename(existing));

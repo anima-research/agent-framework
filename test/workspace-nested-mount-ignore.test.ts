@@ -24,7 +24,7 @@
 
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, win32 } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
@@ -457,6 +457,32 @@ test("a nested mount whose root doesn't exist yet, configured through a symlinke
 });
 
 for (const autoMaterialize of [true, false]) {
+  test(`a nested mount configured as a link to a directory not made yet is nested from the start (autoMaterialize ${autoMaterialize})`, async (t) => {
+    const { root, stops } = scratch(t, 'af-nested-mount-dangling-');
+    const outerDir = join(root, 'outer');
+    mkdirSync(outerDir);
+    writeFileSync(join(outerDir, 'top.txt'), 'top');
+    // `inner-link` names the outer mount's `child`, which doesn't exist yet.
+    symlinkSync(join(outerDir, 'child'), join(root, 'inner-link'));
+    const outer: MountConfig = { name: 'outer', path: outerDir, mode: 'read-write', watch: 'never', autoMaterialize };
+    const { workspace } = await started(stops, join(root, 'workspace.chronicle'), [
+      outer,
+      { name: 'inner', path: join(root, 'inner-link'), mode: 'read-write', watch: 'never' },
+    ]);
+    assert.deepEqual(outer.ignore, ['child/**'], 'the inner root reads as the link names it, before it exists');
+    const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
+    const written = await call('write', { path: 'outer/child/y.txt', content: 'an outer write' });
+    assert.equal(written.success, false, JSON.stringify(written));
+    assert.match(String(written.error), /"outer\/child\/y\.txt" is inside mount "inner", which is nested in "outer" at child\/: use "inner\/y\.txt"/);
+    assert.equal(existsSync(join(outerDir, 'child')), false, "nothing made the inner mount's directory");
+    const owed = await call('materialize', {});
+    assert.doesNotMatch(JSON.stringify(owed), /child\/y\.txt/, 'the outer mount holds nothing at that path');
+    // Once the root is made, the outer mount's sync passes over it.
+    mkdirSync(join(outerDir, 'child'));
+    writeFileSync(join(outerDir, 'child', 'x.txt'), "the inner mount's");
+    assert.deepEqual(await syncedByOuter(workspace), ['top.txt']);
+  });
+
   test(`a mount that comes to lie in another after the module is built is refused there, whatever path reaches it (autoMaterialize ${autoMaterialize})`, async (t) => {
     const { root, stops } = scratch(t, 'af-nested-mount-later-');
     const outerDir = join(root, 'outer');

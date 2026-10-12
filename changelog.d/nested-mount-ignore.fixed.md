@@ -41,13 +41,15 @@
     An inner mount in a directory whose name starts with `..` (such as
     `..cache`) is now recognized as nested.
     A root that doesn't exist yet is read through its nearest existing
-    directory, so a mount configured at `via/child`, where `via` links into
-    another mount, is nested there before `child` is made. Each pass also
-    reads nesting afresh, so a mount that comes to lie inside another after
-    startup (its root made later, or a symlinked parent created) is treated
-    like one found at startup: the outer mount's tools refuse its paths
-    before anything reaches the outer mount's workspace, and the checks
-    below refuse it however it is reached.
+    directory, and a link on the way that leads to nothing yet is read as
+    what it names. So a mount configured at `via/child`, where `via` links
+    into another mount, or at a link to that mount's `child`, is nested
+    there before `child` is made. Each pass also reads nesting afresh, so a
+    mount that comes to lie inside another after startup (its root made
+    later, or a symlinked parent created) is treated like one found at
+    startup: the outer mount's tools refuse its paths before anything
+    reaches the outer mount's workspace, and the checks below refuse it
+    however it is reached.
   - The outer mount's tools refuse a path inside a nested mount, naming the
     mount to use: `outer/a/b/x.txt` is "inside mount "inner", which is nested
     in "outer" at a/b/: use "inner/x.txt"". That covers `read`, `write`,
