@@ -220,6 +220,7 @@ describe('RecordJournal', () => {
       failAppend = 'after-writing';
       assert.throws(() => journal.append({ n: 'B' }), /EIO: fsync failed/);
       assert.strictEqual(journal.needsReconcile, false, 'no load() on this store can read B back');
+      assert.strictEqual(journal.needsReopen, true, 'what this view holds may lack B until a reopen');
       assert.deepStrictEqual(journal.load().entries.map((e) => e.entry.n), ['A'], 'B is outside this view of the store');
       // A checkpoint now would cover B, unreduced, so nothing more is written.
       const blocked = /append failed inside the store \(EIO: fsync failed\).*until the store is reopened/;
@@ -265,6 +266,7 @@ describe('RecordJournal', () => {
       failNextSync = true;
       assert.throws(() => journal.checkpoint({ seen: ['A'] }, { durable: true }), /disk full/);
       assert.strictEqual(journal.needsReconcile, true);
+      assert.strictEqual(journal.needsReopen, false, 'the checkpoint is in this view of the store');
       assert.throws(() => journal.append({ n: 'C' }), /load\(\) and reduce its tail/);
       assert.deepStrictEqual(journal.load(), { snapshot: { seen: ['A'] }, entries: [] }, 'the checkpoint landed');
       journal.append({ n: 'C' });

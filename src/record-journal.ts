@@ -177,6 +177,14 @@ export class RecordJournal<Entry, Snapshot = never> {
     return this.unreconciled !== null;
   }
 
+  /** True once an append threw inside the store, for the rest of the
+   *  journal's life. What `load()` returns may then lack that append's record,
+   *  so a caller that decides from the journal's contents can't trust them
+   *  until a journal on the reopened store has loaded it. */
+  get needsReopen(): boolean {
+    return this.unreadable !== null;
+  }
+
   /** Append one entry. The returned ref says where it landed, not that it's durable. */
   append(entry: Entry, opts: AppendOptions = {}): JournalRecordRef {
     this.assertReconciled();
