@@ -98,9 +98,11 @@ interface Module {
 
   // Optional
   onAgentSpeech?(agentName: string, content: ContentBlock[], context: SpeechContext): Promise<void>;
-  gatherContext?(agentName: string): Promise<ContextInjection[]>;
+  gatherContext?(agentName: string): Promise<ContextInjection[]>;  // DEPRECATED — see below
 }
 ```
+
+> **Deprecated: `gatherContext` and context injection.** Injected blocks are per-compile overlays — never stored, re-anchored to the latest user message on every compile — so they break prompt-cache prefixes across activations (head-only cache hits on OpenAI lanes) and can land between a tool call and its result ([#171](https://github.com/anima-research/agent-framework/issues/171)). Don't add new implementations: put durable content in the system prompt and deliver changing state as conversation content (an `EventResponse` that adds a message, a push event, a tool result). Existing injections still apply; the framework logs one `[deprecated]` line per injecting module or MCPL server.
 
 An `EventResponse` can add/edit/remove messages, request inference, signal tool changes, and atomically update module state:
 
@@ -130,7 +132,7 @@ Each agent has a `ContextManager` (from `@connectome/context-manager`) that main
 - **PassthroughStrategy** - No compression, raw message replay up to budget
 - **AutobiographicalStrategy** - Chunks old messages and summarizes them into diary entries, preserving recent context uncompressed
 
-Before inference, modules and MCPL hooks can inject additional context via `gatherContext()`.
+Before inference, modules (`gatherContext()`) and MCPL servers (`context/beforeInference`) can still inject additional context, but **context injection is deprecated** (see the note under Modules and [#171](https://github.com/anima-research/agent-framework/issues/171)).
 
 ### Persistence
 

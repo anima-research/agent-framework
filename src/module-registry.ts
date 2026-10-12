@@ -24,6 +24,7 @@ import type {
   TraceEventListener,
 } from './types/index.js';
 import type { Agent } from './agent.js';
+import { warnContextInjectionDeprecated } from './context-injection-deprecation.js';
 
 const MODULE_STATE_PREFIX = 'modules/';
 
@@ -379,7 +380,12 @@ export class ModuleRegistry {
       );
       let timer: ReturnType<typeof setTimeout> | undefined;
       const promise = Promise.race([
-        module.gatherContext(agentName).then(r => injections.push(...r)),
+        module.gatherContext(agentName).then(r => {
+          // Deprecated mechanism (agent-framework#171): still applied, but
+          // every injecting module is named once on stderr.
+          if (r.length > 0) warnContextInjectionDeprecated('module', module.name);
+          injections.push(...r);
+        }),
         new Promise<void>((_, rej) => {
           timer = setTimeout(
             () => rej(new Error(`gatherContext timed out after ${budgetMs}ms`)),

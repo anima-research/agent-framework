@@ -28,6 +28,7 @@ import type { McplServerRegistry } from './server-registry.js';
 import type { McplServerConnection } from './server-connection.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { CapabilityGrant } from './capability-grant.js';
+import { warnContextInjectionDeprecated } from '../context-injection-deprecation.js';
 
 /** Timeout for beforeInference per server (fail-open). */
 const BEFORE_INFERENCE_TIMEOUT_MS = 5_000;
@@ -275,6 +276,9 @@ export class HookOrchestrator {
             );
             continue;
           }
+          // Deprecated mechanism (agent-framework#171): still applied, but
+          // every injecting server is named once on stderr.
+          warnContextInjectionDeprecated('mcpl-server', server.id, `position "${mcplInj.position}"`);
           injections.push(convertMcplInjection(mcplInj));
         }
       }

@@ -838,7 +838,15 @@ export interface BeforeInferenceResult {
   /** Feature set that provided this response */
   featureSet: string;
 
-  /** Context injections to apply */
+  /**
+   * Context injections to apply.
+   *
+   * @deprecated Context injection is deprecated (agent-framework#171):
+   * injections are never stored and are re-anchored on every compile, which
+   * breaks prompt-cache prefixes. Servers should return an empty array and
+   * deliver state as push events or tool results instead. Hosts still apply
+   * injections for now and log a `[deprecated]` line per injecting server.
+   */
   contextInjections: McplContextInjection[];
 }
 
