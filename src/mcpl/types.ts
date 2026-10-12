@@ -374,7 +374,9 @@ export interface McplServerConfig {
    * accepts a request and never responds would otherwise freeze the awaiting
    * agent turn forever; with the timeout the pending request rejects with a
    * descriptive error, which the framework surfaces as a normal isError
-   * tool_result. Set 0 to disable. Default: 60000 (60 seconds).
+   * tool_result. Set 0 to disable, except for a channels/publish request,
+   * which keeps the 60 s default: its outcome is reported to the resident and
+   * recorded for its draft, so it must end. Default: 60000 (60 seconds).
    */
   requestTimeoutMs?: number;
 
@@ -986,6 +988,17 @@ export interface ChannelCapabilities {
     kind?: string;
     supportsValue?: boolean;
   };
+  /**
+   * MCPL RFC-011: where a `channels/publish` to this channel lands — a
+   * per-channel behavioral declaration, not a capability path. `exact`: a
+   * publish carrying `threadId` lands exactly there (that thread, or the root
+   * for null) or is refused with nothing posted. `root`: the channel has no
+   * threads; a string `threadId` is refused. Absent: no guarantee, and the
+   * framework does not publish there.
+   */
+  publish?: {
+    target: 'exact' | 'root';
+  };
 }
 
 export interface ChannelHistoryRequest {
@@ -1006,9 +1019,13 @@ export interface ChannelContext {
     threadId?: string;
   };
 
-  /** Default channel for outgoing messages */
+  /** Default channel for outgoing messages, and the place in it the agent's
+   *  plain speech is published to, exactly as that publish carries it (MCPL
+   *  RFC-011 §5, amending §14.4): a thread, or null for the root. A server
+   *  that doesn't read it loses nothing. */
   defaultOutgoing?: {
     channelId: string;
+    threadId?: string | null;
   };
 
   /** All candidate channels for this inference */
@@ -1116,6 +1133,8 @@ export interface ChannelsOutgoingChunkParams {
   channelId: string;
   index: number;
   delta: string;
+  /** MCPL RFC-011 §6: the place the stream's final publish targets. */
+  threadId?: string | null;
 }
 
 /**
@@ -1128,6 +1147,8 @@ export interface ChannelsOutgoingCompleteParams {
   conversationId: string;
   channelId: string;
   content: McplContentBlock[];
+  /** MCPL RFC-011 §6: the place the stream's final publish targets. */
+  threadId?: string | null;
 }
 
 /**
@@ -1140,6 +1161,13 @@ export interface ChannelsPublishParams {
   channelId: string;
   stream?: boolean;
   content: McplContentBlock[];
+  /**
+   * MCPL RFC-011: where in the channel to post — a non-empty string for that
+   * thread, null for the channel root; absent is legacy (the server
+   * chooses). Sent only to a channel that declares
+   * `capabilities.publish.target`, and only in the Request form.
+   */
+  threadId?: string | null;
 }
 
 /**
@@ -1148,6 +1176,10 @@ export interface ChannelsPublishParams {
 export interface ChannelsPublishResult {
   delivered: boolean;
   messageId?: string;
+  /** MCPL RFC-011: where the post landed (null: the channel root). */
+  threadId?: string | null;
+  /** MCPL RFC-011: why a publish was refused, or a note on the outcome. */
+  reason?: string;
 }
 
 /**

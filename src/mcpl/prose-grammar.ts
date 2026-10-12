@@ -1,9 +1,7 @@
 /**
- * Explicit-prose routing grammar — the SINGLE definition shared by the
- * delivery path (framework.deliverProse*) and the outgoing-stream router
- * (prose-stream-router.ts). Extracted from framework.ts verbatim so the two
- * parsers cannot drift: a streamed chunk and its eventual delivery must agree
- * on what is a prefix, what is a modifier, and what is body.
+ * Explicit-prose routing grammar — the single definition the delivery path
+ * (framework.deliverProse*, deliverHybridProse) reads. Outgoing streams carry
+ * only what delivery published, so nothing else parses prose.
  *
  * Grammar (docs/explicit-prose-routing.md):
  *   `>>target [!] [body…]`  — target = channel spec or `skip_reply`

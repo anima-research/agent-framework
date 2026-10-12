@@ -41,13 +41,17 @@ export type TraceEvent =
       type: 'inference:started';
       agentName: string;
       /**
-       * The turn-frozen outbound locus (see turnLocusPins) — the channel this
-       * turn's plain prose will be routed to. Omitted for turns with no locus
-       * (heartbeats with no default channel). Observability only, like every
+       * The channel of the turn's speech route (src/speech-routes.ts) — where
+       * this turn's plain prose will be routed. Omitted when the turn has no
+       * channel route: no route at all (such as a heartbeat's turn), a held
+       * turn, or a local surface. Observability only, like every
        * trace field; lets external taps (e.g. a TTS relay) tag the whole
        * activation with its channel without re-deriving routing.
        */
       channelId?: string;
+      /** The server of that channel route, when known: the same channel id
+       *  on another server is another channel. */
+      serverId?: string;
       /** True for a control-plane wake that must not surface typing/prose. */
       silent?: boolean;
     })
@@ -381,6 +385,8 @@ export type TraceEvent =
       conversationId: string;
       serverId: string;
       channelId: string;
+      /** The thread it was posted in; null for the channel root. */
+      threadId: string | null;
       delivered: boolean;
       textLen: number;
       /** The routed prose segment, verbatim. */
@@ -394,8 +400,13 @@ export type TraceEvent =
       conversationId: string;
       /** Empty string when the failure was "no locus at all". */
       channelId: string;
+      /** The thread it was bound for; null for the channel root (or no locus). */
+      threadId: string | null;
       reason: string;
       textLen: number;
+      /** `failed`: nothing was posted; `unknown`: the request was dispatched
+       *  and no valid receipt came back, so it may have been. */
+      outcome?: 'failed' | 'unknown';
     })
 
   // Admin puppet: an operator executed a tool AS an agent and stored the
@@ -555,6 +566,42 @@ export type TraceEvent =
       type: 'host:quiesced_boot';
       reason?: string;
       since?: number;
+    })
+
+  // Inbound acceptance observation (mcpl/inbound-source.ts): an installed
+  // InboundAcceptanceObserver threw. Delivery is unaffected; the observer's
+  // own coverage is interrupted for that acceptance.
+  | (TraceEventBase & {
+      type: 'inbound:observer-failed';
+      /** Envelope kind of the acceptance the observer failed on. */
+      kind: 'channel' | 'unscoped' | 'surface';
+      error: string;
+    })
+
+  // Held prose drafts (src/prose-drafts.ts): plain speech kept privately
+  // instead of sent; a resident's explicit resend; a deliberate dismissal.
+  | (TraceEventBase & {
+      type: 'prose:drafts-held';
+      agentName: string;
+      reason: 'explicit-send' | 'no-destination' | 'ambiguous' | 'bounced';
+      draftIds: string[];
+      textLen: number;
+    })
+  | (TraceEventBase & {
+      type: 'prose:draft-resent';
+      agentName: string;
+      draftId: string;
+      status: 'delivered' | 'failed' | 'unknown';
+      serverId: string;
+      channelId: string;
+      /** The thread it was sent to; null for the channel root. */
+      threadId: string | null;
+      messageId?: string;
+    })
+  | (TraceEventBase & {
+      type: 'prose:drafts-dismissed';
+      agentName: string;
+      draftIds: string[];
     });
 
 /**

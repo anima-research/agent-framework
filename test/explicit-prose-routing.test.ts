@@ -64,9 +64,13 @@ class ToolboxModule implements Module {
   }
 }
 
+/** A `>>`/`>>>` target as the framework publishes it: on the server its
+ *  target resolved to (the stub's). */
+const pin = (channelId: string) => ({ serverId: 'stub', channelId });
+
 /** Registry stub: two known channels (#alpha guild, laria's DM) + capture. */
 function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'false' | 'throw'> = []) {
-  const routed: Array<{ text: string; locus: string | null }> = [];
+  const routed: Array<{ text: string; locus: unknown }> = [];
   const known: Record<string, { channelId: string; label: string }> = {
     '#alpha': { channelId: 'chan-alpha', label: '#alpha' },
     '#cafe': { channelId: 'discord:g:cafe', label: '#cafe' },
@@ -77,18 +81,27 @@ function stubRegistry(framework: AgentFramework, plan: Array<'delivered' | 'fals
     'discord:dm:99': { channelId: 'discord:dm:99', label: 'DM: laria' },
   };
   const explicit: Record<string, unknown> = {
+    // A target resolves on its server, as the registry's does.
     resolveProseTarget: (spec: string) =>
-      known[spec] ?? { error: `no channel matches "${spec}"` },
-    routeSpeech: async (_agent: string, text: string, locus?: string | null) => {
+      known[spec] ? { serverId: 'stub', ...known[spec] } : { error: `no channel matches "${spec}"` },
+    routeSpeech: async (_agent: string, text: string, locus?: string | null | { channelId: string }) => {
       routed.push({ text, locus: locus ?? null });
       const behavior = plan.shift() ?? 'delivered';
       if (behavior === 'throw') throw new Error('synthetic publication failure');
-      return { delivered: behavior === 'delivered', channelId: locus ?? '' };
+      const channelId = locus && typeof locus === 'object' ? locus.channelId : locus ?? '';
+      return { delivered: behavior === 'delivered', channelId };
     },
+    // The registry's outcome-returning form of routeSpeech, over the same plan.
+    deliverSpeech: async (agent: string, text: string, locus?: string | null | { channelId: string }) => {
+      const result = await (explicit.routeSpeech as (a: string, t: string, l?: unknown) => Promise<{ delivered: boolean; channelId: string }>)(agent, text, locus);
+      return result.delivered
+        ? { status: 'delivered', destination: { serverId: 'stub', channelId: result.channelId }, at: Date.now() }
+        : { status: 'failed', destination: { serverId: 'stub', channelId: result.channelId }, reason: 'stub reported delivered:false', at: Date.now() };
+    },
+    resolveDestination: ({ channelId }: { channelId: string }) => ({ destination: { serverId: 'stub', channelId } }),
     resolveLocus: () => 'world:commons',
-    getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
-    getDescriptor: () => undefined,
+    getDescriptor: () => undefined, publishTarget: () => 'root',
     getChannelTools: () => [],
   };
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(explicit, {
@@ -173,7 +186,7 @@ describe('explicit prose routing', () => {
 
     assert.equal(bounceNotices.length, 1, 'exactly one bounce notice');
     assert.equal(routed.length, 1, 'only the prefixed resend delivered');
-    assert.equal(routed[0]!.locus, 'discord:dm:99', 'delivered to the DM the model named');
+    assert.deepEqual(routed[0]!.locus, pin('discord:dm:99'), 'delivered to the DM the model named, on its server');
     assert.equal(routed[0]!.text, original, 'clipboard substitution is verbatim');
 
     await framework.stop();
@@ -195,8 +208,8 @@ describe('explicit prose routing', () => {
     await framework.runUntilIdle();
 
     assert.deepEqual(routed, [
-      { text: 'first segment', locus: 'chan-alpha' },
-      { text: 'second segment, no prefix', locus: 'chan-alpha' },
+      { text: 'first segment', locus: pin('chan-alpha') },
+      { text: 'second segment, no prefix', locus: pin('chan-alpha') },
     ], 'prefix stripped on wire; sticky target carries the second segment');
 
     await framework.stop();
@@ -240,7 +253,7 @@ describe('explicit prose routing', () => {
 
     assert.equal(membrane.calls.length, 2, 'a second inference ran without any external event');
     assert.deepEqual(routed.map((r) => r.text), ['step one done, continuing', 'step two done']);
-    assert.deepEqual(routed.map((r) => r.locus), ['chan-alpha', 'chan-alpha']);
+    assert.deepEqual(routed.map((r) => r.locus), [pin('chan-alpha'), pin('chan-alpha')]);
 
     await framework.stop();
   });
@@ -291,7 +304,7 @@ describe('explicit prose routing', () => {
     assert.equal(stream.receivedToolResults.length, 1);
     const result = JSON.stringify(stream.receivedToolResults[0]);
     assert.ok(result.includes('destination'), 'help text served as tool result');
-    assert.deepEqual(routed, [{ text: 'got it', locus: 'chan-alpha' }]);
+    assert.deepEqual(routed, [{ text: 'got it', locus: pin('chan-alpha') }]);
 
     await framework.stop();
   });
@@ -308,8 +321,8 @@ describe('explicit prose routing', () => {
     await framework.runUntilIdle();
 
     assert.deepEqual(routed, [
-      { text: 'part one for the channel', locus: 'chan-alpha' },
-      { text: 'part two, just for you\nwith a second line\n>> quoted arrow stays in body', locus: 'discord:dm:99' },
+      { text: 'part one for the channel', locus: pin('chan-alpha') },
+      { text: 'part two, just for you\nwith a second line\n>> quoted arrow stays in body', locus: pin('discord:dm:99') },
     ], 'two envelopes, two destinations; quoted arrow not split');
 
     await framework.stop();
@@ -323,12 +336,12 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     trigger(framework);
     await framework.runUntilIdle();
-    assert.deepEqual(routed, [{ text: 'A message meant for the café.', locus: 'discord:g:cafe' }]);
+    assert.deepEqual(routed, [{ text: 'A message meant for the café.', locus: pin('discord:g:cafe') }]);
     const cm = framework.getAgent('assistant')!.getContextManager();
     const texts = cm.getAllMessages().flatMap(m => m.content)
       .filter(b => b.type === 'text').map(b => (b as { text: string }).text);
     assert.ok(texts.includes(authored), 'source/author view retains exact envelope');
-    assert.ok(texts.includes('[delivered] plain speech → discord:g:cafe'), 'canonical destination receipt enters context');
+    assert.ok(texts.includes('[delivered] plain speech → (stub / discord:g:cafe)'), 'canonical destination receipt enters context, server named');
     await framework.stop();
   });
 
@@ -338,7 +351,8 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     trigger(framework);
     await framework.runUntilIdle();
-    assert.deepEqual(routed, [{ text: 'Ordinary field speech.', locus: 'world:commons' }]);
+    // The route's exact place: its channel, at the root (MCPL RFC-011).
+    assert.deepEqual(routed, [{ text: 'Ordinary field speech.', locus: { channelId: 'world:commons', threadId: null } }]);
     await framework.stop();
   });
 
@@ -371,8 +385,8 @@ describe('explicit prose routing', () => {
     trigger(framework);
     await framework.runUntilIdle();
     assert.deepEqual(routed, [
-      { text: 'first segment', locus: 'discord:g:cafe' },
-      { text: 'second segment, no repeated envelope', locus: 'discord:g:cafe' },
+      { text: 'first segment', locus: pin('discord:g:cafe') },
+      { text: 'second segment, no repeated envelope', locus: pin('discord:g:cafe') },
     ]);
     await framework.stop();
   });
@@ -388,7 +402,7 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     trigger(framework);
     await framework.runUntilIdle();
-    assert.deepEqual(routed, [{ text: 'body follows', locus: 'discord:g:cafe' }]);
+    assert.deepEqual(routed, [{ text: 'body follows', locus: pin('discord:g:cafe') }]);
     await framework.stop();
   });
 
@@ -402,7 +416,7 @@ describe('explicit prose routing', () => {
     const routed = stubRegistry(framework);
     trigger(framework);
     await framework.runUntilIdle();
-    assert.deepEqual(routed, [{ text: 'first', locus: 'discord:g:cafe' }, { text: 'recovered', locus: 'world:commons' }]);
+    assert.deepEqual(routed, [{ text: 'first', locus: pin('discord:g:cafe') }, { text: 'recovered', locus: pin('world:commons') }]);
     await framework.stop();
   });
 
@@ -418,7 +432,7 @@ describe('explicit prose routing', () => {
       trigger(framework);
       await framework.runUntilIdle();
       assert.equal(routed.some(r => r.text.includes('plain text must remain suppressed')), false);
-      assert.deepEqual(routed.filter(r => r.text !== 'fails'), [{ text: 'first', locus: 'discord:g:cafe' }, { text: 'recovered', locus: 'world:commons' }]);
+      assert.deepEqual(routed.filter(r => r.text !== 'fails'), [{ text: 'first', locus: pin('discord:g:cafe') }, { text: 'recovered', locus: pin('world:commons') }]);
       const cm = framework.getAgent('assistant')!.getContextManager();
       const texts = cm.getAllMessages().flatMap(m => m.content).filter(b => b.type === 'text').map(b => (b as { text: string }).text);
       assert.ok(texts.some(t => t.includes('[prose-routing]') && t.includes('>>>#channel {{unsent}}')));
@@ -443,7 +457,15 @@ describe('explicit prose routing', () => {
     const cm = framework.getAgent('assistant')!.getContextManager();
     const texts = cm.getAllMessages().flatMap(m => m.content).filter(b => b.type === 'text').map(b => (b as { text: string }).text);
     assert.ok(texts.includes(authored));
-    assert.ok(texts.some(t => t.startsWith('[delivered] nothing') && t.includes('suppressed')));
+    assert.ok(texts.some(t => t.startsWith('[delivered] nothing') && /2 plain-speech segment\(s\) held as drafts d-[a-z2-9]{5}, d-[a-z2-9]{5}/.test(t)));
+    // The held words are the envelope's body, not its routing syntax; the
+    // destination the resident wrote stays with the draft as a note.
+    const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ text: string; note?: string; reason: string }> } })
+      .proseDrafts.open('assistant').reverse();
+    assert.deepEqual(drafts.map(d => [d.text, d.note, d.reason]), [
+      ['wrong-locus duplicate', 'written for >>>#cafe', 'explicit-send'],
+      ['tool completed', undefined, 'explicit-send'],
+    ]);
     await framework.stop();
   });
 

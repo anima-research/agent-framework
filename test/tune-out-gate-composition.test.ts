@@ -238,3 +238,37 @@ describe('gate composition on subconscious wakes', () => {
     assert.equal(acks.length, 0);
   });
 });
+
+describe('tune-out wakes name their channel', () => {
+  it('the cancel wakes and a subconscious wake each pass the channel, so none takes the fallback route', () => {
+    const requested: Array<[string, string, string | undefined]> = [];
+    const registry = {
+      cancelTuneOut: () => ({ params: PARAMS, wakeCount: 0 }),
+    } as unknown as ChannelRegistry;
+    const hooks = {
+      addMessage: () => '',
+      requestInference: (agentName: string, _reason: string, source: string, channelId?: string) => {
+        requested.push([agentName, source, channelId]);
+      },
+      subconsciousName: () => 'Subconscious',
+      primaryName: () => 'scout',
+      getStoredMessages: () => [],
+      currentSequence: () => 1,
+      setSubconsciousAnchor: () => {},
+      isForkBound: () => false,
+      isPrivilegedAuthor: () => false,
+      allowChannelSpeech: () => false,
+      emitTrace: () => {},
+    } as unknown as TuneOutFrameworkHooks;
+    const coordinator = new TuneOutCoordinator(registry, {} as McplServerRegistry, hooks);
+    assert.deepEqual(coordinator.cancel('disc', '#a', 'resident', 'done'), { ok: true });
+    (coordinator as unknown as { invokeSubconscious(s: string, c: string, t: 'cadence' | 'wake', n: number): void })
+      .invokeSubconscious('disc', '#b', 'cadence', 2);
+    coordinator.stop();
+    assert.deepEqual(requested, [
+      ['scout', 'tune-out', '#a'],
+      ['Subconscious', 'tune-out', '#a'],
+      ['Subconscious', 'tune-out', '#b'],
+    ]);
+  });
+});

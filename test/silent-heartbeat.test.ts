@@ -45,11 +45,11 @@ async function make() {
   const routed: string[] = [];
   const typing: string[] = [];
   (framework as any).channelRegistry = new Proxy({
-    resolveLocus: () => 'world:commons', getDefaultPublishChannel: () => 'world:commons',
+    resolveLocus: () => 'world:commons',
     routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:commons' }; },
     startTyping: (channel: string) => { typing.push(channel); },
     stopTyping: () => {},
-    getChannelTools: () => [], getDescriptor: () => undefined,
+    getChannelTools: () => [], getDescriptor: () => undefined, publishTarget: () => 'root',
   }, { get: (t, p: string) => p in t ? (t as any)[p] : () => undefined });
   return { dir, membrane, mod, framework, routed, typing };
 }
