@@ -18104,20 +18104,24 @@ export class AgentFramework {
             const privateTurn = callingTurn.nonChannelOrigin;
             if (openerAgent
               && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')
-              && this.openLogical.get(agentName) === callingTurn
-              && !privateTurn) {
-              callingTurn.locus = opened;
-              this.lastAnnouncedLocus.set(agentName, opened);
-
+              && this.openLogical.get(agentName) === callingTurn) {
+              if (!privateTurn) {
+                callingTurn.locus = opened;
+                this.lastAnnouncedLocus.set(agentName, opened);
+              }
               result = {
                 ...result,
                 data: {
                   ...(result.data as Record<string, unknown> | undefined),
-                  routing: 'Your plain speech now lands in this channel. Other channels need an explicit send tool.',
+                  routing: privateTurn
+                    ? 'Channel opened for incoming traffic. This turn’s plain speech stays private; use an explicit send tool to publish there.'
+                    : 'Your plain speech now lands in this channel. Other channels need an explicit send tool.',
                 },
               };
               console.error(
-                `[routing] ${agentName}: channel_open -> pin moved to ${opened} (announced in tool result)`,
+                privateTurn
+                  ? `[routing] ${agentName}: channel_open -> private turn pin unchanged (announced in tool result)`
+                  : `[routing] ${agentName}: channel_open -> pin moved to ${opened} (announced in tool result)`,
               );
             }
           }

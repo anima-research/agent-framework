@@ -237,5 +237,3 @@ describe('private non-channel trigger batching', () => {
   });
 
 });
-
-

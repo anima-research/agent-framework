@@ -205,8 +205,9 @@ describe('present while acting', () => {
     framework.pushEvent({
       type: 'external-message',
       source: 'test',
+      channelId: 'test:channel',
       content: 'go',
-      metadata: { channelId: 'test:channel' },
+      metadata: {},
     } as unknown as ProcessEvent);
   }
 
@@ -1524,15 +1525,16 @@ describe('present while acting', () => {
   // result moves that turn's locus and tells the agent. Once the turn has
   // ended, the tool-result handler drops the result, so the agent never reads
   // it, and nothing moves, whether or not a later start has come yet.
-  for (const [label, after, moves] of [
-    ['moves the locus of its turn, still open, when a silent start\'s routing is the live one', 'silent start', true],
-    ['moves no locus once its turn has ended and the next turn has opened', 'next turn', false],
-    ['moves no locus once its turn has settled, before any later start', 'settled', false],
+  for (const [label, after, moves, privateSuccessor] of [
+    ['moves the locus of its turn, still open, when a silent start\'s routing is the live one', 'silent start', true, false],
+    ['moves no locus once its turn has ended and the next turn has opened', 'next turn', false, false],
+    ['cannot redirect a newer private logical turn', 'next turn', false, true],
+    ['moves no locus once its turn has settled, before any later start', 'settled', false, false],
   ] as const) {
     it(`a channel_open whose result lands late ${label}`, async () => {
-      type Routing = { engaged: Set<string>; triggerChannel?: string; locus?: string };
+      type Routing = { engaged: Set<string>; triggerChannel?: string; locus?: string; nonChannelOrigin?: boolean };
       const calling: Routing = { engaged: new Set(), locus: 'chan-before' };
-      const other: Routing = { engaged: new Set(), locus: 'chan-next' };
+      const other: Routing = { engaged: new Set(), locus: privateSuccessor ? undefined : 'chan-next', nonChannelOrigin: privateSuccessor || undefined };
       let resolveOpen!: (result: { success: boolean; data: { channelId: string } }) => void;
       const framework = bareFramework();
       framework.agents = new Map([['assistant', { proseRouting: 'locus' }]]);
@@ -1560,7 +1562,11 @@ describe('present while acting', () => {
 
       assert.equal(calling.triggerChannel, 'discord:guild:observatory', 'the turn that called records the channel it opened');
       assert.equal(calling.locus, moves ? 'discord:guild:observatory' : 'chan-before');
-      assert.deepEqual(other, { engaged: new Set(), locus: 'chan-next' }, 'the other routing state is untouched');
+      assert.deepEqual(other, {
+        engaged: new Set(),
+        locus: privateSuccessor ? undefined : 'chan-next',
+        nonChannelOrigin: privateSuccessor || undefined,
+      }, 'the other routing state is untouched');
       assert.equal((framework.lastAnnouncedLocus as Map<string, string>).get('assistant'),
         moves ? 'discord:guild:observatory' : undefined, "the announce baseline moves with the locus, for a move the agent is told");
       assert.equal(results[0]!.result.data?.routing !== undefined, moves, 'and the result says so only then');
@@ -1806,7 +1812,13 @@ describe('present while acting', () => {
     (registry as { handleChannelToolCall?: unknown }).handleChannelToolCall = async () =>
       ({ success: true, data: { channelId: 'discord:guild:observatory', opened: true } });
     const agent = framework.getAgent('assistant')!;
-    const internals = framework as unknown as { turnRouting: Map<string, { locus?: string; nonChannelOrigin: boolean }> };
+    const internals = framework as unknown as {
+      turnRouting: Map<string, { locus?: string; nonChannelOrigin: boolean }>;
+      pushEvent(event: unknown): void;
+    };
+    const pushed: unknown[] = [];
+    const push = internals.pushEvent.bind(framework);
+    internals.pushEvent = (event: unknown) => { pushed.push(event); push(event); };
     await (framework as unknown as { startAgentStream(agent: unknown, trigger: unknown): Promise<void> })
       .startAgentStream(agent, {
         agentName: 'assistant', reason: 'external-message', source: 'tui', timestamp: Date.now(), nonChannelOrigin: true,
@@ -1815,8 +1827,7 @@ describe('present while acting', () => {
     assert.deepEqual(routed, []);
     assert.equal(internals.turnRouting.get('assistant')?.locus, undefined);
     assert.equal(internals.turnRouting.get('assistant')?.nonChannelOrigin, true);
-    const results = membrane.lastStream!.receivedToolResults.flat() as Array<{ content?: unknown }>;
-    assert.ok(JSON.stringify(results).includes('plain speech stays private'));
+    assert.ok(JSON.stringify(pushed).includes('plain speech stays private'));
     await framework.stop();
   });
 
