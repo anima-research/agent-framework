@@ -143,7 +143,7 @@ describe('speech route across a logical turn', () => {
     assert.deepEqual(opens, ['chan-open'], 'the channel was opened');
     assert.deepEqual(i.turnRoutes.get('scout'), { route: null, silent: {} }, 'and no route set');
     const result = JSON.stringify(membrane.lastStream?.receivedToolResults ?? []);
-    assert.match(result, /This is a silent wake, so your plain speech stays private this turn; to post there, use a send tool\./);
+    assert.match(result, /This call came from a silent wake, so its plain speech stays private; to post there, use a send tool\./);
     await framework.stop();
   });
 
@@ -156,12 +156,23 @@ describe('speech route across a logical turn', () => {
     // is running, and the record says the turn was silent.
     const record = { route: null, silent: {} };
     i.turnRoutes.set('scout', record as never);
+    // The open's result, as it is delivered.
+    const results: Array<{ type?: string; callId?: string; result?: { data?: { routing?: string } } }> = [];
+    const host = framework as unknown as { pushEvent(event: unknown): unknown };
+    const pushEvent = host.pushEvent.bind(framework);
+    host.pushEvent = (event) => {
+      if ((event as { type?: string }).type === 'tool-result') results.push(event as never);
+      return pushEvent(event);
+    };
     (framework as unknown as { dispatchChannelToolCall(agentName: string, call: unknown): void })
       .dispatchChannelToolCall('scout', { id: 'o1', name: 'channel_open', input: { channelId: 'chan-open' } });
     await new Promise((r) => setImmediate(r));
     await framework.runUntilIdle();
     assert.deepEqual(opens, ['chan-open'], 'the channel was opened');
     assert.equal(i.turnRoutes.get('scout'), record, 'and the silent record kept, with no route');
+    const delivered = results.find((r) => r.callId === 'o1');
+    assert.match(delivered?.result?.data?.routing ?? '', /^Opened\. This call came from a silent wake, so its plain speech stays private; to post there, use a send tool\.$/,
+      'its result, delivered, says so');
     await framework.stop();
   });
 

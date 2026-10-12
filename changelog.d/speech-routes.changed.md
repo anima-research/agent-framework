@@ -42,51 +42,51 @@
     a wake gets no route, never the fallback. An ambient-only batch names
     its own conversations: it routes to one, or holds when it names several.
   - **A framework wake that continues a turn names that turn's
-    conversations.** Such wakes are the retry after a rewind (for a
-    refusal, an unstick's forced rewind, or an inference failure), an
-    unstick itself, the results of a non-streaming tool round, an
-    explicit-prose continuation or bounce, and a provider-cooldown retry
-    that holds no wake of its own. The framework reads the turn's record
-    when the wake's batch starts, which is after the continued turn has
-    ended, and gives the wake that turn's conversations as addressed ones.
-    So its words go where the turn's had gone by its end, after a
-    `channel_open` or a hold. A bounce queues its wake at once; one that
-    lands while a later turn is alive wakes after that turn and names its
-    conversations instead, where the resident last spoke. Beside a
-    heartbeat those conversations keep the turn, beside an ambient arrival
-    from elsewhere they win, and beside an addressed one from elsewhere the
-    turn is held. They count as older than anything batched with them, so
-    a newer message in the same conversation gives the reply edge. A held
-    turn's continuation names the conversations its hold named. With
-    inferred prose routing, a continuation names a conversation exactly
-    when the turn it continues did, or when it carries that turn's
-    conversations. So a turn whose words had no place although its wake
-    named a conversation (a reaction, a channel a fork owns) gives its
-    continuation no place either, never the fallback, and a turn whose
-    wake named none, and that found no fallback place, gives a continuation
-    that takes the fallback as it stands then. A fallback turn's
-    continuation keeps that turn's place as its own fallback, so a message
-    that comes in elsewhere without waking the agent doesn't move the rest
-    of the reply. A wake batched with the continuation names its own
-    conversation and takes the turn, as any arrival does. A kept place
-    that the fork rule or its channel's publish target now refuses gives
-    no place, to the continuation and to those after it. A continuation
-    names an unroutable conversation too. One its channel's publish target
-    refused is checked again when the continuation starts, so it takes a
-    place once its channel can take one. One that came from a candidate
-    marked unroutable stays so, unless the framework finds the server of a
-    channel that had none: a raw id the host couldn't resolve never becomes
-    a route. A silent
-    tick's own continuations, such as its retries, are silent ticks too,
-    with the tick's prompt and stamp, and a restart or a guard retry keeps
-    the tick's record. The one exception is a restart batched with an
-    ordinary wake: it runs as an ordinary turn, as on main, and so do the
-    continuations after it. An unstick and a bounce's resend are repairs
-    rather than part of the turn they follow, and are always ordinary
-    turns, as on main. The new turn is otherwise fresh, as
-    any is: a rewind sheds the turn whose choices those were. An unstick
-    is refused while a turn is in progress, including the moments the agent
-    reads idle at a turn's start and end.
+    conversations.** Such wakes are the retry after a rewind (for a refusal,
+    an unstick's forced rewind, or an inference failure), an unstick itself,
+    the results of a non-streaming tool round, an explicit-prose
+    continuation or bounce, and a provider-cooldown retry that holds no wake
+    of its own. The framework reads the turn's record when the wake's batch
+    starts, which is after the continued turn has ended, and gives the wake
+    that turn's conversations as addressed ones. So its words go where the
+    turn's had gone by its end, after a `channel_open` or a hold. A bounce
+    queues its wake at once; one that lands while a later turn is alive
+    wakes after that turn and names its conversations instead, where the
+    resident last spoke. Beside a heartbeat those conversations keep the
+    turn, beside an ambient arrival from elsewhere they win, and beside an
+    addressed one from elsewhere the turn is held. An addressed message
+    batched in the same conversation takes the reply edge if it is newer
+    than the one the turn answered, and an older one doesn't. A held turn's
+    continuation names the conversations its hold named. With inferred prose
+    routing, a continuation names a conversation exactly when the turn it
+    continues did, or when it carries that turn's conversations. So a turn
+    whose words had no place although its wake named a conversation (a
+    reaction, a channel a fork owns) gives its continuation no place either,
+    never the fallback, and a turn whose wake named none, and that found no
+    fallback place, gives a continuation that takes the fallback as it
+    stands then. A fallback turn's continuation keeps that turn's place as
+    its own fallback, so a message that comes in elsewhere without waking
+    the agent doesn't move the rest of the reply. A wake batched with that
+    continuation that names a conversation takes the turn, as any arrival
+    does. A kept place that the fork rule or its channel's publish target
+    now refuses gives no place, to the continuation and to those after it. A
+    continuation names an unroutable conversation too. One its channel's
+    publish target refused is checked again when the continuation starts, so
+    it takes a place once its channel can take one. One that came from a
+    candidate marked unroutable stays so: a channel with no server becomes a
+    route only once the framework finds its server, and a raw id named with
+    its server never does. A silent tick's own continuations, such as its
+    retries, are silent ticks too, with the tick's prompt and stamp, and a
+    restart or a guard retry keeps the tick's record. The exception is a
+    batch that also holds an ordinary wake: it runs as an ordinary turn, as
+    on main, and so do the continuations after it. A restart in such a batch
+    had no route to keep, so its route is decided from the batch's wakes, as
+    a new turn's is. An unstick and a bounce's resend are repairs rather
+    than part of the turn they follow, and are always ordinary turns, as on
+    main. The new turn is otherwise fresh, as any is: a rewind sheds the
+    turn whose choices those were. An unstick is refused while a turn is in
+    progress, including the moments the agent reads idle at a turn's start
+    and end.
   - **An ephemeral subagent never takes the fallback.** Its prose isn't a
     channel's, and before speech routes a subagent's prose between its tool
     calls could reach the resident's live channel this way.

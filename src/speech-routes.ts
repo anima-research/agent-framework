@@ -127,12 +127,18 @@ export interface TurnRoute {
    *  `neverRoutes` says the conversation came from a candidate marked
    *  unroutable (a raw id the host couldn't resolve to a registered
    *  channel, or a channel with no server), so a continuation keeps it
-   *  marked: only finding the channel's server can make it a route. */
+   *  marked. A channel with no server becomes a route only once the
+   *  framework finds its server; one named with its server never does,
+   *  whatever the registry says. */
   unroutable?: { conversation: ConversationRef; reason: UnroutableReason; neverRoutes?: true };
   /** The turn's wake named a conversation (a channel, a thread, an author
    *  or a local surface), candidate or not. A continuation of the turn then
    *  names one too (continuationOf). */
   named?: true;
+  /** When the message the route's reply edge names (`replyTo`) arrived. A
+   *  continuation's candidate for the route carries it, so only a newer
+   *  message batched in the same conversation takes the reply edge. */
+  replyAt?: number;
 }
 
 export type UnroutableReason = 'untargetable' | 'thread' | 'unresolved';
@@ -240,8 +246,10 @@ export function inferTurnRoute(
     const refusal = routeRefusal(conversation, targetOf);
     if (refusal) return { route: null, unroutable: { conversation, reason: refusal } };
     const key = conversationKey(conversation);
-    const replyTo = newestOf(considered(candidates.filter((c) => conversationKey(c.conversation) === key)))?.messageId;
-    return { route: replyTo && home.kind === 'channel' ? { ...home, replyTo } : home };
+    const newest = newestOf(considered(candidates.filter((c) => conversationKey(c.conversation) === key)));
+    return newest?.messageId && home.kind === 'channel'
+      ? { route: { ...home, replyTo: newest.messageId }, replyAt: newest.at }
+      : { route: home };
   }
   const pool = considered(candidates);
   if (pool.length === 0) return { route: fallbackRoute(fallback, targetOf) };
@@ -284,6 +292,7 @@ export function inferTurnRoute(
           ...(c.label ? { label: c.label } : {}),
           origin: 'trigger',
         },
+        ...(chosen!.messageId ? { replyAt: chosen!.at } : {}),
       };
 }
 
@@ -312,11 +321,14 @@ function fallbackRoute(fallback: RouteCandidate | null | undefined, targetOf: Pu
  * rewind retry, an unstick, a prose continuation or bounce), as candidates:
  * the ones that turn answered, so the continuation's words go where the
  * turn's would have. A held turn names each conversation it held between; a
- * turn with a route names its route's conversation, reply edge kept; a turn
- * whose one conversation couldn't take plain speech names that one, to be
- * checked again as any candidate is. Each counts as addressed, since the
- * resident was answering it: an ambient arrival batched beside it doesn't
- * take the turn, and an addressed one from elsewhere holds it.
+ * turn with a route names its route's conversation, reply edge kept, at the
+ * time its reply message arrived (`replyAt`), so only a newer message in
+ * that conversation takes the reply edge; a turn whose one conversation
+ * couldn't take plain speech names that one. A conversation refused for its
+ * publish target is checked again as any candidate is; one from a candidate
+ * marked unroutable stays marked (`neverRoutes`). Each counts as addressed,
+ * since the resident was answering it: an ambient arrival batched beside it
+ * doesn't take the turn, and an addressed one from elsewhere holds it.
  *
  * A turn that answered no conversation gives none: a fallback turn, or a
  * turn whose words had no place. What its continuation names then is
@@ -336,11 +348,12 @@ export function continuationCandidates(turn: TurnRoute | undefined, at: number):
   if (turn.route) {
     const { route } = turn;
     if (route.origin === 'fallback') return [];
+    const replyTo = route.kind === 'channel' ? route.replyTo : undefined;
     return [{
       conversation: routeConversation(route),
       addressed: true,
-      at,
-      ...(route.kind === 'channel' && route.replyTo ? { messageId: route.replyTo } : {}),
+      at: replyTo && turn.replyAt !== undefined ? turn.replyAt : at,
+      ...(replyTo ? { messageId: replyTo } : {}),
     }];
   }
   if (turn.unroutable) {

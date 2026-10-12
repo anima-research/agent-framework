@@ -7123,7 +7123,7 @@ export class AgentFramework {
                 type: 'text',
                 text: fallback
                   ? `[routing] ${cause}. Your unaddressed plain speech was going to ${describeConversation(current)}, ` +
-                    'where the last message had come in when this reply began, because nothing in the wake ' +
+                    'where the last message had come in when your reply began (a continuation of it keeps that place), because nothing in the wake ' +
                     'that began it named a conversation. ' +
                     'For the rest of this turn it is held as drafts instead. ' +
                     `Answer ${competing.length === 1 ? 'it' : 'any of them'} with an explicit send (or a channel_open); ` +
@@ -9227,13 +9227,16 @@ export class AgentFramework {
         wakeChannelId: budgetRestart ? undefined : provReq?.wakeChannelId,
         wakeAt: budgetRestart ? undefined : provReq?.wakeAt,
         // Every conversation this batch carries: a true new turn infers its
-        // speech route from all of them (shelf-355), never from one pick.
-        routeCandidates: budgetRestart ? undefined : requests.flatMap((r) => r.routeCandidates ?? []),
+        // speech route from all of them (shelf-355), never from one pick. A
+        // restart keeps its turn's route and reads them only when it
+        // continues a silent tick that this batch makes ordinary, which had
+        // no route to keep (beginAgentTurn).
+        routeCandidates: requests.flatMap((r) => r.routeCandidates ?? []),
         // Whether any of them named a conversation, candidate or not: only a
         // batch none of whose requests did takes the fallback route.
-        namesConversation: !budgetRestart && requests.some((r) => r.namesConversation) ? true : undefined,
+        namesConversation: requests.some((r) => r.namesConversation) ? true : undefined,
         // A continued fallback turn's place, kept as this batch's fallback.
-        fallbackPlace: budgetRestart ? undefined : requests.find((r) => r.fallbackPlace)?.fallbackPlace,
+        fallbackPlace: requests.find((r) => r.fallbackPlace)?.fallbackPlace,
       });
     }
   }
@@ -11353,6 +11356,59 @@ export class AgentFramework {
   }
 
   /**
+   * Decides a turn's speech route from its wake: at a true new turn, and at
+   * a restart that continues a silent tick a batched ordinary wake made
+   * ordinary, which had no route to keep.
+   */
+  private decideTurnRoute(agent: Agent, trigger: InferenceRequest | undefined): void {
+    // The route comes from a fork's home, else from the
+    // wake's candidates — addressed ones first, one conversation only,
+    // else held (src/speech-routes.ts). A wake that names no
+    // conversation at all (a heartbeat, a timer, a self-wake) takes the
+    // fallback, the last delivered message's conversation, as before
+    // speech routes. A framework wake that continues a turn (a rewind
+    // retry, an unstick, a prose continuation or bounce) carries the
+    // conversations that turn answered as its candidates, or a fallback
+    // turn's place as its fallback (continuationFor), so it is inferred
+    // here like any other.
+    //
+    // The fork rule applies here, where the route is decided, to every
+    // wake's candidates: a fork takes only its home's, and no other agent
+    // takes a channel a fork owns, as ownership stands now. A wake can
+    // wait in the queue while a fork claims or gives up a channel. A
+    // candidate it leaves out still named its conversation, so it still
+    // keeps the fallback away. That includes an unroutable candidate,
+    // which never routes but competes: a fork's channel never holds
+    // another agent's turn.
+    const turn = inferTurnRoute(
+      (trigger?.routeCandidates ?? [])
+        .map((c) => this.resolvedCandidate(c))
+        .filter((c) => this.mayTakeCandidate(agent.name, c)),
+      this.homeRoute(agent.name),
+      (c) => this.publishTargetOf(c),
+      // Only a resident's wake that named no conversation, candidate or
+      // not, takes the fallback: a reaction, a system marker or a channel
+      // a fork owns names one, and gets no route as before. An ephemeral
+      // subagent never takes it: its prose is its caller's business,
+      // never a channel's. (A conversation fork's name is in the same
+      // set, but a fork's home always wins before any fallback is read.)
+      // A continued fallback turn keeps that turn's place, under the same
+      // fork rule as any fallback.
+      trigger?.namesConversation || this.usedEphemeralAgentNames.has(agent.name)
+        ? null
+        : trigger?.fallbackPlace
+          ? (this.mayTakeCandidate(agent.name, trigger.fallbackPlace) ? trigger.fallbackPlace : null)
+          : this.fallbackCandidate(agent.name),
+    );
+    // A continued fallback whose kept place was refused has no place,
+    // and its own continuations take none either: it counts as named.
+    const named = trigger?.namesConversation || (!!trigger?.fallbackPlace && !turn.route);
+    this.turnRoutes.set(agent.name, { ...turn, ...(named ? { named: true as const } : {}) });
+    this.midTurnInputSignals.delete(agent.name);
+    if (!trigger?.suppressProse) this.announceRouteIfChanged(agent.name, turn);
+  }
+
+  /**
    * Body of startAgentStream, split out so the caller's try/finally owns the
    * turn token unconditionally. Returns true iff the token was handed off to
    * driveStream (whose finally then owns clearing it).
@@ -11522,51 +11578,7 @@ export class AgentFramework {
         this.midTurnInputSignals.delete(agent.name);
         this.turnRoutes.delete(agent.name);
       } else if (attempt === 0) {
-        // A true new turn: the route comes from a fork's home, else from the
-        // wake's candidates — addressed ones first, one conversation only,
-        // else held (src/speech-routes.ts). A wake that names no
-        // conversation at all (a heartbeat, a timer, a self-wake) takes the
-        // fallback, the last delivered message's conversation, as before
-        // speech routes. A framework wake that continues a turn (a rewind
-        // retry, an unstick, a prose continuation or bounce) carries the
-        // conversations that turn answered as its candidates, or a fallback
-        // turn's place as its fallback (continuationFor), so it is inferred
-        // here like any other.
-        //
-        // The fork rule applies here, where the route is decided, to every
-        // wake's candidates: a fork takes only its home's, and no other agent
-        // takes a channel a fork owns, as ownership stands now. A wake can
-        // wait in the queue while a fork claims or gives up a channel. A
-        // candidate it leaves out still named its conversation, so it still
-        // keeps the fallback away. That includes an unroutable candidate,
-        // which never routes but competes: a fork's channel never holds
-        // another agent's turn.
-        const turn = inferTurnRoute(
-          (trigger?.routeCandidates ?? [])
-            .map((c) => this.resolvedCandidate(c))
-            .filter((c) => this.mayTakeCandidate(agent.name, c)),
-          this.homeRoute(agent.name),
-          (c) => this.publishTargetOf(c),
-          // Only a resident's wake that named no conversation, candidate or
-          // not, takes the fallback: a reaction, a system marker or a channel
-          // a fork owns names one, and gets no route as before. An ephemeral
-          // subagent never takes it: its prose is its caller's business,
-          // never a channel's. (A conversation fork's name is in the same
-          // set, but a fork's home always wins before any fallback is read.)
-          // A continued fallback turn keeps that turn's place, under the same
-          // fork rule as any fallback.
-          trigger?.namesConversation || this.usedEphemeralAgentNames.has(agent.name)
-            ? null
-            : trigger?.fallbackPlace
-              ? (this.mayTakeCandidate(agent.name, trigger.fallbackPlace) ? trigger.fallbackPlace : null)
-              : this.fallbackCandidate(agent.name),
-        );
-        // A continued fallback whose kept place was refused has no place,
-        // and its own continuations take none either: it counts as named.
-        const named = trigger?.namesConversation || (!!trigger?.fallbackPlace && !turn.route);
-        this.turnRoutes.set(agent.name, { ...turn, ...(named ? { named: true as const } : {}) });
-        this.midTurnInputSignals.delete(agent.name);
-        if (!trigger?.suppressProse) this.announceRouteIfChanged(agent.name, turn);
+        this.decideTurnRoute(agent, trigger);
       }
     }
 
@@ -11589,16 +11601,14 @@ export class AgentFramework {
       }
       this.proseTargetPins.delete(agent.name);
       this.proseContinuations.delete(agent.name);
-    } else if (continuingTurn) {
-      // A restart batched with an ordinary wake runs as an ordinary turn
-      // (processInferenceRequests), so its record stops being a silent
-      // tick's, and so do its continuations. It keeps its route, as any
-      // restart does.
-      const record = this.turnRoutes.get(agent.name);
-      if (record?.silent) {
-        const { silent: _silent, ...ordinary } = record;
-        this.turnRoutes.set(agent.name, ordinary);
-      }
+    } else if (continuingTurn && this.turnRoutes.get(agent.name)?.silent) {
+      // A silent tick's restart batched with an ordinary wake runs as an
+      // ordinary turn (processInferenceRequests). The tick had no route to
+      // keep, so its route is decided now from the batch's wakes, as a true
+      // new turn's is, and its record stops being a silent tick's. In
+      // explicit or disabled prose routing there is no inferred route.
+      if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') this.turnRoutes.delete(agent.name);
+      else this.decideTurnRoute(agent, trigger);
     }
 
     this.touchEphemeralRun(agent.name, true);
@@ -17542,7 +17552,7 @@ export class AgentFramework {
               // A silent control-plane wake keeps its plain speech private:
               // the open stands, and no route is set. The turn's record says
               // so, during the turn and after it ends.
-              routing = 'Opened. This is a silent wake, so your plain speech stays private this turn; ' +
+              routing = 'Opened. This call came from a silent wake, so its plain speech stays private; ' +
                 'to post there, use a send tool.';
             } else if (openInput?.setSpeechTarget !== false) {
               const resolved = this.channelRegistry!.resolveDestination({

@@ -884,10 +884,13 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.runUntilIdle();
     assert.deepEqual(i.turnRoutes.get('scout'), { route: null, named: true }, "no route into the fork's channel, and none elsewhere");
     // The next continuation of the same reply has no place either.
+    const before = i.turnRoutes.get('scout');
     i.pendingRequests.push(i.continuationRequest('scout', 'inference-failure-rewind-retry'));
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'still not moved' }]));
     await framework.runUntilIdle();
-    assert.equal(i.turnRoutes.get('scout')?.route, null);
+    assert.equal(membrane.calls.length, 3, 'the second continuation ran');
+    assert.notEqual(i.turnRoutes.get('scout'), before, 'and wrote its own record');
+    assert.deepEqual(i.turnRoutes.get('scout'), { route: null, named: true });
     assert.deepEqual(published.map((p) => (p.to as { channelId: string }).channelId), ['discord:guild:elsewhere'], 'only the tick was published');
     i.conversationAgentHomes.delete('fork-1');
     await framework.stop();
@@ -1084,6 +1087,30 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
+  it("the inference policy sees a continuation already filled from its turn's record", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'first answer' }]));
+    const framework = await makeFramework();
+    const { registry } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
+    internals(framework).channelRegistry = registry;
+    const i = internals(framework);
+    framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: hi'));
+    await framework.runUntilIdle();
+    const policy = (framework as unknown as { inferencePolicy: { shouldInfer(agentName: string, requests: unknown[], state: unknown): boolean } }).inferencePolicy;
+    const seen: Array<{ reason: string; namesConversation?: true; routeCandidates?: Array<{ conversation: { channelId?: string } }> }> = [];
+    const shouldInfer = policy.shouldInfer.bind(policy);
+    policy.shouldInfer = (agentName, requests, state) => {
+      seen.push(...(requests as typeof seen));
+      return shouldInfer(agentName, requests, state);
+    };
+    i.pendingRequests.push(i.continuationRequest('scout', 'refusal-rewind-retry'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'second answer' }]));
+    await framework.runUntilIdle();
+    const retry = seen.find((r) => r.reason === 'refusal-rewind-retry');
+    assert.deepEqual([retry?.namesConversation, retry?.routeCandidates?.map((c) => c.conversation.channelId)],
+      [true, ['discord:guild:chanA']]);
+    await framework.stop();
+  });
+
   it("a continuation's conversation counts as older than a message batched with it, so that message gives the reply edge", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'first answer' }]));
     const framework = await makeFramework();
@@ -1106,9 +1133,9 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
-  it("a silent tick's record survives a restart, and a restart batched with an ordinary wake runs ordinary and drops it", async () => {
+  it("a silent tick's record survives a restart or a guard retry, and a restart batched with an ordinary wake runs ordinary, routed by that wake", async () => {
     const framework = await makeFramework();
-    const { registry } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
+    const { registry, published } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
     internals(framework).channelRegistry = registry;
     const i = internals(framework);
     const scout = framework.getAgent('scout')!;
@@ -1122,17 +1149,28 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.runUntilIdle();
     const record = i.turnRoutes.get('scout') as { route: unknown; named?: true; silent?: { silentHeartbeat?: { eventId?: string } } };
     assert.deepEqual([record.route, record.named, record.silent?.silentHeartbeat?.eventId], [null, true, 'hb-9']);
-    // Its restart, alone: silent, and the record is kept whole.
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'still private' }]));
-    await start({ reason: 'context_budget_restart', suppressProse: true, silentHeartbeat });
-    await framework.runUntilIdle();
-    assert.equal(i.turnRoutes.get('scout'), record, 'the restart kept the record');
-    // A restart that an ordinary wake shared a batch with runs ordinary: the
-    // record keeps its route and its naming, and stops being silent.
+    // Its restart and its guard retry, each alone: silent, and the record is kept whole.
+    for (const reason of ['context_budget_restart', 'tool_result_guard_retry']) {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'still private' }]));
+      await start({ reason, suppressProse: true, silentHeartbeat });
+      await framework.runUntilIdle();
+      assert.equal(i.turnRoutes.get('scout'), record, `the ${reason} kept the record`);
+    }
+    // A restart that shares its batch with an ordinary wake runs ordinary.
+    // The tick had no route to keep, so the wake's conversation decides it.
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ordinary now' }]));
-    await start({ reason: 'context_budget_restart' });
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'context_budget_restart', source: 'framework', timestamp: Date.now(), suppressProse: true, silentHeartbeat } as never,
+      {
+        agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(), namesConversation: true,
+        routeCandidates: [{ conversation: { kind: 'channel', serverId: 'discord', channelId: 'discord:guild:asked' }, addressed: true, at: Date.now(), messageId: 'm-asked' }],
+      } as never,
+    );
     await framework.runUntilIdle();
-    assert.deepEqual(i.turnRoutes.get('scout'), { route: null, named: true });
+    const ordinary = i.turnRoutes.get('scout') as { route: { channelId?: string; replyTo?: string } | null; named?: true; silent?: unknown };
+    assert.deepEqual([ordinary.route?.channelId, ordinary.route?.replyTo, ordinary.named, ordinary.silent],
+      ['discord:guild:asked', 'm-asked', true, undefined]);
+    assert.deepEqual(published.map((p) => [(p.to as { channelId: string }).channelId, p.text]), [['discord:guild:asked', 'ordinary now']]);
     await framework.stop();
   });
 
@@ -1201,10 +1239,14 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.equal(turn.route, null);
     assert.equal(turn.unroutable?.reason, 'unresolved');
     // Its retry names the same conversation, still marked: no route.
+    const first = i.turnRoutes.get('scout');
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'still held' }]));
     i.pendingRequests.push(i.continuationRequest('scout', 'refusal-rewind-retry'));
     await framework.runUntilIdle();
-    assert.equal(i.turnRoutes.get('scout')?.route, null);
+    assert.equal(membrane.calls.length, 2, 'the retry ran');
+    const retried = i.turnRoutes.get('scout') as { route: unknown; unroutable?: { reason: string; neverRoutes?: true } };
+    assert.notEqual(retried, first, 'and wrote its own record');
+    assert.deepEqual([retried.route, retried.unroutable?.reason, retried.unroutable?.neverRoutes], [null, 'unresolved', true]);
     assert.deepEqual(published, [], 'nothing went to the raw id');
     await framework.stop();
   });
@@ -1231,7 +1273,9 @@ describe('Trunk channel routing (item-3 redux)', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'not to the raw id' }]));
     i.pendingRequests.push(i.continuationRequest('scout', 'refusal-rewind-retry'));
     await framework.runUntilIdle();
-    assert.equal(i.turnRoutes.get('scout')?.route, null);
+    assert.equal(membrane.calls.length, 2, 'the retry ran');
+    const retried = i.turnRoutes.get('scout') as { route: unknown; hold?: unknown; unroutable?: { reason: string; neverRoutes?: true } };
+    assert.deepEqual([retried.route, retried.hold, retried.unroutable?.reason, retried.unroutable?.neverRoutes], [null, undefined, 'unresolved', true]);
     assert.deepEqual(published, [], 'nothing went to the raw id');
     i.conversationAgentHomes.delete('fork-1');
     await framework.stop();

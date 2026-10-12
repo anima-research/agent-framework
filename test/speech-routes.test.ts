@@ -47,13 +47,13 @@ describe('inferTurnRoute', () => {
       candidate(channel('elsewhere'), true, 4, 'm-else'),
       candidate(channel('home', { threadId: 't1' }), true, 5, 'm-thread'),
     ], home, exactEverywhere);
-    assert.deepEqual(turn, { route: { ...home, replyTo: 'm-new' } });
+    assert.deepEqual(turn, { route: { ...home, replyTo: 'm-new' }, replyAt: 3 });
     // Addressed candidates in the home conversation come first, as for an inferred route.
     const addressed = inferTurnRoute([
       candidate(channel('home'), true, 1, 'm-asked'),
       candidate(channel('home'), false, 2, 'm-later'),
     ], home, rootEverywhere);
-    assert.deepEqual(addressed, { route: { ...home, replyTo: 'm-asked' } });
+    assert.deepEqual(addressed, { route: { ...home, replyTo: 'm-asked' }, replyAt: 1 });
     // A candidate without a message gives no reply edge.
     assert.deepEqual(inferTurnRoute([candidate(channel('home'), true, 1)], home, rootEverywhere), { route: home });
   });
@@ -389,6 +389,9 @@ describe('continuationCandidates and continuationOf', () => {
     assert.deepEqual(unresolved, [{ conversation: channel('dup'), addressed: true, at: 3 }]);
     const untargetable = continuationCandidates({ route: null, unroutable: { conversation: channel('quiet'), reason: 'untargetable' } }, 3);
     assert.deepEqual(untargetable, [{ conversation: channel('quiet'), addressed: true, at: 3 }]);
+    const thread = channel('forum', { threadId: 't1' });
+    assert.deepEqual(continuationCandidates({ route: null, unroutable: { conversation: thread, reason: 'thread' } }, 3),
+      [{ conversation: thread, addressed: true, at: 3 }]);
     // One that came from a candidate marked unroutable stays marked: a raw
     // id named with its server never routes, and a channel with no server
     // routes only once the framework finds its server.
@@ -413,6 +416,24 @@ describe('continuationCandidates and continuationOf', () => {
     assert.deepEqual(continuationOf({ route: null }, 1), { candidates: [], namesConversation: false });
     // No record (no turn yet, an explicit-prose turn): nothing.
     assert.deepEqual(continuationOf(undefined, 1), { candidates: [], namesConversation: false });
+  });
+
+  it("a continuation's conversation keeps the time of its reply message, so a newer message batched there takes the reply edge and an older one doesn't", () => {
+    // The turn answered m-1, which arrived at 100.
+    const turn = inferTurnRoute([candidate(channel('a'), true, 100, 'm-1')], null, rootEverywhere);
+    assert.equal(turn.replyAt, 100);
+    const continued = continuationCandidates(turn, 0);
+    assert.deepEqual(continued.map((c) => [c.at, c.messageId]), [[100, 'm-1']]);
+    const replyEdge = (batched: RouteCandidate): string | undefined => {
+      const next = inferTurnRoute([...continued, batched], null, rootEverywhere);
+      return next.route?.kind === 'channel' ? next.route.replyTo : undefined;
+    };
+    assert.equal(replyEdge(candidate(channel('a'), true, 150, 'm-newer')), 'm-newer');
+    assert.equal(replyEdge(candidate(channel('a'), true, 50, 'm-older')), 'm-1', 'an older message held back in the gate');
+    // A route opened by channel_open names no message, so its continuation's
+    // conversation counts as older than anything batched with it.
+    const opened = continuationCandidates({ route: route('a', { origin: 'open' }) }, 0);
+    assert.deepEqual(opened.map((c) => [c.at, c.messageId]), [[0, undefined]]);
   });
 
   it('beside an ambient arrival from elsewhere the continued conversation wins; beside an addressed one the turn holds', () => {

@@ -544,7 +544,7 @@ describe('present while acting', () => {
     const wired = membrane.lastStream!.receivedToolResultOptions
       .map((o) => o?.injectedMessages ?? []).flat().map((m) => JSON.stringify(m.content));
     assert.ok(
-      wired.some((t) => t.includes('[routing] (srv / discord:dm:antra) addressed you mid-turn. Your unaddressed plain speech was going to (srv / chan-A), where the last message had come in when this reply began, because nothing in the wake that began it named a conversation.')),
+      wired.some((t) => t.includes('[routing] (srv / discord:dm:antra) addressed you mid-turn. Your unaddressed plain speech was going to (srv / chan-A), where the last message had come in when your reply began (a continuation of it keeps that place), because nothing in the wake that began it named a conversation.')),
       'the hold notice says what the fallback was, not that it could be answering it',
     );
     await framework.stop();
