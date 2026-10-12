@@ -317,43 +317,54 @@ function convertBlock(block: McplContentBlock): ContentBlock {
 // Channel Tool Definitions
 // ============================================================================
 
+/**
+ * What channel_list's receipt clocks mean, sent with them in its result
+ * (receiptClocks.about) rather than in the tool's description, which every
+ * request carries.
+ */
+export const RECEIPT_CLOCKS_ABOUT =
+  'Receipt clocks are diagnostics about delivery, not a record of attention or a claim ' +
+  'that you chose to ignore anyone. lastReceivedAt: when this host last accepted an item ' +
+  'from the channel (any item, including notices and deferred work), with that item\'s ' +
+  'source message id and source timestamp, so a delayed message is distinguishable from a ' +
+  'fresh one. lastDeliveredAt: when a provider round that stood (not a refusal) last ' +
+  'carried a new raw body from the channel to you, complete: every part present, nothing ' +
+  'truncated, no image or block removed on the way. Summaries that mention a message do ' +
+  'not count, and showing an already-delivered version again never moves the clock. ' +
+  'lastPartialAt: the most recent time a body from the channel first reached you only ' +
+  'partially (cut, or altered on the way); it is history, and a later complete arrival of ' +
+  'that body shows in lastDeliveredAt, not here. A round whose provider path could not ' +
+  'establish what it carried (for example an adapter that does not report content it ' +
+  'leaves out, or a request hook whose changes cannot be seen) confirms neither a delivery ' +
+  'nor a partial exposure: its bodies stay unconfirmed. Null means no observation since ' +
+  'receiptClocks.trackingSince, not silence before it. The clocks cover one store and one ' +
+  'resident (receiptClocks.storeId, agent): a session switch starts a separate history, and ' +
+  'so does a server reconfigured to another endpoint or command, since a channel is keyed ' +
+  'by its binding. Versions are identified by the producer event id where its lane ' +
+  'guarantees one, otherwise by platform message id plus a digest of the body as it was ' +
+  'delivered, before any source header or splitting (a revision restoring earlier bytes ' +
+  'counts as that earlier version), otherwise by the stored copy, so a replay is then not ' +
+  'recognizable (that includes a split body stored before body digests were recorded, even ' +
+  'with a platform message id). A copy edited after it arrived is a partial exposure, never ' +
+  'a delivery; an item stored before body digests were recorded can\'t be checked for such ' +
+  'edits, so its delivery stays unconfirmed. Each delivery names its basis. Every delivered ' +
+  'version is remembered, so one counts when it first reaches you, however long ago it was ' +
+  'accepted. receiptClocks.gaps lists the most recent 20 intervals in which observations ' +
+  'may be missing, and receiptClocks.gapsOmitted counts older ones; one still open ends ' +
+  '"(ongoing)" and sets receiptClocks.degraded. A run whose receipt ledger never became ' +
+  'readable recorded nothing, so a later run cannot list that interval. Until the ledger ' +
+  'has been read in this host\'s run, channels carry no clocks at all. A missing inbound ' +
+  'item is not evidence of upstream inactivity: a connector or allowlist can keep it from ' +
+  'reaching the host at all.';
+
 const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     name: 'channel_list',
     description:
-      'List all available channels. Each channel carries receipt clocks, which are ' +
-      'diagnostics about delivery, not a record of attention or a claim that you chose ' +
-      'to ignore anyone. lastReceivedAt: when this host last accepted an item from the ' +
-      'channel (any item, including notices and deferred work), with that item\'s source ' +
-      'message id and source timestamp, so a delayed message is distinguishable from a ' +
-      'fresh one. lastDeliveredAt: when a provider round that stood (not a refusal) last ' +
-      'carried a new raw body from the channel to you, complete: every part present, ' +
-      'nothing truncated, no image or block removed on the way. Summaries that mention a ' +
-      'message do not count, and showing an already-delivered version again never moves ' +
-      'the clock. lastPartialAt: the most recent time a body from the channel first reached ' +
-      'you only partially (cut, or altered on the way); it is history, and a later complete ' +
-      'arrival of that body shows in lastDeliveredAt, not here. A round whose provider path ' +
-      'could not establish what it carried (for example an adapter that does not report ' +
-      'content it leaves out, or a request hook whose changes cannot be seen) confirms ' +
-      'neither a delivery nor a partial exposure: its bodies stay unconfirmed. Null means no observation ' +
-      'since receiptClocks.trackingSince, ' +
-      'not silence before it. The clocks cover one store and one resident ' +
-      '(receiptClocks.storeId, agent): a session switch starts a separate history. ' +
-      'Versions are identified by the producer event id where its lane guarantees one, ' +
-      'otherwise by platform message id plus a digest of the body as it was delivered, ' +
-      'before any source header or splitting (a revision restoring earlier bytes counts as ' +
-      'that earlier version), otherwise by the stored copy, so a replay is then not ' +
-      'recognizable (that includes a split body stored before body digests were recorded, ' +
-      'even with a platform message id). A copy edited after it arrived is a partial ' +
-      'exposure, never a delivery; an item stored before body digests were recorded can\'t ' +
-      'be checked for such edits, so its delivery stays unconfirmed. Each delivery names ' +
-      'its basis. Every delivered version is ' +
-      'remembered, so one counts when it first reaches you, however long ago it was accepted. ' +
-      'receiptClocks.gaps lists intervals in which observations may be missing; one still ' +
-      'open ends "(ongoing)" and sets receiptClocks.degraded. Until the receipt ledger has ' +
-      'been read in this host\'s run, channels carry no clocks at all. A ' +
-      'missing inbound item is not evidence of upstream inactivity: a connector or ' +
-      'allowlist can keep it from reaching the host at all.',
+      'List all available channels. Each channel carries receipt clocks: when this host ' +
+      'last received an item from it, and when a new body from it last reached you, ' +
+      'complete or in part. They are diagnostics about delivery, not a record of attention; ' +
+      'receiptClocks.about in the result says exactly what each one means.',
     inputSchema: { type: 'object' as const, properties: {} },
   },
   {
@@ -2392,8 +2403,10 @@ export class ChannelRegistry {
       });
     }
 
+    // One shape, with or without clocks: { channels }, and the clocks beside
+    // them when they're wired.
     if (!this.describeChannelClocks) {
-      return { success: true, data: allChannels };
+      return { success: true, data: { channels: allChannels } };
     }
     const agentName = origin?.kind === 'agent' ? origin.agentName : undefined;
     const { scope, clocks } = this.describeChannelClocks(
@@ -2403,7 +2416,7 @@ export class ChannelRegistry {
     for (const channel of allChannels) {
       channel.clocks = clocks.get(`${channel.serverId}\u0000${channel.id}`);
     }
-    return { success: true, data: { channels: allChannels, receiptClocks: scope } };
+    return { success: true, data: { channels: allChannels, receiptClocks: { ...(scope as object), about: RECEIPT_CLOCKS_ABOUT } } };
   }
 
   /**
