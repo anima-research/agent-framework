@@ -216,7 +216,7 @@ describe('inferTurnRoute', () => {
     const competing = inferTurnRoute([candidate(channel('room'), true, 1, 'm1'), raw], undefined, rootEverywhere);
     assert.equal(competing.route, null);
     assert.equal(competing.hold?.conversations.length, 2, 'never the older conversation by default');
-    assert.deepEqual(inferTurnRoute([raw], undefined, rootEverywhere), { route: null, unroutable: { conversation: channel('1548'), reason: 'unresolved' } });
+    assert.deepEqual(inferTurnRoute([raw], undefined, rootEverywhere), { route: null, unroutable: { conversation: channel('1548'), reason: 'unresolved', neverRoutes: true } });
   });
 
   it('a local surface is addressed by nature, and routes to the surface', () => {
@@ -367,6 +367,15 @@ describe('continuationCandidates and continuationOf', () => {
     assert.equal(continuationOf(held, 9).fallback, undefined);
   });
 
+  it('a hold remembers which of its conversations came from a candidate marked unroutable, and its continuation keeps the mark', () => {
+    const raw: RouteCandidate = { conversation: channel('user:U5'), addressed: true, at: 2, unroutable: true };
+    const held = inferTurnRoute([candidate(channel('b'), true, 1), raw], undefined, rootEverywhere);
+    assert.deepEqual(held.hold?.neverRoutes, [conversationKey(channel('user:U5'))]);
+    const continued = continuationCandidates(held, 5);
+    assert.deepEqual(continued.map((c) => [c.conversation.kind === 'channel' && c.conversation.channelId, c.unroutable ?? false]),
+      [['user:U5', true], ['b', false]]);
+  });
+
   it('a held turn names every conversation it held between, so its continuation is held again', () => {
     const held: TurnRoute = { route: route('a'), hold: { conversations: [channel('a'), channel('b')], since: 'mid-turn' } };
     const candidates = continuationCandidates(held, 5);
@@ -380,11 +389,13 @@ describe('continuationCandidates and continuationOf', () => {
     assert.deepEqual(unresolved, [{ conversation: channel('dup'), addressed: true, at: 3 }]);
     const untargetable = continuationCandidates({ route: null, unroutable: { conversation: channel('quiet'), reason: 'untargetable' } }, 3);
     assert.deepEqual(untargetable, [{ conversation: channel('quiet'), addressed: true, at: 3 }]);
-    // One whose channel had no server stays flagged, so the framework
-    // resolves it again when the continuation's turn starts.
-    const bare: ConversationRef = { kind: 'channel', channelId: 'bare' };
-    assert.deepEqual(continuationCandidates({ route: null, unroutable: { conversation: bare, reason: 'unresolved' } }, 3),
-      [{ conversation: bare, addressed: true, at: 3, unroutable: true }]);
+    // One that came from a candidate marked unroutable stays marked: a raw
+    // id named with its server never routes, and a channel with no server
+    // routes only once the framework finds its server.
+    for (const conversation of [channel('user:U5'), { kind: 'channel', channelId: 'bare' } as ConversationRef]) {
+      assert.deepEqual(continuationCandidates({ route: null, unroutable: { conversation, reason: 'unresolved', neverRoutes: true } }, 3),
+        [{ conversation, addressed: true, at: 3, unroutable: true }]);
+    }
     // Checked again: still refused while the channel declares nothing, a route once it does.
     assert.equal(inferTurnRoute(untargetable, null, declaredNowhere).unroutable?.reason, 'untargetable');
     assert.equal(inferTurnRoute(untargetable, null, rootEverywhere).route?.kind, 'channel');

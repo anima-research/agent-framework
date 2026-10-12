@@ -108,10 +108,13 @@ export interface TurnRoute {
    *  has no destination. A mid-turn hold keeps the route it suspended here,
    *  alongside `hold`, which wins while it is set. */
   route: SpeechRoute | null;
-  /** Unaddressed speech is held as drafts: these conversations compete. */
+  /** Unaddressed speech is held as drafts: these conversations compete.
+   *  `neverRoutes` keys (conversationKey) the ones that came from a
+   *  candidate marked unroutable, which a continuation keeps marked. */
   hold?: {
     conversations: ConversationRef[];
     since: 'turn-start' | 'mid-turn';
+    neverRoutes?: string[];
   };
   /** No route because the one conversation the turn answers can't take
    *  plain speech, said in the routing notice and the drafts' note:
@@ -120,8 +123,12 @@ export interface TurnRoute {
    *  - `thread`: a thread on a channel whose connector can't post into a
    *    named thread (it declares `root`: a contradiction the connector
    *    shouldn't produce);
-   *  - `unresolved`: a channel the host couldn't resolve. */
-  unroutable?: { conversation: ConversationRef; reason: UnroutableReason };
+   *  - `unresolved`: a channel the host couldn't resolve.
+   *  `neverRoutes` says the conversation came from a candidate marked
+   *  unroutable (a raw id the host couldn't resolve to a registered
+   *  channel, or a channel with no server), so a continuation keeps it
+   *  marked: only finding the channel's server can make it a route. */
+  unroutable?: { conversation: ConversationRef; reason: UnroutableReason; neverRoutes?: true };
   /** The turn's wake named a conversation (a channel, a thread, an author
    *  or a local surface), candidate or not. A continuation of the turn then
    *  names one too (continuationOf). */
@@ -245,10 +252,16 @@ export function inferTurnRoute(
     if (!seen || candidate.at >= seen.at) newestByConversation.set(key, candidate);
   }
   if (newestByConversation.size > 1) {
-    const conversations = [...newestByConversation.values()]
-      .sort((a, b) => b.at - a.at)
-      .map((c) => c.conversation);
-    return { route: null, hold: { conversations, since: 'turn-start' } };
+    const competing = [...newestByConversation.values()].sort((a, b) => b.at - a.at);
+    const neverRoutes = competing.filter((c) => c.unroutable).map((c) => conversationKey(c.conversation));
+    return {
+      route: null,
+      hold: {
+        conversations: competing.map((c) => c.conversation),
+        since: 'turn-start',
+        ...(neverRoutes.length > 0 ? { neverRoutes } : {}),
+      },
+    };
   }
   const [chosen] = newestByConversation.values();
   const c = chosen!.conversation;
@@ -256,7 +269,7 @@ export function inferTurnRoute(
   // neither can one the framework can't publish into exactly: its connector
   // would choose the place, which may be another conversation (RFC-011).
   // Both still compete for the turn (above).
-  if (chosen!.unroutable) return { route: null, unroutable: { conversation: c, reason: 'unresolved' } };
+  if (chosen!.unroutable) return { route: null, unroutable: { conversation: c, reason: 'unresolved', neverRoutes: true } };
   const refusal = routeRefusal(c, targetOf);
   if (refusal) return { route: null, unroutable: { conversation: c, reason: refusal } };
   return c.kind === 'surface'
@@ -311,7 +324,15 @@ function fallbackRoute(fallback: RouteCandidate | null | undefined, targetOf: Pu
  */
 export function continuationCandidates(turn: TurnRoute | undefined, at: number): RouteCandidate[] {
   if (!turn) return [];
-  if (turn.hold) return turn.hold.conversations.map((conversation) => ({ conversation, addressed: true, at }));
+  if (turn.hold) {
+    const neverRoutes = new Set(turn.hold.neverRoutes ?? []);
+    return turn.hold.conversations.map((conversation) => ({
+      conversation,
+      addressed: true,
+      at,
+      ...(neverRoutes.has(conversationKey(conversation)) ? { unroutable: true as const } : {}),
+    }));
+  }
   if (turn.route) {
     const { route } = turn;
     if (route.origin === 'fallback') return [];
@@ -323,11 +344,12 @@ export function continuationCandidates(turn: TurnRoute | undefined, at: number):
     }];
   }
   if (turn.unroutable) {
-    const { conversation } = turn.unroutable;
-    // A channel the turn couldn't resolve to a server stays flagged, so the
-    // framework resolves it again when the continuation's turn starts.
-    const serverless = conversation.kind === 'channel' && !conversation.serverId;
-    return [{ conversation, addressed: true, at, ...(serverless ? { unroutable: true as const } : {}) }];
+    // A conversation from a candidate marked unroutable stays marked, so it
+    // never routes unless the framework finds its channel's server when the
+    // continuation starts. One refused for its publish target is checked
+    // again as it is.
+    const { conversation, neverRoutes } = turn.unroutable;
+    return [{ conversation, addressed: true, at, ...(neverRoutes ? { unroutable: true as const } : {}) }];
   }
   return [];
 }

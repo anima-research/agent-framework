@@ -70,9 +70,13 @@
     of the reply. A wake batched with the continuation names its own
     conversation and takes the turn, as any arrival does. A kept place
     that the fork rule or its channel's publish target now refuses gives
-    no place, to the continuation and to those after it. An unroutable
-    conversation's continuation names it, and resolves it again when it
-    starts, so it takes a place once its channel can take one. A silent
+    no place, to the continuation and to those after it. A continuation
+    names an unroutable conversation too. One its channel's publish target
+    refused is checked again when the continuation starts, so it takes a
+    place once its channel can take one. One that came from a candidate
+    marked unroutable stays so, unless the framework finds the server of a
+    channel that had none: a raw id the host couldn't resolve never becomes
+    a route. A silent
     tick's own continuations, such as its retries, are silent ticks too,
     with the tick's prompt and stamp, and a restart or a guard retry keeps
     the tick's record. The one exception is a restart batched with an

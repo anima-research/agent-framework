@@ -1180,26 +1180,60 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
-  it("a gate's unroutable candidate that names its server stays unroutable when its turn starts", async () => {
+  it("a gate's unroutable candidate that names its server stays unroutable when its turn starts, and in its continuations", async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'held' }]));
     const framework = await makeFramework();
     const { registry, published } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
-    // Every id has a sole registrant here, so a raw id resolved again would
-    // look routable.
+    // Every id has a sole registrant and declares a target here, so a raw id
+    // checked again would look routable.
     (registry as Record<string, unknown>).getChannelServerId = () => 'discord';
     internals(framework).channelRegistry = registry;
+    const i = internals(framework);
     const now = Date.now();
     // As the gate passes an event whose registered channel the host couldn't
     // resolve: the raw author id, its server named, unroutable.
-    internals(framework).pendingRequests.push({
+    i.pendingRequests.push({
       agentName: 'scout', reason: 'gate', source: 'gate', timestamp: now, namesConversation: true,
       routeCandidates: [{ conversation: { kind: 'channel', serverId: 'discord', channelId: 'user:U5' }, addressed: true, at: now, unroutable: true }],
     } as never);
     await framework.runUntilIdle();
-    const turn = internals(framework).turnRoutes.get('scout') as { route: unknown; unroutable?: { reason: string } };
+    const turn = i.turnRoutes.get('scout') as { route: unknown; unroutable?: { reason: string } };
     assert.equal(turn.route, null);
     assert.equal(turn.unroutable?.reason, 'unresolved');
+    // Its retry names the same conversation, still marked: no route.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'still held' }]));
+    i.pendingRequests.push(i.continuationRequest('scout', 'refusal-rewind-retry'));
+    await framework.runUntilIdle();
+    assert.equal(i.turnRoutes.get('scout')?.route, null);
     assert.deepEqual(published, [], 'nothing went to the raw id');
+    await framework.stop();
+  });
+
+  it("a hold's conversation from an unroutable candidate stays marked in its continuation, even when it is the one left", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'held between them' }]));
+    const framework = await makeFramework();
+    const { registry, published } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
+    (registry as Record<string, unknown>).getChannelServerId = () => 'discord';
+    internals(framework).channelRegistry = registry;
+    const i = internals(framework);
+    const now = Date.now();
+    i.pendingRequests.push({
+      agentName: 'scout', reason: 'gate', source: 'gate', timestamp: now, namesConversation: true,
+      routeCandidates: [
+        { conversation: { kind: 'channel', serverId: 'discord', channelId: 'user:U5' }, addressed: true, at: now, unroutable: true },
+        { conversation: { kind: 'channel', serverId: 'discord', channelId: 'discord:guild:chanB' }, addressed: true, at: now - 1 },
+      ],
+    } as never);
+    await framework.runUntilIdle();
+    assert.equal((i.turnRoutes.get('scout') as { hold?: unknown }).hold !== undefined, true, 'held');
+    // A fork claims chanB, so the raw id is the only conversation left.
+    i.conversationAgentHomes.set('fork-1', 'discord:guild:chanB');
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'not to the raw id' }]));
+    i.pendingRequests.push(i.continuationRequest('scout', 'refusal-rewind-retry'));
+    await framework.runUntilIdle();
+    assert.equal(i.turnRoutes.get('scout')?.route, null);
+    assert.deepEqual(published, [], 'nothing went to the raw id');
+    i.conversationAgentHomes.delete('fork-1');
     await framework.stop();
   });
 

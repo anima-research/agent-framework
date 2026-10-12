@@ -7089,6 +7089,9 @@ export class AgentFramework {
             if (turn?.route && competing.length > 0) {
               const current = routeConversation(turn.route);
               const arrivals = competing.map((c) => c.conversation);
+              // A mid-turn arrival's candidate comes from its inbound source,
+              // which always names a registered channel and its server, so
+              // none is marked unroutable (TurnRoute.hold.neverRoutes).
               const held: TurnRecord = { ...turn, hold: { conversations: [current, ...arrivals], since: 'mid-turn' } };
               this.turnRoutes.set(agent.name, held);
               this.lastAnnouncedRoute.set(agent.name, AgentFramework.routeKey(held));
