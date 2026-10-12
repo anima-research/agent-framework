@@ -1,6 +1,7 @@
 import type { JsStore } from '@animalabs/chronicle';
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
+  ContextManager,
   MessageId,
   MessageMetadata,
   MessageQuery,
@@ -22,6 +23,7 @@ import type {
   SpeechHandlerOptions,
   ProcessEvent,
   TraceEventListener,
+  AgentFoldReader,
 } from './types/index.js';
 import type { Agent } from './agent.js';
 
@@ -639,6 +641,10 @@ class ModuleContextImpl implements ModuleContext {
 
   getAgents(): AgentInfo[] {
     return this.getAgentsFn().map((a) => a.info);
+  }
+
+  getAgentContextManager(agentName: string): AgentFoldReader | null {
+    return this.getAgentsFn().find((a) => a.name === agentName)?.getContextManager() ?? null;
   }
 
   getActiveTools(): ToolDefinition[] {

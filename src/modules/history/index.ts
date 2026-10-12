@@ -50,6 +50,7 @@ import type { EventResponse, ProcessState } from '../../types/module.js';
 import type { SearchWorkerMessage, SearchWorkerMatch } from './search-regex-worker.js';
 import type { ChannelRegistry } from '../../mcpl/channel-registry.js';
 import { SemanticIndexClient, SemanticIndexer, messageIndexText, type SemanticIndexConfig, type SyncReport, type PendingChanges } from './semantic.js';
+import { FOLDS_TOOL, handleFolds, type FoldsInput } from './folds.js';
 
 // ============================================================================
 // Tool input shapes
@@ -265,6 +266,8 @@ export class HistoryModule implements Module {
 
   private ctx: ModuleContext | null = null;
   private cm: ContextManager | null = null;
+  /** The host's fold-export status, shown by history--folds (setFoldExportStatus). */
+  private foldExportStatus: (() => unknown) | undefined;
   private channelRegistry: ChannelRegistry | null = null;
   private readonly semanticCfg: SemanticIndexConfig | null;
   private semanticClient: SemanticIndexClient | null = null;
@@ -302,6 +305,17 @@ export class HistoryModule implements Module {
       else this.indexer.attach();
       this.startSyncTimer();
     }
+  }
+
+  /**
+   * A host that projects the bound resident's fold receipts to a file
+   * (connectome-host's folds.jsonl) reports that export's status here.
+   * history--folds shows it, including an export conflict and its target
+   * path, to the resident whose context manager was passed to bind(): the
+   * export is a projection of that record, not of another caller's.
+   */
+  setFoldExportStatus(provider: (() => unknown) | null): void {
+    this.foldExportStatus = provider ?? undefined;
   }
 
   /**
@@ -772,6 +786,7 @@ export class HistoryModule implements Module {
           },
         },
       },
+      FOLDS_TOOL,
       ...(this.semanticCfg ? [this.semanticSearchTool()] : []),
     ];
   }
@@ -827,6 +842,8 @@ export class HistoryModule implements Module {
           return this.handleOverview((call.input ?? {}) as OverviewInput);
         case 'semantic_search':
           return await this.handleSemanticSearch((call.input ?? {}) as SemanticSearchInput);
+        case 'folds':
+          return this.handleFoldsCall(call);
         default:
           return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
       }
@@ -848,6 +865,30 @@ export class HistoryModule implements Module {
         error: error instanceof Error ? error.message : String(error),
       };
     }
+  }
+
+  /**
+   * history--folds answers for the agent that called it. Each agent accepts
+   * its rounds through its own context manager, whose strategy and fold
+   * journal are its own (a conversation fork's or a second resident's are
+   * not the bound resident's, though they share a store), so the caller's is
+   * resolved by name. A call without a resolvable caller has no record to
+   * show.
+   */
+  private handleFoldsCall(call: ToolCall): ToolResult {
+    const caller = call.callerAgentName;
+    const cm = caller ? this.ctx?.getAgentContextManager(caller) ?? null : null;
+    if (!cm) {
+      return {
+        success: false,
+        isError: true,
+        error: caller
+          ? `No fold record for "${caller}": no agent by that name is registered.`
+          : 'history--folds shows the calling agent\'s fold record, and this call has no calling agent.',
+      };
+    }
+    const exportStatus = cm === this.cm ? this.foldExportStatus?.() : undefined;
+    return handleFolds(cm, (call.input ?? {}) as FoldsInput, exportStatus);
   }
 
   async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {

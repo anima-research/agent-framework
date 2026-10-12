@@ -10,26 +10,40 @@
  * collapsing those distinct messages into one (item 4). This helper instead
  * yields each contiguous run of text — the segments a surface should deliver as
  * separate, ordered messages. Contiguous text blocks merge into one segment;
- * `tool_use` / `tool_result` blocks are segment boundaries; empty or
+ * `tool_use` / `tool_result` blocks are segment boundaries, as are XML tool
+ * mode's `tool_attempt` / `tool_notice` (a refused attempt and the harness's
+ * notice end a round just as a call and its results do); empty or
  * whitespace-only runs are dropped.
  */
 
 import type { ContentBlock } from '@animalabs/membrane';
 
-export function splitProseSegments(content: readonly ContentBlock[]): string[] {
-  const segments: string[] = [];
+/**
+ * The runs exactly as written: contiguous text blocks joined with a newline,
+ * nothing trimmed. Whitespace-only runs are dropped. Held drafts keep these,
+ * so a draft's words (indentation included) are the resident's own, byte for
+ * byte.
+ */
+export function splitProseRuns(content: readonly ContentBlock[]): string[] {
+  const runs: string[] = [];
   let buf: string[] = [];
 
   const flush = (): void => {
-    const s = buf.join('\n').trim();
-    if (s) segments.push(s);
+    const run = buf.join('\n');
+    if (run.trim()) runs.push(run);
     buf = [];
   };
 
   for (const block of content) {
-    if (block.type === 'text') {
+    const type = block.type as string;
+    if (type === 'text') {
       buf.push((block as ContentBlock & { type: 'text' }).text);
-    } else if (block.type === 'tool_use' || block.type === 'tool_result') {
+    } else if (
+      type === 'tool_use' ||
+      type === 'tool_result' ||
+      type === 'tool_attempt' ||
+      type === 'tool_notice'
+    ) {
       flush();
     }
     // Other block types (thinking, redacted_thinking, image, …) are neither
@@ -38,5 +52,10 @@ export function splitProseSegments(content: readonly ContentBlock[]): string[] {
   }
   flush();
 
-  return segments;
+  return runs;
+}
+
+/** The runs as speech is routed: each trimmed of surrounding whitespace. */
+export function splitProseSegments(content: readonly ContentBlock[]): string[] {
+  return splitProseRuns(content).map((run) => run.trim());
 }

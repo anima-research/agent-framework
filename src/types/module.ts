@@ -1,5 +1,6 @@
 import type { ContentBlock } from '@animalabs/membrane';
 import type {
+  ContextManager,
   MessageId,
   MessageMetadata,
   StoredMessage,
@@ -7,6 +8,9 @@ import type {
 } from '@animalabs/context-manager';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from './events.js';
 import type { TraceEventListener } from './trace.js';
+
+/** The reads a module needs of another agent's fold record (history--folds). */
+export type AgentFoldReader = Pick<ContextManager, 'describeRenderedForms' | 'listFoldReceipts'>;
 
 /**
  * Filter criteria for querying messages.
@@ -257,6 +261,17 @@ export interface ModuleContext {
    * Get info about all agents.
    */
   getAgents(): AgentInfo[];
+
+  /**
+   * Read access to one registered agent's fold record (a resident, a
+   * conversation fork, an ephemeral subagent): its context manager, typed to
+   * the two reads a fold reader needs, or null when no agent by that name is
+   * registered. Each agent's strategy and fold record belong to its own
+   * context manager, so a module answering for the agent that called it
+   * (history--folds) resolves `ToolCall.callerAgentName` here. It is the
+   * agent's own object, so it compares equal to a module's bound one.
+   */
+  getAgentContextManager(agentName: string): AgentFoldReader | null;
 
   /**
    * Get all currently available tools.
