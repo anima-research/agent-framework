@@ -138,6 +138,8 @@ describe('targeted publish (MCPL RFC-011)', () => {
       ['publish', ROOM, 't-7', 'answering the thread'],
       ['publish', ROOM, 't-7', 'a scheduled note'],
     ], 'the fallback named the thread the last message came in');
+    assert.ok(texts().some((t) => t.startsWith('[routing] Your plain speech now lands in #room (Guild One) (discord / discord:g1:room, thread t-7)')),
+      'the first turn announced its route');
     assert.ok(texts().some((t) => t.startsWith('[routing] Nothing in this wake named a conversation, so your plain speech lands where the last message came in')) === false,
       'the place is unchanged since the last announced route, so no new notice');
   });

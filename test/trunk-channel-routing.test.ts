@@ -606,6 +606,18 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.runUntilIdle();
     assert.equal(membrane.calls.length, 3);
     assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null }, 'a pushed reaction takes no fallback');
+
+    // A push that names only its author names a conversation too.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'who was that' }]));
+    framework.pushEvent({
+      type: 'mcpl:push-event', serverId: 'discord', featureSet: 'discord.messaging',
+      eventId: `e-${Math.random().toString(36).slice(2)}`, content: [{ type: 'text', text: 'hm' }],
+      origin: { source: 'discord', authorId: 'U9' }, timestamp: new Date().toISOString(),
+      inferenceId: `inf-${Math.random().toString(36).slice(2)}`, triggerInference: true,
+    } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 4);
+    assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null }, 'an author-only push takes no fallback');
     assert.deepEqual(published, [], 'nothing went to the last delivered message\'s channel');
     await framework.stop();
   });
@@ -639,6 +651,80 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.equal(turn.route?.kind, 'surface', 'the console is the route');
     assert.equal(turn.route?.surface, 'tui');
     assert.deepEqual(published, [], 'nothing was published to the last channel');
+    await framework.stop();
+  });
+
+  it('a framework wake that continues the previous turn keeps its route, never the fallback', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'first answer' }]));
+    const framework = await makeFramework();
+    const { registry, published } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
+    internals(framework).channelRegistry = registry;
+    framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: hi'));
+    await framework.runUntilIdle();
+    assert.equal(internals(framework).turnRoutes.get('scout')?.route?.channelId, 'discord:guild:chanA');
+    // A rewind retry of that work names nothing new: it keeps chanA, though
+    // the last message came in elsewhere.
+    for (const reason of ['refusal-rewind-retry', 'inference-failure-rewind-retry', 'tool_results_ready']) {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `again after ${reason}` }]));
+      internals(framework).pendingRequests.push({ agentName: 'scout', reason, source: 'framework', timestamp: Date.now() });
+      await framework.runUntilIdle();
+      assert.equal(internals(framework).turnRoutes.get('scout')?.route?.channelId, 'discord:guild:chanA', `${reason} keeps the route`);
+    }
+    assert.deepEqual(published.map((p) => (p.to as { channelId: string }).channelId),
+      ['discord:guild:chanA', 'discord:guild:chanA', 'discord:guild:chanA', 'discord:guild:chanA']);
+    await framework.stop();
+  });
+
+  it('an ephemeral subagent never takes the fallback, and several requests batched into one turn name a conversation if any does', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'diver notes' }]));
+    const framework = await makeFramework();
+    const { registry, published } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:last' });
+    internals(framework).channelRegistry = registry;
+    // As if scout were an ephemeral subagent: its prose is its caller's.
+    const ephemerals = (framework as unknown as { usedEphemeralAgentNames: Set<string> }).usedEphemeralAgentNames;
+    ephemerals.add('scout');
+    await heartbeat(framework);
+    assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null }, 'no fallback for an ephemeral');
+    ephemerals.delete('scout');
+
+    // A heartbeat batched with a wake that names a conversation (as a
+    // reaction's does) is one turn that names one: no fallback.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'batched' }]));
+    internals(framework).pendingRequests.push(
+      { agentName: 'scout', reason: 'heartbeat', source: 'timer', timestamp: Date.now() },
+      { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(), namesConversation: true } as never,
+    );
+    await framework.runUntilIdle();
+    assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null }, 'the batch named a conversation');
+    assert.deepEqual(published, []);
+    await framework.stop();
+  });
+
+  it('a module event that names a channel in its metadata never takes the fallback', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'about that channel' }]));
+    const relay = {
+      name: 'relay',
+      async start() {},
+      async stop() {},
+      getTools: () => [],
+      async handleToolCall() { return { success: false, error: 'none', isError: true }; },
+      async onProcess(event: ProcessEvent) {
+        return event.type === 'relay:note' ? { requestInference: true } : {};
+      },
+    };
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'relay.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [relay as never],
+    });
+    const { registry, published } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:last' });
+    internals(framework).channelRegistry = registry;
+    framework.pushEvent({ type: 'relay:note', source: 'relay', metadata: { channelId: 'discord:guild:other' } } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 1);
+    assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null });
+    assert.deepEqual(published, []);
     await framework.stop();
   });
 

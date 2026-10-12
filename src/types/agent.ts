@@ -323,9 +323,9 @@ export interface InferenceRequest {
    * The MCPL channel whose message triggered this inference, if any (composite
    * id, e.g. `discord:guild:channel` / `discord:dm:id`). It is not where the
    * turn's plain speech goes: that is the turn's speech route, inferred from
-   * `routeCandidates` (src/speech-routes.ts). Undefined for non-channel wakes
-   * (heartbeat, timers, module events), which name no conversation; a turn
-   * they alone wake takes the fallback route (`namesConversation`).
+   * `routeCandidates` (src/speech-routes.ts). Undefined for wakes from no
+   * channel (a heartbeat, a timer, most module events). Whether a wake names
+   * a conversation at all is `namesConversation`.
    */
   channelId?: string;
   /**

@@ -792,6 +792,23 @@ describe('debounce', () => {
     assert.deepStrictEqual((inferenceRequests[0].routeCandidates ?? []).map((c) => c.channelId), ['discord:g:general']);
   });
 
+  it('a batch naming only an author, or a local surface, names a conversation', async () => {
+    const path = writeConfig('debounce-route-author-surface.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:push-event', 'external-message'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    gate.evaluate(event({ eventType: 'mcpl:push-event', serverId: 'discord', content: 'from someone', metadata: { authorId: '7' } }));
+    await new Promise(r => setTimeout(r, 150));
+    gate.evaluate(event({ eventType: 'external-message', serverId: 'tui', content: 'status?' }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 2);
+    assert.strictEqual((inferenceRequests[0] as { namesConversation?: true }).namesConversation, true, 'an author names a conversation');
+    assert.strictEqual((inferenceRequests[1] as { namesConversation?: true }).namesConversation, true, 'a local surface names one');
+  });
+
   it('a reaction-only batch names its conversation though it has no candidate, so it never takes the fallback route', async () => {
     const path = writeConfig('debounce-route-reaction-only.json', {
       policies: [

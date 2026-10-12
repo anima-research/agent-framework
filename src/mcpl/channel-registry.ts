@@ -726,11 +726,9 @@ export class ChannelRegistry {
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
-  /** The last message any channel delivered (`channels/incoming`, once
-   *  queued, or admitted by its coalescer): a turn whose wake names no
-   *  conversation speaks there, as before speech routes. Only a message
-   *  counts: never a reaction or a withdrawal. Cleared when its channel or
-   *  server goes. */
+  /** Where the last message any channel delivered came in (noteDelivered):
+   *  a turn whose wake names no conversation speaks there, as before speech
+   *  routes. Cleared when its channel or server goes. */
   private lastInbound: { serverId: string; channelId: string; threadId?: string } | null = null;
 
   /**
@@ -1117,23 +1115,10 @@ export class ChannelRegistry {
         const entry = this.channels.get(incomingKey);
         if (entry) entry.open = true;
       };
-      // A delivered message retargets only the fallback: the route of a turn
-      // whose wake names no conversation. Every other route comes from a
-      // turn's own wake or a deliberate choice. It counts once it is queued
-      // (or admitted), on a channel still registered, and only as a message
-      // a conversation could continue: never a reaction or a withdrawal.
-      const rememberDelivered = () => {
-        if (!this.channels.has(incomingKey)) return;
-        if ((message.coalesce as { retract?: unknown } | null | undefined)?.retract === true) return;
-        // An MCPL item's tags alone: `metadata.system` is host-written, and
-        // an adapter's metadata can't mark its item as machinery.
-        if (!isConversational(message.tags)) return;
-        this.lastInbound = {
-          serverId,
-          channelId: message.channelId,
-          ...(typeof message.threadId === 'string' && message.threadId ? { threadId: message.threadId } : {}),
-        };
-      };
+      // An ordinary message, once queued, is where the last message came in
+      // (noteDelivered). A coalesced one counts only when its coalescer
+      // admits it afresh, which the host observes itself: its result here
+      // reads `accepted` for a producer's retry too.
       if (!coalesced) markAccepted();
 
       // Build the incoming event; whether it triggers inference is decided
@@ -1205,10 +1190,7 @@ export class ChannelRegistry {
         // `coalesce` is a per-message failure; siblings are unaffected.
         try {
           const result = await this.handleCoalescedIncoming!(serverId, message, event);
-          if (result.accepted) {
-            markAccepted();
-            rememberDelivered();
-          }
+          if (result.accepted) markAccepted();
           results.push(result);
         } catch (error) {
           const err = error as Error & { code?: number };
@@ -1227,7 +1209,7 @@ export class ChannelRegistry {
       // CustomEvent `${string}:${string}` type pattern but lacks an index signature.
       if (inboundSource) this.inboundAccepted?.(inboundSource);
       this.pushEventFn(event as unknown as ProcessEvent);
-      rememberDelivered();
+      this.noteDelivered(serverId, message.channelId, message.threadId, message.tags);
 
       // Collect per-message result
       results.push({
@@ -1419,7 +1401,10 @@ export class ChannelRegistry {
   // Accessors
   // ==========================================================================
 
-  /** The channel id of the last message any channel delivered, or null. */
+  /** The channel id of where the last message any channel delivered came in
+   *  (noteDelivered: a conversational message, never a reaction or a
+   *  deletion), or null. Kept from before speech routes for hosts that read
+   *  it; the framework uses it only as a turn's fallback route. */
   getDefaultPublishChannel(): string | null {
     return this.lastInbound?.channelId ?? null;
   }
@@ -1429,6 +1414,28 @@ export class ChannelRegistry {
    *  conversation. */
   getLastInbound(): { serverId: string; channelId: string; threadId?: string } | null {
     return this.lastInbound ? { ...this.lastInbound } : null;
+  }
+
+  /**
+   * A message was delivered: it is now where the last message came in, the
+   * fallback route of a turn whose wake names no conversation. Called for an
+   * ordinary `channels/incoming` message once it is queued, and by the host
+   * for a coalesced one when its coalescer admits it afresh (never for a
+   * producer's retry, which the coalescer acknowledges again without
+   * delivering anything). Only a message a conversation could continue
+   * counts, on a channel still registered: never a reaction or a deletion
+   * (`chat:reaction`, `chat:reaction-remove`, `chat:deleted`). The caller
+   * leaves out withdrawals, which deliver nothing. An MCPL item's tags
+   * alone decide: `metadata.system` is host-written.
+   */
+  noteDelivered(serverId: string, channelId: string, threadId?: string, tags?: readonly string[]): void {
+    if (!this.channels.has(`${serverId}:${channelId}`)) return;
+    if (!isConversational(tags) || tags?.includes('chat:deleted')) return;
+    this.lastInbound = {
+      serverId,
+      channelId,
+      ...(typeof threadId === 'string' && threadId ? { threadId } : {}),
+    };
   }
 
   /**

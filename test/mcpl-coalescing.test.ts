@@ -1053,3 +1053,47 @@ for (const reader of ['other', 'agent'] as const) test(`R18 (${reader} read it):
   assert.equal(del.result.coalesce.outcome, 'noted');
   assert(f.context().includes('read_by_one') && f.context().includes('deletion_notice') && !f.context().includes('later_edit'));
 });
+
+test('a producer retry of a coalesced message is no new delivery: the fallback stays where the last message came in', async (t) => {
+  // Clement-2260's sequence (#256 review, room-448 #74615): coalesced A, then
+  // ordinary B, then A retried with the same event id.
+  const f = await fixture(); t.after(f.close);
+  f.alwaysRespond();
+  await f.register('A');
+  await f.register('B');
+  const registry = (f.framework as unknown as {
+    channelRegistry: { getLastInbound(): { channelId: string } | null };
+  }).channelRegistry;
+  const original = { messages: [f.channel('A-1', 'first channel', { initial: true }, 'A', 'message-A')] };
+  const accepted = await f.send('channels/incoming', original);
+  assert.equal(accepted.result.results[0].accepted, true);
+  await f.framework.runUntilIdle();
+  assert.equal(registry.getLastInbound()?.channelId, 'A', 'a fresh admission counts');
+
+  const b = f.channel('B-1', 'latest real message', {}, 'B', 'message-B') as Record<string, unknown>;
+  delete b.coalesce;
+  delete b.eventId;
+  await f.send('channels/incoming', { messages: [b] });
+  await f.framework.runUntilIdle();
+  assert.equal(registry.getLastInbound()?.channelId, 'B');
+  const calls = f.membrane.calls.length;
+
+  const retry = await f.send('channels/incoming', original);
+  assert.deepEqual(retry.result, accepted.result, 'the producer retry gets its cached acknowledgement');
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, calls, 'the retry starts no turn');
+  assert.equal(registry.getLastInbound()?.channelId, 'B', 'a retry is no delivery: the place stays B');
+
+  // A withdrawal admitted afresh delivers nothing either.
+  await f.register('C');
+  await f.send('channels/incoming', { messages: [{ ...f.channel('C-1', '', { retract: true }, 'C', 'message-C'), content: [] }] });
+  await f.framework.runUntilIdle();
+  assert.equal(registry.getLastInbound()?.channelId, 'B', 'a withdrawal is no delivery: the place stays B');
+
+  const publishes = f.published.length;
+  await (f.framework as unknown as { startAgentStream(a: unknown, tr?: unknown): Promise<void> })
+    .startAgentStream(f.framework.getAgent('agent')!, { agentName: 'agent', reason: 'heartbeat', source: 'timer', timestamp: Date.now() });
+  await f.framework.runUntilIdle();
+  await eventually(() => f.published.length > publishes, 'the scheduled note is published');
+  assert.equal(f.published.at(-1)!.channelId, 'B', 'the scheduled note lands where the last message came in');
+});

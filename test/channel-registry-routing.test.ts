@@ -197,19 +197,26 @@ test('only a delivered message becomes the fallback\'s place: not a reaction, a 
   throwFilter = false;
   assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'an unqueued message never becomes the place');
 
-  // A coalesced message counts once its coalescer admits it, not before.
+  // A coalesced message is the host's to count: its coalescer's acceptance
+  // reads `accepted` for a producer's retry too, so the registry's own path
+  // never counts it, refused or admitted.
   admit = false;
   await registry.handleIncoming('slack', { messages: [msg('slack:C2', 'm-3', { eventId: 'e-3', coalesce: { key: 'k' } })] } as never);
   assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'a refused coalesced occurrence never counts');
   admit = true;
   await registry.handleIncoming('slack', { messages: [msg('slack:C2', 'm-4', { eventId: 'e-4', coalesce: { key: 'k' }, threadId: 't-4' })] } as never);
-  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2', threadId: 't-4' }, 'an admitted one counts');
-
-  // A withdrawal the coalescer admits is no message: the place stays.
-  await registry.handleIncoming('slack', {
-    messages: [msg('slack:C3', 'm-5', { eventId: 'e-5', coalesce: { key: 'k2', retract: true }, content: [] })],
-  } as never);
-  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2', threadId: 't-4' }, 'a withdrawal never counts');
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'an accepted coalesced result is the host\'s to count');
+  // The host counts a fresh admission through noteDelivered.
+  registry.noteDelivered('slack', 'slack:C2', 't-4', []);
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2', threadId: 't-4' }, 'a noted delivery counts');
+  registry.noteDelivered('slack', 'slack:C3', undefined, ['chat:deleted']);
+  registry.noteDelivered('slack', 'slack:C3', undefined, ['chat:reaction-remove']);
+  registry.noteDelivered('slack', 'slack:GONE', undefined, []);
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2', threadId: 't-4' },
+    'a deletion, a reaction\'s removal or an unregistered channel never counts');
+  // An ordinary deletion notice never counts either.
+  await registry.handleIncoming('slack', { messages: [msg('slack:C3', 'd-1', { tags: ['chat:deleted'] })] });
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2', threadId: 't-4' }, 'a deletion never counts');
 
   // Stopping forgets it.
   registry.stopAll();
@@ -217,7 +224,7 @@ test('only a delivered message becomes the fallback\'s place: not a reaction, a 
   assert.equal(registry.getDefaultPublishChannel(), null);
 });
 
-test('a coalesced message whose channel goes while its coalescer decides counts for nothing, and breaks nothing', async () => {
+test('a coalesced message whose channel goes while its coalescer decides breaks nothing', async () => {
   let registry: ChannelRegistry;
   registry = new ChannelRegistry(
     { getServer: () => undefined } as unknown as McplServerRegistry,
@@ -243,6 +250,9 @@ test('a coalesced message whose channel goes while its coalescer decides counts 
     content: [{ type: 'text' as const, text: 'bye' }], eventId: 'e-2', coalesce: { key: 'k' },
   }] } as never, { respond: (r: unknown) => { answered = r as typeof answered; } } as never);
   assert.deepEqual(answered?.results.map((r) => [r.accepted, r.reason]), [[true, undefined]], 'the admission itself stands');
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1');
+  // A host noting it afterwards finds the channel gone: it never becomes the place.
+  registry.noteDelivered('slack', 'slack:GONE', undefined, []);
   assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'a channel removed meanwhile never becomes the place');
 });
 

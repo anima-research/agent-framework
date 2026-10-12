@@ -20,8 +20,9 @@
     publish to an exact server.
   - **Also changed:** `resolveProseTarget` returns the `serverId` its
     target resolved to beside the channel id. `startTyping` and
-    `stopTyping` take `{ serverId, channelId }` (a bare id still works,
-    resolving only an id one server registers). The registry no longer
+    `stopTyping` take `{ serverId, channelId }`. A bare id still works:
+    `startTyping` resolves it only when one server registers it, and
+    `stopTyping` stops that id's typing on every server that has it. The registry no longer
     decides a coalesced message's trigger before `handleCoalescedIncoming`:
     the event carries the filter's inputs as `triggerInputs`, and a host's
     own handler decides from them once it admits the occurrence.

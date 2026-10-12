@@ -546,6 +546,24 @@ function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string):
   return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
 }
 
+/**
+ * Framework wakes that continue the resident's previous turn's work: a retry
+ * after a rewind (refusal, unstick, inference failure), the results of a
+ * non-streaming tool round, an explicit-prose continuation or bounce, and a
+ * provider-cooldown retry with nothing else held. Naming nothing new, such a
+ * wake keeps the previous turn's speech route (startAgentStream).
+ */
+const CONTINUES_PREVIOUS_TURN: ReadonlySet<string> = new Set([
+  'tool_results_ready',
+  'refusal-rewind-retry',
+  'unstick',
+  'unstick-retry',
+  'inference-failure-rewind-retry',
+  'prose-continuation',
+  'prose-bounce',
+  'provider-acceleration-retry',
+]);
+
 function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
@@ -1992,8 +2010,12 @@ export class AgentFramework {
           addMessage: (participant, content, metadata, forAgent) =>
             framework.addMessage(participant, content, metadata as MessageMetadata,
               forAgent ? { forAgent } : undefined),
-          requestInference: (agentName, reason, source) => {
-            framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
+          requestInference: (agentName, reason, source, channelId) => {
+            framework.pendingRequests.push({
+              agentName, reason, source, timestamp: Date.now(),
+              // A tune-out wake is about the channel it names.
+              ...(channelId ? { namesConversation: true as const } : {}),
+            });
           },
           subconsciousName: () => framework.subconsciousAgentName,
           primaryName: () => framework.primaryAgentName,
@@ -7337,8 +7359,9 @@ export class AgentFramework {
     // Queue inference requests
     if (response.requestInference) {
       const source = 'source' in event ? (event as { source: string }).source : 'unknown';
-      // The channel a module event names in its metadata, if any.
-      const named = extractGateFields(event).metadata.channelId;
+      // What a module event names in its metadata, if anything.
+      const namedMetadata = extractGateFields(event).metadata;
+      const named = namedMetadata.channelId;
 
       // Gate non-MCPL events (MCPL events are already gated in PushHandler/ChannelRegistry)
       if (this.eventGate && event.type !== 'mcpl:push-event' && event.type !== 'mcpl:channel-incoming') {
@@ -7371,7 +7394,9 @@ export class AgentFramework {
       // is no candidate here: neither takes the fallback. An event naming
       // neither (an `api:inference-request` nudge, a timer) names none.
       const surfaceCandidate = surface ? this.candidateFromSource(surface, true) : undefined;
-      const namesConversation = !!surface || (typeof named === 'string' && named.length > 0);
+      const nonEmpty = (v: unknown): boolean => typeof v === 'string' && v.length > 0;
+      const namesConversation = !!surface || nonEmpty(named) || nonEmpty(namedMetadata.threadId)
+        || nonEmpty(namedMetadata.authorId);
       for (const agentName of targetAgents) {
         const agent = this.agents.get(agentName);
         if (agent && agent.canBeTriggeredBy(source)) {
@@ -7859,6 +7884,8 @@ export class AgentFramework {
         reason: 'conversation:closure',
         source: 'framework',
         timestamp: now,
+        // It closes the conversation in its binding's channel.
+        namesConversation: true,
       });
       // Disposed when the closure stream ends (driveStream finally), with
       // the reaper below as fallback.
@@ -8178,6 +8205,13 @@ export class AgentFramework {
       accepted: (occ) => {
         const source = occ.event.event.inboundSource;
         if (source) this.noteInboundAccepted(source);
+        // A channel message admitted afresh is where the last message came
+        // in: the fallback route's place. This hook never runs for a
+        // producer's retry, which the coalescer acknowledges again without
+        // delivering anything; a withdrawal delivers nothing either.
+        if (occ.event.lane === 'channel' && occ.scope.kind === 'channel' && !occ.retract) {
+          this.channelRegistry?.noteDelivered(occ.serverId, occ.scope.id, occ.identity?.threadId, occ.tags);
+        }
       },
       wasPublished: (subject, eventId) => {
         // Boot-time only: the occurrence's durable delivery identity
@@ -8568,7 +8602,9 @@ export class AgentFramework {
     // reaction names its channel but answers nothing).
     const named = this.candidateFromSource(occ.event.event.inboundSource, addressedHere);
     const candidate = isConversational(occ.tags) ? named : undefined;
-    const namesConversation = !!named || !!channelId;
+    // A channel, a thread or an author names a conversation, as for a gate
+    // batch (wakeProvenance).
+    const namesConversation = !!named || !!channelId || !!authorId || !!occ.identity?.threadId;
     for (const agentName of await this.coalescedAudience(occ)) {
       const takes = candidate && this.mayTakeCandidate(agentName, candidate) ? candidate : undefined;
       this.pendingRequests.push({
@@ -8802,7 +8838,14 @@ export class AgentFramework {
       // and only such a wake takes the fallback route. A reaction names its
       // conversation without being a candidate.
       const pushNamed = this.candidateFromSource(source, pushAddressed);
-      const pushNamesConversation = !!pushNamed || !!triggerChannel?.channelId;
+      // A channel, a thread or an author names a conversation, as for a gate
+      // batch (wakeProvenance): a reaction that names only its author too.
+      const originNames = (key: string): boolean => {
+        const value = event.origin?.[key];
+        return typeof value === 'string' && value.length > 0;
+      };
+      const pushNamesConversation = !!pushNamed || !!triggerChannel?.channelId
+        || originNames('authorId') || originNames('threadId');
       const pushCandidate = silentHeartbeat || !isConversational(event.tags) ? undefined : pushNamed;
       for (const agentName of targetAgents) {
         // The fork rule, as for a gate batch: no agent takes a channel a fork
@@ -11395,16 +11438,28 @@ export class AgentFramework {
         // conversation at all (a heartbeat, a timer, a self-wake) takes the
         // fallback, the last delivered message's conversation, as before
         // speech routes. A silent control-plane wake has none.
+        // A framework wake that continues the resident's previous work (a
+        // retry after a rewind, results of a non-streaming tool round, a
+        // prose continuation or bounce) and names nothing new keeps that
+        // turn's route, as an in-stream retry does: re-inferring it from an
+        // empty wake would send the retried words to the fallback instead.
+        const continues = !!trigger && CONTINUES_PREVIOUS_TURN.has(trigger.reason)
+          && !trigger.namesConversation && !trigger.routeCandidates?.length;
+        const previous = continues ? this.turnRoutes.get(agent.name) : undefined;
         const turn: TurnRoute = trigger?.suppressProse
           ? { route: null }
-          : inferTurnRoute(
+          : previous ?? inferTurnRoute(
               trigger?.routeCandidates ?? [],
               this.homeRoute(agent.name),
               (c) => this.publishTargetOf(c),
-              // Only a wake that named no conversation, candidate or not,
-              // takes the fallback: a reaction, a system marker or a channel
-              // a fork owns names one, and gets no route as before.
-              trigger?.namesConversation ? null : this.fallbackCandidate(agent.name),
+              // Only a resident's wake that named no conversation, candidate
+              // or not, takes the fallback: a reaction, a system marker or a
+              // channel a fork owns names one, and gets no route as before. An
+              // ephemeral subagent never takes it: its prose is its caller's
+              // business, never a channel's.
+              trigger?.namesConversation || this.usedEphemeralAgentNames.has(agent.name)
+                ? null
+                : this.fallbackCandidate(agent.name),
             );
         this.turnRoutes.set(agent.name, turn);
         this.midTurnInputSignals.delete(agent.name);

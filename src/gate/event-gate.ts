@@ -164,11 +164,11 @@ export interface WakeProvenance {
    */
   routeCandidates?: GateRouteCandidate[];
   /**
-   * Some event in the batch names a conversation — a channel, an author, or
-   * a local surface — whether or not it is a route candidate: a reaction or a
-   * system marker names its channel but answers nothing. Unset only when
-   * nothing in the batch named one (a heartbeat, a timer): the one wake the
-   * framework's fallback route serves.
+   * Some event in the batch names a conversation — a channel, a thread, an
+   * author, or a local surface — whether or not it is a route candidate: a
+   * reaction or a system marker names its channel but answers nothing. Unset
+   * only when nothing in the batch named one (a heartbeat, a timer): the one
+   * wake the framework's fallback route serves.
    */
   namesConversation?: true;
 }
@@ -266,7 +266,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
   const routeCandidates: GateRouteCandidate[] = [];
   let namesConversation = false;
   for (const e of events) {
-    if (e.routeChannelId || e.channelId || e.authorId || e.eventType === 'external-message' || e.eventType === 'api:message') {
+    if (e.routeChannelId || e.channelId || e.threadId || e.authorId || e.eventType === 'external-message' || e.eventType === 'api:message') {
       namesConversation = true;
     }
     // A reaction or system marker answers nothing: never a route candidate

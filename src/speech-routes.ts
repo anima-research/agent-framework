@@ -2,16 +2,20 @@
  * Speech routes: where a resident's unaddressed plain speech goes (shelf-355).
  *
  * A route is decided deliberately or inferred from what triggered the turn,
- * and comes from whichever channel last saw traffic only when nothing did:
+ * and comes from where the last message came in only when the wake named no
+ * conversation at all:
  * - deliberate: a conversation fork's home channel, or a channel the resident
  *   opened with `channel_open` (setSpeechTarget, the default); a hybrid
  *   `>>>target` prefix is deliberate too and lives in its own pin;
  * - inferred, at a true new turn, from the wake's candidates: the addressed
  *   ones if any, else the conversational ones. Only candidates that name ONE
  *   conversation infer a route; several conversations start the turn held;
- * - fallback, at a true new turn whose wake has no candidates at all (a
- *   heartbeat, a timer, a self-wake): the conversation of the last message
- *   any channel delivered, as before speech routes, checked like any route.
+ * - fallback, at a true new turn whose wake named no conversation at all (a
+ *   heartbeat, a timer, a self-wake): where the last message any channel
+ *   delivered came in, as before speech routes, checked like any route. The
+ *   framework decides which wakes those are (InferenceRequest
+ *   .namesConversation): a reaction or a channel a fork owns names one
+ *   without being a candidate, and gets no fallback.
  *
  * A held turn (competing conversations at turn start, or a competing
  * addressed or engaged arrival mid-turn) keeps unaddressed speech as drafts
@@ -204,10 +208,12 @@ export function describeConversation(c: ConversationRef): string {
  * or one that couldn't be resolved — leaves the turn without a route, which
  * it records as `unroutable`.
  *
- * A wake with no candidates at all names no conversation (a heartbeat, a
- * timer, a self-wake): its route is `fallback`, the conversation of the last
- * message any channel delivered, when the caller has one and plain speech
- * can go there exactly; otherwise it has none.
+ * `fallback` is for a wake that named no conversation at all (a heartbeat,
+ * a timer, a self-wake), and only the caller can tell that from a wake whose
+ * named conversations all fell out as candidates (a reaction, a channel a
+ * fork owns): it passes one only for the former. With no candidates, the
+ * route is then where the last message any channel delivered came in, when
+ * plain speech can go there exactly; otherwise there is none.
  */
 export function inferTurnRoute(
   candidates: readonly RouteCandidate[],

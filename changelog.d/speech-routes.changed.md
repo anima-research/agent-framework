@@ -13,12 +13,15 @@
   is kept as `ambiguous` drafts, and a `[routing]` notice names each
   conversation's address.
 
-  **A wake that names no conversation at all keeps the fallback,** as
-  before: a heartbeat, a timer, a self-wake, a script or subagent wake, or an
-  `api:inference-request` nudge.
+  **A resident's wake that names no conversation at all keeps the
+  fallback,** as before: a heartbeat, a timer, a self-wake, a background
+  script's wake, an admin nudge, or an `api:inference-request` nudge.
   - **Where it goes:** where the last message any channel delivered came in,
-    now with its server and thread named. A reaction or a withdrawal is no
-    message, so it never becomes that place.
+    now with its server and thread named. An ordinary message counts once
+    it's queued, and a coalesced one once its coalescer admits it afresh,
+    never for a producer's retry the coalescer acknowledges again. A
+    reaction, a deletion or a withdrawal is no message, so it never becomes
+    that place.
   - **What it answers:** no message. It has no reply edge, so the
     `beforeInference` context names where the speech lands
     (`defaultOutgoing`) but no `incoming` message.
@@ -32,11 +35,19 @@
     elsewhere holds a fallback route as it holds an inferred one, and the
     notice says what the route was.
   - **Which wakes name a conversation:** any event in the wake that names a
-    channel, a thread or a local surface does, whether or not it's a route
-    candidate. A reaction, a system marker or a channel another agent's
-    fork owns names one but answers nothing, so such a wake gets no route,
-    never the fallback. An ambient-only batch names its own conversations:
-    it routes to one, or holds when it names several.
+    channel, a thread, an author or a local surface does, whether or not
+    it's a route candidate, on every lane. So does a conversation's closure
+    and a tune-out wake about a channel. A reaction, a system marker or a
+    channel another agent's fork owns names one but answers nothing, so such
+    a wake gets no route, never the fallback. An ambient-only batch names
+    its own conversations: it routes to one, or holds when it names several.
+  - **Wakes that continue the previous turn's work keep its route:** a
+    retry after a refusal, an unstick or an inference failure rewinds, the
+    results of a non-streaming tool round, an explicit-prose continuation or
+    bounce, and a provider-cooldown retry, when they name nothing new.
+  - **An ephemeral subagent never takes the fallback.** Its prose isn't a
+    channel's, and before speech routes a subagent's prose between its tool
+    calls could reach the resident's live channel this way.
 
   A surface route shows speech on that surface and publishes it to no
   channel, so a console turn's reply stays on the console. That's so

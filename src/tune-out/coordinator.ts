@@ -42,7 +42,9 @@ export interface TuneOutFrameworkHooks {
     forAgent?: string,
   ) => string;
   /** Queue an inference request for an agent. */
-  requestInference: (agentName: string, reason: string, source: string) => void;
+  /** Wake an agent. `channelId`, when the wake is about a channel, says it
+   *  names that conversation, so the turn never takes the fallback route. */
+  requestInference: (agentName: string, reason: string, source: string, channelId?: string) => void;
   /** The subconscious's registry/participant name. */
   subconsciousName: () => string | null;
   /** The primary resident's registry name. */
@@ -245,7 +247,7 @@ export class TuneOutCoordinator {
     }
     const primary = this.hooks.primaryName();
     if (primary) {
-      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out', channelId);
     }
     // The subconscious gets one cancel turn of its own (unless it initiated
     // the cancel — its note already carries its words): the issue's cancel
@@ -261,7 +263,7 @@ export class TuneOutCoordinator {
         { system: true, kind: 'tune-out-cancel-report', channelId },
         subName,
       );
-      this.hooks.requestInference(subName, `tune-out cancelled: ${channelId}`, 'tune-out');
+      this.hooks.requestInference(subName, `tune-out cancelled: ${channelId}`, 'tune-out', channelId);
     }
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ended.wakeCount });
     return { ok: true };
@@ -414,7 +416,7 @@ export class TuneOutCoordinator {
       { system: true, kind: `tune-out-${trigger}`, channelId },
       subName,
     );
-    this.hooks.requestInference(subName, `tune-out ${trigger}: ${channelId}`, 'tune-out');
+    this.hooks.requestInference(subName, `tune-out ${trigger}: ${channelId}`, 'tune-out', channelId);
   }
 
   // ==========================================================================
