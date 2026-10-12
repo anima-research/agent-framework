@@ -548,7 +548,7 @@ interface ChannelRegistryOptions {
    */
   acceptInbound?: (event: McplChannelIncomingEvent) => InboundSource | undefined;
   /**
-   * Receipt clocks for channel_list (shelf-354): per listed channel, when the
+   * Receipt clocks for channel_list: per listed channel, when the
    * host last received from it and when a body from it last reached the
    * calling resident, plus the scope those clocks cover. Keyed by
    * `serverId\u0000channelId`.

@@ -1,7 +1,6 @@
 /**
- * Confirms what reached a resident, one provider round at a time (shelf-354),
- * and accepts the compile behind a successful round for fold receipts
- * (shelf-381).
+ * Confirms what reached a resident, one provider round at a time, and
+ * accepts the compile behind a successful round for fold receipts.
  *
  * A request's evidence is captured when it is prepared (evidence.ts). Membrane
  * reports each provider round whose response stands, with that round's own

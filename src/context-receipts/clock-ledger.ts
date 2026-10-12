@@ -1,5 +1,5 @@
 /**
- * Per-channel receipt clocks (shelf-354): when this host last accepted an
+ * Per-channel receipt clocks: when this host last accepted an
  * item from a channel (received), and when a provider round that stood last
  * carried a channel's new raw body, complete, to a given resident (delivered).
  *

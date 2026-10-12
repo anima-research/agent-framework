@@ -1,7 +1,7 @@
 /**
  * history--folds: when your rendered context changed resolution, which spans
  * changed, and what the rounds that confirmed them cost — read from the
- * context manager's fold journal (shelf-381). Nothing here is ever injected
+ * context manager's fold journal. Nothing here is ever injected
  * into context; the journal is only read when this tool is called.
  */
 

@@ -3,7 +3,7 @@
  * sourceBodyDigest, storedBodyDigest), end to end: a real MCPL child, the
  * framework's ingestion, a context-manager strategy that can shard a body at
  * ingestion or render one cut short, and the real membrane with only the
- * provider scripted. Agreed in room-220 #46752–#48150:
+ * provider scripted. It covers:
  *  - one source-body version through sharding and injection;
  *  - a copy rendered short is never a delivery;
  *  - a shard group an interrupted write left short is never a delivery;
@@ -11,8 +11,7 @@
  *  - a stamped copy edited after ingestion is a partial exposure, never a
  *    delivery of the original.
  * The header composition (a rename between two acceptances; a copy rendered
- * as its source header alone) is covered with shelf-356 in
- * combined/receipts-356.
+ * as its source header alone) isn't covered here.
  */
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -242,7 +241,7 @@ describe('receipts through the ingestion stamps', () => {
     assert.deepEqual(p.entries('part', 'c-1').map((e) => e.why), [['content']]);
   });
 
-  it('a shard group an interrupted write left short is never a delivery (Hugo #47804)', async () => {
+  it('a shard group an interrupted write left short is never a delivery', async () => {
     const h = await open();
     const p = probes(h);
     const store = (p.cm() as unknown as { messageStore: { append: (...args: unknown[]) => { id: string } } }).messageStore;
@@ -268,7 +267,7 @@ describe('receipts through the ingestion stamps', () => {
     assert.deepEqual(p.entries('part', 'i-1').map((e) => e.why), [['shards']]);
   });
 
-  it('a copy stored with the closed-channel invitation, untouched, is intact and delivered (Tessa #48282)', async () => {
+  it('a copy stored with the closed-channel invitation, untouched, is intact and delivered', async () => {
     const h = await open();
     const p = probes(h);
     // Accepted while its channel is open, then held until the channel closes,

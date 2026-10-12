@@ -1069,7 +1069,7 @@ export class AgentFramework {
    *  constructor installs the receipt clocks' observer, so every deployment
    *  records each accepted channel item in the clock ledger. */
   private inboundAcceptanceObserver?: InboundAcceptanceObserver;
-  /** Per-channel receipt clocks for this store (shelf-354). */
+  /** Per-channel receipt clocks for this store. */
   private readonly clockLedger: ChannelClockLedger;
   /** Round-by-round confirmation of what reached each resident. */
   private readonly contextReceipts: ContextReceipts;
@@ -7823,7 +7823,7 @@ export class AgentFramework {
   }
 
   /**
-   * channel_list's receipt clocks for one resident (shelf-354). A call with
+   * channel_list's receipt clocks for one resident. A call with
    * no agent origin (a module) gets the host-level received clocks only.
    */
   private describeChannelClocks(

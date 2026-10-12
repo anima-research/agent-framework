@@ -459,7 +459,7 @@ describe('ChannelClockLedger', () => {
     assert.deepEqual(l.scope('r').gaps, [{ from: 5_000, to: 35_000, reason: 'ledger-unreadable' }]);
   });
 
-  it('stays unreadable when the read that recovery\'s own writes call for fails, and writes nothing more until a later read succeeds (Hazel #50598)', () => {
+  it('stays unreadable when the read that recovery\'s own writes call for fails, and writes nothing more until a later read succeeds', () => {
     let l = open();
     clock = 2_000;
     l.delivered('r', CH, src('old', 1_000), ver('old'), BRANCH);
@@ -509,7 +509,7 @@ describe('ChannelClockLedger', () => {
     assert.equal(l.scope('r').degraded, true);
   });
 
-  it('treats a checkpoint whose dedup sets are missing or cut short as unreadable, never as forgetting (Hazel #50719)', () => {
+  it('treats a checkpoint whose dedup sets are missing or cut short as unreadable, never as forgetting', () => {
     let l = open();
     clock = 2_000;
     l.delivered('r', CH, src('m1', 1_000), ver('e1'), BRANCH);
@@ -771,7 +771,7 @@ describe('receipt evidence', () => {
     assert.equal(recordedBodyDigest(undefined), undefined);
   });
 
-  it('a legacy sharded head with one shard available is a stored copy (Hugo #47005 control)', () => {
+  it('a legacy sharded head with one shard available is a stored copy (a control)', () => {
     const source = { ...base, messageId: 'p8' };
     const head = { id: 'h8', sequence: 8, participant: 'u', content: [{ type: 'text', text: 'first half' }], metadata: { inboundSource: source }, bodyGroupId: 'g8', shardIndex: 0 };
     const ev = requestEvidence({
@@ -1039,7 +1039,7 @@ describe('history--folds reads on with afterId', () => {
 });
 
 describe('copies whose fidelity can\'t be checked', () => {
-  it('a body stored before stamping is never confirmed, and on its own records no loss (Hugo #47358)', async () => {
+  it('a body stored before stamping is never confirmed, and on its own records no loss', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'evidence-legacy-'));
     try {
       const cm = await ContextManager.open({ path: join(dir, 'store'), strategy: new PassthroughStrategy(), namespace: 'agents/r' });
