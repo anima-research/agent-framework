@@ -87,6 +87,7 @@ import { ChannelRegistry, publishPlaceRefusal, type ChannelToolOrigin, type Publ
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftSource, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import {
   continuationCandidates,
+  continuationNames,
   conversationKey,
   describeConversation,
   inferTurnRoute,
@@ -1993,8 +1994,7 @@ export class AgentFramework {
           addMessage: (participant, content, metadata, forAgent) =>
             framework.addMessage(participant, content, metadata as MessageMetadata,
               forAgent ? { forAgent } : undefined),
-          requestInference: (agentName, reason, source, channelId) =>
-            framework.queueTuneOutWake(agentName, reason, source, channelId),
+          requestInference: framework.queueTuneOutWake.bind(framework),
           subconsciousName: () => framework.subconsciousAgentName,
           primaryName: () => framework.primaryAgentName,
           getStoredMessages: () => {
@@ -8574,7 +8574,7 @@ export class AgentFramework {
     const candidate = isConversational(occ.tags) ? named : undefined;
     // A channel, a thread or an author names a conversation, as for a gate
     // batch (wakeProvenance) and an uncoalesced push: the batch's merged
-    // thread, or for a scope that merges none, its origin's.
+    // thread or its origin's, either one.
     const originThread = typeof origin?.threadId === 'string' && origin.threadId.length > 0;
     const namesConversation = !!named || !!channelId || !!authorId || !!occ.identity?.threadId || originThread;
     for (const agentName of await this.coalescedAudience(occ)) {
@@ -10170,25 +10170,35 @@ export class AgentFramework {
    * route record gives the conversations that turn answered
    * (continuationCandidates), and the wake names them. So the true new turn
    * it starts, alone or batched with other wakes, infers its route from them
-   * by the rules every wake follows (the fork rule included, at turn start),
-   * rather than taking the fallback. A turn whose words had no place (a
-   * silent tick, a wake whose conversation it couldn't take, a no-name wake
-   * with no fallback place) gives no candidates, but its continuation still
-   * names a conversation: the fallback mustn't give the continuation's words
-   * a place the turn's never had. Only an agent with no route record (no
-   * turn yet, or an explicit-prose turn) gives a wake that names nothing.
+   * by the rules every wake follows (the fork rule included, at turn start).
+   * A fallback turn's continuation names nothing and takes the fallback
+   * afresh, as that turn did; a turn whose words had no place gives a
+   * continuation that names a conversation but no candidate, so the fallback
+   * gives it no place either (continuationNames).
+   *
+   * A continuation of a silent tick queued while that turn runs (a rewind
+   * retry, its tool round's results) is a silent tick too: it carries the
+   * turn's suppressProse, its prompt and its stamp, as a budget restart does.
+   * A budget restart and a guard retry aren't built here: they continue the
+   * same logical turn, which keeps its route record (continuingTurn).
    */
   private continuationRequest(agentName: string, reason: string): InferenceRequest {
     const timestamp = Date.now();
     const turn = this.turnRoutes.get(agentName);
     const candidates = continuationCandidates(turn, timestamp);
+    const active = this.activeTurnTriggers.get(agentName);
     return {
       agentName,
       reason,
       source: 'framework',
       timestamp,
-      ...(turn ? { namesConversation: true as const } : {}),
+      ...(continuationNames(turn) ? { namesConversation: true as const } : {}),
       ...(candidates.length > 0 ? { routeCandidates: candidates } : {}),
+      ...(active?.suppressProse ? {
+        suppressProse: true,
+        ...(active.ephemeralSystemPrompt ? { ephemeralSystemPrompt: active.ephemeralSystemPrompt } : {}),
+        ...(active.silentHeartbeat ? { silentHeartbeat: active.silentHeartbeat } : {}),
+      } : {}),
     };
   }
 

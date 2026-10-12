@@ -42,20 +42,24 @@
     a wake gets no route, never the fallback. An ambient-only batch names
     its own conversations: it routes to one, or holds when it names several.
   - **A framework wake that continues a turn names that turn's
-    conversations:** a retry after a refusal, an unstick or an inference
-    failure rewinds; an unstick; the results of a non-streaming tool round;
-    an explicit-prose continuation or bounce; and a provider-cooldown retry
-    that holds no wake of its own. The wake carries those conversations, read
-    when it is queued, as addressed ones, so its words go where the turn's
-    would have. Beside a heartbeat they keep the turn, beside an ambient
-    arrival from elsewhere they win, and beside an addressed one from
-    elsewhere the turn is held. A bounce during a turn queues its wake when
-    that turn ends, so it names where the turn's words went by then, after a
-    `channel_open` or a hold. A turn whose words had no place (a silent
-    tick, or a wake whose conversation it couldn't take) gives no
-    conversation to carry, and its continuation's words get no place either,
-    never the fallback. Everything else starts afresh, as at any new turn: a
-    rewind sheds the turn whose choices those were.
+    conversations:** the retry after a rewind (for a refusal, an unstick's
+    forced rewind, or an inference failure); an unstick itself; the results
+    of a non-streaming tool round; an explicit-prose continuation or bounce;
+    and a provider-cooldown retry that holds no wake of its own. The wake
+    carries those conversations, read when it is queued, as addressed ones,
+    so its words go where the turn's would have. Beside a heartbeat they keep
+    the turn, beside an ambient arrival from elsewhere they win, and beside
+    an addressed one from elsewhere the turn is held. The route is inferred
+    from them like any wake's: a `channel_open` sets a route for its own
+    turn only. A bounce during a turn queues its wake when that turn ends, so
+    it names where the turn's words went by then, after a `channel_open` or
+    a hold. A fallback turn named no conversation, so its continuation names
+    none and takes the fallback afresh. A turn whose words had no place (a
+    silent tick, or a wake whose conversation it couldn't take) gives its
+    continuation no place either, never the fallback, and a silent tick's
+    continuation queued during it is a silent tick too. The new turn is
+    otherwise fresh, as any is: a rewind sheds the turn whose choices those
+    were.
   - **An ephemeral subagent never takes the fallback.** Its prose isn't a
     channel's, and before speech routes a subagent's prose between its tool
     calls could reach the resident's live channel this way.

@@ -6,6 +6,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   continuationCandidates,
+  continuationNames,
   conversationKey,
   describeConversation,
   inferTurnRoute,
@@ -328,15 +329,26 @@ describe('continuationCandidates', () => {
     ({ kind: 'channel', serverId: 'discord', channelId, origin: 'trigger', ...extra });
 
   it('a turn with a route names its conversation, addressed, with its reply edge', () => {
-    const turn: TurnRoute = { route: route('general', { threadId: 't-1', replyTo: 'm-7', label: '#general', origin: 'fallback' }) };
+    const turn: TurnRoute = { route: route('general', { threadId: 't-1', replyTo: 'm-7', label: '#general', origin: 'open' }) };
     assert.deepEqual(continuationCandidates(turn, 9), [{
       conversation: { kind: 'channel', serverId: 'discord', channelId: 'general', threadId: 't-1', label: '#general' },
       addressed: true,
       at: 9,
       messageId: 'm-7',
     }]);
+    assert.equal(continuationNames(turn), true);
     assert.deepEqual(continuationCandidates({ route: { kind: 'surface', surface: 'tui', origin: 'trigger' } }, 9),
       [{ conversation: { kind: 'surface', surface: 'tui' }, addressed: true, at: 9 }]);
+  });
+
+  it('a fallback turn answered no conversation: its continuation names none, and takes the fallback afresh', () => {
+    const fallback: TurnRoute = { route: route('last', { origin: 'fallback' }) };
+    assert.deepEqual(continuationCandidates(fallback, 9), []);
+    assert.equal(continuationNames(fallback), false);
+    // Held mid-turn, it names what it held between, as any held turn does.
+    const held: TurnRoute = { ...fallback, hold: { conversations: [channel('last'), channel('b')], since: 'mid-turn' } };
+    assert.equal(continuationCandidates(held, 9).length, 2);
+    assert.equal(continuationNames(held), true);
   });
 
   it('a held turn names every conversation it held between, so its continuation is held again', () => {
@@ -349,17 +361,22 @@ describe('continuationCandidates', () => {
 
   it('a turn whose one conversation could not take plain speech names it, to be checked again', () => {
     const unresolved = continuationCandidates({ route: null, unroutable: { conversation: channel('dup'), reason: 'unresolved' } }, 3);
-    assert.deepEqual(unresolved, [{ conversation: channel('dup'), addressed: true, at: 3, unroutable: true }]);
+    assert.deepEqual(unresolved, [{ conversation: channel('dup'), addressed: true, at: 3 }]);
     const untargetable = continuationCandidates({ route: null, unroutable: { conversation: channel('quiet'), reason: 'untargetable' } }, 3);
     assert.deepEqual(untargetable, [{ conversation: channel('quiet'), addressed: true, at: 3 }]);
     // Checked again: still refused while the channel declares nothing, a route once it does.
     assert.equal(inferTurnRoute(untargetable, null, declaredNowhere).unroutable?.reason, 'untargetable');
     assert.equal(inferTurnRoute(untargetable, null, rootEverywhere).route?.kind, 'channel');
+    // An unresolved one too: unresolved while it still is, a route once it resolves.
+    assert.equal(inferTurnRoute(unresolved, null, () => 'unresolved').unroutable?.reason, 'unresolved');
+    assert.equal(inferTurnRoute(unresolved, null, rootEverywhere).route?.kind, 'channel');
   });
 
-  it('a turn that answered no conversation, or left no record, gives none', () => {
+  it("a turn whose words had no place gives no candidate, but its continuation names a conversation; no record names none", () => {
     assert.deepEqual(continuationCandidates({ route: null }, 1), []);
+    assert.equal(continuationNames({ route: null }), true);
     assert.deepEqual(continuationCandidates(undefined, 1), []);
+    assert.equal(continuationNames(undefined), false);
   });
 
   it('beside an ambient arrival from elsewhere the continued conversation wins; beside an addressed one the turn holds', () => {

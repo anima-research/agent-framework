@@ -1406,10 +1406,11 @@ export class ChannelRegistry {
   // ==========================================================================
 
   /** The channel id of where the last message any channel delivered came in
-   *  (noteDelivered: a conversational message, never a reaction, a deletion
-   *  or a withdrawal), or null. Kept from before speech routes for hosts
-   *  that read it. The framework doesn't: a turn's fallback route reads
-   *  getLastInbound, which names the server and thread too. */
+   *  (noteDelivered: a conversational message, never a reaction or a
+   *  deletion, nor a withdrawal, which its callers leave out), or null. Kept
+   *  from before speech routes for hosts that read it. The framework
+   *  doesn't: a turn's fallback route reads getLastInbound, which names the
+   *  server and thread too. */
   getDefaultPublishChannel(): string | null {
     return this.lastInbound?.channelId ?? null;
   }

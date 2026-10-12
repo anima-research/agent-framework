@@ -50,7 +50,8 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   fw.pendingRequests = [];
   // The turn the retry continues answered a channel (its speech route).
   fw.turnRoutes = new Map([['cairn', { route: { kind: 'channel', serverId: 'discord', channelId: 'discord:g:c1', replyTo: 'm-1', origin: 'trigger' } }]]);
-  fw.conversationAgentHomes = new Map();
+  // No running turn's trigger: the turn the retry continues wasn't silent.
+  fw.activeTurnTriggers = new Map();
   fw.traceListeners = [];
   fw.inferenceFailureEscalationThreshold = 3;
   fw.agents = new Map([['cairn', {

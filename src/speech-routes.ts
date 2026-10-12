@@ -297,19 +297,20 @@ function fallbackRoute(fallback: RouteCandidate | null | undefined, targetOf: Pu
  * turn's would have. A held turn names each conversation it held between; a
  * turn with a route names its route's conversation, reply edge kept; a turn
  * whose one conversation couldn't take plain speech names that one, to be
- * checked again. Each counts as addressed, since the resident was answering
- * it: an ambient arrival batched beside it doesn't take the turn, and an
- * addressed one from elsewhere holds it. A turn whose words had no place (a
- * silent wake, a wake whose conversation it couldn't take, a no-name wake
- * with no fallback place) gives none; the framework's wake still names a
- * conversation then, so the fallback gives its words no place either
- * (continuationRequest).
+ * checked again as any candidate is. Each counts as addressed, since the
+ * resident was answering it: an ambient arrival batched beside it doesn't
+ * take the turn, and an addressed one from elsewhere holds it.
+ *
+ * A turn that answered no conversation gives none: a fallback turn, or a
+ * turn whose words had no place. Whether its continuation names a
+ * conversation anyway is continuationNames.
  */
 export function continuationCandidates(turn: TurnRoute | undefined, at: number): RouteCandidate[] {
   if (!turn) return [];
   if (turn.hold) return turn.hold.conversations.map((conversation) => ({ conversation, addressed: true, at }));
   if (turn.route) {
     const { route } = turn;
+    if (route.origin === 'fallback') return [];
     return [{
       conversation: routeConversation(route),
       addressed: true,
@@ -317,15 +318,21 @@ export function continuationCandidates(turn: TurnRoute | undefined, at: number):
       ...(route.kind === 'channel' && route.replyTo ? { messageId: route.replyTo } : {}),
     }];
   }
-  if (turn.unroutable) {
-    return [{
-      conversation: turn.unroutable.conversation,
-      addressed: true,
-      at,
-      ...(turn.unroutable.reason === 'unresolved' ? { unroutable: true as const } : {}),
-    }];
-  }
+  if (turn.unroutable) return [{ conversation: turn.unroutable.conversation, addressed: true, at }];
   return [];
+}
+
+/**
+ * Whether a framework wake that continues a turn names a conversation. A
+ * fallback turn's wake named none, so its continuation names none and takes
+ * the fallback afresh. Every other route record counts as named: a turn
+ * whose words had no place (a silent wake, a wake whose conversation it
+ * couldn't take, or a no-name wake that found no fallback place) gives its
+ * continuation no place either. No record (no turn yet, or an
+ * explicit-prose turn) names none.
+ */
+export function continuationNames(turn: TurnRoute | undefined): boolean {
+  return !!turn && !(turn.route?.origin === 'fallback' && !turn.hold);
 }
 
 /** The candidates a route is inferred from: the addressed ones if any, else all. */
