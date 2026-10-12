@@ -195,6 +195,82 @@ describe('RecordJournal', () => {
     });
   });
 
+  it('an append that throws inside the store blocks writes for the life of the journal; a journal on the reopened store loads its record', () => {
+    withStore((store) => {
+      // As Chronicle's append can fail: the record is written to the log, the
+      // periodic sync then fails, and the record never reaches the index this
+      // process reads. Reopening the store indexes it from the log. `hidden`
+      // is this process's view of the store.
+      let failAppend: 'after-writing' | 'before-writing' | null = null;
+      const hidden = new Set<string>();
+      const live = {
+        getRecordIdsByType: (type: string) => store.getRecordIdsByType(type).filter((id) => !hidden.has(id)),
+        getRecord: (id: string) => (hidden.has(id) ? null : store.getRecord(id)),
+        appendJson: (type: string, data: unknown) => {
+          if (failAppend === 'before-writing') { failAppend = null; throw new Error('EIO: write failed'); }
+          const record = store.appendJson(type, data);
+          if (failAppend === 'after-writing') { failAppend = null; hidden.add(record.id); throw new Error('EIO: fsync failed'); }
+          return record;
+        },
+        sync: () => store.sync(),
+      } as unknown as JsStore;
+      const journal = new RecordJournal<Entry, { seen: string[] }>(live, { type: 'journal-test/entry' });
+      journal.append({ n: 'A' });
+
+      failAppend = 'after-writing';
+      assert.throws(() => journal.append({ n: 'B' }), /EIO: fsync failed/);
+      assert.strictEqual(journal.needsReconcile, false, 'no load() on this store can read B back');
+      assert.deepStrictEqual(journal.load().entries.map((e) => e.entry.n), ['A'], 'B is outside this view of the store');
+      // A checkpoint now would cover B, unreduced, so nothing more is written.
+      const blocked = /append failed inside the store \(EIO: fsync failed\).*until the store is reopened/;
+      assert.throws(() => journal.append({ n: 'C' }), blocked);
+      assert.throws(() => journal.checkpoint({ seen: ['A'] }), blocked);
+      assert.throws(() => journal.append({ n: 'C' }), blocked, 'load() does not lift it');
+
+      // A journal on the reopened store loads B with its tail, and writes again.
+      const reopened = new RecordJournal<Entry, { seen: string[] }>(store, { type: 'journal-test/entry' });
+      assert.deepStrictEqual(reopened.load().entries.map((e) => e.entry.n), ['A', 'B']);
+      reopened.append({ n: 'C' });
+      reopened.checkpoint({ seen: ['A', 'B', 'C'] });
+      assert.deepStrictEqual(new RecordJournal<Entry, { seen: string[] }>(store, { type: 'journal-test/entry' }).load(),
+        { snapshot: { seen: ['A', 'B', 'C'] }, entries: [] });
+
+      // An append that fails before writing anything looks the same from
+      // here, so it blocks the same way; the reopened store has nothing new.
+      const second = new RecordJournal<Entry, { seen: string[] }>(live, { type: 'journal-test/entry' });
+      second.load();
+      failAppend = 'before-writing';
+      assert.throws(() => second.append({ n: 'X' }), /EIO: write failed/);
+      assert.throws(() => second.append({ n: 'D' }), /until the store is reopened/);
+      assert.deepStrictEqual(new RecordJournal<Entry, { seen: string[] }>(store, { type: 'journal-test/entry' }).load(),
+        { snapshot: { seen: ['A', 'B', 'C'] }, entries: [] });
+    });
+  });
+
+  it('a durable checkpoint whose barrier throws blocks writes until load() replays it', () => {
+    withStore((store) => {
+      let failNextSync = false;
+      const flaky = {
+        getRecordIdsByType: (type: string) => store.getRecordIdsByType(type),
+        getRecord: (id: string) => store.getRecord(id),
+        appendJson: (type: string, data: unknown) => store.appendJson(type, data),
+        sync: () => {
+          if (failNextSync) { failNextSync = false; throw new Error('disk full'); }
+          store.sync();
+        },
+      } as unknown as JsStore;
+      const journal = new RecordJournal<Entry, { seen: string[] }>(flaky, { type: 'journal-test/entry' });
+      journal.append({ n: 'A' });
+
+      failNextSync = true;
+      assert.throws(() => journal.checkpoint({ seen: ['A'] }, { durable: true }), /disk full/);
+      assert.strictEqual(journal.needsReconcile, true);
+      assert.throws(() => journal.append({ n: 'C' }), /load\(\) and reduce its tail/);
+      assert.deepStrictEqual(journal.load(), { snapshot: { seen: ['A'] }, entries: [] }, 'the checkpoint landed');
+      journal.append({ n: 'C' });
+    });
+  });
+
   it('refuses a checkpoint type equal to the entry type', () => {
     withStore((store) => {
       assert.throws(() => new RecordJournal(store, { type: 't', checkpointType: 't' }), /distinct record types/);
