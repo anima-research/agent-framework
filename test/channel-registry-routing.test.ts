@@ -128,6 +128,40 @@ test('handleIncoming REJECTS an unknown channel instead of minting it (§14.5)',
   assert.equal(registry.resolveLocus('cairn'), null, 'a rejected message must not establish a locus');
 });
 
+test('the registry remembers the last delivered message for the fallback, and forgets it when its channel or server goes', async () => {
+  const registry = new ChannelRegistry(
+    { getServer: () => undefined } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+  );
+  seedRegistered(registry, 'slack', 'slack:C1', 'slack:C2');
+  assert.equal(registry.getLastInbound(), null);
+  assert.equal(registry.getDefaultPublishChannel(), null);
+  const deliver = (channelId: string, messageId: string, threadId?: string) => registry.handleIncoming('slack', {
+    messages: [{
+      channelId, messageId, author: { id: 'u1', name: 'Ada' }, timestamp: '2026-10-07T00:00:00.000Z',
+      content: [{ type: 'text' as const, text: 'hi' }], ...(threadId ? { threadId } : {}),
+    }],
+  });
+  await deliver('slack:C1', 'm-1', '1700.0001');
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C1', messageId: 'm-1', threadId: '1700.0001' });
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1');
+  await deliver('slack:C2', 'm-2');
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2', messageId: 'm-2' }, 'the newest wins, a root message naming no thread');
+
+  // A removal of another channel leaves it; its own channel's removal forgets it.
+  await registry.handleChanged('slack', { removed: ['slack:C1'] });
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C2');
+  await registry.handleChanged('slack', { removed: ['slack:C2'] });
+  assert.equal(registry.getLastInbound(), null);
+
+  seedRegistered(registry, 'slack', 'slack:C1');
+  await deliver('slack:C1', 'm-3');
+  registry.removeServer('slack');
+  assert.equal(registry.getLastInbound(), null, 'its server going forgets it');
+});
+
 test('the gate reads a message\'s thread from the protocol field, never from adapter metadata', async () => {
   const seen: Array<Record<string, unknown>> = [];
   const registry = new ChannelRegistry(

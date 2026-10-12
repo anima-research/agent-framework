@@ -8840,7 +8840,8 @@ export class AgentFramework {
    * fix works even against a discord-mcpl build that predates `mcplChannelId`.
    * Returns undefined for push events with no channel provenance (heartbeats,
    * reminders, timers): they name no conversation, so they are no route
-   * candidate, and a turn they alone wake infers no speech route (shelf-355).
+   * candidate, and a turn they alone wake takes the fallback route, the last
+   * delivered message's conversation (shelf-355).
    */
   private derivePushEventChannel(
     origin: Record<string, unknown> | undefined,
@@ -9346,7 +9347,7 @@ export class AgentFramework {
 
   private static readonly DRAFT_REASON_TEXT: Record<DraftReason, string> = {
     'explicit-send': 'an explicit send in the same round holds plain speech back',
-    'no-destination': 'it had no destination — nothing this turn named a conversation to answer, or a failed routing envelope left plain speech waiting for a new valid target',
+    'no-destination': 'it had no destination — nothing this turn named a conversation it could speak into, or a failed routing envelope left plain speech waiting for a new valid target',
     ambiguous: 'more than one conversation was waiting for you, so unaddressed speech was held rather than guessed',
     bounced: 'its routing prefix bounced',
   };
@@ -10081,6 +10082,19 @@ export class AgentFramework {
   }
 
   /**
+   * The fallback for a wake that names no conversation: the conversation of
+   * the last message any channel delivered (its server, thread and message),
+   * as plain speech went before speech routes. Not when a conversation fork
+   * owns that channel and this agent isn't the fork: the fork rule that keeps
+   * every other route out of a fork's channel.
+   */
+  private fallbackCandidate(agentName: string): RouteCandidate | null {
+    const last = this.channelRegistry?.getLastInbound?.();
+    if (!last || !this.mayTakeRoute(agentName, last.channelId)) return null;
+    return this.candidateForChannel(last.channelId, false, Date.now(), last.serverId, last.messageId, last.threadId);
+  }
+
+  /**
    * A conversation fork's home as its standing route (it always wins). Homes
    * are bare channel ids: the server is the id's sole registrant, and a
    * shared id gets none, so the route is unresolved rather than guessed.
@@ -10466,6 +10480,10 @@ export class AgentFramework {
       text =
         `[routing] Your plain speech now goes to ${describeConversation(routeConversation(turn.route))}: ` +
         'it is shown there and published to no channel. Channels need an explicit send tool.';
+    } else if (turn.route.origin === 'fallback') {
+      text =
+        `[routing] Nothing in this wake named a conversation, so your plain speech lands where the last message ` +
+        `came in: ${describeConversation(routeConversation(turn.route))}. Other channels need an explicit send tool.`;
     } else {
       text =
         `[routing] Your plain speech now lands in ${describeConversation(routeConversation(turn.route))}. ` +
@@ -11335,11 +11353,18 @@ export class AgentFramework {
       } else if (attempt === 0) {
         // A true new turn: the route comes from a fork's home, else from the
         // wake's candidates — addressed ones first, one conversation only,
-        // else held (src/speech-routes.ts). Never from whichever channel
-        // last saw traffic. A silent control-plane wake has none.
+        // else held (src/speech-routes.ts). A wake that names no
+        // conversation at all (a heartbeat, a timer, a self-wake) takes the
+        // fallback, the last delivered message's conversation, as before
+        // speech routes. A silent control-plane wake has none.
         const turn: TurnRoute = trigger?.suppressProse
           ? { route: null }
-          : inferTurnRoute(trigger?.routeCandidates ?? [], this.homeRoute(agent.name), (c) => this.publishTargetOf(c));
+          : inferTurnRoute(
+              trigger?.routeCandidates ?? [],
+              this.homeRoute(agent.name),
+              (c) => this.publishTargetOf(c),
+              this.fallbackCandidate(agent.name),
+            );
         this.turnRoutes.set(agent.name, turn);
         this.midTurnInputSignals.delete(agent.name);
         if (!trigger?.suppressProse) this.announceRouteIfChanged(agent.name, turn);

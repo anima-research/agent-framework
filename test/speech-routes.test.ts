@@ -60,6 +60,39 @@ describe('inferTurnRoute', () => {
     assert.deepEqual(inferTurnRoute([], undefined, rootEverywhere), { route: null });
   });
 
+  it('no candidates takes the fallback: the last delivered message\'s conversation, its thread and message included', () => {
+    const last = candidate(channel('last', { threadId: 't-9', label: '#last' }), false, 7, 'm-last');
+    assert.deepEqual(inferTurnRoute([], undefined, exactEverywhere, last), {
+      route: { kind: 'channel', serverId: 'discord', channelId: 'last', threadId: 't-9', replyTo: 'm-last', label: '#last', origin: 'fallback' },
+    });
+  });
+
+  it('a fallback plain speech can\'t go to exactly is no route, not an unroutable one', () => {
+    // Nothing in the wake named it, so no conversation is in front of the
+    // resident: the turn simply has no destination.
+    const last = candidate(channel('last'), false, 7, 'm-last');
+    assert.deepEqual(inferTurnRoute([], undefined, declaredNowhere, last), { route: null });
+    const threaded = candidate(channel('last', { threadId: 't-9' }), false, 7);
+    assert.deepEqual(inferTurnRoute([], undefined, rootEverywhere, threaded), { route: null }, 'a thread on a root channel');
+    const unresolved: RouteCandidate = { ...candidate(channel('last'), false, 7), unroutable: true };
+    assert.deepEqual(inferTurnRoute([], undefined, rootEverywhere, unresolved), { route: null });
+  });
+
+  it('the fallback only answers a wake with no candidates: a wake\'s own conversation and a fork home both win', () => {
+    const last = candidate(channel('last'), false, 7, 'm-last');
+    const own = inferTurnRoute([candidate(channel('own'), false, 5, 'm-own')], undefined, rootEverywhere, last);
+    assert.equal((own.route as { channelId: string; origin: string }).channelId, 'own');
+    assert.equal((own.route as { origin: string }).origin, 'trigger');
+    const home: SpeechRoute = { kind: 'channel', serverId: 'discord', channelId: 'home', origin: 'home' };
+    assert.deepEqual(inferTurnRoute([], home, rootEverywhere, last), { route: home });
+    // Two conversations still hold: the fallback never breaks a tie.
+    const held = inferTurnRoute([
+      candidate(channel('a'), true, 1), candidate(channel('b'), true, 2),
+    ], undefined, rootEverywhere, last);
+    assert.equal(held.route, null);
+    assert.ok(held.hold);
+  });
+
   it('an addressed candidate outranks newer ambient chatter elsewhere', () => {
     const turn = inferTurnRoute([
       candidate(channel('dm'), true, 1, 'm-dm'),
@@ -195,6 +228,13 @@ describe('suspendsRoute', () => {
 
   it('an addressed arrival from another conversation suspends an inferred route', () => {
     assert.equal(suspendsRoute(routeA, { conversation: channel('dm'), addressed: true }, notEngaged), true);
+  });
+
+  it('a fallback route is inferred too: an addressed arrival from elsewhere suspends it, its own conversation doesn\'t', () => {
+    const fallback: TurnRoute = { route: { kind: 'channel', serverId: 'discord', channelId: 'A', origin: 'fallback' } };
+    assert.equal(suspendsRoute(fallback, { conversation: channel('dm'), addressed: true }, notEngaged), true);
+    assert.equal(suspendsRoute(fallback, { conversation: channel('A'), addressed: true }, notEngaged), false);
+    assert.equal(suspendsRoute(fallback, { conversation: channel('dm'), addressed: false }, notEngaged), false);
   });
 
   it('the same conversation never does, addressed or not', () => {

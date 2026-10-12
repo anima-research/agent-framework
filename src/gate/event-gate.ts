@@ -147,8 +147,9 @@ export interface WakeProvenance {
    *  addressed the agent (mention / reply / DM) and the host resolved its
    *  registered channel: the framework marks the wake addressed there.
    *  Ambient-only batches set nothing. It is not the speech route, which the
-   *  framework infers from `routeCandidates` (shelf-355); no wake falls back
-   *  to the most recent inbound channel any more. */
+   *  framework infers from `routeCandidates` (shelf-355); only a wake whose
+   *  batch names no conversation at all falls back to the last delivered
+   *  message's conversation. */
   routeChannelId?: string;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
@@ -1718,7 +1719,8 @@ export class EventGate {
     // event addressed the agent and its registered channel is known,
     // `routeChannelId` marks the wake addressed there. The turn's speech
     // route comes from `routeCandidates`, every conversation in the batch
-    // (shelf-355), never from whichever channel last saw any traffic.
+    // (shelf-355); the last delivered message's conversation is the route
+    // only when the batch names none.
     const provenance = wakeProvenance([...evicted, ...events]);
     for (const agentName of this.getAgentNamesFn()) {
       this.requestInferenceFn(agentName, 'gate:debounce', 'gate', provenance);

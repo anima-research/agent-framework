@@ -724,6 +724,10 @@ export class ChannelRegistry {
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
+  /** The last message any channel delivered (`channels/incoming`, once
+   *  accepted): a turn whose wake names no conversation speaks there, as
+   *  before speech routes. Cleared when its channel or server goes. */
+  private lastInbound: { serverId: string; channelId: string; messageId: string; threadId?: string } | null = null;
 
   /**
    * Most-recently-known label per channelId, replayed from
@@ -928,6 +932,7 @@ export class ChannelRegistry {
         const key = `${serverId}:${channelId}`;
         const existed = this.channels.delete(key);
         this.stopTyping({ serverId, channelId });
+        if (this.lastInbound?.serverId === serverId && this.lastInbound.channelId === channelId) this.lastInbound = null;
         addedResults.push({ id: channelId, accepted: existed, reason: existed ? undefined : 'not registered' });
       }
     }
@@ -1098,11 +1103,18 @@ export class ChannelRegistry {
         continue;
       }
 
-      // An accepted message never retargets speech: a route comes from a
-      // turn's own wake or a deliberate choice, never from whichever channel
-      // last saw traffic (shelf-355). A coalesced item is "accepted" only
-      // once the coalescer admits it, so for those this runs after the hook.
+      // An accepted message retargets only the fallback: the route of a turn
+      // whose wake names no conversation. Every other route comes from a
+      // turn's own wake or a deliberate choice. A coalesced item is
+      // "accepted" only once the coalescer admits it, so for those this runs
+      // after the hook.
       const markAccepted = () => {
+        this.lastInbound = {
+          serverId,
+          channelId: message.channelId,
+          messageId: message.messageId,
+          ...(typeof message.threadId === 'string' && message.threadId ? { threadId: message.threadId } : {}),
+        };
         // A server sending channels/incoming is authoritative evidence that
         // the transport is actually open. This repairs transient status only;
         // durable desired state still changes exclusively through lifecycle
@@ -1390,6 +1402,17 @@ export class ChannelRegistry {
   // Accessors
   // ==========================================================================
 
+  /** The channel id of the last message any channel delivered, or null. */
+  getDefaultPublishChannel(): string | null {
+    return this.lastInbound?.channelId ?? null;
+  }
+
+  /** The last message any channel delivered: its server, channel, message and
+   *  thread, for the route of a turn whose wake names no conversation. */
+  getLastInbound(): { serverId: string; channelId: string; messageId: string; threadId?: string } | null {
+    return this.lastInbound ? { ...this.lastInbound } : null;
+  }
+
   /**
    * Get the descriptor for a channel by its channelId (first match across
    * servers). Used by the conversation router for DM classification.
@@ -1594,6 +1617,7 @@ export class ChannelRegistry {
       this.channels.delete(key);
       this.stopTyping({ serverId: entry.serverId, channelId: entry.descriptor.id });
     }
+    if (this.lastInbound?.serverId === serverId) this.lastInbound = null;
     // Desired state and migration markers deliberately survive disconnects.
   }
 
@@ -1610,6 +1634,7 @@ export class ChannelRegistry {
 
     // Clear channels map
     this.channels.clear();
+    this.lastInbound = null;
   }
 
   // ==========================================================================
@@ -3623,9 +3648,9 @@ export class ChannelRegistry {
     }
 
     // The destination: the one named — its root, or the thread named with
-    // it — else the caller's current speech route, thread included; never
-    // the most recent inbound channel (shelf-355), and never a thread
-    // borrowed from an earlier route for a channel named explicitly.
+    // it — else the caller's current speech route, thread included (for a
+    // turn whose wake named no conversation, its fallback route); never a
+    // thread borrowed from an earlier route for a channel named explicitly.
     // Supplied selectors are checked before any default applies: an empty
     // or non-string one is refused, never read as omission (which would
     // widen it to "your route" or "whichever server has the id"). null means

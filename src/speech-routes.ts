@@ -65,7 +65,10 @@ export type RouteOrigin =
   /** A conversation fork's home channel. */
   | 'home'
   /** The resident's own channel_open (setSpeechTarget). */
-  | 'open';
+  | 'open'
+  /** A wake that named no conversation: the conversation of the last
+   *  message any channel delivered, as before speech routes. */
+  | 'fallback';
 
 export type SpeechRoute =
   | {
@@ -192,15 +195,21 @@ export function describeConversation(c: ConversationRef): string {
  * considered if there are any, else every (conversational) candidate; they
  * infer a route only when they name one conversation, from the newest
  * candidate in it (its message is the reply edge). Several conversations
- * start the turn held, naming each; none leaves the turn without a route,
- * and so does one that can't take plain speech — a channel the framework
- * can't publish into exactly (`targetOf`, RFC-011), or one that couldn't be
- * resolved — which the turn records as `unroutable`.
+ * start the turn held, naming each. One that can't take plain speech — a
+ * channel the framework can't publish into exactly (`targetOf`, RFC-011),
+ * or one that couldn't be resolved — leaves the turn without a route, which
+ * it records as `unroutable`.
+ *
+ * A wake with no candidates at all names no conversation (a heartbeat, a
+ * timer, a self-wake): its route is `fallback`, the conversation of the last
+ * message any channel delivered, when the caller has one and plain speech
+ * can go there exactly; otherwise it has none.
  */
 export function inferTurnRoute(
   candidates: readonly RouteCandidate[],
   home: SpeechRoute | null | undefined,
   targetOf: PublishTargetOf,
+  fallback?: RouteCandidate | null,
 ): TurnRoute {
   if (home) {
     const conversation = routeConversation(home);
@@ -211,7 +220,7 @@ export function inferTurnRoute(
     return { route: replyTo && home.kind === 'channel' ? { ...home, replyTo } : home };
   }
   const pool = considered(candidates);
-  if (pool.length === 0) return { route: null };
+  if (pool.length === 0) return { route: fallbackRoute(fallback, targetOf) };
   const newestByConversation = new Map<string, RouteCandidate>();
   for (const candidate of pool) {
     const key = conversationKey(candidate.conversation);
@@ -248,6 +257,25 @@ export function inferTurnRoute(
       };
 }
 
+/** The fallback conversation as a route, or null when there is none or plain
+ *  speech can't go there exactly. Nothing in the wake named it, so it is no
+ *  conversation in front of the resident: an unroutable fallback is simply
+ *  no route, not an `unroutable` one. */
+function fallbackRoute(fallback: RouteCandidate | null | undefined, targetOf: PublishTargetOf): SpeechRoute | null {
+  if (!fallback || fallback.unroutable) return null;
+  const c = fallback.conversation;
+  if (c.kind !== 'channel' || routeRefusal(c, targetOf)) return null;
+  return {
+    kind: 'channel',
+    ...(c.serverId ? { serverId: c.serverId } : {}),
+    channelId: c.channelId,
+    ...(c.threadId ? { threadId: c.threadId } : {}),
+    ...(fallback.messageId ? { replyTo: fallback.messageId } : {}),
+    ...(c.label ? { label: c.label } : {}),
+    origin: 'fallback',
+  };
+}
+
 /** The candidates a route is inferred from: the addressed ones if any, else all. */
 function considered(candidates: readonly RouteCandidate[]): readonly RouteCandidate[] {
   const addressed = candidates.filter((c) => c.addressed);
@@ -280,7 +308,8 @@ export function isConversational(tags: readonly string[] | undefined, metadata?:
 
 /**
  * Whether a mid-turn arrival suspends the turn's route: only an inferred
- * route (origin 'trigger') not already held, and only for an arrival from a
+ * route (origin 'trigger', or the 'fallback' a wake that named no
+ * conversation took) not already held, and only for an arrival from a
  * DIFFERENT conversation that addressed the resident, or that continues a
  * conversation the resident explicitly sent into this turn. Ambient chatter
  * never does; deliberate routes never are. It sees no tags: the caller passes
@@ -292,7 +321,7 @@ export function suspendsRoute(
   arrival: { conversation: ConversationRef; addressed: boolean },
   engaged: (c: ConversationRef) => boolean,
 ): boolean {
-  if (turn.hold || !turn.route || turn.route.origin !== 'trigger') return false;
+  if (turn.hold || !turn.route || (turn.route.origin !== 'trigger' && turn.route.origin !== 'fallback')) return false;
   if (conversationKey(arrival.conversation) === conversationKey(routeConversation(turn.route))) return false;
   return arrival.addressed || engaged(arrival.conversation);
 }

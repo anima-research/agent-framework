@@ -503,14 +503,15 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
-  it('a no-trigger (heartbeat) turn has no speech route, whatever the previous turn had', async () => {
+  it('a no-trigger (heartbeat) turn never carries a stale route over: with no delivered message it has none', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tick' }]));
     const framework = await makeFramework();
     const i = internals(framework);
 
     // A stale route left by a prior turn must not carry over: a turn with no
-    // route candidates (a heartbeat/timer) has no destination, so its plain
-    // speech is held as a draft rather than sent anywhere.
+    // route candidates (a heartbeat/timer) takes only the fallback, the last
+    // delivered message's conversation, and with none delivered it has no
+    // destination, so its plain speech is held as a draft.
     i.turnRoutes.set('scout', { route: { kind: 'channel', channelId: 'discord:guild:stale', origin: 'trigger' } });
     const scout = framework.getAgent('scout')!;
     await (framework as unknown as {
@@ -521,6 +522,69 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.runUntilIdle();
 
     assert.deepEqual(i.turnRoutes.get('scout'), { route: null }, 'a no-trigger turn has no route');
+    await framework.stop();
+  });
+
+  /** A registry stand-in whose last delivered message is `last`. */
+  function withLastInbound(target: 'exact' | 'root' | undefined, last: { serverId: string; channelId: string; messageId: string; threadId?: string }) {
+    const declaring = declaringRegistry(target);
+    (declaring.registry as Record<string, unknown>).getLastInbound = () => ({ ...last });
+    return declaring;
+  }
+
+  async function heartbeat(framework: AgentFramework): Promise<void> {
+    const scout = framework.getAgent('scout')!;
+    await (framework as unknown as {
+      startAgentStream(agent: unknown, trigger?: unknown): Promise<void>;
+    }).startAgentStream(scout, { agentName: 'scout', reason: 'heartbeat', source: 'timer', timestamp: Date.now() });
+    await framework.runUntilIdle();
+  }
+
+  it('a no-trigger (heartbeat) turn takes the fallback, the last delivered message\'s conversation, and speaks there with its thread', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tick' }]));
+    const framework = await makeFramework();
+    const { registry, published } = withLastInbound('exact', {
+      serverId: 'slack', channelId: 'slack:C1', messageId: 'm-last', threadId: '1700.01',
+    });
+    internals(framework).channelRegistry = registry;
+    await heartbeat(framework);
+    const turn = internals(framework).turnRoutes.get('scout') as { route: Record<string, unknown> | null };
+    assert.deepEqual(turn.route, {
+      kind: 'channel', serverId: 'slack', channelId: 'slack:C1', threadId: '1700.01', replyTo: 'm-last', origin: 'fallback',
+    });
+    assert.equal(published.length, 1);
+    assert.equal(published[0]!.text, 'tick');
+    assert.deepEqual(
+      { ...(published[0]!.to as Record<string, unknown>) },
+      { serverId: 'slack', channelId: 'slack:C1', threadId: '1700.01' },
+      'published into the conversation the last message came from, its thread named',
+    );
+    const texts = framework.getAgent('scout')!.getContextManager().getAllMessages()
+      .flatMap((m) => m.content).filter((b) => b.type === 'text').map((b) => (b as { text: string }).text);
+    assert.ok(texts.some((t) => t.startsWith('[routing] Nothing in this wake named a conversation, so your plain speech lands where the last message came in')),
+      'the resident is told why its speech goes there');
+    await framework.stop();
+  });
+
+  it('the fallback never goes into a channel a conversation fork owns, nor into one that declares no publish target', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tick' }]));
+    const framework = await makeFramework();
+    const owned = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:forked', messageId: 'm-1' });
+    internals(framework).channelRegistry = owned.registry;
+    (framework as unknown as { conversationAgentHomes: Map<string, string> }).conversationAgentHomes
+      .set('fork-1', 'discord:guild:forked');
+    await heartbeat(framework);
+    assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null }, 'a fork\'s channel is the fork\'s');
+    assert.deepEqual(owned.published, []);
+    (framework as unknown as { conversationAgentHomes: Map<string, string> }).conversationAgentHomes.delete('fork-1');
+
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tock' }]));
+    const undeclared = withLastInbound(undefined, { serverId: 'discord', channelId: 'discord:guild:plain', messageId: 'm-2' });
+    internals(framework).channelRegistry = undeclared.registry;
+    await heartbeat(framework);
+    assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null },
+      'an undeclared channel is no fallback: no route, not an unroutable conversation in front of the resident');
+    assert.deepEqual(undeclared.published, []);
     await framework.stop();
   });
 });

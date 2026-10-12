@@ -1,6 +1,7 @@
 - **Speech routes: unaddressed plain speech goes where the turn was
-  deliberately or actually addressed, never to the last channel that saw
-  traffic.** A turn's route is decided once at a true new turn:
+  deliberately or actually addressed, and to the last channel that saw
+  traffic only when nothing in its wake named a conversation.** A turn's
+  route is decided once at a true new turn:
   - a conversation fork's home channel always wins;
   - otherwise it is inferred from the whole wake. The addressed messages count
     if there are any, else all of the conversational ones. A local surface
@@ -10,12 +11,22 @@
 
   Several competing conversations start the turn **held**: unaddressed speech
   is kept as `ambiguous` drafts, and a `[routing]` notice names each
-  conversation's address. A turn with no conversation, such as a heartbeat,
-  a timer or a self-wake, has no route, and its speech is held as
-  `no-destination` drafts. Previously such speech went to the process-global
-  most-recent-inbound channel. That is also the fallback the batched-wake
-  routing fix kept for ambient-only batches, and this change replaces it. A surface
-  route shows speech on that surface and publishes it to no channel.
+  conversation's address. A wake that names no conversation at all, such as
+  a heartbeat, a timer or a self-wake, keeps the fallback: the conversation
+  of the last message any channel delivered, as before, now with its server,
+  thread and message named. It is checked like every route: a channel that
+  declares no publish target, a thread on a `root` channel, or a channel a
+  conversation fork owns gives no route, and the speech is held as
+  `no-destination` drafts. A `[routing]` notice says the speech goes where
+  the last message came in because nothing in the wake named a
+  conversation, and a mid-turn arrival that addresses the resident from
+  elsewhere holds a fallback route as it holds an inferred one. An
+  ambient-only batch is no longer such a wake: it routes to its own
+  conversation, or holds when it names several. A surface route shows speech
+  on that surface and publishes it to no channel, so a console turn's reply
+  stays on the console: anima-research/agent-framework#190, by
+  @rufalupa666-netizen with the resident qa-engineer, found and diagnosed
+  such a reply published to the channel that last spoke.
 - Context-budget restarts, guard retries and framework retries keep the
   turn's route, and everything else the turn has chosen or done: its
   explicit-send engagement, its `>>` or `>>>` choice, and the deliveries and
@@ -45,9 +56,9 @@
   new `setSpeechTarget: false` opens the channel for reading only, and the
   result says where speech goes then.
 - **`channel_publish` is an explicit send through the publish executor.**
-  Without `channelId` it goes to the caller's current route. With no route
-  (held, a local surface, or none) it is refused with the reason, and it no
-  longer uses the most recent inbound channel. A new optional `serverId`
+  Without `channelId` it goes to the caller's current route, the fallback
+  included. With no route (held, a local surface, or none) it is refused
+  with the reason, rather than going to the most recent inbound channel. A new optional `serverId`
   disambiguates a channel id that several servers register; a conversation
   fork may name a server only as its home's sole registrant, since the same
   id on another server is another conversation. Its receipt
