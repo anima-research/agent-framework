@@ -246,14 +246,16 @@ function checkedSnapshot(value: unknown): Snapshot {
   const isStamps = (x: unknown) => isObject(x) && Object.values(x).every(isStamp);
   const isGap = (x: unknown) => isObject(x) && typeof x.from === 'number' && typeof x.to === 'number' && typeof x.reason === 'string';
   if (!isObject(value) || value.v !== 2 || !isObject(value.channels) || !isObject(value.agents) || !Array.isArray(value.gaps)
-    || !value.gaps.every(isGap) || typeof value.gapsOmitted !== 'number'
+    || !value.gaps.every(isGap) || (value.gapsOmitted !== undefined && typeof value.gapsOmitted !== 'number')
     || !isTime(value.trackingSince) || !isTime(value.openRun) || !isTime(value.lastAt)
     || !Object.values(value.channels).every((c) => isObject(c) && isObject(c.ch) && isStamp(c.received))
     || !Object.values(value.agents).every((a) => isObject(a) && isStamps(a.delivered) && isStamps(a.partial))
     || !isObject(value.seen) || !Object.values(value.seen).every((sets) => isObject(sets) && isPacked(sets.delivered) && isPacked(sets.partial))) {
     throw new Error('clock ledger checkpoint is not a snapshot this version reads');
   }
-  return value as unknown as Snapshot;
+  // Earlier checkpoints of this format kept no count of the gaps they left
+  // out; they read as none counted, rather than as another version's.
+  return { ...(value as unknown as Snapshot), gapsOmitted: (value.gapsOmitted as number | undefined) ?? 0 };
 }
 
 export class ChannelClockLedger {

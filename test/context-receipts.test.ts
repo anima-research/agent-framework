@@ -550,7 +550,7 @@ describe('ChannelClockLedger', () => {
       ['a resident with no partial stamps', (c) => { delete c.snapshot.agents.r!.partial; }],
       ['a channel with no received stamp', (c) => { delete c.snapshot.channels[channelKey(CH)]!.received; }],
       ['a gap without its bounds', (c) => { c.snapshot.gaps = [{ reason: 'unclean-stop' }]; }],
-      ['no count of the gaps left out', (c) => { delete (c.snapshot as Record<string, unknown>).gapsOmitted; }],
+      ['a gap count that is not a number', (c) => { (c.snapshot as Record<string, unknown>).gapsOmitted = '3'; }],
     ];
     for (const [damage, apply] of damaged) {
       const checkpoint = structuredClone(real);
@@ -581,6 +581,22 @@ describe('ChannelClockLedger', () => {
     assert.match(l.scope('r').gaps.at(-1)!.reason, /ledger-unreadable \(ongoing\)/);
     l.received(CH, src('m2', 5_000), 'channels/incoming');
     assert.equal(recordCount(), before, 'nothing written past an entry it cannot reduce');
+  });
+
+  it('reads a checkpoint written before gaps were counted as none counted', () => {
+    let l = open();
+    clock = 2_000;
+    l.delivered('r', CH, src('m1', 1_000), ver('e1'), BRANCH);
+    l.stop();
+    const checkpoints = `${CLOCK_RECORD}/checkpoint`;
+    const real = JSON.parse(store.getRecord(store.getRecordIdsByType(checkpoints).at(-1)!)!.payload.toString('utf8')) as { snapshot: Record<string, unknown> };
+    delete real.snapshot.gapsOmitted;
+    store.appendJson(checkpoints, real);
+    clock = 5_000;
+    l = open();
+    assert.equal(l.scope('r').degraded, false);
+    assert.equal(l.scope('r').gapsOmitted, 0);
+    assert.equal(l.isDelivered('r', ver('e1')), true, 'the rest of the checkpoint is read');
   });
 
   it('lists the newest 20 gaps and counts the older ones, across a restart', () => {
