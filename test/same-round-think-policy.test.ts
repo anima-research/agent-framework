@@ -170,7 +170,7 @@ function trigger(framework: AgentFramework): void {
     source: 'test',
     channelId: 'test:channel',
     content: 'go',
-    metadata: {},
+    metadata: { channelId: 'test:channel' },
   } as unknown as ProcessEvent);
 }
 
