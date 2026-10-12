@@ -477,11 +477,68 @@ const unmadeRootSpellings: Array<{ name: string; spell: (root: string) => string
       return join(root, 'inner-link');
     },
   },
-  {
-    name: "a path that climbs out of a linked directory with '..'",
-    spell: (root) => [root, 'base', 'hop', '..', 'child'].join(sep),
-  },
 ];
+
+test("a mount configured with '..' after a link reads that path as every workspace operation does, so nesting and its own files agree", async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-mount-written-');
+  const outerDir = join(root, 'outer');
+  mkdirSync(join(outerDir, 'deep'), { recursive: true });
+  mkdirSync(join(outerDir, 'child'));
+  writeFileSync(join(outerDir, 'child', 'x.txt'), 'through the link');
+  mkdirSync(join(root, 'base', 'child'), { recursive: true });
+  writeFileSync(join(root, 'base', 'child', 'x.txt'), 'as written');
+  symlinkSync(join(outerDir, 'deep'), join(root, 'base', 'hop'));
+  const outer: MountConfig = { name: 'outer', path: outerDir, mode: 'read-write', watch: 'never' };
+  // Through the link, `base/hop/..` is the outer mount; as written, it is
+  // `base`. The workspace reads a configured path as written, so this inner
+  // mount is `base/child` for its own operations and for nesting alike.
+  const { workspace } = await started(stops, join(root, 'workspace.chronicle'), [
+    outer,
+    { name: 'inner', path: [root, 'base', 'hop', '..', 'child'].join(sep), mode: 'read-write', watch: 'never' },
+  ]);
+  assert.equal(outer.ignore, undefined, 'not nested in the outer mount');
+  const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
+  const synced = await call('sync', { mount: 'inner' });
+  assert.equal(synced.success, true, String(synced.error));
+  const own = await call('read', { path: 'inner/x.txt' });
+  assert.equal(own.success, true, String(own.error));
+  assert.match((own.data as { content: string }).content, /as written/);
+  assert.equal((await workspace.readFileFromDisk('inner/x.txt')).bytes.toString(), 'as written');
+  const outers = await call('read', { path: 'outer/child/x.txt' });
+  assert.equal(outers.success, true, String(outers.error));
+  assert.match((outers.data as { content: string }).content, /through the link/);
+
+  // Its watcher watches the same root, and reports a change there relative to it.
+  const configured = [root, 'base', 'hop', '..', 'child', ''].join(sep);
+  const seen: FsChange[] = [];
+  let ready!: () => void;
+  const isReady = new Promise<void>((resolveReady) => { ready = resolveReady; });
+  const watcher = new MountWatcher(
+    { name: 'inner', path: configured, mode: 'read-write', watch: 'always', watchDebounceMs: 50, watchRootPollMs: 50 },
+    (changes) => { seen.push(...changes); },
+    { onReady: () => ready() },
+  );
+  const backend = { usePolling: process.env.CHOKIDAR_USEPOLLING, interval: process.env.CHOKIDAR_INTERVAL };
+  process.env.CHOKIDAR_USEPOLLING = 'true';
+  process.env.CHOKIDAR_INTERVAL = '25';
+  try {
+    watcher.start();
+  } finally {
+    if (backend.usePolling === undefined) delete process.env.CHOKIDAR_USEPOLLING;
+    else process.env.CHOKIDAR_USEPOLLING = backend.usePolling;
+    if (backend.interval === undefined) delete process.env.CHOKIDAR_INTERVAL;
+    else process.env.CHOKIDAR_INTERVAL = backend.interval;
+  }
+  stops.push(() => watcher.stop());
+  await isReady;
+  // A new file in each round, until one is reported: the warm-up the
+  // nested-mount watch test explains.
+  for (let round = 0; round < 25 && !seen.some((c) => c.path.startsWith('new-')); round++) {
+    writeFileSync(join(root, 'base', 'child', `new-${round}.txt`), 'new');
+    await new Promise((resolveWait) => setTimeout(resolveWait, 200));
+  }
+  assert.ok(seen.some((c) => /^new-\d+\.txt$/.test(c.path)), `a change under base/child was reported relative to the root: ${JSON.stringify(seen)}`);
+});
 
 for (const autoMaterialize of [true, false]) for (const { name: spelling, spell } of unmadeRootSpellings) {
   test(`a nested mount configured as ${spelling}, before its directory is made, is nested from the start (autoMaterialize ${autoMaterialize})`, async (t) => {

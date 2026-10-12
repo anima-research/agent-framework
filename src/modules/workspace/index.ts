@@ -206,20 +206,22 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
 }
 
 /**
- * A mount root as disk will spell it once it exists. A root that exists is
- * its canonical path. One that doesn't yet is read the way the filesystem
- * will read it: component by component from the start, each existing prefix
- * as disk spells it, a link that leads to nothing yet replaced by what it
- * names, and `..` taken from the directory reached so far. Only what doesn't
- * exist is joined as written. So a mount configured at `via/child`, where
- * `via` links into another mount, or at a link to that mount's `child`
- * (`base/hop/../child` included, where `hop` is a link), is nested in it
- * before `child` is made. At most 40 dangling links are followed, as the
- * platform bounds a path's.
+ * A mount root as disk will spell it once it exists. The configured path is
+ * read as every workspace operation reads it, `resolve(path)`, so the root
+ * this names is the one the mount's own sync, tools and readers use. From
+ * there, a root that exists is its canonical path. One that doesn't yet is
+ * read the way the filesystem will read it: component by component, each
+ * existing prefix as disk spells it, a link that leads to nothing yet
+ * replaced by what it names, and a `..` in that target taken from the
+ * directory reached so far, after any link before it. Only what doesn't exist
+ * is joined as written. So a mount configured at `via/child`, where `via`
+ * links into another mount, or at a link to that mount's `child` (a link
+ * whose target is `base/hop/../child` included, where `hop` is a link), is
+ * nested in it before `child` is made. At most 40 dangling links are
+ * followed, as the platform bounds a path's.
  */
 function canonicalRoot(path: string): string {
-  // Nothing here normalizes `..` before a link on the way is followed.
-  const absolute = isAbsolute(path) ? path : `${process.cwd()}${sep}${path}`;
+  const absolute = resolve(path);
   try {
     return realpathSync.native(absolute);
   } catch {
@@ -1678,7 +1680,7 @@ export class WorkspaceModule implements Module {
     // prefix-matches there and every in-mount path was rejected as traversal.
     const root = resolve(mount.config.path);
     const resolved = resolve(root, written);
-    if (!isContainedPath(mount.config.path, resolved)) {
+    if (!isContainedPath(root, resolved)) {
       throw new Error(`Path traversal detected: "${path}" resolves outside mount "${mountName}"`);
     }
     // One spelling per path: `a/./b`, `a//b` and `a/b/` are `a/b`, as the
@@ -1791,7 +1793,7 @@ export class WorkspaceModule implements Module {
 
     let realMountRoot: string;
     try {
-      realMountRoot = await realpath(mount.config.path);
+      realMountRoot = await realpath(resolve(mount.config.path));
     } catch (err) {
       throw new WorkspaceReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}`, 'realpath_root', errnoOf(err));
     }

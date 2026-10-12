@@ -7,7 +7,7 @@
 
 import { watch, type FSWatcher } from 'chokidar';
 import { mkdirSync, statSync } from 'node:fs';
-import { basename, sep } from 'node:path';
+import { basename, resolve, sep } from 'node:path';
 import { type MountConfig } from './types.js';
 import { coveredByIgnore } from './observe.js';
 
@@ -61,6 +61,8 @@ export class MountWatcher {
   private stopped = true;
   private readonly debounceMs: number;
   private readonly config: MountConfig;
+  /** The mount's root as every workspace operation reads its configured path. */
+  private readonly root: string;
   private readonly onChangeCallback: (changes: FsChange[]) => void;
   private readonly lifecycle: WatcherLifecycle;
 
@@ -70,6 +72,7 @@ export class MountWatcher {
     lifecycle: WatcherLifecycle = {},
   ) {
     this.config = config;
+    this.root = resolve(config.path);
     this.debounceMs = config.watchDebounceMs ?? 300;
     this.onChangeCallback = onChange;
     this.lifecycle = lifecycle;
@@ -96,7 +99,7 @@ export class MountWatcher {
     // directories a user asked us only to read would be surprising.
     if (this.config.mode === 'read-write') {
       try {
-        mkdirSync(this.config.path, { recursive: true });
+        mkdirSync(this.root, { recursive: true });
       } catch (err) {
         this.lifecycle.onError?.(err instanceof Error ? err : new Error(String(err)));
       }
@@ -109,7 +112,7 @@ export class MountWatcher {
     // into an ignored directory.
     const patterns = this.config.ignore ?? [];
 
-    this.watcher = watch(this.config.path, {
+    this.watcher = watch(this.root, {
       ignored: patterns.length > 0
         ? (path: string) => {
           const relative = this.toRelative(path);
@@ -157,7 +160,7 @@ export class MountWatcher {
       if (event !== 'rename') return;
       // A rename on the watched root's path/basename is the one signal that
       // survives inode reuse on Linux, where unlinkDir/error never fire.
-      if (this.isRootPath(rawPath) || basename(rawPath) === basename(this.config.path)) {
+      if (this.isRootPath(rawPath) || basename(rawPath) === basename(this.root)) {
         void this.checkRootLiveness({ force: true });
       }
     });
@@ -354,7 +357,7 @@ export class MountWatcher {
   }
 
   private readRootIdentity(): RootIdentity {
-    const stat = statSync(this.config.path);
+    const stat = statSync(this.root);
     return { dev: stat.dev, ino: stat.ino, birthtimeMs: stat.birthtimeMs };
   }
 
@@ -377,9 +380,7 @@ export class MountWatcher {
     // Chokidar hands back platform-separated absolute paths; compare with
     // the platform separator and normalize the result to the '/'-separated
     // logical form the rest of the workspace uses. No-op on POSIX.
-    const base = this.config.path.endsWith(sep)
-      ? this.config.path
-      : this.config.path + sep;
+    const base = this.root.endsWith(sep) ? this.root : this.root + sep;
     if (absolutePath.startsWith(base)) {
       return absolutePath.slice(base.length).split(sep).join('/');
     }
@@ -387,9 +388,7 @@ export class MountWatcher {
   }
 
   private isRootPath(absolutePath: string): boolean {
-    const root = this.config.path.endsWith(sep)
-      ? this.config.path.slice(0, -1)
-      : this.config.path;
+    const root = this.root.endsWith(sep) ? this.root.slice(0, -1) : this.root;
     const candidate = absolutePath.endsWith(sep)
       ? absolutePath.slice(0, -1)
       : absolutePath;
