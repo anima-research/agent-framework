@@ -26,7 +26,7 @@ import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, win32 } from 'node:path';
+import { dirname, join, sep, win32 } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { nestedAt } from '../src/modules/workspace/observe.js';
@@ -459,20 +459,44 @@ test("a nested mount whose root doesn't exist yet, configured through a symlinke
   assert.equal(readFileSync(join(outerDir, 'child', 'x.txt'), 'utf8'), "the inner mount's");
 });
 
-for (const autoMaterialize of [true, false]) {
-  test(`a nested mount configured as a link to a directory not made yet is nested from the start (autoMaterialize ${autoMaterialize})`, async (t) => {
-    const { root, stops } = scratch(t, 'af-nested-mount-dangling-');
+// Spellings of a root that will be the outer mount's `child`, made before it
+// exists: `base/hop` links to the outer mount's `deep`, so `base/hop/..` is
+// the outer mount, as the filesystem reads it (`..` after following `hop`).
+const unmadeRootSpellings: Array<{ name: string; spell: (root: string) => string }> = [
+  {
+    name: 'a link to it',
+    spell: (root) => {
+      symlinkSync(join(root, 'outer', 'child'), join(root, 'inner-link'));
+      return join(root, 'inner-link');
+    },
+  },
+  {
+    name: "a link whose target climbs out of a linked directory with '..'",
+    spell: (root) => {
+      symlinkSync(['base', 'hop', '..', 'child'].join(sep), join(root, 'inner-link'));
+      return join(root, 'inner-link');
+    },
+  },
+  {
+    name: "a path that climbs out of a linked directory with '..'",
+    spell: (root) => [root, 'base', 'hop', '..', 'child'].join(sep),
+  },
+];
+
+for (const autoMaterialize of [true, false]) for (const { name: spelling, spell } of unmadeRootSpellings) {
+  test(`a nested mount configured as ${spelling}, before its directory is made, is nested from the start (autoMaterialize ${autoMaterialize})`, async (t) => {
+    const { root, stops } = scratch(t, 'af-nested-mount-unmade-');
     const outerDir = join(root, 'outer');
-    mkdirSync(outerDir);
+    mkdirSync(join(outerDir, 'deep'), { recursive: true });
+    mkdirSync(join(root, 'base'));
+    symlinkSync(join(outerDir, 'deep'), join(root, 'base', 'hop'));
     writeFileSync(join(outerDir, 'top.txt'), 'top');
-    // `inner-link` names the outer mount's `child`, which doesn't exist yet.
-    symlinkSync(join(outerDir, 'child'), join(root, 'inner-link'));
     const outer: MountConfig = { name: 'outer', path: outerDir, mode: 'read-write', watch: 'never', autoMaterialize };
     const { workspace } = await started(stops, join(root, 'workspace.chronicle'), [
       outer,
-      { name: 'inner', path: join(root, 'inner-link'), mode: 'read-write', watch: 'never' },
+      { name: 'inner', path: spell(root), mode: 'read-write', watch: 'never' },
     ]);
-    assert.deepEqual(outer.ignore, ['child/**'], 'the inner root reads as the link names it, before it exists');
+    assert.deepEqual(outer.ignore, ['child/**'], 'the inner root reads as the filesystem will read it, before it exists');
     const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
     const written = await call('write', { path: 'outer/child/y.txt', content: 'an outer write' });
     assert.equal(written.success, false, JSON.stringify(written));
@@ -485,7 +509,9 @@ for (const autoMaterialize of [true, false]) {
     writeFileSync(join(outerDir, 'child', 'x.txt'), "the inner mount's");
     assert.deepEqual(await syncedByOuter(workspace), ['top.txt']);
   });
+}
 
+for (const autoMaterialize of [true, false]) {
   test(`a mount that comes to lie in another after the module is built is refused there, whatever path reaches it (autoMaterialize ${autoMaterialize})`, async (t) => {
     const { root, stops } = scratch(t, 'af-nested-mount-later-');
     const outerDir = join(root, 'outer');

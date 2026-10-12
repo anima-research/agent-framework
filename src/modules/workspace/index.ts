@@ -8,7 +8,7 @@
 import { constants as fsConstants, lstatSync, readlinkSync, realpathSync } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { open, stat, lstat, realpath } from 'node:fs/promises';
-import { basename, dirname, join, resolve, relative, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, parse, resolve, relative, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
@@ -206,36 +206,67 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
 }
 
 /**
- * A mount root as disk will spell it: the canonical path of its nearest
- * existing ancestor, joined with the rest as configured, where a symlink on
- * the way that leads to nothing yet is read as what it names. So a root that
- * doesn't exist yet still reads through a symlinked parent, or as a dangling
- * link's target: a mount configured at `via/child`, where `via` links into
- * another mount, or at a link to that mount's `child`, is nested in it before
- * `child` is made. `hops` bounds the links followed, as the platform bounds a
- * path's.
+ * A mount root as disk will spell it once it exists. A root that exists is
+ * its canonical path. One that doesn't yet is read the way the filesystem
+ * will read it: component by component from the start, each existing prefix
+ * as disk spells it, a link that leads to nothing yet replaced by what it
+ * names, and `..` taken from the directory reached so far. Only what doesn't
+ * exist is joined as written. So a mount configured at `via/child`, where
+ * `via` links into another mount, or at a link to that mount's `child`
+ * (`base/hop/../child` included, where `hop` is a link), is nested in it
+ * before `child` is made. At most 40 dangling links are followed, as the
+ * platform bounds a path's.
  */
-function canonicalRoot(path: string, hops = 0): string {
-  let existing = resolve(path);
-  const rest: string[] = [];
-  for (;;) {
+function canonicalRoot(path: string): string {
+  // Nothing here normalizes `..` before a link on the way is followed.
+  const absolute = isAbsolute(path) ? path : `${process.cwd()}${sep}${path}`;
+  try {
+    return realpathSync.native(absolute);
+  } catch {
+    // Some part of it doesn't exist yet: walk it as the filesystem will.
+  }
+  const parts = (p: string): string[] => p.split(sep === '\\' ? /[\\/]+/ : '/').filter((c) => c.length > 0);
+  const root = parse(absolute).root;
+  let current = root;
+  const queue = parts(absolute.slice(root.length));
+  let links = 0;
+  while (queue.length > 0) {
+    const part = queue.shift()!;
+    if (part === '.') continue;
+    if (part === '..') {
+      current = dirname(current);
+      continue;
+    }
+    const next = join(current, part);
     try {
-      return join(realpathSync.native(existing), ...rest);
+      current = realpathSync.native(next);
+      continue;
     } catch {
-      if (hops < 40) {
-        let target: string | null = null;
-        try {
-          // A relative target is read from the link's directory as disk spells it.
-          if (lstatSync(existing).isSymbolicLink()) target = resolve(canonicalRoot(dirname(existing), hops + 1), readlinkSync(existing));
-        } catch { /* not there, or unreadable: read its parent instead */ }
-        if (target !== null) return join(canonicalRoot(target, hops + 1), ...rest);
+      // Missing, or a link that leads to nothing yet.
+    }
+    let target: string | null = null;
+    if (links < 40) {
+      try {
+        if (lstatSync(next).isSymbolicLink()) target = readlinkSync(next);
+      } catch {
+        // Not there.
       }
-      const parent = dirname(existing);
-      if (parent === existing) return resolve(path);
-      rest.unshift(basename(existing));
-      existing = parent;
+    }
+    if (target === null) {
+      current = next;
+      continue;
+    }
+    links++;
+    // A relative target is read from the link's directory, `current`.
+    if (isAbsolute(target)) {
+      const targetRoot = parse(target).root;
+      current = targetRoot;
+      queue.unshift(...parts(target.slice(targetRoot.length)));
+    } else {
+      queue.unshift(...parts(target));
     }
   }
+  return current;
 }
 
 function isContainedPath(root: string, candidate: string): boolean {
