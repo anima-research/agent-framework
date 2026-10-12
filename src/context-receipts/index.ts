@@ -140,6 +140,13 @@ export class ContextReceipts {
 
     const evidence = state.evidence;
     const alteredMessages = new Set(round.altered?.messages ?? []);
+    // Only a round whose fidelity is established confirms anything about
+    // its bodies. A named alteration still makes the compile's presentation
+    // `altered` at any fidelity (below): that claim is negative, and the
+    // alteration proves it. A partial exposure is a positive claim, that the
+    // body reached the resident in part, and a round that couldn't establish
+    // what it carried may have dropped the body altogether, so its bodies,
+    // altered or incomplete, stay unconfirmed.
     if (established && evidence) {
       const branch = branchOf(evidence);
       const alteredInjected = new Set((round.altered?.injected ?? []).map(([b, i]) => `${b}:${i}`));

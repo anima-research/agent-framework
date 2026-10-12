@@ -534,6 +534,117 @@ describe('ChannelClockLedger', () => {
       l.stop();
     }
   });
+
+  it('treats a checkpoint whose channel or resident entries this version would not write as unreadable, never a later TypeError', () => {
+    let l = open();
+    clock = 2_000;
+    l.received(CH, src('m1', 1_000), 'channels/incoming');
+    l.delivered('r', CH, src('m1', 1_000), ver('e1'), BRANCH);
+    l.stop();
+    const checkpoints = `${CLOCK_RECORD}/checkpoint`;
+    const real = JSON.parse(store.getRecord(store.getRecordIdsByType(checkpoints).at(-1)!)!.payload.toString('utf8')) as {
+      through: string; snapshot: { channels: Record<string, Record<string, unknown>>; agents: Record<string, Record<string, unknown>>; gaps: unknown[] };
+    };
+    const damaged: Array<[string, (c: typeof real) => void]> = [
+      ['a resident\'s delivered stamp that is not an object', (c) => { c.snapshot.agents.r!.delivered = { [channelKey(CH)]: 5 }; }],
+      ['a resident with no partial stamps', (c) => { delete c.snapshot.agents.r!.partial; }],
+      ['a channel with no received stamp', (c) => { delete c.snapshot.channels[channelKey(CH)]!.received; }],
+      ['a gap without its bounds', (c) => { c.snapshot.gaps = [{ reason: 'unclean-stop' }]; }],
+      ['no count of the gaps left out', (c) => { delete (c.snapshot as Record<string, unknown>).gapsOmitted; }],
+    ];
+    for (const [damage, apply] of damaged) {
+      const checkpoint = structuredClone(real);
+      apply(checkpoint);
+      store.appendJson(checkpoints, checkpoint);
+      const before = recordCount();
+      clock += 1_000;
+      l = open();
+      assert.equal(l.clocksFor('r', [CH]).size, 0, `${damage}: no clocks, and no TypeError reading them`);
+      assert.equal(l.scope('r').degraded, true, damage);
+      assert.equal(l.delivered('r', CH, src('m1', 1_000), ver('e1'), BRANCH), false, `${damage}: e1 is not delivered again`);
+      assert.equal(recordCount(), before, `${damage}: nothing written over it`);
+      l.stop();
+    }
+  });
+
+  it('treats an entry kind this version does not write as unreadable, never skipping what it records', () => {
+    let l = open();
+    clock = 2_000;
+    l.delivered('r', CH, src('m1', 1_000), ver('e1'), BRANCH);
+    l.stop();
+    store.appendJson(CLOCK_RECORD, { k: 'dlv2', at: 2_500, agent: 'r' });
+    const before = recordCount();
+    clock = 5_000;
+    l = open();
+    assert.equal(l.clocksFor('r', [CH]).size, 0);
+    assert.equal(l.scope('r').degraded, true);
+    assert.match(l.scope('r').gaps.at(-1)!.reason, /ledger-unreadable \(ongoing\)/);
+    l.received(CH, src('m2', 5_000), 'channels/incoming');
+    assert.equal(recordCount(), before, 'nothing written past an entry it cannot reduce');
+  });
+
+  it('lists the newest 20 gaps and counts the older ones, across a restart', () => {
+    let l = open({ checkpointEvery: 5 });
+    // Each run that ends without a stop leaves a gap at the next start.
+    for (let run = 0; run < 23; run++) {
+      clock += 1_000;
+      l.received(CH, src(`m${run}`, clock), 'channels/incoming');
+      clock += 1_000;
+      l = open({ checkpointEvery: 5 });
+    }
+    const scope = l.scope('r');
+    assert.equal(scope.gaps.length, 20);
+    assert.equal(scope.gapsOmitted, 3);
+    assert.ok(scope.gaps.every((g) => g.reason === 'unclean-stop'));
+    const newest = scope.gaps.at(-1)!;
+    l.stop();
+    l = open({ checkpointEvery: 5 });
+    assert.equal(l.scope('r').gapsOmitted, 3, 'the count is read back');
+    assert.deepEqual(l.scope('r').gaps.at(-1), newest);
+  });
+
+  it('opens no gap for a checkpoint that fails, while the next entry, which the journal refuses, does', () => {
+    let failCheckpoint = false;
+    const flaky = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === 'appendJson') {
+          return (type: string, payload: unknown) => {
+            if (failCheckpoint && type === `${CLOCK_RECORD}/checkpoint`) {
+              failCheckpoint = false;
+              throw new Error('the checkpoint could not be written');
+            }
+            return target.appendJson(type, payload);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as JsStore;
+    let l = new ChannelClockLedger(flaky, 'store-1', now, { checkpointEvery: 3 });
+    l.start();
+    failCheckpoint = true;
+    // Entries until the checkpoint is due (the start marker counts too); the
+    // entry that makes it due lands, and the checkpoint after it fails.
+    let last = '';
+    for (let i = 0; failCheckpoint && i < 10; i++) {
+      clock += 100;
+      last = `m${i}`;
+      l.received(CH, src(last, clock), 'channels/incoming');
+    }
+    assert.equal(failCheckpoint, false, 'a checkpoint was attempted and failed');
+    assert.equal(l.scope('r').degraded, false, 'every entry landed: nothing is missing yet');
+    assert.equal(clocks(l, 'r').received?.messageId, last);
+    clock += 100;
+    const refusedAt = clock;
+    l.received(CH, src('after', clock), 'channels/incoming');
+    assert.equal(l.scope('r').degraded, true, 'the journal refused the next entry');
+    assert.equal(l.scope('r').gaps.at(-1)!.from, refusedAt);
+    l.stop();
+    clock += 1_000;
+    l = open();
+    assert.equal(clocks(l, 'r').received?.messageId, last, 'the entries before the failed checkpoint are read back');
+    assert.ok(l.scope('r').gaps.some((g) => g.reason === 'unclean-stop'));
+  });
 });
 
 describe('ContextReceipts', () => {
@@ -568,10 +679,12 @@ describe('ContextReceipts', () => {
     fidelity: 'established',
     ...extra,
   });
-  const delivered = (id: string) => {
-    const c = ledger.clocksFor('r', [CH]).get(channelKey(CH))!;
-    return c.delivered?.messageId === id;
-  };
+  /** Whether the ledger holds a complete delivery of version `id` to the resident. */
+  const delivered = (id: string) => ledger.isDelivered('r', ver(id));
+  /** The ledger's entries of one kind, as written. */
+  const journal = (kind: string) => store.getRecordIdsByType(CLOCK_RECORD)
+    .map((id) => JSON.parse(store.getRecord(id)!.payload.toString('utf8')) as { k: string; ver?: { key: string }; why?: string[]; branch?: { id: string; name: string } })
+    .filter((e) => e.k === kind);
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'context-receipts-'));
@@ -640,12 +753,24 @@ describe('ContextReceipts', () => {
   });
 
   it('confirms nothing for a refused round, a stream that never reports, or unknown fidelity', () => {
-    receipts.beginStream('r', 1, evidence([body(0, 'm1')]));
+    // A stream that ends without a usage event.
+    receipts.beginStream('r', 9, evidence([body(0, 'silent')]));
+    receipts.endStream('r', 9);
+    assert.ok(!delivered('silent'));
+    assert.deepEqual(journal('part'), []);
+    assert.equal(accepted.length, 0, 'a stream that never reports accepts nothing');
+
+    receipts.beginStream('r', 1, evidence([
+      body(0, 'm1'),
+      body(1, 'cut', { complete: false, missing: ['content'] }),
+      body(2, 'altered'),
+    ]));
     receipts.usage('r', 1, round({ stopReason: 'refusal' }));
     assert.ok(!delivered('m1'));
     assert.equal(accepted.length, 0, 'a refusal accepts nothing');
-    receipts.usage('r', 1, round({ fidelity: 'unknown' }));
+    receipts.usage('r', 1, round({ fidelity: 'unknown', altered: { messages: [2], injected: [] } }));
     assert.ok(!delivered('m1'), 'unknown fidelity is neither delivered nor partial');
+    assert.deepEqual(journal('part'), [], 'an incomplete body and an altered one stay unconfirmed under unknown fidelity');
     assert.equal(ledger.clocksFor('r', [CH]).get(channelKey(CH))!.lastPartialAt, null);
     receipts.usage('r', 1, round({ index: 2 }));
     assert.ok(delivered('m1'), 'still eligible at a later round');
@@ -656,7 +781,28 @@ describe('ContextReceipts', () => {
     receipts.usage('r', 1, round({ altered: { messages: [0], injected: [] } }));
     const c = ledger.clocksFor('r', [CH]).get(channelKey(CH))!;
     assert.equal(c.lastDeliveredAt, null);
-    assert.ok(c.partial?.missing.includes('content') || c.partial?.missing.includes('wire-alteration'));
+    assert.deepEqual(
+      journal('part').map((e) => [e.ver!.key, e.why]),
+      [['m1', ['wire-alteration']], ['m2', ['content']]],
+    );
+  });
+
+  it('records an incomplete copy that states no reason as a partial exposure', () => {
+    receipts.beginStream('r', 1, evidence([body(0, 'm1', { complete: false })]));
+    receipts.usage('r', 1, round());
+    assert.ok(!delivered('m1'));
+    assert.deepEqual(journal('part').map((e) => [e.ver!.key, e.why]), [['m1', ['unstated']]]);
+  });
+
+  it('stamps each delivery with the branch its compile names, and "unknown" without one', () => {
+    receipts.beginStream('r', 1, evidence([body(0, 'm1')]));
+    receipts.usage('r', 1, round());
+    receipts.beginStream('r', 2, { ...evidence([body(0, 'm2')]), provenance: null });
+    receipts.usage('r', 2, round());
+    assert.deepEqual(journal('dlv').map((e) => [e.ver!.key, e.branch]), [
+      ['m1', { id: 'br', name: 'main' }],
+      ['m2', { id: 'unknown', name: 'unknown' }],
+    ]);
   });
 
   it('keeps the whole batch\'s coordinates when some injected messages are not bodies', () => {
@@ -673,23 +819,61 @@ describe('ContextReceipts', () => {
     assert.equal(batch, 0);
     receipts.usage('r', 1, round({ injectedBatch: { batch: 0, applied: 1 } }));
     assert.ok(delivered('i0'));
+    assert.ok(!delivered('i1'), 'the withheld body is not delivered yet');
     receipts.usage('r', 1, round({ index: 1, injectedBatch: { batch: 0, applied: 2 } }));
     assert.ok(delivered('i1'));
   });
 
+  it('reads a producer-altered injected body by its batch and its index, not the other way round', () => {
+    receipts.beginStream('r', 1, evidence([]));
+    receipts.injectedBatch('r', 1, 2, [body(0, 'i0'), body(1, 'i1')]);
+    // Batch 0, index 1: a key that swapped batch and index would name batch 1, index 0.
+    receipts.usage('r', 1, round({ injectedBatch: { batch: 0, applied: 2 }, altered: { messages: [], injected: [[0, 1]] } }));
+    assert.ok(delivered('i0'));
+    assert.ok(!delivered('i1'));
+    assert.deepEqual(journal('part').map((e) => [e.ver!.key, e.why]), [['i1', ['wire-alteration']]]);
+  });
+
+  it('syncs the store once per round, before its first delivery is written', () => {
+    const calls: string[] = [];
+    const watched = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === 'sync') return () => { calls.push('sync'); return target.sync(); };
+        if (prop === 'appendJson') {
+          return (type: string, payload: unknown) => {
+            calls.push(`append ${(payload as { k?: string }).k ?? type}`);
+            return target.appendJson(type, payload);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as JsStore;
+    const watchedLedger = new ChannelClockLedger(watched, 'store-1');
+    watchedLedger.start();
+    const watchedReceipts = new ContextReceipts(watchedLedger, { acceptRound: () => {} });
+    watchedReceipts.beginStream('r', 1, evidence([body(0, 'm1'), body(1, 'm2')]));
+    calls.length = 0;
+    watchedReceipts.usage('r', 1, round());
+    assert.deepEqual(calls, ['sync', 'append dlv', 'append dlv']);
+  });
+
   it('records a replayed copy of an already-delivered version once', () => {
-    receipts.beginStream('r', 1, evidence([body(0, 'm1'), body(1, 'm1-replay', { ver: ver('m1'), src: src('m1', 1_000) })]));
+    receipts.beginStream('r', 1, evidence([body(0, 'm1')]));
     receipts.usage('r', 1, round());
-    const dlv = store.getRecordIdsByType(CLOCK_RECORD)
-      .map((id) => JSON.parse(store.getRecord(id)!.payload.toString('utf8')) as { k: string })
-      .filter((e) => e.k === 'dlv');
-    assert.equal(dlv.length, 1);
+    // A later round carries a replayed copy of the version round 1 delivered.
+    receipts.beginStream('r', 2, evidence([body(0, 'other'), body(1, 'm1-replay', { storeMessageId: 's-replay', ver: ver('m1'), src: src('m1', 1_000) })]));
+    receipts.usage('r', 2, round());
+    assert.deepEqual(journal('dlv').map((e) => e.ver!.key), ['m1', 'other']);
   });
 
   it('counts the rounds that could not establish fidelity, refusals aside, so a path that never confirms is visible', () => {
+    let t = 7_000;
+    receipts = new ContextReceipts(ledger, { acceptRound: () => {} }, () => t);
     assert.equal(receipts.roundFidelity('r'), undefined, 'nothing counted before a round reports');
     receipts.beginStream('r', 1, evidence([body(0, 'm1')]));
     receipts.usage('r', 1, round({ fidelity: 'unknown' }));
+    t = 9_000;
     receipts.usage('r', 1, round({ index: 1, stopReason: 'refusal', fidelity: 'unknown' }));
     receipts.usage('r', 1, round({ index: 2, fidelity: 'unknown' }));
     assert.ok(!delivered('m1'), 'unknown rounds confirm nothing');
@@ -702,7 +886,7 @@ describe('ContextReceipts', () => {
     const counted = receipts.roundFidelity('r')!;
     assert.equal(counted.reported, 3);
     assert.equal(counted.unestablished, 2);
-    assert.ok(counted.since > 0);
+    assert.equal(counted.since, 7_000, 'since the first counted round');
     assert.equal(receipts.roundFidelity('someone-else'), undefined);
   });
 
@@ -980,6 +1164,18 @@ describe('request-owned evidence', () => {
       const asEdited = versionOf(source as never, [[{ type: 'text', text: 'edited during inference' }]], cm.getStoreId(), id);
       assert.equal(sent.ver.key, asSent.key);
       assert.notEqual(sent.ver.key, asEdited.key);
+      // The prepared round is confirmed after the edit: the delivery names
+      // the version as prepared, under its pre-edit key.
+      const ledger = new ChannelClockLedger(cm.getStore(), cm.getStoreId());
+      ledger.start();
+      const receipts = new ContextReceipts(ledger, { acceptRound: () => {} });
+      receipts.beginStream('r', 1, evidence);
+      receipts.usage('r', 1, { index: 0, stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, altered: { messages: [], injected: [] }, fidelity: 'established' });
+      const ref = [{ binding: 'b1', channelId: 'discord:g:room' }];
+      assert.equal(ledger.clocksFor('r', ref).get(channelKey(ref[0]!))!.delivered?.messageId, 'p1');
+      assert.equal(ledger.isDelivered('r', asSent), true, 'the version as prepared');
+      assert.equal(ledger.isDelivered('r', asEdited), false, 'not the edited copy');
+      ledger.stop();
       cm.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -993,7 +1189,54 @@ describe('history--folds folding sentence', () => {
     assert.match(foldingSentence('passthrough', ['raw']), /passthrough strategy never folds/);
     assert.match(foldingSentence('windowed-passthrough', ['raw', 'omitted']), /never summarizes/);
     assert.match(foldingSentence('custom', null), /does not report its rendered layout/);
-    assert.match(foldingSentence('autobiographical', ['raw', 'summary', 'omitted']), /folds history into summaries/);
+    assert.match(foldingSentence('autobiographical', ['raw', 'summary', 'omitted']), /folds history into summaries and can leave spans out/);
+    const summariesOnly = foldingSentence('summarizing', ['raw', 'summary']);
+    assert.match(summariesOnly, /folds history into summaries;/);
+    assert.doesNotMatch(summariesOnly, /leave spans out/, 'only a strategy that renders omitted spans leaves any out');
+  });
+});
+
+describe('history--folds renders a change receipt', () => {
+  it('writes one line per changed run, naming each form, and explains its fields in the answer', async () => {
+    const { handleFolds, FOLDS_ABOUT } = await import('../src/modules/history/folds.js');
+    const branch = { id: 'b', name: 'main', created: 1 };
+    const at = (sequence: number, messageId: string) => ({ sequence, messageId });
+    const change = {
+      v: 1, id: '4', kind: 'change', acceptedAt: '2026-10-09T00:00:00.000Z', strategy: 'autobiographical', cause: 'budget',
+      renderedTokens: { before: 900, after: 300 }, presentation: 'verbatim', estimate: { calibration: 1 },
+      usage: { input: 1200, cacheRead: 800, cacheWrite: 0, scope: 'round' },
+      source: { runtime: 'r', storeId: 'st', agent: 'a', namespace: 'n', dataDirectory: 'd', branch },
+      compileId: 'c4',
+      changes: [
+        {
+          first: at(3, 'm3'), last: at(9, 'm9'), messages: 7,
+          before: { form: 'raw', partial: false },
+          after: { form: 'summary', level: 1, summaries: [{ id: 'sum-1', level: 1, method: 'model', partial: false }] },
+          estimatedTokensBefore: 700, estimatedTokensAfter: 120,
+        },
+        {
+          first: at(10, 'm10'), last: at(10, 'm10'), messages: 1,
+          before: { form: 'raw', partial: true },
+          after: { form: 'omitted' },
+          estimatedTokensBefore: 200, estimatedTokensAfter: 0,
+        },
+      ],
+    };
+    const cm = {
+      describeRenderedForms: () => ({ strategy: 'autobiographical', forms: ['raw', 'summary', 'omitted'] }),
+      listFoldReceipts: () => ({ branch, receipts: [change], latestId: '4', more: false }),
+    } as never;
+    const data = handleFolds(cm, {}).data as {
+      receipts: Array<{ changes: string[]; roundUsage: unknown; strategy: string }>; about: string; source: { dataDirectory: string };
+    };
+    assert.deepEqual(data.receipts[0]!.changes, [
+      '#3–#9 (m3 … m9, 7 messages): raw → summary L1 [sum-1 L1 model] (≈700 → ≈120 tokens)',
+      '#10 (m10, 1 message): raw (partial) → omitted (≈200 → ≈0 tokens)',
+    ]);
+    assert.deepEqual(data.receipts[0]!.roundUsage, { input: 1200, cacheRead: 800, cacheWrite: 0 });
+    assert.equal(data.receipts[0]!.strategy, 'autobiographical');
+    assert.equal(data.source.dataDirectory, 'd', 'the answer names the record it read');
+    assert.equal(data.about, FOLDS_ABOUT);
   });
 });
 
