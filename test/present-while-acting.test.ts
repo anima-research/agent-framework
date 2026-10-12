@@ -624,8 +624,13 @@ describe('present while acting', () => {
       .filter((b) => b.type === 'text')
       .map((b) => b.text ?? '')
       .filter((t) => t.startsWith('[delivered]'));
+    // The suppressed words are held as drafts, named in the receipt.
+    const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ id: string; text: string }> } })
+      .proseDrafts.open('assistant').reverse();
+    assert.deepEqual(drafts.map((d) => d.text), ['the reply that silencing will eat', 'trailing prose, also suppressed (sticky)']);
     assert.deepEqual(receipts, [
-      '[delivered] nothing — 2 plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)',
+      `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts.map((d) => d.id).join(', ')} ` +
+        '(not sent — drafts can resend them unchanged, or dismiss them)',
     ]);
 
     await framework.stop();
@@ -665,8 +670,12 @@ describe('present while acting', () => {
         .filter((b) => b.type === 'text')
         .map((b) => b.text ?? '')
         .filter((t) => t.startsWith('[delivered]'));
+      const drafts = (framework as unknown as { proseDrafts: { open(a: string): Array<{ id: string; text: string }> } })
+        .proseDrafts.open('assistant').reverse();
+      assert.deepEqual(drafts.map((d) => d.text), ['adjacent prose that must NOT auto-publish', 'trailing prose, also suppressed (sticky)']);
       assert.deepEqual(receipts, [
-        '[delivered] nothing — 2 plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)',
+        `[delivered] nothing — 2 plain-speech segment(s) held as drafts ${drafts.map((d) => d.id).join(', ')} ` +
+          '(not sent — drafts can resend them unchanged, or dismiss them)',
       ], `${verb}: suppression is visible in the receipt`);
 
       await framework.stop();
