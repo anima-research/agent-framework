@@ -15,26 +15,41 @@ export interface FoldsInput {
   branch?: string;
 }
 
+/**
+ * What a fold record's answer means, sent with it (`about`) rather than in
+ * the tool's description, which every request of a history-module agent
+ * carries.
+ */
+export const FOLDS_ABOUT =
+  'Each time a provider round that stood carried a compile rendering history at a different ' +
+  'resolution than the previous one on the same branch, one receipt lists every run of messages ' +
+  'whose form changed: raw, partial raw (cut), a summary (its level, id and method), a different ' +
+  'summary, or omitted from the window. Each run gives store sequences and message ids and an exact ' +
+  'message count; a change\'s runs give estimated tokens before and after, and a baseline\'s runs ' +
+  'their one estimate. A receipt adds the cause when recorded, and that round\'s input and cache ' +
+  'usage (input, cache read, cache write; unknown when not reported). That usage belongs to the whole ' +
+  'round: no part of it is the cost of the fold. What a fold lost is not measured; compare a summary ' +
+  'with its source through `extract`. Each receipt also says how that round presented the compile, ' +
+  'as the provider path reported: `verbatim` (exactly as compiled, so exactly what you were shown), ' +
+  '`altered` (some of the compiled messages were not carried verbatim), or `unknown`. Messages that ' +
+  'arrived since the previous round are arrivals, not folds. The first receipt on a branch is a ' +
+  'baseline: the layout as rendered then, with history before it unknown. Each receipt describes the ' +
+  'spans as rendered when it was written, even if messages were edited or removed since, and names ' +
+  'the strategy that wrote it; `folding` describes your current strategy. `source` names the record ' +
+  'read (its runtime, store, agent, namespace, data directory and branch), and a host that exports ' +
+  'the record shows the export\'s status and target under `export`. Newest first; with `afterId`, ' +
+  'oldest first from just after that receipt, so you can read on: pass the last id an `afterId` page ' +
+  'returned, `latestReceiptId` to see only new ones, or "0" to read the record from its start. `more` ' +
+  'says whether the query matched more than it returned; when it did, `next` is the input for the ' +
+  'call that reads on, with this call\'s filters kept.';
+
 export const FOLDS_TOOL: ToolDefinition = {
   name: 'folds',
   description:
-    'Your fold record. Each time a provider round that stood carried a compile rendering history at a ' +
-    'different resolution than the previous one on the same branch, one receipt lists every run of ' +
-    'messages whose form changed: raw, partial raw (cut), a summary (its level, id and method), a ' +
-    'different summary, or omitted from the window. Each run gives store sequences and message ids, an ' +
-    'exact message count, and estimated tokens before and after; the receipt adds the cause when ' +
-    'recorded and that round\'s provider usage (input, cache read, cache write; unknown when not ' +
-    'reported). That usage belongs to the whole round: no part of it is the cost of the fold. What a ' +
-    'fold lost is not measured; compare a summary with its source through `extract`. Each receipt also ' +
-    'says how that round presented the compile, as the provider path reported: `verbatim` (exactly as ' +
-    'compiled, so exactly what you were shown), `altered` (some content was not carried verbatim), or ' +
-    '`unknown`. Messages that arrived since the previous round are arrivals, not folds. The first ' +
-    'receipt on a branch is a baseline: the layout as rendered then, with history before it unknown. ' +
-    'Each receipt describes the spans as rendered when it was written, even if messages were edited or ' +
-    'removed since. Newest first; with `afterId`, oldest first from just after that receipt, so you can ' +
-    'read on: pass the last id an `afterId` page returned, `latestReceiptId` to see only new ones, or "0" ' +
-    'to read the record from its start. `more` says whether the query matched more than it returned; when ' +
-    'it did, `next` is the input for the call that reads on, with this call\'s filters kept.',
+    'Your fold record: when your rendered history changed resolution (raw, cut, summarized, or left out ' +
+    'of the window), which runs of messages changed, and the usage of the round that carried the change. ' +
+    'Newest first; `afterId` reads on oldest first from a receipt ("0" from the start). Each answer ' +
+    'explains its fields (`about`) and names the record it read.',
   inputSchema: {
     type: 'object' as const,
     properties: {
@@ -77,10 +92,10 @@ export function foldingSentence(strategy: string, forms: ReadonlyArray<'raw' | '
   if (!forms.includes('summary')) {
     return `The ${strategy} strategy never summarizes: it renders history raw and leaves out what does not fit, which receipts report as omitted.`;
   }
-  return `The ${strategy} strategy folds history into summaries and can leave spans out; receipts record each change.`;
+  return `The ${strategy} strategy folds history into summaries${forms.includes('omitted') ? ' and can leave spans out' : ''}; receipts record each change.`;
 }
 
-export function handleFolds(cm: ContextManager, input: FoldsInput, exportStatus?: unknown): ToolResult {
+export function handleFolds(cm: Pick<ContextManager, 'describeRenderedForms' | 'listFoldReceipts'>, input: FoldsInput, exportStatus?: unknown): ToolResult {
   const forms = cm.describeRenderedForms();
   const result = cm.listFoldReceipts({
     ...(input.afterId !== undefined ? { afterId: input.afterId } : {}),
@@ -124,6 +139,7 @@ export function handleFolds(cm: ContextManager, input: FoldsInput, exportStatus?
         }
         : {}),
       folding: foldingSentence(forms.strategy, forms.forms),
+      about: FOLDS_ABOUT,
       ...(source ? { source } : {}),
       receipts,
       ...(exportStatus !== undefined ? { export: exportStatus } : {}),

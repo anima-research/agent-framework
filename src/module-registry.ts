@@ -23,6 +23,7 @@ import type {
   SpeechHandlerOptions,
   ProcessEvent,
   TraceEventListener,
+  AgentFoldReader,
 } from './types/index.js';
 import type { Agent } from './agent.js';
 
@@ -642,7 +643,7 @@ class ModuleContextImpl implements ModuleContext {
     return this.getAgentsFn().map((a) => a.info);
   }
 
-  getAgentContextManager(agentName: string): ContextManager | null {
+  getAgentContextManager(agentName: string): AgentFoldReader | null {
     return this.getAgentsFn().find((a) => a.name === agentName)?.getContextManager() ?? null;
   }
 
