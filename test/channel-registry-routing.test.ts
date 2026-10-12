@@ -590,3 +590,15 @@ test('proseTargetFor: no token when none is safe (shared id across servers, whit
   assert.equal(registry.proseTargetFor('chan:8', 'discord-a'), '#only-a');
   assert.equal(registry.proseTargetFor('chan:8', 'discord-b'), undefined);
 });
+
+test('channel_list answers { channels } without receipt clocks, the shape it has with them', async () => {
+  const { registry } = makeRegistry({ delivered: true });
+  seedRegistered(registry, 'discord', 'chanA', 'chanB');
+  const result = await registry.handleChannelToolCall('channel_list', {}, { kind: 'agent', agentName: 'scout' } as never);
+  assert.equal(result.success, true);
+  const data = result.data as { channels?: Array<{ id: string; clocks?: unknown }>; receiptClocks?: unknown };
+  assert.ok(!Array.isArray(data), 'not a bare array');
+  assert.deepEqual(data.channels!.map((c) => c.id).sort(), ['chanA', 'chanB']);
+  assert.equal(data.receiptClocks, undefined, 'no clocks wired, so none reported');
+  assert.ok(data.channels!.every((c) => c.clocks === undefined));
+});

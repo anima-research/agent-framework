@@ -79,12 +79,15 @@ class RequestHold {
 /** A provider that plays turns in the shape of the configured tool mode. */
 class ScriptedAdapter implements ProviderAdapter {
   readonly name = 'scripted';
-  readonly reportsContentAlterations = true;
+  /** Whether it reports the content it leaves out, as the shipped Anthropic adapter does. */
+  readonly reportsContentAlterations: boolean;
   readonly usageCacheConvention = 'cache-excluded' as const;
   turns: Turn[] = [];
   requests: ProviderRequest[] = [];
   readonly hold = new RequestHold();
-  constructor(private readonly mode: 'native' | 'xml') {}
+  constructor(private readonly mode: 'native' | 'xml', reportsContentAlterations = true) {
+    this.reportsContentAlterations = reportsContentAlterations;
+  }
   supportsModel(): boolean { return true; }
   async complete(): Promise<ProviderResponse> { throw new Error('not used'); }
   async stream(request: ProviderRequest, callbacks: StreamCallbacks, _options?: ProviderRequestOptions): Promise<ProviderResponse> {
@@ -168,11 +171,14 @@ interface Harness {
 
 let harness: Harness | null = null;
 
-async function open(mode: 'native' | 'xml' | 'anthropic'): Promise<Harness> {
+async function open(mode: 'native' | 'xml' | 'anthropic' | 'unreporting'): Promise<Harness> {
   const tempDir = mkdtempSync(join(tmpdir(), 'receipts-membrane-'));
   const commandPath = join(tempDir, 'commands.jsonl');
   writeFileSync(commandPath, '');
-  const adapter = mode === 'anthropic' ? new ScriptedAnthropic() : new ScriptedAdapter(mode);
+  // `unreporting`: the native path through an adapter that doesn't report what it leaves out.
+  const adapter = mode === 'anthropic' ? new ScriptedAnthropic()
+    : mode === 'unreporting' ? new ScriptedAdapter('native', false)
+    : new ScriptedAdapter(mode);
   const membrane = mode === 'xml' ? new Membrane(adapter) : new Membrane(adapter, { formatter: new NativeFormatter() });
   const probe = new ProbeModule();
   const history = new HistoryModule();
@@ -267,6 +273,24 @@ describe('receipts from the real membrane producer', () => {
     assert.equal(receipts[0]?.presentation, 'verbatim');
     const fw = h.framework as unknown as { contextReceipts: { roundReportsMissing: boolean } };
     assert.equal(fw.contextReceipts.roundReportsMissing, false, 'membrane emitted round reports');
+  });
+
+  it('an adapter that does not report what it leaves out: membrane reports fidelity unknown, and the body stays unconfirmed', async () => {
+    const h = await open('unreporting');
+    const p = probes(h);
+    h.command({ op: 'incoming', channelId: ROOM, messageId: 'u-1', mode: 'addressed', text: 'are you there?' });
+    await waitFor(() => h.adapter.requests.length >= 1, 'provider request');
+    await waitFor(p.idle, 'turn settles');
+    const clocks = await p.roomClocks();
+    assert.equal(clocks.lastDeliveredAt, null, 'not confirmed delivered');
+    assert.equal(clocks.lastPartialAt, null, 'nor shown lost');
+    assert.equal(p.versionState('u-1').delivered, false);
+    const result = await h.framework.executeToolCall({ id: `t-${Math.random()}`, name: 'channel_list', input: {}, callerAgentName: 'scout' } as never);
+    const scope = (result.data as { receiptClocks: { roundFidelity?: string; degraded: boolean } }).receiptClocks;
+    assert.match(scope.roundFidelity ?? '', /^unknown on 1 of 1 provider rounds since /);
+    assert.equal(scope.degraded, false);
+    const receipts = await p.folds();
+    assert.equal(receipts[0]?.presentation, 'unknown', 'the compile\'s presentation is unknown, not verbatim');
   });
 
   it('native: membrane\'s placeholder for an unsupported image makes the body a partial exposure', async () => {

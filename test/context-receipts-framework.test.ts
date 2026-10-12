@@ -51,7 +51,9 @@ type Script =
   | 'ok'
   | { tool: true; carries: 'all' | 0 }
   /** One round that stands, replying with `reply`, its report naming `altered(request)` altered, at `fidelity` (established by default). */
-  | { ok: true; reply?: unknown[]; altered?: (request: NormalizedRequest) => number[]; fidelity?: 'established' | 'unknown' };
+  | { ok: true; reply?: unknown[]; altered?: (request: NormalizedRequest) => number[]; fidelity?: 'established' | 'unknown' }
+  /** One round that stands, whose usage event carries no round report, as an older membrane sends it. */
+  | { ok: true; noRoundReport: true };
 
 const usage = { inputTokens: 40, outputTokens: 3, cacheReadTokens: 0 };
 const roundEvent = (index: number, extra: Record<string, unknown> = {}) =>
@@ -107,6 +109,8 @@ class ScriptedMembrane {
       stream = new ScriptedStream([{ type: 'error', error: new Error('provider unavailable') } as unknown as StreamEvent]);
     } else if (script === 'ok') {
       stream = new ScriptedStream([roundEvent(0), complete()]);
+    } else if ('noRoundReport' in script) {
+      stream = new ScriptedStream([{ type: 'usage', usage } as unknown as StreamEvent, complete()]);
     } else if ('ok' in script) {
       const altered = script.altered ? { altered: { messages: script.altered(request), injected: [] } } : {};
       const fidelity = script.fidelity ? { fidelity: script.fidelity } : {};
@@ -278,6 +282,19 @@ describe('receipt clocks through the framework', () => {
     assert.match(scope.roundFidelity ?? '', /^unknown on 1 of 1 provider rounds since \d{4}-\d\d-\d\dT[\d:.]+Z \(this process\): those rounds can't confirm what they carried, so a delivery there is unconfirmed, not absent$/);
   });
 
+  it('says in its scope when the membrane reports no rounds, so nothing is confirmed delivered', async () => {
+    membrane.scripts = [{ ok: true, noRoundReport: true }];
+    command({ op: 'incoming', channelId: ROOM, messageId: 'n-1', mode: 'addressed', text: 'still there?' });
+    await waitFor(() => membrane.requests.length >= 1, 'provider request');
+    await waitFor(idle, 'turn settles');
+    const clocks = await roomClocks();
+    assert.equal(clocks.received?.messageId, 'n-1');
+    assert.equal(clocks.lastDeliveredAt, null, 'a round without a report confirms nothing');
+    const scope = (await channelList()).receiptClocks as { roundReports?: string; about?: string };
+    assert.equal(scope.roundReports, 'unavailable: this membrane does not report provider rounds, so nothing is confirmed delivered');
+    assert.match(scope.about ?? '', /^Receipt clocks are diagnostics about delivery/, 'what the clocks mean comes with them');
+  });
+
   it('receives an item that wakes nobody without delivering it, until a round carries it', async () => {
     command({ op: 'incoming', channelId: ROOM, messageId: 'm-amb', mode: 'ambient', text: 'just chatting' });
     await waitFor(() => !!stored((m) => m.messageId === 'm-amb'), 'ambient item stored');
@@ -289,6 +306,8 @@ describe('receipt clocks through the framework', () => {
 
     command({ op: 'incoming', channelId: ROOM, messageId: 'm-addr', mode: 'addressed', text: 'now you' });
     await waitFor(() => membrane.requests.length >= 1, 'woken');
+    // A wake on the ambient item would have sent a request without this one.
+    assert.match(JSON.stringify(membrane.requests[0]!.messages), /now you/, 'the first request is the addressed item\'s');
     await waitFor(idle, 'turn settles');
     clocks = await roomClocks();
     assert.equal(clocks.delivered?.messageId, 'm-addr');
@@ -399,10 +418,14 @@ describe('receipt clocks through the framework', () => {
     contextManager.addMessage('user', [{ type: 'text', text: 'Run once.' }]);
     const prepare = agent.startStreamWithInjections.bind(agent);
     let prepared = false;
+    let deregisteredAtResume: boolean | undefined;
     agent.startStreamWithInjections = async (...args: Parameters<typeof prepare>) => {
       // Slow enough for the idle watchdog to dispose the agent meanwhile.
       await new Promise((r) => setTimeout(r, 300));
       const result = await prepare(...args);
+      // Where the framework resumes with the prepared request: the agent
+      // must already be gone, or the guard below this point isn't reached.
+      deregisteredAtResume = framework.getAgent('worker') !== agent;
       prepared = true;
       return result;
     };
@@ -411,7 +434,10 @@ describe('receipt clocks through the framework', () => {
       /stalled/,
     );
     await waitFor(() => prepared, 'the request prepared after disposal');
-    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(deregisteredAtResume, true, 'the agent was disposed before its prepared request resumed');
+    await waitFor(() => membrane.streams.length >= 1, 'the provider stream started');
+    const started = membrane.streams[0] as unknown as { done: boolean };
+    await waitFor(() => started.done, 'the stream abandoned');
     assert.equal(membrane.requests.length, 1, 'a stream was started, then abandoned');
     const receipts = (framework as unknown as { contextReceipts: { streams: Map<string, unknown> } }).contextReceipts;
     assert.equal(receipts.streams.size, 0);
