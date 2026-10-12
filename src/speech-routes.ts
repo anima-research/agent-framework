@@ -15,7 +15,10 @@
  *   delivered came in, as before speech routes, checked like any route. The
  *   framework decides which wakes those are (InferenceRequest
  *   .namesConversation): a reaction or a channel a fork owns names one
- *   without being a candidate, and gets no fallback.
+ *   without being a candidate, and gets no fallback. A framework wake that
+ *   continues a turn (a rewind retry, an unstick, a prose bounce) names the
+ *   conversations that turn answered (continuationCandidates), so its words
+ *   go where that turn's would have, by the rules every wake follows.
  *
  * A held turn (competing conversations at turn start, or a competing
  * addressed or engaged arrival mid-turn) keeps unaddressed speech as drafts
@@ -285,6 +288,42 @@ function fallbackRoute(fallback: RouteCandidate | null | undefined, targetOf: Pu
     ...(c.label ? { label: c.label } : {}),
     origin: 'fallback',
   };
+}
+
+/**
+ * The conversations a framework wake names when it continues a turn (a
+ * rewind retry, an unstick, a prose continuation or bounce), as candidates:
+ * the ones that turn answered, so the continuation's words go where the
+ * turn's would have. A held turn names each conversation it held between; a
+ * turn with a route names its route's conversation, reply edge kept; a turn
+ * whose one conversation couldn't take plain speech names that one, to be
+ * checked again. Each counts as addressed, since the resident was answering
+ * it: an ambient arrival batched beside it doesn't take the turn, and an
+ * addressed one from elsewhere holds it. A turn that answered none (a silent
+ * wake, an explicit-prose turn, a no-name wake with no fallback place) gives
+ * none, so its continuation names none.
+ */
+export function continuationCandidates(turn: TurnRoute | undefined, at: number): RouteCandidate[] {
+  if (!turn) return [];
+  if (turn.hold) return turn.hold.conversations.map((conversation) => ({ conversation, addressed: true, at }));
+  if (turn.route) {
+    const { route } = turn;
+    return [{
+      conversation: routeConversation(route),
+      addressed: true,
+      at,
+      ...(route.kind === 'channel' && route.replyTo ? { messageId: route.replyTo } : {}),
+    }];
+  }
+  if (turn.unroutable) {
+    return [{
+      conversation: turn.unroutable.conversation,
+      addressed: true,
+      at,
+      ...(turn.unroutable.reason === 'unresolved' ? { unroutable: true as const } : {}),
+    }];
+  }
+  return [];
 }
 
 /** The candidates a route is inferred from: the addressed ones if any, else all. */

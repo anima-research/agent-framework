@@ -214,14 +214,42 @@ test('only a delivered message becomes the fallback\'s place: not a reaction, a 
   registry.noteDelivered('slack', 'slack:GONE', undefined, []);
   assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2', threadId: 't-4' },
     'a deletion, a reaction\'s removal or an unregistered channel never counts');
-  // An ordinary deletion notice never counts either.
-  await registry.handleIncoming('slack', { messages: [msg('slack:C3', 'd-1', { tags: ['chat:deleted'] })] });
+  // An ordinary deletion notice is delivered, and never counts either.
+  let deletion: { results: Array<{ accepted: boolean }> } | undefined;
+  await registry.handleIncoming('slack', { messages: [msg('slack:C3', 'd-1', { tags: ['chat:deleted'] })] },
+    { respond: (r: unknown) => { deletion = r as typeof deletion; } } as never);
+  assert.equal(deletion?.results[0]?.accepted, true, 'the deletion notice was delivered');
   assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2', threadId: 't-4' }, 'a deletion never counts');
 
   // Stopping forgets it.
   registry.stopAll();
   assert.equal(registry.getLastInbound(), null);
   assert.equal(registry.getDefaultPublishChannel(), null);
+});
+
+test('on a registry with no coalescing hook, a withdrawal arrives as a plain item and is still never the place', async () => {
+  const registry = new ChannelRegistry(
+    { getServer: () => undefined } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+    { shouldTriggerInference: () => true },
+  );
+  seedRegistered(registry, 'slack', 'slack:C1', 'slack:C2');
+  const msg = (channelId: string, messageId: string, extra: Record<string, unknown> = {}) => ({
+    channelId, messageId, author: { id: 'u1', name: 'Ada' }, timestamp: '2026-10-07T00:00:00.000Z',
+    content: [{ type: 'text' as const, text: 'hi' }], ...extra,
+  });
+  await registry.handleIncoming('slack', { messages: [msg('slack:C1', 'm-1')] });
+  let withdrawal: { results: Array<{ accepted: boolean }> } | undefined;
+  await registry.handleIncoming('slack',
+    { messages: [msg('slack:C2', 'm-2', { eventId: 'e-2', coalesce: { key: 'k', retract: true } })] } as never,
+    { respond: (r: unknown) => { withdrawal = r as typeof withdrawal; } } as never);
+  assert.equal(withdrawal?.results[0]?.accepted, true, 'delivered as a plain item');
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C1' }, 'a withdrawal is never the place');
+  // A plain message there still is.
+  await registry.handleIncoming('slack', { messages: [msg('slack:C2', 'm-3')] });
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2' });
 });
 
 test('a coalesced message whose channel goes while its coalescer decides breaks nothing', async () => {

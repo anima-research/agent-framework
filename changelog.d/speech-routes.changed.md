@@ -41,10 +41,17 @@
     channel another agent's fork owns names one but answers nothing, so such
     a wake gets no route, never the fallback. An ambient-only batch names
     its own conversations: it routes to one, or holds when it names several.
-  - **Wakes that continue the previous turn's work keep its route:** a
-    retry after a refusal, an unstick or an inference failure rewinds, the
-    results of a non-streaming tool round, an explicit-prose continuation or
-    bounce, and a provider-cooldown retry, when they name nothing new.
+  - **A framework wake that continues a turn names that turn's
+    conversations:** a retry after a refusal, an unstick or an inference
+    failure rewinds; an unstick; the results of a non-streaming tool round;
+    an explicit-prose continuation or bounce; and a provider-cooldown retry
+    that holds no wake of its own. The wake carries those conversations, read
+    when it is queued, as addressed ones, so its words go where the turn's
+    would have. Beside a heartbeat they keep the turn, beside an ambient
+    arrival from elsewhere they win, and beside an addressed one from
+    elsewhere the turn is held. A turn that answered none gives a wake that
+    names none. Everything else starts afresh, as at any new turn: a rewind
+    sheds the turn whose choices those were.
   - **An ephemeral subagent never takes the fallback.** Its prose isn't a
     channel's, and before speech routes a subagent's prose between its tool
     calls could reach the resident's live channel this way.
@@ -55,10 +62,11 @@
   inference. anima-research/agent-framework#190, by @rufalupa666-netizen
   with the resident qa-engineer, found and diagnosed such a reply published
   to the channel that last spoke.
-- Context-budget restarts, guard retries and framework retries keep the
-  turn's route, and everything else the turn has chosen or done: its
-  explicit-send engagement, its `>>` or `>>>` choice, and the deliveries and
-  drafts its receipt reports. Only the next true new turn decides again.
+- Context-budget restarts, guard retries and a stream's own retries (its
+  later attempts) keep the turn's route, and everything else the turn has
+  chosen or done: its explicit-send engagement, its `>>` or `>>>` choice, and
+  the deliveries and drafts its receipt reports. Only the next true new turn
+  decides again, and a queued wake that continues a turn starts one.
 - **Speech goes where the route stood when its words were written.** A
   `channel_open`, or a hold, that lands while earlier words still wait to be
   published governs only words written after it; the same goes for a

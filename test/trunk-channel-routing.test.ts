@@ -28,7 +28,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { ProcessEvent } from '../src/index.js';
-import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
+import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
 /** Reach the private per-turn speech routes + the pure channel-deriver. */
 function internals(framework: AgentFramework) {
@@ -40,6 +40,11 @@ function internals(framework: AgentFramework) {
     ): { channelId: string; label?: string } | undefined;
     channelRegistry: unknown;
     handleMcplPushEvent(event: unknown): void;
+    continuationRequest(agentName: string, reason: string): {
+      agentName: string; reason: string; source: string; timestamp: number;
+      namesConversation?: true; routeCandidates?: Array<{ conversation: { channelId?: string }; addressed: boolean }>;
+    };
+    conversationAgentHomes: Map<string, string>;
   };
 }
 
@@ -618,6 +623,18 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.runUntilIdle();
     assert.equal(membrane.calls.length, 4);
     assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null }, 'an author-only push takes no fallback');
+
+    // So does one that names only a thread.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'in that thread' }]));
+    framework.pushEvent({
+      type: 'mcpl:push-event', serverId: 'discord', featureSet: 'discord.messaging',
+      eventId: `e-${Math.random().toString(36).slice(2)}`, content: [{ type: 'text', text: 'hm' }],
+      origin: { source: 'discord', threadId: 'T-9' }, timestamp: new Date().toISOString(),
+      inferenceId: `inf-${Math.random().toString(36).slice(2)}`, triggerInference: true,
+    } as unknown as ProcessEvent);
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 5);
+    assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null }, 'a thread-only push takes no fallback');
     assert.deepEqual(published, [], 'nothing went to the last delivered message\'s channel');
     await framework.stop();
   });
@@ -654,53 +671,161 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
-  it('a framework wake that continues the previous turn keeps its route, never the fallback', async () => {
+  it('a refusal\'s rewind retry names the refused turn\'s conversation, so it speaks there, never where the last message came in', async () => {
+    // One response per stream: the refused turn, then its retry.
+    const streams = [createMockResponse([], 'refusal'), createMockResponse([{ type: 'text', text: 'after the rewind' }])];
+    (membrane as unknown as { streamYielding: unknown }).streamYielding = (request: unknown) => {
+      membrane.calls.push(request as never);
+      return new MockYieldingStream(streams.splice(0, 1));
+    };
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'rewind.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.', refusalHandling: { autoRewind: true } }],
+      modules: [],
+    });
+    const { registry, published } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
+    internals(framework).channelRegistry = registry;
+    framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: hi'));
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 2, 'the refused turn, then its retry');
+    assert.equal(internals(framework).turnRoutes.get('scout')?.route?.channelId, 'discord:guild:chanA');
+    assert.deepEqual(published.map((p) => [(p.to as { channelId: string }).channelId, p.text]),
+      [['discord:guild:chanA', 'after the rewind']]);
+    await framework.stop();
+  });
+
+  it('a continuation names its turn\'s conversation in any batch: it keeps it beside a heartbeat in either order and beside an ambient arrival, and holds beside an addressed one', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'first answer' }]));
     const framework = await makeFramework();
     const { registry, published } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
     internals(framework).channelRegistry = registry;
     framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: hi'));
     await framework.runUntilIdle();
-    assert.equal(internals(framework).turnRoutes.get('scout')?.route?.channelId, 'discord:guild:chanA');
-    // A rewind retry of that work names nothing new: it keeps chanA, though
-    // the last message came in elsewhere.
-    for (const reason of ['refusal-rewind-retry', 'inference-failure-rewind-retry', 'tool_results_ready']) {
-      membrane.pushResponse(createMockResponse([{ type: 'text', text: `again after ${reason}` }]));
-      internals(framework).pendingRequests.push({ agentName: 'scout', reason, source: 'framework', timestamp: Date.now() });
+    const i = internals(framework);
+    const chanA = i.continuationRequest('scout', 'refusal-rewind-retry');
+    assert.equal(chanA.namesConversation, true);
+    assert.deepEqual(chanA.routeCandidates?.map((c) => [c.conversation.channelId, c.addressed]), [['discord:guild:chanA', true]]);
+    const heartbeatRequest = () => ({ agentName: 'scout', reason: 'heartbeat', source: 'timer', timestamp: Date.now() });
+    const arrivalFromB = (addressed: boolean) => ({
+      agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(), namesConversation: true,
+      routeCandidates: [{ conversation: { kind: 'channel', serverId: 'discord', channelId: 'discord:guild:chanB' }, addressed, at: Date.now() }],
+    }) as never;
+    const batches: Array<[string, () => unknown[]]> = [
+      ['first', () => [i.continuationRequest('scout', 'inference-failure-rewind-retry'), heartbeatRequest()]],
+      ['behind a heartbeat', () => [heartbeatRequest(), i.continuationRequest('scout', 'prose-bounce')]],
+      ['beside an ambient arrival', () => [arrivalFromB(false), i.continuationRequest('scout', 'unstick')]],
+    ];
+    for (const [label, batch] of batches) {
+      const calls = membrane.calls.length;
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: label }]));
+      i.pendingRequests.push(...(batch() as never[]));
       await framework.runUntilIdle();
-      assert.equal(internals(framework).turnRoutes.get('scout')?.route?.channelId, 'discord:guild:chanA', `${reason} keeps the route`);
+      assert.equal(membrane.calls.length, calls + 1, `${label}: one turn`);
+      assert.equal(i.turnRoutes.get('scout')?.route?.channelId, 'discord:guild:chanA', `${label}: it keeps chanA`);
     }
     assert.deepEqual(published.map((p) => (p.to as { channelId: string }).channelId),
       ['discord:guild:chanA', 'discord:guild:chanA', 'discord:guild:chanA', 'discord:guild:chanA']);
+    // An addressed arrival from chanB competes with it: the turn is held.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'which one' }]));
+    i.pendingRequests.push(i.continuationRequest('scout', 'refusal-rewind-retry'), arrivalFromB(true));
+    await framework.runUntilIdle();
+    const held = i.turnRoutes.get('scout') as { route: null; hold?: { conversations: Array<{ channelId: string }> } };
+    assert.equal(held.route, null);
+    assert.deepEqual(held.hold?.conversations.map((c) => c.channelId).sort(), ['discord:guild:chanA', 'discord:guild:chanB']);
+    assert.equal(published.length, 4, 'nothing published from the held turn');
+    // Its continuation names both, and is held again.
+    const both = i.continuationRequest('scout', 'prose-bounce');
+    assert.deepEqual(both.routeCandidates?.map((c) => c.conversation.channelId).sort(), ['discord:guild:chanA', 'discord:guild:chanB']);
+    await framework.stop();
+  });
+
+  it('a continuation whose conversation a fork has claimed names it but gets no route; one whose turn answered none names none', async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'first answer' }]));
+    const framework = await makeFramework();
+    const { registry, published } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
+    internals(framework).channelRegistry = registry;
+    framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: hi'));
+    await framework.runUntilIdle();
+    const i = internals(framework);
+    // A fork claims chanA after the turn: the continuation still names chanA,
+    // so it takes no fallback, but it may not take chanA.
+    i.conversationAgentHomes.set('fork-1', 'discord:guild:chanA');
+    const claimed = i.continuationRequest('scout', 'refusal-rewind-retry');
+    assert.equal(claimed.namesConversation, true);
+    assert.equal(claimed.routeCandidates, undefined);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'not into the fork' }]));
+    i.pendingRequests.push(claimed);
+    await framework.runUntilIdle();
+    assert.deepEqual(i.turnRoutes.get('scout'), { route: null });
+    assert.equal(published.length, 1, 'only the first answer was published');
+    // A turn that answered no conversation (a silent wake's record) gives a
+    // continuation that names none, so it takes the fallback like any such wake.
+    i.conversationAgentHomes.delete('fork-1');
+    i.turnRoutes.set('scout', { route: null });
+    const none = i.continuationRequest('scout', 'unstick');
+    assert.equal(none.namesConversation, undefined);
+    assert.equal(none.routeCandidates, undefined);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'where the last message came in' }]));
+    i.pendingRequests.push(none);
+    await framework.runUntilIdle();
+    const fallback = i.turnRoutes.get('scout')?.route;
+    assert.deepEqual([fallback?.channelId, fallback?.origin], ['discord:guild:elsewhere', 'fallback']);
     await framework.stop();
   });
 
   it('an ephemeral subagent never takes the fallback, and several requests batched into one turn name a conversation if any does', async () => {
-    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'diver notes' }]));
     const framework = await makeFramework();
     const { registry, published } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:last' });
     internals(framework).channelRegistry = registry;
-    // As if scout were an ephemeral subagent: its prose is its caller's.
-    const ephemerals = (framework as unknown as { usedEphemeralAgentNames: Set<string> }).usedEphemeralAgentNames;
-    ephemerals.add('scout');
-    await heartbeat(framework);
-    assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null }, 'no fallback for an ephemeral');
-    ephemerals.delete('scout');
+    // A real ephemeral subagent: its prose is its caller's.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'diver notes' }]));
+    const diver = await framework.createEphemeralAgent({ name: 'diver', model: 'test-model', systemPrompt: 'Dive.', allowedTools: 'all' });
+    diver.contextManager.addMessage('user', [{ type: 'text', text: 'Look around.' }]);
+    const run = framework.runEphemeralToCompletion(diver.agent, diver.contextManager);
+    await framework.runUntilIdle();
+    assert.equal((await run).speech, 'diver notes');
+    assert.deepEqual(internals(framework).turnRoutes.get('diver'), { route: null }, 'no fallback for an ephemeral');
 
     // A heartbeat batched with a wake that names a conversation (as a
     // reaction's does) is one turn that names one: no fallback.
+    const calls = membrane.calls.length;
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'batched' }]));
     internals(framework).pendingRequests.push(
       { agentName: 'scout', reason: 'heartbeat', source: 'timer', timestamp: Date.now() },
       { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(), namesConversation: true } as never,
     );
     await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, calls + 1, 'the batch ran, as one turn');
     assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null }, 'the batch named a conversation');
     assert.deepEqual(published, []);
     await framework.stop();
   });
 
-  it('a module event that names a channel in its metadata never takes the fallback', async () => {
+  it('a tune-out wake about a channel names it, so the primary\'s turn after a cancel takes no fallback', async () => {
+    const framework = await makeFramework();
+    // The coordinator's requestInference hook (tune-out/coordinator.ts).
+    const wake = (framework as unknown as {
+      queueTuneOutWake(agent: string, reason: string, source: string, channelId?: string): void;
+    }).queueTuneOutWake.bind(framework);
+    const { registry, published } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:last' });
+    internals(framework).channelRegistry = registry;
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'back from the noisy channel' }]));
+    wake('scout', 'tune-out cancelled (done)', 'tune-out', 'discord:guild:noisy');
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 1);
+    assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null }, 'it names the noisy channel: no fallback');
+    assert.deepEqual(published, []);
+    // A wake through the same hook that names no channel takes the fallback.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tick' }]));
+    wake('scout', 'a wake about nothing', 'tune-out');
+    await framework.runUntilIdle();
+    assert.equal(membrane.calls.length, 2);
+    assert.equal(internals(framework).turnRoutes.get('scout')?.route?.channelId, 'discord:guild:last');
+    await framework.stop();
+  });
+
+  it('a module event that names a channel, a thread or an author in its metadata never takes the fallback', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'about that channel' }]));
     const relay = {
       name: 'relay',
@@ -724,7 +849,22 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.runUntilIdle();
     assert.equal(membrane.calls.length, 1);
     assert.deepEqual(internals(framework).turnRoutes.get('scout'), { route: null });
-    assert.deepEqual(published, []);
+    // A thread alone, or an author alone, names a conversation too; a note
+    // naming none takes the fallback.
+    const cases: Array<[Record<string, unknown>, string | null]> = [
+      [{ threadId: 'T-1' }, null],
+      [{ authorId: 'U-5' }, null],
+      [{}, 'discord:guild:last'],
+    ];
+    for (const [metadata, expected] of cases) {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: `about ${JSON.stringify(metadata)}` }]));
+      framework.pushEvent({ type: 'relay:note', source: 'relay', metadata } as unknown as ProcessEvent);
+      await framework.runUntilIdle();
+      assert.equal(internals(framework).turnRoutes.get('scout')?.route?.channelId ?? null, expected, JSON.stringify(metadata));
+    }
+    assert.equal(membrane.calls.length, 4);
+    assert.deepEqual(published.map((p) => (p.to as { channelId: string }).channelId), ['discord:guild:last'],
+      'only the note naming nothing spoke, where the last message came in');
     await framework.stop();
   });
 

@@ -1062,13 +1062,14 @@ test('a producer retry of a coalesced message is no new delivery: the fallback s
   await f.register('A');
   await f.register('B');
   const registry = (f.framework as unknown as {
-    channelRegistry: { getLastInbound(): { channelId: string } | null };
+    channelRegistry: { getLastInbound(): { channelId: string; threadId?: string } | null };
   }).channelRegistry;
-  const original = { messages: [f.channel('A-1', 'first channel', { initial: true }, 'A', 'message-A')] };
+  const original = { messages: [{ ...f.channel('A-1', 'first channel', { initial: true }, 'A', 'message-A'), threadId: 't-9' }] };
   const accepted = await f.send('channels/incoming', original);
   assert.equal(accepted.result.results[0].accepted, true);
   await f.framework.runUntilIdle();
-  assert.equal(registry.getLastInbound()?.channelId, 'A', 'a fresh admission counts');
+  assert.deepEqual([registry.getLastInbound()?.channelId, registry.getLastInbound()?.threadId], ['A', 't-9'],
+    'a fresh admission counts, with its thread');
 
   const b = f.channel('B-1', 'latest real message', {}, 'B', 'message-B') as Record<string, unknown>;
   delete b.coalesce;
@@ -1084,11 +1085,28 @@ test('a producer retry of a coalesced message is no new delivery: the fallback s
   assert.equal(f.membrane.calls.length, calls, 'the retry starts no turn');
   assert.equal(registry.getLastInbound()?.channelId, 'B', 'a retry is no delivery: the place stays B');
 
-  // A withdrawal admitted afresh delivers nothing either.
+  // A withdrawal admitted afresh is never the place either.
   await f.register('C');
-  await f.send('channels/incoming', { messages: [{ ...f.channel('C-1', '', { retract: true }, 'C', 'message-C'), content: [] }] });
+  const withdrawal = await f.send('channels/incoming', { messages: [{ ...f.channel('C-1', '', { retract: true }, 'C', 'message-C'), content: [] }] });
+  assert.equal(withdrawal.result.results[0].accepted, true, 'the withdrawal was admitted');
   await f.framework.runUntilIdle();
-  assert.equal(registry.getLastInbound()?.channelId, 'B', 'a withdrawal is no delivery: the place stays B');
+  assert.equal(registry.getLastInbound()?.channelId, 'B', 'a withdrawal is never the place: the place stays B');
+
+  // Nor is a coalesced reaction or deletion, nor a push admitted in a
+  // channel's scope: only a channel message is where the last message came in.
+  await f.register('D');
+  for (const [eventId, tags] of [['D-1', ['chat:reaction']], ['D-2', ['chat:deleted']]] as const) {
+    const item = await f.send('channels/incoming', {
+      messages: [{ ...f.channel(eventId, 'not a message', { initial: true }, 'D', `message-${eventId}`), tags: [...tags] }],
+    });
+    assert.equal(item.result.results[0].accepted, true, `${tags[0]} was admitted`);
+    await f.framework.runUntilIdle();
+    assert.equal(registry.getLastInbound()?.channelId, 'B', `a coalesced ${tags[0]} is never the place`);
+  }
+  const push = await f.send('push/event', f.params('P-1', 'a push about D', { channelId: 'D', key: 'message:p-1', initial: true }));
+  assert.equal(push.result.coalesce.outcome, 'first', 'the channel-scoped push was admitted afresh');
+  await f.framework.runUntilIdle();
+  assert.equal(registry.getLastInbound()?.channelId, 'B', 'a push is never the place');
 
   const publishes = f.published.length;
   await (f.framework as unknown as { startAgentStream(a: unknown, tr?: unknown): Promise<void> })
@@ -1096,4 +1114,31 @@ test('a producer retry of a coalesced message is no new delivery: the fallback s
   await f.framework.runUntilIdle();
   await eventually(() => f.published.length > publishes, 'the scheduled note is published');
   assert.equal(f.published.at(-1)!.channelId, 'B', 'the scheduled note lands where the last message came in');
+});
+
+test('a deferred push batch whose origin names only a thread names a conversation, so its turn takes no fallback', async (t) => {
+  const f = await fixture({ server: { shouldTriggerInference: () => true } }); t.after(f.close);
+  f.alwaysRespond();
+  await f.register('A');
+  const a = f.channel('A-1', 'a real message', {}, 'A', 'message-A') as Record<string, unknown>;
+  delete a.coalesce;
+  delete a.eventId;
+  await f.send('channels/incoming', { messages: [a] });
+  await f.framework.runUntilIdle();
+  const turnRoutes = (f.framework as unknown as { turnRoutes: Map<string, { route: { channelId?: string; origin?: string } | null }> }).turnRoutes;
+  assert.equal(turnRoutes.get('agent')?.route?.channelId, 'A');
+  const calls = f.membrane.calls.length;
+  const publishes = f.published.length;
+  // A deferred batch wakes through the coalescer's batch wake, which names
+  // its conversation from the batch (not the ordinary push path).
+  await f.send('push/event', { ...f.params('T-1', 'in a thread', { deferred: true, initial: true }), origin: { threadId: 't-1' } });
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, calls + 1, 'the push woke a turn');
+  assert.deepEqual(turnRoutes.get('agent'), { route: null }, 'its thread names a conversation: no fallback');
+  assert.equal(f.published.length, publishes, 'nothing went where the last message came in');
+  // A deferred batch naming nothing takes the fallback.
+  await f.send('push/event', f.params('T-2', 'a nudge', { key: 'nudge', deferred: true, initial: true }));
+  await f.framework.runUntilIdle();
+  assert.equal(f.membrane.calls.length, calls + 2);
+  assert.deepEqual([turnRoutes.get('agent')?.route?.channelId, turnRoutes.get('agent')?.route?.origin], ['A', 'fallback']);
 });

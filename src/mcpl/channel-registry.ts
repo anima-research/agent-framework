@@ -1209,7 +1209,11 @@ export class ChannelRegistry {
       // CustomEvent `${string}:${string}` type pattern but lacks an index signature.
       if (inboundSource) this.inboundAccepted?.(inboundSource);
       this.pushEventFn(event as unknown as ProcessEvent);
-      this.noteDelivered(serverId, message.channelId, message.threadId, message.tags);
+      // A withdrawal is never the place, as before speech routes: on a
+      // registry with no coalescing hook it arrives here as a plain item.
+      if ((message.coalesce as { retract?: unknown } | null | undefined)?.retract !== true) {
+        this.noteDelivered(serverId, message.channelId, message.threadId, message.tags);
+      }
 
       // Collect per-message result
       results.push({
@@ -1402,9 +1406,10 @@ export class ChannelRegistry {
   // ==========================================================================
 
   /** The channel id of where the last message any channel delivered came in
-   *  (noteDelivered: a conversational message, never a reaction or a
-   *  deletion), or null. Kept from before speech routes for hosts that read
-   *  it; the framework uses it only as a turn's fallback route. */
+   *  (noteDelivered: a conversational message, never a reaction, a deletion
+   *  or a withdrawal), or null. Kept from before speech routes for hosts
+   *  that read it. The framework doesn't: a turn's fallback route reads
+   *  getLastInbound, which names the server and thread too. */
   getDefaultPublishChannel(): string | null {
     return this.lastInbound?.channelId ?? null;
   }
@@ -1424,9 +1429,11 @@ export class ChannelRegistry {
    * producer's retry, which the coalescer acknowledges again without
    * delivering anything). Only a message a conversation could continue
    * counts, on a channel still registered: never a reaction or a deletion
-   * (`chat:reaction`, `chat:reaction-remove`, `chat:deleted`). The caller
-   * leaves out withdrawals, which deliver nothing. An MCPL item's tags
-   * alone decide: `metadata.system` is host-written.
+   * (`chat:reaction`, `chat:reaction-remove`, `chat:deleted`). Each caller
+   * leaves out withdrawals (`coalesce.retract`), which are never the place,
+   * even when a coalescer shows the resident a withdrawal notice: the
+   * place is where the last message came in. An MCPL item's tags alone
+   * decide: `metadata.system` is host-written.
    */
   noteDelivered(serverId: string, channelId: string, threadId?: string, tags?: readonly string[]): void {
     if (!this.channels.has(`${serverId}:${channelId}`)) return;

@@ -86,6 +86,7 @@ import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, publishPlaceRefusal, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SpeechRouteView } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftSource, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import {
+  continuationCandidates,
   conversationKey,
   describeConversation,
   inferTurnRoute,
@@ -545,24 +546,6 @@ const bySeq = (a: { seq: number }, b: { seq: number }): number => a.seq - b.seq;
 function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string): MessageMetadata {
   return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
 }
-
-/**
- * Framework wakes that continue the resident's previous turn's work: a retry
- * after a rewind (refusal, unstick, inference failure), the results of a
- * non-streaming tool round, an explicit-prose continuation or bounce, and a
- * provider-cooldown retry with nothing else held. Naming nothing new, such a
- * wake keeps the previous turn's speech route (startAgentStream).
- */
-const CONTINUES_PREVIOUS_TURN: ReadonlySet<string> = new Set([
-  'tool_results_ready',
-  'refusal-rewind-retry',
-  'unstick',
-  'unstick-retry',
-  'inference-failure-rewind-retry',
-  'prose-continuation',
-  'prose-bounce',
-  'provider-acceleration-retry',
-]);
 
 function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
@@ -2010,13 +1993,8 @@ export class AgentFramework {
           addMessage: (participant, content, metadata, forAgent) =>
             framework.addMessage(participant, content, metadata as MessageMetadata,
               forAgent ? { forAgent } : undefined),
-          requestInference: (agentName, reason, source, channelId) => {
-            framework.pendingRequests.push({
-              agentName, reason, source, timestamp: Date.now(),
-              // A tune-out wake is about the channel it names.
-              ...(channelId ? { namesConversation: true as const } : {}),
-            });
-          },
+          requestInference: (agentName, reason, source, channelId) =>
+            framework.queueTuneOutWake(agentName, reason, source, channelId),
           subconsciousName: () => framework.subconsciousAgentName,
           primaryName: () => framework.primaryAgentName,
           getStoredMessages: () => {
@@ -2381,8 +2359,8 @@ export class AgentFramework {
     }
     const recovery = this.providerAccelerationRecoveries.get(agentName);
     if (recovery) { recovery.releasedAt = Date.now(); recovery.heldRequests = cooldown.heldRequests.length; }
-    const requests = cooldown.heldRequests.length > 0 ? cooldown.heldRequests : [{ agentName,
-      reason: 'provider-acceleration-retry', source: 'framework', timestamp: Date.now() } satisfies InferenceRequest];
+    const requests = cooldown.heldRequests.length > 0 ? cooldown.heldRequests
+      : [this.continuationRequest(agentName, 'provider-acceleration-retry')];
     this.pendingRequests.push(...requests);
     console.error(`[provider-cooldown] agent=${agentName} released after ${Date.now() - cooldown.startedAt}ms — ` +
       `fresh compile queued with ${requests.length} retained request(s)`);
@@ -5472,12 +5450,7 @@ export class AgentFramework {
         channelId: params.channelId ?? '',
       });
       this.refusalRewinds.set(agentName, 0);
-      this.pendingRequests.push({
-        agentName,
-        reason: 'unstick',
-        source: 'framework',
-        timestamp: Date.now(),
-      });
+      this.pendingRequests.push(this.continuationRequest(agentName, 'unstick'));
       console.error(
         `[unstick] agent=${agentName} started cap=${cap} ` +
           `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -7233,12 +7206,7 @@ export class AgentFramework {
             });
           } else {
             // Non-streaming fallback: schedule re-inference
-            this.pendingRequests.push({
-              agentName: agent.name,
-              reason: 'tool_results_ready',
-              source: 'framework',
-              timestamp: Date.now(),
-            });
+            this.pendingRequests.push(this.continuationRequest(agent.name, 'tool_results_ready'));
           }
         }
       }
@@ -8208,7 +8176,9 @@ export class AgentFramework {
         // A channel message admitted afresh is where the last message came
         // in: the fallback route's place. This hook never runs for a
         // producer's retry, which the coalescer acknowledges again without
-        // delivering anything; a withdrawal delivers nothing either.
+        // delivering anything. A withdrawal is never the place, even when
+        // the coalescer shows the resident its notice, as before speech
+        // routes (noteDelivered).
         if (occ.event.lane === 'channel' && occ.scope.kind === 'channel' && !occ.retract) {
           this.channelRegistry?.noteDelivered(occ.serverId, occ.scope.id, occ.identity?.threadId, occ.tags);
         }
@@ -8603,8 +8573,10 @@ export class AgentFramework {
     const named = this.candidateFromSource(occ.event.event.inboundSource, addressedHere);
     const candidate = isConversational(occ.tags) ? named : undefined;
     // A channel, a thread or an author names a conversation, as for a gate
-    // batch (wakeProvenance).
-    const namesConversation = !!named || !!channelId || !!authorId || !!occ.identity?.threadId;
+    // batch (wakeProvenance) and an uncoalesced push: the batch's merged
+    // thread, or for a scope that merges none, its origin's.
+    const originThread = typeof origin?.threadId === 'string' && origin.threadId.length > 0;
+    const namesConversation = !!named || !!channelId || !!authorId || !!occ.identity?.threadId || originThread;
     for (const agentName of await this.coalescedAudience(occ)) {
       const takes = candidate && this.mayTakeCandidate(agentName, candidate) ? candidate : undefined;
       this.pendingRequests.push({
@@ -10176,6 +10148,48 @@ export class AgentFramework {
   }
 
   /**
+   * A tune-out coordinator's wake: the subconscious's cadence and wake
+   * turns, and a cancel's wakes of the resident and the subconscious. One
+   * about a channel names that conversation, so its turn never takes the
+   * fallback: a resident's speech just after a cancel is held rather than
+   * sent where the last message came in (the subconscious is explicit-prose,
+   * so this changes nothing for it).
+   */
+  private queueTuneOutWake(agentName: string, reason: string, source: string, channelId?: string): void {
+    this.pendingRequests.push({
+      agentName, reason, source, timestamp: Date.now(),
+      ...(channelId ? { namesConversation: true as const } : {}),
+    });
+  }
+
+  /**
+   * A framework wake that continues `agentName`'s turn: an unstick, a retry
+   * after a rewind (a refusal, an unstick or an inference failure), the
+   * results of a non-streaming tool round, an explicit-prose continuation or
+   * bounce, or a bare provider-cooldown retry. When it is queued, its turn's
+   * route record gives the conversations that turn answered
+   * (continuationCandidates), and the wake names them. So the true new turn
+   * it starts, alone or batched with other wakes, infers its route from them
+   * by the rules every wake follows, rather than taking the fallback. Like
+   * every producer's candidates, they pass the fork rule here: one a fork has
+   * claimed still names its conversation, so the turn gets no route. A turn
+   * that answered none gives a wake that names none.
+   */
+  private continuationRequest(agentName: string, reason: string): InferenceRequest {
+    const timestamp = Date.now();
+    const named = continuationCandidates(this.turnRoutes.get(agentName), timestamp);
+    const candidates = named.filter((c) => this.mayTakeCandidate(agentName, c));
+    return {
+      agentName,
+      reason,
+      source: 'framework',
+      timestamp,
+      ...(named.length > 0 ? { namesConversation: true as const } : {}),
+      ...(candidates.length > 0 ? { routeCandidates: candidates } : {}),
+    };
+  }
+
+  /**
    * A conversation fork's home as its standing route (it always wins). Homes
    * are bare channel ids: the server is the id's sole registrant, and a
    * shared id gets none, so the route is unresolved rather than guessed.
@@ -11118,12 +11132,7 @@ export class AgentFramework {
     if (!capped) {
       // Wake so the resend can happen immediately — an unsent DM reply must
       // not sit invisible until the next unrelated event.
-      this.pendingRequests.push({
-        agentName: name,
-        reason: 'prose-bounce',
-        source: 'framework',
-        timestamp: Date.now(),
-      });
+      this.pendingRequests.push(this.continuationRequest(name, 'prose-bounce'));
     }
   }
 
@@ -11410,7 +11419,12 @@ export class AgentFramework {
         // A true new turn: forget the previous turn's explicit-send
         // engagements, prose deliveries, drafts and deliberate prose choices
         // (a `>>` or `>>>` target, a hybrid suppression) — all strictly
-        // turn-scoped. A framework retry (attempt > 0), like a restart,
+        // turn-scoped. A queued framework wake that continues a turn (a
+        // rewind retry, an unstick, a prose continuation or bounce) starts a
+        // true new turn too: a rewind sheds the turn whose choices these
+        // were, and only where the words go carries over, through the
+        // conversations the wake names (continuationRequest).
+        // A framework retry (attempt > 0), like a restart,
         // continues the same logical turn: its sends were made, its words
         // delivered or held, its choices chosen, and none of that rolls back
         // with a failed stream, so it keeps them, as it keeps the route.
@@ -11437,18 +11451,14 @@ export class AgentFramework {
         // else held (src/speech-routes.ts). A wake that names no
         // conversation at all (a heartbeat, a timer, a self-wake) takes the
         // fallback, the last delivered message's conversation, as before
-        // speech routes. A silent control-plane wake has none.
-        // A framework wake that continues the resident's previous work (a
-        // retry after a rewind, results of a non-streaming tool round, a
-        // prose continuation or bounce) and names nothing new keeps that
-        // turn's route, as an in-stream retry does: re-inferring it from an
-        // empty wake would send the retried words to the fallback instead.
-        const continues = !!trigger && CONTINUES_PREVIOUS_TURN.has(trigger.reason)
-          && !trigger.namesConversation && !trigger.routeCandidates?.length;
-        const previous = continues ? this.turnRoutes.get(agent.name) : undefined;
+        // speech routes. A silent control-plane wake has none. A framework
+        // wake that continues a turn (a rewind retry, an unstick, a prose
+        // continuation or bounce) carries the conversations that turn
+        // answered as its candidates (continuationRequest), so it is
+        // inferred here like any other.
         const turn: TurnRoute = trigger?.suppressProse
           ? { route: null }
-          : previous ?? inferTurnRoute(
+          : inferTurnRoute(
               trigger?.routeCandidates ?? [],
               this.homeRoute(agent.name),
               (c) => this.publishTargetOf(c),
@@ -11456,7 +11466,9 @@ export class AgentFramework {
               // or not, takes the fallback: a reaction, a system marker or a
               // channel a fork owns names one, and gets no route as before. An
               // ephemeral subagent never takes it: its prose is its caller's
-              // business, never a channel's.
+              // business, never a channel's. (A conversation fork's name is in
+              // the same set, but a fork's home always wins before any
+              // fallback is read.)
               trigger?.namesConversation || this.usedEphemeralAgentNames.has(agent.name)
                 ? null
                 : this.fallbackCandidate(agent.name),
@@ -12438,12 +12450,9 @@ export class AgentFramework {
                 const count = this.updateRewindMarker(agent, category);
                 onStep(count);
                 if (forced) forced.removed.push(rec);
-                this.pendingRequests.push({
-                  agentName: agent.name,
-                  reason: forced ? 'unstick-retry' : 'refusal-rewind-retry',
-                  source: 'framework',
-                  timestamp: Date.now(),
-                });
+                this.pendingRequests.push(
+                  this.continuationRequest(agent.name, forced ? 'unstick-retry' : 'refusal-rewind-retry'),
+                );
                 handledByRewind = true;
               };
 
@@ -12699,12 +12708,7 @@ export class AgentFramework {
             // robotics-style loops where an end-of-turn pause is harmful).
             if (this.proseContinuations.delete(agent.name)) {
               console.error(`[prose] ${agent.name}: '!' continuation — requesting immediate next turn`);
-              this.pendingRequests.push({
-                agentName: agent.name,
-                reason: 'prose-continuation',
-                source: 'framework',
-                timestamp: Date.now(),
-              });
+              this.pendingRequests.push(this.continuationRequest(agent.name, 'prose-continuation'));
             }
 
             break;
@@ -15356,12 +15360,7 @@ export class AgentFramework {
     );
 
     // Retry immediately on the repaired history (bounded by the cap above).
-    this.pendingRequests.push({
-      agentName: agent.name,
-      reason: 'inference-failure-rewind-retry',
-      source: 'framework',
-      timestamp: Date.now(),
-    });
+    this.pendingRequests.push(this.continuationRequest(agent.name, 'inference-failure-rewind-retry'));
   }
 
   // ==========================================================================
