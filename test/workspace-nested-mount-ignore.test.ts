@@ -133,7 +133,21 @@ test("a watched mount's changes pass over what it ignores, a nested mount includ
     onReady: () => ready(),
     onError: (err: Error) => failed(err),
   });
-  watcher.start();
+  // Chokidar's polling backend, as the watcher tests use outside their
+  // Linux-only native cases: the ignore rule is the walk's on either backend.
+  // On macOS in CI, the native stream reported none of the writes into `a/`
+  // and `a/c/`, directories that existed before the watch began.
+  const backend = { usePolling: process.env.CHOKIDAR_USEPOLLING, interval: process.env.CHOKIDAR_INTERVAL };
+  process.env.CHOKIDAR_USEPOLLING = 'true';
+  process.env.CHOKIDAR_INTERVAL = '25';
+  try {
+    watcher.start();
+  } finally {
+    if (backend.usePolling === undefined) delete process.env.CHOKIDAR_USEPOLLING;
+    else process.env.CHOKIDAR_USEPOLLING = backend.usePolling;
+    if (backend.interval === undefined) delete process.env.CHOKIDAR_INTERVAL;
+    else process.env.CHOKIDAR_INTERVAL = backend.interval;
+  }
   t.after(async () => {
     await watcher.stop();
     rmSync(root, { recursive: true, force: true });
@@ -146,7 +160,7 @@ test("a watched mount's changes pass over what it ignores, a nested mount includ
   // Each ignored write has a twin the mount reports, written after it and
   // reported by the same machinery, though not strictly after it: the same
   // directory for the name pattern, and the same depth for the two ignored
-  // directories. Each directory has its own watch, and each file's report
+  // directories. Each directory is polled on its own, and each file's report
   // waits for its size to settle, so reported writes can arrive in any order;
   // waiting for every twin gives each ignored write the time it would take to
   // be reported.
