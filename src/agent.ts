@@ -16,6 +16,7 @@ import {
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
 } from './tool-result-history.js';
+import { requestEvidence, withPreparation, type RequestEvidence } from './context-receipts/evidence.js';
 
 export interface ActivationRequestOptions {
   /** The silent heartbeat tick this request answers, if any. */
@@ -30,7 +31,6 @@ export interface StartStreamResult {
   takeKvSubmission?: () => { submissionId: string; wireReceipt: CacheWireReceipt } | undefined;
   drainKvSubmissionIds?: () => string[];
 }
-import { requestEvidence, withPreparation, type RequestEvidence } from './context-receipts/evidence.js';
 import type {
   ContextManager,
   TokenBudget,
@@ -1042,13 +1042,12 @@ export class Agent {
     this.lastStreamOutputTokens = 0;
 
     const prepared = await this.prepareActivationRequest(availableTools, injections, budget, compressionTools, options);
-    const { request } = prepared;
-    // One-to-one: prepareRequest swaps guarded tool results in place, so
-    // the evidence's request indices still hold; a swap is a change this
-    // preparation made, so the evidence records it.
-    const beforeGuard = request.messages;
+    const { request, evidence } = prepared;
+    // Preparation already swapped the guarded tool results and recorded
+    // where (prepareActivationRequest). This second call records the
+    // submission for the guard; on messages already swapped it changes
+    // nothing the evidence doesn't hold.
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
-    const evidence = withPreparation(prepared.evidence, new Set(substitutedIndices(beforeGuard, request.messages)), false);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
       .getStrategy?.() as {
