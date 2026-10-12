@@ -1065,8 +1065,9 @@ export class AgentFramework {
   private processLoggingPersist: boolean;
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
-  /** Told once per inbound acceptance (mcpl/inbound-source.ts); unset unless
-   *  a receipt consumer installs one. */
+  /** Told once per inbound acceptance (mcpl/inbound-source.ts). The
+   *  constructor installs the receipt clocks' observer, so every deployment
+   *  records each accepted channel item in the clock ledger. */
   private inboundAcceptanceObserver?: InboundAcceptanceObserver;
   /** Per-channel receipt clocks for this store (shelf-354). */
   private readonly clockLedger: ChannelClockLedger;
@@ -6796,6 +6797,9 @@ export class AgentFramework {
         // Check if agent is now ready (state may have changed after provideToolResult)
         // Cast to AgentState to bypass TypeScript's control flow narrowing
         const currentState = agent.state as AgentState;
+        // The stream these results belong to, as currentState holds it: the
+        // agent's stream can move during the awaits below.
+        const resultsStreamId = agent.streamId;
         if (currentState.status === 'ready') {
           // Flush pending assistant blocks (tool_use + preamble text) to context
           const pendingBlocks = this.pendingAssistantBlocks.get(agent.name);
@@ -7072,7 +7076,7 @@ export class AgentFramework {
             // messages (membrane ≥0.5.72) — appended after the tool_result
             // envelope so the next round of THIS turn hears them.
             if (midTurnInjections.length > 0) {
-              this.contextReceipts.injectedBatch(agent.name, agent.streamId, midTurnInjections.length, injectedBodies);
+              this.contextReceipts.injectedBatch(agent.name, resultsStreamId, midTurnInjections.length, injectedBodies);
             }
             currentState.stream.provideToolResults(
               agent.toolResultGuard.submissionResults(membraneResults),
@@ -12194,7 +12198,10 @@ export class AgentFramework {
       agent.reset();
       if (this.agents.get(agent.name) === agent && agent.streamId === myStreamId) this.eventGate?.onInferenceEnded(agent.name);
     } finally {
-      this.contextReceipts.endStream(agent.name, myStreamId);
+      // Name-keyed state is this frame's to clear only while no other agent
+      // holds the name: a successor registered under it may have begun a
+      // stream with the same id (an ephemeral disposed and spawned again).
+      if ((this.agents.get(agent.name) ?? agent) === agent) this.contextReceipts.endStream(agent.name, myStreamId);
       const unsettledKvSubmissions = drainKvSubmissionIds?.() ?? [];
       if (unsettledKvSubmissions.length > 0) {
         try {
