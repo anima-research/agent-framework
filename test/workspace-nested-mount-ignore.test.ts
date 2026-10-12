@@ -504,6 +504,11 @@ test("a mount configured with '..' after a link reads that path as every workspa
   assert.equal(own.success, true, String(own.error));
   assert.match((own.data as { content: string }).content, /as written/);
   assert.equal((await workspace.readFileFromDisk('inner/x.txt')).bytes.toString(), 'as written');
+  // A generated file registers there and reads back, as in a mount configured plainly.
+  workspace.registerGeneratedTextFile('inner/live.txt', () => 'generated content', 'owner');
+  const generated = await workspace.handleToolCall({ id: 'generated', name: 'read', callerAgentName: 'owner', input: { path: 'inner/live.txt' } });
+  assert.equal(generated.success, true, String(generated.error));
+  assert.match((generated.data as { content: string }).content, /generated content/);
   const outers = await call('read', { path: 'outer/child/x.txt' });
   assert.equal(outers.success, true, String(outers.error));
   assert.match((outers.data as { content: string }).content, /through the link/);

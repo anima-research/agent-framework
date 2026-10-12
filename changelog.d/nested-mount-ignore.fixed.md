@@ -78,7 +78,10 @@
     `a/b/` are `a/b`.
   - A mount whose configured path has `.` or `..` segments is read the way
     `path.resolve` reads it, by nesting and by every operation alike. Before,
-    its own sync did that, while the tools refused its files as path
-    traversal, the disk readers followed the path through links first, and
-    its watcher reported none of its changes.
+    its own sync did that, while its tools refused its files as path
+    traversal, and so did registering a generated file in it, such as an
+    agent's tool catalogue. Where a link came before a `..`, the disk readers
+    checked its files against a different root, the one reached by following
+    that link first, and refused them. Its watcher reported none of its
+    changes.
   - (agent-framework #280)

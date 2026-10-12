@@ -1379,8 +1379,11 @@ export class WorkspaceModule implements Module {
     const mountName = slash < 0 ? path : path.slice(0, slash);
     const mount = this.config.mounts.find(m => m.name === mountName);
     if (!mount) throw new Error(`Unknown mount: "${mountName}"`);
-    const resolved = resolve(mount.path, slash < 0 ? '' : path.slice(slash + 1));
-    if (!isContainedPath(mount.path, resolved)) throw new Error(`Path traversal detected: "${path}"`);
+    // The root as parsePath reads it, so a configured path with `.` or `..`
+    // segments contains its own files here too.
+    const root = resolve(mount.path);
+    const resolved = resolve(root, slash < 0 ? '' : path.slice(slash + 1));
+    if (!isContainedPath(root, resolved)) throw new Error(`Path traversal detected: "${path}"`);
     return resolved;
   }
 
