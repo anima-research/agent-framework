@@ -380,6 +380,11 @@ describe('continuationCandidates and continuationOf', () => {
     assert.deepEqual(unresolved, [{ conversation: channel('dup'), addressed: true, at: 3 }]);
     const untargetable = continuationCandidates({ route: null, unroutable: { conversation: channel('quiet'), reason: 'untargetable' } }, 3);
     assert.deepEqual(untargetable, [{ conversation: channel('quiet'), addressed: true, at: 3 }]);
+    // One whose channel had no server stays flagged, so the framework
+    // resolves it again when the continuation's turn starts.
+    const bare: ConversationRef = { kind: 'channel', channelId: 'bare' };
+    assert.deepEqual(continuationCandidates({ route: null, unroutable: { conversation: bare, reason: 'unresolved' } }, 3),
+      [{ conversation: bare, addressed: true, at: 3, unroutable: true }]);
     // Checked again: still refused while the channel declares nothing, a route once it does.
     assert.equal(inferTurnRoute(untargetable, null, declaredNowhere).unroutable?.reason, 'untargetable');
     assert.equal(inferTurnRoute(untargetable, null, rootEverywhere).route?.kind, 'channel');

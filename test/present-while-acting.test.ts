@@ -504,6 +504,10 @@ describe('present while acting', () => {
     assert.deepEqual(heldDrafts(framework), []);
     const turn = (framework as unknown as { turnRoutes: Map<string, { hold?: unknown }> }).turnRoutes.get('assistant');
     assert.equal(turn?.hold, undefined);
+    // The addressed arrival did reach the turn: it was injected mid-turn.
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .map((o) => o?.injectedMessages ?? []).flat().map((m) => JSON.stringify(m.content));
+    assert.ok(wired.some((t) => t.includes('quick question')), 'the addressed message was injected');
     await framework.stop();
   });
 
@@ -540,7 +544,7 @@ describe('present while acting', () => {
     const wired = membrane.lastStream!.receivedToolResultOptions
       .map((o) => o?.injectedMessages ?? []).flat().map((m) => JSON.stringify(m.content));
     assert.ok(
-      wired.some((t) => t.includes('[routing] (srv / discord:dm:antra) addressed you mid-turn. Your unaddressed plain speech was going to (srv / chan-A), where the last message came in, because nothing in this wake named a conversation.')),
+      wired.some((t) => t.includes('[routing] (srv / discord:dm:antra) addressed you mid-turn. Your unaddressed plain speech was going to (srv / chan-A), where the last message had come in when this reply began, because nothing in the wake that began it named a conversation.')),
       'the hold notice says what the fallback was, not that it could be answering it',
     );
     await framework.stop();

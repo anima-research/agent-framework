@@ -147,6 +147,24 @@ describe('speech route across a logical turn', () => {
     await framework.stop();
   });
 
+  it("a channel_open whose result lands after a silent tick has ended still sets no route", async () => {
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const opens: string[] = [];
+    i.channelRegistry = channelsThatOpen(opens);
+    // As a silent tick leaves its record once its turn has ended: no trigger
+    // is running, and the record says the turn was silent.
+    const record = { route: null, silent: {} };
+    i.turnRoutes.set('scout', record as never);
+    (framework as unknown as { dispatchChannelToolCall(agentName: string, call: unknown): void })
+      .dispatchChannelToolCall('scout', { id: 'o1', name: 'channel_open', input: { channelId: 'chan-open' } });
+    await new Promise((r) => setImmediate(r));
+    await framework.runUntilIdle();
+    assert.deepEqual(opens, ['chan-open'], 'the channel was opened');
+    assert.equal(i.turnRoutes.get('scout'), record, 'and the silent record kept, with no route');
+    await framework.stop();
+  });
+
   it('a channel_open into a channel a conversation fork owns opens it but takes no route, and its result says so', async () => {
     const framework = await makeFramework();
     const i = internals(framework);

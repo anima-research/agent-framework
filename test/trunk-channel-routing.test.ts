@@ -868,7 +868,7 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await framework.stop();
   });
 
-  it("a fallback turn's kept place follows the fork rule when its continuation starts: a fork that claimed it meanwhile keeps the continuation out", async () => {
+  it("a fallback turn's kept place that the fork rule refuses when its continuation starts gives no place, then or after, even with the last message come in elsewhere", async () => {
     const framework = await makeFramework();
     const { registry, published } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
     internals(framework).channelRegistry = registry;
@@ -876,13 +876,38 @@ describe('Trunk channel routing (item-3 redux)', () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tick' }]));
     await heartbeat(framework);
     assert.equal(i.turnRoutes.get('scout')?.route?.channelId, 'discord:guild:elsewhere');
+    // A fork claims the kept place, and a message comes in on another channel.
     i.pendingRequests.push(i.continuationRequest('scout', 'refusal-rewind-retry'));
     i.conversationAgentHomes.set('fork-1', 'discord:guild:elsewhere');
+    (registry as Record<string, unknown>).getLastInbound = () => ({ serverId: 'discord', channelId: 'discord:guild:moved' });
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'not into the fork' }]));
     await framework.runUntilIdle();
-    assert.equal(i.turnRoutes.get('scout')?.route, null, "no route into the fork's channel");
+    assert.deepEqual(i.turnRoutes.get('scout'), { route: null, named: true }, "no route into the fork's channel, and none elsewhere");
+    // The next continuation of the same reply has no place either.
+    i.pendingRequests.push(i.continuationRequest('scout', 'inference-failure-rewind-retry'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'still not moved' }]));
+    await framework.runUntilIdle();
+    assert.equal(i.turnRoutes.get('scout')?.route, null);
     assert.deepEqual(published.map((p) => (p.to as { channelId: string }).channelId), ['discord:guild:elsewhere'], 'only the tick was published');
     i.conversationAgentHomes.delete('fork-1');
+    await framework.stop();
+  });
+
+  it("a fallback turn's kept place whose channel no longer declares a publish target gives its continuation no place", async () => {
+    const framework = await makeFramework();
+    const { registry, published } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
+    internals(framework).channelRegistry = registry;
+    const i = internals(framework);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tick' }]));
+    await heartbeat(framework);
+    // The kept place's channel stops declaring; the last inbound moves to one that does.
+    (registry as Record<string, unknown>).publishTarget = (c: { channelId?: string }) => (c.channelId === 'discord:guild:elsewhere' ? undefined : 'root');
+    (registry as Record<string, unknown>).getLastInbound = () => ({ serverId: 'discord', channelId: 'discord:guild:moved' });
+    i.pendingRequests.push(i.continuationRequest('scout', 'refusal-rewind-retry'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'nowhere now' }]));
+    await framework.runUntilIdle();
+    assert.equal(i.turnRoutes.get('scout')?.route, null);
+    assert.deepEqual(published.map((p) => (p.to as { channelId: string }).channelId), ['discord:guild:elsewhere'], 'only the tick was published');
     await framework.stop();
   });
 
@@ -1026,6 +1051,132 @@ describe('Trunk channel routing (item-3 redux)', () => {
     assert.match(refused.error ?? '', /while a turn is in progress/);
     assert.equal(internals(framework).pendingRequests.some((r) => r.reason === 'unstick'), false, 'no unstick queued');
     fw.activeTurnTokens.delete('scout');
+    await framework.stop();
+  });
+
+  it("a continuation of a turn whose channel had no server resolves it again when it starts, and takes the route with its server", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'held' }]));
+    const framework = await makeFramework();
+    const { registry, published } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
+    let registered = false;
+    (registry as Record<string, unknown>).getChannelServerId = (id: string) => (registered && id === 'discord:guild:late' ? 'discord' : undefined);
+    internals(framework).channelRegistry = registry;
+    const i = internals(framework);
+    const fw = framework as unknown as { candidateForChannel(channelId: string, addressed: boolean, at: number): unknown };
+    const now = Date.now();
+    i.pendingRequests.push({
+      agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: now, namesConversation: true,
+      routeCandidates: [fw.candidateForChannel('discord:guild:late', true, now)],
+    } as never);
+    await framework.runUntilIdle();
+    const unresolved = i.turnRoutes.get('scout') as { route: unknown; unroutable?: { reason: string } };
+    assert.equal(unresolved.route, null);
+    assert.equal(unresolved.unroutable?.reason, 'unresolved');
+    // The server registers; the turn's retry takes the channel, with its server.
+    registered = true;
+    i.pendingRequests.push(i.continuationRequest('scout', 'refusal-rewind-retry'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'there now' }]));
+    await framework.runUntilIdle();
+    const route = i.turnRoutes.get('scout')?.route as { channelId?: string; serverId?: string } | null;
+    assert.deepEqual([route?.serverId, route?.channelId], ['discord', 'discord:guild:late']);
+    assert.deepEqual(published.map((p) => [(p.to as { serverId?: string }).serverId, (p.to as { channelId: string }).channelId, p.text]),
+      [['discord', 'discord:guild:late', 'there now']]);
+    await framework.stop();
+  });
+
+  it("a continuation's conversation counts as older than a message batched with it, so that message gives the reply edge", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'first answer' }]));
+    const framework = await makeFramework();
+    const { registry } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
+    internals(framework).channelRegistry = registry;
+    const i = internals(framework);
+    framework.pushEvent(channelIncoming('discord:guild:chanA', 'A: hi'));
+    await framework.runUntilIdle();
+    const first = i.turnRoutes.get('scout')?.route?.replyTo;
+    assert.ok(first);
+    // A newer message in chanA is queued first; the turn's retry is queued after it.
+    const arrival = {
+      agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: Date.now(), namesConversation: true,
+      routeCandidates: [{ conversation: { kind: 'channel', serverId: 'discord', channelId: 'discord:guild:chanA' }, addressed: true, at: Date.now(), messageId: 'm-newer' }],
+    };
+    i.pendingRequests.push(arrival as never, i.continuationRequest('scout', 'refusal-rewind-retry'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'second answer' }]));
+    await framework.runUntilIdle();
+    assert.deepEqual([i.turnRoutes.get('scout')?.route?.channelId, i.turnRoutes.get('scout')?.route?.replyTo], ['discord:guild:chanA', 'm-newer']);
+    await framework.stop();
+  });
+
+  it("a silent tick's record survives a restart, and a restart batched with an ordinary wake runs ordinary and drops it", async () => {
+    const framework = await makeFramework();
+    const { registry } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
+    internals(framework).channelRegistry = registry;
+    const i = internals(framework);
+    const scout = framework.getAgent('scout')!;
+    const start = (trigger: Record<string, unknown>) => (framework as unknown as {
+      startAgentStream(agent: unknown, trigger?: unknown, attempt?: number): Promise<void>;
+    }).startAgentStream(scout, { agentName: 'scout', source: 'framework', timestamp: Date.now(), ...trigger });
+    const silentHeartbeat = { eventId: 'hb-9', origin: { source: 'heartbeat', silent: true } };
+    // A silent tick whose wake named a conversation.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'private' }]));
+    await start({ reason: 'heartbeat', suppressProse: true, namesConversation: true, silentHeartbeat });
+    await framework.runUntilIdle();
+    const record = i.turnRoutes.get('scout') as { route: unknown; named?: true; silent?: { silentHeartbeat?: { eventId?: string } } };
+    assert.deepEqual([record.route, record.named, record.silent?.silentHeartbeat?.eventId], [null, true, 'hb-9']);
+    // Its restart, alone: silent, and the record is kept whole.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'still private' }]));
+    await start({ reason: 'context_budget_restart', suppressProse: true, silentHeartbeat });
+    await framework.runUntilIdle();
+    assert.equal(i.turnRoutes.get('scout'), record, 'the restart kept the record');
+    // A restart that an ordinary wake shared a batch with runs ordinary: the
+    // record keeps its route and its naming, and stops being silent.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ordinary now' }]));
+    await start({ reason: 'context_budget_restart' });
+    await framework.runUntilIdle();
+    assert.deepEqual(i.turnRoutes.get('scout'), { route: null, named: true });
+    await framework.stop();
+  });
+
+  it("an unstick and a bounce's resend after a silent tick are ordinary turns; the tick's own retry stays silent", async () => {
+    const framework = await makeFramework();
+    const { registry } = withLastInbound('root', { serverId: 'discord', channelId: 'discord:guild:elsewhere' });
+    internals(framework).channelRegistry = registry;
+    const i = internals(framework);
+    const silentTick = (eventId: string) => framework.pushEvent({
+      type: 'mcpl:push-event', serverId: 'heartbeat', featureSet: 'heartbeat', eventId, content: [],
+      timestamp: new Date().toISOString(), origin: { source: 'heartbeat', reason: 'schedule', silent: true },
+      inferenceId: `inf-${eventId}`, triggerInference: true,
+    } as unknown as ProcessEvent);
+    const silent = () => (i.turnRoutes.get('scout') as { silent?: unknown } | undefined)?.silent !== undefined;
+    const lastCallSilent = () => JSON.stringify(membrane.calls.at(-1)).includes('[silent heartbeat]');
+    // The tick's own retry is a silent tick.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tick' }]));
+    silentTick('hb-a');
+    await framework.runUntilIdle();
+    assert.equal(silent(), true);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'retry' }]));
+    i.pendingRequests.push(i.continuationRequest('scout', 'refusal-rewind-retry'));
+    await framework.runUntilIdle();
+    assert.equal(lastCallSilent(), true, 'the retry carries the tick\'s prompt');
+    assert.equal(silent(), true);
+    // An operator's unstick after it is an ordinary turn.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'unstuck' }]));
+    const host = framework as unknown as { handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<{ ok: boolean; error?: string }> };
+    const result = await host.handleHostCommand('discord', { command: 'unstick', agentName: 'scout' });
+    assert.equal(result.ok, true, result.error);
+    await framework.runUntilIdle();
+    assert.equal(lastCallSilent(), false, 'no tick prompt');
+    assert.equal(silent(), false, 'an ordinary record');
+    // So is a bounce's resend after another silent tick.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'tick 2' }]));
+    silentTick('hb-b');
+    await framework.runUntilIdle();
+    assert.equal(silent(), true);
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'resending' }]));
+    (framework as unknown as { bounceProse(agent: unknown, text: string, reason: string): void })
+      .bounceProse(framework.getAgent('scout'), 'lost words', 'a late bounce');
+    await framework.runUntilIdle();
+    assert.equal(lastCallSilent(), false, 'no tick prompt');
+    assert.equal(silent(), false, 'an ordinary record');
     await framework.stop();
   });
 

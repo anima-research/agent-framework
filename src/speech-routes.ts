@@ -322,7 +322,13 @@ export function continuationCandidates(turn: TurnRoute | undefined, at: number):
       ...(route.kind === 'channel' && route.replyTo ? { messageId: route.replyTo } : {}),
     }];
   }
-  if (turn.unroutable) return [{ conversation: turn.unroutable.conversation, addressed: true, at }];
+  if (turn.unroutable) {
+    const { conversation } = turn.unroutable;
+    // A channel the turn couldn't resolve to a server stays flagged, so the
+    // framework resolves it again when the continuation's turn starts.
+    const serverless = conversation.kind === 'channel' && !conversation.serverId;
+    return [{ conversation, addressed: true, at, ...(serverless ? { unroutable: true as const } : {}) }];
+  }
   return [];
 }
 
