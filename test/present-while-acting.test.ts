@@ -474,6 +474,45 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it('a fallback route is held by an addressed mid-turn arrival, and the notice says it was only where the last message came in', async () => {
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Checking the logs.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Answering the person who addressed me.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework, { home: false });
+    // Where the last message came in: the fallback of a wake that names none.
+    (framework as unknown as { channelRegistry: Record<string, unknown> }).channelRegistry.getLastInbound =
+      () => ({ serverId: 'srv', channelId: 'chan-A' });
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, quick question over here?';
+    module.interjectionMetadata = {
+      channelId: 'discord:dm:antra', tags: ['chat:addressed'], inboundSource: envelope('discord:dm:antra'),
+    };
+
+    // A heartbeat-like wake: it names no conversation.
+    (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({
+      agentName: 'assistant', reason: 'timer', source: 'timer', timestamp: Date.now(),
+    });
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [{ text: 'Checking the logs.', locus: 'chan-A' }], 'the fallback carried the first round');
+    const [held] = heldDrafts(framework);
+    assert.equal(held?.text, 'Answering the person who addressed me.');
+    assert.equal(held?.reason, 'ambiguous');
+    const wired = membrane.lastStream!.receivedToolResultOptions
+      .map((o) => o?.injectedMessages ?? []).flat().map((m) => JSON.stringify(m.content));
+    assert.ok(
+      wired.some((t) => t.includes('[routing] (srv / discord:dm:antra) addressed you mid-turn. Your unaddressed plain speech was going to (srv / chan-A), where the last message came in, because nothing in this wake named a conversation.')),
+      'the hold notice says what the fallback was, not that it could be answering it',
+    );
+    await framework.stop();
+  });
+
   it('a mid-turn hold names every conversation that suspends the route in that round', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Station four, proceeding.' },

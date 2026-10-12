@@ -1840,8 +1840,10 @@ export class AgentFramework {
             ...(provenance?.routeChannelId && framework.mayTakeRoute(agentName, provenance.routeChannelId)
               ? { channelId: provenance.routeChannelId, addressed: true }
               : {}),
-            // None left, as for an agent the fork rule leaves out, is none.
+            // None left, as for an agent the fork rule leaves out, is none:
+            // the batch still named its conversations, so no fallback either.
             ...(routeCandidates.length > 0 ? { routeCandidates } : {}),
+            ...(provenance?.namesConversation ? { namesConversation: true as const } : {}),
           });
         },
         getAgentNames: () => [...framework.agents.keys()].filter(
@@ -7102,14 +7104,23 @@ export class AgentFramework {
               };
               const causes = competing.map(causeOf);
               const cause = causes.length === 1 ? causes[0]! : `${causes.slice(0, -1).join('; ')}; and ${causes.at(-1)}`;
+              // A fallback route answered no conversation: it was only where
+              // the last message came in, so it isn't one the speech could
+              // be answering.
+              const fallback = turn.route.origin === 'fallback';
               const noticeContent: ContentBlock[] = [{
                 type: 'text',
-                text:
-                  `[routing] ${cause}, so your unaddressed plain speech could now answer ` +
-                  `${competing.length === 1 ? 'either conversation' : 'any of these conversations'}. ` +
-                  'For the rest of this turn it is held as drafts ' +
-                  `instead of going to ${describeConversation(current)}. Answer ${competing.length === 1 ? 'either one' : 'any of them'} ` +
-                  'with an explicit send (or a channel_open); held words can be resent from your drafts.',
+                text: fallback
+                  ? `[routing] ${cause}. Your unaddressed plain speech was going to ${describeConversation(current)}, ` +
+                    'where the last message came in, because nothing in this wake named a conversation. ' +
+                    'For the rest of this turn it is held as drafts instead. ' +
+                    `Answer ${competing.length === 1 ? 'it' : 'any of them'} with an explicit send (or a channel_open); ` +
+                    'held words can be resent from your drafts.'
+                  : `[routing] ${cause}, so your unaddressed plain speech could now answer ` +
+                    `${competing.length === 1 ? 'either conversation' : 'any of these conversations'}. ` +
+                    'For the rest of this turn it is held as drafts ' +
+                    `instead of going to ${describeConversation(current)}. Answer ${competing.length === 1 ? 'either one' : 'any of them'} ` +
+                    'with an explicit send (or a channel_open); held words can be resent from your drafts.',
               }];
               const noticeMeta = { system: true, kind: 'routing-notice' } as MessageMetadata;
               try {
@@ -7326,11 +7337,12 @@ export class AgentFramework {
     // Queue inference requests
     if (response.requestInference) {
       const source = 'source' in event ? (event as { source: string }).source : 'unknown';
+      // The channel a module event names in its metadata, if any.
+      const named = extractGateFields(event).metadata.channelId;
 
       // Gate non-MCPL events (MCPL events are already gated in PushHandler/ChannelRegistry)
       if (this.eventGate && event.type !== 'mcpl:push-event' && event.type !== 'mcpl:channel-incoming') {
         const fields = extractGateFields(event);
-        const named = fields.metadata.channelId;
         const decision = this.eventGate.evaluate({
           ...fields,
           eventType: event.type,
@@ -7352,10 +7364,14 @@ export class AgentFramework {
           : response.requestInference;
 
       // Console/API input is a conversation with a local surface, which
-      // counts as addressed: the turn's speech route can be that surface.
-      const surfaceCandidate = surface && response.addMessages?.length
-        ? this.candidateFromSource(surface, true)
-        : undefined;
+      // counts as addressed: the turn's speech route can be that surface,
+      // however its module put the input in context (with a message or
+      // without one), so a console reply never leaves the console. A module
+      // event that names a channel names that conversation too, though it
+      // is no candidate here: neither takes the fallback. An event naming
+      // neither (an `api:inference-request` nudge, a timer) names none.
+      const surfaceCandidate = surface ? this.candidateFromSource(surface, true) : undefined;
+      const namesConversation = !!surface || (typeof named === 'string' && named.length > 0);
       for (const agentName of targetAgents) {
         const agent = this.agents.get(agentName);
         if (agent && agent.canBeTriggeredBy(source)) {
@@ -7365,6 +7381,7 @@ export class AgentFramework {
             source,
             timestamp: Date.now(),
             ...(surfaceCandidate ? { routeCandidates: [surfaceCandidate] } : {}),
+            ...(namesConversation ? { namesConversation: true as const } : {}),
           });
         }
       }
@@ -7471,6 +7488,8 @@ export class AgentFramework {
           this.pendingRequests.push({
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
             channelId: event.channelId,
+            // Its channel is named even when it is no candidate (a reaction).
+            namesConversation: true,
             counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
             addressed: addressedHere,
             ...(candidate ? { routeCandidates: [candidate] } : {}),
@@ -7556,6 +7575,9 @@ export class AgentFramework {
           source: event.serverId,
           timestamp: Date.now(),
           ...(takesChannel ? { channelId: event.channelId } : {}),
+          // Its channel is named even when it is no candidate here (a
+          // reaction, or a channel a fork owns): no fallback for this wake.
+          namesConversation: true,
           counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
           addressed,
           // This message's conversation, as a speech-route candidate: the
@@ -7666,6 +7688,7 @@ export class AgentFramework {
         source: event.serverId,
         timestamp: Date.now(),
         channelId: event.channelId,
+        namesConversation: true,
         counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
         addressed: addressedHere,
         ...(candidate ? { routeCandidates: [candidate] } : {}),
@@ -8541,9 +8564,11 @@ export class AgentFramework {
     const channelId = occ.scope.kind === 'channel' ? occ.scope.id : this.derivePushEventChannel(origin)?.channelId;
     const authorId = occ.identity?.author?.id ?? (typeof origin?.authorId === 'string' ? origin.authorId : undefined);
     const addressedHere = isAddressedMessage(occ.tags, origin);
-    const candidate = isConversational(occ.tags)
-      ? this.candidateFromSource(occ.event.event.inboundSource, addressedHere)
-      : undefined;
+    // The conversation the batch names, whether or not it is a candidate (a
+    // reaction names its channel but answers nothing).
+    const named = this.candidateFromSource(occ.event.event.inboundSource, addressedHere);
+    const candidate = isConversational(occ.tags) ? named : undefined;
+    const namesConversation = !!named || !!channelId;
     for (const agentName of await this.coalescedAudience(occ)) {
       const takes = candidate && this.mayTakeCandidate(agentName, candidate) ? candidate : undefined;
       this.pendingRequests.push({
@@ -8552,6 +8577,7 @@ export class AgentFramework {
         source: occ.serverId,
         timestamp: Date.now(),
         channelId: channelId && this.mayTakeRoute(agentName, channelId) ? channelId : undefined,
+        ...(namesConversation ? { namesConversation: true as const } : {}),
         counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
         addressed: addressedHere,
         ...(takes ? { routeCandidates: [takes] } : {}),
@@ -8772,10 +8798,12 @@ export class AgentFramework {
       const pushAddressed = isAddressedMessage(event.tags, event.origin);
       // A push that names a conversation (a DM, an addressed-while-closed
       // message) is a route candidate like its channels/incoming
-      // counterpart; an unscoped push names none.
-      const pushCandidate = silentHeartbeat || !isConversational(event.tags)
-        ? undefined
-        : this.candidateFromSource(source, pushAddressed);
+      // counterpart; an unscoped push (a heartbeat, a reminder) names none,
+      // and only such a wake takes the fallback route. A reaction names its
+      // conversation without being a candidate.
+      const pushNamed = this.candidateFromSource(source, pushAddressed);
+      const pushNamesConversation = !!pushNamed || !!triggerChannel?.channelId;
+      const pushCandidate = silentHeartbeat || !isConversational(event.tags) ? undefined : pushNamed;
       for (const agentName of targetAgents) {
         // The fork rule, as for a gate batch: no agent takes a channel a fork
         // owns, and a fork takes only its home.
@@ -8791,6 +8819,7 @@ export class AgentFramework {
           channelId: typingChannel,
           addressed: pushAddressed,
           ...(candidate ? { routeCandidates: [candidate] } : {}),
+          ...(pushNamesConversation ? { namesConversation: true as const } : {}),
           ...(silentHeartbeat ? {
             suppressProse: true,
             ephemeralSystemPrompt:
@@ -8987,10 +9016,16 @@ export class AgentFramework {
           const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}`;
           const prev = newestByKey.get(key);
           // The kept request carries both requests' route candidates: a
-          // parked wake's conversation still competes for the turn's route.
+          // parked wake's conversation still competes for the turn's route,
+          // and one that named a conversation keeps the turn off the fallback.
           const candidates = [...(prev?.routeCandidates ?? []), ...(request.routeCandidates ?? [])];
+          const named = !!prev?.namesConversation || !!request.namesConversation;
           const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
-          newestByKey.set(key, candidates.length > 0 ? { ...kept, routeCandidates: candidates } : kept);
+          newestByKey.set(key, {
+            ...kept,
+            ...(candidates.length > 0 ? { routeCandidates: candidates } : {}),
+            ...(named ? { namesConversation: true as const } : {}),
+          });
         }
         this.pendingRequests.push(...newestByKey.values());
         if (passThrough.length === 0) continue;
@@ -9157,6 +9192,9 @@ export class AgentFramework {
         // Every conversation this batch carries: a true new turn infers its
         // speech route from all of them (shelf-355), never from one pick.
         routeCandidates: budgetRestart ? undefined : requests.flatMap((r) => r.routeCandidates ?? []),
+        // Whether any of them named a conversation, candidate or not: only a
+        // batch none of whose requests did takes the fallback route.
+        namesConversation: !budgetRestart && requests.some((r) => r.namesConversation) ? true : undefined,
       });
     }
   }
@@ -9348,7 +9386,7 @@ export class AgentFramework {
   private static readonly DRAFT_REASON_TEXT: Record<DraftReason, string> = {
     'explicit-send': 'an explicit send in the same round holds plain speech back',
     'no-destination': 'it had no destination — nothing this turn named a conversation it could speak into, or a failed routing envelope left plain speech waiting for a new valid target',
-    ambiguous: 'more than one conversation was waiting for you, so unaddressed speech was held rather than guessed',
+    ambiguous: 'more than one place could have taken it, so unaddressed speech was held rather than guessed',
     bounced: 'its routing prefix bounced',
   };
 
@@ -10082,8 +10120,8 @@ export class AgentFramework {
   }
 
   /**
-   * The fallback for a wake that names no conversation: the conversation of
-   * the last message any channel delivered (its server, thread and message),
+   * The fallback for a wake that names no conversation: where the last
+   * message any channel delivered came in (its server, channel and thread),
    * as plain speech went before speech routes. Not when a conversation fork
    * owns that channel and this agent isn't the fork: the fork rule that keeps
    * every other route out of a fork's channel.
@@ -10091,7 +10129,7 @@ export class AgentFramework {
   private fallbackCandidate(agentName: string): RouteCandidate | null {
     const last = this.channelRegistry?.getLastInbound?.();
     if (!last || !this.mayTakeRoute(agentName, last.channelId)) return null;
-    return this.candidateForChannel(last.channelId, false, Date.now(), last.serverId, last.messageId, last.threadId);
+    return this.candidateForChannel(last.channelId, false, Date.now(), last.serverId, undefined, last.threadId);
   }
 
   /**
@@ -11363,7 +11401,10 @@ export class AgentFramework {
               trigger?.routeCandidates ?? [],
               this.homeRoute(agent.name),
               (c) => this.publishTargetOf(c),
-              this.fallbackCandidate(agent.name),
+              // Only a wake that named no conversation, candidate or not,
+              // takes the fallback: a reaction, a system marker or a channel
+              // a fork owns names one, and gets no route as before.
+              trigger?.namesConversation ? null : this.fallbackCandidate(agent.name),
             );
         this.turnRoutes.set(agent.name, turn);
         this.midTurnInputSignals.delete(agent.name);
@@ -15377,7 +15418,8 @@ export class AgentFramework {
         // The agent's own speech route for the live turn (shelf-355): the
         // beforeInference channel context and a channel_publish without a
         // channel use it, so what the agent is told and where its words land
-        // never diverge. No latest-inbound fallback exists.
+        // never diverge. The latest-inbound fallback is itself a route, taken
+        // only by a turn whose wake named no conversation, so it agrees too.
         speechRouteResolver: (agentName) => this.speechRouteView(agentName),
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the

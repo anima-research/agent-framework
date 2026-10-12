@@ -1,13 +1,15 @@
 - **Hosts and module authors using `ChannelRegistry` directly:** the registry
-  no longer decides where speech goes. It still remembers the last message a
-  channel delivered, which the framework uses only for a turn whose wake
-  names no conversation (`getDefaultPublishChannel()` returns its channel
-  id, and `getLastInbound()` its server, channel, message and thread).
+  no longer decides where speech goes. It still remembers where the last
+  message a channel delivered came in, which the framework uses only for a
+  turn whose wake names no conversation. `getDefaultPublishChannel()`
+  returns its channel id, and `getLastInbound()` its server, channel and
+  thread. A reaction or a withdrawal doesn't count as a message.
   - **Removed:** the `activeChannelResolver` option. The new
     `speechRouteResolver(agentName)` option replaces it, and the framework
     supplies it.
-  - **Changed:** `resolveLocus(agent)` returns only a conversation fork's
-    home channel, or null. `getChannelServerId(id)` names a server only when
+  - **Changed:** `resolveLocus(conversationId)`, which the framework calls
+    with an agent's name, returns only a conversation fork's home channel,
+    or null. `getChannelServerId(id)` names a server only when
     exactly one registered the id, and returns null for an id several
     servers share, where it used to return the first registrant. `buildChannelContext(agent)` advertises the
     agent's own route and reply edge, and nothing for a held, surface-only or

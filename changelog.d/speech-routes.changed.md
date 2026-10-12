@@ -11,22 +11,39 @@
 
   Several competing conversations start the turn **held**: unaddressed speech
   is kept as `ambiguous` drafts, and a `[routing]` notice names each
-  conversation's address. A wake that names no conversation at all, such as
-  a heartbeat, a timer or a self-wake, keeps the fallback: the conversation
-  of the last message any channel delivered, as before, now with its server,
-  thread and message named. It is checked like every route: a channel that
-  declares no publish target, a thread on a `root` channel, or a channel a
-  conversation fork owns gives no route, and the speech is held as
-  `no-destination` drafts. A `[routing]` notice says the speech goes where
-  the last message came in because nothing in the wake named a
-  conversation, and a mid-turn arrival that addresses the resident from
-  elsewhere holds a fallback route as it holds an inferred one. An
-  ambient-only batch is no longer such a wake: it routes to its own
-  conversation, or holds when it names several. A surface route shows speech
-  on that surface and publishes it to no channel, so a console turn's reply
-  stays on the console: anima-research/agent-framework#190, by
-  @rufalupa666-netizen with the resident qa-engineer, found and diagnosed
-  such a reply published to the channel that last spoke.
+  conversation's address.
+
+  **A wake that names no conversation at all keeps the fallback,** as
+  before: a heartbeat, a timer, a self-wake, a script or subagent wake, or an
+  `api:inference-request` nudge.
+  - **Where it goes:** where the last message any channel delivered came in,
+    now with its server and thread named. A reaction or a withdrawal is no
+    message, so it never becomes that place.
+  - **What it answers:** no message. It has no reply edge, so the
+    `beforeInference` context names where the speech lands
+    (`defaultOutgoing`) but no `incoming` message.
+  - **How it's checked:** like every route. A channel that declares no
+    publish target, a thread on a `root` channel, or a channel a
+    conversation fork owns gives no route, and the speech is held as
+    `no-destination` drafts.
+  - **What the resident is told:** a `[routing]` notice says the speech goes
+    where the last message came in because nothing in the wake named a
+    conversation. A mid-turn arrival that addresses the resident from
+    elsewhere holds a fallback route as it holds an inferred one, and the
+    notice says what the route was.
+  - **Which wakes name a conversation:** any event in the wake that names a
+    channel, a thread or a local surface does, whether or not it's a route
+    candidate. A reaction, a system marker or a channel another agent's
+    fork owns names one but answers nothing, so such a wake gets no route,
+    never the fallback. An ambient-only batch names its own conversations:
+    it routes to one, or holds when it names several.
+
+  A surface route shows speech on that surface and publishes it to no
+  channel, so a console turn's reply stays on the console. That's so
+  whether its module added the input as a message or only requested
+  inference. anima-research/agent-framework#190, by @rufalupa666-netizen
+  with the resident qa-engineer, found and diagnosed such a reply published
+  to the channel that last spoke.
 - Context-budget restarts, guard retries and framework retries keep the
   turn's route, and everything else the turn has chosen or done: its
   explicit-send engagement, its `>>` or `>>>` choice, and the deliveries and
@@ -72,8 +89,9 @@
   its home conversation, or else its newest message there.
 - A batched gate wake reports every conversation in its batch to the
   framework (`WakeProvenance.routeCandidates`). An addressed event whose
-  registered channel the host can't resolve still competes, so the turn is
-  held, but it is never itself a route. A coalesced item is gated with the
+  registered channel the host can't resolve still competes with the other
+  addressed conversations: beside one, the turn is held; alone, the turn
+  has no route, since it is never itself a route. A coalesced item is gated with the
   host's source envelope too, the one its coalescer then freezes, and an
   `inboundSource` key in a connector's origin or metadata is never read as
   one.

@@ -148,8 +148,8 @@ export interface WakeProvenance {
    *  registered channel: the framework marks the wake addressed there.
    *  Ambient-only batches set nothing. It is not the speech route, which the
    *  framework infers from `routeCandidates` (shelf-355); only a wake whose
-   *  batch names no conversation at all falls back to the last delivered
-   *  message's conversation. */
+   *  batch names no conversation at all (`namesConversation` unset) falls
+   *  back to the last delivered message's conversation. */
   routeChannelId?: string;
   /** Timestamp (ms) of the chosen event, so a consumer coalescing several
    *  requests can order by event recency, not by flush order. */
@@ -163,6 +163,14 @@ export interface WakeProvenance {
    * trusting a single pick.
    */
   routeCandidates?: GateRouteCandidate[];
+  /**
+   * Some event in the batch names a conversation — a channel, an author, or
+   * a local surface — whether or not it is a route candidate: a reaction or a
+   * system marker names its channel but answers nothing. Unset only when
+   * nothing in the batch named one (a heartbeat, a timer): the one wake the
+   * framework's fallback route serves.
+   */
+  namesConversation?: true;
 }
 
 interface DebounceState {
@@ -256,7 +264,11 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     if (e.addressed && (!newestAddressed || e.timestamp >= newestAddressed.timestamp)) newestAddressed = e;
   }
   const routeCandidates: GateRouteCandidate[] = [];
+  let namesConversation = false;
   for (const e of events) {
+    if (e.routeChannelId || e.channelId || e.authorId || e.eventType === 'external-message' || e.eventType === 'api:message') {
+      namesConversation = true;
+    }
     // A reaction or system marker answers nothing: never a route candidate
     // (the framework's mid-turn rule, applied at turn start too).
     if (!e.conversational) continue;
@@ -292,7 +304,11 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     }
   }
   const pick = newestAddressed ?? newest;
-  if (!pick) return routeCandidates.length > 0 ? { routeCandidates } : undefined;
+  if (!pick) {
+    return routeCandidates.length > 0 || namesConversation
+      ? { ...(routeCandidates.length > 0 ? { routeCandidates } : {}), ...(namesConversation ? { namesConversation: true as const } : {}) }
+      : undefined;
+  }
   // push-event channel ids are the adapter's raw ids (a Discord snowflake):
   // not a composite channel id, so not reported as one
   const channelId = pick.channelId && pick.eventType !== 'mcpl:push-event' ? pick.channelId : undefined;
@@ -304,6 +320,7 @@ export function wakeProvenance(events: PendingEvent[]): WakeProvenance | undefin
     ...(pick.addressed && pick.routeChannelId ? { routeChannelId: pick.routeChannelId } : {}),
     at: pick.timestamp,
     ...(routeCandidates.length > 0 ? { routeCandidates } : {}),
+    ...(namesConversation ? { namesConversation: true as const } : {}),
   };
 }
 

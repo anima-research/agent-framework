@@ -60,10 +60,14 @@ describe('inferTurnRoute', () => {
     assert.deepEqual(inferTurnRoute([], undefined, rootEverywhere), { route: null });
   });
 
-  it('no candidates takes the fallback: the last delivered message\'s conversation, its thread and message included', () => {
+  it('no candidates takes the fallback: where the last delivered message came in, its thread included, answering no message', () => {
     const last = candidate(channel('last', { threadId: 't-9', label: '#last' }), false, 7, 'm-last');
     assert.deepEqual(inferTurnRoute([], undefined, exactEverywhere, last), {
-      route: { kind: 'channel', serverId: 'discord', channelId: 'last', threadId: 't-9', replyTo: 'm-last', label: '#last', origin: 'fallback' },
+      route: { kind: 'channel', serverId: 'discord', channelId: 'last', threadId: 't-9', label: '#last', origin: 'fallback' },
+    }, 'no reply edge: the last message did not trigger this turn');
+    // A root channel's fallback is its root.
+    assert.deepEqual(inferTurnRoute([], undefined, rootEverywhere, candidate(channel('plain'), false, 7)), {
+      route: { kind: 'channel', serverId: 'discord', channelId: 'plain', origin: 'fallback' },
     });
   });
 

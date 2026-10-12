@@ -2,13 +2,16 @@
  * Speech routes: where a resident's unaddressed plain speech goes (shelf-355).
  *
  * A route is decided deliberately or inferred from what triggered the turn,
- * never from whichever channel last saw traffic:
+ * and comes from whichever channel last saw traffic only when nothing did:
  * - deliberate: a conversation fork's home channel, or a channel the resident
  *   opened with `channel_open` (setSpeechTarget, the default); a hybrid
  *   `>>>target` prefix is deliberate too and lives in its own pin;
  * - inferred, at a true new turn, from the wake's candidates: the addressed
  *   ones if any, else the conversational ones. Only candidates that name ONE
- *   conversation infer a route; several conversations start the turn held.
+ *   conversation infer a route; several conversations start the turn held;
+ * - fallback, at a true new turn whose wake has no candidates at all (a
+ *   heartbeat, a timer, a self-wake): the conversation of the last message
+ *   any channel delivered, as before speech routes, checked like any route.
  *
  * A held turn (competing conversations at turn start, or a competing
  * addressed or engaged arrival mid-turn) keeps unaddressed speech as drafts
@@ -67,7 +70,8 @@ export type RouteOrigin =
   /** The resident's own channel_open (setSpeechTarget). */
   | 'open'
   /** A wake that named no conversation: the conversation of the last
-   *  message any channel delivered, as before speech routes. */
+   *  message any channel delivered (its thread, but no reply edge), as
+   *  before speech routes. */
   | 'fallback';
 
 export type SpeechRoute =
@@ -265,12 +269,13 @@ function fallbackRoute(fallback: RouteCandidate | null | undefined, targetOf: Pu
   if (!fallback || fallback.unroutable) return null;
   const c = fallback.conversation;
   if (c.kind !== 'channel' || routeRefusal(c, targetOf)) return null;
+  // No reply edge: the turn answers no message, and the last delivered one
+  // didn't trigger it (MCPL's `incoming` names only a triggering message).
   return {
     kind: 'channel',
     ...(c.serverId ? { serverId: c.serverId } : {}),
     channelId: c.channelId,
     ...(c.threadId ? { threadId: c.threadId } : {}),
-    ...(fallback.messageId ? { replyTo: fallback.messageId } : {}),
     ...(c.label ? { label: c.label } : {}),
     origin: 'fallback',
   };

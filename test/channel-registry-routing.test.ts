@@ -145,10 +145,10 @@ test('the registry remembers the last delivered message for the fallback, and fo
     }],
   });
   await deliver('slack:C1', 'm-1', '1700.0001');
-  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C1', messageId: 'm-1', threadId: '1700.0001' });
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C1', threadId: '1700.0001' });
   assert.equal(registry.getDefaultPublishChannel(), 'slack:C1');
   await deliver('slack:C2', 'm-2');
-  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2', messageId: 'm-2' }, 'the newest wins, a root message naming no thread');
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2' }, 'the newest wins, a root message naming no thread');
 
   // A removal of another channel leaves it; its own channel's removal forgets it.
   await registry.handleChanged('slack', { removed: ['slack:C1'] });
@@ -160,6 +160,90 @@ test('the registry remembers the last delivered message for the fallback, and fo
   await deliver('slack:C1', 'm-3');
   registry.removeServer('slack');
   assert.equal(registry.getLastInbound(), null, 'its server going forgets it');
+});
+
+test('only a delivered message becomes the fallback\'s place: not a reaction, a refused or unqueued message, or a withdrawal', async () => {
+  let throwFilter = false;
+  let admit = true;
+  const registry = new ChannelRegistry(
+    { getServer: () => undefined } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+    {
+      shouldTriggerInference: () => { if (throwFilter) throw new Error('filter broke'); return true; },
+      handleCoalescedIncoming: async (_serverId, message) => ({ messageId: message.messageId, accepted: admit }),
+    },
+  );
+  seedRegistered(registry, 'slack', 'slack:C1', 'slack:C2', 'slack:C3');
+  const msg = (channelId: string, messageId: string, extra: Record<string, unknown> = {}) => ({
+    channelId, messageId, author: { id: 'u1', name: 'Ada' }, timestamp: '2026-10-07T00:00:00.000Z',
+    content: [{ type: 'text' as const, text: 'hi' }], ...extra,
+  });
+  await registry.handleIncoming('slack', { messages: [msg('slack:C1', 'm-1')] });
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1');
+
+  // A reaction answers nothing: it isn't a message a conversation continues.
+  await registry.handleIncoming('slack', { messages: [msg('slack:C2', 'r-1', { tags: ['chat:reaction'] })] });
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'a reaction never becomes the place');
+
+  // An unregistered channel's message is refused before anything counts.
+  await registry.handleIncoming('slack', { messages: [msg('slack:NOPE', 'm-x')] });
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'a refused message never becomes the place');
+
+  // A message whose trigger filter throws is never queued, so never counts.
+  throwFilter = true;
+  await assert.rejects(registry.handleIncoming('slack', { messages: [msg('slack:C2', 'm-2')] }), /filter broke/);
+  throwFilter = false;
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'an unqueued message never becomes the place');
+
+  // A coalesced message counts once its coalescer admits it, not before.
+  admit = false;
+  await registry.handleIncoming('slack', { messages: [msg('slack:C2', 'm-3', { eventId: 'e-3', coalesce: { key: 'k' } })] } as never);
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'a refused coalesced occurrence never counts');
+  admit = true;
+  await registry.handleIncoming('slack', { messages: [msg('slack:C2', 'm-4', { eventId: 'e-4', coalesce: { key: 'k' }, threadId: 't-4' })] } as never);
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2', threadId: 't-4' }, 'an admitted one counts');
+
+  // A withdrawal the coalescer admits is no message: the place stays.
+  await registry.handleIncoming('slack', {
+    messages: [msg('slack:C3', 'm-5', { eventId: 'e-5', coalesce: { key: 'k2', retract: true }, content: [] })],
+  } as never);
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2', threadId: 't-4' }, 'a withdrawal never counts');
+
+  // Stopping forgets it.
+  registry.stopAll();
+  assert.equal(registry.getLastInbound(), null);
+  assert.equal(registry.getDefaultPublishChannel(), null);
+});
+
+test('a coalesced message whose channel goes while its coalescer decides counts for nothing, and breaks nothing', async () => {
+  let registry: ChannelRegistry;
+  registry = new ChannelRegistry(
+    { getServer: () => undefined } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+    {
+      handleCoalescedIncoming: async (serverId, message) => {
+        // The channel is withdrawn while the occurrence is being admitted.
+        await registry.handleChanged(serverId, { removed: [message.channelId] });
+        return { messageId: message.messageId, accepted: true };
+      },
+    },
+  );
+  seedRegistered(registry, 'slack', 'slack:C1', 'slack:GONE');
+  await registry.handleIncoming('slack', { messages: [{
+    channelId: 'slack:C1', messageId: 'm-1', author: { id: 'u1', name: 'Ada' }, timestamp: '2026-10-07T00:00:00.000Z',
+    content: [{ type: 'text' as const, text: 'hi' }],
+  }] });
+  let answered: { results: Array<{ accepted: boolean; reason?: string }> } | undefined;
+  await registry.handleIncoming('slack', { messages: [{
+    channelId: 'slack:GONE', messageId: 'm-2', author: { id: 'u1', name: 'Ada' }, timestamp: '2026-10-07T00:00:00.000Z',
+    content: [{ type: 'text' as const, text: 'bye' }], eventId: 'e-2', coalesce: { key: 'k' },
+  }] } as never, { respond: (r: unknown) => { answered = r as typeof answered; } } as never);
+  assert.deepEqual(answered?.results.map((r) => [r.accepted, r.reason]), [[true, undefined]], 'the admission itself stands');
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'a channel removed meanwhile never becomes the place');
 });
 
 test('the gate reads a message\'s thread from the protocol field, never from adapter metadata', async () => {

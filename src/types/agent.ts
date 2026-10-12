@@ -325,8 +325,7 @@ export interface InferenceRequest {
    * turn's plain speech goes: that is the turn's speech route, inferred from
    * `routeCandidates` (src/speech-routes.ts). Undefined for non-channel wakes
    * (heartbeat, timers, module events), which name no conversation; a turn
-   * they alone wake has no inferred route, and nothing falls back to the most
-   * recent inbound channel.
+   * they alone wake takes the fallback route (`namesConversation`).
    */
   channelId?: string;
   /**
@@ -367,6 +366,16 @@ export interface InferenceRequest {
    * batch: the addressed ones if any, else all; one conversation only.
    */
   routeCandidates?: import('../speech-routes.js').RouteCandidate[];
+  /**
+   * The wake names a conversation — a channel, a thread or a local surface —
+   * whether or not any of it became a route candidate: a reaction, a system
+   * marker, or a channel a conversation fork owns names one but answers
+   * nothing here. A turn none of whose requests names one (a heartbeat, a
+   * timer, a self-wake, a script or subagent wake, a nudge) takes the
+   * fallback route, the last delivered message's conversation; every other
+   * turn's route comes from its candidates alone.
+   */
+  namesConversation?: true;
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
   suppressProse?: boolean;
