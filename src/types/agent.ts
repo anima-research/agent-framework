@@ -323,10 +323,9 @@ export interface InferenceRequest {
    * The MCPL channel whose message triggered this inference, if any (composite
    * id, e.g. `discord:guild:channel` / `discord:dm:id`). It is not where the
    * turn's plain speech goes: that is the turn's speech route, inferred from
-   * `routeCandidates` (src/speech-routes.ts). Undefined for non-channel wakes
-   * (heartbeat, timers, module events), which name no conversation; a turn
-   * they alone wake has no inferred route, and nothing falls back to the most
-   * recent inbound channel.
+   * `routeCandidates` (src/speech-routes.ts). Undefined for wakes from no
+   * channel (a heartbeat, a timer, most module events). Whether a wake names
+   * a conversation at all is `namesConversation`.
    */
   channelId?: string;
   /**
@@ -367,6 +366,31 @@ export interface InferenceRequest {
    * batch: the addressed ones if any, else all; one conversation only.
    */
   routeCandidates?: import('../speech-routes.js').RouteCandidate[];
+  /**
+   * The wake names a conversation — a channel, a thread or a local surface —
+   * whether or not any of it became a route candidate: a reaction, a system
+   * marker, or a channel a conversation fork owns names one but answers
+   * nothing here. A turn none of whose requests names one (a heartbeat, a
+   * timer, a self-wake, a script or subagent wake, a nudge) takes the
+   * fallback route, the last delivered message's conversation; every other
+   * turn's route comes from its candidates alone.
+   */
+  namesConversation?: true;
+  /**
+   * A framework wake that continues its agent's turn (a rewind retry, an
+   * unstick, a tool round's results, a prose continuation or bounce, a
+   * provider-cooldown retry). It carries nothing else of that turn: when
+   * its batch starts, the framework reads the agent's turn record then and
+   * fills in the conversations, whether it names one, the place a fallback
+   * turn spoke into, and a silent wake's silence (continuationOf).
+   */
+  continuesTurn?: true;
+  /**
+   * The place a continued fallback turn spoke into: the turn's fallback,
+   * kept in place of the last delivered message's conversation. Like any
+   * fallback, it applies only to a turn whose batch names no conversation.
+   */
+  fallbackPlace?: import('../speech-routes.js').RouteCandidate;
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
   suppressProse?: boolean;

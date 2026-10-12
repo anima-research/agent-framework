@@ -1,6 +1,7 @@
 - **Speech routes: unaddressed plain speech goes where the turn was
-  deliberately or actually addressed, never to the last channel that saw
-  traffic.** A turn's route is decided once at a true new turn:
+  deliberately or actually addressed, and to the last channel that saw
+  traffic only when nothing in its wake named a conversation.** A turn's
+  route is decided once at a true new turn:
   - a conversation fork's home channel always wins;
   - otherwise it is inferred from the whole wake. The addressed messages count
     if there are any, else all of the conversational ones. A local surface
@@ -10,16 +11,97 @@
 
   Several competing conversations start the turn **held**: unaddressed speech
   is kept as `ambiguous` drafts, and a `[routing]` notice names each
-  conversation's address. A turn with no conversation, such as a heartbeat,
-  a timer or a self-wake, has no route, and its speech is held as
-  `no-destination` drafts. Previously such speech went to the process-global
-  most-recent-inbound channel. That is also the fallback the batched-wake
-  routing fix kept for ambient-only batches, and this change replaces it. A surface
-  route shows speech on that surface and publishes it to no channel.
-- Context-budget restarts, guard retries and framework retries keep the
-  turn's route, and everything else the turn has chosen or done: its
-  explicit-send engagement, its `>>` or `>>>` choice, and the deliveries and
-  drafts its receipt reports. Only the next true new turn decides again.
+  conversation's address.
+
+  **A resident's wake that names no conversation at all keeps the
+  fallback,** as before: a heartbeat, a timer, a self-wake, a background
+  script's wake, an admin nudge, or an `api:inference-request` nudge.
+  - **Where it goes:** where the last message any channel delivered came in,
+    now with its server and thread named. An ordinary message counts once
+    it's queued, and a coalesced one once its coalescer admits it afresh,
+    never for a producer's retry the coalescer acknowledges again. A
+    reaction, a deletion or a withdrawal is no message, so it never becomes
+    that place.
+  - **What it answers:** no message. It has no reply edge, so the
+    `beforeInference` context names where the speech lands
+    (`defaultOutgoing`) but no `incoming` message.
+  - **How it's checked:** like every route. A channel that declares no
+    publish target, a thread on a `root` channel, or a channel a
+    conversation fork owns gives no route, and the speech is held as
+    `no-destination` drafts.
+  - **What the resident is told:** a `[routing]` notice says the speech goes
+    where the last message came in because nothing in the wake named a
+    conversation. A mid-turn arrival that addresses the resident from
+    elsewhere holds a fallback route as it holds an inferred one, and the
+    notice says what the route was.
+  - **Which wakes name a conversation:** any event in the wake that names a
+    channel, a thread, an author or a local surface does, whether or not
+    it's a route candidate, on every lane. So does a conversation's closure
+    and a tune-out wake about a channel. A reaction, a system marker or a
+    channel another agent's fork owns names one but answers nothing, so such
+    a wake gets no route, never the fallback. An ambient-only batch names
+    its own conversations: it routes to one, or holds when it names several.
+  - **A framework wake that continues a turn names that turn's
+    conversations.** Such wakes are the retry after a rewind (for a refusal,
+    an unstick's forced rewind, or an inference failure), an unstick itself,
+    the results of a non-streaming tool round, an explicit-prose
+    continuation or bounce, and a provider-cooldown retry that holds no wake
+    of its own. The framework reads the turn's record when the wake's batch
+    starts, which is after the continued turn has ended, and gives the wake
+    that turn's conversations as addressed ones. So its words go where the
+    turn's had gone by its end, after a `channel_open` or a hold. A bounce
+    queues its wake at once; one that lands while a later turn is alive
+    wakes after that turn and names its conversations instead, where the
+    resident last spoke. Beside a heartbeat those conversations keep the
+    turn, beside an ambient arrival from elsewhere they win, and beside an
+    addressed one from elsewhere the turn is held. An addressed message
+    batched in the same conversation takes the reply edge if it is newer
+    than the one the turn answered, and an older one doesn't. A held turn's
+    continuation names the conversations its hold named. With inferred prose
+    routing, a continuation names a conversation exactly when the turn it
+    continues did, or when it carries that turn's conversations. So a turn
+    whose words had no place although its wake named a conversation (a
+    reaction, a channel a fork owns) gives its continuation no place either,
+    never the fallback, and a turn whose wake named none, and that found no
+    fallback place, gives a continuation that takes the fallback as it
+    stands then. A fallback turn's continuation keeps that turn's place as
+    its own fallback, so a message that comes in elsewhere without waking
+    the agent doesn't move the rest of the reply. A wake batched with that
+    continuation that names a conversation takes the turn, as any arrival
+    does. A kept place that the fork rule or its channel's publish target
+    now refuses gives no place, to the continuation and to those after it. A
+    continuation names an unroutable conversation too. One its channel's
+    publish target refused is checked again when the continuation starts, so
+    it takes a place once its channel can take one. One that came from a
+    candidate marked unroutable stays so: a channel with no server becomes a
+    route only once the framework finds its server, and a raw id named with
+    its server never does. A silent tick's own continuations, such as its
+    retries, are silent ticks too, with the tick's prompt and stamp, and a
+    restart or a guard retry keeps the tick's record. The exception is a
+    batch that also holds an ordinary wake: it runs as an ordinary turn, as
+    on main, and so do the continuations after it. A restart in such a batch
+    had no route to keep, so its route is decided from the batch's wakes, as
+    a new turn's is. An unstick and a bounce's resend are repairs rather
+    than part of the turn they follow, and are always ordinary turns, as on
+    main. The new turn is otherwise fresh, as any is: a rewind sheds the
+    turn whose choices those were. An unstick is refused while a turn is in
+    progress, including the moments the agent reads idle at a turn's start
+    and end.
+  - **An ephemeral subagent never takes the fallback.** Its prose isn't a
+    channel's, and before speech routes a subagent's prose between its tool
+    calls could reach the resident's live channel this way.
+
+  A surface route shows speech on that surface and publishes it to no
+  channel, so a console turn's reply stays on the console. That's so
+  whether its module added the input as a message or only requested
+  inference. anima-research/agent-framework#190, by @rufalupa666-netizen
+  with the resident qa-engineer, found and diagnosed such a reply published
+  to the channel that last spoke.
+- Context-budget restarts, guard retries and a stream's own retries (its
+  later attempts) keep the turn's route, and everything else the turn has
+  chosen or done: its explicit-send engagement, its `>>` or `>>>` choice, and
+  the deliveries and drafts its receipt reports. Only the next true new turn
+  decides again, and a queued wake that continues a turn starts one.
 - **Speech goes where the route stood when its words were written.** A
   `channel_open`, or a hold, that lands while earlier words still wait to be
   published governs only words written after it; the same goes for a
@@ -45,9 +127,9 @@
   new `setSpeechTarget: false` opens the channel for reading only, and the
   result says where speech goes then.
 - **`channel_publish` is an explicit send through the publish executor.**
-  Without `channelId` it goes to the caller's current route. With no route
-  (held, a local surface, or none) it is refused with the reason, and it no
-  longer uses the most recent inbound channel. A new optional `serverId`
+  Without `channelId` it goes to the caller's current route, the fallback
+  included. With no route (held, a local surface, or none) it is refused
+  with the reason, rather than going to the most recent inbound channel. A new optional `serverId`
   disambiguates a channel id that several servers register; a conversation
   fork may name a server only as its home's sole registrant, since the same
   id on another server is another conversation. Its receipt
@@ -61,8 +143,9 @@
   its home conversation, or else its newest message there.
 - A batched gate wake reports every conversation in its batch to the
   framework (`WakeProvenance.routeCandidates`). An addressed event whose
-  registered channel the host can't resolve still competes, so the turn is
-  held, but it is never itself a route. A coalesced item is gated with the
+  registered channel the host can't resolve still competes with the other
+  addressed conversations: beside one, the turn is held; alone, the turn
+  has no route, since it is never itself a route. A coalesced item is gated with the
   host's source envelope too, the one its coalescer then freezes, and an
   `inboundSource` key in a connector's origin or metadata is never read as
   one.
@@ -71,13 +154,19 @@
   takes the server only from the id's sole registrant. On an id that several
   servers share, the turn records the conversation as `unresolved`, and its
   speech is held as drafts rather than published to whichever server
-  registered first. `unresolved` also now covers a route whose channel was
-  withdrawn, which used to read as undeclared (`untargetable`).
+  registered first. The server is looked for again when the turn starts, so
+  one that registered while the wake waited is found. `unresolved` also now
+  covers a route whose channel was withdrawn, which used to read as
+  undeclared (`untargetable`).
 - **A fork's channel is its own on every wake path.** A push event, a
   coalesced push and a `channels/incoming` broadcast now give no other agent
   a speech route or a typing indicator in a channel a conversation fork owns,
   and a fork takes neither in a channel other than its home. Batched gate
-  wakes already worked this way.
+  wakes already worked this way. A route is judged when the turn starts, as
+  ownership stands then, so a fork's claim, or its giving a channel up,
+  while a wake waits in the queue counts. A `channel_open` into a fork's
+  channel opens it but sets no route, and its result says why. An arrival
+  in a fork's channel never holds another agent's route mid-turn.
 - The `[discord-send-failed]` marker for a reply on a thread route names the
   thread with its channel, and an unconfirmed one says to check the thread.
 - **Routing names each conversation with its server.** Routing notices,

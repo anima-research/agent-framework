@@ -792,6 +792,48 @@ describe('debounce', () => {
     assert.deepStrictEqual((inferenceRequests[0].routeCandidates ?? []).map((c) => c.channelId), ['discord:g:general']);
   });
 
+  it('a batch naming only an author, a thread or a local surface names a conversation; one naming none does not', async () => {
+    const path = writeConfig('debounce-route-author-surface.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:push-event', 'external-message'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    // Each event is its own batch: the next is evaluated only once the
+    // previous batch's wake has arrived.
+    const batches = [
+      event({ eventType: 'mcpl:push-event', serverId: 'discord', content: 'from someone', metadata: { authorId: '7' } }),
+      event({ eventType: 'mcpl:push-event', serverId: 'discord', content: 'in a thread', metadata: { threadId: 't-3' } }),
+      event({ eventType: 'external-message', serverId: 'tui', content: 'status?' }),
+      event({ eventType: 'mcpl:push-event', serverId: 'discord', content: 'a nudge' }),
+    ];
+    for (const [index, e] of batches.entries()) {
+      gate.evaluate(e);
+      await waitForRequests(inferenceRequests, index + 1);
+    }
+    assert.strictEqual(inferenceRequests.length, 4);
+    const names = inferenceRequests.map((r) => (r as { namesConversation?: true }).namesConversation);
+    assert.deepStrictEqual(names, [true, true, true, undefined],
+      'an author, a thread and a local surface each name a conversation; a bare push names none');
+  });
+
+  it('a reaction-only batch names its conversation though it has no candidate, so it never takes the fallback route', async () => {
+    const path = writeConfig('debounce-route-reaction-only.json', {
+      policies: [
+        { name: 'chat', match: { scope: ['mcpl:channel-incoming'] }, behavior: { debounce: 100 } },
+      ],
+      default: 'skip',
+    });
+    const { gate, inferenceRequests } = makeGate(path);
+    gate.evaluate(event({ eventType: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:g:room', content: '👍',
+      tags: ['chat:reaction', 'chat:addressed'], metadata: { authorId: '1', messageId: 'r-1' } }));
+    await new Promise(r => setTimeout(r, 150));
+    assert.strictEqual(inferenceRequests.length, 1);
+    assert.strictEqual(inferenceRequests[0].routeCandidates, undefined, 'a reaction is no candidate');
+    assert.strictEqual((inferenceRequests[0] as { namesConversation?: true }).namesConversation, true, 'but it names its conversation');
+  });
+
   it('a batched wake with no channel-bearing event carries no provenance', async () => {
     const path = writeConfig('debounce-noprov.json', {
       policies: [
@@ -805,6 +847,8 @@ describe('debounce', () => {
     assert.strictEqual(inferenceRequests.length, 1);
     assert.strictEqual(inferenceRequests[0].channelId, undefined);
     assert.strictEqual(inferenceRequests[0].counterparty, undefined);
+    assert.strictEqual((inferenceRequests[0] as { namesConversation?: true }).namesConversation, undefined,
+      'a batch that names no conversation is the one wake the fallback route serves');
   });
 
   it('quotes content for non-MCPL events (no context entry of their own)', async () => {

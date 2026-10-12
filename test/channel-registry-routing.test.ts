@@ -128,6 +128,162 @@ test('handleIncoming REJECTS an unknown channel instead of minting it (§14.5)',
   assert.equal(registry.resolveLocus('cairn'), null, 'a rejected message must not establish a locus');
 });
 
+test('the registry remembers the last delivered message for the fallback, and forgets it when its channel or server goes', async () => {
+  const registry = new ChannelRegistry(
+    { getServer: () => undefined } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+  );
+  seedRegistered(registry, 'slack', 'slack:C1', 'slack:C2');
+  assert.equal(registry.getLastInbound(), null);
+  assert.equal(registry.getDefaultPublishChannel(), null);
+  const deliver = (channelId: string, messageId: string, threadId?: string) => registry.handleIncoming('slack', {
+    messages: [{
+      channelId, messageId, author: { id: 'u1', name: 'Ada' }, timestamp: '2026-10-07T00:00:00.000Z',
+      content: [{ type: 'text' as const, text: 'hi' }], ...(threadId ? { threadId } : {}),
+    }],
+  });
+  await deliver('slack:C1', 'm-1', '1700.0001');
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C1', threadId: '1700.0001' });
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1');
+  await deliver('slack:C2', 'm-2');
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2' }, 'the newest wins, a root message naming no thread');
+
+  // A removal of another channel leaves it; its own channel's removal forgets it.
+  await registry.handleChanged('slack', { removed: ['slack:C1'] });
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C2');
+  await registry.handleChanged('slack', { removed: ['slack:C2'] });
+  assert.equal(registry.getLastInbound(), null);
+
+  seedRegistered(registry, 'slack', 'slack:C1');
+  await deliver('slack:C1', 'm-3');
+  registry.removeServer('slack');
+  assert.equal(registry.getLastInbound(), null, 'its server going forgets it');
+});
+
+test('only a delivered message becomes the fallback\'s place: not a reaction, a refused or unqueued message, or a withdrawal', async () => {
+  let throwFilter = false;
+  let admit = true;
+  const registry = new ChannelRegistry(
+    { getServer: () => undefined } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+    {
+      shouldTriggerInference: () => { if (throwFilter) throw new Error('filter broke'); return true; },
+      handleCoalescedIncoming: async (_serverId, message) => ({ messageId: message.messageId, accepted: admit }),
+    },
+  );
+  seedRegistered(registry, 'slack', 'slack:C1', 'slack:C2', 'slack:C3');
+  const msg = (channelId: string, messageId: string, extra: Record<string, unknown> = {}) => ({
+    channelId, messageId, author: { id: 'u1', name: 'Ada' }, timestamp: '2026-10-07T00:00:00.000Z',
+    content: [{ type: 'text' as const, text: 'hi' }], ...extra,
+  });
+  await registry.handleIncoming('slack', { messages: [msg('slack:C1', 'm-1')] });
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1');
+
+  // A reaction answers nothing: it isn't a message a conversation continues.
+  await registry.handleIncoming('slack', { messages: [msg('slack:C2', 'r-1', { tags: ['chat:reaction'] })] });
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'a reaction never becomes the place');
+
+  // An unregistered channel's message is refused before anything counts.
+  await registry.handleIncoming('slack', { messages: [msg('slack:NOPE', 'm-x')] });
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'a refused message never becomes the place');
+
+  // A message whose trigger filter throws is never queued, so never counts.
+  throwFilter = true;
+  await assert.rejects(registry.handleIncoming('slack', { messages: [msg('slack:C2', 'm-2')] }), /filter broke/);
+  throwFilter = false;
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'an unqueued message never becomes the place');
+
+  // A coalesced message is the host's to count: its coalescer's acceptance
+  // reads `accepted` for a producer's retry too, so the registry's own path
+  // never counts it, refused or admitted.
+  admit = false;
+  await registry.handleIncoming('slack', { messages: [msg('slack:C2', 'm-3', { eventId: 'e-3', coalesce: { key: 'k' } })] } as never);
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'a refused coalesced occurrence never counts');
+  admit = true;
+  await registry.handleIncoming('slack', { messages: [msg('slack:C2', 'm-4', { eventId: 'e-4', coalesce: { key: 'k' }, threadId: 't-4' })] } as never);
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'an accepted coalesced result is the host\'s to count');
+  // The host counts a fresh admission through noteDelivered.
+  registry.noteDelivered('slack', 'slack:C2', 't-4', []);
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2', threadId: 't-4' }, 'a noted delivery counts');
+  registry.noteDelivered('slack', 'slack:C3', undefined, ['chat:deleted']);
+  registry.noteDelivered('slack', 'slack:C3', undefined, ['chat:reaction-remove']);
+  registry.noteDelivered('slack', 'slack:GONE', undefined, []);
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2', threadId: 't-4' },
+    'a deletion, a reaction\'s removal or an unregistered channel never counts');
+  // An ordinary deletion notice is delivered, and never counts either.
+  let deletion: { results: Array<{ accepted: boolean }> } | undefined;
+  await registry.handleIncoming('slack', { messages: [msg('slack:C3', 'd-1', { tags: ['chat:deleted'] })] },
+    { respond: (r: unknown) => { deletion = r as typeof deletion; } } as never);
+  assert.equal(deletion?.results[0]?.accepted, true, 'the deletion notice was delivered');
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2', threadId: 't-4' }, 'a deletion never counts');
+
+  // Stopping forgets it.
+  registry.stopAll();
+  assert.equal(registry.getLastInbound(), null);
+  assert.equal(registry.getDefaultPublishChannel(), null);
+});
+
+test('on a registry with no coalescing hook, a withdrawal arrives as a plain item and is still never the place', async () => {
+  const registry = new ChannelRegistry(
+    { getServer: () => undefined } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+    { shouldTriggerInference: () => true },
+  );
+  seedRegistered(registry, 'slack', 'slack:C1', 'slack:C2');
+  const msg = (channelId: string, messageId: string, extra: Record<string, unknown> = {}) => ({
+    channelId, messageId, author: { id: 'u1', name: 'Ada' }, timestamp: '2026-10-07T00:00:00.000Z',
+    content: [{ type: 'text' as const, text: 'hi' }], ...extra,
+  });
+  await registry.handleIncoming('slack', { messages: [msg('slack:C1', 'm-1')] });
+  let withdrawal: { results: Array<{ accepted: boolean }> } | undefined;
+  await registry.handleIncoming('slack',
+    { messages: [msg('slack:C2', 'm-2', { eventId: 'e-2', coalesce: { key: 'k', retract: true } })] } as never,
+    { respond: (r: unknown) => { withdrawal = r as typeof withdrawal; } } as never);
+  assert.equal(withdrawal?.results[0]?.accepted, true, 'delivered as a plain item');
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C1' }, 'a withdrawal is never the place');
+  // A plain message there still is.
+  await registry.handleIncoming('slack', { messages: [msg('slack:C2', 'm-3')] });
+  assert.deepEqual(registry.getLastInbound(), { serverId: 'slack', channelId: 'slack:C2' });
+});
+
+test('a coalesced message whose channel goes while its coalescer decides breaks nothing', async () => {
+  let registry: ChannelRegistry;
+  registry = new ChannelRegistry(
+    { getServer: () => undefined } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+    {
+      handleCoalescedIncoming: async (serverId, message) => {
+        // The channel is withdrawn while the occurrence is being admitted.
+        await registry.handleChanged(serverId, { removed: [message.channelId] });
+        return { messageId: message.messageId, accepted: true };
+      },
+    },
+  );
+  seedRegistered(registry, 'slack', 'slack:C1', 'slack:GONE');
+  await registry.handleIncoming('slack', { messages: [{
+    channelId: 'slack:C1', messageId: 'm-1', author: { id: 'u1', name: 'Ada' }, timestamp: '2026-10-07T00:00:00.000Z',
+    content: [{ type: 'text' as const, text: 'hi' }],
+  }] });
+  let answered: { results: Array<{ accepted: boolean; reason?: string }> } | undefined;
+  await registry.handleIncoming('slack', { messages: [{
+    channelId: 'slack:GONE', messageId: 'm-2', author: { id: 'u1', name: 'Ada' }, timestamp: '2026-10-07T00:00:00.000Z',
+    content: [{ type: 'text' as const, text: 'bye' }], eventId: 'e-2', coalesce: { key: 'k' },
+  }] } as never, { respond: (r: unknown) => { answered = r as typeof answered; } } as never);
+  assert.deepEqual(answered?.results.map((r) => [r.accepted, r.reason]), [[true, undefined]], 'the admission itself stands');
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1');
+  // A host noting it afterwards finds the channel gone: it never becomes the place.
+  registry.noteDelivered('slack', 'slack:GONE', undefined, []);
+  assert.equal(registry.getDefaultPublishChannel(), 'slack:C1', 'a channel removed meanwhile never becomes the place');
+});
+
 test('the gate reads a message\'s thread from the protocol field, never from adapter metadata', async () => {
   const seen: Array<Record<string, unknown>> = [];
   const registry = new ChannelRegistry(

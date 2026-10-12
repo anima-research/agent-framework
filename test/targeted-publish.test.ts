@@ -123,6 +123,27 @@ describe('targeted publish (MCPL RFC-011)', () => {
     assert.ok(texts().some((t) => t.startsWith('[delivered]') && t.includes('thread t-1')), texts().filter((t) => t.startsWith('[delivered]')).join(' | '));
   });
 
+  it('a wake that names no conversation speaks where the last message came in, its thread named, through the real registry', async () => {
+    // A delivered message in a thread: its own turn answers it there.
+    await turn([say('answering the thread')], ROOM, { threadId: 't-7' });
+    // Then a heartbeat-like wake that names no conversation: the fallback.
+    membrane.pushResponse(say('a scheduled note'));
+    const before = membrane.calls.length;
+    await (framework as unknown as { startAgentStream(a: unknown, t?: unknown): Promise<void> })
+      .startAgentStream(framework.getAgent('scout')!, { agentName: 'scout', reason: 'heartbeat', source: 'timer', timestamp: Date.now() });
+    await until(() => membrane.calls.length > before, 'heartbeat turn start');
+    await framework.runUntilIdle();
+    await until(() => publishes().length >= 2, 'the fallback publish');
+    assert.deepEqual(publishes().map((p) => [p.event, p.channelId, p.threadId, p.text]), [
+      ['publish', ROOM, 't-7', 'answering the thread'],
+      ['publish', ROOM, 't-7', 'a scheduled note'],
+    ], 'the fallback named the thread the last message came in');
+    assert.ok(texts().some((t) => t.startsWith('[routing] Your plain speech now lands in #room (Guild One) (discord / discord:g1:room, thread t-7)')),
+      'the first turn announced its route');
+    assert.ok(texts().some((t) => t.startsWith('[routing] Nothing in this wake named a conversation, so your plain speech lands where the last message came in')) === false,
+      'the place is unchanged since the last announced route, so no new notice');
+  });
+
   it('plain speech answering the channel itself names the root explicitly: threadId null on the wire', async () => {
     await turn([say('at the top level')], ROOM);
     assert.deepEqual(publishes().map((p) => [p.channelId, p.threadId]), [[ROOM, null]]);

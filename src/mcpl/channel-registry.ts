@@ -42,7 +42,7 @@ import { isVisiblyEmptyContent } from './visible-content.js';
 import { CapabilityGrant } from './capability-grant.js';
 import { INBOUND_SOURCE_KEY, markHeaderOpenings, renderSourceHeader, SOURCE_HEADER_RULE, type InboundSource } from './inbound-source.js';
 import { McplRequestError } from './server-connection.js';
-import { describeConversation, readThreadId } from '../speech-routes.js';
+import { describeConversation, isConversational, readThreadId } from '../speech-routes.js';
 import type { TriggerInputs } from './push-handler.js';
 
 // ============================================================================
@@ -675,8 +675,10 @@ interface ChannelRegistryOptions {
    * goes, if anywhere. The same route feeds the beforeInference channel
    * context (defaultOutgoing, and its reply edge as `incoming`) and is the
    * destination of a channel_publish that names no channel — so what the
-   * agent is told and where it lands never diverge. There is no
-   * latest-inbound fallback: without a route there is nothing to default to.
+   * agent is told and where it lands never diverge. The registry's last
+   * delivered message reaches speech only through the framework, as the
+   * fallback route of a turn whose wake named no conversation: without a
+   * route there is nothing to default to.
    */
   speechRouteResolver?: (agentName: string) => SpeechRouteView;
 }
@@ -725,6 +727,10 @@ export class ChannelRegistry {
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
+  /** Where the last message any channel delivered came in (noteDelivered):
+   *  a turn whose wake names no conversation speaks there, as before speech
+   *  routes. Cleared when its channel or server goes. */
+  private lastInbound: { serverId: string; channelId: string; threadId?: string } | null = null;
 
   /**
    * Most-recently-known label per channelId, replayed from
@@ -929,6 +935,7 @@ export class ChannelRegistry {
         const key = `${serverId}:${channelId}`;
         const existed = this.channels.delete(key);
         this.stopTyping({ serverId, channelId });
+        if (this.lastInbound?.serverId === serverId && this.lastInbound.channelId === channelId) this.lastInbound = null;
         addedResults.push({ id: channelId, accepted: existed, reason: existed ? undefined : 'not registered' });
       }
     }
@@ -1099,17 +1106,20 @@ export class ChannelRegistry {
         continue;
       }
 
-      // An accepted message never retargets speech: a route comes from a
-      // turn's own wake or a deliberate choice, never from whichever channel
-      // last saw traffic (shelf-355). A coalesced item is "accepted" only
-      // once the coalescer admits it, so for those this runs after the hook.
+      // A coalesced item is "accepted" only once the coalescer admits it, so
+      // for those this runs after the hook, when its channel may be gone.
       const markAccepted = () => {
         // A server sending channels/incoming is authoritative evidence that
         // the transport is actually open. This repairs transient status only;
         // durable desired state still changes exclusively through lifecycle
         // operations.
-        this.channels.get(incomingKey)!.open = true;
+        const entry = this.channels.get(incomingKey);
+        if (entry) entry.open = true;
       };
+      // An ordinary message, once queued, is where the last message came in
+      // (noteDelivered). A coalesced one counts only when its coalescer
+      // admits it afresh, which the host observes itself: its result here
+      // reads `accepted` for a producer's retry too.
       if (!coalesced) markAccepted();
 
       // Build the incoming event; whether it triggers inference is decided
@@ -1200,6 +1210,11 @@ export class ChannelRegistry {
       // CustomEvent `${string}:${string}` type pattern but lacks an index signature.
       if (inboundSource) this.inboundAccepted?.(inboundSource);
       this.pushEventFn(event as unknown as ProcessEvent);
+      // A withdrawal is never the place, as before speech routes: on a
+      // registry with no coalescing hook it arrives here as a plain item.
+      if ((message.coalesce as { retract?: unknown } | null | undefined)?.retract !== true) {
+        this.noteDelivered(serverId, message.channelId, message.threadId, message.tags);
+      }
 
       // Collect per-message result
       results.push({
@@ -1391,6 +1406,47 @@ export class ChannelRegistry {
   // Accessors
   // ==========================================================================
 
+  /** The channel id of where the last message any channel delivered came in
+   *  (noteDelivered: a conversational message, never a reaction or a
+   *  deletion, nor a withdrawal, which its callers leave out), or null. Kept
+   *  from before speech routes for hosts that read it. The framework
+   *  doesn't: a turn's fallback route reads getLastInbound, which names the
+   *  server and thread too. */
+  getDefaultPublishChannel(): string | null {
+    return this.lastInbound?.channelId ?? null;
+  }
+
+  /** Where the last message any channel delivered came in: its server,
+   *  channel and thread, for the route of a turn whose wake names no
+   *  conversation. */
+  getLastInbound(): { serverId: string; channelId: string; threadId?: string } | null {
+    return this.lastInbound ? { ...this.lastInbound } : null;
+  }
+
+  /**
+   * A message was delivered: it is now where the last message came in, the
+   * fallback route of a turn whose wake names no conversation. Called for an
+   * ordinary `channels/incoming` message once it is queued, and by the host
+   * for a coalesced one when its coalescer admits it afresh (never for a
+   * producer's retry, which the coalescer acknowledges again without
+   * delivering anything). Only a message a conversation could continue
+   * counts, on a channel still registered: never a reaction or a deletion
+   * (`chat:reaction`, `chat:reaction-remove`, `chat:deleted`). Each caller
+   * leaves out withdrawals (`coalesce.retract`), which are never the place,
+   * even when a coalescer shows the resident a withdrawal notice: the
+   * place is where the last message came in. An MCPL item's tags alone
+   * decide: `metadata.system` is host-written.
+   */
+  noteDelivered(serverId: string, channelId: string, threadId?: string, tags?: readonly string[]): void {
+    if (!this.channels.has(`${serverId}:${channelId}`)) return;
+    if (!isConversational(tags) || tags?.includes('chat:deleted')) return;
+    this.lastInbound = {
+      serverId,
+      channelId,
+      ...(typeof threadId === 'string' && threadId ? { threadId } : {}),
+    };
+  }
+
   /**
    * Get the descriptor for a channel by its channelId (first match across
    * servers). Used by the conversation router for DM classification.
@@ -1537,9 +1593,10 @@ export class ChannelRegistry {
     const openChannels = this.getOpenChannels();
 
     // The agent's own speech route, the one its plain speech will actually
-    // use: the outgoing channel, and the message it answers as `incoming`.
-    // Without a channel route there is no outgoing channel to advertise —
-    // never a latest-inbound guess.
+    // use: the outgoing channel, and the message it answers as `incoming`
+    // (a fallback route answers none). Without a channel route there is no
+    // outgoing channel to advertise — never a latest-inbound guess beyond
+    // the fallback route itself.
     const route = agentName ? this.speechRouteResolver?.(agentName) : undefined;
     // The outgoing channel, while its publish can still go there: a route
     // lasts its turn, but a declaration withdrawn mid-turn refuses the
@@ -1595,6 +1652,7 @@ export class ChannelRegistry {
       this.channels.delete(key);
       this.stopTyping({ serverId: entry.serverId, channelId: entry.descriptor.id });
     }
+    if (this.lastInbound?.serverId === serverId) this.lastInbound = null;
     // Desired state and migration markers deliberately survive disconnects.
   }
 
@@ -1611,6 +1669,7 @@ export class ChannelRegistry {
 
     // Clear channels map
     this.channels.clear();
+    this.lastInbound = null;
   }
 
   // ==========================================================================
@@ -3671,9 +3730,9 @@ export class ChannelRegistry {
     }
 
     // The destination: the one named — its root, or the thread named with
-    // it — else the caller's current speech route, thread included; never
-    // the most recent inbound channel (shelf-355), and never a thread
-    // borrowed from an earlier route for a channel named explicitly.
+    // it — else the caller's current speech route, thread included (for a
+    // turn whose wake named no conversation, its fallback route); never a
+    // thread borrowed from an earlier route for a channel named explicitly.
     // Supplied selectors are checked before any default applies: an empty
     // or non-string one is refused, never read as omission (which would
     // widen it to "your route" or "whichever server has the id"). null means

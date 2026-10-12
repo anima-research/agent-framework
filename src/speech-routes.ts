@@ -2,13 +2,23 @@
  * Speech routes: where a resident's unaddressed plain speech goes (shelf-355).
  *
  * A route is decided deliberately or inferred from what triggered the turn,
- * never from whichever channel last saw traffic:
+ * and comes from where the last message came in only when the wake named no
+ * conversation at all:
  * - deliberate: a conversation fork's home channel, or a channel the resident
  *   opened with `channel_open` (setSpeechTarget, the default); a hybrid
  *   `>>>target` prefix is deliberate too and lives in its own pin;
  * - inferred, at a true new turn, from the wake's candidates: the addressed
  *   ones if any, else the conversational ones. Only candidates that name ONE
- *   conversation infer a route; several conversations start the turn held.
+ *   conversation infer a route; several conversations start the turn held;
+ * - fallback, at a true new turn whose wake named no conversation at all (a
+ *   heartbeat, a timer, a self-wake): where the last message any channel
+ *   delivered came in, as before speech routes, checked like any route. The
+ *   framework decides which wakes those are (InferenceRequest
+ *   .namesConversation): a reaction or a channel a fork owns names one
+ *   without being a candidate, and gets no fallback. A framework wake that
+ *   continues a turn (a rewind retry, an unstick, a prose bounce) names the
+ *   conversations that turn answered (continuationCandidates), so its words
+ *   go where that turn's would have, by the rules every wake follows.
  *
  * A held turn (competing conversations at turn start, or a competing
  * addressed or engaged arrival mid-turn) keeps unaddressed speech as drafts
@@ -67,7 +77,11 @@ export type RouteOrigin =
   /** A conversation fork's home channel. */
   | 'home'
   /** The resident's own channel_open (setSpeechTarget). */
-  | 'open';
+  | 'open'
+  /** A wake that named no conversation: the conversation of the last
+   *  message any channel delivered (its thread, but no reply edge), as
+   *  before speech routes. */
+  | 'fallback';
 
 export type SpeechRoute =
   | {
@@ -96,10 +110,13 @@ export interface TurnRoute {
    *  has no destination. A mid-turn hold keeps the route it suspended here,
    *  alongside `hold`, which wins while it is set. */
   route: SpeechRoute | null;
-  /** Unaddressed speech is held as drafts: these conversations compete. */
+  /** Unaddressed speech is held as drafts: these conversations compete.
+   *  `neverRoutes` keys (conversationKey) the ones that came from a
+   *  candidate marked unroutable, which a continuation keeps marked. */
   hold?: {
     conversations: ConversationRef[];
     since: 'turn-start' | 'mid-turn';
+    neverRoutes?: string[];
   };
   /** No route because the one conversation the turn answers can't take
    *  plain speech, said in the routing notice and the drafts' note:
@@ -108,8 +125,22 @@ export interface TurnRoute {
    *  - `thread`: a thread on a channel whose connector can't post into a
    *    named thread (it declares `root`: a contradiction the connector
    *    shouldn't produce);
-   *  - `unresolved`: a channel the host couldn't resolve. */
-  unroutable?: { conversation: ConversationRef; reason: UnroutableReason };
+   *  - `unresolved`: a channel the host couldn't resolve.
+   *  `neverRoutes` says the conversation came from a candidate marked
+   *  unroutable (a raw id the host couldn't resolve to a registered
+   *  channel, or a channel with no server), so a continuation keeps it
+   *  marked. A channel with no server becomes a route only once the
+   *  framework finds its server; one named with its server never does,
+   *  whatever the registry says. */
+  unroutable?: { conversation: ConversationRef; reason: UnroutableReason; neverRoutes?: true };
+  /** The turn's wake named a conversation (a channel, a thread, an author
+   *  or a local surface), candidate or not. A continuation of the turn then
+   *  names one too (continuationOf). */
+  named?: true;
+  /** When the message the route's reply edge names (`replyTo`) arrived. A
+   *  continuation's candidate for the route carries it, so only a newer
+   *  message batched in the same conversation takes the reply edge. */
+  replyAt?: number;
 }
 
 export type UnroutableReason = 'untargetable' | 'thread' | 'unresolved';
@@ -200,26 +231,36 @@ export function describeConversation(c: ConversationRef): string {
  * considered if there are any, else every (conversational) candidate; they
  * infer a route only when they name one conversation, from the newest
  * candidate in it (its message is the reply edge). Several conversations
- * start the turn held, naming each; none leaves the turn without a route,
- * and so does one that can't take plain speech — a channel the framework
- * can't publish into exactly (`targetOf`, RFC-011), or one that couldn't be
- * resolved — which the turn records as `unroutable`.
+ * start the turn held, naming each. One that can't take plain speech — a
+ * channel the framework can't publish into exactly (`targetOf`, RFC-011),
+ * or one that couldn't be resolved — leaves the turn without a route, which
+ * it records as `unroutable`.
+ *
+ * `fallback` is for a wake that named no conversation at all (a heartbeat,
+ * a timer, a self-wake), and only the caller can tell that from a wake whose
+ * named conversations all fell out as candidates (a reaction, a channel a
+ * fork owns): it passes one only for the former. With no candidates, the
+ * route is then where the last message any channel delivered came in, when
+ * plain speech can go there exactly; otherwise there is none.
  */
 export function inferTurnRoute(
   candidates: readonly RouteCandidate[],
   home: SpeechRoute | null | undefined,
   targetOf: PublishTargetOf,
+  fallback?: RouteCandidate | null,
 ): TurnRoute {
   if (home) {
     const conversation = routeConversation(home);
     const refusal = routeRefusal(conversation, targetOf);
     if (refusal) return { route: null, unroutable: { conversation, reason: refusal } };
     const key = conversationKey(conversation);
-    const replyTo = newestOf(considered(candidates.filter((c) => conversationKey(c.conversation) === key)))?.messageId;
-    return { route: replyTo && home.kind === 'channel' ? { ...home, replyTo } : home };
+    const newest = newestOf(considered(candidates.filter((c) => conversationKey(c.conversation) === key)));
+    return newest?.messageId && home.kind === 'channel'
+      ? { route: { ...home, replyTo: newest.messageId }, replyAt: newest.at }
+      : { route: home };
   }
   const pool = considered(candidates);
-  if (pool.length === 0) return { route: null };
+  if (pool.length === 0) return { route: fallbackRoute(fallback, targetOf) };
   const newestByConversation = new Map<string, RouteCandidate>();
   for (const candidate of pool) {
     const key = conversationKey(candidate.conversation);
@@ -227,10 +268,16 @@ export function inferTurnRoute(
     if (!seen || candidate.at >= seen.at) newestByConversation.set(key, candidate);
   }
   if (newestByConversation.size > 1) {
-    const conversations = [...newestByConversation.values()]
-      .sort((a, b) => b.at - a.at)
-      .map((c) => c.conversation);
-    return { route: null, hold: { conversations, since: 'turn-start' } };
+    const competing = [...newestByConversation.values()].sort((a, b) => b.at - a.at);
+    const neverRoutes = competing.filter((c) => c.unroutable).map((c) => conversationKey(c.conversation));
+    return {
+      route: null,
+      hold: {
+        conversations: competing.map((c) => c.conversation),
+        since: 'turn-start',
+        ...(neverRoutes.length > 0 ? { neverRoutes } : {}),
+      },
+    };
   }
   const [chosen] = newestByConversation.values();
   const c = chosen!.conversation;
@@ -238,7 +285,7 @@ export function inferTurnRoute(
   // neither can one the framework can't publish into exactly: its connector
   // would choose the place, which may be another conversation (RFC-011).
   // Both still compete for the turn (above).
-  if (chosen!.unroutable) return { route: null, unroutable: { conversation: c, reason: 'unresolved' } };
+  if (chosen!.unroutable) return { route: null, unroutable: { conversation: c, reason: 'unresolved', neverRoutes: true } };
   const refusal = routeRefusal(c, targetOf);
   if (refusal) return { route: null, unroutable: { conversation: c, reason: refusal } };
   return c.kind === 'surface'
@@ -253,7 +300,111 @@ export function inferTurnRoute(
           ...(c.label ? { label: c.label } : {}),
           origin: 'trigger',
         },
+        ...(chosen!.messageId ? { replyAt: chosen!.at } : {}),
       };
+}
+
+/** The fallback conversation as a route, or null when there is none or plain
+ *  speech can't go there exactly. Nothing in the wake named it, so it is no
+ *  conversation in front of the resident: an unroutable fallback is simply
+ *  no route, not an `unroutable` one. */
+function fallbackRoute(fallback: RouteCandidate | null | undefined, targetOf: PublishTargetOf): SpeechRoute | null {
+  if (!fallback || fallback.unroutable) return null;
+  const c = fallback.conversation;
+  if (c.kind !== 'channel' || routeRefusal(c, targetOf)) return null;
+  // No reply edge: the turn answers no message, and the last delivered one
+  // didn't trigger it (MCPL's `incoming` names only a triggering message).
+  return {
+    kind: 'channel',
+    ...(c.serverId ? { serverId: c.serverId } : {}),
+    channelId: c.channelId,
+    ...(c.threadId ? { threadId: c.threadId } : {}),
+    ...(c.label ? { label: c.label } : {}),
+    origin: 'fallback',
+  };
+}
+
+/**
+ * The conversations a framework wake names when it continues a turn (a
+ * rewind retry, an unstick, a prose continuation or bounce), as candidates:
+ * the ones that turn answered, so the continuation's words go where the
+ * turn's would have. A held turn names each conversation it held between; a
+ * turn with a route names its route's conversation, reply edge kept, at the
+ * time its reply message arrived (`replyAt`), so only a newer message in
+ * that conversation takes the reply edge; a turn whose one conversation
+ * couldn't take plain speech names that one. A conversation refused for its
+ * publish target is checked again as any candidate is; one from a candidate
+ * marked unroutable stays marked (`neverRoutes`). Each counts as addressed,
+ * since the resident was answering it: an ambient arrival batched beside it
+ * doesn't take the turn, and an addressed one from elsewhere holds it.
+ *
+ * A turn that answered no conversation gives none: a fallback turn, or a
+ * turn whose words had no place. What its continuation names then is
+ * continuationOf's to say.
+ */
+export function continuationCandidates(turn: TurnRoute | undefined, at: number): RouteCandidate[] {
+  if (!turn) return [];
+  if (turn.hold) {
+    const neverRoutes = new Set(turn.hold.neverRoutes ?? []);
+    return turn.hold.conversations.map((conversation) => ({
+      conversation,
+      addressed: true,
+      at,
+      ...(neverRoutes.has(conversationKey(conversation)) ? { unroutable: true as const } : {}),
+    }));
+  }
+  if (turn.route) {
+    const { route } = turn;
+    if (route.origin === 'fallback') return [];
+    const replyTo = route.kind === 'channel' ? route.replyTo : undefined;
+    return [{
+      conversation: routeConversation(route),
+      addressed: true,
+      at: replyTo && turn.replyAt !== undefined ? turn.replyAt : at,
+      ...(replyTo ? { messageId: replyTo } : {}),
+    }];
+  }
+  if (turn.unroutable) {
+    // A conversation from a candidate marked unroutable stays marked, so it
+    // never routes unless the framework finds its channel's server when the
+    // continuation starts. One refused for its publish target is checked
+    // again as it is.
+    const { conversation, neverRoutes } = turn.unroutable;
+    return [{ conversation, addressed: true, at, ...(neverRoutes ? { unroutable: true as const } : {}) }];
+  }
+  return [];
+}
+
+/**
+ * What a framework wake that continues a turn carries into its own turn,
+ * read from that turn's record when the continuation's batch starts:
+ * - `candidates`: the conversations the turn answered
+ *   (continuationCandidates);
+ * - `namesConversation`: whether it names a conversation. It does when it
+ *   has candidates, or when the turn's own wake named one. So a turn whose
+ *   words had no place although its wake named a conversation (a reaction,
+ *   a channel a conversation fork owns) gives its continuation no place
+ *   either. A turn whose wake named none gives a continuation that names
+ *   none, and that continuation takes the fallback;
+ * - `fallback`: for a fallback turn that wasn't held, the place it spoke
+ *   into. Its continuation keeps that place as its own fallback, rather
+ *   than the last delivered message's conversation as it is by then, so a
+ *   message arriving between them doesn't move the rest of the reply. Like
+ *   any fallback, it applies only when nothing the batch carries names a
+ *   conversation.
+ * No record (no turn yet, or an explicit-prose turn) gives nothing.
+ */
+export function continuationOf(
+  turn: TurnRoute | undefined,
+  at: number,
+): { candidates: RouteCandidate[]; namesConversation: boolean; fallback?: RouteCandidate } {
+  const candidates = continuationCandidates(turn, at);
+  const namesConversation = candidates.length > 0 || turn?.named === true;
+  const route = turn?.route;
+  const fallback = !namesConversation && route?.origin === 'fallback'
+    ? { conversation: routeConversation(route), addressed: false, at }
+    : undefined;
+  return { candidates, namesConversation, ...(fallback ? { fallback } : {}) };
 }
 
 /** The candidates a route is inferred from: the addressed ones if any, else all. */
@@ -288,7 +439,8 @@ export function isConversational(tags: readonly string[] | undefined, metadata?:
 
 /**
  * Whether a mid-turn arrival suspends the turn's route: only an inferred
- * route (origin 'trigger') not already held, and only for an arrival from a
+ * route (origin 'trigger', or the 'fallback' a wake that named no
+ * conversation took) not already held, and only for an arrival from a
  * DIFFERENT conversation that addressed the resident, or that continues a
  * conversation the resident explicitly sent into this turn. Ambient chatter
  * never does; deliberate routes never are. It sees no tags: the caller passes
@@ -300,7 +452,7 @@ export function suspendsRoute(
   arrival: { conversation: ConversationRef; addressed: boolean },
   engaged: (c: ConversationRef) => boolean,
 ): boolean {
-  if (turn.hold || !turn.route || turn.route.origin !== 'trigger') return false;
+  if (turn.hold || !turn.route || (turn.route.origin !== 'trigger' && turn.route.origin !== 'fallback')) return false;
   if (conversationKey(arrival.conversation) === conversationKey(routeConversation(turn.route))) return false;
   return arrival.addressed || engaged(arrival.conversation);
 }

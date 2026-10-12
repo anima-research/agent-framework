@@ -1,10 +1,15 @@
 - **Hosts and module authors using `ChannelRegistry` directly:** the registry
-  no longer tracks the most recent inbound channel.
-  - **Removed:** `getDefaultPublishChannel()`, and the
-    `activeChannelResolver` option. The new `speechRouteResolver(agentName)`
-    option replaces that option, and the framework supplies it.
-  - **Changed:** `resolveLocus(agent)` returns only a conversation fork's
-    home channel, or null. `getChannelServerId(id)` names a server only when
+  no longer decides where speech goes. It still remembers where the last
+  message a channel delivered came in, which the framework uses only for a
+  turn whose wake names no conversation. `getDefaultPublishChannel()`
+  returns its channel id, and `getLastInbound()` its server, channel and
+  thread. A reaction or a withdrawal doesn't count as a message.
+  - **Removed:** the `activeChannelResolver` option. The new
+    `speechRouteResolver(agentName)` option replaces it, and the framework
+    supplies it.
+  - **Changed:** `resolveLocus(conversationId)`, which the framework calls
+    with an agent's name, returns only a conversation fork's home channel,
+    or null. `getChannelServerId(id)` names a server only when
     exactly one registered the id, and returns null for an id several
     servers share, where it used to return the first registrant. `buildChannelContext(agent)` advertises the
     agent's own route and reply edge, and nothing for a held, surface-only or
@@ -15,25 +20,11 @@
     publish to an exact server.
   - **Also changed:** `resolveProseTarget` returns the `serverId` its
     target resolved to beside the channel id. `startTyping` and
-    `stopTyping` take `{ serverId, channelId }` (a bare id still works,
-    resolving only an id one server registers). The registry no longer
+    `stopTyping` take `{ serverId, channelId }`. A bare id still works:
+    `startTyping` resolves it only when one server registers it, and
+    `stopTyping` stops that id's typing on every server that has it. The registry no longer
     decides a coalesced message's trigger before `handleCoalescedIncoming`:
     the event carries the filter's inputs as `triggerInputs`, and a host's
     own handler decides from them once it admits the occurrence.
   - **Unchanged:** fork homes, explicit sends naming a channel, and
     `resolveDestination`. No sibling package version changes.
-- **Operators whose residents speak on scheduled wakes:** a turn woken only
-  by events that name no conversation now has no speech route, unless the
-  resident is a conversation fork, whose home is its route. That covers
-  heartbeat-mcpl's message-mode heartbeats and its reminders, whose `origin`
-  names no conversation, as well as timers and self-wakes. Their plain speech
-  used to go to the most recent inbound channel. It is now held as
-  `no-destination` drafts, which the turn's `[delivered]` receipt names.
-  - **Migration:** a routine that should post names its place on every
-    wake. Before speaking, the resident can `channel_open` the channel,
-    which sets the speech route for that turn only, or it can send
-    explicitly with `channel_publish` and a `channelId`, or with the
-    connector's own send tool. The heartbeat's or reminder's own message can
-    say where. Held words can be resent with `drafts`.
-  - **Unaffected:** heartbeat-mcpl's silent ticks, whose prose was already
-    private.
