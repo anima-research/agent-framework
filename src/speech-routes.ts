@@ -299,9 +299,11 @@ function fallbackRoute(fallback: RouteCandidate | null | undefined, targetOf: Pu
  * whose one conversation couldn't take plain speech names that one, to be
  * checked again. Each counts as addressed, since the resident was answering
  * it: an ambient arrival batched beside it doesn't take the turn, and an
- * addressed one from elsewhere holds it. A turn that answered none (a silent
- * wake, an explicit-prose turn, a no-name wake with no fallback place) gives
- * none, so its continuation names none.
+ * addressed one from elsewhere holds it. A turn whose words had no place (a
+ * silent wake, a wake whose conversation it couldn't take, a no-name wake
+ * with no fallback place) gives none; the framework's wake still names a
+ * conversation then, so the fallback gives its words no place either
+ * (continuationRequest).
  */
 export function continuationCandidates(turn: TurnRoute | undefined, at: number): RouteCandidate[] {
   if (!turn) return [];

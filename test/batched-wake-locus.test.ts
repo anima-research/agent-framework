@@ -214,7 +214,7 @@ describe('batched wake routing with conversation forks', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it('a batch candidate the host could not resolve follows the fork rule too: no other agent is held by a fork-owned channel', async () => {
+  it("a batch candidate the host could not resolve reaches every agent's wake, for the fork rule to judge when each turn starts", async () => {
     const internals = framework as unknown as {
       conversationAgentHomes: Map<string, string>;
       pendingRequests: Array<{ agentName: string; routeCandidates?: Array<{ conversation: { channelId?: string }; unroutable?: true }> }>;
@@ -229,11 +229,12 @@ describe('batched wake routing with conversation forks', () => {
     });
     await waitFor(() => internals.pendingRequests.some((r) => r.agentName === 'trunk'), 'gate wake broadcast');
     const byAgent = new Map(internals.pendingRequests.map((r) => [r.agentName, r]));
-    assert.deepEqual(byAgent.get('fork-room')?.routeCandidates?.map((c) => [c.conversation.channelId, c.unroutable]), [[ROOM, true]],
-      'the fork homed there competes for it');
-    for (const other of ['trunk', 'fork-other']) {
-      assert.equal(byAgent.get(other)?.routeCandidates, undefined, `${other}'s turn is not held by the fork's channel`);
-      assert.ok(byAgent.has(other), `${other} is still woken`);
+    // Only the fork homed there may take it, as ownership stands when its
+    // turn starts (trunk-channel-routing pins that a fork's channel holds no
+    // other agent's turn).
+    for (const agent of ['fork-room', 'trunk', 'fork-other']) {
+      assert.deepEqual(byAgent.get(agent)?.routeCandidates?.map((c) => [c.conversation.channelId, c.unroutable]), [[ROOM, true]],
+        `${agent}'s wake names it`);
     }
   });
 
@@ -267,7 +268,7 @@ describe('batched wake routing with conversation forks', () => {
     origin: { mcplChannelId: channelId, messageId: `${eventId}-m`, authorId: '5' },
   });
 
-  it('a push event follows the fork rule: no agent takes a fork-owned channel as its route or typing', async () => {
+  it('a push event follows the fork rule for typing, and names its conversation for the turn to judge', async () => {
     const internals = framework as unknown as {
       conversationAgentHomes: Map<string, string>;
       pendingRequests: Wake[];
@@ -278,7 +279,7 @@ describe('batched wake routing with conversation forks', () => {
     const trunk = internals.pendingRequests.find((r) => r.agentName === 'trunk');
     assert.ok(trunk, 'the trunk is still woken');
     assert.equal(trunk!.channelId, undefined, 'no typing in a fork-owned channel');
-    assert.equal(trunk!.routeCandidates, undefined, 'and no route into it');
+    assert.deepEqual(trunk!.routeCandidates?.map((c) => c.conversation.channelId), [ROOM], 'its route is judged at turn start');
     // Control: the same push into a channel no fork owns.
     internals.pendingRequests.length = 0;
     internals.handleMcplPushEvent(pushInto(GENERAL, 'e2'));
@@ -287,7 +288,7 @@ describe('batched wake routing with conversation forks', () => {
     assert.deepEqual(free?.routeCandidates?.map((c) => c.conversation.channelId), [GENERAL]);
   });
 
-  it('a coalesced push batch follows the fork rule for its typing channel and route candidate', async () => {
+  it('a coalesced push batch follows the fork rule for its typing channel, and names its conversation for the turn to judge', async () => {
     const internals = framework as unknown as {
       conversationAgentHomes: Map<string, string>;
       pendingRequests: Wake[];
@@ -310,7 +311,7 @@ describe('batched wake routing with conversation forks', () => {
     const trunk = internals.pendingRequests.find((r) => r.agentName === 'trunk');
     assert.ok(trunk, 'the trunk is still woken');
     assert.equal(trunk!.channelId, undefined, 'no typing in a fork-owned channel');
-    assert.equal(trunk!.routeCandidates, undefined, 'and no route into it');
+    assert.deepEqual(trunk!.routeCandidates?.map((c) => c.conversation.channelId), [ROOM], 'its route is judged at turn start');
     internals.pendingRequests.length = 0;
     await internals.wakeForCoalescedBatch(batch(GENERAL, 'c2'));
     const free = internals.pendingRequests.find((r) => r.agentName === 'trunk');
@@ -318,7 +319,7 @@ describe('batched wake routing with conversation forks', () => {
     assert.deepEqual(free?.routeCandidates?.map((c) => c.conversation.channelId), [GENERAL], 'as a route candidate too');
   });
 
-  it('a channel-incoming broadcast follows the fork rule for every agent it wakes', async () => {
+  it('a channel-incoming broadcast follows the fork rule for every agent it wakes: typing here, the route at turn start', async () => {
     const internals = framework as unknown as {
       conversationAgentHomes: Map<string, string>;
       pendingRequests: Wake[];
@@ -336,7 +337,8 @@ describe('batched wake routing with conversation forks', () => {
     assert.deepEqual(byAgent.get('fork-room')?.routeCandidates?.map((c) => c.conversation.channelId), [ROOM]);
     for (const other of ['fork-other', 'trunk']) {
       assert.equal(byAgent.get(other)?.channelId, undefined, `${other} gets no typing there`);
-      assert.equal(byAgent.get(other)?.routeCandidates, undefined, `${other} gets no route there`);
+      assert.deepEqual(byAgent.get(other)?.routeCandidates?.map((c) => c.conversation.channelId), [ROOM],
+        `${other}'s wake names it; its turn may not take it (trunk-channel-routing)`);
     }
   });
 

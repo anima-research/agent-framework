@@ -49,9 +49,13 @@
     when it is queued, as addressed ones, so its words go where the turn's
     would have. Beside a heartbeat they keep the turn, beside an ambient
     arrival from elsewhere they win, and beside an addressed one from
-    elsewhere the turn is held. A turn that answered none gives a wake that
-    names none. Everything else starts afresh, as at any new turn: a rewind
-    sheds the turn whose choices those were.
+    elsewhere the turn is held. A bounce during a turn queues its wake when
+    that turn ends, so it names where the turn's words went by then, after a
+    `channel_open` or a hold. A turn whose words had no place (a silent
+    tick, or a wake whose conversation it couldn't take) gives no
+    conversation to carry, and its continuation's words get no place either,
+    never the fallback. Everything else starts afresh, as at any new turn: a
+    rewind sheds the turn whose choices those were.
   - **An ephemeral subagent never takes the fallback.** Its prose isn't a
     channel's, and before speech routes a subagent's prose between its tool
     calls could reach the resident's live channel this way.
@@ -125,7 +129,9 @@
   coalesced push and a `channels/incoming` broadcast now give no other agent
   a speech route or a typing indicator in a channel a conversation fork owns,
   and a fork takes neither in a channel other than its home. Batched gate
-  wakes already worked this way.
+  wakes already worked this way. A route is judged when the turn starts, as
+  ownership stands then, so a fork's claim, or its giving a channel up,
+  while a wake waits in the queue counts.
 - The `[discord-send-failed]` marker for a reply on a thread route names the
   thread with its channel, and an unconfirmed one says to check the thread.
 - **Routing names each conversation with its server.** Routing notices,

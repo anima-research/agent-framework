@@ -1203,6 +1203,11 @@ export class AgentFramework {
   /** Consecutive bounce-wakes per agent; capped so an agent that keeps
    *  emitting unprefixed prose can't wake-loop (notices still append). */
   private proseBounceStreaks: Map<string, number> = new Map();
+  /** Agents whose words bounced while their turn was live: the bounce's wake
+   *  is queued when that turn ends (driveStream), so it names the
+   *  conversations the turn answered by then, after a channel_open or a hold
+   *  later in the turn. It couldn't start before the turn ends anyway. */
+  private proseBounceWakes: Set<string> = new Set();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
   /** Streams the FRAMEWORK cancelled for non-terminal reasons, keyed
    *  `${agentName}:${streamId}`: an endTurn tool result or a context-budget
@@ -1797,13 +1802,10 @@ export class AgentFramework {
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
         addMessage: (p, c, m, forAgent) => framework.addMessage(p, c, m as MessageMetadata, forAgent ? { forAgent } : undefined),
         requestInference: (agentName, reason, source, provenance) => {
-          // The batch's conversations as speech-route candidates, under the
-          // same fork rule: a fork takes only its home's, and no other agent
-          // takes a channel a fork owns. That includes an unroutable
-          // candidate: it never routes, but it competes, so a fork's
-          // channel would otherwise hold another agent's turn.
+          // The batch's conversations as speech-route candidates. The fork
+          // rule is applied to them at turn start (beginAgentTurn), as for
+          // every wake.
           const routeCandidates = (provenance?.routeCandidates ?? [])
-            .filter((c) => c.kind === 'surface' || framework.mayTakeRoute(agentName, c.channelId))
             .map((c): RouteCandidate => c.kind === 'surface'
               ? { conversation: { kind: 'surface', surface: c.surface }, addressed: true, at: c.at }
               : c.unroutable
@@ -1841,8 +1843,6 @@ export class AgentFramework {
             ...(provenance?.routeChannelId && framework.mayTakeRoute(agentName, provenance.routeChannelId)
               ? { channelId: provenance.routeChannelId, addressed: true }
               : {}),
-            // None left, as for an agent the fork rule leaves out, is none:
-            // the batch still named its conversations, so no fallback either.
             ...(routeCandidates.length > 0 ? { routeCandidates } : {}),
             ...(provenance?.namesConversation ? { namesConversation: true as const } : {}),
           });
@@ -7560,7 +7560,7 @@ export class AgentFramework {
       for (const agentName of targetAgents) {
         if (!this.agents.has(agentName)) continue;
         // The broadcast reaches forks too: the fork rule keeps each agent's
-        // typing and route candidate to a channel it may take.
+        // typing to a channel it may take (and its route, at turn start).
         const takesChannel = this.mayTakeRoute(agentName, event.channelId);
         this.pendingRequests.push({
           agentName,
@@ -7575,7 +7575,7 @@ export class AgentFramework {
           addressed,
           // This message's conversation, as a speech-route candidate: the
           // turn's route is inferred from every candidate of its batch.
-          ...(candidate && this.mayTakeCandidate(agentName, candidate) ? { routeCandidates: [candidate] } : {}),
+          ...(candidate ? { routeCandidates: [candidate] } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
         });
       }
@@ -8578,7 +8578,6 @@ export class AgentFramework {
     const originThread = typeof origin?.threadId === 'string' && origin.threadId.length > 0;
     const namesConversation = !!named || !!channelId || !!authorId || !!occ.identity?.threadId || originThread;
     for (const agentName of await this.coalescedAudience(occ)) {
-      const takes = candidate && this.mayTakeCandidate(agentName, candidate) ? candidate : undefined;
       this.pendingRequests.push({
         agentName,
         reason: 'mcpl:push-event',
@@ -8588,7 +8587,7 @@ export class AgentFramework {
         ...(namesConversation ? { namesConversation: true as const } : {}),
         counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
         addressed: addressedHere,
-        ...(takes ? { routeCandidates: [takes] } : {}),
+        ...(candidate ? { routeCandidates: [candidate] } : {}),
         coalescingSubject: subject,
         coalescingBatch: true,
       });
@@ -8820,12 +8819,12 @@ export class AgentFramework {
         || originNames('authorId') || originNames('threadId');
       const pushCandidate = silentHeartbeat || !isConversational(event.tags) ? undefined : pushNamed;
       for (const agentName of targetAgents) {
-        // The fork rule, as for a gate batch: no agent takes a channel a fork
-        // owns, and a fork takes only its home.
+        // The fork rule for typing, as for a gate batch: no agent types in a
+        // channel a fork owns, and a fork only in its home. (Its route is
+        // judged at turn start.)
         const typingChannel = triggerChannel?.channelId && this.mayTakeRoute(agentName, triggerChannel.channelId)
           ? triggerChannel.channelId
           : undefined;
-        const candidate = pushCandidate && this.mayTakeCandidate(agentName, pushCandidate) ? pushCandidate : undefined;
         this.pendingRequests.push({
           agentName,
           reason: 'mcpl:push-event',
@@ -8833,7 +8832,7 @@ export class AgentFramework {
           timestamp: Date.now(),
           channelId: typingChannel,
           addressed: pushAddressed,
-          ...(candidate ? { routeCandidates: [candidate] } : {}),
+          ...(pushCandidate ? { routeCandidates: [pushCandidate] } : {}),
           ...(pushNamesConversation ? { namesConversation: true as const } : {}),
           ...(silentHeartbeat ? {
             suppressProse: true,
@@ -8850,10 +8849,11 @@ export class AgentFramework {
   }
 
   /**
-   * Whether a wake's channel may become `agentName`'s speech route or typing
-   * channel: for a gate batch, a push event or a coalesced push alike. A
-   * fork speaks only in its home channel, and a channel bound to a fork is
-   * that fork's conversation, so no other agent takes it.
+   * Whether a channel may become `agentName`'s speech route or typing
+   * channel: read for a wake's typing channel when it is queued, and for its
+   * route candidates and the fallback when its turn starts. A fork speaks
+   * only in its home channel, and a channel bound to a fork is that fork's
+   * conversation, so no other agent takes it.
    */
   private mayTakeRoute(agentName: string, routeChannelId: string): boolean {
     const home = this.conversationAgentHomes.get(agentName);
@@ -10170,21 +10170,24 @@ export class AgentFramework {
    * route record gives the conversations that turn answered
    * (continuationCandidates), and the wake names them. So the true new turn
    * it starts, alone or batched with other wakes, infers its route from them
-   * by the rules every wake follows, rather than taking the fallback. Like
-   * every producer's candidates, they pass the fork rule here: one a fork has
-   * claimed still names its conversation, so the turn gets no route. A turn
-   * that answered none gives a wake that names none.
+   * by the rules every wake follows (the fork rule included, at turn start),
+   * rather than taking the fallback. A turn whose words had no place (a
+   * silent tick, a wake whose conversation it couldn't take, a no-name wake
+   * with no fallback place) gives no candidates, but its continuation still
+   * names a conversation: the fallback mustn't give the continuation's words
+   * a place the turn's never had. Only an agent with no route record (no
+   * turn yet, or an explicit-prose turn) gives a wake that names nothing.
    */
   private continuationRequest(agentName: string, reason: string): InferenceRequest {
     const timestamp = Date.now();
-    const named = continuationCandidates(this.turnRoutes.get(agentName), timestamp);
-    const candidates = named.filter((c) => this.mayTakeCandidate(agentName, c));
+    const turn = this.turnRoutes.get(agentName);
+    const candidates = continuationCandidates(turn, timestamp);
     return {
       agentName,
       reason,
       source: 'framework',
       timestamp,
-      ...(named.length > 0 ? { namesConversation: true as const } : {}),
+      ...(turn ? { namesConversation: true as const } : {}),
       ...(candidates.length > 0 ? { routeCandidates: candidates } : {}),
     };
   }
@@ -11131,8 +11134,10 @@ export class AgentFramework {
     );
     if (!capped) {
       // Wake so the resend can happen immediately — an unsent DM reply must
-      // not sit invisible until the next unrelated event.
-      this.pendingRequests.push(this.continuationRequest(name, 'prose-bounce'));
+      // not sit invisible until the next unrelated event. A bounce in a live
+      // turn wakes when that turn ends (proseBounceWakes).
+      if (this.activeTurnTokens.has(name)) this.proseBounceWakes.add(name);
+      else this.pendingRequests.push(this.continuationRequest(name, 'prose-bounce'));
     }
   }
 
@@ -11436,6 +11441,9 @@ export class AgentFramework {
         this.turnDraftFailures.delete(agent.name);
         this.proseHybridSuppressed.delete(agent.name);
         this.proseTargetPins.delete(agent.name);
+        // A bounce whose turn ended without waking (superseded) is in this
+        // turn's history already.
+        this.proseBounceWakes.delete(agent.name);
         (this.logicalTurns ??= new Map()).set(agent.name, this.logicalTurn(agent.name) + 1);
       }
       if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') {
@@ -11456,10 +11464,19 @@ export class AgentFramework {
         // continuation or bounce) carries the conversations that turn
         // answered as its candidates (continuationRequest), so it is
         // inferred here like any other.
+        //
+        // The fork rule applies here, where the route is decided, to every
+        // wake's candidates: a fork takes only its home's, and no other agent
+        // takes a channel a fork owns, as ownership stands now. A wake can
+        // wait in the queue while a fork claims or gives up a channel. A
+        // candidate it leaves out still named its conversation, so it still
+        // keeps the fallback away. That includes an unroutable candidate,
+        // which never routes but competes: a fork's channel never holds
+        // another agent's turn.
         const turn: TurnRoute = trigger?.suppressProse
           ? { route: null }
           : inferTurnRoute(
-              trigger?.routeCandidates ?? [],
+              (trigger?.routeCandidates ?? []).filter((c) => this.mayTakeCandidate(agent.name, c)),
               this.homeRoute(agent.name),
               (c) => this.publishTargetOf(c),
               // Only a resident's wake that named no conversation, candidate
@@ -13181,6 +13198,11 @@ export class AgentFramework {
           this.settleTurnDrafts(agent);
         } catch (err) {
           console.error('[drafts] turn-end settlement failed:', err);
+        }
+        // A bounce during the turn wakes now, naming the conversations the
+        // turn answered at its end.
+        if (this.proseBounceWakes.delete(agent.name)) {
+          this.pendingRequests.push(this.continuationRequest(agent.name, 'prose-bounce'));
         }
       }
     }
