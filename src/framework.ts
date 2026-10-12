@@ -10424,6 +10424,17 @@ export class AgentFramework {
       // requests[0] in that mixed batch bypassed the turn lock because a
       // restart existed, then treated the continuation as a fresh turn.
       const trigger = budgetRestart ?? requests[0];
+      if (!budgetRestart && (trigger.nonChannelOrigin || trigger.channelId)) {
+        // Private-surface and channel wakes never share a fresh turn. Preserve
+        // queue order: the first request's kind runs now; opposite-kind siblings
+        // remain queued for a distinct turn.
+        const opposite = trigger.nonChannelOrigin
+          ? (request: InferenceRequest) => !!request.channelId
+          : (request: InferenceRequest) => request.nonChannelOrigin === true;
+        const siblings = requests.filter((request) => request !== trigger && opposite(request));
+        if (siblings.length > 0) this.pendingRequests.push(...siblings);
+        requests = requests.filter((request) => request === trigger || !opposite(request));
+      }
       // Route this turn's auto-published speech to the channel that triggered
       // it (item-3 redux). A batched wake may carry several triggering channels
       // (messages arrived in >1 channel while the agent was busy/idle):

@@ -211,6 +211,31 @@ describe('private non-channel trigger batching', () => {
     assert.equal(captured[1]?.addressed, true);
     await framework.stop();
   });
+
+  it('runs a channel-first request separately and requeues the later private request', async () => {
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'channel-first.chronicle'), membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'scout' }], modules: [],
+    });
+    const i = internals(framework);
+    const captured: InferenceRequest[] = [];
+    i.startAgentStream = async (_agent: unknown, trigger?: InferenceRequest) => { if (trigger) captured.push(trigger); };
+    const t = Date.now();
+    i.pendingRequests.push(
+      { agentName: 'scout', reason: 'mcpl:channel-incoming', source: 'discord', timestamp: t,
+        channelId: 'discord:g:room', addressed: true },
+      { agentName: 'scout', reason: 'external-message', source: 'tui', timestamp: t + 1, nonChannelOrigin: true },
+    );
+    await i.processInferenceRequests();
+    assert.ok(i.pendingRequests.some((request) => request.nonChannelOrigin));
+    await i.processInferenceRequests();
+    assert.equal(captured[0]?.channelId, 'discord:g:room');
+    assert.equal(captured[0]?.nonChannelOrigin, undefined);
+    assert.equal(captured[1]?.nonChannelOrigin, true);
+    assert.equal(captured[1]?.channelId, undefined);
+    await framework.stop();
+  });
+
 });
 
 
