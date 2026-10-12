@@ -1600,18 +1600,17 @@ export class WorkspaceModule implements Module {
     // The other readers' boundary, checked against the file actually opened:
     // a symlink may lead only within this mount, never into a mount nested in
     // it. Symlinks within the mount are followed, whatever its followSymlinks.
-    const tooLarge = new Map<'size', number>();
+    let tooLargeSize: number | undefined;
     let opened: Awaited<ReturnType<WorkspaceModule['openContainedFile']>>;
     try {
       opened = await this.openContainedFile(mount, relativePath, mountPrefixedPath, (fileStat) => {
         if (opts.maxBytes !== undefined && fileStat.size > opts.maxBytes) {
-          tooLarge.set('size', fileStat.size);
+          tooLargeSize = fileStat.size;
           throw new Error('too large');
         }
       }, { follow: true });
     } catch (error) {
-      const size = tooLarge.get('size');
-      if (size !== undefined) return { error: `File too large: ${size} > ${opts.maxBytes} bytes` };
+      if (tooLargeSize !== undefined) return { error: `File too large: ${tooLargeSize} > ${opts.maxBytes} bytes` };
       if (error instanceof WorkspaceReadError) {
         if (error.code === 'not_found' && (error.errno === 'ENOENT' || error.errno === 'ENOTDIR')) {
           return { error: `File not found on disk: ${mountPrefixedPath}` };

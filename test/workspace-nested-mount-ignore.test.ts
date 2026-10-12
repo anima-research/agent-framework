@@ -422,6 +422,9 @@ test("the disk readers reach nothing of a nested mount through an alias, and the
   const own = await workspace.readBinaryFromDisk('outer/own-link.txt');
   assert.ok('data' in own, 'error' in own ? own.error : '');
   assert.equal(own.data.toString(), "the outer mount's");
+  // Its size limit is checked on the file it opens, with its old text.
+  const capped = await workspace.readBinaryFromDisk('outer/own-link.txt', { maxBytes: 3 });
+  assert.deepEqual(capped, { error: `File too large: ${Buffer.byteLength("the outer mount's")} > 3 bytes` });
   const out = await workspace.readBinaryFromDisk('outer/out-link.txt');
   assert.ok('error' in out);
   assert.match(out.error, /Symlink escape detected: outer\/out-link\.txt/);
