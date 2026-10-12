@@ -161,6 +161,8 @@ interface Snapshot {
   /** Exact dedup sets per resident (rebuilt into memory at load). */
   seen: Record<string, PackedSets>;
   gaps: Array<{ from: number; to: number; reason: string }>;
+  /** How many older gaps the list no longer holds. */
+  gapsOmitted: number;
   /** Start time of a run with no stop recorded yet. */
   openRun: number | null;
   /** Time of the latest entry (any kind). */
@@ -181,8 +183,10 @@ export interface ClockScope {
   storeId: string;
   agent: string;
   trackingSince: number | null;
-  /** Recent intervals in which observations may be missing. */
+  /** The most recent intervals (up to 20) in which observations may be missing. */
   gaps: Array<{ from: number; to: number; reason: string }>;
+  /** How many older intervals the list no longer holds. */
+  gapsOmitted: number;
   /** True while a gap is still open: a ledger write failed, or the journal can't be read. */
   degraded: boolean;
 }
@@ -218,7 +222,7 @@ function emptyAgent(): AgentState {
 }
 
 function emptySnapshot(): Snapshot {
-  return { v: 2, trackingSince: null, channels: {}, agents: {}, seen: {}, gaps: [], openRun: null, lastAt: null };
+  return { v: 2, trackingSince: null, channels: {}, agents: {}, seen: {}, gaps: [], gapsOmitted: 0, openRun: null, lastAt: null };
 }
 
 /**
@@ -237,8 +241,15 @@ function checkedSnapshot(value: unknown): Snapshot {
     const bytes = Buffer.from(x, 'base64');
     return bytes.length % 32 === 0 && bytes.toString('base64') === x;
   };
+  // A stamp the readers dereference: when, and the source it names.
+  const isStamp = (x: unknown) => isObject(x) && typeof x.at === 'number' && isObject(x.src);
+  const isStamps = (x: unknown) => isObject(x) && Object.values(x).every(isStamp);
+  const isGap = (x: unknown) => isObject(x) && typeof x.from === 'number' && typeof x.to === 'number' && typeof x.reason === 'string';
   if (!isObject(value) || value.v !== 2 || !isObject(value.channels) || !isObject(value.agents) || !Array.isArray(value.gaps)
+    || !value.gaps.every(isGap) || typeof value.gapsOmitted !== 'number'
     || !isTime(value.trackingSince) || !isTime(value.openRun) || !isTime(value.lastAt)
+    || !Object.values(value.channels).every((c) => isObject(c) && isObject(c.ch) && isStamp(c.received))
+    || !Object.values(value.agents).every((a) => isObject(a) && isStamps(a.delivered) && isStamps(a.partial))
     || !isObject(value.seen) || !Object.values(value.seen).every((sets) => isObject(sets) && isPacked(sets.delivered) && isPacked(sets.partial))) {
     throw new Error('clock ledger checkpoint is not a snapshot this version reads');
   }
@@ -394,6 +405,7 @@ export class ChannelClockLedger {
       agent,
       trackingSince: this.state.trackingSince,
       gaps: [...this.state.gaps, ...(this.pendingGap ? [{ from: this.pendingGap.from, to: this.now(), reason: `${this.pendingGap.reason} (ongoing)` }] : [])],
+      gapsOmitted: this.state.gapsOmitted,
       degraded: this.pendingGap !== null,
     };
   }
@@ -547,7 +559,11 @@ export class ChannelClockLedger {
       try {
         this.journal.checkpoint(this.snapshot());
       } catch (err) {
-        this.noteFailure(err);
+        // Every entry it would cover landed and was reduced, so no
+        // observation is missing yet: it opens no gap. Its append threw
+        // inside the store, so the journal takes no further writes this run
+        // (RecordJournal), and the next entry's refused write opens the gap.
+        console.error('[receipts] clock checkpoint failed:', err);
       }
     }
     return true;
@@ -612,7 +628,7 @@ export class ChannelClockLedger {
         break;
       case 'gap':
         s.gaps.push({ from: entry.from, to: entry.to, reason: entry.reason });
-        if (s.gaps.length > GAPS_KEPT) s.gaps.splice(0, s.gaps.length - GAPS_KEPT);
+        if (s.gaps.length > GAPS_KEPT) s.gapsOmitted += s.gaps.splice(0, s.gaps.length - GAPS_KEPT).length;
         break;
       case 'recv': {
         const key = channelKey(entry.ch);
@@ -649,6 +665,11 @@ export class ChannelClockLedger {
         set.add(versionDigest(entry.ver));
         break;
       }
+      default:
+        // Another version's entry: reading on would skip what it records (a
+        // delivery a later round would then count again), so the journal
+        // reads as unreadable, as another version's checkpoint does.
+        throw new Error(`clock ledger entry of kind ${JSON.stringify((entry as { k?: unknown }).k)} is not one this version writes`);
     }
   }
 }
