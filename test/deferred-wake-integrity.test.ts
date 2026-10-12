@@ -119,10 +119,11 @@ function stubChannelRegistry(framework: AgentFramework) {
     routeSpeech: async (_agent: string, text: string, locus?: string | null) => {
       routed.push({ text, locus: locus ?? null });
     },
-    getDefaultPublishChannel: () => null,
     isChannelOpen: () => true,
     getDescriptor: () => undefined,
     getChannelTools: () => [],
+    // As the registry answers for a locus no server registered.
+    resolveDestination: () => ({ error: 'no registered channel' }),
   };
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy(explicit, {
     get: (target, prop: string) => (prop in target ? target[prop] : () => undefined),

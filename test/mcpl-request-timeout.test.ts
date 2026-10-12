@@ -8,7 +8,7 @@
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { McplRequestError, McplServerConnection } from '../src/mcpl/server-connection.js';
 import type { McplHostCapabilities, McplServerConfig } from '../src/mcpl/types.js';
 
 // Stdio server: answers initialize and tools/list, but swallows tools/call —
@@ -98,6 +98,24 @@ test('requestTimeoutMs: 0 disables the per-request watchdog', async () => {
   connection = null;
   await call;
   assert.equal(settled, true);
+});
+
+test('requestTimeoutMs: 0 leaves channels/publish its own deadline, whose expiry is a no-response', async () => {
+  connection = await McplServerConnection.connect(config({ requestTimeoutMs: 0 }), HOST_CAPS);
+  connection.ready();
+  // The default is 60 s; the test shortens it rather than wait.
+  (connection as unknown as { publishDeadlineMs: number }).publishDeadlineMs = 150;
+  const started = Date.now();
+  await assert.rejects(
+    connection.sendChannelsPublish({ conversationId: 'c', channelId: 'x', content: [{ type: 'text', text: 'hi' }] }),
+    (err: Error) => {
+      assert.ok(err instanceof McplRequestError);
+      assert.equal(err.outcome, 'no-response');
+      assert.match(err.message, /did not respond to channels\/publish .*within 150ms/);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - started < 5000);
 });
 
 test('the timeout error warns the model the tool may have completed server-side', async () => {

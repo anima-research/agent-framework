@@ -44,7 +44,11 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
         } } }, serverInfo: { name: 'editor', version: '1' } });
       } else if (m.method === 'featureSets/update') reply({ accepted: true });
       else if (m.method === 'tools/list') reply({ tools: [] });
-      else if (m.method === 'channels/publish') { published.push(m.params); if (m.id !== undefined) reply({ delivered: true }); }
+      else if (m.method === 'channels/publish') {
+        published.push(m.params);
+        // RFC-011: a delivery echoes the place it was asked for.
+        if (m.id !== undefined) reply({ delivered: true, ...('threadId' in (m.params ?? {}) ? { threadId: m.params.threadId } : {}) });
+      }
       else if (m.method === 'channels/close') reply({ closed: true });
       else if (m.method === 'channels/open') reply({ channel: { id: m.params.channelId, type: 'discord', label: m.params.channelId } });
       else if (m.method === 'push/render') { renders.push(m.params); reply(await renderer(m.params)); }
@@ -77,7 +81,14 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
     port: (wss.address() as AddressInfo).port,
     disconnect: () => socket.terminate(),
     online: (value: boolean) => { online = value; },
-    register: (id = 'chat') => send('channels/register', { channels: [{ id, type: 'discord', label: id, metadata: { channelType: 'guild_text' } }] }),
+    /** Registers a channel; it declares an RFC-011 publish target (default
+     *  `exact`: a thread posts into that thread), or none with `null`. */
+    register: (id = 'chat', target: 'exact' | 'root' | null = 'exact') => send('channels/register', {
+      channels: [{
+        id, type: 'discord', label: id, metadata: { channelType: 'guild_text' },
+        ...(target ? { capabilities: { publish: { target } } } : {}),
+      }],
+    }),
     /** A coalesced channels/incoming message for platform message `m`. */
     channel: (eventId: string, text: string, flags: Record<string, unknown> = {}, channelId = 'chat', messageId = 'm') => ({
       channelId, messageId, eventId, timestamp: TS, author: { id: 'u', name: 'User' }, tags: ['chat:mention'],

@@ -19,6 +19,7 @@ import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import { expandCoreTags } from './tags.js';
 import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
+import { INBOUND_SOURCE_KEY, type InboundSource } from './inbound-source.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyContent } from './visible-content.js';
 
 // ============================================================================
@@ -48,6 +49,21 @@ export interface McplPushEvent {
   coalescingSubject?: string;
   /** RFC-006 assembly: materialized for this agent's turn (store directly). */
   assemblingFor?: string;
+  /** Host acceptance time (epoch ms), stamped where the push is admitted. */
+  acceptedAt?: number;
+  /** Framework-owned source envelope, frozen at a coalesced occurrence's
+   *  acceptance so its later delivery cannot restamp it (inbound-source.ts). */
+  inboundSource?: InboundSource;
+  /** A coalesced push's trigger-filter inputs, until the framework decides
+   *  its trigger when its coalescer first delivers or wakes for an admitted
+   *  occurrence. Plain data, so a persisted occurrence keeps them. */
+  triggerInputs?: TriggerInputs;
+}
+
+/** What a trigger filter (shouldTriggerInference) is called with. */
+export interface TriggerInputs {
+  content: string;
+  metadata: Record<string, unknown>;
 }
 
 // ============================================================================
@@ -177,7 +193,25 @@ export class PushHandler {
     pushEventFn: (event: McplPushEvent) => void,
     emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
     shouldTriggerInference?: (content: string, metadata: Record<string, unknown>) => boolean,
+    /** RFC-006: hand a coalesced push to its coalescer. Its trigger isn't
+     *  decided here: the event carries the filter's inputs
+     *  (triggerInputs), and the framework decides only once the coalescer
+     *  admits the occurrence for delivery, so a refused one, a retry or a
+     *  retraction is never gated (never a route candidate). */
     private readonly handleCoalesced?: (serverId: string, params: PushEventParams, event: McplPushEvent) => Promise<PushEventResult>,
+    /** An ordinary (uncoalesced) push was just admitted: return its source
+     *  envelope, frozen now (mcpl/inbound-source.ts), before the trigger
+     *  filter reads it. Building it accepts nothing (inboundAccepted).
+     *  Coalesced work is stamped by its own path. */
+    private readonly inboundSource?: (event: McplPushEvent) => InboundSource | undefined,
+    /** A coalesced push's source envelope, built — not accepted — before it
+     *  is gated: its coalescer freezes and carries this same envelope, and
+     *  observes the acceptance itself if it admits the occurrence. */
+    private readonly coalescedSource?: (serverId: string, params: PushEventParams, event: McplPushEvent) => InboundSource | undefined,
+    /** An ordinary push is accepted: once its trigger filter has returned,
+     *  right before it is queued, as a coalesced one is on admission. A
+     *  filter that throws leaves nothing accepted. */
+    private readonly inboundAccepted?: (source: InboundSource) => void,
   ) {
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -191,10 +225,14 @@ export class PushHandler {
    * 1. Validate feature set
    * 2. Convert content blocks; reject visibly-empty content
    * 3. Deduplicate by eventId
-   * 4. Optionally check shouldTriggerInference callback
-   * 5. Push event to queue
-   * 6. Emit trace
-   * 7. Respond with accepted + inferenceId
+   * 4. Generate inferenceId
+   * 5. Build the event and its host source envelope (accepted now for an
+   *    ordinary push; only built for a coalesced one, whose coalescer
+   *    freezes it)
+   * 6. Optionally check shouldTriggerInference, with that envelope; then
+   *    hand a coalesced push to its coalescer, or queue an ordinary one
+   * 7. Emit trace
+   * 8. Respond with accepted + inferenceId
    */
   async handlePushEvent(
     serverId: string,
@@ -270,28 +308,10 @@ export class PushHandler {
       return;
     }
 
-    // 4. Check shouldTriggerInference callback
-    let triggerInference = true;
-    if (this.shouldTriggerInference) {
-      const textContent = content
-        .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
-        .map((b) => b.text)
-        .join('\n');
-      const metadata: Record<string, unknown> = {
-        serverId,
-        featureSet: params.featureSet,
-        eventId: params.eventId,
-        eventType: 'mcpl:push-event',
-        ...(params.origin ?? {}),
-        ...(params.tags ? { tags: params.tags } : {}),
-      };
-      triggerInference = this.shouldTriggerInference(textContent, metadata);
-    }
-
-    // 5. Generate inferenceId
+    // 4. Generate inferenceId
     const inferenceId = `${serverId}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
-    // 6. Push event to queue
+    // 5. The event; whether it triggers inference is decided below.
     const pushEvent: McplPushEvent = {
       type: 'mcpl:push-event',
       serverId,
@@ -302,8 +322,46 @@ export class PushHandler {
       tags: params.tags,
       timestamp: params.timestamp,
       inferenceId,
-      triggerInference,
+      triggerInference: true,
+      acceptedAt: Date.now(),
     };
+    // The source envelope is the host's, built at admission, before the item
+    // is gated, queued or acknowledged: nothing that changes while it waits
+    // can rewrite where it came from, and the gate reads the same envelope
+    // the direct path does. Building it accepts nothing: an ordinary push is
+    // accepted once its trigger filter returns (below), a coalesced one by
+    // its coalescer if it admits the occurrence.
+    const inboundSource = coalesced
+      ? this.coalescedSource?.(serverId, params, pushEvent)
+      : this.inboundSource?.(pushEvent);
+    if (inboundSource) pushEvent.inboundSource = inboundSource;
+
+    // 6. The shouldTriggerInference callback: decided now for an ordinary
+    // push; a coalesced one carries the inputs, decided once its coalescer
+    // admits it.
+    if (this.shouldTriggerInference) {
+      const textContent = content
+        .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
+        .map((b) => b.text)
+        .join('\n');
+      // The server's origin first; the host's own fields after it, so an
+      // origin key can never stand in for which server sent this or what
+      // kind of event it is; the frozen envelope last — always present, even
+      // undefined, so an origin key can't pose as it either — which the
+      // gate's route candidates read first.
+      const metadata: Record<string, unknown> = {
+        ...(params.origin ?? {}),
+        serverId,
+        featureSet: params.featureSet,
+        eventId: params.eventId,
+        eventType: 'mcpl:push-event',
+        ...(params.tags ? { tags: params.tags } : {}),
+        [INBOUND_SOURCE_KEY]: inboundSource,
+      };
+      if (coalesced) pushEvent.triggerInputs = { content: textContent, metadata };
+      else pushEvent.triggerInference = this.shouldTriggerInference(textContent, metadata);
+    }
+
     if (coalesced) {
       // RFC-006: the coalescer decides whether this occurrence replaces an
       // unread one, appends, or withdraws; it delivers through the same event
@@ -320,6 +378,7 @@ export class PushHandler {
       }
       return;
     }
+    if (inboundSource) this.inboundAccepted?.(inboundSource);
     this.pushEventFn(pushEvent);
 
     // 7. Emit trace

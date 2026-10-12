@@ -458,6 +458,7 @@ describe('Conversation routing', () => {
       channelRegistry: {
         handleChannelToolCall(name: string, input: unknown, origin?: unknown): Promise<{ success: boolean }>;
         stopAll(): void;
+        getChannelServerId?(id: string): string | null;
       } | null;
     };
 
@@ -466,7 +467,12 @@ describe('Conversation routing', () => {
     // channel_* tools). Stub the downstream boundary — the unit under test is
     // the fence ABOVE it, and a home-defaulted publish must get past the fence
     // to be observable at tool:started.
-    fw.channelRegistry = { handleChannelToolCall: async () => ({ success: true }), stopAll: () => {} };
+    fw.channelRegistry = {
+      handleChannelToolCall: async () => ({ success: true }),
+      stopAll: () => {},
+      // The home's sole registrant (a fork's home is a bare channel id).
+      getChannelServerId: (id: string) => (id === 'slack:C7' ? 'slack-a' : null),
+    } as typeof fw.channelRegistry;
 
     // (a) omitted channelId → rewritten to the home channel, passes the fence
     fw.dispatchChannelToolCall(forkName, { id: 'p1', name: 'channel_publish', input: { content: 'hello home' } });
@@ -487,6 +493,18 @@ describe('Conversation routing', () => {
       started.filter((t) => t.tool === 'channel_publish').length, 1,
       'foreign publish never reaches tool:started',
     );
+
+    // (c) the home's id on another server → rejected: the same id there is
+    // another conversation
+    fw.dispatchChannelToolCall(forkName, { id: 'p3', name: 'channel_publish', input: { channelId: 'slack:C7', serverId: 'slack-b', content: 'elsewhere' } });
+    const otherServer = failures.find((f) => f.callId === 'p3');
+    assert.ok(otherServer, 'the home id named on another server is rejected');
+    assert.ok(otherServer!.error.includes('on server slack-a; publishing to it on server slack-b is not allowed'), otherServer!.error);
+
+    // (d) the home with its own server → passes the fence
+    fw.dispatchChannelToolCall(forkName, { id: 'p4', name: 'channel_publish', input: { channelId: 'slack:C7', serverId: 'slack-a', content: 'here' } });
+    assert.ok(!failures.some((f) => f.callId === 'p4'), "naming the home's own server passes");
+    assert.equal(started.filter((t) => t.tool === 'channel_publish').length, 2);
 
     await framework.stop();
   });

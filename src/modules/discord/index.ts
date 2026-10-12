@@ -42,6 +42,13 @@ import type {
   FetchHistoryInput,
 } from './types.js';
 import { formatZonedDateTime, resolveTimeZone } from '../../timezone.js';
+import { markHeaderOpenings } from '../../mcpl/inbound-source.js';
+
+/** Discord text as stored: its header-shaped openings marked, as a channel
+ *  body's are, since only the host writes a [source: …] header. */
+function storedText(text: string): string {
+  return (markHeaderOpenings([{ type: 'text' as const, text }])[0] as { text: string }).text;
+}
 
 // Re-export event types for consumers who want to handle them
 export type { DiscordMessageEvent, DiscordEditEvent, DiscordDeleteEvent } from './types.js';
@@ -507,8 +514,9 @@ export class DiscordModule implements Module {
         });
       }
 
-      // Build content blocks from message and attachments
-      const contentBlocks = msg.contentBlocks ?? [{ type: 'text' as const, text: msg.content }];
+      // Build content blocks from message and attachments, with its
+      // header-shaped openings marked.
+      const contentBlocks = markHeaderOpenings(msg.contentBlocks ?? [{ type: 'text' as const, text: msg.content }]);
 
       // Return declarative response - framework applies all writes atomically
       return {
@@ -539,7 +547,7 @@ export class DiscordModule implements Module {
         editMessages: [
           {
             messageId: internalId,
-            content: [{ type: 'text', text: edit.newContent }],
+            content: [{ type: 'text', text: storedText(edit.newContent) }],
           },
         ],
       };
@@ -795,7 +803,7 @@ export class DiscordModule implements Module {
         
         this.ctx.addMessage(
           participantName,
-          [{ type: 'text', text: discordMsg.content }],
+          [{ type: 'text', text: storedText(discordMsg.content) }],
           {
             external: { source: 'discord', id: discordMsg.id },
             channelId,
@@ -805,10 +813,12 @@ export class DiscordModule implements Module {
         );
         newMessages++;
       } else {
-        // We have this message - check if content changed (offline edit detection)
-        if (stored.content !== discordMsg.content) {
+        // We have this message - check if content changed (offline edit
+        // detection), against the text as it would be stored.
+        const asStored = storedText(discordMsg.content);
+        if (stored.content !== asStored) {
           this.ctx.editMessage(stored.internalId, [
-            { type: 'text', text: discordMsg.content },
+            { type: 'text', text: asStored },
           ]);
           editedMessages++;
         }

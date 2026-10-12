@@ -51,6 +51,9 @@ function ordinaryEvent(text: string) {
   return {
     type: 'mcpl:push-event', serverId: 'notes', featureSet: 'notes',
     eventId: `ev-${n}`, content: [{ type: 'text', text }], timestamp: new Date().toISOString(),
+    // Names its channel, so the turn has a speech route (shelf-355: speech
+    // goes only to a conversation that woke the turn, never a fallback).
+    origin: { mcplChannelId: 'world:commons' },
     inferenceId: `inf-ev-${n}`, triggerInference: true,
   };
 }
@@ -105,10 +108,13 @@ async function make(opts: {
     modules: [mod],
   });
   (framework as any).channelRegistry = new Proxy({
-    resolveLocus: () => 'world:commons', getDefaultPublishChannel: () => 'world:commons',
+    resolveLocus: () => 'world:commons',
     routeSpeech: async () => ({ delivered: opts.deliver ?? true, channelId: 'world:commons' }),
     startTyping: () => {}, stopTyping: () => {},
     getChannelTools: () => [], getDescriptor: () => undefined,
+    // The channel declares a root publish target (MCPL RFC-011), so the
+    // route is publishable.
+    publishTarget: () => 'root', isChannelOpen: () => true,
   }, { get: (t, p: string) => p in t ? (t as any)[p] : () => undefined });
   return { dir, membrane, mod, framework };
 }

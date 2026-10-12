@@ -21,6 +21,7 @@ import type { StoredMessage } from '@animalabs/context-manager';
 import type { ChannelRegistry, TuneOutParams } from '../mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../mcpl/server-registry.js';
 import { CapabilityGrant } from '../mcpl/capability-grant.js';
+import { withoutSourceHeader } from '../mcpl/inbound-source.js';
 
 /** Defaults for tune_out tool params. */
 export const TUNE_OUT_DEFAULTS = {
@@ -42,7 +43,9 @@ export interface TuneOutFrameworkHooks {
     forAgent?: string,
   ) => string;
   /** Queue an inference request for an agent. */
-  requestInference: (agentName: string, reason: string, source: string) => void;
+  /** Wake an agent. `channelId`, when the wake is about a channel, says it
+   *  names that conversation, so the turn never takes the fallback route. */
+  requestInference: (agentName: string, reason: string, source: string, channelId?: string) => void;
   /** The subconscious's registry/participant name. */
   subconsciousName: () => string | null;
   /** The primary resident's registry name. */
@@ -214,7 +217,10 @@ export class TuneOutCoordinator {
 
     const lines = shown.map((m) => {
       const author = (m.metadata as { author?: { name?: string } } | undefined)?.author?.name ?? m.participant;
-      const text = m.content
+      // The body without its source header: the backlog names
+      // its channel itself, and each entry reads `author: body` rather than
+      // opening on the header.
+      const text = withoutSourceHeader(m.content, m.metadata, m.shardIndex)
         .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
         .map((b) => b.text)
         .join('\n');
@@ -245,7 +251,7 @@ export class TuneOutCoordinator {
     }
     const primary = this.hooks.primaryName();
     if (primary) {
-      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out');
+      this.hooks.requestInference(primary, `tune-out cancelled (${reason})`, 'tune-out', channelId);
     }
     // The subconscious gets one cancel turn of its own (unless it initiated
     // the cancel — its note already carries its words): the issue's cancel
@@ -261,7 +267,7 @@ export class TuneOutCoordinator {
         { system: true, kind: 'tune-out-cancel-report', channelId },
         subName,
       );
-      this.hooks.requestInference(subName, `tune-out cancelled: ${channelId}`, 'tune-out');
+      this.hooks.requestInference(subName, `tune-out cancelled: ${channelId}`, 'tune-out', channelId);
     }
     this.hooks.emitTrace({ type: 'tune-out:cancelled', serverId, channelId, epochId, reason, wakeCount: ended.wakeCount });
     return { ok: true };
@@ -414,7 +420,7 @@ export class TuneOutCoordinator {
       { system: true, kind: `tune-out-${trigger}`, channelId },
       subName,
     );
-    this.hooks.requestInference(subName, `tune-out ${trigger}: ${channelId}`, 'tune-out');
+    this.hooks.requestInference(subName, `tune-out ${trigger}: ${channelId}`, 'tune-out', channelId);
   }
 
   // ==========================================================================

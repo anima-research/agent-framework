@@ -81,11 +81,27 @@ import {
 import type { ChannelIncomingMessage, ChannelIncomingMessageResult, McplContentBlock, PushEventResult } from './mcpl/types.js';
 import { isSilentHeartbeatMarker, isVisiblyEmptyContent } from './mcpl/visible-content.js';
 import { parseProsePrefix, parseHybridProsePrefix } from './mcpl/prose-grammar.js';
-import { ProseStreamRouter } from './mcpl/prose-stream-router.js';
 import { detectKnownToolWrapperProse } from './tool-wrapper-prose-guard.js';
 import { InferenceRouter } from './mcpl/inference-router.js';
-import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry.js';
+import { ChannelRegistry, publishPlaceRefusal, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SpeechRouteView } from './mcpl/channel-registry.js';
+import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftSource, type DraftState, type InheritedRisk } from './prose-drafts.js';
+import {
+  continuationOf,
+  conversationKey,
+  describeConversation,
+  inferTurnRoute,
+  isConversational,
+  readThreadId,
+  routeConversation,
+  routeRefusal,
+  suspendsRoute,
+  type ConversationRef,
+  type RouteCandidate,
+  type SpeechRoute,
+  type TurnRoute,
+} from './speech-routes.js';
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
+import { INBOUND_SOURCE_KEY, headerValue, labelValue, markHeaderOpenings, quoted, readInboundSource, renderSourceHeader, SOURCE_HEADER_RULE, sourceBodyDigest, type InboundAcceptanceObserver, type InboundChannelSource, type InboundLane, type InboundSource, type InboundUnscopedSource } from './mcpl/inbound-source.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
 import {
@@ -110,7 +126,7 @@ import {
   scriptTimeLimits,
   validateCodeExecutionConfig,
 } from './code-execution/tool-definition.js';
-import { splitProseSegments } from './prose-segments.js';
+import { splitProseRuns } from './prose-segments.js';
 import { cumulativeDelta } from './usage-accounting.js';
 import { stampThinkingTokenEstimates } from './thinking-token-stamp.js';
 
@@ -177,6 +193,38 @@ const isSilencingTool = (name: string): boolean => {
   return SILENCING_TOOLS.has(bare) || WORLD_PUBLICATION_TOOLS.has(bare);
 };
 
+/** True when a model-issued call silences the round's auto-routed prose: a
+ *  silencing tool by name, or the resident's `drafts` resend (an explicit
+ *  send, though inspecting drafts is not). */
+const isSilencingCall = (call: { name: string; input?: unknown }): boolean => {
+  if (isSilencingTool(call.name)) return true;
+  return bareToolName(call.name) === 'drafts'
+    && (call.input as { action?: unknown } | null | undefined)?.action === 'resend';
+};
+
+/** Hybrid prose envelopes: every line starting with `>>>` opens a new one.
+ *  Leading whitespace before a `>>>` is dropped; blank envelopes are skipped. */
+const splitHybridEnvelopes = (rawText: string): string[] => {
+  const envelopes: string[] = [];
+  let current: string[] = [];
+  for (const line of rawText.split('\n')) {
+    if (line.trimStart().startsWith('>>>') && current.length > 0) {
+      envelopes.push(current.join('\n'));
+      current = [];
+    }
+    current.push(line);
+  }
+  if (current.length > 0) envelopes.push(current.join('\n'));
+  return envelopes.filter((e) => e.trim()).map((e) => e.replace(/^\s+(?=>>>)/, ''));
+};
+
+/** Why a round's calls silence its prose: `skip_reply` deliberately keeps it
+ *  private; an explicit send holds it back as resendable drafts. */
+const silenceCauseOf = (calls: Array<{ name: string; input?: unknown }>): 'send' | 'private' | null => {
+  if (calls.some((c) => bareToolName(c.name) === 'skip_reply')) return 'private';
+  return calls.some(isSilencingCall) ? 'send' : null;
+};
+
 /**
  * True when an injected message is real conversational input — something the
  * agent might actually be replying to — rather than ambient machinery.
@@ -187,9 +235,7 @@ const isSilencingTool = (name: string): boolean => {
 const isConversationalInjection = (metadata?: MessageMetadata): boolean => {
   if (!metadata) return true;
   const m = metadata as Record<string, unknown>;
-  if (m.system === true) return false;
-  if (Array.isArray(m.tags) && m.tags.includes('chat:reaction')) return false;
-  return true;
+  return isConversational(Array.isArray(m.tags) ? (m.tags as string[]) : undefined, m);
 };
 
 /**
@@ -227,6 +273,28 @@ function estimateAppendedRoundTokens(
   }
   const blockCount = toolResults.length + injections.length;
   return Math.ceil(chars / 4) + images * 1600 + blockCount * 20;
+}
+
+/**
+ * A turn's routing state, and what a continuation of the turn needs from it
+ * after the turn's teardown: for a silent wake (suppressProse), its prompt
+ * and stamp, so the continuation is a silent tick too (continuationFor).
+ */
+type TurnRecord = TurnRoute & {
+  silent?: Pick<InferenceRequest, 'ephemeralSystemPrompt' | 'silentHeartbeat'>;
+};
+
+/**
+ * What decides where one piece of speech goes, captured when its words were
+ * produced: the turn's route then. Speech is published later, in order, on
+ * the agent's speech chain, and a tool result (a channel_open) or an arrival
+ * (a hold) can land in between; neither may change where words already
+ * written go. `inferenceId` names the physical stream that wrote them: once
+ * published, they go to that inference's outgoing stream (MCPL §14.3).
+ */
+interface SpeechMoment {
+  turn: TurnRoute | undefined;
+  inferenceId?: string;
 }
 
 /**
@@ -271,19 +339,20 @@ const isAddressedMessage = (
   _metadata?: Record<string, unknown>,
 ): boolean => Array.isArray(tags) && tags.includes('chat:addressed');
 
-// parseProsePrefix moved to ./mcpl/prose-grammar.ts — ONE grammar shared with
-// the outgoing-stream router (Spec 14.3), so streamed chunks and delivered
-// envelopes can never disagree on what is a prefix.
+// parseProsePrefix lives in ./mcpl/prose-grammar.ts. Outgoing streams (Spec
+// 14.3) carry only what delivery published, so no second parser reads it.
 
 /** One-time primer appended when an agent's proseRouting mode changes. */
 function proseModePrimer(mode: 'explicit' | 'hybrid' | 'locus' | 'disabled'): string {
   if (mode === 'locus') {
-    return '[prose-routing] Mode change: your plain text auto-routes to the ' +
-      'conversational locus again. `>>` destination prefixes are no longer needed.';
+    return '[prose-routing] Mode change: your plain text goes again to the conversation ' +
+      'that woke your turn (or a channel you open); when that is unclear it is held as a ' +
+      'draft. `>>` destination prefixes are no longer needed.';
   }
   if (mode === 'hybrid') {
-    return '[prose-routing] Hybrid routing enabled: unprefixed text still lands in the ' +
-      'current conversational locus. A leading `>>>destination` envelope instead routes ' +
+    return '[prose-routing] Hybrid routing enabled: unprefixed text still goes to the ' +
+      'conversation that woke your turn (held as a draft when that is unclear). A leading ' +
+      '`>>>destination` envelope instead routes ' +
       'that prose to one uniquely resolved authorized Discord or Eidoverse channel. The ' +
       'envelope remains in your memory but recipients see only its body; delivery or failure ' +
       'is reported back to you.';
@@ -315,9 +384,11 @@ const PROSE_ROUTING_HELP =
   '  Append " !" after the destination (e.g. ">>#ops !") to start your next turn\n' +
   '  immediately when this one ends, instead of pausing until the next event.\n' +
   '  >>skip_reply — text stays in your context only, like the skip_reply tool.\n' +
-  'Text without a destination is not delivered: it is retained, and a notice will\n' +
-  'prompt you to resend — reply e.g. ">>#channel {{unsent}}" to deliver the retained\n' +
-  'text unchanged. Send tools (send_message, send_dm, …) are unaffected.';
+  'Text without a destination is not delivered: it is held as a draft, and a notice\n' +
+  'names it — reply e.g. ">>#channel {{unsent}}" to deliver your latest held text\n' +
+  'unchanged, or use the drafts tool to list, resend or dismiss any draft by id.\n' +
+  '">>skip_reply {{unsent}}" sets the latest one aside. Send tools (send_message,\n' +
+  'send_dm, …) are unaffected.';
 
 const PROSE_HELP_TOOL: import('./types/index.js').ToolDefinition = {
   name: 'prose_help',
@@ -444,6 +515,11 @@ interface CoalescedChannelEvent {
   assemblingFor?: string;
   /** RFC-006 §3.2: deliver into this agent only (replacement / notice audience). */
   deliverTo?: string;
+  /** Host acceptance time (epoch ms), stamped where the message was admitted. */
+  acceptedAt?: number;
+  /** Framework-owned source envelope, frozen at a coalesced occurrence's
+   *  acceptance so its later delivery cannot restamp it (inbound-source.ts). */
+  inboundSource?: InboundSource;
 }
 type CoalescedDelivery =
   | { lane: 'channel'; event: CoalescedChannelEvent }
@@ -952,6 +1028,15 @@ function truncateReason(reason: string, max = 160): string {
   return reason.length <= max ? reason : reason.slice(0, max) + '…';
 }
 
+/** Where one segment of a turn's plain speech was delivered, as resolved then. */
+interface ProseDelivery {
+  serverId?: string;
+  channelId: string;
+  /** The channel's label when the words were delivered. */
+  label?: string;
+  threadId?: string;
+}
+
 export class AgentFramework {
   private toolPresentations = new Map<string, ToolPresentation>();
   private presentationPreviews = new WeakMap<object, PresentationSnapshot>();
@@ -968,16 +1053,6 @@ export class AgentFramework {
   private inferencePolicy: InferencePolicy;
   private errorPolicy: ErrorPolicy;
   private pendingRequests: InferenceRequest[] = [];
-  /**
-   * Per-agent channel that triggered the agent's CURRENT inference turn, if any
-   * (item-3 redux). Read by the ChannelRegistry's `activeChannelResolver` to
-   * route a single-trunk agent's plain-text speech back to the channel it is
-   * answering, instead of the process-global most-recent-inbound locus that a
-   * concurrent message elsewhere can hijack. Set at turn start (or cleared for a
-   * heartbeat / no-trigger turn) in startAgentStream; overwritten by the next
-   * turn. Never read between turns (a given agent runs one turn at a time).
-   */
-  private activeTriggerChannels: Map<string, string> = new Map();
   private running = false;
   private loopPromise: Promise<void> | null = null;
   /** Quiesce/maintenance mode (issue #122). DELIBERATELY separate from
@@ -1015,33 +1090,43 @@ export class AgentFramework {
   private processLoggingPersist: boolean;
   private processLoggingBroadcast: boolean;
   private activeStreams: Map<string, Promise<void>> = new Map();
+  /** Told once per inbound acceptance (mcpl/inbound-source.ts). An internal
+   *  seam, unset here: the receipt work (shelf-354) assigns it inside the
+   *  framework, and tests set it by cast. */
+  private inboundAcceptanceObserver?: InboundAcceptanceObserver;
 
-  /** Per-agent output locus FROZEN for the CURRENT logical turn. Resolved
-   *  eagerly in startAgentStream (home → addressed trigger → global default)
-   *  and never moved until the next turn: mid-turn injected messages — ambient
-   *  chatter, reactions, system markers — must not hijack where the agent's
-   *  plain prose lands (2026-07-21 Cairn lounge misroute). Lives here — not in
-   *  driveStream locals — so the pin survives a context-budget stream restart,
-   *  which continues the same logical turn in a fresh driveStream. Cleared or
-   *  re-set at the start of every non-restart turn. Since 2026-07-31 the pin
-   *  is no longer fully frozen: an ADDRESSED conversational injection — or a
-   *  conversational follow-up in a channel the agent itself explicitly sent
-   *  into this turn (turnEngagedChannels) — re-pins it at the boundary (see
-   *  the addressed re-pin block in the tool-result handler). Ambient chatter
-   *  elsewhere, reactions, and system markers still cannot move it. */
-  private turnLocusPins: Map<string, string> = new Map();
-  /** Channels the agent EXPLICITLY sent into during the CURRENT turn
-   *  (SEND_ENGAGEMENT_TOOLS, successful calls), per agent. Second re-pin
-   *  signal: a conversational reply in a channel the agent just engaged is
-   *  addressed by context even without a mention (2026-07-31 n=7: q's
-   *  #portables follow-up — no @mention — was answered in trailing prose
-   *  that followed the stale pin into repligate's DM). No author-kind
-   *  filter: agent-residents are full participants, and the bot flag
-   *  tracks nothing that matters (antra). Reactions/system markers are
-   *  excluded by isConversationalInjection; the engaged-this-turn scope
-   *  keeps unrelated channels from moving the pin. Cleared at every fresh
-   *  turn's start; budget restarts keep it. */
-  private turnEngagedChannels: Map<string, Set<string>> = new Map();
+  /** Per-agent speech route for the CURRENT logical turn (shelf-355,
+   *  src/speech-routes.ts): where unaddressed plain speech goes. Decided at a
+   *  true new turn — a fork's home, else inferred from the wake's candidates
+   *  (addressed first; one conversation only, else held) — and changed during
+   *  the turn only by the resident's own channel_open, or suspended by a
+   *  competing addressed/engaged arrival (the ambiguity hold). Incoming
+   *  traffic never selects a new destination. Lives here, not in driveStream,
+   *  so context-budget restarts and retries keep it. */
+  private turnRoutes: Map<string, TurnRecord> = new Map();
+  /** Where the agent EXPLICITLY sent during the CURRENT turn, per agent: the
+   *  second ambiguity signal. A conversational reply where the agent just
+   *  sent competes for its unaddressed words even without a mention
+   *  (2026-07-31 n=7: q's #portables follow-up — no @mention — was answered
+   *  in trailing prose that followed the stale pin into repligate's DM), so
+   *  it holds an inferred route (shelf-355). Recorded as exactly as the host
+   *  knows the place (noteSendEngagement, noteChannelEngagement):
+   *  - `conversations`: the exact conversation (conversationKey: server,
+   *    channel, thread) of the host's own publications — a resend or
+   *    channel_publish whose outcome was delivered, or unknown (something
+   *    may have been posted there: a possible reply claim, not a delivery);
+   *  - `channels`: the server and channel of a connector's own send tool
+   *    (SEND_ENGAGEMENT_TOOLS), which chooses the place in the channel
+   *    itself, so any conversation there may be the one it engaged.
+   *  No author-kind filter: agent-residents are full participants, and the
+   *  bot flag tracks nothing that matters (antra). Reactions/system markers
+   *  are excluded by isConversationalInjection; the engaged-this-turn scope
+   *  keeps unrelated conversations from holding anything. Cleared at every
+   *  fresh turn's start; budget restarts keep it. */
+  private turnEngagement: Map<string, {
+    conversations: Map<string, 'delivered' | 'unknown'>;
+    channels: Set<string>;
+  }> = new Map();
   /** Channels this turn's PLAIN PROSE was actually delivered to, in delivery
    *  order (deduped at render). Feeds the `[delivered]` receipt appended at
    *  logical turn end: explicit sends receipt themselves via their
@@ -1050,7 +1135,7 @@ export class AgentFramework {
    *  words landed (2026-07-31 misroute series; antra: minimal receipts).
    *  Cleared at every fresh turn's start; budget restarts keep it (same
    *  logical turn, receipt covers the whole turn). */
-  private turnProseDeliveries: Map<string, string[]> = new Map();
+  private turnProseDeliveries: Map<string, ProseDelivery[]> = new Map();
   /** Count of plain-prose segments SUPPRESSED this turn by sticky
    *  explicit-send silencing. The suppression rule itself is untouched
    *  (antra, 2026-07-31: visibility is enough) — but it must never be a
@@ -1067,20 +1152,60 @@ export class AgentFramework {
    *  driveStream to clear sticky explicit-send suppression before handling
    *  the next model round. Never affects routing: the turn locus is frozen. */
   private midTurnInputSignals: Set<string> = new Set();
-  /** Last outbound locus announced to each agent as a durable `[routing]`
-   *  window message. Announce-on-change only: steady state emits nothing
-   *  (KV-safe, no per-turn chatter). In-memory — after a process restart the
-   *  first turn's locus is announced once to re-establish the baseline. */
-  private lastAnnouncedLocus: Map<string, string | null> = new Map();
+  /** The route last announced to each agent in a durable `[routing]` window
+   *  message, as its identity key. Announce-on-change only (KV-safe, no
+   *  per-turn chatter). In-memory: after a restart the first turn's route is
+   *  announced once to re-establish the baseline. */
+  private lastAnnouncedRoute: Map<string, string> = new Map();
+  /** Whether the agent's current live round presents mid-turn injections
+   *  (native rounds do; XML rounds don't), for the ambiguity hold. */
+  private roundPresentsInjections: Map<string, boolean> = new Map();
+
+  // ---- Held prose drafts (src/prose-drafts.ts) ---------------------------
+  /** Every resident's held drafts: suppressed, bounced or ambiguous plain
+   *  speech, never published except by their resident's resend, kept until
+   *  resent or dismissed. */
+  private proseDrafts: ProseDraftStore;
+  /** Drafts held during the current logical turn, for its `[delivered]`
+   *  receipt. Cleared each fresh turn; restarts keep it. */
+  private turnDrafts: Map<string, Draft[]> = new Map();
+  /** Plain-speech segments this turn kept private by the resident's own
+   *  choice (skip_reply in the same round) — counted, never drafted. */
+  private turnProsePrivate: Map<string, number> = new Map();
+  /** Segments that should have been held as drafts but could not be
+   *  journaled (the words remain in the resident's history only). */
+  private turnDraftFailures: Map<string, { count: number; error: string }> = new Map();
 
   // ---- Explicit prose routing (docs/explicit-prose-routing.md) ----------
-  /** Latest bounced (undelivered) prose per agent — the `{{unsent}}` source. */
-  private proseClipboards: Map<string, string> = new Map();
-  /** Sticky per-TURN delivery target set by the turn's first `>>` prefix.
-   *  Cleared at every non-restart turn start; survives context restarts. */
-  private proseTargetPins: Map<string, string> = new Map();
-  /** Hybrid router is fail-closed after a malformed/unresolved envelope until a new valid target. */
-  private proseHybridSuppressed: Set<string> = new Set();
+  /** Sticky per-TURN delivery target set by a `>>` (explicit) or `>>>`
+   *  (hybrid) prefix. Written and read on the speech chain, in the order the
+   *  words were written. Cleared at a true new turn; a context restart or
+   *  framework retry continues the turn and keeps it. */
+  private proseTargetPins: Map<string, { serverId: string; channelId: string }> = new Map();
+  /** Hybrid router is fail-closed after a `>>>skip_reply` envelope (the
+   *  rest is private) or a malformed/unresolved/undelivered one (the rest is
+   *  held as drafts, having no destination) until a new valid target. On the
+   *  speech chain, like the pins. */
+  private proseHybridSuppressed: Map<string, 'private' | 'failed'> = new Map();
+  /** Per agent: the number of its current logical turn, advanced only at a
+   *  true new turn (a context restart or framework retry keeps it). A tool
+   *  completion that arrives after a newer turn has begun compares it, so it
+   *  can't change that turn's speech (channel_open). */
+  private logicalTurns: Map<string, number> = new Map();
+  /** Outgoing streams (MCPL §14.3) by inference id: what each physical
+   *  stream's published prose has sent to each channel so far, and the next
+   *  chunk index. Completed and removed after the stream's last speech
+   *  (completeOutgoingStreams). */
+  private outgoingStreams: Map<string, {
+    conversationId: string;
+    index: number;
+    channels: Map<string, { serverId: string; channelId: string; text: string }>;
+  }> = new Map();
+  /** Per agent: the ordered chain of speech deliveries (chainSpeech). One
+   *  chain for all of an agent's physical streams, so a restart's or
+   *  retry's speech can never overtake words still being published from
+   *  the stream before it. Each link catches its own error. */
+  private speechChains: Map<string, Promise<void>> = new Map();
   /** Agents whose current turn requested `!` continuation — re-woken when the
    *  turn completes instead of pausing until the next external event. */
   private proseContinuations: Set<string> = new Set();
@@ -1403,8 +1528,8 @@ export class AgentFramework {
 
   // Session-level token usage tracking (always-on)
   private usageTracker: UsageTracker;
-  /** Explicit-send suppression carried into a tool-result-guard retry. */
-  private guardRetryTurnSilenced = new Map<string, boolean>();
+  /** Explicit-send or private suppression carried into a tool-result-guard retry. */
+  private guardRetryTurnSilenced = new Map<string, 'send' | 'private'>();
   /** Presentation-only wall-clock zone; persistence remains UTC/epoch. */
   private readonly timeZone: string;
 
@@ -1427,6 +1552,9 @@ export class AgentFramework {
     this.operatorLog = operatorLog;
     this.store = store;
     this.ownsStore = ownsStore;
+    // Held prose drafts live in typed Chronicle records that do not follow
+    // branch switches (RecordJournal): replayed here, never re-sent.
+    this.proseDrafts = new ProseDraftStore(store);
     this.membrane = membrane;
     this.inferencePolicy = inferencePolicy;
     this.errorPolicy = errorPolicy;
@@ -1678,6 +1806,25 @@ export class AgentFramework {
         emitTrace: (e) => framework.emitTrace(e as { type: TraceEvent['type']; [key: string]: unknown }),
         addMessage: (p, c, m, forAgent) => framework.addMessage(p, c, m as MessageMetadata, forAgent ? { forAgent } : undefined),
         requestInference: (agentName, reason, source, provenance) => {
+          // The batch's conversations as speech-route candidates. The fork
+          // rule is applied to them at turn start (beginAgentTurn), as for
+          // every wake.
+          const routeCandidates = (provenance?.routeCandidates ?? [])
+            .map((c): RouteCandidate => c.kind === 'surface'
+              ? { conversation: { kind: 'surface', surface: c.surface }, addressed: true, at: c.at }
+              : c.unroutable
+                ? {
+                    conversation: {
+                      kind: 'channel',
+                      ...(c.serverId ? { serverId: c.serverId } : {}),
+                      channelId: c.channelId,
+                      ...(c.threadId ? { threadId: c.threadId } : {}),
+                    },
+                    addressed: c.addressed,
+                    at: c.at,
+                    unroutable: true,
+                  }
+                : framework.candidateForChannel(c.channelId, c.addressed, c.at, c.serverId, c.messageId, c.threadId));
           framework.pendingRequests.push({
             agentName, reason, source, timestamp: Date.now(),
             // gate-requested wakes carry where/who (EventGate wakeProvenance)
@@ -1686,21 +1833,22 @@ export class AgentFramework {
             ...(provenance?.counterparty ? { counterparty: provenance.counterparty } : {}),
             ...(provenance?.at ? { wakeAt: provenance.at } : {}),
             // A batch that contains an ADDRESSED message (mention / reply /
-            // DM) routes like the direct path does: the reply goes to that
-            // message's channel. Without it the turn froze on the
-            // process-global most-recent-inbound channel, which an ambient
-            // message elsewhere could retarget between the DM's arrival and
-            // the debounce firing (2026-09-30). Ambient-only batches set no
-            // locus and keep the legacy fallback.
+            // DM) marks the wake addressed, with that message's channel as
+            // the request's channelId, as the direct path does; an
+            // ambient-only batch sets neither. Neither is the speech route: a
+            // true new turn infers that from the batch's route candidates
+            // below (shelf-355).
             //
             // The wake is broadcast to every agent, conversation forks
             // included, and a fork speaks only in its home channel: the
             // route applies to a fork only when it IS that home, and never to
             // another agent when a fork owns that channel. Otherwise a fork
             // bound elsewhere would show typing where it isn't replying.
-            ...(provenance?.routeChannelId && framework.mayTakeGateRoute(agentName, provenance.routeChannelId)
+            ...(provenance?.routeChannelId && framework.mayTakeRoute(agentName, provenance.routeChannelId)
               ? { channelId: provenance.routeChannelId, addressed: true }
               : {}),
+            ...(routeCandidates.length > 0 ? { routeCandidates } : {}),
+            ...(provenance?.namesConversation ? { namesConversation: true as const } : {}),
           });
         },
         getAgentNames: () => [...framework.agents.keys()].filter(
@@ -1849,9 +1997,7 @@ export class AgentFramework {
           addMessage: (participant, content, metadata, forAgent) =>
             framework.addMessage(participant, content, metadata as MessageMetadata,
               forAgent ? { forAgent } : undefined),
-          requestInference: (agentName, reason, source) => {
-            framework.pendingRequests.push({ agentName, reason, source, timestamp: Date.now() });
-          },
+          requestInference: framework.queueTuneOutWake.bind(framework),
           subconsciousName: () => framework.subconsciousAgentName,
           primaryName: () => framework.primaryAgentName,
           getStoredMessages: () => {
@@ -2011,6 +2157,10 @@ export class AgentFramework {
       await this.loopPromise;
     }
 
+    // Speech the streams already wrote is still on its agents' speech
+    // chains: let it publish while the connections are open, bounded.
+    await this.settleSpeechChains('before the connections close');
+
     // Stop typing indicators
     this.channelRegistry?.stopAll();
 
@@ -2024,6 +2174,12 @@ export class AgentFramework {
       shutdownPromises.push(this.mcplServerRegistry.closeAll());
     }
     await Promise.all(shutdownPromises);
+
+    // A publish still waiting has its answer now that the connections are
+    // closed, and speech queued behind it can no longer go out: let the
+    // chains record what became of their words while the store is open (a
+    // publish that provably sent nothing keeps its words as a draft).
+    await this.settleSpeechChains('before the store closes');
 
     // Streams may queue storage repairs while being cancelled above. Retry
     // after their teardown, while the store is still open, before final sync.
@@ -2206,8 +2362,8 @@ export class AgentFramework {
     }
     const recovery = this.providerAccelerationRecoveries.get(agentName);
     if (recovery) { recovery.releasedAt = Date.now(); recovery.heldRequests = cooldown.heldRequests.length; }
-    const requests = cooldown.heldRequests.length > 0 ? cooldown.heldRequests : [{ agentName,
-      reason: 'provider-acceleration-retry', source: 'framework', timestamp: Date.now() } satisfies InferenceRequest];
+    const requests = cooldown.heldRequests.length > 0 ? cooldown.heldRequests
+      : [this.continuationRequest(agentName, 'provider-acceleration-retry')];
     this.pendingRequests.push(...requests);
     console.error(`[provider-cooldown] agent=${agentName} released after ${Date.now() - cooldown.startedAt}ms — ` +
       `fresh compile queued with ${requests.length} retained request(s)`);
@@ -2357,9 +2513,57 @@ export class AgentFramework {
   }
 
   /**
+   * A server's push or incoming message the host couldn't handle, answered
+   * with a JSON-RPC error when it is a request (a notification has no one to
+   * answer, and is logged), rather than thrown out of the connection's
+   * listener, where it was an unhandled rejection and the server's request
+   * waited for its timeout.
+   * - `refused`: the listener turned it away before its handler ran; the
+   *   host is stopping, and none of it was taken.
+   * - `failed`: the handler threw (the host stopped while it ran, or a
+   *   fault; whatever it threw, `undefined` included). The request failed,
+   *   but the handler may have admitted part of it first (an earlier message
+   *   of a batch), so nothing here claims that none of it was taken.
+   */
+  private refuseServerItem(
+    method: string,
+    serverId: string,
+    responder: { respondError?: (code: number, message: string) => void } | undefined,
+    outcome: { kind: 'refused' } | { kind: 'failed'; error: unknown },
+  ): void {
+    // Optional chaining: prototype-built harnesses leave the queue unset.
+    const reason = outcome.kind === 'refused'
+      ? 'the host is stopping'
+      : this.queue?.isClosed
+        ? 'the host stopped while handling this request'
+        : outcome.error instanceof Error
+          ? outcome.error.message
+          : `the handler failed${outcome.error === undefined ? '' : `: ${String(outcome.error)}`}`;
+    console.error(outcome.kind === 'refused'
+      ? `[mcpl] ${method} from ${serverId} refused: ${reason}`
+      : `[mcpl] ${method} from ${serverId} failed: ${reason} (part of it may already have been admitted)`);
+    try {
+      responder?.respondError?.(-32603, reason);
+    } catch {
+      // The connection is going too; there is no one left to tell.
+    }
+  }
+
+  /**
    * Push a process event to the queue.
+   *
+   * After stop() the queue is closed and this throws, so a direct caller
+   * learns the framework is stopped — except for a tool's result. A call
+   * still running at stop() completes later, into a callback with nothing
+   * to catch the throw (an unhandled rejection), and nothing could take its
+   * result anyway: the stream that asked is gone, and the tool has already
+   * run. That result is dropped, and the drop is logged.
    */
   pushEvent(event: ProcessEvent): void {
+    if (event.type === 'tool-result' && this.queue?.isClosed) {
+      console.error(`[framework] ${event.agentName}: result of tool call ${event.callId} (${event.moduleName}) arrived after stop — dropped`);
+      return;
+    }
     this.queue.push(event);
     this.emitTrace({ type: 'process:received', processEvent: event });
   }
@@ -2466,6 +2670,9 @@ export class AgentFramework {
     // Copy: getChannelTools() returns the registry's shared definitions
     // array; pushing onto it would append another tune_out on every call.
     const channelTools = [...(this.channelRegistry?.getChannelTools() ?? [])];
+    if (this.channelRegistry) {
+      channelTools.push(AgentFramework.DRAFTS_TOOL);
+    }
     if (this.tuneOutCoordinator) {
       channelTools.push(AgentFramework.TUNE_OUT_TOOL);
     }
@@ -4611,6 +4818,63 @@ export class AgentFramework {
     inputSchema: { type: 'object' },
   };
 
+  /** How long, in days, a draft beyond a resident's newest is kept (KEEP_IDLE_MS). */
+  private static readonly DRAFT_KEEP_DAYS = Math.round(KEEP_IDLE_MS / 86_400_000);
+
+  /** Synthesized drafts tool — present whenever MCPL channels are
+   *  configured. A resident's held drafts (src/prose-drafts.ts): plain speech
+   *  that was not sent, never published except by its resident's resend, and
+   *  kept as that module's retention says. Nullable
+   *  fields, cast like save_recent_image's: a caller whose provider presents
+   *  every property as required can still say "not in use". */
+  private static readonly DRAFTS_TOOL = {
+    name: 'drafts',
+    description:
+      'Your held drafts: plain speech of yours that was NOT sent — held back because an explicit send in the ' +
+      'same round holds plain speech back, because a routing prefix bounced, or because it had no destination. ' +
+      `Drafts are never published except by your own resend, and only you can list or act on them. Your ${KEEP_NEWEST} newest ` +
+      `drafts are always kept; an older one is let go after ${AgentFramework.DRAFT_KEEP_DAYS} days in which nothing happened to it. ` +
+      'list: your open drafts, newest first. read: drafts in full, with every delivery attempt. ' +
+      'resend: publish drafts verbatim, in the order given, to one destination ("#channel", "@person" or a ' +
+      'channel id) — an explicit send, like send_message; it stops at the first draft not confirmed delivered. ' +
+      'A draft already delivered returns its receipt instead of sending again. If an earlier attempt may ' +
+      'already have been posted (its outcome is unknown), resend needs confirmDuplicate: true. dismiss: set ' +
+      'drafts aside (your history keeps the words). A field you are not using may be omitted or passed as null.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'read', 'resend', 'dismiss'], description: 'What to do.' },
+        draftIds: {
+          type: ['array', 'null'],
+          items: { type: 'string' },
+          description: 'read, resend, dismiss: draft ids such as "d-k7x3q", in order. null for list.',
+        },
+        destination: {
+          type: ['string', 'null'],
+          description: 'resend: where to publish — "#channel", "@person" or a channel id. null otherwise.',
+        },
+        threadId: {
+          type: ['string', 'null'],
+          description:
+            'resend: a thread of the destination channel to post in (the id from a [source: … · thread <id>] ' +
+            'line), where its connector can post into a named thread. null, like omitting it, means the ' +
+            "channel's root.",
+        },
+        confirmDuplicate: {
+          type: ['boolean', 'null'],
+          description:
+            'resend: true to send a draft again although an earlier attempt may already have been posted. ' +
+            'null or false otherwise.',
+        },
+        offset: {
+          type: ['integer', 'null'],
+          description: 'list: how many of the newest drafts to skip. null, like omitting it, means 0.',
+        },
+      },
+      required: ['action'],
+    },
+  } as unknown as import('./types/index.js').ToolDefinition;
+
   /** Synthesized save_image tool — present when a workspace module is
    *  registered. Lets the agent persist an image it has already seen in its
    *  own context (Discord attachments arrive inlined as base64 and are
@@ -4769,14 +5033,14 @@ export class AgentFramework {
   };
 
   /**
-   * Mark an inference refusal visibly: react on the message that holds the
-   * conversational locus (the most recent incoming channel message) with a
-   * category-specific emoji. Best-effort — failures are logged, never thrown,
-   * and non-Discord loci are silently skipped.
+   * Mark an inference refusal visibly: react on the message the agent's
+   * speech route answers (its reply edge) with a category-specific emoji.
+   * Best-effort — failures are logged, never thrown; a turn without a
+   * channel route (held, surface, none) and non-Discord routes are skipped.
    */
   private async reactToRefusal(agentName: string, category: string): Promise<void> {
     try {
-      const incoming = this.channelRegistry?.buildChannelContext()?.incoming;
+      const incoming = this.channelRegistry?.buildChannelContext(agentName)?.incoming;
       if (!incoming) return;
       // incoming.channelId is the MCPL composite id ("discord:<guild>:<channel>");
       // the reaction tool wants the raw Discord channel (or thread) id — the
@@ -4933,7 +5197,7 @@ export class AgentFramework {
   /**
    * Announce a refusal-rewind on the conversational surface (Discord), used
    * when the withheld turn was a *human* message so it isn't dropped silently.
-   * Best-effort; mirrors reactToRefusal's locus resolution.
+   * Best-effort; mirrors reactToRefusal: the agent's own route's reply edge.
    */
   private async announceRewind(
     agentName: string,
@@ -4941,7 +5205,7 @@ export class AgentFramework {
     category: string,
   ): Promise<void> {
     try {
-      const incoming = this.channelRegistry?.buildChannelContext()?.incoming;
+      const incoming = this.channelRegistry?.buildChannelContext(agentName)?.incoming;
       if (!incoming) return;
       const parts = incoming.channelId.split(':');
       if (parts[0] !== 'discord') return;
@@ -5180,6 +5444,12 @@ export class AgentFramework {
       if (agent.state.status !== 'idle') {
         return { ok: false, error: `Cannot unstick while agent is ${agent.state.status}` };
       }
+      // A turn is alive from its dequeue to its settled teardown, which
+      // includes moments the state machine reads idle: the start of a turn
+      // before its inference, and the end of one after endTurn's reset.
+      if (this.activeTurnTokens.has(agentName)) {
+        return { ok: false, error: 'Cannot unstick while a turn is in progress' };
+      }
       const cap = Math.max(1, Math.min(10,
         Math.floor(params.maxRewinds ?? agent.refusalHandling?.maxRewinds ?? 3)));
       this.forcedRewind.set(agentName, {
@@ -5189,12 +5459,7 @@ export class AgentFramework {
         channelId: params.channelId ?? '',
       });
       this.refusalRewinds.set(agentName, 0);
-      this.pendingRequests.push({
-        agentName,
-        reason: 'unstick',
-        source: 'framework',
-        timestamp: Date.now(),
-      });
+      this.pendingRequests.push(this.continuationRequest(agentName, 'unstick'));
       console.error(
         `[unstick] agent=${agentName} started cap=${cap} ` +
           `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
@@ -6768,74 +7033,106 @@ export class AgentFramework {
             : 0;
           const overPhysical = projectedRealTokens > (agent.physicalWindowTokens ?? Infinity);
 
-          // Addressed re-pin (2026-07-31 Mythos misroutes, antra-ratified):
-          // when someone ADDRESSES the agent mid-turn from another channel
-          // (mention / reply / DM — the same chat:addressed signal the
-          // turn-START batch policy prefers), the agent's subsequent plain
-          // prose almost always answers THEM. Six recorded misroutes
-          // delivered those answers to the stale frozen locus instead (the
-          // LabClaude answer into #hospital_commons mid-examination; the
-          // hospital scene into antra's DM). Re-pin the turn locus to the
-          // LAST addressed conversational injection, at segment granularity:
-          // prose routed in earlier rounds already went to the old pin,
-          // which was correct when it was delivered. Ambient chatter,
-          // reactions, and system markers still cannot move the pin — the
-          // 2026-07-21 Cairn hijack protection is unchanged; this extends
-          // the ratified addressed-outranks-ambient principle from turn
-          // start to boundaries. Locus mode only (explicit mode has no pin).
-          // Skipped on endTurn/overBudget: no further prose this stream, and
-          // a stale "for this turn" notice would be pure noise.
+          // Ambiguity hold (shelf-355; replaces the 2026-07-31 addressed
+          // re-pin). When an arrival PRESENTED in this batch is a
+          // conversational message from another conversation that addressed
+          // the resident (mention / reply / DM / its local surface), or that
+          // continues a conversation the resident explicitly sent into this
+          // turn, the resident's next unaddressed words could answer either
+          // conversation. Re-pinning to the newcomer guessed — and sent words
+          // still meant for the first conversation into the second. The
+          // inferred route is held instead: unaddressed speech becomes drafts
+          // until the turn ends or a deliberate target is set (`>>>target`,
+          // channel_open), and explicit sends keep naming their own
+          // destination. Deliberate routes (a fork's home, a channel_open)
+          // are never held; ambient chatter, reactions and system markers
+          // never hold anything; an arrival in the SAME conversation keeps
+          // the route and its reply edge. Only a presented batch counts: on a
+          // round that cannot present injections (XML tool mode) the arrival
+          // isn't in the turn, so it can't make the resident's words
+          // ambiguous. Skipped on endTurn/overBudget: no further prose this
+          // stream, and the notice would be noise.
           //
-          // The notice rides the SAME injection batch — stored right after
-          // the flushed messages and appended to midTurnInjections — so the
-          // window byte-matches the wire (short event-style notice: the
-          // classifier-safe D-class from the 2026-07-24 ablation). It also
-          // updates lastAnnouncedLocus so the next turn's announce-on-change
-          // diffs against what the agent was actually last told.
+          // The notice rides the SAME injection batch (stored right after the
+          // flushed messages and appended to midTurnInjections), so the
+          // window byte-matches the wire, and the next turn's
+          // announce-on-change diffs against what the resident was told.
           if (
             (agent.proseRouting === 'locus' || agent.proseRouting === 'hybrid') &&
-            !shouldEndTurn && !overBudget && currentState.stream
+            !shouldEndTurn && !overBudget && currentState.stream &&
+            this.roundPresentsInjections.get(agent.name) === true
           ) {
-            // Two signals qualify an injection to move the pin (n=6 + n=7):
-            //  - chat:addressed — someone explicitly spoke TO the agent
-            //    (mention / reply / DM);
-            //  - a conversational follow-up in a channel the agent itself
-            //    explicitly sent into THIS turn (turnEngagedChannels) —
-            //    conversation the agent just engaged continues without
-            //    re-mentioning it (2026-07-31: q's #portables reply, no @,
-            //    answered in prose that followed the stale pin into
-            //    repligate's DM). Deliberately NO author-kind filter: this
-            //    fleet's participants include agent-residents whose speech
-            //    is as conversational as anyone's — the Discord bot flag
-            //    tracks nothing that matters here (antra, 2026-07-31).
-            //    Reactions and system markers are already excluded by
-            //    isConversationalInjection, and the engaged-this-turn scope
-            //    keeps unrelated channels from moving the pin.
-            const engaged = this.turnEngagedChannels.get(agent.name);
-            const lastQualifying = [...midTurnInjections].reverse().find((inj) => {
-              const m = inj.metadata as Record<string, unknown> | undefined;
-              if (!isConversationalInjection(inj.metadata)) return false;
-              if (typeof m?.channelId !== 'string') return false;
-              const tags = m.tags as string[] | undefined;
-              if (isAddressedMessage(tags, m)) return true;
-              return engaged?.has(m.channelId as string) === true;
-            });
-            const newLocus = (lastQualifying?.metadata as Record<string, unknown> | undefined)
-              ?.channelId as string | undefined;
-            if (newLocus && this.turnLocusPins.get(agent.name) !== newLocus) {
-              const prevPin = this.turnLocusPins.get(agent.name) ?? null;
-              this.turnLocusPins.set(agent.name, newLocus);
-              this.lastAnnouncedLocus.set(agent.name, newLocus);
-              const label = this.channelRegistry?.getDescriptor(newLocus)?.label;
-              const shown = label && label !== newLocus
-                ? `${label.startsWith('#') ? label : `#${label}`} (${newLocus})`
-                : newLocus;
+            const turn = this.turnRoutes.get(agent.name);
+            const isEngaged = (c: ConversationRef): boolean => this.engagementOf(agent.name, c) !== undefined;
+            // Every arrival in this round that suspends the route, each
+            // conversation once (its newest arrival), oldest first.
+            const competing: RouteCandidate[] = [];
+            if (turn) {
+              const seen = new Set<string>();
+              for (const inj of [...midTurnInjections].reverse()) {
+                if (!isConversationalInjection(inj.metadata)) continue;
+                const m = inj.metadata as Record<string, unknown> | undefined;
+                const candidate = this.candidateFromSource(
+                  readInboundSource(m),
+                  isAddressedMessage(m?.tags as string[] | undefined, m),
+                );
+                // A channel a conversation fork owns is never another
+                // agent's place, so it doesn't compete for this one's.
+                if (!candidate || !this.mayTakeCandidate(agent.name, candidate)) continue;
+                if (!suspendsRoute(turn, candidate, isEngaged)) continue;
+                const key = conversationKey(candidate.conversation);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                competing.unshift(candidate);
+              }
+            }
+            if (turn?.route && competing.length > 0) {
+              const current = routeConversation(turn.route);
+              const arrivals = competing.map((c) => c.conversation);
+              // A mid-turn arrival's candidate comes from its inbound source,
+              // which always names a registered channel and its server, so
+              // none is marked unroutable (TurnRoute.hold.neverRoutes).
+              const held: TurnRecord = { ...turn, hold: { conversations: [current, ...arrivals], since: 'mid-turn' } };
+              this.turnRoutes.set(agent.name, held);
+              this.lastAnnouncedRoute.set(agent.name, AgentFramework.routeKey(held));
+              // Name each actual cause, as certain as the host is of it:
+              // someone addressed the resident (the arrival's own addressed
+              // flag: a local surface's message always addresses it), or a
+              // conversation continued where it sent this turn — there
+              // exactly, there maybe (the send's delivery is unconfirmed), or
+              // somewhere in the channel (a connector's own tool chose where).
+              const causeOf = (candidate: RouteCandidate): string => {
+                const arrival = candidate.conversation;
+                const engagement = this.engagementOf(agent.name, arrival);
+                return candidate.addressed
+                  ? `${describeConversation(arrival)} addressed you mid-turn`
+                  : engagement === 'delivered'
+                    ? `${describeConversation(arrival)}, where you sent a message this turn, continued mid-turn`
+                    : engagement === 'unknown'
+                      ? `${describeConversation(arrival)}, where you tried to send a message this turn (its delivery wasn't confirmed), continued mid-turn`
+                      : `${describeConversation(arrival)} continued mid-turn, in a channel you sent something into this turn (where in the channel isn't known)`;
+              };
+              const causes = competing.map(causeOf);
+              const cause = causes.length === 1 ? causes[0]! : `${causes.slice(0, -1).join('; ')}; and ${causes.at(-1)}`;
+              // A fallback route answered no conversation: it was only where
+              // the last message had come in when the reply began (a
+              // continuation keeps that place), so it isn't one the speech
+              // could be answering.
+              const fallback = turn.route.origin === 'fallback';
               const noticeContent: ContentBlock[] = [{
                 type: 'text',
-                text:
-                  `[routing] The conversation moved to ${shown} — your plain ` +
-                  'speech now lands there for the rest of this turn. Other ' +
-                  'channels need an explicit send tool.',
+                text: fallback
+                  ? `[routing] ${cause}. Your unaddressed plain speech was going to ${describeConversation(current)}, ` +
+                    'where the last message had come in when your reply began (a continuation of it keeps that place), because nothing in the wake ' +
+                    'that began it named a conversation. ' +
+                    'For the rest of this turn it is held as drafts instead. ' +
+                    `Answer ${competing.length === 1 ? 'it' : 'any of them'} with an explicit send (or a channel_open); ` +
+                    'held words can be resent from your drafts.'
+                  : `[routing] ${cause}, so your unaddressed plain speech could now answer ` +
+                    `${competing.length === 1 ? 'either conversation' : 'any of these conversations'}. ` +
+                    'For the rest of this turn it is held as drafts ' +
+                    `instead of going to ${describeConversation(current)}. Answer ${competing.length === 1 ? 'either one' : 'any of them'} ` +
+                    'with an explicit send (or a channel_open); held words can be resent from your drafts.',
               }];
               const noticeMeta = { system: true, kind: 'routing-notice' } as MessageMetadata;
               try {
@@ -6843,10 +7140,10 @@ export class AgentFramework {
                 this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
                 midTurnInjections.push({ participant: 'user', content: noticeContent, metadata: noticeMeta });
                 console.error(
-                  `[routing] ${agent.name}: mid-turn addressed re-pin ${prevPin ?? '(none)'} -> ${newLocus}`,
+                  `[routing] ${agent.name}: mid-turn ambiguity hold — ${[current, ...arrivals].map(describeConversation).join(' vs ')}`,
                 );
               } catch (err) {
-                console.error('mid-turn locus re-pin: failed to record routing notice:', err);
+                console.error('mid-turn ambiguity hold: failed to record routing notice:', err);
               }
             }
           }
@@ -6926,12 +7223,7 @@ export class AgentFramework {
             });
           } else {
             // Non-streaming fallback: schedule re-inference
-            this.pendingRequests.push({
-              agentName: agent.name,
-              reason: 'tool_results_ready',
-              source: 'framework',
-              timestamp: Date.now(),
-            });
+            this.pendingRequests.push(this.continuationRequest(agent.name, 'tool_results_ready'));
           }
         }
       }
@@ -6980,9 +7272,15 @@ export class AgentFramework {
       }
     }
 
-    // Apply responses
+    // Apply responses. Console/API input is conversation from a non-channel
+    // surface: one acceptance per event, whose envelope every message the
+    // modules add for it carries.
+    const surface = this.surfaceSourceFor(event);
+    if (surface && responses.some(({ response }) => (response.addMessages?.length ?? 0) > 0)) {
+      this.noteInboundAccepted(surface);
+    }
     for (const { moduleName, response } of responses) {
-      await this.applyProcessResponse(response, event, moduleName);
+      await this.applyProcessResponse(response, event, moduleName, surface);
     }
 
     // Handle tool calls specially
@@ -7004,12 +7302,26 @@ export class AgentFramework {
   private async applyProcessResponse(
     response: EventResponse,
     event: ProcessEvent,
-    moduleName: string
+    moduleName: string,
+    /** The event's surface envelope, when it is console/API input. */
+    surface?: InboundSource,
   ): Promise<void> {
-    // Add messages
+    // Add messages. Only the framework writes the inbound envelope: one a
+    // module's metadata carries (echoed from a server's event, say) is
+    // dropped, and a surface event's messages carry the framework's own.
     if (response.addMessages) {
       for (const msg of response.addMessages) {
-        const id = this.addMessage(msg.participant, msg.content, msg.metadata);
+        let metadata = msg.metadata;
+        if (metadata && INBOUND_SOURCE_KEY in metadata) {
+          const { [INBOUND_SOURCE_KEY]: _dropped, ...rest } = metadata;
+          metadata = rest;
+        }
+        // A local surface's input is what a sender wrote, so its
+        // header-shaped openings are marked as a channel body's are: only the
+        // host writes a [source: …] header.
+        const content = surface ? markHeaderOpenings(msg.content) : msg.content;
+        if (surface) metadata = { ...metadata, [INBOUND_SOURCE_KEY]: surface };
+        const id = this.addMessage(msg.participant, content, metadata);
         this.emitTrace({ type: 'message:added', messageId: id, source: event.type });
       }
     }
@@ -7036,14 +7348,21 @@ export class AgentFramework {
     // Queue inference requests
     if (response.requestInference) {
       const source = 'source' in event ? (event as { source: string }).source : 'unknown';
+      // What a module event names in its metadata, if anything.
+      const namedMetadata = extractGateFields(event).metadata;
+      const named = namedMetadata.channelId;
 
       // Gate non-MCPL events (MCPL events are already gated in PushHandler/ChannelRegistry)
       if (this.eventGate && event.type !== 'mcpl:push-event' && event.type !== 'mcpl:channel-incoming') {
+        const fields = extractGateFields(event);
         const decision = this.eventGate.evaluate({
-          ...extractGateFields(event),
+          ...fields,
           eventType: event.type,
           serverId: source,
-          channelId: '',
+          // A module event that names a channel isn't a local surface's
+          // conversation (surfaceSourceFor): the gate's wake carries that
+          // channel, unroutable, never a surface candidate.
+          channelId: !surface && typeof named === 'string' ? named : '',
         });
         if (!decision.trigger) return;
       }
@@ -7056,6 +7375,17 @@ export class AgentFramework {
               (n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName)
           : response.requestInference;
 
+      // Console/API input is a conversation with a local surface, which
+      // counts as addressed: the turn's speech route can be that surface,
+      // however its module put the input in context (with a message or
+      // without one), so a console reply never leaves the console. A module
+      // event that names a channel names that conversation too, though it
+      // is no candidate here: neither takes the fallback. An event naming
+      // neither (an `api:inference-request` nudge, a timer) names none.
+      const surfaceCandidate = surface ? this.candidateFromSource(surface, true) : undefined;
+      const nonEmpty = (v: unknown): boolean => typeof v === 'string' && v.length > 0;
+      const namesConversation = !!surface || nonEmpty(named) || nonEmpty(namedMetadata.threadId)
+        || nonEmpty(namedMetadata.authorId);
       for (const agentName of targetAgents) {
         const agent = this.agents.get(agentName);
         if (agent && agent.canBeTriggeredBy(source)) {
@@ -7064,6 +7394,8 @@ export class AgentFramework {
             reason: event.type,
             source,
             timestamp: Date.now(),
+            ...(surfaceCandidate ? { routeCandidates: [surfaceCandidate] } : {}),
+            ...(namesConversation ? { namesConversation: true as const } : {}),
           });
         }
       }
@@ -7096,6 +7428,8 @@ export class AgentFramework {
     eventId?: string;
     assemblingFor?: string;
     deliverTo?: string;
+    acceptedAt?: number;
+    inboundSource?: InboundSource;
   }): Promise<CoalescingPlacement | undefined> {
     // Same backstop as the push lane: no row, no wake, no fork spawned for a
     // message with nothing visible in it.
@@ -7117,8 +7451,44 @@ export class AgentFramework {
       triggered: event.triggerInference ?? false,
       serverId: event.serverId,
     };
+    // `system` marks host machinery (isConversational): host-written only,
+    // so an adapter's is dropped.
+    delete metadata.system;
     if (event.threadId) metadata.threadId = event.threadId;
     if (event.tags) metadata.tags = event.tags;
+    // The inbound source envelope (mcpl/inbound-source.ts): frozen at the
+    // occurrence's acceptance when the coalescer delivers, else stamped now
+    // from this event. Written after the adapter's metadata, so an adapter
+    // cannot supply it.
+    let source: InboundSource;
+    if (event.inboundSource) {
+      source = event.inboundSource;
+    } else {
+      // Only a caller that bypassed admission (none in the framework's own
+      // lanes) arrives without a frozen envelope.
+      source = this.channelEventSource(event, 'channels/incoming');
+      this.noteInboundAccepted(source);
+    }
+    metadata[INBOUND_SOURCE_KEY] = source;
+    // The delivered body's version identity (mcpl/inbound-source.ts
+    // sourceBodyDigest), recorded first, from the
+    // body as delivered — before the header decorates it, its header-shaped
+    // text is marked, or storage shards it. The header text is recorded
+    // beside it. Neither proves later presence or completeness: they
+    // describe this delivery at stamping. The stored copy's own digest is
+    // taken at each storage site below, over exactly the blocks stored there.
+    metadata.sourceBodyDigest = sourceBodyDigest(event.content);
+    // The visible source header: stamped once, here, from this
+    // item's own frozen envelope, and stored with the message — a later
+    // rename, a recompile or a replay never rewrites it, and each message
+    // names its conversation when read alone. Creates, coalesced deliveries
+    // and RFC-006 corrections all pass through here.
+    const header = renderSourceHeader(source);
+    // Always the host's: an adapter-supplied sourceHeader in the metadata
+    // never survives, rendered or not.
+    if (header) metadata.sourceHeader = header;
+    else delete metadata.sourceHeader;
+    event = { ...event, content: AgentFramework.withSourceHeader(header, event.content) };
 
     // Per-channel conversation routing: messages go to the channel's fork
     // agent (spawned from the template on first qualifying message), never
@@ -7131,7 +7501,7 @@ export class AgentFramework {
       if (!target) return undefined;
       if (this.conversationRouter && this.conversationAgentHomes.has(target.name)) {
         metadata.triggered = event.triggerInference ?? false;
-        const id = target.getContextManager().addMessage('user', event.content, metadata);
+        const id = target.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(metadata, event.content));
         // A correction may target an older engagement. Refresh only the
         // binding whose agent actually received the message.
         if (this.conversationRouter.getBinding(event.channelId)?.agentName === target.name) {
@@ -7139,11 +7509,18 @@ export class AgentFramework {
         }
         this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
         if (event.triggerInference) {
+          const addressedHere = isAddressedMessage(event.tags, event.metadata);
+          const candidate = isConversational(event.tags)
+            ? this.candidateFromSource(source, addressedHere)
+            : undefined;
           this.pendingRequests.push({
             agentName: target.name, reason: 'mcpl:channel-incoming', source: event.serverId, timestamp: Date.now(),
             channelId: event.channelId,
+            // Its channel is named even when it is no candidate (a reaction).
+            namesConversation: true,
             counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
-            addressed: isAddressedMessage(event.tags, event.metadata),
+            addressed: addressedHere,
+            ...(candidate ? { routeCandidates: [candidate] } : {}),
             ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
           });
         }
@@ -7176,7 +7553,9 @@ export class AgentFramework {
           : undefined,
       });
       if (invitation) {
-        incomingContent.push(invitation.block);
+        // It interpolates adapter-supplied names (author, guild, label, id),
+        // so it is marked as the body it follows is.
+        incomingContent.push(...markHeaderOpenings([invitation.block]));
         Object.assign(metadata, invitation.metadataPatch);
       }
     }
@@ -7200,7 +7579,7 @@ export class AgentFramework {
     }
 
     const placement: CoalescingPlacement = { agent: '' };
-    const id = this.addMessage('user', incomingContent, metadata, { placement, bypassDeferralFor: event.assemblingFor });
+    const id = this.addMessage('user', incomingContent, AgentFramework.withStoredDigest(metadata, incomingContent), { placement, bypassDeferralFor: event.assemblingFor });
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
     if (event.triggerInference && !divert) {
@@ -7212,20 +7591,28 @@ export class AgentFramework {
       // tune-out's wake routing is the first setter.)
       const targetAgents = event.targetAgents
         ?? [...this.agents.keys()].filter((n) => n !== this.subconsciousAgentName);
+      // A reaction or system marker can wake a turn, but answers nothing:
+      // it is never a route candidate (the same predicate as mid-turn).
+      const candidate = isConversational(event.tags) ? this.candidateFromSource(source, addressed) : undefined;
       for (const agentName of targetAgents) {
         if (!this.agents.has(agentName)) continue;
+        // The broadcast reaches forks too: the fork rule keeps each agent's
+        // typing to a channel it may take (and its route, at turn start).
+        const takesChannel = this.mayTakeRoute(agentName, event.channelId);
         this.pendingRequests.push({
           agentName,
           reason: 'mcpl:channel-incoming',
           source: event.serverId,
           timestamp: Date.now(),
-          // Route this turn's auto-published speech back to THIS channel, not
-          // the global most-recent-inbound locus (item-3 redux, trunk agents).
-          channelId: event.channelId,
+          ...(takesChannel ? { channelId: event.channelId } : {}),
+          // Its channel is named even when it is no candidate here (a
+          // reaction, or a channel a fork owns): no fallback for this wake.
+          namesConversation: true,
           counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
-          // Addressed messages outrank ambient chatter when a batched wake
-          // picks the turn's frozen speech locus.
           addressed,
+          // This message's conversation, as a speech-route candidate: the
+          // turn's route is inferred from every candidate of its batch.
+          ...(candidate ? { routeCandidates: [candidate] } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
         });
       }
@@ -7315,21 +7702,26 @@ export class AgentFramework {
     const trigger = decision.trigger && event.triggerInference !== false;
     messageMetadata.triggered = trigger;
 
-    const id = agent.getContextManager().addMessage('user', event.content, messageMetadata);
+    const id = agent.getContextManager().addMessage('user', event.content, AgentFramework.withStoredDigest(messageMetadata, event.content));
     router.touch(event.channelId);
     this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:channel-incoming' });
 
     if (trigger) {
+      const addressedHere = isAddressedMessage(event.tags, event.metadata);
+      // A fork's home route always wins; the candidate is carried for parity.
+      const candidate = isConversational(event.tags)
+        ? this.candidateFromSource(readInboundSource(messageMetadata), addressedHere)
+        : undefined;
       this.pendingRequests.push({
         agentName: agent.name,
         reason: 'mcpl:channel-incoming',
         source: event.serverId,
         timestamp: Date.now(),
-        // A fork's home channel wins in routeSpeech regardless, but carry the
-        // triggering channel too so the trunk/active path stays consistent.
         channelId: event.channelId,
+        namesConversation: true,
         counterparty: event.author?.id ? `${event.serverId}:user:${event.author.id}` : undefined,
-        addressed: isAddressedMessage(event.tags, event.metadata),
+        addressed: addressedHere,
+        ...(candidate ? { routeCandidates: [candidate] } : {}),
         ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
       });
     }
@@ -7497,6 +7889,8 @@ export class AgentFramework {
         reason: 'conversation:closure',
         source: 'framework',
         timestamp: now,
+        // It closes the conversation in its binding's channel.
+        namesConversation: true,
       });
       // Disposed when the closure stream ends (driveStream finally), with
       // the reaper below as fallback.
@@ -7563,9 +7957,20 @@ export class AgentFramework {
     if (this.channelRegistry.isChannelOpen(opts.channelId)) return null;
     const descriptor = this.channelRegistry.getDescriptor(opts.channelId);
     const maxBackscroll = descriptor?.capabilities?.history?.maxMessages ?? 0;
-    const label = opts.channelLabel ?? descriptor?.label;
-    const channelLabel = label ? `#${label}` : `"${opts.channelId}"`;
-    const place = opts.guildName ? `${channelLabel} in "${opts.guildName}"` : channelLabel;
+    // The registry's label for the channel on its own server first (a
+    // channel registered at start keeps the label its connector gave it),
+    // else the one this event carries.
+    const label = this.channelRegistry.getChannelLabel?.(opts.serverId, opts.channelId) ?? opts.channelLabel;
+    // Every name here is the connector's, shown by the source header's rule
+    // (headerValue, labelValue), and the ids the options quote are JSON
+    // string literals, so none can imitate host text or break the line. The
+    // block is then marked as the body it follows is, so a quoted name that
+    // holds an opening reads `"\[source: …"`: safe, though no longer exactly
+    // the literal JSON.parse gives back.
+    const channelLabel = label ? labelValue(label) : quoted(opts.channelId);
+    const place = opts.guildName ? `${channelLabel} in ${quoted(opts.guildName)}` : channelLabel;
+    const author = headerValue(opts.authorName);
+    const [channelArg, serverArg, messageArg] = [opts.channelId, opts.serverId, opts.messageId].map(quoted);
     // The label is for reading; the prefix must be ONE token that resolves back
     // here, on this server (a DM label "DM: alice" quoted verbatim parses as
     // target "#DM:"). A registry that can name targets is authoritative: no safe
@@ -7589,18 +7994,18 @@ export class AgentFramework {
     const block: ContentBlock = {
       type: 'text',
       text:
-        `\n[Channel invitation] ${opts.authorName} addressed you in ${place} — ` +
+        `\n[Channel invitation] ${author} addressed you in ${place} — ` +
         `a channel you haven't joined. Only messages that address you directly (an @-mention or ` +
         `a reply to one of your messages) reach you from it; the rest of its traffic is invisible to you. ` +
         missedNote +
         `Your options:\n` +
         replyOption +
-        `2. Join the channel — call channel_open with channelId "${opts.channelId}" and serverId "${opts.serverId}"` +
+        `2. Join the channel — call channel_open with channelId ${channelArg} and serverId ${serverArg}` +
         (maxBackscroll > 0
-          ? `; to also read recent history, add backscroll (a number up to ${maxBackscroll}) and beforeMessageId "${opts.messageId}".\n`
+          ? `; to also read recent history, add backscroll (a number up to ${maxBackscroll}) and beforeMessageId ${messageArg}.\n`
           : `.\n`) +
-        `3. Stay out — call channel_decline with channelId "${opts.channelId}", serverId "${opts.serverId}", ` +
-        `and messageId "${opts.messageId}" (optionally set acknowledge to an emoji like 👀 so ${opts.authorName} isn't left hanging).\n` +
+        `3. Stay out — call channel_decline with channelId ${channelArg}, serverId ${serverArg}, ` +
+        `and messageId ${messageArg} (optionally set acknowledge to an emoji like 👀 so ${author} isn't left hanging).\n` +
         `Doing nothing is also fine.`,
     };
     return {
@@ -7628,6 +8033,166 @@ export class AgentFramework {
     return createHash('sha256').update(JSON.stringify([serverId, config?.url ?? null, config?.command ?? null, config?.args ?? null])).digest('hex').slice(0, 16);
   }
 
+  /**
+   * Report one inbound acceptance to the observer, if one is installed
+   * (InboundAcceptanceObserver). Called where an envelope is first created —
+   * never for a delivery that reuses a frozen one. A failing observer is
+   * reported loudly (stderr + trace) and never affects delivery.
+   */
+  private noteInboundAccepted(source: InboundSource): void {
+    if (!this.inboundAcceptanceObserver) return;
+    try {
+      this.inboundAcceptanceObserver.inboundAccepted(source);
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      console.error(`[inbound] acceptance observer failed (${source.kind}): ${error}`);
+      this.emitTrace({ type: 'inbound:observer-failed', kind: source.kind, error });
+    }
+  }
+
+  /**
+   * The inbound source envelope (mcpl/inbound-source.ts) of an item that
+   * belongs to a registered channel. The one place the framework decides
+   * which conversation an inbound item came from; every lane calls it at the
+   * point the host accepted the item, or reuses the envelope frozen then.
+   * `acceptedAt` falls back to now only for an event no admission path
+   * stamped (a direct framework caller), which is the closest observation.
+   */
+  private channelSource(fields: {
+    lane: InboundLane;
+    coalesced?: boolean;
+    serverId: string;
+    channelId: string;
+    threadId?: unknown;
+    messageId?: unknown;
+    eventId?: unknown;
+    replyTo?: unknown;
+    labelFallback?: string;
+    acceptedAt?: number;
+    sourceTimestamp?: unknown;
+    deferred?: boolean;
+  }): InboundChannelSource {
+    const str = (v: unknown): string | undefined => (typeof v === 'string' && v.length > 0 ? v : undefined);
+    const label = this.channelRegistry?.getChannelLabel(fields.serverId, fields.channelId) ?? str(fields.labelFallback);
+    const threadId = str(fields.threadId);
+    const messageId = str(fields.messageId);
+    const eventId = str(fields.eventId);
+    const replyTo = str(fields.replyTo);
+    const sourceTimestamp = str(fields.sourceTimestamp);
+    return {
+      kind: 'channel',
+      lane: fields.lane,
+      ...(fields.coalesced ? { coalesced: true as const } : {}),
+      serverId: fields.serverId,
+      binding: this.coalescingBinding(fields.serverId),
+      channelId: fields.channelId,
+      ...(threadId ? { threadId } : {}),
+      ...(messageId ? { messageId } : {}),
+      ...(eventId ? { eventId } : {}),
+      ...(label ? { label } : {}),
+      ...(replyTo ? { replyTo } : {}),
+      acceptedAt: fields.acceptedAt ?? Date.now(),
+      ...(sourceTimestamp ? { sourceTimestamp } : {}),
+      ...(fields.deferred ? { deferred: true as const } : {}),
+    };
+  }
+
+  /**
+   * An inbound item's metadata with its stored copy's own digest
+   * (`storedBodyDigest`): the delivered-body digest's function over exactly
+   * the blocks handed to storage here — every decoration included, before
+   * storage shards them. That function hashes blocks as the store keeps them
+   * (inline media re-encoded and relabeled from its bytes), so an unsharded
+   * copy read back hashes to this too. A body the store shards (adaptive
+   * ingress chunking) carries this on every shard, with its metadata, and no
+   * shard hashes to it. Taken at each storage site, never earlier, because
+   * a path can still decorate the body after ingestion stamped it (the
+   * closed-channel invitation; room-220 #48282). An edit through
+   * editMessage keeps metadata but not this hash.
+   */
+  private static withStoredDigest(
+    metadata: Record<string, unknown>,
+    content: readonly ContentBlock[],
+  ): Record<string, unknown> {
+    metadata.storedBodyDigest = sourceBodyDigest(content);
+    return metadata;
+  }
+
+  /** Source envelope of a channels/incoming event (lane facts as given). */
+  private channelEventSource(
+    event: {
+      serverId: string; channelId: string; threadId?: string; messageId?: string; eventId?: string;
+      metadata?: Record<string, unknown>; acceptedAt?: number; timestamp?: string;
+    },
+    lane: InboundLane,
+    coalesced = false,
+  ): InboundChannelSource {
+    return this.channelSource({
+      lane,
+      coalesced,
+      serverId: event.serverId,
+      channelId: event.channelId,
+      threadId: event.threadId,
+      messageId: event.messageId,
+      eventId: event.eventId,
+      replyTo: event.metadata?.replyTo,
+      acceptedAt: event.acceptedAt,
+      sourceTimestamp: event.timestamp,
+    });
+  }
+
+  /** Source envelope of a push event: its derived channel, else unscoped. */
+  private pushSource(event: McplPushEvent, coalesced: { deferred: boolean } | undefined = undefined): InboundSource {
+    const origin = (event.origin ?? {}) as Record<string, unknown>;
+    const deferred = coalesced?.deferred ?? false;
+    const channel = this.derivePushEventChannel(event.origin);
+    if (channel) {
+      return this.channelSource({
+        lane: 'push/event',
+        coalesced: !!coalesced,
+        serverId: event.serverId,
+        channelId: channel.channelId,
+        threadId: origin.threadId,
+        messageId: origin.messageId,
+        eventId: event.eventId,
+        replyTo: origin.replyTo,
+        labelFallback: channel.label,
+        acceptedAt: event.acceptedAt,
+        sourceTimestamp: event.timestamp,
+        deferred,
+      });
+    }
+    const unscoped: InboundUnscopedSource = {
+      kind: 'unscoped',
+      lane: 'push/event',
+      ...(coalesced ? { coalesced: true as const } : {}),
+      serverId: event.serverId,
+      binding: this.coalescingBinding(event.serverId),
+      ...(typeof event.eventId === 'string' && event.eventId ? { eventId: event.eventId } : {}),
+      acceptedAt: event.acceptedAt ?? Date.now(),
+      ...(typeof event.timestamp === 'string' && event.timestamp ? { sourceTimestamp: event.timestamp } : {}),
+      ...(deferred ? { deferred: true as const } : {}),
+    };
+    return unscoped;
+  }
+
+  /**
+   * Source envelope for conversational input from a non-channel surface: a
+   * module's messages in response to an `external-message` (console, TUI) or
+   * `api:message` event. An event whose metadata names a channel is not a
+   * surface conversation and gets none (never a guessed identity).
+   */
+  private surfaceSourceFor(event: ProcessEvent): InboundSource | undefined {
+    if (event.type !== 'external-message' && event.type !== 'api:message') return undefined;
+    const metadata = (event as { metadata?: Record<string, unknown> }).metadata;
+    if (typeof metadata?.channelId === 'string' && metadata.channelId) return undefined;
+    const declared = (event as { source?: unknown }).source;
+    const surface = typeof declared === 'string' && declared
+      ? declared
+      : event.type === 'api:message' ? 'api' : 'external';
+    return { kind: 'surface', surface, acceptedAt: Date.now() };
+  }
+
   private initializePushCoalescer(): void {
     const coalescer = new PushCoalescer<CoalescedDelivery>({
       isUnread: (p) => this.isUnreadPlacement(p),
@@ -7650,6 +8215,21 @@ export class AgentFramework {
         // accepted work itself to a crash. A failure here fails the acceptance.
         this.coalescingRecentReceipts.push(record);
         this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
+      },
+      // The acceptance of coalesced work (deferred included) is observed
+      // here, once; its later delivery reuses the frozen envelope.
+      accepted: (occ) => {
+        const source = occ.event.event.inboundSource;
+        if (source) this.noteInboundAccepted(source);
+        // A channel message admitted afresh is where the last message came
+        // in: the fallback route's place. This hook never runs for a
+        // producer's retry, which the coalescer acknowledges again without
+        // delivering anything. A withdrawal is never the place, even when
+        // the coalescer shows the resident its notice, as before speech
+        // routes (noteDelivered).
+        if (occ.event.lane === 'channel' && occ.scope.kind === 'channel' && !occ.retract) {
+          this.channelRegistry?.noteDelivered(occ.serverId, occ.scope.id, occ.identity?.threadId, occ.tags);
+        }
       },
       wasPublished: (subject, eventId) => {
         // Boot-time only: the occurrence's durable delivery identity
@@ -7737,6 +8317,80 @@ export class AgentFramework {
     return run;
   }
 
+  /**
+   * The source envelope of a coalesced `channels/incoming` message, built at
+   * admission (before it is gated) and frozen by its coalescer. Building it
+   * observes no acceptance: the coalescer does that if it admits the
+   * occurrence.
+   */
+  private coalescedIncomingSource(
+    serverId: string,
+    message: ChannelIncomingMessage,
+    event: { acceptedAt?: number },
+  ): InboundSource {
+    return this.channelSource({
+      lane: 'channels/incoming',
+      coalesced: true,
+      serverId,
+      channelId: message.channelId,
+      threadId: message.threadId,
+      messageId: message.messageId,
+      eventId: message.eventId,
+      replyTo: message.metadata?.replyTo,
+      acceptedAt: event.acceptedAt,
+      sourceTimestamp: message.timestamp,
+    });
+  }
+
+  /**
+   * The source envelope of a coalesced push, built at admission (before it is
+   * gated) and frozen by its coalescer; like coalescedIncomingSource, it
+   * observes no acceptance. A channel-scoped push belongs to the channel its
+   * subject names — never one its `origin` names.
+   */
+  private coalescedPushSource(serverId: string, params: PushEventParams, event: McplPushEvent): InboundSource {
+    const c = params.coalesce;
+    const origin = params.origin ?? {};
+    const deferred = !!c?.deferred;
+    return c?.channelId
+      ? this.channelSource({
+          lane: 'push/event',
+          coalesced: true,
+          serverId,
+          channelId: c.channelId,
+          threadId: origin.threadId,
+          messageId: origin.messageId,
+          eventId: params.eventId,
+          replyTo: origin.replyTo,
+          acceptedAt: event.acceptedAt,
+          sourceTimestamp: params.timestamp,
+          deferred,
+        })
+      : this.pushSource(event, { deferred });
+  }
+
+  /** The trigger filter both MCPL lanes use (a server's
+   *  shouldTriggerInference, else the event gate's), for coalesced items,
+   *  whose trigger is decided at their first delivery or wake. */
+  private coalescedTriggerFilter?: (content: string, metadata: Record<string, unknown>) => boolean;
+
+  /**
+   * Make a coalesced item's trigger decision (the gate's, which records the
+   * item in its batch as a route candidate), once: when the coalescer first
+   * delivers or wakes for an occurrence it admitted, from the filter inputs
+   * the event carries (triggerInputs). A refused occurrence, a retry it
+   * deduplicates, or a retraction is never delivered or woken for, so it
+   * never reaches the gate. The decision replaces the inputs on the event,
+   * which is plain data either way, so a persisted occurrence keeps
+   * whichever it has.
+   */
+  private settleCoalescedTrigger(event: { triggerInference?: boolean; triggerInputs?: { content: string; metadata: Record<string, unknown> } }): void {
+    const inputs = event.triggerInputs;
+    if (!inputs) return;
+    delete event.triggerInputs;
+    if (this.coalescedTriggerFilter) event.triggerInference = this.coalescedTriggerFilter(inputs.content, inputs.metadata);
+  }
+
   private handleCoalescedIncoming(
     serverId: string,
     message: ChannelIncomingMessage,
@@ -7751,6 +8405,11 @@ export class AgentFramework {
       if (typeof message.timestamp !== 'string') throw new CoalesceError('timestamp', 'timestamp is required');
       validateCoalescedContent(message.content, undefined, { allowEmpty: message.coalesce.retract === true });
       const c = message.coalesce;
+      // The inbound source envelope the gate read, frozen at acceptance:
+      // deferral, fan-out and replay deliver it unchanged
+      // (mcpl/inbound-source.ts).
+      const inboundSource = event.inboundSource ?? this.coalescedIncomingSource(serverId, message, event);
+      const delivery = { ...event, eventId: message.eventId, inboundSource };
       const result = await this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
@@ -7764,7 +8423,7 @@ export class AgentFramework {
         tags: event.tags,
         content: message.content,
         identity: { messageId: message.messageId, author: message.author, threadId: message.threadId },
-        event: { lane: 'channel', event: { ...event, eventId: message.eventId } },
+        event: { lane: 'channel', event: delivery },
       });
       return { messageId: message.messageId, accepted: true, coalesce: result.coalesce };
     });
@@ -7785,6 +8444,10 @@ export class AgentFramework {
       if (c.channelId) this.assertChannelScopedPush(serverId, c.channelId);
       const origin = params.origin ?? {};
       const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+      // The inbound source envelope the gate read, frozen at acceptance (see
+      // the channel lane).
+      const inboundSource = event.inboundSource ?? this.coalescedPushSource(serverId, params, event);
+      const delivery = { ...event, inboundSource };
       return this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
@@ -7806,7 +8469,7 @@ export class AgentFramework {
             ...(str(origin.authorId) ? { author: { id: str(origin.authorId)!, name: str(origin.authorName) ?? str(origin.authorId)! } } : {}),
           },
         } : {}),
-        event: { lane: 'push', event },
+        event: { lane: 'push', event: delivery },
       });
     });
   }
@@ -7878,8 +8541,15 @@ export class AgentFramework {
     materialized?: McplContentBlock[],
     assemblingFor?: string,
   ): Promise<CoalescingPlacement | undefined> {
+    this.settleCoalescedTrigger(occ.event.event);
     const coalescingSubject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     const narrowing = occ.deliverTo ? { deliverTo: occ.deliverTo } : {};
+    // The envelope frozen at acceptance travels unchanged; this delivery only
+    // adds the fact that it carries the rendered body.
+    const frozenSource = (source: InboundSource | undefined): { inboundSource?: InboundSource } =>
+      source
+        ? { inboundSource: materialized && source.kind !== 'surface' ? { ...source, materialized: true } : source }
+        : {};
     if (occ.event.lane === 'channel') {
       const event = { ...occ.event.event, coalescingSubject, ...narrowing, ...(assemblingFor ? { assemblingFor } : {}) };
       const placement = await this.handleMcplChannelIncoming(event);
@@ -7912,6 +8582,7 @@ export class AgentFramework {
         eventId: occ.eventId,
         ...narrowing,
         ...(assemblingFor ? { assemblingFor } : {}),
+        ...frozenSource(push.inboundSource),
       };
       const placement = await this.handleMcplChannelIncoming(event);
       await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
@@ -7927,6 +8598,7 @@ export class AgentFramework {
       // assembled; the wake that started it is not repeated.
       ...(assemblingFor ? { assemblingFor, triggerInference: false } : {}),
       ...(occ.deliverTo ? { targetAgents: [occ.deliverTo] } : {}),
+      ...frozenSource(occ.event.event.inboundSource),
     };
     const placement = this.handleMcplPushEvent(event);
     await this.dispatchProcessEventToModules(event as unknown as ProcessEvent);
@@ -7936,21 +8608,34 @@ export class AgentFramework {
   private async wakeForCoalescedBatch(occ: CoalescedOccurrence<CoalescedDelivery>): Promise<void> {
     const subject = coalescingSubjectKey(occ.serverId, occ.binding, occ.scope, occ.key);
     this.cancelCoalescedWakes(subject);
+    this.settleCoalescedTrigger(occ.event.event);
     if (occ.event.lane !== 'push' || !occ.event.event.triggerInference) return;
     const origin = occ.event.event.origin;
     // The wake carries the batch's channel so the turn freezes its reply
     // locus there (the materialized delivery at assembly wakes nobody).
     const channelId = occ.scope.kind === 'channel' ? occ.scope.id : this.derivePushEventChannel(origin)?.channelId;
     const authorId = occ.identity?.author?.id ?? (typeof origin?.authorId === 'string' ? origin.authorId : undefined);
+    const addressedHere = isAddressedMessage(occ.tags, origin);
+    // The conversation the batch names, whether or not it is a candidate (a
+    // reaction names its channel but answers nothing).
+    const named = this.candidateFromSource(occ.event.event.inboundSource, addressedHere);
+    const candidate = isConversational(occ.tags) ? named : undefined;
+    // A channel, a thread or an author names a conversation, as for a gate
+    // batch (wakeProvenance) and an uncoalesced push: the batch's merged
+    // thread or its origin's, either one.
+    const originThread = typeof origin?.threadId === 'string' && origin.threadId.length > 0;
+    const namesConversation = !!named || !!channelId || !!authorId || !!occ.identity?.threadId || originThread;
     for (const agentName of await this.coalescedAudience(occ)) {
       this.pendingRequests.push({
         agentName,
         reason: 'mcpl:push-event',
         source: occ.serverId,
         timestamp: Date.now(),
-        channelId,
+        channelId: channelId && this.mayTakeRoute(agentName, channelId) ? channelId : undefined,
+        ...(namesConversation ? { namesConversation: true as const } : {}),
         counterparty: authorId ? `${occ.serverId}:user:${authorId}` : undefined,
-        addressed: isAddressedMessage(occ.tags, origin),
+        addressed: addressedHere,
+        ...(candidate ? { routeCandidates: [candidate] } : {}),
         coalescingSubject: subject,
         coalescingBatch: true,
       });
@@ -8096,6 +8781,9 @@ export class AgentFramework {
       ...(event.tags ? { tags: event.tags } : {}),
       ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
     };
+    // `system` marks host machinery (isConversational): host-written only,
+    // so an origin's is dropped.
+    delete metadata.system;
     // `origin.channelId` is the server-internal raw id (a bare Discord
     // snowflake) — unroutable as a locus and unresolvable by the agent. Store
     // the composite MCPL id instead wherever we can derive it, so anything
@@ -8105,8 +8793,25 @@ export class AgentFramework {
     if (triggerChannel) {
       metadata.channelId = triggerChannel.channelId;
     }
+    // The inbound source envelope (mcpl/inbound-source.ts), after the
+    // adapter's origin fields so an adapter cannot supply it.
+    let source: InboundSource;
+    if (event.inboundSource) {
+      source = event.inboundSource;
+    } else {
+      source = this.pushSource(event);
+      this.noteInboundAccepted(source);
+    }
+    metadata[INBOUND_SOURCE_KEY] = source;
 
-    const content = [...event.content];
+    // The delivered body's version identity, before any host decoration (the
+    // invitation, the source header and its marking of header-shaped text
+    // below). Every push that reaches here gets one, written over any value
+    // the adapter's origin carried. (A visibly-empty push is refused at
+    // admission; the silent-heartbeat marker stores nothing, so its metadata
+    // is never kept.)
+    metadata.sourceBodyDigest = sourceBodyDigest(event.content);
+    const invitations: ContentBlock[] = [];
     if (triggerChannel) {
       const origin = (event.origin ?? {}) as Record<string, unknown>;
       const invitation = this.buildClosedChannelInvitation({
@@ -8122,7 +8827,9 @@ export class AgentFramework {
           typeof origin.missedCharacters === 'number' ? origin.missedCharacters : undefined,
       });
       if (invitation) {
-        content.push(invitation.block);
+        // It interpolates adapter-supplied names (author, guild, label, id),
+        // so it is marked as the body it follows is.
+        invitations.push(...markHeaderOpenings([invitation.block]));
         Object.assign(metadata, invitation.metadataPatch);
       }
     }
@@ -8130,12 +8837,22 @@ export class AgentFramework {
     // Silent heartbeat ticks are control-plane wakes, not autobiography.
     // Accept the no-message path only for the heartbeat feature's own exact
     // marker with an empty payload — arbitrary MCPL servers cannot hide
-    // content merely by setting `origin.silent`.
-    const silentHeartbeat = isSilentHeartbeatMarker({ ...event, content });
+    // content merely by setting `origin.silent`. It reads the blocks before
+    // the header decorates them.
+    const silentHeartbeat = isSilentHeartbeatMarker({ ...event, content: [...event.content, ...invitations] });
+    // The visible source header, from this item's own envelope:
+    // its registered channel, or `unscoped` — never a guessed channel. A
+    // silent heartbeat stores no message, so it gets none.
+    const header = silentHeartbeat ? undefined : renderSourceHeader(source);
+    // Always the host's: an adapter-supplied sourceHeader in the origin
+    // never survives, rendered or not.
+    if (header) metadata.sourceHeader = header;
+    else delete metadata.sourceHeader;
+    const content = [...AgentFramework.withSourceHeader(header, event.content), ...invitations];
 
     const placement: CoalescingPlacement = { agent: '' };
     if (!silentHeartbeat) {
-      const id = this.addMessage('user', content, metadata, { placement, bypassDeferralFor: event.assemblingFor });
+      const id = this.addMessage('user', content, AgentFramework.withStoredDigest(metadata, content), { placement, bypassDeferralFor: event.assemblingFor });
       this.emitTrace({ type: 'message:added', messageId: id, source: 'mcpl:push-event' });
     } else {
       console.error(`[heartbeat] ${event.serverId}: accepted silent scheduled wake ${event.eventId}`);
@@ -8146,17 +8863,38 @@ export class AgentFramework {
       const targetAgents = event.targetAgents
         ?? [...this.agents.keys()].filter(
           (n) => !this.conversationAgentHomes.has(n) && n !== this.subconsciousAgentName);
+      const pushAddressed = isAddressedMessage(event.tags, event.origin);
+      // A push that names a conversation (a DM, an addressed-while-closed
+      // message) is a route candidate like its channels/incoming
+      // counterpart; an unscoped push (a heartbeat, a reminder) names none,
+      // and only such a wake takes the fallback route. A reaction names its
+      // conversation without being a candidate.
+      const pushNamed = this.candidateFromSource(source, pushAddressed);
+      // A channel, a thread or an author names a conversation, as for a gate
+      // batch (wakeProvenance): a reaction that names only its author too.
+      const originNames = (key: string): boolean => {
+        const value = event.origin?.[key];
+        return typeof value === 'string' && value.length > 0;
+      };
+      const pushNamesConversation = !!pushNamed || !!triggerChannel?.channelId
+        || originNames('authorId') || originNames('threadId');
+      const pushCandidate = silentHeartbeat || !isConversational(event.tags) ? undefined : pushNamed;
       for (const agentName of targetAgents) {
+        // The fork rule for typing, as for a gate batch: no agent types in a
+        // channel a fork owns, and a fork only in its home. (Its route is
+        // judged at turn start.)
+        const typingChannel = triggerChannel?.channelId && this.mayTakeRoute(agentName, triggerChannel.channelId)
+          ? triggerChannel.channelId
+          : undefined;
         this.pendingRequests.push({
           agentName,
           reason: 'mcpl:push-event',
           source: event.serverId,
           timestamp: Date.now(),
-          channelId: triggerChannel?.channelId,
-          // DMs and addressed-while-closed messages arrive as push events;
-          // they must outrank ambient chatter in a batched wake's locus
-          // selection just like their channels/incoming counterparts.
-          addressed: isAddressedMessage(event.tags, event.origin),
+          channelId: typingChannel,
+          addressed: pushAddressed,
+          ...(pushCandidate ? { routeCandidates: [pushCandidate] } : {}),
+          ...(pushNamesConversation ? { namesConversation: true as const } : {}),
           ...(silentHeartbeat ? {
             suppressProse: true,
             ephemeralSystemPrompt:
@@ -8172,18 +8910,24 @@ export class AgentFramework {
   }
 
   /**
-   * Whether a batched gate wake's addressed route may become `agentName`'s
-   * speech locus. The gate broadcasts to every agent, conversation forks
-   * included. A fork speaks only in its home channel, and a channel bound to
-   * a fork is that fork's conversation, so no other agent takes it.
+   * Whether a channel may become `agentName`'s speech route or typing
+   * channel: read for a wake's typing channel when it is queued, and for its
+   * route candidates and the fallback when its turn starts. A fork speaks
+   * only in its home channel, and a channel bound to a fork is that fork's
+   * conversation, so no other agent takes it.
    */
-  private mayTakeGateRoute(agentName: string, routeChannelId: string): boolean {
+  private mayTakeRoute(agentName: string, routeChannelId: string): boolean {
     const home = this.conversationAgentHomes.get(agentName);
     if (home !== undefined) return home === routeChannelId;
     for (const boundChannel of this.conversationAgentHomes.values()) {
       if (boundChannel === routeChannelId) return false;
     }
     return true;
+  }
+
+  /** mayTakeRoute for a route candidate: a local surface is never a fork's. */
+  private mayTakeCandidate(agentName: string, candidate: RouteCandidate): boolean {
+    return candidate.conversation.kind === 'surface' || this.mayTakeRoute(agentName, candidate.conversation.channelId);
   }
 
   /**
@@ -8200,7 +8944,9 @@ export class AgentFramework {
    * discord-mcpl's `mcplChannelId()` / `parseMcplChannelId()` convention so the
    * fix works even against a discord-mcpl build that predates `mcplChannelId`.
    * Returns undefined for push events with no channel provenance (heartbeats,
-   * timers), which correctly keep the global fallback.
+   * reminders, timers): they name no conversation, so they are no route
+   * candidate, and a turn they alone wake takes the fallback route, the last
+   * delivered message's conversation (shelf-355).
    */
   private derivePushEventChannel(
     origin: Record<string, unknown> | undefined,
@@ -8345,9 +9091,17 @@ export class AgentFramework {
           // must not absorb an unrelated wake that would vanish with it.
           const key = `${request.reason}|${request.addressed ? 'a' : 'n'}|${request.coalescingSubject ?? ''}`;
           const prev = newestByKey.get(key);
-          if (!prev || request.timestamp >= prev.timestamp) {
-            newestByKey.set(key, request);
-          }
+          // The kept request carries both requests' route candidates: a
+          // parked wake's conversation still competes for the turn's route,
+          // and one that named a conversation keeps the turn off the fallback.
+          const candidates = [...(prev?.routeCandidates ?? []), ...(request.routeCandidates ?? [])];
+          const named = !!prev?.namesConversation || !!request.namesConversation;
+          const kept = !prev || request.timestamp >= prev.timestamp ? request : prev;
+          newestByKey.set(key, {
+            ...kept,
+            ...(candidates.length > 0 ? { routeCandidates: candidates } : {}),
+            ...(named ? { namesConversation: true as const } : {}),
+          });
         }
         this.pendingRequests.push(...newestByKey.values());
         if (passThrough.length === 0) continue;
@@ -8410,6 +9164,11 @@ export class AgentFramework {
         continue;
       }
 
+      // A request that continues the agent's turn reads that turn's record
+      // now, as the turn left it (continuationFor), before the policy sees
+      // the batch and before its fields are merged below.
+      requests = requests.map((r) => this.continuationFor(r));
+
       // Check policy
       if (!this.inferencePolicy.shouldInfer(agentName, requests, state)) {
         // Loud drop: a queued request that dies here is otherwise invisible —
@@ -8438,17 +9197,19 @@ export class AgentFramework {
       // requests[0] in that mixed batch bypassed the turn lock because a
       // restart existed, then treated the continuation as a fresh turn.
       const trigger = budgetRestart ?? requests[0];
-      // Route this turn's auto-published speech to the channel that triggered
-      // it (item-3 redux). A batched wake may carry several triggering channels
-      // (messages arrived in >1 channel while the agent was busy/idle):
+      // The channel that triggered this turn (the trigger's channelId), and
+      // the provenance below. Neither is the speech route, which a true new
+      // turn infers from every request's route candidates (shelf-355). A
+      // batched wake may carry several triggering channels (messages arrived
+      // in >1 channel while the agent was busy/idle):
       //   1. the most recent ADDRESSED channel wins (mention / reply / DM —
       //      someone explicitly spoke TO the agent);
       //   2. else the most recent channel-bearing request (ambient message in
-      //      an open channel — legacy last-inbound semantics).
+      //      an open channel).
       // Ambient chatter must not outrank an addressed message just by being
       // newest (2026-07-21 Cairn lounge misroute, turn-start variant).
       // Non-channel wakes (heartbeats, module events, reactions — which never
-      // carry channelId) leave both undefined → global fallback.
+      // carry channelId) leave both undefined: the turn has no trigger channel.
       // Track the winning REQUEST, not just its channel: channel, addressed
       // and counterparty must come from the same message, or a batch of
       // "ambient from A, then addressed from B" would report B's channel
@@ -8509,6 +9270,17 @@ export class AgentFramework {
         counterparty: budgetRestart ? undefined : provReq?.counterparty,
         wakeChannelId: budgetRestart ? undefined : provReq?.wakeChannelId,
         wakeAt: budgetRestart ? undefined : provReq?.wakeAt,
+        // Every conversation this batch carries: a true new turn infers its
+        // speech route from all of them (shelf-355), never from one pick. A
+        // restart keeps its turn's route and reads them only when it
+        // continues a silent tick that this batch makes ordinary, which had
+        // no route to keep (beginAgentTurn).
+        routeCandidates: requests.flatMap((r) => r.routeCandidates ?? []),
+        // Whether any of them named a conversation, candidate or not: only a
+        // batch none of whose requests did takes the fallback route.
+        namesConversation: requests.some((r) => r.namesConversation) ? true : undefined,
+        // A continued fallback turn's place, kept as this batch's fallback.
+        fallbackPlace: requests.find((r) => r.fallbackPlace)?.fallbackPlace,
       });
     }
   }
@@ -8530,16 +9302,710 @@ export class AgentFramework {
     return stamp ? { silentHeartbeat: stamp } : undefined;
   }
 
-  /** Record prose segments suppressed by explicit-send silencing. */
+  /** Record prose segments suppressed without drafts (proseRouting=disabled). */
   private recordProseSuppression(agentName: string, count: number): void {
     if (count <= 0) return;
     this.turnProseSuppressed.set(agentName, (this.turnProseSuppressed.get(agentName) ?? 0) + count);
   }
 
-  /** Record a successful plain-prose delivery for this turn's receipt. */
+  /**
+   * Silenced plain speech: an explicit send holds it as resendable drafts; a
+   * deliberate silence (skip_reply, a silent turn, a same-round private
+   * think in a native round, where that policy applies) keeps it private —
+   * counted for the receipt, never drafted. `segments` are the runs exactly
+   * as written (splitProseRuns), so a draft keeps the resident's words byte
+   * for byte.
+   */
+  private holdSilencedProse(
+    agent: Agent,
+    segments: string[],
+    cause: 'send' | 'private' | null,
+    privateThink: boolean,
+    opts: { round?: number; notice: 'now' | 'later' },
+  ): void {
+    if (segments.length === 0) return;
+    if (cause === 'private' || privateThink) {
+      this.turnProsePrivate.set(agent.name, (this.turnProsePrivate.get(agent.name) ?? 0) + segments.length);
+      return;
+    }
+    if (agent.proseRouting !== 'hybrid') {
+      this.holdProseDrafts(agent, segments, 'explicit-send', opts);
+      return;
+    }
+    // Hybrid prose may carry `>>>` envelopes. A send suppresses speech, not
+    // what the envelopes do: they move the router's state exactly as
+    // deliverHybridProse's do. After `>>>skip_reply` the rest stays private
+    // (across segments and later rounds) until a destination is named;
+    // naming one sets the sticky target, or leaves none when it does not
+    // resolve; `>>>skip_reply {{unsent}}` sets the latest bounce aside, and
+    // ` !` asks to continue. Only publication is withheld: a draft holds
+    // what the envelope would have published (`{{unsent}}` under the
+    // re-bounce rule, unsentWords), not its routing syntax, and the
+    // destination the resident wrote stays with it as a note.
+    let privateCount = 0;
+    const parts: Array<{ text: string; note?: string; inheritedRisk?: InheritedRisk }> = [];
+    /** Latest bounces a bare `{{unsent}}` named: still the one draft of those words. */
+    const kept: Draft[] = [];
+    for (const segment of segments) {
+      for (const envelope of splitHybridEnvelopes(segment)) {
+        const parsed = parseHybridProsePrefix(envelope);
+        if (parsed.continueTurn) this.proseContinuations.add(agent.name);
+        if (parsed.kind === 'private') {
+          this.proseTargetPins.delete(agent.name);
+          this.proseHybridSuppressed.set(agent.name, 'private');
+          if (parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent);
+          privateCount++;
+        } else if (parsed.kind === 'target') {
+          const resolved = this.channelRegistry?.resolveProseTarget(parsed.target!);
+          if (resolved && !('error' in resolved)) {
+            this.proseTargetPins.set(agent.name, { serverId: resolved.serverId, channelId: resolved.channelId });
+            this.proseHybridSuppressed.delete(agent.name);
+          } else {
+            this.proseTargetPins.delete(agent.name);
+            this.proseHybridSuppressed.set(agent.name, 'failed');
+          }
+          const words = this.unsentWords(agent, parsed.body);
+          if ('draft' in words) {
+            if (!kept.includes(words.draft)) kept.push(words.draft);
+          } else {
+            parts.push({
+              text: words.text,
+              note: `written for >>>${parsed.target}`,
+              ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}),
+            });
+          }
+        } else if (envelope.startsWith('>>>')) {
+          // Malformed: an attempted destination that names none.
+          this.proseTargetPins.delete(agent.name);
+          this.proseHybridSuppressed.set(agent.name, 'failed');
+          parts.push({ text: envelope });
+        } else if (this.proseHybridSuppressed.get(agent.name) === 'private') {
+          privateCount++;
+        } else {
+          parts.push({ text: envelope });
+        }
+      }
+    }
+    if (privateCount > 0) {
+      this.turnProsePrivate.set(agent.name, (this.turnProsePrivate.get(agent.name) ?? 0) + privateCount);
+    }
+    this.holdProseDrafts(agent, parts, 'explicit-send', opts);
+    if (kept.length > 0) {
+      // The turn's receipt names them by their state at turn end; each was
+      // named when it bounced.
+      const list = this.turnDrafts.get(agent.name) ?? [];
+      for (const draft of kept) if (!list.some((d) => d.id === draft.id)) list.push(draft);
+      this.turnDrafts.set(agent.name, list);
+    }
+  }
+
+  /**
+   * Hold plain speech as drafts (src/prose-drafts.ts) instead of
+   * letting it vanish: journaled durably and recorded for this turn's
+   * receipt. `notice: 'now'` also queues a private notice naming them, which
+   * the resident hears at its next tool boundary — only when the live stream
+   * presents mid-turn injections. Otherwise the turn-end receipt names them
+   * (or, after a crash, the next turn's catch-up). Drafts the journal cannot
+   * hold are reported in the receipt: their words remain in history only.
+   */
+  private holdProseDrafts(
+    agent: Agent,
+    texts: Array<string | { text: string; note?: string; inheritedRisk?: InheritedRisk }>,
+    reason: DraftReason,
+    opts: { round?: number; note?: string; notice: 'now' | 'later' },
+  ): Draft[] {
+    const segments = texts
+      .map((t) => (typeof t === 'string'
+        ? { text: t, note: opts.note }
+        : { text: t.text, note: t.note ?? opts.note, inheritedRisk: t.inheritedRisk }))
+      .filter((t) => t.text.trim().length > 0);
+    if (segments.length === 0) return [];
+    const turn = this.logicalTurnToolCalls.get(agent)?.turnToken ?? 0;
+    let branch = 'unknown';
+    try {
+      branch = this.store.currentBranch().name;
+    } catch {
+      // provenance only
+    }
+    const { held, notHeld } = this.proseDrafts.hold(
+      agent.name,
+      segments.map(({ text, note, inheritedRisk }, segment) => ({
+        text,
+        ...(note ? { note } : {}),
+        ...(inheritedRisk ? { inheritedRisk } : {}),
+        source: { branch, turn, round: opts.round ?? 0, segment } satisfies DraftSource,
+      })),
+      reason,
+    );
+    if (notHeld) {
+      console.error(`[drafts] ${agent.name}: ${notHeld.count} segment(s) could not be held as drafts: ${notHeld.error}`);
+      const prior = this.turnDraftFailures.get(agent.name);
+      this.turnDraftFailures.set(agent.name, { count: (prior?.count ?? 0) + notHeld.count, error: notHeld.error });
+    }
+    if (held.length === 0) return held;
+    const list = this.turnDrafts.get(agent.name) ?? [];
+    list.push(...held);
+    this.turnDrafts.set(agent.name, list);
+    console.error(`[drafts] ${agent.name}: held ${held.length} segment(s) as ${held.map((d) => d.id).join(', ')} (${reason})`);
+    this.emitTrace({
+      type: 'prose:drafts-held',
+      agentName: agent.name,
+      reason,
+      draftIds: held.map((d) => d.id),
+      textLen: held.reduce((n, d) => n + d.text.length, 0),
+    });
+    if (opts.notice === 'now') {
+      try {
+        this.addMessage(
+          'user',
+          [{ type: 'text', text: this.draftsHeldNotice(agent.name, held, reason) }],
+          { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: held.map((d) => d.id) } as MessageMetadata,
+          { forAgent: agent.name },
+        );
+      } catch (err) {
+        console.error('[drafts] held-draft notice failed:', err);
+      }
+    }
+    return held;
+  }
+
+  private static readonly DRAFT_REASON_TEXT: Record<DraftReason, string> = {
+    'explicit-send': 'an explicit send in the same round holds plain speech back',
+    'no-destination': 'it had no destination — nothing this turn named a conversation it could speak into, or a failed routing envelope left plain speech waiting for a new valid target',
+    ambiguous: 'more than one place could have taken it, so unaddressed speech was held rather than guessed',
+    bounced: 'its routing prefix bounced',
+  };
+
+  private static readonly DRAFT_REASON_SHORT: Record<DraftReason, string> = {
+    'explicit-send': 'explicit send in the same round',
+    'no-destination': 'no destination',
+    ambiguous: 'competing conversations',
+    bounced: 'routing prefix bounced',
+  };
+
+  private draftsHeldNotice(agentName: string, held: Draft[], reason: DraftReason): string {
+    const ids = held.map((d) => d.id);
+    const many = held.length > 1;
+    const quoted = (ds: Draft[]): string => ds.map((d) => `"${d.id}"`).join(', ');
+    // Words copied from a draft that may already have been posted resend
+    // only with the resident's confirmation; the rest resend freely.
+    const free = held.filter((d) => draftState(d) !== 'unconfirmed');
+    const risky = held.filter((d) => draftState(d) === 'unconfirmed');
+    const resend = [
+      ...(free.length > 0
+        ? [`drafts(action: "resend", draftIds: [${quoted(free)}], destination: "#channel") delivers ` +
+          `${free.length > 1 ? 'them' : 'it'} unchanged`]
+        : []),
+      ...risky.map((d) => `${this.riskText(d)}, so check that channel before resending ${d.id} ` +
+        `(drafts(action: "resend", draftIds: ["${d.id}"], destination: "#channel", confirmDuplicate: true))`),
+    ];
+    // Named: residents that share one message slot (#197) share this window.
+    // "Not sent" only when no copied words may already have been posted.
+    return (
+      `[drafts] ${agentName}: ${risky.length > 0 ? '' : 'not sent — '}` +
+      `${many ? `${held.length} plain-speech segments` : 'a plain-speech segment'} ` +
+      `held as draft${many ? 's' : ''} ${ids.join(', ')} — ${AgentFramework.DRAFT_REASON_TEXT[reason]}. ` +
+      `Nothing publishes drafts but your own resend, and they stay until you act: ${resend.join('; ')}; ` +
+      `drafts(action: "dismiss", draftIds: [${quoted(held)}]) sets ${many ? 'them' : 'it'} aside.`
+    );
+  }
+
+  /** Compact local time for draft listings. */
+  private draftTime(t: number): string {
+    return formatZonedDateTime(t, this.timeZone).replace(/:\d\d\.\d{3}/, '');
+  }
+
+  private static draftPreview(text: string, max = 80): string {
+    const flat = text.replace(/\s+/g, ' ').trim();
+    return JSON.stringify(flat.length > max ? `${flat.slice(0, max)}…` : flat);
+  }
+
+  private static destinationText(d: PublishDestination): string {
+    return AgentFramework.placeText(d);
+  }
+
+  /** A destination in words, as every conversation is named to a resident
+   *  (describeConversation): its label as recorded, then `server / channel-id`
+   *  and its thread. */
+  private static placeText(d: { serverId?: string; channelId: string; label?: string; threadId?: string | null }): string {
+    return describeConversation({
+      kind: 'channel',
+      ...(d.serverId ? { serverId: d.serverId } : {}),
+      channelId: d.channelId,
+      ...(d.threadId ? { threadId: d.threadId } : {}),
+      ...(d.label ? { label: d.label } : {}),
+    });
+  }
+
+  /** One line per draft: id, state, when, why, size, preview. */
+  private draftLine(draft: Draft): string {
+    const stateText = this.draftStateText(draft);
+    return `${draft.id} · ${stateText} · held ${this.draftTime(draft.heldAt)} · ` +
+      `${AgentFramework.DRAFT_REASON_SHORT[draft.reason]} · ${draft.text.length} chars · ` +
+      AgentFramework.draftPreview(draft.text);
+  }
+
+  /** A draft's state in words that claim only what is known. */
+  private draftStateText(draft: Draft): string {
+    const state = draftState(draft);
+    if (state === 'unconfirmed') {
+      const risky = uncertainAttempt(draft);
+      if (risky) {
+        return `UNCONFIRMED — an attempt to ${AgentFramework.destinationText(risky.destination)} at ` +
+          `${this.draftTime(risky.at)} may have been posted`;
+      }
+      return `UNCONFIRMED — it includes the words of ${draft.inheritedRisk!.draftId}, which may already have been posted`;
+    }
+    if (state === 'held') {
+      return draft.attempts.length > 0 ? 'held (every attempt failed: nothing was posted)' : 'held (not sent)';
+    }
+    return state;
+  }
+
+  /** Why an unconfirmed draft may already have been posted, in full. */
+  private riskText(draft: Draft): string {
+    const risky = uncertainAttempt(draft);
+    if (risky) {
+      return `${draft.id}'s attempt to ${AgentFramework.destinationText(risky.destination)} at ` +
+        `${this.draftTime(risky.at)} may already have been posted: ${risky.outcome?.reason ?? this.noOutcomeText(draft, risky)}`;
+    }
+    const inherited = draft.inheritedRisk!;
+    const owner = inherited.sourceDraftId ?? inherited.draftId;
+    const via = owner !== inherited.draftId ? `, which itself includes the words of ${owner}` : '';
+    const where = inherited.destination
+      ? `${owner}'s attempt to ${AgentFramework.destinationText(inherited.destination)}` +
+        (inherited.at !== undefined ? ` at ${this.draftTime(inherited.at)}` : '')
+      : owner;
+    return `${draft.id} includes the words of ${inherited.draftId}${via}, and ${where} may already have been posted: ${inherited.reason}`;
+  }
+
+  /** Whether an attempt with no outcome is still out: its draft's latest,
+   *  while that draft is being sent. Otherwise it never got one (a crash). */
+  private attemptIsOut(draft: Draft, attempt: DraftAttempt): boolean {
+    return !attempt.outcome && this.draftsSending.has(`${draft.agent}\u0000${draft.id}`) &&
+      draft.attempts.at(-1)?.attemptId === attempt.attemptId;
+  }
+
+  /** Why an attempt has no outcome, in a risk's words. */
+  private noOutcomeText(draft: Draft, attempt: DraftAttempt): string {
+    return this.attemptIsOut(draft, attempt) ? "it is being sent right now, so its outcome isn't known yet" : 'its outcome was never recorded';
+  }
+
+  /** A delivered draft's historical receipt. */
+  private draftReceipt(draft: Draft): string {
+    const delivered = draft.attempts.find((a) => a.outcome?.status === 'delivered');
+    if (!delivered) return `${draft.id}: not delivered`;
+    return `${draft.id}: delivered — confirmed at ${this.draftTime(delivered.outcome!.at)} to ` +
+      `${AgentFramework.destinationText(delivered.destination)}` +
+      (delivered.outcome!.messageId ? `, message ${delivered.outcome!.messageId}` : '') +
+      ' (a record of that delivery, not a check that the message is still there)';
+  }
+
+  /**
+   * Turn start (or after a crash): name, privately and before the turn's
+   * compile, any open drafts no notice on the current branch names: none
+   * reached the history (a crash, an aborted turn), or a rollback or branch
+   * move took the notices away. Every draft it marks is named by id, newest
+   * first: the newest eight with their state and a preview, the rest by id.
+   */
+  private noticeUnnoticedDrafts(agent: Agent): void {
+    const cm = agent.getContextManager();
+    const pending = this.proseDrafts.unnoticed(agent.name, (id) => cm.getMessage(id as MessageId) !== null);
+    if (pending.length === 0) return;
+    const shown = pending.slice(0, 8).map((d) =>
+      `${d.id} (${this.draftStateText(d)}; held ${this.draftTime(d.heldAt)}, ` +
+      `${AgentFramework.DRAFT_REASON_SHORT[d.reason]}, ${d.text.length} chars: ${AgentFramework.draftPreview(d.text, 60)})`);
+    const rest = pending.slice(shown.length).map((d) => d.id);
+    const more = rest.length > 0 ? ` · and ${rest.length} more: ${rest.join(', ')}` : '';
+    const text =
+      `[drafts] ${agent.name}: ${pending.length === 1 ? 'a held draft' : `${pending.length} held drafts`} of yours ` +
+      `${pending.length === 1 ? 'is' : 'are'} unnamed on this branch of your history: ${shown.join(' · ')}${more}. ` +
+      'drafts(action: "list") shows your open drafts; resend or dismiss them by id.';
+    let mid: string;
+    try {
+      mid = cm.addMessage(
+        'user',
+        [{ type: 'text', text }],
+        { system: true, kind: 'prose-drafts', draftOwner: agent.name, draftIds: pending.map((d) => d.id) } as MessageMetadata,
+      );
+      this.emitTrace({ type: 'message:added', messageId: mid, source: 'prose-drafts' });
+    } catch (err) {
+      console.error('[drafts] catch-up notice failed:', err);
+      return;
+    }
+    try {
+      this.proseDrafts.markNoticed(agent.name, pending.map((d) => d.id), mid);
+    } catch (err) {
+      // Named again by the next turn's catch-up.
+      console.error('[drafts] could not record the catch-up notice:', err);
+    }
+  }
+
+  /**
+   * Logical turn end, after the turn's deferred notices are flushed: record
+   * as noticed exactly the drafts a stored message names (the receipt, a
+   * held-draft notice, a bounce notice), each with the message that names
+   * it. One whose notice never reached the history stays unnoticed, for the
+   * next turn's catch-up.
+   */
+  private settleTurnDrafts(agent: Agent): void {
+    const held = this.turnDrafts.get(agent.name);
+    this.turnDrafts.delete(agent.name);
+    this.turnDraftFailures.delete(agent.name);
+    this.turnProsePrivate.delete(agent.name);
+    if (!held?.length) return;
+    const byMessage = new Map<string, string[]>();
+    for (const [draftId, messageId] of this.draftsNamedInHistory(agent, held.map((d) => d.id))) {
+      byMessage.set(messageId, [...(byMessage.get(messageId) ?? []), draftId]);
+    }
+    for (const [messageId, ids] of byMessage) {
+      try {
+        this.proseDrafts.markNoticed(agent.name, ids, messageId);
+      } catch (err) {
+        // Unmarked drafts are named again by the next turn's catch-up.
+        console.error('[drafts] could not record notice:', err);
+      }
+    }
+  }
+
+  /** How far back draftsNamedInHistory looks: this turn's notices are near
+   *  the end. One beyond it leaves its draft for the next turn's catch-up. */
+  private static readonly DRAFT_NOTICE_SCAN = 500;
+
+  /** Which of these drafts a stored notice or receipt OF THIS RESIDENT names
+   *  (draft ids are unique only per resident, and residents can share one
+   *  history), each with the newest message that names it, reading only the
+   *  recent history, where this turn's notices are. */
+  private draftsNamedInHistory(agent: Agent, ids: string[]): Map<string, string> {
+    const wanted = new Set(ids);
+    const named = new Map<string, string>();
+    const cm = agent.getContextManager();
+    const total = cm.getMessageCount();
+    const start = Math.max(0, total - AgentFramework.DRAFT_NOTICE_SCAN);
+    const { messages } = cm.getMessageWindow(start, total - start, { resolveBlobs: false });
+    for (let i = messages.length - 1; i >= 0 && named.size < wanted.size; i--) {
+      const meta = messages[i]!.metadata as { draftIds?: unknown; draftOwner?: unknown } | undefined;
+      if (meta?.draftOwner !== agent.name || !Array.isArray(meta.draftIds)) continue;
+      for (const id of meta.draftIds) {
+        if (typeof id === 'string' && wanted.has(id) && !named.has(id)) named.set(id, String(messages[i]!.id));
+      }
+    }
+    return new Map(ids.filter((id) => named.has(id)).map((id) => [id, named.get(id)!]));
+  }
+
+  /** Page size for drafts(action: "list"). */
+  private static readonly DRAFTS_PAGE = 10;
+  /** Drafts with a delivery attempt in flight, `${agent}\u0000${id}`: a
+   *  parallel resend (or `{{unsent}}`) of the same draft is refused. */
+  private draftsInFlight = new Set<string>();
+  /** The drafts in draftsInFlight whose attempt is out right now (journaled,
+   *  its publish awaited). A dismissal of one is refused, and the resident
+   *  told to wait for that result, since a dismissal can't call back words
+   *  already on their way. A draft only queued in a resend batch can still
+   *  be dismissed: the batch honours that when it reaches the draft. */
+  private draftsSending = new Set<string>();
+
+  /**
+   * The resident's `drafts` tool: list, read, resend and dismiss its own held
+   * drafts. Private to the calling resident. `resend` is an explicit send:
+   * each draft is published verbatim, in order, through the normal publish
+   * executor, its attempt journaled durably before the request leaves.
+   */
+  private async handleDraftsTool(agentName: string, rawInput: unknown): Promise<ToolResult> {
+    const input = (rawInput && typeof rawInput === 'object' && !Array.isArray(rawInput) ? rawInput : {}) as Record<string, unknown>;
+    const refuse = (error: string): ToolResult => ({ success: false, error, isError: true });
+    // Plain text, not a JSON-quoted string: draft text must read exactly as held.
+    const ok = (text: string): ToolResult => ({ success: true, data: [{ type: 'text', text }] });
+    // null and omission mean the same thing: the field is not in use.
+    const present = (v: unknown): boolean => v !== undefined && v !== null;
+    const action = input.action;
+    if (action !== 'list' && action !== 'read' && action !== 'resend' && action !== 'dismiss') {
+      return refuse('action must be one of "list", "read", "resend" or "dismiss".');
+    }
+    const unused = (field: string): ToolResult =>
+      refuse(`${field} is not used by action "${action}" — pass null or omit it.`);
+
+    let ids: string[] = [];
+    if (present(input.draftIds)) {
+      if (action === 'list') return unused('draftIds');
+      if (!Array.isArray(input.draftIds) || input.draftIds.some((id) => typeof id !== 'string' || !id.trim())) {
+        return refuse('draftIds must be a list of draft ids such as "d-k7x3q", or null.');
+      }
+      ids = (input.draftIds as string[]).map((id) => id.trim());
+      if (new Set(ids).size !== ids.length) return refuse('draftIds names a draft more than once.');
+      if (ids.length > 20) return refuse('draftIds names more than 20 drafts; act on them in smaller groups.');
+    }
+    if (present(input.destination) && action !== 'resend') return unused('destination');
+    if (present(input.threadId) && action !== 'resend') return unused('threadId');
+    if (present(input.confirmDuplicate) && action !== 'resend') return unused('confirmDuplicate');
+    if (present(input.offset) && action !== 'list') return unused('offset');
+
+    if (action === 'list') {
+      let offset = 0;
+      if (present(input.offset)) {
+        const raw = input.offset;
+        const n = typeof raw === 'number' ? raw : typeof raw === 'string' && /^\d+$/.test(raw.trim()) ? Number(raw) : NaN;
+        if (!Number.isInteger(n) || n < 0) return refuse('offset must be a whole number of drafts to skip (0 or more), or null.');
+        offset = n;
+      }
+      const open = this.proseDrafts.open(agentName);
+      if (open.length === 0) return ok('You have no open drafts.');
+      const page = open.slice(offset, offset + AgentFramework.DRAFTS_PAGE);
+      const header = `${open.length} open draft${open.length === 1 ? '' : 's'}, newest first` +
+        (offset > 0 || page.length < open.length ? ` (showing ${page.length} from #${offset + 1})` : '') + ':';
+      const more = offset + page.length < open.length
+        ? `\nMore: drafts(action: "list", offset: ${offset + page.length}).`
+        : '';
+      return ok(
+        `${header}\n${page.map((d) => this.draftLine(d)).join('\n')}${more}\n` +
+          'drafts(action: "read", draftIds: [...]) shows full text and every attempt.',
+      );
+    }
+
+    if (ids.length === 0) return refuse(`action "${action}" needs draftIds: the drafts to ${action}.`);
+    const drafts: Draft[] = [];
+    const missing: string[] = [];
+    for (const id of ids) {
+      const draft = this.proseDrafts.get(agentName, id);
+      if (draft) drafts.push(draft);
+      else missing.push(id);
+    }
+    if (missing.length > 0) {
+      return refuse(
+        `No draft of yours with id ${missing.join(', ')}: there was none, or it was let go (a draft beyond your ${KEEP_NEWEST} newest ` +
+        `is kept for ${AgentFramework.DRAFT_KEEP_DAYS} days after anything last happened to it). drafts(action: "list") shows your open drafts.`,
+      );
+    }
+
+    if (action === 'read') {
+      const blocks = drafts.map((d) => {
+        const lines = [
+          `${d.id} — ${draftState(d)}; held ${this.draftTime(d.heldAt)} (${AgentFramework.DRAFT_REASON_TEXT[d.reason]})` +
+            (d.note ? `; ${d.note}` : ''),
+          ...(d.inheritedRisk && draftState(d) === 'unconfirmed' && !uncertainAttempt(d) ? [`  ${this.riskText(d)}`] : []),
+          ...d.attempts.map((a) => {
+            const o = a.outcome;
+            const status = !o
+              ? (this.attemptIsOut(d, a) ? 'being sent right now — no outcome yet' : 'outcome never recorded — it may have been posted')
+              : o.status === 'delivered'
+                ? `delivered${o.messageId ? `, message ${o.messageId}` : ''}`
+                : o.status === 'unknown'
+                  ? `UNKNOWN — may have been posted: ${o.reason ?? 'no valid receipt'}`
+                  : `failed, nothing posted: ${o.reason ?? 'refused'}`;
+            return `  attempt ${this.draftTime(a.at)} → ${AgentFramework.destinationText(a.destination)}: ${status}` +
+              (a.confirmedDuplicate ? ' (resent knowing it might duplicate)' : '');
+          }),
+          `Text (${d.text.length} chars, exactly as a resend publishes it):`,
+          d.text,
+        ];
+        return lines.join('\n');
+      });
+      return ok(blocks.join('\n\n'));
+    }
+
+    if (action === 'dismiss') {
+      // Refuse up front, before anything is dismissed, rather than half-way.
+      const sending = drafts.find((d) => this.draftsSending.has(`${agentName}\u0000${d.id}`));
+      if (sending) {
+        return refuse(
+          `${sending.id} is being sent right now, and dismissing it can't call those words back; ` +
+          'wait for that result before dismissing it. Nothing was dismissed.',
+        );
+      }
+      const lines: string[] = [];
+      for (const d of drafts) {
+        const state = draftState(d);
+        if (state === 'delivered') {
+          lines.push(`${d.id}: already delivered — nothing to dismiss. ${this.draftReceipt(d)}`);
+          continue;
+        }
+        if (state === 'dismissed') {
+          lines.push(`${d.id}: already dismissed.`);
+          continue;
+        }
+        // A dismissal sets the words aside; it can't take back an attempt
+        // that may already have been posted, so that is said with it.
+        const risk = state === 'unconfirmed' ? ` Note that ${this.riskText(d)}.` : '';
+        try {
+          this.proseDrafts.dismiss(agentName, d.id);
+        } catch (err) {
+          return refuse(
+            `${lines.length > 0 ? `${lines.join('\n')}\n` : ''}Could not record dismissing ${d.id}: ` +
+            `${err instanceof Error ? err.message : String(err)}. It is still open.`,
+          );
+        }
+        lines.push(`${d.id}: dismissed (your history keeps the words).${risk}`);
+      }
+      this.emitTrace({ type: 'prose:drafts-dismissed', agentName, draftIds: drafts.map((d) => d.id) });
+      return ok(lines.join('\n'));
+    }
+
+    // resend
+    // Idempotence first: a request whose drafts were all delivered returns
+    // their historical receipts, whether or not the former destination is
+    // still registered or resolvable — nothing needs sending, so nothing
+    // needs authorizing.
+    if (drafts.every((d) => draftState(d) === 'delivered')) {
+      return ok(drafts.map((d) => `${this.draftReceipt(d)} — not sent again.`).join('\n'));
+    }
+    const registry = this.channelRegistry;
+    if (!registry) return refuse('No channels are configured, so there is nowhere to resend to.');
+    const home = this.conversationAgentHomes.get(agentName);
+    let spec = typeof input.destination === 'string' ? input.destination.trim() : '';
+    if (present(input.destination) && typeof input.destination !== 'string') {
+      return refuse('destination must be "#channel", "@person" or a channel id.');
+    }
+    if (!spec && home) spec = home;
+    if (!spec) return refuse('resend needs a destination: "#channel", "@person" or a channel id.');
+    let confirmDuplicate = false;
+    if (present(input.confirmDuplicate)) {
+      if (typeof input.confirmDuplicate !== 'boolean') return refuse('confirmDuplicate must be true, false or null.');
+      confirmDuplicate = input.confirmDuplicate;
+    }
+    const resolved = registry.resolveProseTarget(spec);
+    if ('error' in resolved) {
+      const cand = resolved.candidates?.length ? ` It could mean: ${resolved.candidates.join(', ')}.` : '';
+      return refuse(`Destination "${spec}" did not resolve: ${resolved.error}.${cand} Nothing was sent.`);
+    }
+    const target = registry.resolveDestination({ channelId: resolved.channelId });
+    if ('error' in target) return refuse(`Destination "${spec}": ${target.error}. Nothing was sent.`);
+    if (home && target.destination.channelId !== home) {
+      return refuse(`This conversation is bound to channel ${home}; resending to ${target.destination.channelId} is not allowed. Nothing was sent.`);
+    }
+    // The place inside the channel (MCPL RFC-011): the thread named with it,
+    // else the root — never a thread borrowed from where the words were held.
+    const thread = readThreadId(input.threadId);
+    if ('error' in thread) return refuse(`${thread.error} Nothing was sent.`);
+    const destination: PublishDestination = { ...target.destination, threadId: thread.threadId };
+    const placeRefusal = publishPlaceRefusal(registry.publishTarget(destination), destination.threadId ?? null);
+    if (placeRefusal) {
+      const why = ChannelRegistry.placeRefusalText(placeRefusal, destination, destination.threadId ?? null);
+      const consult = this.connectorToolsText(destination.serverId);
+      return refuse(`${why}.${consult ? ` ${consult}` : ''} Nothing was sent.`);
+    }
+
+    // Refuse up front, before anything is published, rather than half-way.
+    for (const d of drafts) {
+      if (this.draftsInFlight.has(`${agentName}\u0000${d.id}`)) {
+        return refuse(`${d.id} is being sent right now (or is queued in a resend in progress); wait for that result before sending it again. Nothing was sent.`);
+      }
+      const refusal = this.resendRefusal(d, confirmDuplicate);
+      if (refusal) return refuse(`${refusal} Nothing was sent.`);
+    }
+
+    // Claim every draft of the batch before the first await: a concurrent
+    // resend of any of them is refused while this batch owns it. Each draft
+    // is still re-read and re-checked at its own dispatch boundary below, so
+    // a dismissal (or a delivery) since the batch began is honoured.
+    const claims = drafts.map((d) => `${agentName}\u0000${d.id}`);
+    for (const claim of claims) this.draftsInFlight.add(claim);
+    const lines: string[] = [];
+    // Why the batch stopped, said for each draft after it: the resend sends
+    // in order, so one that can't go stops the rest.
+    let stopped: string | undefined;
+    try {
+      for (const queued of drafts) {
+        if (stopped) {
+          lines.push(`${queued.id}: not attempted (${stopped}).`);
+          continue;
+        }
+        // The current projection, not the batch's snapshot (it may have been
+        // rebuilt by a reconcile, or changed while an earlier draft was sent).
+        const d = this.proseDrafts.get(agentName, queued.id);
+        if (!d) {
+          lines.push(`${queued.id}: no longer found among your drafts — not sent.`);
+          stopped = `${queued.id} was no longer found`;
+          continue;
+        }
+        if (draftState(d) === 'delivered') {
+          lines.push(`${this.draftReceipt(d)} — not sent again.`);
+          continue;
+        }
+        const refusal = this.resendRefusal(d, confirmDuplicate);
+        if (refusal) {
+          lines.push(`${refusal} It changed while this resend was waiting — not sent.`);
+          stopped = draftState(d) === 'dismissed' ? `${d.id} was dismissed while it waited` : `${d.id} changed while it waited`;
+          continue;
+        }
+        let attemptId: string;
+        try {
+          attemptId = this.proseDrafts.beginAttempt(agentName, d.id, destination, 'resend', draftState(d) === 'unconfirmed');
+        } catch (err) {
+          lines.push(`${d.id}: not sent — the attempt could not be recorded durably (${err instanceof Error ? err.message : String(err)}).`);
+          stopped = `${d.id}'s attempt could not be recorded`;
+          continue;
+        }
+        const sendingKey = `${agentName}\u0000${d.id}`;
+        this.draftsSending.add(sendingKey);
+        const outcome = await registry.publish(agentName, d.text, { serverId: destination.serverId, channelId: destination.channelId, threadId: destination.threadId ?? null });
+        this.draftsSending.delete(sendingKey);
+        let recorded = true;
+        try {
+          this.proseDrafts.recordOutcome(agentName, d.id, attemptId, outcome);
+        } catch (err) {
+          recorded = false;
+          console.error(`[drafts] ${agentName}: outcome of ${d.id} not recorded:`, err);
+        }
+        this.emitTrace({
+          type: 'prose:draft-resent',
+          agentName,
+          draftId: d.id,
+          status: outcome.status,
+          serverId: outcome.destination?.serverId ?? destination.serverId,
+          channelId: outcome.destination?.channelId ?? destination.channelId,
+          threadId: outcome.destination?.threadId ?? destination.threadId ?? null,
+          ...(outcome.messageId ? { messageId: outcome.messageId } : {}),
+        });
+        const where = AgentFramework.destinationText(outcome.destination ?? destination);
+        // A record that failed after reaching the journal was reconciled into
+        // it, so say what the draft reads as now rather than guess.
+        const unrecorded = recorded ? '' : ` (recording this outcome failed; the draft reads as ${this.draftStateNow(agentName, d.id)} now)`;
+        this.noteSendEngagement(agentName, outcome.status, outcome.destination ?? destination);
+        if (outcome.status === 'delivered') {
+          lines.push(`${d.id}: delivered to ${where}${outcome.messageId ? `, message ${outcome.messageId}` : ''}${unrecorded}.`);
+          continue;
+        }
+        stopped = `${d.id} was not confirmed delivered`;
+        const after = this.proseDrafts.get(agentName, d.id);
+        const stillAtRisk = after !== undefined && draftState(after) === 'unconfirmed';
+        lines.push(outcome.status === 'unknown'
+          ? `${d.id}: delivery to ${where} NOT confirmed — it may or may not have been posted: ${outcome.reason ?? 'no valid receipt'}. ` +
+            `Check the channel before sending it again (that needs confirmDuplicate: true)${unrecorded}.`
+          : `${d.id}: not sent to ${where} — ${outcome.reason ?? 'refused'}. Nothing was posted by this attempt${unrecorded}.` +
+            (stillAtRisk
+              ? ` The draft stays unconfirmed: ${this.riskText(after!)}.`
+              : ' The draft stays held.'));
+      }
+    } finally {
+      for (const claim of claims) {
+        this.draftsInFlight.delete(claim);
+        this.draftsSending.delete(claim);
+      }
+    }
+    const allDelivered = !stopped;
+    return allDelivered ? ok(lines.join('\n')) : refuse(lines.join('\n'));
+  }
+
+  /** Why a draft can't be resent now (dismissed, or possibly already posted
+   *  without the resident's confirmation), or undefined when it can. */
+  private resendRefusal(d: Draft, confirmDuplicate: boolean): string | undefined {
+    const state = draftState(d);
+    if (state === 'dismissed') return `${d.id} was dismissed, so it can't be resent.`;
+    if (state === 'unconfirmed' && !confirmDuplicate) {
+      return `${this.riskText(d)}. Check that channel; to send it again anyway, resend with confirmDuplicate: true.`;
+    }
+    return undefined;
+  }
+
+  /**
+   * Record a successful plain-prose delivery for this turn's receipt: the
+   * destination as resolved when it was delivered — its server, channel,
+   * the label it had then, and its thread — so the receipt says exactly
+   * where the words went, whatever is renamed or shares an id later.
+   */
   private recordProseDelivery(
     agentName: string,
-    outcome: { delivered: boolean; channelId: string } | null | undefined,
+    outcome: { delivered: boolean; channelId: string; serverId?: string; label?: string; threadId?: string | null } | null | undefined,
   ): void {
     if (!outcome?.delivered) return;
     let list = this.turnProseDeliveries.get(agentName);
@@ -8547,7 +10013,21 @@ export class AgentFramework {
       list = [];
       this.turnProseDeliveries.set(agentName, list);
     }
-    list.push(outcome.channelId);
+    const surface = outcome.channelId.startsWith('surface:');
+    const label = surface ? undefined : outcome.label ?? (outcome.serverId
+      ? this.channelRegistry?.resolveDestination({ serverId: outcome.serverId, channelId: outcome.channelId })
+      : this.channelRegistry?.resolveDestination({ channelId: outcome.channelId }));
+    list.push({
+      channelId: outcome.channelId,
+      ...(outcome.serverId ? { serverId: outcome.serverId } : {}),
+      ...(typeof label === 'string' ? { label } : label && 'destination' in label && label.destination.label ? { label: label.destination.label } : {}),
+      ...(outcome.threadId ? { threadId: outcome.threadId } : {}),
+    });
+  }
+
+  /** A delivery's identity for the receipt: server, channel and thread. */
+  private static deliveryKey(d: { serverId?: string; channelId: string; threadId?: string | null }): string {
+    return `${d.serverId ?? ''}\u0000${d.channelId}\u0000${d.threadId ?? ''}`;
   }
 
   /**
@@ -8566,36 +10046,96 @@ export class AgentFramework {
   private appendProseDeliveryReceipt(agent: Agent): void {
     const list = this.turnProseDeliveries.get(agent.name);
     const suppressed = this.turnProseSuppressed.get(agent.name) ?? 0;
-    if ((!list || list.length === 0) && suppressed === 0) return;
+    const drafts = this.turnDrafts.get(agent.name) ?? [];
+    const kept = this.turnProsePrivate.get(agent.name) ?? 0;
+    const notHeld = this.turnDraftFailures.get(agent.name);
+    if ((!list || list.length === 0) && suppressed === 0 && drafts.length === 0 && kept === 0 && !notHeld) return;
     this.turnProseDeliveries.delete(agent.name);
     this.turnProseSuppressed.delete(agent.name);
     const seen = new Set<string>();
     const shown: string[] = [];
-    for (const id of list ?? []) {
-      if (seen.has(id)) continue;
-      seen.add(id);
-      const label = this.channelRegistry?.getDescriptor(id)?.label;
-      shown.push(
-        label && label !== id
-          ? `${label.startsWith('#') ? label : `#${label}`} (${id})`
-          : id,
+    const unique: ProseDelivery[] = [];
+    for (const d of list ?? []) {
+      const key = AgentFramework.deliveryKey(d);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push(d);
+    }
+    for (const d of unique) {
+      if (d.channelId.startsWith('surface:')) {
+        // Speech on a surface route was shown there, never published.
+        shown.push(`${d.channelId.slice('surface:'.length)} (the local surface that messaged you; not published to any channel)`);
+        continue;
+      }
+      shown.push(AgentFramework.placeText(d));
+    }
+    const notes: string[] = [];
+    // Each of the turn's drafts as it stands now: a mid-turn notice lets the
+    // resident resend or dismiss one before the turn ends, so "not sent" is
+    // said only of drafts still held.
+    const current = drafts.map((d) => this.proseDrafts.get(agent.name, d.id) ?? d);
+    const inState = (state: DraftState): Draft[] => current.filter((d) => draftState(d) === state);
+    const idList = (ds: Draft[]): string =>
+      ds.slice(0, 8).map((d) => d.id).join(', ') + (ds.length > 8 ? `, and ${ds.length - 8} more` : '');
+    const held = inState('held');
+    if (held.length > 0) {
+      notes.push(
+        `${held.length} plain-speech segment(s) held as draft${held.length === 1 ? '' : 's'} ${idList(held)} ` +
+        '(not sent — drafts can resend them unchanged, or dismiss them)',
       );
     }
-    const suppressedNote =
-      suppressed > 0
-        ? agent.proseRouting === 'disabled'
-          ? `${suppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)`
-          : `${suppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`
-        : '';
+    const unconfirmed = inState('unconfirmed');
+    for (const d of unconfirmed) {
+      notes.push(`draft ${d.id} is unconfirmed: ${this.riskText(d)} — check that channel before sending it again (resend needs confirmDuplicate: true)`);
+    }
+    // A dismissal sets a draft aside; it doesn't unsay that the draft's own
+    // attempt may already have been posted.
+    const dismissed = inState('dismissed');
+    const dismissedAtRisk = dismissed.filter((d) => uncertainAttempt(d));
+    const dismissedQuietly = dismissed.filter((d) => !uncertainAttempt(d));
+    for (const d of dismissedAtRisk) notes.push(`draft ${d.id} dismissed by you, but ${this.riskText(d)}`);
+    if (dismissedQuietly.length > 0) {
+      notes.push(`draft${dismissedQuietly.length === 1 ? '' : 's'} ${idList(dismissedQuietly)} dismissed by you`);
+    }
+    for (const d of inState('delivered')) {
+      const attempt = d.attempts.find((a) => a.outcome?.status === 'delivered')!;
+      const how = attempt.via === 'resend' ? 'by your resend' : 'by your {{unsent}}';
+      // A hybrid `{{unsent}}` envelope is already listed above, as the plain
+      // speech it was; a resend is not.
+      if (attempt.via === 'unsent-token' && seen.has(AgentFramework.deliveryKey(attempt.destination))) {
+        notes.push(`draft ${d.id} delivered ${how}`);
+      } else {
+        shown.push(`${AgentFramework.destinationText(attempt.destination)} (draft ${d.id}, ${how})`);
+      }
+    }
+    if (notHeld) {
+      notes.push(
+        `${notHeld.count} plain-speech segment(s) suppressed and NOT held as drafts (${notHeld.error}) — ` +
+        'the words remain only in your history',
+      );
+    }
+    if (kept > 0) notes.push(`${kept} plain-speech segment(s) kept private (skip_reply)`);
+    if (suppressed > 0) {
+      notes.push(agent.proseRouting === 'disabled'
+        ? `${suppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)`
+        : `${suppressed} plain-speech segment(s) suppressed`);
+    }
+    const suppressedNote = notes.join(' · ');
+    // Nothing is confirmed delivered, but an unconfirmed draft (or a dismissed
+    // one whose own attempt is uncertain) may have been.
     const text =
       shown.length > 0
         ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}`
-        : `[delivered] nothing — ${suppressedNote}`;
+        : `[delivered] nothing${unconfirmed.length > 0 || dismissedAtRisk.length > 0 ? ' confirmed' : ''} — ${suppressedNote}`;
     try {
       const mid = agent.getContextManager().addMessage(
         'user',
         [{ type: 'text', text }],
-        { system: true, kind: 'delivery-receipt' } as MessageMetadata,
+        {
+          system: true,
+          kind: 'delivery-receipt',
+          ...(drafts.length > 0 ? { draftOwner: agent.name, draftIds: drafts.map((d) => d.id) } : {}),
+        } as MessageMetadata,
       );
       this.emitTrace({ type: 'message:added', messageId: mid, source: 'delivery-receipt' });
     } catch (err) {
@@ -8604,43 +10144,658 @@ export class AgentFramework {
   }
 
   /**
-   * Announce-on-change locus notice (turn-frozen routing). Appends a durable
-   * `[routing]` window message when the turn's effective outbound locus
-   * differs from the last one announced — the agent must never have to guess
-   * where its plain prose lands. Durable append (never retracted) keeps the
-   * KV prefix stable; change-only keeps it out of steady-state turns. The
-   * first resolution after boot announces only a non-null locus ("prose has
-   * no destination" is the unremarkable boot default). Never triggers
-   * inference; never locus-eligible itself (system + no channel metadata).
+   * A route candidate from an accepted item's source envelope: its channel
+   * conversation (server, channel, thread; the message is the reply edge) or
+   * the local surface that messaged the resident (always addressed).
    */
-  private announceLocusIfChanged(agentName: string, locus: string | null): void {
-    const hasBaseline = this.lastAnnouncedLocus.has(agentName);
-    const prev = this.lastAnnouncedLocus.get(agentName) ?? null;
-    if (hasBaseline ? prev === locus : locus === null) {
-      if (!hasBaseline) this.lastAnnouncedLocus.set(agentName, locus);
+  private candidateFromSource(
+    source: InboundSource | undefined,
+    addressed: boolean,
+  ): RouteCandidate | undefined {
+    if (!source) return undefined;
+    if (source.kind === 'surface') {
+      return { conversation: { kind: 'surface', surface: source.surface }, addressed: true, at: source.acceptedAt };
+    }
+    if (source.kind !== 'channel') return undefined;
+    return {
+      conversation: {
+        kind: 'channel',
+        serverId: source.serverId,
+        channelId: source.channelId,
+        ...(source.threadId ? { threadId: source.threadId } : {}),
+        ...(source.label ? { label: source.label } : {}),
+      },
+      addressed,
+      ...(source.messageId ? { messageId: source.messageId } : {}),
+      at: source.acceptedAt,
+    };
+  }
+
+  /**
+   * An adapter's blocks as stored under their source header: the header
+   * first, then the blocks with every header-shaped opening in their text
+   * marked (markHeaderOpenings). Outside the host's header line no unmarked
+   * opening remains; a header value that holds one is quoted inside the
+   * header (headerValue), where it reads as a literal. Both MCPL lanes
+   * attach headers only through here. Without a header (a silent heartbeat
+   * stores nothing), the blocks as given.
+   */
+  private static withSourceHeader(header: string | undefined, content: readonly ContentBlock[]): ContentBlock[] {
+    return header ? [{ type: 'text', text: header }, ...markHeaderOpenings(content)] : [...content];
+  }
+
+  /**
+   * Once per resident, the first time it holds an item with a source header
+   * (channel traffic, or a push that names no channel): what the
+   * `[source: …]` headers are, that the canonical id is authoritative when a
+   * label differs, and that `\[source…` in a message is its sender's text.
+   * The rule is also in the channel tools' descriptions; this introduces it
+   * where the headers appear.
+   */
+  private maybeExplainSourceHeaders(agent: Agent): void {
+    if (!this.channelRegistry) return;
+    let state: Record<string, unknown>;
+    let explained: unknown[];
+    try {
+      const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+      state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      // The residents already told, as a list of names rather than an object
+      // keyed by them: an object answers `constructor` or `toString` from its
+      // prototype, and a `__proto__` key doesn't survive the store's round trip.
+      explained = Array.isArray(state.sourceHeadersExplained) ? state.sourceHeadersExplained : [];
+      if (explained.includes(agent.name)) return;
+      // Any retained item stored with a header counts, a channel item or an
+      // unscoped push, however much later traffic stands between it and this
+      // turn. getAllMessages is the store's cached view (each compile reads
+      // the same one), so this is a pass over memory, and none runs once the
+      // notice is recorded.
+      let sees = false;
+      let given = false;
+      for (const message of agent.getContextManager().getAllMessages()) {
+        const meta = message.metadata as { sourceHeader?: unknown; kind?: unknown } | undefined;
+        if (typeof meta?.sourceHeader === 'string') sees = true;
+        if (meta?.kind === 'source-header-notice') given = true;
+      }
+      // A notice already in the context counts as given, though its record
+      // failed to write: record it now, and append nothing.
+      if (given) {
+        this.recordSourceHeadersExplained(state, explained, agent.name);
+        return;
+      }
+      if (!sees) return;
+    } catch (err) {
+      console.error('maybeExplainSourceHeaders: state read failed:', err);
       return;
     }
-    this.lastAnnouncedLocus.set(agentName, locus);
+    // The notice is stored first, and only a stored notice is recorded as
+    // given — in the same store, after it — so a failed append leaves the
+    // explanation due at the next turn instead of suppressing it.
+    try {
+      const id = agent.getContextManager().addMessage(
+        'user',
+        [{
+          type: 'text',
+          text:
+            '[source] Each channel message begins with a [source: server / channel-id · label] line naming the ' +
+            'conversation it came from (with a thread or the message it replies to, when it has one), and an event ' +
+            `that names no conversation with [source: server · unscoped]. ${SOURCE_HEADER_RULE}`,
+        }],
+        { system: true, kind: 'source-header-notice' },
+      );
+      this.emitTrace({ type: 'message:added', messageId: id, source: 'source-header-notice' });
+    } catch (err) {
+      console.error('maybeExplainSourceHeaders: failed to append notice:', err);
+      return;
+    }
+    this.recordSourceHeadersExplained(state, explained, agent.name);
+  }
 
+  /** Record that a resident has been given the source-header notice. A
+   *  failed write is logged: the notice in its context counts as given at
+   *  the next turn, so it isn't appended again. */
+  private recordSourceHeadersExplained(state: Record<string, unknown>, explained: unknown[], agentName: string): void {
+    try {
+      state.sourceHeadersExplained = [...explained, agentName];
+      this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+    } catch (err) {
+      console.error('maybeExplainSourceHeaders: failed to record the notice:', err);
+    }
+  }
+
+  /**
+   * A route candidate for a registered channel id (gate and coalesced wakes).
+   * The server is the event's own, else the id's sole registrant. An id no
+   * single server holds (shared across servers, or withdrawn since) gets no
+   * guessed server: the candidate competes for the turn but is unroutable.
+   */
+  private candidateForChannel(
+    channelId: string,
+    addressed: boolean,
+    at: number,
+    serverId?: string,
+    messageId?: string,
+    threadId?: string,
+  ): RouteCandidate {
+    const server = serverId || this.channelRegistry?.getChannelServerId(channelId) || undefined;
+    // The label is the server's own for the id: another server's channel
+    // with the same id may carry another. With no server, any label would be
+    // a guess, so there is none.
+    const label = server ? this.channelRegistry?.getChannelLabel(server, channelId) : undefined;
+    return {
+      conversation: {
+        kind: 'channel',
+        ...(server ? { serverId: server } : {}),
+        channelId,
+        ...(threadId ? { threadId } : {}),
+        ...(label ? { label } : {}),
+      },
+      addressed,
+      ...(messageId ? { messageId } : {}),
+      at,
+      ...(server ? {} : { unroutable: true as const }),
+    };
+  }
+
+  /**
+   * A candidate as it stands when its turn starts. One whose channel had no
+   * server when its wake was queued (candidateForChannel) is resolved again,
+   * so a server that registered while the wake waited makes it routable. A
+   * gate's unroutable candidate that names its server is a raw id the host
+   * couldn't resolve to a registered channel, and stays as it is.
+   */
+  private resolvedCandidate(c: RouteCandidate): RouteCandidate {
+    if (!c.unroutable || c.conversation.kind !== 'channel' || c.conversation.serverId) return c;
+    const { channelId, threadId } = c.conversation;
+    return this.candidateForChannel(channelId, c.addressed, c.at, undefined, c.messageId, threadId);
+  }
+
+  /**
+   * The fallback for a wake that names no conversation: where the last
+   * message any channel delivered came in (its server, channel and thread),
+   * as plain speech went before speech routes. Not when a conversation fork
+   * owns that channel and this agent isn't the fork: the fork rule that keeps
+   * every other route out of a fork's channel.
+   */
+  private fallbackCandidate(agentName: string): RouteCandidate | null {
+    const last = this.channelRegistry?.getLastInbound?.();
+    if (!last || !this.mayTakeRoute(agentName, last.channelId)) return null;
+    return this.candidateForChannel(last.channelId, false, Date.now(), last.serverId, undefined, last.threadId);
+  }
+
+  /**
+   * A tune-out coordinator's wake: the subconscious's cadence and wake
+   * turns, and a cancel's wakes of the resident and the subconscious. One
+   * about a channel names that conversation, so its turn never takes the
+   * fallback: a resident's speech just after a cancel is held rather than
+   * sent where the last message came in (the subconscious is explicit-prose,
+   * so this changes nothing for it).
+   */
+  private queueTuneOutWake(agentName: string, reason: string, source: string, channelId?: string): void {
+    this.pendingRequests.push({
+      agentName, reason, source, timestamp: Date.now(),
+      ...(channelId ? { namesConversation: true as const } : {}),
+    });
+  }
+
+  /**
+   * A framework wake that continues `agentName`'s turn: an unstick, a retry
+   * after a rewind (a refusal, an unstick or an inference failure), the
+   * results of a non-streaming tool round, an explicit-prose continuation or
+   * bounce, or a bare provider-cooldown retry. It carries only that it
+   * continues the turn; continuationFor fills in the rest when its batch
+   * starts. A budget restart and a guard retry aren't built here: they
+   * continue the same logical turn, which keeps its route record
+   * (continuingTurn).
+   */
+  private continuationRequest(agentName: string, reason: string): InferenceRequest {
+    return { agentName, reason, source: 'framework', timestamp: Date.now(), continuesTurn: true };
+  }
+
+  /**
+   * A request that continues its agent's turn, as its batch starts
+   * (processInferenceRequests): what that turn's record gives it now
+   * (continuationOf). The conversations the turn answered become the
+   * request's candidates, so the true new turn it starts, alone or batched
+   * with other wakes, infers its route from them by the rules every wake
+   * follows, the fork rule included. A fallback turn's place becomes its
+   * fallback. A silent wake's own continuations are silent ticks too, with
+   * the turn's prompt and stamp, as a budget restart is; an unstick and a
+   * bounce's resend never are (ORDINARY_CONTINUATIONS).
+   *
+   * The record read is the agent's most recent turn's, as that turn left
+   * it, which is the turn the request continues: a resident's true new turn
+   * starts only here, an agent's requests wait while a turn is alive, and
+   * the next turn takes every request the agent has pending. So a request
+   * queued during its turn or in its teardown names where that turn's words
+   * went by its end, after a channel_open or a hold. An unstick waits for an
+   * idle agent, and a provider cooldown holds every request of the agent.
+   * Only a bounce can be queued after a successor turn has begun, from the
+   * previous turn's speech landing while the successor waits for it; its
+   * wake then runs after the successor and names the successor's
+   * conversations, where the resident last spoke, but never takes the
+   * successor's silence.
+   */
+  private continuationFor(request: InferenceRequest): InferenceRequest {
+    if (!request.continuesTurn) return request;
+    const turn = this.turnRoutes.get(request.agentName);
+    // The turn's conversations count as older than anything batched with
+    // them: whatever else is in the batch arrived after that turn began, so
+    // a message in the same conversation gives the reply edge.
+    const { candidates, namesConversation, fallback } = continuationOf(turn, 0);
+    const silent = turn?.silent && !AgentFramework.ORDINARY_CONTINUATIONS.has(request.reason);
+    return {
+      ...request,
+      continuesTurn: undefined,
+      ...(namesConversation ? { namesConversation: true as const } : {}),
+      ...(candidates.length > 0 ? { routeCandidates: candidates } : {}),
+      ...(fallback ? { fallbackPlace: fallback } : {}),
+      ...(silent ? { suppressProse: true, ...turn.silent } : {}),
+    };
+  }
+
+  /**
+   * Wakes that follow a turn without being part of it: an operator's unstick,
+   * and a bounce's resend, which can land after a later turn has begun. They
+   * take the turn's conversations but never its silence, so each is an
+   * ordinary turn, as on main.
+   */
+  private static readonly ORDINARY_CONTINUATIONS: ReadonlySet<string> = new Set(['unstick', 'prose-bounce']);
+
+  /**
+   * A conversation fork's home as its standing route (it always wins). Homes
+   * are bare channel ids: the server is the id's sole registrant, and a
+   * shared id gets none, so the route is unresolved rather than guessed.
+   */
+  private homeRoute(agentName: string): SpeechRoute | null {
+    const home = this.conversationAgentHomes.get(agentName) ?? this.channelRegistry?.resolveLocus(agentName) ?? null;
+    if (!home) return null;
+    const serverId = this.channelRegistry?.getChannelServerId(home) ?? undefined;
+    const label = serverId ? this.channelRegistry?.getChannelLabel(serverId, home) : undefined;
+    return {
+      kind: 'channel',
+      ...(serverId ? { serverId } : {}),
+      channelId: home,
+      ...(label ? { label } : {}),
+      origin: 'home',
+    };
+  }
+
+  /** The current logical turn's number (logicalTurns). */
+  private logicalTurn(agentName: string): number {
+    return this.logicalTurns?.get(agentName) ?? 0;
+  }
+
+  /**
+   * Prose the resident's speech has just published, confirmed, at a channel
+   * root goes to that inference's outgoing stream too (MCPL §14.3): a voice
+   * surface speaks only what was published, where it was published —
+   * never held, private, failed or unconfirmed words. The chunk names the
+   * outcome's own server and channel, and the root; a thread placement isn't
+   * streamed, so a channel's stream names one place. Each publish is its own
+   * message, so a later one on a channel that has already streamed opens with
+   * a paragraph break: deltas concatenated (what a voice consumer speaks) and
+   * the completion keep the messages apart instead of running "Let me
+   * look.Found it." together.
+   */
+  private streamPublished(
+    agentName: string,
+    moment: SpeechMoment,
+    published: { serverId: string; channelId: string; threadId?: string | null },
+    text: string,
+  ): void {
+    if (!moment.inferenceId || !this.channelRegistry || published.threadId || !text) return;
+    const streams = (this.outgoingStreams ??= new Map());
+    let stream = streams.get(moment.inferenceId);
+    if (!stream) {
+      stream = { conversationId: agentName, index: 0, channels: new Map() };
+      streams.set(moment.inferenceId, stream);
+    }
+    const key = `${published.serverId}\u0000${published.channelId}`;
+    // Only what this channel actually streamed counts: a chunk that didn't go
+    // out leaves no entry, so it never earns the next one a separator.
+    const channel = stream.channels.get(key);
+    const delta = channel ? `\n\n${text}` : text;
+    const sent = this.channelRegistry.sendOutgoingChunk(
+      { serverId: published.serverId, channelId: published.channelId },
+      agentName, moment.inferenceId, stream.index++, delta,
+    );
+    if (!sent) return;
+    if (channel) channel.text += delta;
+    else stream.channels.set(key, { serverId: published.serverId, channelId: published.channelId, text: delta });
+  }
+
+  /**
+   * Close the outgoing streams of these inferences: each channel gets its
+   * one completion, with exactly the text its stream carried. Chained at the
+   * physical stream's end, so it follows that stream's last speech.
+   */
+  private completeOutgoingStreams(inferenceIds: Iterable<string>): void {
+    for (const inferenceId of inferenceIds) {
+      const stream = this.outgoingStreams?.get(inferenceId);
+      if (!stream) continue;
+      this.outgoingStreams.delete(inferenceId);
+      for (const channel of stream.channels.values()) {
+        this.channelRegistry?.sendOutgoingComplete(
+          { serverId: channel.serverId, channelId: channel.channelId },
+          stream.conversationId, inferenceId, channel.text,
+        );
+      }
+    }
+  }
+
+  /** Append a link to the agent's speech chain (speechChains); it runs after every earlier one. */
+  private chainSpeech(agentName: string, what: string, work: () => Promise<void> | void): void {
+    const chains = (this.speechChains ??= new Map());
+    chains.set(agentName, (chains.get(agentName) ?? Promise.resolve())
+      .then(work)
+      .catch((err) => console.error(`${what} failed:`, err)));
+  }
+
+  /** Settles once every link chained so far for the agent has. */
+  private speechSettled(agentName: string): Promise<void> {
+    return this.speechChains?.get(agentName) ?? Promise.resolve();
+  }
+
+  /** How long stop() waits, at each of its two points, for the speech
+   *  chains to settle. A chain still busy then is left, and logged. */
+  private static SPEECH_DRAIN_MS = 10_000;
+
+  /** stop(): wait for every agent's speech chain, bounded. */
+  private async settleSpeechChains(when: string): Promise<void> {
+    const chains = [...(this.speechChains?.entries() ?? [])];
+    if (chains.length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const settled = new Set<string>();
+    const all = Promise.all(chains.map(([agent, chain]) => chain.then(() => { settled.add(agent); })));
+    const bound = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), AgentFramework.SPEECH_DRAIN_MS); });
+    const outcome = await Promise.race([all.then(() => 'settled' as const), bound]);
+    clearTimeout(timer);
+    if (outcome === 'timeout') {
+      const busy = chains.map(([agent]) => agent).filter((agent) => !settled.has(agent));
+      console.error(`[stop] speech of ${busy.join(', ')} still settling after ${AgentFramework.SPEECH_DRAIN_MS} ms, ${when}; going on without it`);
+    }
+  }
+
+  /**
+   * Record an explicit send by the host itself — a resend or channel_publish
+   * — as engagement (turnEngagement), from its outcome: delivered, or
+   * unknown (something may have been posted: a possible reply claim, not a
+   * delivery), engages the exact conversation asked for; failed engages
+   * nothing. The one rule for every host-publication path.
+   */
+  private noteSendEngagement(
+    agentName: string,
+    status: PublishOutcome['status'],
+    place: { serverId?: string; channelId: string; threadId?: string | null },
+  ): void {
+    if (status === 'failed') return;
+    const key = conversationKey({
+      kind: 'channel',
+      ...(place.serverId ? { serverId: place.serverId } : {}),
+      channelId: place.channelId,
+      ...(place.threadId ? { threadId: place.threadId } : {}),
+    });
+    const engaged = this.engagementFor(agentName);
+    if (engaged.conversations.get(key) !== 'delivered') engaged.conversations.set(key, status);
+  }
+
+  /** Record a connector's own send tool, whose place in the channel the host can't know, as engagement of the channel (turnEngagement). */
+  private noteChannelEngagement(agentName: string, serverId: string | undefined, channelId: string): void {
+    this.engagementFor(agentName).channels.add(AgentFramework.channelScopeKey(serverId, channelId));
+  }
+
+  private engagementFor(agentName: string): { conversations: Map<string, 'delivered' | 'unknown'>; channels: Set<string> } {
+    const all = (this.turnEngagement ??= new Map());
+    let engaged = all.get(agentName);
+    if (!engaged) {
+      engaged = { conversations: new Map(), channels: new Set() };
+      all.set(agentName, engaged);
+    }
+    return engaged;
+  }
+
+  /**
+   * How the resident engaged a conversation this turn, if it did: `delivered`
+   * or `unknown` — the host published there itself, confirmed or not — or
+   * `channel`: a connector's send tool posted somewhere in its channel.
+   */
+  private engagementOf(agentName: string, c: ConversationRef): 'delivered' | 'unknown' | 'channel' | undefined {
+    if (c.kind !== 'channel') return undefined;
+    const engaged = this.turnEngagement?.get(agentName);
+    if (!engaged) return undefined;
+    return engaged.conversations.get(conversationKey(c))
+      ?? (engaged.channels.has(AgentFramework.channelScopeKey(c.serverId, c.channelId)) ? 'channel' : undefined);
+  }
+
+  private static channelScopeKey(serverId: string | undefined, channelId: string): string {
+    return `${serverId ?? ''}\u0000${channelId}`;
+  }
+
+  /** The channel the agent's unaddressed speech goes to now, if it is a channel and not held. */
+  private routeChannelId(agentName: string): string | null {
+    // Optional chaining: prototype-built harnesses leave the map unset.
+    const turn = this.turnRoutes?.get(agentName);
+    return turn && !turn.hold && turn.route?.kind === 'channel' ? turn.route.channelId : null;
+  }
+
+  /** The channel route's channel with its server, where typing shows and
+   *  logs name it: the same id on another server is another channel. */
+  private routeChannel(agentName: string): { serverId?: string; channelId: string } | null {
+    const turn = this.turnRoutes?.get(agentName);
+    if (!turn || turn.hold || turn.route?.kind !== 'channel') return null;
+    return { ...(turn.route.serverId ? { serverId: turn.route.serverId } : {}), channelId: turn.route.channelId };
+  }
+
+  /**
+   * The exact place the agent's unaddressed speech is published to now — its
+   * channel route's server, channel and thread (null: the channel root) — or
+   * null when it has no channel route or is held.
+   */
+  private routeTarget(agentName: string): { serverId?: string; channelId: string; threadId: string | null } | null {
+    const turn = this.turnRoutes?.get(agentName);
+    if (!turn || turn.hold || turn.route?.kind !== 'channel') return null;
+    const route = turn.route;
+    return { ...(route.serverId ? { serverId: route.serverId } : {}), channelId: route.channelId, threadId: route.threadId ?? null };
+  }
+
+  /** A channel's declared publish target (MCPL RFC-011), read live from the registry. */
+  private publishTargetOf(channel: { serverId?: string; channelId: string }): 'exact' | 'root' | 'unresolved' | undefined {
+    const registry = this.channelRegistry;
+    if (!registry) return undefined;
+    const declared = registry.publishTarget(channel);
+    if (declared) return declared;
+    // No declaration read: a registered channel that declares none, or a
+    // channel that isn't exactly one registration (unknown, withdrawn, or a
+    // shared id named without its server). Only the second is unresolved.
+    return 'error' in registry.resolveDestination(channel) ? 'unresolved' : undefined;
+  }
+
+  /**
+   * Connector tools worth consulting for a conversation the framework can't
+   * publish into, as the resident calls them — only what the connector
+   * actually lists: its tools of class `comms` (MCPL RFC-008), or whose own
+   * names begin send/reply/post/say; failing those, the prefix its tools
+   * share. A match says where to look, not that the tool can post there:
+   * the resident judges from the tool's own description.
+   */
+  private connectorSendTools(serverId: string | undefined): { tools: string[]; prefix?: string } {
+    if (!serverId) return { tools: [] };
+    const tools: string[] = [];
+    let prefix: string | undefined;
+    for (const tool of this.mcplTools ?? []) {
+      if (this.mcplToolServers?.get(tool.name) !== serverId) continue;
+      const hit = this.resolveMcplTool(tool.name);
+      prefix ??= hit?.[1];
+      const own = hit ? tool.name.slice(hit[1].length + 2) : tool.name;
+      const comms = this.effectiveToolClass(tool.name, true).classes.includes('comms' as ToolClass);
+      if (comms || /^(send|reply|post|say)(_|$)/i.test(own)) tools.push(tool.name);
+    }
+    return { tools: tools.slice(0, 4), ...(prefix ? { prefix } : {}) };
+  }
+
+  /** The connector tools to consult, in words; empty when it lists none. */
+  private connectorToolsText(serverId: string | undefined): string {
+    const { tools, prefix } = this.connectorSendTools(serverId);
+    if (tools.length > 0) return `Its connector's own tools may reach it; consult them: ${tools.map((t) => `\`${t}\``).join(', ')}.`;
+    if (prefix) return `Its connector's own tools (\`${prefix}--…\`) may reach it; consult their descriptions.`;
+    return '';
+  }
+
+  /** Why plain speech can't go to a conversation, and which connector tools to consult. */
+  private unroutableText(unroutable: NonNullable<TurnRoute['unroutable']>): string {
+    const c = unroutable.conversation;
+    const where = describeConversation(c);
+    const consult = c.kind === 'channel' ? this.connectorToolsText(c.serverId) : '';
+    const tail = consult ? ` ${consult}` : '';
+    switch (unroutable.reason) {
+      case 'untargetable':
+        return `${where}: its connector doesn't declare where a post lands (MCPL RFC-011) — it may choose a thread ` +
+          `itself — so publication from here is unavailable until it does.${tail}`;
+      case 'thread':
+        return `${where} is a thread, but its connector declares the channel has no threads, so publication from ` +
+          `here can't target it.${tail}`;
+      case 'unresolved':
+        return `${where} doesn't resolve to exactly one registered channel.${tail || ' Use an explicit send tool to reach it.'}`;
+    }
+  }
+
+  /** The agent's route as the registry needs it (context, channel_publish default). */
+  private speechRouteView(agentName: string): SpeechRouteView {
+    const turn = this.turnRoutes.get(agentName);
+    if (!turn) return { kind: 'none' };
+    if (turn.hold) return { kind: 'held', conversations: turn.hold.conversations.map(describeConversation) };
+    const route = turn.route;
+    if (!route) return { kind: 'none' };
+    if (route.kind === 'surface') return { kind: 'surface', surface: route.surface };
+    return {
+      kind: 'channel',
+      ...(route.serverId ? { serverId: route.serverId } : {}),
+      channelId: route.channelId,
+      ...(route.threadId ? { threadId: route.threadId } : {}),
+      ...(route.replyTo ? { replyTo: route.replyTo } : {}),
+    };
+  }
+
+  /**
+   * Deliver one segment of unaddressed plain speech along the route it was
+   * written under (its SpeechMoment, captured when the words were produced:
+   * a channel_open or a hold that lands while they wait on the speech chain
+   * governs only words written after it): a channel route publishes it; a
+   * surface route shows it there (the
+   * surface already holds the turn's words) and publishes nothing; a held
+   * turn keeps it as an `ambiguous` draft naming the competing
+   * conversations; no route keeps it as a `no-destination` draft.
+   */
+  private async speakUnaddressed(
+    agent: Agent,
+    text: string,
+    hold: { round?: number; notice: 'now' | 'later' },
+    /** When the words were produced: the route they were written under, and their stream. */
+    moment: SpeechMoment = { turn: this.turnRoutes?.get(agent.name) },
+  ): Promise<void> {
+    const turn = moment.turn;
+    if (turn?.hold) {
+      this.holdProseDrafts(agent, [text], 'ambiguous', {
+        ...hold,
+        note: `competing conversations: ${turn.hold.conversations.map(describeConversation).join('; ')}`,
+      });
+      return;
+    }
+    const route = turn?.route;
+    if (!route) {
+      const unroutable = turn?.unroutable;
+      this.holdProseDrafts(agent, [text], 'no-destination', {
+        ...hold,
+        ...(unroutable ? { note: this.unroutableText(unroutable) } : {}),
+      });
+      return;
+    }
+    if (route.kind === 'surface') {
+      this.recordProseDelivery(agent.name, { delivered: true, channelId: `surface:${route.surface}` });
+      return;
+    }
+    if (!this.channelRegistry) {
+      // No channel subsystem to publish through: keep the words.
+      this.holdProseDrafts(agent, [text], 'no-destination', hold);
+      return;
+    }
+    // The route's exact place: its server, channel and thread (or root).
+    const target = { ...(route.serverId ? { serverId: route.serverId } : {}), channelId: route.channelId, threadId: route.threadId ?? null };
+    const outcome = await this.channelRegistry.routeSpeech(agent.name, text, target, { holdFailed: this.holdUndelivered(agent, text, hold) });
+    this.recordProseDelivery(agent.name, outcome);
+    if (outcome?.delivered) this.streamPublished(agent.name, moment, outcome, text);
+  }
+
+  /** deliverSpeech's holdFailed for unaddressed speech: words that provably
+   *  weren't posted are kept as a bounce draft (as a failed `>>>` delivery's
+   *  are), named by the one failure notice. An unknown outcome keeps none,
+   *  so as not to invite a duplicate. */
+  private holdUndelivered(agent: Agent, text: string, hold: { round?: number }): (reason: string) => string | undefined {
+    return (reason) => this.holdProseDrafts(agent, [text], 'bounced', { round: hold.round, note: `delivery failed: ${reason}`, notice: 'later' })[0]?.id;
+  }
+
+  /** A turn route in words, for logs. */
+  private static routeText(turn: TurnRoute): string {
+    if (turn.hold) return `held between ${turn.hold.conversations.map(describeConversation).join(' and ')}`;
+    if (turn.route) return describeConversation(routeConversation(turn.route));
+    return turn.unroutable ? `none (${turn.unroutable.reason}: ${describeConversation(turn.unroutable.conversation)})` : 'none';
+  }
+
+  /** Identity of a turn route for announce-on-change. */
+  private static routeKey(turn: TurnRoute): string {
+    if (turn.hold) return `held:${turn.hold.conversations.map(conversationKey).sort().join('|')}`;
+    if (!turn.route) return turn.unroutable ? `unroutable:${conversationKey(turn.unroutable.conversation)}` : 'none';
+    return conversationKey(routeConversation(turn.route));
+  }
+
+  /**
+   * Announce-on-change route notice. Appends a durable `[routing]` window
+   * message when the turn's route differs from the last one announced — the
+   * agent must never have to guess where its plain speech goes, or why it is
+   * held. Durable append (never retracted) keeps the KV prefix stable;
+   * change-only keeps it out of steady-state turns. The first resolution
+   * after boot announces only a route that exists ("no destination" is the
+   * unremarkable boot default). Never triggers inference.
+   */
+  private announceRouteIfChanged(agentName: string, turn: TurnRoute): void {
+    const key = AgentFramework.routeKey(turn);
+    const hasBaseline = this.lastAnnouncedRoute.has(agentName);
+    const prev = this.lastAnnouncedRoute.get(agentName);
+    if (hasBaseline ? prev === key : key === 'none') {
+      if (!hasBaseline) this.lastAnnouncedRoute.set(agentName, key);
+      return;
+    }
+    this.lastAnnouncedRoute.set(agentName, key);
     const agent = this.agents.get(agentName);
     if (!agent) return;
 
     let text: string;
-    if (locus === null) {
+    if (turn.hold) {
       text =
-        '[routing] Your plain speech currently has no channel — it stays in ' +
-        'your archive. Use an explicit send tool to reach a channel.';
+        `[routing] More than one conversation is waiting for you: ${turn.hold.conversations.map(describeConversation).join('; ')}. ` +
+        'Your unaddressed plain speech is held as drafts this turn rather than guessed: answer one with an ' +
+        'explicit send (or channel_open it), and resend held words with the drafts tool.';
+    } else if (!turn.route && turn.unroutable) {
+      text =
+        `[routing] Your plain speech can't go to the conversation in front of you, so it is held as drafts. ` +
+        this.unroutableText(turn.unroutable);
+    } else if (!turn.route) {
+      text =
+        '[routing] Your plain speech currently has no destination — it is held as drafts you can resend. ' +
+        'Use an explicit send tool to reach a channel.';
+    } else if (turn.route.kind === 'surface') {
+      text =
+        `[routing] Your plain speech now goes to ${describeConversation(routeConversation(turn.route))}: ` +
+        'it is shown there and published to no channel. Channels need an explicit send tool.';
+    } else if (turn.route.origin === 'fallback') {
+      text =
+        `[routing] Nothing in this wake named a conversation, so your plain speech lands where the last message ` +
+        `came in: ${describeConversation(routeConversation(turn.route))}. Other channels need an explicit send tool.`;
     } else {
-      const label = this.channelRegistry?.getDescriptor(locus)?.label;
-      const shown =
-        label && label !== locus
-          ? `${label.startsWith('#') ? label : `#${label}`} (${locus})`
-          : locus;
       text =
-        `[routing] Your plain speech now lands in ${shown}. ` +
+        `[routing] Your plain speech now lands in ${describeConversation(routeConversation(turn.route))}. ` +
         'Other channels need an explicit send tool.';
     }
-
     try {
       const id = agent.getContextManager().addMessage(
         'user',
@@ -8648,13 +10803,12 @@ export class AgentFramework {
         { system: true, kind: 'routing-notice' },
       );
       this.emitTrace({ type: 'message:added', messageId: id, source: 'routing-notice' });
-      console.error(
-        `[routing] ${agentName}: locus ${prev ?? '(none)'} -> ${locus ?? '(none)'} (announced in window)`,
-      );
+      console.error(`[routing] ${agentName}: route -> ${AgentFramework.routeText(turn)} (announced in window)`);
     } catch (err) {
-      console.error('announceLocusIfChanged: failed to record routing notice:', err);
+      console.error('announceRouteIfChanged: failed to record routing notice:', err);
     }
   }
+
 
   /**
    * Durable window notice for a channel the agent did not ask to open —
@@ -8666,12 +10820,18 @@ export class AgentFramework {
    */
   private recordChannelAutoOpenNotice(
     agentName: string | undefined,
-    channels: Array<{ channelId: string; label?: string }>,
+    channels: Array<{ serverId?: string; channelId: string; label?: string }>,
     cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply',
   ): void {
     if (channels.length === 0) return;
+    // Named as every conversation is (describeConversation), server included.
     const shown = channels
-      .map((c) => (c.label && c.label !== c.channelId ? `${c.label} (${c.channelId})` : c.channelId))
+      .map((c) => describeConversation({
+        kind: 'channel',
+        ...(c.serverId ? { serverId: c.serverId } : {}),
+        channelId: c.channelId,
+        ...(c.label ? { label: c.label } : {}),
+      }))
       .join(', ');
     const plural = channels.length > 1;
     const causeText =
@@ -8704,7 +10864,13 @@ export class AgentFramework {
    * nothing is ever sent to a destination the model did not name (directly
    * or via the turn's sticky target).
    */
-  private async deliverProse(agent: Agent, rawText: string): Promise<void> {
+  private async deliverProse(
+    agent: Agent,
+    rawText: string,
+    hold: { round?: number; notice: 'now' | 'later' } = { notice: 'later' },
+    /** When the words were produced: their outgoing stream, once published. */
+    moment: SpeechMoment = { turn: undefined },
+  ): Promise<void> {
     // Multi-envelope: a single prose block may address SEVERAL destinations —
     // every line beginning with `>>` opens a new envelope, routed
     // independently (first live use: Tilde 2026-07-24, one block carrying a
@@ -8728,38 +10894,152 @@ export class AgentFramework {
 
     for (const envelope of envelopes) {
       if (!envelope.trim()) continue;
-      await this.deliverProseEnvelope(agent, envelope.replace(/^\s+(?=>>)/, ''));
+      await this.deliverProseEnvelope(agent, envelope.replace(/^\s+(?=>>)/, ''), hold, moment);
     }
+  }
+
+  /**
+   * `{{unsent}}` in an envelope body: the latest bounce draft's words. One
+   * that is out (being sent, or queued in a resend) or unconfirmed (its last
+   * attempt may have been posted) is never substituted — nothing is sent,
+   * and the resident gets the facts and the explicit route (drafts resend
+   * with confirmDuplicate) instead. The envelope's own words are held, as a
+   * bounced envelope's would be (unsentWords): one bounce draft with the
+   * whole text, `{{unsent}}` written out and its risk carried, so nothing
+   * the resident wrote has to be typed again. A bare `{{unsent}}` holds
+   * nothing new: its words already are that draft.
+   */
+  private takeUnsent(
+    agent: Agent,
+    body: string,
+    hold: { round?: number; notice: 'now' | 'later' },
+  ): { draft?: Draft; refused?: true } {
+    const draft = this.proseDrafts.latestBounce(agent.name);
+    if (!draft) return {};
+    const key = `${agent.name}\u0000${draft.id}`;
+    let why: string;
+    let next: string;
+    if (this.draftsInFlight.has(key)) {
+      why = this.draftsSending.has(key) ? 'which is being sent right now' : 'which is queued in a resend in progress';
+      next = 'wait for that result';
+    } else if (draftState(draft) === 'unconfirmed') {
+      why = this.riskText(draft);
+      next = 'check that channel; to send that draft again anyway use ' +
+        `drafts(action: "resend", draftIds: ["${draft.id}"], destination: "#channel", confirmDuplicate: true)`;
+    } else {
+      return { draft };
+    }
+    const words = this.unsentWords(agent, body);
+    const held = 'draft' in words
+      ? undefined
+      : this.holdProseDrafts(
+        agent,
+        [{ text: words.text, ...(words.inheritedRisk ? { inheritedRisk: words.inheritedRisk } : {}) }],
+        'bounced',
+        { round: hold.round, note: `{{unsent}} was draft ${draft.id}, which could not be sent`, notice: 'later' },
+      )[0];
+    const kept = held
+      ? ` Your message is held as draft ${held.id}, with {{unsent}} written out; since it includes ${draft.id}'s words, it ` +
+        'can be resent only with confirmDuplicate: true, after that.'
+      : '';
+    const text = `[prose-routing] {{unsent}} is draft ${draft.id}, ${why.startsWith('which') ? why : `and ${why}`}. ` +
+      `Nothing was sent; ${next}.${kept}`;
+    try {
+      this.addMessage(
+        'user',
+        [{ type: 'text', text }],
+        { system: true, kind: 'prose-bounce', ...(held ? { draftOwner: agent.name, draftIds: [held.id] } : {}) } as MessageMetadata,
+        { forAgent: agent.name },
+      );
+    } catch (err) {
+      console.error('[drafts] refused-unsent notice failed:', err);
+    }
+    return { draft, refused: true };
+  }
+
+  /**
+   * Deliver an envelope that substituted `{{unsent}}`: the substituted
+   * draft's attempt is journaled durably before the request leaves, and its
+   * outcome after, exactly as a drafts resend would.
+   */
+  private async deliverWithUnsent(
+    agent: Agent,
+    body: string,
+    /** The envelope's destination, on the server its target resolved to. */
+    destination: { serverId: string; channelId: string },
+    unsent: Draft | undefined,
+  ): Promise<PublishOutcome> {
+    const registry = this.channelRegistry!;
+    let attemptId: string | undefined;
+    if (unsent) {
+      const target = registry.resolveDestination(destination);
+      if (!('error' in target)) {
+        try {
+          attemptId = this.proseDrafts.beginAttempt(agent.name, unsent.id, target.destination, 'unsent-token', false);
+        } catch (err) {
+          const reason = `the attempt for draft ${unsent.id} could not be recorded durably (${err instanceof Error ? err.message : String(err)})`;
+          console.error(`[drafts] ${agent.name}: ${reason} — not sending`);
+          return { status: 'failed', reason, at: Date.now() };
+        }
+      }
+    }
+    const flight = unsent ? `${agent.name}\u0000${unsent.id}` : undefined;
+    if (flight) {
+      this.draftsInFlight.add(flight);
+      this.draftsSending.add(flight);
+    }
+    let outcome: PublishOutcome;
+    try {
+      outcome = await registry.deliverSpeech(agent.name, body, destination);
+    } finally {
+      if (flight) {
+        this.draftsInFlight.delete(flight);
+        this.draftsSending.delete(flight);
+      }
+    }
+    if (unsent && attemptId) {
+      try {
+        this.proseDrafts.recordOutcome(agent.name, unsent.id, attemptId, outcome);
+      } catch (err) {
+        console.error(`[drafts] ${agent.name}: outcome of ${unsent.id} not recorded:`, err);
+        const text =
+          `[prose-routing] {{unsent}} was draft ${unsent.id}; its send came back ${outcome.status}, but recording that ` +
+          `failed, so the draft reads as ${this.draftStateNow(agent.name, unsent.id)} now. drafts(action: "read") shows it.`;
+        try {
+          this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'prose-bounce' }, { forAgent: agent.name });
+        } catch (noticeErr) {
+          console.error('[drafts] unrecorded-outcome notice failed:', noticeErr);
+        }
+      }
+    }
+    return outcome;
+  }
+
+  /** A draft's state as the journal reads it now: after a write that failed
+   *  and was reconciled, whatever reached the journal counts. */
+  private draftStateNow(agentName: string, id: string): DraftState | 'let go' {
+    const draft = this.proseDrafts.get(agentName, id);
+    return draft ? draftState(draft) : 'let go';
   }
 
   /** Locus-preserving explicit publication. Source remains byte-identical in Chronicle. */
   private async deliverHybridProse(
     agent: Agent,
     rawText: string,
-    locus: string | null,
-    allowLocus: boolean,
+    hold: { round?: number; notice: 'now' | 'later' } = { notice: 'later' },
+    /** When the words were produced: the route they were written under, and their stream. */
+    moment: SpeechMoment = { turn: this.turnRoutes?.get(agent.name) },
   ): Promise<void> {
-    const lines = rawText.split('\n');
-    const envelopes: string[] = [];
-    let current: string[] = [];
-    for (const line of lines) {
-      if (line.trimStart().startsWith('>>>') && current.length > 0) {
-        envelopes.push(current.join('\n'));
-        current = [];
-      }
-      current.push(line);
-    }
-    if (current.length > 0) envelopes.push(current.join('\n'));
-
-    for (const envelope of envelopes) {
-      if (!envelope.trim()) continue;
-      const normalized = envelope.replace(/^\s+(?=>>>)/, '');
+    for (const envelope of splitHybridEnvelopes(rawText)) {
+      const normalized = envelope;
       const attempted = normalized.startsWith('>>>');
       const parsed = parseHybridProsePrefix(normalized);
       if (parsed.continueTurn) this.proseContinuations.add(agent.name);
       if (parsed.kind === 'private') {
         this.proseTargetPins.delete(agent.name);
-        this.proseHybridSuppressed.add(agent.name);
+        this.proseHybridSuppressed.set(agent.name, 'private');
+        // `>>>skip_reply {{unsent}}`: the resident sets the bounced draft aside.
+        if (parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent);
         console.error(`[prose] ${agent.name}: >>>skip_reply — ${parsed.body.length} chars kept in context (not sent)`);
         continue;
       }
@@ -8767,101 +11047,162 @@ export class AgentFramework {
         const resolved = this.channelRegistry!.resolveProseTarget(parsed.target!);
         if ('error' in resolved) {
           this.proseTargetPins.delete(agent.name);
-          this.proseHybridSuppressed.add(agent.name);
-          this.bounceProse(agent, parsed.body, resolved.error, resolved.candidates, '>>>');
+          this.proseHybridSuppressed.set(agent.name, 'failed');
+          this.bounceProse(agent, parsed.body, resolved.error, resolved.candidates, '>>>', hold);
           continue;
         }
         let body = parsed.body;
         const usedClipboard = body.includes('{{unsent}}');
-        if (usedClipboard) body = body.replaceAll('{{unsent}}', this.proseClipboards.get(agent.name) ?? '');
-        this.proseTargetPins.set(agent.name, resolved.channelId);
+        const unsent = usedClipboard ? this.takeUnsent(agent, body, hold) : {};
+        if (unsent.refused) {
+          this.proseTargetPins.delete(agent.name);
+          this.proseHybridSuppressed.set(agent.name, 'failed');
+          continue;
+        }
+        if (usedClipboard) body = body.replaceAll('{{unsent}}', unsent.draft?.text ?? '');
+        const pin = { serverId: resolved.serverId, channelId: resolved.channelId };
+        this.proseTargetPins.set(agent.name, pin);
         this.proseHybridSuppressed.delete(agent.name);
         if (!body.trim()) {
           console.error(`[prose] ${agent.name}: >>>${parsed.target} established target; empty body — nothing sent yet`);
           continue;
         }
         try {
-          const outcome = await this.channelRegistry!.routeSpeech(agent.name, body, resolved.channelId);
-          this.recordProseDelivery(agent.name, outcome);
-          if (outcome?.delivered) {
+          const outcome = await this.deliverWithUnsent(agent, body, pin, unsent.draft);
+          this.recordProseDelivery(agent.name, outcome.status === 'delivered' ? { delivered: true, ...outcome.destination! } : null);
+          if (outcome.status === 'delivered') {
+            this.streamPublished(agent.name, moment, outcome.destination!, body);
             this.proseBounceStreaks.delete(agent.name);
-            if (usedClipboard) this.proseClipboards.delete(agent.name);
           } else {
             this.proseTargetPins.delete(agent.name);
-            this.proseHybridSuppressed.add(agent.name);
-            this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} was not confirmed`, undefined, '>>>');
+            this.proseHybridSuppressed.set(agent.name, 'failed');
+            // An uncertain delivery is reported by the failure marker; it is
+            // not bounced, so its words are not re-held as a fresh draft that
+            // invites a duplicate.
+            if (outcome.status === 'failed') {
+              this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${outcome.reason ?? 'refused'}`, undefined, '>>>', hold);
+            }
           }
         } catch (err) {
           this.proseTargetPins.delete(agent.name);
-          this.proseHybridSuppressed.add(agent.name);
-          this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>>');
+          this.proseHybridSuppressed.set(agent.name, 'failed');
+          this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>>', hold);
         }
         continue;
       }
       if (attempted) {
         this.proseTargetPins.delete(agent.name);
-        this.proseHybridSuppressed.add(agent.name);
-        this.bounceProse(agent, normalized, 'malformed >>> routing envelope: destination is missing', undefined, '>>>');
+        this.proseHybridSuppressed.set(agent.name, 'failed');
+        this.bounceProse(agent, normalized, 'malformed >>> routing envelope: destination is missing', undefined, '>>>', hold);
         continue;
       }
-      if (this.proseHybridSuppressed.has(agent.name)) {
-        this.recordProseSuppression(agent.name, 1);
+      const suppressedBy = this.proseHybridSuppressed.get(agent.name);
+      if (suppressedBy === 'private') {
+        this.turnProsePrivate.set(agent.name, (this.turnProsePrivate.get(agent.name) ?? 0) + 1);
         continue;
       }
+      if (suppressedBy === 'failed') {
+        this.holdProseDrafts(agent, [envelope], 'no-destination', hold);
+        continue;
+      }
+      // A `>>>target` set this turn is deliberate and wins; otherwise the
+      // envelope is unaddressed speech, which follows the route it was
+      // written under.
       const sticky = this.proseTargetPins.get(agent.name);
-      if (!allowLocus && !sticky) {
-        this.recordProseSuppression(agent.name, 1);
-        continue;
-      }
-      const target = sticky ?? locus;
       try {
-        const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
-        this.recordProseDelivery(agent.name, outcome);
+        if (sticky) {
+          const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, sticky, { holdFailed: this.holdUndelivered(agent, envelope, hold) });
+          this.recordProseDelivery(agent.name, outcome);
+          if (outcome?.delivered) this.streamPublished(agent.name, moment, outcome, envelope);
+        } else {
+          await this.speakUnaddressed(agent, envelope, hold, moment);
+        }
       } catch (err) {
         console.error('hybrid locus delivery failed:', err);
       }
     }
   }
 
-  private async deliverProseEnvelope(agent: Agent, rawText: string): Promise<void> {
+  /** `>>skip_reply {{unsent}}` and its hybrid form: set the latest bounce
+   *  draft aside — unless it is being sent right now, which a dismissal
+   *  can't call back: the resident is told instead. So are a dismissal that
+   *  can't be recorded (the draft stays, and `{{unsent}}` still names it)
+   *  and one whose draft may already have been posted. */
+  private dismissLatestBounce(agent: Agent): void {
+    const draft = this.proseDrafts.latestBounce(agent.name);
+    if (!draft) return;
+    const tell = (text: string, what: string): void => {
+      try {
+        this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'prose-bounce' }, { forAgent: agent.name });
+      } catch (err) {
+        console.error(`[drafts] ${what} notice failed:`, err);
+      }
+    };
+    if (this.draftsSending.has(`${agent.name}\u0000${draft.id}`)) {
+      tell(`[prose-routing] {{unsent}} is draft ${draft.id}, which is being sent right now. It was not set aside, ` +
+        'since that can\'t call back words already on their way; wait for that result.', 'in-flight-dismiss');
+      return;
+    }
+    const risk = draftState(draft) === 'unconfirmed' ? this.riskText(draft) : undefined;
+    try {
+      this.proseDrafts.dismiss(agent.name, draft.id);
+      this.emitTrace({ type: 'prose:drafts-dismissed', agentName: agent.name, draftIds: [draft.id] });
+    } catch (err) {
+      console.error(`[drafts] ${agent.name}: could not dismiss ${draft.id}:`, err);
+      tell(`[prose-routing] {{unsent}} is draft ${draft.id}, which could not be set aside ` +
+        `(${err instanceof Error ? err.message : String(err)}): it is still held, and {{unsent}} still names it.`, 'failed-dismiss');
+      return;
+    }
+    if (risk) tell(`[prose-routing] Draft ${draft.id} is set aside. Note that ${risk}.`, 'at-risk-dismiss');
+  }
+
+  private async deliverProseEnvelope(
+    agent: Agent,
+    rawText: string,
+    hold: { round?: number; notice: 'now' | 'later' },
+    moment: SpeechMoment,
+  ): Promise<void> {
     const name = agent.name;
     const parsed = parseProsePrefix(rawText);
     if (parsed.continueTurn) this.proseContinuations.add(name);
 
     if (parsed.kind === 'private') {
       // The text already lives in the assistant message (window/chronicle);
-      // "delivery" is deliberately a no-op. Consumes the retained text if the
-      // segment embedded it.
-      if (parsed.body.includes('{{unsent}}')) this.proseClipboards.delete(name);
+      // "delivery" is deliberately a no-op. `>>skip_reply {{unsent}}` sets
+      // the bounced draft aside.
+      if (parsed.body.includes('{{unsent}}')) this.dismissLatestBounce(agent);
       console.error(`[prose] ${name}: >>skip_reply — ${parsed.body.length} chars kept in context (not sent)`);
       return;
     }
 
-    let targetChannel: string;
+    let target: { serverId: string; channelId: string };
     let body: string;
     if (parsed.kind === 'target') {
       const res = this.channelRegistry!.resolveProseTarget(parsed.target!);
       if ('error' in res) {
-        this.bounceProse(agent, parsed.body, res.error, res.candidates);
+        this.bounceProse(agent, parsed.body, res.error, res.candidates, '>>', hold);
         return;
       }
-      targetChannel = res.channelId;
-      // Sticky within the turn: later unprefixed segments follow this target.
-      this.proseTargetPins.set(name, targetChannel);
+      target = { serverId: res.serverId, channelId: res.channelId };
+      // Sticky within the turn: later unprefixed segments follow this
+      // target, on its server.
+      this.proseTargetPins.set(name, target);
       body = parsed.body;
     } else {
       const sticky = this.proseTargetPins.get(name);
       if (!sticky) {
-        this.bounceProse(agent, rawText, 'no destination prefix and no destination set yet this turn');
+        this.bounceProse(agent, rawText, 'no destination prefix and no destination set yet this turn', undefined, '>>', hold);
         return;
       }
-      targetChannel = sticky;
+      target = sticky;
       body = rawText;
     }
 
     const usedClipboard = body.includes('{{unsent}}');
+    const unsent = usedClipboard ? this.takeUnsent(agent, body, hold) : {};
+    if (unsent.refused) return;
     if (usedClipboard) {
-      body = body.replaceAll('{{unsent}}', this.proseClipboards.get(name) ?? '');
+      body = body.replaceAll('{{unsent}}', unsent.draft?.text ?? '');
     }
     if (!body.trim()) {
       console.error(`[prose] ${name}: empty body after prefix/substitution — nothing to send`);
@@ -8869,30 +11210,112 @@ export class AgentFramework {
     }
 
     try {
-      const result = await this.channelRegistry!.routeSpeech(name, body, targetChannel);
-      if (result?.delivered) {
+      const outcome = await this.deliverWithUnsent(agent, body, target, unsent.draft);
+      if (outcome.status === 'delivered') {
+        this.streamPublished(name, moment, outcome.destination!, body);
         this.proseBounceStreaks.delete(name);
-        if (usedClipboard) this.proseClipboards.delete(name);
       }
     } catch (err) {
-      console.error(`[prose] ${name}: delivery to ${targetChannel} failed:`, err);
+      console.error(`[prose] ${name}: delivery to ${target.channelId} failed:`, err);
     }
   }
 
   /** Cap on consecutive bounce-triggered wakes (notices still append after). */
   private static readonly PROSE_BOUNCE_WAKE_CAP = 2;
 
-  private bounceProse(agent: Agent, text: string, reason: string, candidates?: string[], prefix: '>>' | '>>>' = '>>'): void {
+  /**
+   * Words about to be held that may use `{{unsent}}` (a bounce, or an
+   * envelope an explicit send suppressed), under the one re-bounce rule. A
+   * bare `{{unsent}}` is the latest bounce itself, which stays the one draft
+   * of those words rather than being copied. Otherwise the whole authored
+   * text is kept, the token expanded to the latest bounce's words, nothing
+   * stripped or substituted. When that draft may already have been posted
+   * (unconfirmed, or in flight) the words carry its duplication risk: they
+   * can be resent only with confirmDuplicate, like the draft they copy. The
+   * evidence is the risk's own: the copied draft's uncertain attempt, else
+   * the risk that draft itself inherited, else (truly) that it was in flight
+   * when copied.
+   */
+  private unsentWords(agent: Agent, text: string): { draft: Draft } | { text: string; inheritedRisk?: InheritedRisk } {
+    if (!text.includes('{{unsent}}')) return { text };
     const name = agent.name;
-    this.proseClipboards.set(name, text);
+    const previous = this.proseDrafts.latestBounce(name);
+    if (previous && text.trim() === '{{unsent}}') return { draft: previous };
+    const expanded = text.replaceAll('{{unsent}}', previous?.text ?? '');
+    if (!previous || !(draftState(previous) === 'unconfirmed' || this.draftsInFlight.has(`${name}\u0000${previous.id}`))) {
+      return { text: expanded };
+    }
+    const risky = uncertainAttempt(previous);
+    const inheritedRisk: InheritedRisk = risky
+      ? {
+          draftId: previous.id,
+          destination: risky.destination,
+          at: risky.at,
+          reason: risky.outcome?.reason ?? (this.attemptIsOut(previous, risky)
+            ? "it was being sent when these words were held, so its outcome wasn't known yet"
+            : 'its outcome was never recorded'),
+        }
+      : previous.inheritedRisk
+        ? {
+            draftId: previous.id,
+            sourceDraftId: previous.inheritedRisk.sourceDraftId ?? previous.inheritedRisk.draftId,
+            ...(previous.inheritedRisk.destination ? { destination: previous.inheritedRisk.destination } : {}),
+            ...(previous.inheritedRisk.at !== undefined ? { at: previous.inheritedRisk.at } : {}),
+            reason: previous.inheritedRisk.reason,
+          }
+        : {
+            draftId: previous.id,
+            reason: this.draftsSending.has(`${name}\u0000${previous.id}`)
+              ? 'it was being sent when these words were held'
+              : 'it was queued in a resend when these words were held',
+          };
+    return { text: expanded, inheritedRisk };
+  }
+
+  /**
+   * A routing envelope that could not be delivered: its words are held as a
+   * draft (the `{{unsent}}` source) and the resident is told, privately.
+   * `{{unsent}}` in it follows the re-bounce rule (unsentWords).
+   */
+  private bounceProse(
+    agent: Agent,
+    text: string,
+    reason: string,
+    candidates?: string[],
+    prefix: '>>' | '>>>' = '>>',
+    hold: { round?: number; notice: 'now' | 'later' } = { notice: 'later' },
+  ): void {
+    const name = agent.name;
+    const words = this.unsentWords(agent, text);
+    let draft: Draft | undefined;
+    let inherited: InheritedRisk | undefined;
+    if ('draft' in words) {
+      draft = words.draft;
+    } else {
+      inherited = words.inheritedRisk;
+      // The bounce notice below names the draft, so no separate held notice.
+      draft = this.holdProseDrafts(
+        agent,
+        [{ text: words.text, ...(inherited ? { inheritedRisk: inherited } : {}) }],
+        'bounced',
+        { round: hold.round, note: reason, notice: 'later' },
+      )[0];
+    }
     const streak = (this.proseBounceStreaks.get(name) ?? 0) + 1;
     this.proseBounceStreaks.set(name, streak);
     const cand = candidates?.length ? ` Known channels it could mean: ${candidates.join(', ')}.` : '';
+    const kept = draft
+      ? `It is held as draft ${draft.id}; nothing is lost. To deliver it unchanged, reply with a destination plus the ` +
+        `token {{unsent}}, e.g. "${prefix}#channel {{unsent}}" or "${prefix}@person {{unsent}}", or use ` +
+        `drafts(action: "resend", draftIds: ["${draft.id}"], destination: "#channel"). ` +
+        `"${prefix}skip_reply {{unsent}}" sets it aside.`
+      : 'It could not be held as a draft; the words remain in your history.';
+    const risky = inherited && draft
+      ? ` It includes the words of draft ${inherited.draftId}, which may already have been posted, so ${draft.id} ` +
+        'can be resent only with the drafts tool and confirmDuplicate: true, after checking that channel.'
+      : '';
     const notice =
-      `[prose-routing] Your text (${text.length} chars) was not delivered — ${reason}.${cand} ` +
-      'The text is retained; nothing is lost. To deliver it unchanged, reply with a ' +
-      `destination plus the token {{unsent}}, e.g. "${prefix}#channel {{unsent}}" or "${prefix}@person {{unsent}}". ` +
-      `"${prefix}skip_reply {{unsent}}" keeps it in context only.` +
+      `[prose-routing] Your text (${text.length} chars) was not delivered — ${reason}.${cand} ${kept}${risky}` +
       (prefix === '>>' ? ' The prose_help tool shows the full syntax.' : '');
     try {
       // Through framework.addMessage, NOT the context manager directly: while
@@ -8901,11 +11324,12 @@ export class AgentFramework {
       // stream (hear-while-acting) — the model sees the error and can correct
       // the prefix within the same turn. A direct append here would land the
       // notice before the turn's assistant blocks (cache bust, invisible
-      // until the next compile).
+      // until the next compile). Addressed to the bouncing resident alone.
       const id = this.addMessage(
         'user',
         [{ type: 'text', text: notice }],
-        { system: true, kind: 'prose-bounce' },
+        { system: true, kind: 'prose-bounce', ...(draft ? { draftOwner: name, draftIds: [draft.id] } : {}) } as MessageMetadata,
+        { forAgent: name },
       );
       if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-bounce' });
       else this.emitTrace({ type: 'message:added', messageId: 'deferred', source: 'prose-bounce' });
@@ -8919,13 +11343,10 @@ export class AgentFramework {
     );
     if (!capped) {
       // Wake so the resend can happen immediately — an unsent DM reply must
-      // not sit invisible until the next unrelated event.
-      this.pendingRequests.push({
-        agentName: name,
-        reason: 'prose-bounce',
-        source: 'framework',
-        timestamp: Date.now(),
-      });
+      // not sit invisible until the next unrelated event. A bounce in a live
+      // turn wakes once that turn has ended, and names the conversations it
+      // answered by then (continuationFor).
+      this.pendingRequests.push(this.continuationRequest(name, 'prose-bounce'));
     }
   }
 
@@ -9070,6 +11491,59 @@ export class AgentFramework {
   }
 
   /**
+   * Decides a turn's speech route from its wake: at a true new turn, and at
+   * a restart that continues a silent tick a batched ordinary wake made
+   * ordinary, which had no route to keep.
+   */
+  private decideTurnRoute(agent: Agent, trigger: InferenceRequest | undefined): void {
+    // The route comes from a fork's home, else from the
+    // wake's candidates — addressed ones first, one conversation only,
+    // else held (src/speech-routes.ts). A wake that names no
+    // conversation at all (a heartbeat, a timer, a self-wake) takes the
+    // fallback, the last delivered message's conversation, as before
+    // speech routes. A framework wake that continues a turn (a rewind
+    // retry, an unstick, a prose continuation or bounce) carries the
+    // conversations that turn answered as its candidates, or a fallback
+    // turn's place as its fallback (continuationFor), so it is inferred
+    // here like any other.
+    //
+    // The fork rule applies here, where the route is decided, to every
+    // wake's candidates: a fork takes only its home's, and no other agent
+    // takes a channel a fork owns, as ownership stands now. A wake can
+    // wait in the queue while a fork claims or gives up a channel. A
+    // candidate it leaves out still named its conversation, so it still
+    // keeps the fallback away. That includes an unroutable candidate,
+    // which never routes but competes: a fork's channel never holds
+    // another agent's turn.
+    const turn = inferTurnRoute(
+      (trigger?.routeCandidates ?? [])
+        .map((c) => this.resolvedCandidate(c))
+        .filter((c) => this.mayTakeCandidate(agent.name, c)),
+      this.homeRoute(agent.name),
+      (c) => this.publishTargetOf(c),
+      // Only a resident's wake that named no conversation, candidate or
+      // not, takes the fallback: a reaction, a system marker or a channel
+      // a fork owns names one, and gets no route as before. An ephemeral
+      // subagent never takes it: its prose is its caller's business,
+      // never a channel's. (A conversation fork's name is in the same
+      // set, but a fork's home always wins before any fallback is read.)
+      // A continued fallback turn keeps that turn's place, under the same
+      // fork rule as any fallback.
+      trigger?.namesConversation || this.usedEphemeralAgentNames.has(agent.name)
+        ? null
+        : trigger?.fallbackPlace
+          ? (this.mayTakeCandidate(agent.name, trigger.fallbackPlace) ? trigger.fallbackPlace : null)
+          : this.fallbackCandidate(agent.name),
+    );
+    // A continued fallback whose kept place was refused has no place,
+    // and its own continuations take none either: it counts as named.
+    const named = trigger?.namesConversation || (!!trigger?.fallbackPlace && !turn.route);
+    this.turnRoutes.set(agent.name, { ...turn, ...(named ? { named: true as const } : {}) });
+    this.midTurnInputSignals.delete(agent.name);
+    if (!trigger?.suppressProse) this.announceRouteIfChanged(agent.name, turn);
+  }
+
+  /**
    * Body of startAgentStream, split out so the caller's try/finally owns the
    * turn token unconditionally. Returns true iff the token was handed off to
    * driveStream (whose finally then owns clearing it).
@@ -9084,6 +11558,12 @@ export class AgentFramework {
     const continuingTurn = trigger?.reason === 'context_budget_restart'
       || trigger?.reason === 'tool_result_guard_retry';
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
+    // A true new turn begins once the previous turn's speech has landed. A
+    // turn that ends without settling its chain (an abort, an explicit-mode
+    // endTurn) could otherwise publish late into this one: its words
+    // overtaken by this turn's, its `>>`/`>>>` choices and deliveries
+    // written into the state cleared for this turn below.
+    if (attempt === 0 && !continuingTurn) await this.speechSettled(agent.name);
     // Flush messages deferred during the PREVIOUS turn — before the
     // checkpoint, the locus announcement, and the compile — so a turn started
     // by a queued wake actually CONTAINS the message that woke it. (2026-07-31
@@ -9178,39 +11658,12 @@ export class AgentFramework {
       this.redoStacks.delete(agent.name); // new work invalidates redo
     }
 
-    // Establish this turn's outbound routing locus (item-3 redux). Set it to the
-    // triggering channel for a channel/DM-triggered turn; clear it otherwise so
-    // a heartbeat / no-trigger turn doesn't inherit a previous turn's channel and
-    // instead falls back to the global default. A given agent runs one turn at a
-    // time, so a set here is only read during THIS turn's routeSpeech /
-    // buildChannelContext; retries re-run with the same trigger, re-setting it.
-    // A context-budget restart continues the SAME logical turn in a fresh
-    // stream — its trigger carries no channelId, and deleting the trigger
-    // channel here mid-logical-turn is exactly the hole that sent Sol's DM
-    // reply to a stale guild channel (2026-07-22): any live locus resolution
-    // after the restart fell through to the hours-old defaultPublishChannel.
-    // Keep the turn's trigger channel across restarts; only real new turns
-    // reset it.
-    if (!continuingTurn) {
-      if (trigger?.channelId) {
-        this.activeTriggerChannels.set(agent.name, trigger.channelId);
-      } else {
-        this.activeTriggerChannels.delete(agent.name);
-      }
-    }
-
-    // FREEZE this turn's outbound locus now (turn-frozen routing). Resolved
-    // once — home channel for forks, else the triggering channel, else the
-    // global default — and never moved for the rest of the turn: mid-turn
-    // injections must not redirect the agent's plain prose (ambient chatter /
-    // reactions hijacked it before, 2026-07-21). A context-budget restart
-    // continues the same logical turn, so it keeps the existing pin. The
-    // eager snapshot also protects heartbeat turns from a moving
-    // defaultPublishChannel mid-turn. If the effective locus differs from the
-    // last one announced, drop a durable `[routing]` notice into the window
-    // BEFORE this turn compiles, so the agent always knows where its voice
-    // goes (announce-on-change only — no per-turn chatter, append-only for
-    // KV stability).
+    // This turn's speech route (shelf-355) is decided below, once, at a true
+    // new turn: a fork's home, else inferred from the wake's candidates. A
+    // context-budget restart or a framework retry continues the SAME logical
+    // turn and keeps it — including a channel_open the resident made — so a
+    // late or repeated stream never re-resolves where its words go (the
+    // 2026-07-22 Sol DM misroute was exactly such a re-resolution).
     if (continuingTurn) {
       const previousLogicalToolState = this.logicalTurnToolCalls.get(agent);
       this.logicalTurnToolCalls.set(agent, { turnToken, count: previousLogicalToolState?.count ?? 0 });
@@ -9218,6 +11671,10 @@ export class AgentFramework {
 
     if (!continuingTurn) {
       if (attempt === 0) this.maybePrimeProseMode(agent);
+      if (attempt === 0) this.maybeExplainSourceHeaders(agent);
+      // Name any held drafts no notice reached (a crash, an aborted turn),
+      // privately, before this turn's compile.
+      if (attempt === 0) this.noticeUnnoticedDrafts(agent);
       const previousLogicalToolState = this.logicalTurnToolCalls.get(agent);
       if (attempt === 0) {
         // A true new turn gets a fresh generation and count.
@@ -9226,47 +11683,79 @@ export class AgentFramework {
         // A framework retry is a new physical stream in the same logical turn.
         this.logicalTurnToolCalls.set(agent, { turnToken, count: previousLogicalToolState?.count ?? 0 });
       }
-      // Fresh turn: forget the previous turn's explicit-send engagements and
-      // prose deliveries — both are strictly turn-scoped (a restart continues
-      // the same logical turn and keeps them).
-      this.turnEngagedChannels.delete(agent.name);
-      this.turnProseDeliveries.delete(agent.name);
-      this.turnProseSuppressed.delete(agent.name);
-      this.proseHybridSuppressed.delete(agent.name);
-      if (turnProseRouting === 'hybrid') this.proseTargetPins.delete(agent.name);
-      if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') {
-        // Explicit and disabled prose routing have no inferred locus.
-        // Explicit mode uses a turn-scoped `>>` target; disabled mode has no
-        // prose target at all. Neither mode freezes or announces a locus.
+      if (attempt === 0) {
+        // A true new turn: forget the previous turn's explicit-send
+        // engagements, prose deliveries, drafts and deliberate prose choices
+        // (a `>>` or `>>>` target, a hybrid suppression) — all strictly
+        // turn-scoped. A queued framework wake that continues a turn (a
+        // rewind retry, an unstick, a prose continuation or bounce) starts a
+        // true new turn too: a rewind sheds the turn whose choices these
+        // were, and only where the words go carries over, through the
+        // conversations the wake names (continuationFor).
+        // A framework retry (attempt > 0), like a restart,
+        // continues the same logical turn: its sends were made, its words
+        // delivered or held, its choices chosen, and none of that rolls back
+        // with a failed stream, so it keeps them, as it keeps the route.
+        this.turnEngagement?.delete(agent.name);
+        this.turnProseDeliveries.delete(agent.name);
+        this.turnProseSuppressed.delete(agent.name);
+        this.turnDrafts.delete(agent.name);
+        this.turnProsePrivate.delete(agent.name);
+        this.turnDraftFailures.delete(agent.name);
+        this.proseHybridSuppressed.delete(agent.name);
         this.proseTargetPins.delete(agent.name);
+        (this.logicalTurns ??= new Map()).set(agent.name, this.logicalTurn(agent.name) + 1);
+      }
+      if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') {
+        // Explicit and disabled prose routing have no inferred route.
+        // Explicit mode uses a turn-scoped `>>` target; disabled mode has no
+        // prose target at all. Neither mode infers or announces a route.
         this.proseContinuations.delete(agent.name);
         this.midTurnInputSignals.delete(agent.name);
-        this.turnLocusPins.delete(agent.name);
-      } else {
-        const locus = this.channelRegistry?.resolveLocus(agent.name) ?? null;
-        if (locus !== null) this.turnLocusPins.set(agent.name, locus);
-        else this.turnLocusPins.delete(agent.name);
-        this.midTurnInputSignals.delete(agent.name);
-        if (attempt === 0) this.announceLocusIfChanged(agent.name, locus);
+        this.turnRoutes.delete(agent.name);
+      } else if (attempt === 0) {
+        this.decideTurnRoute(agent, trigger);
       }
     }
 
-    // A context-budget restart normally preserves the turn locus, but a
-    // silent control-plane wake must remain locusless even if an explicit tool
-    // opened/pinned a channel mid-turn.
+    // A context-budget restart normally preserves the turn route. A silent
+    // control-plane wake has none: its channel_open sets none (the result
+    // says so), so this resets only what a restart could carry over.
     if (trigger?.suppressProse) {
-      this.turnLocusPins.delete(agent.name);
+      // The record keeps the wake's silence, so the turn's own continuations
+      // are silent ticks too (continuationFor). It is written when the turn
+      // begins; a restart or a guard retry continues the turn and keeps it.
+      if (!continuingTurn) {
+        this.turnRoutes.set(agent.name, {
+          route: null,
+          ...(trigger.namesConversation ? { named: true as const } : {}),
+          silent: {
+            ...(trigger.ephemeralSystemPrompt ? { ephemeralSystemPrompt: trigger.ephemeralSystemPrompt } : {}),
+            ...(trigger.silentHeartbeat ? { silentHeartbeat: trigger.silentHeartbeat } : {}),
+          },
+        });
+      }
       this.proseTargetPins.delete(agent.name);
       this.proseContinuations.delete(agent.name);
+    } else if (continuingTurn && this.turnRoutes.get(agent.name)?.silent) {
+      // A silent tick's restart batched with an ordinary wake runs as an
+      // ordinary turn (processInferenceRequests). The tick had no route to
+      // keep, so its route is decided now from the batch's wakes, as a true
+      // new turn's is, and its record stops being a silent tick's. In
+      // explicit or disabled prose routing there is no inferred route.
+      if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') this.turnRoutes.delete(agent.name);
+      else this.decideTurnRoute(agent, trigger);
     }
 
     this.touchEphemeralRun(agent.name, true);
     this.emitTrace({
       type: 'inference:started',
       agentName: agent.name,
-      // The turn-frozen locus was pinned just above (kept across a
-      // context-budget restart, which skips the re-pin but re-emits this).
-      channelId: this.turnLocusPins.get(agent.name),
+      // The turn's route channel and its server, decided just above (kept
+      // across a context-budget restart, which skips the decision but
+      // re-emits this).
+      channelId: this.routeChannelId(agent.name) ?? undefined,
+      ...(this.routeChannel(agent.name)?.serverId ? { serverId: this.routeChannel(agent.name)!.serverId } : {}),
       ...(trigger?.suppressProse ? { silent: true } : {}),
     });
     // A budget restart continues the same logical inference window. The
@@ -9288,7 +11777,7 @@ export class AgentFramework {
     const earlyTypingChannel =
       turnProseRouting === 'explicit'
         ? trigger?.channelId ?? null
-        : this.turnLocusPins.get(agent.name) ?? null;
+        : this.routeChannel(agent.name);
     if (earlyTypingChannel) this.channelRegistry?.startTyping(earlyTypingChannel);
 
     try {
@@ -9505,40 +11994,39 @@ export class AgentFramework {
     let generationLost = false;
 
     // ---- Present-while-acting turn state ---------------------------------
-    // Output locus for the WHOLE logical turn: frozen in startAgentStream
-    // (home → addressed trigger → global default) before this stream began,
-    // and never moved until the next turn. Mid-turn injections do not touch
-    // it — an ambient message or a reaction arriving at a tool boundary must
-    // not redirect the agent's task narration (2026-07-21 Cairn misroute).
-    // The pin lives in `turnLocusPins` so a context-budget restart (same
-    // logical turn, fresh driveStream) keeps it.
-    const resolveTurnLocus = (): string | null =>
-      this.turnLocusPins.get(agent.name) ?? null;
+    // The turn's speech route (turnRoutes) was decided in startAgentStream
+    // before this stream began and lives there, so a context-budget restart
+    // (same logical turn, fresh driveStream) keeps it. An arrival can HOLD an
+    // inferred route mid-turn (the ambiguity hold), and a channel_open can
+    // set a deliberate one, but nothing that arrives can point it somewhere
+    // else. Speech is published along the route it was WRITTEN under: each
+    // round's words take their SpeechMoment when the round ends, so a hold
+    // or an open that lands while they wait on the speech chain governs only
+    // words written after it.
+    const routeLabel = (moment: SpeechMoment): string => AgentFramework.routeText(moment.turn ?? { route: null });
 
-    // Ordered delivery chain for live-routed prose. Links are enqueued
+    // Ordered delivery for live-routed prose: the agent's speech chain
+    // (chainSpeech), shared by its physical streams. Links are enqueued
     // WITHOUT awaiting in the stream-event loop — an awaited network post
     // here would stall consumption of the next round's events by
     // segments × RTT on every prose-bearing round. The 'complete' case
     // awaits the chain before routing trailing prose, so in-channel ordering
     // is preserved end-to-end. Each link catches its own error: one failed
     // post must not silence the rest of the turn.
-    let turnSpeechChain: Promise<void> = Promise.resolve();
-    const enqueueSpeech = (text: string, locus: string | null): void => {
-      turnSpeechChain = turnSpeechChain
-        .then(async () => {
-          const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
-          this.recordProseDelivery(agent.name, outcome);
-        })
-        .catch((err) => console.error('mid-turn speech routing failed:', err));
-    };
 
     // Sticky explicit-send suppression: prose after send_message stays quiet
     // to prevent a redundant "sent it" postscript. Fresh injected input
     // clears it, because the following prose is a reply to a new message.
-    let turnSilenced = trigger?.suppressProse === true
-      || (trigger?.reason === 'tool_result_guard_retry'
-        && this.guardRetryTurnSilenced.get(agent.name) === true);
+    // Why it is silenced decides what happens to the held words: an explicit
+    // send ('send') holds them as resendable drafts; a deliberate silence
+    // ('private': skip_reply, a silent control-plane turn) keeps them private.
+    let silenceCause: 'send' | 'private' | null = trigger?.suppressProse === true
+      ? 'private'
+      : (trigger?.reason === 'tool_result_guard_retry' ? this.guardRetryTurnSilenced.get(agent.name) : undefined) ?? null;
+    let turnSilenced = silenceCause !== null;
     this.guardRetryTurnSilenced.delete(agent.name);
+    /** Provider rounds of this physical stream, for draft provenance. */
+    let draftRound = 0;
 
     // Live routing is only trusted when the membrane provides verbatim
     // round-scoped blocks (roundContent, native tool mode, membrane ≥0.5.64).
@@ -9565,8 +12053,8 @@ export class AgentFramework {
         ? null
         : turnProseRouting === 'explicit'
           ? trigger?.channelId ?? null
-          : resolveTurnLocus();
-    if (typingChannel) this.channelRegistry!.startTyping(typingChannel);
+          : this.routeChannel(agent.name);
+    if (typingChannel) this.channelRegistry?.startTyping(typingChannel);
 
     // MCPL Spec 14.3 outgoing streaming: route text deltas to their
     // destination server AS THEY GENERATE (voice synthesis, live message
@@ -9578,13 +12066,13 @@ export class AgentFramework {
       `inf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     // NOT const: a membrane refusal retry abandons everything streamed so
     // far, and the surface must not concatenate two attempts. Re-minting the
-    // id makes the discarded attempt's chunk buffer orphaned (never
-    // finalized) instead of being appended to — see the 'retrying' case.
+    // id makes the discarded attempt a separate inference instead of one
+    // appended to — see the 'retrying' case.
     let outgoingInferenceId = newOutgoingInferenceId();
     // RFC-007: every inference id THIS stream mints, so the stream's end
-    // aborts only its own open tool calls — never a successor's.
+    // aborts only its own open tool calls — never a successor's — and
+    // completes only its own outgoing streams.
     const lifecycleInferenceIds = new Set<string>([outgoingInferenceId]);
-    let outgoingIndex = 0;
 
     // §10.5 inference/lifecycle: `started` now, exactly one terminal in the
     // finally below (the one block every exit path shares). Which terminal
@@ -9599,44 +12087,24 @@ export class AgentFramework {
       turnIndex: 0,
       phase: 'started',
     });
-    // The wrapper guard needs the complete response before it can distinguish
-    // an exact invocation-shaped body from ordinary XML/prose. Buffer guarded
-    // turns until completion: otherwise speculative outgoing chunks could
-    // expose the wrapper before the fail-closed classifier runs.
-    const proseStream = this.channelRegistry &&
-      turnProseRouting !== 'disabled' &&
-      !agent.toolWrapperProseGuard
-      ? new ProseStreamRouter({
-          mode: turnProseRouting === 'explicit' ? 'explicit' : turnProseRouting === 'hybrid' ? 'hybrid' : 'locus',
-          initialTarget: typingChannel,
-          resolve: (spec) => {
-            const r = this.channelRegistry!.resolveProseTarget(spec);
-            return 'channelId' in r ? r.channelId : null;
-          },
-        })
-      : null;
-    const emitOutgoing = (deltas: { channelId: string; delta: string }[]): void => {
-      for (const rd of deltas) {
-        this.channelRegistry!.sendOutgoingChunk(
-          rd.channelId, agent.name, outgoingInferenceId, outgoingIndex++, rd.delta,
-        );
-      }
-    };
+    // Outgoing streams (MCPL §14.3) carry only prose already published: the
+    // speech chain sends each confirmed publication at a channel root to the
+    // inference that wrote it (streamPublished), and this stream's teardown
+    // completes them after its last speech (completeOutgoingStreams). Nothing
+    // is streamed while it is generated, since a later call in the same
+    // round can still make the words private, held or unsent.
 
     // Tool-result-guard publication boundary. While a SUBMITTED batch is
     // pending (or a guard recovery is running), a refusal can still abandon
     // this physical round, so its streamed text must not reach any surface
-    // yet — neither the prose router nor the inference:tokens trace (TTS and
-    // other trace consumers voice it). Hold both; release in order on a clean
-    // round (tool-calls / non-guard completion), discard on a guard refusal.
-    let guardHeld: Array<{ trace: Parameters<AgentFramework['emitTrace']>[0]; text?: string }> = [];
+    // yet — the inference:tokens trace (TTS and other trace consumers voice
+    // it). Hold it; release in order on a clean round (tool-calls / non-guard
+    // completion), discard on a guard refusal.
+    let guardHeld: Array<Parameters<AgentFramework['emitTrace']>[0]> = [];
     const releaseGuardHeld = (): void => {
       const held = guardHeld;
       guardHeld = [];
-      for (const item of held) {
-        this.emitTrace(item.trace);
-        if (proseStream && item.text !== undefined) emitOutgoing(proseStream.feed(item.text));
-      }
+      for (const trace of held) this.emitTrace(trace);
     };
     const discardGuardHeld = (): void => { guardHeld = []; };
 
@@ -9648,6 +12116,7 @@ export class AgentFramework {
       // earlier explicit delivery has completed its conversational job.
       // Routing is NOT touched: the turn locus stays frozen.
       turnSilenced = trigger?.suppressProse === true;
+      silenceCause = turnSilenced ? 'private' : null;
     };
 
     try {
@@ -9674,12 +12143,10 @@ export class AgentFramework {
               // turn's prose is bound for, without re-deriving routing.
               channelId: typingChannel ?? undefined,
             };
-            const text = event.meta.type === 'text' ? event.content : undefined;
             if (agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering) {
-              guardHeld.push({ trace, text });
+              guardHeld.push(trace);
             } else {
               this.emitTrace(trace);
-              if (proseStream && text !== undefined) emitOutgoing(proseStream.feed(text));
             }
             break;
           }
@@ -9687,15 +12154,14 @@ export class AgentFramework {
           case 'retrying': {
             // Membrane is re-issuing after a content-policy refusal. Per the
             // RetryingEvent contract we must DISCARD everything this call has
-            // emitted: the tokens above were already streamed to the surface
-            // as outgoing chunks, and appending a second attempt to them
-            // would show the human two half-answers spliced together.
+            // emitted: the tokens above already reached trace consumers, and
+            // appending a second attempt to them would show the human two
+            // half-answers spliced together.
             //
-            // Re-mint the outgoing id so the partial buffer is orphaned
-            // rather than continued (delivery is authoritative via
-            // deliverProse and has not happened yet — nothing has been
-            // *sent*, only previewed), and reset the prose router so its
-            // destination bookkeeping starts clean for the new attempt.
+            // Re-mint the outgoing id so the attempt that stands is a new
+            // inference (the empty tokens trace below tells consumers to
+            // drop the partial one). Its words never reached the speech
+            // chain, so no outgoing channel stream carries them.
             console.error(
               `[refusal-retry] agent=${agent.name} membrane retry ` +
                 `${event.attempt}/${event.maxAttempts}` +
@@ -9704,9 +12170,7 @@ export class AgentFramework {
             );
             outgoingInferenceId = newOutgoingInferenceId();
             lifecycleInferenceIds.add(outgoingInferenceId);
-            outgoingIndex = 0;
             discardGuardHeld();
-            proseStream?.reset();
             this.emitTrace({
               type: 'inference:tokens',
               agentName: agent.name,
@@ -9806,6 +12270,11 @@ export class AgentFramework {
 
             agent.enterWaitingForTools(event.calls, stream);
 
+            // This round's words were written before any of its calls ran:
+            // they go where the route stood then, whatever those calls (a
+            // channel_open) or the arrivals at their results (a hold) change.
+            const roundMoment: SpeechMoment = { turn: this.turnRoutes.get(agent.name), inferenceId: outgoingInferenceId };
+
             for (const call of event.calls) {
               // RFC-007: register at the one dispatch point for model-issued
               // calls, keyed by (agent, call id) with this inference's id;
@@ -9828,17 +12297,39 @@ export class AgentFramework {
             // from the round it occurs (see SILENCING_TOOLS). Only rounds
             // with verbatim roundContent are live-routed (see liveProseRouting
             // note above — the fallback preamble is cumulative in XML mode).
+            draftRound++;
+            // Whether this round's tool-result batch (and anything queued with
+            // it) reaches the model before it speaks again: the producer says
+            // so when it can; otherwise native rounds (verbatim roundContent)
+            // carry injections and XML rounds don't.
+            this.roundPresentsInjections.set(
+              agent.name,
+              (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages
+                ?? (roundContent !== undefined && roundContent.length > 0),
+            );
             if (this.channelRegistry) {
               const roundToolNames = event.calls.map((c) => c.name);
               const hasSameRoundPrivateThink =
                 roundToolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
-              if (roundToolNames.some(isSilencingTool)) {
+              const roundCause = silenceCauseOf(event.calls);
+              if (roundCause) {
                 turnSilenced = true;
+                silenceCause = roundCause === 'private' || silenceCause === 'private' ? 'private' : 'send';
               }
               if (roundContent && roundContent.length > 0) {
                 liveProseRouting = true;
-                const roundSegments = splitProseSegments(assistantBlocks);
+                // Whether this round's tool-result batch (and anything queued
+                // with it) will be presented to the model before it speaks
+                // again: the producer says so when it can; otherwise native
+                // rounds (verbatim roundContent) carry injections.
+                const presentsInjections =
+                  (event.context as { supportsInjectedMessages?: boolean }).supportsInjectedMessages ?? true;
+                const holdOpts = { round: draftRound, notice: presentsInjections ? 'now' as const : 'later' as const };
+                // Routing publishes trimmed segments; held drafts keep the
+                // runs exactly as written.
+                const roundRuns = splitProseRuns(assistantBlocks);
+                const roundSegments = roundRuns.map((run) => run.trim());
                 if (roundSegments.length > 0) {
                   if (turnProseRouting === 'disabled') {
                     console.error(
@@ -9847,13 +12338,15 @@ export class AgentFramework {
                     this.recordProseSuppression(agent.name, roundSegments.length);
                   } else if (turnProseRouting === 'hybrid') {
                     if (turnSilenced) {
-                      this.recordProseSuppression(agent.name, roundSegments.length);
+                      // In order behind earlier rounds' envelopes: the router
+                      // state they leave is where this round's starts.
+                      const cause = silenceCause;
+                      this.chainSpeech(agent.name, 'mid-turn hybrid prose hold', () =>
+                        this.holdSilencedProse(agent, roundRuns, cause, hasSameRoundPrivateThink, holdOpts));
                     } else if (!hasSameRoundPrivateThink) {
-                      const locus = resolveTurnLocus();
                       for (const seg of roundSegments) {
-                        turnSpeechChain = turnSpeechChain
-                          .then(() => this.deliverHybridProse(agent, seg, locus, true))
-                          .catch((err) => console.error('mid-turn hybrid prose delivery failed:', err));
+                        this.chainSpeech(agent.name, 'mid-turn hybrid prose delivery', () =>
+                          this.deliverHybridProse(agent, seg, holdOpts, roundMoment));
                       }
                     }
                   } else if (turnProseRouting === 'explicit') {
@@ -9865,29 +12358,26 @@ export class AgentFramework {
                         `[prose] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway`,
                       );
                       for (const seg of roundSegments) {
-                        turnSpeechChain = turnSpeechChain
-                          .then(() => this.deliverProse(agent, seg))
-                          .catch((err) => console.error('mid-turn prose delivery failed:', err));
+                        this.chainSpeech(agent.name, 'mid-turn prose delivery', () => this.deliverProse(agent, seg, holdOpts, roundMoment));
                       }
                     }
                   } else if (turnSilenced) {
                     console.error(
-                      `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (turn silenced)`,
+                      `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (turn silenced: ${silenceCause})`,
                     );
-                    // Visible in the turn-end receipt — silencing must never
-                    // be a silent black hole (n=8: the flying-scene reply).
-                    this.recordProseSuppression(agent.name, roundSegments.length);
+                    // Never a silent black hole (n=8: the flying-scene reply):
+                    // held as drafts the resident can resend, and named.
+                    this.holdSilencedProse(agent, roundRuns, silenceCause, hasSameRoundPrivateThink, holdOpts);
                   } else if (hasSameRoundPrivateThink) {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
                     );
                   } else {
-                    const locus = resolveTurnLocus();
                     console.error(
-                      `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> routing ${roundSegments.length} prose segment(s) live -> ${locus ?? '(default)'}`,
+                      `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> routing ${roundSegments.length} prose segment(s) live -> ${routeLabel(roundMoment)}`,
                     );
                     for (const seg of roundSegments) {
-                      enqueueSpeech(seg, locus);
+                      this.chainSpeech(agent.name, 'mid-turn speech routing', () => this.speakUnaddressed(agent, seg, holdOpts, roundMoment));
                     }
                   }
                 }
@@ -9898,6 +12388,11 @@ export class AgentFramework {
           }
 
           case 'complete': {
+            // The final round's words were all written by now: they go where
+            // the route stood as they were, even though they are published
+            // after the agent is idle, when a next turn may already have
+            // decided its own (the 2026-07-22 Sol DM misroute's shape).
+            const finalMoment: SpeechMoment = { turn: this.turnRoutes.get(agent.name), inferenceId: outgoingInferenceId };
             adoptInjectedRound();
             const durationMs = Date.now() - startTime;
             let response = event.response;
@@ -9917,7 +12412,6 @@ export class AgentFramework {
               // Nothing from the abandoned physical attempt is published or
               // persisted as assistant speech, including a terminal refusal
               // after the single recovery retry.
-              proseStream?.reset();
               if (withheld) {
                 const usage = response.details?.usage ?? response.usage;
                 const tokenUsage = usage ? {
@@ -9951,7 +12445,7 @@ export class AgentFramework {
                   reason: 'tool_result_guard', inputTokens: agent.lastStreamInputTokens,
                   budget: agent.maxStreamTokens,
                 });
-                await turnSpeechChain;
+                await this.speechSettled(agent.name);
                 if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
                   generationLost = true;
                   lifecyclePhase = 'aborted';
@@ -9963,7 +12457,7 @@ export class AgentFramework {
                 // Carry same-turn explicit-send suppression into the retry:
                 // a text-only recovery after a successful send must not post
                 // a postscript to a message already delivered.
-                if (turnSilenced) this.guardRetryTurnSilenced.set(agent.name, true);
+                if (turnSilenced) this.guardRetryTurnSilenced.set(agent.name, silenceCause ?? 'send');
                 // Restart inference inside this logical turn. No tool is
                 // executed again and no settle/checkpoint/locus reset occurs.
                 await this.startAgentStream(agent, {
@@ -10215,12 +12709,9 @@ export class AgentFramework {
                 const count = this.updateRewindMarker(agent, category);
                 onStep(count);
                 if (forced) forced.removed.push(rec);
-                this.pendingRequests.push({
-                  agentName: agent.name,
-                  reason: forced ? 'unstick-retry' : 'refusal-rewind-retry',
-                  source: 'framework',
-                  timestamp: Date.now(),
-                });
+                this.pendingRequests.push(
+                  this.continuationRequest(agent.name, forced ? 'unstick-retry' : 'refusal-rewind-retry'),
+                );
                 handledByRewind = true;
               };
 
@@ -10310,54 +12801,63 @@ export class AgentFramework {
             // they are never routed here — which is precisely how the `think`
             // tool (and any explicit send tool) yields a silent turn.
             if (speechContent.length > 0 && this.channelRegistry) {
-              const speechText = speechContent
+              const speechRun = speechContent
                 .map((b) => (b as ContentBlock & { type: 'text' }).text)
-                .join('\n')
-                .trim();
-              if (speechText) {
+                .join('\n');
+              // A text-only turn is one message — unless an all-refused XML
+              // round (membrane `tool_attempt`, answered in-band with a
+              // `tool_notice`) separates its prose: nothing was called, but
+              // the words before the attempt and after its notice are two
+              // messages, routed as segments like a tool turn's. Routing
+              // publishes trimmed segments; held drafts keep the runs exactly
+              // as written.
+              const speechRuns = response.content.some((b) => (b.type as string) === 'tool_attempt')
+                ? splitProseRuns(response.content)
+                : speechRun.trim() ? [speechRun] : [];
+              const speechSegments = speechRuns.map((run) => run.trim());
+              const textOnlyHold = { round: draftRound + 1, notice: 'later' as const };
+              if (speechSegments.length > 0) {
                 if (turnProseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
-                  this.recordProseSuppression(agent.name, 1);
+                  this.recordProseSuppression(agent.name, speechSegments.length);
                 } else if (turnSilenced && turnProseRouting !== 'explicit') {
                   // Only reachable on a guard recovery that carried the
                   // same-turn send suppression, or a suppressProse trigger
                   // (a fresh text-only turn starts unsilenced). Explicit
                   // mode is exempt, as mid-turn.
-                  console.error(`[routing] ${agent.name}: text-only prose NOT routed (turn silenced)`);
-                  this.recordProseSuppression(agent.name, 1);
+                  console.error(`[routing] ${agent.name}: text-only prose NOT routed (turn silenced: ${silenceCause})`);
+                  const cause = silenceCause;
+                  this.chainSpeech(agent.name, 'text-only prose hold', () =>
+                    this.holdSilencedProse(agent, speechRuns, cause, false, textOnlyHold));
                 } else if (turnProseRouting === 'hybrid') {
-                  const locus = resolveTurnLocus();
                   console.error(`[prose] ${agent.name}: text-only turn -> hybrid prose gateway`);
-                  try {
-                    await this.deliverHybridProse(agent, speechText, locus, true);
-                  } catch (err) {
-                    console.error('text-only hybrid prose delivery failed:', err);
+                  for (const segment of speechSegments) {
+                    this.chainSpeech(agent.name, 'text-only hybrid prose delivery', () =>
+                      this.deliverHybridProse(agent, segment, textOnlyHold, finalMoment));
                   }
                 } else if (turnProseRouting === 'explicit') {
                   console.error(`[prose] ${agent.name}: text-only turn -> prose gateway`);
-                  try {
-                    await this.deliverProse(agent, speechText);
-                  } catch (err) {
-                    console.error('text-only prose delivery failed:', err);
+                  for (const segment of speechSegments) {
+                    this.chainSpeech(agent.name, 'text-only prose delivery', () => this.deliverProse(agent, segment, textOnlyHold, finalMoment));
                   }
                 } else {
-                  // Route to the TURN-FROZEN locus, like every other speech
-                  // path. This dispatch runs AFTER the agent is idle, so a live
-                  // resolution here can read the NEXT turn's trigger state (or
-                  // a post-restart cleared one) and land the reply in a stale
-                  // channel — the 2026-07-22 Sol DM-to-guild misroute. The
-                  // frozen pin is immune to both races.
-                  const locus = resolveTurnLocus();
+                  // Route along the route the words were written under
+                  // (finalMoment), like every other speech path. This
+                  // dispatch runs AFTER the agent is idle, so a live
+                  // resolution here can read the NEXT turn's route (or a
+                  // post-restart cleared one) and land the reply in a stale
+                  // channel — the 2026-07-22 Sol DM-to-guild misroute.
                   console.error(
-                    `[routing] ${agent.name}: text-only turn -> routing speech -> ${locus ?? '(none)'}`,
+                    `[routing] ${agent.name}: text-only turn -> routing speech -> ${routeLabel(finalMoment)}`,
                   );
-                  try {
-                    const outcome = await this.channelRegistry.routeSpeech(agent.name, speechText, locus);
-                    this.recordProseDelivery(agent.name, outcome);
-                  } catch (err) {
-                    console.error('speech routing failed:', err);
+                  for (const segment of speechSegments) {
+                    this.chainSpeech(agent.name, 'speech routing', () => this.speakUnaddressed(agent, segment, textOnlyHold, finalMoment));
                   }
                 }
+                // In order behind anything an earlier physical stream of the
+                // turn still has on the chain, and settled before the turn's
+                // receipt is written.
+                await this.speechSettled(agent.name);
               }
             } else if (this.channelRegistry && hadToolCalls && allText.length > 0) {
               // Tool-call turn that also produced prose. When live routing was
@@ -10374,21 +12874,28 @@ export class AgentFramework {
               // injected message can reset. The legacy/fallback path has no
               // reliable round boundaries, so retain its historical turn-wide
               // scan to avoid double-posting.
-              const toolNames = response.content
+              const toolCalls = response.content
                 .filter((b) => b.type === 'tool_use')
-                .map((b) => (b as unknown as { name?: string }).name)
-                .filter((n): n is string => typeof n === 'string');
+                .map((b) => b as unknown as { name?: string; input?: unknown })
+                .filter((c): c is { name: string; input?: unknown } => typeof c.name === 'string');
+              const toolNames = toolCalls.map((c) => c.name);
+              const fallbackCause = liveProseRouting ? null : silenceCauseOf(toolCalls);
               const silenced = liveProseRouting
                 ? turnSilenced
-                : turnSilenced || toolNames.some(isSilencingTool);
+                : turnSilenced || fallbackCause !== null;
+              const trailingCause: 'send' | 'private' | null =
+                silenceCause === 'private' || fallbackCause === 'private' ? 'private' : (silenceCause ?? fallbackCause);
+              const trailingHold = { round: draftRound + 1, notice: 'later' as const };
 
-              const segments = splitProseSegments(liveProseRouting ? terminalContent : response.content);
+              // Routing publishes trimmed segments; held drafts keep the runs
+              // exactly as written.
+              const runs = splitProseRuns(liveProseRouting ? terminalContent : response.content);
+              const segments = runs.map((run) => run.trim());
 
-              // Preserve in-channel ordering: everything enqueued live must
-              // land before the trailing prose. Awaited even when silenced —
-              // the chain may still be flushing earlier rounds' posts.
-              await turnSpeechChain;
-
+              // Preserve in-channel ordering: trailing prose is chained behind
+              // everything enqueued live (by this stream or an earlier one of
+              // the turn), and the chain is settled even when silenced — it
+              // may still be flushing earlier rounds' posts.
               if (turnProseRouting === 'disabled') {
                 if (segments.length > 0) {
                   console.error(
@@ -10398,15 +12905,12 @@ export class AgentFramework {
                 }
               } else if (turnProseRouting === 'hybrid') {
                 if (silenced && segments.length > 0) {
-                  this.recordProseSuppression(agent.name, segments.length);
+                  this.chainSpeech(agent.name, 'trailing hybrid prose hold', () =>
+                    this.holdSilencedProse(agent, runs, trailingCause, false, trailingHold));
                 } else if (segments.length > 0) {
-                  const locus = resolveTurnLocus();
                   for (const seg of segments) {
-                    try {
-                      await this.deliverHybridProse(agent, seg, locus, true);
-                    } catch (err) {
-                      console.error('trailing hybrid prose delivery failed:', err);
-                    }
+                    this.chainSpeech(agent.name, 'trailing hybrid prose delivery', () =>
+                      this.deliverHybridProse(agent, seg, trailingHold, finalMoment));
                   }
                 }
               } else if (turnProseRouting === 'explicit') {
@@ -10415,53 +12919,43 @@ export class AgentFramework {
                     `[prose] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> ${segments.length} trailing segment(s) via prose gateway`,
                   );
                   for (const seg of segments) {
-                    try {
-                      await this.deliverProse(agent, seg);
-                    } catch (err) {
-                      console.error('trailing prose delivery failed:', err);
-                    }
+                    this.chainSpeech(agent.name, 'trailing prose delivery', () => this.deliverProse(agent, seg, trailingHold, finalMoment));
                   }
                 }
               } else if (silenced || segments.length === 0) {
                 console.error(
                   `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ') || 'none'}] -> trailing prose NOT routed ` +
-                  `(${silenced ? 'silencing tool / explicit send' : 'no trailing prose'})`,
+                  `(${silenced ? `turn silenced: ${trailingCause}` : 'no trailing prose'})`,
                 );
                 if (silenced && segments.length > 0) {
-                  this.recordProseSuppression(agent.name, segments.length);
+                  this.chainSpeech(agent.name, 'trailing prose hold', () =>
+                    this.holdSilencedProse(agent, runs, trailingCause, false, trailingHold));
                 }
               } else {
-                // Reuse the locus pinned at the turn's first live-routed
-                // segment (or resolve it now for a turn whose only prose is
-                // trailing). This dispatch runs AFTER the agent is idle (see
-                // PR #32 note below), so a queued inbound from another channel
-                // could otherwise overwrite the per-agent triggering channel
-                // between segments — and a turn that narrated live into one
+                // Along the route the words were written under (finalMoment).
+                // This dispatch runs AFTER the agent is idle (see PR #32 note
+                // below), so a next turn could otherwise have decided its own
+                // route meanwhile — and a turn that narrated live into one
                 // channel must not land its postscript in another.
-                const locus = resolveTurnLocus();
                 console.error(
-                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} ${liveProseRouting ? 'trailing ' : ''}prose segment(s) -> ${locus ?? '(default)'}`,
+                  `[routing] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> routing ${segments.length} ${liveProseRouting ? 'trailing ' : ''}prose segment(s) -> ${routeLabel(finalMoment)}`,
                 );
-                // Deliver sequentially (await each) so the segments land in order.
+                // Chained, so the segments land in order.
                 for (const seg of segments) {
-                  try {
-                    const outcome = await this.channelRegistry.routeSpeech(agent.name, seg, locus);
-                    this.recordProseDelivery(agent.name, outcome);
-                  } catch (err) {
-                    console.error('speech routing failed:', err);
-                  }
+                  this.chainSpeech(agent.name, 'speech routing', () => this.speakUnaddressed(agent, seg, trailingHold, finalMoment));
                 }
               }
+              await this.speechSettled(agent.name);
             }
             // NOTE: agent.reset() + onInferenceEnded() already ran above,
             // BEFORE dispatchSpeech. Locus routing is speech dispatch and
             // doesn't depend on the status field, so it correctly runs after.
 
             // Logical turn end (normal completion): drop the `[delivered]`
-            // receipt. All deliveries are settled — the live chain was
-            // awaited before trailing dispatch, and trailing/text-only
-            // segments were awaited in-loop. Locus mode only; explicit-mode
-            // envelopes acknowledge themselves through the prose gateway.
+            // receipt. All deliveries are settled — the speech chain, with
+            // the trailing and text-only segments on it, was awaited above.
+            // Locus mode only; explicit-mode envelopes acknowledge themselves
+            // through the prose gateway.
             if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
               this.appendProseDeliveryReceipt(agent);
             }
@@ -10473,12 +12967,7 @@ export class AgentFramework {
             // robotics-style loops where an end-of-turn pause is harmful).
             if (this.proseContinuations.delete(agent.name)) {
               console.error(`[prose] ${agent.name}: '!' continuation — requesting immediate next turn`);
-              this.pendingRequests.push({
-                agentName: agent.name,
-                reason: 'prose-continuation',
-                source: 'framework',
-                timestamp: Date.now(),
-              });
+              this.pendingRequests.push(this.continuationRequest(agent.name, 'prose-continuation'));
             }
 
             break;
@@ -10632,7 +13121,7 @@ export class AgentFramework {
                 // start) and the continuation stream's end writes ONE
                 // receipt for the whole turn.
                 if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
-                  await turnSpeechChain;
+                  await this.speechSettled(agent.name);
                   this.appendProseDeliveryReceipt(agent);
                 }
                 return;
@@ -10899,15 +13388,12 @@ export class AgentFramework {
       // exhausted, abort) so it never sticks after the turn ends.
       if (frameReachedTerminal) this.channelRegistry?.stopTyping();
 
-      // Spec 14.3: flush any held line-start text, then close each streamed
-      // channel with its final moderated content — the consumer's signal to
-      // finalize (end the TTS utterance, settle the rendered message).
-      if (frameReachedTerminal && proseStream) {
-        emitOutgoing(proseStream.finish());
-        for (const [channelId, text] of proseStream.byChannel()) {
-          this.channelRegistry!.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text);
-        }
-      }
+      // Spec 14.3: close each channel this stream's published prose went to,
+      // with exactly what it carried — the consumer's signal to finalize (end
+      // the TTS utterance). Chained, so it follows the stream's last speech,
+      // which may still be publishing.
+      const inferenceIds = [...lifecycleInferenceIds];
+      this.chainSpeech(agent.name, 'outgoing stream completion', () => this.completeOutgoingStreams(inferenceIds));
       this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`);
       if (ownsPhysicalStream) {
         this.activeStreams.delete(agent.name);
@@ -10945,6 +13431,16 @@ export class AgentFramework {
           });
         }
         this.ackDeferredWrites();
+      }
+
+      // The logical turn has ended and its notices are written: record the
+      // drafts they name as noticed (the store is synced first).
+      if (frameReachedTerminal && ownsPhysicalStream) {
+        try {
+          this.settleTurnDrafts(agent);
+        } catch (err) {
+          console.error('[drafts] turn-end settlement failed:', err);
+        }
       }
     }
   }
@@ -12327,7 +14823,9 @@ export class AgentFramework {
       void this.tuneOutCoordinator
         .handleSubconsciousTool(enrichedCall.name, enrichedCall.input as Record<string, unknown>)
         .then((result) => {
-          this.queue.push({
+          // Through pushEvent, like every other tool's result, so one that
+          // arrives after stop() is dropped rather than rejected unhandled.
+          this.pushEvent({
             type: 'tool-result',
             callId: enrichedCall.id,
             agentName,
@@ -12389,6 +14887,25 @@ export class AgentFramework {
     // this very dispatcher with waiter-tracked call IDs).
     if (enrichedCall.name === CODE_EXECUTION_TOOL_NAME && this.codeExecutionConfig) {
       this.dispatchCodeExecutionToolCall(agentName, enrichedCall);
+      return;
+    }
+
+    // drafts: the resident's own held drafts (list/read/resend/dismiss).
+    // Answered by the framework; resend publishes through the registry's
+    // publish executor, so the result arrives asynchronously.
+    if (enrichedCall.name === 'drafts' && this.channelRegistry) {
+      const startedAt = Date.now();
+      this.emitTrace({ type: 'tool:started', module: 'framework', tool: 'drafts', callId: enrichedCall.id, input: enrichedCall.input });
+      void this.handleDraftsTool(agentName, enrichedCall.input)
+        .catch((err): ToolResult => ({
+          success: false,
+          error: `drafts failed: ${err instanceof Error ? err.message : String(err)}`,
+          isError: true,
+        }))
+        .then((result) => {
+          this.emitTrace({ type: 'tool:completed', module: 'framework', tool: 'drafts', callId: enrichedCall.id, durationMs: Date.now() - startedAt });
+          this.pushEvent({ type: 'tool-result', callId: enrichedCall.id, agentName, moduleName: 'framework', result });
+        });
       return;
     }
 
@@ -12877,7 +15394,8 @@ export class AgentFramework {
       kind: 'refusal',
       category,
       streak,
-      locus: this.channelRegistry?.buildChannelContext()?.incoming?.channelId ?? null,
+      locus: this.routeChannelId(agentName),
+      locusServer: this.routeChannel(agentName)?.serverId ?? null,
       tokens: tokens ?? null,
     });
     if (streak >= 2) {
@@ -13101,12 +15619,7 @@ export class AgentFramework {
     );
 
     // Retry immediately on the repaired history (bounded by the cap above).
-    this.pendingRequests.push({
-      agentName: agent.name,
-      reason: 'inference-failure-rewind-retry',
-      source: 'framework',
-      timestamp: Date.now(),
-    });
+    this.pendingRequests.push(this.continuationRequest(agent.name, 'inference-failure-rewind-retry'));
   }
 
   // ==========================================================================
@@ -13143,6 +15656,7 @@ export class AgentFramework {
     // Per-server callback takes precedence; fall back to EventGate; fall back to no filter.
     const triggerFilter = serverConfigs.find(c => c.shouldTriggerInference)?.shouldTriggerInference
       ?? (this.eventGate ? this.eventGate.asShouldTriggerCallback() : undefined);
+    this.coalescedTriggerFilter = triggerFilter;
 
     // Push events handler (Step 6)
     this.initializePushCoalescer();
@@ -13152,6 +15666,14 @@ export class AgentFramework {
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       triggerFilter,
       (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
+      // An ordinary push: freeze its envelope at admission; it is accepted
+      // (the last argument) once its trigger filter returns, before it is
+      // queued.
+      (event) => this.pushSource(event),
+      // A coalesced push: its envelope before it is gated; its coalescer
+      // observes the acceptance.
+      (serverId, params, event) => this.coalescedPushSource(serverId, params, event),
+      (source) => this.noteInboundAccepted(source),
     );
 
     // Server-initiated inference router (Step 6)
@@ -13183,6 +15705,14 @@ export class AgentFramework {
         store: this.store,
         handleCoalescedIncoming: (serverId, message, event) =>
           this.handleCoalescedIncoming(serverId, message, event as CoalescedChannelEvent),
+        // An ordinary channels/incoming message: freeze its envelope at
+        // admission; accepted once its trigger filter returns, before it is
+        // queued.
+        inboundSource: (event) => this.channelEventSource(event, 'channels/incoming'),
+        inboundAccepted: (source) => this.noteInboundAccepted(source),
+        // A coalesced message: its envelope before it is gated; its
+        // coalescer observes the acceptance.
+        coalescedSource: (serverId, message, event) => this.coalescedIncomingSource(serverId, message, event),
         sendTypingFn: (serverId, channelId, metadata, op) => {
           const server = this.mcplServerRegistry!.getServer(serverId);
           if (server) {
@@ -13190,50 +15720,68 @@ export class AgentFramework {
           }
         },
         shouldTriggerInference: triggerFilter,
-        // Route a conversation fork's plain-text speech to its HOME channel, not
-        // the process-global most-recent-inbound locus (item 3). The trunk agent
-        // has no home entry, so this returns undefined and routeSpeech falls back
-        // to defaultPublishChannel. `conversationAgentHomes` is the permanent
-        // spawn-time binding; `channelForAgent` is the router's live binding as a
-        // belt-and-suspenders fallback.
+        // A conversation fork's HOME channel: its standing speech route, which
+        // always wins (item 3). The trunk agent has no home entry; its route
+        // comes from each turn. `conversationAgentHomes` is the permanent
+        // spawn-time binding; `channelForAgent` is the router's live binding as
+        // a belt-and-suspenders fallback.
         homeChannelResolver: (agentName) =>
           this.conversationAgentHomes.get(agentName)
           ?? this.conversationRouter?.channelForAgent(agentName),
-        // Route a single TRUNK agent's plain-text speech to the channel that
-        // triggered its CURRENT turn (item-3 redux). connectome-host runs every
-        // agent as a trunk (it never exposes conversation forks), so without this
-        // a reply falls back to the process-global most-recent-inbound locus and
-        // a concurrent message in another channel hijacks it. Empty for
-        // heartbeat / no-trigger turns → correct global fallback.
-        activeChannelResolver: (agentName) => this.activeTriggerChannels.get(agentName),
+        // The agent's own speech route for the live turn (shelf-355): the
+        // beforeInference channel context and a channel_publish without a
+        // channel use it, so what the agent is told and where its words land
+        // never diverge. The latest-inbound fallback is itself a route, taken
+        // only by a turn whose wake named no conversation, so it agrees too.
+        speechRouteResolver: (agentName) => this.speechRouteView(agentName),
         // A text-only turn whose speech couldn't be delivered must not vanish
         // silently: record a `[discord-send-failed]` marker in chronicle so the
         // agent sees, on her next turn, that her reply never reached the human.
         // addMessage() alone does not request inference, so this never wakes
         // her (matching the `discord-send-failed-skip` gate intent: context
         // yes, wake no).
-        onRouteFailure: ({ channelId, reason, textLen }) => {
+        onRouteFailure: ({ conversationId, serverId, channelId, label, threadId, reason, textLen, outcome, draftId }) => {
           try {
-            // Render a human-readable channel name when we can — a bare
-            // snowflake in the marker is unresolvable for the agent (the
-            // 2026-07-21 incident read as "a stale artifact", not a live
-            // failure). The marker is `system: true`, so it is never
-            // conversational and never influences routing.
-            const label = channelId
-              ? this.channelRegistry?.getDescriptor(channelId)?.label
-              : undefined;
+            // Name the conversation the words were bound for as every
+            // conversation is named (describeConversation): its label, its
+            // server and channel, and its thread, so a check or a resend
+            // looks in the right place. A bare snowflake in the marker is
+            // unresolvable for the agent (the 2026-07-21 incident read as "a
+            // stale artifact", not a live failure); the label is the
+            // destination's own, or else its server's, never another
+            // server's by first match. The marker is `system: true`, so it is
+            // never conversational and never influences routing.
+            const ownLabel = label ?? (serverId && channelId ? this.channelRegistry?.getChannelLabel(serverId, channelId) : undefined);
             const where = channelId
-              ? label && label !== channelId
-                ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
-                : channelId
+              ? describeConversation({
+                kind: 'channel',
+                ...(serverId ? { serverId } : {}),
+                channelId,
+                ...(threadId ? { threadId } : {}),
+                ...(ownLabel ? { label: ownLabel } : {}),
+              })
               : 'the channel';
             this.addMessage(
               'user',
               [{
                 type: 'text',
-                text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
+                text: outcome === 'unknown'
+                  // A request went out and no valid receipt came back: it may
+                  // have been posted (in part or whole). Never claim it wasn't.
+                  ? `[discord-send-failed] Delivery of your previous reply (${textLen} chars) to ${where} was not confirmed (${reason}). It may or may not have been posted; check the ${threadId ? 'thread' : 'channel'} before sending it again. It is saved in your archive.`
+                  : draftId
+                    ? `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). ` +
+                      `Nothing was posted; it is held as draft ${draftId}. drafts(action: "resend", draftIds: ["${draftId}"]` +
+                      (channelId ? `, destination: "${channelId}"${threadId ? `, threadId: "${threadId}"` : ''}` : '') +
+                      ') sends it there once that can work, or name another destination.'
+                    : `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). Nothing was posted; it is saved in your archive.`,
               }],
-              { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason },
+              {
+                system: true, kind: 'discord-send-failed', ...(serverId ? { serverId } : {}), channelId: channelId ?? '',
+                ...(threadId ? { threadId } : {}), reason, ...(outcome ? { outcome } : {}),
+                // The draft it names counts as named (settleTurnDrafts).
+                ...(draftId ? { draftOwner: conversationId, draftIds: [draftId] } : {}),
+              } as MessageMetadata,
             );
           } catch (err) {
             console.error('onRouteFailure: failed to record send-failure marker:', err);
@@ -13243,8 +15791,8 @@ export class AgentFramework {
         // open forced by delivery) must be announced in the window, with the
         // opt-out named. Routed here so registry-driven opens and framework-
         // driven opens produce the same durable notice.
-        onChannelAutoOpened: ({ conversationId, source, channels }) => {
-          this.recordChannelAutoOpenNotice(conversationId, channels, source);
+        onChannelAutoOpened: ({ conversationId, serverId, source, channels }) => {
+          this.recordChannelAutoOpenNotice(conversationId, channels.map((c) => ({ serverId, ...c })), source);
         },
       },
     );
@@ -14280,9 +16828,19 @@ export class AgentFramework {
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
-      const barrier = this.discordAwarenessBarrier;
-      if (barrier) await barrier.promise;
-      await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+      try {
+        const barrier = this.discordAwarenessBarrier;
+        if (barrier) await barrier.promise;
+        // Checked here, after the barrier and before anything records the
+        // push as accepted: a stopped host refuses it.
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('push/event', connection.id, responder, { kind: 'refused' });
+          return;
+        }
+        await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+      } catch (error) {
+        this.refuseServerItem('push/event', connection.id, responder, { kind: 'failed', error });
+      }
     });
 
     // Handle server-initiated inference requests (Step 6)
@@ -14381,11 +16939,19 @@ export class AgentFramework {
     // Handle incoming channel messages (Step 7)
     connection.on('channels-incoming', async (
       params: ChannelsIncomingParams,
-      responder?: { respond: (result: unknown) => void },
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      const barrier = this.discordAwarenessBarrier;
-      if (barrier) await barrier.promise;
-      await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
+      try {
+        const barrier = this.discordAwarenessBarrier;
+        if (barrier) await barrier.promise;
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('channels/incoming', connection.id, responder, { kind: 'refused' });
+          return;
+        }
+        await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
+      } catch (error) {
+        this.refuseServerItem('channels/incoming', connection.id, responder, { kind: 'failed', error });
+      }
     });
 
     // Handle host-level admin commands from a surface (e.g. Discord /undo)
@@ -14896,22 +17462,20 @@ export class AgentFramework {
             this.channelRegistry
               .openIfClosedForSend(target, serverId)
               .then(({ status, channelId, label }) => {
-                // Turn-scoped engagement record (mid-turn re-pin, 2026-07-31
-                // n=7): a human follow-up in a channel the agent explicitly
-                // sent into this turn counts as conversationally addressed.
-                // Recorded here — not eagerly — because injection metadata
-                // carries the CANONICAL channel id (descriptor form), while
-                // send args often carry the raw provider id; this callback
-                // has the resolved form. The already-open path resolves on
-                // the microtask queue, i.e. before the tool-result event
-                // that evaluates injections.
+                // Turn-scoped engagement record (2026-07-31 n=7; the
+                // ambiguity hold): a follow-up where the agent explicitly
+                // sent this turn competes for its speech. A connector's own
+                // send tool chooses its place in the channel, so what the
+                // host knows is the channel: any conversation in it may be
+                // the one engaged (turnEngagement). Recorded here — not
+                // eagerly — because injection metadata carries the
+                // CANONICAL channel id (descriptor form), while send args
+                // often carry the raw provider id; this callback has the
+                // resolved form. The already-open path resolves on the
+                // microtask queue, i.e. before the tool-result event that
+                // evaluates injections.
                 if (status !== 'unknown-channel' && status !== 'ambiguous') {
-                  let engaged = this.turnEngagedChannels.get(agentName);
-                  if (!engaged) {
-                    engaged = new Set();
-                    this.turnEngagedChannels.set(agentName, engaged);
-                  }
-                  engaged.add(channelId ?? target);
+                  this.noteChannelEngagement(agentName, serverId, channelId ?? target);
                 }
                 if (status === 'opened') {
                   console.error(
@@ -14919,7 +17483,7 @@ export class AgentFramework {
                   );
                   this.recordChannelAutoOpenNotice(
                     agentName,
-                    [{ channelId: channelId ?? target, label }],
+                    [{ ...(serverId ? { serverId } : {}), channelId: channelId ?? target, label }],
                     'opened-by-reply',
                   );
                 } else if (status === 'open-failed') {
@@ -14985,6 +17549,28 @@ export class AgentFramework {
    * Dispatch a synthesized channel tool call.
    */
   private dispatchChannelToolCall(agentName: string, call: ToolCall): void {
+    const reject = (error: string, who = ''): void => {
+      // RFC-007: the guard refuses before the tool runs — no lifecycle events.
+      this.toolLifecycleEmitter?.refuse(agentName, call.id);
+      this.emitTrace({
+        type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id,
+        error: `${who}${error}`,
+      });
+      this.pushEvent({
+        type: 'tool-result',
+        callId: call.id,
+        agentName,
+        moduleName: 'channels',
+        result: { success: false, error, isError: true },
+      });
+    };
+    // Supplied selectors are checked before any default applies, as
+    // channel_publish's own are: an empty or non-string one is refused,
+    // never read as omission (a fork's home, the channel root, "any
+    // server"). null means the field is not in use.
+    const supplied = (v: unknown): boolean => v !== undefined && v !== null;
+    const named = (v: unknown): boolean => typeof v === 'string' && v.length > 0;
+
     // Conversation forks act only on their home channel. channel_publish and
     // channel_close default a missing channelId to home and reject foreign
     // ones; channel_open is rejected outright — opening channels mutates
@@ -14992,79 +17578,185 @@ export class AgentFramework {
     // are scoped against), which is not a fork's call to make.
     const home = this.conversationAgentHomes.get(agentName);
     if (home) {
-      const reject = (error: string): void => {
-        // RFC-007: the guard refuses before the tool runs — no lifecycle events.
-        this.toolLifecycleEmitter?.refuse(agentName, call.id);
-        this.emitTrace({
-          type: 'tool:failed', module: 'channels', tool: call.name, callId: call.id,
-          error: `conversation agent ${agentName}: ${error}`,
-        });
-        this.pushEvent({
-          type: 'tool-result',
-          callId: call.id,
-          agentName,
-          moduleName: 'channels',
-          result: { success: false, error, isError: true },
-        });
-      };
-
+      const who = `conversation agent ${agentName}: `;
       if (call.name === 'channel_open') {
-        reject(`This conversation is bound to channel ${home}; conversation agents cannot open channels.`);
+        reject(`This conversation is bound to channel ${home}; conversation agents cannot open channels.`, who);
         return;
       }
       if (call.name === 'channel_publish' || call.name === 'channel_close') {
-        const input = (call.input ?? {}) as { channelId?: string };
-        if (!input.channelId) {
+        const input = (call.input ?? {}) as { channelId?: unknown; serverId?: unknown };
+        if (!supplied(input.channelId)) {
           call = { ...call, input: { ...input, channelId: home } };
+        } else if (!named(input.channelId)) {
+          reject(`channelId must name a channel (leave it out for this conversation's channel, ${home}). Nothing was ${call.name === 'channel_publish' ? 'sent' : 'closed'}.`, who);
+          return;
         } else if (input.channelId !== home) {
           const verb = call.name === 'channel_publish' ? 'publishing to' : 'closing';
-          reject(`This conversation is bound to channel ${home}; ${verb} ${input.channelId} is not allowed.`);
+          reject(`This conversation is bound to channel ${home}; ${verb} ${input.channelId as string} is not allowed.`, who);
           return;
         }
+        // The home is a bare channel id, so a server named with it must be
+        // the one server that registered it: the same id on another server
+        // is another conversation, and a shared id names no server at all.
+        if (supplied(input.serverId)) {
+          const homeServer = this.channelRegistry?.getChannelServerId(home) ?? null;
+          if (input.serverId !== homeServer) {
+            const verb = call.name === 'channel_publish' ? 'publishing to' : 'closing';
+            reject(
+              homeServer
+                ? `This conversation is bound to channel ${home} on server ${homeServer}; ${verb} it on server ${String(input.serverId)} is not allowed.`
+                : `This conversation is bound to channel ${home}, which isn't registered by exactly one server, so it can't be named with a server. Nothing was ${call.name === 'channel_publish' ? 'sent' : 'closed'}.`,
+              who,
+            );
+            return;
+          }
+        }
+      }
+    }
+
+    // channel_open's own choices: where speech goes (a thread, with
+    // setSpeechTarget) and which server's channel. Checked before anything is
+    // opened, so an invalid choice can't open a channel or become a route.
+    if (call.name === 'channel_open') {
+      const input = (call.input ?? {}) as { serverId?: unknown; threadId?: unknown; setSpeechTarget?: unknown };
+      const thread = readThreadId(input.threadId);
+      const invalid = supplied(input.serverId) && !named(input.serverId)
+        ? 'serverId must name a server (leave it out to resolve the channel id alone).'
+        : 'error' in thread
+          ? thread.error
+          : supplied(input.setSpeechTarget) && typeof input.setSpeechTarget !== 'boolean'
+            ? 'setSpeechTarget must be true or false (left out, it is true).'
+            : undefined;
+      if (invalid) {
+        reject(`${invalid} Nothing was opened.`);
+        return;
       }
     }
 
     this.emitTrace({ type: 'tool:started', module: 'channels', tool: call.name, callId: call.id, input: call.input });
     const startTime = Date.now();
+    const turnAtDispatch = this.logicalTurn(agentName);
 
     this.channelRegistry!.handleChannelToolCall(call.name, call.input, { kind: 'agent', agentName })
       .then((result) => {
         const durationMs = Date.now() - startTime;
         this.emitTrace({ type: 'tool:completed', module: 'channels', tool: call.name, callId: call.id, durationMs });
-        // A successful channel_open plants the agent's feet in the opened
-        // channel. The agent's own deliberate open is the strongest "my next
-        // words go here" signal in the system — stronger than any injection —
-        // so it MOVES the current turn's prose pin (turnLocusPins), not just
-        // the next turn's trigger state. (The original 2026-07-21 Aria fix
-        // set only activeTriggerChannels, which resolveLocus reads at the
-        // NEXT turn's freeze — the turn-frozen refactor had silently
-        // regressed the "reply right after opening" case; found while
-        // mapping the routing logic 2026-07-31, antra-ratified fix.) The
-        // announcement rides THIS TOOL RESULT — model-requested content,
-        // distance zero, the safest role there is — instead of a separate
-        // window notice. lastAnnouncedLocus tracks it so announce-on-change
-        // stays coherent. Locus-mode agents only: explicit mode has no pin.
+        // channel_publish is an explicit send to an exact place: its outcome
+        // engages the conversation it named, as a resend's does.
+        if (call.name === 'channel_publish') {
+          const sent = result?.data as { status?: unknown; serverId?: unknown; channelId?: unknown; threadId?: unknown } | undefined;
+          if ((sent?.status === 'delivered' || sent?.status === 'unknown') && typeof sent.channelId === 'string') {
+            this.noteSendEngagement(agentName, sent.status, {
+              ...(typeof sent.serverId === 'string' ? { serverId: sent.serverId } : {}),
+              channelId: sent.channelId,
+              threadId: typeof sent.threadId === 'string' ? sent.threadId : null,
+            });
+          }
+        }
+        // channel_open is a deliberate speech choice (shelf-355): unless the
+        // resident says setSpeechTarget: false, its unaddressed plain speech
+        // goes to the opened channel for the rest of this logical turn — a
+        // true new turn decides afresh. It replaces an inferred route or an
+        // ambiguity hold, and a hybrid `>>>` pin (the latest deliberate choice
+        // wins). With setSpeechTarget: false the channel is opened for
+        // reading and the route is unchanged; the result says what it is.
+        // The announcement rides THIS TOOL RESULT (model-requested content,
+        // distance zero) instead of a separate window notice, and
+        // lastAnnouncedRoute tracks it so announce-on-change stays coherent.
+        // Locus and hybrid modes only: explicit mode has no route.
         if (call.name === 'channel_open' && result?.success) {
-          const opened =
-            (result.data as { channelId?: string } | undefined)?.channelId
-            ?? (call.input as { channelId?: string } | undefined)?.channelId;
-          if (opened) {
-            this.activeTriggerChannels.set(agentName, opened);
-            const openerAgent = this.agents.get(agentName);
-            if (openerAgent && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')) {
-              this.turnLocusPins.set(agentName, opened);
-              this.lastAnnouncedLocus.set(agentName, opened);
-              result = {
-                ...result,
-                data: {
-                  ...(result.data as Record<string, unknown> | undefined),
-                  routing: 'Your plain speech now lands in this channel. Other channels need an explicit send tool.',
-                },
+          const openInput = call.input as { channelId?: string; serverId?: string; threadId?: string | null; setSpeechTarget?: boolean | null } | undefined;
+          const opened = (result.data as { channelId?: string } | undefined)?.channelId ?? openInput?.channelId;
+          const openerAgent = this.agents.get(agentName);
+          if (opened && openerAgent && (openerAgent.proseRouting === 'locus' || openerAgent.proseRouting === 'hybrid')) {
+            const unchanged = (): string => {
+              const turn = this.turnRoutes.get(agentName);
+              return turn?.hold
+                ? 'Your speech route is unchanged: it is held between ' +
+                  `${turn.hold.conversations.map(describeConversation).join(' and ')}, so unaddressed plain speech stays as drafts.`
+                : turn?.route
+                  ? `Your plain speech still goes to ${describeConversation(routeConversation(turn.route))}.`
+                  : 'You have no speech route, so unaddressed plain speech is held as drafts.';
+            };
+            let routing: string;
+            if (this.logicalTurn(agentName) !== turnAtDispatch) {
+              // The turn that asked has been superseded by a newer one, whose
+              // speech is its own to decide: the open stands, the route and
+              // prose choices don't move.
+              routing = 'Opened. A newer turn has begun since this call, so its speech route is unchanged.';
+            } else if (this.turnRoutes.get(agentName)?.silent) {
+              // A silent control-plane wake keeps its plain speech private:
+              // the open stands, and no route is set. The turn's record says
+              // so, during the turn and after it ends.
+              routing = 'Opened. This call came from a silent wake, so its plain speech stays private; ' +
+                'to post there, use a send tool.';
+            } else if (openInput?.setSpeechTarget !== false) {
+              const resolved = this.channelRegistry!.resolveDestination({
+                channelId: opened,
+                ...(openInput?.serverId ? { serverId: openInput.serverId } : {}),
+              });
+              const destination = resolved && 'destination' in resolved ? resolved.destination : undefined;
+              const openedServer = destination?.serverId ?? openInput?.serverId;
+              // A channel named alone means its root — never a thread
+              // borrowed from an earlier route; a thread is named with it.
+              const read = readThreadId(openInput?.threadId);
+              const threadId = 'threadId' in read && read.threadId ? read.threadId : undefined;
+              const route: SpeechRoute = {
+                kind: 'channel',
+                ...(openedServer ? { serverId: openedServer } : {}),
+                channelId: opened,
+                ...(threadId ? { threadId } : {}),
+                ...(destination?.label ? { label: destination.label } : {}),
+                origin: 'open',
               };
-              console.error(
-                `[routing] ${agentName}: channel_open -> pin moved to ${opened} (announced in tool result)`,
-              );
+              // Only a place the framework can publish into exactly becomes
+              // a route (MCPL RFC-011); otherwise the open stands, and the
+              // route doesn't move.
+              const refusal = routeRefusal(routeConversation(route), (c) => this.publishTargetOf(c));
+              if (!this.mayTakeRoute(agentName, opened)) {
+                // The fork rule, as for every route: a channel a conversation
+                // fork owns is that fork's conversation. (A fork's own
+                // channel_open is refused before this.)
+                routing = 'Opened, but your plain speech can\'t go there: a conversation fork owns that channel. ' +
+                  unchanged();
+                console.error(`[routing] ${agentName}: channel_open ${opened} not a speech route (fork rule)`);
+              } else if (refusal) {
+                routing =
+                  `Opened, but your plain speech can't go there: ${this.unroutableText({ conversation: routeConversation(route), reason: refusal })} ` +
+                  unchanged();
+                console.error(`[routing] ${agentName}: channel_open ${opened} not a speech route (${refusal})`);
+              } else {
+                const next: TurnRecord = { route };
+                this.turnRoutes.set(agentName, next);
+                this.lastAnnouncedRoute.set(agentName, AgentFramework.routeKey(next));
+                // The open supersedes a hybrid `>>>` choice — a pin, or the
+                // suppression a skip_reply or failed envelope left — in the
+                // order the resident chose: on the speech chain, after the
+                // words written before it (already chained) and before any
+                // written after (chained only once this result is in).
+                if (openerAgent.proseRouting === 'hybrid') {
+                  this.chainSpeech(agentName, 'channel_open hybrid reset', () => {
+                    if (this.logicalTurn(agentName) !== turnAtDispatch) return;
+                    this.proseTargetPins.delete(agentName);
+                    this.proseHybridSuppressed.delete(agentName);
+                  });
+                }
+                routing =
+                  `Your unaddressed plain speech now goes to ${describeConversation(routeConversation(route))} for the ` +
+                  'rest of this turn. Other channels need an explicit send tool.';
+                console.error(`[routing] ${agentName}: channel_open -> speech route ${opened}${threadId ? ` thread ${threadId}` : ''} (announced in tool result)`);
+              }
+            } else {
+              const read = readThreadId(openInput?.threadId);
+              const ignored = 'threadId' in read && read.threadId
+                ? ` threadId ${read.threadId} chooses where speech goes, so with setSpeechTarget: false it was not used.`
+                : '';
+              routing = `Opened for reading.${ignored} ${unchanged()}`;
             }
+            result = {
+              ...result,
+              data: { ...(result.data as Record<string, unknown> | undefined), routing },
+            };
           }
         }
         this.pushEvent({
@@ -15273,7 +17965,7 @@ export class AgentFramework {
           }
         : { success: false, error: r.error, isError: false };
     }
-    this.queue.push({
+    this.pushEvent({
       type: 'tool-result',
       callId: call.id,
       agentName,
@@ -15311,9 +18003,10 @@ export class AgentFramework {
       : seconds >= 60 ? `${Math.round(seconds / 60)}m`
       : `${Math.round(seconds)}s`;
 
-    // Announce in the TURN's frozen locus (best-effort; never blocks the
-    // result). The sleep tool runs mid-turn, so the pin is live — same
-    // authority as every other speech path, no live re-resolution.
+    // Announce as the turn's speech goes (best-effort; never blocks the
+    // result): an explicit-mode resident's pinned target, a hybrid one's
+    // `>>>` pin when it set one, else the turn's route, exactly as other
+    // unaddressed speech, with no live re-resolution.
     if (announce && this.channelRegistry) {
       const text = input.message ?? `💤 Going quiet for ${human}. I'll still see messages, but won't respond until I wake.`;
       const agent = this.agents.get(agentName);
@@ -15331,10 +18024,23 @@ export class AgentFramework {
         } else {
           console.error(`[sleep] ${agentName}: no prose target this turn — sleep announcement not posted (explicit mode never guesses)`);
         }
-      } else {
-        const locus = this.turnLocusPins.get(agentName) ?? null;
-        this.channelRegistry.routeSpeech(agentName, text, locus).catch((err) => {
-          console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
+      } else if (agent) {
+        // Unaddressed speech like any other, after the words written before
+        // it. A hybrid `>>>` pin set this turn wins, as for an unprefixed
+        // envelope; else the route as it stands when the tool runs: a held
+        // turn keeps the words as a draft, a surface shows them, no route
+        // keeps them with no destination, and only a publish that was tried
+        // can fail.
+        const moment: SpeechMoment = { turn: this.turnRoutes.get(agentName) };
+        this.chainSpeech(agentName, '[sleep] announcement', async () => {
+          const pin = agent.proseRouting === 'hybrid' ? this.proseTargetPins.get(agentName) : undefined;
+          if (pin) {
+            const outcome = await this.channelRegistry!.routeSpeech(agentName, text, pin, { holdFailed: this.holdUndelivered(agent, text, {}) });
+            this.recordProseDelivery(agentName, outcome);
+            if (outcome?.delivered) this.streamPublished(agentName, moment, outcome, text);
+            return;
+          }
+          await this.speakUnaddressed(agent, text, { notice: 'later' }, moment);
         });
       }
     }
@@ -16203,11 +18909,10 @@ export class AgentFramework {
     return {
       inferenceId,
       // Conversation identity = the agent (a trunk agent IS its own conversation;
-      // forks get their own agent). The turn's channel LOCUS — the "proper
-      // conversation tracking" this once flagged as a TODO — is now tracked
-      // per-agent in `activeTriggerChannels` and surfaced to the agent via
+      // forks get their own agent). The turn's speech route is tracked
+      // per-agent in `turnRoutes` and surfaced to the agent via
       // buildChannelContext (channels.defaultOutgoing) below, so the agent is
-      // told the same channel its speech will route to (item-3 redux).
+      // told the same channel its speech will route to.
       conversationId: agent.name,
       turnIndex: 0, // Simplified; needs per-conversation counter TODO
       userMessage: null, // Could extract from trigger context

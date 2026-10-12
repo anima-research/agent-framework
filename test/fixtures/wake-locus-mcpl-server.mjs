@@ -6,6 +6,9 @@
 // TEST appends lines to COMMAND_PATH:
 //   incoming <channelId> <messageId> <ambient|addressed> <text…>
 //   dm <eventId> <authorId> <rawChannelId> <text…>
+// Every channel declares an MCPL RFC-011 publish target (root), and a DM's
+// channel (discord:dm:<raw>) is registered with one just before the DM is
+// pushed, as discord-mcpl registers its DM channels.
 // Host-side channels/publish and channels/open calls are recorded to
 // STATUS_PATH as JSONL.
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
@@ -27,6 +30,7 @@ const CHANNELS = [
 ];
 let nextId = 500;
 let processedCommands = 0;
+const registeredDms = new Set();
 
 function pollCommands() {
   if (!commandPath || !existsSync(commandPath)) return;
@@ -56,6 +60,22 @@ function pollCommands() {
       });
     } else if (kind === 'dm') {
       const [eventId, authorId, rawChannelId, ...words] = rest;
+      const dmChannel = `discord:dm:${rawChannelId}`;
+      if (!registeredDms.has(dmChannel)) {
+        registeredDms.add(dmChannel);
+        send({
+          jsonrpc: '2.0',
+          id: nextId++,
+          method: 'channels/changed',
+          params: {
+            added: [{
+              id: dmChannel, type: 'discord', label: 'DM: antra', direction: 'bidirectional',
+              metadata: { channelType: 'dm', recipientName: 'antra', recipientId: authorId },
+              capabilities: { publish: { target: 'root' } },
+            }],
+          },
+        });
+      }
       log('dm-sent', { eventId });
       send({
         jsonrpc: '2.0',
@@ -126,6 +146,8 @@ rl.on('line', (line) => {
       params: {
         channels: CHANNELS.map((c) => ({
           id: c.id, type: 'discord', label: c.label, direction: 'bidirectional', initiallyOpen: true,
+          // MCPL RFC-011: every channel posts exactly where it is asked.
+          capabilities: { publish: { target: 'root' } },
         })),
       },
     });
@@ -142,7 +164,9 @@ rl.on('line', (line) => {
   }
   if (msg.method === 'channels/publish') {
     log('publish', { channelId: msg.params?.channelId });
-    if (msg.id !== undefined && msg.id !== null) reply(msg.id, { delivered: true });
+    // RFC-011: a delivery echoes the place it was asked for.
+    const placed = msg.params && 'threadId' in msg.params ? { threadId: msg.params.threadId } : {};
+    if (msg.id !== undefined && msg.id !== null) reply(msg.id, { delivered: true, ...placed });
     return;
   }
   if (msg.method === 'tools/list') {
