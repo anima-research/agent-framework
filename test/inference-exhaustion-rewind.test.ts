@@ -50,8 +50,6 @@ function makeHarness(opts?: { maxRewinds?: number; messages?: any[] }) {
   fw.pendingRequests = [];
   // The turn the retry continues answered a channel (its speech route).
   fw.turnRoutes = new Map([['cairn', { route: { kind: 'channel', serverId: 'discord', channelId: 'discord:g:c1', replyTo: 'm-1', origin: 'trigger' } }]]);
-  // No running turn's trigger: the turn the retry continues wasn't silent.
-  fw.activeTurnTriggers = new Map();
   fw.traceListeners = [];
   fw.inferenceFailureEscalationThreshold = 3;
   fw.agents = new Map([['cairn', {
@@ -93,9 +91,12 @@ test('at the threshold, invalid_request failures trigger an automatic rewind + r
   // A retry was queued so the rewound history is verified immediately.
   assert.equal(fw.pendingRequests.length, 1);
   assert.equal(fw.pendingRequests[0].reason, 'inference-failure-rewind-retry');
-  // It names the conversation the failed turn answered, so its words go there.
-  assert.equal(fw.pendingRequests[0].namesConversation, true);
-  assert.deepEqual(fw.pendingRequests[0].routeCandidates.map((c: any) => [c.conversation.channelId, c.addressed, c.messageId]),
+  // It continues the failed turn: when its batch starts, it names the
+  // conversation that turn answered, so its words go there.
+  assert.equal(fw.pendingRequests[0].continuesTurn, true);
+  const started = fw.continuationFor(fw.pendingRequests[0]);
+  assert.equal(started.namesConversation, true);
+  assert.deepEqual(started.routeCandidates.map((c: any) => [c.conversation.channelId, c.addressed, c.messageId]),
     [['discord:g:c1', true, 'm-1']]);
 
   assert.ok(errs.some((e) => e.includes('[inference-rewind]') && e.includes('auto-quarantined')));

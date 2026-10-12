@@ -376,6 +376,21 @@ export interface InferenceRequest {
    * turn's route comes from its candidates alone.
    */
   namesConversation?: true;
+  /**
+   * A framework wake that continues its agent's turn (a rewind retry, an
+   * unstick, a tool round's results, a prose continuation or bounce, a
+   * provider-cooldown retry). It carries nothing else of that turn: when
+   * its batch starts, the framework reads the agent's turn record then and
+   * fills in the conversations, whether it names one, the place a fallback
+   * turn spoke into, and a silent wake's silence (continuationOf).
+   */
+  continuesTurn?: true;
+  /**
+   * The place a continued fallback turn spoke into: the turn's fallback,
+   * kept in place of the last delivered message's conversation. Like any
+   * fallback, it applies only to a turn whose batch names no conversation.
+   */
+  fallbackPlace?: import('../speech-routes.js').RouteCandidate;
   /** Suppress every automatic plain-prose delivery for this logical turn.
    * Explicit tool calls remain available. Used by authenticated silent wakes. */
   suppressProse?: boolean;

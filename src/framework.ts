@@ -86,8 +86,7 @@ import { InferenceRouter } from './mcpl/inference-router.js';
 import { ChannelRegistry, publishPlaceRefusal, type ChannelToolOrigin, type PublishDestination, type PublishOutcome, type SpeechRouteView } from './mcpl/channel-registry.js';
 import { KEEP_IDLE_MS, KEEP_NEWEST, ProseDraftStore, draftState, uncertainAttempt, type Draft, type DraftAttempt, type DraftReason, type DraftSource, type DraftState, type InheritedRisk } from './prose-drafts.js';
 import {
-  continuationCandidates,
-  continuationNames,
+  continuationOf,
   conversationKey,
   describeConversation,
   inferTurnRoute,
@@ -275,6 +274,15 @@ function estimateAppendedRoundTokens(
   const blockCount = toolResults.length + injections.length;
   return Math.ceil(chars / 4) + images * 1600 + blockCount * 20;
 }
+
+/**
+ * A turn's routing state, and what a continuation of the turn needs from it
+ * after the turn's teardown: for a silent wake (suppressProse), its prompt
+ * and stamp, so the continuation is a silent tick too (continuationFor).
+ */
+type TurnRecord = TurnRoute & {
+  silent?: Pick<InferenceRequest, 'ephemeralSystemPrompt' | 'silentHeartbeat'>;
+};
 
 /**
  * What decides where one piece of speech goes, captured when its words were
@@ -1095,7 +1103,7 @@ export class AgentFramework {
    *  competing addressed/engaged arrival (the ambiguity hold). Incoming
    *  traffic never selects a new destination. Lives here, not in driveStream,
    *  so context-budget restarts and retries keep it. */
-  private turnRoutes: Map<string, TurnRoute> = new Map();
+  private turnRoutes: Map<string, TurnRecord> = new Map();
   /** Where the agent EXPLICITLY sent during the CURRENT turn, per agent: the
    *  second ambiguity signal. A conversational reply where the agent just
    *  sent competes for its unaddressed words even without a mention
@@ -1204,11 +1212,6 @@ export class AgentFramework {
   /** Consecutive bounce-wakes per agent; capped so an agent that keeps
    *  emitting unprefixed prose can't wake-loop (notices still append). */
   private proseBounceStreaks: Map<string, number> = new Map();
-  /** Agents whose words bounced while their turn was live: the bounce's wake
-   *  is queued when that turn ends (driveStream), so it names the
-   *  conversations the turn answered by then, after a channel_open or a hold
-   *  later in the turn. It couldn't start before the turn ends anyway. */
-  private proseBounceWakes: Set<string> = new Set();
   private pendingAssistantBlocks: Map<string, ContentBlock[]> = new Map();
   /** Streams the FRAMEWORK cancelled for non-terminal reasons, keyed
    *  `${agentName}:${streamId}`: an endTurn tool result or a context-budget
@@ -5441,6 +5444,12 @@ export class AgentFramework {
       if (agent.state.status !== 'idle') {
         return { ok: false, error: `Cannot unstick while agent is ${agent.state.status}` };
       }
+      // A turn is alive from its dequeue to its settled teardown, which
+      // includes moments the state machine reads idle: the start of a turn
+      // before its inference, and the end of one after endTurn's reset.
+      if (this.activeTurnTokens.has(agentName)) {
+        return { ok: false, error: 'Cannot unstick while a turn is in progress' };
+      }
       const cap = Math.max(1, Math.min(10,
         Math.floor(params.maxRewinds ?? agent.refusalHandling?.maxRewinds ?? 3)));
       this.forcedRewind.set(agentName, {
@@ -7067,7 +7076,10 @@ export class AgentFramework {
                   readInboundSource(m),
                   isAddressedMessage(m?.tags as string[] | undefined, m),
                 );
-                if (!candidate || !suspendsRoute(turn, candidate, isEngaged)) continue;
+                // A channel a conversation fork owns is never another
+                // agent's place, so it doesn't compete for this one's.
+                if (!candidate || !this.mayTakeCandidate(agent.name, candidate)) continue;
+                if (!suspendsRoute(turn, candidate, isEngaged)) continue;
                 const key = conversationKey(candidate.conversation);
                 if (seen.has(key)) continue;
                 seen.add(key);
@@ -7077,7 +7089,7 @@ export class AgentFramework {
             if (turn?.route && competing.length > 0) {
               const current = routeConversation(turn.route);
               const arrivals = competing.map((c) => c.conversation);
-              const held: TurnRoute = { route: turn.route, hold: { conversations: [current, ...arrivals], since: 'mid-turn' } };
+              const held: TurnRecord = { ...turn, hold: { conversations: [current, ...arrivals], since: 'mid-turn' } };
               this.turnRoutes.set(agent.name, held);
               this.lastAnnouncedRoute.set(agent.name, AgentFramework.routeKey(held));
               // Name each actual cause, as certain as the host is of it:
@@ -9124,6 +9136,11 @@ export class AgentFramework {
         continue;
       }
 
+      // A request that continues the agent's turn reads that turn's record
+      // now, as the turn left it (continuationFor), before the batch's
+      // fields are merged below.
+      requests = requests.map((r) => this.continuationFor(r));
+
       // Start streaming inference (non-blocking — driveStream runs in background)
       // The request that grants the turn-alive exception must also define the
       // downstream turn semantics. An ordinary wake can already be pending
@@ -9210,6 +9227,8 @@ export class AgentFramework {
         // Whether any of them named a conversation, candidate or not: only a
         // batch none of whose requests did takes the fallback route.
         namesConversation: !budgetRestart && requests.some((r) => r.namesConversation) ? true : undefined,
+        // A continued fallback turn's place, kept as this batch's fallback.
+        fallbackPlace: budgetRestart ? undefined : requests.find((r) => r.fallbackPlace)?.fallbackPlace,
       });
     }
   }
@@ -10135,6 +10154,19 @@ export class AgentFramework {
   }
 
   /**
+   * A candidate as it stands when its turn starts. One whose channel had no
+   * server when its wake was queued (candidateForChannel) is resolved again,
+   * so a server that registered while the wake waited makes it routable. A
+   * gate's unroutable candidate that names its server is a raw id the host
+   * couldn't resolve to a registered channel, and stays as it is.
+   */
+  private resolvedCandidate(c: RouteCandidate): RouteCandidate {
+    if (!c.unroutable || c.conversation.kind !== 'channel' || c.conversation.serverId) return c;
+    const { channelId, threadId } = c.conversation;
+    return this.candidateForChannel(channelId, c.addressed, c.at, undefined, c.messageId, threadId);
+  }
+
+  /**
    * The fallback for a wake that names no conversation: where the last
    * message any channel delivered came in (its server, channel and thread),
    * as plain speech went before speech routes. Not when a conversation fork
@@ -10166,39 +10198,49 @@ export class AgentFramework {
    * A framework wake that continues `agentName`'s turn: an unstick, a retry
    * after a rewind (a refusal, an unstick or an inference failure), the
    * results of a non-streaming tool round, an explicit-prose continuation or
-   * bounce, or a bare provider-cooldown retry. When it is queued, its turn's
-   * route record gives the conversations that turn answered
-   * (continuationCandidates), and the wake names them. So the true new turn
-   * it starts, alone or batched with other wakes, infers its route from them
-   * by the rules every wake follows (the fork rule included, at turn start).
-   * A fallback turn's continuation names nothing and takes the fallback
-   * afresh, as that turn did; a turn whose words had no place gives a
-   * continuation that names a conversation but no candidate, so the fallback
-   * gives it no place either (continuationNames).
-   *
-   * A continuation of a silent tick queued while that turn runs (a rewind
-   * retry, its tool round's results) is a silent tick too: it carries the
-   * turn's suppressProse, its prompt and its stamp, as a budget restart does.
-   * A budget restart and a guard retry aren't built here: they continue the
-   * same logical turn, which keeps its route record (continuingTurn).
+   * bounce, or a bare provider-cooldown retry. It carries only that it
+   * continues the turn; continuationFor fills in the rest when its batch
+   * starts. A budget restart and a guard retry aren't built here: they
+   * continue the same logical turn, which keeps its route record
+   * (continuingTurn).
    */
   private continuationRequest(agentName: string, reason: string): InferenceRequest {
-    const timestamp = Date.now();
-    const turn = this.turnRoutes.get(agentName);
-    const candidates = continuationCandidates(turn, timestamp);
-    const active = this.activeTurnTriggers.get(agentName);
+    return { agentName, reason, source: 'framework', timestamp: Date.now(), continuesTurn: true };
+  }
+
+  /**
+   * A request that continues its agent's turn, as its batch starts
+   * (processInferenceRequests): what that turn's record gives it now
+   * (continuationOf). The conversations the turn answered become the
+   * request's candidates, so the true new turn it starts, alone or batched
+   * with other wakes, infers its route from them by the rules every wake
+   * follows, the fork rule included. A fallback turn's place becomes its
+   * fallback. A silent wake's continuation is a silent tick too, with the
+   * turn's prompt and stamp, as a budget restart is.
+   *
+   * The record read is the agent's most recent turn's, as that turn left
+   * it, which is the turn the request continues: a resident's true new turn
+   * starts only here, an agent's requests wait while a turn is alive, and
+   * the next turn takes every request the agent has pending. So a request
+   * queued during its turn or in its teardown names where that turn's words
+   * went by its end, after a channel_open or a hold. An unstick waits for an
+   * idle agent, and a provider cooldown holds every request of the agent.
+   * Only a bounce can be queued after a successor turn has begun, from the
+   * previous turn's speech landing while the successor waits for it; its
+   * wake then runs after the successor and names the successor's
+   * conversations, where the resident last spoke.
+   */
+  private continuationFor(request: InferenceRequest): InferenceRequest {
+    if (!request.continuesTurn) return request;
+    const turn = this.turnRoutes.get(request.agentName);
+    const { candidates, namesConversation, fallback } = continuationOf(turn, request.timestamp);
     return {
-      agentName,
-      reason,
-      source: 'framework',
-      timestamp,
-      ...(continuationNames(turn) ? { namesConversation: true as const } : {}),
+      ...request,
+      continuesTurn: undefined,
+      ...(namesConversation ? { namesConversation: true as const } : {}),
       ...(candidates.length > 0 ? { routeCandidates: candidates } : {}),
-      ...(active?.suppressProse ? {
-        suppressProse: true,
-        ...(active.ephemeralSystemPrompt ? { ephemeralSystemPrompt: active.ephemeralSystemPrompt } : {}),
-        ...(active.silentHeartbeat ? { silentHeartbeat: active.silentHeartbeat } : {}),
-      } : {}),
+      ...(fallback ? { fallbackPlace: fallback } : {}),
+      ...(turn?.silent ? { suppressProse: true, ...turn.silent } : {}),
     };
   }
 
@@ -11145,9 +11187,9 @@ export class AgentFramework {
     if (!capped) {
       // Wake so the resend can happen immediately — an unsent DM reply must
       // not sit invisible until the next unrelated event. A bounce in a live
-      // turn wakes when that turn ends (proseBounceWakes).
-      if (this.activeTurnTokens.has(name)) this.proseBounceWakes.add(name);
-      else this.pendingRequests.push(this.continuationRequest(name, 'prose-bounce'));
+      // turn wakes once that turn has ended, and names the conversations it
+      // answered by then (continuationFor).
+      this.pendingRequests.push(this.continuationRequest(name, 'prose-bounce'));
     }
   }
 
@@ -11438,7 +11480,7 @@ export class AgentFramework {
         // rewind retry, an unstick, a prose continuation or bounce) starts a
         // true new turn too: a rewind sheds the turn whose choices these
         // were, and only where the words go carries over, through the
-        // conversations the wake names (continuationRequest).
+        // conversations the wake names (continuationFor).
         // A framework retry (attempt > 0), like a restart,
         // continues the same logical turn: its sends were made, its words
         // delivered or held, its choices chosen, and none of that rolls back
@@ -11451,9 +11493,6 @@ export class AgentFramework {
         this.turnDraftFailures.delete(agent.name);
         this.proseHybridSuppressed.delete(agent.name);
         this.proseTargetPins.delete(agent.name);
-        // A bounce whose turn ended without waking (superseded) is in this
-        // turn's history already.
-        this.proseBounceWakes.delete(agent.name);
         (this.logicalTurns ??= new Map()).set(agent.name, this.logicalTurn(agent.name) + 1);
       }
       if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') {
@@ -11469,11 +11508,11 @@ export class AgentFramework {
         // else held (src/speech-routes.ts). A wake that names no
         // conversation at all (a heartbeat, a timer, a self-wake) takes the
         // fallback, the last delivered message's conversation, as before
-        // speech routes. A silent control-plane wake has none. A framework
-        // wake that continues a turn (a rewind retry, an unstick, a prose
-        // continuation or bounce) carries the conversations that turn
-        // answered as its candidates (continuationRequest), so it is
-        // inferred here like any other.
+        // speech routes. A framework wake that continues a turn (a rewind
+        // retry, an unstick, a prose continuation or bounce) carries the
+        // conversations that turn answered as its candidates, or a fallback
+        // turn's place as its fallback (continuationFor), so it is inferred
+        // here like any other.
         //
         // The fork rule applies here, where the route is decided, to every
         // wake's candidates: a fork takes only its home's, and no other agent
@@ -11483,24 +11522,27 @@ export class AgentFramework {
         // keeps the fallback away. That includes an unroutable candidate,
         // which never routes but competes: a fork's channel never holds
         // another agent's turn.
-        const turn: TurnRoute = trigger?.suppressProse
-          ? { route: null }
-          : inferTurnRoute(
-              (trigger?.routeCandidates ?? []).filter((c) => this.mayTakeCandidate(agent.name, c)),
-              this.homeRoute(agent.name),
-              (c) => this.publishTargetOf(c),
-              // Only a resident's wake that named no conversation, candidate
-              // or not, takes the fallback: a reaction, a system marker or a
-              // channel a fork owns names one, and gets no route as before. An
-              // ephemeral subagent never takes it: its prose is its caller's
-              // business, never a channel's. (A conversation fork's name is in
-              // the same set, but a fork's home always wins before any
-              // fallback is read.)
-              trigger?.namesConversation || this.usedEphemeralAgentNames.has(agent.name)
-                ? null
-                : this.fallbackCandidate(agent.name),
-            );
-        this.turnRoutes.set(agent.name, turn);
+        const turn = inferTurnRoute(
+          (trigger?.routeCandidates ?? [])
+            .map((c) => this.resolvedCandidate(c))
+            .filter((c) => this.mayTakeCandidate(agent.name, c)),
+          this.homeRoute(agent.name),
+          (c) => this.publishTargetOf(c),
+          // Only a resident's wake that named no conversation, candidate or
+          // not, takes the fallback: a reaction, a system marker or a channel
+          // a fork owns names one, and gets no route as before. An ephemeral
+          // subagent never takes it: its prose is its caller's business,
+          // never a channel's. (A conversation fork's name is in the same
+          // set, but a fork's home always wins before any fallback is read.)
+          // A continued fallback turn keeps that turn's place, under the same
+          // fork rule as any fallback.
+          trigger?.namesConversation || this.usedEphemeralAgentNames.has(agent.name)
+            ? null
+            : trigger?.fallbackPlace
+              ? (this.mayTakeCandidate(agent.name, trigger.fallbackPlace) ? trigger.fallbackPlace : null)
+              : this.fallbackCandidate(agent.name),
+        );
+        this.turnRoutes.set(agent.name, { ...turn, ...(trigger?.namesConversation ? { named: true as const } : {}) });
         this.midTurnInputSignals.delete(agent.name);
         if (!trigger?.suppressProse) this.announceRouteIfChanged(agent.name, turn);
       }
@@ -11510,7 +11552,16 @@ export class AgentFramework {
     // control-plane wake has none: its channel_open sets none (the result
     // says so), so this resets only what a restart could carry over.
     if (trigger?.suppressProse) {
-      this.turnRoutes.set(agent.name, { route: null });
+      // The record keeps the wake's silence, so a continuation of this turn
+      // is a silent tick too, whenever it is queued (continuationFor).
+      this.turnRoutes.set(agent.name, {
+        route: null,
+        ...(trigger.namesConversation ? { named: true as const } : {}),
+        silent: {
+          ...(trigger.ephemeralSystemPrompt ? { ephemeralSystemPrompt: trigger.ephemeralSystemPrompt } : {}),
+          ...(trigger.silentHeartbeat ? { silentHeartbeat: trigger.silentHeartbeat } : {}),
+        },
+      });
       this.proseTargetPins.delete(agent.name);
       this.proseContinuations.delete(agent.name);
     }
@@ -13208,11 +13259,6 @@ export class AgentFramework {
           this.settleTurnDrafts(agent);
         } catch (err) {
           console.error('[drafts] turn-end settlement failed:', err);
-        }
-        // A bounce during the turn wakes now, naming the conversations the
-        // turn answered at its end.
-        if (this.proseBounceWakes.delete(agent.name)) {
-          this.pendingRequests.push(this.continuationRequest(agent.name, 'prose-bounce'));
         }
       }
     }
@@ -17485,13 +17531,24 @@ export class AgentFramework {
               // a route (MCPL RFC-011); otherwise the open stands, and the
               // route doesn't move.
               const refusal = routeRefusal(routeConversation(route), (c) => this.publishTargetOf(c));
-              if (refusal) {
+              if (!this.mayTakeRoute(agentName, opened)) {
+                // The fork rule, as for every route: a channel a conversation
+                // fork owns is that fork's conversation, and a fork speaks
+                // only in its home.
+                routing = 'Opened, but your plain speech can\'t go there: ' +
+                  (this.conversationAgentHomes.has(agentName)
+                    ? 'a conversation fork speaks only in its home channel. '
+                    : 'a conversation fork owns that channel. ') +
+                  unchanged();
+                console.error(`[routing] ${agentName}: channel_open ${opened} not a speech route (fork rule)`);
+              } else if (refusal) {
                 routing =
                   `Opened, but your plain speech can't go there: ${this.unroutableText({ conversation: routeConversation(route), reason: refusal })} ` +
                   unchanged();
                 console.error(`[routing] ${agentName}: channel_open ${opened} not a speech route (${refusal})`);
               } else {
-                const next: TurnRoute = { route };
+                const prev = this.turnRoutes.get(agentName);
+                const next: TurnRecord = { route, ...(prev?.named ? { named: true as const } : {}) };
                 this.turnRoutes.set(agentName, next);
                 this.lastAnnouncedRoute.set(agentName, AgentFramework.routeKey(next));
                 // The open supersedes a hybrid `>>>` choice — a pin, or the

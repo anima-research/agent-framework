@@ -122,6 +122,10 @@ export interface TurnRoute {
    *    shouldn't produce);
    *  - `unresolved`: a channel the host couldn't resolve. */
   unroutable?: { conversation: ConversationRef; reason: UnroutableReason };
+  /** The turn's wake named a conversation (a channel, a thread, an author
+   *  or a local surface), candidate or not. A continuation of the turn then
+   *  names one too (continuationOf). */
+  named?: true;
 }
 
 export type UnroutableReason = 'untargetable' | 'thread' | 'unresolved';
@@ -302,8 +306,8 @@ function fallbackRoute(fallback: RouteCandidate | null | undefined, targetOf: Pu
  * take the turn, and an addressed one from elsewhere holds it.
  *
  * A turn that answered no conversation gives none: a fallback turn, or a
- * turn whose words had no place. Whether its continuation names a
- * conversation anyway is continuationNames.
+ * turn whose words had no place. What its continuation names then is
+ * continuationOf's to say.
  */
 export function continuationCandidates(turn: TurnRoute | undefined, at: number): RouteCandidate[] {
   if (!turn) return [];
@@ -323,16 +327,35 @@ export function continuationCandidates(turn: TurnRoute | undefined, at: number):
 }
 
 /**
- * Whether a framework wake that continues a turn names a conversation. A
- * fallback turn's wake named none, so its continuation names none and takes
- * the fallback afresh. Every other route record counts as named: a turn
- * whose words had no place (a silent wake, a wake whose conversation it
- * couldn't take, or a no-name wake that found no fallback place) gives its
- * continuation no place either. No record (no turn yet, or an
- * explicit-prose turn) names none.
+ * What a framework wake that continues a turn carries into its own turn,
+ * read from that turn's record when the continuation's batch starts:
+ * - `candidates`: the conversations the turn answered
+ *   (continuationCandidates);
+ * - `namesConversation`: whether it names a conversation. It does when it
+ *   has candidates, or when the turn's own wake named one. So a turn whose
+ *   words had no place although its wake named a conversation (a reaction,
+ *   a channel a conversation fork owns) gives its continuation no place
+ *   either. A turn whose wake named none gives a continuation that names
+ *   none, and that continuation takes the fallback;
+ * - `fallback`: for a fallback turn that wasn't held, the place it spoke
+ *   into. Its continuation keeps that place as its own fallback, rather
+ *   than the last delivered message's conversation as it is by then, so a
+ *   message arriving between them doesn't move the rest of the reply. Like
+ *   any fallback, it applies only when nothing the batch carries names a
+ *   conversation.
+ * No record (no turn yet, or an explicit-prose turn) gives nothing.
  */
-export function continuationNames(turn: TurnRoute | undefined): boolean {
-  return !!turn && !(turn.route?.origin === 'fallback' && !turn.hold);
+export function continuationOf(
+  turn: TurnRoute | undefined,
+  at: number,
+): { candidates: RouteCandidate[]; namesConversation: boolean; fallback?: RouteCandidate } {
+  const candidates = continuationCandidates(turn, at);
+  const namesConversation = candidates.length > 0 || turn?.named === true;
+  const route = turn?.route;
+  const fallback = !namesConversation && route?.origin === 'fallback'
+    ? { conversation: routeConversation(route), addressed: false, at }
+    : undefined;
+  return { candidates, namesConversation, ...(fallback ? { fallback } : {}) };
 }
 
 /** The candidates a route is inferred from: the addressed ones if any, else all. */

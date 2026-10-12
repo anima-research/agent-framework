@@ -1134,7 +1134,7 @@ test('a deferred push batch whose origin names only a thread names a conversatio
   await f.send('push/event', { ...f.params('T-1', 'in a thread', { deferred: true, initial: true }), origin: { threadId: 't-1' } });
   await f.framework.runUntilIdle();
   assert.equal(f.membrane.calls.length, calls + 1, 'the push woke a turn');
-  assert.deepEqual(turnRoutes.get('agent'), { route: null }, 'its thread names a conversation: no fallback');
+  assert.deepEqual(turnRoutes.get('agent'), { route: null, named: true }, 'its thread names a conversation: no fallback');
   assert.equal(f.published.length, publishes, 'nothing went where the last message came in');
   // A deferred batch naming nothing takes the fallback.
   await f.send('push/event', f.params('T-2', 'a nudge', { key: 'nudge', deferred: true, initial: true }));

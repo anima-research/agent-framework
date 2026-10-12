@@ -474,6 +474,39 @@ describe('present while acting', () => {
     await framework.stop();
   });
 
+  it("an addressed mid-turn arrival in a channel a conversation fork owns doesn't hold another agent's route", async () => {
+    // The fork rule, as at turn start: a fork's channel is that fork's
+    // conversation, so it never competes for another agent's words.
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Station four, proceeding.' },
+      { type: 'tool_use', id: 'c1', name: 'robot--move', input: { dir: 'north' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([
+      { type: 'text', text: 'Still answering chan-A.' },
+    ] as ContentBlock[]));
+
+    const framework = await createFramework();
+    const routed = stubChannelRegistry(framework, { home: false });
+    (framework as unknown as { conversationAgentHomes: Map<string, string> }).conversationAgentHomes.set('fork-antra', 'discord:dm:antra');
+    module.toolDelayMs = 25;
+    module.interjection = 'hey, quick question over here?';
+    module.interjectionMetadata = {
+      channelId: 'discord:dm:antra', tags: ['chat:addressed'], inboundSource: envelope('discord:dm:antra'),
+    };
+
+    triggerFromChannel(framework, 'chan-A');
+    await framework.runUntilIdle();
+
+    assert.deepEqual(routed, [
+      { text: 'Station four, proceeding.', locus: 'chan-A' },
+      { text: 'Still answering chan-A.', locus: 'chan-A' },
+    ], 'the route was never held');
+    assert.deepEqual(heldDrafts(framework), []);
+    const turn = (framework as unknown as { turnRoutes: Map<string, { hold?: unknown }> }).turnRoutes.get('assistant');
+    assert.equal(turn?.hold, undefined);
+    await framework.stop();
+  });
+
   it('a fallback route is held by an addressed mid-turn arrival, and the notice says it was only where the last message came in', async () => {
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'Checking the logs.' },

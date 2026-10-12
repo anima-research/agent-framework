@@ -6,7 +6,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   continuationCandidates,
-  continuationNames,
+  continuationOf,
   conversationKey,
   describeConversation,
   inferTurnRoute,
@@ -324,7 +324,7 @@ describe('conversation identity and wording', () => {
   });
 });
 
-describe('continuationCandidates', () => {
+describe('continuationCandidates and continuationOf', () => {
   const route = (channelId: string, extra: Partial<Extract<SpeechRoute, { kind: 'channel' }>> = {}): SpeechRoute =>
     ({ kind: 'channel', serverId: 'discord', channelId, origin: 'trigger', ...extra });
 
@@ -336,19 +336,35 @@ describe('continuationCandidates', () => {
       at: 9,
       messageId: 'm-7',
     }]);
-    assert.equal(continuationNames(turn), true);
+    assert.equal(continuationOf(turn, 9).namesConversation, true);
     assert.deepEqual(continuationCandidates({ route: { kind: 'surface', surface: 'tui', origin: 'trigger' } }, 9),
       [{ conversation: { kind: 'surface', surface: 'tui' }, addressed: true, at: 9 }]);
   });
 
-  it('a fallback turn answered no conversation: its continuation names none, and takes the fallback afresh', () => {
-    const fallback: TurnRoute = { route: route('last', { origin: 'fallback' }) };
+  it("a fallback turn answered no conversation: its continuation names none, and keeps the turn's place as its fallback", () => {
+    const fallback: TurnRoute = { route: route('last', { threadId: 't-2', label: '#last', origin: 'fallback' }) };
     assert.deepEqual(continuationCandidates(fallback, 9), []);
-    assert.equal(continuationNames(fallback), false);
-    // Held mid-turn, it names what it held between, as any held turn does.
+    assert.deepEqual(continuationOf(fallback, 9), {
+      candidates: [],
+      namesConversation: false,
+      fallback: {
+        conversation: { kind: 'channel', serverId: 'discord', channelId: 'last', threadId: 't-2', label: '#last' },
+        addressed: false,
+        at: 9,
+      },
+    });
+    // As a fallback, it is taken only when nothing in the batch names a
+    // conversation: an ambient arrival's conversation is the route instead.
+    const kept = continuationOf(fallback, 9).fallback!;
+    assert.equal(inferTurnRoute([], null, () => 'exact', kept).route?.origin, 'fallback');
+    const arrival = inferTurnRoute([candidate(channel('b'), false, 20)], null, rootEverywhere, kept).route;
+    assert.equal(arrival?.kind === 'channel' && arrival.channelId, 'b');
+    // Held mid-turn, it names what it held between, as any held turn does,
+    // and keeps no fallback.
     const held: TurnRoute = { ...fallback, hold: { conversations: [channel('last'), channel('b')], since: 'mid-turn' } };
     assert.equal(continuationCandidates(held, 9).length, 2);
-    assert.equal(continuationNames(held), true);
+    assert.equal(continuationOf(held, 9).namesConversation, true);
+    assert.equal(continuationOf(held, 9).fallback, undefined);
   });
 
   it('a held turn names every conversation it held between, so its continuation is held again', () => {
@@ -372,11 +388,15 @@ describe('continuationCandidates', () => {
     assert.equal(inferTurnRoute(unresolved, null, rootEverywhere).route?.kind, 'channel');
   });
 
-  it("a turn whose words had no place gives no candidate, but its continuation names a conversation; no record names none", () => {
-    assert.deepEqual(continuationCandidates({ route: null }, 1), []);
-    assert.equal(continuationNames({ route: null }), true);
-    assert.deepEqual(continuationCandidates(undefined, 1), []);
-    assert.equal(continuationNames(undefined), false);
+  it('a turn whose words had no place gives no candidate; its continuation names a conversation exactly when the turn\'s wake did', () => {
+    // A reaction, a channel a fork owns, a silent wake: the wake named one,
+    // so the continuation names one, gets no place, and takes no fallback.
+    assert.deepEqual(continuationOf({ route: null, named: true }, 1), { candidates: [], namesConversation: true });
+    // A wake that named none and found no fallback place: the continuation
+    // names none either, and takes the fallback as it stands then.
+    assert.deepEqual(continuationOf({ route: null }, 1), { candidates: [], namesConversation: false });
+    // No record (no turn yet, an explicit-prose turn): nothing.
+    assert.deepEqual(continuationOf(undefined, 1), { candidates: [], namesConversation: false });
   });
 
   it('beside an ambient arrival from elsewhere the continued conversation wins; beside an addressed one the turn holds', () => {

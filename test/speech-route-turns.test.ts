@@ -23,6 +23,7 @@ function internals(framework: AgentFramework) {
     turnRoutes: Map<string, Route>;
     startAgentStream(agent: unknown, trigger?: InferenceRequest, attempt?: number): Promise<void>;
     channelRegistry: unknown;
+    conversationAgentHomes: Map<string, string>;
   };
 }
 
@@ -140,9 +141,29 @@ describe('speech route across a logical turn', () => {
     await i.startAgentStream(scout, { agentName: 'scout', reason: 'heartbeat', source: 'timer', timestamp: Date.now(), suppressProse: true });
     await framework.runUntilIdle();
     assert.deepEqual(opens, ['chan-open'], 'the channel was opened');
-    assert.deepEqual(i.turnRoutes.get('scout'), { route: null }, 'and no route set');
+    assert.deepEqual(i.turnRoutes.get('scout'), { route: null, silent: {} }, 'and no route set');
     const result = JSON.stringify(membrane.lastStream?.receivedToolResults ?? []);
     assert.match(result, /This is a silent wake, so your plain speech stays private this turn; to post there, use a send tool\./);
+    await framework.stop();
+  });
+
+  it('a channel_open into a channel a conversation fork owns opens it but takes no route, and its result says so', async () => {
+    const framework = await makeFramework();
+    const i = internals(framework);
+    const scout = framework.getAgent('scout')!;
+    const opens: string[] = [];
+    i.channelRegistry = channelsThatOpen(opens);
+    i.conversationAgentHomes.set('fork-1', 'chan-fork');
+    membrane.pushResponse(createMockResponse([
+      { type: 'tool_use', id: 'o1', name: 'channel_open', input: { channelId: 'chan-fork' } },
+    ] as ContentBlock[], 'tool_use'));
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'still here' }]));
+    await i.startAgentStream(scout, fromChannel('chan-A'));
+    await framework.runUntilIdle();
+    assert.deepEqual(opens, ['chan-fork'], 'the channel was opened');
+    assert.equal(i.turnRoutes.get('scout')?.route?.channelId, 'chan-A', 'the route stayed');
+    const result = JSON.stringify(membrane.lastStream?.receivedToolResults ?? []);
+    assert.match(result, /Opened, but your plain speech can't go there: a conversation fork owns that channel\. Your plain speech still goes to/);
     await framework.stop();
   });
 
