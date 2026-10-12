@@ -7,8 +7,8 @@
 
 import { constants as fsConstants, realpathSync } from 'node:fs';
 import type { Stats } from 'node:fs';
-import { open, readFile, stat, lstat, realpath } from 'node:fs/promises';
-import { join, resolve, relative, sep } from 'node:path';
+import { open, stat, lstat, realpath } from 'node:fs/promises';
+import { basename, dirname, join, resolve, relative, sep } from 'node:path';
 import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
@@ -108,7 +108,8 @@ class WorkspaceImageReadError extends Error {
  * (`mount_unavailable`), an ordinary missing file (`not_found`), a directory
  * (`directory`), a symlink refused by the mount's `followSymlinks` policy
  * (`symlink`), a symlink whose canonical target lands outside the canonical
- * mount root (`escape`), and a file swapped underneath the read (`changed`).
+ * mount root or inside a mount nested in it (`escape`), and a file swapped
+ * underneath the read (`changed`).
  */
 export type WorkspaceReadErrorCode =
   | 'unknown_mount'
@@ -204,13 +205,25 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
   return buffer.length > 0 && prefix.subarray(0, buffer.length).equals(buffer);
 }
 
-/** A mount root as disk spells it: its canonical path, or as configured while it doesn't exist. */
+/**
+ * A mount root as disk spells it: the canonical path of its nearest existing
+ * ancestor, joined with the rest as configured. A root that doesn't exist yet
+ * still reads through a symlinked parent, so a mount configured at
+ * `via/child`, where `via` links into another mount, is nested in it before
+ * `child` is made.
+ */
 function canonicalRoot(path: string): string {
-  const configured = resolve(path);
-  try {
-    return realpathSync.native(configured);
-  } catch {
-    return configured;
+  let existing = resolve(path);
+  const rest: string[] = [];
+  for (;;) {
+    try {
+      return join(realpathSync.native(existing), ...rest);
+    } catch {
+      const parent = dirname(existing);
+      if (parent === existing) return resolve(path);
+      rest.unshift(basename(existing));
+      existing = parent;
+    }
   }
 }
 
@@ -691,6 +704,31 @@ export class WorkspaceModule implements Module {
     this.config = config;
   }
 
+  /**
+   * The mounts nested in `mount` as disk spells their roots now: every other
+   * mount whose canonical root lies inside `rootReal`. Read afresh each time,
+   * so a nesting that came about after the module was built (a root made
+   * later, a symlinked parent created) is refused like one found then.
+   */
+  private nestedRootsOf(mount: MountState, rootReal: string): Array<{ name: string; real: string }> {
+    const nested: Array<{ name: string; real: string }> = [];
+    for (const inner of this.mounts.values()) {
+      if (inner === mount) continue;
+      const real = canonicalRoot(inner.config.path);
+      if (real !== rootReal && contained(rootReal, real)) nested.push({ name: inner.config.name, real });
+    }
+    return nested;
+  }
+
+  /** Refuse a canonical path that lies in a mount nested in `mount`, naming where it belongs. */
+  private nestedRefusal(mount: MountState, rootReal: string, real: string, mountPrefixedPath: string): string | null {
+    const inner = this.nestedRootsOf(mount, rootReal).find((n) => contained(n.real, real));
+    if (!inner) return null;
+    const rest = relative(inner.real, real).split(sep).join('/');
+    return `"${mountPrefixedPath}" is inside mount "${inner.name}", which is nested in "${mount.config.name}": ` +
+      `use "${rest ? `${inner.name}/${rest}` : inner.name}"`;
+  }
+
   /** The mount nested in `mount` that a mount-relative path lies in, if any. */
   private nestedMountAt(mount: MountState, relativePath: string): { name: string; at: string } | undefined {
     return this.nestedIn.get(mount.config.name)?.find((n) => relativePath === n.at || relativePath.startsWith(n.at + '/'));
@@ -785,15 +823,9 @@ export class WorkspaceModule implements Module {
       this.ctimeTrust.set(rootReal, trustedDev);
     }
     // Canonical now, whatever they were when the module was built: the
-    // containment checks compare canonical paths.
-    const nested: Array<{ name: string; real: string }> = [];
-    for (const n of this.nestedIn.get(mount.config.name) ?? []) {
-      const inner = this.mounts.get(n.name);
-      if (!inner) continue;
-      const innerRoot = resolve(inner.config.path);
-      const real = await realpath(innerRoot).catch(() => innerRoot);
-      if (real !== rootReal && contained(rootReal, real)) nested.push({ name: n.name, real });
-    }
+    // containment checks compare canonical paths, and a mount nested since
+    // then is refused like one found at construction.
+    const nested = this.nestedRootsOf(mount, rootReal);
     return {
       name: mount.config.name,
       view: {
@@ -1516,8 +1548,10 @@ export class WorkspaceModule implements Module {
    * permanent cost to send something once is the wrong trade.
    *
    * Same mount boundary and traversal guard as every other path here: only
-   * declared mounts, nothing above their root. Deliberately does NOT sync,
-   * register, or hash anything — it reads and returns.
+   * declared mounts, nothing whose canonical path lies outside the mount's
+   * root, and nothing in a mount nested in it. Symlinks inside the mount are
+   * followed. Deliberately does NOT sync, register, or hash anything — it
+   * reads and returns.
    */
   async readBinaryFromDisk(
     mountPrefixedPath: string,
@@ -1531,17 +1565,35 @@ export class WorkspaceModule implements Module {
       return { error: error instanceof Error ? error.message : String(error) };
     }
     const absolutePath = resolve(mount.config.path, relativePath);
+    // The other readers' boundary, checked against the file actually opened:
+    // a symlink may lead only within this mount, never into a mount nested in
+    // it. Symlinks within the mount are followed, whatever its followSymlinks.
+    const tooLarge = new Map<'size', number>();
+    let opened: Awaited<ReturnType<WorkspaceModule['openContainedFile']>>;
     try {
-      const info = await stat(absolutePath);
-      if (!info.isFile()) return { error: `Not a file: ${mountPrefixedPath}` };
-      if (opts.maxBytes !== undefined && info.size > opts.maxBytes) {
-        return { error: `File too large: ${info.size} > ${opts.maxBytes} bytes` };
-      }
-      return { data: await readFile(absolutePath), absolutePath };
+      opened = await this.openContainedFile(mount, relativePath, mountPrefixedPath, (fileStat) => {
+        if (opts.maxBytes !== undefined && fileStat.size > opts.maxBytes) {
+          tooLarge.set('size', fileStat.size);
+          throw new Error('too large');
+        }
+      }, { follow: true });
     } catch (error) {
-      const code = (error as { code?: string }).code;
-      if (code === 'ENOENT') return { error: `File not found on disk: ${mountPrefixedPath}` };
+      const size = tooLarge.get('size');
+      if (size !== undefined) return { error: `File too large: ${size} > ${opts.maxBytes} bytes` };
+      if (error instanceof WorkspaceReadError) {
+        if (error.code === 'not_found' && (error.errno === 'ENOENT' || error.errno === 'ENOTDIR')) {
+          return { error: `File not found on disk: ${mountPrefixedPath}` };
+        }
+        if (error.code === 'directory') return { error: `Not a file: ${mountPrefixedPath}` };
+      }
       return { error: error instanceof Error ? error.message : String(error) };
+    }
+    try {
+      return { data: await opened.handle.readFile(), absolutePath };
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) };
+    } finally {
+      await opened.handle.close();
     }
   }
 
@@ -1652,9 +1704,10 @@ export class WorkspaceModule implements Module {
     relativePath: string,
     mountPrefixedPath: string,
     inspect?: (fileStat: Stats) => void,
+    opts: { follow?: boolean } = {},
   ): Promise<{ handle: Awaited<ReturnType<typeof open>>; fileStat: Stats; realFilePath: string }> {
     const lexicalPath = resolve(mount.config.path, relativePath);
-    const follow = mount.config.followSymlinks === true;
+    const follow = opts.follow ?? mount.config.followSymlinks === true;
     const useNoFollow = !follow && typeof fsConstants.O_NOFOLLOW === 'number';
 
     let fileInfo: Awaited<ReturnType<typeof lstat>>;
@@ -1746,6 +1799,10 @@ export class WorkspaceModule implements Module {
       if (!isContainedPath(realMountRoot, realFilePath)) {
         throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
       }
+      // A file in a mount nested in this one is that mount's, whatever path
+      // reaches it: an alias inside this mount reads none of it.
+      const nested = this.nestedRefusal(mount, realMountRoot, realFilePath, mountPrefixedPath);
+      if (nested) throw new WorkspaceReadError('escape', nested, 'realpath');
 
       let pathStat: Stats;
       try {
@@ -1845,7 +1902,8 @@ export class WorkspaceModule implements Module {
       case 'symlink':
         return new WorkspaceImageReadError('symlink', `Symlinks are not allowed: ${p}`);
       case 'escape':
-        return new WorkspaceImageReadError('escape', `Symlink escape detected: ${p}`);
+        // Outside the mount, or inside a mount nested in it (which the message names).
+        return new WorkspaceImageReadError('escape', err.message);
       case 'changed':
         return new WorkspaceImageReadError('changed', `Image file changed during read: ${p}`);
       case 'not_found':

@@ -34,6 +34,9 @@ import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import { MountWatcher, type FsChange } from '../src/modules/workspace/watcher.js';
 
+/** A valid 1x1 PNG, for read_image. */
+const ONE_PIXEL_PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==', 'base64');
+
 function workspaceWith(t: TestContext, files: string[], innerRel: string, outerIgnore?: string[]) {
   const root = mkdtempSync(join(tmpdir(), 'af-nested-mount-'));
   const outerDir = join(root, 'outer');
@@ -354,6 +357,102 @@ test('an alias inside a following outer mount reaches nothing of a nested mount'
   const written = await call('write', { path: 'outer/alias/y.txt', content: 'through the alias' });
   assert.match(JSON.stringify(written), /inside mount \\"inner\\", which is nested in this one/, JSON.stringify(written));
   assert.throws(() => readFileSync(join(outerDir, 'a', 'b', 'y.txt')), "nothing was written into the inner mount's directory");
+});
+
+test("the disk readers reach nothing of a nested mount through an alias, and the raw reader keeps the mount's boundary", async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-mount-readers-');
+  const outerDir = join(root, 'outer');
+  const innerDir = join(outerDir, 'a', 'b');
+  mkdirSync(innerDir, { recursive: true });
+  writeFileSync(join(innerDir, 'x.txt'), "the inner mount's");
+  writeFileSync(join(innerDir, 'i.png'), ONE_PIXEL_PNG);
+  writeFileSync(join(outerDir, 'own.txt'), "the outer mount's");
+  writeFileSync(join(root, 'outside.txt'), 'outside every mount');
+  symlinkSync(innerDir, join(outerDir, 'alias'));
+  symlinkSync(join(outerDir, 'own.txt'), join(outerDir, 'own-link.txt'));
+  symlinkSync(join(root, 'outside.txt'), join(outerDir, 'out-link.txt'));
+  const { workspace } = await started(stops, join(root, 'workspace.chronicle'), [
+    { name: 'outer', path: outerDir, mode: 'read-write', watch: 'never', followSymlinks: true },
+    { name: 'inner', path: innerDir, mode: 'read-write', watch: 'never' },
+  ]);
+  const naming = /"outer\/alias\/(x\.txt|i\.png)" is inside mount "inner", which is nested in "outer": use "inner\/(x\.txt|i\.png)"/;
+
+  await assert.rejects(workspace.readFileFromDisk('outer/alias/x.txt'), (err: Error & { code?: string }) => {
+    assert.equal(err.code, 'escape');
+    assert.match(err.message, naming);
+    return true;
+  });
+  const raw = await workspace.readBinaryFromDisk('outer/alias/x.txt');
+  assert.ok('error' in raw, 'the raw reader refuses it');
+  assert.match(raw.error, naming);
+  const image = await workspace.handleToolCall({ id: 'img', name: 'read_image', input: { path: 'outer/alias/i.png' } });
+  assert.equal(image.success, false, 'read_image refuses it');
+  assert.match(String(image.error), naming);
+  // The inner mount answers for its own files.
+  assert.equal((await workspace.readFileFromDisk('inner/x.txt')).bytes.toString(), "the inner mount's");
+
+  // The raw reader follows a symlink within the mount, and refuses one that leads outside it, as the others do.
+  const own = await workspace.readBinaryFromDisk('outer/own-link.txt');
+  assert.ok('data' in own, 'error' in own ? own.error : '');
+  assert.equal(own.data.toString(), "the outer mount's");
+  const out = await workspace.readBinaryFromDisk('outer/out-link.txt');
+  assert.ok('error' in out);
+  assert.match(out.error, /Symlink escape detected: outer\/out-link\.txt/);
+  await assert.rejects(workspace.readFileFromDisk('outer/out-link.txt'), /Symlink escape detected/);
+});
+
+test("a nested mount whose root doesn't exist yet, configured through a symlinked parent, is nested from the start", async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-mount-absent-');
+  const outerDir = join(root, 'outer');
+  mkdirSync(outerDir);
+  writeFileSync(join(outerDir, 'top.txt'), 'top');
+  symlinkSync(outerDir, join(root, 'via'));
+  const outer: MountConfig = { name: 'outer', path: outerDir, mode: 'read-write', watch: 'never', autoMaterialize: true };
+  const inner: MountConfig = { name: 'inner', path: join(root, 'via', 'child'), mode: 'read-write', watch: 'never' };
+  const store = JsStore.openOrCreate({ path: join(root, 'workspace.chronicle') });
+  const warn = console.warn;
+  console.warn = () => {};
+  let workspace: WorkspaceModule;
+  try { workspace = new WorkspaceModule({ mounts: [outer, inner] }); } finally { console.warn = warn; }
+  stops.push(async () => { await workspace.stop(); if (!store.isClosed()) store.close(); });
+  assert.deepEqual(outer.ignore, ['child/**'], 'the inner root reads through the symlink before it exists');
+  // The inner root is made, and a file in it, after the module was built.
+  mkdirSync(join(outerDir, 'child'));
+  writeFileSync(join(outerDir, 'child', 'x.txt'), "the inner mount's");
+  workspace.initStore(store);
+  await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+  const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
+  assert.deepEqual(await syncedByOuter(workspace), ['top.txt']);
+  const written = await call('write', { path: 'outer/child/x.txt', content: 'an outer overwrite' });
+  assert.equal(written.success, false);
+  assert.match(String(written.error), /is inside mount "inner", which is nested in "outer" at child\/: use "inner\/x\.txt"/);
+  assert.equal(readFileSync(join(outerDir, 'child', 'x.txt'), 'utf8'), "the inner mount's");
+});
+
+test('a mount that comes to lie in another after the module is built is refused there, whatever path reaches it', async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-mount-later-');
+  const outerDir = join(root, 'outer');
+  mkdirSync(outerDir);
+  writeFileSync(join(outerDir, 'top.txt'), 'top');
+  // `via` doesn't exist when the module is built, so the inner root isn't inside the outer one then.
+  const { workspace } = await started(stops, join(root, 'workspace.chronicle'), [
+    { name: 'outer', path: outerDir, mode: 'read-write', watch: 'never', autoMaterialize: true },
+    { name: 'inner', path: join(root, 'via', 'child'), mode: 'read-write', watch: 'never' },
+  ]);
+  symlinkSync(outerDir, join(root, 'via'));
+  mkdirSync(join(outerDir, 'child'));
+  writeFileSync(join(outerDir, 'child', 'x.txt'), "the inner mount's");
+  const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
+
+  const synced = await call('sync', { mount: 'outer' });
+  assert.equal(synced.success, true, String(synced.error));
+  assert.doesNotMatch(JSON.stringify((synced.data as { results: unknown[] }).results), /"synced":\[[^\]]*child\/x\.txt/, 'not taken in');
+  const written = await call('write', { path: 'outer/child/y.txt', content: 'an outer write' });
+  assert.match(JSON.stringify(written), /inside mount \\"inner\\", which is nested in this one/, JSON.stringify(written));
+  assert.throws(() => readFileSync(join(outerDir, 'child', 'y.txt')), "nothing was written into the inner mount's directory");
+  await assert.rejects(workspace.readFileFromDisk('outer/child/x.txt'), /inside mount "inner", which is nested in "outer": use "inner\/x\.txt"/);
+  const raw = await workspace.readBinaryFromDisk('outer/child/x.txt');
+  assert.ok('error' in raw && /inside mount "inner"/.test(raw.error), JSON.stringify(raw));
 });
 
 test("a path named with '.' segments is read as its one spelling, and the ignore note says so", async (t) => {

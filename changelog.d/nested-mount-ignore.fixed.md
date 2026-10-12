@@ -40,6 +40,12 @@
     filesystem, is still nested, and the rule is spelled as disk spells it.
     An inner mount in a directory whose name starts with `..` (such as
     `..cache`) is now recognized as nested.
+    A root that doesn't exist yet is read through its nearest existing
+    directory, so a mount configured at `via/child`, where `via` links into
+    another mount, is nested there before `child` is made. Each pass also
+    reads nesting afresh, so a mount that comes to lie inside another after
+    startup (its root made later, or a symlinked parent created) is refused
+    there too.
   - The outer mount's tools refuse a path inside a nested mount, naming the
     mount to use: `outer/a/b/x.txt` is "inside mount "inner", which is nested
     in "outer" at a/b/: use "inner/x.txt"". That covers `read`, `write`,
@@ -55,6 +61,12 @@
     walking or writing, also refuses one inside a nested mount. So a symlink
     that a `followSymlinks` mount follows into a nested mount reaches nothing
     there, and a write through it is refused.
+    `readFileFromDisk` and `read_image` refuse a file there, naming the
+    mount to use, and so does `readBinaryFromDisk`. That reader now keeps the
+    boundary the other readers keep, checked against the file it opens: it
+    still follows a symlink that stays within the mount, and it now refuses
+    one that leads outside the mount ("Symlink escape detected"), which it
+    used to read.
   - Every workspace tool reads a path in one spelling: `a/./b`, `a//b` and
     `a/b/` are `a/b`.
   - (agent-framework #280)
