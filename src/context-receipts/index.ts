@@ -183,9 +183,12 @@ export class ContextReceipts {
           const missing = new Set<string>();
           for (const c of copies.values()) for (const why of c.missing) missing.add(why);
           // A copy whose fidelity can't be checked confirms nothing, and on
-          // its own shows no loss either: the version stays unconfirmed.
-          if ([...missing].every((why) => why === 'unverifiable')) continue;
-          this.ledger.partial(agent, first.body.ch, first.body.src, first.body.ver, branch, [...missing], at);
+          // its own shows no loss either: the version stays unconfirmed. An
+          // incomplete copy that states no reason did lose something: it is
+          // a partial exposure, recorded as saying none.
+          if (missing.size > 0 && [...missing].every((why) => why === 'unverifiable')) continue;
+          const why = missing.size > 0 ? [...missing] : ['unstated'];
+          this.ledger.partial(agent, first.body.ch, first.body.src, first.body.ver, branch, why, at);
         }
       });
     }
