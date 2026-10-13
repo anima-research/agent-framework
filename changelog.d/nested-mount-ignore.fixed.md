@@ -1,5 +1,4 @@
-- A mount never takes in or writes out what lies in a mount nested in it, and
-  a mount's ignore patterns now apply to its watcher.
+- Workspace tools check nested-mount boundaries before and inside each mount's turn, and disk operations check again before their effects. A mount's ignore patterns now apply to its watcher.
   - The watcher handed the patterns to chokidar as strings, which chokidar
     takes as exact paths, so on a watched mount (`watch` defaults to
     `'always'`) every change under an ignored path, `node_modules` included,
@@ -59,9 +58,7 @@
     `edit`, `ls`, `glob`, `grep`, and a `sync` or `materialize` that names the
     path. Before, a named sync took the inner mount's files into the outer
     one. `write`, `edit`, `writeBinary` and `delete` also read where the
-    path leads on disk before anything reaches the outer mount's workspace,
-    so a case variant on a case-insensitive disk (`A/B` for `a/b`), or a link
-    inside the mount, dangling or not, is treated the same way.
+    path leads on disk at their checks, so existing case variants and links inside the mount, dangling or not, are checked too. A link changed after the store check can leave an outer draft at a now-nested path; materialize refuses the later disk write.
     - The one exception is `delete` of a file the outer mount still holds
       there, taken in before this fix. It stops tracking the file in the
       outer mount and leaves disk alone, where the file is the inner mount's.
@@ -89,3 +86,10 @@
     that link first, and refused them. Its watcher reported none of its
     changes.
   - (agent-framework #280)
+
+- Nested refusals name the innermost mount, even when several mounts contain the path. A lexical refusal includes its directory, such as `"outer/a/b/x.txt" is inside mount "inner", which is nested in "outer" at a/b/: use "inner/x.txt"`. A path reached through disk spelling omits that location clause: `"outer/via/x.txt" is inside mount "inner", which is nested in "outer": use "inner/x.txt"`. The public tool wrapper prefixes thrown lexical errors with `Error:`.
+- An unmade path component is lowercased on macOS and Windows and preserved elsewhere. Existing components still use disk's spelling. This is a platform default, not a filesystem probe: case-sensitive macOS/Windows volumes can receive conservative refusals for unmade variants, and case-insensitive filesystems on other platforms are outside this missing-component rule. The workspace writes no case-probe entry into a user's mount.
+- A path-less materialize lists copies reached through links or case variants as nested skips, with the same stop-tracking note as lexical copies. Deleting an old nested copy first tries its supplied store key, then its directory-entry spelling on disk. This lets a differently spelled path remove the copy stored by an earlier walk.
+- Delete resolves the parent but keeps the final entry rather than following its link. An outer link into a nested mount therefore takes the ordinary delete path instead of claiming to remove an inner-owned file. The disk unlink's existing boundary refusal remains; the error reports that refusal without promising a later materialize can remove the link.
+- Disk readers check containment and nested boundaries before answering a target's kind, including a directory reached through a link. They also check the opened file's path and identity.
+- These checks make synchronous filesystem reads on the event loop for mount roots and target path components, including realpath, lstat, readlink, and the directory-entry lookup for an old copy's spelling. They can block while mounted storage does not answer. This is the existing synchronous-I/O limitation tracked in #311, now explicitly including per-path reads.

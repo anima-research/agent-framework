@@ -13,11 +13,10 @@
  * The watcher read none of a mount's patterns: chokidar takes a string as one
  * exact path. It now reads them as the walk does.
  *
- * #282's round makes the invariant whole: a mount never takes in or writes
- * out what lies in a mount nested in it. Nesting is read from canonical
- * roots; the outer mount's tools refuse paths in the inner's directory,
- * naming the inner; and every containment check refuses a canonical path
- * there, however it was reached.
+ * #282 checks nesting at tool admission, at the store mutation, and at
+ * disk effects. An intervening disk change can leave an outer draft whose
+ * later materialize is refused. Existing components use disk spelling;
+ * unmade components follow the documented platform-default case rule.
  *
  * Driven through the public tools, and a real watcher, over tmpdir mounts.
  */
@@ -26,6 +25,9 @@ import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import fsPromises from 'node:fs/promises';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { dirname, join, sep, win32 } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
@@ -354,7 +356,7 @@ test("the outer mount's tools refuse a path in a nested mount, naming it; deleti
   assert.equal(readFileSync(join(outerDir, 'a', 'b', 'x.txt'), 'utf8'), "the inner mount's");
   const again = await call('delete', { path: 'outer/a/b/x.txt' });
   assert.equal(again.success, false);
-  assert.match(String(again.error), /doesn't hold it: use "inner\/x\.txt"/);
+  assert.equal(again.error, '"outer/a/b/x.txt" is inside mount "inner", which is nested in "outer" at a/b/, and "outer" doesn\'t hold it: use "inner/x.txt"');
   // Nothing of it is owed any more: a later materialize doesn't list it.
   const after = await call('materialize', {});
   assert.doesNotMatch(JSON.stringify(after), /a\/b\/x\.txt/, JSON.stringify(after));
@@ -552,18 +554,16 @@ test("a case variant of a nested path is refused at the tool where the disk igno
   mkdirSync(join(outerDir, 'a', 'b'), { recursive: true });
   // Where the disk tells case apart, `A/B` would be a directory of the outer
   // mount's own, so there's nothing to refuse.
-  if (!existsSync(join(outerDir, 'A', 'B'))) {
-    t.skip('this disk tells case apart');
-    return;
-  }
+  const ignoresCase = existsSync(join(outerDir, 'A', 'B'));
+  if (!ignoresCase) mkdirSync(join(outerDir, 'A', 'B'), { recursive: true });
   const { workspace } = await started(stops, join(root, 'workspace.chronicle'), [
     { name: 'outer', path: outerDir, mode: 'read-write', watch: 'never', autoMaterialize: false },
     { name: 'inner', path: join(outerDir, 'a', 'b'), mode: 'read-write', watch: 'never' },
   ]);
   const written = await workspace.handleToolCall({ id: 'write', name: 'write', input: { path: 'outer/A/B/y.txt', content: 'a case variant' } });
-  assert.equal(written.success, false);
-  assert.match(String(written.error), /"outer\/A\/B\/y\.txt" is inside mount "inner", which is nested in "outer": use "inner\/y\.txt"/);
-  assert.equal(storeHolds(workspace, 'outer', 'A/B/y.txt'), false);
+  assert.equal(written.success, !ignoresCase, JSON.stringify(written));
+  if (ignoresCase) assert.match(String(written.error), /"outer\/A\/B\/y\.txt" is inside mount "inner", which is nested in "outer": use "inner\/y\.txt"/);
+  assert.equal(storeHolds(workspace, 'outer', 'A/B/y.txt'), !ignoresCase);
 });
 
 for (const autoMaterialize of [false, true]) {
@@ -587,7 +587,7 @@ for (const autoMaterialize of [false, true]) {
     if (existsSync(join(outerDir, 'flink.txt'))) rmSync(join(outerDir, 'flink.txt'));
     symlinkSync(join(outerDir, 'a', 'b', 'x.txt'), join(outerDir, 'flink.txt'));
     const forced = await call('materialize', { path: 'outer/flink.txt', force: true });
-    assert.match(JSON.stringify(forced), /flink\.txt: not written: inside mount \\"inner\\", which is nested in this one/, JSON.stringify(forced));
+    assert.match(JSON.stringify(forced), /flink\.txt: inside mount \\"inner\\", which is nested in this one; delete it here to stop tracking it/, JSON.stringify(forced));
     assert.equal(readFileSync(join(outerDir, 'a', 'b', 'x.txt'), 'utf8'), "the inner mount's", "the inner mount's file is as it was");
   });
 }
@@ -854,4 +854,201 @@ test("a path named with '.' segments is read as its one spelling, and the ignore
   const data = result.data as { results: Array<{ synced: string[] }>; ignored?: Array<{ path: string }> };
   assert.deepEqual(data.results.flatMap((r) => r.synced), ['node_modules/pkg.js']);
   assert.deepEqual(data.ignored?.map((i) => i.path), ['node_modules/pkg.js']);
+});
+
+test('#282 round: path-less materialize reports an aliased nested copy as skipped', async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-round-materialize-');
+  const outer = join(root, 'outer');
+  mkdirSync(join(outer, 'inner'), { recursive: true });
+  mkdirSync(join(outer, 'alias'));
+  writeFileSync(join(outer, 'inner', 'x.txt'), 'inner bytes');
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', autoMaterialize: false, followSymlinks: true },
+    { name: 'inner', path: join(outer, 'inner'), mode: 'read-write', watch: 'never' },
+  ]);
+  const write = await workspace.handleToolCall({ id: 'write', name: 'write', input: { path: 'outer/alias/x.txt', content: 'old draft' } });
+  assert.equal(write.success, true);
+  rmSync(join(outer, 'alias'), { recursive: true });
+  symlinkSync(join(outer, 'inner'), join(outer, 'alias'));
+  const result = await workspace.handleToolCall({ id: 'push', name: 'materialize', input: { mount: 'outer' } });
+  assert.match(JSON.stringify(result.data), /alias\/x.txt: inside mount \\"inner\\", which is nested in this one; delete it here to stop tracking it/);
+  assert.equal(readFileSync(join(outer, 'inner', 'x.txt'), 'utf8'), 'inner bytes');
+});
+
+for (const destination of ['outside', 'inner'] as const) {
+  test(`#282 round: a directory link to ${destination} is refused by its boundary, not its kind`, async (t) => {
+    const { root, stops } = scratch(t, 'af-nested-round-directory-');
+    const outer = join(root, 'outer');
+    mkdirSync(join(outer, 'inner'), { recursive: true });
+    mkdirSync(join(root, 'outside'));
+    symlinkSync(destination === 'inner' ? join(outer, 'inner') : join(root, 'outside'), join(outer, 'link'));
+    const { workspace } = await started(stops, join(root, 'store'), [
+      { name: 'outer', path: outer, mode: 'read-write', watch: 'never', followSymlinks: true },
+      { name: 'inner', path: join(outer, 'inner'), mode: 'read-write', watch: 'never' },
+    ]);
+    await assert.rejects(workspace.readFileFromDisk('outer/link'),
+      destination === 'inner'
+        ? /"outer\/link" is inside mount "inner", which is nested in "outer": use "inner"$/
+        : /Symlink escape detected: outer\/link$/);
+  });
+}
+
+for (const autoMaterialize of [false, true]) {
+  test(`#282 round: deleting an outer final link follows ordinary delete semantics (autoMaterialize ${autoMaterialize})`, async (t) => {
+    const { root, stops } = scratch(t, 'af-nested-round-unlink-');
+    const outer = join(root, 'outer');
+    mkdirSync(join(outer, 'inner'), { recursive: true });
+    writeFileSync(join(outer, 'inner', 'x.txt'), 'inner bytes');
+    const { workspace } = await started(stops, join(root, 'store'), [
+      { name: 'outer', path: outer, mode: 'read-write', watch: 'never', autoMaterialize, followSymlinks: true },
+      { name: 'inner', path: join(outer, 'inner'), mode: 'read-write', watch: 'never' },
+    ]);
+    assert.equal((await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'outer/link', content: 'old draft' } })).success, true);
+    rmSync(join(outer, 'link'), { force: true });
+    symlinkSync(join(outer, 'inner', 'x.txt'), join(outer, 'link'));
+    const result = await workspace.handleToolCall({ id: 'd', name: 'delete', input: { path: 'outer/link' } });
+    assert.equal(result.success, !autoMaterialize);
+    if (autoMaterialize) {
+      assert.match(String(result.error), /Removed from Chronicle but did not unlink/);
+      assert.match(String(result.error), /inside mount "inner"/);
+      assert.doesNotMatch(String(result.error), /until materialize with applyDeletions removes it/);
+    } else {
+      assert.deepEqual(result.data, { path: 'outer/link', deleted: true });
+    }
+    assert.equal(storeHolds(workspace, 'outer', 'link'), false);
+    const later = await workspace.handleToolCall({ id: 'later', name: 'materialize', input: { mount: 'outer', applyDeletions: true, force: true } });
+    assert.match(JSON.stringify(later), /inside mount/);
+    assert.doesNotMatch(JSON.stringify(later), /delete it here to stop tracking it/,
+      'the copy is already deleted; report the disk refusal rather than suggesting the same delete again');
+    assert.equal(readFileSync(join(outer, 'inner', 'x.txt'), 'utf8'), 'inner bytes');
+  });
+}
+
+test('#282 round: every nested lookup names the innermost mount', async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-round-deep-');
+  const outer = join(root, 'outer');
+  mkdirSync(join(outer, 'mid', 'deep'), { recursive: true });
+  writeFileSync(join(outer, 'mid', 'deep', 'x.txt'), 'inner bytes');
+  symlinkSync(join(outer, 'mid', 'deep'), join(outer, 'alias'));
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', followSymlinks: true },
+    { name: 'mid', path: join(outer, 'mid'), mode: 'read-write', watch: 'never' },
+    { name: 'inner', path: join(outer, 'mid', 'deep'), mode: 'read-write', watch: 'never' },
+  ]);
+  const lexical = await workspace.handleToolCall({ id: 'l', name: 'write', input: { path: 'outer/mid/deep/new.txt', content: 'draft' } });
+  assert.equal(lexical.error, 'Error: "outer/mid/deep/new.txt" is inside mount "inner", which is nested in "outer" at mid/deep/: use "inner/new.txt"');
+  const alias = await workspace.handleToolCall({ id: 'a', name: 'write', input: { path: 'outer/alias/new.txt', content: 'draft' } });
+  assert.equal(alias.error, '"outer/alias/new.txt" is inside mount "inner", which is nested in "outer": use "inner/new.txt"');
+  await assert.rejects(workspace.readFileFromDisk('outer/alias/x.txt'),
+    /"outer\/alias\/x.txt" is inside mount "inner", which is nested in "outer": use "inner\/x.txt"$/);
+});
+
+test('#282 round: root-level disk-spelled write and delete refusals name the mount without a slash', async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-round-root-');
+  const outer = join(root, 'outer');
+  mkdirSync(join(outer, 'a', 'b'), { recursive: true });
+  symlinkSync(join(outer, 'a'), join(outer, 'via'));
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', followSymlinks: true },
+    { name: 'inner', path: join(outer, 'a', 'b'), mode: 'read-write', watch: 'never' },
+  ]);
+  const write = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'outer/via/b', content: 'draft' } });
+  assert.equal(write.error, '"outer/via/b" is inside mount "inner", which is nested in "outer": use "inner"');
+  const deleted = await workspace.handleToolCall({ id: 'd', name: 'delete', input: { path: 'outer/via/b' } });
+  assert.equal(deleted.error, '"outer/via/b" is inside mount "inner", which is nested in "outer", and "outer" doesn\'t hold it: use "inner"');
+});
+
+test('#282 round: the insensitive default covers an unmade nested root without changing existing spelling', async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-round-default-case-');
+  const outer = join(root, 'outer');
+  mkdirSync(outer);
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', autoMaterialize: false },
+    { name: 'inner', path: join(outer, 'Child'), mode: 'read-write', watch: 'never' },
+  ]);
+  // This exercises the chosen platform policy on a real local directory.
+  // It is not a stand-in for a case-insensitive filesystem integration run.
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    const result = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'outer/child/x.txt', content: 'draft' } });
+    assert.equal(result.success, false);
+    assert.match(String(result.error), /use "inner\/x.txt"/);
+    assert.equal(storeHolds(workspace, 'outer', 'child/x.txt'), false);
+    assert.equal(existsSync(join(outer, 'Child')), false);
+  } finally { Object.defineProperty(process, 'platform', platform); }
+});
+
+test('#282 round: a case-variant nested delete finds the stored disk spelling', async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-round-delete-case-');
+  const outer = join(root, 'outer');
+  mkdirSync(join(outer, 'a', 'b'), { recursive: true });
+  if (!existsSync(join(outer, 'A', 'B'))) { t.skip('requires a case-insensitive directory'); return; }
+  writeFileSync(join(outer, 'a', 'b', 'File.txt'), 'inner bytes');
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never' },
+    { name: 'inner', path: join(outer, 'a', 'b'), mode: 'read-write', watch: 'never' },
+  ]);
+  const store = (workspace as unknown as { getStore(): JsStore }).getStore();
+  const blobHash = store.storeBlob(Buffer.from('old copy'), 'text/plain');
+  store.treeSet('workspace/outer/tree', 'a/b/File.txt', { blobHash, size: 8, mode: 0o644 });
+  const result = await workspace.handleToolCall({ id: 'd', name: 'delete', input: { path: 'outer/A/B/file.txt' } });
+  assert.equal(result.success, true, JSON.stringify(result));
+  assert.equal(storeHolds(workspace, 'outer', 'a/b/File.txt'), false);
+  assert.equal(readFileSync(join(outer, 'a', 'b', 'File.txt'), 'utf8'), 'inner bytes');
+});
+
+test('#282 round: a nested delete reached by alias finds a copy stored under its disk spelling', async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-round-stored-spelling-');
+  const outer = join(root, 'outer');
+  mkdirSync(join(outer, 'a', 'b'), { recursive: true });
+  writeFileSync(join(outer, 'a', 'b', 'x.txt'), 'inner bytes');
+  symlinkSync(join(outer, 'a', 'b'), join(outer, 'via'));
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', followSymlinks: true },
+    { name: 'inner', path: join(outer, 'a', 'b'), mode: 'read-write', watch: 'never' },
+  ]);
+  const store = (workspace as unknown as { getStore(): JsStore }).getStore();
+  const blobHash = store.storeBlob(Buffer.from('old copy'), 'text/plain');
+  store.treeSet('workspace/outer/tree', 'a/b/x.txt', { blobHash, size: 8, mode: 0o644 });
+  const readDir = fs.readdirSync;
+  try {
+    fs.readdirSync = (() => { throw Object.assign(new Error('directory unavailable'), { code: 'EIO' }); }) as typeof readDir;
+    syncBuiltinESMExports();
+    const refused = await workspace.handleToolCall({ id: 'unavailable', name: 'delete', input: { path: 'outer/via/x.txt' } });
+    assert.match(String(refused.error), /Cannot identify the stored spelling.*directory unavailable/);
+    assert.equal(storeHolds(workspace, 'outer', 'a/b/x.txt'), true);
+  } finally { fs.readdirSync = readDir; syncBuiltinESMExports(); }
+  const result = await workspace.handleToolCall({ id: 'd', name: 'delete', input: { path: 'outer/via/x.txt' } });
+  assert.equal(result.success, true, JSON.stringify(result));
+  assert.equal(storeHolds(workspace, 'outer', 'a/b/x.txt'), false);
+  assert.equal(readFileSync(join(outer, 'a', 'b', 'x.txt'), 'utf8'), 'inner bytes');
+});
+
+test('#282 round: boundary refusal precedes opening a directory', async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-round-open-boundary-');
+  const outer = join(root, 'outer');
+  mkdirSync(outer);
+  mkdirSync(join(root, 'outside'));
+  writeFileSync(join(outer, 'own.txt'), 'owned');
+  symlinkSync(join(root, 'outside'), join(outer, 'link'));
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', followSymlinks: true },
+  ]);
+  const original = fsPromises.open;
+  let opens = 0;
+  try {
+    fsPromises.open = (async (...args: Parameters<typeof original>) => {
+      opens++;
+      return original(...args);
+    }) as typeof original;
+    syncBuiltinESMExports();
+    assert.equal((await workspace.readFileFromDisk('outer/own.txt')).bytes.toString(), 'owned');
+    assert.equal(opens, 1, 'the counter observes this reader');
+    await assert.rejects(workspace.readFileFromDisk('outer/link'), /Symlink escape detected/);
+    assert.equal(opens, 1, 'a platform that refuses opening directories still receives the boundary answer');
+  } finally {
+    fsPromises.open = original;
+    syncBuiltinESMExports();
+  }
 });

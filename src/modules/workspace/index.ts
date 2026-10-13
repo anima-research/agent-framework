@@ -5,7 +5,7 @@
  * auto-sync between real filesystem and Chronicle, and manual materialization.
  */
 
-import { constants as fsConstants, lstatSync, readlinkSync, realpathSync } from 'node:fs';
+import { constants as fsConstants, lstatSync, readdirSync, readlinkSync, realpathSync } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { open, stat, lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, parse, resolve, relative, sep } from 'node:path';
@@ -209,20 +209,9 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
 }
 
 /**
- * A path as disk will spell it once it exists: a mount's root, or a path
- * inside one. The configured path is read as every workspace operation reads
- * it, `resolve(path)`, so the root this names is the one the mount's own
- * sync, tools and readers use. From there, a path that exists is its
- * canonical path. One that doesn't yet is
- * read the way the filesystem will read it: component by component, each
- * existing prefix as disk spells it, a link that leads to nothing yet
- * replaced by what it names, and a `..` in that target taken from the
- * directory reached so far, after any link before it. Only what doesn't exist
- * is joined as written. So a mount configured at `via/child`, where `via`
- * links into another mount, or at a link to that mount's `child` (a link
- * whose target is `base/hop/../child` included, where `hop` is a link), is
- * nested in it before `child` is made. At most 40 dangling links are
- * followed, as the platform bounds a path's.
+ * Resolve existing path components to disk's spelling, following up to 40 links. A dangling link contributes its target; a relative target is read from the directory reached so far, including any preceding link before a '..'. The starting path uses resolve(), like the workspace's tools, sync, and watcher.
+ *
+ * A component that does not exist has no disk spelling yet. Lowercase it on darwin and win32, and preserve it elsewhere. This uses platform defaults without writing a probe into the mount: case-sensitive macOS/Windows directories can receive conservative refusals, while case-insensitive filesystems on other platforms are outside this missing-component rule. Existing components retain their observed spelling.
  */
 function canonicalRoot(path: string): string {
   const absolute = resolve(path);
@@ -251,15 +240,21 @@ function canonicalRoot(path: string): string {
       // Missing, or a link that leads to nothing yet.
     }
     let target: string | null = null;
+    let missingPart = false;
     if (links < 40) {
       try {
         if (lstatSync(next).isSymbolicLink()) target = readlinkSync(next);
-      } catch {
-        // Not there.
+      } catch (error) {
+        missingPart = errnoOf(error) === 'ENOENT' || errnoOf(error) === 'ENOTDIR';
       }
     }
     if (target === null) {
-      current = next;
+      // Existing components above retain disk's spelling. For an unmade
+      // component there is no spelling to observe: use the platform default,
+      // without creating a probe file in the user's mount.
+      const fold = missingPart && (process.platform === 'darwin' || process.platform === 'win32');
+      const missing = fold ? part.toLowerCase() : part;
+      current = join(current, missing);
       continue;
     }
     links++;
@@ -721,10 +716,9 @@ export class WorkspaceModule implements Module {
   private savedState: WorkspaceModuleState | null = null;
 
   constructor(config: WorkspaceConfig) {
-    // A mount never takes in or writes out what lies in a mount nested in it
-    // (agent-framework #280). Nesting is read from canonical roots, so a
-    // symlinked or differently cased spelling of the same directory still
-    // nests, and the rule is spelled as disk spells the path. The outer
+    // Nesting checks keep each mount's disk operations out of nested mounts
+    // (agent-framework #280). Roots use canonicalRoot: existing components
+    // use disk spelling; unmade components use its documented platform rule. The outer
     // mount's walk and watcher pass over the inner's directory by an ignore
     // rule; its tools refuse paths there (parsePath), and every containment
     // check refuses what reaches the inner's directory another way
@@ -767,7 +761,7 @@ export class WorkspaceModule implements Module {
       const real = canonicalRoot(inner.config.path);
       if (real !== rootReal && contained(rootReal, real)) nested.push({ name: inner.config.name, real });
     }
-    return nested;
+    return nested.sort((a, b) => b.real.length - a.real.length);
   }
 
   /**
@@ -776,14 +770,16 @@ export class WorkspaceModule implements Module {
    * on a case-insensitive disk (`A/B` for `a/b`), or a link inside the mount,
    * dangling or not. The path is read as canonicalRoot reads a root: what
    * exists as disk spells it, a link that leads to nothing yet replaced by
-   * what it names, and only what doesn't exist joined as written. The tools
-   * that change the store (write, edit, writeBinary, delete) ask before
-   * anything reaches it, so the outer mount never takes a draft at a path
-   * that is the inner mount's.
+   * what it names, and unmade components using the platform-default rule.
+   * Store-changing tools check before the turn and at their mutation point.
+   * A later disk change can make an accepted draft's path nested; the disk
+   * effect checks that boundary again when materialize attempts the write.
    */
-  private nestedByDisk(mount: MountState, relativePath: string): { name: string; rest: string } | null {
+  private nestedByDisk(mount: MountState, relativePath: string, followFinal = true): { name: string; rest: string } | null {
     const rootReal = canonicalRoot(mount.config.path);
-    const real = canonicalRoot(resolve(mount.config.path, relativePath));
+    const path = resolve(mount.config.path, relativePath);
+    // Unlink addresses the directory entry, not the last link's target.
+    const real = followFinal ? canonicalRoot(path) : join(canonicalRoot(dirname(path)), basename(path));
     const inner = this.nestedRootsOf(mount, rootReal).find((n) => contained(n.real, real));
     return inner ? { name: inner.name, rest: relative(inner.real, real).split(sep).join('/') } : null;
   }
@@ -828,7 +824,8 @@ export class WorkspaceModule implements Module {
     relativePath: string,
     ats: Array<{ name: string; at: string }> = this.nestedAtsOf(mount),
   ): { name: string; at: string } | undefined {
-    return ats.find((n) => relativePath === n.at || relativePath.startsWith(n.at + '/'));
+    return ats.filter((n) => relativePath === n.at || relativePath.startsWith(n.at + '/'))
+      .sort((a, b) => b.at.length - a.at.length)[0];
   }
 
   /**
@@ -1849,9 +1846,6 @@ export class WorkspaceModule implements Module {
       }
       throw new WorkspaceReadError('not_found', `Unable to read file: ${mountPrefixedPath}`, 'lstat', code);
     }
-    if (fileInfo.isDirectory()) {
-      throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'lstat');
-    }
     if (fileInfo.isSymbolicLink() && !follow) {
       throw new WorkspaceReadError('symlink', `Symlinks are not allowed: ${mountPrefixedPath}`, 'lstat');
     }
@@ -1861,6 +1855,27 @@ export class WorkspaceModule implements Module {
       realMountRoot = await realpath(resolve(mount.config.path));
     } catch (err) {
       throw new WorkspaceReadError('mount_unavailable', `Mount unavailable: ${mount.config.name}`, 'realpath_root', errnoOf(err));
+    }
+
+    const checkBoundary = (real: string): void => {
+      if (!isContainedPath(realMountRoot, real)) {
+        throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
+      }
+      const nested = this.nestedRefusal(mount, realMountRoot, real, mountPrefixedPath);
+      if (nested) throw new WorkspaceReadError('escape', nested, 'realpath');
+    };
+    let beforeOpen: string;
+    try {
+      beforeOpen = await realpath(lexicalPath);
+    } catch (err) {
+      const code = errnoOf(err);
+      throw new WorkspaceReadError('not_found',
+        code === 'ENOENT' || code === 'ENOTDIR' ? `File not found: ${mountPrefixedPath}` : `Unable to resolve file: ${mountPrefixedPath}`,
+        'realpath', code);
+    }
+    checkBoundary(beforeOpen);
+    if (fileInfo.isDirectory()) {
+      throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'lstat');
     }
 
     let handle: Awaited<ReturnType<typeof open>>;
@@ -1890,13 +1905,6 @@ export class WorkspaceModule implements Module {
           code,
         );
       }
-      if (fileStat.isDirectory()) {
-        throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'fstat');
-      }
-      if (!fileStat.isFile()) {
-        throw new WorkspaceReadError('not_found', `File not found: ${mountPrefixedPath}`, 'fstat');
-      }
-
       if (!follow && !useNoFollow) {
         let postOpenInfo: Awaited<ReturnType<typeof lstat>>;
         try {
@@ -1924,13 +1932,13 @@ export class WorkspaceModule implements Module {
         throw new WorkspaceReadError('not_found', `Unable to resolve file: ${mountPrefixedPath}`, 'realpath', code);
       }
 
-      if (!isContainedPath(realMountRoot, realFilePath)) {
-        throw new WorkspaceReadError('escape', `Symlink escape detected: ${mountPrefixedPath}`, 'realpath');
+      checkBoundary(realFilePath);
+      if (fileStat.isDirectory()) {
+        throw new WorkspaceReadError('directory', `Path is a directory: ${mountPrefixedPath}`, 'fstat');
       }
-      // A file in a mount nested in this one is that mount's, whatever path
-      // reaches it: an alias inside this mount reads none of it.
-      const nested = this.nestedRefusal(mount, realMountRoot, realFilePath, mountPrefixedPath);
-      if (nested) throw new WorkspaceReadError('escape', nested, 'realpath');
+      if (!fileStat.isFile()) {
+        throw new WorkspaceReadError('not_found', `File not found: ${mountPrefixedPath}`, 'fstat');
+      }
 
       let pathStat: Stats;
       try {
@@ -2495,7 +2503,7 @@ export class WorkspaceModule implements Module {
     const nestedAt = (): { name: string; rest: string; where: string } | null => {
       const lexical = this.nestedMountAt(mount, relativePath);
       if (lexical) return { name: lexical.name, rest: relativePath.slice(lexical.at.length + 1), where: ` at ${lexical.at}/` };
-      const byDisk = this.nestedByDisk(mount, relativePath);
+      const byDisk = this.nestedByDisk(mount, relativePath, false);
       return byDisk ? { ...byDisk, where: '' } : null;
     };
     // A copy the outer mount took in from a nested mount's directory before
@@ -2503,7 +2511,34 @@ export class WorkspaceModule implements Module {
     // where the file is the inner mount's. Anything else at such a path is
     // refused, as every other tool refuses it.
     const nestedDelete = (inner: { name: string; rest: string; where: string }): ToolResult => {
-      if (!store.treeGet(mount.treeStateId, relativePath)) {
+      // Older scans stored disk's spelling. Prefer a copy at the supplied
+      // path (which may be an old alias), then resolve its directory entry.
+      let storedPath = relativePath;
+      if (!store.treeGet(mount.treeStateId, storedPath)) {
+        const absolute = resolve(mount.config.path, relativePath);
+        const parent = canonicalRoot(dirname(absolute));
+        let name = basename(absolute);
+        try {
+          const entries = readdirSync(parent);
+          if (!entries.includes(name)) {
+            const named = lstatSync(join(parent, name));
+            const actual = entries.find((entry) => {
+              if (entry.toLowerCase() !== name.toLowerCase()) return false;
+              const candidate = lstatSync(join(parent, entry));
+              return candidate.dev === named.dev && candidate.ino === named.ino;
+            });
+            if (actual !== undefined) name = actual;
+          }
+          storedPath = relative(canonicalRoot(mount.config.path), join(parent, name)).split(sep).join('/');
+        } catch (error) {
+          if (errnoOf(error) !== 'ENOENT' && errnoOf(error) !== 'ENOTDIR') {
+            return { success: false, isError: true,
+              error: `Cannot identify the stored spelling of "${input.path}": ${error instanceof Error ? error.message : String(error)}` };
+          }
+          // An absent disk entry supplies no alternate spelling.
+        }
+      }
+      if (!store.treeGet(mount.treeStateId, storedPath)) {
         return {
           success: false,
           error: `"${input.path}" is inside mount "${inner.name}", which is nested in "${mount.config.name}"${inner.where}, ` +
@@ -2511,9 +2546,9 @@ export class WorkspaceModule implements Module {
           isError: true,
         };
       }
-      store.treeRemove(mount.treeStateId, relativePath);
-      this.intents.get(mount.config.name)!.put(relativePath, null);
-      this.agreementOrThrow().forget(mount.config.name, relativePath);
+      store.treeRemove(mount.treeStateId, storedPath);
+      this.intents.get(mount.config.name)!.put(storedPath, null);
+      this.agreementOrThrow().forget(mount.config.name, storedPath);
       return {
         success: true,
         data: {
@@ -2540,7 +2575,7 @@ export class WorkspaceModule implements Module {
         return {
           success: false,
           error: `Removed from Chronicle but did not unlink "${input.path}" from disk: ${materializeError}. ` +
-            'The disk copy stays (ls shows its state) until materialize with applyDeletions removes it.',
+            'The disk copy remains (ls shows its state). Resolve the reported refusal before retrying materialize with applyDeletions.',
           isError: true,
         };
       }
@@ -2931,11 +2966,14 @@ export class WorkspaceModule implements Module {
         // in before #280's fix) is never written there, nor deleted there:
         // the files are the inner mount's (agent-framework #280).
         const ats = this.nestedAtsOf(mount);
-        const nested = selected.flatMap((path) => {
-          const inner = this.nestedMountAt(mount, path, ats);
-          return inner ? [{ path, inner: inner.name }] : [];
-        });
-        const paths = nested.length > 0 ? selected.filter((path) => !this.nestedMountAt(mount, path, ats)) : selected;
+        const nested: Array<{ path: string; inner: string }> = [];
+        const paths: string[] = [];
+        for (const path of selected) {
+          const writing = store.treeGet(mount.treeStateId, path) !== null;
+          const inner = this.nestedMountAt(mount, path, ats) ?? this.nestedByDisk(mount, path, writing);
+          if (inner) nested.push({ path, inner: inner.name });
+          else paths.push(path);
+        }
         return {
           inPlace,
           nested,
