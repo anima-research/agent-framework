@@ -1472,6 +1472,53 @@ test('a read or an edit of a tracked file the mount ignores checks it against di
   assert.equal(edited.success, true, JSON.stringify(edited));
 });
 
+test("a read of a tracked file the mount ignores says when disk couldn't be checked, and still returns the workspace copy", async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-pass2-ignored-unchecked-');
+  const outer = join(root, 'outer');
+  mkdirSync(join(outer, 'node_modules'), { recursive: true });
+  writeFileSync(join(outer, 'node_modules', 'pkg.js'), 'v1');
+  writeFileSync(join(outer, 'other.js'), 'elsewhere');
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', ignore: ['node_modules'] },
+  ]);
+  const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
+  assert.equal((await call('sync', { path: 'outer/node_modules/pkg.js' })).success, true);
+  // A package manager puts a link there, which this mount doesn't follow.
+  rmSync(join(outer, 'node_modules', 'pkg.js'));
+  symlinkSync(join(outer, 'other.js'), join(outer, 'node_modules', 'pkg.js'));
+  const read = await call('read', { path: 'outer/node_modules/pkg.js' });
+  assert.equal(read.success, true, JSON.stringify(read));
+  const data = read.data as { content: string; diskCheck?: { state: string; note?: string } };
+  assert.match(data.content, /\tv1/);
+  assert.deepEqual(data.diskCheck, { state: 'unverified', note: 'a symlink, which this mount does not follow' });
+  const bytes = await workspace.readBinary('outer/node_modules/pkg.js');
+  assert.ok('data' in bytes && bytes.data.toString() === 'v1', JSON.stringify(bytes));
+  assert.deepEqual('data' in bytes ? bytes.diskCheck : null, { state: 'unverified', note: 'a symlink, which this mount does not follow' });
+  const edited = await call('edit', { path: 'outer/node_modules/pkg.js', oldString: 'v1', newString: 'v2' });
+  assert.equal(edited.success, true, JSON.stringify(edited));
+  assert.equal((edited.data as { diskCheck?: { state: string } }).diskCheck?.state, 'unverified');
+  // A copy that agrees with disk says nothing more.
+  const plain = await call('read', { path: 'outer/other.js' });
+  assert.equal((plain.data as { diskCheck?: unknown }).diskCheck, undefined);
+});
+
+test("a delete of a tracked file the mount ignores doesn't take in a disk change first, so it never removes one the workspace hasn't seen", async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-pass2-ignored-delete-');
+  const outer = join(root, 'outer');
+  mkdirSync(join(outer, 'node_modules'), { recursive: true });
+  writeFileSync(join(outer, 'node_modules', 'pkg.js'), 'v1');
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', autoMaterialize: true, ignore: ['node_modules'] },
+  ]);
+  const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
+  assert.equal((await call('sync', { path: 'outer/node_modules/pkg.js' })).success, true);
+  writeFileSync(join(outer, 'node_modules', 'pkg.js'), 'v2');
+  const result = await call('delete', { path: 'outer/node_modules/pkg.js' });
+  assert.equal(result.success, false, JSON.stringify(result));
+  assert.match(String(result.error), /did not unlink.*disk changed since it last agreed/);
+  assert.equal(readFileSync(join(outer, 'node_modules', 'pkg.js'), 'utf8'), 'v2', 'the change the workspace never saw is still on disk');
+});
+
 test("an untracked outer link into a nested mount is refused as leading into it, not as lying inside it", async (t) => {
   const r = await secondPassRig(t);
   symlinkSync(join(r.inner, 'x.txt'), join(r.outer, 'link'));

@@ -1686,7 +1686,7 @@ export class WorkspaceModule implements Module {
    */
   async readBinary(
     mountPrefixedPath: string,
-  ): Promise<{ data: Buffer } | { error: string }> {
+  ): Promise<({ data: Buffer } & DiskCheck) | { error: string }> {
     if (!this.running()) return { error: NOT_RUNNING };
     let mount: MountState;
     let relativePath: string;
@@ -1697,12 +1697,12 @@ export class WorkspaceModule implements Module {
     }
     const store = this.getStore();
     return this.withMount(mount, async () => {
-      await this.ensureSynced(mount, relativePath);
+      const report = await this.ensureSynced(mount, relativePath, { checkIgnored: true });
       const entry = store.treeGet(mount.treeStateId, relativePath);
       if (!entry) return { error: `File not found: ${mountPrefixedPath}` };
       const blob = store.getBlob(entry.blobHash);
       if (!blob) return { error: `Blob not found for: ${mountPrefixedPath}` };
-      return { data: blob };
+      return { data: blob, ...diskCheckView(report) };
     });
   }
 
@@ -2236,14 +2236,21 @@ export class WorkspaceModule implements Module {
   /**
    * Before a read: a path the workspace doesn't hold is observed under the
    * three-way rule, which ingests a new disk file but never brings back a
-   * workspace deletion or a file absent from this branch. So is a path it
-   * holds that the mount ignores: neither the watcher nor a sync without a
-   * path keeps such a copy current, so it's checked by its own path, as a
-   * sync that names it would. The caller holds the mount's turn.
+   * workspace deletion or a file absent from this branch. With
+   * `checkIgnored`, so is a path it holds that the mount ignores: neither the
+   * watcher nor a sync without a path keeps such a copy current, so a caller
+   * that hands its content on (read, edit, readBinary) checks it by its own
+   * path, as a sync that names it would, and says so when the check couldn't
+   * confirm it (diskCheckView). A delete doesn't: it matches no content, so
+   * taking in a disk change first would let its unlink remove a change the
+   * workspace never saw. The caller holds the mount's turn.
    */
-  private async ensureSynced(mount: MountState, relativePath: string): Promise<PathReport | undefined> {
+  private async ensureSynced(
+    mount: MountState, relativePath: string, opts: { checkIgnored?: boolean } = {},
+  ): Promise<PathReport | undefined> {
     const store = this.getStore();
-    if (store.treeGet(mount.treeStateId, relativePath) && !coveredByIgnore(relativePath, mount.config.ignore ?? [])) return undefined;
+    if (store.treeGet(mount.treeStateId, relativePath)
+      && !(opts.checkIgnored && coveredByIgnore(relativePath, mount.config.ignore ?? []))) return undefined;
     const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
     return pass.reports.get(relativePath);
   }
@@ -2287,19 +2294,21 @@ export class WorkspaceModule implements Module {
       }
     }
     let content = generatedContent;
+    let checked: DiskCheck = {};
     if (content === undefined) {
       const { mount, relativePath } = this.parsePath(input.path);
       const store = this.getStore();
-      const found = await this.withMount(mount, async (): Promise<{ text: string } | { error: string }> => {
-        const report = await this.ensureSynced(mount, relativePath);
+      const found = await this.withMount(mount, async (): Promise<{ text: string; report?: PathReport } | { error: string }> => {
+        const report = await this.ensureSynced(mount, relativePath, { checkIgnored: true });
         const entry = store.treeGet(mount.treeStateId, relativePath);
         if (!entry) return { error: this.notInWorkspace(input.path, report) };
         const blob = store.getBlob(entry.blobHash);
         if (!blob) return { error: `Blob not found for: ${input.path}` };
-        return { text: blob.toString('utf-8') };
+        return { text: blob.toString('utf-8'), report };
       });
       if ('error' in found) return { success: false, error: found.error, isError: true };
       content = found.text;
+      checked = diskCheckView(found.report);
     }
     if (characterPaging) {
       const start = Math.min(offsetChars, content.length);
@@ -2320,6 +2329,7 @@ export class WorkspaceModule implements Module {
           offsetChars: start,
           nextOffsetChars: end < content.length ? end : null,
           content: content.slice(start, end),
+          ...checked,
         },
       };
     }
@@ -2352,6 +2362,7 @@ export class WorkspaceModule implements Module {
           ? { note: `Truncated at ${effectiveLimit} lines (file has ${lines.length}). Use offset/limit to read more.` }
           : {}),
         content: formatted,
+        ...checked,
       },
     };
   }
@@ -2483,7 +2494,7 @@ export class WorkspaceModule implements Module {
 
     const store = this.getStore();
     return this.withMount(mount, async (): Promise<ToolResult> => {
-      const report = await this.ensureSynced(mount, relativePath);
+      const report = await this.ensureSynced(mount, relativePath, { checkIgnored: true });
       await this.settleBeforeMutation(mount, relativePath); // before the edit reads the entry
       // Read again in the mount's turn, after the last await: the path may have
       // come to lie in a nested mount while the edit waited.
@@ -2542,6 +2553,7 @@ export class WorkspaceModule implements Module {
         data: {
           path: input.path,
           size: newBuffer.byteLength,
+          ...diskCheckView(report),
         },
       };
     });
@@ -3483,6 +3495,26 @@ export class WorkspaceModule implements Module {
     }
   }
 
+}
+
+/** What checking a held copy against disk found, when it didn't confirm it. */
+type DiskCheck = { diskCheck?: Pick<PathReport, 'state' | 'note' | 'conflict'> };
+
+/**
+ * What a read of a held copy says when checking it against disk didn't
+ * confirm it (ensureSynced with `checkIgnored`): the state, as listings show
+ * it, beside the workspace copy the read still returns. Nothing when the copy
+ * agrees with disk or holds the workspace's own unwritten change.
+ */
+function diskCheckView(report: PathReport | undefined): DiskCheck {
+  if (!report || report.state === 'synced' || report.state === 'workspace-draft') return {};
+  return {
+    diskCheck: {
+      state: report.state,
+      ...(report.note ? { note: report.note } : {}),
+      ...(report.conflict ? { conflict: report.conflict } : {}),
+    },
+  };
 }
 
 /** What a listing shows of a path beyond its name. */

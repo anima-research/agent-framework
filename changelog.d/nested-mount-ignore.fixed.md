@@ -10,7 +10,11 @@
     tracked, and the watcher and a sync without a path no longer update them.
     A sync that names such a path still takes disk's copy, and says the
     mount ignores it. A `read` or `edit` of one checks it against disk first,
-    by its own path, so neither works from a copy disk has moved on from.
+    by its own path. Where disk can't be checked, as through a link the
+    mount doesn't follow, it works from the workspace copy and says so under
+    `diskCheck`, as listings mark it unverified. A `delete` doesn't take
+    disk's copy first, so it still refuses to remove a change on disk the
+    workspace hasn't seen.
     Each sync without a path lists them under `skipped`
     ("disk could not be checked: ignored by the mount"). It also lists, under
     `incomplete`, the ignored entry that hides them: the file itself for a
