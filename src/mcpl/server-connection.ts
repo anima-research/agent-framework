@@ -112,11 +112,12 @@ const MAX_TOOL_LIST_PAGES = 100;
  * - `rejected`: the server refused every revision offered. The legacy
  *   engine's `initialize` was answered with error -32022, or a modern
  *   server's discovery or -32022 error named no revision in common (over
- *   HTTP, a discovery's list counts once the `initialize` tried after it has
- *   failed too). `supported` is the server's own list, when it gave one.
- * - `mismatch`: the server answered `initialize` with a revision that wasn't
- *   offered, or with none: the legacy engine's, or a modern connection's
- *   over HTTP.
+ *   HTTP, a discovery's list counts once the server has refused the
+ *   `initialize` tried after it too). `supported` is the server's own list,
+ *   when it gave one.
+ * - `mismatch`: the server answered `initialize` with a revision that
+ *   handshake doesn't accept, or with none: the legacy engine's, or a modern
+ *   connection's 2025 handshake over HTTP.
  */
 export class McplProtocolVersionError extends Error {
   constructor(

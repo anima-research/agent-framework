@@ -13,6 +13,8 @@
 //   ignore-sigterm       the process survives SIGTERM (only SIGKILL ends it)
 //   other-revision       every launch's server/discover lists only a revision the client doesn't speak
 //   other-revision-later  launches after the first do
+//   unreadable-older-revision  server/discover's result isn't a DiscoverResult the SDK
+//                        can read (its capabilities aren't an object), and lists only 2025-11-25
 // Tools: op (outputSchema {value: integer}, answers with a string: invalid
 // structured content), plain (text), err (a JSON-RPC error), touch (announces
 // a tool list change on the open subscription), nullframe (writes JSON lines
@@ -48,6 +50,9 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   note({ event: m.id === undefined ? 'notification' : 'request', method: m.method, id: m.id ?? null, ...(m.method === 'tools/call' ? { tool: m.params?.name } : {}) });
   switch (m.method) {
     case 'server/discover':
+      if (flags.has('unreadable-older-revision')) {
+        return result(m.id, { supportedVersions: ['2025-11-25'], capabilities: 'none' });
+      }
       if (flags.has('other-revision') || (flags.has('other-revision-later') && launch > 1)) {
         return result(m.id, {
           supportedVersions: ['2099-01-01'],
