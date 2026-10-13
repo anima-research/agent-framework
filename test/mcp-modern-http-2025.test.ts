@@ -391,6 +391,25 @@ test('the standalone stream\'s first open is tried again after a failure that ma
   await until(() => changes === 1, 'the list change on the stream that opened');
 });
 
+test('a request stream resumed before the standalone stream first opens doesn\'t make that open a reopen', async (t) => {
+  t.mock.method(Math, 'random', () => 0.5); // no jitter
+  // The call's resume comes at the server's 50 ms hint; the first open's retry at 400 ms.
+  const fixture = await start2025({ versions: ['2025-11-25'], resumable: { retryMs: 50 } });
+  fixture.getAnswers.push(503);
+  const connection = await connect(fixture, { reconnectIntervalMs: 400, reconnectMaxIntervalMs: 800 });
+  let changes = 0;
+  connection.on('tools-list-changed', () => changes++);
+  const calling = connection.callTool('slow', { ms: 150 });
+  await until(() => fixture.events.includes('slow-start'), 'the call running');
+  const callId = fixture.seen.find((s) => s.rpc === 'tools/call')!.id;
+  fixture.sessions.get(sessionOf(connection)!)!.closeSSEStream(callId as never);
+  await calling; // its answer came on the resumed stream
+  assert.ok(fixture.seen.some((s) => s.method === 'GET' && s.resumed && s.status === 200), 'the call\'s stream resumed');
+  await until(() => count(fixture, (s) => s.method === 'GET' && !s.resumed && s.status === 200) === 1, 'the standalone stream open at last');
+  await sleep(100);
+  assert.equal(changes, 0, 'its first open relisted nothing');
+});
+
 test('a first open refused in a way that won\'t pass (501) isn\'t tried again', async () => {
   const fixture = await start2025({ versions: ['2025-06-18'], get: 501 });
   const connection = await connect(fixture, { reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
@@ -452,42 +471,49 @@ test('the server\'s retry hint paces the stream\'s return, end to end', async ()
   assert.ok(back - cut >= 250, `the stream came back ${back - cut} ms after the cut, sooner than the hint`);
 });
 
-test('a cut request stream is resumed for as long as its request lives, and not after its deadline', async () => {
-  const fixture = await start2025({ versions: ['2025-11-25'], resumable: {} });
-  const connection = await connect(fixture, { requestTimeoutMs: 400, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
-  await connection.listTools();
-  // Every resume fails, as from a server whose event store lost the stream:
-  // a 400 for the id, then outages.
-  fixture.resumeAnswers.push(400, ...Array<number>(1000).fill(503));
-  const calling = connection.callTool('slow', { ms: 5000 });
-  await until(() => fixture.events.includes('slow-start'), 'the call running');
-  const callId = fixture.seen.find((s) => s.rpc === 'tools/call')!.id;
-  fixture.sessions.get(sessionOf(connection)!)!.closeSSEStream(callId as never);
-  await assert.rejects(calling, (err: unknown) => {
-    assert.ok(err instanceof McplRequestError, String(err));
-    assert.equal(err.outcome, 'no-response');
-    assert.match(err.message, /Cancellation was requested; the outcome is unknown/);
-    return true;
+for (const held of [false, true]) {
+  test(`a cut request stream is resumed for as long as its request lives, and not after its deadline${held ? ', though the cancel\'s POST never settles' : ''}`, async () => {
+    const fixture = await start2025({
+      versions: ['2025-11-25'],
+      resumable: {},
+      // A cancel that hangs: the server never answers its POST.
+      answer: (message) => held && message.method === 'notifications/cancelled',
+    });
+    const connection = await connect(fixture, { requestTimeoutMs: 400, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+    await connection.listTools();
+    // Every resume fails, as from a server whose event store lost the stream:
+    // a 400 for the id, then outages.
+    fixture.resumeAnswers.push(400, ...Array<number>(1000).fill(503));
+    const calling = connection.callTool('slow', { ms: 5000 });
+    await until(() => fixture.events.includes('slow-start'), 'the call running');
+    const callId = fixture.seen.find((s) => s.rpc === 'tools/call')!.id;
+    fixture.sessions.get(sessionOf(connection)!)!.closeSSEStream(callId as never);
+    await assert.rejects(calling, (err: unknown) => {
+      assert.ok(err instanceof McplRequestError, String(err));
+      assert.equal(err.outcome, 'no-response');
+      assert.match(err.message, /Cancellation was requested; the outcome is unknown/);
+      return true;
+    });
+    const resumes = () => count(fixture, (s) => s.method === 'GET' && s.resumed);
+    assert.ok(resumes() > 1, 'the stream was resumed, past the 400, while the call lived');
+    // A resume already under way may still land; then the count holds for
+    // longer than the 20-40 ms between tries.
+    let settled = resumes();
+    for (const deadline = Date.now() + 2000; ;) {
+      await sleep(100);
+      const now = resumes();
+      if (now === settled) break;
+      settled = now;
+      assert.ok(Date.now() < deadline, `the resumes still going: ${now}`);
+    }
+    await sleep(300);
+    assert.equal(resumes(), settled, 'no resume after the call ended');
+    // A request's resume isn't the standalone stream: nothing opened beside it.
+    assert.equal(count(fixture, (s) => s.method === 'GET' && !s.resumed), 1);
+    assert.equal(count(fixture, (s) => s.rpc === 'notifications/cancelled'), 1);
+    assert.ok(connection.isConnected);
   });
-  const resumes = () => count(fixture, (s) => s.method === 'GET' && s.resumed);
-  assert.ok(resumes() > 1, 'the stream was resumed, past the 400, while the call lived');
-  // A resume already under way may still land; then the count holds for
-  // longer than the 20-40 ms between tries.
-  let settled = resumes();
-  for (const deadline = Date.now() + 2000; ;) {
-    await sleep(100);
-    const now = resumes();
-    if (now === settled) break;
-    settled = now;
-    assert.ok(Date.now() < deadline, `the resumes still going: ${now}`);
-  }
-  await sleep(300);
-  assert.equal(resumes(), settled, 'no resume after the call ended');
-  // A request's resume isn't the standalone stream: nothing opened beside it.
-  assert.equal(count(fixture, (s) => s.method === 'GET' && !s.resumed), 1);
-  assert.equal(count(fixture, (s) => s.rpc === 'notifications/cancelled'), 1);
-  assert.ok(connection.isConnected);
-});
+}
 
 test('a stream retry waits the server\'s hint first, and never less than the backoff after a failed try', (t) => {
   const connection = ModernMcpConnection.create({ id: 'remote', url: 'http://127.0.0.1:1/mcp', reconnectIntervalMs: 100, reconnectMaxIntervalMs: 10_000_000 });
