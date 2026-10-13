@@ -359,6 +359,23 @@ test('a session the server ended under a call: the call is refused with 404, and
   assert.equal(count(fixture, (s) => s.rpc === 'tools/call' && s.status === 404), 1, 'the refused call was not replayed');
 });
 
+test('close() while the new session starts reports the connection closed, once, and nothing reconnects', async () => {
+  const fixture = await start2025({ versions: ['2025-11-25'] });
+  const connection = await connect(fixture);
+  await connection.listTools();
+  const events: string[] = [];
+  for (const event of ['close', 'reconnect', 'reconnect-failed']) connection.on(event, () => events.push(event));
+  await fixture.forget(false);
+  await connection.callTool('echo', {}).catch(() => {});
+  assert.equal(connection.willReconnect, true, 'the new session is starting');
+  await connection.close();
+  // The ended session emitted no 'close', so the host's close is the one.
+  assert.deepEqual(events, ['close']);
+  await sleep(100);
+  assert.deepEqual(events, ['close']);
+  assert.equal(connection.isConnected, false);
+});
+
 test('a session the server ended while idle: the stream\'s reopen meets 404, and a new session starts', async () => {
   const fixture = await start2025({ versions: ['2025-06-18'] });
   const connection = await connect(fixture, { reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });

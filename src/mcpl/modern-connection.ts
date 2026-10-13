@@ -1136,7 +1136,9 @@ export class ModernMcpConnection extends EventEmitter {
    * engine does. Calls queue behind the one in flight, so none resolves
    * while teardown is still pending. A call after a failed close re-checks
    * what wasn't reaped. 'close' is emitted once, when the teardown of a
-   * session the host closed while live completes, not on a failed close.
+   * session the host closed while live completes, not on a failed close. A
+   * new session starting in place of one the server ended counts as live:
+   * no 'close' was emitted for the session it replaces.
    */
   close(): Promise<void> {
     const previous = this.closing;
@@ -1153,7 +1155,7 @@ export class ModernMcpConnection extends EventEmitter {
     const opening = this.opening;
     const session = this.session;
     this.session = null;
-    if (session) this.closeIncomplete = true;
+    if (session || this.restarting) this.closeIncomplete = true;
     // Every generation this connection still owns: a connect in flight, the
     // live one, and any a failed cleanup couldn't reap.
     const targets: Session[] = [];
