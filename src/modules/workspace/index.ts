@@ -2256,10 +2256,12 @@ export class WorkspaceModule implements Module {
     if (held && !(opts.checkIgnored && coveredByIgnore(relativePath, mount.config.ignore ?? []))) return undefined;
     const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
     const report = pass.reports.get(relativePath);
-    // A pass that decided nothing (the selected branch kept changing) left a
-    // held copy unchecked, which the caller must not present as confirmed.
-    if (report === undefined && held) {
-      return { path: relativePath, state: 'unverified', note: pass.incomplete[0]?.reason ?? 'disk was not checked' };
+    // A pass that gave up (the selected branch kept changing) decided nothing
+    // and says why; one that decided leaves no report only where it agreed
+    // with an absence (a copy disk no longer has, removed). The caller must
+    // not present the first as a confirmed copy or a confirmed absence.
+    if (report === undefined && pass.incomplete.length > 0) {
+      return { path: relativePath, state: 'unverified', note: pass.incomplete[0].reason };
     }
     return report;
   }
@@ -2418,7 +2420,9 @@ export class WorkspaceModule implements Module {
       : fromTree();
     if (image) {
       const check = checked.diskCheck;
-      const detail = check?.note ?? check?.conflict?.kind;
+      const conflict = check?.conflict;
+      const detail = check?.note
+        ?? (conflict ? `${conflict.kind}${conflict.diskChangedSinceRecorded ? '; disk changed since' : ''}` : undefined);
       return {
         success: true,
         data: [

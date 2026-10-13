@@ -1462,8 +1462,8 @@ test('a read-only mount can stop tracking an old nested copy, and refuses every 
       }
     } finally { Object.defineProperty(process, 'platform', platform); }
   } finally {
-    fs.realpathSync.native = native;
     Object.assign(fs, { lstatSync, readlinkSync, realpathSync });
+    fs.realpathSync.native = native;
     Object.assign(fsPromises, { realpath, lstat, readlink, stat });
     syncBuiltinESMExports();
   }
@@ -1538,10 +1538,36 @@ test("a read of a tracked file the mount ignores says when disk couldn't be chec
   const pass = internals.passUnlocked;
   internals.passUnlocked = async () => ({ ops: [], discarded: [], newConflicts: [], reports: new Map(), passedOver: new Map(), dirs: [],
     incomplete: [{ path: '', reason: 'the selected branch kept changing while the scan ran' }] });
+  const gaveUp = { state: 'unverified', note: 'the selected branch kept changing while the scan ran' };
   try {
     const undecided = await call('read', { path: 'outer/node_modules/pkg.js' });
-    assert.deepEqual((undecided.data as { diskCheck?: unknown }).diskCheck, { state: 'unverified', note: 'the selected branch kept changing while the scan ran' });
+    assert.match((undecided.data as { content: string }).content, /\tv2/, 'the workspace copy is returned');
+    assert.deepEqual((undecided.data as { diskCheck?: unknown }).diskCheck, gaveUp);
+    const undecidedBytes = await workspace.readBinary('outer/node_modules/pkg.js');
+    assert.ok('data' in undecidedBytes && undecidedBytes.data.toString() === 'v2', JSON.stringify(undecidedBytes));
+    assert.deepEqual('data' in undecidedBytes ? undecidedBytes.diskCheck : null, gaveUp);
+    // A path the workspace doesn't hold isn't reported absent when disk went unchecked.
+    const unheld = await call('read', { path: 'outer/node_modules/other.js' });
+    assert.equal(unheld.success, false);
+    assert.match(String(unheld.error), /not in the workspace, and disk could not be checked \(the selected branch kept changing while the scan ran\)/);
   } finally { internals.passUnlocked = pass; }
+});
+
+test('a read of an ignored copy that disk no longer has, and the workspace never changed, finds it gone', async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-pass2-ignored-gone-');
+  const outer = join(root, 'outer');
+  mkdirSync(join(outer, 'node_modules'), { recursive: true });
+  writeFileSync(join(outer, 'node_modules', 'pkg.js'), 'v1');
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', ignore: ['node_modules'] },
+  ]);
+  const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
+  assert.equal((await call('sync', { path: 'outer/node_modules/pkg.js' })).success, true);
+  rmSync(join(outer, 'node_modules', 'pkg.js'));
+  const read = await call('read', { path: 'outer/node_modules/pkg.js' });
+  assert.equal(read.success, false);
+  assert.equal(read.error, 'File not found: outer/node_modules/pkg.js', 'a decided absence, not an unchecked one');
+  assert.equal(storeHolds(workspace, 'outer', 'node_modules/pkg.js'), false);
 });
 
 test("a read of an ignored copy keeps the workspace's own unwritten change, says nothing while disk agrees, and names a conflict", async (t) => {
@@ -1601,6 +1627,51 @@ test("read_image of a held image the mount ignores says when disk couldn't be ch
   assert.equal(image.success, true, JSON.stringify(image));
   const text = (image.data as Array<{ type: string; text?: string }>).find((block) => block.type === 'text')!.text!;
   assert.match(text, /\nDisk check: unverified \(a symlink, which this mount does not follow\)$/);
+});
+
+test("read_image names a conflict's kind and a check that decided nothing, and keeps the tree's refusal when disk has no copy", async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-pass2-ignored-image-states-');
+  const outer = join(root, 'outer');
+  mkdirSync(join(outer, 'assets'), { recursive: true });
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', ignore: ['assets'] },
+  ]);
+  const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
+  const header = (result: { data?: unknown }) => (result.data as Array<{ type: string; text?: string }>).find((block) => block.type === 'text')!.text!;
+  // The workspace changes an image disk agreed with, and disk changes it too.
+  const gif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+  assert.equal((await workspace.writeBinary('outer/assets/a.png', ONE_PIXEL_PNG, 'image/png')).success, true);
+  assert.equal((await call('materialize', { mount: 'outer' })).success, true);
+  assert.equal((await workspace.writeBinary('outer/assets/a.png', gif, 'image/gif')).success, true);
+  writeFileSync(join(outer, 'assets', 'a.png'), Buffer.concat([ONE_PIXEL_PNG, Buffer.from('changed')]));
+  const conflicted = await call('read_image', { path: 'outer/assets/a.png' });
+  assert.equal(conflicted.success, true, JSON.stringify(conflicted));
+  const bytes = await workspace.readBinary('outer/assets/a.png');
+  const kind = 'data' in bytes ? bytes.diskCheck?.conflict?.kind : undefined;
+  assert.ok(kind, JSON.stringify(bytes));
+  assert.match(header(conflicted), new RegExp(`\\nDisk check: conflict \\(${kind}`));
+  // Disk moves on again after the conflict was recorded: the line says so.
+  writeFileSync(join(outer, 'assets', 'a.png'), Buffer.concat([ONE_PIXEL_PNG, Buffer.from('changed again')]));
+  const movedOn = await call('read_image', { path: 'outer/assets/a.png' });
+  assert.match(header(movedOn), new RegExp(`\\nDisk check: conflict \\(${kind}; disk changed since\\)$`), header(movedOn));
+  // A check that decided nothing says so.
+  const internals = workspace as unknown as { passUnlocked: (...args: unknown[]) => Promise<unknown> };
+  const pass = internals.passUnlocked;
+  internals.passUnlocked = async () => ({ ops: [], discarded: [], newConflicts: [], reports: new Map(), passedOver: new Map(), dirs: [],
+    incomplete: [{ path: '', reason: 'the selected branch kept changing while the scan ran' }] });
+  try {
+    const undecided = await call('read_image', { path: 'outer/assets/a.png' });
+    assert.match(header(undecided), /\nDisk check: unverified \(the selected branch kept changing while the scan ran\)$/);
+  } finally { internals.passUnlocked = pass; }
+  // A held copy the tree refuses as an image, which disk no longer has: the tree's refusal is the answer.
+  writeFileSync(join(outer, 'assets', 't.png'), 'text');
+  assert.equal((await call('sync', { path: 'outer/assets/t.png' })).success, true);
+  assert.equal((await call('edit', { path: 'outer/assets/t.png', oldString: 'text', newString: 'texts' })).success, true);
+  rmSync(join(outer, 'assets', 't.png'));
+  const refused = await call('read_image', { path: 'outer/assets/t.png' });
+  assert.equal(refused.success, false);
+  assert.doesNotMatch(String(refused.error), /not found/i, String(refused.error));
+  assert.match(String(refused.error), /outer\/assets\/t\.png/);
 });
 
 test("a delete of a tracked file the mount ignores doesn't take in a disk change first, so it never removes one the workspace hasn't seen", async (t) => {
