@@ -12,14 +12,20 @@
  * - 2026-07-28 still wins when the server offers it, a dual server included;
  * - every 2025 result is final: an answered result that fails its schema is a
  *   plain error, not an unknown outcome;
- * - list changes arrive on the session's standalone stream, which reopens for
- *   as long as the session lives, refreshing the inventory when it does;
- * - a 404 to a request carrying the session's id ends the session. The call
- *   that met it is refused (404). A session that had answered gets a new one
- *   at once; one that hadn't is a failed connect, backing off;
- * - `close()` DELETEs a live session, bounded, and leaves an ended one alone;
+ * - list changes arrive on the session's standalone stream, which is opened
+ *   and reopened for as long as the session lives, at the server's retry
+ *   hint or the backoff. A reopen that can't replay what it missed refreshes
+ *   the inventory; one that can doesn't. A request's cut stream is resumed
+ *   only while its request lives;
+ * - a 404 to a request carrying the session's id ends the session, except
+ *   the stream's first open. The call whose POST met it is refused (404). A
+ *   session that had answered gets a new one at once ('close', then
+ *   'reconnect'); one that hadn't is a failed connect, backing off;
+ * - `close()` DELETEs each session the server holds, bounded, and leaves an
+ *   ended one alone;
  * - a server with no revision in common is a permanent verdict, read from
- *   the wire, with no reconnect loop.
+ *   the wire, with no reconnect loop; a handshake that failed without an
+ *   answer is no verdict.
  */
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -32,7 +38,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { AddressInfo } from 'node:net';
 
-import { WebStandardStreamableHTTPServerTransport, createMcpHandler, fromJsonSchema, type McpServer } from '@modelcontextprotocol/server';
+import { WebStandardStreamableHTTPServerTransport, createMcpHandler, fromJsonSchema, type EventStore, type JSONRPCMessage, type McpServer } from '@modelcontextprotocol/server';
 import { AgentFramework } from '../src/framework.js';
 import { ModernMcpConnection } from '../src/mcpl/modern-connection.js';
 import { McplProtocolVersionError, McplRequestError } from '../src/mcpl/server-connection.js';
@@ -47,7 +53,17 @@ type Message = { method?: unknown; id?: unknown; params?: Record<string, unknown
 /** A request the test answers itself, at the HTTP layer. True once answered. */
 type HandAnswer = (message: Message, res: ServerResponse) => boolean;
 
-interface Seen { method: string; session: string | null; rpc: string | null; status: number; at: number }
+interface Seen {
+  method: string;
+  session: string | null;
+  rpc: string | null;
+  /** The JSON-RPC id of a request. */
+  id: unknown;
+  /** A GET that carried Last-Event-ID: a stream resumed. */
+  resumed: boolean;
+  status: number;
+  at: number;
+}
 
 interface Fixture {
   url: string;
@@ -57,8 +73,11 @@ interface Fixture {
   events: string[];
   /** The sessions the server holds, by id. */
   sessions: Map<string, WebStandardStreamableHTTPServerTransport>;
-  /** Statuses for the next GETs, used up in order, before the session's own stream. */
+  /** Statuses for the next GETs without Last-Event-ID, used up in order,
+   *  before the session's own stream. */
   getAnswers: number[];
+  /** The same for GETs that resume a stream (with Last-Event-ID). */
+  resumeAnswers: number[];
   /** Forget every session, as a restarted server has. With `cut`, also end
    *  their streams, as a restart's lost connections do. */
   forget(cut: boolean): Promise<void>;
@@ -110,11 +129,38 @@ async function tools(): Promise<{ createServer: (opts: { log?: (line: string) =>
   return await import(pathToFileURL(join(here, 'fixtures', 'modern-tools.mjs')).href) as never;
 }
 
+/** Every stream's events, kept for replay, as a resumable server keeps them.
+ *  A priming event (an empty message) is stored but never replayed. */
+function memoryEventStore(): EventStore {
+  const events: Array<{ id: string; stream: string; message: JSONRPCMessage }> = [];
+  return {
+    async storeEvent(stream, message) {
+      const id = `${stream}_${String(events.length).padStart(6, '0')}`;
+      events.push({ id, stream, message });
+      return id;
+    },
+    async replayEventsAfter(lastEventId, { send }) {
+      const at = events.findIndex((event) => event.id === lastEventId);
+      if (at < 0) return '';
+      const { stream } = events[at]!;
+      for (const event of events.slice(at + 1)) {
+        if (event.stream === stream && 'jsonrpc' in event.message) await send(event.id, event.message);
+      }
+      return stream;
+    },
+  };
+}
+
 async function start2025(opts: {
   /** The revisions `initialize` can settle on. */
   versions?: string[];
-  /** A status every GET is answered with, instead of a stream. */
+  /** A status every GET without Last-Event-ID is answered with, instead of a
+   *  stream. */
   get?: number;
+  /** Keep every stream's events and give them ids, with a priming event on
+   *  each request's stream (2025-11-25), so a cut stream can be resumed. With
+   *  `retryMs`, the priming events carry that retry hint. */
+  resumable?: { retryMs?: number };
   answer?: HandAnswer;
   /** DELETE is never answered. */
   deleteHangs?: boolean;
@@ -126,6 +172,8 @@ async function start2025(opts: {
   const events: string[] = [];
   const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
   const getAnswers: number[] = [];
+  const resumeAnswers: number[] = [];
+  const eventStore = opts.resumable ? memoryEventStore() : undefined;
   const server = createHttpServer(async (req, res) => {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
@@ -133,13 +181,16 @@ async function start2025(opts: {
     let message: Message | undefined;
     try { message = body.length > 0 ? JSON.parse(body.toString('utf8')) as Message : undefined; } catch { message = undefined; }
     const session = (req.headers['mcp-session-id'] as string | undefined) ?? null;
-    const entry: Seen = { method: req.method ?? '', session, rpc: typeof message?.method === 'string' ? message.method : null, status: 0, at: Date.now() };
+    const resumed = req.headers['last-event-id'] !== undefined;
+    const entry: Seen = {
+      method: req.method ?? '', session, rpc: typeof message?.method === 'string' ? message.method : null, id: message?.id, resumed, status: 0, at: Date.now(),
+    };
     seen.push(entry);
     const writeHead = res.writeHead.bind(res) as (status: number, ...rest: unknown[]) => ServerResponse;
     res.writeHead = ((status: number, ...rest: unknown[]) => { entry.status = status; return writeHead(status, ...rest); }) as never;
     if (req.method === 'POST' && message && opts.answer?.(message, res)) return;
     if (req.method === 'GET') {
-      const status = getAnswers.shift() ?? opts.get;
+      const status = resumed ? resumeAnswers.shift() : getAnswers.shift() ?? opts.get;
       if (status !== undefined) {
         res.writeHead(status).end();
         return;
@@ -160,6 +211,7 @@ async function start2025(opts: {
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (id) => { sessions.set(id, transport); },
         onsessionclosed: (id) => { sessions.delete(id); },
+        ...(eventStore ? { eventStore, retryInterval: opts.resumable?.retryMs } : {}),
       });
       const mcp = createServer({ log: (line) => events.push(line), ...(opts.versions ? { supportedProtocolVersions: opts.versions } : {}) });
       opts.extra?.(mcp);
@@ -179,6 +231,7 @@ async function start2025(opts: {
     events,
     sessions,
     getAnswers,
+    resumeAnswers,
     async forget(cut: boolean) {
       const live = [...sessions.values()];
       sessions.clear();
@@ -207,6 +260,9 @@ const count = (fixture: Fixture, what: (s: Seen) => boolean) => fixture.seen.fil
 const initializes = (fixture: Fixture) => fixture.seen.filter((s) => s.rpc === 'initialize');
 const sessionOf = (connection: ModernMcpConnection) =>
   (connection as unknown as { session: { http?: { transport: { sessionId?: string } } } | null }).session?.http?.transport.sessionId;
+/** The requests whose own abort the connection still holds: none, once each is answered or cancelled. */
+const heldAborts = (connection: ModernMcpConnection) =>
+  (connection as unknown as { session: { wire: { aborts: Map<unknown, unknown> } } }).session.wire.aborts.size;
 
 for (const version of ['2025-03-26', '2025-06-18', '2025-11-25']) {
   test(`a server on ${version} connects at that revision, lists and calls`, async () => {
@@ -221,6 +277,7 @@ for (const version of ['2025-03-26', '2025-06-18', '2025-11-25']) {
     assert.equal(fixture.seen[0]!.rpc, 'server/discover');
     assert.equal(initializes(fixture).length, 1);
     assert.ok(fixture.seen.filter((s) => s.rpc === 'tools/call').every((s) => s.session !== null), 'every call carried the session id');
+    assert.equal(heldAborts(connection), 0, 'nothing kept for requests that were answered');
   });
 }
 
@@ -312,6 +369,73 @@ test('the standalone stream keeps trying while its session lives, past the trans
   assert.ok(connection.isConnected);
 });
 
+test('the standalone stream\'s first open is tried again after a failure that may pass, and then carries list changes', async (t) => {
+  t.mock.method(Math, 'random', () => 0.5); // no jitter
+  const fixture = await start2025({ versions: ['2025-06-18'] });
+  // The SDK makes this open once; the connection tries it again.
+  fixture.getAnswers.push(503, 429);
+  const connection = await connect(fixture, { reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+  await until(() => count(fixture, (s) => s.method === 'GET' && s.status === 200) === 1, 'the stream open after two failures');
+  assert.deepEqual(fixture.seen.filter((s) => s.method === 'GET').map((s) => s.status), [503, 429, 200]);
+  let changes = 0;
+  connection.on('tools-list-changed', () => changes++);
+  await connection.callTool('add_tool', {});
+  await until(() => changes === 1, 'the list change on the stream that opened');
+});
+
+test('a standalone stream resumed with Last-Event-ID has what it missed replayed, and relists nothing', async () => {
+  const fixture = await start2025({ versions: ['2025-11-25'], resumable: {} });
+  const connection = await connect(fixture, { reconnectIntervalMs: 200, reconnectMaxIntervalMs: 400 });
+  await until(() => count(fixture, (s) => s.method === 'GET' && s.status === 200) === 1, 'the stream open');
+  let changes = 0;
+  connection.on('tools-list-changed', () => changes++);
+  // An event with an id reaches the stream, so its reopen can ask for what came after.
+  await connection.callTool('add_tool', {});
+  await until(() => changes === 1, 'the first list change');
+  fixture.sessions.get(sessionOf(connection)!)!.closeStandaloneSSEStream();
+  // While the stream is down (its reopen waits 200 ms), the server announces another.
+  await connection.callTool('add_tool', {});
+  await until(() => count(fixture, (s) => s.method === 'GET' && s.resumed && s.status === 200) === 1, 'the stream resumed');
+  await until(() => changes === 2, 'the missed change, replayed');
+  await sleep(150);
+  assert.equal(changes, 2, 'the resume relisted nothing');
+});
+
+test('the server\'s retry hint paces the stream\'s return, end to end', async () => {
+  const fixture = await start2025({ versions: ['2025-11-25'], resumable: { retryMs: 300 } });
+  // The base interval is a minute: only the hint brings the stream back within the test.
+  const connection = await connect(fixture, { reconnectIntervalMs: 60_000, reconnectMaxIntervalMs: 60_000 });
+  await until(() => count(fixture, (s) => s.method === 'GET' && s.status === 200) === 1, 'the stream open');
+  // A request's priming event carries the hint.
+  await connection.callTool('echo', { text: 'x' });
+  const cut = Date.now();
+  fixture.sessions.get(sessionOf(connection)!)!.closeStandaloneSSEStream();
+  await until(() => count(fixture, (s) => s.method === 'GET' && s.status === 200) === 2, 'the stream back at the hint');
+  const back = fixture.seen.filter((s) => s.method === 'GET' && s.status === 200)[1]!.at;
+  assert.ok(back - cut >= 250, `the stream came back ${back - cut} ms after the cut, sooner than the hint`);
+});
+
+test('a cut request stream is resumed for as long as its request lives, and not after its deadline', async () => {
+  const fixture = await start2025({ versions: ['2025-11-25'], resumable: {} });
+  const connection = await connect(fixture, { requestTimeoutMs: 400, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+  await connection.listTools();
+  // Every resume fails, as from a server whose event store lost the stream.
+  fixture.resumeAnswers.push(...Array<number>(1000).fill(503));
+  const calling = connection.callTool('slow', { ms: 5000 });
+  await until(() => fixture.events.includes('slow-start'), 'the call running');
+  const callId = fixture.seen.find((s) => s.rpc === 'tools/call')!.id;
+  fixture.sessions.get(sessionOf(connection)!)!.closeSSEStream(callId as never);
+  await assert.rejects(calling, (err: unknown) => err instanceof McplRequestError && err.outcome === 'no-response');
+  const resumes = () => count(fixture, (s) => s.method === 'GET' && s.resumed);
+  assert.ok(resumes() > 0, 'the stream was resumed while the call lived');
+  await sleep(50); // a resume already under way lands
+  const after = resumes();
+  await sleep(300);
+  assert.equal(resumes(), after, 'no resume after the call ended');
+  assert.equal(count(fixture, (s) => s.rpc === 'notifications/cancelled'), 1);
+  assert.ok(connection.isConnected);
+});
+
 test('a stream retry waits the server\'s hint first, and never less than the backoff after a failed try', (t) => {
   const connection = ModernMcpConnection.create({ id: 'remote', url: 'http://127.0.0.1:1/mcp', reconnectIntervalMs: 100, reconnectMaxIntervalMs: 10_000_000 });
   t.mock.method(Math, 'random', () => 0.5); // no jitter
@@ -334,8 +458,8 @@ test('a session the server ended under a call: the call is refused with 404, and
   const first = sessionOf(connection);
   let reconnects = 0;
   connection.on('reconnect', () => reconnects++);
-  let closes = 0;
-  connection.on('close', () => closes++);
+  const closes: boolean[] = [];
+  connection.on('close', () => closes.push(connection.willReconnect));
   await fixture.forget(false);
   // Ending the session closes its client, which fails the call at once, ahead
   // of the transport's own 404 error. The refusal is still the call's answer.
@@ -351,7 +475,7 @@ test('a session the server ended under a call: the call is refused with 404, and
   assert.equal(connection.isConnected, false);
   assert.equal(connection.willReconnect, true);
   await until(() => reconnects === 1, 'the new session');
-  assert.equal(closes, 0, 'the server is never reported lost');
+  assert.deepEqual(closes, [true], 'reported closed once, with a new session coming');
   assert.ok(connection.isConnected);
   assert.notEqual(sessionOf(connection), first);
   assert.equal(connection.protocolVersion, '2025-11-25');
@@ -369,7 +493,7 @@ test('close() while the new session starts reports the connection closed, once, 
   await connection.callTool('echo', {}).catch(() => {});
   assert.equal(connection.willReconnect, true, 'the new session is starting');
   await connection.close();
-  // The ended session emitted no 'close', so the host's close is the one.
+  // The session's end emitted 'close'; closing during the restart adds none.
   assert.deepEqual(events, ['close']);
   await sleep(100);
   assert.deepEqual(events, ['close']);
@@ -390,6 +514,33 @@ test('a session the server ended while idle: the stream\'s reopen meets 404, and
   assert.notEqual(sessionOf(connection), first);
   assert.equal(initializes(fixture).length, 2);
   assert.deepEqual((await connection.callTool('echo', { text: 'x' })).content, [{ type: 'text', text: 'echo:x' }]);
+});
+
+test('a cut request stream whose resume meets 404 ends the session, though no standalone stream ever opened', async () => {
+  const fixture = await start2025({ versions: ['2025-11-25'], get: 405, resumable: {} });
+  const connection = await connect(fixture, { reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+  await connection.listTools();
+  let reconnects = 0;
+  connection.on('reconnect', () => reconnects++);
+  const calling = connection.callTool('slow', { ms: 5000 });
+  await until(() => fixture.events.includes('slow-start'), 'the call running');
+  const sid = sessionOf(connection)!;
+  const transport = fixture.sessions.get(sid)!;
+  const callId = fixture.seen.find((s) => s.rpc === 'tools/call')!.id;
+  // A restart: the session is forgotten, and the call's stream cut after its priming event.
+  await fixture.forget(false);
+  transport.closeSSEStream(callId as never);
+  await assert.rejects(calling, (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    // Its POST was answered: the server may have run it.
+    assert.equal(err.outcome, 'no-response', err.message);
+    assert.match(err.message, /The outcome is unknown: the server may already have acted on the call\./);
+    return true;
+  });
+  await until(() => reconnects === 1, 'the new session');
+  assert.ok(fixture.seen.some((s) => s.method === 'GET' && s.resumed && s.session === sid && s.status === 404), 'the resume met 404');
+  assert.equal(count(fixture, (s) => s.method === 'GET' && !s.resumed), 2, 'one standalone GET per session, each refused');
+  assert.equal(count(fixture, (s) => s.rpc === 'tools/call'), 1, 'the cut call was not replayed');
 });
 
 test('a session that ends before it answered is a failed connect: refused, reported, and not restarted at once', async () => {
@@ -415,6 +566,64 @@ test('a session that ends before it answered is a failed connect: refused, repor
   await sleep(150);
   assert.equal(initializes(fixture).length, 1, 'no new session at once');
 });
+
+for (const answered of [false, true]) {
+  test(`a second 404 for a session already ended changes nothing (${answered ? 'answered' : 'unanswered'})`, async () => {
+    const fixture = await start2025({ versions: ['2025-06-18'] });
+    const connection = await connect(fixture);
+    if (answered) await connection.listTools();
+    const events: string[] = [];
+    for (const event of ['close', 'reconnect-failed', 'reconnect']) connection.on(event, () => events.push(event));
+    const internals = connection as unknown as { session: unknown; sessionEnded: (session: unknown) => void };
+    const session = internals.session;
+    // Two requests of the session met 404, one after the other.
+    internals.sessionEnded.call(connection, session);
+    internals.sessionEnded.call(connection, session);
+    if (answered) {
+      await until(() => events.includes('reconnect'), 'the new session');
+      assert.deepEqual(events, ['close', 'reconnect']);
+      assert.equal(initializes(fixture).length, 2, 'one new session');
+    } else {
+      assert.deepEqual(events, ['reconnect-failed', 'close']);
+    }
+  });
+}
+
+for (const reconnect of [true, false]) {
+  test(`a restart whose connect fails is attempt 1 of a reconnect: ${reconnect ? 'attempt 2 follows the doubled backoff' : 'without reconnect, the connection closes for good'}`, async (t) => {
+    t.mock.method(Math, 'random', () => 0.5); // no jitter
+    let failInitialize = false;
+    const fixture = await start2025({
+      versions: ['2025-06-18'],
+      answer: (message, res) => {
+        if (message.method !== 'initialize' || !failInitialize) return false;
+        failInitialize = false;
+        res.writeHead(503).end();
+        return true;
+      },
+    });
+    const connection = await connect(fixture, { reconnect, reconnectIntervalMs: 50, reconnectMaxIntervalMs: 1000 });
+    await connection.listTools();
+    const events: string[] = [];
+    connection.on('close', () => events.push(`close willReconnect=${connection.willReconnect}`));
+    connection.on('reconnect-failed', (f: { attempt: number }) => events.push(`reconnect-failed ${f.attempt}`));
+    connection.on('reconnect', (r: { attempts: number }) => events.push(`reconnect ${r.attempts}`));
+    failInitialize = true;
+    await fixture.forget(false);
+    await connection.callTool('echo', {}).catch(() => {});
+    if (reconnect) {
+      await until(() => events.includes('reconnect 2'), 'the second attempt connecting');
+      assert.deepEqual(events, ['close willReconnect=true', 'reconnect-failed 1', 'reconnect 2']);
+      const [, failed, retried] = initializes(fixture).map((s) => s.at);
+      assert.ok(retried! - failed! >= 95, `the retry waited ${retried! - failed!} ms, less than the doubled backoff`);
+    } else {
+      await until(() => events.length === 3, 'the connection closing for good');
+      assert.deepEqual(events, ['close willReconnect=true', 'reconnect-failed 1', 'close willReconnect=false']);
+      await sleep(150);
+      assert.equal(initializes(fixture).length, 2, 'nothing tried again');
+    }
+  });
+}
 
 test('behind a load balancer without sticky sessions, each new session ends unanswered, and the backoff grows', async (t) => {
   t.mock.method(Math, 'random', () => 0.5); // no jitter: each wait is its nominal backoff
@@ -453,6 +662,7 @@ test('a deadline on a 2025 call: cancellation is POSTed, and the server sees the
   });
   await until(() => fixture.events.includes('slow-aborted'), 'the server seeing the cancellation');
   assert.equal(count(fixture, (s) => s.rpc === 'notifications/cancelled'), 1);
+  assert.equal(heldAborts(connection), 0, 'nothing kept for the cancelled request');
 });
 
 test('close() DELETEs a live session, and leaves alone one the server ended', async () => {
@@ -473,14 +683,40 @@ test('close() DELETEs a live session, and leaves alone one the server ended', as
   assert.equal(fixture.sessions.size, 0, 'the server dropped the live session');
 });
 
-test('close() waits for a DELETE the server never answers only so long', async () => {
+test('close() waits for a DELETE the server never answers only so long', { timeout: 20_000 }, async () => {
   const fixture = await start2025({ versions: ['2025-06-18'], deleteHangs: true });
   const connection = await connect(fixture);
   const began = Date.now();
+  // A close() that waited on the DELETE itself would never end: the test's
+  // timeout is what catches that.
   await connection.close();
   const took = Date.now() - began;
-  assert.ok(took >= 2900 && took < 6000, `close() took ${took} ms`);
+  assert.ok(took >= 2900, `close() took ${took} ms, less than the DELETE's bound`);
   assert.equal(count(fixture, (s) => s.method === 'DELETE'), 1);
+});
+
+test('close() during a connect ends the session the server already issued', async () => {
+  // The handshake stops after initialize: its notification is never answered.
+  let held: ServerResponse | undefined;
+  const fixture = await start2025({
+    versions: ['2025-06-18'],
+    answer: (message, res) => {
+      if (message.method !== 'notifications/initialized') return false;
+      held = res;
+      return true;
+    },
+  });
+  cleanups.push(() => { held?.destroy(); });
+  const connection = ModernMcpConnection.create({ id: 'remote', url: fixture.url });
+  connection.on('error', () => {});
+  const starting = connection.start().catch(() => {});
+  await until(() => held !== undefined, 'the handshake waiting on its notification');
+  assert.equal(fixture.sessions.size, 1, 'initialize was answered with a session');
+  const [issued] = fixture.sessions.keys();
+  await connection.close();
+  await starting;
+  assert.deepEqual(fixture.seen.filter((s) => s.method === 'DELETE').map((s) => [s.session, s.status]), [[issued, 200]]);
+  assert.equal(fixture.sessions.size, 0);
 });
 
 for (const [what, get] of [['405', 405], ['404', 404]] as const) {
@@ -535,12 +771,57 @@ test('a discovery refusal that lists no revision in common is a verdict, naming 
   assert.equal(initializes(fixture).length, 0);
 });
 
-test('an initialize answered with a revision this client doesn\'t offer is a mismatch, read from the wire', async () => {
+test('an initialize answered with a revision the 2025 handshake doesn\'t accept is a mismatch, read from the wire', async () => {
   const fixture = await start2025({ versions: ['2024-11-05'] });
   const verdict = await refused(fixture);
   assert.equal(verdict.kind, 'mismatch');
   assert.equal(verdict.returned, '2024-11-05');
-  assert.match(verdict.message, /^MCP server "remote" answered initialize with MCP 2024-11-05, which this client reaches over stdio or WebSocket \(ws:\/\/, wss:\/\/\), not http\(s\)\. Over http\(s\) this client speaks 2026-07-28, 2025-11-25, 2025-06-18 and 2025-03-26\.$/);
+  assert.match(verdict.message, /^MCP server "remote" answered initialize with MCP 2024-11-05, which this client reaches over stdio or WebSocket \(ws:\/\/, wss:\/\/\), not http\(s\)\. Over http\(s\) this client's initialize accepts 2025-11-25, 2025-06-18 or 2025-03-26\.$/);
+});
+
+test('an initialize answered with 2026-07-28 is a mismatch: that revision is negotiated through discovery alone', async () => {
+  // A server that answers no discovery, but names 2026-07-28 in its initialize.
+  const fixture = await start2025({
+    answer: (message, res) => {
+      if (message.method !== 'initialize') return false;
+      json(res, 200, { jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2026-07-28', capabilities: {}, serverInfo: { name: 'half-upgraded', version: '1' } } });
+      return true;
+    },
+  });
+  const verdict = await refused(fixture);
+  assert.equal(verdict.kind, 'mismatch');
+  assert.equal(verdict.returned, '2026-07-28');
+  assert.match(verdict.message, /answered initialize with MCP 2026-07-28, which this client negotiates through server\/discover, not initialize\./);
+});
+
+test('a failed initialize that refused nothing, after a discovery with no revision in common, is no verdict: it is retried', async () => {
+  let initializeFailures = 1;
+  const fixture = await start2025({
+    answer: (message, res) => {
+      if (message.method === 'server/discover') {
+        json(res, 200, { jsonrpc: '2.0', id: message.id, result: { supportedVersions: ['2099-01-01'], capabilities: {} } });
+        return true;
+      }
+      // An outage, not an answer about revisions; then the server is back.
+      if (message.method === 'initialize' && initializeFailures-- > 0) {
+        res.writeHead(503).end();
+        return true;
+      }
+      return false;
+    },
+  });
+  const connection = ModernMcpConnection.create({ id: 'remote', url: fixture.url, reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+  connection.on('error', () => {});
+  cleanups.push(() => connection.close());
+  const failures: unknown[] = [];
+  connection.on('connect-failed', (f) => failures.push(f));
+  let reconnected = false;
+  connection.on('reconnect', () => { reconnected = true; });
+  await connection.start();
+  await until(() => reconnected, 'the retry connecting');
+  assert.equal(failures.length, 1);
+  assert.equal(connection.protocolVersion, '2025-11-25');
+  assert.equal(initializes(fixture).length, 2);
 });
 
 // A discovery result listing a revision the client doesn't speak, or a

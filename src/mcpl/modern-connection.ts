@@ -35,13 +35,15 @@
  *   awareness is kept while the connection lives: on 2026-07-28, a
  *   subscription the server advertises but that didn't open, or that ended,
  *   is reopened; on a 2025 revision, the session's standalone stream, which
- *   carries its list changes, is reopened while the session lives. Each
- *   connect is a generation, so a superseded client never touches a newer
- *   one. `close()` owns a connect in flight too.
+ *   carries its list changes, is opened and reopened while the session
+ *   lives. Each connect is a generation, so a superseded client never
+ *   touches a newer one. `close()` owns a connect in flight too.
  * - **A 2025 session over HTTP** ends when the server answers 404 to a
  *   request that carried its id (`sessionEnded`). A new one starts at once
- *   if the old one had served a request; otherwise its end is a failed
- *   connect. `close()` DELETEs a live session.
+ *   if the old one had served a request ('close', then 'reconnect');
+ *   otherwise its end is a failed connect. A request's stream the server cut
+ *   is resumed for as long as the request lives. `close()` DELETEs each
+ *   session the server holds by its id.
  *
  * Nothing here is MCPL: a modern server has no grant, no planes and no
  * server→host requests. The framework uses this connection only through its
@@ -140,11 +142,12 @@ const wireScope = new AsyncLocalStorage<WireRecord>();
 
 /** What the server said while a connection was negotiated, read when its
  *  connect fails: the revisions its discovery listed (in a `server/discover`
- *  result, or in a -32022 error with its code and data), and the revision
- *  its `initialize` answer named (null when it named none). */
+ *  result, or in a -32022 error with its code and data), and how it answered
+ *  `initialize`: with a result naming a revision (null when it named none),
+ *  or with a JSON-RPC error. */
 interface NegotiationEvidence {
   listed?: { versions: string[]; code?: number; data?: unknown };
-  answered?: { version: string | null };
+  initialize?: { version: string | null } | { refused: true };
 }
 
 /** A JSON value's strings, when it's a list of nothing else. */
@@ -172,6 +175,16 @@ class ObservedTransport implements Transport {
   /** A request sent since the connection was established has had an answer:
    *  a result or a JSON-RPC error, so the server knows this session. */
   answered = false;
+  /**
+   * Each unanswered request's own abort, by id. Streamable HTTP stops a
+   * request's stream when the request's signal fires, and stops resuming it.
+   * The SDK gives a request such a signal only on 2026-07-28, where closing
+   * the stream is the cancellation. On a 2025 revision this boundary gives
+   * each request one and fires it once the request's `notifications/cancelled`
+   * has gone out, so a stream the server cut is resumed for as long as its
+   * request is, not for the session's whole life.
+   */
+  private readonly aborts = new Map<string | number, AbortController>();
 
   constructor(private readonly inner: Transport) {}
 
@@ -201,6 +214,7 @@ class ObservedTransport implements Transport {
     this.inner.onmessage = (message, extra) => {
       if (typeof message === 'object' && message !== null && 'id' in message && ('result' in message || 'error' in message)) {
         this.noteNegotiation(message);
+        if (message.id !== undefined) this.aborts.delete(message.id);
         if (this.established) this.answered = true;
       }
       // An answer to a request in scope is handed to the SDK inside that
@@ -237,14 +251,30 @@ class ObservedTransport implements Transport {
         Object.assign(record, prior);
       };
     }
+    let sendOptions = options;
+    if ('method' in message && 'id' in message && options?.requestSignal === undefined) {
+      const abort = new AbortController();
+      this.aborts.set(message.id, abort);
+      sendOptions = { ...options, requestSignal: abort.signal };
+    }
     try {
-      await this.inner.send(message, options);
+      await this.inner.send(message, sendOptions);
     } catch (error) {
       // Refused before any write: this leg never reached the server, so the
       // record is as it was before it. Any other throw (an HTTP send can fail
       // after part of the request went out) leaves it handed off.
       if (error instanceof NotWrittenError) undo?.();
+      // The SDK settles a request whose send failed itself: nothing cancels it.
+      if ('method' in message && 'id' in message) this.aborts.delete(message.id);
       throw error;
+    } finally {
+      if ('method' in message && message.method === 'notifications/cancelled') {
+        const id = (message.params as { requestId?: unknown } | undefined)?.requestId;
+        if (typeof id === 'string' || typeof id === 'number') {
+          this.aborts.get(id)?.abort();
+          this.aborts.delete(id);
+        }
+      }
     }
   }
 
@@ -286,15 +316,19 @@ class ObservedTransport implements Transport {
     if (step === undefined) return;
     this.negotiating.delete(id);
     if ('error' in message) {
+      if (step === 'initialize') {
+        this.negotiation.initialize = { refused: true };
+        return;
+      }
       const { code, data } = message.error as { code: number; data?: unknown };
-      const versions = step === 'server/discover' && code === -32022 ? stringList((data as { supported?: unknown } | undefined)?.supported) : undefined;
+      const versions = code === -32022 ? stringList((data as { supported?: unknown } | undefined)?.supported) : undefined;
       if (versions) this.negotiation.listed = { versions, code, data };
       return;
     }
     const result = (message as { result?: unknown }).result as Record<string, unknown> | null | undefined;
     if (step === 'initialize') {
       const version = result?.protocolVersion;
-      this.negotiation.answered = { version: typeof version === 'string' ? version : null };
+      this.negotiation.initialize = { version: typeof version === 'string' ? version : null };
     } else {
       const versions = stringList(result?.supportedVersions);
       if (versions) this.negotiation.listed = { versions };
@@ -736,10 +770,14 @@ export class ModernMcpConnection extends EventEmitter {
    * engines alike. Retrying can't change it. What the server said decides:
    * - the SDK's typed refusal: a discovery, or a -32022 error, naming no
    *   revision in common, with nothing to fall back to;
-   * - over HTTP, an `initialize` answered with a revision this client
-   *   doesn't offer, or with none (`mismatch`);
-   * - over HTTP, a discovery that listed revisions, none of them offered,
-   *   followed by an `initialize` that didn't succeed (`rejected`).
+   * - over HTTP, an `initialize` answered with a revision the 2025 handshake
+   *   doesn't accept, or with none (`mismatch`). 2026-07-28 isn't one: it is
+   *   negotiated through `server/discover` alone;
+   * - a discovery that listed revisions, none of them offered, once nothing
+   *   else can succeed (`rejected`): over stdio, pinned, nothing else is
+   *   tried, and over HTTP the server refused the 2025 handshake that
+   *   followed (a JSON-RPC error). A handshake that failed any other way,
+   *   such as a timeout, says nothing about revisions.
    * The last two are read from the wire (`evidence`), as outcomes are, not
    * from the SDK's error text. Any other failed connect is no verdict.
    */
@@ -754,7 +792,7 @@ export class ModernMcpConnection extends EventEmitter {
       ? ''
       : this.transportKind === 'stdio'
         ? ` It speaks legacy MCP: configure it without protocol: 'modern'.`
-        : ` It speaks only legacy MCP, which this client reaches over stdio or WebSocket (ws://, wss://), not http(s).`;
+        : ` It speaks legacy MCP (${LEGACY_MCP_PROTOCOL_VERSION}), which this client reaches over stdio or WebSocket (ws://, wss://), not http(s).`;
     const rejected = (supported: string[] | null, why: string, code?: number, data?: unknown) => new McplProtocolVersionError(
       `MCP server "${this.id}" does not support MCP ${joinVersions(offered, 'or')}` +
         (supported ? ` (it supports: ${supported.join(', ') || 'none listed'}).` : ` (${why}).`) +
@@ -770,21 +808,26 @@ export class ModernMcpConnection extends EventEmitter {
       const { code, data } = error as { code?: unknown; data?: unknown };
       return rejected(stringList((data as { supported?: unknown } | undefined)?.supported) ?? null, error.message, code === undefined ? undefined : Number(code), data);
     }
-    const { answered, listed } = evidence;
-    if (answered && (answered.version === null || !offered.includes(answered.version))) {
-      const named = answered.version === null ? 'without naming a protocol revision' : `with MCP ${answered.version}`;
-      const where = answered.version === LEGACY_MCP_PROTOCOL_VERSION ? ', which this client reaches over stdio or WebSocket (ws://, wss://), not http(s)' : '';
+    const { initialize, listed } = evidence;
+    // The revisions the 2025 handshake offers and accepts.
+    const accepted = offered.filter((version) => version !== MODERN_MCP_PROTOCOL_VERSION);
+    if (initialize && 'version' in initialize && (initialize.version === null || !accepted.includes(initialize.version))) {
+      const named = initialize.version === null ? 'without naming a protocol revision' : `with MCP ${initialize.version}`;
+      const where = initialize.version === LEGACY_MCP_PROTOCOL_VERSION
+        ? ', which this client reaches over stdio or WebSocket (ws://, wss://), not http(s)'
+        : initialize.version === MODERN_MCP_PROTOCOL_VERSION ? ', which this client negotiates through server/discover, not initialize' : '';
       return new McplProtocolVersionError(
-        `MCP server "${this.id}" answered initialize ${named}${where}. Over http(s) this client speaks ${joinVersions(offered, 'and')}.`,
+        `MCP server "${this.id}" answered initialize ${named}${where}. Over http(s) this client's initialize accepts ${joinVersions(accepted, 'or')}.`,
         'mismatch',
-        answered.version,
+        initialize.version,
         null,
         undefined,
         undefined,
         offered,
       );
     }
-    if (listed && !answered && !listed.versions.some((version) => offered.includes(version))) {
+    const nothingElse = this.transportKind === 'stdio' || (initialize !== undefined && 'refused' in initialize);
+    if (listed && nothingElse && !listed.versions.some((version) => offered.includes(version))) {
       return rejected(listed.versions, '', listed.code, listed.data);
     }
     return null;
@@ -856,24 +899,37 @@ export class ModernMcpConnection extends EventEmitter {
    *   refused it without running it. That's marked on the leg's record (its
    *   body's id names the leg) before anything else runs, since ending the
    *   session closes its client, which can fail the call before the
-   *   transport's own 404 error reaches it. A GET's 404 counts once a GET has
-   *   opened a stream for this session: a server that answers the first one
-   *   404 routes only POST, and the transport doesn't ask it again.
-   * - A GET that opens a stream after an earlier one did: a reopen.
+   *   transport's own 404 error reaches it.
+   * - The standalone stream's first open, the one GET without
+   *   `Last-Event-ID` before any stream has opened, is the exception. Its 404
+   *   can also mean the server has no GET route at all, which a server that
+   *   routes only POST answers, and reading it as the session's end would
+   *   make such a server unreachable. It is "no stream", as a 405 is. A
+   *   session that really ended meets the 404 on its next POST, such as the
+   *   framework's relist after the connect. The SDK never retries this
+   *   open, so {@link firstOpen} does, on a failure that may pass.
+   * - A GET that opens a stream after one had opened, without
+   *   `Last-Event-ID`: the standalone stream is back, and couldn't ask for
+   *   what it missed (see {@link streamReopened}). A GET that carries one
+   *   resumes a stream, the standalone one or a request's, and the server
+   *   replays what that stream missed.
    */
   private observedFetch(sessionOf: () => Session): FetchLike {
     return async (url, init) => {
-      const response = await fetch(url, init);
-      if (!new Headers(init?.headers).has('mcp-session-id')) return response;
+      const headers = new Headers(init?.headers);
+      if (!headers.has('mcp-session-id')) return fetch(url, init);
       const session = sessionOf();
       const http = session.http!;
       const method = (init?.method ?? 'GET').toUpperCase();
-      if (response.status === 404 && (method === 'POST' || (method === 'GET' && http.streamOpened))) {
+      const resuming = headers.has('last-event-id');
+      const firstOpen = method === 'GET' && !resuming && !http.streamOpened;
+      const response = firstOpen ? await this.firstOpen(url, init) : await fetch(url, init);
+      if (response.status === 404 && !firstOpen) {
         const record = method === 'POST' ? wireScope.getStore() : undefined;
         if (record?.currentId !== undefined && bodyId(init?.body) === record.currentId) record.sessionEnded = true;
         queueMicrotask(() => this.sessionEnded(session));
       } else if (method === 'GET' && response.ok) {
-        if (http.streamOpened) queueMicrotask(() => this.streamReopened(session));
+        if (http.streamOpened && !resuming) queueMicrotask(() => this.streamReopened(session));
         http.streamOpened = true;
       }
       return response;
@@ -881,18 +937,56 @@ export class ModernMcpConnection extends EventEmitter {
   }
 
   /**
+   * The standalone stream's first open, which the SDK makes once and never
+   * retries. A failure that may pass (a 5xx, 408 or 429, or a network error)
+   * is tried again here, with the connection's backoff, until the stream
+   * opens, the server refuses it (404, 405 or another 4xx, which go back to
+   * the SDK as they came), or the session ends: closing its transport aborts
+   * the request's signal, which ends the wait.
+   */
+  private async firstOpen(url: string | URL, init: RequestInit | undefined): Promise<Response> {
+    for (let failures = 1; ; failures++) {
+      let response: Response | undefined;
+      try {
+        response = await fetch(url, init);
+      } catch (error) {
+        if (init?.signal?.aborted) throw error;
+      }
+      if (response && response.status < 500 && response.status !== 408 && response.status !== 429) return response;
+      await response?.body?.cancel().catch(() => {});
+      await new Promise<void>((resolve, reject) => {
+        const signal = init?.signal;
+        if (signal?.aborted) return reject(signal.reason);
+        const timer = setTimeout(() => {
+          signal?.removeEventListener('abort', aborted);
+          resolve();
+        }, this.backoffDelay(failures));
+        timer.unref?.();
+        const aborted = () => {
+          clearTimeout(timer);
+          reject(signal?.reason);
+        };
+        signal?.addEventListener('abort', aborted, { once: true });
+      });
+    }
+  }
+
+  /**
    * When the HTTP transport tries a stream again. One scheduler serves both
    * streams the transport retries: the standalone stream, which carries a
    * 2025 session's list changes, and a request's stream that the server
-   * closed after a priming event, resumed (2025-11-25). Both are retried
-   * without limit (`maxRetries`): a stream comes back for as long as its
-   * session lives, and the session's end closes its transport, which stops
-   * them. The server's `retry` hint is respected, as the spec requires. The
-   * first try after a stream ends waits the hint when the server gave one,
-   * and the base interval otherwise. A try after a failed one waits the
-   * longer of the hint and the connection's doubling backoff, so a short
-   * hint can't spin against a server that's down. `hinted` is the server's
-   * hint alone, or 0, since the transport's own backoff is zeroed.
+   * closed after a priming event, resumed (2025-11-25). Neither has a retry
+   * limit (`maxRetries`). The standalone stream comes back for as long as
+   * its session lives: the session's end closes its transport, which stops
+   * it. A request's stream is resumed for as long as its request is: the
+   * request's own signal stops it when the request is cancelled (see
+   * ObservedTransport's `aborts`). The server's `retry` hint is respected,
+   * as the spec requires. The first try after a stream ends waits the hint
+   * when the server gave one, and the base interval otherwise. A try after a
+   * failed one waits the longer of the hint and the connection's doubling
+   * backoff, so a short hint can't spin against a server that's down.
+   * `hinted` is the server's hint alone, or 0, since the transport's own
+   * backoff is zeroed.
    */
   private readonly streamRetry: ReconnectionScheduler = (reconnect, hinted, attempt) => {
     const wait = attempt === 0 && hinted > 0 ? hinted : Math.max(hinted, this.backoffDelay(attempt + 1));
@@ -905,22 +999,28 @@ export class ModernMcpConnection extends EventEmitter {
    * The server ended an HTTP session: it answered 404 to a request that
    * carried the session's id. The spec's answer is a new session. A session
    * that had answered a request since its handshake gets one at once,
-   * whatever `reconnect` says, so a server's restart costs at most the call
-   * that met it, as on 2026-07-28, where a restart isn't seen at all. A
-   * session that hadn't answered is a failed connect: behind a load balancer
-   * without sticky sessions every new session would meet the same 404. It
-   * counts as a failed attempt, is reported as one (`reconnect-failed`, so
-   * the framework's alert comes at the fifth), and follows `reconnect` with
-   * its backoff. The ended session isn't DELETEd: the server has dropped it.
+   * whatever `reconnect` says: 'close', with `willReconnect` true, then
+   * 'reconnect' once it's up. A server's restart then costs the calls in
+   * flight, and the server keeps its place and its tools. A session that
+   * hadn't answered is a failed connect: behind a load balancer without
+   * sticky sessions every new session would meet the same 404. It counts as
+   * a failed attempt, is reported as one (`reconnect-failed`, so the
+   * framework's alert comes at the fifth), and follows `reconnect` with its
+   * backoff. The ended session isn't DELETEd: the server has dropped it.
    */
   private sessionEnded(session: Session): void {
     // Only the live session's end changes anything: a connect still running
     // fails on its own, and a session already ended or superseded is gone.
     if (this.session !== session || !this.isCurrent(session.generation)) return;
     this.session = null;
+    // An HTTP session has no child to reap, so its close has no failure to keep.
     void ModernMcpConnection.closeSession(session);
     if (session.wire.answered) {
+      // This is where an answered session's count of failed connects resets:
+      // nothing reads it while the session lives.
       this.reconnectAttempts = 0;
+      this.restarting = true;
+      this.emit('close', { reason: 'the server ended the session; a new one is starting' });
       void this.restartSession();
       return;
     }
@@ -935,23 +1035,27 @@ export class ModernMcpConnection extends EventEmitter {
     this.scheduleReconnect();
   }
 
-  /** A new session at once, in place of one the server ended after it had
-   *  answered (see {@link sessionEnded}). Its failure is a failed reconnect's,
-   *  after which the connection is closed and follows `reconnect`. */
+  /**
+   * A new session at once, in place of one the server ended after it had
+   * answered (see {@link sessionEnded}). It is attempt 1 of a reconnect, and
+   * a failure is one's: with `reconnect` set, the connection backs off and
+   * tries again, or stops for good on a revision verdict, as
+   * attemptReconnect does. Without it, nothing more is tried, so the
+   * connection closes as a lost one does: 'close' with `willReconnect`
+   * false, which tells its owner the server is gone.
+   */
   private async restartSession(): Promise<void> {
-    this.restarting = true;
     try {
       await this.open();
     } catch (error) {
       this.restarting = false;
       if (this.closedByHost) return;
-      // A server that no longer shares a revision with this client stops
-      // the connection for good, as on any reconnect.
       const permanent = error instanceof McplProtocolVersionError;
+      const reconnecting = this.reconnectEnabled;
       if (permanent) this.reconnectEnabled = false;
       this.reconnectAttempts = 2; // The restart was attempt 1.
       this.emit('reconnect-failed', { error: (error as Error).message, attempt: 1, ...(permanent ? { permanent: true } : {}) });
-      this.emit('close', { reason: 'the server ended the session, and a new one could not start' });
+      if (!reconnecting) this.emit('close', { reason: 'the server ended the session, and a new one could not start' });
       this.scheduleReconnect();
       return;
     }
@@ -961,8 +1065,10 @@ export class ModernMcpConnection extends EventEmitter {
     this.emit('reconnect', { attempts: 1 });
   }
 
-  /** A session's stream opened again after it had been open. List changes
-   *  may have been announced while it was down, so the inventory is read
+  /** The standalone stream opened again, after it had been open, without
+   *  asking for what it missed (no `Last-Event-ID`: the server gave its
+   *  events no ids). List changes may have been announced while it was
+   *  down, so, for a server that announces them, the inventory is read
    *  again, as after a reopened 2026-07-28 subscription. */
   private streamReopened(session: Session): void {
     if (this.session !== session || !this.isCurrent(session.generation)) return;
@@ -1105,11 +1211,11 @@ export class ModernMcpConnection extends EventEmitter {
   /**
    * End a live HTTP session on the server (a DELETE), as the spec asks of a
    * client that no longer needs it, waiting at most DELETE_TIMEOUT_MS. It has
-   * to come before the transport closes, which would abort it. A session the
-   * server ended is no longer the live one (see sessionEnded), and the
-   * transport sends nothing for one without an id (2026-07-28, or a
-   * stateless server). A DELETE that fails is let go: the server expires
-   * the session on its own.
+   * to come before the transport closes, which would abort it. The
+   * transport sends nothing for a session without an id (2026-07-28, a
+   * stateless server, or a connect whose initialize hasn't been answered).
+   * A DELETE that fails is let go: the server expires the session on its
+   * own.
    */
   private static async endSession(session: Session): Promise<void> {
     if (!session.http) return;
@@ -1136,9 +1242,7 @@ export class ModernMcpConnection extends EventEmitter {
    * engine does. Calls queue behind the one in flight, so none resolves
    * while teardown is still pending. A call after a failed close re-checks
    * what wasn't reaped. 'close' is emitted once, when the teardown of a
-   * session the host closed while live completes, not on a failed close. A
-   * new session starting in place of one the server ended counts as live:
-   * no 'close' was emitted for the session it replaces.
+   * session the host closed while live completes, not on a failed close.
    */
   close(): Promise<void> {
     const previous = this.closing;
@@ -1155,20 +1259,22 @@ export class ModernMcpConnection extends EventEmitter {
     const opening = this.opening;
     const session = this.session;
     this.session = null;
-    if (session || this.restarting) this.closeIncomplete = true;
+    if (session) this.closeIncomplete = true;
     // Every generation this connection still owns: a connect in flight, the
     // live one, and any a failed cleanup couldn't reap.
+    // A connect adopts its session before it stops being the connect in
+    // flight, so the two can be one session.
     const targets: Session[] = [];
-    if (opening) targets.push(opening.session);
-    if (session) targets.push(session);
-    for (const held of this.unreaped) if (!targets.includes(held.session)) targets.push(held.session);
+    for (const target of [opening?.session, session, ...this.unreaped.map((held) => held.session)]) {
+      if (target && !targets.includes(target)) targets.push(target);
+    }
     this.unreaped = [];
     const failures: Error[] = [];
     for (const target of targets) {
-      // Only the live session is ended on the server: a connect's session
-      // isn't one yet, and a failed handshake has already closed its
-      // transport.
-      if (target === session) await ModernMcpConnection.endSession(target);
+      // A session the server holds by its id is ended there first, a
+      // connect's included once its initialize was answered. One the server
+      // ended is no longer among these (see sessionEnded).
+      await ModernMcpConnection.endSession(target);
       // Closing the transport ends a probe in flight too: its connect then
       // rejects and its own cleanup runs (sharing this verdict).
       const failure = await ModernMcpConnection.closeSession(target);
@@ -1216,17 +1322,15 @@ export class ModernMcpConnection extends EventEmitter {
    *   rounds cap). Nothing is in flight then, so nothing is cancelled. A
    *   result of a type this client doesn't recognize ends the call where it
    *   is;
-   * - the current leg's POST answered 404 by a server that had ended the
-   *   session (`sessionEnded`, read at the HTTP layer): `error-response` with
-   *   `data.httpStatus` 404. The server ran nothing, whatever error the call
-   *   then met as its session closed;
-   * - an HTTP 401/403 refusal of the current leg: `error-response`, the
-   *   status in `data.httpStatus` with `code` absent (the server answered at
-   *   the HTTP layer, outside the JSON-RPC code space). After an earlier leg
-   *   asked for another round it is `no-response` instead: the server may
-   *   already have acted on the call;
-   * - handed off and unanswered: `no-response`. At the deadline, cancellation
-   *   was requested and the outcome is unknown.
+   * - an HTTP refusal of the current leg: `error-response`, the status in
+   *   `data.httpStatus` with `code` absent (the server answered at the HTTP
+   *   layer, outside the JSON-RPC code space). That's a 401 or 403, or a 404
+   *   to a POST from a server that had ended the session (`sessionEnded`,
+   *   read at the HTTP layer, whatever error the call then met as its session
+   *   closed). After an earlier leg asked for another round it is
+   *   `no-response` instead: the server may already have acted on the call;
+   * - handed off and unanswered: `no-response`, and the outcome is unknown.
+   *   At the deadline, cancellation was requested.
    * A `tools/list` failure says so: listing changes nothing on the server, so
    * a retry is safe, where a tool call's retry may duplicate a side effect.
    */
@@ -1261,27 +1365,31 @@ export class ModernMcpConnection extends EventEmitter {
         'no-response',
       );
     }
-    if (record.sessionEnded) {
-      return new McplRequestError(
-        `${prefix} refused ${what}: HTTP 404. The server had ended this connection's session, so the request was not run.`,
-        'error-response',
-        undefined,
-        { httpStatus: 404 },
-      );
-    }
-    // An HTTP refusal of the credential: 401 or 403, however the SDK raised
-    // it. It raises a plain 403 under another code than its step-up limit's,
-    // and an insufficient_scope 403 as InsufficientScopeError when no OAuth
-    // provider is configured.
-    const refusedWith = error instanceof SdkHttpError && (error.status === 401 || error.status === 403)
-      ? error.status
-      : error instanceof InsufficientScopeError ? 403 : null;
+    // An HTTP refusal: the session's end, read at the HTTP layer, or the
+    // credential's, 401 or 403, however the SDK raised it. It raises a plain
+    // 403 under another code than its step-up limit's, and an
+    // insufficient_scope 403 as InsufficientScopeError when no OAuth provider
+    // is configured.
+    const refusedWith = record.sessionEnded
+      ? 404
+      : error instanceof SdkHttpError && (error.status === 401 || error.status === 403)
+        ? error.status
+        : error instanceof InsufficientScopeError ? 403 : null;
     if (refusedWith !== null) {
+      const why = refusedWith === 404 ? "the server had ended this connection's session" : message;
       if (record.continued) {
         return new McplRequestError(
           `${prefix} did not finish ${what}: it asked for another round (input_required), and the server refused a later one: ` +
-            `HTTP ${refusedWith} (${message}). The outcome is unknown: the server may already have acted on the call. ${advice}`,
+            `HTTP ${refusedWith} (${why}). The outcome is unknown: the server may already have acted on the call. ${advice}`,
           'no-response',
+        );
+      }
+      if (refusedWith === 404) {
+        return new McplRequestError(
+          `${prefix} refused ${what}: HTTP 404. The server had ended this connection's session, so the request was not run.`,
+          'error-response',
+          undefined,
+          { httpStatus: 404 },
         );
       }
       // The response body (the SDK's `text`) is the server's text and can
@@ -1298,6 +1406,9 @@ export class ModernMcpConnection extends EventEmitter {
         'no-response',
       );
     }
-    return new McplRequestError(`${prefix} ${what} failed: ${message}`, 'no-response');
+    const unknown = record.method === 'tools/list'
+      ? 'The list did not arrive.'
+      : 'The outcome is unknown: the server may already have acted on the call.';
+    return new McplRequestError(`${prefix} ${what} failed: ${/[.!?]$/.test(message) ? message : `${message}.`} ${unknown} ${advice}`, 'no-response');
   }
 }

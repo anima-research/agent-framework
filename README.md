@@ -325,29 +325,50 @@ connects at `2026-07-28` when the server offers it. A server that doesn't
 gets the 2025 `initialize` handshake, offering `2025-11-25`, `2025-06-18`
 and `2025-03-26`. `listMcplServers()` shows the revision it settles on as
 `protocolVersion`, and its `family` stays `modern`. On a 2025 revision:
-- List changes arrive on the session's standalone stream. While the session
-  lives, a stream that drops is reopened with the reconnect backoff, never
-  sooner than the server's own `retry` hint asks, and each reopen relists
-  the server's tools, since changes may have been missed meanwhile.
-- When the server ends the session, answering 404 to a request that carried
-  its id, the request that met the 404 fails as `error-response` with
-  `data.httpStatus` 404, and isn't replayed. A session that had answered a
-  request gets a new one at once, whatever `reconnect` says, and the
-  framework relists. One that ended before answering any is a failed
-  connect: it emits `reconnect-failed` and `close`, and follows `reconnect`
-  with a growing backoff, so a load balancer without sticky sessions shows
-  up as a failing server rather than a silent loop.
-- `close()`, and so `stop()` or a disconnect, ends a live session with a
-  `DELETE`, waiting at most 3 s for it.
+- List changes arrive on the session's standalone stream, which is kept
+  open while the session lives. Its first open is tried again after a 5xx,
+  408, 429 or network error; a 405, or a 404 to that first open, means the
+  server offers no stream. A stream that drops is reopened: the first try
+  waits the server's `retry` hint when it sent one, and the base interval
+  otherwise, and a try after a failed one waits the longer of the hint and
+  the doubling backoff. A reopen that carries `Last-Event-ID` has what it
+  missed replayed by the server; one that can't, because the server's events
+  had no ids, relists the tools of a server that announces list changes.
+- A request's stream that the server closes after a priming event is
+  resumed for as long as the request lives. Its cancellation at the
+  deadline stops the resume too.
+- The server ends the session by answering 404 to a request that carried
+  its id (except the stream's first open, whose 404 can also mean the
+  server has no GET route). A call whose POST met the 404 fails as
+  `error-response` with `data.httpStatus` 404, and isn't replayed. A call
+  whose stream the server's restart cut is `no-response`, since the server
+  may have run it. A session that had answered a request gets a new one at
+  once, whatever `reconnect` says: the connection emits `close` with
+  `willReconnect` true, then `reconnect`, and the framework keeps the server
+  and its tools and relists. If the new session can't start, `reconnect`
+  decides, as for any lost connection. A session that ended before
+  answering anything is a failed connect: it emits `reconnect-failed` and
+  `close`, and follows `reconnect` with a growing backoff, so a load
+  balancer without sticky sessions shows up as a failing server rather than
+  a silent loop.
+- `close()`, and so `stop()` or a disconnect, ends each session the server
+  holds by its id with a `DELETE`, a connect in flight included, waiting at
+  most 3 s for each.
 
 A server over HTTP that shares no revision with this client fails with
 `McplProtocolVersionError`, naming what each side speaks, and is not
 retried: a discovery or `-32022` error that lists no revision in common,
-with no `initialize` succeeding after it (`rejected`), or an `initialize`
-answered with a revision this client doesn't offer, or with none
-(`mismatch`). Its `offered` lists the revisions this client offered.
-`2024-11-05` isn't one of them over HTTP: its HTTP binding was HTTP+SSE,
-another transport.
+once the server has also refused the `initialize` tried after it
+(`rejected`), or an `initialize` answered with a revision the 2025
+handshake doesn't accept, or with none (`mismatch`). `2026-07-28` is
+negotiated through `server/discover` alone, so it isn't accepted from
+`initialize`. An `initialize` that fails without an answer, such as a
+timeout, is no verdict, and is retried as any failed connect is. The
+error's `offered` lists the revisions this client offered. `2024-11-05`
+isn't one of them over HTTP: its HTTP binding was HTTP+SSE, another
+transport. Over stdio, a discovery answer that lists revisions without
+`2026-07-28` is a verdict too, even one the SDK can't read as a
+DiscoverResult.
 
 Server and transport text the framework records has the server's configured credentials replaced, in both engines. That covers connection traces, console lines, stderr traces, ops alerts, and a tool call's failure as its caller, the model and the `tool:failed` trace get it. The credentials are those the configuration holds: from the url, credential-like path segments and query names, credential-shaped or credential-named query values, and a `ws://` url's userinfo, in their encoded and decoded forms, replaced wherever they occur; every non-empty query parameter as its whole `name=value`, where no letter or digit adjoins it; the static `token`, raw and url-encoded; and a stdio server's `env` values whose names have a part ending in a credential word, such as `GITHUB_TOKEN`, `PGPASSWORD` or `SESSION_COOKIE`, raw and url-encoded. A stdio server's command-line arguments aren't derived. Standalone strings shorter than eight characters stay unchanged because they may be ordinary words; short query values are still removed with their parameter names. Treat a submitted configuration as immutable while the server uses it: apply changes with `restartMcplServer(id, newConfig)`. The token an `accessProvider` fetches, and secrets the configuration doesn't hold, remain outside this filtering. JSON-RPC tool answers, and the error a host's own connect raises, pass through as sent.
 
