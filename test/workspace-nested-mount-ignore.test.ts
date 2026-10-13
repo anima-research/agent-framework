@@ -468,7 +468,9 @@ for (const op of ['write', 'edit', 'writeBinary', 'delete'] as const) {
     assert.equal(result.success, false, JSON.stringify(result));
     assert.match(String(result.error), /is inside mount "inner", which is nested in "outer"/);
     if (op === 'edit') {
-      assert.equal(storeHolds(workspace, 'outer', 'alias/x.txt'), true, 'the old copy is as it was');
+      const internals2 = workspace as unknown as { mounts: Map<string, { treeStateId: string }>; getStore(): { treeGet(id: string, rel: string): { blobHash: string } | null; getBlob(hash: string): Buffer | null } };
+      const kept = internals2.getStore().treeGet(internals2.mounts.get('outer')!.treeStateId, 'alias/x.txt');
+      assert.equal(kept && internals2.getStore().getBlob(kept.blobHash)?.toString(), 'old draft', 'the old copy is as it was');
     } else {
       assert.equal(storeHolds(workspace, 'outer', op === 'delete' ? 'alias/y.txt' : 'alias/x.txt'), false, "nothing reaches the outer mount's store");
     }
