@@ -1431,14 +1431,45 @@ test('a read-only mount can stop tracking an old nested copy, and refuses every 
   assert.equal(refused.success, false);
   assert.equal(refused.error, 'Mount "outer" is read-only');
   assert.equal(storeHolds(workspace, 'outer', 'top.txt'), true);
-  // A key it doesn't hold is refused as read-only at once, nested or not:
-  // a path in the nested mount, and an outer link into it.
+  // A key it doesn't hold is refused as read-only at once, nested or not (a
+  // path in the nested mount, and an outer link into it), reading no root.
   symlinkSync(join(outer, 'inner', 'x.txt'), join(outer, 'link'));
-  for (const path of ['outer/inner/x.txt', 'outer/inner/other.txt', 'outer/link']) {
-    const unheld = await call('delete', { path });
-    assert.equal(unheld.error, 'Mount "outer" is read-only', path);
-  }
+  const native = fs.realpathSync.native;
+  let reads = 0;
+  try {
+    fs.realpathSync.native = ((path: Parameters<typeof native>[0], options?: Parameters<typeof native>[1]) => {
+      reads++;
+      return native(path, options as never);
+    }) as typeof native;
+    for (const path of ['outer/inner/x.txt', 'outer/inner/other.txt', 'outer/link']) {
+      const unheld = await call('delete', { path });
+      assert.equal(unheld.error, 'Mount "outer" is read-only', path);
+    }
+  } finally { fs.realpathSync.native = native; }
+  assert.equal(reads, 0, 'the refusal reads no root from disk');
   assert.equal(readFileSync(join(outer, 'inner', 'x.txt'), 'utf8'), 'inner bytes');
+});
+
+test('a read or an edit of a tracked file the mount ignores checks it against disk first, as nothing else keeps it current', async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-pass2-ignored-read-');
+  const outer = join(root, 'outer');
+  mkdirSync(join(outer, 'node_modules'), { recursive: true });
+  writeFileSync(join(outer, 'node_modules', 'pkg.js'), 'v1');
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', ignore: ['node_modules'] },
+  ]);
+  const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
+  // Taken in by name, as the old watcher took such files in unasked.
+  assert.equal((await call('sync', { path: 'outer/node_modules/pkg.js' })).success, true);
+  assert.equal(storeHolds(workspace, 'outer', 'node_modules/pkg.js'), true);
+  writeFileSync(join(outer, 'node_modules', 'pkg.js'), 'v2');
+  // A sync without a path passes over it, so the workspace copy is still v1.
+  assert.equal((await call('sync', { mount: 'outer' })).success, true);
+  const read = await call('read', { path: 'outer/node_modules/pkg.js' });
+  assert.match(JSON.stringify(read.data), /\\tv2/, JSON.stringify(read));
+  writeFileSync(join(outer, 'node_modules', 'pkg.js'), 'v3');
+  const edited = await call('edit', { path: 'outer/node_modules/pkg.js', oldString: 'v3', newString: 'v4' });
+  assert.equal(edited.success, true, JSON.stringify(edited));
 });
 
 test("an untracked outer link into a nested mount is refused as leading into it, not as lying inside it", async (t) => {

@@ -1,14 +1,17 @@
 - Workspace tools check nested-mount boundaries before and inside each mount's turn, and disk operations check again before their effects. A mount's ignore patterns now apply to its watcher.
-  - The watcher handed the patterns to chokidar as strings, which chokidar
-    takes as exact paths, so on a watched mount (`watch` defaults to
-    `'always'`) every change under an ignored path, `node_modules` included,
-    was synced. The watcher now applies the walk's own rule: a path is passed
-    over when it or a directory above it matches. Chokidar also no longer
-    descends into ignored directories.
+  - A watched mount (`watch` defaults to `'always'`) now leaves changes
+    under its ignored paths, `node_modules` included, out of the workspace.
+    The watcher handed the patterns to chokidar as strings, which chokidar
+    takes as exact paths, so every such change was synced. The watcher now
+    applies the walk's own rule: a path is passed over when it or a
+    directory above it matches. Chokidar also no longer descends into
+    ignored directories.
   - Files the old watcher already took in from under an ignored path stay
     tracked, and the watcher and a sync without a path no longer update them.
     A sync that names such a path still takes disk's copy, and says the
-    mount ignores it. Each sync without a path lists them under `skipped`
+    mount ignores it. A `read` or `edit` of one checks it against disk first,
+    by its own path, so neither works from a copy disk has moved on from.
+    Each sync without a path lists them under `skipped`
     ("disk could not be checked: ignored by the mount"). It also lists, under
     `incomplete`, the ignored entry that hides them: the file itself for a
     pattern it matches, such as `app.log` under `*.log`, or the ignored

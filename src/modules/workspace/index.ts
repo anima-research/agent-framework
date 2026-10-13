@@ -1793,9 +1793,10 @@ export class WorkspaceModule implements Module {
     const relativePath = relative(root, resolved).split(sep).join('/');
 
     // What lies in a mount nested in this one is that mount's: its tools
-    // answer for it there (agent-framework #280).
-    const inner = this.nestedMountAt(mount, relativePath);
-    if (inner && opts.nested !== 'allow') {
+    // answer for it there (agent-framework #280). Delete classifies the path
+    // itself, in the mount's turn, so it reads no roots here.
+    const inner = opts.nested === 'allow' ? undefined : this.nestedMountAt(mount, relativePath);
+    if (inner) {
       const rest = relativePath.slice(inner.at.length + 1);
       throw new Error(
         `"${path}" is inside mount "${inner.name}", which is nested in "${mountName}" at ${inner.at}/: ` +
@@ -2235,12 +2236,14 @@ export class WorkspaceModule implements Module {
   /**
    * Before a read: a path the workspace doesn't hold is observed under the
    * three-way rule, which ingests a new disk file but never brings back a
-   * workspace deletion or a file absent from this branch. The caller holds
-   * the mount's turn.
+   * workspace deletion or a file absent from this branch. So is a path it
+   * holds that the mount ignores: neither the watcher nor a sync without a
+   * path keeps such a copy current, so it's checked by its own path, as a
+   * sync that names it would. The caller holds the mount's turn.
    */
   private async ensureSynced(mount: MountState, relativePath: string): Promise<PathReport | undefined> {
     const store = this.getStore();
-    if (store.treeGet(mount.treeStateId, relativePath)) return undefined;
+    if (store.treeGet(mount.treeStateId, relativePath) && !coveredByIgnore(relativePath, mount.config.ignore ?? [])) return undefined;
     const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
     return pass.reports.get(relativePath);
   }
