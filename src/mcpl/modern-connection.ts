@@ -179,16 +179,17 @@ class ObservedTransport implements Transport {
    *  a result or a JSON-RPC error, so the server knows this session. */
   answered = false;
   /**
-   * Each unanswered request's own abort, by id, over HTTP. Streamable HTTP
-   * stops a request's stream when the request's signal fires, and stops
-   * resuming it. The SDK gives a request such a signal only on 2026-07-28,
-   * where closing the stream is the cancellation. On a 2025 revision this
-   * boundary gives each request one, and fires it as the request's
-   * `notifications/cancelled` is sent, so a stream the server cut is resumed
-   * for as long as its request is, not for the session's whole life. An
-   * entry goes with its request's answer, its failed send or its
-   * cancellation. The handshake's `initialize`, which is never cancelled,
-   * keeps its entry until its connect ends with the wire.
+   * Each unanswered request's own abort, by id. Streamable HTTP stops a
+   * request's stream when the request's signal fires, and stops resuming it.
+   * The SDK gives a request such a signal only on 2026-07-28 over HTTP, where
+   * closing the stream is the cancellation. This boundary gives every other
+   * request one, and fires it as the request's `notifications/cancelled` is
+   * sent, so on a 2025 revision a stream the server cut is resumed for as
+   * long as its request is, not for the session's whole life. (The stdio
+   * transport has no such stream, and ignores it.) An entry goes with its
+   * request's answer, its failed send or its cancellation. The handshake's
+   * `initialize`, which is never cancelled, keeps its entry until its
+   * connect ends with the wire.
    */
   private readonly aborts = new Map<string | number, AbortController>();
 
@@ -267,7 +268,7 @@ class ObservedTransport implements Transport {
       };
     }
     let sendOptions = options;
-    if ('method' in message && 'id' in message && options?.requestSignal === undefined && this.inner.hasPerRequestStream === true) {
+    if ('method' in message && 'id' in message && options?.requestSignal === undefined) {
       const abort = new AbortController();
       this.aborts.set(message.id, abort);
       sendOptions = { ...options, requestSignal: abort.signal };
