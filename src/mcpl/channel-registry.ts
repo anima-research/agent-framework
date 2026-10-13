@@ -378,7 +378,10 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
   },
   {
     name: 'channel_close',
-    description: 'Close a channel to stop receiving messages',
+    description:
+      'Close a channel to stop receiving its ongoing traffic. Messages that address you still ' +
+      'reach you, and you can still speak there. It stays closed until you open it with ' +
+      'channel_open: speaking there never reopens it.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -501,19 +504,18 @@ interface ChannelRegistryOptions {
     textLen: number;
   }) => void;
   /**
-   * Called when channels were opened WITHOUT the agent asking (subscription
-   * policy admitting a newly discovered channel, or delivery into a closed
-   * locus). The host wires this to drop a durable notice into the agent's
-   * window — the agent must always learn that new traffic will start
-   * flowing, and that `channel_close` opts out (their decision outranks
-   * policy). Fires ONCE per channel ever: the desired-state decision is
-   * durable, so reboots do not re-announce. Must not trigger inference.
+   * Called when the subscription policy opened channels WITHOUT the agent
+   * asking (admitting newly discovered channels). The host wires this to drop
+   * a durable notice into the agent's window — the agent must always learn
+   * that new traffic will start flowing, and that `channel_close` opts out
+   * (their decision outranks policy). Fires ONCE per channel ever: the
+   * desired-state decision is durable, so reboots do not re-announce. Must
+   * not trigger inference. Speaking never opens a channel, so no send or
+   * delivery is reported here.
    */
   onChannelAutoOpened?: (info: {
-    /** Agent whose action caused the open (delivery); absent for policy opens. */
-    conversationId?: string;
     serverId: string;
-    source: 'subscription-policy' | 'opened-by-delivery';
+    source: 'subscription-policy';
     channels: Array<{ channelId: string; label?: string }>;
   }) => void;
   /**
@@ -581,9 +583,8 @@ export class ChannelRegistry {
     textLen: number;
   }) => void;
   private onChannelAutoOpened?: (info: {
-    conversationId?: string;
     serverId: string;
-    source: 'subscription-policy' | 'opened-by-delivery';
+    source: 'subscription-policy';
     channels: Array<{ channelId: string; label?: string }>;
   }) => void;
   private homeChannelResolver?: (agentName: string) => string | undefined;
@@ -2383,13 +2384,13 @@ export class ChannelRegistry {
   }
 
   /**
-   * The single open executor: record durable desired-open intent, tell the
-   * server to subscribe, mark the live entry open. Every path that opens a
-   * channel — the agent's channel_open tool, delivery into a closed locus,
-   * an explicit send into a closed channel — funnels here, so lifecycle
-   * events, desired state, and live state can never diverge by path.
-   * Desired state is recorded BEFORE the server round-trip: intent sticks
-   * even if the subscribe fails, and reconciliation retries later.
+   * The open executor behind the agent's channel_open tool: record durable
+   * desired-open intent, tell the server to subscribe, mark the live entry
+   * open. Speaking never opens a channel, so no send or delivery comes here:
+   * an agent's speech into a closed channel publishes and leaves the
+   * channel's lifecycle as the agent left it. Desired state is recorded
+   * BEFORE the server round-trip: intent sticks even if the subscribe fails,
+   * and reconciliation retries later.
    */
   private async openChannelNow(
     entry: ChannelEntry,
@@ -2597,21 +2598,17 @@ export class ChannelRegistry {
   }
 
   /**
-   * Open a channel because something was DELIVERED into it (explicit send
-   * tool or routed speech). Sending into a closed channel is not a thing:
-   * engaging a channel opens it, so typing indicators, reaction machinery,
-   * and inbound forwarding all come alive with the first outbound message.
-   * Accepts composite MCPL ids or raw server-internal ids (explicit send
-   * tools receive whatever the agent typed).
+   * The registered channel an explicit send tool delivered into, as its
+   * descriptor id, from the id the tool reported or was given: a composite
+   * MCPL id, or the raw server-internal id (`address.channelId`), since send
+   * tools receive whatever the agent typed. Undefined when no channel on
+   * `serverId` matches, or more than one does. A lookup only: speaking never
+   * opens a channel, so a send into a closed channel leaves it closed, with
+   * its desired state as the agent left it. Typing indicators and reactions
+   * don't depend on a channel being open; opening only subscribes to its
+   * ongoing traffic.
    */
-  async openIfClosedForSend(
-    rawChannelId: string,
-    serverId?: string,
-  ): Promise<{
-    status: 'opened' | 'already-open' | 'unknown-channel' | 'ambiguous' | 'open-failed';
-    channelId?: string;
-    label?: string;
-  }> {
+  resolveSendTarget(rawChannelId: string, serverId?: string): string | undefined {
     let matches = [...this.channels.values()].filter(
       (e) => e.descriptor.id === rawChannelId && (!serverId || e.serverId === serverId),
     );
@@ -2622,30 +2619,7 @@ export class ChannelRegistry {
           (!serverId || e.serverId === serverId),
       );
     }
-    if (matches.length === 0) return { status: 'unknown-channel' };
-    if (matches.length > 1) return { status: 'ambiguous' };
-    const entry = matches[0]!;
-    const resolved = { channelId: entry.descriptor.id, label: entry.descriptor.label };
-    if (entry.open && this.getDesiredState(entry.serverId, entry.descriptor.id) === 'open') {
-      return { status: 'already-open', ...resolved };
-    }
-    try {
-      await this.openChannelNow(entry, 'opened-by-reply');
-      this.emitTraceFn({
-        type: 'mcpl:channel-opened-by-send',
-        serverId: entry.serverId,
-        channelId: entry.descriptor.id,
-      });
-      return { status: 'opened', ...resolved };
-    } catch (err) {
-      this.emitTraceFn({
-        type: 'mcpl:channel-open-failed',
-        serverId: entry.serverId,
-        channelId: entry.descriptor.id,
-        error: (err as Error).message,
-      });
-      return { status: 'open-failed', ...resolved };
-    }
+    return matches.length === 1 ? matches[0]!.descriptor.id : undefined;
   }
 
   private async handleToolOpen(input: {
@@ -3100,38 +3074,11 @@ export class ChannelRegistry {
       return fail(channelId, `no registered channel for locus "${channelId}"`);
     }
 
-    // INVARIANT: it is not possible to send into a closed channel. Speech
-    // routed into a closed-but-registered locus (the canonical case: a DM
-    // that woke the agent — DMs register closed) OPENS the channel first,
-    // so typing indicators, reaction machinery, and inbound forwarding come
-    // alive with the reply. If the open fails, the speech does NOT go out:
-    // a half-alive delivery is worse than a loud marker.
-    if (!entry.open) {
-      try {
-        await this.openChannelNow(entry, 'opened-by-delivery');
-        console.error(
-          `[routeSpeech] ${conversationId}: locus ${logValue(channelId)} was closed — opened by delivery (speech implies engagement)`,
-        );
-        this.emitTraceFn({
-          type: 'mcpl:channel-opened-by-send',
-          serverId: entry.serverId,
-          channelId,
-        });
-        try {
-          this.onChannelAutoOpened?.({
-            conversationId,
-            serverId: entry.serverId,
-            source: 'opened-by-delivery',
-            channels: [{ channelId, label: entry.descriptor.label }],
-          });
-        } catch (err) {
-          console.error('onChannelAutoOpened (delivery) failed:', err);
-        }
-      } catch (err) {
-        return fail(channelId, `locus channel is closed and open failed: ${(err as Error).message}`);
-      }
-    }
-
+    // Speaking never opens a channel: speech into a closed but registered
+    // locus (a DM that woke the agent, since DMs register closed) publishes
+    // and leaves the channel's lifecycle as the agent left it. Publishing
+    // doesn't need an open channel, and neither do typing and reactions;
+    // opening only subscribes to ongoing traffic, which is channel_open's.
     const server = this.serverRegistry.getServer(entry.serverId);
     if (!server) {
       return fail(channelId, `server "${entry.serverId}" not found`);

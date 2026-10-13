@@ -235,9 +235,10 @@ function estimateAppendedRoundTokens(
 }
 
 /**
- * Explicit delivery tools whose successful use into a closed channel OPENS
- * it (send implies engagement — see openIfClosedForSend). Bare tool names,
- * matched after stripping the MCPL server prefix.
+ * Explicit delivery tools. A successful call records the channel it
+ * delivered into as engaged this turn (turnEngagedChannels) and opens
+ * nothing: speaking never opens a channel. Bare tool names, matched after
+ * stripping the MCPL server prefix.
  */
 const SEND_ENGAGEMENT_TOOLS = new Set([
   'send_message', 'reply_message', 'send_dm', 'send_file', 'send_files',
@@ -9462,6 +9463,14 @@ export class AgentFramework {
    * the surface tracks a missed-ambient tally (discord-mcpl sends
    * `missedMessages`/`missedCharacters` in push origin), the invitation shows
    * the count — the cost of staying out, as a number, at decision time.
+   *
+   * No invitation on a direct message (`chat:dm`): every message of a DM is
+   * addressed, so it reaches the agent open or closed, and there is nothing
+   * to miss or join. Speaking never opens a channel, so a DM the agent has
+   * answered stays closed, and without this every DM would carry the block.
+   * The tag describes the message, not the channel: a whisper tagged
+   * `chat:dm` inside a shared channel that is closed carries no invitation
+   * either, though its channel's other traffic stays out of reach.
    */
   private buildClosedChannelInvitation(opts: {
     serverId: string;
@@ -9478,6 +9487,7 @@ export class AgentFramework {
   }): { block: ContentBlock; metadataPatch: Record<string, unknown> } | null {
     if (!this.channelRegistry) return null;
     if (!opts.tags?.includes('chat:addressed')) return null;
+    if (opts.tags.includes('chat:dm')) return null;
     if (this.channelRegistry.isChannelOpen(opts.channelId)) return null;
     const descriptor = this.channelRegistry.getDescriptor(opts.channelId);
     const maxBackscroll = descriptor?.capabilities?.history?.maxMessages ?? 0;
@@ -10593,40 +10603,32 @@ export class AgentFramework {
   }
 
   /**
-   * Durable window notice for a channel the agent did not ask to open —
-   * subscription-policy admission, or an open forced by the agent's own
-   * delivery into a closed channel. The agent must always learn that new
+   * Durable window notice for channels the agent did not ask to open: the
+   * subscription policy admitted them. (Speaking never opens a channel, so
+   * nothing the agent says lands here.) The agent must always learn that new
    * traffic will start flowing, and that `channel_close` opts out (their
    * decision outranks policy). System message: never triggers inference,
    * never conversational, never locus-eligible.
    */
-  private recordChannelAutoOpenNotice(
-    agentName: string | undefined,
-    channels: Array<{ channelId: string; label?: string }>,
-    cause: 'subscription-policy' | 'opened-by-delivery' | 'opened-by-reply',
-  ): void {
+  private recordChannelAutoOpenNotice(channels: Array<{ channelId: string; label?: string }>): void {
     if (channels.length === 0) return;
     const shown = channels
       .map((c) => (c.label && c.label !== c.channelId ? `${c.label} (${c.channelId})` : c.channelId))
       .join(', ');
     const plural = channels.length > 1;
-    const causeText =
-      cause === 'subscription-policy'
-        ? 'your subscription policy just admitted ' + (plural ? 'them' : 'it')
-        : 'your own message into the closed channel engaged it';
     const text =
-      `[channels] Now open: ${shown} — ${causeText}. Ongoing traffic from ` +
-      (plural ? 'these channels' : 'this channel') +
-      ` will reach you. If you don't want ${plural ? 'one of them' : 'it'}, use channel_close — ` +
-      'your choice sticks; neither policy nor a later send will silently reopen it.';
+      `[channels] Now open: ${shown} — your subscription policy just admitted ${plural ? 'them' : 'it'}. ` +
+      `Ongoing traffic from ${plural ? 'these channels' : 'this channel'} will reach you. ` +
+      `If you don't want ${plural ? 'one of them' : 'it'}, use channel_close: a closed channel stays ` +
+      'closed until you open it with channel_open, and speaking there never reopens it.';
     try {
       // Through framework.addMessage for mid-turn safety (deferral +
-      // hear-while-acting injection) — a delivery-forced open happens inside
-      // a live turn, and a direct context-manager append there would store
-      // the notice out of order. Targets the primary agent; connectome-host
-      // runs trunk-only, so this is the delivering agent in practice.
+      // hear-while-acting injection): an admission can arrive inside a live
+      // turn (a channels/changed mid-stream), and a direct context-manager
+      // append there would store the notice out of order. Targets the
+      // primary agent.
       this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'channel-notice' });
-      console.error(`[channel] auto-open notice (${cause}) -> ${agentName ?? 'primary'}: ${shown}`);
+      console.error(`[channel] auto-open notice (subscription-policy): ${shown}`);
     } catch (err) {
       console.error('recordChannelAutoOpenNotice failed:', err);
     }
@@ -15743,12 +15745,10 @@ export class AgentFramework {
             console.error('onRouteFailure: failed to record send-failure marker:', err);
           }
         },
-        // A channel opened without the agent asking (policy admission or an
-        // open forced by delivery) must be announced in the window, with the
-        // opt-out named. Routed here so registry-driven opens and framework-
-        // driven opens produce the same durable notice.
-        onChannelAutoOpened: ({ conversationId, source, channels }) => {
-          this.recordChannelAutoOpenNotice(conversationId, channels, source);
+        // A channel the subscription policy opened without the agent asking
+        // must be announced in the window, with the opt-out named.
+        onChannelAutoOpened: ({ channels }) => {
+          this.recordChannelAutoOpenNotice(channels);
         },
       },
     );
@@ -17639,13 +17639,13 @@ export class AgentFramework {
           }
         }
 
-        // INVARIANT: engaging a channel opens it. A successful explicit send
-        // into a channel the registry knows as closed drives the same open
-        // flow as channel_open (durable desired state, server subscribe), so
-        // there is no such thing as posting into a channel that stays
-        // half-alive (no typing, no reactions, no inbound forwarding).
-        // Fire-and-forget: the send already succeeded; the open must not
-        // delay or fail the tool result.
+        // Turn-scoped engagement record (mid-turn re-pin, 2026-07-31 n=7): a
+        // human follow-up in a channel the agent explicitly sent into this
+        // turn counts as conversationally addressed. Injection metadata
+        // carries the CANONICAL channel id (descriptor form), while send args
+        // often carry the raw provider id, so the registry resolves it first.
+        // The send opens nothing: speaking never opens a channel, so a closed
+        // channel stays closed, with its desired state as the agent left it.
         if (
           this.channelRegistry &&
           SEND_ENGAGEMENT_TOOLS.has(toolName) &&
@@ -17654,43 +17654,14 @@ export class AgentFramework {
           const target =
             extractChannelIdFromToolResult(result.content) ??
             (typeof args.channelId === 'string' ? (args.channelId as string) : undefined);
-          if (target) {
-            this.channelRegistry
-              .openIfClosedForSend(target, serverId)
-              .then(({ status, channelId, label }) => {
-                // Turn-scoped engagement record (mid-turn re-pin, 2026-07-31
-                // n=7): a human follow-up in a channel the agent explicitly
-                // sent into this turn counts as conversationally addressed.
-                // Recorded here — not eagerly — because injection metadata
-                // carries the CANONICAL channel id (descriptor form), while
-                // send args often carry the raw provider id; this callback
-                // has the resolved form. The already-open path resolves on
-                // the microtask queue, i.e. before the tool-result event
-                // that evaluates injections.
-                if (status !== 'unknown-channel' && status !== 'ambiguous') {
-                  let engaged = this.turnEngagedChannels.get(agentName);
-                  if (!engaged) {
-                    engaged = new Set();
-                    this.turnEngagedChannels.set(agentName, engaged);
-                  }
-                  engaged.add(channelId ?? target);
-                }
-                if (status === 'opened') {
-                  console.error(
-                    `[channel] ${agentName}: explicit ${toolName} into closed channel ${target} — opened (send implies engagement)`,
-                  );
-                  this.recordChannelAutoOpenNotice(
-                    agentName,
-                    [{ channelId: channelId ?? target, label }],
-                    'opened-by-reply',
-                  );
-                } else if (status === 'open-failed') {
-                  console.error(
-                    `[channel] ${agentName}: ${toolName} delivered to ${target} but the open-on-send failed — channel remains half-alive, will reconcile`,
-                  );
-                }
-              })
-              .catch((err) => console.error('[channel] open-on-send error:', err));
+          const engagedChannel = target ? this.channelRegistry.resolveSendTarget(target, serverId) : undefined;
+          if (engagedChannel) {
+            let engaged = this.turnEngagedChannels.get(agentName);
+            if (!engaged) {
+              engaged = new Set();
+              this.turnEngagedChannels.set(agentName, engaged);
+            }
+            engaged.add(engagedChannel);
           }
         }
 

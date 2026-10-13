@@ -305,6 +305,41 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await fw3.stop();
   });
 
+  it('a direct message carries no invitation: all of a DM reaches the agent, open or closed', async () => {
+    // Speaking never opens a channel, so a DM the agent has answered stays closed. An invitation
+    // on each DM would repeat a block whose premise is false there: there is no other traffic
+    // to miss, and nothing to join.
+    const framework = await makeFramework();
+    const i = internals(framework);
+    i.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      getDescriptor: () => ({ label: 'DM: _reim0n', capabilities: { history: { maxMessages: 80 } } }),
+      proseTargetFor: () => '@_reim0n',
+      stopAll: () => {},
+    };
+    i.handleMcplPushEvent({
+      type: 'mcpl:push-event',
+      serverId: 'discord',
+      featureSet: 'discord.messaging',
+      eventId: 'discord_msg_m6',
+      content: [{ type: 'text', text: '_reim0n: you there?' }],
+      origin: { source: 'discord', messageId: 'm6', mcplChannelId: 'discord:dm:1555', isDM: true, authorName: '_reim0n' },
+      // As discord-mcpl tags a DM, after the host's core-tag closure.
+      tags: ['chat:dm', 'chat:addressed', 'chat:private'],
+      timestamp: new Date().toISOString(),
+      inferenceId: 'i6',
+      triggerInference: false,
+    });
+    const text = framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+      .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+      .map((block) => block.text)
+      .join('\n') ?? '';
+    assert.match(text, /you there\?/);
+    assert.doesNotMatch(text, /Channel invitation/);
+    await framework.stop();
+  });
+
   it('a channel-incoming trunk turn records its triggering channel', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'the date is ...' }]));
     const framework = await makeFramework();

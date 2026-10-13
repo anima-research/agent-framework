@@ -48,9 +48,10 @@ agent (then notices append without waking, breaking any loop).
   unprefixed prose bounces and prefixed prose is deliberate.
 - The entire "which event may move the agent's voice" question.
 
-Explicit send tools (`send_message` etc.) are unchanged. Channel lifecycle
-invariants (send-opens-channel, subscribed⇒open) are unchanged — a `>>` send
-into a closed channel opens it, with the usual `[channels]` notice.
+Explicit send tools (`send_message` etc.) are unchanged, and so is channel
+lifecycle: speaking never opens a channel in any mode, so a `>>` send into a
+closed channel publishes there and leaves it closed. Subscribed⇒open still
+holds.
 
 ## Teaching the grammar (teach-by-bounce)
 
