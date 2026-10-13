@@ -382,9 +382,10 @@ export interface McplServerConfig {
    * A modern server reached over HTTP at a 2025 revision can hold a session
    * for this client. When the server ends it (HTTP 404) after it has answered
    * a request, a new session starts at once whether or not this is set: the
-   * connection emits 'close' with `willReconnect` true, then 'reconnect'. If
-   * that new session can't start, this setting decides, as for any lost
-   * connection. A session that ends before it has answered counts as a
+   * connection emits 'close' while its `willReconnect` reads true, then
+   * 'reconnect'. If that new session can't start, this setting decides, as
+   * for any lost connection, and a revision verdict stops it for good, as on
+   * any reconnect. A session that ends before it has answered counts as a
    * failed connect, and follows this setting.
    */
   reconnect?: boolean;

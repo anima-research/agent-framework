@@ -322,18 +322,21 @@ or reach it over http(s).
 Over HTTP the revision is negotiated at each connect, so the connection
 follows a server's upgrades. The client asks `server/discover` first and
 connects at `2026-07-28` when the server offers it. A server that doesn't
-gets the 2025 `initialize` handshake, offering `2025-11-25`, `2025-06-18`
-and `2025-03-26`. `listMcplServers()` shows the revision it settles on as
-`protocolVersion`, and its `family` stays `modern`. On a 2025 revision:
+gets the 2025 `initialize` handshake, which asks for `2025-11-25` and
+accepts `2025-11-25`, `2025-06-18` or `2025-03-26` in the answer.
+`listMcplServers()` shows the revision it settles on as `protocolVersion`,
+and its `family` stays `modern`. On a 2025 revision:
 - List changes arrive on the session's standalone stream, which is kept
-  open while the session lives. Its first open is tried again after a 5xx,
-  408, 429 or network error; a 405, or a 404 to that first open, means the
-  server offers no stream. A stream that drops is reopened: the first try
-  waits the server's `retry` hint when it sent one, and the base interval
-  otherwise, and a try after a failed one waits the longer of the hint and
-  the doubling backoff. A reopen that carries `Last-Event-ID` has what it
-  missed replayed by the server; one that can't, because the server's events
-  had no ids, relists the tools of a server that announces list changes.
+  open while the session lives. Its first open is tried again after a 408,
+  429, 500, 502, 503, 504 or network error, each reported as the
+  connection's `error`; any other refusal of it means the server offers no
+  stream. A stream that drops is reopened: the first try waits the server's
+  `retry` hint when it sent one, and the base interval otherwise, and a try
+  after a failed one waits the longer of the hint and the doubling backoff.
+  A reopen that carries `Last-Event-ID` has what it missed replayed by the
+  server. One that can't, because the server's events had no ids or the
+  server refused the id with 400, opens without it and relists the tools of
+  a server that announces list changes.
 - A request's stream that the server closes after a priming event is
   resumed for as long as the request lives. Its cancellation at the
   deadline stops the resume too.
@@ -343,10 +346,11 @@ and `2025-03-26`. `listMcplServers()` shows the revision it settles on as
   `error-response` with `data.httpStatus` 404, and isn't replayed. A call
   whose stream the server's restart cut is `no-response`, since the server
   may have run it. A session that had answered a request gets a new one at
-  once, whatever `reconnect` says: the connection emits `close` with
-  `willReconnect` true, then `reconnect`, and the framework keeps the server
-  and its tools and relists. If the new session can't start, `reconnect`
-  decides, as for any lost connection. A session that ended before
+  once, whatever `reconnect` says: the connection emits `close` while its
+  `willReconnect` reads true, then `reconnect`, and the framework keeps the
+  server and its tools and relists. If the new session can't start,
+  `reconnect` decides, as for any lost connection, and a revision verdict
+  stops it for good, as on any reconnect. A session that ended before
   answering anything is a failed connect: it emits `reconnect-failed` and
   `close`, and follows `reconnect` with a growing backoff, so a load
   balancer without sticky sessions shows up as a failing server rather than
@@ -357,10 +361,12 @@ and `2025-03-26`. `listMcplServers()` shows the revision it settles on as
 
 A server over HTTP that shares no revision with this client fails with
 `McplProtocolVersionError`, naming what each side speaks, and is not
-retried: a discovery or `-32022` error that lists no revision in common,
-once the server has also refused the `initialize` tried after it
-(`rejected`), or an `initialize` answered with a revision the 2025
-handshake doesn't accept, or with none (`mismatch`). `2026-07-28` is
+retried: the SDK's refusal of `2026-07-28` after a discovery or `-32022`
+error, when it tries no `initialize` (which it doesn't once the list names a
+revision newer than `2026-07-28`); a discovery or `-32022` error that lists
+no revision in common, once the server has also refused the `initialize`
+tried after it (`rejected`); or an `initialize` answered with a revision
+the 2025 handshake doesn't accept, or with none (`mismatch`). `2026-07-28` is
 negotiated through `server/discover` alone, so it isn't accepted from
 `initialize`. An `initialize` that fails without an answer, such as a
 timeout, is no verdict, and is retried as any failed connect is. The

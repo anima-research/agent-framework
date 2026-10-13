@@ -369,18 +369,35 @@ test('the standalone stream keeps trying while its session lives, past the trans
   assert.ok(connection.isConnected);
 });
 
-test('the standalone stream\'s first open is tried again after a failure that may pass, and then carries list changes', async (t) => {
+test('the standalone stream\'s first open is tried again after a failure that may pass, each one reported, and then carries list changes', async (t) => {
   t.mock.method(Math, 'random', () => 0.5); // no jitter
   const fixture = await start2025({ versions: ['2025-06-18'] });
   // The SDK makes this open once; the connection tries it again.
   fixture.getAnswers.push(503, 429);
-  const connection = await connect(fixture, { reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+  const connection = ModernMcpConnection.create({ id: 'remote', url: fixture.url, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+  const errors: string[] = [];
+  connection.on('error', (error: Error) => errors.push(error.message));
+  cleanups.push(() => connection.close());
+  await connection.start();
   await until(() => count(fixture, (s) => s.method === 'GET' && s.status === 200) === 1, 'the stream open after two failures');
   assert.deepEqual(fixture.seen.filter((s) => s.method === 'GET').map((s) => s.status), [503, 429, 200]);
+  assert.deepEqual(errors, [
+    'MCP server "remote" did not open its list-change stream (HTTP 503); trying again',
+    'MCP server "remote" did not open its list-change stream (HTTP 429); trying again',
+  ]);
   let changes = 0;
   connection.on('tools-list-changed', () => changes++);
   await connection.callTool('add_tool', {});
   await until(() => changes === 1, 'the list change on the stream that opened');
+});
+
+test('a first open refused in a way that won\'t pass (501) isn\'t tried again', async () => {
+  const fixture = await start2025({ versions: ['2025-06-18'], get: 501 });
+  const connection = await connect(fixture, { reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+  await connection.listTools();
+  await sleep(150);
+  assert.equal(count(fixture, (s) => s.method === 'GET'), 1);
+  assert.ok(connection.isConnected);
 });
 
 test('a standalone stream resumed with Last-Event-ID has what it missed replayed, and relists nothing', async () => {
@@ -401,6 +418,26 @@ test('a standalone stream resumed with Last-Event-ID has what it missed replayed
   assert.equal(changes, 2, 'the resume relisted nothing');
 });
 
+test('a standalone resume refused with 400 opens again without its event id, and relists what it missed', async () => {
+  const fixture = await start2025({ versions: ['2025-11-25'], resumable: {} });
+  const connection = await connect(fixture, { reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+  await until(() => count(fixture, (s) => s.method === 'GET' && s.status === 200) === 1, 'the stream open');
+  let changes = 0;
+  connection.on('tools-list-changed', () => changes++);
+  // An event with an id, so the stream's return asks for what came after it.
+  await connection.callTool('add_tool', {});
+  await until(() => changes === 1, 'the first list change');
+  // The server no longer holds that id.
+  fixture.resumeAnswers.push(400);
+  fixture.sessions.get(sessionOf(connection)!)!.closeStandaloneSSEStream();
+  await until(() => changes === 2, 'the relist after the stream came back without replay');
+  const gets = fixture.seen.filter((s) => s.method === 'GET').map((s) => [s.resumed, s.status]);
+  assert.deepEqual(gets, [[false, 200], [true, 400], [false, 200]]);
+  // The stream that came back carries what the server announces next.
+  await connection.callTool('add_tool', {});
+  await until(() => changes === 3, 'a list change on the stream that came back');
+});
+
 test('the server\'s retry hint paces the stream\'s return, end to end', async () => {
   const fixture = await start2025({ versions: ['2025-11-25'], resumable: { retryMs: 300 } });
   // The base interval is a minute: only the hint brings the stream back within the test.
@@ -419,19 +456,35 @@ test('a cut request stream is resumed for as long as its request lives, and not 
   const fixture = await start2025({ versions: ['2025-11-25'], resumable: {} });
   const connection = await connect(fixture, { requestTimeoutMs: 400, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
   await connection.listTools();
-  // Every resume fails, as from a server whose event store lost the stream.
-  fixture.resumeAnswers.push(...Array<number>(1000).fill(503));
+  // Every resume fails, as from a server whose event store lost the stream:
+  // a 400 for the id, then outages.
+  fixture.resumeAnswers.push(400, ...Array<number>(1000).fill(503));
   const calling = connection.callTool('slow', { ms: 5000 });
   await until(() => fixture.events.includes('slow-start'), 'the call running');
   const callId = fixture.seen.find((s) => s.rpc === 'tools/call')!.id;
   fixture.sessions.get(sessionOf(connection)!)!.closeSSEStream(callId as never);
-  await assert.rejects(calling, (err: unknown) => err instanceof McplRequestError && err.outcome === 'no-response');
+  await assert.rejects(calling, (err: unknown) => {
+    assert.ok(err instanceof McplRequestError, String(err));
+    assert.equal(err.outcome, 'no-response');
+    assert.match(err.message, /Cancellation was requested; the outcome is unknown/);
+    return true;
+  });
   const resumes = () => count(fixture, (s) => s.method === 'GET' && s.resumed);
-  assert.ok(resumes() > 0, 'the stream was resumed while the call lived');
-  await sleep(50); // a resume already under way lands
-  const after = resumes();
+  assert.ok(resumes() > 1, 'the stream was resumed, past the 400, while the call lived');
+  // A resume already under way may still land; then the count holds for
+  // longer than the 20-40 ms between tries.
+  let settled = resumes();
+  for (const deadline = Date.now() + 2000; ;) {
+    await sleep(100);
+    const now = resumes();
+    if (now === settled) break;
+    settled = now;
+    assert.ok(Date.now() < deadline, `the resumes still going: ${now}`);
+  }
   await sleep(300);
-  assert.equal(resumes(), after, 'no resume after the call ended');
+  assert.equal(resumes(), settled, 'no resume after the call ended');
+  // A request's resume isn't the standalone stream: nothing opened beside it.
+  assert.equal(count(fixture, (s) => s.method === 'GET' && !s.resumed), 1);
   assert.equal(count(fixture, (s) => s.rpc === 'notifications/cancelled'), 1);
   assert.ok(connection.isConnected);
 });
@@ -483,7 +536,7 @@ test('a session the server ended under a call: the call is refused with 404, and
   assert.equal(count(fixture, (s) => s.rpc === 'tools/call' && s.status === 404), 1, 'the refused call was not replayed');
 });
 
-test('close() while the new session starts reports the connection closed, once, and nothing reconnects', async () => {
+test('close() while the new session starts stops it: nothing reconnects, and no second close', async () => {
   const fixture = await start2025({ versions: ['2025-11-25'] });
   const connection = await connect(fixture);
   await connection.listTools();
@@ -625,6 +678,35 @@ for (const reconnect of [true, false]) {
   });
 }
 
+test('a restart that meets a revision verdict, with reconnect set, stops for good as any reconnect does: alerted, and still registered', async () => {
+  let downgraded = false;
+  const fixture = await start2025({
+    versions: ['2025-06-18'],
+    answer: (message, res) => {
+      if (message.method !== 'initialize' || !downgraded) return false;
+      // The restarted server speaks only legacy MCP now.
+      json(res, 200, { jsonrpc: '2.0', id: message.id, result: { protocolVersion: '2024-11-05', capabilities: {}, serverInfo: { name: 'downgraded', version: '1' } } });
+      return true;
+    },
+  });
+  const connection = await connect(fixture, { reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+  await connection.listTools();
+  const events: string[] = [];
+  connection.on('close', () => events.push(`close willReconnect=${connection.willReconnect}`));
+  connection.on('reconnect-failed', (f: { attempt: number; permanent?: boolean }) => events.push(`reconnect-failed ${f.attempt}${f.permanent ? ' permanent' : ''}`));
+  connection.on('reconnect', () => events.push('reconnect'));
+  downgraded = true;
+  await fixture.forget(false);
+  await connection.callTool('echo', {}).catch(() => {});
+  await until(() => events.length === 2, 'the verdict');
+  await sleep(150);
+  // As attemptReconnect does after a verdict: no further try, and no 'close'
+  // saying the server is gone, since a reconnecting server stays registered.
+  assert.deepEqual(events, ['close willReconnect=true', 'reconnect-failed 1 permanent']);
+  assert.equal(connection.willReconnect, false);
+  assert.equal(initializes(fixture).length, 2, 'nothing tried after the verdict');
+});
+
 test('behind a load balancer without sticky sessions, each new session ends unanswered, and the backoff grows', async (t) => {
   t.mock.method(Math, 'random', () => 0.5); // no jitter: each wait is its nominal backoff
   // Every request after the handshake reaches a node that doesn't hold the session.
@@ -649,6 +731,22 @@ test('behind a load balancer without sticky sessions, each new session ends unan
   // Lower bounds only: each wait is at least its backoff, 20 ms doubling.
   assert.ok(third! - second! >= 75, `the third session waited ${third! - second!} ms`);
   assert.ok(fourth! - third! >= 155, `the fourth session waited ${fourth! - third!} ms`);
+});
+
+test('a request whose POST fails keeps nothing for the session\'s life', async () => {
+  const fixture = await start2025({
+    versions: ['2025-06-18'],
+    answer: (message, res) => {
+      if (message.method !== 'tools/call') return false;
+      res.writeHead(500).end();
+      return true;
+    },
+  });
+  const connection = await connect(fixture);
+  await connection.listTools();
+  await assert.rejects(connection.callTool('echo', {}));
+  assert.ok(connection.isConnected);
+  assert.equal(heldAborts(connection), 0);
 });
 
 test('a deadline on a 2025 call: cancellation is POSTed, and the server sees the abort', async () => {
@@ -767,7 +865,22 @@ test('a discovery refusal that lists no revision in common is a verdict, naming 
   assert.equal(verdict.kind, 'rejected');
   assert.deepEqual(verdict.supported, ['2099-01-01']);
   assert.equal(verdict.code, -32022);
-  assert.match(verdict.message, /^MCP server "remote" does not support MCP 2026-07-28, 2025-11-25, 2025-06-18 or 2025-03-26 \(it supports: 2099-01-01\)\.$/);
+  // The SDK refused the revision it asked for, and tried nothing else.
+  assert.match(verdict.message, /^MCP server "remote" does not support MCP 2026-07-28 \(it supports: 2099-01-01\)\.$/);
+  assert.equal(initializes(fixture).length, 0);
+});
+
+test('a discovery refusal naming a newer revision ends negotiation though it also lists a 2025 one, and says so', async () => {
+  const fixture = await start2025({
+    answer: (message, res) => {
+      if (message.method !== 'server/discover') return false;
+      json(res, 200, { jsonrpc: '2.0', id: message.id, error: { code: -32022, message: 'Unsupported protocol version', data: { supported: ['2099-01-01', '2025-06-18'], requested: '2026-07-28' } } });
+      return true;
+    },
+  });
+  const verdict = await refused(fixture);
+  assert.equal(verdict.kind, 'rejected');
+  assert.match(verdict.message, /does not support MCP 2026-07-28 \(it supports: 2099-01-01, 2025-06-18\)\. It lists 2025-06-18, which this client also speaks, but the SDK doesn't fall back to initialize after a refusal that names a newer revision\.$/);
   assert.equal(initializes(fixture).length, 0);
 });
 

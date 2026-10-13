@@ -484,6 +484,15 @@ test('failures are classified in order: nothing sent first, then the answers, th
   assert.equal(outcome(endedLater), 'no-response');
   assert.match(endedLater.message, /refused a later one: HTTP 404 \(the server had ended this connection's session\)\. The outcome is unknown/);
 
+  // Handed off and unanswered, with no deadline: the outcome is unknown, and
+  // the advice is the method's. A reason gets its full stop once.
+  const cut = classify({}, new Error('Connection closed'));
+  assert.equal(outcome(cut), 'no-response');
+  assert.match(cut.message, /tools\/call "op" failed: Connection closed\. The outcome is unknown: the server may already have acted on the call\. Verify state before retrying/);
+  const cutList = classify({}, new Error('socket hang up.'), 'tools/list');
+  assert.equal(outcome(cutList), 'no-response');
+  assert.match(cutList.message, /tools\/list failed: socket hang up\. The list did not arrive\. Listing changes nothing on the server, so it is safe to retry\.$/);
+
   const listing = classify({}, new SdkError(SdkErrorCode.RequestTimeout, 'Request timed out'), 'tools/list');
   assert.equal(outcome(listing), 'no-response');
   assert.match(listing.message, /did not answer tools\/list within 1000ms\. Cancellation was requested; the list did not arrive in time\. Listing changes nothing on the server, so it is safe to retry\./);
