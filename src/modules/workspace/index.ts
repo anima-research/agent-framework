@@ -1433,7 +1433,8 @@ export class WorkspaceModule implements Module {
           + 'directory replaced on purpose, or a drive back under a new device number, never for one still '
           + 'unplugged, whose empty mountpoint would become the root. What the scan passed over by design and '
           + 'reported nowhere else is counted under `passedOver`, by mount and reason: entries the mount\'s '
-          + 'ignore list covers that hold nothing the workspace tracks (an ignored directory counts once). So a '
+          + 'ignore list covers, and nested mounts\' directories, that hold nothing the workspace tracks (a '
+          + 'directory counts once). So a '
           + 'total of 0, with no conflicts and nothing under `passedOver`, `incomplete` or `skipped`, means the '
           + 'sync looked everywhere and nothing had changed. A path the mount ignores is synced when you name '
           + 'it, and listed under `ignored`: a sync without a path passes over it. Naming an ignored directory '
@@ -2568,34 +2569,46 @@ export class WorkspaceModule implements Module {
       '". The file or link on disk, if any, was left untouched.';
   }
 
-  /** This decision uses only the outer store and the classified path.
-   * A different case is a hint, not authority to remove a different key. */
+  /** Whether the outer store holds anything at this exact key: a tree copy,
+   * a branch intent or disk agreement, each of which untrackPath removes. */
+  private holdsKey(mount: MountState, path: string): boolean {
+    return this.getStore().treeGet(mount.treeStateId, path) !== null
+      || this.intents.get(mount.config.name)!.get(path) !== null
+      || this.agreementOrThrow().get(mount.config.name, path) !== undefined;
+  }
+
+  /** The keys this may remove come from the outer store and the classified
+   * path alone; nothing inside the nested mount is read. A different case is
+   * only a hint, never authority to remove a different key. */
   private deleteNestedCopy(
     mount: MountState, relativePath: string, inputPath: string, inner: NestedDeletion, snapshot: NestedSnapshot,
   ): ToolResult {
-    const store = this.getStore();
-    const intents = this.intents.get(mount.config.name)!;
     // The key as given, else the one disk names for the entry, which
     // nestedByDisk derives only by exact containment, never by folding case.
     const keys = inner.derivedKey !== undefined && inner.derivedKey !== relativePath ? [relativePath, inner.derivedKey] : [relativePath];
-    const storedPath = keys.find((path) => store.treeGet(mount.treeStateId, path) ||
-      intents.get(path) || this.agreementOrThrow().get(mount.config.name, path));
+    const storedPath = keys.find((path) => this.holdsKey(mount, path));
     if (storedPath !== undefined) {
       this.untrackPath(mount, storedPath);
       return { success: true, data: { path: inputPath, deleted: true, note: this.untrackNote(mount, storedPath) } };
     }
 
     if (process.platform === 'darwin' || process.platform === 'win32') {
-      // A copy stored under another case of this path is named only where a
-      // delete by its own name would stop tracking it too. Where that name
-      // reaches a different directory (a case-sensitive volume), the copy is
-      // the outer mount's own, and naming it would steer its deletion.
+      // A key held under another case of this path (for a link, its own path;
+      // for an entry, also its place in the nested mount) is named only where
+      // a delete by that key would stop tracking it too, which classifying it
+      // tells, reading disk as a delete would. Where that name reaches a
+      // different directory of the outer mount's own, naming it would steer
+      // the caller to delete an ordinary file.
       const wanted = new Set([relativePath, inner.kind === 'link' ? relativePath : inner.at + (inner.rest ? '/' + inner.rest : '')]
         .map((path) => path.toLowerCase()));
-      const hint = store.treeList(mount.treeStateId).find((entry) =>
-        wanted.has(entry.path.toLowerCase()) && this.nestedDeletion(mount, entry.path, snapshot) !== null);
-      if (hint) return { success: false, isError: true,
-        error: 'Tracked spelling: "' + mount.config.name + '/' + hint.path + '"; use that exact path to stop tracking this copy.' };
+      const held = new Set([
+        ...this.getStore().treeList(mount.treeStateId).map((entry) => entry.path),
+        ...this.intents.get(mount.config.name)!.list().map(([path]) => path),
+        ...this.agreementOrThrow().paths(mount.config.name).map(([path]) => path),
+      ]);
+      const hint = [...held].find((path) => wanted.has(path.toLowerCase()) && this.nestedDeletion(mount, path, snapshot) !== null);
+      if (hint !== undefined) return { success: false, isError: true,
+        error: 'Tracked spelling: "' + mount.config.name + '/' + hint + '"; use that exact path to stop tracking this copy.' };
     }
     // A link is the outer mount's own entry; what lies in the nested mount is its target.
     return { success: false, isError: true,
@@ -2606,18 +2619,20 @@ export class WorkspaceModule implements Module {
 
   private async handleDelete(input: DeleteInput): Promise<ToolResult> {
     const { mount, relativePath } = this.parsePath(input.path, { nested: 'allow' });
+    // A read-only mount takes one delete: stopping tracking an old copy it
+    // holds at a nested path, by its exact key, which writes nothing to disk.
+    // A key it doesn't hold is refused at once, as every delete there was,
+    // without waiting for the mount's turn or reading disk.
+    const readOnly = (): ToolResult => ({ success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true });
+    if (mount.config.mode === 'read-only' && !this.holdsKey(mount, relativePath)) return readOnly();
     const store = this.getStore();
     return this.withMount(mount, async (): Promise<ToolResult> => {
       // Decide from the copy already held. Observing first could import a
       // nested alias merely to forget it and announce that transient copy.
-      // Stopping tracking writes nothing to disk, so a read-only mount can drop
-      // an old nested copy too; it refuses every other delete.
       const before = this.nestedSnapshot(mount);
       const beforeRead = this.nestedDeletion(mount, relativePath, before);
       if (beforeRead) return this.deleteNestedCopy(mount, relativePath, input.path, beforeRead, before);
-      if (mount.config.mode === 'read-only') {
-        return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
-      }
+      if (mount.config.mode === 'read-only') return readOnly();
       const report = await this.ensureSynced(mount, relativePath);
       await this.settleBeforeMutation(mount, relativePath);
       // Decided after the last await, beside the store change: the path may

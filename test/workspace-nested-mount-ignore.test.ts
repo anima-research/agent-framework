@@ -253,6 +253,14 @@ test('nesting by the platform rules: separators, `..`, and another Windows drive
   assert.equal(at('C:\\w\\outer', 'C:\\w\\outer'), '', 'the root itself: inside, but nothing nests there');
   assert.equal(at('C:\\w\\outer', 'C:\\w\\outer\\..cache'), '..cache');
   assert.equal(nestedSuffix({ real: '/w/outer' }, { real: '/w/outer/..cache/x' }), '..cache/x');
+  // Windows' default: case is ignored only where a component isn't made yet
+  // (`missingFrom` counts components after the drive root).
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+    assert.equal(nestedSuffix({ real: 'C:\\w\\Inner', missingFrom: 1 }, { real: 'C:\\w\\inner\\x' }, win32), 'x');
+    assert.equal(nestedSuffix({ real: 'C:\\w\\Inner' }, { real: 'C:\\w\\inner\\x' }, win32), null, 'both made: compared exactly');
+  } finally { Object.defineProperty(process, 'platform', platform); }
 });
 
 test('a nested mount configured through a symlink, or an outer one, is still nested', async (t) => {
@@ -1366,6 +1374,22 @@ test('a tracked spelling whose nested directory differs in case is named, where 
   } finally { Object.defineProperty(process, 'platform', platform); }
 });
 
+test('a tracked spelling held only as a pending deletion is named too, as the delete it names would find it', async (t) => {
+  const r = await secondPassRig(t);
+  const hash = r.store.storeBlob(Buffer.from('old copy'), 'text/plain');
+  r.state.intents.get('outer')!.put('Inner/a.txt', { tombstone: { hash } });
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    const result = await r.call('delete', { path: 'outer/inner/a.txt' });
+    assert.equal(result.success, false);
+    assert.match(String(result.error), /^Tracked spelling: "outer\/Inner\/a\.txt"; use that exact path/);
+    const exact = await r.call('delete', { path: 'outer/Inner/a.txt' });
+    assert.equal(exact.success, true, JSON.stringify(exact));
+    assert.equal(r.state.intents.get('outer')!.get('Inner/a.txt'), null);
+  } finally { Object.defineProperty(process, 'platform', platform); }
+});
+
 test("a case variant that is the outer mount's own directory is never named as a nested copy's spelling", async (t) => {
   const r = await secondPassRig(t);
   if (existsSync(join(r.outer, 'Inner'))) { t.skip('requires distinct case spellings for this control'); return; }
@@ -1407,6 +1431,14 @@ test('a read-only mount can stop tracking an old nested copy, and refuses every 
   assert.equal(refused.success, false);
   assert.equal(refused.error, 'Mount "outer" is read-only');
   assert.equal(storeHolds(workspace, 'outer', 'top.txt'), true);
+  // A key it doesn't hold is refused as read-only at once, nested or not:
+  // a path in the nested mount, and an outer link into it.
+  symlinkSync(join(outer, 'inner', 'x.txt'), join(outer, 'link'));
+  for (const path of ['outer/inner/x.txt', 'outer/inner/other.txt', 'outer/link']) {
+    const unheld = await call('delete', { path });
+    assert.equal(unheld.error, 'Mount "outer" is read-only', path);
+  }
+  assert.equal(readFileSync(join(outer, 'inner', 'x.txt'), 'utf8'), 'inner bytes');
 });
 
 test("an untracked outer link into a nested mount is refused as leading into it, not as lying inside it", async (t) => {

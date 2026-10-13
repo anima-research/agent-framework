@@ -129,9 +129,11 @@ export function pathComponents(p: string, path: PathApi = PLATFORM_PATH): string
 
 /** Mount-relative suffix, preserving candidate spelling: '' for the root
  * itself, null when the candidate isn't inside it (outside it, or on another
- * Windows drive). Known components compare exactly. On darwin/win32, a
- * comparison involving an unmade component uses the platform's default case
- * folding. */
+ * Windows drive). It compares spellings, so both must be resolved
+ * (resolveWorkspacePath, realpath): an unresolved link or case variant of the
+ * same directory doesn't nest. Known components compare exactly. On
+ * darwin/win32, a comparison involving an unmade component uses the
+ * platform's default case folding, whatever the volume's own setting. */
 export function nestedSuffix(root: ResolvedPath, candidate: ResolvedPath, path: PathApi = PLATFORM_PATH): string | null {
   if (path.relative(path.parse(root.real).root, path.parse(candidate.real).root) !== '') return null;
   const a = pathComponents(root.real, path);

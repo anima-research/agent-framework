@@ -41,7 +41,8 @@
     directory is refused like any path in a nested mount.
   - Nesting is read from the mounts' canonical roots. A mount configured
     through a symlink, or spelled in another case on a case-insensitive
-    filesystem, is still nested, and the rule is spelled as disk spells it.
+    filesystem, is still nested, and the rule is spelled as disk spells the
+    root, or as configured for a root not made yet.
     An inner mount in a directory whose name starts with `..` (such as
     `..cache`) is now recognized as nested.
     A root that doesn't exist yet is its configured path, resolved as
@@ -64,7 +65,7 @@
     path. Before, a named sync took the inner mount's files into the outer
     one. `write`, `edit`, `writeBinary` and `delete` also read where the
     path leads on disk at their checks, so existing case variants and links inside the mount, dangling or not, are checked too. A link changed after the store check can leave an outer draft at a now-nested path; materialize refuses the later disk write.
-    - `delete` can stop tracking an old outer copy at a nested path, on a read-only mount too. It removes the exact stored key and its intent and agreement; the disk entry, if any, stays untouched.
+    - `delete` can stop tracking an old outer copy at a nested path, on a read-only mount too, where it takes the exact key. It removes that key's copy, intent and agreement; the disk entry, if any, stays untouched. A read-only mount still refuses every other delete.
     - A `materialize` without a path skips writes of such copies, with a note saying that disk was left untouched and the copy can be deleted here to stop tracking it. An already-pending deletion at a nested path is untracked once instead of receiving that advice again.
   - Every check that a canonical path lies inside the mount, when reading,
     walking or writing, also refuses one inside a nested mount. So a symlink
@@ -87,11 +88,10 @@
     checked its files against a different root, the one reached by following
     that link first, and refused them. Its watcher reported none of its
     changes.
+  - Refusals name the innermost mount when several contain the path. A refusal of a path as written includes its directory, such as `"outer/a/b/x.txt" is inside mount "inner", which is nested in "outer" at a/b/: use "inner/x.txt"`, and the tool's answer prefixes it with `Error:`. One of a path reached by how disk spells it leaves the directory out: `"outer/via/x.txt" is inside mount "inner", which is nested in "outer": use "inner/x.txt"`.
+  - On macOS and Windows, a nesting comparison ignores case only where a directory isn't made yet; directories that exist compare exactly, and a generated rule keeps an unmade root's configured spelling. That's the platforms' default, not a probe of the volume. On a case-sensitive volume there, a directory of the outer mount's whose name differs only in case from a nested root not made yet is treated as that root's: refused, passed over by the walk, and untracked by delete. A case-insensitive filesystem on another platform isn't covered.
+  - A delete at a nested path removes only the exact key given, or the key disk names for the entry, never one chosen by ignoring case. So a path through a link back out of the nested mount can't make the outer mount forget its own file. On macOS and Windows, its refusal names a tracked key that differs only in case, when a delete by that key would stop tracking it as well.
+  - Deleting an outer link into a nested mount stops tracking the link, rather than recording a deletion on disk that the outer mount can't make; the result says the file or link on disk, if any, was left untouched. A `materialize` without a path clears older pending deletions at nested paths, or of such links, the same way, whatever `force` and `applyDeletions` say. It notes each once, also when branch divergence blocks the rest of the push.
+  - The disk readers refuse a path outside the mount, or inside a nested one, before saying what kind of entry it is, a directory reached through a link included.
+  - The nesting checks read disk synchronously, so a mount whose storage stops answering can block the process (#311).
   - (agent-framework #280)
-
-- Nested refusals name the innermost mount, even when several mounts contain the path. A lexical refusal includes its directory, such as `"outer/a/b/x.txt" is inside mount "inner", which is nested in "outer" at a/b/: use "inner/x.txt"`. A path reached through disk spelling omits that location clause: `"outer/via/x.txt" is inside mount "inner", which is nested in "outer": use "inner/x.txt"`. The public tool wrapper prefixes thrown lexical errors with `Error:`.
-- Path spelling and comparison are separate. Existing components use disk's spelling, and unmade components keep their written spelling, including in generated ignore rules. On macOS and Windows, a nesting comparison ignores case only when one of the compared components was unmade. This uses platform defaults without a filesystem probe: non-default case-sensitive volumes can receive conservative refusals, while case-insensitive filesystems elsewhere are outside the missing-component rule.
-- After classification, nested deletion uses the outer store rather than listing or statting the inner directory. It removes only an exact supplied key or an exact derived key contained in the identified nested mount. On macOS and Windows, a tracked key that differs only in case is named in the refusal so the caller can request it exactly, when a delete by that key would stop tracking it as well; a case variant that is the outer mount's own directory is never named. Case folding never chooses a key to remove. This also prevents a path through an inner link back out from forgetting an outer-owned entry.
-- An outer link into a nested mount is untracked rather than assigned a disk deletion the outer mount cannot perform. Its stored copy, intent, and disk agreement are removed, and the result says the file or link on disk, if any, was left untouched. The disk unlink boundary itself is unchanged. Path-less materialize also clears legacy pending deletions at nested paths or for such links, independently of `force` and `applyDeletions`. It reports cleanup once, including if remaining physical writes are blocked by branch divergence, and leaves no pending action to report on the next call.
-- Disk readers check containment and nested boundaries before answering a target's kind, including a directory reached through a link. They also check the opened file's path and identity.
-- Classification still makes synchronous realpath, lstat, and readlink calls on the event loop for roots and target paths; untracking adds no post-classification directory lookup. Materialize resolves the nested roots once for its selection and shares that snapshot across selected paths. Disk effects obtain their own fresh view. A mounted filesystem that does not answer can still block the synchronous reads, as tracked in #311.
