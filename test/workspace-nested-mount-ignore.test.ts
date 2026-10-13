@@ -1440,28 +1440,42 @@ test('a read-only mount can stop tracking an old nested copy, and refuses every 
   // path in the nested mount, and an outer link into it), reading no root.
   symlinkSync(join(outer, 'inner', 'x.txt'), join(outer, 'link'));
   const native = fs.realpathSync.native;
-  const { lstatSync, readlinkSync } = fs;
-  const { realpath, lstat } = fsPromises;
+  const { lstatSync, readlinkSync, realpathSync } = fs;
+  const { realpath, lstat, readlink, stat } = fsPromises;
   const reads: string[] = [];
   const counted = <F extends (...args: never[]) => unknown>(name: string, f: F): F =>
     ((...args: Parameters<F>) => { reads.push(name); return f(...args); }) as F;
   try {
     fs.realpathSync.native = counted('realpathSync.native', native);
-    Object.assign(fs, { lstatSync: counted('lstatSync', lstatSync), readlinkSync: counted('readlinkSync', readlinkSync) });
-    Object.assign(fsPromises, { realpath: counted('realpath', realpath), lstat: counted('lstat', lstat) });
+    const plain = counted('realpathSync', realpathSync);
+    Object.assign(plain, { native: fs.realpathSync.native });
+    Object.assign(fs, { lstatSync: counted('lstatSync', lstatSync), readlinkSync: counted('readlinkSync', readlinkSync), realpathSync: plain });
+    Object.assign(fsPromises, { realpath: counted('realpath', realpath), lstat: counted('lstat', lstat), readlink: counted('readlink', readlink), stat: counted('stat', stat) });
     syncBuiltinESMExports();
-    for (const path of ['outer/inner/x.txt', 'outer/inner/other.txt', 'outer/link', 'outer/nothing.txt']) {
-      const unheld = await call('delete', { path });
-      assert.equal(unheld.error, 'Mount "outer" is read-only', path);
-    }
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    try {
+      // A case variant of the nested root, where classifying it would read disk.
+      Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+      for (const path of ['outer/inner/x.txt', 'outer/inner/other.txt', 'outer/link', 'outer/nothing.txt', 'outer/INNER/x.txt']) {
+        const unheld = await call('delete', { path });
+        assert.equal(unheld.error, 'Mount "outer" is read-only', path);
+      }
+    } finally { Object.defineProperty(process, 'platform', platform); }
   } finally {
     fs.realpathSync.native = native;
-    Object.assign(fs, { lstatSync, readlinkSync });
-    Object.assign(fsPromises, { realpath, lstat });
+    Object.assign(fs, { lstatSync, readlinkSync, realpathSync });
+    Object.assign(fsPromises, { realpath, lstat, readlink, stat });
     syncBuiltinESMExports();
   }
   assert.deepEqual(reads, [], 'the refusal reads nothing from disk');
   assert.equal(readFileSync(join(outer, 'inner', 'x.txt'), 'utf8'), 'inner bytes');
+  // A held outer link into the nested mount is an old nested copy by alias.
+  symlinkSync(join(outer, 'inner', 'x.txt'), join(outer, 'held-link'));
+  store.treeSet('workspace/outer/tree', 'held-link', { blobHash: store.storeBlob(Buffer.from('inner bytes'), 'text/plain'), size: 11, mode: 0o644 });
+  const link = await call('delete', { path: 'outer/held-link' });
+  assert.equal(link.success, true, JSON.stringify(link));
+  assert.equal(storeHolds(workspace, 'outer', 'held-link'), false);
+  assert.equal(fs.lstatSync(join(outer, 'held-link')).isSymbolicLink(), true);
 });
 
 test('a read or an edit of a tracked file the mount ignores checks it against disk first, as nothing else keeps it current', async (t) => {
@@ -1508,6 +1522,8 @@ test("a read of a tracked file the mount ignores says when disk couldn't be chec
   const data = read.data as { content: string; diskCheck?: { state: string; note?: string } };
   assert.match(data.content, /\tv1/);
   assert.deepEqual(data.diskCheck, { state: 'unverified', note: 'a symlink, which this mount does not follow' });
+  const paged = await call('read', { path: 'outer/node_modules/pkg.js', limitChars: 1 });
+  assert.deepEqual((paged.data as { diskCheck?: unknown }).diskCheck, { state: 'unverified', note: 'a symlink, which this mount does not follow' });
   const bytes = await workspace.readBinary('outer/node_modules/pkg.js');
   assert.ok('data' in bytes && bytes.data.toString() === 'v1', JSON.stringify(bytes));
   assert.deepEqual('data' in bytes ? bytes.diskCheck : null, { state: 'unverified', note: 'a symlink, which this mount does not follow' });
@@ -1517,6 +1533,37 @@ test("a read of a tracked file the mount ignores says when disk couldn't be chec
   // A copy that agrees with disk says nothing more.
   const plain = await call('read', { path: 'outer/other.js' });
   assert.equal((plain.data as { diskCheck?: unknown }).diskCheck, undefined);
+  // A check that decided nothing (the selected branch kept changing) says so.
+  const internals = workspace as unknown as { passUnlocked: (...args: unknown[]) => Promise<unknown> };
+  const pass = internals.passUnlocked;
+  internals.passUnlocked = async () => ({ ops: [], discarded: [], newConflicts: [], reports: new Map(), passedOver: new Map(), dirs: [],
+    incomplete: [{ path: '', reason: 'the selected branch kept changing while the scan ran' }] });
+  try {
+    const undecided = await call('read', { path: 'outer/node_modules/pkg.js' });
+    assert.deepEqual((undecided.data as { diskCheck?: unknown }).diskCheck, { state: 'unverified', note: 'the selected branch kept changing while the scan ran' });
+  } finally { internals.passUnlocked = pass; }
+});
+
+test("a read of an ignored copy keeps the workspace's own unwritten change, says nothing while disk agrees, and names a conflict", async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-pass2-ignored-draft-');
+  const outer = join(root, 'outer');
+  mkdirSync(join(outer, 'node_modules'), { recursive: true });
+  writeFileSync(join(outer, 'node_modules', 'pkg.js'), 'v1');
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', ignore: ['node_modules'] },
+  ]);
+  const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
+  assert.equal((await call('sync', { path: 'outer/node_modules/pkg.js' })).success, true);
+  assert.equal((await call('edit', { path: 'outer/node_modules/pkg.js', oldString: 'v1', newString: 'mine' })).success, true);
+  const draft = await call('read', { path: 'outer/node_modules/pkg.js' });
+  assert.match((draft.data as { content: string }).content, /\tmine/);
+  assert.equal((draft.data as { diskCheck?: unknown }).diskCheck, undefined, "the workspace's own change isn't a disk question");
+  writeFileSync(join(outer, 'node_modules', 'pkg.js'), 'v2');
+  const both = await call('read', { path: 'outer/node_modules/pkg.js' });
+  assert.match((both.data as { content: string }).content, /\tmine/, 'the workspace change is kept');
+  const check = (both.data as { diskCheck?: { state: string; conflict?: unknown } }).diskCheck;
+  assert.equal(check?.state, 'conflict', JSON.stringify(both.data));
+  assert.ok(check?.conflict, 'with what the conflict is');
 });
 
 test("readBinary of a tracked file the mount ignores, gone binary on disk, says why the workspace no longer holds it", async (t) => {
@@ -1544,6 +1591,11 @@ test("read_image of a held image the mount ignores says when disk couldn't be ch
   ]);
   // A sync never stores an image, so a held one is an agent's own write.
   assert.equal((await workspace.writeBinary('outer/assets/a.png', ONE_PIXEL_PNG, 'image/png')).success, true);
+  assert.equal((await workspace.handleToolCall({ id: 'm', name: 'materialize', input: { mount: 'outer' } })).success, true);
+  const agreed = await workspace.handleToolCall({ id: 'img0', name: 'read_image', input: { path: 'outer/assets/a.png' } });
+  const agreedText = (agreed.data as Array<{ type: string; text?: string }>).find((block) => block.type === 'text')!.text!;
+  assert.doesNotMatch(agreedText, /Disk check/, 'a copy disk agrees with says nothing more');
+  rmSync(join(outer, 'assets', 'a.png'));
   symlinkSync(join(outer, 'other.png'), join(outer, 'assets', 'a.png'));
   const image = await workspace.handleToolCall({ id: 'img', name: 'read_image', input: { path: 'outer/assets/a.png' } });
   assert.equal(image.success, true, JSON.stringify(image));

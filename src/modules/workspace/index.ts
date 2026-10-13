@@ -2239,11 +2239,12 @@ export class WorkspaceModule implements Module {
    * workspace deletion or a file absent from this branch. With
    * `checkIgnored`, so is a path it holds that the mount ignores: neither the
    * watcher nor a sync without a path keeps such a copy current, so a caller
-   * that hands its content on (read, edit, readBinary) checks it by its own
-   * path under the three-way rule, which never gives up a workspace change
-   * (a sync that names the path takes disk's copy outright), and says so
-   * when the check couldn't confirm it (diskCheckView). A delete doesn't: it
-   * matches no content, so
+   * that hands its content on (read, edit, readBinary, read_image) checks it
+   * by its own path under the three-way rule, which never gives up a
+   * workspace change (a sync that names the path takes disk's copy
+   * outright), and says so when the check couldn't confirm it
+   * (diskCheckView), a check that decided nothing included. A delete of a
+   * held copy doesn't: it matches no content, so
    * taking in a disk change first would let its unlink remove a change the
    * workspace never saw. The caller holds the mount's turn.
    */
@@ -2251,10 +2252,16 @@ export class WorkspaceModule implements Module {
     mount: MountState, relativePath: string, opts: { checkIgnored?: boolean } = {},
   ): Promise<PathReport | undefined> {
     const store = this.getStore();
-    if (store.treeGet(mount.treeStateId, relativePath)
-      && !(opts.checkIgnored && coveredByIgnore(relativePath, mount.config.ignore ?? []))) return undefined;
+    const held = store.treeGet(mount.treeStateId, relativePath) !== null;
+    if (held && !(opts.checkIgnored && coveredByIgnore(relativePath, mount.config.ignore ?? []))) return undefined;
     const pass = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] });
-    return pass.reports.get(relativePath);
+    const report = pass.reports.get(relativePath);
+    // A pass that decided nothing (the selected branch kept changing) left a
+    // held copy unchecked, which the caller must not present as confirmed.
+    if (report === undefined && held) {
+      return { path: relativePath, state: 'unverified', note: pass.incomplete[0]?.reason ?? 'disk was not checked' };
+    }
+    return report;
   }
 
   /** Why the workspace holds no entry at a path, when disk explains it. */
@@ -2386,41 +2393,47 @@ export class WorkspaceModule implements Module {
     }
 
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
-    let treeError: WorkspaceImageReadError | null = null;
+    // Set by the tree read below, inside a closure, so not narrowed to null.
+    let treeError = null as WorkspaceImageReadError | null;
 
-    // A held image the mount ignores is checked against disk first, as read
-    // checks a held file there; a sync never stores an image, so it's one an
-    // agent wrote. Any other image is read from the tree, or from disk.
+    // A held copy the mount ignores is checked against disk first, as read
+    // checks one, and the tree is read in the same turn (a sync never stores
+    // an image, so a held image there is one an agent wrote). Any other path
+    // is read from the tree, or from disk, as before.
     let checked: DiskCheck = {};
-    if (this.getStore().treeGet(mount.treeStateId, relativePath) && coveredByIgnore(relativePath, mount.config.ignore ?? [])) {
-      checked = diskCheckView(await this.withMount(mount, () => this.ensureSynced(mount, relativePath, { checkIgnored: true })));
-    }
-    try {
-      const image = this.tryReadImageFromTree(mount, relativePath, input.path, maxSize);
-      if (image) {
-        const check = checked.diskCheck;
-        return {
-          success: true,
-          data: [
-            {
-              type: 'text',
-              text: `Path: ${input.path}\nMIME: ${image.mimeType}\nBytes: ${image.bytes.byteLength}` +
-                (check ? `\nDisk check: ${check.state}${check.note ? ` (${check.note})` : ''}` : ''),
-            },
-            {
-              type: 'image',
-              data: image.bytes.toString('base64'),
-              mimeType: image.mimeType,
-            },
-          ],
-        };
-      }
-    } catch (err) {
-      if (err instanceof WorkspaceImageReadError) {
+    const fromTree = (): ReturnType<WorkspaceModule['tryReadImageFromTree']> => {
+      try {
+        return this.tryReadImageFromTree(mount, relativePath, input.path, maxSize);
+      } catch (err) {
+        if (!(err instanceof WorkspaceImageReadError)) throw err;
         treeError = err;
-      } else {
-        throw err;
+        return null;
       }
+    };
+    const image = this.getStore().treeGet(mount.treeStateId, relativePath) && coveredByIgnore(relativePath, mount.config.ignore ?? [])
+      ? await this.withMount(mount, async () => {
+        checked = diskCheckView(await this.ensureSynced(mount, relativePath, { checkIgnored: true }));
+        return fromTree();
+      })
+      : fromTree();
+    if (image) {
+      const check = checked.diskCheck;
+      const detail = check?.note ?? check?.conflict?.kind;
+      return {
+        success: true,
+        data: [
+          {
+            type: 'text',
+            text: `Path: ${input.path}\nMIME: ${image.mimeType}\nBytes: ${image.bytes.byteLength}` +
+              (check ? `\nDisk check: ${check.state}${detail ? ` (${detail})` : ''}` : ''),
+          },
+          {
+            type: 'image',
+            data: image.bytes.toString('base64'),
+            mimeType: image.mimeType,
+          },
+        ],
+      };
     }
 
     try {
