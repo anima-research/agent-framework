@@ -385,8 +385,10 @@ export interface McplServerConfig {
    * connection emits 'close' while its `willReconnect` reads true, then
    * 'reconnect'. If that new session can't start, this setting decides, as
    * for any lost connection, and a revision verdict stops it for good, as on
-   * any reconnect. A session that ends before it has answered counts as a
-   * failed connect, and follows this setting.
+   * any reconnect; without this setting, a second 'close', while
+   * `willReconnect` reads false, says the server is gone. A session that
+   * ends before it has answered counts as a failed connect, and follows this
+   * setting.
    */
   reconnect?: boolean;
 

@@ -83,9 +83,15 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 const CONNECT_TIMEOUT_MS = 30_000;
 /** Bound on the DELETE that ends a live 2025 session at `close()`. */
 const DELETE_TIMEOUT_MS = 3_000;
-/** Answers to the standalone stream's first open that may pass, so it is
- *  tried again (see `firstOpen`). */
-const TRANSIENT_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+/**
+ * An answer to the standalone stream's first open that may pass, so it is
+ * tried again (see `firstOpen`): a timeout (408), a stream the server still
+ * holds for this session from a try whose answer never reached us (409), a
+ * rate limit (429), or a server error, except 501 and 505, which say this
+ * server never will.
+ */
+const mayPass = (status: number): boolean =>
+  status === 408 || status === 409 || status === 429 || (status >= 500 && status !== 501 && status !== 505);
 /** Inventory listing has its own bound: it is host work, not a resident's call. */
 const LIST_TIMEOUT_MS = 30_000;
 /** Startup stderr kept for the first listener. */
@@ -187,9 +193,9 @@ class ObservedTransport implements Transport {
    * sent, so on a 2025 revision a stream the server cut is resumed for as
    * long as its request is, not for the session's whole life. (The stdio
    * transport has no such stream, and ignores it.) An entry goes with its
-   * request's answer, its failed send or its cancellation. The handshake's
-   * `initialize`, which is never cancelled, keeps its entry until its
-   * connect ends with the wire.
+   * request's answer, its failed send or its cancellation. An `initialize`
+   * left unanswered, which the SDK never cancels, keeps its entry until its
+   * failed connect drops the wire.
    */
   private readonly aborts = new Map<string | number, AbortController>();
 
@@ -769,6 +775,10 @@ export class ModernMcpConnection extends EventEmitter {
     }
     const era = session.client.getProtocolEra() ?? 'modern';
     session.wire.establish(era);
+    // Adopted: from here the session is live, no longer the connect in
+    // flight. Both change in one step, so a close() never finds one session
+    // in both places (it would end it twice).
+    if (this.opening?.session === session) this.opening = null;
     this.session = session;
     this.protocolVersion = session.client.getNegotiatedProtocolVersion() ?? null;
     // A session the server holds by its id (a 2025 revision over HTTP) is a
@@ -821,17 +831,19 @@ export class ModernMcpConnection extends EventEmitter {
       offered,
     );
     if (error instanceof UnsupportedProtocolVersionError) {
-      // The SDK's own refusal ends negotiation at the revision it asked for:
-      // over HTTP it tries no initialize after a refusal whose list names a
-      // revision newer than 2026-07-28, even one that also names a 2025
-      // revision this client offers.
+      // The SDK's own refusal ends negotiation, whatever else the server's
+      // list names. Over HTTP it raises one for a -32022 whose list names a
+      // revision from 2026-07-28 on that this client doesn't speak, or for a
+      // second refusal of the one it asked for, and tries no initialize
+      // after either, even when the list also names a 2025 revision this
+      // client offers.
       const { code, data } = error as { code?: unknown; data?: unknown };
       const supported = stringList((data as { supported?: unknown } | undefined)?.supported) ?? null;
       const requested = (data as { requested?: unknown } | undefined)?.requested;
       const asked = typeof requested === 'string' ? requested : MODERN_MCP_PROTOCOL_VERSION;
       const shared = supported?.filter((version) => version !== asked && offered.includes(version)) ?? [];
       const note = shared.length > 0
-        ? ` It lists ${joinVersions(shared, 'and')}, which this client also speaks, but the SDK doesn't fall back to initialize after a refusal that names a newer revision.`
+        ? ` It lists ${joinVersions(shared, 'and')}, which this client also speaks, but the SDK negotiates no further after this refusal.`
         : '';
       return rejected([asked], supported, error.message, code === undefined ? undefined : Number(code), data, note);
     }
@@ -933,21 +945,25 @@ export class ModernMcpConnection extends EventEmitter {
    *   that routes only POST answers, and reading it as the session's end
    *   would make such a server unreachable. It ends nothing: the SDK reports
    *   it as an error and opens no stream, as it does for any refusal of that
-   *   open but a 405, which it takes quietly. A session that really ended
+   *   open but a 405, which it takes quietly, and a 401, which its credential
+   *   refresh tries once more. A session that really ended
    *   meets the 404 on its next POST, such as the framework's relist after
    *   the connect. The SDK never retries this open, so {@link firstOpen}
    *   does, on a failure that may pass.
    * - The standalone stream opening again, after it had opened, without
-   *   `Last-Event-ID`: its events had no ids, so it couldn't ask for what it
-   *   missed (see {@link streamReopened}). A GET that carries one resumes a
-   *   stream, the standalone one or a request's, and the server replays what
-   *   that stream missed.
+   *   `Last-Event-ID`: it couldn't ask for what it missed, whether because
+   *   the server's events carry no ids or because the stream that dropped
+   *   had carried none (the SDK keeps a stream's last id only for that
+   *   stream). See {@link streamReopened}. A GET that carries one resumes a
+   *   stream, the standalone one or a request's, and the server replays
+   *   what that stream missed.
    * - A standalone resume the server refuses with 400, as one does for an
    *   event id it no longer holds: retrying the same id can't succeed, and
    *   the SDK would retry it for the session's life. The stream opens again
    *   without the id instead, which is a reopen that missed what came between.
    *   A request stream's resume refused that way is left to the SDK: it is
-   *   retried until its request ends (see ObservedTransport's `aborts`).
+   *   retried until its request's answer arrives on it, or its deadline
+   *   cancels it (see ObservedTransport's `aborts`).
    */
   private observedFetch(sessionOf: () => Session): FetchLike {
     return async (url, init) => {
@@ -960,7 +976,10 @@ export class ModernMcpConnection extends EventEmitter {
       const firstOpen = method === 'GET' && !resuming && !http.streamOpened;
       if (firstOpen && http.standaloneSignal === undefined) http.standaloneSignal = init?.signal ?? null;
       const standalone = method === 'GET' && (!resuming || (http.standaloneSignal != null && init?.signal === http.standaloneSignal));
-      let response = firstOpen ? await this.firstOpen(session, url, init) : await fetch(url, init);
+      let response: Response;
+      let retried = false;
+      if (firstOpen) ({ response, retried } = await this.firstOpen(session, url, init));
+      else response = await fetch(url, init);
       let replayed = resuming;
       if (resuming && standalone && response.status === 400) {
         await response.body?.cancel().catch(() => {});
@@ -973,7 +992,9 @@ export class ModernMcpConnection extends EventEmitter {
         if (record?.currentId !== undefined && bodyId(init?.body) === record.currentId) record.sessionEnded = true;
         queueMicrotask(() => this.sessionEnded(session));
       } else if (standalone && response.ok) {
-        if (http.streamOpened && !replayed) queueMicrotask(() => this.streamReopened(session));
+        // Back without replay, or open at last after failed tries: list
+        // changes may have gone by meanwhile.
+        if (http.streamOpened ? !replayed : retried) queueMicrotask(() => this.streamReopened(session));
         http.streamOpened = true;
       }
       return response;
@@ -982,19 +1003,19 @@ export class ModernMcpConnection extends EventEmitter {
 
   /**
    * The standalone stream's first open, which the SDK makes once and never
-   * retries. A failure that may pass (a 408, 429, 500, 502, 503 or 504, or a
-   * network error) is reported as this connection's 'error' and tried again,
-   * with the connection's backoff, until the stream opens, the server
-   * refuses it (any other answer, which goes back to the SDK as it came), or
-   * the session ends: closing its transport aborts the request's signal,
-   * which ends the wait.
+   * retries. A failure that may pass (see `mayPass`, or a network error) is
+   * reported as this connection's 'error' and tried again, with the
+   * connection's backoff, until the stream opens, the server answers
+   * otherwise (that answer goes back to the SDK as it came), or the session
+   * ends: closing its transport aborts the request's signal, which ends the
+   * wait. `retried` says a try failed first, so changes may have gone by.
    */
-  private async firstOpen(session: Session, url: string | URL, init: RequestInit | undefined): Promise<Response> {
+  private async firstOpen(session: Session, url: string | URL, init: RequestInit | undefined): Promise<{ response: Response; retried: boolean }> {
     for (let failures = 1; ; failures++) {
       let failure: string;
       try {
         const response = await fetch(url, init);
-        if (!TRANSIENT_HTTP_STATUSES.has(response.status)) return response;
+        if (!mayPass(response.status)) return { response, retried: failures > 1 };
         await response.body?.cancel().catch(() => {});
         failure = `HTTP ${response.status}`;
       } catch (error) {
@@ -1118,11 +1139,11 @@ export class ModernMcpConnection extends EventEmitter {
     this.emit('reconnect', { attempts: 1 });
   }
 
-  /** The standalone stream opened again, after it had been open, without
-   *  asking for what it missed (no `Last-Event-ID`: the server gave its
-   *  events no ids). List changes may have been announced while it was
-   *  down, so, for a server that announces them, the inventory is read
-   *  again, as after a reopened 2026-07-28 subscription. */
+  /** The standalone stream is open again without having asked for what it
+   *  missed (no `Last-Event-ID`), or open at last after its first tries
+   *  failed. List changes may have been announced while it was down, so,
+   *  for a server that announces them, the inventory is read again, as
+   *  after a reopened 2026-07-28 subscription. */
   private streamReopened(session: Session): void {
     if (this.session !== session || !this.isCurrent(session.generation)) return;
     if (!session.client.getServerCapabilities()?.tools?.listChanged) return;
