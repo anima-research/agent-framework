@@ -528,7 +528,7 @@ test('a server that shares no revision with this client is a configuration verdi
   await assert.rejects(connection.start(), (err: unknown) => {
     assert.ok(err instanceof McplProtocolVersionError, String(err));
     assert.equal(err.kind, 'rejected');
-    assert.equal(err.offered, '2026-07-28');
+    assert.deepEqual(err.offered, ['2026-07-28']);
     assert.deepEqual(err.supported, ['2099-01-01']);
     assert.match(err.message, /MCP server "raw" does not support MCP 2026-07-28 \(it supports: 2099-01-01\)\./);
     return true;

@@ -270,18 +270,19 @@ A pattern that matches no tool is reported once, as a console line and an
 A pattern that could name a server's tools is not judged until that server
 has listed them, so late connects and reconnects don't cause early reports.
 
-#### Modern MCP servers (2026-07-28)
+#### Modern MCP servers
 
-The same `mcplServers` list also takes servers that speak modern MCP
-(revision `2026-07-28`), reached through the official SDK client. The
-configuration chooses the family, and nothing is probed:
+The same `mcplServers` list also takes servers that speak modern MCP,
+reached through the official SDK client: revision `2026-07-28`, and over
+HTTP the 2025 revisions too. The configuration chooses the family, and a
+stdio server is never probed:
 
 | Configuration | Family | Transport |
 |---|---|---|
 | `url: 'ws://…'` / `'wss://…'` | MCPL (MCP `2024-11-05`) | WebSocket |
-| `url: 'http://…'` / `'https://…'` | modern MCP | Streamable HTTP (`token` / `accessProvider` as bearer) |
+| `url: 'http://…'` / `'https://…'` | modern MCP (`2026-07-28`, `2025-11-25`, `2025-06-18` or `2025-03-26`, negotiated) | Streamable HTTP (`token` / `accessProvider` as bearer) |
 | `command` | MCPL | stdio |
-| `command` + `protocol: 'modern'` | modern MCP | stdio |
+| `command` + `protocol: 'modern'` | modern MCP (`2026-07-28`) | stdio |
 
 ```typescript
 {
@@ -317,6 +318,36 @@ and is not retried. The error names the revisions the server says it
 supports, or its error text when it lists none, and when the list includes
 `2026-07-28` it says to configure the server with `protocol: 'modern'` (stdio)
 or reach it over http(s).
+
+Over HTTP the revision is negotiated at each connect, so the connection
+follows a server's upgrades. The client asks `server/discover` first and
+connects at `2026-07-28` when the server offers it. A server that doesn't
+gets the 2025 `initialize` handshake, offering `2025-11-25`, `2025-06-18`
+and `2025-03-26`. `listMcplServers()` shows the revision it settles on as
+`protocolVersion`, and its `family` stays `modern`. On a 2025 revision:
+- List changes arrive on the session's standalone stream. While the session
+  lives, a stream that drops is reopened with the reconnect backoff, never
+  sooner than the server's own `retry` hint asks, and each reopen relists
+  the server's tools, since changes may have been missed meanwhile.
+- When the server ends the session, answering 404 to a request that carried
+  its id, the request that met the 404 fails as `error-response` with
+  `data.httpStatus` 404, and isn't replayed. A session that had answered a
+  request gets a new one at once, whatever `reconnect` says, and the
+  framework relists. One that ended before answering any is a failed
+  connect: it emits `reconnect-failed` and `close`, and follows `reconnect`
+  with a growing backoff, so a load balancer without sticky sessions shows
+  up as a failing server rather than a silent loop.
+- `close()`, and so `stop()` or a disconnect, ends a live session with a
+  `DELETE`, waiting at most 3 s for it.
+
+A server over HTTP that shares no revision with this client fails with
+`McplProtocolVersionError`, naming what each side speaks, and is not
+retried: a discovery or `-32022` error that lists no revision in common,
+with no `initialize` succeeding after it (`rejected`), or an `initialize`
+answered with a revision this client doesn't offer, or with none
+(`mismatch`). Its `offered` lists the revisions this client offered.
+`2024-11-05` isn't one of them over HTTP: its HTTP binding was HTTP+SSE,
+another transport.
 
 Server and transport text the framework records has the server's configured credentials replaced, in both engines. That covers connection traces, console lines, stderr traces, ops alerts, and a tool call's failure as its caller, the model and the `tool:failed` trace get it. The credentials are those the configuration holds: from the url, credential-like path segments and query names, credential-shaped or credential-named query values, and a `ws://` url's userinfo, in their encoded and decoded forms, replaced wherever they occur; every non-empty query parameter as its whole `name=value`, where no letter or digit adjoins it; the static `token`, raw and url-encoded; and a stdio server's `env` values whose names have a part ending in a credential word, such as `GITHUB_TOKEN`, `PGPASSWORD` or `SESSION_COOKIE`, raw and url-encoded. A stdio server's command-line arguments aren't derived. Standalone strings shorter than eight characters stay unchanged because they may be ordinary words; short query values are still removed with their parameter names. Treat a submitted configuration as immutable while the server uses it: apply changes with `restartMcplServer(id, newConfig)`. The token an `accessProvider` fetches, and secrets the configuration doesn't hold, remain outside this filtering. JSON-RPC tool answers, and the error a host's own connect raises, pass through as sent.
 
