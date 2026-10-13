@@ -41,7 +41,7 @@ import { constants as fsConstants } from 'node:fs';
 import type { BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, readdir, realpath, stat, statfs } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { dirname, isAbsolute, join, parse, relative, sep } from 'node:path';
 import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
 
 export interface MountView {
@@ -57,12 +57,11 @@ export interface MountView {
   maxFileSize: number;
   ignore: string[];
   /**
-   * The canonical roots of the mounts nested in this one. A mount never
-   * reads or writes what lies in a mount nested in it, whatever path reaches
-   * it (agent-framework #280): every containment check refuses a canonical
-   * path inside one of these, as it refuses one outside the mount.
+   * Roots nested in this mount, preserving spelling and unmade-component
+   * metadata. Disk-content reads and effects check these boundaries, as
+   * they check containment in the outer mount (agent-framework #280).
    */
-  nested?: ReadonlyArray<{ name: string; real: string }>;
+  nested?: ReadonlyArray<ResolvedPath & { name: string }>;
 }
 
 export type StatFingerprint = Omit<Fingerprint, 'hashedAt'>;
@@ -110,9 +109,40 @@ export const RACY_WINDOW_MS = 2000;
 export const OUTSIDE_PARENT = 'a parent directory resolves outside the mount';
 export const NOT_FOLLOWED = 'a symlink, which this mount does not follow';
 
+/**
+ * A resolved spelling, with the first component that was absent when it was
+ * read. Missing components keep their spelling; the marker is used only by
+ * the nesting comparison. Components are counted after the filesystem root.
+ */
+export interface ResolvedPath {
+  real: string;
+  missingFrom?: number;
+}
+
+export function pathComponents(path: string): string[] {
+  return path.slice(parse(path).root.length).split(sep).filter(Boolean);
+}
+
+/** Mount-relative suffix, preserving candidate spelling. Known components
+ * compare exactly. On darwin/win32, a comparison involving an unmade
+ * component uses the platform's default case folding. */
+export function nestedSuffix(root: ResolvedPath, candidate: ResolvedPath): string | null {
+  if (relative(parse(root.real).root, parse(candidate.real).root) !== '') return null;
+  const a = pathComponents(root.real);
+  const b = pathComponents(candidate.real);
+  if (b.length < a.length) return null;
+  const fold = process.platform === 'darwin' || process.platform === 'win32';
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] === b[i]) continue;
+    const unmade = i >= (root.missingFrom ?? Infinity) || i >= (candidate.missingFrom ?? Infinity);
+    if (!fold || !unmade || a[i].toLowerCase() !== b[i].toLowerCase()) return null;
+  }
+  return b.slice(a.length).join('/');
+}
+
 /** Why a canonical path inside the mount is still not the mount's: it lies in a mount nested in it. */
 export function insideNested(view: MountView, real: string): string | null {
-  const inner = view.nested?.find((n) => contained(n.real, real));
+  const inner = view.nested?.find((n) => nestedSuffix(n, { real }) !== null);
   return inner ? `inside mount "${inner.name}", which is nested in this one` : null;
 }
 export const ROOT_UNAVAILABLE = 'the mount root is unavailable';

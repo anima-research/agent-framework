@@ -5,7 +5,7 @@
  * auto-sync between real filesystem and Chronicle, and manual materialization.
  */
 
-import { constants as fsConstants, lstatSync, readdirSync, readlinkSync, realpathSync } from 'node:fs';
+import { constants as fsConstants, lstatSync, readlinkSync, realpathSync } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { open, stat, lstat, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, parse, resolve, relative, sep } from 'node:path';
@@ -39,7 +39,7 @@ import { MountWatcher, type FsChange } from './watcher.js';
 import { hashContent, DEFAULT_MAX_FILE_SIZE } from './sync.js';
 import { DiskAgreement, sameRootIdentity } from './disk-agreement.js';
 import { BranchIntents } from './branch-intent.js';
-import { contained, coveredByIgnore, filesystemTrustsCtime, locateRoot, nestedAt } from './observe.js';
+import { contained, coveredByIgnore, filesystemTrustsCtime, locateRoot, nestedSuffix, pathComponents, type ResolvedPath } from './observe.js';
 import { TOOL_BATCH_HOOK_TIMEOUT_MS } from '../../module-registry.js';
 import {
   type MountRuntime,
@@ -211,18 +211,19 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
 /**
  * Resolve existing path components to disk's spelling, following up to 40 links. A dangling link contributes its target; a relative target is read from the directory reached so far, including any preceding link before a '..'. The starting path uses resolve(), like the workspace's tools, sync, and watcher.
  *
- * A component that does not exist has no disk spelling yet. Lowercase it on darwin and win32, and preserve it elsewhere. This uses platform defaults without writing a probe into the mount: case-sensitive macOS/Windows directories can receive conservative refusals, while case-insensitive filesystems on other platforms are outside this missing-component rule. Existing components retain their observed spelling.
+ * Components that do not exist keep their written spelling, and missingFrom records where that suffix starts. Only nestedSuffix's comparison folds case on darwin/win32 when either component is unmade. Paths, ignore patterns, and store keys retain their spelling. This is a platform default rather than a per-filesystem probe.
  */
-function canonicalRoot(path: string): string {
+function resolveWorkspacePath(path: string): ResolvedPath {
   const absolute = resolve(path);
   try {
-    return realpathSync.native(absolute);
+    return { real: realpathSync.native(absolute) };
   } catch {
     // Some part of it doesn't exist yet: walk it as the filesystem will.
   }
   const parts = (p: string): string[] => p.split(sep === '\\' ? /[\\/]+/ : '/').filter((c) => c.length > 0);
   const root = parse(absolute).root;
   let current = root;
+  let missingFrom: number | undefined;
   const queue = parts(absolute.slice(root.length));
   let links = 0;
   while (queue.length > 0) {
@@ -230,11 +231,13 @@ function canonicalRoot(path: string): string {
     if (part === '.') continue;
     if (part === '..') {
       current = dirname(current);
+      if (missingFrom !== undefined && missingFrom >= pathComponents(current).length) missingFrom = undefined;
       continue;
     }
     const next = join(current, part);
     try {
       current = realpathSync.native(next);
+      missingFrom = undefined;
       continue;
     } catch {
       // Missing, or a link that leads to nothing yet.
@@ -249,12 +252,8 @@ function canonicalRoot(path: string): string {
       }
     }
     if (target === null) {
-      // Existing components above retain disk's spelling. For an unmade
-      // component there is no spelling to observe: use the platform default,
-      // without creating a probe file in the user's mount.
-      const fold = missingPart && (process.platform === 'darwin' || process.platform === 'win32');
-      const missing = fold ? part.toLowerCase() : part;
-      current = join(current, missing);
+      if (missingPart && missingFrom === undefined) missingFrom = pathComponents(current).length;
+      current = next;
       continue;
     }
     links++;
@@ -262,12 +261,50 @@ function canonicalRoot(path: string): string {
     if (isAbsolute(target)) {
       const targetRoot = parse(target).root;
       current = targetRoot;
+      missingFrom = undefined;
       queue.unshift(...parts(target.slice(targetRoot.length)));
     } else {
       queue.unshift(...parts(target));
     }
   }
-  return current;
+  return { real: current, ...(missingFrom !== undefined ? { missingFrom } : {}) };
+}
+
+/** Consumers that need a path, rather than a comparison, keep its spelling. */
+function canonicalRoot(path: string): string { return resolveWorkspacePath(path).real; }
+
+/** The last directory entry is not followed when classifying an unlink. */
+function resolveWorkspaceEntry(path: string): ResolvedPath {
+  let missing = false;
+  try {
+    if (!lstatSync(path).isSymbolicLink()) return resolveWorkspacePath(path);
+  } catch (error) {
+    missing = errnoOf(error) === 'ENOENT' || errnoOf(error) === 'ENOTDIR';
+  }
+  const parent = resolveWorkspacePath(dirname(path));
+  return {
+    real: join(parent.real, basename(path)),
+    ...(parent.missingFrom !== undefined ? { missingFrom: parent.missingFrom }
+      : missing ? { missingFrom: pathComponents(parent.real).length } : {}),
+  };
+}
+
+interface NestedRoot extends ResolvedPath { name: string; at: string }
+interface NestedSnapshot {
+  root: ResolvedPath;
+  roots: NestedRoot[];
+  ats: Array<{ name: string; at: string }>;
+}
+interface NestedLocation {
+  name: string;
+  at: string;
+  rest: string;
+  /** An exact disk-derived key, never one chosen by case folding. */
+  derivedKey?: string;
+}
+interface NestedDeletion extends NestedLocation {
+  where: string;
+  kind: 'entry' | 'link';
 }
 
 function isContainedPath(root: string, candidate: string): boolean {
@@ -723,12 +760,12 @@ export class WorkspaceModule implements Module {
     // rule; its tools refuse paths there (parsePath), and every containment
     // check refuses what reaches the inner's directory another way
     // (MountView.nested).
-    const roots = new Map(config.mounts.map((m) => [m, canonicalRoot(m.path)]));
+    const roots = new Map(config.mounts.map((m) => [m, resolveWorkspacePath(m.path)]));
     for (const outer of config.mounts) {
       for (const inner of config.mounts) {
         if (outer === inner) continue;
-        const at = nestedAt(roots.get(outer)!, roots.get(inner)!);
-        if (at === null) continue;
+        const at = nestedSuffix(roots.get(outer)!, roots.get(inner)!);
+        if (at === null || at === '') continue;
         const nested = this.nestedIn.get(outer.name) ?? [];
         nested.push({ name: inner.name, at });
         this.nestedIn.set(outer.name, nested);
@@ -754,14 +791,27 @@ export class WorkspaceModule implements Module {
    * so a nesting that came about after the module was built (a root made
    * later, a symlinked parent created) is refused like one found then.
    */
-  private nestedRootsOf(mount: MountState, rootReal: string): Array<{ name: string; real: string }> {
-    const nested: Array<{ name: string; real: string }> = [];
+  private nestedRootsOf(mount: MountState, outer: string | ResolvedPath): NestedRoot[] {
+    const root = typeof outer === 'string' ? { real: outer } : outer;
+    const nested: NestedRoot[] = [];
     for (const inner of this.mounts.values()) {
       if (inner === mount) continue;
-      const real = canonicalRoot(inner.config.path);
-      if (real !== rootReal && contained(rootReal, real)) nested.push({ name: inner.config.name, real });
+      const resolved = resolveWorkspacePath(inner.config.path);
+      const at = nestedSuffix(root, resolved);
+      if (at !== null && at !== '') nested.push({ name: inner.config.name, ...resolved, at });
     }
-    return nested.sort((a, b) => b.real.length - a.real.length);
+    return nested.sort((a, b) => pathComponents(b.real).length - pathComponents(a.real).length);
+  }
+
+  /** One root reading shared by all paths in a materialize selection. */
+  private nestedSnapshot(mount: MountState): NestedSnapshot {
+    const root = resolveWorkspacePath(mount.config.path);
+    const roots = this.nestedRootsOf(mount, root);
+    const ats = [...(this.nestedIn.get(mount.config.name) ?? [])];
+    for (const { name, at } of roots) {
+      if (!ats.some((n) => n.name === name && n.at === at)) ats.push({ name, at });
+    }
+    return { root, roots, ats };
   }
 
   /**
@@ -775,13 +825,23 @@ export class WorkspaceModule implements Module {
    * A later disk change can make an accepted draft's path nested; the disk
    * effect checks that boundary again when materialize attempts the write.
    */
-  private nestedByDisk(mount: MountState, relativePath: string, followFinal = true): { name: string; rest: string } | null {
-    const rootReal = canonicalRoot(mount.config.path);
+  private nestedByDisk(
+    mount: MountState, relativePath: string, followFinal = true, snapshot?: NestedSnapshot,
+  ): NestedLocation | null {
+    const view = snapshot ?? this.nestedSnapshot(mount);
+    if (view.roots.length === 0) return null;
     const path = resolve(mount.config.path, relativePath);
-    // Unlink addresses the directory entry, not the last link's target.
-    const real = followFinal ? canonicalRoot(path) : join(canonicalRoot(dirname(path)), basename(path));
-    const inner = this.nestedRootsOf(mount, rootReal).find((n) => contained(n.real, real));
-    return inner ? { name: inner.name, rest: relative(inner.real, real).split(sep).join('/') } : null;
+    const candidate = followFinal ? resolveWorkspacePath(path) : resolveWorkspaceEntry(path);
+    for (const inner of view.roots) {
+      const rest = nestedSuffix(inner, candidate);
+      if (rest === null) continue;
+      // Policy folding can justify a refusal, never the choice of another
+      // stored key to remove. A derived key needs exact containment.
+      const derivedKey = contained(inner.real, candidate.real) && contained(view.root.real, candidate.real)
+        ? relative(view.root.real, candidate.real).split(sep).join('/') : undefined;
+      return { name: inner.name, at: inner.at, rest, derivedKey };
+    }
+    return null;
   }
 
   /** {@link nestedByDisk}'s refusal, naming where the path belongs. */
@@ -794,9 +854,9 @@ export class WorkspaceModule implements Module {
 
   /** Refuse a canonical path that lies in a mount nested in `mount`, naming where it belongs. */
   private nestedRefusal(mount: MountState, rootReal: string, real: string, mountPrefixedPath: string): string | null {
-    const inner = this.nestedRootsOf(mount, rootReal).find((n) => contained(n.real, real));
+    const inner = this.nestedRootsOf(mount, rootReal).find((n) => nestedSuffix(n, { real }) !== null);
     if (!inner) return null;
-    const rest = relative(inner.real, real).split(sep).join('/');
+    const rest = nestedSuffix(inner, { real })!;
     return `"${mountPrefixedPath}" is inside mount "${inner.name}", which is nested in "${mount.config.name}": ` +
       `use "${rest ? `${inner.name}/${rest}` : inner.name}"`;
   }
@@ -809,13 +869,7 @@ export class WorkspaceModule implements Module {
    * anything reaches its tree.
    */
   private nestedAtsOf(mount: MountState): Array<{ name: string; at: string }> {
-    const ats = [...(this.nestedIn.get(mount.config.name) ?? [])];
-    const rootReal = canonicalRoot(mount.config.path);
-    for (const inner of this.nestedRootsOf(mount, rootReal)) {
-      const at = relative(rootReal, inner.real).split(sep).join('/');
-      if (!ats.some((n) => n.name === inner.name && n.at === at)) ats.push({ name: inner.name, at });
-    }
-    return ats;
+    return this.nestedSnapshot(mount).ats;
   }
 
   /** The mount nested in `mount` that a mount-relative path lies in, if any. */
@@ -1280,9 +1334,10 @@ export class WorkspaceModule implements Module {
       },
       {
         name: 'delete',
-        description: 'Delete a file from the workspace. On a mount without autoMaterialize the disk copy stays, '
-          + 'listed as workspace-deleted (no scan brings it back), until materialize with applyDeletions removes it '
-          + 'or a sync of the path restores it.',
+        description: 'Delete a file from the workspace. For a tracked nested path or an outer link into one, '
+          + 'the workspace stops tracking the path and leaves any disk entry untouched. Other deletions on mounts '
+          + 'without autoMaterialize remain pending on disk, shown as workspace-deleted. Materialize with '
+          + 'applyDeletions attempts those deletions, or sync the path to restore it.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1353,7 +1408,8 @@ export class WorkspaceModule implements Module {
       {
         name: 'materialize',
         description: 'Write workspace files to the real filesystem. Use after writing/editing to push changes to disk. '
-          + 'Never deletes disk files unless applyDeletions is given; lists workspace deletions it left on disk.',
+          + 'Never deletes disk files unless applyDeletions is given; lists ordinary workspace deletions it left on disk. '
+          + 'Pending deletions blocked by nested-mount ownership stop being tracked, with a one-time note that any disk entry was left untouched.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1809,15 +1865,12 @@ export class WorkspaceModule implements Module {
    * Open a mount-relative file for reading with the mount boundary enforced on
    * the *filesystem*, not just the path string:
    *
-   * 1. `lstat` the lexical path — refuse directories; refuse a final-component
-   *    symlink when the mount does not `followSymlinks`.
-   * 2. Open with `O_NOFOLLOW` where the platform has it (POSIX) so the refusal
-   *    holds against a symlink swapped in between lstat and open; where it
-   *    doesn't (Windows), re-`lstat` after opening instead.
-   * 3. `realpath` both the mount root and the opened path and require canonical
-   *    containment — this is what catches an *intermediate* symlinked
-   *    directory escaping the mount, and a followed symlink whose target lands
-   *    outside, on every platform (junctions included).
+   * 1. `lstat` the lexical path; refuse a final-component symlink when the
+   *    mount does not `followSymlinks`.
+   * 2. Resolve the root and path, check containment and nesting, then answer
+   *    a directory's kind. Boundary refusal precedes open.
+   * 3. Open with `O_NOFOLLOW` where available, else re-`lstat` after open.
+   *    Recheck the opened path's boundary before answering its kind.
    * 4. Confirm the descriptor and the canonical path are the same inode.
    *
    * `inspect` runs once the file is known to be this mount's (after step 4),
@@ -2491,6 +2544,63 @@ export class WorkspaceModule implements Module {
     });
   }
 
+  /** Classify the entry first, then a final link's target. Both are
+   * untracked rather than tombstoned when the outer mount cannot unlink them. */
+  private nestedDeletion(mount: MountState, path: string, snapshot: NestedSnapshot): NestedDeletion | null {
+    const lexical = this.nestedMountAt(mount, path, snapshot.ats);
+    if (lexical) return { ...lexical, rest: path.slice(lexical.at.length + 1),
+      derivedKey: path, where: ' at ' + lexical.at + '/', kind: 'entry' };
+    const entry = this.nestedByDisk(mount, path, false, snapshot);
+    if (entry) return { ...entry, where: '', kind: 'entry' };
+    const target = this.nestedByDisk(mount, path, true, snapshot);
+    return target ? { ...target, derivedKey: undefined, where: '', kind: 'link' } : null;
+  }
+
+  /** Forget disk evidence first: a partial failure leaves it unknown rather
+   * than claiming agreement with a tree entry that has been removed. */
+  private untrackPath(mount: MountState, path: string): void {
+    this.agreementOrThrow().forget(mount.config.name, path);
+    const store = this.getStore();
+    if (store.treeGet(mount.treeStateId, path)) store.treeRemove(mount.treeStateId, path);
+    this.intents.get(mount.config.name)!.put(path, null);
+  }
+
+  private untrackNote(mount: MountState, path: string): string {
+    return 'Stopped tracking "' + mount.config.name + '/' + path +
+      '". The file or link on disk, if any, was left untouched.';
+  }
+
+  /** This decision uses only the outer store and the classified path.
+   * A different case is a hint, not authority to remove a different key. */
+  private deleteNestedCopy(
+    mount: MountState, relativePath: string, inputPath: string, inner: NestedDeletion,
+  ): ToolResult {
+    const store = this.getStore();
+    const intents = this.intents.get(mount.config.name)!;
+    const inside = (path: string): boolean =>
+      path === inner.at || path.startsWith(inner.at + '/');
+    const keys = [relativePath];
+    if (inner.kind === 'entry' && inner.derivedKey !== undefined && inside(inner.derivedKey)) keys.push(inner.derivedKey);
+    const storedPath = keys.find((path) => store.treeGet(mount.treeStateId, path) ||
+      intents.get(path) || this.agreementOrThrow().get(mount.config.name, path));
+    if (storedPath !== undefined) {
+      this.untrackPath(mount, storedPath);
+      return { success: true, data: { path: inputPath, deleted: true, note: this.untrackNote(mount, storedPath) } };
+    }
+
+    if (process.platform === 'darwin' || process.platform === 'win32') {
+      const hintKey = inner.kind === 'link' ? relativePath : inner.at + (inner.rest ? '/' + inner.rest : '');
+      const hint = store.treeList(mount.treeStateId).find((entry) =>
+        (inner.kind === 'link' || inside(entry.path)) && entry.path.toLowerCase() === hintKey.toLowerCase());
+      if (hint) return { success: false, isError: true,
+        error: 'Tracked spelling: "' + mount.config.name + '/' + hint.path + '"; use that exact path to stop tracking this copy.' };
+    }
+    return { success: false, isError: true,
+      error: '"' + inputPath + '" is inside mount "' + inner.name + '", which is nested in "' +
+        mount.config.name + '"' + inner.where + ', and "' + mount.config.name +
+        '" doesn\'t hold it: use "' + (inner.rest ? inner.name + '/' + inner.rest : inner.name) + '"' };
+  }
+
   private async handleDelete(input: DeleteInput): Promise<ToolResult> {
     const { mount, relativePath } = this.parsePath(input.path, { nested: 'allow' });
     if (mount.config.mode === 'read-only') {
@@ -2498,73 +2608,17 @@ export class WorkspaceModule implements Module {
     }
 
     const store = this.getStore();
-    // Nested as written, or by how disk spells the path (a case variant, a
-    // link inside the mount), decided in the mount's turn.
-    const nestedAt = (): { name: string; rest: string; where: string } | null => {
-      const lexical = this.nestedMountAt(mount, relativePath);
-      if (lexical) return { name: lexical.name, rest: relativePath.slice(lexical.at.length + 1), where: ` at ${lexical.at}/` };
-      const byDisk = this.nestedByDisk(mount, relativePath, false);
-      return byDisk ? { ...byDisk, where: '' } : null;
-    };
-    // A copy the outer mount took in from a nested mount's directory before
-    // #280's fix: deleting it stops tracking it here, and never touches disk,
-    // where the file is the inner mount's. Anything else at such a path is
-    // refused, as every other tool refuses it.
-    const nestedDelete = (inner: { name: string; rest: string; where: string }): ToolResult => {
-      // Older scans stored disk's spelling. Prefer a copy at the supplied
-      // path (which may be an old alias), then resolve its directory entry.
-      let storedPath = relativePath;
-      if (!store.treeGet(mount.treeStateId, storedPath)) {
-        const absolute = resolve(mount.config.path, relativePath);
-        const parent = canonicalRoot(dirname(absolute));
-        let name = basename(absolute);
-        try {
-          const entries = readdirSync(parent);
-          if (!entries.includes(name)) {
-            const named = lstatSync(join(parent, name));
-            const actual = entries.find((entry) => {
-              if (entry.toLowerCase() !== name.toLowerCase()) return false;
-              const candidate = lstatSync(join(parent, entry));
-              return candidate.dev === named.dev && candidate.ino === named.ino;
-            });
-            if (actual !== undefined) name = actual;
-          }
-          storedPath = relative(canonicalRoot(mount.config.path), join(parent, name)).split(sep).join('/');
-        } catch (error) {
-          if (errnoOf(error) !== 'ENOENT' && errnoOf(error) !== 'ENOTDIR') {
-            return { success: false, isError: true,
-              error: `Cannot identify the stored spelling of "${input.path}": ${error instanceof Error ? error.message : String(error)}` };
-          }
-          // An absent disk entry supplies no alternate spelling.
-        }
-      }
-      if (!store.treeGet(mount.treeStateId, storedPath)) {
-        return {
-          success: false,
-          error: `"${input.path}" is inside mount "${inner.name}", which is nested in "${mount.config.name}"${inner.where}, ` +
-            `and "${mount.config.name}" doesn't hold it: use "${inner.rest ? `${inner.name}/${inner.rest}` : inner.name}"`,
-          isError: true,
-        };
-      }
-      store.treeRemove(mount.treeStateId, storedPath);
-      this.intents.get(mount.config.name)!.put(storedPath, null);
-      this.agreementOrThrow().forget(mount.config.name, storedPath);
-      return {
-        success: true,
-        data: {
-          path: input.path,
-          deleted: true,
-          note: `inside mount "${inner.name}": no longer tracked by "${mount.config.name}"; the file on disk is "${inner.name}"'s and was left as it is`,
-        },
-      };
-    };
     return this.withMount(mount, async (): Promise<ToolResult> => {
+      // Decide from the copy already held. Observing first could import a
+      // nested alias merely to forget it and announce that transient copy.
+      const beforeRead = this.nestedDeletion(mount, relativePath, this.nestedSnapshot(mount));
+      if (beforeRead) return this.deleteNestedCopy(mount, relativePath, input.path, beforeRead);
       const report = await this.ensureSynced(mount, relativePath);
       await this.settleBeforeMutation(mount, relativePath);
       // Decided after the last await, beside the store change: the path may
       // have come to lie in a nested mount while the delete waited.
-      const inner = nestedAt();
-      if (inner) return nestedDelete(inner);
+      const inner = this.nestedDeletion(mount, relativePath, this.nestedSnapshot(mount));
+      if (inner) return this.deleteNestedCopy(mount, relativePath, input.path, inner);
       const entry = store.treeGet(mount.treeStateId, relativePath);
       if (!entry) {
         return { success: false, error: this.notInWorkspace(input.path, report), isError: true };
@@ -2954,26 +3008,33 @@ export class WorkspaceModule implements Module {
         blocked.push({ mount: name, reason: 'a read-only mount: materialize writes nothing to it' });
         continue;
       }
-      const turn = await this.withMount(mount, async (): Promise<{ blocked: string } | { pushed: PushResult; inPlace: boolean; nested: Array<{ path: string; inner: string }> }> => {
+      const turn = await this.withMount(mount, async (): Promise<
+        { blocked: string; nested: Array<{ path: string; inner: string; stopped: boolean }> } |
+        { pushed: PushResult; inPlace: boolean; nested: Array<{ path: string; inner: string; stopped: boolean }> }
+      > => {
         const branchId = store.currentBranch().id;
         const reason = this.mountMaterializeBlockReason(store, mount);
         // Force passes a divergence. The selection follows the evidence, which
         // is per path and kept across branches, so nothing needs resetting:
         // the push re-pins to this branch.
-        if (reason && !input.force) return { blocked: reason };
         const { paths: selected, inPlace } = this.materializeSelection(mount, explicit?.relativePath ?? '');
         // What the outer mount still holds in a nested mount's directory (taken
         // in before #280's fix) is never written there, nor deleted there:
         // the files are the inner mount's (agent-framework #280).
-        const ats = this.nestedAtsOf(mount);
-        const nested: Array<{ path: string; inner: string }> = [];
+        const snapshot = this.nestedSnapshot(mount);
+        const nested: Array<{ path: string; inner: string; stopped: boolean }> = [];
         const paths: string[] = [];
         for (const path of selected) {
           const writing = store.treeGet(mount.treeStateId, path) !== null;
-          const inner = this.nestedMountAt(mount, path, ats) ?? this.nestedByDisk(mount, path, writing);
-          if (inner) nested.push({ path, inner: inner.name });
-          else paths.push(path);
+          const inner = writing
+            ? this.nestedMountAt(mount, path, snapshot.ats) ?? this.nestedByDisk(mount, path, true, snapshot)
+            : this.nestedDeletion(mount, path, snapshot);
+          if (inner) {
+            if (!writing) this.untrackPath(mount, path);
+            nested.push({ path, inner: inner.name, stopped: !writing });
+          } else paths.push(path);
         }
+        if (reason && !input.force) return { blocked: reason, nested };
         return {
           inPlace,
           nested,
@@ -2982,6 +3043,10 @@ export class WorkspaceModule implements Module {
           }),
         };
       });
+      for (const { path, inner, stopped } of turn.nested) {
+        blocked.push({ mount: name, reason: stopped ? this.untrackNote(mount, path)
+          : path + ': inside mount "' + inner + '", which is nested in this one; delete it here to stop tracking it; the disk entry, if any, was left untouched' });
+      }
       if ('blocked' in turn) {
         blocked.push({ mount: name, reason: turn.blocked });
         guarded.push(name);
@@ -2997,9 +3062,6 @@ export class WorkspaceModule implements Module {
       // be visible, not resolved silently either way.
       for (const s of pushed.skipped) {
         blocked.push({ mount: name, reason: `${s.path}: ${s.reason}` });
-      }
-      for (const { path, inner } of turn.nested) {
-        blocked.push({ mount: name, reason: `${path}: inside mount "${inner}", which is nested in this one; delete it here to stop tracking it` });
       }
 
       // What disk still owes is kept by its evidence, so the watermark and

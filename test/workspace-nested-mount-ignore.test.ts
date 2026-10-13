@@ -294,14 +294,14 @@ function storeHolds(workspace: WorkspaceModule, mount: string, rel: string): boo
 }
 
 /** A started workspace on a store at `storePath`; `stops` stops it at the end, if nothing has. */
-async function started(stops: Array<() => Promise<void>>, storePath: string, mounts: MountConfig[]) {
+async function started(stops: Array<() => Promise<void>>, storePath: string, mounts: MountConfig[], pushEvent: (event: unknown) => void = () => {}) {
   const store = JsStore.openOrCreate({ path: storePath });
   const warn = console.warn;
   console.warn = () => {};
   let workspace: WorkspaceModule;
   try { workspace = new WorkspaceModule({ mounts }); } finally { console.warn = warn; }
   workspace.initStore(store);
-  await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+  await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent } as unknown as ModuleContext);
   let stopped = false;
   const stop = async () => {
     if (stopped) return;
@@ -352,7 +352,7 @@ test("the outer mount's tools refuse a path in a nested mount, naming it; deleti
   // Deleting the old copy stops tracking it here, and leaves disk alone.
   const dropped = await call('delete', { path: 'outer/a/b/x.txt' });
   assert.equal(dropped.success, true, String(dropped.error));
-  assert.match(JSON.stringify(dropped.data), /no longer tracked by \\"outer\\"/);
+  assert.match(JSON.stringify(dropped.data), /stopped tracking/i);
   assert.equal(readFileSync(join(outerDir, 'a', 'b', 'x.txt'), 'utf8'), "the inner mount's");
   const again = await call('delete', { path: 'outer/a/b/x.txt' });
   assert.equal(again.success, false);
@@ -519,7 +519,7 @@ test("a delete through a link into a nested mount stops tracking an old copy and
   symlinkSync(join(outerDir, 'a', 'b'), join(outerDir, 'moved'));
   const forgotten = await call('delete', { path: 'outer/moved/z.txt' });
   assert.equal(forgotten.success, true, String(forgotten.error));
-  assert.match(JSON.stringify(forgotten.data), /no longer tracked by \\"outer\\"/);
+  assert.match(JSON.stringify(forgotten.data), /stopped tracking/i);
   assert.equal(storeHolds(workspace, 'outer', 'moved/z.txt'), false);
   assert.equal(readFileSync(join(outerDir, 'a', 'b', 'z.txt'), 'utf8'), "the inner mount's", 'disk is untouched');
   // With no old copy, the delete is refused, naming the inner mount.
@@ -893,37 +893,6 @@ for (const destination of ['outside', 'inner'] as const) {
   });
 }
 
-for (const autoMaterialize of [false, true]) {
-  test(`#282 round: deleting an outer final link follows ordinary delete semantics (autoMaterialize ${autoMaterialize})`, async (t) => {
-    const { root, stops } = scratch(t, 'af-nested-round-unlink-');
-    const outer = join(root, 'outer');
-    mkdirSync(join(outer, 'inner'), { recursive: true });
-    writeFileSync(join(outer, 'inner', 'x.txt'), 'inner bytes');
-    const { workspace } = await started(stops, join(root, 'store'), [
-      { name: 'outer', path: outer, mode: 'read-write', watch: 'never', autoMaterialize, followSymlinks: true },
-      { name: 'inner', path: join(outer, 'inner'), mode: 'read-write', watch: 'never' },
-    ]);
-    assert.equal((await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'outer/link', content: 'old draft' } })).success, true);
-    rmSync(join(outer, 'link'), { force: true });
-    symlinkSync(join(outer, 'inner', 'x.txt'), join(outer, 'link'));
-    const result = await workspace.handleToolCall({ id: 'd', name: 'delete', input: { path: 'outer/link' } });
-    assert.equal(result.success, !autoMaterialize);
-    if (autoMaterialize) {
-      assert.match(String(result.error), /Removed from Chronicle but did not unlink/);
-      assert.match(String(result.error), /inside mount "inner"/);
-      assert.doesNotMatch(String(result.error), /until materialize with applyDeletions removes it/);
-    } else {
-      assert.deepEqual(result.data, { path: 'outer/link', deleted: true });
-    }
-    assert.equal(storeHolds(workspace, 'outer', 'link'), false);
-    const later = await workspace.handleToolCall({ id: 'later', name: 'materialize', input: { mount: 'outer', applyDeletions: true, force: true } });
-    assert.match(JSON.stringify(later), /inside mount/);
-    assert.doesNotMatch(JSON.stringify(later), /delete it here to stop tracking it/,
-      'the copy is already deleted; report the disk refusal rather than suggesting the same delete again');
-    assert.equal(readFileSync(join(outer, 'inner', 'x.txt'), 'utf8'), 'inner bytes');
-  });
-}
-
 test('#282 round: every nested lookup names the innermost mount', async (t) => {
   const { root, stops } = scratch(t, 'af-nested-round-deep-');
   const outer = join(root, 'outer');
@@ -1015,13 +984,12 @@ test('#282 round: a nested delete reached by alias finds a copy stored under its
   try {
     fs.readdirSync = (() => { throw Object.assign(new Error('directory unavailable'), { code: 'EIO' }); }) as typeof readDir;
     syncBuiltinESMExports();
-    const refused = await workspace.handleToolCall({ id: 'unavailable', name: 'delete', input: { path: 'outer/via/x.txt' } });
-    assert.match(String(refused.error), /Cannot identify the stored spelling.*directory unavailable/);
-    assert.equal(storeHolds(workspace, 'outer', 'a/b/x.txt'), true);
+    const result = await workspace.handleToolCall({ id: 'unavailable', name: 'delete', input: { path: 'outer/via/x.txt' } });
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.equal(storeHolds(workspace, 'outer', 'a/b/x.txt'), false);
+    assert.equal((result.data as { note: string }).note,
+      'Stopped tracking "outer/a/b/x.txt". The file or link on disk, if any, was left untouched.');
   } finally { fs.readdirSync = readDir; syncBuiltinESMExports(); }
-  const result = await workspace.handleToolCall({ id: 'd', name: 'delete', input: { path: 'outer/via/x.txt' } });
-  assert.equal(result.success, true, JSON.stringify(result));
-  assert.equal(storeHolds(workspace, 'outer', 'a/b/x.txt'), false);
   assert.equal(readFileSync(join(outer, 'a', 'b', 'x.txt'), 'utf8'), 'inner bytes');
 });
 
@@ -1051,4 +1019,234 @@ test('#282 round: boundary refusal precedes opening a directory', async (t) => {
     fsPromises.open = original;
     syncBuiltinESMExports();
   }
+});
+
+async function secondPassRig(t: TestContext, autoMaterialize = false, maxFileSize?: number) {
+  const { root, stops } = scratch(t, 'af-nested-pass2-');
+  const outer = join(root, 'outer');
+  const inner = join(outer, 'inner');
+  mkdirSync(inner, { recursive: true });
+  writeFileSync(join(inner, 'x.txt'), 'inner bytes');
+  const events: unknown[] = [];
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', followSymlinks: true, autoMaterialize, maxFileSize },
+    { name: 'inner', path: inner, mode: 'read-write', watch: 'never' },
+  ], (event) => { events.push(event); });
+  const state = workspace as unknown as {
+    getStore(): JsStore;
+    intents: Map<string, import('../src/modules/workspace/branch-intent.js').BranchIntents>;
+    agreementOrThrow(): import('../src/modules/workspace/disk-agreement.js').DiskAgreement;
+  };
+  const store = state.getStore();
+  const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
+  const seedCopy = (path: string) => {
+    const blobHash = store.storeBlob(Buffer.from('old copy'), 'text/plain');
+    store.treeSet('workspace/outer/tree', path, { blobHash, size: 8, mode: 0o644 });
+    return blobHash;
+  };
+  return { root, stops, outer, inner, workspace, state, store, call, seedCopy, events };
+}
+
+for (const kind of ['lexical', 'parent-alias', 'final-link'] as const) {
+  for (const force of [false, true]) for (const applyDeletions of [false, true]) {
+    test(`#282 pass2: a legacy ${kind} pending deletion stops tracking once (force ${force}, applyDeletions ${applyDeletions})`, async (t) => {
+      const r = await secondPassRig(t);
+      const path = kind === 'lexical' ? 'inner/x.txt' : kind === 'parent-alias' ? 'via/x.txt' : 'link';
+      if (kind === 'parent-alias') symlinkSync(r.inner, join(r.outer, 'via'));
+      if (kind === 'final-link') symlinkSync(join(r.inner, 'x.txt'), join(r.outer, 'link'));
+      // A deletion recorded before this path became nested, or by an older
+      // version. Its tree entry is gone but intent and agreement remain.
+      const hash = r.store.storeBlob(Buffer.from('old copy'), 'text/plain');
+      r.state.intents.get('outer')!.put(path, { tombstone: { hash } });
+      r.state.agreementOrThrow().set('outer', path, { kind: 'content', hash, size: 8 });
+      const result = await r.call('materialize', { mount: 'outer', force, applyDeletions });
+      assert.equal(result.success, true, JSON.stringify(result));
+      assert.match(JSON.stringify(result.data), /stopped tracking.*disk.*untouched/i);
+      assert.doesNotMatch(JSON.stringify(result.data), /delete it here|applyDeletions to remove/);
+      assert.equal(r.state.intents.get('outer')!.get(path), null);
+      assert.equal(r.state.agreementOrThrow().get('outer', path), undefined);
+      assert.equal(readFileSync(join(r.inner, 'x.txt'), 'utf8'), 'inner bytes');
+      const again = await r.call('materialize', { mount: 'outer', force, applyDeletions });
+      assert.doesNotMatch(JSON.stringify(again), /stopped tracking|delete it here|workspaceDeletionsLeftOnDisk/i);
+    });
+  }
+}
+
+for (const autoMaterialize of [false, true]) {
+  test(`#282 pass2: delete of an outer link stops tracking instead of leaving an impossible unlink (autoMaterialize ${autoMaterialize})`, async (t) => {
+    const r = await secondPassRig(t, autoMaterialize);
+    assert.equal((await r.call('write', { path: 'outer/link', content: 'old copy' })).success, true);
+    rmSync(join(r.outer, 'link'), { force: true });
+    symlinkSync(join(r.inner, 'x.txt'), join(r.outer, 'link'));
+    const result = await r.call('delete', { path: 'outer/link' });
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.match(JSON.stringify(result.data), /stopped tracking.*link.*disk.*untouched/i);
+    assert.equal(storeHolds(r.workspace, 'outer', 'link'), false);
+    assert.equal(r.state.intents.get('outer')!.get('link'), null);
+    assert.equal(r.state.agreementOrThrow().get('outer', 'link'), undefined);
+    assert.equal(fs.lstatSync(join(r.outer, 'link')).isSymbolicLink(), true);
+    assert.equal(readFileSync(join(r.inner, 'x.txt'), 'utf8'), 'inner bytes');
+    for (const force of [false, true]) for (const applyDeletions of [false, true]) {
+      const later = await r.call('materialize', { mount: 'outer', force, applyDeletions });
+      assert.doesNotMatch(JSON.stringify(later), /link|workspaceDeletionsLeftOnDisk/);
+    }
+  });
+}
+
+test('#282 pass2: a Darwin-policy constructor preserves an unmade root in its ignore rule', async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-pass2-ignore-');
+  const outer = join(root, 'outer');
+  mkdirSync(outer);
+  writeFileSync(join(outer, 'top.txt'), 'top');
+  const store = JsStore.openOrCreate({ path: join(root, 'store') });
+  let workspace: WorkspaceModule | undefined;
+  stops.push(async () => { await workspace?.stop(); if (!store.isClosed()) store.close(); });
+  const config: MountConfig = { name: 'outer', path: outer, mode: 'read-write', watch: 'never' };
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    workspace = new WorkspaceModule({ mounts: [config,
+      { name: 'inner', path: join(outer, 'CamelChild'), mode: 'read-write', watch: 'never' }] });
+    workspace.initStore(store);
+    await workspace.start({ isRestart: false, getState: () => null, setState: () => {}, pushEvent: () => {} } as unknown as ModuleContext);
+    assert.deepEqual(config.ignore, ['CamelChild/**']);
+    const denied = await workspace.handleToolCall({ id: 'w', name: 'write', input: { path: 'outer/camelchild/new.txt', content: 'draft' } });
+    assert.equal(denied.success, false);
+    mkdirSync(join(outer, 'CamelChild'));
+    writeFileSync(join(outer, 'CamelChild', 'x.txt'), 'inner');
+    assert.deepEqual(await syncedByOuter(workspace), ['top.txt']);
+    const synced = await workspace.handleToolCall({ id: 's', name: 'sync', input: { mount: 'outer' } });
+    assert.deepEqual((synced.data as { passedOver: unknown }).passedOver, [{ mount: 'outer', reason: 'ignored by the mount', count: 1 }]);
+  } finally { Object.defineProperty(process, 'platform', platform); }
+});
+
+test('#282 pass2: existing case-distinct paths retain their spelling under the Darwin policy', async (t) => {
+  const r = await secondPassRig(t);
+  if (existsSync(join(r.outer, 'INNER'))) { t.skip('requires a case-sensitive directory for the control'); return; }
+  mkdirSync(join(r.outer, 'INNER'));
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    const result = await r.call('write', { path: 'outer/INNER/KeepCase.txt', content: 'owned' });
+    assert.equal(result.success, true, JSON.stringify(result));
+    assert.equal(storeHolds(r.workspace, 'outer', 'INNER/KeepCase.txt'), true);
+    assert.equal(storeHolds(r.workspace, 'outer', 'inner/keepcase.txt'), false);
+  } finally { Object.defineProperty(process, 'platform', platform); }
+});
+
+test('#282 pass2: delete recognises a case variant of the nested root itself', async (t) => {
+  const r = await secondPassRig(t);
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    const result = await r.call('delete', { path: 'outer/INNER' });
+    assert.equal(result.success, false);
+    assert.match(String(result.error), /is inside mount "inner".*use "inner"$/);
+  } finally { Object.defineProperty(process, 'platform', platform); }
+});
+
+test('#282 pass2: a nested delete refuses before importing or announcing an alias', async (t) => {
+  const r = await secondPassRig(t);
+  assert.equal((await r.call('write', { path: 'outer/owned.txt', content: 'outer bytes' })).success, true);
+  // The old disk-spelling lookup reaches its derived-key assignment only
+  // when the entry exists on disk as well as in the outer store.
+  writeFileSync(join(r.outer, 'owned.txt'), 'outer bytes');
+  symlinkSync(r.outer, join(r.inner, 'back'));
+  const result = await r.call('delete', { path: 'outer/inner/back/owned.txt' });
+  assert.equal(result.success, false, JSON.stringify({ result, events: r.events }));
+  assert.equal(storeHolds(r.workspace, 'outer', 'owned.txt'), true);
+  assert.doesNotMatch(JSON.stringify(r.events), /inner\/back\/owned.txt/,
+    'a refused nested delete neither imports nor announces a temporary copy');
+});
+
+test('#282 pass2: nestedDelete neither lists the inner directory nor returns its OS errors', async (t) => {
+  const r = await secondPassRig(t);
+  const readdir = fs.readdirSync;
+  let listed = 0;
+  try {
+    fs.readdirSync = (() => {
+      listed++;
+      throw Object.assign(new Error('EACCES /private/inner-directory'), { code: 'EACCES' });
+    }) as typeof readdir;
+    syncBuiltinESMExports();
+    const result = await r.call('delete', { path: 'outer/inner/x.txt' });
+    assert.equal(result.success, false);
+    assert.match(String(result.error), /is inside mount "inner".*doesn't hold it: use "inner\/x.txt"/);
+    assert.doesNotMatch(String(result.error), /EACCES|private|Cannot identify/);
+    assert.equal(listed, 0);
+  } finally { fs.readdirSync = readdir; syncBuiltinESMExports(); }
+});
+
+test('#282 pass2: a case-folded store match is a hint, not permission to forget that key', async (t) => {
+  const r = await secondPassRig(t);
+  r.seedCopy('inner/File.txt');
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    const result = await r.call('delete', { path: 'outer/INNER/file.txt' });
+    assert.equal(result.success, false);
+    assert.match(String(result.error), /tracked spelling.*outer\/inner\/File.txt/i);
+    assert.equal(storeHolds(r.workspace, 'outer', 'inner/File.txt'), true);
+    const exact = await r.call('delete', { path: 'outer/inner/File.txt' });
+    assert.equal(exact.success, true, JSON.stringify(exact));
+    assert.equal(storeHolds(r.workspace, 'outer', 'inner/File.txt'), false);
+  } finally { Object.defineProperty(process, 'platform', platform); }
+});
+
+test('#282 pass2: untracking a stale nested copy makes no claim that its disk file exists', async (t) => {
+  const r = await secondPassRig(t);
+  assert.match(r.workspace.getTools().find((tool) => tool.name === 'delete')!.description, /stops tracking.*any disk entry untouched/);
+  assert.match(r.workspace.getTools().find((tool) => tool.name === 'materialize')!.description, /Pending deletions blocked by nested-mount ownership stop being tracked/);
+  r.seedCopy('inner/missing.txt');
+  const result = await r.call('delete', { path: 'outer/inner/missing.txt' });
+  assert.equal(result.success, true);
+  assert.match(JSON.stringify(result.data), /if any.*untouched/);
+  assert.equal(existsSync(join(r.inner, 'missing.txt')), false);
+});
+
+test('#282 pass2: materialize reads nested roots once for its selection, not per path', async (t) => {
+  const r = await secondPassRig(t);
+  for (let i = 0; i < 4; i++) assert.equal((await r.call('write', { path: `outer/own-${i}.txt`, content: 'owned' })).success, true);
+  const native = fs.realpathSync.native;
+  let innerReads = 0;
+  try {
+    fs.realpathSync.native = ((path: Parameters<typeof native>[0], options?: Parameters<typeof native>[1]) => {
+      if (String(path) === r.inner) innerReads++;
+      return native(path, options as never);
+    }) as typeof native;
+    const result = await r.call('materialize', { mount: 'outer' });
+    assert.equal(result.success, true, JSON.stringify(result));
+    // One snapshot for selection and one for the subsequent disk push.
+    assert.equal(innerReads, 2);
+  } finally { fs.realpathSync.native = native; }
+});
+
+test('#282 pass2: a blocked physical push still reports its completed nested-deletion cleanup', async (t) => {
+  const r = await secondPassRig(t);
+  const path = 'inner/x.txt';
+  const hash = r.store.storeBlob(Buffer.from('old copy'), 'text/plain');
+  r.state.intents.get('outer')!.put(path, { tombstone: { hash } });
+  r.state.agreementOrThrow().set('outer', path, { kind: 'content', hash, size: 8 });
+  (r.workspace as unknown as { mountMaterializeBlockReason(): string }).mountMaterializeBlockReason = () => 'test branch barrier';
+  const result = await r.call('materialize', { mount: 'outer' });
+  assert.equal(result.success, false);
+  assert.match(String(result.error), /Stopped tracking.*test branch barrier/);
+  assert.equal(r.state.intents.get('outer')!.get(path), null);
+  assert.equal(r.state.agreementOrThrow().get('outer', path), undefined);
+  const again = await r.call('materialize', { mount: 'outer' });
+  assert.doesNotMatch(String(again.error), /Stopped tracking/);
+  assert.equal(readFileSync(join(r.inner, 'x.txt'), 'utf8'), 'inner bytes');
+});
+
+test('#282 pass2: a non-ingested nested alias cannot derive an outer-owned key', async (t) => {
+  const r = await secondPassRig(t, false, 4);
+  assert.equal((await r.call('write', { path: 'outer/owned.txt', content: 'old' })).success, true);
+  // Too large for observation to import under the alias. The old fallback
+  // therefore reached its derived key and removed the outer-owned copy.
+  writeFileSync(join(r.outer, 'owned.txt'), 'outer bytes above the four-byte cap');
+  symlinkSync(r.outer, join(r.inner, 'back'));
+  const result = await r.call('delete', { path: 'outer/inner/back/owned.txt' });
+  assert.equal(storeHolds(r.workspace, 'outer', 'owned.txt'), true, JSON.stringify(result));
+  assert.equal(result.success, false, JSON.stringify(result));
+  assert.equal(readFileSync(join(r.outer, 'owned.txt'), 'utf8'), 'outer bytes above the four-byte cap');
 });

@@ -19,7 +19,7 @@
     mount without `autoMaterialize`, deleting such a file from the workspace
     doesn't end the listing either. On one with it, the delete removes the
     disk copy, which ends it. There is no way yet to stop tracking a file and
-    keep it on disk, except inside a nested mount (below).
+    keep it on disk, except for nested paths and outer links into nested mounts (below).
   - A pattern with a trailing slash (`node_modules/`, `build/cache/`) or a
     slash inside it (`build/cache`) matched nothing. Now a trailing slash is
     dropped, so `node_modules/` reads as `node_modules` (gitignore would
@@ -57,13 +57,10 @@
     in "outer" at a/b/: use "inner/x.txt"". That covers `read`, `write`,
     `edit`, `ls`, `glob`, `grep`, and a `sync` or `materialize` that names the
     path. Before, a named sync took the inner mount's files into the outer
-    one. `write`, `edit`, `writeBinary` and `delete` also read where the
+    one. `write`, `edit` and `writeBinary` also read where the
     path leads on disk at their checks, so existing case variants and links inside the mount, dangling or not, are checked too. A link changed after the store check can leave an outer draft at a now-nested path; materialize refuses the later disk write.
-    - The one exception is `delete` of a file the outer mount still holds
-      there, taken in before this fix. It stops tracking the file in the
-      outer mount and leaves disk alone, where the file is the inner mount's.
-    - A `materialize` without a path never writes or deletes such a file. It
-      lists the file under `skipped`, saying to delete it to stop tracking it.
+    - `delete` can stop tracking an old outer copy at a nested path. It removes the exact stored key and its intent and agreement; the disk entry, if any, stays untouched.
+    - A `materialize` without a path skips writes of such copies, with a note saying that disk was left untouched and the copy can be deleted here to stop tracking it. An already-pending deletion at a nested path is untracked once instead of receiving that advice again.
   - Every check that a canonical path lies inside the mount, when reading,
     walking or writing, also refuses one inside a nested mount. So a symlink
     that a `followSymlinks` mount follows into a nested mount reaches nothing
@@ -88,8 +85,8 @@
   - (agent-framework #280)
 
 - Nested refusals name the innermost mount, even when several mounts contain the path. A lexical refusal includes its directory, such as `"outer/a/b/x.txt" is inside mount "inner", which is nested in "outer" at a/b/: use "inner/x.txt"`. A path reached through disk spelling omits that location clause: `"outer/via/x.txt" is inside mount "inner", which is nested in "outer": use "inner/x.txt"`. The public tool wrapper prefixes thrown lexical errors with `Error:`.
-- An unmade path component is lowercased on macOS and Windows and preserved elsewhere. Existing components still use disk's spelling. This is a platform default, not a filesystem probe: case-sensitive macOS/Windows volumes can receive conservative refusals for unmade variants, and case-insensitive filesystems on other platforms are outside this missing-component rule. The workspace writes no case-probe entry into a user's mount.
-- A path-less materialize lists copies reached through links or case variants as nested skips, with the same stop-tracking note as lexical copies. Deleting an old nested copy first tries its supplied store key, then its directory-entry spelling on disk. This lets a differently spelled path remove the copy stored by an earlier walk.
-- Delete resolves the parent but keeps the final entry rather than following its link. An outer link into a nested mount therefore takes the ordinary delete path instead of claiming to remove an inner-owned file. The disk unlink's existing boundary refusal remains; the error reports that refusal without promising a later materialize can remove the link.
+- Path spelling and comparison are separate. Existing components use disk's spelling, and unmade components keep their written spelling, including in generated ignore rules. On macOS and Windows, a nesting comparison ignores case only when one of the compared components was unmade. This uses platform defaults without a filesystem probe: non-default case-sensitive volumes can receive conservative refusals, while case-insensitive filesystems elsewhere are outside the missing-component rule.
+- After classification, nested deletion uses the outer store rather than listing or statting the inner directory. It removes only an exact supplied key or an exact derived key contained in the identified nested mount. A differently cased tracked key is named in a refusal so the caller can request it exactly; case folding never chooses a key to remove. This also prevents a path through an inner link back out from forgetting an outer-owned entry.
+- An outer link into a nested mount is untracked rather than assigned a disk deletion the outer mount cannot perform. Its stored copy, intent, and disk agreement are removed, and the result says the file or link on disk, if any, was left untouched. The disk unlink boundary itself is unchanged. Path-less materialize also clears legacy pending deletions at nested paths or for such links, independently of `force` and `applyDeletions`. It reports cleanup once, including if remaining physical writes are blocked by branch divergence, and leaves no pending action to report on the next call.
 - Disk readers check containment and nested boundaries before answering a target's kind, including a directory reached through a link. They also check the opened file's path and identity.
-- These checks make synchronous filesystem reads on the event loop for mount roots and target path components, including realpath, lstat, readlink, and the directory-entry lookup for an old copy's spelling. They can block while mounted storage does not answer. This is the existing synchronous-I/O limitation tracked in #311, now explicitly including per-path reads.
+- Classification still makes synchronous realpath, lstat, and readlink calls on the event loop for roots and target paths; untracking adds no post-classification directory lookup. Materialize resolves the nested roots once for its selection and shares that snapshot across selected paths. Disk effects obtain their own fresh view. A mounted filesystem that does not answer can still block the synchronous reads, as tracked in #311.
