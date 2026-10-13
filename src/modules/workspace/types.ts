@@ -137,7 +137,13 @@ export interface MountState {
    * The after-batch scan queued behind the mount's running work, not yet
    * started: later batches share it, since it starts after their tools ran.
    */
-  agentActionScanWaiting?: Promise<{ incomplete: Array<{ path: string; reason: string }> }>;
+  agentActionScanWaiting?: AgentActionScan;
+  /**
+   * The mount's newest after-batch scan. Only its outcome is put on
+   * `lastAgentActionScan`: one queued behind an older scan describes a later
+   * batch, which the older scan's outcome mustn't speak for.
+   */
+  agentActionScanLatest?: AgentActionScan;
   /** A scan that outlasted a batch's deadline, while it still runs. */
   agentActionScanLate?: Promise<unknown>;
   /**
@@ -237,6 +243,14 @@ export interface GrepInput {
   contextBefore?: number;
   /** Context lines after match */
   contextAfter?: number;
+}
+
+/** One after-batch scan of a mount, shared by the batches that wait for it. */
+export interface AgentActionScan {
+  /** Whether some batch stopped waiting for it (its deadline passed, or an earlier scan still ran late). */
+  late: boolean;
+  /** Settles, never rejects, once its outcome is recorded: on status if it is the newest, as events either way. */
+  settled: Promise<void>;
 }
 
 export interface StatusInput {

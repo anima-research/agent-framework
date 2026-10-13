@@ -20,12 +20,15 @@
  * Every transition is write-ahead (see reconcile.ts): an `intent` entry
  * (`pending`, with the prior value and the expected one) is durable before the
  * disk effect or tree adoption it announces, and the completion `set` is
- * appended only after that effect is durable. A pending adoption resolves at
- * its next observation, by the tree. A pending disk effect resolves there only
- * when disk shows it didn't happen (the prior) or can't tell (`interrupted`,
- * a sticky state resolved only explicitly); one that shows on disk is
- * completed only by a push whose barriers succeed, since its completion
- * releases a draft's protection.
+ * appended only after that effect is durable. One tree adoption has no
+ * intent: a drop, which removes the store's copy of a disk version the
+ * workspace can't hold, forgets P first, so a crash before the removal leaves
+ * P unknown, never a wrong adoption. A pending adoption resolves at its next
+ * observation, by the tree. A pending disk effect resolves there only when
+ * disk shows it didn't happen (the prior) or can't tell (`interrupted`, a
+ * sticky conflict resolved explicitly, or by disk and the store coming to
+ * agree); one that shows on disk is completed only by a push whose barriers
+ * succeed, since its completion releases a draft's protection.
  */
 
 import { resolve } from 'node:path';
@@ -141,8 +144,22 @@ export class DiskAgreement {
     this.rebuild();
   }
 
-  /** Re-read the journal when an earlier write left it unreconciled. */
+  /**
+   * Re-read the journal when an earlier write left it unreconciled, and throw
+   * once an append failed inside the store. P may then lack what that append
+   * recorded (the store may hold it where this process can't read it back),
+   * and a decision from stale P can record what reopening contradicts, such
+   * as a conflict that stays after the right evidence is back. So until the
+   * store is reopened, no evidence is read, written or checkpointed, and
+   * every pass and tool call that needs it fails.
+   */
   ensureReconciled(): void {
+    if (this.journal.needsReopen) {
+      throw new Error(
+        'Disk-agreement evidence is unavailable until the store is reopened, as at the next start: ' +
+        'an append to its journal failed inside the store, and the evidence may lack what it recorded',
+      );
+    }
     if (this.journal.needsReconcile) this.rebuild();
   }
 

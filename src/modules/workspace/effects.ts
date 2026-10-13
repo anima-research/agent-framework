@@ -29,7 +29,13 @@
  * before it, and a file replaced at its path after that check is the one
  * unlinked. Content writes stay bound to the descriptor verified before
  * modification: inside the mount, with no other hard links (a link another
- * process makes to it after that check shares the write).
+ * process makes to it after that check shares the write). The hash, which
+ * reads the whole file, comes before the checks of where the file is, and
+ * the root is checked again beside the parent, since the parent is found by
+ * path beneath the root's. A last look at the file (its descriptor's stat
+ * before a write, its entry's lstat before an unlink) refuses one written
+ * since it was first seen, so only an edit made in the moment between that
+ * look and the effect is overwritten or removed.
  */
 
 import { createHash } from 'node:crypto';
@@ -37,15 +43,17 @@ import { constants as fsConstants } from 'node:fs';
 import { lstat, open, realpath, stat, unlink } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import {
+  type CheckedDir,
   type MountView,
   NONBLOCK,
   NOT_FOLLOWED,
   OUTSIDE_PARENT,
+  ROOT_REPLACED,
   contained,
   errno,
   checkDir,
+  checkRoot,
   insideNested,
-  locateRoot,
   nameOf,
   parentOf,
 } from './observe.js';
@@ -86,17 +94,45 @@ function noFollowFlag(view: MountView): number {
 }
 
 /**
- * The parent of a path, checked for an effect; proven absent; or why neither.
- * The root comes first: still a directory, and still the one disk last agreed
- * under, as any observation of it checks. An effect under a replaced root
- * acts on nothing, whatever its caller checked before.
+ * The parent of a path, checked for an effect; proven absent; or why neither;
+ * with the root. The root comes first: still a directory, and still the one
+ * disk last agreed under, as any observation of it checks. An effect under a
+ * replaced root acts on nothing, whatever its caller checked before, and the
+ * parent is found by path beneath the root's path, so whoever acts checks the
+ * root again with the parent (`moved`): a root replaced after it was
+ * checked would otherwise lend the effect its replacement's directory.
  */
 async function parentFor(view: MountView, rootReal: string, rel: string, create: boolean) {
-  const root = await locateRoot(view, rootReal);
+  const root = await checkRoot(view, rootReal);
   if ('reason' in root) throw new EffectFailed(root.reason, false);
   const checked = await checkDir(view, rootReal, parentOf(rel), { create });
   if (checked.kind === 'unobserved') throw new EffectFailed(checked.outside ? OUTSIDE_PARENT : checked.reason, false);
-  return checked;
+  return { ...checked, root: root.dir };
+}
+
+/**
+ * Why the parent, or the root it was found beneath, is no longer the
+ * directory its path names; null while each still is. The root is asked
+ * first, so a replaced root reads the same wherever it's found.
+ */
+async function moved(root: CheckedDir, parent: CheckedDir): Promise<string | null> {
+  if (!(await root.stillHere())) return ROOT_REPLACED;
+  return (await parent.stillHere()) ? null : MOVED;
+}
+
+/** A file as a stat describes it: which file, and the size and stamps a write changes. */
+type Stamped = { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint };
+
+/**
+ * Whether the file at `target` is still the one `before` described: the same
+ * file, with the same size and stamps, so nothing wrote it since. Read just
+ * before an effect, after the slower checks, so an edit made while the file
+ * was hashed is never overwritten or deleted unseen; what remains is the
+ * moment between this and the effect, which Node can't close (see the header).
+ */
+function unchanged(before: Stamped, now: Stamped | null): boolean {
+  return now !== null && now.dev === before.dev && now.ino === before.ino && now.size === before.size
+    && now.mtimeNs === before.mtimeNs && now.ctimeNs === before.ctimeNs;
 }
 
 /** The hash of what `target` holds, read through a descriptor that must be the file `id` names. */
@@ -133,6 +169,7 @@ export async function writeContained(view: MountView, rootReal: string, rel: str
   const checked = await parentFor(view, rootReal, rel, true);
   if (checked.kind !== 'checked') throw new EffectFailed('a parent path is not a directory', false);
   const parent = checked.dir;
+  const root = checked.root;
   const target = parent.at(nameOf(rel));
   const noFollow = noFollowFlag(view);
   if (!view.followSymlinks && !noFollow) {
@@ -174,11 +211,16 @@ export async function writeContained(view: MountView, rootReal: string, rel: str
 
   let stage = 'write the file';
   try {
-    // Before any byte: a regular file, canonically inside the mount, the one
-    // this path names, with no other names, in the directory still at its
-    // path, and — unless forced — still holding what was decided on.
+    // Before any byte: a regular file, and — unless forced — still holding
+    // what was decided on. The hash reads the whole file, so it comes first,
+    // and the checks of where the file is follow it.
     const info = await handle.stat({ bigint: true });
     if (!info.isFile()) throw new EffectFailed('not a regular file', touched);
+    if (expect.kind === 'content' && (await hashAt(target, info, noFollow)) !== expect.hash) throw new EffectFailed(CHANGED, touched);
+    // Then: canonically inside the mount, the one this path names (and not a
+    // symlink, where the mount follows none and the open couldn't refuse
+    // one), with no other names, in the directory still at its path beneath
+    // the root still at its own.
     const real = await realpath(target).catch(() => null);
     if (real === null) throw new EffectFailed(CHANGED, touched);
     if (!contained(rootReal, real)) throw new EffectFailed(view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT, touched);
@@ -186,9 +228,16 @@ export async function writeContained(view: MountView, rootReal: string, rel: str
     if (nested) throw new EffectFailed(nested, touched);
     const named = await stat(real, { bigint: true }).catch(() => null);
     if (named === null || named.dev !== info.dev || named.ino !== info.ino) throw new EffectFailed(CHANGED, touched);
+    if (!view.followSymlinks) {
+      const entry = await lstat(target, { bigint: true }).catch(() => null);
+      if (entry?.isSymbolicLink()) throw new EffectFailed(NOT_FOLLOWED, touched);
+      if (entry === null || !entry.isFile() || entry.dev !== info.dev || entry.ino !== info.ino) throw new EffectFailed(CHANGED, touched);
+    }
     if (info.nlink > 1n) throw new EffectFailed(HARD_LINKED, touched);
-    if (!(await parent.stillHere())) throw new EffectFailed(MOVED, touched);
-    if (expect.kind === 'content' && (await hashAt(target, info, noFollow)) !== expect.hash) throw new EffectFailed(CHANGED, touched);
+    const gone = await moved(root, parent);
+    if (gone !== null) throw new EffectFailed(gone, touched);
+    // Nothing wrote it while those ran.
+    if (!unchanged(info, await handle.stat({ bigint: true }).catch(() => null))) throw new EffectFailed(CHANGED, touched);
 
     touched = true;
     await handle.truncate(0);
@@ -212,15 +261,21 @@ export async function writeContained(view: MountView, rootReal: string, rel: str
  */
 export async function unlinkContained(view: MountView, rootReal: string, rel: string, expect: Expect): Promise<string> {
   const checked = await parentFor(view, rootReal, rel, false);
-  if (checked.kind === 'absent') return checked.by; // no directory, so no file
+  if (checked.kind === 'absent') {
+    // No directory, so no file: proven beneath a root still at its path.
+    if (!(await checked.root.stillHere())) throw new EffectFailed(ROOT_REPLACED, false);
+    return checked.by;
+  }
   const parent = checked.dir;
+  const root = checked.root;
   const target = parent.at(nameOf(rel));
   let info;
   try {
     info = await lstat(target, { bigint: true });
   } catch (err) {
     if (errno(err) === 'ENOENT') {
-      if (!(await parent.stillHere())) throw new EffectFailed(MOVED, false);
+      const gone = await moved(root, parent);
+      if (gone !== null) throw new EffectFailed(gone, false);
       return parent.rel;
     }
     throw new EffectFailed(`cannot stat (${errno(err) ?? message(err)})`, false);
@@ -231,7 +286,7 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     const kind = info.isDirectory() ? 'a directory' : info.isSymbolicLink() ? 'a symlink' : 'a file';
     throw new EffectFailed(`${kind} appeared at this path since it was checked`, false);
   }
-  let id = { dev: info.dev, ino: info.ino };
+  let file = info;
   if (info.isSymbolicLink()) {
     // The link itself is what is removed; a followed one must still lie inside.
     if (!view.followSymlinks) throw new EffectFailed(NOT_FOLLOWED, false);
@@ -241,17 +296,19 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     if (nested) throw new EffectFailed(nested, false);
     const through = await stat(real, { bigint: true }).catch(() => null);
     if (through === null) throw new EffectFailed(CHANGED, false);
-    id = { dev: through.dev, ino: through.ino };
+    file = through;
   } else if (info.isDirectory()) {
     throw new EffectFailed('a directory', false);
   }
-  if (expect.kind === 'content' && (await hashAt(target, id, noFollowFlag(view))) !== expect.hash) throw new EffectFailed(CHANGED, false);
-  if (!(await parent.stillHere())) throw new EffectFailed(MOVED, false);
-  // The entry checked is still the one at the path, as close to the unlink as
-  // Node allows (see the header): a file replaced while it was hashed isn't.
+  if (expect.kind === 'content' && (await hashAt(target, file, noFollowFlag(view))) !== expect.hash) throw new EffectFailed(CHANGED, false);
+  const gone = await moved(root, parent);
+  if (gone !== null) throw new EffectFailed(gone, false);
+  // The entry checked is still the one at the path, unwritten since it was
+  // hashed, as close to the unlink as Node allows (see the header): a file
+  // replaced or edited while it was hashed isn't removed.
   const again = await lstat(target, { bigint: true }).catch(() => null);
   const named = again?.isSymbolicLink() ? await stat(target, { bigint: true }).catch(() => null) : again;
-  if (named === null || named.dev !== id.dev || named.ino !== id.ino) throw new EffectFailed(CHANGED, false);
+  if (!unchanged(file, named)) throw new EffectFailed(CHANGED, false);
   try {
     await unlink(target);
   } catch (err) {
@@ -275,7 +332,16 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
 export async function syncDirectories(view: MountView, rootReal: string, rels: Iterable<string>): Promise<Map<string, string>> {
   const failed = new Map<string, string>();
   const depth = (rel: string): number => (rel === '' ? 0 : rel.split('/').length);
-  for (const rel of [...new Set(rels)].sort((a, b) => depth(b) - depth(a))) {
+  const sorted = [...new Set(rels)].sort((a, b) => depth(b) - depth(a));
+  // Each directory is found by path beneath the root's path: under a root
+  // that isn't the one disk agreed under, or that is replaced while they're
+  // synced, none of them is the mount's.
+  const root = await checkRoot(view, rootReal);
+  if ('reason' in root) {
+    for (const rel of sorted) failed.set(rel, root.reason);
+    return failed;
+  }
+  for (const rel of sorted) {
     const checked = await checkDir(view, rootReal, rel);
     if (checked.kind !== 'checked') {
       failed.set(rel, checked.kind === 'absent' ? 'the directory is gone' : checked.reason);
@@ -283,6 +349,7 @@ export async function syncDirectories(view: MountView, rootReal: string, rels: I
     }
     try {
       await checked.dir.sync();
+      if (!(await root.dir.stillHere())) failed.set(rel, ROOT_REPLACED);
     } catch (err) {
       failed.set(rel, message(err));
     }

@@ -269,7 +269,10 @@ test('vector 20: an empty render appends nothing', async (t) => {
   await f.send('push/event', f.params('1', 'fallback', { deferred: true }));
   await f.framework.runUntilIdle();
   assert.equal(f.renders.length, 1);
-  assert(!f.lastRequest().includes('fallback'));
+  assert(!f.context().includes('fallback'));
+  // The batch was the turn's only cause and rendered nothing: no inference
+  // (an uncaused wake would show the model only older context).
+  assert.equal(f.membrane.calls.length, 0);
 });
 
 test('vectors 21/23: a render past the deadline materializes the fallback; the late result is discarded', async (t) => {
@@ -319,9 +322,16 @@ test('vectors 27a/27c: retract or plain replacement during a render cancels the 
       if (operation === 'plain') f.alwaysRespond();
       release({ content: [{ type: 'text', text: 'late_old_render' }] });
       await run;
-      const req = f.lastRequest();
-      assert(!req.includes('late_old_render') && !req.includes('fallback_one') && !req.includes('deletion_notice'));
-      if (operation === 'plain') assert(req.includes('complete_snapshot'));
+      if (operation === 'retract') {
+        // The cancelled batch was the turn's only cause and never-read
+        // content was withdrawn (vector 28): no inference at all.
+        assert.equal(f.membrane.calls.length, 0);
+        assert(!f.context().includes('late_old_render') && !f.context().includes('fallback_one') && !f.context().includes('deletion_notice'));
+      } else {
+        const req = f.lastRequest();
+        assert(!req.includes('late_old_render') && !req.includes('fallback_one') && !req.includes('deletion_notice'));
+        assert(req.includes('complete_snapshot'));
+      }
     } finally { await f.close(); }
   }
 });
@@ -636,7 +646,9 @@ test('G15: inference/request is refused while a cancelled render is still outsta
   await f.send('push/event', f.params('1', 'fallback', { deferred: true, initial: true }));
   await f.framework.runUntilIdle();
   assert.equal(refused, -32600);
-  assert(!f.lastRequest().includes('late') && !f.lastRequest().includes('fallback'));
+  // The withdrawn batch was the turn's only cause: no inference at all.
+  assert.equal(f.membrane.calls.length, 0);
+  assert(!f.context().includes('late') && !f.context().includes('fallback'));
 });
 
 // ---------------------------------------------------------------------------
@@ -832,7 +844,8 @@ test('R11: a retraction during the render-start commit wait is final; the batch 
   assert.equal(r.result.coalesce.outcome, 'retracted');
   await run;
   assert.equal((f.framework as unknown as { pushCoalescer: { pendingBatches(): number } }).pushCoalescer.pendingBatches(), 0);
-  assert(!f.context().includes('withdrawn_fallback') && !f.lastRequest().includes('document_diff'), 'nothing of the withdrawn batch was published');
+  assert(!f.context().includes('withdrawn_fallback') && !f.context().includes('document_diff'), 'nothing of the withdrawn batch was published');
+  assert.equal(f.membrane.calls.length, 0, 'and the withdrawn batch, the only cause, started no inference');
   const renders = f.renders.length;
   await f.turn();
   assert.equal(f.renders.length, renders, 'and nothing renders later');

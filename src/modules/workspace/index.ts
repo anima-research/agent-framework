@@ -13,6 +13,7 @@ import type { JsStore } from '@animalabs/chronicle';
 import type { Module, ModuleContext, ProcessState, EventResponse } from '../../types/module.js';
 import type { ProcessEvent, ToolDefinition, ToolCall, ToolResult } from '../../types/events.js';
 import type {
+  AgentActionScan,
   WorkspaceConfig,
   MountConfig,
   MountState,
@@ -56,6 +57,8 @@ import {
 
 /** Default for how long the after-batch scan may hold the agent's next inference. */
 const AGENT_ACTION_SCAN_DEADLINE_MS = 20_000;
+/** Why a call is refused once the module has stopped. */
+const NOT_RUNNING = 'The workspace has stopped: it takes no more work until it starts again';
 /** The workspace's own deadline must end before the framework's hook bound. */
 const AGENT_ACTION_SCAN_DEADLINE_MAX_MS = TOOL_BATCH_HOOK_TIMEOUT_MS - 1_000;
 
@@ -692,6 +695,8 @@ export class WorkspaceModule implements Module {
 
   private ctx: ModuleContext | null = null;
   private store: JsStore | null = null;
+  /** Set once stop has drained and saved, cleared by start (running()). */
+  private stopped = false;
   private config: WorkspaceConfig;
   private mounts = new Map<string, MountState>();
   /** Per mount, the mounts nested in it and where, '/'-joined (agent-framework #280). */
@@ -928,6 +933,7 @@ export class WorkspaceModule implements Module {
 
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
+    this.stopped = false;
 
     // Decode persisted state if restarting; application waits until mounts
     // exist (see applySavedState) — in the Host ordering they don't yet.
@@ -952,7 +958,9 @@ export class WorkspaceModule implements Module {
 
     for (const [name, meta] of Object.entries(this.savedState.mounts)) {
       const mount = this.mounts.get(name);
-      if (mount) {
+      // A mount materialized this session already (a call between initStore
+      // and start) has a pin and watermark newer than anything saved.
+      if (mount && mount.lastMaterializedBranchId === null && mount.lastMaterializedSeq === 0) {
         mount.lastMaterializedSeq = meta.lastMaterializedSeq;
         mount.lastMaterializedBranchId = meta.lastMaterializedBranchId ?? null;
         // A store that ran #169's stop-time baselines (#109) saved them here
@@ -1154,6 +1162,9 @@ export class WorkspaceModule implements Module {
       const now = [...this.mountTurns.values()];
       if (now.length === tails.length && now.every((tail, i) => tail === tails[i])) break;
     }
+    // Nothing is queued now, and nothing more is taken: what follows saves
+    // the pins and watermarks as the last work left them.
+    this.stopped = true;
 
     // Persist state
     if (this.ctx) {
@@ -1261,8 +1272,9 @@ export class WorkspaceModule implements Module {
         description: 'List a directory, checked against disk first. Each file has a state: synced; '
           + 'workspace-draft (the workspace has changes disk lacks); workspace-deleted (deleted in the workspace, '
           + 'still on disk); not-in-branch (on disk, absent from this branch\'s workspace); disk-only (binary or over '
-          + 'the size limit, never stored — shown with size and image type); conflict (disk and workspace both '
-          + 'changed — sync the path to take disk, or materialize with force to take the workspace); '
+          + 'the size limit, never stored — shown with size and image type); conflict, with its kind (disk and the '
+          + 'workspace both changed; disk holds a different copy and nothing records which is newer; or a write was '
+          + 'interrupted) — sync the path to take disk, or materialize that path with force to take the workspace; '
           + 'disk-missing-provenance-unknown; unverified (disk could not be checked). `incomplete` names regions '
           + 'the listing could not see.',
         inputSchema: {
@@ -1345,8 +1357,9 @@ export class WorkspaceModule implements Module {
           + 'ignore list covers that hold nothing the workspace tracks (an ignored directory counts once). So a '
           + 'total of 0, with no conflicts and nothing under `passedOver`, `incomplete` or `skipped`, means the '
           + 'sync looked everywhere and nothing had changed. A path the mount ignores is synced when you name '
-          + 'it, a directory\'s contents included, and listed under `ignored`: a sync without a path passes '
-          + 'over it.',
+          + 'it, and listed under `ignored`: a sync without a path passes over it. Naming an ignored directory '
+          + 'sets aside the patterns that cover it or a directory above it; one that covers only something '
+          + 'inside it still applies, and what it covers is passed over.',
         inputSchema: {
           type: 'object' as const,
           properties: {
@@ -1407,6 +1420,7 @@ export class WorkspaceModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    if (!this.running()) return { success: false, isError: true, error: NOT_RUNNING };
     try {
       const input = call.input as Record<string, unknown>;
       const generated = typeof input?.path === 'string' ? this.findGeneratedTextFile(input.path) : undefined;
@@ -1541,6 +1555,7 @@ export class WorkspaceModule implements Module {
     data: Buffer,
     mimeType: string,
   ): Promise<ToolResult> {
+    if (!this.running()) return { success: false, isError: true, error: NOT_RUNNING };
     let mount: MountState;
     let relativePath: string;
     try {
@@ -1586,6 +1601,7 @@ export class WorkspaceModule implements Module {
   async readBinary(
     mountPrefixedPath: string,
   ): Promise<{ data: Buffer } | { error: string }> {
+    if (!this.running()) return { error: NOT_RUNNING };
     let mount: MountState;
     let relativePath: string;
     try {
@@ -1702,6 +1718,18 @@ export class WorkspaceModule implements Module {
     }
 
     return { mount, relativePath };
+  }
+
+  /**
+   * Whether the module takes work: stop hasn't finished. Work admitted while
+   * stop drains still runs; once stop has saved the pins and watermarks,
+   * nothing more changes them, so it takes nothing until it starts again. A
+   * call before start is taken, as it always was (a generated file's read
+   * needs no store at all): in the host's order, start runs first, and
+   * initStore applies the saved pins.
+   */
+  private running(): boolean {
+    return !this.stopped;
   }
 
   private getStore(): JsStore {
@@ -2606,9 +2634,25 @@ export class WorkspaceModule implements Module {
           store.treeGet(mount.treeStateId, relativePath) !== null ||
           await lstat(join(mount.config.path, relativePath)).then((s) => !s.isDirectory(), () => false)
         );
-        const pass = await this.passUnlocked(mount, fileScope
-          ? { kind: 'paths', paths: [relativePath] }
-          : { kind: 'dir', dir: relativePath, recursive: true });
+        // What follows reads the tree and branch intent to go with the pass's
+        // reports, synchronously. They must be the branch the pass decided
+        // on: one selected in between would label its content with the other
+        // branch's states. So a pass whose branch is no longer selected runs
+        // again, and a branch that keeps changing leaves the scope unsearched.
+        let pass: PassResult | null = null;
+        for (let attempt = 0; attempt < 3 && pass === null; attempt++) {
+          const next = await this.passUnlocked(mount, fileScope
+            ? { kind: 'paths', paths: [relativePath] }
+            : { kind: 'dir', dir: relativePath, recursive: true });
+          if (next.branchId === undefined || next.branchId === store.currentBranch().id) pass = next;
+        }
+        if (pass === null) {
+          incomplete.push({
+            path: `${mount.config.name}/${relativePath}`,
+            reason: 'the selected branch kept changing while grep ran; nothing here was searched — grep again',
+          });
+          return;
+        }
         for (const region of pass.incomplete) {
           incomplete.push({ path: `${mount.config.name}/${region.path}`, reason: region.reason });
         }
@@ -2632,6 +2676,8 @@ export class WorkspaceModule implements Module {
           if (blob) {
             const found = search(blob.toString('utf-8'));
             if (found.length > 0) results.push({ file, state: report.state, version: 'workspace', matches: found });
+          } else if (entry) {
+            skipped.push({ file, reason: 'the workspace copy is missing from the store, so it was not searched' });
           }
           if (report.state !== 'conflict') continue;
           // A conflict's disk side. The version recorded with the conflict is
@@ -2645,6 +2691,9 @@ export class WorkspaceModule implements Module {
           if (diskBlob) {
             const found = search(diskBlob.toString('utf-8'));
             if (found.length > 0) results.push({ file, state: report.state, version: changed ? 'recorded-disk' : 'conflicting-disk', matches: found });
+          }
+          if (disk?.stored && !diskBlob) {
+            skipped.push({ file, reason: 'conflict: the disk version recorded with the conflict is missing from the store, so it was not searched' });
           }
           if (changed) {
             if (report.diskNow === 'file') {
@@ -2669,11 +2718,15 @@ export class WorkspaceModule implements Module {
     };
   }
 
-  private async handleStatus(_input: StatusInput): Promise<ToolResult> {
+  private async handleStatus(input: StatusInput): Promise<ToolResult> {
     const store = this.getStore();
     const status: Record<string, unknown> = {};
+    if (input.mount !== undefined && !this.mounts.has(input.mount)) {
+      return { success: false, error: `Unknown mount: ${input.mount}`, isError: true };
+    }
 
     for (const [name, mount] of this.mounts) {
+      if (input.mount !== undefined && name !== input.mount) continue;
       const entries = store.treeList(mount.treeStateId);
       const currentSeq = store.currentSequence();
       const intents = this.intents.get(name)!.list();
@@ -2803,7 +2856,12 @@ export class WorkspaceModule implements Module {
     let proceeded = 0;
 
     for (const { name, mount } of mountsToMaterialize) {
-      if (mount.config.mode === 'read-only') continue;
+      if (mount.config.mode === 'read-only') {
+        // Only a mount the caller named gets here read-only (a bare
+        // materialize takes the read-write ones): say why nothing was written.
+        blocked.push({ mount: name, reason: 'a read-only mount: materialize writes nothing to it' });
+        continue;
+      }
       const turn = await this.withMount(mount, async (): Promise<{ blocked: string } | { pushed: PushResult; inPlace: boolean; nested: Array<{ path: string; inner: string }> }> => {
         const branchId = store.currentBranch().id;
         const reason = this.mountMaterializeBlockReason(store, mount);
@@ -2900,6 +2958,7 @@ export class WorkspaceModule implements Module {
    * Resets branch tracking to allow cross-branch materialization.
    */
   async materializeMount(mountName: string): Promise<string[]> {
+    if (!this.running()) return [];
     const store = this.getStore();
     const mount = this.mounts.get(mountName);
     if (!mount || mount.config.mode === 'read-only') return [];
@@ -2976,10 +3035,35 @@ export class WorkspaceModule implements Module {
           store.treeList(mount.treeStateId, prefix).length > 0 ||
           this.agreementOrThrow().paths(name, relativePath).some(([p]) => p.startsWith(prefix)) ||
           this.intents.get(name)!.list(relativePath).some(([p]) => p.startsWith(prefix));
-        const scope: Scope = isDir
-          ? { kind: 'dir', dir: relativePath, recursive: true }
-          : { kind: 'paths', paths: [relativePath] };
-        return this.passUnlocked(mount, scope, { rehash: true, adopt: () => true, branchId: askedOn, named: true });
+        // named: ignore patterns covering the path asked for don't apply
+        // beneath it (a directory scope's walk; a path scope doesn't walk).
+        const opts: PassOptions = { rehash: true, adopt: () => true, branchId: askedOn, named: true };
+        if (!isDir) return this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, opts);
+        const beneath = await this.passUnlocked(mount, { kind: 'dir', dir: relativePath, recursive: true }, opts);
+        // Something at the path itself is no part of a directory scope: a file
+        // disk has where the workspace holds a directory, or a workspace file
+        // where disk has a directory. Its own pass takes disk's state there
+        // too, after what lies beneath, so a file never sits over entries it
+        // replaced.
+        const onDisk = await lstat(join(mount.config.path, relativePath)).catch(() => null);
+        const atPath = (onDisk !== null && !onDisk.isDirectory())
+          || store.treeGet(mount.treeStateId, relativePath) !== null
+          || this.agreementOrThrow().get(name, relativePath) !== undefined
+          || this.intents.get(name)!.get(relativePath) !== null;
+        if (!atPath) return beneath;
+        const itself = await this.passUnlocked(mount, { kind: 'paths', paths: [relativePath] }, opts);
+        const passedOver = new Map(beneath.passedOver);
+        for (const [reason, count] of itself.passedOver) passedOver.set(reason, (passedOver.get(reason) ?? 0) + count);
+        return {
+          ops: [...beneath.ops, ...itself.ops],
+          discarded: [...beneath.discarded, ...itself.discarded],
+          newConflicts: [...beneath.newConflicts, ...itself.newConflicts],
+          reports: new Map([...beneath.reports, ...itself.reports]),
+          incomplete: [...beneath.incomplete, ...itself.incomplete],
+          passedOver,
+          dirs: beneath.dirs,
+          branchId: itself.branchId ?? beneath.branchId,
+        };
       });
 
       const conflicts = [...pass.reports.values()]
@@ -3062,7 +3146,7 @@ export class WorkspaceModule implements Module {
    */
   private async handleFsChanges(mountName: string, changes: FsChange[]): Promise<void> {
     const mount = this.mounts.get(mountName);
-    if (!this.store || !mount) return;
+    if (!this.store || !this.running() || !mount) return;
     const paths = [...new Set(changes.map((c) => c.path))];
     if (paths.length === 0) return;
     await this.withMount(mount, () => this.passUnlocked(mount, { kind: 'paths', paths }));
@@ -3081,74 +3165,93 @@ export class WorkspaceModule implements Module {
     // Every agent's workspace is the store's current branch, so the agent
     // that ran the batch doesn't choose what is scanned.
     const mounts = [...this.mounts.values()].filter((m) => m.config.watch === 'on-agent-action');
-    if (mounts.length === 0 || !this.store) return;
+    if (mounts.length === 0 || !this.store || !this.running()) return;
     const deadlineMs = this.agentActionScanDeadlineMs();
     await Promise.all(mounts.map(async (mount) => {
-      const missed = (reason: string): void => {
-        mount.lastAgentActionScan = { at: Date.now(), complete: false, withinDeadline: false, reason };
-        this.ctx?.pushEvent({ type: 'workspace:agent-action-scan-incomplete', mount: mount.config.name, reason } as ProcessEvent);
-      };
       const runningLate = mount.agentActionScanLate !== undefined;
       const scan = this.agentActionScan(mount);
       if (runningLate) {
         // An earlier batch's scan outlasted its deadline and still runs: this
-        // round isn't held as well. Its own scan is queued after that one.
-        missed('an earlier scan is still running past its deadline; this batch is scanned after it');
+        // round isn't held as well. Its own scan is queued after that one,
+        // and records its outcome when it finishes. It is late from the
+        // start, so a batch that comes while it runs isn't held either.
+        this.agentActionScanLateUntil(mount, scan);
+        this.agentActionScanMissed(mount, 'an earlier scan is still running past its deadline; this batch is scanned after it');
         return;
       }
-      let late = false;
-      const recorded = scan.then(
-        (pass) => {
-          const incomplete = pass.incomplete.length > 0 ? { incomplete: pass.incomplete } : {};
-          mount.lastAgentActionScan = late
-            ? { at: Date.now(), complete: true, withinDeadline: false, reason: 'finished after the deadline', ...incomplete }
-            : { at: Date.now(), complete: true, withinDeadline: true, ...incomplete };
-        },
-        (err: unknown) => {
-          missed(`scan failed: ${err instanceof Error ? err.message : String(err)}`);
-        },
-      );
       let timer: ReturnType<typeof setTimeout> | undefined;
       const deadline = new Promise<'late'>((resolveDeadline) => {
         timer = setTimeout(() => resolveDeadline('late'), deadlineMs);
       });
-      const outcome = await Promise.race([recorded.then(() => 'done' as const), deadline]);
+      const outcome = await Promise.race([scan.settled.then(() => 'done' as const), deadline]);
       clearTimeout(timer);
       if (outcome === 'late') {
-        late = true;
-        if (mount.agentActionScanLate === undefined) {
-          mount.agentActionScanLate = recorded;
-          void recorded.then(() => { if (mount.agentActionScanLate === recorded) mount.agentActionScanLate = undefined; });
-        }
-        missed(`deadline exceeded (${deadlineMs} ms); the scan continues`);
+        this.agentActionScanLateUntil(mount, scan);
+        this.agentActionScanMissed(mount, `deadline exceeded (${deadlineMs} ms); the scan continues`);
       }
     }));
   }
 
   /**
+   * Mark a scan late, and the mount as running late until it settles. The
+   * marker follows the newest late scan: a mount's scans run one after
+   * another, so the newest is the last to settle, and a batch that comes
+   * while any late scan of the chain still runs isn't held.
+   */
+  private agentActionScanLateUntil(mount: MountState, scan: AgentActionScan): void {
+    scan.late = true;
+    const settled = scan.settled;
+    mount.agentActionScanLate = settled;
+    void settled.then(() => { if (mount.agentActionScanLate === settled) mount.agentActionScanLate = undefined; });
+  }
+
+  /** A batch's scan missed its deadline, or failed: said on status and as an event. */
+  private agentActionScanMissed(mount: MountState, reason: string): void {
+    mount.lastAgentActionScan = { at: Date.now(), complete: false, withinDeadline: false, reason };
+    this.ctx?.pushEvent({ type: 'workspace:agent-action-scan-incomplete', mount: mount.config.name, reason } as ProcessEvent);
+  }
+
+  /**
    * The mount's after-batch scan: one may run and one wait behind it. A batch
    * that comes while one waits shares it, since it starts after the batch's
-   * tools ran. A scan that finished without seeing everything (the file cap,
-   * an unreadable or changing region, a branch that kept changing) says
-   * where, as an event.
+   * tools ran. Each scan records its own outcome when it settles: on status
+   * while it is the mount's newest scan (a scan queued behind it describes a
+   * later batch), and as an event for regions it couldn't observe (the file
+   * cap, an unreadable or changing region, a branch that kept changing) or a
+   * failure, whichever scan it is.
    */
-  private agentActionScan(mount: MountState): Promise<{ incomplete: Array<{ path: string; reason: string }> }> {
+  private agentActionScan(mount: MountState): AgentActionScan {
     if (mount.agentActionScanWaiting) return mount.agentActionScanWaiting;
-    const waiting = this.withMount(mount, () => {
-      if (mount.agentActionScanWaiting === waiting) mount.agentActionScanWaiting = undefined;
+    const scan: AgentActionScan = { late: false, settled: Promise.resolve() };
+    const pass = this.withMount(mount, () => {
+      if (mount.agentActionScanWaiting === scan) mount.agentActionScanWaiting = undefined;
       return this.passUnlocked(mount, { kind: 'dir', dir: '', recursive: true });
     });
-    mount.agentActionScanWaiting = waiting;
-    void waiting.then((pass) => {
-      if (pass.incomplete.length === 0) return;
-      this.ctx?.pushEvent({
-        type: 'workspace:agent-action-scan-incomplete',
-        mount: mount.config.name,
-        reason: 'the scan finished, but some regions could not be observed',
-        incomplete: pass.incomplete,
-      } as ProcessEvent);
-    }, () => {});
-    return waiting;
+    scan.settled = pass.then(
+      (result) => {
+        if (result.incomplete.length > 0) {
+          this.ctx?.pushEvent({
+            type: 'workspace:agent-action-scan-incomplete',
+            mount: mount.config.name,
+            reason: 'the scan finished, but some regions could not be observed',
+            incomplete: result.incomplete,
+          } as ProcessEvent);
+        }
+        if (mount.agentActionScanLatest !== scan) return;
+        const incomplete = result.incomplete.length > 0 ? { incomplete: result.incomplete } : {};
+        mount.lastAgentActionScan = scan.late
+          ? { at: Date.now(), complete: true, withinDeadline: false, reason: 'finished after the deadline', ...incomplete }
+          : { at: Date.now(), complete: true, withinDeadline: true, ...incomplete };
+      },
+      (err: unknown) => {
+        const reason = `scan failed: ${err instanceof Error ? err.message : String(err)}`;
+        if (mount.agentActionScanLatest === scan) this.agentActionScanMissed(mount, reason);
+        else this.ctx?.pushEvent({ type: 'workspace:agent-action-scan-incomplete', mount: mount.config.name, reason } as ProcessEvent);
+      },
+    );
+    mount.agentActionScanWaiting = scan;
+    mount.agentActionScanLatest = scan;
+    return scan;
   }
 
   /** The scan deadline, kept below the framework's hook bound (warned once). */

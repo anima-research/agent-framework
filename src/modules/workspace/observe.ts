@@ -270,8 +270,14 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
  * the one the pass was given, and the one disk last agreed under), else why not.
  */
 export async function locateRoot(view: MountView, rootReal: string): Promise<{ identity: RootIdentity } | { reason: string }> {
+  const found = await checkRoot(view, rootReal);
+  return 'dir' in found ? { identity: found.dir.identity() } : found;
+}
+
+/** The mount root as locateRoot finds it, checked, so a caller can ask later whether it's still there. */
+export async function checkRoot(view: MountView, rootReal: string): Promise<{ dir: CheckedDir } | { reason: string }> {
   const found = await locateDir(view, rootReal, '');
-  if (found.kind === 'checked') return { identity: found.dir.identity() };
+  if (found.kind === 'checked') return { dir: found.dir };
   return { reason: found.kind === 'unobserved' ? found.reason : ROOT_UNAVAILABLE };
 }
 
@@ -323,17 +329,26 @@ async function createDir(view: MountView, rootReal: string, rel: string): Promis
 /**
  * Prove that nothing exists at a mount-relative path (`entry`), or that no
  * directory does, so nothing can exist beneath it (`beneath`). Walking down
- * from the root through checked directories: some directory, still the one its
- * path names afterwards, lacks the next component; or a component is a
- * non-directory, still the same one in a directory still at its path,
- * beneath which nothing can exist. Symlinked directories inside the mount
- * are followed as parents; any other symlink proves nothing. Returns the
- * directory whose entries prove it, or why absence couldn't be shown.
+ * from the root through checked directories: some directory lacks the next
+ * component; or a component is a non-directory, still the same one, beneath
+ * which nothing can exist. Either proves it only while every directory the
+ * walk went through, the root included, is still the one its path names
+ * afterwards: a root or parent replaced during the walk would otherwise lend
+ * its replacement's absence to the original's path. Symlinked directories
+ * inside the mount are followed as parents; any other symlink proves
+ * nothing. Returns the directory whose entries prove it, or why absence
+ * couldn't be shown.
  */
 export async function confirmAbsent(view: MountView, rootReal: string, rel: string, target: 'entry' | 'beneath' = 'entry'): Promise<{ by: string } | string> {
   const root = await locateDir(view, rootReal, '');
   if (root.kind !== 'checked') return ROOT_UNAVAILABLE;
   let cur: CheckedDir = root.dir;
+  /** Every directory the walk went through, the root first. */
+  const walked: CheckedDir[] = [cur];
+  const proven = async (): Promise<{ by: string } | string> => {
+    for (const dir of walked) if (!(await dir.stillHere())) return CHANGED;
+    return { by: cur.rel };
+  };
   const parts = rel.split('/');
   for (let i = 0; i < parts.length; i++) {
     const name = parts[i]!;
@@ -346,12 +361,13 @@ export async function confirmAbsent(view: MountView, rootReal: string, rel: stri
       const code = errno(err);
       if (code === 'ENOTDIR') return CHANGED;
       if (code !== 'ENOENT') return `cannot stat (${code ?? String(err)})`;
-      // Absent from the directory that is still the one its path names.
-      return (await cur.stillHere()) ? { by: cur.rel } : CHANGED;
+      // Absent from a directory that, like each above it, is still the one its path names.
+      return proven();
     }
     if (info.isDirectory()) {
       if (last) return CHANGED; // present after all
       cur = new CheckedDir(childRel, cur.at(name), lexicalOf(view, childRel), info.dev, info.ino);
+      walked.push(cur);
       continue;
     }
     if (info.isSymbolicLink()) {
@@ -360,6 +376,7 @@ export async function confirmAbsent(view: MountView, rootReal: string, rel: stri
       if (located.kind !== 'checked') return BENEATH_SYMLINK;
       if (last) return CHANGED; // a directory there after all
       cur = located.dir;
+      walked.push(cur);
       continue;
     }
     if (last && target === 'entry') return CHANGED; // present after all
@@ -367,7 +384,7 @@ export async function confirmAbsent(view: MountView, rootReal: string, rel: stri
     // same one, in the directory still at its path.
     const again = await lstat(cur.at(name), { bigint: true }).catch(() => null);
     if (again === null || again.isDirectory() || again.isSymbolicLink() || again.dev !== info.dev || again.ino !== info.ino) return CHANGED;
-    return (await cur.stillHere()) ? { by: cur.rel } : CHANGED;
+    return proven();
   }
   return CHANGED;
 }
@@ -553,6 +570,16 @@ async function openContained(
     const named = await stat(real, { bigint: true }).catch(() => null);
     if (named === null || named.dev !== info.dev || named.ino !== info.ino) {
       return { kind: 'unobserved', reason: 'the file changed while it was read' };
+    }
+    if (!view.followSymlinks) {
+      // Where no symlink is followed, the path itself must be the file the
+      // descriptor holds: without O_NOFOLLOW, a link swapped in after the
+      // lstat above is followed by the open.
+      const entry = await lstat(lexical, { bigint: true }).catch(() => null);
+      if (entry?.isSymbolicLink()) return { kind: 'unobserved', reason: NOT_FOLLOWED };
+      if (entry === null || !entry.isFile() || entry.dev !== info.dev || entry.ino !== info.ino) {
+        return { kind: 'unobserved', reason: 'the file changed while it was read' };
+      }
     }
     keep = true;
     return { handle, info };

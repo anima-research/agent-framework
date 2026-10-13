@@ -219,6 +219,30 @@ describe('Module.onToolBatchComplete', () => {
     await framework.stop();
   });
 
+  it('a result is dropped when the round is replaced by one that reuses its call id', async () => {
+    scriptTwoCallRound();
+    const framework = await createFramework();
+    const traces: TraceEvent[] = [];
+    framework.onTrace((e) => traces.push(e));
+    tools.onHook = async (agentName) => {
+      // The round is replaced while modules catch up by one waiting on a call
+      // with the same id: a new entry for it, not the one this result answers.
+      const agent = framework.getAgent(agentName) as unknown as { _state: { status: string; pending: Map<string, { id: string }> } };
+      const [id] = [...agent._state.pending.keys()];
+      agent._state = {
+        ...agent._state,
+        status: 'waiting_for_tools',
+        pending: new Map([[id!, { id: id!, name: 'robot--act', input: { generation: 2 }, startedAt: Date.now() } as unknown as { id: string }]]),
+      };
+      setTimeout(() => framework.abortInference(agentName, 'end the replaced round'), 50);
+    };
+    trigger(framework);
+    await framework.runUntilIdle();
+    assert.ok(traces.some((e) => e.type === 'tool:result_dropped'), 'the stale result is traced as dropped');
+    assert.equal(membrane.lastStream!.receivedToolResults.length, 0, 'nothing was provided to the replacing round');
+    await framework.stop();
+  });
+
   it("a result for a call that isn't pending doesn't run the hook early", async () => {
     // One call: while it runs, a stray result for another call arrives.
     membrane.pushResponse(createMockResponse([

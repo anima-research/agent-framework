@@ -32,16 +32,25 @@
  * one THIS journal loaded or appended, so entries another instance appended
  * to the same type in between would be covered without being reduced.
  *
- * An ambiguous write must be reconciled before the journal writes again. Once
- * `append` or `checkpoint` has handed a record to the store, any failure from
- * there on (the append itself, or a barrier after it) leaves it unknown
- * whether that record exists, and the caller didn't reduce it. A later
- * checkpoint would then cover it without its ever entering the reducer. So
- * such a failure marks the journal unreconciled: every further `append` and
- * `checkpoint` throws until `load()` has replayed the tail — the possibly
- * written record included — for the caller to reduce. A failure BEFORE the
- * record reaches the store (the `afterCommittedState` sync) wrote nothing and
- * leaves the journal usable.
+ * An ambiguous write must be resolved before the journal writes again. Once
+ * `append` or `checkpoint` has handed a record to the store, a failure leaves
+ * a record the caller didn't reduce, or may leave one, and a later checkpoint
+ * would cover it without its ever entering the reducer. There are two kinds:
+ *  - The store's append itself throws. Its record may still be in the store's
+ *    log, outside this process's view of the store: the store writes a
+ *    record to its log, syncs the log every so often, and only then indexes
+ *    the record, which is what `getRecordIdsByType` reads. So a failed sync
+ *    leaves a record that reopening the store will find and no `load()` on
+ *    this store can. Nothing but a reopen rereads the log, so from then on
+ *    every `append` and `checkpoint` throws, for the life of the journal. A
+ *    journal on the store reopened, as at the next start, loads that record
+ *    with its tail for the caller to reduce.
+ *  - A failure after the append returned: a `durable` barrier, or reading
+ *    the id it returned. The record is in this process's view, so every
+ *    further `append` and `checkpoint` throws until `load()` has replayed the
+ *    tail, that record included, for the caller to reduce.
+ * A failure BEFORE the record reaches the store (the `afterCommittedState`
+ * sync) wrote nothing and leaves the journal usable.
  */
 
 import type { JsStore } from '@animalabs/chronicle';
@@ -78,6 +87,8 @@ interface CheckpointPayload<Snapshot> {
   snapshot: Snapshot;
 }
 
+const asError = (err: unknown): Error => (err instanceof Error ? err : new Error(String(err)));
+
 /** Record ids are decimal strings from one store-wide counter. */
 function idValue(id: string): bigint {
   if (!/^\d+$/.test(id)) throw new Error(`RecordJournal: unexpected chronicle record id "${id}"`);
@@ -99,8 +110,11 @@ export class RecordJournal<Entry, Snapshot = never> {
   /** Highest entry id this journal has loaded or appended (0 when none). */
   private lastEntryId = 0n;
   private sinceCheckpoint = 0;
-  /** Set by a failure after a record reached the store; cleared by load(). */
+  /** Set by a failure after the store's append returned; cleared by load(). */
   private unreconciled: Error | null = null;
+  /** Set when the store's append itself threw: its record may be in the log
+   *  but not in this process's view of the store. Never cleared. */
+  private unreadable: Error | null = null;
 
   constructor(store: JsStore, opts: { type: string; checkpointType?: string }) {
     if (!opts.type) throw new Error('RecordJournal: a record type is required');
@@ -156,9 +170,19 @@ export class RecordJournal<Entry, Snapshot = never> {
     return { snapshot, entries };
   }
 
-  /** True after an ambiguous write, until load() has replayed it. */
+  /** True after a failure that load() can resolve, until it has replayed the
+   *  tail. An append that threw inside the store is never resolved here: the
+   *  journal stays unwritable until a journal on the reopened store loads it. */
   get needsReconcile(): boolean {
     return this.unreconciled !== null;
+  }
+
+  /** True once an append threw inside the store, for the rest of the
+   *  journal's life. What `load()` returns may then lack that append's record,
+   *  so a caller that decides from the journal's contents can't trust them
+   *  until a journal on the reopened store has loaded it. */
+  get needsReopen(): boolean {
+    return this.unreadable !== null;
   }
 
   /** Append one entry. The returned ref says where it landed, not that it's durable. */
@@ -186,19 +210,32 @@ export class RecordJournal<Entry, Snapshot = never> {
 
   /** Hand one record to the store; any failure from here on is ambiguous. */
   private write(type: string, payload: unknown, durable: boolean, onWritten: (ref: JournalRecordRef) => void): JournalRecordRef {
+    let record: { id: string; sequence: number };
     try {
-      const record = this.store.appendJson(type, payload);
+      record = this.store.appendJson(type, payload);
+    } catch (err) {
+      this.unreadable = asError(err);
+      throw err;
+    }
+    try {
       const ref = { id: record.id, sequence: record.sequence };
       onWritten(ref);
       if (durable) this.store.sync();
       return ref;
     } catch (err) {
-      this.unreconciled = err instanceof Error ? err : new Error(String(err));
+      this.unreconciled = asError(err);
       throw err;
     }
   }
 
   private assertReconciled(): void {
+    if (this.unreadable) {
+      throw new Error(
+        `RecordJournal(${this.type}): an earlier append failed inside the store ` +
+        `(${this.unreadable.message}), and its record may be in the store's log where this process can't ` +
+        `read it back; nothing more is written until the store is reopened, as at the next start`,
+      );
+    }
     if (this.unreconciled) {
       throw new Error(
         `RecordJournal(${this.type}): an earlier write failed after reaching the store ` +

@@ -209,6 +209,9 @@ export class McplServerConnection extends EventEmitter {
    * observable even though its original promise has already been rejected. */
   private orphanedRequests = new Map<string | number, { method: string; renderParams?: Record<string, unknown> }>();
   private closed = false;
+  private closePromise: Promise<void> | null = null;
+  private closeIncomplete = false;
+  private reconnectPromise: Promise<void> | null = null;
 
   /** Per-request timeout in ms (0 disables). See McplServerConfig.requestTimeoutMs. */
   private requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS;
@@ -837,10 +840,10 @@ export class McplServerConnection extends EventEmitter {
       this.reconnectTimer = null;
     }
 
-    if (this.closed) {
-      return;
-    }
+    if (this.closePromise) return this.closePromise;
+    if (this.closed && !this.closeIncomplete && !this.reconnectPromise) return;
     this.closed = true;
+    this.closeIncomplete = true;
     this.resetPolicyForTransportBoundary();
 
     // Reject all pending requests
@@ -854,11 +857,20 @@ export class McplServerConnection extends EventEmitter {
     // Tear down the transport (kills the child / closes the socket). The
     // transport's own 'close' event is short-circuited by `this.closed` in
     // setupLifecycle, so this is the single source of the connection 'close'.
-    if (this.transport) {
-      await this.transport.close();
-    }
-
-    this.emit('close');
+    const attempt = Promise.resolve().then(async () => {
+      // An already opened handshake owns a transport too. It hands that
+      // transport back without admission once reconnect has been disabled.
+      // The registry bounds this wait; retry reuses this real close attempt.
+      if (this.reconnectPromise) await this.reconnectPromise;
+      if (this.transport) await this.transport.close();
+      this.closeIncomplete = false;
+      this.emit('close');
+    });
+    this.closePromise = attempt;
+    void attempt.catch(() => {
+      if (this.closePromise === attempt) this.closePromise = null;
+    });
+    return attempt;
   }
 
   /**
@@ -912,8 +924,19 @@ export class McplServerConnection extends EventEmitter {
    * approach this builds no throwaway connection instance, so there are no
    * leaked listeners on a dead object.
    */
-  private async attemptReconnect(): Promise<void> {
-    if (!this.reconnectEnabled || !this.config || !this.hostCapabilities) return;
+  private attemptReconnect(): Promise<void> {
+    if (this.reconnectPromise) return this.reconnectPromise;
+    const attempt = this.reconnectOnce();
+    this.reconnectPromise = attempt;
+    const clear = () => { if (this.reconnectPromise === attempt) this.reconnectPromise = null; };
+    void attempt.then(clear, clear);
+    return attempt;
+  }
+
+  private async reconnectOnce(): Promise<void> {
+    // A queued recovery timer may outlive an earlier successful handshake.
+    // Recheck disconnection before opening or replacing any owned transport.
+    if (!this.closed || !this.reconnectEnabled || !this.config || !this.hostCapabilities) return;
 
     // Ordinal of this attempt: 0 was the initial connect, so the Nth retry
     // reports attempt N (reconnectAttempts counts failures so far).
@@ -924,6 +947,14 @@ export class McplServerConnection extends EventEmitter {
         this.config,
         this.hostCapabilities,
       );
+
+      if (!this.reconnectEnabled) {
+        // The prior transport was disconnected before this retry began. Keep
+        // the fresh, unadmitted transport owned by close(), including on a
+        // failed transport cleanup, instead of reviving a stopped connection.
+        this.transport = transport;
+        return;
+      }
 
       // Close the data plane before the new transport can emit. The reconnect
       // lifecycle event bypasses buffering; its framework listener installs the
