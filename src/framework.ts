@@ -8,7 +8,7 @@ import type { Membrane, ContentBlock, NormalizedRequest, YieldingStream, ToolRes
 import { MembraneError } from '@animalabs/membrane';
 import { ContextManager, PassthroughStrategy, WindowedPassthroughStrategy, OverBudgetError, UncoveredDropError } from '@animalabs/context-manager';
 import type { CacheWireReceipt } from './kv-unified-wire.js';
-import type { SilentHeartbeatStamp } from './silent-heartbeat.js';
+import { SILENT_HEARTBEAT_SEPARATOR, type RequestOnlyPrompt, type RequestOnlyStamps } from './silent-heartbeat.js';
 import { SUBCONSCIOUS_TOOLS, SUBCONSCIOUS_TOOL_NAMES, type SubconsciousConfig } from './tune-out/tools.js';
 import { TuneOutCoordinator, TUNE_OUT_DEFAULTS } from './tune-out/coordinator.js';
 import type {
@@ -1384,6 +1384,16 @@ export class AgentFramework {
    * guessing from the newest message in the window.
    */
   private activeTurnTriggers: Map<string, InferenceRequest | undefined> = new Map();
+
+  /**
+   * The `[Continue]` prompt the current round of each turn follows, keyed by
+   * the turn's trigger. Each stream start sets it from what the Agent read in
+   * its request (`StartStreamResult.continuePrompt`), and a tool boundary
+   * that hands the live stream messages after the results clears it, since
+   * the next round follows those messages. `silentTurnRowMetadata` stamps the
+   * round's rows with it.
+   */
+  private readonly turnPrompts = new WeakMap<InferenceRequest, RequestOnlyPrompt>();
 
   /** The trigger of `agentName`'s turn in progress, if a turn is running. */
   getActiveTurnTrigger(agentName: string): InferenceRequest | undefined {
@@ -7032,6 +7042,15 @@ export class AgentFramework {
             this.midTurnInputSignals.add(agent.name);
           }
 
+          // The next round is handed these messages after the results, so it
+          // follows them, not the tool loop of a reply to [Continue]: its rows
+          // carry no prompt. (The routing notice below rides only an
+          // injection already here.)
+          if (midTurnInjections.length > 0) {
+            const turnTrigger = this.activeTurnTriggers.get(agent.name);
+            if (turnTrigger) this.turnPrompts.delete(turnTrigger);
+          }
+
           // Check if any tool result requested endTurn
           const shouldEndTurn = currentState.toolResults.some(tc => tc.result.endTurn);
 
@@ -7202,7 +7221,6 @@ export class AgentFramework {
               source: 'framework',
               timestamp: Date.now(),
               suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
-              ephemeralSystemPrompt: this.activeTurnTriggers.get(agent.name)?.ephemeralSystemPrompt,
               silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
             });
           } else if (currentState.stream) {
@@ -7221,12 +7239,16 @@ export class AgentFramework {
               ...(midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections.length } : {}),
             });
           } else {
-            // Non-streaming fallback: schedule re-inference
+            // Non-streaming fallback: schedule re-inference. It continues the
+            // same turn, so it carries the turn's properties, as the budget
+            // restart does.
             this.pendingRequests.push({
               agentName: agent.name,
               reason: 'tool_results_ready',
               source: 'framework',
               timestamp: Date.now(),
+              suppressProse: this.activeTurnTriggers.get(agent.name)?.suppressProse,
+              silentHeartbeat: this.activeTurnTriggers.get(agent.name)?.silentHeartbeat,
             });
           }
         }
@@ -8455,9 +8477,11 @@ export class AgentFramework {
           addressed: isAddressedMessage(event.tags, event.origin),
           ...(silentHeartbeat ? {
             suppressProse: true,
-            ephemeralSystemPrompt:
-              '[silent heartbeat] Scheduled private self-check. Review pending matters privately. ' +
-              'Do not narrate or publish plain prose; use an explicit send tool only if you deliberately choose to contact someone.',
+            // The tick's instruction rides its request-only separator
+            // (SILENT_HEARTBEAT_SEPARATOR), never the system prompt: a
+            // per-turn system change would cost the heartbeat's request
+            // its prompt cache from the system on, and fail the binding of
+            // every retained thinking block (context-manager #155).
             silentHeartbeat: { eventId: event.eventId, serverId: event.serverId },
           } : {}),
           ...(event.coalescingSubject ? { coalescingSubject: event.coalescingSubject } : {}),
@@ -8794,7 +8818,6 @@ export class AgentFramework {
           ? [...new Set(requests.flatMap((r) => r.coalescingBatchSubjects ?? [r.coalescingSubject!]))]
           : undefined,
         suppressProse: silentOnly ? trigger?.suppressProse : undefined,
-        ephemeralSystemPrompt: silentOnly ? trigger?.ephemeralSystemPrompt : undefined,
         silentHeartbeat: silentOnly ? trigger?.silentHeartbeat : undefined,
         channelId: channelReq?.channelId,
         addressed: addressedReq !== undefined,
@@ -8810,20 +8833,39 @@ export class AgentFramework {
   }
 
   /**
-   * Metadata for rows the agent's current turn stores: a silent heartbeat
-   * tick stamps each of them (assistant responses, tool_result rows) so they
-   * stay identifiable after the turn — request builds key the tick separator
-   * on it, and a later retention policy can find or collapse them. The stamp
-   * names the agent: residents share one message slot and a broadcast tick
-   * reaches each of them with the same eventId. Undefined for ordinary
-   * turns, whose rows are stored exactly as before.
+   * Stamps for the rows the agent's reply stores in its current turn: its
+   * assistant responses, its tool_result rows (through `storeResults`), and
+   * the contained-wrapper row that stands in for a response. The turn's other
+   * stores (a delivery receipt, a routing notice, a deferred flush) aren't the
+   * reply's, and carry none.
+   * - A silent heartbeat tick stamps each of them for the whole turn, with the
+   *   separator text its request rendered. Request builds render the
+   *   separator before the first of the tick's assistant rows that survives,
+   *   and the stamps keep every row of the tick identifiable after the turn,
+   *   for a later retention policy to find or collapse. The stamp names the
+   *   agent: residents share one message slot, and a broadcast tick reaches
+   *   each of them with the same eventId.
+   * - A `[Continue]` prompt stamps the rows of each round that follows it
+   *   (`turnPrompts`). Request builds render it before the first of its
+   *   assistant rows that survives. On the round's tool_result rows it marks
+   *   them as the reply's, as the tick stamp does.
+   * Undefined for ordinary turns, whose rows are stored exactly as before.
+   * (Named for its first use, the silent tick.)
    */
-  private silentTurnRowMetadata(agentName: string): MessageMetadata | undefined {
-    const tick = this.activeTurnTriggers.get(agentName)?.silentHeartbeat;
-    const stamp: SilentHeartbeatStamp | undefined = tick
-      ? { eventId: tick.eventId, serverId: tick.serverId, agentName }
-      : undefined;
-    return stamp ? { silentHeartbeat: stamp } : undefined;
+  private silentTurnRowMetadata(agentName: string): RequestOnlyStamps | undefined {
+    const trigger = this.activeTurnTriggers.get(agentName);
+    if (!trigger) return undefined;
+    const tick = trigger.silentHeartbeat;
+    const prompt = this.turnPrompts.get(trigger);
+    if (!tick && !prompt) return undefined;
+    const stamps: RequestOnlyStamps = {};
+    if (tick) {
+      stamps.silentHeartbeat = {
+        eventId: tick.eventId, serverId: tick.serverId, agentName, separator: SILENT_HEARTBEAT_SEPARATOR,
+      };
+    }
+    if (prompt) stamps.promptedBy = prompt;
+    return stamps;
   }
 
   /** Record prose segments suppressed by explicit-send silencing. */
@@ -9681,15 +9723,6 @@ export class AgentFramework {
         }
       }
 
-      if (trigger?.ephemeralSystemPrompt) {
-        const silentInjection: ContextInjection = {
-          namespace: 'framework:silent-heartbeat',
-          position: 'system',
-          content: [{ type: 'text', text: trigger.ephemeralSystemPrompt }],
-        };
-        injections = injections ? [...injections, silentInjection] : [silentInjection];
-      }
-
       // An ephemeral watchdog may dispose this Agent while hooks/compile await.
       // Do not create a provider stream after its generation lost ownership.
       if (this.agents.get(agent.name) !== agent) {
@@ -9714,6 +9747,7 @@ export class AgentFramework {
         request: compiledRequest,
         takeKvSubmission,
         drainKvSubmissionIds,
+        continuePrompt,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
       });
@@ -9723,6 +9757,14 @@ export class AgentFramework {
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
+      }
+      // The [Continue] prompt this stream's first round follows, if any, as
+      // the Agent read it from the request: the round's rows carry it
+      // (silentTurnRowMetadata), and so do later rounds' until a tool
+      // boundary hands the stream messages after the results.
+      if (trigger) {
+        if (continuePrompt) this.turnPrompts.set(trigger, continuePrompt);
+        else this.turnPrompts.delete(trigger);
       }
 
       const handle = this.driveStream(
