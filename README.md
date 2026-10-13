@@ -328,9 +328,11 @@ accepts `2025-11-25`, `2025-06-18` or `2025-03-26` in the answer.
 and its `family` stays `modern`. On a 2025 revision:
 - List changes arrive on the session's standalone stream, which is kept
   open while the session lives. Its first open is tried again after a 408,
-  429, 500, 502, 503, 504 or network error, each reported as the
-  connection's `error`; any other refusal of it means the server offers no
-  stream. A stream that drops is reopened: the first try waits the server's
+  409, 429, a 5xx other than 501 and 505, or a network error, each reported
+  as the connection's `error`, and a relist follows once it opens. Any other
+  answer goes to the SDK, which opens no stream: it takes a 405 quietly,
+  reports any other refusal as an `error`, and tries a 401 once more after
+  the credential's refresh. A stream that drops is reopened: the first try waits the server's
   `retry` hint when it sent one, and the base interval otherwise, and a try
   after a failed one waits the longer of the hint and the doubling backoff.
   A reopen that carries `Last-Event-ID` has what it missed replayed by the
@@ -350,7 +352,9 @@ and its `family` stays `modern`. On a 2025 revision:
   `willReconnect` reads true, then `reconnect`, and the framework keeps the
   server and its tools and relists. If the new session can't start,
   `reconnect` decides, as for any lost connection, and a revision verdict
-  stops it for good, as on any reconnect. A session that ended before
+  stops it for good, as on any reconnect. Without `reconnect`, that failure
+  emits a second `close`, while `willReconnect` reads false: the server is
+  gone. A session that ended before
   answering anything is a failed connect: it emits `reconnect-failed` and
   `close`, and follows `reconnect` with a growing backoff, so a load
   balancer without sticky sessions shows up as a failing server rather than
@@ -359,12 +363,13 @@ and its `family` stays `modern`. On a 2025 revision:
   holds by its id with a `DELETE`, a connect in flight included, waiting at
   most 3 s for each.
 
-A server over HTTP that shares no revision with this client fails with
-`McplProtocolVersionError`, naming what each side speaks, and is not
-retried: the SDK's refusal of `2026-07-28` after a discovery or `-32022`
-error, when it tries no `initialize` (which it doesn't once the list names a
-revision newer than `2026-07-28`); a discovery or `-32022` error that lists
-no revision in common, once the server has also refused the `initialize`
+A server over HTTP that this client can't negotiate a revision with fails
+with `McplProtocolVersionError`, naming what each side speaks, and is not
+retried: the SDK's own refusal, after which it negotiates no further (a
+`-32022` whose list names a revision from `2026-07-28` on that this client
+doesn't speak, even if the list also names a 2025 revision it does, which
+the message then says); a discovery or `-32022` error that lists no
+revision in common, once the server has also refused the `initialize`
 tried after it (`rejected`); or an `initialize` answered with a revision
 the 2025 handshake doesn't accept, or with none (`mismatch`). `2026-07-28` is
 negotiated through `server/discover` alone, so it isn't accepted from

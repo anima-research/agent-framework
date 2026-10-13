@@ -74,7 +74,7 @@ interface Fixture {
   /** The sessions the server holds, by id. */
   sessions: Map<string, WebStandardStreamableHTTPServerTransport>;
   /** Statuses for the next GETs without Last-Event-ID, used up in order,
-   *  before the session's own stream. */
+   *  before the session's own stream; 0 drops the connection unanswered. */
   getAnswers: number[];
   /** The same for GETs that resume a stream (with Last-Event-ID). */
   resumeAnswers: number[];
@@ -191,6 +191,10 @@ async function start2025(opts: {
     if (req.method === 'POST' && message && opts.answer?.(message, res)) return;
     if (req.method === 'GET') {
       const status = resumed ? resumeAnswers.shift() : getAnswers.shift() ?? opts.get;
+      if (status === 0) {
+        req.socket.destroy();
+        return;
+      }
       if (status !== undefined) {
         res.writeHead(status).end();
         return;
@@ -377,6 +381,8 @@ test('the standalone stream\'s first open is tried again after a failure that ma
   const connection = ModernMcpConnection.create({ id: 'remote', url: fixture.url, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
   const errors: string[] = [];
   connection.on('error', (error: Error) => errors.push(error.message));
+  let changes = 0;
+  connection.on('tools-list-changed', () => changes++);
   cleanups.push(() => connection.close());
   await connection.start();
   await until(() => count(fixture, (s) => s.method === 'GET' && s.status === 200) === 1, 'the stream open after two failures');
@@ -385,13 +391,12 @@ test('the standalone stream\'s first open is tried again after a failure that ma
     'MCP server "remote" did not open its list-change stream (HTTP 503); trying again',
     'MCP server "remote" did not open its list-change stream (HTTP 429); trying again',
   ]);
-  let changes = 0;
-  connection.on('tools-list-changed', () => changes++);
+  await until(() => changes === 1, 'the relist once the stream opened');
   await connection.callTool('add_tool', {});
-  await until(() => changes === 1, 'the list change on the stream that opened');
+  await until(() => changes === 2, 'the list change on the stream that opened');
 });
 
-test('a request stream resumed before the standalone stream first opens doesn\'t make that open a reopen', async (t) => {
+test('a request stream resumed while the first open waits to try again leaves that open its own: one stream, one relist', async (t) => {
   t.mock.method(Math, 'random', () => 0.5); // no jitter
   // The call's resume comes at the server's 50 ms hint; the first open's retry at 400 ms.
   const fixture = await start2025({ versions: ['2025-11-25'], resumable: { retryMs: 50 } });
@@ -407,16 +412,62 @@ test('a request stream resumed before the standalone stream first opens doesn\'t
   assert.ok(fixture.seen.some((s) => s.method === 'GET' && s.resumed && s.status === 200), 'the call\'s stream resumed');
   await until(() => count(fixture, (s) => s.method === 'GET' && !s.resumed && s.status === 200) === 1, 'the standalone stream open at last');
   await sleep(100);
-  assert.equal(changes, 0, 'its first open relisted nothing');
+  // The open after its failed try relists; the call's resume doesn't.
+  assert.equal(changes, 1);
+  assert.deepEqual(fixture.seen.filter((s) => s.method === 'GET' && !s.resumed).map((s) => s.status), [503, 200]);
 });
 
-test('a first open refused in a way that won\'t pass (501) isn\'t tried again', async () => {
-  const fixture = await start2025({ versions: ['2025-06-18'], get: 501 });
-  const connection = await connect(fixture, { reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
-  await connection.listTools();
-  await sleep(150);
-  assert.equal(count(fixture, (s) => s.method === 'GET'), 1);
-  assert.ok(connection.isConnected);
+for (const status of [408, 409, 500, 502, 504, 507, 522, 0]) {
+  test(`a first open that meets ${status === 0 ? 'a dropped connection' : `HTTP ${status}`} is tried again, reported, and relists once it opens`, async (t) => {
+    t.mock.method(Math, 'random', () => 0.5); // no jitter
+    const fixture = await start2025({ versions: ['2025-06-18'] });
+    fixture.getAnswers.push(status);
+    const connection = ModernMcpConnection.create({ id: 'remote', url: fixture.url, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+    const errors: string[] = [];
+    connection.on('error', (error: Error) => errors.push(error.message));
+    let changes = 0;
+    connection.on('tools-list-changed', () => changes++);
+    cleanups.push(() => connection.close());
+    await connection.start();
+    await until(() => count(fixture, (s) => s.method === 'GET' && s.status === 200) === 1, 'the stream open after the failure');
+    assert.deepEqual(fixture.seen.filter((s) => s.method === 'GET').map((s) => s.status), [status, 200]);
+    assert.equal(errors.length, 1, errors.join(' | '));
+    assert.match(errors[0]!, status === 0
+      ? /^MCP server "remote" did not open its list-change stream \(.+\); trying again$/
+      : new RegExp(`^MCP server "remote" did not open its list-change stream \\(HTTP ${status}\\); trying again$`));
+    await until(() => changes === 1, 'the relist once the stream opened');
+  });
+}
+
+for (const status of [501, 505]) {
+  test(`a first open refused with HTTP ${status}, which won't pass, isn't tried again`, async () => {
+    const fixture = await start2025({ versions: ['2025-06-18'], get: status });
+    const connection = ModernMcpConnection.create({ id: 'remote', url: fixture.url, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+    const errors: string[] = [];
+    connection.on('error', (error: Error) => errors.push(error.message));
+    cleanups.push(() => connection.close());
+    await connection.start();
+    // The refusal went back to the SDK, which reports it.
+    await until(() => errors.some((message) => /Failed to open SSE stream/.test(message)), 'the SDK reporting the refusal');
+    await sleep(150); // seven times the 20 ms a retry would wait
+    assert.equal(count(fixture, (s) => s.method === 'GET'), 1);
+    assert.ok(!errors.some((message) => /trying again/.test(message)));
+    assert.ok(connection.isConnected);
+  });
+}
+
+test('a first open that opens only after failed tries relists what changed meanwhile', async (t) => {
+  t.mock.method(Math, 'random', () => 0.5); // no jitter
+  const fixture = await start2025({ versions: ['2025-06-18'] });
+  fixture.getAnswers.push(503);
+  // The retry waits 300 ms: time for a change the stream can't carry yet.
+  const connection = await connect(fixture, { reconnectIntervalMs: 300, reconnectMaxIntervalMs: 600 });
+  let changes = 0;
+  connection.on('tools-list-changed', () => changes++);
+  await connection.callTool('add_tool', {});
+  assert.equal(count(fixture, (s) => s.method === 'GET' && s.status === 200), 0, 'the change went by before the stream opened');
+  await until(() => changes === 1, 'the relist once the stream opened');
+  assert.ok((await connection.listTools()).some((tool) => tool.name === 'added_1'));
 });
 
 test('a standalone stream resumed with Last-Event-ID has what it missed replayed, and relists nothing', async () => {
@@ -789,6 +840,33 @@ test('a deadline on a 2025 call: cancellation is POSTed, and the server sees the
   assert.equal(heldAborts(connection), 0, 'nothing kept for the cancelled request');
 });
 
+test('close() at the moment a connect adopts its session ends that session once', async () => {
+  const fixture = await start2025({ versions: ['2025-06-18'] });
+  const connection = ModernMcpConnection.create({ id: 'remote', url: fixture.url });
+  connection.on('error', () => {});
+  const internals = connection as unknown as { establish: (session: unknown) => Promise<void> };
+  const establish = internals.establish.bind(connection);
+  let closing: Promise<void> | undefined;
+  internals.establish = async (session: unknown) => {
+    await establish(session);
+    // Adopted, and open() hasn't finished: a close() now runs before it does.
+    closing = connection.close();
+  };
+  const statics = ModernMcpConnection as unknown as { closeSession: (session: unknown) => Promise<Error | null> };
+  const real = statics.closeSession;
+  const closed: unknown[] = [];
+  statics.closeSession = async (session: unknown) => {
+    closed.push(session);
+    return real.call(ModernMcpConnection, session);
+  };
+  cleanups.push(() => { statics.closeSession = real; });
+  await connection.start();
+  await closing;
+  statics.closeSession = real;
+  assert.equal(closed.length, 1, 'the session was closed once');
+  assert.equal(count(fixture, (s) => s.method === 'DELETE'), 1);
+});
+
 test('close() DELETEs a live session, and leaves alone one the server ended', async () => {
   const fixture = await start2025({ versions: ['2025-06-18'] });
   const connection = await connect(fixture);
@@ -906,7 +984,7 @@ test('a discovery refusal naming a newer revision ends negotiation though it als
   });
   const verdict = await refused(fixture);
   assert.equal(verdict.kind, 'rejected');
-  assert.match(verdict.message, /does not support MCP 2026-07-28 \(it supports: 2099-01-01, 2025-06-18\)\. It lists 2025-06-18, which this client also speaks, but the SDK doesn't fall back to initialize after a refusal that names a newer revision\.$/);
+  assert.match(verdict.message, /does not support MCP 2026-07-28 \(it supports: 2099-01-01, 2025-06-18\)\. It lists 2025-06-18, which this client also speaks, but the SDK negotiates no further after this refusal\.$/);
   assert.equal(initializes(fixture).length, 0);
 });
 

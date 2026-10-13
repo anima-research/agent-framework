@@ -8,7 +8,8 @@
   `2026-07-28`. On a 2025 revision:
   - **List changes** arrive on the session's standalone stream, which is kept
     open while the session lives. Its first open is tried again after a 408,
-    429, 500, 502, 503, 504 or network error, each reported as an `error`.
+    409, 429, a 5xx other than 501 and 505, or a network error, each
+    reported as an `error`, and a relist follows once it opens.
     A stream that drops is reopened: the first try waits the server's `retry`
     hint when it sent one, and the base interval otherwise, and a try after a
     failed one waits the longer of the hint and the doubling backoff. A
