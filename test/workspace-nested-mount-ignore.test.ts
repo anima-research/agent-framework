@@ -426,6 +426,56 @@ test("a write or an edit through an alias into a nested mount is refused at the 
   assert.equal(readFileSync(join(outerDir, 'a', 'b', 'x.txt'), 'utf8'), "the inner mount's");
 });
 
+for (const op of ['write', 'edit', 'writeBinary', 'delete'] as const) {
+  test(`${op === 'edit' ? 'an' : 'a'} ${op} that waits for the mount's turn is judged on the path as it is when its turn comes: a nesting made meanwhile is refused`, async (t) => {
+    // The check that counts runs in the mount's turn, after the last await,
+    // beside the store change, so a path that came to lie in a nested mount
+    // while the call waited changes nothing in the outer mount's store.
+    const { root, stops } = scratch(t, `af-nested-mount-queued-${op}-`);
+    const outerDir = join(root, 'outer');
+    const innerDir = join(outerDir, 'inner');
+    mkdirSync(innerDir, { recursive: true });
+    mkdirSync(join(outerDir, 'alias'));
+    writeFileSync(join(innerDir, 'x.txt'), 'inner original');
+    const { workspace } = await started(stops, join(root, 'workspace.chronicle'), [
+      { name: 'outer', path: outerDir, mode: 'read-write', watch: 'never', followSymlinks: true, autoMaterialize: false },
+      { name: 'inner', path: innerDir, mode: 'read-write', watch: 'never' },
+    ]);
+    const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
+    if (op === 'edit') {
+      const drafted = await call('write', { path: 'outer/alias/x.txt', content: 'old draft' });
+      assert.equal(drafted.success, true, String(drafted.error));
+    }
+    const internals = workspace as unknown as { mounts: Map<string, unknown>; withMount(m: unknown, f: () => Promise<void>): Promise<void> };
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let entered!: () => void;
+    const inTurn = new Promise<void>((resolve) => { entered = resolve; });
+    const held = internals.withMount(internals.mounts.get('outer'), async () => { entered(); await gate; });
+    await inTurn;
+    const pending = op === 'writeBinary'
+      ? workspace.writeBinary('outer/alias/x.txt', Buffer.from('binary draft'), 'application/octet-stream')
+      : op === 'write'
+        ? call('write', { path: 'outer/alias/x.txt', content: 'new draft' })
+        : op === 'edit'
+          ? call('edit', { path: 'outer/alias/x.txt', oldString: 'old', newString: 'new' })
+          : call('delete', { path: 'outer/alias/y.txt' });
+    rmSync(join(outerDir, 'alias'), { recursive: true });
+    symlinkSync(innerDir, join(outerDir, 'alias'));
+    release();
+    await held;
+    const result = await pending;
+    assert.equal(result.success, false, JSON.stringify(result));
+    assert.match(String(result.error), /is inside mount "inner", which is nested in "outer"/);
+    if (op === 'edit') {
+      assert.equal(storeHolds(workspace, 'outer', 'alias/x.txt'), true, 'the old copy is as it was');
+    } else {
+      assert.equal(storeHolds(workspace, 'outer', op === 'delete' ? 'alias/y.txt' : 'alias/x.txt'), false, "nothing reaches the outer mount's store");
+    }
+    assert.equal(readFileSync(join(innerDir, 'x.txt'), 'utf8'), 'inner original');
+  });
+}
+
 test("a write through a dangling link into a nested mount is refused at the tool, for a file link and a directory link", async (t) => {
   const { root, stops } = scratch(t, 'af-nested-mount-dangling-');
   const outerDir = join(root, 'outer');

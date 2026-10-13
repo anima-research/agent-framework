@@ -1606,6 +1606,10 @@ export class WorkspaceModule implements Module {
     const store = this.getStore();
     return this.withMount(mount, async () => {
       await this.settleBeforeMutation(mount, relativePath);
+      // Read again in the mount's turn, after the last await: the path may have
+      // come to lie in a nested mount while the write waited.
+      const nestedNow = this.canonicalNestedRefusal(mount, relativePath, mountPrefixedPath);
+      if (nestedNow) return { success: false, error: nestedNow, isError: true };
       const blobHash = store.storeBlob(data, mimeType);
       const materializeError = await this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: data.byteLength });
       if (materializeError) {
@@ -2375,11 +2379,18 @@ export class WorkspaceModule implements Module {
     }
 
     const buffer = Buffer.from(input.content, 'utf-8');
-    const materializeError = await this.withMount(mount, async () => {
+    const outcome = await this.withMount(mount, async (): Promise<{ refused: string } | { materializeError: string | null }> => {
       await this.settleBeforeMutation(mount, relativePath);
+      // Read again in the mount's turn, after the last await, so the store
+      // changes on what the path is now: it may have come to lie in a nested
+      // mount while the write waited.
+      const nestedNow = this.canonicalNestedRefusal(mount, relativePath, input.path);
+      if (nestedNow) return { refused: nestedNow };
       const blobHash = store.storeBlob(buffer, 'text/plain');
-      return this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: buffer.byteLength });
+      return { materializeError: await this.commitToolChange(mount, relativePath, { kind: 'set', blobHash, size: buffer.byteLength }) };
     });
+    if ('refused' in outcome) return { success: false, error: outcome.refused, isError: true };
+    const materializeError = outcome.materializeError;
     if (materializeError) {
       return {
         success: false,
@@ -2410,6 +2421,10 @@ export class WorkspaceModule implements Module {
     return this.withMount(mount, async (): Promise<ToolResult> => {
       const report = await this.ensureSynced(mount, relativePath);
       await this.settleBeforeMutation(mount, relativePath); // before the edit reads the entry
+      // Read again in the mount's turn, after the last await: the path may have
+      // come to lie in a nested mount while the edit waited.
+      const nestedNow = this.canonicalNestedRefusal(mount, relativePath, input.path);
+      if (nestedNow) return { success: false, error: nestedNow, isError: true };
 
       const entry = store.treeGet(mount.treeStateId, relativePath);
       if (!entry) {
@@ -2476,45 +2491,45 @@ export class WorkspaceModule implements Module {
 
     const store = this.getStore();
     // Nested as written, or by how disk spells the path (a case variant, a
-    // link inside the mount).
-    const lexical = this.nestedMountAt(mount, relativePath);
-    const inner = lexical
-      ? { name: lexical.name, rest: relativePath.slice(lexical.at.length + 1), where: ` at ${lexical.at}/` }
-      : (() => {
-        const byDisk = this.nestedByDisk(mount, relativePath);
-        return byDisk ? { ...byDisk, where: '' } : null;
-      })();
-    if (inner) {
-      // A copy the outer mount took in from a nested mount's directory before
-      // #280's fix: deleting it stops tracking it here, and never touches
-      // disk, where the file is the inner mount's. Anything else at such a
-      // path is refused, as every other tool refuses it.
-      return this.withMount(mount, async (): Promise<ToolResult> => {
-        if (!store.treeGet(mount.treeStateId, relativePath)) {
-          const rest = inner.rest;
-          return {
-            success: false,
-            error: `"${input.path}" is inside mount "${inner.name}", which is nested in "${mount.config.name}"${inner.where}, ` +
-              `and "${mount.config.name}" doesn't hold it: use "${rest ? `${inner.name}/${rest}` : inner.name}"`,
-            isError: true,
-          };
-        }
-        store.treeRemove(mount.treeStateId, relativePath);
-        this.intents.get(mount.config.name)!.put(relativePath, null);
-        this.agreementOrThrow().forget(mount.config.name, relativePath);
+    // link inside the mount), decided in the mount's turn.
+    const nestedAt = (): { name: string; rest: string; where: string } | null => {
+      const lexical = this.nestedMountAt(mount, relativePath);
+      if (lexical) return { name: lexical.name, rest: relativePath.slice(lexical.at.length + 1), where: ` at ${lexical.at}/` };
+      const byDisk = this.nestedByDisk(mount, relativePath);
+      return byDisk ? { ...byDisk, where: '' } : null;
+    };
+    // A copy the outer mount took in from a nested mount's directory before
+    // #280's fix: deleting it stops tracking it here, and never touches disk,
+    // where the file is the inner mount's. Anything else at such a path is
+    // refused, as every other tool refuses it.
+    const nestedDelete = (inner: { name: string; rest: string; where: string }): ToolResult => {
+      if (!store.treeGet(mount.treeStateId, relativePath)) {
         return {
-          success: true,
-          data: {
-            path: input.path,
-            deleted: true,
-            note: `inside mount "${inner.name}": no longer tracked by "${mount.config.name}"; the file on disk is "${inner.name}"'s and was left as it is`,
-          },
+          success: false,
+          error: `"${input.path}" is inside mount "${inner.name}", which is nested in "${mount.config.name}"${inner.where}, ` +
+            `and "${mount.config.name}" doesn't hold it: use "${inner.rest ? `${inner.name}/${inner.rest}` : inner.name}"`,
+          isError: true,
         };
-      });
-    }
+      }
+      store.treeRemove(mount.treeStateId, relativePath);
+      this.intents.get(mount.config.name)!.put(relativePath, null);
+      this.agreementOrThrow().forget(mount.config.name, relativePath);
+      return {
+        success: true,
+        data: {
+          path: input.path,
+          deleted: true,
+          note: `inside mount "${inner.name}": no longer tracked by "${mount.config.name}"; the file on disk is "${inner.name}"'s and was left as it is`,
+        },
+      };
+    };
     return this.withMount(mount, async (): Promise<ToolResult> => {
       const report = await this.ensureSynced(mount, relativePath);
       await this.settleBeforeMutation(mount, relativePath);
+      // Decided after the last await, beside the store change: the path may
+      // have come to lie in a nested mount while the delete waited.
+      const inner = nestedAt();
+      if (inner) return nestedDelete(inner);
       const entry = store.treeGet(mount.treeStateId, relativePath);
       if (!entry) {
         return { success: false, error: this.notInWorkspace(input.path, report), isError: true };
