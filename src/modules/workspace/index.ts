@@ -1699,7 +1699,7 @@ export class WorkspaceModule implements Module {
     return this.withMount(mount, async () => {
       const report = await this.ensureSynced(mount, relativePath, { checkIgnored: true });
       const entry = store.treeGet(mount.treeStateId, relativePath);
-      if (!entry) return { error: `File not found: ${mountPrefixedPath}` };
+      if (!entry) return { error: this.notInWorkspace(mountPrefixedPath, report) };
       const blob = store.getBlob(entry.blobHash);
       if (!blob) return { error: `Blob not found for: ${mountPrefixedPath}` };
       return { data: blob, ...diskCheckView(report) };
@@ -2240,8 +2240,10 @@ export class WorkspaceModule implements Module {
    * `checkIgnored`, so is a path it holds that the mount ignores: neither the
    * watcher nor a sync without a path keeps such a copy current, so a caller
    * that hands its content on (read, edit, readBinary) checks it by its own
-   * path, as a sync that names it would, and says so when the check couldn't
-   * confirm it (diskCheckView). A delete doesn't: it matches no content, so
+   * path under the three-way rule, which never gives up a workspace change
+   * (a sync that names the path takes disk's copy outright), and says so
+   * when the check couldn't confirm it (diskCheckView). A delete doesn't: it
+   * matches no content, so
    * taking in a disk change first would let its unlink remove a change the
    * workspace never saw. The caller holds the mount's turn.
    */
@@ -2386,15 +2388,24 @@ export class WorkspaceModule implements Module {
     const maxSize = mount.config.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
     let treeError: WorkspaceImageReadError | null = null;
 
+    // A held image the mount ignores is checked against disk first, as read
+    // checks a held file there; a sync never stores an image, so it's one an
+    // agent wrote. Any other image is read from the tree, or from disk.
+    let checked: DiskCheck = {};
+    if (this.getStore().treeGet(mount.treeStateId, relativePath) && coveredByIgnore(relativePath, mount.config.ignore ?? [])) {
+      checked = diskCheckView(await this.withMount(mount, () => this.ensureSynced(mount, relativePath, { checkIgnored: true })));
+    }
     try {
       const image = this.tryReadImageFromTree(mount, relativePath, input.path, maxSize);
       if (image) {
+        const check = checked.diskCheck;
         return {
           success: true,
           data: [
             {
               type: 'text',
-              text: `Path: ${input.path}\nMIME: ${image.mimeType}\nBytes: ${image.bytes.byteLength}`,
+              text: `Path: ${input.path}\nMIME: ${image.mimeType}\nBytes: ${image.bytes.byteLength}` +
+                (check ? `\nDisk check: ${check.state}${check.note ? ` (${check.note})` : ''}` : ''),
             },
             {
               type: 'image',
@@ -2593,8 +2604,9 @@ export class WorkspaceModule implements Module {
   }
 
   /** The keys this may remove come from the outer store and the classified
-   * path alone; nothing inside the nested mount is read. A different case is
-   * only a hint, never authority to remove a different key. */
+   * path alone, without reading inside the nested mount. A different case is
+   * only a hint, never authority to remove a different key; naming one
+   * classifies it as a delete would, which reads disk. */
   private deleteNestedCopy(
     mount: MountState, relativePath: string, inputPath: string, inner: NestedDeletion, snapshot: NestedSnapshot,
   ): ToolResult {

@@ -1374,10 +1374,11 @@ test('a tracked spelling whose nested directory differs in case is named, where 
   } finally { Object.defineProperty(process, 'platform', platform); }
 });
 
-test('a tracked spelling held only as a pending deletion is named too, as the delete it names would find it', async (t) => {
+test('a tracked spelling held only as a pending deletion, or only as disk agreement, is named too, as the delete it names would find it', async (t) => {
   const r = await secondPassRig(t);
   const hash = r.store.storeBlob(Buffer.from('old copy'), 'text/plain');
   r.state.intents.get('outer')!.put('Inner/a.txt', { tombstone: { hash } });
+  r.state.agreementOrThrow().set('outer', 'Inner/b.txt', { kind: 'content', hash, size: 8 });
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
   try {
     Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
@@ -1387,6 +1388,10 @@ test('a tracked spelling held only as a pending deletion is named too, as the de
     const exact = await r.call('delete', { path: 'outer/Inner/a.txt' });
     assert.equal(exact.success, true, JSON.stringify(exact));
     assert.equal(r.state.intents.get('outer')!.get('Inner/a.txt'), null);
+    const agreed = await r.call('delete', { path: 'outer/inner/b.txt' });
+    assert.match(String(agreed.error), /^Tracked spelling: "outer\/Inner\/b\.txt"; use that exact path/);
+    assert.equal((await r.call('delete', { path: 'outer/Inner/b.txt' })).success, true);
+    assert.equal(r.state.agreementOrThrow().get('outer', 'Inner/b.txt'), undefined);
   } finally { Object.defineProperty(process, 'platform', platform); }
 });
 
@@ -1435,18 +1440,27 @@ test('a read-only mount can stop tracking an old nested copy, and refuses every 
   // path in the nested mount, and an outer link into it), reading no root.
   symlinkSync(join(outer, 'inner', 'x.txt'), join(outer, 'link'));
   const native = fs.realpathSync.native;
-  let reads = 0;
+  const { lstatSync, readlinkSync } = fs;
+  const { realpath, lstat } = fsPromises;
+  const reads: string[] = [];
+  const counted = <F extends (...args: never[]) => unknown>(name: string, f: F): F =>
+    ((...args: Parameters<F>) => { reads.push(name); return f(...args); }) as F;
   try {
-    fs.realpathSync.native = ((path: Parameters<typeof native>[0], options?: Parameters<typeof native>[1]) => {
-      reads++;
-      return native(path, options as never);
-    }) as typeof native;
-    for (const path of ['outer/inner/x.txt', 'outer/inner/other.txt', 'outer/link']) {
+    fs.realpathSync.native = counted('realpathSync.native', native);
+    Object.assign(fs, { lstatSync: counted('lstatSync', lstatSync), readlinkSync: counted('readlinkSync', readlinkSync) });
+    Object.assign(fsPromises, { realpath: counted('realpath', realpath), lstat: counted('lstat', lstat) });
+    syncBuiltinESMExports();
+    for (const path of ['outer/inner/x.txt', 'outer/inner/other.txt', 'outer/link', 'outer/nothing.txt']) {
       const unheld = await call('delete', { path });
       assert.equal(unheld.error, 'Mount "outer" is read-only', path);
     }
-  } finally { fs.realpathSync.native = native; }
-  assert.equal(reads, 0, 'the refusal reads no root from disk');
+  } finally {
+    fs.realpathSync.native = native;
+    Object.assign(fs, { lstatSync, readlinkSync });
+    Object.assign(fsPromises, { realpath, lstat });
+    syncBuiltinESMExports();
+  }
+  assert.deepEqual(reads, [], 'the refusal reads nothing from disk');
   assert.equal(readFileSync(join(outer, 'inner', 'x.txt'), 'utf8'), 'inner bytes');
 });
 
@@ -1465,6 +1479,9 @@ test('a read or an edit of a tracked file the mount ignores checks it against di
   writeFileSync(join(outer, 'node_modules', 'pkg.js'), 'v2');
   // A sync without a path passes over it, so the workspace copy is still v1.
   assert.equal((await call('sync', { mount: 'outer' })).success, true);
+  const store = (workspace as unknown as { getStore(): JsStore }).getStore();
+  const held = store.treeGet('workspace/outer/tree', 'node_modules/pkg.js');
+  assert.equal(held && store.getBlob(held.blobHash)?.toString(), 'v1');
   const read = await call('read', { path: 'outer/node_modules/pkg.js' });
   assert.match(JSON.stringify(read.data), /\\tv2/, JSON.stringify(read));
   writeFileSync(join(outer, 'node_modules', 'pkg.js'), 'v3');
@@ -1500,6 +1517,38 @@ test("a read of a tracked file the mount ignores says when disk couldn't be chec
   // A copy that agrees with disk says nothing more.
   const plain = await call('read', { path: 'outer/other.js' });
   assert.equal((plain.data as { diskCheck?: unknown }).diskCheck, undefined);
+});
+
+test("readBinary of a tracked file the mount ignores, gone binary on disk, says why the workspace no longer holds it", async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-pass2-ignored-binary-');
+  const outer = join(root, 'outer');
+  mkdirSync(join(outer, 'node_modules'), { recursive: true });
+  writeFileSync(join(outer, 'node_modules', 'pkg.js'), 'v1');
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', ignore: ['node_modules'] },
+  ]);
+  assert.equal((await workspace.handleToolCall({ id: 's', name: 'sync', input: { path: 'outer/node_modules/pkg.js' } })).success, true);
+  writeFileSync(join(outer, 'node_modules', 'pkg.js'), ONE_PIXEL_PNG);
+  const bytes = await workspace.readBinary('outer/node_modules/pkg.js');
+  assert.ok('error' in bytes, JSON.stringify(bytes));
+  assert.match(bytes.error, /on disk but not stored in the workspace \(binary or over the size limit\)/);
+});
+
+test("read_image of a held image the mount ignores says when disk couldn't be checked", async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-pass2-ignored-image-');
+  const outer = join(root, 'outer');
+  mkdirSync(join(outer, 'assets'), { recursive: true });
+  writeFileSync(join(outer, 'other.png'), ONE_PIXEL_PNG);
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-write', watch: 'never', ignore: ['assets'] },
+  ]);
+  // A sync never stores an image, so a held one is an agent's own write.
+  assert.equal((await workspace.writeBinary('outer/assets/a.png', ONE_PIXEL_PNG, 'image/png')).success, true);
+  symlinkSync(join(outer, 'other.png'), join(outer, 'assets', 'a.png'));
+  const image = await workspace.handleToolCall({ id: 'img', name: 'read_image', input: { path: 'outer/assets/a.png' } });
+  assert.equal(image.success, true, JSON.stringify(image));
+  const text = (image.data as Array<{ type: string; text?: string }>).find((block) => block.type === 'text')!.text!;
+  assert.match(text, /\nDisk check: unverified \(a symlink, which this mount does not follow\)$/);
 });
 
 test("a delete of a tracked file the mount ignores doesn't take in a disk change first, so it never removes one the workspace hasn't seen", async (t) => {

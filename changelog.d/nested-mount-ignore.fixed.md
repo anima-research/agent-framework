@@ -9,12 +9,13 @@
   - Files the old watcher already took in from under an ignored path stay
     tracked, and the watcher and a sync without a path no longer update them.
     A sync that names such a path still takes disk's copy, and says the
-    mount ignores it. A `read` or `edit` of one checks it against disk first,
-    by its own path. Where disk can't be checked, as through a link the
-    mount doesn't follow, it works from the workspace copy and says so under
-    `diskCheck`, as listings mark it unverified. A `delete` doesn't take
-    disk's copy first, so it still refuses to remove a change on disk the
-    workspace hasn't seen.
+    mount ignores it. A `read`, `edit` or `read_image` of one checks it
+    against disk first, by its own path. Where disk can't be checked, as
+    through a link the mount doesn't follow, it works from the workspace copy
+    and says so (`diskCheck`; for `read_image`, a "Disk check" line), as
+    listings mark it unverified. A `delete` doesn't take disk's copy first,
+    so it still refuses to remove a change on disk the workspace hasn't
+    seen.
     Each sync without a path lists them under `skipped`
     ("disk could not be checked: ignored by the mount"). It also lists, under
     `incomplete`, the ignored entry that hides them: the file itself for a
@@ -72,7 +73,7 @@
     path. Before, a named sync took the inner mount's files into the outer
     one. `write`, `edit`, `writeBinary` and `delete` also read where the
     path leads on disk at their checks, so existing case variants and links inside the mount, dangling or not, are checked too. A link changed after the store check can leave an outer draft at a now-nested path; materialize refuses the later disk write.
-    - `delete` can stop tracking an old outer copy at a nested path, on a read-only mount too, where it takes the exact key. It removes that key's copy, intent and agreement; the disk entry, if any, stays untouched. A read-only mount still refuses every other delete.
+    - `delete` can stop tracking an old outer copy at a nested path, or an outer link into a nested mount, on a read-only mount too, where it takes the exact key alone. It removes that key's copy, intent and agreement; the disk entry, if any, stays untouched. A read-only mount still refuses every other delete.
     - A `materialize` without a path skips writes of such copies, with a note saying that disk was left untouched and the copy can be deleted here to stop tracking it. An already-pending deletion at a nested path is untracked once instead of receiving that advice again.
   - Every check that a canonical path lies inside the mount, when reading,
     walking or writing, also refuses one inside a nested mount. So a symlink
