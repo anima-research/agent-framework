@@ -6,10 +6,14 @@
  * - **Legacy**: MCP 2024-11-05, with MCPL riding on it as an experimental
  *   capability. `McplServerConnection` speaks it, over stdio or MCPL's
  *   WebSocket binding.
- * - **Modern**: MCP 2026-07-28, which is stateless. It has no `initialize`;
- *   every request carries its version and client capabilities in `_meta`, and
- *   server-to-client requests are replaced by in-band continuation.
- *   `ModernMcpConnection` speaks it, over stdio or Streamable HTTP.
+ * - **Modern**: the official SDK's client, which `ModernMcpConnection` drives.
+ *   Over stdio it speaks MCP 2026-07-28, which is stateless. That revision
+ *   has no `initialize`: every request carries its version and client
+ *   capabilities in `_meta`, and server-to-client requests are replaced by
+ *   in-band continuation. Over Streamable HTTP the revision is negotiated at
+ *   each connect, from {@link MODERN_HTTP_PROTOCOL_VERSIONS}: 2026-07-28
+ *   when the server offers it, and otherwise a 2025 revision, with its
+ *   `initialize` handshake and its session.
  *
  * A URL's scheme decides a network server's family: `ws://`/`wss://` is
  * legacy, `http://`/`https://` is modern, because neither family has the
@@ -17,17 +21,28 @@
  * unless its config says `protocol: 'modern'`, so every existing stdio
  * configuration opens exactly as before.
  *
- * Why no auto-detection: the modern spec's discover-first probe makes some
- * real MCPL servers exit (heartbeat-mcpl closes on any first message that
- * isn't `initialize`), the SDK's stdio probe launches the server twice, and a
- * server's era is a stable fact its configuration can state.
+ * Why a stdio server's era isn't detected: the modern spec's discover-first
+ * probe makes some real MCPL servers exit (heartbeat-mcpl closes on any first
+ * message that isn't `initialize`), the SDK's stdio probe launches the server
+ * twice, and a server's era is a stable fact its configuration can state.
+ * Those reasons are stdio's. MCPL has no HTTP binding, so a probe over http(s)
+ * can't reach an MCPL server, and a remote server's revision changes when its
+ * operator upgrades it: negotiating at every connect follows that.
  */
 import type { McplServerConfig } from './types.js';
 
 /** The one revision the legacy engine offers and accepts. */
 export const LEGACY_MCP_PROTOCOL_VERSION = '2024-11-05';
-/** The revision the modern engine pins. */
+/** The revision the modern engine pins over stdio, and prefers over HTTP. */
 export const MODERN_MCP_PROTOCOL_VERSION = '2026-07-28';
+/**
+ * What the modern engine offers an http(s) server, in its order of
+ * preference: 2026-07-28, then the 2025 revisions of Streamable HTTP. The list
+ * is named here rather than taken from the SDK, whose own list grows with its
+ * releases, so a revision reaches servers only once it's tested here.
+ * 2024-11-05 isn't offered: its HTTP binding was HTTP+SSE, another transport.
+ */
+export const MODERN_HTTP_PROTOCOL_VERSIONS: readonly string[] = [MODERN_MCP_PROTOCOL_VERSION, '2025-11-25', '2025-06-18', '2025-03-26'];
 
 export type McpProtocolFamily = 'legacy' | 'modern';
 export type McpTransportKind = 'stdio' | 'websocket' | 'http';

@@ -103,18 +103,20 @@ const MAX_TOOL_LIST_PAGES = 100;
 /**
  * The server and this engine have no protocol revision in common, so the
  * connection was never established. This is a protocol-negotiation fact, not
- * a request outcome. Retrying cannot change it: each engine offers one
- * revision, and only configuration can fix the mismatch. A connection that
- * gets this error does not schedule reconnects. The legacy engine and the
- * modern one (ModernMcpConnection, whose pinned revision the server refused)
- * both throw it, so its readers treat them alike.
+ * a request outcome. Retrying cannot change it: each engine offers the same
+ * revisions every time (`offered`), and only configuration, or the server's
+ * operator, can fix the mismatch. A connection that gets this error does not
+ * schedule reconnects. The legacy engine and the modern one
+ * (ModernMcpConnection) both throw it, so its readers treat them alike.
  *
- * - `rejected`: the server refused the offered revision: the legacy engine's
- *   `initialize` answered with error -32022, or a modern server's discovery
- *   or error naming no common revision. `supported` is the server's own list,
- *   when it gave one.
- * - `mismatch`: the server answered the legacy engine's `initialize` with a
- *   revision other than 2024-11-05, or with none.
+ * - `rejected`: the server refused every revision offered. The legacy
+ *   engine's `initialize` was answered with error -32022, or a modern
+ *   server's discovery or -32022 error named no revision in common (over
+ *   HTTP, a discovery's list counts once the `initialize` tried after it has
+ *   failed too). `supported` is the server's own list, when it gave one.
+ * - `mismatch`: the server answered `initialize` with a revision that wasn't
+ *   offered, or with none: the legacy engine's, or a modern connection's
+ *   over HTTP.
  */
 export class McplProtocolVersionError extends Error {
   constructor(
@@ -127,9 +129,10 @@ export class McplProtocolVersionError extends Error {
     /** The JSON-RPC error's code and data, verbatim (`rejected`). */
     readonly code?: number,
     readonly data?: unknown,
-    /** The revision this client offered: the legacy engine's, unless a
-     *  modern connection's. */
-    readonly offered: string = MCP_PROTOCOL_VERSION,
+    /** The revisions this client offered, in its order of preference: the
+     *  legacy engine's one, a modern connection's one over stdio, or its
+     *  list over HTTP. */
+    readonly offered: readonly string[] = [MCP_PROTOCOL_VERSION],
   ) {
     super(message);
     this.name = 'McplProtocolVersionError';

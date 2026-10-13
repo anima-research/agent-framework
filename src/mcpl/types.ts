@@ -256,8 +256,9 @@ export interface McplServerConfig {
    * - `ws://` or `wss://` is a legacy MCPL server over MCPL's WebSocket
    *   binding. The host dials it and runs the same newline-delimited JSON-RPC
    *   as over stdio.
-   * - `http://` or `https://` is a modern MCP (2026-07-28) server over
-   *   Streamable HTTP.
+   * - `http://` or `https://` is a modern MCP server over Streamable HTTP.
+   *   Its revision is negotiated at each connect: 2026-07-28 when the server
+   *   offers it, and otherwise 2025-11-25, 2025-06-18 or 2025-03-26.
    */
   url?: string;
 
@@ -377,14 +378,23 @@ export interface McplServerConfig {
    * When true, connect() resolves immediately (with null capabilities) if the
    * server is unavailable, and retries in the background.
    * Adapted from Anarchid/agent-framework@mcpl-module-proto.
+   *
+   * A modern server reached over HTTP at a 2025 revision can hold a session
+   * for this client. When the server ends it (HTTP 404) after it has answered
+   * a request, a new session starts at once whether or not this is set. One
+   * that ends before it has answered counts as a failed connect, and follows
+   * this setting.
    */
   reconnect?: boolean;
 
   /**
    * Base interval between reconnection attempts in milliseconds.
    * The actual delay doubles with each consecutive failure (with ±25% jitter)
-   * up to `reconnectMaxIntervalMs`, and resets after a successful handshake.
-   * Default: 5000 (5 seconds).
+   * up to `reconnectMaxIntervalMs`, and resets after a successful handshake
+   * (for a modern server's 2025 session over HTTP, once that session has
+   * answered a request). The same backoff paces reopening a modern server's
+   * dropped stream over HTTP, never sooner than the server's own `retry`
+   * hint asks. Default: 5000 (5 seconds).
    */
   reconnectIntervalMs?: number;
 

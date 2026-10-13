@@ -17518,8 +17518,9 @@ export class AgentFramework {
     connected: boolean;
     retrying: boolean;
     /** Which engine serves it: `legacy` (MCP 2024-11-05 + MCPL) or `modern`
-     *  (MCP 2026-07-28), as its configuration selects; null when the
-     *  configuration names no usable transport (see `refused`). */
+     *  (the SDK's client: MCP 2026-07-28, or over HTTP a 2025 revision), as
+     *  its configuration selects; null when the configuration names no
+     *  usable transport (see `refused`). */
     family: 'legacy' | 'modern' | null;
     /** The MCP revision its last handshake established; null until one has. */
     protocolVersion: string | null;
