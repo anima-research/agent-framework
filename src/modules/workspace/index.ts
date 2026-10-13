@@ -209,10 +209,11 @@ function matchesPartialPrefix(buffer: Buffer, prefix: Buffer): boolean {
 }
 
 /**
- * A mount root as disk will spell it once it exists. The configured path is
- * read as every workspace operation reads it, `resolve(path)`, so the root
- * this names is the one the mount's own sync, tools and readers use. From
- * there, a root that exists is its canonical path. One that doesn't yet is
+ * A path as disk will spell it once it exists: a mount's root, or a path
+ * inside one. The configured path is read as every workspace operation reads
+ * it, `resolve(path)`, so the root this names is the one the mount's own
+ * sync, tools and readers use. From there, a path that exists is its
+ * canonical path. One that doesn't yet is
  * read the way the filesystem will read it: component by component, each
  * existing prefix as disk spells it, a link that leads to nothing yet
  * replaced by what it names, and a `..` in that target taken from the
@@ -767,6 +768,32 @@ export class WorkspaceModule implements Module {
       if (real !== rootReal && contained(rootReal, real)) nested.push({ name: inner.config.name, real });
     }
     return nested;
+  }
+
+  /**
+   * The mount nested in `mount` that a mount-relative path lies in by how
+   * disk spells it, where the path as written may not show it: a case variant
+   * on a case-insensitive disk (`A/B` for `a/b`), or a link inside the mount,
+   * dangling or not. The path is read as canonicalRoot reads a root: what
+   * exists as disk spells it, a link that leads to nothing yet replaced by
+   * what it names, and only what doesn't exist joined as written. The tools
+   * that change the store (write, edit, writeBinary, delete) ask before
+   * anything reaches it, so the outer mount never takes a draft at a path
+   * that is the inner mount's.
+   */
+  private nestedByDisk(mount: MountState, relativePath: string): { name: string; rest: string } | null {
+    const rootReal = canonicalRoot(mount.config.path);
+    const real = canonicalRoot(resolve(mount.config.path, relativePath));
+    const inner = this.nestedRootsOf(mount, rootReal).find((n) => contained(n.real, real));
+    return inner ? { name: inner.name, rest: relative(inner.real, real).split(sep).join('/') } : null;
+  }
+
+  /** {@link nestedByDisk}'s refusal, naming where the path belongs. */
+  private canonicalNestedRefusal(mount: MountState, relativePath: string, mountPrefixedPath: string): string | null {
+    const inner = this.nestedByDisk(mount, relativePath);
+    if (!inner) return null;
+    return `"${mountPrefixedPath}" is inside mount "${inner.name}", which is nested in "${mount.config.name}": ` +
+      `use "${inner.rest ? `${inner.name}/${inner.rest}` : inner.name}"`;
   }
 
   /** Refuse a canonical path that lies in a mount nested in `mount`, naming where it belongs. */
@@ -1567,6 +1594,8 @@ export class WorkspaceModule implements Module {
         isError: true,
       };
     }
+    const nestedHere = this.canonicalNestedRefusal(mount, relativePath, mountPrefixedPath);
+    if (nestedHere) return { success: false, error: nestedHere, isError: true };
     if (mount.config.mode === 'read-only') {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
     }
@@ -1790,9 +1819,10 @@ export class WorkspaceModule implements Module {
    *    outside, on every platform (junctions included).
    * 4. Confirm the descriptor and the canonical path are the same inode.
    *
-   * `inspect` runs right after the descriptor is stat'd and before the
-   * containment work, so callers can impose size policy in the same order the
-   * image reader always has. The returned handle is the caller's to close.
+   * `inspect` runs once the file is known to be this mount's (after step 4),
+   * so a caller's size policy never answers for a file the boundary refuses:
+   * a link out of the mount, or into a mount nested in it, is refused as such,
+   * and its size isn't reported. The returned handle is the caller's to close.
    */
   private async openContainedFile(
     mount: MountState,
@@ -1862,7 +1892,6 @@ export class WorkspaceModule implements Module {
       if (!fileStat.isFile()) {
         throw new WorkspaceReadError('not_found', `File not found: ${mountPrefixedPath}`, 'fstat');
       }
-      inspect?.(fileStat);
 
       if (!follow && !useNoFollow) {
         let postOpenInfo: Awaited<ReturnType<typeof lstat>>;
@@ -1912,6 +1941,7 @@ export class WorkspaceModule implements Module {
       if (pathStat.dev !== fileStat.dev || pathStat.ino !== fileStat.ino) {
         throw new WorkspaceReadError('changed', `File changed during read: ${mountPrefixedPath}`, 'stat');
       }
+      inspect?.(fileStat);
 
       return { handle, fileStat, realFilePath };
     } catch (err) {
@@ -2332,6 +2362,8 @@ export class WorkspaceModule implements Module {
 
   private async handleWrite(input: WriteInput): Promise<ToolResult> {
     const { mount, relativePath } = this.parsePath(input.path);
+    const nestedHere = this.canonicalNestedRefusal(mount, relativePath, input.path);
+    if (nestedHere) return { success: false, error: nestedHere, isError: true };
     if (mount.config.mode === 'read-only') {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
     }
@@ -2368,6 +2400,8 @@ export class WorkspaceModule implements Module {
 
   private async handleEdit(input: EditInput): Promise<ToolResult> {
     const { mount, relativePath } = this.parsePath(input.path);
+    const nestedHere = this.canonicalNestedRefusal(mount, relativePath, input.path);
+    if (nestedHere) return { success: false, error: nestedHere, isError: true };
     if (mount.config.mode === 'read-only') {
       return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
     }
@@ -2441,7 +2475,15 @@ export class WorkspaceModule implements Module {
     }
 
     const store = this.getStore();
-    const inner = this.nestedMountAt(mount, relativePath);
+    // Nested as written, or by how disk spells the path (a case variant, a
+    // link inside the mount).
+    const lexical = this.nestedMountAt(mount, relativePath);
+    const inner = lexical
+      ? { name: lexical.name, rest: relativePath.slice(lexical.at.length + 1), where: ` at ${lexical.at}/` }
+      : (() => {
+        const byDisk = this.nestedByDisk(mount, relativePath);
+        return byDisk ? { ...byDisk, where: '' } : null;
+      })();
     if (inner) {
       // A copy the outer mount took in from a nested mount's directory before
       // #280's fix: deleting it stops tracking it here, and never touches
@@ -2449,10 +2491,10 @@ export class WorkspaceModule implements Module {
       // path is refused, as every other tool refuses it.
       return this.withMount(mount, async (): Promise<ToolResult> => {
         if (!store.treeGet(mount.treeStateId, relativePath)) {
-          const rest = relativePath.slice(inner.at.length + 1);
+          const rest = inner.rest;
           return {
             success: false,
-            error: `"${input.path}" is inside mount "${inner.name}", which is nested in "${mount.config.name}" at ${inner.at}/, ` +
+            error: `"${input.path}" is inside mount "${inner.name}", which is nested in "${mount.config.name}"${inner.where}, ` +
               `and "${mount.config.name}" doesn't hold it: use "${rest ? `${inner.name}/${rest}` : inner.name}"`,
             isError: true,
           };

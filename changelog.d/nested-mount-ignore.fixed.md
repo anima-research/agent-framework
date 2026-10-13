@@ -47,10 +47,10 @@
     counts after any link before it in that target, as the filesystem
     counts it. So a mount configured at `via/child`, where `via` links into
     another mount, or at a link to that mount's `child`, is nested there
-    before `child` is made. Each pass also reads nesting afresh, so a
-    mount that comes to lie inside another after startup (its root made
-    later, or a symlinked parent created) is treated like one found at
-    startup: the outer mount's tools refuse its paths before anything
+    before `child` is made. Each pass and each tool call also reads
+    nesting afresh, so a mount that comes to lie inside another after
+    startup (its root made later, or a symlinked parent created) is treated
+    like one found at startup: the outer mount's tools refuse its paths before anything
     reaches the outer mount's workspace, and the checks below refuse it
     however it is reached.
   - The outer mount's tools refuse a path inside a nested mount, naming the
@@ -58,7 +58,10 @@
     in "outer" at a/b/: use "inner/x.txt"". That covers `read`, `write`,
     `edit`, `ls`, `glob`, `grep`, and a `sync` or `materialize` that names the
     path. Before, a named sync took the inner mount's files into the outer
-    one.
+    one. `write`, `edit`, `writeBinary` and `delete` also read where the
+    path leads on disk before anything reaches the outer mount's workspace,
+    so a case variant on a case-insensitive disk (`A/B` for `a/b`), or a link
+    inside the mount, dangling or not, is treated the same way.
     - The one exception is `delete` of a file the outer mount still holds
       there, taken in before this fix. It stops tracking the file in the
       outer mount and leaves disk alone, where the file is the inner mount's.
@@ -73,7 +76,8 @@
     boundary the other readers keep, checked against the file it opens: it
     still follows a symlink that stays within the mount, and it now refuses
     one that leads outside the mount ("Symlink escape detected"), which it
-    used to read.
+    used to read. Under a size limit, a file the boundary refuses is refused
+    as such, and its size isn't reported.
   - Every workspace tool reads a path in one spelling: `a/./b`, `a//b` and
     `a/b/` are `a/b`.
   - A mount whose configured path has `.` or `..` segments is read the way
