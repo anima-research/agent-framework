@@ -41,7 +41,7 @@ import { constants as fsConstants } from 'node:fs';
 import type { BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, readdir, realpath, stat, statfs } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { dirname, isAbsolute, join, parse, relative, sep } from 'node:path';
+import { dirname, join, parse, relative, sep } from 'node:path';
 import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
 
 export interface MountView {
@@ -119,17 +119,23 @@ export interface ResolvedPath {
   missingFrom?: number;
 }
 
-export function pathComponents(path: string): string[] {
-  return path.slice(parse(path).root.length).split(sep).filter(Boolean);
+/** The platform's path functions the nesting comparison uses; tests pass path.win32. */
+export type PathApi = Pick<typeof import('node:path'), 'parse' | 'relative' | 'sep'>;
+const PLATFORM_PATH: PathApi = { parse, relative, sep };
+
+export function pathComponents(p: string, path: PathApi = PLATFORM_PATH): string[] {
+  return p.slice(path.parse(p).root.length).split(path.sep).filter(Boolean);
 }
 
-/** Mount-relative suffix, preserving candidate spelling. Known components
- * compare exactly. On darwin/win32, a comparison involving an unmade
- * component uses the platform's default case folding. */
-export function nestedSuffix(root: ResolvedPath, candidate: ResolvedPath): string | null {
-  if (relative(parse(root.real).root, parse(candidate.real).root) !== '') return null;
-  const a = pathComponents(root.real);
-  const b = pathComponents(candidate.real);
+/** Mount-relative suffix, preserving candidate spelling: '' for the root
+ * itself, null when the candidate isn't inside it (outside it, or on another
+ * Windows drive). Known components compare exactly. On darwin/win32, a
+ * comparison involving an unmade component uses the platform's default case
+ * folding. */
+export function nestedSuffix(root: ResolvedPath, candidate: ResolvedPath, path: PathApi = PLATFORM_PATH): string | null {
+  if (path.relative(path.parse(root.real).root, path.parse(candidate.real).root) !== '') return null;
+  const a = pathComponents(root.real, path);
+  const b = pathComponents(candidate.real, path);
   if (b.length < a.length) return null;
   const fold = process.platform === 'darwin' || process.platform === 'win32';
   for (let i = 0; i < a.length; i++) {
@@ -759,24 +765,6 @@ export function coveredByIgnore(relativePath: string, patterns: string[]): boole
 }
 
 /**
- * Where `innerRoot` lies in `outerRoot`, '/'-joined, or null when it isn't
- * nested in it: the same directory, outside it (`..`, or `../…`; a name like
- * `..cache` is inside), or another root (`relative()` across Windows drives
- * gives an absolute path). Both roots should be canonical, so a symlinked or
- * differently cased spelling of the same directory still nests (#282's
- * round). `path` is the platform's; tests pass path.win32.
- */
-export function nestedAt(
-  outerRoot: string,
-  innerRoot: string,
-  path: Pick<typeof import('node:path'), 'relative' | 'isAbsolute' | 'sep'> = { relative, isAbsolute, sep },
-): string | null {
-  const rel = path.relative(outerRoot, innerRoot);
-  if (!rel || rel === '..' || rel.startsWith('..' + path.sep) || path.isAbsolute(rel)) return null;
-  return rel.split(path.sep).join('/');
-}
-
-/**
  * Simple ignore patterns, as the walk and the watcher read them (types.ts
  * `MountConfig.ignore` lists the forms). A name matches an entry so named at
  * any depth; a path (`a/b`, or `a/b/**`) matches that path from the mount
@@ -878,7 +866,11 @@ export async function walkScope(
     let reachedCap = false;
     for (const entry of entries) {
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
-      if (isIgnored(childRel, entry.name, ignore)) {
+      // A nested mount's directory is passed over as its generated rule passes
+      // it over, also where the rule doesn't name it: made under another case
+      // than configured, or nested only after the module was built. Walking it
+      // would list files the checks refuse one by one, counting toward the cap.
+      if (isIgnored(childRel, entry.name, ignore) || (entry.isDirectory() && insideNested(view, dir.at(entry.name)) !== null)) {
         others.push([childRel, 'ignored by the mount']);
         regions.push({ path: childRel, reason: 'ignored by the mount', kind: 'ignored' });
         continue;

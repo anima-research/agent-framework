@@ -270,9 +270,6 @@ function resolveWorkspacePath(path: string): ResolvedPath {
   return { real: current, ...(missingFrom !== undefined ? { missingFrom } : {}) };
 }
 
-/** Consumers that need a path, rather than a comparison, keep its spelling. */
-function canonicalRoot(path: string): string { return resolveWorkspacePath(path).real; }
-
 /** The last directory entry is not followed when classifying an unlink. */
 function resolveWorkspaceEntry(path: string): ResolvedPath {
   let missing = false;
@@ -754,12 +751,13 @@ export class WorkspaceModule implements Module {
 
   constructor(config: WorkspaceConfig) {
     // Nesting checks keep each mount's disk operations out of nested mounts
-    // (agent-framework #280). Roots use canonicalRoot: existing components
-    // use disk spelling; unmade components use its documented platform rule. The outer
-    // mount's walk and watcher pass over the inner's directory by an ignore
-    // rule; its tools refuse paths there (parsePath), and every containment
-    // check refuses what reaches the inner's directory another way
-    // (MountView.nested).
+    // (agent-framework #280). Roots are read by resolveWorkspacePath: existing
+    // components in disk's spelling, unmade ones as written, compared by
+    // nestedSuffix's platform rule. The outer mount's walk and watcher pass
+    // over the inner's directory by an ignore rule, and the walk also over one
+    // the rule doesn't name (MountView.nested); its tools refuse paths there
+    // (parsePath), and every containment check refuses what reaches the
+    // inner's directory another way (MountView.nested).
     const roots = new Map(config.mounts.map((m) => [m, resolveWorkspacePath(m.path)]));
     for (const outer of config.mounts) {
       for (const inner of config.mounts) {
@@ -818,9 +816,10 @@ export class WorkspaceModule implements Module {
    * The mount nested in `mount` that a mount-relative path lies in by how
    * disk spells it, where the path as written may not show it: a case variant
    * on a case-insensitive disk (`A/B` for `a/b`), or a link inside the mount,
-   * dangling or not. The path is read as canonicalRoot reads a root: what
-   * exists as disk spells it, a link that leads to nothing yet replaced by
-   * what it names, and unmade components using the platform-default rule.
+   * dangling or not. The path is read as resolveWorkspacePath reads a root:
+   * what exists as disk spells it, a link that leads to nothing yet replaced
+   * by what it names, and unmade components as written, which nestedSuffix
+   * compares by the platform-default rule.
    * Store-changing tools check before the turn and at their mutation point.
    * A later disk change can make an accepted draft's path nested; the disk
    * effect checks that boundary again when materialize attempts the write.
@@ -1335,7 +1334,7 @@ export class WorkspaceModule implements Module {
       {
         name: 'delete',
         description: 'Delete a file from the workspace. For a tracked nested path or an outer link into one, '
-          + 'the workspace stops tracking the path and leaves any disk entry untouched. Other deletions on mounts '
+          + 'the workspace stops tracking the path and leaves any disk entry untouched, on a read-only mount too. Other deletions on mounts '
           + 'without autoMaterialize remain pending on disk, shown as workspace-deleted. Materialize with '
           + 'applyDeletions attempts those deletions, or sync the path to restore it.',
         inputSchema: {
@@ -2548,8 +2547,7 @@ export class WorkspaceModule implements Module {
    * untracked rather than tombstoned when the outer mount cannot unlink them. */
   private nestedDeletion(mount: MountState, path: string, snapshot: NestedSnapshot): NestedDeletion | null {
     const lexical = this.nestedMountAt(mount, path, snapshot.ats);
-    if (lexical) return { ...lexical, rest: path.slice(lexical.at.length + 1),
-      derivedKey: path, where: ' at ' + lexical.at + '/', kind: 'entry' };
+    if (lexical) return { ...lexical, rest: path.slice(lexical.at.length + 1), where: ' at ' + lexical.at + '/', kind: 'entry' };
     const entry = this.nestedByDisk(mount, path, false, snapshot);
     if (entry) return { ...entry, where: '', kind: 'entry' };
     const target = this.nestedByDisk(mount, path, true, snapshot);
@@ -2573,14 +2571,13 @@ export class WorkspaceModule implements Module {
   /** This decision uses only the outer store and the classified path.
    * A different case is a hint, not authority to remove a different key. */
   private deleteNestedCopy(
-    mount: MountState, relativePath: string, inputPath: string, inner: NestedDeletion,
+    mount: MountState, relativePath: string, inputPath: string, inner: NestedDeletion, snapshot: NestedSnapshot,
   ): ToolResult {
     const store = this.getStore();
     const intents = this.intents.get(mount.config.name)!;
-    const inside = (path: string): boolean =>
-      path === inner.at || path.startsWith(inner.at + '/');
-    const keys = [relativePath];
-    if (inner.kind === 'entry' && inner.derivedKey !== undefined && inside(inner.derivedKey)) keys.push(inner.derivedKey);
+    // The key as given, else the one disk names for the entry, which
+    // nestedByDisk derives only by exact containment, never by folding case.
+    const keys = inner.derivedKey !== undefined && inner.derivedKey !== relativePath ? [relativePath, inner.derivedKey] : [relativePath];
     const storedPath = keys.find((path) => store.treeGet(mount.treeStateId, path) ||
       intents.get(path) || this.agreementOrThrow().get(mount.config.name, path));
     if (storedPath !== undefined) {
@@ -2589,36 +2586,45 @@ export class WorkspaceModule implements Module {
     }
 
     if (process.platform === 'darwin' || process.platform === 'win32') {
-      const hintKey = inner.kind === 'link' ? relativePath : inner.at + (inner.rest ? '/' + inner.rest : '');
+      // A copy stored under another case of this path is named only where a
+      // delete by its own name would stop tracking it too. Where that name
+      // reaches a different directory (a case-sensitive volume), the copy is
+      // the outer mount's own, and naming it would steer its deletion.
+      const wanted = new Set([relativePath, inner.kind === 'link' ? relativePath : inner.at + (inner.rest ? '/' + inner.rest : '')]
+        .map((path) => path.toLowerCase()));
       const hint = store.treeList(mount.treeStateId).find((entry) =>
-        (inner.kind === 'link' || inside(entry.path)) && entry.path.toLowerCase() === hintKey.toLowerCase());
+        wanted.has(entry.path.toLowerCase()) && this.nestedDeletion(mount, entry.path, snapshot) !== null);
       if (hint) return { success: false, isError: true,
         error: 'Tracked spelling: "' + mount.config.name + '/' + hint.path + '"; use that exact path to stop tracking this copy.' };
     }
+    // A link is the outer mount's own entry; what lies in the nested mount is its target.
     return { success: false, isError: true,
-      error: '"' + inputPath + '" is inside mount "' + inner.name + '", which is nested in "' +
-        mount.config.name + '"' + inner.where + ', and "' + mount.config.name +
+      error: '"' + inputPath + '" ' + (inner.kind === 'link' ? 'leads into' : 'is inside') + ' mount "' + inner.name +
+        '", which is nested in "' + mount.config.name + '"' + inner.where + ', and "' + mount.config.name +
         '" doesn\'t hold it: use "' + (inner.rest ? inner.name + '/' + inner.rest : inner.name) + '"' };
   }
 
   private async handleDelete(input: DeleteInput): Promise<ToolResult> {
     const { mount, relativePath } = this.parsePath(input.path, { nested: 'allow' });
-    if (mount.config.mode === 'read-only') {
-      return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
-    }
-
     const store = this.getStore();
     return this.withMount(mount, async (): Promise<ToolResult> => {
       // Decide from the copy already held. Observing first could import a
       // nested alias merely to forget it and announce that transient copy.
-      const beforeRead = this.nestedDeletion(mount, relativePath, this.nestedSnapshot(mount));
-      if (beforeRead) return this.deleteNestedCopy(mount, relativePath, input.path, beforeRead);
+      // Stopping tracking writes nothing to disk, so a read-only mount can drop
+      // an old nested copy too; it refuses every other delete.
+      const before = this.nestedSnapshot(mount);
+      const beforeRead = this.nestedDeletion(mount, relativePath, before);
+      if (beforeRead) return this.deleteNestedCopy(mount, relativePath, input.path, beforeRead, before);
+      if (mount.config.mode === 'read-only') {
+        return { success: false, error: `Mount "${mount.config.name}" is read-only`, isError: true };
+      }
       const report = await this.ensureSynced(mount, relativePath);
       await this.settleBeforeMutation(mount, relativePath);
       // Decided after the last await, beside the store change: the path may
       // have come to lie in a nested mount while the delete waited.
-      const inner = this.nestedDeletion(mount, relativePath, this.nestedSnapshot(mount));
-      if (inner) return this.deleteNestedCopy(mount, relativePath, input.path, inner);
+      const after = this.nestedSnapshot(mount);
+      const inner = this.nestedDeletion(mount, relativePath, after);
+      if (inner) return this.deleteNestedCopy(mount, relativePath, input.path, inner, after);
       const entry = store.treeGet(mount.treeStateId, relativePath);
       if (!entry) {
         return { success: false, error: this.notInWorkspace(input.path, report), isError: true };

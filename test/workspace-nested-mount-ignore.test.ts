@@ -31,7 +31,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { dirname, join, parse, sep, win32 } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
-import { insideNested, nestedAt, readPath } from '../src/modules/workspace/observe.js';
+import { nestedSuffix, readPath } from '../src/modules/workspace/observe.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import { MountWatcher, type FsChange } from '../src/modules/workspace/watcher.js';
@@ -245,13 +245,14 @@ test("a parent or a sibling mount isn't nested in a mount; the parent holds its 
 });
 
 test('nesting by the platform rules: separators, `..`, and another Windows drive', () => {
-  assert.equal(nestedAt('C:\\w\\outer', 'C:\\w\\outer\\a\\b', win32), 'a/b');
-  assert.equal(nestedAt('C:\\w\\outer', 'D:\\w\\outer\\a', win32), null, 'another drive is another root');
-  assert.equal(nestedAt('C:\\w\\outer', 'C:\\w', win32), null);
-  assert.equal(nestedAt('C:\\w\\outer', 'C:\\w\\side', win32), null);
-  assert.equal(nestedAt('C:\\w\\outer', 'C:\\w\\outer', win32), null);
-  assert.equal(nestedAt('C:\\w\\outer', 'C:\\w\\outer\\..cache', win32), '..cache');
-  assert.equal(nestedAt('/w/outer', '/w/outer/..cache/x'), '..cache/x');
+  const at = (outer: string, inner: string) => nestedSuffix({ real: outer }, { real: inner }, win32);
+  assert.equal(at('C:\\w\\outer', 'C:\\w\\outer\\a\\b'), 'a/b');
+  assert.equal(at('C:\\w\\outer', 'D:\\w\\outer\\a'), null, 'another drive is another root');
+  assert.equal(at('C:\\w\\outer', 'C:\\w'), null);
+  assert.equal(at('C:\\w\\outer', 'C:\\w\\side'), null);
+  assert.equal(at('C:\\w\\outer', 'C:\\w\\outer'), '', 'the root itself: inside, but nothing nests there');
+  assert.equal(at('C:\\w\\outer', 'C:\\w\\outer\\..cache'), '..cache');
+  assert.equal(nestedSuffix({ real: '/w/outer' }, { real: '/w/outer/..cache/x' }), '..cache/x');
 });
 
 test('a nested mount configured through a symlink, or an outer one, is still nested', async (t) => {
@@ -834,6 +835,10 @@ for (const autoMaterialize of [true, false]) {
     const synced = await call('sync', { mount: 'outer' });
     assert.equal(synced.success, true, String(synced.error));
     assert.doesNotMatch(JSON.stringify((synced.data as { results: unknown[] }).results), /"synced":\[[^\]]*child\/x\.txt/, 'not taken in');
+    // No ignore rule names it, since the nesting came about after the module
+    // was built; the walk passes over it all the same, rather than listing
+    // files it would refuse one by one.
+    assert.deepEqual((synced.data as { passedOver?: unknown }).passedOver, [{ mount: 'outer', reason: 'ignored by the mount', count: 1 }]);
     const owed = await call('materialize', {});
     assert.doesNotMatch(JSON.stringify(owed), /child\/y\.txt/, 'the outer mount holds nothing at that path');
     assert.throws(() => readFileSync(join(outerDir, 'child', 'y.txt')), "nothing was written into the inner mount's directory");
@@ -1049,7 +1054,7 @@ async function secondPassRig(t: TestContext, autoMaterialize = false, maxFileSiz
 
 for (const kind of ['lexical', 'parent-alias', 'final-link'] as const) {
   for (const force of [false, true]) for (const applyDeletions of [false, true]) {
-    test(`#282 pass2: a legacy ${kind} pending deletion stops tracking once (force ${force}, applyDeletions ${applyDeletions})`, async (t) => {
+    test(`a legacy ${kind} pending deletion stops tracking once (force ${force}, applyDeletions ${applyDeletions})`, async (t) => {
       const r = await secondPassRig(t);
       const path = kind === 'lexical' ? 'inner/x.txt' : kind === 'parent-alias' ? 'via/x.txt' : 'link';
       if (kind === 'parent-alias') symlinkSync(r.inner, join(r.outer, 'via'));
@@ -1073,7 +1078,7 @@ for (const kind of ['lexical', 'parent-alias', 'final-link'] as const) {
 }
 
 for (const autoMaterialize of [false, true]) {
-  test(`#282 pass2: delete of an outer link stops tracking instead of leaving an impossible unlink (autoMaterialize ${autoMaterialize})`, async (t) => {
+  test(`delete of an outer link stops tracking instead of leaving an impossible unlink (autoMaterialize ${autoMaterialize})`, async (t) => {
     const r = await secondPassRig(t, autoMaterialize);
     assert.equal((await r.call('write', { path: 'outer/link', content: 'old copy' })).success, true);
     rmSync(join(r.outer, 'link'), { force: true });
@@ -1093,7 +1098,7 @@ for (const autoMaterialize of [false, true]) {
   });
 }
 
-test('#282 pass2: a Darwin-policy constructor preserves an unmade root in its ignore rule', async (t) => {
+test('a Darwin-policy constructor preserves an unmade root in its ignore rule', async (t) => {
   const { root, stops } = scratch(t, 'af-nested-pass2-ignore-');
   const outer = join(root, 'outer');
   mkdirSync(outer);
@@ -1120,7 +1125,7 @@ test('#282 pass2: a Darwin-policy constructor preserves an unmade root in its ig
   } finally { Object.defineProperty(process, 'platform', platform); }
 });
 
-test('#282 pass2: existing case-distinct paths retain their spelling under the Darwin policy', async (t) => {
+test('existing case-distinct paths retain their spelling under the Darwin policy', async (t) => {
   const r = await secondPassRig(t);
   if (existsSync(join(r.outer, 'INNER'))) { t.skip('requires a case-sensitive directory for the control'); return; }
   mkdirSync(join(r.outer, 'INNER'));
@@ -1134,7 +1139,7 @@ test('#282 pass2: existing case-distinct paths retain their spelling under the D
   } finally { Object.defineProperty(process, 'platform', platform); }
 });
 
-test('#282 pass2: delete recognises a case variant of the nested root itself', async (t) => {
+test('delete recognises a case variant of the nested root itself', async (t) => {
   const r = await secondPassRig(t);
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
   try {
@@ -1145,7 +1150,7 @@ test('#282 pass2: delete recognises a case variant of the nested root itself', a
   } finally { Object.defineProperty(process, 'platform', platform); }
 });
 
-test('#282 pass2: a nested delete refuses before importing or announcing an alias', async (t) => {
+test('a nested delete refuses before importing or announcing an alias', async (t) => {
   const r = await secondPassRig(t);
   assert.equal((await r.call('write', { path: 'outer/owned.txt', content: 'outer bytes' })).success, true);
   // The old disk-spelling lookup reaches its derived-key assignment only
@@ -1159,7 +1164,7 @@ test('#282 pass2: a nested delete refuses before importing or announcing an alia
     'a refused nested delete neither imports nor announces a temporary copy');
 });
 
-test('#282 pass2: nestedDelete neither lists the inner directory nor returns its OS errors', async (t) => {
+test('a nested delete neither lists the inner directory nor returns its OS errors', async (t) => {
   const r = await secondPassRig(t);
   const readdir = fs.readdirSync;
   let listed = 0;
@@ -1177,7 +1182,7 @@ test('#282 pass2: nestedDelete neither lists the inner directory nor returns its
   } finally { fs.readdirSync = readdir; syncBuiltinESMExports(); }
 });
 
-test('#282 pass2: a case-folded store match is a hint, not permission to forget that key', async (t) => {
+test('a case-folded store match is a hint, not permission to forget that key', async (t) => {
   const r = await secondPassRig(t);
   r.seedCopy('inner/File.txt');
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
@@ -1193,7 +1198,7 @@ test('#282 pass2: a case-folded store match is a hint, not permission to forget 
   } finally { Object.defineProperty(process, 'platform', platform); }
 });
 
-test('#282 pass2: untracking a stale nested copy makes no claim that its disk file exists', async (t) => {
+test('untracking a stale nested copy makes no claim that its disk file exists', async (t) => {
   const r = await secondPassRig(t);
   assert.match(r.workspace.getTools().find((tool) => tool.name === 'delete')!.description, /stops tracking.*any disk entry untouched/);
   assert.match(r.workspace.getTools().find((tool) => tool.name === 'materialize')!.description, /Pending deletions blocked by nested-mount ownership stop being tracked/);
@@ -1204,7 +1209,7 @@ test('#282 pass2: untracking a stale nested copy makes no claim that its disk fi
   assert.equal(existsSync(join(r.inner, 'missing.txt')), false);
 });
 
-test('#282 pass2: materialize reads nested roots once for its selection, not per path', async (t) => {
+test('materialize reads nested roots once for its selection, not per path', async (t) => {
   const r = await secondPassRig(t);
   for (let i = 0; i < 4; i++) assert.equal((await r.call('write', { path: `outer/own-${i}.txt`, content: 'owned' })).success, true);
   const native = fs.realpathSync.native;
@@ -1221,7 +1226,7 @@ test('#282 pass2: materialize reads nested roots once for its selection, not per
   } finally { fs.realpathSync.native = native; }
 });
 
-test('#282 pass2: a blocked physical push still reports its completed nested-deletion cleanup', async (t) => {
+test('a blocked physical push still reports its completed nested-deletion cleanup', async (t) => {
   const r = await secondPassRig(t);
   const path = 'inner/x.txt';
   const hash = r.store.storeBlob(Buffer.from('old copy'), 'text/plain');
@@ -1238,7 +1243,7 @@ test('#282 pass2: a blocked physical push still reports its completed nested-del
   assert.equal(readFileSync(join(r.inner, 'x.txt'), 'utf8'), 'inner bytes');
 });
 
-test('#282 pass2: a non-ingested nested alias cannot derive an outer-owned key', async (t) => {
+test('a non-ingested nested alias cannot derive an outer-owned key', async (t) => {
   const r = await secondPassRig(t, false, 4);
   assert.equal((await r.call('write', { path: 'outer/owned.txt', content: 'old' })).success, true);
   // Too large for observation to import under the alias. The old fallback
@@ -1251,7 +1256,7 @@ test('#282 pass2: a non-ingested nested alias cannot derive an outer-owned key',
   assert.equal(readFileSync(join(r.outer, 'owned.txt'), 'utf8'), 'outer bytes above the four-byte cap');
 });
 
-test('#282 pass2: an ordinary delete rechecks nesting after awaited settlement', async (t) => {
+test('an ordinary delete rechecks nesting after awaited settlement', async (t) => {
   const r = await secondPassRig(t);
   mkdirSync(join(r.outer, 'moved'));
   writeFileSync(join(r.outer, 'moved', 'x.txt'), 'old');
@@ -1270,28 +1275,36 @@ test('#282 pass2: an ordinary delete rechecks nesting after awaited settlement',
   assert.equal(readFileSync(join(r.inner, 'x.txt'), 'utf8'), 'inner bytes');
 });
 
-test('#282 pass2: the disk-effect view retains the missing-root comparison policy', async (t) => {
-  const { root } = scratch(t, 'af-nested-pass2-effect-view-');
-  const realRoot = realpathSync.native(root);
-  const inner = join(realRoot, 'CamelChild');
-  const missingFrom = inner.slice(parse(inner).root.length).split(sep).filter(Boolean).length - 1;
-  const view = {
-    root: realRoot, followSymlinks: true, maxFileSize: 100, ignore: [],
-    nested: [{ name: 'inner', real: inner, missingFrom }],
-  } as unknown as Parameters<typeof insideNested>[0];
-  // The view was taken before this directory existed. The effect's check
-  // must retain that fact when the directory is made under another case.
-  mkdirSync(join(realRoot, 'camelchild'));
-  writeFileSync(join(realRoot, 'camelchild', 'x.txt'), 'inner');
-  const candidate = realpathSync.native(join(realRoot, 'camelchild', 'x.txt'));
+test("a pass's view keeps an unmade nested root's marker: a directory made under another case is passed over, its file refused", async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-pass2-view-');
+  const outer = join(root, 'outer');
+  mkdirSync(outer);
+  writeFileSync(join(outer, 'top.txt'), 'top');
   const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
   try {
     Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
-    assert.equal(insideNested(view, candidate), 'inside mount "inner", which is nested in this one');
+    const config: MountConfig = { name: 'outer', path: outer, mode: 'read-write', watch: 'never', followSymlinks: true };
+    const { workspace } = await started(stops, join(root, 'store'), [config,
+      { name: 'inner', path: join(outer, 'CamelChild'), mode: 'read-write', watch: 'never' }]);
+    assert.deepEqual(config.ignore, ['CamelChild/**']);
+    // Made under another case than configured, so the rule doesn't name it.
+    // On a case-insensitive disk it would be the inner root; here, a
+    // case-sensitive one, the inner root stays unmade and the platform rule
+    // still reads this directory as it, from the marker in the pass's view.
+    mkdirSync(join(outer, 'camelchild'));
+    writeFileSync(join(outer, 'camelchild', 'x.txt'), 'inner');
+    symlinkSync(join(outer, 'camelchild', 'x.txt'), join(outer, 'alias.txt'));
+    const synced = await workspace.handleToolCall({ id: 's', name: 'sync', input: { mount: 'outer' } });
+    assert.equal(synced.success, true, JSON.stringify(synced));
+    const data = synced.data as { results: Array<{ synced: string[] }>; passedOver?: unknown };
+    assert.deepEqual([...data.results[0]!.synced].sort(), ['top.txt'], JSON.stringify(synced.data));
+    assert.deepEqual(data.passedOver, [{ mount: 'outer', reason: 'ignored by the mount', count: 1 }]);
+    // A link the walk lists is read through, and its target is refused.
+    assert.match(JSON.stringify(synced.data), /alias\.txt[^}]*inside mount \\"inner\\"/);
   } finally { Object.defineProperty(process, 'platform', platform); }
 });
 
-test('#282 pass2: failed agreement removal leaves the tracked copy available for retry', async (t) => {
+test('failed agreement removal leaves the tracked copy available for retry', async (t) => {
   const r = await secondPassRig(t);
   const hash = r.seedCopy('inner/x.txt');
   const agreement = r.state.agreementOrThrow();
@@ -1309,7 +1322,7 @@ test('#282 pass2: failed agreement removal leaves the tracked copy available for
   assert.equal(agreement.get('outer', 'inner/x.txt'), undefined);
 });
 
-test('#282 pass2: policy-only nesting cannot authorize a derived-key removal', async (t) => {
+test('policy-only nesting cannot authorize a derived-key removal', async (t) => {
   const { root, stops } = scratch(t, 'af-nested-pass2-derived-policy-');
   const outer = join(root, 'outer');
   mkdirSync(join(outer, 'camel'), { recursive: true });
@@ -1330,5 +1343,76 @@ test('#282 pass2: policy-only nesting cannot authorize a derived-key removal', a
     assert.equal(result.success, false, JSON.stringify(result));
     assert.equal(storeHolds(workspace, 'outer', 'camel/x.txt'), true,
       'folding can refuse the path but cannot select that different exact key to remove');
+    // The policy reads `camel` as the unmade `Camel`, so a delete by that key's
+    // own name would stop tracking it: the refusal names it, and removes nothing.
+    assert.match(String(result.error), /^Tracked spelling: "outer\/camel\/x\.txt"; use that exact path to stop tracking this copy\.$/);
   } finally { Object.defineProperty(process, 'platform', platform); }
+});
+
+test('a tracked spelling whose nested directory differs in case is named, where a delete by it would stop tracking it', async (t) => {
+  const r = await secondPassRig(t);
+  r.seedCopy('Inner/a.txt');
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    const result = await r.call('delete', { path: 'outer/inner/a.txt' });
+    assert.equal(result.success, false);
+    assert.match(String(result.error), /^Tracked spelling: "outer\/Inner\/a\.txt"; use that exact path/);
+    assert.equal(storeHolds(r.workspace, 'outer', 'Inner/a.txt'), true, 'a hint removes nothing');
+    const exact = await r.call('delete', { path: 'outer/Inner/a.txt' });
+    assert.equal(exact.success, true, JSON.stringify(exact));
+    assert.equal(storeHolds(r.workspace, 'outer', 'Inner/a.txt'), false);
+    assert.equal(readFileSync(join(r.inner, 'x.txt'), 'utf8'), 'inner bytes');
+  } finally { Object.defineProperty(process, 'platform', platform); }
+});
+
+test("a case variant that is the outer mount's own directory is never named as a nested copy's spelling", async (t) => {
+  const r = await secondPassRig(t);
+  if (existsSync(join(r.outer, 'Inner'))) { t.skip('requires distinct case spellings for this control'); return; }
+  mkdirSync(join(r.outer, 'Inner'));
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  try {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    // A real directory of its own: known components compare exactly, so it isn't nested.
+    assert.equal((await r.call('write', { path: 'outer/Inner/a.txt', content: 'owned' })).success, true);
+    const result = await r.call('delete', { path: 'outer/inner/a.txt' });
+    assert.equal(result.success, false);
+    assert.match(String(result.error), /^"outer\/inner\/a\.txt" is inside mount "inner", which is nested in "outer" at inner\/, and "outer" doesn't hold it: use "inner\/a\.txt"$/);
+    assert.equal(storeHolds(r.workspace, 'outer', 'Inner/a.txt'), true);
+  } finally { Object.defineProperty(process, 'platform', platform); }
+});
+
+test('a read-only mount can stop tracking an old nested copy, and refuses every other delete', async (t) => {
+  const { root, stops } = scratch(t, 'af-nested-pass2-read-only-');
+  const outer = join(root, 'outer');
+  mkdirSync(join(outer, 'inner'), { recursive: true });
+  writeFileSync(join(outer, 'inner', 'x.txt'), 'inner bytes');
+  writeFileSync(join(outer, 'top.txt'), 'top');
+  const { workspace } = await started(stops, join(root, 'store'), [
+    { name: 'outer', path: outer, mode: 'read-only', watch: 'never' },
+    { name: 'inner', path: join(outer, 'inner'), mode: 'read-write', watch: 'never' },
+  ]);
+  const store = (workspace as unknown as { getStore(): JsStore }).getStore();
+  // As a scan before the nesting was honoured took it in.
+  store.treeSet('workspace/outer/tree', 'inner/x.txt', { blobHash: store.storeBlob(Buffer.from('old copy'), 'text/plain'), size: 8, mode: 0o644 });
+  const call = (name: string, input: Record<string, unknown>) => workspace.handleToolCall({ id: name, name, input });
+  const stopped = await call('delete', { path: 'outer/inner/x.txt' });
+  assert.equal(stopped.success, true, JSON.stringify(stopped));
+  assert.match(JSON.stringify(stopped.data), /Stopped tracking \\"outer\/inner\/x\.txt\\"/);
+  assert.equal(storeHolds(workspace, 'outer', 'inner/x.txt'), false);
+  assert.equal(readFileSync(join(outer, 'inner', 'x.txt'), 'utf8'), 'inner bytes');
+  assert.equal((await call('sync', { mount: 'outer' })).success, true);
+  assert.equal(storeHolds(workspace, 'outer', 'top.txt'), true);
+  const refused = await call('delete', { path: 'outer/top.txt' });
+  assert.equal(refused.success, false);
+  assert.equal(refused.error, 'Mount "outer" is read-only');
+  assert.equal(storeHolds(workspace, 'outer', 'top.txt'), true);
+});
+
+test("an untracked outer link into a nested mount is refused as leading into it, not as lying inside it", async (t) => {
+  const r = await secondPassRig(t);
+  symlinkSync(join(r.inner, 'x.txt'), join(r.outer, 'link'));
+  const result = await r.call('delete', { path: 'outer/link' });
+  assert.equal(result.success, false);
+  assert.equal(result.error, '"outer/link" leads into mount "inner", which is nested in "outer", and "outer" doesn\'t hold it: use "inner/x.txt"');
 });
