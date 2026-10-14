@@ -319,20 +319,22 @@ supports, or its error text when it lists none, and when the list includes
 `2026-07-28` it says to configure the server with `protocol: 'modern'` (stdio)
 or reach it over http(s).
 
-Over HTTP the revision is negotiated at each connect, so the connection
-follows a server's upgrades. The client asks `server/discover` first and
-connects at `2026-07-28` when the server offers it. A server that doesn't
-gets the 2025 `initialize` handshake, which asks for `2025-11-25` and
-accepts `2025-11-25`, `2025-06-18` or `2025-03-26` in the answer.
+Over HTTP the revision is negotiated at each connect. The client asks
+`server/discover` first and connects at `2026-07-28` when the server offers
+it. A server that doesn't gets the 2025 `initialize` handshake, which asks
+for `2025-11-25` and accepts `2025-11-25`, `2025-06-18` or `2025-03-26` in
+the answer.
 `listMcplServers()` shows the revision it settles on as `protocolVersion`,
 and its `family` stays `modern`. On a 2025 revision:
 - List changes arrive on the session's standalone stream, which is kept
-  open while the session lives. Its first open is tried again after a 408,
-  409, 429, a 5xx other than 501 and 505, or a network error, each reported
-  as the connection's `error`, and a relist follows once it opens. Any other
-  answer goes to the SDK, which opens no stream: it takes a 405 quietly,
-  reports any other refusal as an `error`, and tries a 401 once more after
-  the credential's refresh. A stream that drops is reopened: the first try waits the server's
+  open while the session lives, whether or not the server issues a session
+  id. Its first open is tried again after a 408, 409, 429, a 5xx other than
+  501 and 505, or a network error, each reported as the connection's
+  `error`, and a relist follows once it opens, also when it opens on the
+  SDK's own retry after a credential refresh. Any other answer goes to the
+  SDK, which opens no stream: it takes a 405 quietly, reports any other
+  refusal as an `error`, and tries a 401 once more after the credential's
+  refresh. A stream that drops is reopened: the first try waits the server's
   `retry` hint when it sent one, and the base interval otherwise, and a try
   after a failed one waits the longer of the hint and the doubling backoff.
   A reopen that carries `Last-Event-ID` has what it missed replayed by the
@@ -354,14 +356,32 @@ and its `family` stays `modern`. On a 2025 revision:
   `reconnect` decides, as for any lost connection, and a revision verdict
   stops it for good, as on any reconnect. Without `reconnect`, that failure
   emits a second `close`, while `willReconnect` reads false: the server is
-  gone. A session that ended before
-  answering anything is a failed connect: it emits `reconnect-failed` and
-  `close`, and follows `reconnect` with a growing backoff, so a load
-  balancer without sticky sessions shows up as a failing server rather than
-  a silent loop.
-- `close()`, and so `stop()` or a disconnect, ends each session the server
-  holds by its id with a `DELETE`, a connect in flight included, waiting at
-  most 3 s for each.
+  gone. A session that ended before answering anything is a failed connect:
+  it emits `reconnect-failed` and `close`, and follows `reconnect` with a
+  growing backoff. So a load balancer without sticky sessions, or a rolling
+  upgrade that lands a connect on an old node and its requests on a new
+  one, shows up as a failing server rather than a silent loop.
+- A server that moves to `2026-07-28` in place is followed, since the
+  session's end brings a new connect, which negotiates afresh. Two more
+  answers end a 2025 session, with a session id or without: a 400 carrying
+  JSON-RPC `-32022` to any request, as the SDK's 2026 handler answers 2025
+  traffic it refuses (`legacy: 'reject'`), and a 405 to the standalone
+  stream's reopen after it had opened, as that handler answers a 2025
+  session it serves statelessly (its default). A call refused with
+  `-32022` fails as `error-response` with the server's code and data, and
+  isn't replayed. A server that keeps serving a 2025 revision statelessly
+  to a connection that never had a standalone stream isn't followed: that
+  connection stays on 2025 until its next connect.
+- Each session the server holds by its id is ended with a `DELETE` when the
+  connection lets it go, waiting at most 3 s: at `close()`, and so `stop()`
+  or a disconnect, a connect in flight included, and when a connect fails
+  after its `initialize` was answered. A session the server ended with 404
+  gets none.
+
+On `2026-07-28` too, a dropped stream's retries follow that timing: the
+server's `retry` hint first, and the connection's backoff after a failed
+try. They stop after two, the SDK's default, as before, so a listen
+stream that can't be resumed is reopened, with a relist.
 
 A server over HTTP that this client can't negotiate a revision with fails
 with `McplProtocolVersionError`, naming what each side speaks, and is not
