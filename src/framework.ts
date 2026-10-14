@@ -7956,8 +7956,9 @@ export class AgentFramework {
 
   /**
    * Re-initialize every agent's manager after an undo's or redo's move, and
-   * release the move's store reservation once they are all current. It runs
-   * on after the undo or redo has returned. A move made under the same
+   * release the move's store reservation once they are all current. Its
+   * first pass starts inside the undo or redo, and it finishes after the
+   * call has returned. A move made under the same
    * reservation meanwhile sets `again`, and the pass runs again for the
    * branch the store is on then. Only the last pass's failures are reported,
    * since an earlier pass can fail because of the later move.
