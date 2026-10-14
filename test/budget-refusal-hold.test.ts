@@ -60,13 +60,13 @@ const storedText = (framework: AgentFramework): string => stored(framework).map(
  * until then, or until `readyAt` ticks, whichever is sooner, as a strategy
  * reports a backlog. The maintenance loop and the drain kick tick it. A
  * compile decides at its start, as the context manager selects at its start;
- * a dry run then waits for `dryRunGate` when one is set, and throws
- * `dryRunError` once when one is set.
+ * a dry run then waits for `dryRunGate` and `dryRunMs` when they are set,
+ * and throws `dryRunError` once when one is set.
  */
 interface Backlog {
   ticks: number; fitAt: number; readyAt: number; fit: boolean;
   dryRuns: number; compiles: number;
-  dryRunGate?: Promise<void>; dryRunError?: Error;
+  dryRunGate?: Promise<void>; dryRunError?: Error; dryRunMs?: number;
 }
 const fits = (b: Backlog): boolean => b.fit || b.ticks >= b.fitAt;
 const pending = (b: Backlog): boolean => !fits(b) && b.ticks < b.readyAt;
@@ -83,6 +83,7 @@ async function withBacklog<T>(backlog: Partial<Backlog>, run: (b: Backlog) => Pr
     else b.compiles++;
     const fitsNow = fits(b);
     if (dryRun && b.dryRunGate) await b.dryRunGate;
+    if (dryRun && b.dryRunMs) await new Promise((r) => setTimeout(r, b.dryRunMs));
     if (dryRun && b.dryRunError) {
       const error = b.dryRunError;
       b.dryRunError = undefined;
@@ -298,8 +299,24 @@ describe('a compile refused for budget holds its turn (#304)', () => {
   it('keeps the note out of the store and out of the turn\'s routing', async () => {
     await withBacklog({ fitAt: 12 }, async () => {
       const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      // The routing the released turn starts with, and the routing it has
+      // once its compile, the one carrying the note, has been sent.
+      type Routing = { triggerChannel?: string; locus?: string; engaged: Set<string>; pin?: string; destination: string | null; arrivals: unknown[] };
+      const routingNow = () => {
+        const r = (t.framework as unknown as { turnRouting: Map<string, Routing> }).turnRouting.get('prime');
+        return r && {
+          triggerChannel: r.triggerChannel, locus: r.locus, engaged: [...r.engaged].sort(), pin: r.pin,
+          destination: r.destination, arrivals: r.arrivals.length,
+        };
+      };
+      const atStart: unknown[] = [];
+      const afterCompile: unknown[] = [];
+      t.framework.onTrace((e) => {
+        if (e.type === 'inference:started') atStart.push(routingNow());
+        if (e.type === 'inference:completed') afterCompile.push(routingNow());
+      });
       try {
-        // A message on a channel, so the turn has a locus to keep.
+        // A message on a channel, so the turn has a trigger channel to keep.
         await (t.framework as unknown as { handleMcplChannelIncoming: (e: unknown) => Promise<unknown> }).handleMcplChannelIncoming({
           type: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:guild:chanA', messageId: 'm-1',
           author: { id: 'U1', name: 'owner' }, content: [{ type: 'text', text: 'Are you there?' }],
@@ -307,14 +324,15 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         });
         assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 10_000));
         assert.equal(t.of('inference:held').length, 1);
-        assert.ok(JSON.stringify(t.membrane.calls[0]).includes('[budget-hold]'));
+        assert.ok(JSON.stringify(t.membrane.calls[0]).includes('[budget-hold]'), 'the released compile carried the note');
         // Every message in the store, every metadata field included.
         const everything = JSON.stringify(t.framework.getAgent('prime')!.getContextManager().queryMessages({}).messages);
         assert.ok(!everything.includes('budget-hold'), 'nothing of the note is stored');
-        // The refused start and the released one: both on the message's channel.
-        const started = t.of('inference:started');
-        assert.ok(started.length >= 2);
-        assert.ok(started.every((e) => e.channelId === 'discord:guild:chanA'), 'the released turn keeps its locus');
+        // The released start (the last one) and the routing after its compile.
+        assert.equal(afterCompile.length, 1);
+        const released = atStart[atStart.length - 1] as { triggerChannel?: string };
+        assert.equal(released.triggerChannel, 'discord:guild:chanA', 'the released turn starts from the message\'s channel');
+        assert.deepEqual(afterCompile[0], released, 'and the compile with the note leaves its routing as it was');
       } finally {
         await t.close();
       }
@@ -545,6 +563,44 @@ describe('a compile refused for budget holds its turn (#304)', () => {
     });
   });
 
+  it('lands a fit while checks are asked for faster than a dry run takes', async () => {
+    // Beth-2389's probe: dry runs of 300 ms, a pass every 50 ms, each asking.
+    await withBacklog({ dryRunMs: 300 }, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50, holdMs: 6_000 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        await new Promise((r) => setTimeout(r, 400));
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000),
+          'the turn runs within 3 s of the fit, not at the deadline');
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['fit']);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('tells a turn that fits after its hold\'s deadline why it waited', async () => {
+    await withBacklog({}, async (backlog) => {
+      // No passes after the first, so nothing looks between the hold's first
+      // check and its deadline.
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000, holdMs: 400 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        assert.ok(await pollUntil(() => backlog.dryRuns >= 1, 2_000));
+        backlog.fit = true;
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 3_000));
+        assert.deepEqual(t.of('inference:hold_ended').map((e) => e.outcome), ['deadline']);
+        assert.match(JSON.stringify(t.membrane.calls[0]), /\[budget-hold\][^"]*so this turn waited \d+ s while compression caught up/);
+        assert.deepEqual(t.of('inference:exhausted'), []);
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
   it('looks again after an undo', async () => {
     await withBacklog({}, async (backlog) => {
       const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
@@ -564,8 +620,9 @@ describe('a compile refused for budget holds its turn (#304)', () => {
   });
 
   it('holds a released turn again with its first refusal\'s start and deadline when its own compile still refuses', async () => {
-    // The dry run fits at once, but the turn's compile refuses twice more,
-    // as a compile with injections can where the dry run fits.
+    // The dry run fits at once, but the turn's compile refuses twice more, as
+    // it can when content reaches it after the dry run (the turn start's
+    // flush of deferred messages, a coalesced batch's assembly).
     const proto = ContextManager.prototype as unknown as Patchable;
     const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady };
     let refusals = 0;
