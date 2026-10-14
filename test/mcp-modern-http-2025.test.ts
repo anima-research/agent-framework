@@ -67,6 +67,8 @@ interface Seen {
   id: unknown;
   /** A GET that carried Last-Event-ID: a stream resumed. */
   resumed: boolean;
+  /** The Last-Event-ID it carried. */
+  lastEventId: string | null;
   status: number;
   at: number;
 }
@@ -206,9 +208,10 @@ async function start2025(opts: {
     let message: Message | undefined;
     try { message = body.length > 0 ? JSON.parse(body.toString('utf8')) as Message : undefined; } catch { message = undefined; }
     const session = (req.headers['mcp-session-id'] as string | undefined) ?? null;
-    const resumed = req.headers['last-event-id'] !== undefined;
+    const lastEventId = (req.headers['last-event-id'] as string | undefined) ?? null;
+    const resumed = lastEventId !== null;
     const entry: Seen = {
-      method: req.method ?? '', session, rpc: typeof message?.method === 'string' ? message.method : null, id: message?.id, resumed, status: 0, at: Date.now(),
+      method: req.method ?? '', session, rpc: typeof message?.method === 'string' ? message.method : null, id: message?.id, resumed, lastEventId, status: 0, at: Date.now(),
     };
     seen.push(entry);
     const writeHead = res.writeHead.bind(res) as (status: number, ...rest: unknown[]) => ServerResponse;
@@ -1116,6 +1119,43 @@ test('a cut request stream whose resume meets 405 ends the session, and the call
   assert.ok(fixture.seen.some((s) => s.method === 'GET' && s.resumed && s.session === sid && s.status === 405), 'the resume met 405');
   assert.equal(count(fixture, (s) => s.method === 'DELETE'), 0, 'a session the server let go gets no DELETE');
   assert.equal(count(fixture, (s) => s.rpc === 'tools/call'), 1, 'the cut call was not replayed');
+});
+
+test('two calls whose streams are each cut twice before a new event are both answered, each resume carrying its own call\'s id', async () => {
+  // SEP-1699's polling, done twice. The SDK resumes a stream cut again
+  // before it carried a new event id without its id (typescript-sdk#2499);
+  // the engine gives back the one its call's resumes last carried.
+  const fixture = await start2025({ versions: ['2025-11-25'], resumable: {} });
+  const connection = await connect(fixture, { requestTimeoutMs: 10_000, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 40 });
+  await connection.listTools();
+  await until(() => count(fixture, (s) => s.method === 'GET' && !s.resumed && s.status === 200) === 1, 'the standalone stream open');
+  const transport = fixture.sessions.get(sessionOf(connection)!)!;
+  const calls = [connection.callTool('slow', { ms: 2000 }), connection.callTool('slow', { ms: 2300 })];
+  await until(() => fixture.events.filter((e) => e === 'slow-start').length === 2, 'both calls running');
+  const [a, b] = fixture.seen.filter((s) => s.rpc === 'tools/call').map((s) => s.id);
+  const streams = (transport as unknown as { _requestToStreamMapping: Map<unknown, string> })._requestToStreamMapping;
+  const [streamA, streamB] = [streams.get(a)!, streams.get(b)!];
+  const resumes = () => fixture.seen.filter((s) => s.method === 'GET' && s.resumed && s.status === 200).map((s) => s.lastEventId!);
+  // The first cuts, a's first, each after its stream's priming event: the
+  // SDK resumes each with its own id.
+  transport.closeSSEStream(a as never);
+  await until(() => resumes().length === 1, 'a resumed');
+  transport.closeSSEStream(b as never);
+  await until(() => resumes().length === 2, 'b resumed');
+  const [primedA, primedB] = resumes();
+  assert.ok(primedA!.startsWith(`${streamA}_`) && primedB!.startsWith(`${streamB}_`), `each resume carried its own stream's id: ${resumes()}`);
+  // The second cuts, on the resumed streams, before anything new: the SDK
+  // resumes each bare, and each gets its own call's id back, a's though b's
+  // came last.
+  transport.closeSSEStream(a as never);
+  await until(() => resumes().length === 3, 'a resumed again');
+  transport.closeSSEStream(b as never);
+  await until(() => resumes().length === 4, 'b resumed again');
+  assert.deepEqual(resumes(), [primedA, primedB, primedA, primedB]);
+  const results = await Promise.all(calls);
+  assert.deepEqual(results.map((r) => r.content), [[{ type: 'text', text: 'slept 2000' }], [{ type: 'text', text: 'slept 2300' }]]);
+  // Only the standalone stream's one GET went out without an id.
+  assert.equal(count(fixture, (s) => s.method === 'GET' && !s.resumed), 1, 'no request stream resumed bare, and the standalone stream left alone');
 });
 
 test('a session that ends before it answered is a failed connect: refused, reported, and not restarted at once', async () => {
