@@ -102,7 +102,7 @@ const MAX_TOOL_LIST_PAGES = 100;
 
 /**
  * This engine and the server could not negotiate a protocol revision, so the
- * connection was never established. Usually they share none. Over HTTP it
+ * connect that throws it established no connection. Usually they share none. Over HTTP it
  * can also be the SDK's own refusal: after a -32022 whose list names a
  * revision from 2026-07-28 on that this client doesn't speak, the SDK
  * negotiates no further, even when the list also names a 2025 revision both

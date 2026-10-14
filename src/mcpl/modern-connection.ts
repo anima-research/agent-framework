@@ -93,7 +93,7 @@ const HTTP_2025_REVISIONS: ReadonlySet<string> = new Set(MODERN_HTTP_PROTOCOL_VE
 /**
  * StreamableHTTPClientTransport's default `maxRetries`: how many times it
  * retries a stream that dropped before giving it up. A 2026-07-28 session
- * keeps it (see `establish`).
+ * is given it when it is adopted (see `establish`).
  */
 const SDK_STREAM_RETRIES = 2;
 /** What ended a 2025 HTTP session, as the connection's events say it (see
@@ -101,7 +101,7 @@ const SDK_STREAM_RETRIES = 2;
 const SESSION_END = {
   ended: 'ended its session (HTTP 404)',
   revision: "refused its session's revision (HTTP 400, -32022)",
-  stream: "stopped serving its session's stream (HTTP 405)",
+  stream: "stopped serving its session's streams (HTTP 405)",
 } as const;
 /**
  * An answer to the standalone stream's first open that may pass, so it is
@@ -112,6 +112,13 @@ const SESSION_END = {
  */
 const mayPass = (status: number): boolean =>
   status === 408 || status === 409 || status === 429 || (status >= 500 && status !== 501 && status !== 505);
+/**
+ * The reason a call whose stream was lost fails with (see WireRecord's
+ * `cancel`). An SdkError, so the SDK passes it on as it is, where it reads
+ * any other abort reason as a timeout.
+ */
+const lostStream = (): SdkError =>
+  new SdkError(SdkErrorCode.ConnectionClosed, 'the stream that would carry its answer ended, and could not be resumed');
 /** Inventory listing has its own bound: it is host work, not a resident's call. */
 const LIST_TIMEOUT_MS = 30_000;
 /** Startup stderr kept for the first listener. */
@@ -152,6 +159,13 @@ interface WireRecord {
    *  layer (`observedFetch`), since ending the session closes the client,
    *  which can fail the call before the transport's own 404 error reaches it. */
   sessionEnded?: boolean;
+  /**
+   * The call's own abort, given to the SDK, which cancels the call when it
+   * fires: at the call's deadline, or as soon as the stream that would carry
+   * the current leg's answer ends unanswered and can't be resumed (see
+   * ObservedTransport's `send`). Either way the call reports `no-response`.
+   */
+  readonly cancel: AbortController;
 }
 
 /**
@@ -304,6 +318,22 @@ class ObservedTransport implements Transport {
       const abort = new AbortController();
       this.aborts.set(message.id, abort);
       sendOptions = { ...options, requestSignal: abort.signal };
+    }
+    if (undo && record && 'id' in message && sendOptions?.onRequestStreamEnd === undefined) {
+      // The transport calls this once the stream that would carry this leg's
+      // answer is over: after the answer, or without it, when the stream
+      // can't be resumed. That is a stream that ended with no event id to
+      // resume from, a resume answered 405 or with no body, or the
+      // transport's retries spent (two on 2026-07-28; on 2025 it has no
+      // limit). Unanswered, the call is lost, so it fails now rather than at
+      // its deadline. A 2026-07-28 listen brings its own.
+      const leg = message.id;
+      sendOptions = {
+        ...sendOptions,
+        onRequestStreamEnd: () => {
+          if (record.currentId === leg && record.answer === 'none') record.cancel.abort(lostStream());
+        },
+      };
     }
     try {
       await this.inner.send(message, sendOptions);
@@ -493,7 +523,10 @@ interface HttpObservations {
   readonly transport: StreamableHTTPClientTransport;
   /** The options object the transport keeps and reads at each stream retry. */
   readonly reconnection: { initialReconnectionDelay: number; maxReconnectionDelay: number; reconnectionDelayGrowFactor: number; maxRetries: number };
-  /** The server answered 404 for this session: it holds it no longer. */
+  /** The server has let this session go, so it gets no DELETE: it answered
+   *  404 to a request carrying the session's id, refused the session's
+   *  revision (-32022), or answered 405 to a GET for one of the session's
+   *  streams that it had served (see observedFetch). */
   ended: boolean;
   /** The DELETE for this session, once begun (see `endSession`). */
   deleting?: Promise<void>;
@@ -833,11 +866,12 @@ export class ModernMcpConnection extends EventEmitter {
     }
     const era = session.client.getProtocolEra() ?? 'modern';
     session.wire.establish(era);
-    // On 2026-07-28 a stream the transport gives up on ends its request, and
-    // the subscription keeper reopens a listen stream that ended and relists,
-    // so the transport's own retry limit stands. A 2025 session's standalone
-    // stream has no keeper above it: its retries stay unlimited (see
-    // streamRetry).
+    // On 2026-07-28 the transport's own retry limit applies from here on, one
+    // for all its streams. A listen stream it gives up on ends its
+    // subscription, and the subscription keeper reopens it and relists. A
+    // request's stream it gives up on fails its call (see WireRecord's
+    // `cancel`). A 2025 session's standalone stream has no keeper above it, so
+    // its retries stay unlimited (see streamRetry).
     if (session.http && era === 'modern') session.http.reconnection.maxRetries = SDK_STREAM_RETRIES;
     // Adopted: from here the session is live, no longer the connect in
     // flight. Both change in one step, so a close() never finds one session
@@ -1026,11 +1060,15 @@ export class ModernMcpConnection extends EventEmitter {
    *   and settles on 2026-07-28 when the server offers it. A POST's refusal
    *   is that request's answer, a JSON-RPC error, as the SDK reads such a 400
    *   on 2026-07-28: marked on its record as a 404 is.
-   * - A 405 to the standalone stream opening again, after it had opened:
-   *   the server no longer serves this session a stream, as the SDK's 2026
-   *   handler answers a 2025 session it now serves statelessly, or refuses.
-   *   The connection negotiates again. A first open's 405 says only that the
+   * - A 405 to a GET for one of the session's streams that the server had
+   *   served: the standalone stream opening again after it had opened, or a
+   *   request's stream resumed, which the server gave an event id. The server
+   *   no longer serves this session a stream, as the SDK's 2026 handler
+   *   answers a 2025 session it now serves statelessly, or refuses. The
+   *   connection negotiates again. A first open's 405 says only that the
    *   server offers no stream, so it changes nothing.
+   * Each of these three marks the session ended at once (`http.ended`), so
+   * it gets no DELETE: the server has let it go.
    * - The standalone stream opening again, after it had opened, without
    *   `Last-Event-ID`: it couldn't ask for what it missed, whether because
    *   the server's events carry no ids or because the stream that dropped
@@ -1070,6 +1108,7 @@ export class ModernMcpConnection extends EventEmitter {
           record.answer = 'error';
           record.error = refusal;
         }
+        http.ended = true;
         queueMicrotask(() => this.sessionEnded(session, 'revision'));
         return response;
       }
@@ -1085,7 +1124,8 @@ export class ModernMcpConnection extends EventEmitter {
         if (record?.currentId !== undefined && bodyId(init?.body) === record.currentId) record.sessionEnded = true;
         http.ended = true;
         queueMicrotask(() => this.sessionEnded(session, 'ended'));
-      } else if (standalone && http.streamOpened && response.status === 405) {
+      } else if (method === 'GET' && response.status === 405 && (standalone ? http.streamOpened : resuming)) {
+        http.ended = true;
         queueMicrotask(() => this.sessionEnded(session, 'stream'));
       } else if (standalone && response.ok) {
         // Back without replay, or open at last after failed tries: list
@@ -1148,8 +1188,10 @@ export class ModernMcpConnection extends EventEmitter {
    * transport, which stops it. A request's stream is resumed for as long as
    * its request is: the request's own signal stops it when the request is
    * cancelled (see ObservedTransport's `aborts`). On 2026-07-28 the
-   * transport's own limit stands (see establish), and a listen stream it
-   * gives up on is reopened by the subscription keeper. The server's `retry` hint is respected,
+   * transport's own limit applies once the session is adopted (see
+   * establish): a listen stream it gives up on is reopened by the
+   * subscription keeper, and a request's stream it gives up on fails its
+   * call. The server's `retry` hint is respected,
    * as the spec requires. The first try after a stream ends waits the hint
    * when the server gave one, and the base interval otherwise. A try after a
    * failed one waits the longer of the hint and the connection's doubling
@@ -1167,8 +1209,8 @@ export class ModernMcpConnection extends EventEmitter {
   /**
    * A 2025 HTTP session is over (see `observedFetch`): the server ended it,
    * answering 404 to a request that carried its id, or it no longer serves
-   * the session's revision (a 400 carrying -32022) or its stream (a 405 to
-   * the stream's reopen). The spec's answer to the first is a new session,
+   * the session's revision (a 400 carrying -32022) or its streams (a 405 to
+   * a GET for one it had served). The spec's answer to the first is a new session,
    * and a new connect negotiates afresh, which follows a server that moved
    * to 2026-07-28. A session that had answered a request since its handshake
    * gets one at once, whatever `reconnect` says: 'close', while
@@ -1180,8 +1222,8 @@ export class ModernMcpConnection extends EventEmitter {
    * during a rolling upgrade a connect can land on an old node and its calls
    * on a new one. It counts as a failed attempt, is reported as one
    * (`reconnect-failed`, so the framework's alert comes at the fifth), and
-   * follows `reconnect` with its backoff. A session the server ended with
-   * 404 isn't DELETEd: the server has dropped it.
+   * follows `reconnect` with its backoff. None of these sessions is
+   * DELETEd: the server has let it go (`http.ended`).
    */
   private sessionEnded(session: Session, cause: keyof typeof SESSION_END): void {
     // Only the live session's end changes anything: a connect still running
@@ -1315,11 +1357,11 @@ export class ModernMcpConnection extends EventEmitter {
    * to that call, and leaves the call's evidence alone.
    */
   async listTools(): Promise<McpToolDefinition[]> {
-    const { tools } = await this.request('tools/list', 'tools/list', (client) =>
+    const { tools } = await this.request('tools/list', 'tools/list', (client, signal) =>
       client.listTools(undefined, {
         cacheMode: 'refresh',
         timeout: LIST_TIMEOUT_MS,
-        signal: AbortSignal.timeout(LIST_TIMEOUT_MS),
+        signal,
       }), LIST_TIMEOUT_MS);
     return tools.map((tool) => ({
       name: tool.name,
@@ -1333,14 +1375,15 @@ export class ModernMcpConnection extends EventEmitter {
    * Call a tool within the configured deadline. One budget covers the whole
    * logical call: the SDK's per-leg timer and its `maxTotalTimeout` across
    * continuation rounds, and an abort signal around any retry the SDK makes
-   * before dispatch (an auth refresh, or a header-mismatch relist).
+   * before dispatch (an auth refresh, or a header-mismatch relist). That
+   * signal also fires when the call's stream is lost (WireRecord's `cancel`).
    */
   async callTool(name: string, args: Record<string, unknown>): Promise<ModernToolCallResult> {
     const timeoutMs = this.requestTimeoutMs;
-    const result = await this.request('tools/call', `tools/call "${name}"`, (client) =>
+    const result = await this.request('tools/call', `tools/call "${name}"`, (client, signal) =>
       client.callTool(
         { name, arguments: args },
-        { timeout: timeoutMs, maxTotalTimeout: timeoutMs, signal: AbortSignal.timeout(timeoutMs) },
+        { timeout: timeoutMs, maxTotalTimeout: timeoutMs, signal },
       ), timeoutMs);
     return {
       content: result.content ?? [],
@@ -1351,19 +1394,27 @@ export class ModernMcpConnection extends EventEmitter {
   }
 
   /** Run one logical request in a wire scope, and classify its failure by
-   *  what that scope saw. */
-  private async request<T>(method: string, what: string, run: (client: Client) => Promise<T>, timeoutMs?: number): Promise<T> {
+   *  what that scope saw. `run` gets the call's abort signal for the SDK,
+   *  which fires at `timeoutMs` or when the call's stream is lost
+   *  (WireRecord's `cancel`). */
+  private async request<T>(method: string, what: string, run: (client: Client, signal: AbortSignal) => Promise<T>, timeoutMs: number): Promise<T> {
     const session = this.session;
     if (!session) {
       // Connectome refuses before anything reaches the SDK: provably not sent.
       throw new McplRequestError(`Cannot send ${what}: connection to "${this.id}" is not established`, 'not-sent');
     }
-    const record: WireRecord = { method, handedOff: false, answer: 'none', continued: false };
+    const record: WireRecord = { method, handedOff: false, answer: 'none', continued: false, cancel: new AbortController() };
+    // The deadline aborts with its own reason, a timeout, which the SDK reads
+    // as one.
+    const deadline = AbortSignal.timeout(timeoutMs);
+    const atDeadline = () => record.cancel.abort(deadline.reason);
+    deadline.addEventListener('abort', atDeadline, { once: true });
     try {
-      return await wireScope.run(record, () => run(session.client));
+      return await wireScope.run(record, () => run(session.client, record.cancel.signal));
     } catch (error) {
       throw this.requestFailure(what, record, error, timeoutMs);
     } finally {
+      deadline.removeEventListener('abort', atDeadline);
       session.wire.forget(record);
     }
   }
@@ -1395,8 +1446,12 @@ export class ModernMcpConnection extends EventEmitter {
    * otherwise. Each session is DELETEd once, however many closes ask. The
    * transport sends nothing for a session without an id (2026-07-28, a
    * stateless server, or a connect whose initialize hasn't been answered),
-   * and a session the server ended with 404 gets nothing. A DELETE that
-   * fails is let go: the server expires the session on its own.
+   * and a session the server let go (`http.ended`: a 404, a -32022, or a 405
+   * to one of its streams) gets nothing. A DELETE that fails isn't tried
+   * again, since the server expires the session on its own. The SDK reports
+   * its failure through the transport's onerror, which reaches the host as
+   * the connection's 'error' while that connect is current: a failed
+   * connect's, as the host's close and a superseded connect are no longer.
    */
   private static endSession(session: Session): Promise<void> {
     const http = session.http;
@@ -1511,7 +1566,9 @@ export class ModernMcpConnection extends EventEmitter {
    *   closed). After an earlier leg asked for another round it is
    *   `no-response` instead: the server may already have acted on the call;
    * - handed off and unanswered: `no-response`, and the outcome is unknown.
-   *   At the deadline, cancellation was requested.
+   *   At the deadline, cancellation was requested, and so it was when the
+   *   stream that would carry the answer ended unresumed (WireRecord's
+   *   `cancel`).
    * A `tools/list` failure says so: listing changes nothing on the server, so
    * a retry is safe, where a tool call's retry may duplicate a side effect.
    */
