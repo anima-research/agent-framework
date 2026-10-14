@@ -404,6 +404,13 @@ class CapturingMembrane {
   }
 }
 
+/** The first pass the timer recorded. The history lists the newest first, and
+ *  under load more passes can end before a test reads it. */
+function firstPass(framework: AgentFramework) {
+  const history = framework.getContextMaintenanceSnapshot().history;
+  return history[history.length - 1]!;
+}
+
 async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
@@ -667,7 +674,7 @@ describe('queued context maintenance timer', () => {
     try {
       framework.start();
       await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
-      const run = framework.getContextMaintenanceSnapshot().history[0].agents[0];
+      const run = firstPass(framework).agents[0];
       assert.equal(run.agentName, 'agent');
       assert.equal(run.ticks, 1);
       assert.match(run.error ?? '', /requires successful strategy initialization/);
@@ -943,7 +950,7 @@ describe('queued context maintenance timer', () => {
     try {
       framework.start();
       await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
-      const run = framework.getContextMaintenanceSnapshot().history[0].agents[0];
+      const run = firstPass(framework).agents[0];
       assert.equal(run.ticks, 8);
       assert.equal(run.error, 'readiness refused after the ticks');
       assert.equal(run.readyAfter, undefined);
@@ -971,7 +978,7 @@ describe('queued context maintenance timer', () => {
     try {
       framework.start();
       await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
-      const run = framework.getContextMaintenanceSnapshot().history[0].agents[0];
+      const run = firstPass(framework).agents[0];
       assert.equal(run.ticks, 0);
       assert.equal(run.error, 'tick failed');
       assert.deepEqual(alerts, ['context-maintenance-failed:agent:tick failed']);
@@ -1081,7 +1088,7 @@ describe('queued context maintenance timer', () => {
         assert.equal(strategy.calls, 0, 'the withdrawn call sent nothing');
         assert.notEqual(cm.currentBranch().name, 'main');
         assert.deepEqual(alerts.filter((alert) => alert.startsWith('context-maintenance-failed')), []);
-        const run = framework.getContextMaintenanceSnapshot().history[0]!.agents[0]!;
+        const run = firstPass(framework).agents[0]!;
         assert.equal(run.error, undefined);
       } finally {
         console.error = quiet;
@@ -1308,7 +1315,7 @@ describe('queued context maintenance timer', () => {
     try {
       framework.start();
       await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
-      const run = framework.getContextMaintenanceSnapshot().history[0].agents[0];
+      const run = firstPass(framework).agents[0];
       assert.equal(strategy.ticks, 1);
       assert.equal(run.ticks, 1);
       assert.equal(run.error, undefined);
@@ -1348,7 +1355,7 @@ describe('queued context maintenance timer', () => {
     try {
       framework.start();
       await waitFor(() => framework.getContextMaintenanceSnapshot().history.length >= 1);
-      const run = framework.getContextMaintenanceSnapshot().history[0].agents[0];
+      const run = firstPass(framework).agents[0];
       assert.equal(run.ticks, 0);
       assert.equal(run.error, 'the tick failed while a surgery waited');
       assert.deepEqual(alerts, ['context-maintenance-failed']);
