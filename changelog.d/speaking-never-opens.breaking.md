@@ -14,9 +14,11 @@
     agent whether the DM is open or not; a DM the agent answers now stays closed, so the
     invitation would otherwise repeat on every DM. A whisper tagged `chat:dm` inside a shared
     channel that is closed carries none either. Where no single-word target reaches a channel,
-    the invitation no longer says that replying needs a join. A send no longer re-runs the open
-    of a channel decided open whose transport is down: `channel_open` and the next registration's
-    reconciliation do that, as they do for a channel nobody speaks in.
+    the invitation no longer says that replying needs a join: it points to the server's own send
+    tool, and says that follow-ups reach the agent only when they address it. A send no longer
+    re-runs the open of a channel decided open whose transport is down: `channel_open` does
+    that, and so does the next registration's reconciliation for a channel its server
+    registers, as for a channel nobody speaks in.
   - **Unchanged:** typing indicators and reactions, which never depended on a channel being
     open. A registered channel with a stored decision to open, including one that an earlier
     send opened, reconciles open at its next registration, as before. A DM known only from push

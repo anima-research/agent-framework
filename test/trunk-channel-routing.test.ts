@@ -35,6 +35,7 @@ function internals(framework: AgentFramework) {
     ): { channelId: string; label?: string } | undefined;
     channelRegistry: unknown;
     handleMcplPushEvent(event: unknown): void;
+    handleMcplChannelIncoming(event: unknown): Promise<unknown>;
   };
 }
 
@@ -288,8 +289,8 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const t2 = textOf(fw2);
     assert.doesNotMatch(t2, /prefixed with ">>/);
     assert.match(t2, /no single-word target reaches this channel unambiguously/);
-    assert.match(t2, /use the server's own send tool, or join it \(option 2\) and reply/,
-      'replying needs no join: speaking never opens a channel');
+    assert.match(t2, /reply with discord's own send tool instead\. Note: follow-ups to your reply will NOT reach you/,
+      "replying needs no join, and the server's own tool can't take another server's channel");
     assert.match(t2, /channel_open with channelId "discord:dm:1555"/, 'joining stays available');
     await fw2.stop();
 
@@ -339,6 +340,44 @@ describe('Trunk channel routing (item-3 redux)', () => {
       .join('\n') ?? '';
     assert.match(text, /you there\?/);
     assert.doesNotMatch(text, /Channel invitation/);
+    await framework.stop();
+  });
+
+  it('on channels/incoming too, a mention in a closed channel is invited and a DM is not', async () => {
+    const framework = await makeFramework();
+    const i = internals(framework);
+    i.channelRegistry = {
+      ensureChannelRegistered: () => {},
+      isChannelOpen: () => false,
+      getDesiredState: () => undefined,
+      getDescriptor: () => ({ capabilities: { history: { maxMessages: 80 } } }),
+      proseTargetFor: () => '#portables',
+      stopAll: () => {},
+    };
+    const lastText = () =>
+      framework.getAgent('scout')!.getContextManager().queryMessages({}).messages.at(-1)?.content
+        .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+        .map((block) => block.text)
+        .join('\n') ?? '';
+    const incomingOn = (channelId: string, text: string, tags: string[]) => i.handleMcplChannelIncoming({
+      type: 'mcpl:channel-incoming',
+      serverId: 'discord',
+      channelId,
+      messageId: `m-${Math.random().toString(36).slice(2)}`,
+      author: { id: 'U1', name: 'antra' },
+      content: [{ type: 'text', text }],
+      timestamp: new Date().toISOString(),
+      metadata: {},
+      tags,
+      triggerInference: false,
+    });
+
+    await incomingOn('discord:G1:C7', 'antra: a question for you', ['chat:mention', 'chat:addressed']);
+    assert.match(lastText(), /Channel invitation/, 'this path builds the invitation');
+
+    await incomingOn('discord:dm:1555', 'antra: and one in private', ['chat:dm', 'chat:addressed', 'chat:private']);
+    assert.match(lastText(), /one in private/);
+    assert.doesNotMatch(lastText(), /Channel invitation/);
     await framework.stop();
   });
 

@@ -341,6 +341,56 @@ test('routeSpeech into a closed channel publishes and leaves it closed (speaking
   assert.equal(autoOpened.length, 0, 'nothing is announced as opened');
 });
 
+test('routeSpeech into a closed channel publishes on a server whose grant lacks channels.lifecycle', async () => {
+  const published: Array<string | undefined> = [];
+  const server = {
+    grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS.filter((p) => p !== 'channels.lifecycle')), []),
+    sendChannelsPublish: async (params: { channelId?: string }) => {
+      published.push(params.channelId);
+      return { delivered: true };
+    },
+  };
+  const registry = new ChannelRegistry(
+    { getServer: () => server } as unknown as McplServerRegistry,
+    {} as FeatureSetManager,
+    () => {},
+    () => {},
+  );
+  seedRegistered(registry, 'portal', 'lobby');
+
+  const res = await registry.routeSpeech('sol', 'hello from outside', 'lobby');
+
+  assert.deepEqual(res, { delivered: true, channelId: 'lobby' }, 'no open stands in the way');
+  assert.deepEqual(published, ['lobby']);
+});
+
+test('a close or decline of a channel nobody decided about sticks against later policy', async () => {
+  const { registry, openCalls } = makeRegistry({ delivered: true });
+  const added = {
+    added: [
+      { id: 'closed-by-agent', type: 'discord', label: '#a', direction: 'bidirectional' },
+      { id: 'declined-by-agent', type: 'discord', label: '#b', direction: 'bidirectional' },
+    ],
+  } as never;
+  // Registered closed by default: nobody has decided about either.
+  await registry.handleChanged('discord', added);
+  const origin = { kind: 'agent' as const, agentName: 'sol' };
+  const closed = await registry.handleChannelToolCall('channel_close', { channelId: 'closed-by-agent' }, origin);
+  assert.deepEqual(closed.data, { channelId: 'closed-by-agent', status: 'already closed' });
+  const declined = await registry.handleChannelToolCall(
+    'channel_decline', { channelId: 'declined-by-agent', messageId: 'm1' }, origin);
+  assert.equal(declined.success, true);
+
+  // Policy now admits every channel, and both register again.
+  registry.setSubscriptionPolicy('discord', 'auto');
+  const opensBefore = openCalls.length;
+  await registry.handleChanged('discord', added);
+
+  assert.equal(registry.getDesiredState('discord', 'closed-by-agent'), 'closed', 'the close sticks');
+  assert.equal(registry.getDesiredState('discord', 'declined-by-agent'), 'closed', 'the decline sticks');
+  assert.equal(openCalls.length, opensBefore, 'policy opens neither');
+});
+
 test('resolveSendTarget names the channel a send went to and guesses nothing', async () => {
   const { registry, openCalls } = makeRegistry({ delivered: true });
   const added = (id: string, raw: string) => ({

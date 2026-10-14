@@ -9506,7 +9506,9 @@ export class AgentFramework {
     const replyOption = target
       ? `1. Reply without joining — write your reply this turn prefixed with ">>${target}"; it will be delivered there. ` +
         `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`
-      : `1. Reply without joining — no single-word target reaches this channel unambiguously, so a ">>" prefix can't name it; use the server's own send tool, or join it (option 2) and reply.\n`;
+      : `1. Reply without joining — no single-word target reaches this channel unambiguously, so a ">>" prefix can't name it; ` +
+        `reply with ${opts.serverId}'s own send tool instead. ` +
+        `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`;
     const missedCount = opts.missedMessages ?? 0;
     const missedNote =
       missedCount > 0
@@ -17645,9 +17647,9 @@ export class AgentFramework {
         // carries the CANONICAL channel id (descriptor form), while send args
         // often carry the raw provider id, so the registry resolves it first.
         // The send opens nothing: speaking never opens a channel, so a closed
-        // channel stays closed, with its desired state as the agent left it.
-        // A closed channel delivers only follow-ups that address the agent,
-        // which re-pin on their own.
+        // channel stays closed, and its recorded decision stays as it was.
+        // Where a closed channel delivers only follow-ups that address the
+        // agent (discord-mcpl), those re-pin on their own.
         if (
           this.channelRegistry &&
           SEND_ENGAGEMENT_TOOLS.has(toolName) &&

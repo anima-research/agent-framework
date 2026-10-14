@@ -1942,7 +1942,11 @@ export class ChannelRegistry {
     source: string,
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
-    if (this.desiredStates.get(key)?.state === desired) return;
+    const current = this.desiredStates.get(key);
+    // The same state again records nothing, except that a real decision
+    // replaces a pure default: a close or decline of a channel nobody decided
+    // about must stick, and policy and bootstrap lift only 'default-closed'.
+    if (current?.state === desired && (current.source !== 'default-closed' || source === 'default-closed')) return;
     this.desiredStates.set(key, { state: desired, source });
     this.appendLifecycleEvent({
       kind: 'desired-state',
@@ -2387,10 +2391,10 @@ export class ChannelRegistry {
    * The open executor behind the agent's channel_open tool: record durable
    * desired-open intent, tell the server to subscribe, mark the live entry
    * open. Speaking never opens a channel, so no send or delivery comes here:
-   * an agent's speech into a closed channel publishes and leaves the
-   * channel's lifecycle as the agent left it. Desired state is recorded
-   * BEFORE the server round-trip: intent sticks even if the subscribe fails,
-   * and reconciliation retries later.
+   * an agent's speech into a closed channel publishes, and the channel's
+   * open state and recorded decision stay as they were. Desired state is
+   * recorded BEFORE the server round-trip: intent sticks even if the
+   * subscribe fails, and reconciliation retries later.
    */
   private async openChannelNow(
     entry: ChannelEntry,
@@ -2604,10 +2608,10 @@ export class ChannelRegistry {
    * tools receive whatever the agent typed. Matches on `serverId` when it is
    * given, across every server otherwise, and is undefined when nothing
    * matches or more than one channel does. A lookup only: speaking never
-   * opens a channel, so a send into a closed channel leaves it closed, with
-   * its desired state as the agent left it. Typing indicators and reactions
-   * don't depend on a channel being open; opening only subscribes to its
-   * ongoing traffic.
+   * opens a channel, so a send into a closed channel leaves it closed, and
+   * its recorded decision as it was. Typing indicators and reactions don't
+   * depend on a channel being open; opening only subscribes to its ongoing
+   * traffic.
    */
   resolveSendTarget(channelId: string, serverId?: string): string | undefined {
     let matches = [...this.channels.values()].filter(
@@ -2718,14 +2722,6 @@ export class ChannelRegistry {
       };
     }
 
-    const alreadyDesiredClosed = this.getDesiredState(entry.serverId, input.channelId) === 'closed';
-    if (!entry.open && alreadyDesiredClosed) {
-      return {
-        success: true,
-        data: { channelId: input.channelId, status: 'already closed' },
-      };
-    }
-
     // Provenance comes from trusted dispatch, not from self-description:
     // only module-origin calls may record a machine source, and only from
     // the closed vocabulary. Agent-origin (or origin-less — the safe
@@ -2744,6 +2740,18 @@ export class ChannelRegistry {
         };
       }
       closeSource = input.source;
+    }
+
+    const alreadyDesiredClosed = this.getDesiredState(entry.serverId, input.channelId) === 'closed';
+    if (!entry.open && alreadyDesiredClosed) {
+      // Nothing to send, but a close of a channel nobody decided about is
+      // still a decision: recording it keeps policy and bootstrap, which lift
+      // only a pure default, from opening the channel later.
+      this.setDesiredState(entry.serverId, input.channelId, 'closed', closeSource);
+      return {
+        success: true,
+        data: { channelId: input.channelId, status: 'already closed' },
+      };
     }
 
     // Housekeeping must not override stated intent (issue #5: GC closes wore
@@ -3076,10 +3084,10 @@ export class ChannelRegistry {
     }
 
     // Speaking never opens a channel: speech into a closed but registered
-    // locus (a DM that woke the agent, since DMs register closed) publishes
-    // and leaves the channel's lifecycle as the agent left it. Publishing
-    // doesn't need an open channel, and neither do typing and reactions;
-    // opening only subscribes to ongoing traffic, which is channel_open's.
+    // locus (such as a DM that woke the agent) publishes, and the channel's
+    // open state and recorded decision stay as they were. Publishing doesn't
+    // need an open channel, and neither do typing and reactions; opening
+    // only subscribes to ongoing traffic, which is channel_open's.
     const server = this.serverRegistry.getServer(entry.serverId);
     if (!server) {
       return fail(channelId, `server "${entry.serverId}" not found`);

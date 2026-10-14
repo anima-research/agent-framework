@@ -48,8 +48,8 @@ agent (then notices append without waking, breaking any loop).
   unprefixed prose bounces and prefixed prose is deliberate.
 - The entire "which event may move the agent's voice" question.
 
-Explicit mode leaves the send tools (`send_message` etc.) and channel
-lifecycle as they are in every mode. Speaking never opens a channel, so a
+Send tools (`send_message` etc.) and channel lifecycle work the same in
+explicit mode as in the other modes. Speaking never opens a channel, so a
 `>>` send into a closed channel publishes there and leaves it closed.
 
 ## Teaching the grammar (teach-by-bounce)

@@ -2,7 +2,8 @@
  * Speaking never opens a channel: an explicit send tool's successful call
  * posts (the server sends it) and leaves the channel's lifecycle as the agent
  * left it, with no "[channels] Now open" notice: a channel the agent closed
- * stays closed, and a tuned-out channel stays tuned out. The call still
+ * stays closed, a channel whose open failed isn't opened again, and a
+ * tuned-out channel stays tuned out. The call still
  * records the channel as engaged this turn, by its descriptor id, for the
  * mid-turn re-pin.
  */
@@ -22,7 +23,9 @@ const origin = { kind: 'agent' as const, agentName: 'sol' };
 /** A real ChannelRegistry with one registered channel, and a framework with
  *  just what dispatchMcplToolCall reads. */
 async function harness() {
+  // Every channels/open attempt, including one the server refuses.
   const opens: Array<{ channelId?: string }> = [];
+  let refuseOpens = false;
   const server = {
     id: 'discord',
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
@@ -32,6 +35,7 @@ async function harness() {
     },
     async sendChannelsOpen(params: { channelId?: string }) {
       opens.push(params);
+      if (refuseOpens) throw new Error('open refused by server');
       return {};
     },
     async sendChannelsClose() {
@@ -88,7 +92,10 @@ async function harness() {
     return out;
   }
 
-  return { registry, opens, windowMessages, reply };
+  return {
+    registry, opens, windowMessages, reply,
+    setRefuseOpens: (v: boolean) => { refuseOpens = v; },
+  };
 }
 
 test('a reply_message into a channel the agent closed leaves it closed, and records the turn engagement', async () => {
@@ -107,6 +114,23 @@ test('a reply_message into a channel the agent closed leaves it closed, and reco
   assert.deepEqual(windowMessages, [], 'no notice says the channel opened');
   assert.deepEqual(engagedAtResult, [channelId],
     'recorded by the descriptor id the re-pin compares, before the tool result is queued');
+});
+
+test('a reply_message into a channel decided open whose open failed retries no open', async () => {
+  const { registry, opens, windowMessages, reply, setRefuseOpens } = await harness();
+  // The agent opened it, but the server refused: decided open, transport closed.
+  setRefuseOpens(true);
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, false);
+  assert.equal(registry.getDesiredState('discord', channelId), 'open');
+  assert.equal(registry.isChannelOpen(channelId), false);
+  const opensBefore = opens.length;
+
+  const { success } = await reply();
+
+  assert.equal(success, true);
+  assert.equal(opens.length, opensBefore, 'the send attempts no channels/open');
+  assert.equal(registry.isChannelOpen(channelId), false);
+  assert.deepEqual(windowMessages, []);
 });
 
 test('a reply_message into a tuned-out channel leaves the tune-out in place', async () => {
