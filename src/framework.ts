@@ -9595,6 +9595,14 @@ export class AgentFramework {
         this.coalescingRecentReceipts.push(record);
         this.store.setStateJson(COALESCING_RECENT_ID, this.coalescingRecentReceipts);
       },
+      // A push admitted afresh, deferred included, is where a message came
+      // in. This hook never runs for a producer's retry, which the coalescer
+      // acknowledges again without delivering anything; a withdrawal never
+      // counts, even when its notice is shown.
+      accepted: (occ) => {
+        if (occ.event.lane !== 'push' || occ.retract) return;
+        this.notePushAccepted(occ.event.event, occ.scope.kind === 'channel' ? occ.scope.id : undefined);
+      },
       wasPublished: (subject, eventId) => {
         // Boot-time only: the occurrence's durable delivery identity
         // (subject + eventId in message metadata) in any agent's context.
@@ -9729,11 +9737,7 @@ export class AgentFramework {
       if (c.channelId) this.assertChannelScopedPush(serverId, c.channelId);
       const origin = params.origin ?? {};
       const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
-      // Admitted afresh, as markAccepted counts: a withdrawal, or a producer's
-      // retry of work already acknowledged, is never where the last message
-      // came in.
-      const fresh = !c.retract && !this.pushCoalescer.receipt(serverId, this.coalescingBinding(serverId), params.eventId);
-      const result = await this.pushCoalescer.accept({
+      return this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
         featureSet: params.featureSet,
@@ -9756,8 +9760,6 @@ export class AgentFramework {
         } : {}),
         event: { lane: 'push', event },
       });
-      if (fresh) this.notePushAccepted(event, c.channelId);
-      return result;
     });
   }
 

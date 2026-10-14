@@ -115,7 +115,8 @@ test('a reply_message into a channel the agent closed leaves it closed, and reco
   assert.deepEqual(engagedAtResult, [channelId],
     'recorded by the descriptor id the re-pin compares, before the tool result is queued');
 
-  // The channel's next message, by push, is where a turn with no trigger speaks.
+  // The send marked the channel answered: when the push lane reports its
+  // next message, a turn with no trigger speaks there.
   assert.equal(registry.getDefaultPublishChannel(), null);
   registry.notePushDelivered('discord', channelId, 'm2', undefined, ['chat:mention']);
   assert.equal(registry.getDefaultPublishChannel(), channelId, 'the send answered the channel');

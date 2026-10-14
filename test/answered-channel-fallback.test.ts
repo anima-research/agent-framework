@@ -109,6 +109,14 @@ test("a coalesced push counts once, when it's admitted afresh, and a withdrawal 
   await f.send('push/event', first);
   assert.equal(registry.getDefaultPublishChannel(), 'lobby', "a retry of acknowledged work isn't a new message");
 
+  // A push scoped to its feature set, whose channel comes from its origin, as
+  // discord-mcpl sends one for a channel it hasn't declared.
+  await f.send('push/event', { ...push('c3', 'dm', ['chat:dm', 'chat:addressed']), coalesce: { key: 'message:m-c3', initial: true } });
+  assert.equal(registry.getDefaultPublishChannel(), 'dm', 'a feature-set-scoped push counts by its origin');
+  await f.send('channels/incoming', {
+    messages: [{ channelId: 'lobby', messageId: 'l3', timestamp: TS, author: { id: 'u', name: 'User' }, content: [{ type: 'text', text: 'and again' }] }],
+  });
+
   // A withdrawal of the DM's message, tagged as a message so only the
   // withdrawal itself can keep it from counting.
   const withdrawal = { ...push('c2', 'dm', ['chat:dm', 'chat:addressed']), coalesce: { channelId: 'dm', key: 'message:m-c1', retract: true }, payload: { content: [] } };

@@ -1981,34 +1981,42 @@ export class ChannelRegistry {
    * moves the most recent inbound channel (notePushDelivered), as an open
    * channel's channels/incoming does. Kept on the desired-state record, so it
    * survives a restart, until the next decision about the channel: an open,
-   * a close, a decline or a tune-out.
+   * a close, a decline or a tune-out. It runs after a delivered publish, so a
+   * store that fails to record it is logged, not thrown: the publish stands,
+   * and the mark holds until this process ends.
    */
-  noteAnswered(channelId: string, serverId?: string): void {
-    const entry = serverId ? this.channels.get(`${serverId}:${channelId}`) : this.findChannelEntry(channelId);
+  noteAnswered(channelId: string, serverId: string): void {
+    const entry = this.channels.get(`${serverId}:${channelId}`);
     if (!entry || entry.open) return;
-    const key = this.lifecycleKey(entry.serverId, entry.descriptor.id);
+    const key = this.lifecycleKey(serverId, channelId);
     const current = this.desiredStates.get(key);
     if (current?.answered || current?.state === 'tuned-out') return;
     const state = current?.state ?? 'closed';
     const source = current?.source ?? 'default-closed';
     this.desiredStates.set(key, { ...current, state, source, answered: true });
-    this.appendLifecycleEvent({
-      kind: 'desired-state',
-      serverId: entry.serverId,
-      channelId: entry.descriptor.id,
-      desired: state,
-      source,
-      answered: true,
-      timestamp: new Date().toISOString(),
-    });
+    try {
+      this.appendLifecycleEvent({
+        kind: 'desired-state',
+        serverId,
+        channelId,
+        desired: state,
+        source,
+        answered: true,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.error(`[channel] answered mark for ${channelId} not recorded: ${(error as Error).message}`);
+    }
   }
 
   /**
    * A push was accepted from this channel. One from a channel the agent
-   * answered while it was closed (noteAnswered) is where the last message
-   * came in, as an accepted channels/incoming message is (markAccepted), so
-   * a turn with no trigger speaks there. A push from any other channel moves
-   * nothing, as before, and neither does a reaction or a deletion.
+   * answered while it was closed (noteAnswered), and that is closed still, is
+   * where the last message came in, as an accepted channels/incoming message
+   * is (markAccepted), so a turn with no trigger speaks there. Once the
+   * channel's transport is open, its messages arrive as channels/incoming and
+   * move it there. A push from any other channel moves nothing, as before,
+   * and neither does a reaction or a deletion.
    */
   notePushDelivered(
     serverId: string,
@@ -2018,6 +2026,7 @@ export class ChannelRegistry {
     tags?: readonly string[],
   ): void {
     if (!this.desiredStates.get(this.lifecycleKey(serverId, channelId))?.answered) return;
+    if (this.channels.get(`${serverId}:${channelId}`)?.open) return;
     if (tags?.some((t) => t === 'chat:reaction' || t === 'chat:reaction-remove' || t === 'chat:deleted')) return;
     this.defaultPublishChannel = channelId;
     this.defaultPublishMessageId = messageId ?? null;

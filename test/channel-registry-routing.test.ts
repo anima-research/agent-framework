@@ -397,6 +397,73 @@ test("the agent's close or decline of a channel nobody decided about sticks agai
   assert.deepEqual(openCalls.slice(opensBefore).map((c) => c.channelId), ['closed-by-gc'], 'policy opens only that one');
 });
 
+test('only a delivered answer into a closed channel marks it, and only its conversational pushes count while it stays closed', async () => {
+  const conversational = ['chat:dm', 'chat:addressed'];
+  // A refused publish answers nothing.
+  const refused = makeRegistry({ delivered: false });
+  seedRegistered(refused.registry, 'discord', 'dm');
+  assert.equal(await refused.registry.routeSpeech('sol', 'not delivered', 'dm'), null);
+  refused.registry.notePushDelivered('discord', 'dm', 'm1', undefined, conversational);
+  assert.equal(refused.registry.getDefaultPublishChannel(), null, 'a refused publish answers nothing');
+
+  const { registry } = makeRegistry({ delivered: true });
+  seedRegistered(registry, 'discord', 'dm', 'lobby');
+  await registry.routeSpeech('sol', 'answered', 'dm');
+  registry.handleIncoming('discord', incoming('lobby', 'hi'));
+  for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:deleted']) {
+    registry.notePushDelivered('discord', 'dm', 'm2', undefined, [tag]);
+    assert.equal(registry.getDefaultPublishChannel(), 'lobby', `${tag} isn't a message coming in`);
+  }
+  registry.notePushDelivered('discord', 'dm', 'm3', undefined, conversational);
+  assert.equal(registry.getDefaultPublishChannel(), 'dm');
+
+  // Its transport opens (the server delivers channels/incoming from it): its
+  // messages move the fallback that way now, and a push, such as an edit, doesn't.
+  registry.handleIncoming('discord', incoming('dm', 'over incoming'));
+  registry.handleIncoming('discord', incoming('lobby', 'hi again'));
+  registry.notePushDelivered('discord', 'dm', 'm4', undefined, ['chat:edited']);
+  assert.equal(registry.getDefaultPublishChannel(), 'lobby');
+});
+
+test('the next decision about an answered channel ends its answer', async () => {
+  const origin = { kind: 'agent' as const, agentName: 'sol' };
+  const dm = { added: [{ id: 'dm', type: 'discord', label: 'DM: antra', direction: 'bidirectional' }] } as never;
+  const cases: Array<[string, (r: ChannelRegistry, lookup: (id: string) => { open: boolean } | undefined) => Promise<unknown>]> = [
+    ['channel_open', async (r, lookup) => {
+      await r.handleChannelToolCall('channel_open', { channelId: 'dm' }, origin);
+      lookup('dm')!.open = false; // and its transport drops again later
+    }],
+    ['channel_decline', (r) => r.handleChannelToolCall('channel_decline', { channelId: 'dm', messageId: 'm0' }, origin)],
+    ['a tune-out', async (r) => r.enterTuneOut('discord', 'dm', {
+      epochId: 'e1', cadenceSeconds: 600, backlogCap: 50, maxWakes: 3, startedAtSequence: 0,
+    }, 'agent-tool')],
+    ['a machine close', (r) => r.handleChannelToolCall(
+      'channel_close', { channelId: 'dm', source: 'subscription-gc' }, { kind: 'module', moduleName: 'subscription-gc' })],
+    // The agent had closed it before it answered, so this close keeps the
+    // same decision on record and still ends the answer.
+    ["the agent's close, again", (r) => r.handleChannelToolCall('channel_close', { channelId: 'dm' }, origin)],
+  ];
+  for (const [name, decide] of cases) {
+    const { registry, lookup } = makeRegistry({ delivered: true });
+    await registry.handleChanged('discord', dm);
+    seedRegistered(registry, 'discord', 'lobby');
+    if (name === "the agent's close, again") {
+      await registry.handleChannelToolCall('channel_close', { channelId: 'dm' }, origin);
+    }
+    await registry.routeSpeech('sol', 'answered', 'dm');
+    await decide(registry, lookup);
+    registry.handleIncoming('discord', incoming('lobby', 'elsewhere'));
+    registry.notePushDelivered('discord', 'dm', 'm1', undefined, ['chat:dm', 'chat:addressed']);
+    assert.equal(registry.getDefaultPublishChannel(), 'lobby', `${name} ends the answer`);
+    if (name === 'a machine close') {
+      assert.equal(registry.getDesiredState('discord', 'dm'), 'closed');
+      registry.setSubscriptionPolicy('discord', 'auto');
+      await registry.handleChanged('discord', dm);
+      assert.equal(registry.getDesiredState('discord', 'dm'), 'open', 'and decides nothing: policy may still open it');
+    }
+  }
+});
+
 test('resolveSendTarget names the channel a send went to and guesses nothing', async () => {
   const { registry, openCalls } = makeRegistry({ delivered: true });
   const added = (id: string, raw: string) => ({
@@ -405,7 +472,7 @@ test('resolveSendTarget names the channel a send went to and guesses nothing', a
   await registry.handleChanged('discord-a', { added: [added('discord:g:444', '444'), added('discord:g:555', '555')] } as never);
   await registry.handleChanged('discord-b', { added: [added('discord:h:555', '555')] } as never);
   const opensBefore = openCalls.length;
-  // Awaited, so main's openIfClosedForSend can stand in for it in a red-first run.
+  // Awaited, so the test holds whether the lookup answers at once or later.
 
   assert.equal(await registry.resolveSendTarget('discord:g:444'), 'discord:g:444', 'a descriptor id');
   assert.equal(await registry.resolveSendTarget('444', 'discord-a'), 'discord:g:444', 'a raw id, on its server');

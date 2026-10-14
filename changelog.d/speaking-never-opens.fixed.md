@@ -5,5 +5,5 @@
 - The agent's `channel_close` or `channel_decline` of a channel nobody had decided about, which
   is closed by default, is now recorded as its decision. Before, the channel kept its default,
   so subscription policy or a server's `initiallyOpen` could open it later. A machine close of
-  such a channel, such as connectome-host's `subscription-gc`, still records nothing, so policy
-  can still open it.
+  such a channel, such as connectome-host's `subscription-gc`, still records no decision: the
+  channel keeps its default, so policy can still open it.
