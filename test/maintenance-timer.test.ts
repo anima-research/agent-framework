@@ -287,6 +287,48 @@ class GatedTickStrategy implements ContextStrategy {
   }
 }
 
+/**
+ * A strategy whose first tick makes a provider call that parks at the agent's
+ * provider gate, as one does once a cooldown a primary call started has ended
+ * and the retry turn it queued hasn't run yet.
+ */
+class ParkedCallTickStrategy implements ContextStrategy {
+  readonly name = 'parked-call-tick-test';
+  ticks = 0;
+  calls = 0;
+  outcome?: string;
+  framework?: AgentFramework;
+
+  checkReadiness(): ReadinessState {
+    return { ready: false, description: 'parked call queued' };
+  }
+
+  async tick(_ctx: StrategyContext): Promise<void> {
+    this.ticks++;
+    if (this.ticks > 1) return;
+    const internals = this.framework as unknown as {
+      providerGate(name: string): { primaryPending: boolean };
+      withAuxiliaryAdmission<T>(name: string, run: () => Promise<T>): Promise<T>;
+    };
+    internals.providerGate('agent').primaryPending = true;
+    try {
+      await internals.withAuxiliaryAdmission('agent', async () => { this.calls++; });
+      this.outcome = 'ran';
+    } catch (error) {
+      this.outcome = (error as Error).name;
+      throw error;
+    }
+  }
+
+  select(
+    _store: MessageStoreView,
+    _log: ContextLogView,
+    _budget: TokenBudget,
+  ): ContextEntry[] {
+    return [];
+  }
+}
+
 /** A strategy whose ticks succeed and whose readiness can't be read once all of a pass's ticks have run. */
 class RefusesAfterTicksStrategy implements ContextStrategy {
   readonly name = 'refuses-after-ticks-test';
@@ -826,6 +868,64 @@ describe('queued context maintenance timer', () => {
     }
   });
 
+  it('a failure that lasts is posted to the webhook again a cooldown after its last post, whatever changed-text report came between', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-webhook-reminder-'));
+    const strategy = new SayingStrategy();
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'saying', model: 'test-model', systemPrompt: 'test', strategy }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 10,
+    });
+    const internals = framework as unknown as { runQueuedMaintenance: () => Promise<void> };
+    let passes = 0;
+    const runPass = internals.runQueuedMaintenance.bind(framework);
+    internals.runQueuedMaintenance = () => { passes++; return runPass(); };
+    const passed = async (n: number) => { const after = passes; await waitFor(() => passes >= after + n); };
+    // The real opsAlert, with a webhook whose posts are recorded.
+    const posts: string[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+      posts.push(String(JSON.parse(String(init?.body)).content));
+      return new Response('{}');
+    }) as typeof fetch;
+    const hook = process.env.CONNECTOME_OPS_WEBHOOK;
+    process.env.CONNECTOME_OPS_WEBHOOK = 'http://webhook.invalid/hook';
+    const realNow = Date.now;
+    const start = realNow();
+    let offset = 0;
+    Date.now = () => realNow() + offset;
+    const minute = 60_000;
+    const maintenancePosts = () => posts.filter((post) => post.includes('context-maintenance-failed'));
+    const quiet = console.error;
+    console.error = () => {};
+    try {
+      framework.start();
+      await waitFor(() => maintenancePosts().length === 1);
+      assert.match(maintenancePosts()[0]!, /the first refusal/);
+      // 14 minutes on, the text changes: it's reported, and the webhook,
+      // still within its cooldown, doesn't post it.
+      offset = 14 * minute;
+      strategy.says = 'the second refusal';
+      await passed(3);
+      assert.equal(maintenancePosts().length, 1);
+      // At 15 minutes the webhook's cooldown since its post has passed.
+      offset = 15 * minute + 1_000;
+      await waitFor(() => maintenancePosts().length === 2);
+      assert.match(maintenancePosts()[1]!, /the second refusal/);
+      assert.ok(Date.now() - start < 16 * minute);
+    } finally {
+      console.error = quiet;
+      Date.now = realNow;
+      globalThis.fetch = realFetch;
+      if (hook === undefined) delete process.env.CONNECTOME_OPS_WEBHOOK; else process.env.CONNECTOME_OPS_WEBHOOK = hook;
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('a readiness refusal read after an agent\'s last tick is that agent\'s failure, alerted once', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-refused-after-ticks-'));
     const strategy = new RefusesAfterTicksStrategy();
@@ -935,6 +1035,108 @@ describe('queued context maintenance timer', () => {
       }
     });
   }
+
+  for (const surgery of [
+    { verb: 'roll back', run: (framework: AgentFramework, first: string) => framework.rollbackToMessage('agent', { messageId: first }) },
+    { verb: 'suppress', run: (framework: AgentFramework, first: string) => framework.suppressMessages('agent', { messageIds: [first] }) },
+    {
+      verb: 'switch branch',
+      run: (framework: AgentFramework, first: string) => {
+        framework.getAgent('agent')!.getContextManager().branchAt(first as never, 'elsewhere');
+        return framework.switchBranch('elsewhere');
+      },
+    },
+  ] as Array<{ verb: string; run: (framework: AgentFramework, first: string) => Promise<unknown> }>) {
+    it(`a ${surgery.verb} withdraws a maintenance call parked at the provider gate rather than waiting on it, and that is no failure`, { timeout: 10_000 }, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-parked-call-'));
+      const strategy = new ParkedCallTickStrategy();
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store'),
+        membrane,
+        agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+        modules: [],
+        syncIntervalMs: 0,
+        maintenanceIntervalMs: 10,
+      });
+      strategy.framework = framework;
+      const alerts: string[] = [];
+      (framework as any).opsAlert = (kind: string, agentName: string, message: string) => alerts.push(`${kind}:${agentName}:${message}`);
+      const cm = framework.getAgent('agent')!.getContextManager();
+      const first = String(cm.addMessage('user', [{ type: 'text', text: 'm1' }]));
+      cm.addMessage('user', [{ type: 'text', text: 'm2' }]);
+      const internals = framework as unknown as { providerGate(name: string): { auxiliaryWaiters: unknown[] } };
+      const quiet = console.error;
+      console.error = () => {};
+      try {
+        await framework.quiesce();
+        framework.start();
+        await waitFor(() => internals.providerGate('agent').auxiliaryWaiters.length === 1);
+        const moved = surgery.run(framework, first);
+        const outcome = await Promise.race([
+          moved.then(() => 'moved'),
+          new Promise<string>((resolve) => setTimeout(() => resolve(`the ${surgery.verb} still waits`), 3_000)),
+        ]);
+        assert.equal(outcome, 'moved');
+        assert.equal(strategy.outcome, 'MaintenanceWithdrawnError');
+        assert.equal(strategy.calls, 0, 'the withdrawn call sent nothing');
+        assert.notEqual(cm.currentBranch().name, 'main');
+        assert.deepEqual(alerts.filter((alert) => alert.startsWith('context-maintenance-failed')), []);
+        const run = framework.getContextMaintenanceSnapshot().history[0]!.agents[0]!;
+        assert.equal(run.error, undefined);
+      } finally {
+        console.error = quiet;
+        await framework.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it('a maintenance provider call made while a surgery holds the store is withdrawn before it is sent, with the gate closed too', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-withdrawn-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: new GatedTickStrategy() }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    const internals = framework as unknown as {
+      reserveStoreForSurgery(verb: string, agentName: string): () => void;
+      withAuxiliaryAdmission<T>(name: string, run: () => Promise<T>): Promise<T>;
+      providerGate(name: string): { primaryPending: boolean };
+    };
+    try {
+      for (const closed of [false, true]) {
+        let ran = false;
+        const release = internals.reserveStoreForSurgery('roll back', 'agent');
+        // Closed: a cooldown's retry turn is queued, which the hold keeps from
+        // starting, so a call that parked would never be woken.
+        internals.providerGate('agent').primaryPending = closed;
+        try {
+          const admitted = internals.withAuxiliaryAdmission('agent', async () => { ran = true; });
+          void admitted.catch(() => {});
+          const outcome = await Promise.race([
+            admitted.then(() => 'admitted', (error: unknown) => error),
+            new Promise<string>((resolve) => setTimeout(() => resolve('parked'), 1_000)),
+          ]);
+          assert.ok(
+            outcome instanceof Error && outcome.name === 'MaintenanceWithdrawnError'
+              && outcome.message === 'maintenance call withdrawn: a live roll back for agent holds the store',
+            `${closed ? 'gate closed' : 'gate open'}: ${outcome instanceof Error ? outcome.message : String(outcome)}`,
+          );
+          assert.equal(ran, false);
+        } finally {
+          internals.providerGate('agent').primaryPending = false;
+          release();
+        }
+      }
+      assert.equal(await internals.withAuxiliaryAdmission('agent', async () => 7), 7, 'admitted again once the hold is released');
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it('a surgery that takes the store while resume waits for a tick is refused by resume after the wait', { timeout: 10_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-resume-rechecks-'));

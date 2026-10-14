@@ -366,6 +366,8 @@ test('message-granular undo prepares markers before switching branches', async (
     // A surgery waits for maintenance work that is running: here, none.
     framework.maintenancePass = null;
     framework.overBudgetDrains = new Set();
+    // Its hold wakes maintenance calls parked at the provider gates: here, none.
+    framework.providerGates = new Map();
     framework.operatorLog = new OperatorLog(undefined);
 
     const result = await framework.handleHostCommand('discord', {

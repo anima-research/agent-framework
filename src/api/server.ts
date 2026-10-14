@@ -78,7 +78,20 @@ export class ApiServer {
   private wss: WebSocketServer | null = null;
   private httpServer: ReturnType<typeof createServer> | null = null;
   private clients: Set<WebSocket> = new Set();
-  private currentBranch = 'main';
+  /** The store's branch as last read: what the API reports once the store has closed. */
+  private lastKnownBranch = 'main';
+
+  /**
+   * The store's current branch, read from the store while it's open. A cached
+   * name would go stale behind any move the API server didn't make itself (a
+   * rollback, a host's switch), and behind a switch whose move comes after
+   * its call returns, as one does once running maintenance has finished.
+   */
+  private get currentBranch(): string {
+    const store = this.framework.getStore();
+    if (!store.isClosed()) this.lastKnownBranch = store.currentBranch().name;
+    return this.lastKnownBranch;
+  }
 
   /** Map from client to their subscription IDs */
   private clientSubscriptions: Map<WebSocket, Set<string>> = new Map();
@@ -572,43 +585,31 @@ export class ApiServer {
       throw new Error('name is required');
     }
 
-    const store = this.framework.getStore();
-    const from = store.isClosed() ? this.currentBranch : store.currentBranch().name;
+    const from = this.currentBranch;
 
     // The framework switches the store, starts the delivery of its Discord
     // awareness marks behind the data-plane gate, and re-materializes the
     // config mount. It refuses during a live turn or once stop() has begun,
-    // and stop() waits for one already running.
-    // The store has moved when the call returns, before its promise settles
-    // (a refusal moves nothing). The branch read then is this switch's
-    // destination, and the event names what was read here: the framework
-    // refuses another move until this one's awaited steps end, but a host
-    // that switches through an agent's own context manager can still move
-    // the store meanwhile.
-    const switching = this.framework.switchBranch(params.name);
-    void switching.catch(() => {}); // awaited below; handled even if the next line throws
-    this.followStoreBranch();
-    const to = this.currentBranch;
-    const moved = to !== from;
+    // and stop() waits for one already running. It moves the store once any
+    // maintenance already running has finished, so the move can come after
+    // this call returns. The event names this switch's own move, from the
+    // branch read here to the one it was asked for: the framework refuses
+    // another move until this one's awaited steps end, but a host that
+    // switches through an agent's own context manager can still move the
+    // store before this one continues.
     let switched = false;
     try {
-      await switching;
+      await this.framework.switchBranch(params.name);
       switched = true;
     } finally {
       // A later step can fail after the store has moved: clients still hear
       // where it went. A refusal moved nothing, so there's nothing to tell.
-      if (switched || moved) {
-        this.broadcast('branch:switched', { from, to });
+      if (switched || (this.currentBranch === params.name && params.name !== from)) {
+        this.broadcast('branch:switched', { from, to: params.name });
       }
     }
 
     return { switched: true };
-  }
-
-  /** Take the current branch from the store, while it's open. */
-  private followStoreBranch(): void {
-    const store = this.framework.getStore();
-    if (!store.isClosed()) this.currentBranch = store.currentBranch().name;
   }
 
   private async cmdBranchCurrent(): Promise<{ name: string }> {
@@ -648,7 +649,6 @@ export class ApiServer {
     const result = this.framework.undoLastTurn(params.agentName);
 
     if (result.undone) {
-      this.currentBranch = result.toBranch!;
       // Marks follow behind the data-plane gate; the undo doesn't wait for Discord.
       this.framework.startDiscordAwarenessDelivery('undo', params.agentName);
       this.broadcast('branch:switched', {
@@ -669,7 +669,6 @@ export class ApiServer {
     const result = this.framework.redo(params.agentName);
 
     if (result.redone) {
-      this.currentBranch = result.toBranch!;
       // Marks follow behind the data-plane gate; the redo doesn't wait for Discord.
       this.framework.startDiscordAwarenessDelivery('redo', params.agentName);
       this.broadcast('branch:switched', {

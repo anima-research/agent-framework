@@ -19,7 +19,14 @@ import type {
   StoredMessage,
   TokenBudget,
 } from '@animalabs/context-manager';
-import { bodyRangeIn, removeStoredMessage, removeStoredMessages } from './stored-removal.js';
+import {
+  bodyGroupRun,
+  bodyRangeIn,
+  locateMessageIndex,
+  locateMessageIndices,
+  removeStoredMessage,
+  removeStoredMessages,
+} from './stored-removal.js';
 import type {
   FrameworkConfig,
   InferencePolicy,
@@ -713,6 +720,19 @@ function logSeedOmissions(
   );
 }
 
+/**
+ * A maintenance provider call withdrawn because a surgery holds the store. It
+ * sent nothing: it was refused at the provider gate, or woken there from its
+ * wait. context-manager keeps the work it was for queued, with no attempt
+ * counted, and the next pass after the hold does it again.
+ */
+class MaintenanceWithdrawnError extends Error {
+  constructor(hold: { verb: string; agentName: string }) {
+    super(`maintenance call withdrawn: a live ${hold.verb} for ${hold.agentName} holds the store`);
+    this.name = 'MaintenanceWithdrawnError';
+  }
+}
+
 class DiscordAwarenessAccountingError extends Error {
   constructor(operation: string, cause: unknown) {
     const detail = cause instanceof Error ? cause.message : String(cause);
@@ -841,72 +861,6 @@ class DefaultInferencePolicy implements InferencePolicy {
   ): boolean {
     return requests.some((r) => r.agentName === agentName);
   }
-}
-
-/** Minimal read surface the live-surgery helpers need from a ContextManager. */
-interface SurgeryReadableCm {
-  getMessageCount(): number;
-  getMessageWindow(
-    offset: number,
-    limit: number,
-    opts?: { resolveBlobs?: boolean; alignToBodyGroups?: boolean },
-  ): { messages: Array<{ id: unknown; bodyGroupId?: string }>; startIndex: number };
-}
-
-const SURGERY_SCAN_WINDOW = 500;
-
-/**
- * Slot index of `messageId` on the active branch, or -1. Scans from the tail
- * in blob-free windows: operator targets are almost always recent, and a
- * full `getAllMessages()` re-inflates every attachment on the branch.
- */
-function locateMessageIndex(cm: SurgeryReadableCm, messageId: string): number {
-  const hit = locateMessageIndices(cm, new Set([messageId])).get(messageId);
-  return hit ? hit.index : -1;
-}
-
-/** Tail-first scan resolving many ids at once; stops as soon as all are found. */
-function locateMessageIndices(
-  cm: SurgeryReadableCm,
-  ids: Set<string>,
-): Map<string, { index: number; bodyGroupId?: string }> {
-  const found = new Map<string, { index: number; bodyGroupId?: string }>();
-  const total = cm.getMessageCount();
-  for (let end = total; end > 0 && found.size < ids.size; end -= SURGERY_SCAN_WINDOW) {
-    const start = Math.max(0, end - SURGERY_SCAN_WINDOW);
-    const { messages, startIndex } = cm.getMessageWindow(start, end - start, { resolveBlobs: false });
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const id = String(messages[i].id);
-      if (ids.has(id) && !found.has(id)) {
-        found.set(id, {
-          index: startIndex + i,
-          ...(messages[i].bodyGroupId ? { bodyGroupId: messages[i].bodyGroupId } : {}),
-        });
-      }
-    }
-  }
-  return found;
-}
-
-/**
- * Inclusive slot range of the body-group run containing `index` (the slot
- * itself when it is not sharded). Delegates to the store's own
- * `alignToBodyGroups` edge walk — one contiguity assumption, not two.
- */
-function bodyGroupRun(
-  cm: SurgeryReadableCm,
-  index: number,
-): { from: number; to: number; fromId: string; toId: string; group: boolean } {
-  const win = cm.getMessageWindow(index, 1, { alignToBodyGroups: true, resolveBlobs: false });
-  const from = win.startIndex;
-  const to = win.startIndex + win.messages.length - 1;
-  return {
-    from,
-    to,
-    fromId: String(win.messages[0].id),
-    toId: String(win.messages[win.messages.length - 1].id),
-    group: win.messages[0].bodyGroupId !== undefined,
-  };
 }
 
 function describeMarkers(m: SurgeryMarkerReceipt): string {
@@ -2903,6 +2857,7 @@ export class AgentFramework {
   private async withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T> {
     const gate = this.providerGate(agentName);
     this.refuseHeldProviderModel(agentName, model);
+    this.withdrawMaintenanceUnderSurgery();
     if (this.providerGateBlocked(agentName)) {
       gate.deferredAuxiliary++;
       try {
@@ -2914,6 +2869,8 @@ export class AgentFramework {
     if (this.providerAdmissionClosed) {
       throw new Error(`Provider admission closed while stopping (${agentName})`);
     }
+    // A surgery that took the store while this call was parked withdraws it.
+    this.withdrawMaintenanceUnderSurgery();
     // A wait recorded while this call was parked binds it too.
     this.refuseHeldProviderModel(agentName, model);
     gate.auxiliaryInFlight++;
@@ -2934,6 +2891,16 @@ export class AgentFramework {
       gate.auxiliaryInFlight = Math.max(0, gate.auxiliaryInFlight - 1);
       if (gate.auxiliaryInFlight === 0) for (const resolve of gate.idleWaiters.splice(0)) resolve();
     }
+  }
+  /**
+   * Maintenance makes no provider call while a surgery holds the store. The
+   * surgery waits for the maintenance work that is running before it moves
+   * the branch, so a call that parked at the gate would make it wait on
+   * whatever reopens the gate: the end of a cooldown, or the retry turn a
+   * cooldown queues, which the hold itself keeps from starting.
+   */
+  private withdrawMaintenanceUnderSurgery(): void {
+    if (this.surgeryHold) throw new MaintenanceWithdrawnError(this.surgeryHold);
   }
   private auxiliaryMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting((run, model) => this.withAuxiliaryAdmission(agentName, run, model));
@@ -3533,6 +3500,10 @@ export class AgentFramework {
       const running = queued.filter((item): item is Extract<Queued, { failed: false }> => !item.failed);
       // Settled, not all: the pass ends only when every agent's work has.
       const outcomes = await Promise.allSettled(running.map(async ({ agent, cm, record }) => {
+        // A tick whose provider call a surgery withdrew ends this agent's
+        // work for the pass, as the hold would have before its next tick: it
+        // is no failure, and what the failure reports remember stays as it is.
+        let withdrawn = false;
         try {
           for (
             let i = 0;
@@ -3543,22 +3514,27 @@ export class AgentFramework {
             record.ticks++;
           }
         } catch (error) {
-          this.reportMaintenanceFailure(
-            agent.name,
-            record,
-            error instanceof Error ? String(error.message) : failureDescription(error),
-          );
+          if (error instanceof MaintenanceWithdrawnError) {
+            withdrawn = true;
+            console.error(`[context-maintenance] agent=${agent.name} stopped: ${error.message}`);
+          } else {
+            this.reportMaintenanceFailure(
+              agent.name,
+              record,
+              error instanceof Error ? String(error.message) : failureDescription(error),
+            );
+          }
         } finally {
           record.finishedAt = Date.now();
           const state = this.contextReadiness(cm);
           if ('error' in state) {
             // A run records an agent's first failure: a readiness refusal
             // after a tick that failed is read again by the next pass.
-            if (record.error === undefined) this.reportMaintenanceFailure(agent.name, record, state.error);
+            if (record.error === undefined && !withdrawn) this.reportMaintenanceFailure(agent.name, record, state.error);
           } else {
             record.readyAfter = state.ready;
             if (state.pending) record.pendingAfter = state.pending;
-            if (record.error === undefined) this.maintenanceFailureReported.delete(agent.name);
+            if (record.error === undefined && !withdrawn) this.maintenanceFailureReported.delete(agent.name);
           }
           const progress = this.contextProgress(cm);
           if (progress) record.progressAfter = progress;
@@ -3584,16 +3560,23 @@ export class AgentFramework {
    * with the whole text. A failure that lasts, such as a manager whose
    * strategy failed to initialize, meets every pass, a few seconds apart:
    * each run records it, and it is logged and alerted again only when its
-   * whole text changes, once opsAlert's cooldown for it has passed (so the
-   * webhook, which posts a kind at most once per cooldown, hears a failure
-   * that lasts), or after a pass in which that agent's maintenance went
-   * without a failure (maintenanceFailureReported).
+   * whole text changes, once opsAlert's cooldown for it has passed since the
+   * webhook last posted it (so the webhook, which posts a kind at most once
+   * per cooldown, hears a failure that lasts), or after a pass in which that
+   * agent's maintenance went without a failure (maintenanceFailureReported).
    */
   private reportMaintenanceFailure(agentName: string, record: ContextMaintenanceAgentRun, wholeError: string): void {
     record.error = boundFailureText(wholeError);
     const reported = this.maintenanceFailureReported.get(agentName);
     const now = Date.now();
-    if (reported && reported.text === wholeError && now - reported.at < this.opsAlertCooldownMs) return;
+    if (reported && reported.text === wholeError) {
+      // The same failure again is alerted once the webhook's cooldown for it
+      // has passed, counted from the webhook's last post of it: a report of
+      // changed text that the webhook didn't post doesn't push the reminder
+      // back. With no webhook, it's counted from this failure's last report.
+      const since = this.opsAlertLastSent.get(`${agentName}:context-maintenance-failed`) ?? reported.at;
+      if (now - since < this.opsAlertCooldownMs) return;
+    }
     this.maintenanceFailureReported.set(agentName, { text: wholeError, at: now });
     console.error(`[context-maintenance] agent=${agentName} failed:`, record.error);
     this.opsAlert(
@@ -7113,12 +7096,20 @@ export class AgentFramework {
           `[host-command] hide agent=${agentName} removed=${hidden} (${params.fromMessageId}) ` +
             `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
         );
+        // Every shard of every copy goes, so the ids are bounded as the
+        // range form's are.
+        const loggedIds = capIds(hiddenIds);
         this.recordOperatorAction({
           kind: 'hide',
           agent: agentName,
           requester: hostCommandRequester(serverId, params),
           params: { fromMessageId: params.fromMessageId },
-          result: { branch: this.store.currentBranch().name, hidden, removedIds: hiddenIds },
+          result: {
+            branch: this.store.currentBranch().name,
+            hidden,
+            removedIds: loggedIds.ids,
+            ...(loggedIds.truncated ? { removedIdsTruncated: true } : {}),
+          },
         });
         return {
           ok: true,
@@ -7841,6 +7832,9 @@ export class AgentFramework {
     // arrivals during the awaited switch (see surgeryHold).
     const hold = { verb, agentName, since: Date.now() };
     this.surgeryHold = hold;
+    // Maintenance calls parked at a provider gate wake, find the hold and are
+    // withdrawn, so the wait for running maintenance can't wait on them.
+    for (const gate of this.providerGates.values()) for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
     // stop() waits for the release (see stopOwned): a surgery admitted before
     // stop() began finishes, flush included, before the store closes.
     let settle!: () => void;
@@ -15968,7 +15962,11 @@ export class AgentFramework {
               `${ticks < 8 ? ', stopped while a surgery holds the store' : ''})`,
           );
         } catch (err) {
-          console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
+          if (err instanceof MaintenanceWithdrawnError) {
+            console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks, stopped: ${err.message})`);
+          } else {
+            console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
+          }
         } finally {
           this.overBudgetDrainInFlight.delete(agentName);
         }
