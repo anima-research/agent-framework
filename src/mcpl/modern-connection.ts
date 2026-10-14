@@ -184,8 +184,16 @@ class NotWrittenError extends Error {
   }
 }
 
-/** The logical request a send belongs to. The SDK hands each request to the
- *  transport inside the caller's async chain, so the scope reaches `send`. */
+/**
+ * The logical request a send belongs to. The SDK hands each request to the
+ * transport inside the caller's async chain, so the scope reaches `send`, and
+ * the resumes of the request's stream, which follow on from that chain
+ * (see observedFetch). Anything else started on that chain carries the scope
+ * too: a session's end queued from a call's fetch restarts the session
+ * inside that call's scope, the new session's standalone stream included. So
+ * the scope tells which call a request stream's resume belongs to, never
+ * whether a GET is the standalone stream's, which its signal tells.
+ */
 const wireScope = new AsyncLocalStorage<WireRecord>();
 
 /** What the server said while a connection was negotiated, read when its
