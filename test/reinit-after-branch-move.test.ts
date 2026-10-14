@@ -14,7 +14,16 @@ import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { AutobiographicalStrategy } from '@animalabs/context-manager';
-import type { ContextManager } from '@animalabs/context-manager';
+import type {
+  ContextEntry,
+  ContextLogView,
+  ContextManager,
+  ContextStrategy,
+  MessageStoreView,
+  ReadinessState,
+  StrategyContext,
+  TokenBudget,
+} from '@animalabs/context-manager';
 import { AgentFramework, OperatorActionError } from '../src/index.js';
 import type { TraceEvent } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
@@ -570,4 +579,111 @@ describe('conversation forks and an undo', () => {
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
+});
+
+/** A strategy whose next tick, once armed, closes its agent's provider gate and parks a maintenance call there. */
+class ArmedParkedCallStrategy implements ContextStrategy {
+  readonly name = 'armed-parked-call-test';
+  armed = false;
+  calls = 0;
+  outcomes: string[] = [];
+  framework?: AgentFramework;
+
+  checkReadiness(): ReadinessState {
+    return { ready: false, description: 'parked call queued' };
+  }
+
+  async tick(_ctx: StrategyContext): Promise<void> {
+    if (!this.armed) return;
+    this.armed = false;
+    const internals = this.framework as unknown as {
+      providerGate(name: string): { primaryPending: boolean };
+      withAuxiliaryAdmission<T>(name: string, run: () => Promise<T>): Promise<T>;
+    };
+    internals.providerGate('agent').primaryPending = true;
+    try {
+      await internals.withAuxiliaryAdmission('agent', async () => { this.calls++; });
+      this.outcomes.push('ran');
+    } catch (error) {
+      this.outcomes.push((error as Error).name);
+      throw error;
+    }
+  }
+
+  select(_store: MessageStoreView, _log: ContextLogView, _budget: TokenBudget): ContextEntry[] {
+    return [];
+  }
+}
+
+describe('an undo or redo while a maintenance call waits at the provider gate', () => {
+  for (const variant of ['undo', 'undo, then redo'] as const) {
+    it(`${variant}: each move withdraws the parked call, and its re-initialization releases the store`, { timeout: 20_000 }, async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'reinit-parked-'));
+      const strategy = new ArmedParkedCallStrategy();
+      const framework = await AgentFramework.create({
+        storePath: join(dir, 'store'),
+        membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy }],
+        modules: [],
+        syncIntervalMs: 0,
+        maintenanceIntervalMs: 10,
+      });
+      strategy.framework = framework;
+      const alerts: string[] = [];
+      (framework as unknown as { opsAlert: (kind: string, agentName: string, message: string) => void }).opsAlert =
+        (kind, agentName, message) => alerts.push(`${kind}:${agentName}:${message}`);
+      const internals = framework as unknown as {
+        providerGate(name: string): { primaryPending: boolean; auxiliaryWaiters: Array<() => void> };
+        surgeryHold: unknown;
+        syncMoveReinit: { done: Promise<void> } | null;
+        saveTurnCheckpoints(agentName: string, checkpoints: unknown[]): void;
+      };
+      const gate = () => internals.providerGate('agent');
+      const cm = framework.getAgent('agent')!.getContextManager();
+      cm.addMessage('user', [{ type: 'text', text: 'm1' }]);
+      const sequenceBefore = framework.getStore().currentSequence();
+      cm.addMessage('user', [{ type: 'text', text: 'a turn to undo' }]);
+      internals.saveTurnCheckpoints('agent', [{ agentName: 'agent', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
+      // Park a maintenance call at the gate, then make the move: its
+      // re-initialization waits for the running pass, which the withdrawal ends.
+      const parkThen = async (label: string, move: () => unknown): Promise<void> => {
+        gate().primaryPending = false;
+        strategy.armed = true;
+        await waitParked();
+        move();
+        const running = internals.syncMoveReinit;
+        assert.ok(running, `${label}: a re-initialization is running`);
+        const outcome = await Promise.race([
+          running.done.then(() => 'released'),
+          new Promise<string>((resolve) => setTimeout(() => resolve(`${label}: the re-initialization still waits`), 3_000)),
+        ]);
+        assert.equal(outcome, 'released');
+        assert.equal(internals.surgeryHold, null, `${label}: the store is released`);
+      };
+      const waitParked = async () => {
+        const start = Date.now();
+        while (gate().auxiliaryWaiters.length !== 1) {
+          if (Date.now() - start > 3_000) throw new Error('no maintenance call parked at the gate');
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+      };
+      const quiet = console.error;
+      console.error = () => {};
+      try {
+        await framework.quiesce();
+        framework.start();
+        await parkThen('undo', () => framework.undoLastTurn('agent'));
+        if (variant === 'undo, then redo') await parkThen('redo', () => framework.redo('agent'));
+        assert.deepEqual(strategy.outcomes, variant === 'undo' ? ['MaintenanceWithdrawnError'] : ['MaintenanceWithdrawnError', 'MaintenanceWithdrawnError']);
+        assert.equal(strategy.calls, 0, 'the withdrawn calls sent nothing');
+        assert.deepEqual(alerts.filter((alert) => alert.startsWith('context-maintenance-failed')), []);
+      } finally {
+        console.error = quiet;
+        gate().primaryPending = false;
+        for (const resolve of gate().auxiliaryWaiters.splice(0)) resolve();
+        await framework.stop();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 });
