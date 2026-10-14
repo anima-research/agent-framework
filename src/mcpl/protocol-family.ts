@@ -27,7 +27,8 @@
  * twice, and a server's era is a stable fact its configuration can state.
  * Those reasons are stdio's. MCPL has no HTTP binding, so a probe over http(s)
  * can't reach an MCPL server, and a remote server's revision changes when its
- * operator upgrades it: negotiating at every connect follows that.
+ * operator upgrades it: negotiating at every connect follows that, once the
+ * old session is over (see ModernMcpConnection's `sessionEnded`).
  */
 import type { McplServerConfig } from './types.js';
 
