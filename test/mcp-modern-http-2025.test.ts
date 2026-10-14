@@ -565,6 +565,35 @@ test('a first open that opens only after failed tries relists what changed meanw
   assert.ok((await connection.listTools()).some((tool) => tool.name === 'added_1'));
 });
 
+test('a first open whose failed tries go on through the SDK\'s credential retry relists once it opens', async () => {
+  // A 503, which the first open tries again, then a 401, which the SDK
+  // retries itself, as a new GET, after refreshing the credential.
+  const fixture = await start2025();
+  fixture.getAnswers.push(503, 401);
+  let tokenReads = 0;
+  let release!: () => void;
+  const refreshed = new Promise<void>((resolve) => { release = resolve; });
+  const connection = await connect(fixture, {
+    reconnectIntervalMs: 20,
+    reconnectMaxIntervalMs: 40,
+    accessProvider: async () => {
+      if (++tokenReads === 1) return 'initial-token';
+      await refreshed;
+      return 'refreshed-token';
+    },
+  });
+  let relists = 0;
+  connection.on('tools-list-changed', () => relists++);
+  await connection.listTools();
+  await until(() => tokenReads >= 2, 'the credential refresh, held after the 401');
+  release();
+  await until(() => fixture.seen.some((s) => s.method === 'GET' && s.status === 200), 'the stream open after a 503 and a 401');
+  await until(() => relists === 1, 'one relist once it opens');
+  await sleep(50);
+  assert.equal(relists, 1);
+  assert.deepEqual(fixture.seen.filter((s) => s.method === 'GET' && !s.resumed).map((s) => s.status), [503, 401, 200]);
+});
+
 test('a 2025 server that issues no session id keeps its stream as one that does: the first open is tried again, and a reopen relists', async (t) => {
   t.mock.method(Math, 'random', () => 0.5); // no jitter
   // The id is optional in 2025, and a stream doesn't need one. The SDK's
