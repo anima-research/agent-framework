@@ -866,6 +866,9 @@ describe('a compile refused for budget holds its turn (#304)', () => {
       assert.equal(held.length, 1, 'the restart\'s refused compile was held');
       assert.ok(inferringDuringResume.length >= 1);
       assert.ok(inferringDuringResume.every((names) => names.includes('prime')), 'the resumed turn is inferring at the gate, so its events buffer');
+      // And closed once the turn ends: the reopening leaves no turn open at
+      // the gate, where it would buffer every agent's events.
+      assert.ok(await pollUntil(() => !gate.inferenceDiagnostics().inferring.includes('prime'), 2_000), 'the gate closes when the turn ends');
     } finally {
       await framework.stop();
       Object.assign(proto, original);
