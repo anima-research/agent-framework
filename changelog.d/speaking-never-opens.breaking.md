@@ -16,12 +16,12 @@
     the agent arrive as push events, as any closed channel's do, instead of `channels/incoming`.
     Host code that acts on `channels/incoming`, such as connectome-host's outage reply and typing
     hints, doesn't see them. Where a turn with no trigger (a heartbeat) speaks still follows the
-    agent: a push from a channel it answered while the channel was closed moves the most recent
-    inbound channel, as an open channel's `channels/incoming` does. That holds across a restart,
-    until the next decision about the channel (an open, a close, a decline or a tune-out). For a
-    DM, every message of which reaches the agent, that is as before. An answered guild channel's
-    messages that don't address the agent no longer arrive, so only those that do move it. A
-    push from a closed channel the agent never answered moves nothing, as before.
+    agent: a message pushed from a channel it answered while the channel was closed moves the
+    most recent inbound channel, as an open channel's `channels/incoming` does. That holds across
+    a restart, until the next decision about the channel (an open, a close, a decline or a
+    tune-out). For a DM, every message of which reaches the agent, that is as before. An answered
+    guild channel's messages that don't address the agent no longer arrive, so only those that do
+    move it. A push from a closed channel the agent never answered moves nothing, as before.
   - **What else changes:** the subscription-policy notice's last sentence and `channel_close`'s
     description now say that a channel the agent closes stays closed until it opens it with
     `channel_open`, and that neither speaking there nor policy reopens it. The closed-channel
