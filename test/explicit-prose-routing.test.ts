@@ -26,7 +26,6 @@ import type {
 } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
-import { ProseStreamRouter } from '../src/mcpl/prose-stream-router.js';
 import { MembraneError } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedRequest } from '@animalabs/membrane';
 
@@ -355,13 +354,13 @@ describe('explicit prose routing', () => {
 
 
   type RoutingState = {
-    pin?: string; destination: string | null; hybridHold: boolean;
+    pin?: string; hybridHold: boolean;
     continuation: boolean; deliveries: string[]; suppressed: number;
     triggerChannel?: string; locus?: string; engaged: Set<string>; arrivals: Array<{ messageId: string; channelId: string }>;
   };
   /** A turn's routing state, as the framework makes a fresh one. */
   const routingState = (fields: Partial<RoutingState> = {}): RoutingState => ({
-    destination: null, hybridHold: false, continuation: false, deliveries: [], suppressed: 0,
+    hybridHold: false, continuation: false, deliveries: [], suppressed: 0,
     engaged: new Set(), arrivals: [], ...fields,
   });
 
@@ -1201,7 +1200,7 @@ describe('explicit prose routing', () => {
     await framework.stop();
   });
 
-  it('the stream reads leading whitespace and a token\'s end as delivery does', async () => {
+  it("delivery reads leading whitespace and a token's end before a `>>` prefix", async () => {
     const framework = await createFramework();
     const routed = stubRegistry(framework);
     const gateway = framework as unknown as { deliverProse(agent: unknown, text: string): Promise<void> };
@@ -1211,61 +1210,23 @@ describe('explicit prose routing', () => {
       for (const text of cases) {
         routed.length = 0;
         await gateway.deliverProse(agent, text);
-        const router = new ProseStreamRouter({
-          mode: 'explicit', initialTarget: null, resolve: (spec) => (spec === '#alpha' ? 'chan-alpha' : null),
-        });
-        const streamed = [...router.feed(text), ...router.finish()];
-        assert.deepEqual(routed.map((r) => r.locus), ['chan-alpha'], `delivery sends ${JSON.stringify(text)} to #alpha`);
-        assert.ok(streamed.length > 0 && streamed.every((d) => d.channelId === 'chan-alpha'),
-          `the stream sends ${JSON.stringify(text)} there too`);
+        assert.deepEqual(routed.map((r) => ({ text: r.text.trim(), locus: r.locus })), [{ text: 'hello', locus: 'chan-alpha' }],
+          `delivery sends the body of ${JSON.stringify(text)} to #alpha`);
       }
     } finally {
       await framework.stop();
     }
   });
 
-  it("a round's destination, decided at its boundary, is the sticky destination its delivery leaves", async () => {
-    const framework = await createFramework();
-    stubRegistry(framework);
-    const internals = framework as unknown as {
-      deliverProse(agent: unknown, text: string): Promise<void>;
-      admitProse(text: string): unknown[];
-      roundDestination(current: string | null, envelopes: unknown[]): string | null;
-      turnRouting: Map<string, RoutingState>;
-    };
-    const agent = framework.getAgent('assistant')!;
-    const rounds: string[][] = [
-      ['>>#alpha first\n>>#alpha'],
-      ['  >>#alpha indented'],
-      ['>>#nowhere bounced'],
-      ['>>skip_reply kept\nand unprefixed'],
-      ['unprefixed', '>>#alpha second segment'],
-    ];
-    try {
-      for (const segments of rounds) {
-        for (const start of [null, 'chan-alpha']) {
-          internals.turnRouting.set('assistant', routingState({ pin: start ?? undefined }));
-          for (const segment of segments) await internals.deliverProse(agent, segment);
-          const admitted = segments.flatMap((segment) => internals.admitProse(segment));
-          assert.equal(internals.roundDestination(start, admitted), internals.turnRouting.get('assistant')?.pin ?? null,
-            `${JSON.stringify(segments)} from ${start}`);
-        }
-      }
-    } finally {
-      await framework.stop();
-    }
-  });
-
-  it('hybrid: a `>>>` envelope with no target streams nothing, as delivery bounces it', async () => {
+  it('hybrid: a `>>>` envelope with no target publishes nothing, so nothing streams, and holds the turn that queued it', async () => {
     const framework = await createFramework('hybrid');
     const routed = stubRegistry(framework);
     const gateway = framework as unknown as {
-      deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean, routing: RoutingState): Promise<void>;
+      deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean, routing: RoutingState,
+        onPublished?: (channelId: string, text: string) => void): Promise<void>;
       turnRouting: Map<string, RoutingState>;
     };
     const agent = framework.getAgent('assistant')!;
-    // The registry's resolver trims its argument, as the router's must here.
-    const resolve = (spec: string) => (spec.trim() === '#alpha' ? 'chan-alpha' : null);
     const cases = ['>>>\r\nsecret', '>>>\nsecret', '>>>\u00a0#alpha secret', '>>> \u00a0#alpha secret'];
     try {
       for (const text of cases) {
@@ -1273,50 +1234,45 @@ describe('explicit prose routing', () => {
         const queued: RoutingState = routingState();
         const live: RoutingState = routingState();
         gateway.turnRouting.set('assistant', live);
-        await gateway.deliverHybridProse(agent, text, 'chan-locus', true, queued);
+        const streamed: string[] = [];
+        await gateway.deliverHybridProse(agent, text, 'chan-locus', true, queued, (_channel, body) => streamed.push(body));
         assert.equal(queued.hybridHold, true, 'the supplied turn receives the hold');
         assert.equal(live.hybridHold, false, 'the live turn stays unheld');
-        const router = new ProseStreamRouter({ mode: 'hybrid', initialTarget: 'chan-locus', resolve });
-        const streamed = [...router.feed(text), ...router.finish()];
         assert.equal(routed.length, 0, `delivery bounces ${JSON.stringify(text)}`);
-        assert.deepEqual(streamed, [], `and the stream sends none of ${JSON.stringify(text)}`);
+        assert.deepEqual(streamed, [], `and the stream hears none of ${JSON.stringify(text)}`);
       }
     } finally {
       await framework.stop();
     }
   });
 
-  it('hybrid: a segment that is only `>>>`, or `>>>` and a gap, holds back the next segment, as delivery does', async () => {
+  it('hybrid: a segment that is only `>>>`, or `>>>` and a gap, holds back the next segment, from delivery and the stream alike', async () => {
     const framework = await createFramework('hybrid');
     const routed = stubRegistry(framework);
     const gateway = framework as unknown as {
-      deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean, routing: RoutingState): Promise<void>;
+      deliverHybridProse(agent: unknown, text: string, locus: string, allowLocus: boolean, routing: RoutingState,
+        onPublished?: (channelId: string, text: string) => void): Promise<void>;
       turnRouting: Map<string, RoutingState>;
     };
     const agent = framework.getAgent('assistant')!;
-    const resolve = (spec: string) => (spec.trim() === '#alpha' ? 'chan-alpha' : null);
     try {
       for (const prefix of ['>>>', '>>> ', '>>>\t']) {
         routed.length = 0;
         const queued: RoutingState = routingState();
         const live: RoutingState = routingState();
         gateway.turnRouting.set('assistant', live);
-        await gateway.deliverHybridProse(agent, '>>>#alpha first', 'chan-locus', true, queued);
-        await gateway.deliverHybridProse(agent, prefix, 'chan-locus', true, queued);
-        await gateway.deliverHybridProse(agent, 'secret', 'chan-locus', true, queued);
+        const streamed: Array<{ channelId: string; text: string }> = [];
+        const onPublished = (channelId: string, text: string) => { streamed.push({ channelId, text }); };
+        await gateway.deliverHybridProse(agent, '>>>#alpha first', 'chan-locus', true, queued, onPublished);
+        await gateway.deliverHybridProse(agent, prefix, 'chan-locus', true, queued, onPublished);
+        await gateway.deliverHybridProse(agent, 'secret', 'chan-locus', true, queued, onPublished);
         assert.deepEqual(queued.deliveries, ['chan-alpha'], 'the supplied turn records its delivery');
         assert.equal(queued.suppressed, 1, 'the supplied turn records its suppression');
         assert.deepEqual(live.deliveries, [], 'the live turn receives no delivery');
         assert.equal(live.suppressed, 0, 'the live turn receives no suppression');
-        const router = new ProseStreamRouter({ mode: 'hybrid', initialTarget: 'chan-locus', resolve });
-        const streamed = [
-          ...router.feed('>>>#alpha first'), ...router.endSegment(),
-          ...router.feed(prefix), ...router.endSegment(),
-          ...router.feed('secret'), ...router.finish(),
-        ];
         assert.deepEqual(routed.map((r) => r.text), ['first'], `delivery sends only first, after ${JSON.stringify(prefix)}`);
-        assert.equal(streamed.filter((d) => d.delta.includes('secret')).length, 0,
-          `and the stream holds secret back after ${JSON.stringify(prefix)}`);
+        assert.deepEqual(streamed, [{ channelId: 'chan-alpha', text: 'first' }],
+          `and the stream hears first, where it was published, and holds secret back after ${JSON.stringify(prefix)}`);
       }
     } finally {
       await framework.stop();
@@ -1624,8 +1580,8 @@ describe('explicit prose routing', () => {
   // ---- A start that continues a logical turn keeps the turn's routing ----
   // A framework retry after a stream error, the compile a provider-capacity
   // hold defers a turn to, and the re-inference that consumes unstreamed tool
-  // results each continue the turn: the sticky destination, explicit mode's
-  // turn destination and hybrid's hold carry into the new stream.
+  // results each continue the turn: the sticky destination and hybrid's hold
+  // carry into the new stream, which streams what its deliveries publish.
 
   /** An organization acceleration 429, which holds the turn for a later compile. */
   const accelerationLimit = (request: NormalizedRequest): MembraneError => new MembraneError({
@@ -1706,7 +1662,7 @@ describe('explicit prose routing', () => {
     for (const [label, mode, first, expected] of [
       ['hybrid >>>skip_reply keeps later unprefixed prose private', 'hybrid', '>>>skip_reply an aside', []],
       ['hybrid >>>#alpha is sticky', 'hybrid', '>>>#alpha first', [{ text: 'first', locus: 'chan-alpha' }, { text: 'carrying on', locus: 'chan-alpha' }]],
-      ['explicit >>#alpha is sticky, and the stream starts at the turn\'s destination', 'explicit', '>>#alpha first', [{ text: 'first', locus: 'chan-alpha' }, { text: 'carrying on', locus: 'chan-alpha' }]],
+      ['explicit >>#alpha is sticky, and the later stream streams where delivery publishes', 'explicit', '>>#alpha first', [{ text: 'first', locus: 'chan-alpha' }, { text: 'carrying on', locus: 'chan-alpha' }]],
     ] as const) {
       it(`across ${start}, ${label}`, async () => {
         const { framework, routed, bounces, laterChunks } = await continueTurn(how, mode, first);
@@ -1714,11 +1670,11 @@ describe('explicit prose routing', () => {
           // Publication as the registry stub saw it; bounce notices by their kind.
           assert.deepEqual(routed.map((r) => ({ text: r.text.trim(), locus: r.locus })), expected);
           assert.equal(bounces, 0, 'nothing bounced');
-          if (mode === 'explicit') {
-            // The later stream streams its unprefixed text where delivery sends it.
-            assert.deepEqual(laterChunks.map((c) => c.channelId), laterChunks.map(() => 'chan-alpha'));
-            assert.equal(laterChunks.map((c) => c.delta).join(''), 'carrying on');
-          }
+          // In every mode, the later stream streams what it published, where
+          // it published it: nothing under a hold, and its unprefixed text at
+          // the sticky destination.
+          assert.deepEqual(laterChunks.map((c) => ({ text: c.delta, locus: c.channelId })),
+            expected.filter((post) => post.text === 'carrying on'));
         } finally {
           await framework.stop();
         }
@@ -1729,7 +1685,7 @@ describe('explicit prose routing', () => {
   for (const [label, mode, left, expected] of [
     ['hybrid: the hold keeps later unprefixed prose private', 'hybrid', { hybridHold: true, locus: 'world:commons' }, []],
     ['hybrid: the sticky destination', 'hybrid', { pin: 'chan-alpha', locus: 'world:commons' }, [{ text: 'carrying on', locus: 'chan-alpha' }]],
-    ['explicit: the sticky destination, and the stream starts at the turn\'s destination', 'explicit', { pin: 'chan-alpha', destination: 'chan-alpha' }, [{ text: 'carrying on', locus: 'chan-alpha' }]],
+    ['explicit: the sticky destination, and the stream streams where delivery publishes', 'explicit', { pin: 'chan-alpha' }, [{ text: 'carrying on', locus: 'chan-alpha' }]],
   ] as const) {
     it(`a re-inference on unstreamed tool results keeps the turn's routing: ${label}`, async () => {
       membrane.pushResponse(createMockResponse([{ type: 'text', text: 'carrying on' }] as ContentBlock[]));
@@ -1752,10 +1708,9 @@ describe('explicit prose routing', () => {
         await within(framework.runUntilIdle(), 'the re-inference', 10000);
         assert.deepEqual(routed.map((r) => ({ text: r.text.trim(), locus: r.locus })), expected);
         assert.equal(context(framework).bounces, 0, 'nothing bounced');
-        if (mode === 'explicit') {
-          assert.deepEqual(chunks.map((c) => c.channelId), chunks.map(() => 'chan-alpha'));
-          assert.equal(chunks.map((c) => c.delta).join(''), 'carrying on');
-        }
+        // In every mode, the re-inference streams what it published, where it
+        // published it.
+        assert.deepEqual(chunks.map((c) => ({ text: c.delta, locus: c.channelId })), expected);
       } finally {
         await framework.stop();
       }
@@ -1779,7 +1734,7 @@ describe('explicit prose routing', () => {
       const cm = framework.getAgent('assistant')!.getContextManager();
       const getMessage = cm.getMessage.bind(cm);
       try {
-        const earlier = routingState({ pin: 'chan-alpha', destination: 'chan-alpha' });
+        const earlier = routingState({ pin: 'chan-alpha' });
         internals.turnRouting.set('assistant', earlier);
         internals.openLogical.set('assistant', earlier);
         // Someone addresses the agent from another channel while the turn waits.
@@ -1839,12 +1794,10 @@ describe('explicit prose routing', () => {
         return outcome;
       };
       let starts = 0;
-      let retryChunks = 0;
       framework.onTrace((event) => {
         if (event.type !== 'inference:started') return;
         starts++;
         if (starts === 2) {
-          retryChunks = chunks.length;
           membrane.pushResponse(createMockResponse([{ type: 'text', text: 'carrying on' }]));
         }
         if (starts >= 3) membrane.pushResponse(createMockResponse([{ type: 'text', text: `${p}skip_reply` }]));
@@ -1881,7 +1834,6 @@ describe('explicit prose routing', () => {
         const routing = internals.turnRouting.get('assistant')!;
         if (mode === 'explicit') {
           assert.equal(routing.pin, 'discord:g:cafe', "round two's delivery hasn't run yet");
-          assert.equal(routing.destination, 'chan-alpha', 'though round two set the destination as it ended');
         } else {
           assert.equal(routing.hybridHold, false, "round two's delivery hasn't run yet");
         }
@@ -1894,11 +1846,16 @@ describe('explicit prose routing', () => {
             { text: 'first', locus: 'chan-alpha' },
             { text: 'carrying on', locus: 'chan-alpha' },
           ], "the replaced stream's posts go first, and the retry's text follows the destination they set");
-          assert.deepEqual(chunks.slice(retryChunks).map((c) => c.channelId), chunks.slice(retryChunks).map(() => 'chan-alpha'),
-            "the retry's stream starts at the destination round two set");
+          assert.deepEqual(chunks.map((c) => ({ text: c.delta.trim(), locus: c.channelId })), [
+            { text: 'zero', locus: 'discord:g:cafe' },
+            { text: 'first', locus: 'chan-alpha' },
+            { text: 'carrying on', locus: 'chan-alpha' },
+          ], "every chunk follows its publish: the replaced stream's late posts, then the retry's text at the destination they set");
         } else {
           assert.deepEqual(posts, [{ text: 'zero', locus: 'discord:g:cafe' }],
             "the retry's unprefixed text stays private under the hold the late delivery set");
+          assert.deepEqual(chunks.map((c) => ({ text: c.delta.trim(), locus: c.channelId })), [{ text: 'zero', locus: 'discord:g:cafe' }],
+            "only the late post streams: the retry's held text doesn't");
           const receipt = context(framework).texts.filter((t) => t.startsWith('[delivered]'));
           assert.equal(receipt.length, 1, `one receipt for the logical turn: ${receipt.join(' | ')}`);
           assert.match(receipt[0]!, /discord:g:cafe/, "it reports the replaced stream's late post");

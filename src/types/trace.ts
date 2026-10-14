@@ -156,6 +156,48 @@ export type TraceEvent =
       type: 'inference:turn_ended';
       agentName: string;
     })
+  | (TraceEventBase & {
+      /**
+       * Prose that delivery published, sent once the publish is confirmed:
+       * the outgoing stream's chunk (MCPL Spec 14.3
+       * `channels/outgoing/chunk`), emitted whether or not the channel's
+       * server takes the stream. It carries only what was published, so a
+       * consumer that speaks or shows it, such as a voice relay, never gets
+       * text that delivery withholds (a `skip_reply`, a silencing send, a
+       * private `think`, a hold, a bounce) or a publish that failed or
+       * wasn't confirmed. `inference:tokens` stays the model's text as it is
+       * written (held, as before, while a tool-result guard's batch is
+       * pending). A later publish to the same channel by the same stream
+       * opens with a paragraph break (`\n\n`), so a channel's chunks joined
+       * in `index` order are its text, its messages kept apart.
+       * `mcpl:speech-routed` also reports each speech publish, the `sleep`
+       * tool's announcement among them, with no stream id, index or end, so
+       * a relay that voices speech takes one of the two.
+       */
+      type: 'inference:speech';
+      agentName: string;
+      /** Where the prose is published. */
+      channelId: string;
+      /** The stream's id, shared with its `channels/outgoing/*` notifications. */
+      inferenceId: string;
+      /** Increases by one per chunk of the stream, across its channels. */
+      index: number;
+      text: string;
+    })
+  | (TraceEventBase & {
+      /**
+       * A stream's end for one channel it published to (MCPL Spec 14.3
+       * `channels/outgoing/complete`), sent on every exit path once the
+       * stream has ended and its deliveries have run, or, when the host
+       * stops, at once: `text` is everything its `inference:speech` chunks
+       * carried there, and none follows it.
+       */
+      type: 'inference:speech_complete';
+      agentName: string;
+      channelId: string;
+      inferenceId: string;
+      text: string;
+    })
 
   // Tool lifecycle
   | (TraceEventBase & {

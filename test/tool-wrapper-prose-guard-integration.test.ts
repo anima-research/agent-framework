@@ -121,7 +121,9 @@ async function run(enabled?: boolean, allowedTools?: string[]) {
   const outgoing: string[] = [];
   (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
     resolveLocus: () => 'world:test',
-    routeSpeech: async (_agent: string, speech: string) => { routed.push(speech); return { delivered: true, channelId: 'world:test' }; },
+    routeSpeech: async (_agent: string, speech: string, channelId: string) => {
+      routed.push(speech); return { delivered: true, channelId: 'world:test' };
+    },
     sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
     getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
   }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
@@ -172,7 +174,9 @@ describe('tool wrapper prose guard integration', () => {
       agents: [{ name: 'assistant', model: 'test', systemPrompt: 'sys', toolWrapperProseGuard: true }], modules: [module],
     });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
-      resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
+      resolveLocus: () => 'world:test', routeSpeech: async (_a: string, text: string, channelId: string) => {
+        routed.push(text); return { delivered: true, channelId: 'world:test' };
+      },
       sendOutgoingChunk: (_c: string, _a: string, _id: string, _i: number, delta: string) => { outgoing.push(delta); },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
@@ -219,7 +223,7 @@ describe('tool wrapper prose guard integration', () => {
     assert.ok(!all.some((m) => m.metadata?.kind === 'tool-wrapper-prose-contained'));
   });
 
-  it('buffers then delivers ordinary prose when enabled', async () => {
+  it("a guarded turn's ordinary prose streams what delivery publishes", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-ordinary-')); dirs.push(dir);
     const membrane = new MockMembrane();
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Ordinary answer.' }] as ContentBlock[]));
@@ -230,7 +234,9 @@ describe('tool wrapper prose guard integration', () => {
     });
     (framework as unknown as { channelRegistry: unknown }).channelRegistry = new Proxy({
       resolveLocus: () => 'world:test',
-      routeSpeech: async (_agent: string, text: string) => { routed.push(text); return { delivered: true, channelId: 'world:test' }; },
+      routeSpeech: async (_agent: string, text: string, channelId: string) => {
+        routed.push(text); return { delivered: true, channelId: 'world:test' };
+      },
       sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => { outgoing.push(delta); },
       getDefaultPublishChannel: () => null, isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
     }, { get: (target, prop: string) => (prop in target ? (target as Record<string, unknown>)[prop] : () => undefined) });
@@ -240,7 +246,8 @@ describe('tool wrapper prose guard integration', () => {
     const all = framework.getAgent('assistant')!.getContextManager().getAllMessages() as Array<{ content: ContentBlock[]; metadata?: Record<string, unknown> }>;
     await framework.stop();
     assert.deepEqual(routed, ['Ordinary answer.']);
-    assert.deepEqual(outgoing, [], 'guarded turns buffer ordinary prose until completion');
+    assert.deepEqual(outgoing, ['Ordinary answer.'],
+      'the guard classifies before delivery, and the stream carries what delivery publishes');
     assert.ok(all.some((m) => m.content.some((b) => b.type === 'text' && b.text === 'Ordinary answer.')));
     assert.ok(!all.some((m) => m.metadata?.kind === 'tool-wrapper-prose-contained'));
   });
@@ -413,7 +420,9 @@ describe('tool wrapper prose guard integration', () => {
       resolveLocus: () => 'world:test',
       startTyping: (channel: string) => typing.push(`start:${channel}`),
       stopTyping: (channel?: string) => typing.push(`stop:${channel ?? '(all)'}`),
-      routeSpeech: async () => ({ delivered: true, channelId: 'world:test' }),
+      routeSpeech: async (_agent: string, text: string, channelId: string) => {
+        return { delivered: true, channelId: 'world:test' };
+      },
       sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => outgoing.push(['chunk', delta]),
       sendOutgoingComplete: (_channel: string, _agent: string, _id: string, text: string) => outgoing.push(['complete', text]),
       getDefaultPublishChannel: () => 'world:test', isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
@@ -423,11 +432,18 @@ describe('tool wrapper prose guard integration', () => {
     created.contextManager.addMessage('user', [{ type: 'text', text: 'go' }]);
     const run = framework.runEphemeralToCompletion(created.agent, created.contextManager);
     framework.start();
-    assert.deepEqual(await run, { speech: 'Ordinary ephemeral answer.', toolCallsCount: 0 });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.ok(typing.includes('stop:(all)'), 'terminal physical frame stops typing after ephemeral caller disposal');
-    assert.ok(outgoing.some(([kind, text]) => kind === 'complete' && text === 'Ordinary ephemeral answer.'), 'terminal physical frame finalizes outgoing stream');
-    await framework.stop();
+    try {
+      assert.deepEqual(await run, { speech: 'Ordinary ephemeral answer.', toolCallsCount: 0 });
+      // The terminal frame's teardown stops typing and sends the complete.
+      const until = Date.now() + 5000;
+      while (Date.now() < until && !(typing.includes('stop:(all)') && outgoing.some(([kind]) => kind === 'complete'))) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.ok(typing.includes('stop:(all)'), 'terminal physical frame stops typing after ephemeral caller disposal');
+      assert.ok(outgoing.some(([kind, text]) => kind === 'complete' && text === 'Ordinary ephemeral answer.'), 'terminal physical frame finalizes outgoing stream');
+    } finally {
+      await framework.stop();
+    }
   });
 
   it('releases a conversation name reservation after transient creation failure', async () => {
@@ -452,7 +468,7 @@ describe('tool wrapper prose guard integration', () => {
   });
 
 
-  it('idle-disposed ephemeral stops typing and finalizes every started outgoing stream', async () => {
+  it("idle-disposed ephemeral stops typing, and text it never delivered doesn't stream", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-wrapper-guard-idle-terminal-')); dirs.push(dir);
     const framework = await AgentFramework.create({ storePath: join(dir, 'store'), membrane: new LateCompletionAfterIdleMembrane().asMembrane(), agents: [], modules: [] });
     const events: string[] = [];
@@ -460,7 +476,9 @@ describe('tool wrapper prose guard integration', () => {
       resolveLocus: () => 'world:test',
       startTyping: (channel: string) => events.push(`start:${channel}`),
       stopTyping: (channel?: string) => events.push(`stop:${channel ?? '(all)'}`),
-      routeSpeech: async () => ({ delivered: true, channelId: 'world:test' }),
+      routeSpeech: async (_agent: string, text: string, channelId: string) => {
+        return { delivered: true, channelId: 'world:test' };
+      },
       sendOutgoingChunk: (_channel: string, _agent: string, _id: string, _index: number, delta: string) => events.push(`chunk:${delta}`),
       sendOutgoingComplete: (_channel: string, _agent: string, _id: string, text: string) => events.push(`complete:${text}`),
       getDefaultPublishChannel: () => 'world:test', isChannelOpen: () => true, getDescriptor: () => undefined, getChannelTools: () => [],
@@ -470,12 +488,18 @@ describe('tool wrapper prose guard integration', () => {
     created.contextManager.addMessage('user', [{ type: 'text', text: 'go' }]);
     const run = framework.runEphemeralToCompletion(created.agent, created.contextManager, { startupTimeoutMs: 500, idleTimeoutMs: 20, idlePollMs: 5 });
     framework.start();
-    await assert.rejects(run, /stalled/);
-    await new Promise((resolve) => setTimeout(resolve, 180));
-    assert.ok(events.includes('stop:(all)'), 'disposer-owned frame stops typing');
-    assert.ok(events.some((event) => event.startsWith('chunk:')), 'probe actually opened an outgoing stream');
-    assert.ok(events.some((event) => event.startsWith('complete:')), 'every started outgoing stream receives a terminal complete');
-    await framework.stop();
+    try {
+      await assert.rejects(run, /stalled/);
+      // The disposed frame's typing stops in its teardown, which runs once
+      // its late answer has come in.
+      const until = Date.now() + 5000;
+      while (Date.now() < until && !events.includes('stop:(all)')) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.ok(events.includes('stop:(all)'), 'disposer-owned frame stops typing');
+      assert.deepEqual(events.filter((event) => event.startsWith('chunk:') || event.startsWith('complete:')), [],
+        "the partial text and the disposed frame's late answer were never delivered, so neither streams");
+    } finally {
+      await framework.stop();
+    }
   });
 
 });

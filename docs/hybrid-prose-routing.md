@@ -30,8 +30,8 @@ names a destination that resolves; if that envelope's body then isn't
 delivered, the hold returns. The sticky destination and this hold last for
 the whole logical turn, across its later streams, such as a framework
 retry's, a budget restart's or the compile a provider-capacity hold defers
-the turn to. They govern publication: a stream's live outgoing deltas still
-start at the turn's locus.
+the turn to. They govern publication, and with it the outgoing stream, which
+carries only what delivery publishes, where delivery publishes it.
 
 This is publication routing only. It creates no privacy meaning for `<think>`
 or other prose tags, and grants no channel authority beyond the existing

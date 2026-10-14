@@ -11,9 +11,6 @@
   - the turn's locus was resolved again: a retry lost a mid-turn addressed
     re-pin, a re-inference took the locus of whichever wake started it, and
     a held turn's later compile let a newer ambient message move it.
-
-  A hybrid stream's live outgoing deltas still start at the turn's locus,
-  as before.
 - A message that no tool boundary weighed now moves the turn's locus at the
   turn's next start, by the rule a mid-turn message follows: a
   conversational message that addressed the agent, or that follows up in a

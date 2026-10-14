@@ -4,7 +4,7 @@
 
 The guard matches only when the entire visible prose is one wrapper naming a tool registered on that exact inference. Signed thinking may precede the visible wrapper. It does not parse or execute the wrapper body.
 
-Guarded turns buffer prose until completion so outgoing preview/voice surfaces cannot expose a wrapper before classification. Ordinary non-wrapper prose is then delivered normally at turn completion.
+The outgoing preview/voice stream carries only prose that delivery has published, so a wrapper the guard contains never reaches it. Prose the guard doesn't match, wrapper-shaped text in a turn that has made a real tool call among it, is ordinary prose: delivery posts it, and it streams once its publish is confirmed.
 
 On a match, Agent Framework:
 

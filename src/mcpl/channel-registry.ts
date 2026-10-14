@@ -2994,12 +2994,13 @@ export class ChannelRegistry {
    *  process-global default). Public so a multi-segment caller can snapshot it
    *  ONCE and pin every segment to it via routeSpeech's `overrideChannelId`. */
   /**
-   * MCPL Spec 14.3 outgoing streaming: forward a moderated text delta to the
-   * server owning the channel, AS THE MODEL GENERATES. Emitted only when that
-   * server declared `channels.streaming` in its initialize capabilities —
-   * servers that never opted in (the whole existing fleet) receive nothing.
-   * Fire-and-forget and never throws: streaming is an observer surface; the
-   * authoritative delivery is the eventual channels/publish.
+   * MCPL Spec 14.3 outgoing streaming: forward a text delta to the server
+   * owning the channel. The framework sends each piece of prose once its
+   * publish is confirmed, so a stream carries only what was published.
+   * Emitted only when that server's grant has `channels.streaming` —
+   * servers that never opted in receive nothing. Fire-and-forget and never
+   * throws: streaming is an observer surface; the authoritative delivery is
+   * channels/publish.
    */
   sendOutgoingChunk(
     channelId: string,
