@@ -879,6 +879,35 @@ test('on a 2025 revision a call whose stream ends with neither its answer nor an
   assert.ok(connection.isConnected, 'the session stays');
 });
 
+test('on 2026-07-28 a round whose stream ends just as its answer asks for another leaves the call alone', async () => {
+  // The transport calls a request's stream-end callback after its answer
+  // too. Here round 1's stream ends in the same turn as its answer, an
+  // input_required, before the SDK sends round 2: failing the call then
+  // would stop round 2 before it went out. Each round is held at the
+  // transport (an own `send` keeps its options and sends nothing) and
+  // answered through the transport's onmessage.
+  const fixture = await start2025();
+  await fixture.upgrade('reject'); // a 2026-07-28 server from the start
+  const connection = await connect(fixture);
+  assert.equal(connection.protocolVersion, '2026-07-28');
+  const transport = (connection as unknown as { session: { http: { transport: { send: (message: Message, options?: { onRequestStreamEnd?: () => void }) => Promise<void>; onmessage?: (message: unknown) => void } } } }).session.http.transport;
+  const held: Array<{ id: unknown; end?: () => void }> = [];
+  const send = transport.send.bind(transport);
+  transport.send = async (message, options) => {
+    if (message.method !== 'tools/call') return send(message, options);
+    held.push({ id: message.id, end: options?.onRequestStreamEnd });
+  };
+  const calling = connection.callTool('cont', {});
+  await until(() => held.length === 1, 'round 1 handed to the transport');
+  assert.equal(typeof held[0]!.end, 'function', 'the call\'s request carries a stream-end callback');
+  transport.onmessage!({ jsonrpc: '2.0', id: held[0]!.id, result: { resultType: 'input_required', requestState: 'state-1' } });
+  held[0]!.end!();
+  await until(() => held.length === 2, 'round 2 handed to the transport');
+  transport.onmessage!({ jsonrpc: '2.0', id: held[1]!.id, result: { resultType: 'complete', content: [{ type: 'text', text: 'done' }] } });
+  const result = await calling;
+  assert.deepEqual(result.content, [{ type: 'text', text: 'done' }]);
+});
+
 test('a session the server ended under a call: the call is refused with 404, and a new session starts at once', async () => {
   const fixture = await start2025({ versions: ['2025-11-25'] });
   // No `reconnect`: a session that served gets a new one anyway.
