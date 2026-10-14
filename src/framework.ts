@@ -63,7 +63,7 @@ import type {
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
-import { Agent } from './agent.js';
+import { Agent, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS } from './agent.js';
 import { ModuleRegistry, checkedToolResult, isStateExistsError, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { logValue } from './mcpl/log-value.js';
@@ -683,6 +683,13 @@ function combineDrainOutcomes(outcomes: DiscordAwarenessDrainOutcome[]): Discord
     delivered: outcomes.reduce((count, outcome) => count + (outcome.status === 'delivered' ? outcome.delivered : 0), 0),
     failed: outcomes.reduce((count, outcome) => count + (outcome.status === 'delivered' ? outcome.failed : 0), 0),
   };
+}
+
+/** FrameworkConfig.inferenceProgressTimeoutMs, or its default for a value
+ *  that would turn the deadline off (NaN, zero or negative): membrane reads
+ *  those as no deadline, and a resident would hang again. */
+function normalizeInferenceProgressTimeout(value: number | undefined): number {
+  return value !== undefined && value > 0 ? value : DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS;
 }
 
 function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
@@ -1649,6 +1656,8 @@ export class AgentFramework {
   private providerAccelerationDefaultCooldownMs = PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS;
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
   private providerHoldHook: ProviderHoldHook | undefined;
+  /** Each provider call's progress deadline (FrameworkConfig.inferenceProgressTimeoutMs). */
+  private inferenceProgressTimeoutMs = DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS;
   /** Provider waits (stated retry-after) per (agent, model), kept across restarts. */
   private providerWaits: ProviderWaits | undefined;
   /** Wakers for error-policy retry waits in progress: stop() ends them. */
@@ -2219,6 +2228,7 @@ export class AgentFramework {
       new OperatorLog(operatorLogPath),
     );
     framework.providerHoldHook = config.providerHold;
+    framework.inferenceProgressTimeoutMs = normalizeInferenceProgressTimeout(config.inferenceProgressTimeoutMs);
 
     // If an offline recovery process crashed after switching Chronicle but
     // before committing its prepared marker batch, the active branch is the
@@ -11659,6 +11669,7 @@ export class AgentFramework {
         drainKvSubmissionIds,
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
+        progressTimeoutMs: this.inferenceProgressTimeoutMs,
       });
       // The compile can wait for annotations (each batch has one spill
       // deadline), so check ownership, admission, and the lifecycle again.
@@ -12028,7 +12039,7 @@ export class AgentFramework {
     };
 
     try {
-      for await (const event of stream) {
+      for await (const arrived of stream) {
         // Ignore every late event from an Agent generation that no longer owns
         // this name (ephemeral watchdog/disposal, conversation replacement).
         if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId) {
@@ -12038,6 +12049,26 @@ export class AgentFramework {
           break;
         }
         this.touchEphemeralRun(agent.name, true);
+        // A provider call that went inferenceProgressTimeoutMs without a
+        // parsed event (membrane's progressTimeoutMs) ends the stream as
+        // `aborted` with reason 'timeout'. Unless the framework cancelled this
+        // stream itself, that is a failed request, so it takes the `error`
+        // path: the error policy retries it, and a fresh stream gets a fresh
+        // deadline. A stall that persists exhausts the turn with its reason.
+        // Membrane types the expiry as non-retryable because that deadline
+        // belongs to the one call; a new stream is a new call with its own.
+        const event = arrived.type === 'aborted' && arrived.reason === 'timeout'
+          && !this.frameworkCancelledStreams.has(`${agent.name}:${myStreamId}`)
+          ? {
+              type: 'error' as const,
+              error: new MembraneError({
+                type: 'timeout',
+                retryable: true,
+                message: `No stream progress within ${this.inferenceProgressTimeoutMs}ms (inferenceProgressTimeoutMs)`,
+                rawError: undefined,
+              }),
+            }
+          : arrived;
         switch (event.type) {
           case 'tokens': {
             const trace: Parameters<AgentFramework['emitTrace']>[0] = {
@@ -13082,6 +13113,9 @@ export class AgentFramework {
                 return;
               }
             }
+            // A progress deadline's 'timeout' took the `error` path at the
+            // loop's head; any other abort the framework didn't make itself
+            // settles here.
             const reason = event.reason ?? 'unknown';
             // Only reset if this is still the active stream (a budget restart
             // may have already started a new stream, bumping streamId)
@@ -15906,6 +15940,7 @@ export class AgentFramework {
         const server = this.mcplServerRegistry!.getServer(serverId);
         server?.sendInferenceChunk(params);
       },
+      { progressTimeoutMs: this.inferenceProgressTimeoutMs },
     );
 
     // Checkpoint manager (Step 8)

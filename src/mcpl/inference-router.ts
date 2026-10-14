@@ -19,6 +19,7 @@ import type {
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import type { HookOrchestrator } from './hook-orchestrator.js';
+import { DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS } from '../agent.js';
 
 // ============================================================================
 // Responder interface
@@ -78,6 +79,8 @@ export class InferenceRouter {
   private routingPolicy: InferenceRoutingPolicy | null;
   private emitTraceFn: (event: { type: string; [key: string]: unknown }) => void;
   private sendChunkFn?: (serverId: string, params: InferenceChunkParams) => void;
+  /** Each provider call's progress deadline (membrane's `progressTimeoutMs`). */
+  private progressTimeoutMs: number;
 
   constructor(
     membrane: Membrane,
@@ -86,6 +89,7 @@ export class InferenceRouter {
     routingPolicy: InferenceRoutingPolicy | null,
     emitTraceFn: (event: { type: string; [key: string]: unknown }) => void,
     sendChunkFn?: (serverId: string, params: InferenceChunkParams) => void,
+    options: { progressTimeoutMs?: number } = {},
   ) {
     this.membrane = membrane;
     this.hookOrchestrator = hookOrchestrator;
@@ -93,6 +97,7 @@ export class InferenceRouter {
     this.routingPolicy = routingPolicy;
     this.emitTraceFn = emitTraceFn;
     this.sendChunkFn = sendChunkFn;
+    this.progressTimeoutMs = options.progressTimeoutMs ?? DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS;
   }
 
   /**
@@ -168,7 +173,9 @@ export class InferenceRouter {
         await this.handleStreaming(serverId, model, request, responder);
       } else {
         // Non-streaming mode
-        const response = await this.membrane.complete(request);
+        // A non-streaming call reports no progress before its response, so
+        // here the progress deadline bounds the whole call.
+        const response = await this.membrane.complete(request, { progressTimeoutMs: this.progressTimeoutMs });
 
         // Extract text content from response
         const contentText = response.content
@@ -278,7 +285,7 @@ export class InferenceRouter {
 
     // Check if streamYielding is available on the membrane instance.
     // We use streamYielding to iterate events and forward text deltas as chunks.
-    const stream = this.membrane.streamYielding(request);
+    const stream = this.membrane.streamYielding(request, { progressTimeoutMs: this.progressTimeoutMs });
     let chunkIndex = 0;
     let fullContent = '';
 
@@ -291,6 +298,16 @@ export class InferenceRouter {
           index: chunkIndex++,
           delta,
         });
+      } else if (event.type === 'error') {
+        // A failed stream answers the server as a failure, with the reason,
+        // not as a finished reply holding whatever arrived before it.
+        throw event.error;
+      } else if (event.type === 'aborted') {
+        // Nothing here cancels the stream: an abort is the progress deadline
+        // expiring ('timeout'), or a failure that ended the call.
+        throw new Error(event.reason === 'timeout'
+          ? `No stream progress within ${this.progressTimeoutMs}ms`
+          : `Inference aborted (${event.reason})`);
       }
     }
 
