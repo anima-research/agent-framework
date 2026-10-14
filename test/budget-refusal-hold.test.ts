@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ContextManager } from '@animalabs/context-manager';
-import type { EventResponse, Module, ProcessEvent, TraceEvent } from '../src/index.js';
+import type { EventResponse, Module, ProcessEvent, ToolDefinition, ToolResult, TraceEvent } from '../src/index.js';
 import { AgentFramework } from '../src/index.js';
 import type { NormalizedRequest, YieldingStream } from '@animalabs/membrane';
 import { createMockResponse, MockMembrane, MockYieldingStream } from './helpers/mock-membrane.js';
@@ -122,6 +122,36 @@ class InboxModule implements Module {
   }
 }
 
+/** A tool whose result is large, and a first round whose usage reports a
+ *  prompt near a 200k window, so the round's continuation restarts the stream
+ *  through a fresh compile (physicalWindowTokens, #92). */
+class BlobToolModule implements Module {
+  readonly name = 'canned';
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  getTools(): ToolDefinition[] {
+    return [{ name: 'fetch', description: 'blob', inputSchema: { type: 'object', properties: {} } }];
+  }
+  async handleToolCall(): Promise<ToolResult> {
+    return { success: true, data: { blob: 'x'.repeat(30_000) } };
+  }
+  async onProcess(event: ProcessEvent): Promise<EventResponse> {
+    if (event.type !== 'external-message') return {};
+    return {
+      addMessages: [{ participant: 'User', content: (event as { content: unknown }).content as never }],
+      requestInference: true,
+    };
+  }
+}
+function nearCapToolResponse() {
+  const r = createMockResponse([
+    { type: 'text', text: 'Working' },
+    { type: 'tool_use', id: 'call_1', name: 'canned--fetch', input: {} },
+  ], 'tool_use');
+  (r as { usage: unknown }).usage = { inputTokens: 5_000, outputTokens: 5, cacheReadTokens: 195_000 };
+  return r;
+}
+
 /** The framework's internals these tests read or shorten. */
 interface Internal {
   budgetHoldMs: number;
@@ -224,6 +254,67 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered turn 2'), 5_000));
         assert.equal(t.membrane.calls.length, 2);
         assert.ok(!JSON.stringify(t.membrane.calls[1]).includes('[budget-hold]'), 'the next turn carries no note');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('puts the note into the released turn\'s first compile only: a restart inside the turn compiles without it', async () => {
+    await withBacklog({ fitAt: 12 }, async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-restart-'));
+      const membrane = new SequentialStreamMembrane();
+      membrane.pushResponse(nearCapToolResponse());
+      membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answered after the restart' }]));
+      const framework = await AgentFramework.create({
+        storePath: join(tempDir, 'store'),
+        membrane: membrane.asMembrane(),
+        agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all', maxTokens: 4_000, physicalWindowTokens: 200_000 }],
+        modules: [new BlobToolModule()],
+        syncIntervalMs: 0,
+        maintenanceIntervalMs: 50,
+        errorPolicy: { maxRetries: 3, onInferenceError: (_error, _agent, attempt) => (attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false }) },
+      });
+      const traces: TraceEvent[] = [];
+      framework.onTrace((e) => traces.push(e));
+      try {
+        framework.start();
+        framework.pushEvent({
+          type: 'external-message', source: 'test', content: [{ type: 'text', text: 'fetch it' }], metadata: {}, triggerInference: true,
+        } as unknown as ProcessEvent);
+        assert.ok(await pollUntil(() => storedText(framework).includes('Answered after the restart'), 10_000));
+        assert.ok(traces.some((e) => e.type === 'inference:held'), 'the turn was held first');
+        assert.ok(traces.some((e) => e.type === 'inference:stream_restarted'), 'and restarted inside the turn');
+        assert.equal(membrane.calls.length, 2);
+        assert.ok(JSON.stringify(membrane.calls[0]).includes('[budget-hold]'), 'the first compile after the release carries the note');
+        assert.ok(!JSON.stringify(membrane.calls[1]).includes('[budget-hold]'), 'the restart\'s compile does not');
+      } finally {
+        await framework.stop();
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it('keeps the note out of the store and out of the turn\'s routing', async () => {
+    await withBacklog({ fitAt: 12 }, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      try {
+        // A message on a channel, so the turn has a locus to keep.
+        await (t.framework as unknown as { handleMcplChannelIncoming: (e: unknown) => Promise<unknown> }).handleMcplChannelIncoming({
+          type: 'mcpl:channel-incoming', serverId: 'discord', channelId: 'discord:guild:chanA', messageId: 'm-1',
+          author: { id: 'U1', name: 'owner' }, content: [{ type: 'text', text: 'Are you there?' }],
+          timestamp: new Date().toISOString(), metadata: {}, triggerInference: true,
+        });
+        assert.ok(await pollUntil(() => storedText(t.framework).includes('Answered once it fit'), 10_000));
+        assert.equal(t.of('inference:held').length, 1);
+        assert.ok(JSON.stringify(t.membrane.calls[0]).includes('[budget-hold]'));
+        // Every message in the store, every metadata field included.
+        const everything = JSON.stringify(t.framework.getAgent('prime')!.getContextManager().queryMessages({}).messages);
+        assert.ok(!everything.includes('budget-hold'), 'nothing of the note is stored');
+        // The refused start and the released one: both on the message's channel.
+        const started = t.of('inference:started');
+        assert.ok(started.length >= 2);
+        assert.ok(started.every((e) => e.channelId === 'discord:guild:chanA'), 'the released turn keeps its locus');
       } finally {
         await t.close();
       }
