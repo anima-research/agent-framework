@@ -7553,8 +7553,11 @@ export class AgentFramework {
         await (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config');
       }
     } finally {
-      if (reinitializing) this.reportReinitFailures('branch switch', await reinitializing);
-      release();
+      try {
+        if (reinitializing) this.reportReinitFailures('branch switch', await reinitializing);
+      } finally {
+        release();
+      }
     }
   }
 
@@ -7601,7 +7604,7 @@ export class AgentFramework {
       throw new Error(`Unknown agent: ${agentName}`);
     }
     if (agent.state.status !== 'idle') {
-      throw new Error(`Cannot undo while agent is ${agent.state.status}`);
+      throw new OperatorActionError('agent-busy', `Cannot undo while agent is ${agent.state.status}`);
     }
     // A surgery or a branch switch holds the store while it awaits its steps.
     // An earlier undo or redo whose managers are still re-initializing holds
@@ -7625,7 +7628,12 @@ export class AgentFramework {
       this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
       this.store.switchBranch(undoBranchName);
     } catch (error) {
-      move.abandon();
+      // The store didn't move: the turn is still there to undo.
+      try {
+        this.saveTurnCheckpoints(agentName, [...checkpoints, checkpoint]);
+      } finally {
+        move.abandon();
+      }
       throw error;
     }
     move.landed();
@@ -7683,7 +7691,7 @@ export class AgentFramework {
       throw new Error(`Unknown agent: ${agentName}`);
     }
     if (agent.state.status !== 'idle') {
-      throw new Error(`Cannot redo while agent is ${agent.state.status}`);
+      throw new OperatorActionError('agent-busy', `Cannot redo while agent is ${agent.state.status}`);
     }
     // A surgery or a branch switch holds the store while it awaits its steps.
     // An earlier undo or redo whose managers are still re-initializing holds
@@ -7699,10 +7707,13 @@ export class AgentFramework {
 
     const currentBranch = this.store.currentBranch();
     const move = this.beginSyncMove('redo', agentName);
-    const { branchName, checkpoint } = redoStack.pop()!;
+    const entry = redoStack.pop()!;
+    const { branchName, checkpoint } = entry;
     try {
       this.store.switchBranch(branchName);
     } catch (error) {
+      // The store didn't move: the turn is still there to redo.
+      redoStack.push(entry);
       move.abandon();
       throw error;
     }
@@ -7886,8 +7897,8 @@ export class AgentFramework {
     const failures: ManagerReinitFailure[] = [];
     await Promise.all([...this.agents].map(async ([agentName, agent]) => {
       if (agentName === except) return;
-      const cm = agent.getContextManager();
       try {
+        const cm = agent.getContextManager();
         await cm.setStrategy(cm.getStrategy());
       } catch (error) {
         failures.push({ agentName, error: failureDescription(error) });
@@ -7922,6 +7933,15 @@ export class AgentFramework {
   private beginSyncMove(verb: 'undo' | 'redo', agentName: string): { landed(): void; abandon(): void } {
     const running = this.syncMoveReinit;
     if (running) {
+      // Under the running reservation, as reserveStoreForSurgery would check:
+      // every agent sharing the store is idle.
+      const busy = [...this.agents].filter(([, a]) => a.state.status !== 'idle').map(([name, a]) => `${name} is ${a.state.status}`);
+      if (busy.length > 0) {
+        throw new OperatorActionError(
+          'agent-busy',
+          `Cannot ${verb} while ${busy.join(', ')} — every agent sharing the store must be idle (quiesce the host first)`,
+        );
+      }
       return {
         landed: () => { running.again = true; running.after = verb; },
         abandon: () => {},
@@ -7947,6 +7967,10 @@ export class AgentFramework {
     this.syncMoveReinit = state;
     state.done = (async () => {
       try {
+        // A maintenance tick already running finishes before any manager is
+        // re-initialized under it. The move itself was synchronous, so a tick
+        // in flight then ran across it, as on main.
+        if (this.maintenanceRunning()) await this.settleMaintenancePass();
         let failures: ManagerReinitFailure[];
         do {
           state.again = false;
@@ -7984,6 +8008,13 @@ export class AgentFramework {
       const detail = restoreError instanceof Error ? restoreError.message : String(restoreError);
       const status = `RESTORE TO ${sourceBranch} ALSO FAILED (${detail}); agent is still on ${failedBranch}`;
       console.error(`[operator] agent=${agentName} ${status}`);
+      // Its manager is left as the failed switch left it, as the others are
+      // after a failed re-initialization: said the same way.
+      try {
+        this.reportReinitFailures(`restore to ${sourceBranch}`, [{ agentName, error: detail }]);
+      } catch (reportError) {
+        console.error(`[operator] agent=${agentName} reporting the failed restore failed: ${boundFailureText(failureDescription(reportError))}`);
+      }
       return status;
     }
   }
@@ -8117,8 +8148,11 @@ export class AgentFramework {
         // switch back to the source. Every other agent's is loaded for a
         // branch generation the store has left, after a failed rollback too:
         // its switch back is a move of its own.
-        if (moved) this.reportReinitFailures('rollback', await this.reinitializeManagers(agentName));
-        release();
+        try {
+          if (moved) this.reportReinitFailures('rollback', await this.reinitializeManagers(agentName));
+        } finally {
+          release();
+        }
       }
 
       console.error(
@@ -8319,8 +8353,11 @@ export class AgentFramework {
       } finally {
         // As in rollbackToMessage: fork() re-initialized only this agent's
         // manager.
-        if (moved) this.reportReinitFailures('suppression', await this.reinitializeManagers(agentName));
-        release();
+        try {
+          if (moved) this.reportReinitFailures('suppression', await this.reinitializeManagers(agentName));
+        } finally {
+          release();
+        }
       }
 
       console.error(
@@ -9606,6 +9643,10 @@ export class AgentFramework {
    * primary.
    */
   private async createConversationAgent(name: string, channelId: string): Promise<Agent> {
+    // An undo's or redo's managers re-initialize after it returns, the
+    // template's among them, and a fork is seeded from the template's
+    // compile: wait for them first.
+    if (this.syncMoveReinit) await this.syncMoveReinit.done;
     const router = this.conversationRouter!;
     const templateConfig = this.agentConfigs.get(router.templateAgent);
     const template = this.agents.get(router.templateAgent);
