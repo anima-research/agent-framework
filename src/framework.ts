@@ -1728,9 +1728,12 @@ export class AgentFramework {
    */
   private proseSpeechChains: Map<string, Promise<void>> = new Map();
   /**
-   * Each ended stream whose `channels/outgoing/complete` still waits for the
-   * deliveries it queued (driveStream's finally). stop() sends them at once,
-   * before it clears the channel registry and closes the MCPL connections.
+   * Each stream whose `channels/outgoing/complete` hasn't gone yet, from
+   * its start: an ended one's waits for the deliveries it queued
+   * (driveStream's finally), and one the framework no longer tracks, such
+   * as a disposed ephemeral's, may still be running. stop() sends them at
+   * once, before it clears the channel registry and closes the MCPL
+   * connections.
    */
   private pendingOutgoingCompletes: Set<() => void> = new Set();
   /**
@@ -2819,10 +2822,11 @@ export class AgentFramework {
     // A stream's `complete` waits for the deliveries it queued, and the
     // teardown below would leave it nowhere to go: the registry forgets its
     // channels, and closing an MCPL connection marks it closed before it
-    // rejects a publish still out. Every stream has ended by now (its finally
-    // ran before activeStreams settled), so each still waiting sends its
-    // `complete` now, with what it has streamed, and streams nothing after
-    // (pendingOutgoingCompletes).
+    // rejects a publish still out. So each stream that hasn't sent it sends
+    // it now, with what it has streamed, and streams nothing after
+    // (pendingOutgoingCompletes): every stream activeStreams tracked has
+    // ended by now, and one it no longer tracks, such as a disposed
+    // ephemeral's, may still be finishing.
     for (const complete of [...this.pendingOutgoingCompletes]) complete();
 
     // Stop typing indicators, and forget the registry's channels
@@ -11976,6 +11980,29 @@ export class AgentFramework {
         text: delta,
       });
     };
+    // Spec 14.3: the stream's end for each channel it streamed to, with
+    // everything it sent there, the consumer's signal to finalize (end the
+    // TTS utterance, settle the rendered message). Sent once, and no chunk
+    // follows it. The finally below sends it once the stream's deliveries
+    // have run. It is registered as the stream starts, so a stop() reaches
+    // every stream that hasn't sent it, one the framework no longer tracks
+    // included, such as a disposed ephemeral's still finishing its last
+    // publish (pendingOutgoingCompletes).
+    const completeOutgoing = (): void => {
+      if (outgoingCompleted) return;
+      outgoingCompleted = true;
+      this.pendingOutgoingCompletes.delete(completeOutgoing);
+      for (const [channelId, text] of outgoingText) {
+        this.channelRegistry?.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text);
+        this.emitTrace({
+          type: 'inference:speech_complete',
+          agentName: agent.name,
+          channelId,
+          inferenceId: outgoingInferenceId,
+          text,
+        });
+      }
+    };
 
     const enqueueSpeech = (text: string, locus: string | null): void => {
       chainSpeech(async () => {
@@ -12058,6 +12085,9 @@ export class AgentFramework {
       turnSilenced = trigger?.suppressProse === true;
     };
 
+    // The stream's `complete` is pending from here: every exit reaches the
+    // finally, which sends it, and a stop() can send it sooner.
+    this.pendingOutgoingCompletes.add(completeOutgoing);
     try {
       for await (const event of stream) {
         // Ignore every late event from an Agent generation that no longer owns
@@ -13431,31 +13461,13 @@ export class AgentFramework {
       }
 
       // Spec 14.3: once the deliveries this stream queued have run, close
-      // each channel it streamed to with everything it sent there, the
-      // consumer's signal to finalize (end the TTS utterance, settle the
-      // rendered message). Every exit path does, a stream that hands its turn
-      // to a successor (a budget restart, a guard retry) included: the
-      // successor streams under its own inference id. Its deliveries can
-      // still be queued here, as when a tool ends an explicit-mode turn, so
-      // `complete` waits for them and no chunk follows it. A stop() sends it
-      // at once instead, with what the stream has sent, since stopping closes
-      // the connections a queued delivery waits on (pendingOutgoingCompletes).
-      const completeOutgoing = (): void => {
-        if (outgoingCompleted) return;
-        outgoingCompleted = true;
-        this.pendingOutgoingCompletes.delete(completeOutgoing);
-        for (const [channelId, text] of outgoingText) {
-          this.channelRegistry?.sendOutgoingComplete(channelId, agent.name, outgoingInferenceId, text);
-          this.emitTrace({
-            type: 'inference:speech_complete',
-            agentName: agent.name,
-            channelId,
-            inferenceId: outgoingInferenceId,
-            text,
-          });
-        }
-      };
-      this.pendingOutgoingCompletes.add(completeOutgoing);
+      // each channel it streamed to (completeOutgoing). Every exit path does,
+      // a stream that hands its turn to a successor (a budget restart, a
+      // guard retry) included: the successor streams under its own inference
+      // id. Its deliveries can still be queued here, as when a tool ends an
+      // explicit-mode turn, so `complete` waits for them and no chunk follows
+      // it. A stop() sends it at once instead, with what the stream has sent,
+      // since stopping closes the connections a queued delivery waits on.
       void turnSpeechChain.then(completeOutgoing);
       this.frameworkCancelledStreams.delete(`${agent.name}:${myStreamId}`);
       if (ownsPhysicalStream) {

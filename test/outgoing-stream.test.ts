@@ -483,6 +483,38 @@ for (const late of ['rejected', 'confirmed'] as const) {
   });
 }
 
+test('a stop() completes a stream the framework no longer tracks, as a disposed ephemeral\'s, before the registry forgets its channels', async () => {
+  const h = await harness([[round(text('first'), call('one', 'test--read')), final(text('second'))]]);
+  // The turn's last publish is still out when stop() begins; teardown rejects
+  // it, as closing an MCPL connection rejects a request it still holds.
+  let rejectSecond!: () => void;
+  const secondHeld = new Promise<void>((_, reject) => { rejectSecond = () => reject(new Error('connection closed')); });
+  secondHeld.catch(() => {});
+  h.holds.set('second', secondHeld);
+  h.module.stop = async () => {
+    h.log.push({ kind: 'mark', channelId: '', text: 'teardown' });
+    rejectSecond();
+  };
+  try {
+    h.framework.pushEvent({ type: 'external-message', source: 'test', content: 'go', metadata: {} });
+    void h.framework.runUntilIdle().catch(() => {});
+    for (const end = Date.now() + 10000; !h.log.some((e) => e.kind === 'publish' && e.text === 'second');) {
+      assert.ok(Date.now() < end, 'the last publish went out');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    // The stream, still awaiting that publish, is no longer tracked, as when
+    // an idle ephemeral is disposed, so stop() doesn't wait for it.
+    (h.framework as unknown as { activeStreams: Map<string, unknown> }).activeStreams.delete('assistant');
+    await h.framework.stop();
+    await h.settled();
+    assert.deepEqual(h.log.filter((e) => e.kind !== 'publish').map((e) => `${e.kind}:${e.text}`),
+      ['chunk:first', 'complete:first', 'mark:registry stopped', 'mark:teardown'],
+      'the stream completes with what it sent before the registry forgets its channels, and nothing streams after');
+  } finally {
+    await h.framework.stop();
+  }
+});
+
 test("with the real channel registry, a stop() with a publish still out sends the stream's complete to the server before the registry forgets its channels", async () => {
   // The stop tests above use the harness's stub registry. Here the publishes,
   // the chunks, the complete and stopAll go through a real ChannelRegistry
