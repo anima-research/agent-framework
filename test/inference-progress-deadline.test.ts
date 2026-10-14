@@ -207,6 +207,21 @@ test('a turn whose stream ended on its progress deadline goes to the error polic
   });
 });
 
+test('an expiry names the deadline the turn ran with, the default when the configured value would turn it off', async () => {
+  const membrane = new RecordingMembrane();
+  membrane.streams.push(() => new ExpiredStream());
+  const policy = recordingPolicy(0);
+  await withFramework(membrane, { errorPolicy: policy, inferenceProgressTimeoutMs: 0 }, async (framework, traces) => {
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('the turn to exhaust', () => traces.some((t) => t.type === 'inference:exhausted'));
+    assert.equal(
+      policy.seen[0]?.error.message,
+      `No stream progress within ${DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS}ms (inferenceProgressTimeoutMs)`,
+    );
+  });
+});
+
 test('a stall that persists through the retries exhausts the turn with its reason and classification', async () => {
   // Every attempt's stream ends on its deadline; the policy retries twice.
   const membrane = new RecordingMembrane();
