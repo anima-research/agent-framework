@@ -114,6 +114,11 @@ test('a reply_message into a channel the agent closed leaves it closed, and reco
   assert.deepEqual(windowMessages, [], 'no notice says the channel opened');
   assert.deepEqual(engagedAtResult, [channelId],
     'recorded by the descriptor id the re-pin compares, before the tool result is queued');
+
+  // The channel's next message, by push, is where a turn with no trigger speaks.
+  assert.equal(registry.getDefaultPublishChannel(), null);
+  registry.notePushDelivered('discord', channelId, 'm2', undefined, ['chat:mention']);
+  assert.equal(registry.getDefaultPublishChannel(), channelId, 'the send answered the channel');
 });
 
 test('a reply_message into a channel decided open whose open failed retries no open', async () => {

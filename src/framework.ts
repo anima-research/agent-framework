@@ -9507,7 +9507,7 @@ export class AgentFramework {
       ? `1. Reply without joining — write your reply this turn prefixed with ">>${target}"; it will be delivered there. ` +
         `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`
       : `1. Reply without joining — no single-word target reaches this channel unambiguously, so a ">>" prefix can't name it; ` +
-        `reply with ${opts.serverId}'s own send tool instead. ` +
+        `check whether ${opts.serverId} exposes a send tool that can address it. ` +
         `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`;
     const missedCount = opts.missedMessages ?? 0;
     const missedNote =
@@ -9729,7 +9729,11 @@ export class AgentFramework {
       if (c.channelId) this.assertChannelScopedPush(serverId, c.channelId);
       const origin = params.origin ?? {};
       const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
-      return this.pushCoalescer.accept({
+      // Admitted afresh, as markAccepted counts: a withdrawal, or a producer's
+      // retry of work already acknowledged, is never where the last message
+      // came in.
+      const fresh = !c.retract && !this.pushCoalescer.receipt(serverId, this.coalescingBinding(serverId), params.eventId);
+      const result = await this.pushCoalescer.accept({
         serverId,
         binding: this.coalescingBinding(serverId),
         featureSet: params.featureSet,
@@ -9752,7 +9756,24 @@ export class AgentFramework {
         } : {}),
         event: { lane: 'push', event },
       });
+      if (fresh) this.notePushAccepted(event, c.channelId);
+      return result;
     });
+  }
+
+  /**
+   * A push the host accepted, from the channel it belongs to (`channelId`, or
+   * the one its origin names): from a channel the agent answered while it was
+   * closed, it is where the last message came in, as an accepted
+   * channels/incoming message is (ChannelRegistry.notePushDelivered).
+   */
+  private notePushAccepted(event: McplPushEvent, channelId?: string): void {
+    if (!this.channelRegistry) return;
+    const id = channelId ?? this.derivePushEventChannel(event.origin)?.channelId;
+    if (!id) return;
+    const origin = (event.origin ?? {}) as Record<string, unknown>;
+    const str = (v: unknown): string | undefined => (typeof v === 'string' && v ? v : undefined);
+    this.channelRegistry.notePushDelivered(event.serverId, id, str(origin.messageId), str(origin.threadId), event.tags);
   }
 
   /** §3.2: a channel-scoped push needs what a channels/incoming message needs. */
@@ -15656,7 +15677,11 @@ export class AgentFramework {
     this.initializePushCoalescer();
     this.pushHandler = new PushHandler(
       this.featureSetManager,
-      (event) => this.pushEvent(event as unknown as ProcessEvent),
+      // Called once a push is accepted, its trigger filter returned.
+      (event) => {
+        this.notePushAccepted(event);
+        this.pushEvent(event as unknown as ProcessEvent);
+      },
       (event) => this.emitTrace(event as { type: TraceEvent['type']; [key: string]: unknown }),
       triggerFilter,
       (serverId, params, event) => this.handleCoalescedPush(serverId, params, event),
@@ -17666,6 +17691,9 @@ export class AgentFramework {
               this.turnEngagedChannels.set(agentName, engaged);
             }
             engaged.add(engagedChannel);
+            // A closed channel stays closed, and where a turn with no trigger
+            // speaks still follows the agent there.
+            this.channelRegistry.noteAnswered(engagedChannel, serverId);
           }
         }
 

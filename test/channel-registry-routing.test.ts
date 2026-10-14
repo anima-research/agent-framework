@@ -364,15 +364,16 @@ test('routeSpeech into a closed channel publishes on a server whose grant lacks 
   assert.deepEqual(published, ['lobby']);
 });
 
-test('a close or decline of a channel nobody decided about sticks against later policy', async () => {
+test("the agent's close or decline of a channel nobody decided about sticks against later policy; a machine close doesn't", async () => {
   const { registry, openCalls } = makeRegistry({ delivered: true });
   const added = {
     added: [
       { id: 'closed-by-agent', type: 'discord', label: '#a', direction: 'bidirectional' },
       { id: 'declined-by-agent', type: 'discord', label: '#b', direction: 'bidirectional' },
+      { id: 'closed-by-gc', type: 'discord', label: '#c', direction: 'bidirectional' },
     ],
   } as never;
-  // Registered closed by default: nobody has decided about either.
+  // Registered closed by default: nobody has decided about any of them.
   await registry.handleChanged('discord', added);
   const origin = { kind: 'agent' as const, agentName: 'sol' };
   const closed = await registry.handleChannelToolCall('channel_close', { channelId: 'closed-by-agent' }, origin);
@@ -380,15 +381,20 @@ test('a close or decline of a channel nobody decided about sticks against later 
   const declined = await registry.handleChannelToolCall(
     'channel_decline', { channelId: 'declined-by-agent', messageId: 'm1' }, origin);
   assert.equal(declined.success, true);
+  // connectome-host's subscription-gc closes an idle channel in this shape.
+  const gc = await registry.handleChannelToolCall(
+    'channel_close', { channelId: 'closed-by-gc', source: 'subscription-gc' }, { kind: 'module', moduleName: 'subscription-gc' });
+  assert.deepEqual(gc.data, { channelId: 'closed-by-gc', status: 'already closed' });
 
-  // Policy now admits every channel, and both register again.
+  // Policy now admits every channel, and all three register again.
   registry.setSubscriptionPolicy('discord', 'auto');
   const opensBefore = openCalls.length;
   await registry.handleChanged('discord', added);
 
   assert.equal(registry.getDesiredState('discord', 'closed-by-agent'), 'closed', 'the close sticks');
   assert.equal(registry.getDesiredState('discord', 'declined-by-agent'), 'closed', 'the decline sticks');
-  assert.equal(openCalls.length, opensBefore, 'policy opens neither');
+  assert.equal(registry.getDesiredState('discord', 'closed-by-gc'), 'open', 'a machine close decided nothing');
+  assert.deepEqual(openCalls.slice(opensBefore).map((c) => c.channelId), ['closed-by-gc'], 'policy opens only that one');
 });
 
 test('resolveSendTarget names the channel a send went to and guesses nothing', async () => {

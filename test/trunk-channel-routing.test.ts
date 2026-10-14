@@ -289,8 +289,8 @@ describe('Trunk channel routing (item-3 redux)', () => {
     const t2 = textOf(fw2);
     assert.doesNotMatch(t2, /prefixed with ">>/);
     assert.match(t2, /no single-word target reaches this channel unambiguously/);
-    assert.match(t2, /reply with discord's own send tool instead\. Note: follow-ups to your reply will NOT reach you/,
-      "replying needs no join, and the server's own tool can't take another server's channel");
+    assert.match(t2, /check whether discord exposes a send tool that can address it\. Note: follow-ups to your reply will NOT reach you/,
+      'replying needs no join, and the hint promises no tool');
     assert.match(t2, /channel_open with channelId "discord:dm:1555"/, 'joining stays available');
     await fw2.stop();
 
