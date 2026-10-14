@@ -93,6 +93,43 @@ export type TraceEvent =
       /** The provider's own error code, when it sent one (at most 128 characters). */
       providerErrorCode?: string;
     })
+  | (TraceEventBase & {
+      /**
+       * A turn whose compile was refused for budget is held while compression
+       * makes its context fit, instead of failing (#304). Its logical turn
+       * stays open; `inference:hold_ended` follows, and then the turn's fresh
+       * compile, or after a hold that ended without a fit, its exhaustion.
+       */
+      type: 'inference:held';
+      agentName: string;
+      /** 'over_budget', or 'context_refusal' when no summary covers a span the compile would drop. */
+      errorType: 'over_budget' | 'context_refusal';
+      /** The refusal's message, bounded (300 characters). */
+      error: string;
+      /** The refused compile's budget and size in tokens, when context-manager gave them. */
+      budget?: number;
+      actual?: number;
+      /** The hold's deadline (epoch ms), 30 minutes after the first refusal. */
+      until: number;
+      /** Requests the hold has taken so far, the refused one included. */
+      heldRequests: number;
+    })
+  | (TraceEventBase & {
+      type: 'inference:hold_ended';
+      agentName: string;
+      /**
+       * 'fit': a dry-run compile fits, and the held requests are queued for
+       * one fresh compile. 'deadline': the 30 minutes passed. 'nothing_pending':
+       * compression has nothing left to do and the context still doesn't fit.
+       * After those two the requests are queued too, and the turn fails as a
+       * refused compile did before the hold. 'stopped': the framework stopped
+       * or the agent left, and the requests went with it.
+       */
+      outcome: 'fit' | 'deadline' | 'nothing_pending' | 'stopped';
+      /** Since the first refusal. */
+      waitedMs: number;
+      heldRequests: number;
+    })
 
   // Streaming inference lifecycle
   | (TraceEventBase & {
