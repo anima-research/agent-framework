@@ -166,6 +166,9 @@ interface Internal {
   providerGateBlocked: (agentName: string) => boolean;
   disposeConversationAgent: (agentName: string) => void;
 }
+type HeldRequest = { agentName: string; reason: string; coalescingBatch?: boolean; coalescingBatchSubjects?: string[]; coalescingSubject?: string };
+const holdOf = (t: { internal: Internal }) =>
+  (t.internal.budgetHolds as unknown as Map<string, { heldRequests: HeldRequest[] }>).get('prime');
 
 const heldRequests = (framework: AgentFramework): number | undefined => {
   const agents = (framework.healthSnapshot() as { agents: Array<{ name: string; budgetHold: { heldRequests: number } | null }> }).agents;
@@ -720,6 +723,154 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         rmSync(tempDir, { recursive: true, force: true });
       }
     });
+  });
+
+  it('holds a batch-only start\'s request as an ordinary cause: its batches were already stored', async () => {
+    await withBacklog({}, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+      try {
+        // A batch-only wake reaches its compile, which is refused.
+        t.internal.pendingRequests.push({
+          agentName: 'prime', reason: 'mcpl:push-event', source: 'test', timestamp: Date.now(),
+          coalescingSubject: 'zz-subject', coalescingBatch: true, coalescingBatchSubjects: ['zz-subject'],
+        } as unknown as { agentName: string });
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        const held = holdOf(t)!.heldRequests;
+        assert.equal(held.length, 1);
+        assert.equal(held[0]!.coalescingBatch, undefined, 'no longer batch-only, so the released start keeps its turn');
+        assert.equal(held[0]!.coalescingBatchSubjects, undefined);
+        assert.equal(held[0]!.coalescingSubject, 'zz-subject', 'its subject stays, for a cancellation');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('lets a withdrawn coalesced wake leave a hold, as it leaves a provider hold', async () => {
+    await withBacklog({}, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        t.internal.pendingRequests.push({
+          agentName: 'prime', reason: 'mcpl:push-event', source: 'test', timestamp: Date.now(), coalescingSubject: 'zz-retracted',
+        } as unknown as { agentName: string });
+        assert.ok(await pollUntil(() => holdOf(t)?.heldRequests.length === 2, 5_000), 'the wake joins the hold');
+        (t.framework as unknown as { cancelCoalescedWakes: (subject: string) => void }).cancelCoalescedWakes('zz-retracted');
+        assert.deepEqual(holdOf(t)!.heldRequests.map((r) => r.coalescingSubject), [undefined], 'the withdrawn wake is gone, the turn\'s own stays');
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('keeps a closing conversation\'s held closure turn from the reaper', async () => {
+    await withBacklog({}, async () => {
+      const t = await residentTurn({ maintenanceIntervalMs: 50 });
+      const fw = t.framework as unknown as {
+        conversationRouter: unknown; lastConversationSweep: number; closingConversationAgents: Set<string>;
+        sweepExpiredConversations: () => void; agents: Map<string, unknown>;
+      };
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        // As a fork closing with its closure turn held: no stream, no pending request.
+        fw.conversationRouter = { expired: () => [] };
+        fw.lastConversationSweep = 0;
+        fw.closingConversationAgents.add('prime');
+        fw.sweepExpiredConversations();
+        assert.ok(fw.agents.has('prime'), 'the held closure turn is unfinished work');
+        assert.ok(holdOf(t), 'and its hold stays');
+      } finally {
+        fw.closingConversationAgents.delete('prime');
+        fw.conversationRouter = undefined;
+        await t.close();
+      }
+    });
+  });
+
+  it('clears what a hold kept when the released start fails outside its compile', async () => {
+    await withBacklog({}, async (backlog) => {
+      const t = await residentTurn({ maintenanceIntervalMs: 3_600_000 });
+      const fw = t.framework as unknown as { recordTurnCheckpoint: (name: string) => void };
+      try {
+        t.send('Are you there?');
+        assert.ok(await pollUntil(() => t.of('inference:held').length === 1, 5_000));
+        assert.ok(await pollUntil(() => !t.internal.activeTurnTokens.has('prime'), 3_000));
+        // The released start's checkpoint write fails, as a full disk would.
+        const original = fw.recordTurnCheckpoint;
+        let failed = 0;
+        fw.recordTurnCheckpoint = function (this: unknown, name: string) {
+          if (failed++ === 0) throw new Error('ENOSPC: no space left on device');
+          return original.call(this, name);
+        };
+        backlog.fit = true;
+        await t.framework.switchBranch('main');
+        assert.ok(await pollUntil(() => failed > 0 && t.internal.budgetHolds.size === 0, 3_000));
+        await new Promise((r) => setTimeout(r, 100));
+        for (const map of [t.internal.budgetHoldCarry, t.internal.budgetHoldSpent, t.internal.budgetHoldNotes]) {
+          assert.equal(map.size, 0, 'nothing of the failed turn\'s hold is left for the next');
+        }
+      } finally {
+        await t.close();
+      }
+    });
+  });
+
+  it('opens the event gate again when a held continuation resumes', async () => {
+    const proto = ContextManager.prototype as unknown as Patchable;
+    const original = { compile: proto.compile, tick: proto.tick, isReady: proto.isReady };
+    // The turn's first compile fits, and its restart's fresh compile is
+    // refused once: the hold takes a context_budget_restart.
+    let real = 0;
+    proto.compile = async function (this: unknown, ...args: unknown[]) {
+      const dryRun = (args[2] as { dryRun?: boolean } | undefined)?.dryRun === true;
+      if (!dryRun && ++real === 2) {
+        throw Object.assign(new Error('Compile plan would exceed hard budget: budget=48568'), { name: 'OverBudgetError', budget: 48_568, actual: 49_000 });
+      }
+      return original.compile.apply(this, args);
+    };
+    proto.tick = async function () {};
+    proto.isReady = function () { return false; };
+    const tempDir = mkdtempSync(join(tmpdir(), 'budget-hold-gate-'));
+    const membrane = new SequentialStreamMembrane();
+    membrane.pushResponse(nearCapToolResponse());
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'Answered after the restart' }]));
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'prime', model: 'test-model', systemPrompt: 'You are prime.', allowedTools: 'all', maxTokens: 4_000, physicalWindowTokens: 200_000 }],
+      modules: [new BlobToolModule()],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 50,
+      gate: { config: { policies: [], default: 'skip' } },
+      errorPolicy: { maxRetries: 3, onInferenceError: (_error: Error, _agent: string, attempt: number) => (attempt < 3 ? { retry: true, delayMs: 0 } : { retry: false }) },
+    });
+    const gate = (framework as unknown as { eventGate: { inferenceDiagnostics(): { inferring: string[] } } }).eventGate;
+    const traces: TraceEvent[] = [];
+    const inferringDuringResume: string[][] = [];
+    framework.onTrace((e) => {
+      traces.push(e);
+      // Sampled while the resumed stream runs (by inference:completed the
+      // gate has closed the turn again).
+      if (e.type === 'inference:content_block' && traces.some((x) => x.type === 'inference:hold_ended')) {
+        inferringDuringResume.push(gate.inferenceDiagnostics().inferring);
+      }
+    });
+    try {
+      framework.start();
+      framework.getAgent('prime')!.getContextManager().addMessage('user', [{ type: 'text', text: 'fetch it' }]);
+      (framework as unknown as { pendingRequests: unknown[] }).pendingRequests.push({ agentName: 'prime', reason: 'external-message', source: 'test', timestamp: Date.now() });
+      assert.ok(await pollUntil(() => storedText(framework).includes('Answered after the restart'), 10_000));
+      const held = traces.filter((e) => e.type === 'inference:held');
+      assert.equal(held.length, 1, 'the restart\'s refused compile was held');
+      assert.ok(inferringDuringResume.length >= 1);
+      assert.ok(inferringDuringResume.every((names) => names.includes('prime')), 'the resumed turn is inferring at the gate, so its events buffer');
+    } finally {
+      await framework.stop();
+      Object.assign(proto, original);
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('drops the hold, its requests and what it left for the name, at stop and at disposal', async () => {

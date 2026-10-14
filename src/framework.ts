@@ -1706,6 +1706,9 @@ export class AgentFramework {
    *  turn ends: that turn's refusals take the error policy's path, as before
    *  #304, and say how long the turn was held. */
   private budgetHoldSpent: Map<string, { outcome: 'deadline' | 'nothing_pending'; waitedMs: number }> = new Map();
+  /** Agents whose released budget hold held a continuation, which opens the
+   *  event gate again when it resumes (endBudgetHold, beginAgentTurn). */
+  private budgetHoldGateClosed: Set<string> = new Set();
   /** What runs when an agent's drain kick ends (kickOverBudgetDrain). */
   private overBudgetDrainAfter: Map<string, Array<() => void>> = new Map();
   /** The note a released turn's compile carries, saying why the turn waited:
@@ -2802,6 +2805,7 @@ export class AgentFramework {
     this.budgetHoldCarry?.clear();
     this.budgetHoldSpent?.clear();
     this.budgetHoldNotes?.clear();
+    this.budgetHoldGateClosed?.clear();
     // An open logical turn doesn't survive a stop: a start after a restart
     // on this instance opens a new one rather than continuing the old turn's
     // routing (openLogical). A resume still continues its turn, with its
@@ -3221,9 +3225,17 @@ export class AgentFramework {
     if (!this.budgetHolds || this.providerAdmissionClosed) return false;
     if (this.ephemeralRuns.has(agent.name) || this.agents.get(agent.name) !== agent) return false;
     if (this.budgetHoldSpent.has(agent.name)) return false;
+    // A batch-only start that reached its compile had its batches assembled
+    // and their content stored first (beginAgentTurn): the held request is an
+    // ordinary cause now. Left marked batch-only, the released start would
+    // assemble again, find nothing new if a later batch of the subject
+    // renders empty, and withdraw the turn that content was owed.
+    const held = trigger?.coalescingBatch
+      ? { ...trigger, coalescingBatch: undefined, coalescingBatchSubjects: undefined }
+      : trigger;
     const existing = this.budgetHolds.get(agent.name);
     if (existing) {
-      if (trigger && !existing.heldRequests.some((r) => this.sameInferenceRequest(r, trigger))) existing.heldRequests.push(trigger);
+      if (held && !existing.heldRequests.some((r) => this.sameInferenceRequest(r, held))) existing.heldRequests.push(held);
       return true;
     }
     if (!this.compressionPending(agent)) return false;
@@ -3239,7 +3251,7 @@ export class AgentFramework {
     const hold: BudgetHold = {
       startedAt,
       until,
-      heldRequests: trigger ? [trigger] : [],
+      heldRequests: held ? [held] : [],
       errorType,
       reason: boundFailureText(String(error.message), FAILURE_SUMMARY_MAX_CHARS),
       ...(typeof figures.budget === 'number' ? { budget: figures.budget } : {}),
@@ -3418,9 +3430,7 @@ export class AgentFramework {
     if (outcome === 'stopped') {
       // Whatever the agent's name carries outlives no stop and no disposal:
       // a later agent of the name starts with none of it.
-      this.budgetHoldCarry?.delete(agentName);
-      this.budgetHoldSpent?.delete(agentName);
-      this.budgetHoldNotes?.delete(agentName);
+      this.clearBudgetHoldState(agentName);
     }
     if (!hold) return;
     clearTimeout(hold.timer);
@@ -3453,7 +3463,21 @@ export class AgentFramework {
     const requests = hold.heldRequests.length > 0 ? hold.heldRequests : [{
       agentName, reason: 'budget-hold-release', source: 'framework', timestamp: Date.now(),
     } satisfies InferenceRequest];
+    // The refusal closed the turn at the event gate. A held continuation (a
+    // budget restart, a guard retry) skips the gate's start when it resumes,
+    // since its predecessor would have kept the gate open: this one didn't,
+    // so its start opens it again (beginAgentTurn).
+    if (requests.some((r) => resumesLogicalTurn(r.reason))) this.budgetHoldGateClosed.add(agentName);
     this.pendingRequests.push(...requests);
+  }
+
+  /** What a hold keeps for an agent's name beyond the hold itself: cleared
+   *  when the turn it was for has run or failed, and at stop and disposal. */
+  private clearBudgetHoldState(agentName: string): void {
+    this.budgetHoldCarry?.delete(agentName);
+    this.budgetHoldSpent?.delete(agentName);
+    this.budgetHoldNotes?.delete(agentName);
+    this.budgetHoldGateClosed?.delete(agentName);
   }
 
   /** A refusal of a turn whose hold ended without a fit, its reason saying
@@ -9877,11 +9901,13 @@ export class AgentFramework {
 
     // Fallback reaper: a closing fork whose closure inference never ran
     // (request dropped as stale, inference policy veto) would otherwise stay
-    // registered forever. No active stream + no pending request = done.
+    // registered forever. No active stream + no pending request = done. A
+    // closure turn held for budget is pending too, in its hold.
     for (const agentName of [...this.closingConversationAgents]) {
       if (
         !this.activeStreams.has(agentName) &&
-        !this.pendingRequests.some((r) => r.agentName === agentName)
+        !this.pendingRequests.some((r) => r.agentName === agentName) &&
+        !this.budgetHolds?.has(agentName)
       ) {
         this.disposeConversationAgent(agentName);
       }
@@ -10348,6 +10374,9 @@ export class AgentFramework {
     this.pendingRequests = this.pendingRequests.filter((r) => r.coalescingSubject !== subject);
     for (const cooldown of this.providerAccelerationCooldowns.values()) {
       cooldown.heldRequests = cooldown.heldRequests.filter((r) => r.coalescingSubject !== subject);
+    }
+    for (const hold of this.budgetHolds?.values() ?? []) {
+      hold.heldRequests = hold.heldRequests.filter((r) => r.coalescingSubject !== subject);
     }
   }
 
@@ -11724,6 +11753,8 @@ export class AgentFramework {
           stopReason: 'exhausted', speech: '', error: error instanceof Error ? error.message : String(error),
         }, this.openLogical.get(agent.name));
       }
+      // The start's turn has failed: what a budget hold kept for it goes too.
+      this.clearBudgetHoldState(agent.name);
       throw error;
     } finally {
       if (!tokenHandedOff && this.activeTurnTokens.get(agent.name) === turnToken) {
@@ -11980,7 +12011,8 @@ export class AgentFramework {
     });
     // A budget restart continues the same logical inference window. The
     // predecessor keeps EventGate liveness until its successor terminates.
-    if (!resumesTurn) {
+    // A continuation a budget hold released does open it: the hold closed it.
+    if (!resumesTurn || this.budgetHoldGateClosed?.delete(agent.name)) {
       this.eventGate?.onInferenceStarted(agent.name);
     }
     this.lastInferenceAt.set(agent.name, { ...this.lastInferenceAt.get(agent.name), startedAt: Date.now() });
@@ -12149,6 +12181,7 @@ export class AgentFramework {
       this.budgetHoldCarry?.delete(agent.name);
       this.budgetHoldSpent?.delete(agent.name);
       this.budgetHoldNotes?.delete(agent.name);
+      this.budgetHoldGateClosed?.delete(agent.name);
       const handle = this.driveStream(
         agent,
         stream,
@@ -12238,9 +12271,7 @@ export class AgentFramework {
         }, routing);
         // The turn has failed, after a hold or not: the next refusal is a new
         // turn's, holds afresh, and carries no note of this one's wait.
-        this.budgetHoldSpent?.delete(agent.name);
-        this.budgetHoldCarry?.delete(agent.name);
-        this.budgetHoldNotes?.delete(agent.name);
+        this.clearBudgetHoldState(agent.name);
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
