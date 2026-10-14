@@ -344,8 +344,11 @@ and its `family` stays `modern`. On a 2025 revision:
   list changes.
 - A request's stream that the server closes after a priming event is
   resumed for as long as the request lives. Its cancellation at the
-  deadline stops the resume too. A call whose stream ends unanswered with
-  nothing to resume from fails then, as `no-response`, not at its deadline.
+  deadline stops the resume too. A stream cut again before it carried a
+  new event id is resumed with the last id its call's resumes carried,
+  which the SDK would leave out (modelcontextprotocol/typescript-sdk#2499).
+  A call whose stream ends unanswered with nothing to resume from fails
+  then, as `no-response`, not at its deadline.
 - The server ends the session by answering 404 to a request that carried
   its id (except the stream's first open, whose 404 can also mean the
   server has no GET route). A call whose POST met the 404 fails as

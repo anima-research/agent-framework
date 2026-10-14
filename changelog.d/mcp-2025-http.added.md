@@ -19,7 +19,10 @@
     reopen without one, or one whose id the server refused with 400, relists
     the tools of a server that announces list changes.
   - **A request's stream** that the server closes after a priming event is
-    resumed for as long as the request lives. A call whose stream ends
+    resumed for as long as the request lives, cut again before it carried
+    a new event id included: the engine gives back the last id the call's
+    resumes carried, which the SDK would leave out
+    (modelcontextprotocol/typescript-sdk#2499). A call whose stream ends
     unanswered with nothing to resume from fails then, as `no-response`,
     not at its deadline.
   - **A session the server ends** (HTTP 404 to a request carrying its id):
