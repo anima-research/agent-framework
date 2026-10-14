@@ -9506,7 +9506,7 @@ export class AgentFramework {
     const replyOption = target
       ? `1. Reply without joining — write your reply this turn prefixed with ">>${target}"; it will be delivered there. ` +
         `Note: follow-ups to your reply will NOT reach you unless they @-mention you or use the reply feature on your message.\n`
-      : `1. Reply without joining isn't available here: no single-word target reaches this channel unambiguously. Join it (option 2) to reply.\n`;
+      : `1. Reply without joining — no single-word target reaches this channel unambiguously, so a ">>" prefix can't name it; use the server's own send tool, or join it (option 2) and reply.\n`;
     const missedCount = opts.missedMessages ?? 0;
     const missedNote =
       missedCount > 0
@@ -10619,8 +10619,8 @@ export class AgentFramework {
     const text =
       `[channels] Now open: ${shown} — your subscription policy just admitted ${plural ? 'them' : 'it'}. ` +
       `Ongoing traffic from ${plural ? 'these channels' : 'this channel'} will reach you. ` +
-      `If you don't want ${plural ? 'one of them' : 'it'}, use channel_close: a closed channel stays ` +
-      'closed until you open it with channel_open, and speaking there never reopens it.';
+      `If you don't want ${plural ? 'one of them' : 'it'}, use channel_close: a channel you close ` +
+      'stays closed until you open it with channel_open, and neither speaking there nor policy reopens it.';
     try {
       // Through framework.addMessage for mid-turn safety (deferral +
       // hear-while-acting injection): an admission can arrive inside a live
@@ -17646,6 +17646,8 @@ export class AgentFramework {
         // often carry the raw provider id, so the registry resolves it first.
         // The send opens nothing: speaking never opens a channel, so a closed
         // channel stays closed, with its desired state as the agent left it.
+        // A closed channel delivers only follow-ups that address the agent,
+        // which re-pin on their own.
         if (
           this.channelRegistry &&
           SEND_ENGAGEMENT_TOOLS.has(toolName) &&

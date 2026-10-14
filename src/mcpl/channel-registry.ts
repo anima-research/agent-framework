@@ -381,7 +381,7 @@ const CHANNEL_TOOL_DEFINITIONS: ToolDefinition[] = [
     description:
       'Close a channel to stop receiving its ongoing traffic. Messages that address you still ' +
       'reach you, and you can still speak there. It stays closed until you open it with ' +
-      'channel_open: speaking there never reopens it.',
+      'channel_open: neither speaking there nor subscription policy reopens it.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -2601,21 +2601,22 @@ export class ChannelRegistry {
    * The registered channel an explicit send tool delivered into, as its
    * descriptor id, from the id the tool reported or was given: a composite
    * MCPL id, or the raw server-internal id (`address.channelId`), since send
-   * tools receive whatever the agent typed. Undefined when no channel on
-   * `serverId` matches, or more than one does. A lookup only: speaking never
+   * tools receive whatever the agent typed. Matches on `serverId` when it is
+   * given, across every server otherwise, and is undefined when nothing
+   * matches or more than one channel does. A lookup only: speaking never
    * opens a channel, so a send into a closed channel leaves it closed, with
    * its desired state as the agent left it. Typing indicators and reactions
    * don't depend on a channel being open; opening only subscribes to its
    * ongoing traffic.
    */
-  resolveSendTarget(rawChannelId: string, serverId?: string): string | undefined {
+  resolveSendTarget(channelId: string, serverId?: string): string | undefined {
     let matches = [...this.channels.values()].filter(
-      (e) => e.descriptor.id === rawChannelId && (!serverId || e.serverId === serverId),
+      (e) => e.descriptor.id === channelId && (!serverId || e.serverId === serverId),
     );
     if (matches.length === 0) {
       matches = [...this.channels.values()].filter(
         (e) =>
-          (e.descriptor.address as { channelId?: string } | undefined)?.channelId === rawChannelId &&
+          (e.descriptor.address as { channelId?: string } | undefined)?.channelId === channelId &&
           (!serverId || e.serverId === serverId),
       );
     }

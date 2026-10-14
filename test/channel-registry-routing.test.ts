@@ -319,21 +319,44 @@ test('routeSpeech into a closed channel publishes and leaves it closed (speaking
   const { registry, publishCalls, openCalls, lookup } = makeRegistry(
     { delivered: true }, undefined, undefined, (info) => autoOpened.push(info),
   );
-
-  // A channel the agent closed: registered, transport closed, decision recorded.
-  seedRegistered(registry, 'discord', 'upkeep');
-  (registry as unknown as {
+  const setDesired = (registry as unknown as {
     setDesiredState(s: string, c: string, d: 'open' | 'closed', src: string): void;
-  }).setDesiredState('discord', 'upkeep', 'closed', 'agent-tool');
+  }).setDesiredState.bind(registry);
 
-  const res = await registry.routeSpeech('sol', 'a reply into a channel she closed', 'upkeep');
+  // A channel the agent closed, and one it opened whose transport is down (a
+  // failed open): both registered with the transport flag false.
+  seedRegistered(registry, 'discord', 'upkeep', 'standup');
+  setDesired('discord', 'upkeep', 'closed', 'agent-tool');
+  setDesired('discord', 'standup', 'open', 'agent-tool');
 
-  assert.deepEqual(res, { delivered: true, channelId: 'upkeep' });
-  assert.equal(publishCalls.at(-1)?.channelId, 'upkeep', 'the speech is published');
+  for (const channelId of ['upkeep', 'standup']) {
+    const res = await registry.routeSpeech('sol', `a reply into ${channelId}`, channelId);
+    assert.deepEqual(res, { delivered: true, channelId });
+    assert.equal(publishCalls.at(-1)?.channelId, channelId, 'the speech is published');
+    assert.equal(lookup(channelId)!.open, false, 'the transport flag is left as it was');
+  }
   assert.equal(openCalls.length, 0, 'speaking never opens a channel');
-  assert.equal(lookup('upkeep')!.open, false, 'the transport stays closed');
   assert.equal(registry.getDesiredState('discord', 'upkeep'), 'closed', "the agent's close stands");
+  assert.equal(registry.getDesiredState('discord', 'standup'), 'open');
   assert.equal(autoOpened.length, 0, 'nothing is announced as opened');
+});
+
+test('resolveSendTarget names the channel a send went to and guesses nothing', async () => {
+  const { registry, openCalls } = makeRegistry({ delivered: true });
+  const added = (id: string, raw: string) => ({
+    id, type: 'discord', label: `#${raw}`, direction: 'bidirectional', address: { guildId: 'g', channelId: raw },
+  });
+  await registry.handleChanged('discord-a', { added: [added('discord:g:444', '444'), added('discord:g:555', '555')] } as never);
+  await registry.handleChanged('discord-b', { added: [added('discord:h:555', '555')] } as never);
+  const opensBefore = openCalls.length;
+
+  assert.equal(registry.resolveSendTarget('discord:g:444'), 'discord:g:444', 'a descriptor id');
+  assert.equal(registry.resolveSendTarget('444', 'discord-a'), 'discord:g:444', 'a raw id, on its server');
+  assert.equal(registry.resolveSendTarget('444', 'discord-b'), undefined, 'not on another server');
+  assert.equal(registry.resolveSendTarget('555'), undefined, 'a raw id two servers share');
+  assert.equal(registry.resolveSendTarget('555', 'discord-b'), 'discord:h:555', 'the server settles it');
+  assert.equal(registry.resolveSendTarget('999', 'discord-a'), undefined, 'an unknown id');
+  assert.equal(openCalls.length, opensBefore, 'a lookup opens nothing');
 });
 
 test('routeSpeech with an omitted locus fails loudly as a routing bug', async () => {

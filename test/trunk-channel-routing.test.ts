@@ -287,7 +287,9 @@ describe('Trunk channel routing (item-3 redux)', () => {
     i2.handleMcplPushEvent(dmEvent('m4'));
     const t2 = textOf(fw2);
     assert.doesNotMatch(t2, /prefixed with ">>/);
-    assert.match(t2, /Reply without joining isn't available here/);
+    assert.match(t2, /no single-word target reaches this channel unambiguously/);
+    assert.match(t2, /use the server's own send tool, or join it \(option 2\) and reply/,
+      'replying needs no join: speaking never opens a channel');
     assert.match(t2, /channel_open with channelId "discord:dm:1555"/, 'joining stays available');
     await fw2.stop();
 
