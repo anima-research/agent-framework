@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
+import type { AbortedResponse, NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import { MembraneError } from '@animalabs/membrane';
 import type {
   ErrorAction,
@@ -58,10 +58,13 @@ class RecordingMembrane extends MockMembrane {
     return next ? next() : new MockYieldingStream([createMockResponse([{ type: 'text', text: 'done' }])]);
   }
 
-  async stream(request: NormalizedRequest, options?: unknown): Promise<NormalizedResponse> {
+  /** What the direct API's next stream() call answers instead of a reply. */
+  directAnswers: Array<NormalizedResponse | AbortedResponse> = [];
+
+  async stream(request: NormalizedRequest, options?: unknown): Promise<NormalizedResponse | AbortedResponse> {
     this.calls.push(request);
     this.options.push(options as Options);
-    return createMockResponse([{ type: 'text', text: 'direct' }]);
+    return this.directAnswers.shift() ?? createMockResponse([{ type: 'text', text: 'direct' }]);
   }
 
   override async complete(request: NormalizedRequest, options?: unknown): Promise<NormalizedResponse> {
@@ -71,30 +74,48 @@ class RecordingMembrane extends MockMembrane {
   }
 }
 
-/** A provider call that ended on its progress deadline: membrane's yielding
- *  stream reports it as `aborted` with reason 'timeout'. */
+/** A stream that ends with an abort of its own: by default a provider call
+ *  that ended on its progress deadline, which membrane's yielding stream
+ *  reports as `aborted` with reason 'timeout'. */
 class ExpiredStream implements YieldingStream {
+  constructor(private readonly reason: 'timeout' | 'user' | 'error' = 'timeout') {}
   cancel(): void {}
   provideToolResults(): void {}
   get isWaitingForTools() { return false; }
   get pendingToolCallIds(): string[] { return []; }
   get toolDepth() { return 0; }
   async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
-    yield { type: 'aborted', reason: 'timeout' } as StreamEvent;
+    yield { type: 'aborted', reason: this.reason } as StreamEvent;
   }
 }
 
-/** A policy that records what it's asked and answers `retry`. */
-function recordingPolicy(retry: boolean): ErrorPolicy & { seen: Array<{ error: Error; attempt: number }> } {
+/** A policy that records what it's asked, and retries at once `retries` times. */
+function recordingPolicy(retries: number): ErrorPolicy & { seen: Array<{ error: Error; attempt: number }> } {
   const seen: Array<{ error: Error; attempt: number }> = [];
   return {
-    maxRetries: 3,
+    maxRetries: retries,
     seen,
     onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
       seen.push({ error, attempt });
-      return retry ? { retry: true, delayMs: 0 } : { retry: false };
+      return attempt < retries ? { retry: true, delayMs: 0 } : { retry: false };
     },
   };
+}
+
+/** Settles with the promise, or fails the test after `ms`, so a stream that
+ *  never ends fails here instead of hanging the file. */
+async function within<T>(ms: number, description: string, promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`Timed out waiting for ${description}`)), ms);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** A tool module with one tool that ends the turn. */
@@ -167,7 +188,7 @@ test('each agent turn carries the progress deadline: 30 minutes unless inference
 test('a turn whose stream ended on its progress deadline goes to the error policy as a retryable timeout, and the retry gets its own deadline', async () => {
   const membrane = new RecordingMembrane();
   membrane.streams.push(() => new ExpiredStream());
-  const policy = recordingPolicy(true);
+  const policy = recordingPolicy(1);
   await withFramework(membrane, { errorPolicy: policy, inferenceProgressTimeoutMs: 1234 }, async (framework, traces) => {
     framework.start();
     framework.nudgeAgent('agent', 'operator');
@@ -186,21 +207,42 @@ test('a turn whose stream ended on its progress deadline goes to the error polic
   });
 });
 
-test('a stall that persists exhausts the turn with its reason and classification', async () => {
+test('a stall that persists through the retries exhausts the turn with its reason and classification', async () => {
+  // Every attempt's stream ends on its deadline; the policy retries twice.
   const membrane = new RecordingMembrane();
-  membrane.streams.push(() => new ExpiredStream());
-  const policy = recordingPolicy(false);
+  for (let i = 0; i < 3; i++) membrane.streams.push(() => new ExpiredStream());
+  const policy = recordingPolicy(2);
   await withFramework(membrane, { errorPolicy: policy, inferenceProgressTimeoutMs: 1234 }, async (framework, traces) => {
     framework.start();
     framework.nudgeAgent('agent', 'operator');
     await waitFor('the turn to exhaust', () => traces.some((t) => t.type === 'inference:exhausted'));
 
-    const exhausted = traces.find((t) => t.type === 'inference:exhausted') as Extract<TraceEvent, { type: 'inference:exhausted' }>;
-    assert.equal(exhausted.error, 'No stream progress within 1234ms (inferenceProgressTimeoutMs)');
-    assert.equal(exhausted.errorType, 'timeout');
-    assert.equal(exhausted.retryable, true);
-    assert.equal(membrane.calls.length, 1);
+    assert.deepEqual(policy.seen.map((s) => s.attempt), [0, 1, 2]);
+    assert.deepEqual(membrane.options.map((o) => o?.progressTimeoutMs), [1234, 1234, 1234]);
+    const exhausted = traces.filter((t) => t.type === 'inference:exhausted') as Array<Extract<TraceEvent, { type: 'inference:exhausted' }>>;
+    assert.equal(exhausted.length, 1);
+    assert.equal(exhausted[0]!.error, 'No stream progress within 1234ms (inferenceProgressTimeoutMs)');
+    assert.equal(exhausted[0]!.errorType, 'timeout');
+    assert.equal(exhausted[0]!.retryable, true);
+    assert.equal(traces.filter((t) => t.type === 'inference:failed').length, 3);
     await waitFor('the agent to go idle', () => framework.getAgent('agent')?.state.status === 'idle');
+  });
+});
+
+test("an abort that isn't the deadline's, with no recorded cancel, still settles the turn as it did", async () => {
+  // Such as an operator's abortInference: reason 'user', nothing recorded.
+  const membrane = new RecordingMembrane();
+  membrane.streams.push(() => new ExpiredStream('user'));
+  const policy = recordingPolicy(1);
+  await withFramework(membrane, { errorPolicy: policy }, async (framework, traces) => {
+    framework.start();
+    framework.nudgeAgent('agent', 'operator');
+    await waitFor('the turn to settle', () => traces.some((t) => t.type === 'inference:exhausted'));
+
+    assert.deepEqual(policy.seen, []);
+    const exhausted = traces.find((t) => t.type === 'inference:exhausted') as Extract<TraceEvent, { type: 'inference:exhausted' }>;
+    assert.equal(exhausted.error, 'Stream aborted: user');
+    assert.equal(membrane.calls.length, 1);
   });
 });
 
@@ -211,6 +253,8 @@ test("a deadline that expires as the framework ends the turn itself stays the fr
   class EndTurnRace implements YieldingStream {
     private wake: (() => void) | null = null;
     private cancelled = false;
+    /** Set once the consumer is done with the stream after its last event. */
+    finished = false;
     cancel(): void { this.cancelled = true; this.wake?.(); }
     provideToolResults(): void {}
     get isWaitingForTools() { return !this.cancelled; }
@@ -227,20 +271,27 @@ test("a deadline that expires as the framework ends the turn itself stays the fr
         },
       } as StreamEvent;
       if (!this.cancelled) await new Promise<void>((resolve) => { this.wake = resolve; });
-      yield { type: 'aborted', reason: 'timeout' } as StreamEvent;
+      try {
+        yield { type: 'aborted', reason: 'timeout' } as StreamEvent;
+      } finally {
+        this.finished = true;
+      }
     }
   }
+  const race = new EndTurnRace();
   const membrane = new RecordingMembrane();
-  membrane.streams.push(() => new EndTurnRace());
-  const policy = recordingPolicy(false);
+  membrane.streams.push(() => race);
+  const policy = recordingPolicy(0);
   await withFramework(membrane, { errorPolicy: policy, modules: [new FinishModule()] }, async (framework, traces) => {
     framework.start();
     framework.nudgeAgent('agent', 'operator');
     await waitFor('the tool to end the turn', () => traces.some((t) => t.type === 'inference:turn_ended'));
     // The stream's last event, its 'timeout' abort, follows the endTurn. Wait
     // for the turn's driveStream to finish with it, unless it already has.
-    await (framework as unknown as { activeStreams: Map<string, Promise<void>> }).activeStreams.get('agent');
+    const drive = (framework as unknown as { activeStreams: Map<string, Promise<void>> }).activeStreams.get('agent');
+    await within(3_000, "the turn's stream to end", Promise.resolve(drive));
 
+    assert.equal(race.finished, true, 'driveStream took the abort and was done with the stream');
     assert.deepEqual(policy.seen, []);
     assert.equal(traces.some((t) => t.type === 'inference:failed' || t.type === 'inference:exhausted'), false);
     assert.equal(membrane.calls.length, 1);
@@ -254,12 +305,29 @@ test('the direct Agent API carries the deadline on each call: the default, or th
     agent.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' }]);
     await agent.runInference(framework.getAllTools());
     await agent.runInference(framework.getAllTools(), undefined, { progressTimeoutMs: 1234 });
+    // Values membrane would read as no deadline get the default here too.
+    await agent.runInference(framework.getAllTools(), undefined, { progressTimeoutMs: 0 });
+    await agent.runInference(framework.getAllTools(), undefined, { progressTimeoutMs: Number.NaN });
     const started = await agent.startStream(framework.getAllTools());
     started.stream.cancel();
     assert.deepEqual(
       membrane.options.map((o) => o?.progressTimeoutMs),
-      [DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, 1234, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS],
+      [DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, 1234, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS,
+        DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS],
     );
+  });
+});
+
+test("the direct Agent API returns an expiry as an aborted result, with abortReason 'timeout'", async () => {
+  const membrane = new RecordingMembrane();
+  membrane.directAnswers.push({ aborted: true, reason: 'timeout' } as AbortedResponse);
+  await withFramework(membrane, {}, async (framework) => {
+    const agent = framework.getAgent('agent')!;
+    agent.getContextManager().addMessage('user', [{ type: 'text', text: 'hello' }]);
+    const result = await agent.runInference(framework.getAllTools());
+    assert.equal(result.aborted, true);
+    assert.equal(result.abortReason, 'timeout');
+    assert.equal(agent.state.status, 'idle');
   });
 });
 
@@ -312,7 +380,11 @@ function routerHarness(stream: () => YieldingStream, routerOptions?: { progressT
 }
 
 test('the router puts its deadline on both its calls: 30 minutes, or the one it was given', async () => {
-  for (const [given, expected] of [[undefined, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS], [1234, 1234]] as const) {
+  for (const [given, expected] of [
+    [undefined, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS],
+    [1234, 1234],
+    [Number.NaN, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS],
+  ] as const) {
     const h = routerHarness(
       () => new MockYieldingStream([createMockResponse([{ type: 'text', text: 'streamed' }])]),
       given === undefined ? undefined : { progressTimeoutMs: given },
@@ -327,9 +399,16 @@ test('the router puts its deadline on both its calls: 30 minutes, or the one it 
 test('a streamed request that ends on its deadline answers the server with an error, not with what arrived', async () => {
   const h = routerHarness(() => new ExpiredStream(), { progressTimeoutMs: 1234 });
   await h.router.handleInferenceRequest('srv', { featureSet: 'f', stream: true, messages: [{ role: 'user', content: 'hi' }] }, h.responder);
-  assert.deepEqual(h.answers, [{ error: { code: -32603, message: 'No stream progress within 1234ms' } }]);
-  assert.ok(h.traces.some((t) => t.type === 'mcpl:inference_fail' && t.error === 'No stream progress within 1234ms'));
+  const message = 'No stream progress within 1234ms (inferenceProgressTimeoutMs)';
+  assert.deepEqual(h.answers, [{ error: { code: -32603, message } }]);
+  assert.ok(h.traces.some((t) => t.type === 'mcpl:inference_fail' && t.error === message));
   assert.equal(h.traces.some((t) => t.type === 'mcpl:inference_complete'), false);
+});
+
+test("a streamed request that ends on another abort answers the server with an error naming it", async () => {
+  const h = routerHarness(() => new ExpiredStream('error'));
+  await h.router.handleInferenceRequest('srv', { featureSet: 'f', stream: true, messages: [{ role: 'user', content: 'hi' }] }, h.responder);
+  assert.deepEqual(h.answers, [{ error: { code: -32603, message: 'Inference aborted (error)' } }]);
 });
 
 test("a streamed request whose stream fails answers the server with the stream's error", async () => {

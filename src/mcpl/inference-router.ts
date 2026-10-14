@@ -19,7 +19,7 @@ import type {
 import type { FeatureSetManager } from './feature-set-manager.js';
 import { McplFeatureSetError } from './feature-set-manager.js';
 import type { HookOrchestrator } from './hook-orchestrator.js';
-import { DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS } from '../agent.js';
+import { progressTimeoutOrDefault } from '../agent.js';
 
 // ============================================================================
 // Responder interface
@@ -97,7 +97,7 @@ export class InferenceRouter {
     this.routingPolicy = routingPolicy;
     this.emitTraceFn = emitTraceFn;
     this.sendChunkFn = sendChunkFn;
-    this.progressTimeoutMs = options.progressTimeoutMs ?? DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS;
+    this.progressTimeoutMs = progressTimeoutOrDefault(options.progressTimeoutMs);
   }
 
   /**
@@ -306,7 +306,7 @@ export class InferenceRouter {
         // Nothing here cancels the stream: an abort is the progress deadline
         // expiring ('timeout'), or a failure that ended the call.
         throw new Error(event.reason === 'timeout'
-          ? `No stream progress within ${this.progressTimeoutMs}ms`
+          ? `No stream progress within ${this.progressTimeoutMs}ms (inferenceProgressTimeoutMs)`
           : `Inference aborted (${event.reason})`);
       }
     }

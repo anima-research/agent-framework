@@ -63,7 +63,7 @@ import type {
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage, waitForShutdown, ShutdownTimeoutError } from './shutdown.js';
 import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
-import { Agent, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS } from './agent.js';
+import { Agent, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, progressTimeoutOrDefault } from './agent.js';
 import { ModuleRegistry, checkedToolResult, isStateExistsError, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { logValue } from './mcpl/log-value.js';
@@ -683,13 +683,6 @@ function combineDrainOutcomes(outcomes: DiscordAwarenessDrainOutcome[]): Discord
     delivered: outcomes.reduce((count, outcome) => count + (outcome.status === 'delivered' ? outcome.delivered : 0), 0),
     failed: outcomes.reduce((count, outcome) => count + (outcome.status === 'delivered' ? outcome.failed : 0), 0),
   };
-}
-
-/** FrameworkConfig.inferenceProgressTimeoutMs, or its default for a value
- *  that would turn the deadline off (NaN, zero or negative): membrane reads
- *  those as no deadline, and a resident would hang again. */
-function normalizeInferenceProgressTimeout(value: number | undefined): number {
-  return value !== undefined && value > 0 ? value : DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS;
 }
 
 function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
@@ -2228,7 +2221,7 @@ export class AgentFramework {
       new OperatorLog(operatorLogPath),
     );
     framework.providerHoldHook = config.providerHold;
-    framework.inferenceProgressTimeoutMs = normalizeInferenceProgressTimeout(config.inferenceProgressTimeoutMs);
+    framework.inferenceProgressTimeoutMs = progressTimeoutOrDefault(config.inferenceProgressTimeoutMs);
 
     // If an offline recovery process crashed after switching Chronicle but
     // before committing its prepared marker batch, the active branch is the
@@ -12051,10 +12044,12 @@ export class AgentFramework {
         this.touchEphemeralRun(agent.name, true);
         // A provider call that went inferenceProgressTimeoutMs without a
         // parsed event (membrane's progressTimeoutMs) ends the stream as
-        // `aborted` with reason 'timeout'. Unless the framework cancelled this
-        // stream itself, that is a failed request, so it takes the `error`
-        // path: the error policy retries it, and a fresh stream gets a fresh
-        // deadline. A stall that persists exhausts the turn with its reason.
+        // `aborted` with reason 'timeout'. Unless the framework recorded a
+        // cancel of this stream (frameworkCancelledStreams: a tool's endTurn,
+        // a budget restart, a quiesce abandon), that is a failed request, so
+        // it takes the `error` path: the error policy retries it, and a fresh
+        // stream gets a fresh deadline. A stall that persists exhausts the
+        // turn with its reason.
         // Membrane types the expiry as non-retryable because that deadline
         // belongs to the one call; a new stream is a new call with its own.
         const event = arrived.type === 'aborted' && arrived.reason === 'timeout'
@@ -13113,9 +13108,10 @@ export class AgentFramework {
                 return;
               }
             }
-            // A progress deadline's 'timeout' took the `error` path at the
-            // loop's head; any other abort the framework didn't make itself
-            // settles here.
+            // A progress deadline's 'timeout' with no recorded cancel took the
+            // `error` path at the loop's head. Any other abort no recorded
+            // cancel explains, such as an operator's abortInference or stop(),
+            // settles the turn here.
             const reason = event.reason ?? 'unknown';
             // Only reset if this is still the active stream (a budget restart
             // may have already started a new stream, bumping streamId)

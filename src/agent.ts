@@ -24,8 +24,8 @@ export interface ActivationRequestOptions {
    *  run (see `compileWithInjections` for what that leaves alone). */
   dryRun?: boolean;
   /** The stream's progress deadline, per provider call (membrane's
-   *  `progressTimeoutMs`): DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS when
-   *  absent. */
+   *  `progressTimeoutMs`): DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS when absent,
+   *  NaN, zero or negative. */
   progressTimeoutMs?: number;
 }
 
@@ -89,6 +89,16 @@ const DEFAULT_SAME_ROUND_THINK_TEXT_POLICY: SameRoundThinkTextPolicy = 'public';
  * for minutes (agent-framework #268).
  */
 export const DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * A progress deadline to pass membrane: the value given, or the default for
+ * one membrane would read as no deadline (absent, NaN, zero or negative), so
+ * a slip in a caller's value can't bring the hang back. Infinity, the explicit
+ * way to have no bound, passes.
+ */
+export function progressTimeoutOrDefault(value: number | undefined): number {
+  return value !== undefined && value > 0 ? value : DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS;
+}
 
 /**
  * An agent wraps a context manager and manages inference state.
@@ -1021,7 +1031,7 @@ export class Agent {
     // Set state to inferring
     this._inferenceStartedAt = Date.now();
     const inferencePromise = this.doInference(request, abortController.signal, assemble,
-      options?.progressTimeoutMs ?? DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS);
+      progressTimeoutOrDefault(options?.progressTimeoutMs));
     this._state = { status: 'inferring', promise: inferencePromise, abortController };
 
     try {
@@ -1328,7 +1338,7 @@ export class Agent {
       emitTokens: true,
       emitBlocks: false,
       emitUsage: true,
-      progressTimeoutMs: options.progressTimeoutMs ?? DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS,
+      progressTimeoutMs: progressTimeoutOrDefault(options.progressTimeoutMs),
       // Retry a content-policy refusal at the provider seam rather than at
       // the framework level: membrane replays the SAME request immediately
       // (cache-warm), where a framework-level requeue would recompile and
