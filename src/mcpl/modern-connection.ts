@@ -500,6 +500,14 @@ interface HttpObservations {
   /** The standalone stream has opened: the server serves one. */
   streamOpened: boolean;
   /**
+   * A try at the stream's first open failed before it opened: one
+   * `firstOpen` tried again, or an answer the SDK retries itself after
+   * refreshing a credential (a 401). Its eventual open then relists, since
+   * list changes had nowhere to go meanwhile. Kept here, not in one
+   * `firstOpen` call, because the SDK's retry is a new GET.
+   */
+  firstOpenFailed: boolean;
+  /**
    * The signal the standalone stream's GETs carry: the transport's own,
    * taken from its first open. A request stream's resume carries another, its
    * request's signal combined with the transport's, so this tells the two
@@ -752,7 +760,7 @@ export class ModernMcpConnection extends EventEmitter {
         reconnectionOptions: reconnection,
         reconnectionScheduler: this.streamRetry,
       });
-      http = { transport, reconnection, streamOpened: false, ended: false };
+      http = { transport, reconnection, streamOpened: false, firstOpenFailed: false, ended: false };
       inner = transport;
     }
     // Every close of this generation ends its HTTP session first, whoever
@@ -1054,6 +1062,7 @@ export class ModernMcpConnection extends EventEmitter {
       let retried = false;
       if (firstOpen) ({ response, retried } = await this.firstOpen(session, url, init));
       else response = await fetch(url, init);
+      if (firstOpen && (retried || !response.ok)) http.firstOpenFailed = true;
       const refusal = response.status === 400 ? await revisionRefusal(response) : undefined;
       if (refusal) {
         const record = method === 'POST' ? wireScope.getStore() : undefined;
@@ -1081,7 +1090,7 @@ export class ModernMcpConnection extends EventEmitter {
       } else if (standalone && response.ok) {
         // Back without replay, or open at last after failed tries: list
         // changes may have gone by meanwhile.
-        if (http.streamOpened ? !replayed : retried) queueMicrotask(() => this.streamReopened(session));
+        if (http.streamOpened ? !replayed : http.firstOpenFailed) queueMicrotask(() => this.streamReopened(session));
         http.streamOpened = true;
       }
       return response;
