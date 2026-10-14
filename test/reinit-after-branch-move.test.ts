@@ -500,7 +500,7 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.match(alerts[0]!.message, /The restore to main moved the store's branch/);
   });
 
-  it("a redo made from a listener of the last pass's alert is refused as busy, and every manager ends current", async () => {
+  it("a redo made from a listener of the last pass's alert is refused as busy, the store stays where the undo left it, and the agent that moved compiles", async () => {
     checkpointTurn();
     // b's next initialization fails, so the undo's pass reports an alert.
     const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };

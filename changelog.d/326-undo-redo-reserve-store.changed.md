@@ -7,7 +7,10 @@
   and finishes after it returns, and the store stays reserved until it's
   done: a turn asked for meanwhile starts after, and a
   `rollbackToMessage()`, `suppressMessages()` or `switchBranch()` made
-  meanwhile is refused as busy. An undo or redo made meanwhile moves the
+  meanwhile is refused as busy. A context-settings preview or a
+  runtime-settings change made meanwhile is refused by context-manager
+  until that agent's manager is current, as during a surgery's switch. An
+  undo or redo made meanwhile moves the
   store again under the same reservation, and the managers are
   re-initialized for the branch the last one leaves. The re-initialization
   waits first for maintenance already running, a pass or an over-budget
