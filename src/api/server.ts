@@ -581,8 +581,10 @@ export class ApiServer {
     // and stop() waits for one already running.
     // The store has moved when the call returns, before its promise settles
     // (a refusal moves nothing). The branch read then is this switch's
-    // destination: another switch can move the store before this one's
-    // awaited steps end, so the event names what was read here.
+    // destination, and the event names what was read here: the framework
+    // refuses another move until this one's awaited steps end, but a host
+    // that switches through an agent's own context manager can still move
+    // the store meanwhile.
     const switching = this.framework.switchBranch(params.name);
     void switching.catch(() => {}); // awaited below; handled even if the next line throws
     this.followStoreBranch();
