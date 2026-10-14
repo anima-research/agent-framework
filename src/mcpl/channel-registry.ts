@@ -562,6 +562,14 @@ export type ChannelToolOrigin =
   | { kind: 'module'; moduleName?: string }
   | { kind: 'agent'; agentName: string };
 
+/** Push tags that mark something other than a new message: a reaction, its
+ *  removal, an edit or a deletion. discord-mcpl sends these as pushes from an
+ *  open channel too, so on their own they never moved the most recent inbound
+ *  channel (notePushDelivered). */
+const NOT_A_NEW_MESSAGE: ReadonlySet<string> = new Set([
+  'chat:reaction', 'chat:reaction-remove', 'chat:edited', 'chat:deleted',
+]);
+
 /** The machine decision sources a module-origin channel_close may record.
  *  Closed on purpose: honest provenance means a small, auditable vocabulary,
  *  not arbitrary self-description. */
@@ -2016,7 +2024,8 @@ export class ChannelRegistry {
    * is (markAccepted), so a turn with no trigger speaks there. Once the
    * channel's transport is open, its messages arrive as channels/incoming and
    * move it there. A push from any other channel moves nothing, as before,
-   * and neither does a reaction or a deletion.
+   * and neither does a reaction, an edit or a deletion: those arrive as pushes
+   * from an open channel too, and never moved it.
    */
   notePushDelivered(
     serverId: string,
@@ -2027,7 +2036,7 @@ export class ChannelRegistry {
   ): void {
     if (!this.desiredStates.get(this.lifecycleKey(serverId, channelId))?.answered) return;
     if (this.channels.get(`${serverId}:${channelId}`)?.open) return;
-    if (tags?.some((t) => t === 'chat:reaction' || t === 'chat:reaction-remove' || t === 'chat:deleted')) return;
+    if (tags?.some((t) => NOT_A_NEW_MESSAGE.has(t))) return;
     this.defaultPublishChannel = channelId;
     this.defaultPublishMessageId = messageId ?? null;
     this.defaultPublishThreadId = threadId;

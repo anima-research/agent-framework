@@ -410,7 +410,7 @@ test('only a delivered answer into a closed channel marks it, and only its conve
   seedRegistered(registry, 'discord', 'dm', 'lobby');
   await registry.routeSpeech('sol', 'answered', 'dm');
   registry.handleIncoming('discord', incoming('lobby', 'hi'));
-  for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:deleted']) {
+  for (const tag of ['chat:reaction', 'chat:reaction-remove', 'chat:edited', 'chat:deleted']) {
     registry.notePushDelivered('discord', 'dm', 'm2', undefined, [tag]);
     assert.equal(registry.getDefaultPublishChannel(), 'lobby', `${tag} isn't a message coming in`);
   }
@@ -418,10 +418,10 @@ test('only a delivered answer into a closed channel marks it, and only its conve
   assert.equal(registry.getDefaultPublishChannel(), 'dm');
 
   // Its transport opens (the server delivers channels/incoming from it): its
-  // messages move the fallback that way now, and a push, such as an edit, doesn't.
+  // messages move the fallback that way now, and a push doesn't.
   registry.handleIncoming('discord', incoming('dm', 'over incoming'));
   registry.handleIncoming('discord', incoming('lobby', 'hi again'));
-  registry.notePushDelivered('discord', 'dm', 'm4', undefined, ['chat:edited']);
+  registry.notePushDelivered('discord', 'dm', 'm4', undefined, conversational);
   assert.equal(registry.getDefaultPublishChannel(), 'lobby');
 });
 
