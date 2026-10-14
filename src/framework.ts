@@ -723,8 +723,12 @@ function logSeedOmissions(
 /**
  * A maintenance provider call withdrawn because a surgery holds the store. It
  * sent nothing: it was refused at the provider gate, or woken there from its
- * wait. context-manager keeps the work it was for queued, with no attempt
- * counted, and the next pass after the hold does it again.
+ * wait. context-manager counts no attempt for it. A merge keeps its queue
+ * entry, so the next tick after the hold does it again. A chunk's
+ * compression has already left the queue: it logs "Failed to compress chunk
+ * (hierarchical)" with this error and records the call, and the chunk, still
+ * uncompressed, is queued again at that manager's next rebuild (its next
+ * initialization, message, sent compile or released hold).
  */
 class MaintenanceWithdrawnError extends Error {
   constructor(hold: { verb: string; agentName: string }) {
@@ -2858,19 +2862,23 @@ export class AgentFramework {
     const gate = this.providerGate(agentName);
     this.refuseHeldProviderModel(agentName, model);
     this.withdrawMaintenanceUnderSurgery();
-    if (this.providerGateBlocked(agentName)) {
+    // A parked call is woken when the gate opens, when stop() closes
+    // admission, or when a surgery takes the store; one woken while the gate
+    // is still closed parks again.
+    while (this.providerGateBlocked(agentName)) {
       gate.deferredAuxiliary++;
       try {
         await new Promise<void>((resolve) => gate.auxiliaryWaiters.push(resolve));
       } finally {
         gate.deferredAuxiliary = Math.max(0, gate.deferredAuxiliary - 1);
       }
+      if (this.providerAdmissionClosed) break;
+      // A surgery that took the store while this call was parked withdraws it.
+      this.withdrawMaintenanceUnderSurgery();
     }
     if (this.providerAdmissionClosed) {
       throw new Error(`Provider admission closed while stopping (${agentName})`);
     }
-    // A surgery that took the store while this call was parked withdraws it.
-    this.withdrawMaintenanceUnderSurgery();
     // A wait recorded while this call was parked binds it too.
     this.refuseHeldProviderModel(agentName, model);
     gate.auxiliaryInFlight++;

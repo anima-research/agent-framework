@@ -1138,6 +1138,40 @@ describe('queued context maintenance timer', () => {
     }
   });
 
+  it('a parked maintenance call woken while its gate is still closed parks again, and goes once the gate opens', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-parks-again-'));
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane,
+      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test', strategy: new GatedTickStrategy() }],
+      modules: [],
+      syncIntervalMs: 0,
+      maintenanceIntervalMs: 0,
+    });
+    const internals = framework as unknown as {
+      withAuxiliaryAdmission<T>(name: string, run: () => Promise<T>): Promise<T>;
+      providerGate(name: string): { primaryPending: boolean; auxiliaryWaiters: Array<() => void> };
+      flushAuxiliaryAdmission(name: string): void;
+    };
+    try {
+      const gate = internals.providerGate('agent');
+      gate.primaryPending = true;
+      let ran = false;
+      const call = internals.withAuxiliaryAdmission('agent', async () => { ran = true; return 7; });
+      await waitFor(() => gate.auxiliaryWaiters.length === 1);
+      for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
+      await waitFor(() => gate.auxiliaryWaiters.length === 1);
+      assert.equal(ran, false, 'woken with the gate still closed, it parked again');
+      gate.primaryPending = false;
+      internals.flushAuxiliaryAdmission('agent');
+      assert.equal(await call, 7);
+      assert.equal(ran, true);
+    } finally {
+      await framework.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('a surgery that takes the store while resume waits for a tick is refused by resume after the wait', { timeout: 10_000 }, async () => {
     const dir = mkdtempSync(join(tmpdir(), 'af-maintenance-resume-rechecks-'));
     const strategy = new GatedTickStrategy();
