@@ -381,7 +381,7 @@ export interface McplServerConfig {
    *
    * A modern server reached over HTTP at a 2025 revision can hold a session
    * for this client. When the server ends it (HTTP 404), or stops serving its
-   * revision or its stream as a server upgraded to 2026-07-28 does, after it
+   * revision or its streams as a server upgraded to 2026-07-28 does, after it
    * has answered a request, a new session starts at once whether or not this
    * is set: the connection emits 'close' while its `willReconnect` reads
    * true, then 'reconnect'. If that new session can't start, this setting

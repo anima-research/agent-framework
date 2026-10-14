@@ -331,19 +331,21 @@ and its `family` stays `modern`. On a 2025 revision:
   id. Its first open is tried again after a 408, 409, 429, a 5xx other than
   501 and 505, or a network error, each reported as the connection's
   `error`, and a relist follows once it opens, also when it opens on the
-  SDK's own retry after a credential refresh. Any other answer goes to the
-  SDK, which opens no stream: it takes a 405 quietly, reports any other
-  refusal as an `error`, and tries a 401 once more after the credential's
-  refresh. A stream that drops is reopened: the first try waits the server's
-  `retry` hint when it sent one, and the base interval otherwise, and a try
-  after a failed one waits the longer of the hint and the doubling backoff.
-  A reopen that carries `Last-Event-ID` has what it missed replayed by the
-  server. One that can't, because the server's events had no ids or the
-  server refused the id with 400, opens without it and relists the tools of
-  a server that announces list changes.
+  SDK's own retry after a credential refresh. Any other refusal goes to the
+  SDK, which opens no stream: it takes a 405 quietly, tries a 401 once more
+  after the credential's refresh, and reports the rest as an `error`. A
+  stream that drops is reopened: the first try waits the server's `retry`
+  hint when it sent one, and the base interval otherwise, and a try after a
+  failed one waits the longer of the hint and the doubling backoff. A
+  reopen that carries `Last-Event-ID` has what it missed replayed by the
+  server. One that can't, because the server's events had no ids, the
+  stream that dropped had carried none, or the server refused the id with
+  400, opens without it and relists the tools of a server that announces
+  list changes.
 - A request's stream that the server closes after a priming event is
   resumed for as long as the request lives. Its cancellation at the
-  deadline stops the resume too.
+  deadline stops the resume too. A call whose stream ends unanswered with
+  nothing to resume from fails then, as `no-response`, not at its deadline.
 - The server ends the session by answering 404 to a request that carried
   its id (except the stream's first open, whose 404 can also mean the
   server has no GET route). A call whose POST met the 404 fails as
@@ -365,23 +367,27 @@ and its `family` stays `modern`. On a 2025 revision:
   session's end brings a new connect, which negotiates afresh. Two more
   answers end a 2025 session, with a session id or without: a 400 carrying
   JSON-RPC `-32022` to any request, as the SDK's 2026 handler answers 2025
-  traffic it refuses (`legacy: 'reject'`), and a 405 to the standalone
-  stream's reopen after it had opened, as that handler answers a 2025
-  session it serves statelessly (its default). A call refused with
+  traffic it refuses (`legacy: 'reject'`), and a 405 to a GET for one of
+  the session's streams after the server had served it (the standalone
+  stream's reopen, or a request stream's resume), as that handler answers a
+  2025 session it serves statelessly (its default). A call refused with
   `-32022` fails as `error-response` with the server's code and data, and
   isn't replayed. A server that keeps serving a 2025 revision statelessly
-  to a connection that never had a standalone stream isn't followed: that
+  to a connection that never had a standalone stream isn't followed, unless
+  its upgrade cut a call's stream, whose resume then meets the 405: that
   connection stays on 2025 until its next connect.
 - Each session the server holds by its id is ended with a `DELETE` when the
   connection lets it go, waiting at most 3 s: at `close()`, and so `stop()`
   or a disconnect, a connect in flight included, and when a connect fails
-  after its `initialize` was answered. A session the server ended with 404
-  gets none.
+  after its `initialize` was answered. A session the server let go, with a
+  404, a `-32022` or such a 405, gets none.
 
 On `2026-07-28` too, a dropped stream's retries follow that timing: the
 server's `retry` hint first, and the connection's backoff after a failed
-try. They stop after two, the SDK's default, as before, so a listen
-stream that can't be resumed is reopened, with a relist.
+try. They stop after two failed tries, the SDK's default, on every stream:
+a listen stream that can't be resumed is reopened, with a relist, and a
+call whose stream can't be resumed fails then, as `no-response`, rather
+than at its deadline.
 
 A server over HTTP that this client can't negotiate a revision with fails
 with `McplProtocolVersionError`, naming what each side speaks, and is not
