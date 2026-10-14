@@ -1206,6 +1206,23 @@ interface EphemeralRun {
   toolCallsCount: number;
 }
 
+/** The re-initialization of every context manager after an undo's or redo's
+ *  move (AgentFramework.syncMoveReinit). */
+interface SyncMoveReinit {
+  /** A later undo or redo moved the store again: the pass runs again. */
+  again: boolean;
+  /** The last move made under the reservation, for the failure report. */
+  after: 'undo' | 'redo';
+  /** Settles once the reservation is released; never rejects. */
+  done: Promise<void>;
+}
+
+/** An agent whose context manager failed to re-initialize after a move. */
+interface ManagerReinitFailure {
+  agentName: string;
+  error: string;
+}
+
 /**
  * Longest failure text the inference-failure pipeline writes to one sink: the
  * reason in the exhaustion stderr line, a field of a logs/failures.log record,
@@ -2002,6 +2019,14 @@ export class AgentFramework {
    * scheduler, ephemeral admission and puppet entry points.
    */
   private surgeryHold: { verb: string; agentName: string; since: number } | null = null;
+  /**
+   * The re-initialization of every context manager that an undo or redo
+   * starts once its move has landed (reinitializeAfterSyncMove). Those two
+   * return before it finishes, so it holds their store reservation until
+   * every manager is current. An undo or redo made meanwhile moves the store
+   * again under that reservation and sets `again`, and the pass runs again.
+   */
+  private syncMoveReinit: SyncMoveReinit | null = null;
   /** Serialize per-server drains so reconnect and an online undo cannot race. */
   private discordAwarenessDrains: Map<string, Promise<DiscordAwarenessDrainOutcome>> = new Map();
   /** Framework-global inference gate; older generations cannot release it. */
@@ -6961,6 +6986,9 @@ export class AgentFramework {
     // The branch has moved: delivery of the marks it changes starts behind
     // the data-plane gate, and the command doesn't wait for Discord.
     this.startDiscordAwarenessDelivery('turn undo', agentName);
+    // The preview compiles, so it waits for the managers the undos left
+    // re-initializing.
+    await this.syncMoveReinit?.done;
 
     return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
@@ -7281,12 +7309,24 @@ export class AgentFramework {
    * reserves the store as a surgery does: every agent must be idle, or it is
    * refused (OperatorActionError 'agent-busy'), and no turn starts until the
    * switch is done.
+   *
+   * Every agent's context manager is re-initialized for the branch before
+   * the store is released (reinitializeManagers). One whose
+   * re-initialization fails raises an ops alert naming its agent
+   * (`context-reinit-failed`), and the switch still resolves. A switch to the
+   * branch the store is already on re-initializes them too, which is how a
+   * manager left refusing by a failed re-initialization is recovered without
+   * a restart.
    */
   async switchBranch(name: string): Promise<void> {
     this.refuseOperatorAfterStop('switch branch');
     const release = this.reserveStoreForSurgery('switch branch', 'every agent');
+    let reinitializing: Promise<ManagerReinitFailure[]> | undefined;
     try {
       this.store.switchBranch(name);
+      // No manager made this move, so each one's strategy is loaded for the
+      // branch generation the store has left.
+      reinitializing = this.reinitializeManagers();
       // Reversible Discord awareness markers are part of the branch
       // projection. Their delivery starts behind the data-plane gate, which
       // goes up before the store is released, and the switch doesn't wait
@@ -7297,6 +7337,7 @@ export class AgentFramework {
         await (ws as { materializeMount: (m: string) => Promise<void> }).materializeMount('_config');
       }
     } finally {
+      if (reinitializing) this.reportReinitFailures('branch switch', await reinitializing);
       release();
     }
   }
@@ -7310,6 +7351,16 @@ export class AgentFramework {
    *
    * The undone branch is saved so `redo()` can restore it.
    * Returns the checkpoint that was undone, or null if nothing to undo.
+   *
+   * The branch moves under every agent sharing the store, so an undo
+   * reserves the store as a surgery does: every agent must be idle, or it is
+   * refused (OperatorActionError 'agent-busy'). It returns once the store has
+   * moved, and the store stays reserved until every agent's context manager
+   * is re-initialized for the new branch, so no turn starts before then. One
+   * whose re-initialization fails raises an ops alert naming its agent
+   * (`context-reinit-failed`). An undo or redo made before the managers are
+   * done moves the store again under the same reservation, and they are
+   * re-initialized for the branch the last one leaves.
    */
   undoLastTurn(agentName: string, requester?: OperatorRequester): {
     undone: boolean;
@@ -7337,7 +7388,9 @@ export class AgentFramework {
       throw new Error(`Cannot undo while agent is ${agent.state.status}`);
     }
     // A surgery or a branch switch holds the store while it awaits its steps.
-    if (this.surgeryHold) {
+    // An earlier undo or redo whose managers are still re-initializing holds
+    // it too, and this undo moves the store again under its reservation.
+    if (this.surgeryHold && !this.syncMoveReinit) {
       throw new OperatorActionError('agent-busy', `Cannot undo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
@@ -7347,13 +7400,19 @@ export class AgentFramework {
     }
 
     const checkpoint = checkpoints.pop()!;
-    this.saveTurnCheckpoints(agentName, checkpoints);
-
     const currentBranch = this.store.currentBranch();
     const undoBranchName = `undo/${agentName}/${checkpoint.turnIndex}-${Date.now()}`;
 
-    this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
-    this.store.switchBranch(undoBranchName);
+    const move = this.beginSyncMove('undo', agentName);
+    try {
+      this.saveTurnCheckpoints(agentName, checkpoints);
+      this.store.createBranchAt(undoBranchName, currentBranch.name, checkpoint.sequenceBefore);
+      this.store.switchBranch(undoBranchName);
+    } catch (error) {
+      move.abandon();
+      throw error;
+    }
+    move.landed();
 
     this.materializeConfigMountAfterBranchSwitch();
 
@@ -7393,6 +7452,9 @@ export class AgentFramework {
    *
    * Switches back to the branch that was active before the last undo.
    * Returns false if there's nothing to redo.
+   *
+   * It reserves the store and re-initializes every agent's context manager
+   * as undoLastTurn() does.
    */
   redo(agentName: string, requester?: OperatorRequester): {
     redone: boolean;
@@ -7408,7 +7470,9 @@ export class AgentFramework {
       throw new Error(`Cannot redo while agent is ${agent.state.status}`);
     }
     // A surgery or a branch switch holds the store while it awaits its steps.
-    if (this.surgeryHold) {
+    // An earlier undo or redo whose managers are still re-initializing holds
+    // it too, and this redo moves the store again under its reservation.
+    if (this.surgeryHold && !this.syncMoveReinit) {
       throw new OperatorActionError('agent-busy', `Cannot redo: the store is under live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName}`);
     }
 
@@ -7417,10 +7481,16 @@ export class AgentFramework {
       return { redone: false };
     }
 
-    const { branchName, checkpoint } = redoStack.pop()!;
     const currentBranch = this.store.currentBranch();
-
-    this.store.switchBranch(branchName);
+    const move = this.beginSyncMove('redo', agentName);
+    const { branchName, checkpoint } = redoStack.pop()!;
+    try {
+      this.store.switchBranch(branchName);
+    } catch (error) {
+      move.abandon();
+      throw error;
+    }
+    move.landed();
 
     this.materializeConfigMountAfterBranchSwitch();
 
@@ -7578,6 +7648,107 @@ export class AgentFramework {
   }
 
   /**
+   * Re-initialize the context manager of every registered agent but
+   * `except`, for the branch the store is on now, after the branch moved
+   * (#326). A manager loads its strategy for one branch generation, and
+   * context-manager re-initializes only the manager that makes a move
+   * (switchBranch, fork), so every other manager on the store keeps a
+   * strategy that refuses its compiles, its readiness and its maintenance.
+   * Setting a manager's own strategy again re-initializes it for the
+   * store's current generation. A switchBranch() to the same branch would
+   * advance the generation, and leave stale each manager re-initialized
+   * before it.
+   *
+   * Called under the move's store reservation, so no turn starts while a
+   * manager re-initializes, and the messages the reservation defers for its
+   * agents are written after. The managers re-initialize side by side. Never
+   * rejects: it answers the agents whose re-initialization failed. Each of
+   * those managers refuses its work, as context-manager leaves a failed
+   * initialization, until another one succeeds.
+   */
+  private async reinitializeManagers(except?: string): Promise<ManagerReinitFailure[]> {
+    const failures: ManagerReinitFailure[] = [];
+    await Promise.all([...this.agents].map(async ([agentName, agent]) => {
+      if (agentName === except) return;
+      const cm = agent.getContextManager();
+      try {
+        await cm.setStrategy(cm.getStrategy());
+      } catch (error) {
+        failures.push({ agentName, error: failureDescription(error) });
+      }
+    }));
+    return failures;
+  }
+
+  /** Say which agents a move left with a manager that refuses its work:
+   *  on the console, in failures.log and in an ops alert, one per agent. */
+  private reportReinitFailures(after: string, failures: ManagerReinitFailure[]): void {
+    for (const { agentName, error } of failures) {
+      const message =
+        `The ${after} moved the store's branch, and re-initializing this agent's context manager for it failed: ${error}. ` +
+        'Until it is re-initialized it refuses its work, compiles and message writes included: ' +
+        'switchBranch() to the current branch, or a restart, re-initializes it.';
+      console.error(`[operator] agent=${agentName} ${boundFailureText(message)}`);
+      this.opsAlert('context-reinit-failed', agentName, message, { data: { after } });
+    }
+  }
+
+  /**
+   * Take the store for an undo's or redo's move. It's reserved as a surgery
+   * reserves it, unless an earlier undo's or redo's managers are still
+   * re-initializing under their reservation (syncMoveReinit): then this move
+   * is made under that one. `landed()`, once the store has moved, hands a
+   * reservation this call took to the re-initialization that releases it
+   * (reinitializeAfterSyncMove), or has the joined one run again. `abandon()`,
+   * when the move failed before the store moved, releases a reservation this
+   * call took.
+   */
+  private beginSyncMove(verb: 'undo' | 'redo', agentName: string): { landed(): void; abandon(): void } {
+    const running = this.syncMoveReinit;
+    if (running) {
+      return {
+        landed: () => { running.again = true; running.after = verb; },
+        abandon: () => {},
+      };
+    }
+    const release = this.reserveStoreForSurgery(verb, agentName);
+    return {
+      landed: () => this.reinitializeAfterSyncMove(verb, release),
+      abandon: release,
+    };
+  }
+
+  /**
+   * Re-initialize every agent's manager after an undo's or redo's move, and
+   * release the move's store reservation once they are all current. It runs
+   * on after the undo or redo has returned. A move made under the same
+   * reservation meanwhile sets `again`, and the pass runs again for the
+   * branch the store is on then. Only the last pass's failures are reported,
+   * since an earlier pass can fail because of the later move.
+   */
+  private reinitializeAfterSyncMove(after: 'undo' | 'redo', release: () => void): void {
+    const state: SyncMoveReinit = { again: false, after, done: Promise.resolve() };
+    this.syncMoveReinit = state;
+    state.done = (async () => {
+      try {
+        let failures: ManagerReinitFailure[];
+        do {
+          state.again = false;
+          failures = await this.reinitializeManagers();
+        } while (state.again);
+        this.reportReinitFailures(state.after, failures);
+      } finally {
+        if (this.syncMoveReinit === state) this.syncMoveReinit = null;
+        release();
+      }
+    })().catch((error: unknown) => {
+      // Nothing awaits this: a release that throws is said here, where a
+      // surgery's caller would hear it from the surgery.
+      console.error(`[operator] releasing the store the ${state.after} reserved failed: ${boundFailureText(failureDescription(error))}`);
+    });
+  }
+
+  /**
    * After a failed switch or redaction: put the store back on `sourceBranch`
    * if it moved, and return a sentence saying what actually happened. Never
    * throws — the caller reports the original failure with this appended.
@@ -7682,6 +7853,7 @@ export class AgentFramework {
       const release = this.reserveStoreForSurgery('roll back', agentName);
       let branchName: string;
       let markers: SurgeryMarkerReceipt;
+      let moved = false;
       try {
         // Prepare the external side effect before switching Chronicle. If the
         // process dies after the switch but before activate(), startup
@@ -7698,6 +7870,7 @@ export class AgentFramework {
 
         try {
           branchName = cm.branchAt(tailMessageId as MessageId, targetBranch);
+          moved = true;
           await cm.switchBranch(branchName);
         } catch (error) {
           // switchBranch moves the chronicle branch BEFORE awaiting strategy
@@ -7722,6 +7895,11 @@ export class AgentFramework {
         this.startDiscordAwarenessDelivery('rollback', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
+        // The agent's own manager re-initialized with its switch, or with the
+        // switch back to the source. Every other agent's is loaded for a
+        // branch generation the store has left, after a failed rollback too:
+        // its switch back is a move of its own.
+        if (moved) this.reportReinitFailures('rollback', await this.reinitializeManagers(agentName));
         release();
       }
 
@@ -7850,6 +8028,7 @@ export class AgentFramework {
       const release = this.reserveStoreForSurgery('suppress', agentName);
       let createdBranch: string;
       let markers: SurgeryMarkerReceipt;
+      let moved = false;
       try {
         const markerBatch = this.discordAwarenessOutbox?.prepare({
           agentName,
@@ -7872,6 +8051,7 @@ export class AgentFramework {
         };
 
         try {
+          moved = true;
           createdBranch = await cm.fork(targetBranch);
         } catch (error) {
           // fork() switches the chronicle branch before awaiting strategy
@@ -7917,6 +8097,9 @@ export class AgentFramework {
         this.startDiscordAwarenessDelivery('suppress', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
+        // As in rollbackToMessage: fork() re-initialized only this agent's
+        // manager.
+        if (moved) this.reportReinitFailures('suppression', await this.reinitializeManagers(agentName));
         release();
       }
 
