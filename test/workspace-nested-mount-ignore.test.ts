@@ -23,7 +23,7 @@
 
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import fsPromises from 'node:fs/promises';
 import fs from 'node:fs';
@@ -32,6 +32,7 @@ import { dirname, join, parse, sep, win32 } from 'node:path';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule } from '../src/modules/workspace/index.js';
 import { nestedSuffix, readPath } from '../src/modules/workspace/observe.js';
+import { EffectFailed, unlinkContained, writeContained } from '../src/modules/workspace/effects.js';
 import type { MountConfig } from '../src/modules/workspace/types.js';
 import type { ModuleContext } from '../src/types/module.js';
 import { MountWatcher, type FsChange } from '../src/modules/workspace/watcher.js';
@@ -616,6 +617,41 @@ test("the located read refuses a file it opens through a link into a nested moun
   const view = { root: outerDir, followSymlinks: true, maxFileSize: 1 << 20, ignore: [], nested: [{ name: 'inner', real: realpathSync(innerDir) }] };
   assert.deepEqual(await readPath(view, realpathSync(outerDir), 'flink.txt', 1 << 20),
     { kind: 'unobserved', reason: 'inside mount "inner", which is nested in this one' });
+});
+
+test("the contained write refuses a file it opens through a link into a nested mount, as materialize's check does", async (t) => {
+  // materialize refuses a write through a file link into a nested mount
+  // before anything is pushed. The write checks the file it actually opened
+  // again, so a link that appears between that check and the write reaches
+  // nothing either. Called directly here, as a push calls it.
+  const { root } = scratch(t, 'af-nested-mount-contained-write-');
+  const outerDir = join(root, 'outer');
+  const innerDir = join(outerDir, 'a', 'b');
+  mkdirSync(innerDir, { recursive: true });
+  writeFileSync(join(innerDir, 'x.txt'), "the inner mount's");
+  symlinkSync(join(innerDir, 'x.txt'), join(outerDir, 'flink.txt'));
+  const view = { root: outerDir, followSymlinks: true, maxFileSize: 1 << 20, ignore: [], nested: [{ name: 'inner', real: realpathSync(innerDir) }] };
+  const err = await writeContained(view, realpathSync(outerDir), 'flink.txt', Buffer.from('outer wrote'), { kind: 'any' }).then(() => null, (e) => e);
+  assert.ok(err instanceof EffectFailed, String(err));
+  assert.equal(err.message, 'inside mount "inner", which is nested in this one');
+  assert.equal(readFileSync(join(innerDir, 'x.txt'), 'utf8'), "the inner mount's", "the inner mount's file is as it was");
+});
+
+test("the contained unlink refuses a final link into a nested mount, and leaves the link and the file", async (t) => {
+  // A delete routed to disk removes a link itself, not what it names, and
+  // only a link whose target lies in this mount and in no mount nested in it.
+  const { root } = scratch(t, 'af-nested-mount-contained-unlink-');
+  const outerDir = join(root, 'outer');
+  const innerDir = join(outerDir, 'a', 'b');
+  mkdirSync(innerDir, { recursive: true });
+  writeFileSync(join(innerDir, 'x.txt'), "the inner mount's");
+  symlinkSync(join(innerDir, 'x.txt'), join(outerDir, 'flink.txt'));
+  const view = { root: outerDir, followSymlinks: true, maxFileSize: 1 << 20, ignore: [], nested: [{ name: 'inner', real: realpathSync(innerDir) }] };
+  const err = await unlinkContained(view, realpathSync(outerDir), 'flink.txt', { kind: 'any' }).then(() => null, (e) => e);
+  assert.ok(err instanceof EffectFailed, String(err));
+  assert.equal(err.message, 'inside mount "inner", which is nested in this one');
+  assert.ok(lstatSync(join(outerDir, 'flink.txt')).isSymbolicLink(), 'the link is still there');
+  assert.equal(readFileSync(join(innerDir, 'x.txt'), 'utf8'), "the inner mount's", "the inner mount's file is as it was");
 });
 
 test("the disk readers reach nothing of a nested mount through an alias, and the raw reader keeps the mount's boundary", async (t) => {
@@ -1251,7 +1287,9 @@ test('a blocked physical push still reports its completed nested-deletion cleanu
   assert.equal(readFileSync(join(r.inner, 'x.txt'), 'utf8'), 'inner bytes');
 });
 
-test('a non-ingested nested alias cannot derive an outer-owned key', async (t) => {
+test('a delete through a nested mount\'s link back into the outer mount keeps the outer-owned copy', async (t) => {
+  // The written-path check (nestedMountAt) refuses this first, so it never
+  // reaches the derived key's containment, which nesting implies today.
   const r = await secondPassRig(t, false, 4);
   assert.equal((await r.call('write', { path: 'outer/owned.txt', content: 'old' })).success, true);
   // Too large for observation to import under the alias. The old fallback

@@ -835,7 +835,10 @@ export class WorkspaceModule implements Module {
       const rest = nestedSuffix(inner, candidate);
       if (rest === null) continue;
       // Policy folding can justify a refusal, never the choice of another
-      // stored key to remove. A derived key needs exact containment.
+      // stored key to remove. A derived key needs exact containment. The
+      // second half is implied today, since nestedRootsOf admits only a mount
+      // whose resolved root lies under this one; it stays so that no key that
+      // climbs out of the mount (`../…`) can be derived if that ever changes.
       const derivedKey = contained(inner.real, candidate.real) && contained(view.root.real, candidate.real)
         ? relative(view.root.real, candidate.real).split(sep).join('/') : undefined;
       return { name: inner.name, at: inner.at, rest, derivedKey };
