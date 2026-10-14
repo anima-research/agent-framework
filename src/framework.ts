@@ -15711,6 +15711,13 @@ export class AgentFramework {
       const cause = [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
         .filter((part): part is string => part !== undefined)
         .join(', ');
+      // A timeout is the provider or the connection going quiet, which agent
+      // turns have already retried; the advice, about what a request carries,
+      // doesn't fit it.
+      const advice = errorType === 'timeout'
+        ? ''
+        : ' If this recurs with the same cause, change approach rather than ' +
+          'retrying identically (e.g. drop an oversized attachment or an unsupported setting).';
       try {
         agent.getContextManager().addMessage(
           'user',
@@ -15719,9 +15726,7 @@ export class AgentFramework {
             text:
               `[inference-failed] Your previous turn did not complete: the model ` +
               `call failed${cause ? ` (${cause})` : ''} and produced no response, so nothing was sent. Reason: ` +
-              `${markerReason}. If this recurs with the same cause, change approach ` +
-              `rather than retrying identically (e.g. drop an oversized attachment ` +
-              `or an unsupported setting).`,
+              `${markerReason}.${advice}`,
           }],
           { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
