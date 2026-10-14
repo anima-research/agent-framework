@@ -50,3 +50,10 @@ jobs:
       # are asynchronous on macOS), and ubuntu-only runs have missed that.
       - name: Test
         run: npm test
+
+      # npm test runs with --test-force-exit, which hides async work a test
+      # leaves running, such as a late arrival after stop() ("Queue is
+      # closed"). These files run unforced so that class fails here, not in a
+      # later PR's qualification.
+      - name: Test unforced (work in flight at stop)
+        run: node --test dist/test/stop-with-work-in-flight.test.js dist/test/conversation-routing.test.js

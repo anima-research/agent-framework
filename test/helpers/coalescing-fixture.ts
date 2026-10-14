@@ -111,8 +111,9 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
 }
 
 export async function eventually(predicate: () => boolean, what = 'condition'): Promise<void> {
-  const deadline = Date.now() + 3000;
-  while (!predicate()) { assert(Date.now() < deadline, `${what} did not settle`); await new Promise((r) => setTimeout(r, 10)); }
+  // The monotonic clock: a wall-clock step must not fail a wait that's on schedule.
+  const deadline = performance.now() + 3000;
+  while (!predicate()) { assert(performance.now() < deadline, `${what} did not settle`); await new Promise((r) => setTimeout(r, 10)); }
 }
 
 

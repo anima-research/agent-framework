@@ -66,20 +66,28 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'inference:failed';
       agentName: string;
+      /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
       error: string;
+      /** Bounded like `error`. */
       stack?: string;
     })
   | (TraceEventBase & {
       type: 'inference:exhausted';
       agentName: string;
+      /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
       error: string;
       /** Whether membrane classified the failure as retryable (observability). */
       retryable?: boolean;
       /**
-       * The membrane error type (e.g. 'invalid_request', 'auth', 'context_length').
-       * The poison-history breaker fires only on 'invalid_request'.
+       * The membrane error type (e.g. 'invalid_request', 'auth', 'context_length'),
+       * at most 128 characters. The poison-history breaker fires only on
+       * 'invalid_request'.
        */
       errorType?: string;
+      /** The provider's HTTP status, when the failure carried one. */
+      httpStatus?: number;
+      /** The provider's own error code, when it sent one (at most 128 characters). */
+      providerErrorCode?: string;
     })
 
   // Streaming inference lifecycle
@@ -534,8 +542,10 @@ export type TraceEvent =
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;
+      /** At most 2,000 characters. */
       message: string;
-      /** Kind-specific structured payload (mirrors the failures.log record). */
+      /** Kind-specific structured payload (mirrors the failures.log record),
+       *  bounded field by field as that record is. */
       data?: Record<string, unknown>;
     })
 

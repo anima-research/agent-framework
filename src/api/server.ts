@@ -543,8 +543,13 @@ export class ApiServer {
     this.currentBranch = params.name;
 
     // Reversible Discord awareness markers are part of the branch projection.
-    // Do not acknowledge the switch until add/remove operations were attempted.
-    await this.framework.syncDiscordAwarenessMarkers();
+    // The switch is acknowledged once it has landed: delivery of the marks it
+    // adds and removes starts behind the MCPL data-plane gate, which holds
+    // channel traffic that arrives after it until they are attempted, or
+    // deferred while their server is disconnected, and a failure is an ops
+    // alert rather than a failed switch. (It used to await the awareness
+    // sync, which after a large rollback took the drain's whole length.)
+    this.framework.startDiscordAwarenessDelivery('branch switch');
 
     // Materialize config files from the new branch
     const ws = this.framework.getModule('workspace');
@@ -598,7 +603,8 @@ export class ApiServer {
 
     if (result.undone) {
       this.currentBranch = result.toBranch!;
-      await this.framework.syncDiscordAwarenessMarkers();
+      // Marks follow behind the data-plane gate; the undo doesn't wait for Discord.
+      this.framework.startDiscordAwarenessDelivery('undo', params.agentName);
       this.broadcast('branch:switched', {
         from: result.fromBranch,
         to: result.toBranch,
@@ -618,7 +624,8 @@ export class ApiServer {
 
     if (result.redone) {
       this.currentBranch = result.toBranch!;
-      await this.framework.syncDiscordAwarenessMarkers();
+      // Marks follow behind the data-plane gate; the redo doesn't wait for Discord.
+      this.framework.startDiscordAwarenessDelivery('redo', params.agentName);
       this.broadcast('branch:switched', {
         from: result.fromBranch,
         to: result.toBranch,

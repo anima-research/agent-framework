@@ -2,7 +2,7 @@
  * Agent framework integration tests
  */
 
-import { describe, it, beforeEach, mock } from 'node:test';
+import { describe, it, beforeEach, afterEach, mock } from 'node:test';
 import assert from 'node:assert';
 import { tmpdir } from 'node:os';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -17,6 +17,7 @@ import type {
   ToolDefinition,
   ToolCall,
   ToolResult,
+  TraceEvent,
 } from '../src/index.js';
 import { AgentFramework, ProcessQueueImpl } from '../src/index.js';
 
@@ -1087,5 +1088,194 @@ describe('Module state persistence', () => {
 
     await framework.stop();
     rmSync(tempDir, { recursive: true });
+  });
+});
+
+describe('Trace listeners', () => {
+  let tempDir: string;
+  let framework: AgentFramework;
+
+  beforeEach(async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'agent-framework-test-'));
+    framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Test' }],
+      modules: [new TestModule()],
+    });
+  });
+
+  afterEach(async () => {
+    await framework.stop();
+    rmSync(tempDir, { recursive: true });
+  });
+
+  /** One trace event, process:received, emitted before pushEvent returns.
+   *  Nothing processes the queue, so no other event follows it. */
+  function emit(name: string): void {
+    framework.pushEvent({ type: 'external-message', source: 'test', content: name, metadata: {} });
+  }
+
+  /** A listener recording the events emit() names, in order. */
+  function recorder(heard: string[]): (event: TraceEvent) => void {
+    return (event) => {
+      if (event.type === 'process:received' && event.processEvent.type === 'external-message') {
+        heard.push(String(event.processEvent.content));
+      }
+    };
+  }
+
+  /** A listener recording the events emit() names, each tagged with whose it is. */
+  function tagged(order: string[], tag: string): (event: TraceEvent) => void {
+    return (event) => {
+      if (event.type === 'process:received' && event.processEvent.type === 'external-message') {
+        order.push(`${tag}:${String(event.processEvent.content)}`);
+      }
+    };
+  }
+
+  it('a listener that unsubscribes itself during an event does not hide it from the next listener', () => {
+    const heard: string[] = [];
+    let selfCalls = 0;
+    const unsubscribe = framework.onTrace(() => {
+      selfCalls++;
+      unsubscribe();
+    });
+    framework.onTrace(recorder(heard));
+
+    emit('first');
+    emit('second');
+
+    assert.strictEqual(selfCalls, 1, 'the first listener hears the first event, then is gone');
+    assert.deepStrictEqual(heard, ['first', 'second']);
+  });
+
+  it('a listener that unsubscribes an earlier one during an event does not hide it from the next listener', () => {
+    const heard: string[] = [];
+    let earlierCalls = 0;
+    const earlier = (): void => { earlierCalls++; };
+    framework.onTrace(earlier);
+    framework.onTrace(() => framework.offTrace(earlier));
+    framework.onTrace(recorder(heard));
+
+    emit('first');
+    emit('second');
+
+    assert.strictEqual(earlierCalls, 1, 'the earlier listener hears the first event, then is gone');
+    assert.deepStrictEqual(heard, ['first', 'second']);
+  });
+
+  it('a listener unsubscribed before its turn hears neither that event nor any after it', () => {
+    const heard: string[] = [];
+    const after: string[] = [];
+    let unsubscribeRecorder = (): void => {};
+    framework.onTrace(() => unsubscribeRecorder());
+    unsubscribeRecorder = framework.onTrace(recorder(heard));
+    framework.onTrace(recorder(after));
+
+    emit('first');
+    emit('second');
+
+    assert.deepStrictEqual(heard, []);
+    assert.deepStrictEqual(after, ['first', 'second']);
+  });
+
+  it('a listener added during an event hears the next event, not that one', () => {
+    const heard: string[] = [];
+    let added = false;
+    framework.onTrace(() => {
+      if (added) return;
+      added = true;
+      framework.onTrace(recorder(heard));
+    });
+
+    emit('first');
+    emit('second');
+
+    assert.deepStrictEqual(heard, ['second']);
+  });
+
+  it('a listener unsubscribed and subscribed again during an event hears the next event, not that one', () => {
+    const heard: string[] = [];
+    const listener = recorder(heard);
+    let resubscribed = false;
+    framework.onTrace(() => {
+      if (resubscribed) return;
+      resubscribed = true;
+      framework.offTrace(listener);
+      framework.onTrace(listener);
+    });
+    framework.onTrace(listener);
+
+    emit('first');
+    emit('second');
+
+    assert.deepStrictEqual(heard, ['second']);
+  });
+
+  it('a listener is called as a plain function, not as a method of its subscription', () => {
+    const receivers: unknown[] = [];
+    framework.onTrace(function (this: unknown) {
+      receivers.push(this);
+    });
+
+    emit('first');
+
+    assert.deepStrictEqual(receivers, [undefined]);
+  });
+
+  it('an unsubscribe removes its own subscription, however often it is called', () => {
+    const order: string[] = [];
+    const listener = tagged(order, 'L');
+    framework.onTrace(listener);
+    framework.onTrace(tagged(order, 'X'));
+    const unsubscribeSecond = framework.onTrace(listener);
+
+    unsubscribeSecond();
+    unsubscribeSecond();
+    emit('first');
+
+    assert.deepStrictEqual(order, ['L:first', 'X:first']);
+  });
+
+  it('offTrace removes the first subscription its listener still has, and does nothing once none is left', () => {
+    const order: string[] = [];
+    const listener = tagged(order, 'L');
+    framework.onTrace(listener);
+    framework.onTrace(tagged(order, 'X'));
+    framework.onTrace(listener);
+
+    framework.offTrace(listener);
+    emit('first');
+    framework.offTrace(listener);
+    emit('second');
+    assert.doesNotThrow(() => framework.offTrace(listener));
+
+    assert.deepStrictEqual(order, ['X:first', 'L:first', 'X:second']);
+  });
+
+  it('a listener that emits during delivery does not cut the outer delivery short, and an unsubscribe in the nested delivery holds for it', () => {
+    const heard: string[] = [];
+    const later: string[] = [];
+    let nested = false;
+    framework.onTrace(() => {
+      if (nested) return;
+      nested = true;
+      emit('inner');
+    });
+    framework.onTrace(recorder(heard));
+    let unsubscribeLater = (): void => {};
+    framework.onTrace((event) => {
+      if (event.type === 'process:received' && event.processEvent.type === 'external-message'
+        && event.processEvent.content === 'inner') {
+        unsubscribeLater();
+      }
+    });
+    unsubscribeLater = framework.onTrace(recorder(later));
+
+    emit('outer');
+
+    assert.deepStrictEqual(heard, ['inner', 'outer']);
+    assert.deepStrictEqual(later, []);
   });
 });

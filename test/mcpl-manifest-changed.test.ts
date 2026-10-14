@@ -72,7 +72,8 @@ class ManifestFake extends EventEmitter {
 function makeHarness() {
   const traces: Array<{ type: string; [k: string]: unknown }> = [];
   const fw = Object.create(AgentFramework.prototype) as any;
-  fw.traceListeners = [(e: unknown) => traces.push(e as never)];
+  fw.traceListeners = [];
+  fw.onTrace((e: unknown) => traces.push(e as never));
   fw.featureSetManager = new FeatureSetManager();
   fw.mcplTools = [];
   fw.mcplToolRefreshInFlight = false;

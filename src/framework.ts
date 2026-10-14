@@ -1,6 +1,6 @@
 import { ToolPresentation, presentationTools, isPresentationTool, renderCatalogue, type PresentationSnapshot } from "./tool-presentation.js";
 import { dirname, join } from 'node:path';
-import { INLINE_WITHHELD_TEXT, classifyBlock, isInlineContradiction, referenceRegistry, referenceStubOrNull } from './mcpl/references.js';
+import { EXPIRY_REASON, INLINE_WITHHELD_TEXT, REFERENCE_LIMITS, classifyBlock, isInlineContradiction, isReferenceExpired, referenceExpiry, referenceRegistry, referenceStubOrNull, referenceTypeLabel, sanitizeLabel } from './mcpl/references.js';
 import { ReferenceFetcher, DEFAULT_FETCH_MAX_BYTES, EAGER_FETCH_TIMEOUT_MS } from './mcpl/reference-fetcher.js';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { JsStore } from '@animalabs/chronicle';
@@ -62,9 +62,9 @@ import type {
 } from './types/index.js';
 import { ProcessQueueImpl } from './queue.js';
 import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, shutdownErrorMessage } from './shutdown.js';
-import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK } from './refusal-reactions.js';
+import { REFUSAL_REACTIONS, REFUSAL_REACTION_FALLBACK, REFUSAL_REACTION_BASELINE } from './refusal-reactions.js';
 import { Agent } from './agent.js';
-import { ModuleRegistry, isStateExistsError } from './module-registry.js';
+import { ModuleRegistry, checkedToolResult, isStateExistsError, storableToolResult, thrownResult } from './module-registry.js';
 import { McplServerRegistry } from './mcpl/server-registry.js';
 import { FeatureSetManager } from './mcpl/feature-set-manager.js';
 import { computeGrant, CapabilityGrant, expandAdvertisementShorthand } from './mcpl/capability-grant.js';
@@ -89,7 +89,9 @@ import { ChannelRegistry, type ChannelToolOrigin } from './mcpl/channel-registry
 import { ConversationRouter, CONVERSATION_ROUTING_DEPRECATION_NOTICE } from './mcpl/conversation-router.js';
 import { safeSlice } from './safe-slice.js';
 import type { WorkspaceModule } from './modules/workspace/index.js';
+import type { ToolResultGuard, WithheldSpill } from './tool-result-guard.js';
 import {
+  nonErrorResultText,
   toolResultDataToHistoryString,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
@@ -392,6 +394,7 @@ import { EventGate, formatShadowWarning } from './gate/event-gate.js';
 import { UsageTracker, type PersistedUsageState } from './usage/usage-tracker.js';
 import type { SessionUsageSnapshot, UsageUpdatedEvent } from './usage/types.js';
 import type { McplServerConnection } from './mcpl/server-connection.js';
+import { isWebSocketTransport } from './mcpl/transport.js';
 import type {
   McplServerConfig,
   McplHostCapabilities,
@@ -410,12 +413,14 @@ import {
   DiscordAwarenessOutbox,
   defaultDiscordAwarenessOutboxPath,
   extractDiscordAwarenessRefs,
+  type DiscordAwarenessBatch,
 } from './recovery/discord-awareness-outbox.js';
 import {
   OperatorActionError,
   OperatorLog,
   capIds,
   defaultOperatorLogPath,
+  type SurgeryMarkerReceipt,
   type OperatorLogEntry,
   type OperatorLogInput,
   type OperatorRequester,
@@ -481,6 +486,97 @@ function withDeferredWriteId(metadata: MessageMetadata | undefined, id: string):
   return { ...(metadata ?? {}), deferredWriteId: id } as MessageMetadata;
 }
 
+/**
+ * A prose block's envelopes, as explicit mode routes them: every line whose
+ * text, after its leading whitespace, is `>>` and then a non-space opens a
+ * new envelope (first live use: Tilde 2026-07-24, one block carrying a
+ * letter to #tilde-mythos AND a `>>#tilde` aside; the single-envelope
+ * parser delivered the aside literally into the first destination — exactly
+ * the leak class this mode exists to kill). Text before the first `>>` is
+ * its own unprefixed envelope. A quoted `>> arrow` (space after) stays body
+ * text. Blank envelopes are dropped, and an envelope's whitespace before its
+ * `>>` is trimmed.
+ */
+function splitExplicitEnvelopes(rawText: string): string[] {
+  const envelopes: string[] = [];
+  let current: string[] = [];
+  for (const line of rawText.split('\n')) {
+    if (/^>>\S/.test(line.trimStart()) && current.length > 0) {
+      envelopes.push(current.join('\n'));
+      current = [];
+    }
+    current.push(line);
+  }
+  if (current.length > 0) envelopes.push(current.join('\n'));
+  return envelopes.filter((envelope) => envelope.trim()).map((envelope) => envelope.replace(/^\s+(?=>>)/, ''));
+}
+
+/**
+ * An envelope of explicit prose as its round was admitted: for a `>>` target,
+ * the registry's answer then, which its delivery uses.
+ */
+interface AdmittedEnvelope {
+  text: string;
+  resolved?: { channelId: string } | { error: string; candidates?: string[] };
+}
+
+/**
+ * Whether a stream resumes its logical turn rather than starting one: a budget
+ * restart, or a tool-result-guard retry. Such a stream keeps the turn's
+ * routing state (the sticky destination, the turn's destination) and queues
+ * its deliveries behind the turn's earlier ones.
+ */
+function resumesLogicalTurn(reason: string | undefined): boolean {
+  return reason === 'context_budget_restart' || reason === 'tool_result_guard_retry';
+}
+
+/**
+ * One turn's routing and delivery receipts (AgentFramework.turnRouting).
+ * A fresh turn gets a new object; a queued delivery keeps its own turn's.
+ */
+interface TurnRouting {
+  /** The sticky destination, set by each `>>` (hybrid: `>>>`) prefix that resolves. */
+  pin?: string;
+  /**
+   * Explicit mode: the destination the turn's delivered rounds have set,
+   * decided at each round boundary (roundDestination), where a stream that
+   * resumes the turn starts.
+   */
+  destination: string | null;
+  /** Hybrid: held back after a malformed or unresolved envelope, until a later `>>>` names a target. */
+  hybridHold: boolean;
+  /** What the logical turn keeps across a new stream (LogicalTurn). */
+  logical: LogicalTurn;
+}
+
+/**
+ * What every stream of one logical turn shares, from the fresh start that
+ * opens it until it settles (AgentFramework.openLogical): a framework retry,
+ * a re-inference after unstreamed tool results, a capacity-held turn's later
+ * compile. beginAgentTurn starts each with fresh routing, but a ` !` asked
+ * for in any of them stands, and the receipt at the turn's end reports every
+ * stream's deliveries, even ones that land after a new stream began.
+ */
+interface LogicalTurn {
+  /** The turn asked for a ` !` continuation; taken once. */
+  continuation: boolean;
+  /** Successful plain-prose destinations in delivery order; deduped by the receipt. */
+  deliveries: string[];
+  /** Plain-prose segments the turn suppressed, reported by its receipt. */
+  suppressed: number;
+}
+
+function freshTurnRouting(): TurnRouting {
+  return { destination: null, hybridHold: false, logical: { continuation: false, deliveries: [], suppressed: 0 } };
+}
+
+/** How a round's prose is delivered: kept private, and under which turn's routing. */
+interface ProseRound {
+  keepPrivate?: boolean;
+  /** The routing state of the turn that queued the round. */
+  routing: TurnRouting;
+}
+
 function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
@@ -513,6 +609,21 @@ interface DiscordAwarenessBarrier {
   generation: number;
   requiresBarrier: boolean;
   promise: Promise<DiscordAwarenessDrainOutcome>;
+}
+
+/** Several drains' outcomes as one: unavailable only if every one was. */
+function combineDrainOutcomes(outcomes: DiscordAwarenessDrainOutcome[]): DiscordAwarenessDrainOutcome {
+  if (outcomes.every((outcome) => outcome.status === 'unavailable')) {
+    return {
+      status: 'unavailable',
+      accounted: outcomes.reduce((count, outcome) => count + (outcome.status === 'unavailable' ? outcome.accounted : 0), 0),
+    };
+  }
+  return {
+    status: 'delivered',
+    delivered: outcomes.reduce((count, outcome) => count + (outcome.status === 'delivered' ? outcome.delivered : 0), 0),
+    failed: outcomes.reduce((count, outcome) => count + (outcome.status === 'delivered' ? outcome.failed : 0), 0),
+  };
 }
 
 function normalizeDiscordAwarenessDeadline(value: number | undefined): number {
@@ -721,6 +832,13 @@ function bodyGroupRun(
   };
 }
 
+function describeMarkers(m: SurgeryMarkerReceipt): string {
+  if (m.status === 'queued') return `queued:${m.queued}`;
+  if (m.status === 'not-scheduled') return 'not-scheduled(batch retired)';
+  if (m.status === 'unresolved') return `unresolved(batch ${m.batchId} may still be delivered)`;
+  return 'none';
+}
+
 function describeRequester(r: OperatorRequester | undefined): string {
   if (!r) return 'unknown';
   return `${r.name ?? r.id ?? 'unknown'} (${r.via})`;
@@ -755,11 +873,11 @@ class DefaultErrorPolicy implements ErrorPolicy {
   maxRetries = 3;
 
   onInferenceError(error: Error, _agentName: string, attempt: number): ErrorAction {
-    if (error instanceof MembraneError && !error.retryable) {
+    if (isMembraneError(error) && error.retryable === false) {
       return { retry: false };
     }
     if (attempt < this.maxRetries) {
-      const delayMs = error instanceof MembraneError && error.retryAfterMs !== undefined
+      const delayMs = isMembraneError(error) && typeof error.retryAfterMs === 'number'
         ? error.retryAfterMs
         : Math.pow(2, attempt) * 1000;
       return { retry: true, delayMs };
@@ -770,6 +888,10 @@ class DefaultErrorPolicy implements ErrorPolicy {
 
 /** Default sync interval in milliseconds */
 const DEFAULT_SYNC_INTERVAL_MS = 1000;
+/** Total time one withheld batch may spend awaiting workspace writes.
+ *  At the deadline its unfinished write is named as such, and later
+ *  originals stay in the audit. This bound applies to withheld spills. */
+const WITHHELD_SPILL_DEADLINE_MS = 30_000;
 /** Poll pending context-strategy maintenance independently of user activity. */
 const DEFAULT_MAINTENANCE_INTERVAL_MS = 5000;
 /** Bound one pass so a large backlog yields to inference and other agents. */
@@ -820,8 +942,19 @@ interface ProviderAccelerationReceipt {
 const PROVIDER_ACCELERATION_DEFAULT_COOLDOWN_MS = 65_000;
 const PROVIDER_ACCELERATION_MAX_COOLDOWN_MS = 10 * 60_000;
 const PROVIDER_ACCELERATION_JITTER_MS = 5_000;
+/**
+ * A MembraneError, from this framework's copy of membrane or from another: the
+ * host supplies the Membrane instance (config.membrane), so with two copies
+ * installed its errors are instances of a class this framework's `instanceof`
+ * doesn't match. Recognised by name as well, as context-manager's errors are;
+ * its fields are the same, so callers still check each one's type.
+ */
+function isMembraneError(error: unknown): error is MembraneError {
+  return error instanceof MembraneError || (error instanceof Error && error.name === 'MembraneError');
+}
+
 function isOrganizationAccelerationRateLimit(error: Error): error is MembraneError {
-  if (!(error instanceof MembraneError) || error.type !== 'rate_limit') return false;
+  if (!isMembraneError(error) || error.type !== 'rate_limit') return false;
   return (
     /organization(?:'s)?[^\n]{0,120}maximum(?:\s+usage)?\s+increase\s+rate/i.test(error.message) ||
     /organization(?:'s)?[^\n]{0,120}acceleration(?:\s+limit)?/i.test(error.message)
@@ -918,6 +1051,14 @@ interface Deferred<T> {
   reject: (reason?: unknown) => void;
 }
 
+/** One onTrace subscription. Removing it, by its unsubscribe or by offTrace,
+ *  clears `active` as it splices it out, so a delivery already under way
+ *  skips it (see emitTrace). */
+interface TraceRegistration {
+  listener: TraceEventListener;
+  active: boolean;
+}
+
 /** Per-run state for a framework-driven ephemeral agent: the settle signal
  *  the caller awaits plus the liveness/progress bookkeeping the watchdogs and
  *  the stream driver share. One map entry per run — created and torn down in
@@ -946,11 +1087,288 @@ interface EphemeralRun {
   toolCallsCount: number;
 }
 
-/** Cap an API error message for inline use in a rewind marker: keep enough to
- *  identify the failure class without pasting a wall of provider JSON into the
- *  agent's context. */
-function truncateReason(reason: string, max = 160): string {
-  return reason.length <= max ? reason : reason.slice(0, max) + '…';
+/**
+ * Longest failure text the inference-failure pipeline writes to one sink: the
+ * reason in the exhaustion stderr line, a field of a logs/failures.log record,
+ * an ops alert's message, the inference log's `error`, and a trace event's
+ * `error` and `stack`. A failure's text is whatever its source put in
+ * `Error.message`, and a provider can echo the entire rejected request there
+ * (one OpenAI-compatible 400 echoed ~1.7 MB). The sinks with shorter bounds
+ * name them below, and every cut goes through boundFailureText. This bound
+ * doesn't depend on membrane bounding its own errors.
+ */
+const FAILURE_TEXT_MAX_CHARS = 2_000;
+/** Longest failure reason written into an agent's own context (the
+ *  `[inference-failed]` marker): enough for a provider's explanation, not a
+ *  self-dump the agent then carries in every later request. */
+const FAILURE_MARKER_REASON_MAX_CHARS = 600;
+/** Longest failure reason in the rewind marker, also the agent's own context:
+ *  enough to identify the failure class without a wall of provider JSON. */
+const REWIND_MARKER_REASON_MAX_CHARS = 160;
+/** Longest failure reason in an agent's status (`lastInference.lastError`) and
+ *  in the compile-refused ops alert. */
+const FAILURE_SUMMARY_MAX_CHARS = 300;
+/** Longest alert message posted to the ops webhook. */
+const OPS_WEBHOOK_MESSAGE_MAX_CHARS = 500;
+/** Longest provider error code recorded verbatim; real codes are short tokens.
+ *  A failure's name and type are bounded the same way. */
+const PROVIDER_ERROR_CODE_MAX_CHARS = 128;
+
+const isHighSurrogate = (text: string, index: number): boolean => {
+  const code = text.charCodeAt(index);
+  return code >= 0xd800 && code <= 0xdbff;
+};
+const isLowSurrogate = (text: string, index: number): boolean => {
+  const code = text.charCodeAt(index);
+  return code >= 0xdc00 && code <= 0xdfff;
+};
+/** Whether a cut before `index` would separate the halves of a surrogate pair. */
+const splitsPair = (text: string, index: number): boolean =>
+  index > 0 && index < text.length && isHighSurrogate(text, index - 1) && isLowSurrogate(text, index);
+
+/**
+ * `text` when it fits within `max` characters; otherwise its head and tail
+ * around a marker stating how many of how many characters were omitted, the
+ * whole within `max`. A cut that would separate a surrogate pair moves toward
+ * omission, so the result never holds half of a pair the text held whole, and
+ * bounding bounded text returns it as is. Each sink cuts the whole text, so
+ * its marker states the whole length.
+ */
+function boundFailureText(text: string, max: number = FAILURE_TEXT_MAX_CHARS): string {
+  if (text.length <= max) return text;
+  const markerLength = ` …[${text.length} of ${text.length} characters omitted]… `.length;
+  const budget = Math.max(0, max - markerLength);
+  const tailLength = Math.floor(budget / 4);
+  let headEnd = budget - tailLength;
+  if (splitsPair(text, headEnd)) headEnd--;
+  let tailStart = text.length - tailLength;
+  if (splitsPair(text, tailStart)) tailStart++;
+  return `${text.slice(0, headEnd)} …[${tailStart - headEnd} of ${text.length} characters omitted]… ${text.slice(tailStart)}`;
+}
+
+/** A provider error code, verbatim when token-sized; otherwise bounded. */
+function boundProviderErrorCode(code: unknown): string | undefined {
+  if (typeof code !== 'string') return undefined;
+  return boundFailureText(code, PROVIDER_ERROR_CODE_MAX_CHARS);
+}
+
+/**
+ * A value's JSON for a failure sink, with every Error inside it written as its
+ * whole projection (failureDescription): serialising an Error writes its own
+ * fields, a MembraneError's whole `rawRequest` among them. The projection is
+ * left uncut, as a nested string is, so the sink's one cut of the JSON states
+ * its whole length. An Error is recognised by instanceof, so one from another
+ * realm (a vm context) is written as its own JSON, as any object is. Throws,
+ * or returns undefined, as JSON.stringify does.
+ */
+function failureJson(value: unknown): string | undefined {
+  return JSON.stringify(value, (_key, nested: unknown) => (nested instanceof Error ? failureDescription(nested) : nested));
+}
+
+/**
+ * The whole text describeFailure cuts. For an Error, its head (name,
+ * classification, status, provider code, each bounded) and its whole
+ * message. For a primitive, its String. For another object, its String when
+ * that's text of its own (a Buffer, an Error from another realm, a class
+ * with its own toString). An array, or an object whose String is empty or
+ * only its tag, such as `[object Object]`, is its JSON instead
+ * (failureJson), so its fields and elements are kept; its tag stands when
+ * JSON can't write it or finds nothing in it.
+ */
+function failureDescription(error: unknown): string {
+  try {
+    if (!(error instanceof Error)) {
+      if (typeof error !== 'object' || error === null) return String(error);
+      if (!Array.isArray(error)) {
+        let text: string | undefined;
+        try { text = String(error); } catch { /* no String of its own: its JSON, below */ }
+        if (text && !/^\[object [^\]]*\]$/.test(text)) return text;
+      }
+      try {
+        const json = failureJson(error);
+        if (json !== undefined && json !== '{}') return json;
+      } catch { /* its tag, below */ }
+      return Object.prototype.toString.call(error);
+    }
+    const fields = error as Error & {
+      type?: unknown; httpStatus?: unknown; providerErrorCode?: unknown; retryable?: unknown;
+    };
+    // Every component is remote or caller-supplied text, the name included.
+    const classification = [
+      typeof fields.type === 'string' ? boundFailureText(fields.type, PROVIDER_ERROR_CODE_MAX_CHARS) : undefined,
+      typeof fields.httpStatus === 'number' ? `HTTP ${fields.httpStatus}` : undefined,
+      boundProviderErrorCode(fields.providerErrorCode),
+      typeof fields.retryable === 'boolean' ? `retryable=${fields.retryable}` : undefined,
+    ].filter((part): part is string => part !== undefined);
+    const name = boundFailureText(String(error.name), PROVIDER_ERROR_CODE_MAX_CHARS);
+    const head = classification.length > 0 ? `${name} (${classification.join(', ')})` : name;
+    return `${head}: ${String(error.message)}`;
+  } catch {
+    return '[failure could not be described]';
+  }
+}
+
+/**
+ * A bounded string describing a failure, for logs that would otherwise print
+ * the error object; it is one line unless one of its parts has newlines, as a
+ * message can. Printing the object prints its message whole, in the stack,
+ * and every own field: a MembraneError's `rawRequest` is the whole request
+ * that failed, and Node's console prints each of its strings, a long system
+ * prompt among them, up to 10,000 characters. The projection keeps what a
+ * reader needs (name, classification, status, provider code, message) and
+ * nothing else. The head's parts are bounded each, and the whole
+ * (failureDescription) is cut once, so its marker states the length of the
+ * head and the whole message.
+ */
+function describeFailure(error: unknown): string {
+  return boundFailureText(failureDescription(error));
+}
+
+/** A stack frame's line: an indent of spaces or tabs, then `at `. The indent
+ *  never crosses a line break, so a run of blank lines isn't rescanned from
+ *  each line's start. */
+const FRAME_LINE = /^[ \t]+at /m;
+
+/**
+ * describeFailure, then the error's stack frames, bounded, on the lines
+ * below: for a log of a failure the framework's own code may have thrown,
+ * where the frames say where. The stack opens with the message, and a
+ * message's own lines can look like frames (an echoed request quoting a stack
+ * trace), so when the message is the stack's header, before its first frame
+ * line, the frames are the stack from its first frame line after the
+ * message. Otherwise (a stack without its header, a message that isn't in
+ * the stack or is empty) they are the stack from its first frame line. The
+ * leak the projection closes was the object's own fields, not its stack.
+ */
+function describeFailureWithFrames(error: unknown): string {
+  let frames: string | undefined;
+  try {
+    const stack = error instanceof Error ? error.stack : undefined;
+    if (typeof stack === 'string') {
+      const message = String((error as Error).message);
+      // The message is the stack's header only before its first frame: a
+      // stack without its header (copied, or frames only) can hold the
+      // message's text inside a frame's name.
+      const firstFrame = stack.search(FRAME_LINE);
+      const at = message ? stack.indexOf(message) : -1;
+      const frameLine = new RegExp(FRAME_LINE.source, 'gm');
+      frameLine.lastIndex = at >= 0 && (firstFrame < 0 || at < firstFrame) ? at + message.length : 0;
+      const found = frameLine.exec(stack);
+      if (found) frames = boundFailureText(stack.slice(found.index));
+    }
+  } catch { /* the projection alone */ }
+  const described = describeFailure(error);
+  return frames === undefined ? described : `${described}\n${frames}`;
+}
+
+/**
+ * A failure record's fields, each bounded, for logs/failures.log and the
+ * ops:alert trace: a string to FAILURE_TEXT_MAX_CHARS; an Error to its
+ * projection, since serialising one writes its own fields, a MembraneError's
+ * whole `rawRequest` among them; any other value to its JSON, with each Error
+ * inside it as its projection (failureJson), as the plain data that JSON
+ * describes when it fits FAILURE_TEXT_MAX_CHARS and as the JSON text,
+ * bounded, when it doesn't. So the trace's data is what failures.log writes:
+ * a Map or an object with toJSON whose JSON is small never hands a listener
+ * the value itself.
+ */
+function boundFailureFields(record: Record<string, unknown>): Record<string, unknown> {
+  const bounded: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(record)) {
+    if (typeof value === 'string') bounded[key] = boundFailureText(value);
+    else if (value instanceof Error) bounded[key] = describeFailure(value);
+    else {
+      let json: string | undefined;
+      try { json = failureJson(value); } catch { bounded[key] = describeFailure(value); continue; }
+      // A value JSON writes nothing for (a function, undefined) is left out,
+      // as the log's JSON leaves it out.
+      if (json === undefined) continue;
+      bounded[key] = json.length <= FAILURE_TEXT_MAX_CHARS ? JSON.parse(json) : boundFailureText(json);
+    }
+  }
+  return bounded;
+}
+
+/** The most of a thrown value's or a tool error's text that reaches a log line or a server's error answer. */
+const THROWN_TEXT_LIMIT = 500;
+
+/**
+ * What a thrown value says, safely and briefly: an Error's message, or any
+ * other value, as a string. Every inspection and coercion of the value is
+ * inside the try, so reading it can't throw: a revoked Proxy (whose
+ * instanceof throws), a hostile getter, an Error whose message isn't a
+ * string, or a value with no string form reads as text or as unreadable.
+ * The text is bounded, since a provider or handler error can carry a whole
+ * request body.
+ */
+function thrownText(error: unknown): string {
+  let text: string;
+  try {
+    text = String(error instanceof Error ? error.message : error);
+  } catch {
+    text = '(a value that could not be read)';
+  }
+  return text.length <= THROWN_TEXT_LIMIT ? text : `${text.slice(0, THROWN_TEXT_LIMIT)}… (${text.length} characters)`;
+}
+
+/**
+ * A failed handler's reason, never throwing: an Error's message, else "the
+ * handler failed" and what it threw (nothing, for `undefined`). Telling an
+ * Error apart is itself guarded, since instanceof throws on a revoked Proxy.
+ */
+function handlerFailureText(error: unknown): string {
+  let isError = false;
+  try {
+    isError = error instanceof Error;
+  } catch {
+    // Not an Error that can be read; thrownText says so.
+  }
+  if (isError) return thrownText(error);
+  return error === undefined ? 'the handler failed' : `the handler failed: ${thrownText(error)}`;
+}
+
+/** A server's responder, and whether the request it belongs to has been answered yet. */
+type AnswerOnce = {
+  responder: { respond?: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void } | undefined;
+  answered: () => boolean;
+};
+
+/**
+ * Wrap a server request's responder so the request is answered at most once,
+ * and a later failure can tell whether the handler already answered.
+ * - An answer counts once the responder returns. One that throws, such as a
+ *   result the transport can't serialize, leaves the request unanswered, so
+ *   the listener's failure answer still goes out. This assumes a responder
+ *   that throws has sent nothing, which holds for the connection's own: they
+ *   serialize before they write, and their transports' writes don't throw
+ *   after writing.
+ * - A second answer is refused and logged: a handler that answered and then
+ *   threw isn't answered again, and a handler that answers after the
+ *   listener answered its failure doesn't send a second response.
+ * - Only the methods the responder has are wrapped, so a handler that checks
+ *   for `respondError` still finds a responder without one.
+ */
+function answerOnce<R extends { respond?: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void }>(
+  responder: R | undefined,
+  method: string,
+  serverId: string,
+): AnswerOnce & { responder: R | undefined } {
+  if (!responder) return { responder: undefined, answered: () => false };
+  let done = false;
+  const once = <A extends unknown[]>(kind: string, send: (...args: A) => void) => (...args: A): void => {
+    if (done) {
+      console.error(`[mcpl] ${method} from ${serverId}: a second answer (${kind}) was refused; the request was already answered`);
+      return;
+    }
+    send(...args);
+    done = true;
+  };
+  const wrapped: { respond?: (result: unknown) => void; respondError?: (code: number, message: string, data?: unknown) => void } = { ...responder };
+  if (responder.respond) wrapped.respond = once('respond', (result: unknown) => responder.respond!(result));
+  if (responder.respondError) {
+    wrapped.respondError = once('respondError', (code: number, message: string, data?: unknown) => responder.respondError!(code, message, data));
+  }
+  return { responder: wrapped as R, answered: () => done };
 }
 
 export class AgentFramework {
@@ -995,7 +1413,7 @@ export class AgentFramework {
   private quiesced = false;
   private quiesceReason?: string;
   private quiescedAt?: number;
-  private traceListeners: TraceEventListener[] = [];
+  private traceListeners: TraceRegistration[] = [];
   private syncIntervalMs: number;
   private syncTimer: ReturnType<typeof setInterval> | null = null;
   private maintenanceIntervalMs: number;
@@ -1012,6 +1430,8 @@ export class AgentFramework {
   private providerAccelerationJitterMs = PROVIDER_ACCELERATION_JITTER_MS;
   private providerHoldHook: ProviderHoldHook | undefined;
   private providerAdmissionClosed = false;
+  /** Invalidates framework turns still assembling when stop begins. */
+  private lifecycleGeneration = 0;
   /** Last time we reported stale (busy-requeued) inference requests, per agent. */
   private staleWarnAt = new Map<string, number>();
   /** Per-agent last inference activity (epoch ms), for /healthz + doctor tooling. */
@@ -1046,26 +1466,6 @@ export class AgentFramework {
    *  keeps unrelated channels from moving the pin. Cleared at every fresh
    *  turn's start; budget restarts keep it. */
   private turnEngagedChannels: Map<string, Set<string>> = new Map();
-  /** Channels this turn's PLAIN PROSE was actually delivered to, in delivery
-   *  order (deduped at render). Feeds the `[delivered]` receipt appended at
-   *  logical turn end: explicit sends receipt themselves via their
-   *  tool_result, but auto-routed prose previously vanished into the router
-   *  with no in-window record — the agent could never see where its own
-   *  words landed (2026-07-31 misroute series; antra: minimal receipts).
-   *  Cleared at every fresh turn's start; budget restarts keep it (same
-   *  logical turn, receipt covers the whole turn). */
-  private turnProseDeliveries: Map<string, string[]> = new Map();
-  /** Count of plain-prose segments SUPPRESSED this turn by sticky
-   *  explicit-send silencing. The suppression rule itself is untouched
-   *  (antra, 2026-07-31: visibility is enough) — but it must never be a
-   *  silent black hole: Mythos multiplexed two threads in one round (prose
-   *  for the lane + explicit send for another channel, textbook per the
-   *  routing doc), the silencing ate the prose reply, and his own record
-   *  ("scene delivered to #mythos via plain speech — routing confirmed")
-   *  believed it delivered. The receipt now reports suppression, so the
-   *  author sees the segment's fate one turn later. Cleared each fresh
-   *  turn; budget restarts keep it. */
-  private turnProseSuppressed: Map<string, number> = new Map();
   /** A tool boundary injected fresh CONVERSATIONAL input (a real message —
    *  not a reaction or a system marker) into the live stream. Tells
    *  driveStream to clear sticky explicit-send suppression before handling
@@ -1080,14 +1480,43 @@ export class AgentFramework {
   // ---- Explicit prose routing (docs/explicit-prose-routing.md) ----------
   /** Latest bounced (undelivered) prose per agent — the `{{unsent}}` source. */
   private proseClipboards: Map<string, string> = new Map();
-  /** Sticky per-TURN delivery target set by the turn's first `>>` prefix.
-   *  Cleared at every non-restart turn start; survives context restarts. */
-  private proseTargetPins: Map<string, string> = new Map();
-  /** Hybrid router is fail-closed after a malformed/unresolved envelope until a new valid target. */
-  private proseHybridSuppressed: Set<string> = new Set();
-  /** Agents whose current turn requested `!` continuation — re-woken when the
-   *  turn completes instead of pausing until the next external event. */
-  private proseContinuations: Set<string> = new Set();
+  /**
+   * Each agent's routing state for its current turn (TurnRouting): the
+   * sticky destination, the turn's destination for a resumed stream,
+   * hybrid's hold, a `!` continuation and receipt tallies. A fresh turn starts a new object
+   * instead of clearing the old one, and a stream that resumes the turn
+   * (resumesLogicalTurn) keeps it. A queued delivery holds the object of the
+   * turn that queued it, so prose a turn leaves queued when it ends (a
+   * skip_reply ends it before its posts have run) still follows that turn's
+   * destination, and its late writes can't reach the next turn.
+   */
+  private turnRouting: Map<string, TurnRouting> = new Map();
+  /**
+   * The latest link of each agent's chain of queued prose deliveries. Every
+   * stream queues its own behind it, a fresh turn's included, so the agent's
+   * posts go out in the order they were written, across streams and turns.
+   */
+  private proseSpeechChains: Map<string, Promise<void>> = new Map();
+  /**
+   * Each agent's open logical turn (LogicalTurn). It stays open from the
+   * fresh start that opens it until the turn settles (settleAgent: it
+   * completes, a tool ends it, or it fails or is abandoned), and every fresh
+   * start that routes prose while it is open continues it: a framework
+   * retry, the start that consumes tool results the non-streaming fallback
+   * left (whichever wake the scheduler starts it with), the later compile a
+   * provider-capacity hold defers a turn to. A silent start neither
+   * continues nor opens one. A stream that ends without settling needs to do
+   * nothing to carry its turn. Settling only detaches the turn from future
+   * starts: the settling stream keeps its own object, which its remaining
+   * deliveries, its receipt and its ` !` check go on using (a completion
+   * settles before it awaits its chain and writes its receipt). So every
+   * logical end must close inheritance once, before the next fresh start:
+   * a turn left open would hand its object, late writes and all, to an
+   * unrelated turn. A tool-ended turn settles before the next turn can
+   * start. Only the stream that holds the open turn closes it; disposal
+   * drops it, and stop() clears every agent's.
+   */
+  private openLogical: Map<string, LogicalTurn> = new Map();
   /** Consecutive bounce-wakes per agent; capped so an agent that keeps
    *  emitting unprefixed prose can't wake-loop (notices still append). */
   private proseBounceStreaks: Map<string, number> = new Map();
@@ -1448,14 +1877,16 @@ export class AgentFramework {
     });
 
     // Initialize module registry with callbacks
-    this.moduleRegistry = new ModuleRegistry(store, this.queue, {
+    // A module's events, through pushEvent() or its deprecated queue handle,
+    // go through pushModuleEvent(), which names the module.
+    this.moduleRegistry = new ModuleRegistry(store, { push: (event, moduleName) => this.pushModuleEvent(event, moduleName, false) }, {
       getAgents: () => Array.from(this.agents.values()),
       addMessage: (p, c, m) => this.addMessage(p, c, m),
       editMessage: (id, c) => this.editMessage(id, c),
       removeMessage: (id) => this.removeMessage(id),
       getMessage: (id) => this.getMessage(id),
       queryMessages: (filter) => this.queryMessages(filter),
-      pushEvent: (event) => this.pushEvent(event),
+      pushEvent: (event, moduleName) => this.pushModuleEvent(event, moduleName, true),
       onTrace: (listener) => this.onTrace(listener),
       // The ONLY entry that confers module origin — a private closure the
       // framework hands to its own module registry. The public
@@ -1923,6 +2354,10 @@ export class AgentFramework {
 
     this.running = true;
     this.providerAdmissionClosed = false;
+    // A new lifecycle: a turn compiled before an earlier stop() never drives,
+    // and withheld spills, closed for the generation a stop ended, are open
+    // for this one.
+    this.lifecycleGeneration++;
     this.loopPromise = this.runLoop();
 
     // Start periodic sync timer (if enabled)
@@ -1985,6 +2420,10 @@ export class AgentFramework {
     // store is still open, rather than leaving them to a reboot replay.
     this.ackDeferredWrites();
     this.providerAdmissionClosed = true;
+    this.lifecycleGeneration++;
+    // The generation this stop ends; withheld spills close for it alone, so a
+    // start() made before this stop finishes reopens them for its own.
+    const stoppingGeneration = this.lifecycleGeneration;
     this.queue.close();
     this.tuneOutCoordinator?.stop();
 
@@ -2012,6 +2451,10 @@ export class AgentFramework {
 
     // A stopped host must never hang behind its own cooldown.
     this.cancelProviderAdmission();
+    // An open logical turn doesn't survive a stop: a start after a restart
+    // on this instance opens a new one rather than carrying its ` !` and
+    // receipt tallies across (openLogical).
+    this.openLogical.clear();
 
     // Cancel all active streams
     for (const agent of this.agents.values()) {
@@ -2051,6 +2494,18 @@ export class AgentFramework {
     this.eventGate?.dispose();
     this.livenessWatchdog?.stop();
 
+    // A stopping stream's batch settles as withheld, and its stub names where
+    // the original went: let those writes finish while the workspace is up.
+    // Tracked here rather than per agent, since an ephemeral run or a closed
+    // fork leaves the agent map while its annotation can still be running.
+    while (this.guardAnnotations.size > 0) await Promise.all([...this.guardAnnotations]);
+    // An annotation that starts after this point, such as one from a direct
+    // Agent API call stop doesn't cancel, starts no write to the stopping
+    // workspace: its stub names the audit record. A write that was past its
+    // deadline isn't waited for here, but the workspace's own stop waits for
+    // the mount turn it holds, bounded only by teardownTimeoutMs.
+    this.guardSpillsClosedFor = stoppingGeneration;
+
     // Stop modules and MCPL servers in parallel
     const shutdownPromises: Promise<void>[] = [this.moduleRegistry.stopAll(teardownTimeoutMs)];
     if (this.mcplServerRegistry) {
@@ -2065,13 +2520,19 @@ export class AgentFramework {
 
     const teardownSucceeded = shutdownErrors.length === 0;
 
+    // Those later annotations write nothing, so they finish at once; let them
+    // record and edit their stubs before the store closes.
+    while (this.guardAnnotations.size > 0) await Promise.all([...this.guardAnnotations]);
+
     // Streams may queue storage repairs while being cancelled above. Retry
-    // after their teardown, while the store is still open, before final sync.
-    for (const agent of this.agents.values()) {
+    // after their teardown, while the store is still open, before final sync:
+    // every live agent's guard, and every other guard that isn't idle, whose
+    // ephemeral run or closed fork has left the agent map.
+    for (const [guard, name] of this.guardsWithStorageWork()) {
       try {
-        agent.toolResultGuard.flushUnrecorded();
+        guard.flushUnrecorded();
       } catch (error) {
-        console.error(`[tool-result-guard] agent=${agent.name} could not finish queued storage work at stop:`, error);
+        console.error(`[tool-result-guard] agent=${name} could not finish queued storage work at stop:`, error);
         shutdownErrors.push(error);
       }
     }
@@ -2193,10 +2654,14 @@ export class AgentFramework {
     try {
       const hold = this.providerHoldHook(error, agentName, { model: this.agents.get(agentName)?.model });
       if (!hold || !Number.isFinite(hold.holdMs) || hold.holdMs <= 0) return undefined;
+      // The reason is printed, kept in the cooldown and shown in the status
+      // snapshot (cooldownReason); without the host's own, it is the error's
+      // message, which can echo the whole request.
       return { holdMs: Math.min(PROVIDER_ACCELERATION_MAX_COOLDOWN_MS, Math.max(1_000, hold.holdMs)),
-        reason: typeof hold.reason === 'string' && hold.reason ? hold.reason : error.message };
+        reason: boundFailureText(typeof hold.reason === 'string' && hold.reason ? hold.reason : String(error.message)) };
     } catch (err) {
-      console.error(`[provider-cooldown] providerHold hook threw for ${agentName}; treating as no hold:`, err);
+      // The hook is handed the model's error, and may throw it back.
+      console.error(`[provider-cooldown] providerHold hook threw for ${agentName}; treating as no hold: ${describeFailureWithFrames(err)}`);
       return undefined;
     }
   }
@@ -2231,7 +2696,7 @@ export class AgentFramework {
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this.releaseProviderAccelerationCooldown(agent.name), delayMs); timer.unref?.();
     this.providerAccelerationCooldowns.set(agent.name, { startedAt: existing?.startedAt ?? now,
-      until: now + delayMs, timer, heldRequests: held, reason: hostHold?.reason ?? error.message,
+      until: now + delayMs, timer, heldRequests: held, reason: hostHold?.reason ?? boundFailureText(String(error.message)),
       failures: (existing?.failures ?? 0) + 1, ...(hostHold ? { hostHoldError: error } : {}),
       ...(auxiliary && (!existing || existing.auxiliaryOrigin) ? { auxiliaryOrigin: true } : {}) });
     if (auxiliary && !existing) {
@@ -2241,7 +2706,7 @@ export class AgentFramework {
     }
     const gate = this.providerGate(agent.name); gate.primaryPending = true;
     this.providerAccelerationRecoveries.set(agent.name, { startedAt: existing?.startedAt ?? now,
-      failures: (existing?.failures ?? 0) + 1, heldRequests: held.length, reason: error.message });
+      failures: (existing?.failures ?? 0) + 1, heldRequests: held.length, reason: boundFailureText(String(error.message)) });
     console.error(`[provider-cooldown] agent=${agent.name} ` +
       `${hostHold ? `host hold (${hostHold.reason})` : 'organization acceleration 429'} — ` +
       `holding primary/auxiliary for ${delayMs}ms; ${held.length} request(s) retained`);
@@ -2299,7 +2764,10 @@ export class AgentFramework {
   private startQueuedMaintenance(): void {
     if (this.maintenancePass || !this.running) return;
     const pass = this.runQueuedMaintenance().catch((error) => {
-      const reason = error instanceof Error ? error.message : String(error);
+      // The alert cuts its own copies from the whole message, so the
+      // webhook's states the whole length.
+      const wholeReason = error instanceof Error ? String(error.message) : failureDescription(error);
+      const reason = boundFailureText(wholeReason);
       console.error(
         '[context-maintenance] pass failed:',
         reason,
@@ -2307,7 +2775,7 @@ export class AgentFramework {
       this.opsAlert(
         'context-maintenance-failed',
         'framework',
-        reason,
+        wholeReason,
         { data: { scope: 'pass' } },
       );
     });
@@ -2318,6 +2786,17 @@ export class AgentFramework {
   }
 
   private async runQueuedMaintenance(): Promise<void> {
+    // A guard whose agent has left the map gets no activation to retry its
+    // queue; retry it here. It leaves busyGuards once nothing of it is left.
+    const live = new Set([...this.agents.values()].map((agent) => agent.toolResultGuard));
+    for (const [guard, name] of this.busyGuards) {
+      if (live.has(guard)) continue;
+      try {
+        guard.flushUnrecorded();
+      } catch (error) {
+        console.error(`[tool-result-guard] agent=${name} storage retry failed during maintenance:`, error);
+      }
+    }
     const queued = [...this.agents.values()].flatMap((agent) => {
       try {
         agent.toolResultGuard.flushUnrecorded();
@@ -2366,12 +2845,13 @@ export class AgentFramework {
             record.ticks++;
           }
         } catch (error) {
-          record.error = error instanceof Error ? error.message : String(error);
+          const wholeError = error instanceof Error ? String(error.message) : failureDescription(error);
+          record.error = boundFailureText(wholeError);
           console.error(`[context-maintenance] agent=${agent.name} failed:`, record.error);
           this.opsAlert(
             'context-maintenance-failed',
             agent.name,
-            record.error,
+            wholeError,
             {
               data: {
                 scope: 'agent',
@@ -2410,25 +2890,111 @@ export class AgentFramework {
   }
 
   /**
+   * A server's request or notification the host couldn't handle, answered
+   * with a JSON-RPC error when it is a request (a notification has no one to
+   * answer, and is logged), rather than thrown out of the connection's
+   * listener, where it was an unhandled rejection and the server's request
+   * waited for its timeout.
+   * - `refused`: the listener turned it away before its handler ran; the
+   *   host is stopping, and none of it was taken. Answered -32000, "the host
+   *   is stopping", the code the push coalescer already gives a stopping
+   *   host: the server can send it again to the host's next run.
+   * - `failed`: the handler threw, whatever it threw, `undefined` included.
+   *   While the host stops (its queue closed), that's answered -32000 too,
+   *   with the handler's own message after the stop wording; on a live host
+   *   it's a fault, answered -32603 with the handler's message. The handler
+   *   may have admitted part of the request first (an earlier message of a
+   *   batch), so nothing here claims that none of it was taken.
+   * A request the handler already answered before it threw isn't answered
+   * again: the failure is logged.
+   */
+  private refuseServerItem(
+    method: string,
+    serverId: string,
+    answer: AnswerOnce,
+    outcome: { kind: 'refused' } | { kind: 'failed'; error: unknown },
+  ): void {
+    // Optional chaining: prototype-built harnesses leave the queue unset.
+    const stopping = outcome.kind === 'refused' || !!this.queue?.isClosed;
+    const what = outcome.kind === 'refused' ? '' : handlerFailureText(outcome.error);
+    const reason = outcome.kind === 'refused'
+      ? 'the host is stopping'
+      : stopping
+        ? `the host stopped while handling this request (${what})`
+        : what;
+    if (outcome.kind === 'failed' && answer.answered()) {
+      console.error(`[mcpl] ${method} from ${serverId} failed after it was answered: ${reason}`);
+      return;
+    }
+    console.error(outcome.kind === 'refused'
+      ? `[mcpl] ${method} from ${serverId} refused: ${reason}`
+      : `[mcpl] ${method} from ${serverId} failed: ${reason} (part of it may already have been admitted)`);
+    try {
+      answer.responder?.respondError?.(stopping ? -32000 : -32603, reason);
+    } catch {
+      // The connection is going too; there is no one left to tell.
+    }
+  }
+
+  /**
    * Push a process event to the queue.
+   *
+   * After stop() the queue is closed and this throws, so a direct caller
+   * learns the framework is stopped — except for a tool's result. A call
+   * still running at stop() completes later, into a callback with nothing
+   * to catch the throw (an unhandled rejection), and nothing could take its
+   * result anyway: the queue that would carry it to its stream is closed,
+   * stop() is ending the streams, and the tool has already run. That
+   * result is dropped, and the drop is logged.
    */
   pushEvent(event: ProcessEvent): void {
+    if (event.type === 'tool-result' && this.queue?.isClosed) {
+      // What an operator reconciling a dropped result needs (the resident
+      // may run the tool again): which tool, and whether it succeeded.
+      const outcome = event.result.success && !event.result.isError
+        ? 'succeeded'
+        : `failed${event.result.error ? `: ${thrownText(event.result.error)}` : ''}`;
+      console.error(`[framework] ${event.agentName}: result of tool call ${event.callId} (${event.toolName ? `${event.toolName}, ` : ''}${event.moduleName}) arrived after stop — dropped; the tool ${outcome}`);
+      return;
+    }
     this.queue.push(event);
     this.emitTrace({ type: 'process:received', processEvent: event });
+  }
+
+  /**
+   * A module's event. stop() closes the queue before it stops modules, so a
+   * module's event can arrive after that: from a listener that fires while
+   * stop() runs, or from the module's own stop(). Nothing will process it,
+   * and a throw there can go unhandled or fail stop(), so it's dropped with a
+   * log line naming the module. Otherwise it's queued as pushEvent() queues
+   * it, or, through the deprecated queue handle, without the trace.
+   */
+  private pushModuleEvent(event: ProcessEvent, moduleName: string | undefined, traced: boolean): void {
+    if (this.queue.isClosed) {
+      // A tool result takes pushEvent()'s own drop, whose line names the
+      // call, the tool and its outcome.
+      if (event.type === 'tool-result') {
+        this.pushEvent(event);
+        return;
+      }
+      console.error(`[framework] a '${event.type}' event from module ${moduleName ?? '(unnamed)'} arrived after stop() began — dropped`);
+      return;
+    }
+    if (traced) this.pushEvent(event);
+    else this.queue.push(event);
   }
 
   /**
    * Add a trace event listener for observability.
    */
   onTrace(listener: TraceEventListener): () => void {
-    this.traceListeners.push(listener);
+    const registration: TraceRegistration = { listener, active: true };
+    this.traceListeners.push(registration);
     // Return an unsubscribe so callers with a bounded lifetime (e.g. modules
     // that get torn down and recreated on session switch) don't leak
     // listeners. Existing callers that ignore the return value are unaffected.
-    return () => {
-      const idx = this.traceListeners.indexOf(listener);
-      if (idx >= 0) this.traceListeners.splice(idx, 1);
-    };
+    // It removes this subscription, whatever else the same function holds.
+    return () => this.removeTraceRegistration(registration);
   }
 
   /**
@@ -2442,13 +3008,18 @@ export class AgentFramework {
   }
 
   /**
-   * Remove a trace event listener.
+   * Remove a trace event listener: its first subscription, if it holds more
+   * than one.
    */
   offTrace(listener: TraceEventListener): void {
-    const index = this.traceListeners.indexOf(listener);
-    if (index >= 0) {
-      this.traceListeners.splice(index, 1);
-    }
+    const registration = this.traceListeners.find((r) => r.listener === listener);
+    if (registration) this.removeTraceRegistration(registration);
+  }
+
+  private removeTraceRegistration(registration: TraceRegistration): void {
+    registration.active = false;
+    const index = this.traceListeners.indexOf(registration);
+    if (index >= 0) this.traceListeners.splice(index, 1);
   }
 
   /**
@@ -2575,7 +3146,14 @@ export class AgentFramework {
           if (!mount) return null;
           const path = `${mount}/refs/${fileName}`;
           const res = await workspace.writeBinary(path, data, mimeType);
-          return res.success ? path : null;
+          if (res.success) return path;
+          // Stored, with its disk copy failed: the workspace's tools read it
+          // from the tree, so the reference is fetched to that path.
+          if ((res.data as { inChronicle?: boolean } | undefined)?.inChronicle === true) {
+            console.error(`[refs] ${path} is in the workspace's Chronicle tree, but the rest of its write failed: ${res.error ?? 'unknown error'}`);
+            return path;
+          }
+          return null;
         },
       );
     }
@@ -2589,14 +3167,27 @@ export class AgentFramework {
    *  says fetch_reference instead of a path. */
   private async autoFetchReferences(content: unknown[] | undefined, serverId: string, eager: boolean): Promise<void> {
     if (!content) return;
-    const fetcher = this.getReferenceFetcher();
-    const eligible: import('./mcpl/references.js').ReferenceRecord[] = [];
+    // Register every block first, then judge each uri once, by its latest
+    // record. The registry keys records by uri and evicts the one registered
+    // least recently, so a uri this result mentions keeps its record through
+    // the result's later blocks, short of more distinct references in one
+    // result than the registry holds; past that, a uri can get a second
+    // record here, hence the key by uri. A uri that any of this result's
+    // blocks calls expired takes no slot, whichever block registered last. A
+    // later result's fresh expiry still supersedes, through register().
+    const byUri = new Map<string, { record: import('./mcpl/references.js').ReferenceRecord; expiredHere: boolean }>();
     for (const block of content) {
       const c = classifyBlock(block);
       if (c.kind !== 'reference') continue;
       const record = referenceRegistry.register(c.testimony, serverId);
-      if (eager && fetcher.isEagerEligible(record)) eligible.push(record);
+      const expiredHere = byUri.get(c.testimony.uri)?.expiredHere === true || isReferenceExpired(c.testimony);
+      byUri.set(c.testimony.uri, { record, expiredHere });
     }
+    if (!eager) return;
+    const fetcher = this.getReferenceFetcher();
+    const eligible = [...byUri.values()]
+      .filter(({ record, expiredHere }) => !expiredHere && fetcher.isEagerEligible(record))
+      .map(({ record }) => record);
     // Parallel with a count cap: N small fetches cost one round-trip of
     // wall-clock, and anything past the cap stays lazy (stub says so).
     const MAX_EAGER_PER_RESULT = 8;
@@ -2748,7 +3339,38 @@ export class AgentFramework {
     };
   }
 
-  private restoreToolResultGuardSetting(agent: Agent): void {
+  /** Every guard's annotation still running, for stop() (agent-framework #277). */
+  private readonly guardAnnotations = new Set<Promise<void>>();
+  /** Each guard that isn't idle, by agent name, as the guard reports it. An
+   *  ephemeral run or a closed fork leaves the agent map with an annotation
+   *  maybe still running, or a stub edit, acceptance edit or audit write
+   *  queued, which maintenance and stop then retry (agent-framework #277). A
+   *  guard is here from the moment it has work left until the moment it has
+   *  none, however that comes about. */
+  private readonly busyGuards = new Map<ToolResultGuard, string>();
+  /** Withheld originals' writes still under way past their deadline: while
+   *  any is, the workspace isn't answering and no other withheld original's
+   *  write is started. Several can be, when writes of different agents'
+   *  batches stalled together. */
+  private readonly stalledSpills = new Set<Promise<void>>();
+  /** Withheld spills skipped since the current stall began. */
+  private stallSkips = 0;
+  /** See WITHHELD_SPILL_DEADLINE_MS; an instance field so tests can shorten it. */
+  private withheldSpillDeadlineMs = WITHHELD_SPILL_DEADLINE_MS;
+  /** The lifecycle generation whose stop() has let the running annotations
+   *  finish: a withheld original is then no longer written to a workspace
+   *  that is stopping, and its stub names the audit record. A start() after
+   *  that stop() has finished has a generation of its own, so the spill gate
+   *  is open again for an instance kept with a store it doesn't own and that
+   *  is still open (start() doesn't restore stopped modules or MCPL
+   *  connections, and refuses an owned store that stop() closed). A start()
+   *  made while a stop() is still draining isn't a supported order. */
+  private guardSpillsClosedFor: number | null = null;
+
+  /** A new agent's guard: its persisted setting, the tool-results spill its
+   *  withheld originals are written to, and the set stop() waits on
+   *  (agent-framework #277). */
+  private adoptToolResultGuard(agent: Agent): void {
     const enabled = (this.store.getStateJson(FRAMEWORK_STATE_ID) as {
       toolResultGuards?: Record<string, unknown>;
     } | null)?.toolResultGuards?.[agent.name];
@@ -2756,6 +3378,28 @@ export class AgentFramework {
       throw new Error(`Invalid persisted tool_result_guard for ${agent.name}: expected a boolean`);
     }
     agent.toolResultGuard.setOverride(enabled);
+    const guard = agent.toolResultGuard;
+    guard.setHost({
+      spill: (label, text, branch, deadline) => this.spillWithheld(label, text, branch, deadline),
+      deadline: () => Date.now() + this.withheldSpillDeadlineMs,
+      track: (annotation) => {
+        this.guardAnnotations.add(annotation);
+        void annotation.finally(() => this.guardAnnotations.delete(annotation));
+      },
+      idle: (idle) => {
+        if (idle) this.busyGuards.delete(guard);
+        else this.busyGuards.set(guard, agent.name);
+      },
+    });
+  }
+
+  /** Each guard that may have queued storage work, once, by agent name: the
+   *  live agents' and every other that isn't idle. */
+  private guardsWithStorageWork(): Map<ToolResultGuard, string> {
+    const guards = new Map<ToolResultGuard, string>();
+    for (const agent of this.agents.values()) guards.set(agent.toolResultGuard, agent.name);
+    for (const [guard, name] of this.busyGuards) if (!guards.has(guard)) guards.set(guard, name);
+    return guards;
   }
 
   private buildThinkTool(
@@ -4205,7 +4849,7 @@ export class AgentFramework {
       });
 
       const agent = new Agent(config, contextManager, this.membrane);
-      this.restoreToolResultGuardSetting(agent);
+      this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.ephemeralCandidates.set(agent, contextManager);
 
@@ -4259,18 +4903,28 @@ export class AgentFramework {
     run.lastActivity = Date.now();
   }
 
-  /** Settle an active ephemeral run (no-op for resident agents). The tool-call
-   *  count comes from the run's own counter — the single source of truth,
-   *  which unlike a per-stream local survives budget restarts. */
+  /** A logical turn's end, for every agent: it closes the agent's open
+   *  logical turn when it is the settling stream's own (openLogical), and
+   *  settles an active ephemeral run. The run's tool-call count comes from
+   *  its own counter — the single source of truth, which unlike a
+   *  per-stream local survives budget restarts. */
   private settleAgent(
     agentName: string,
     outcome: { stopReason: AgentSettleResult['stopReason']; speech: string; error?: string },
+    /** The settling stream's logical turn, when that stream still owns the
+     *  agent: it ends here, so the agent's next fresh start opens a new one.
+     *  A settle from a stream a newer one replaced closes nothing. */
+    closes: LogicalTurn | undefined,
   ): void {
+    // This identity check is the only guard against a stale settle closing
+    // a newer turn (no test reaches one); keep it when editing call sites.
+    if (closes && this.openLogical.get(agentName) === closes) this.openLogical.delete(agentName);
     const run = this.ephemeralRuns.get(agentName);
     if (!run) return;
     run.lastActivity = Date.now();
     if (outcome.stopReason === 'exhausted') {
-      run.settle.reject(new Error(outcome.error ?? 'Unknown error'));
+      // The caller may log or relay the message, which can echo the whole request.
+      run.settle.reject(new Error(boundFailureText(outcome.error ?? 'Unknown error')));
       return;
     }
     run.settle.resolve({
@@ -4407,6 +5061,9 @@ export class AgentFramework {
         // generation mismatch and leave any future owner untouched.
         this.activeStreams.delete(agent.name);
         this.pendingAssistantBlocks.delete(agent.name);
+        this.turnRouting.delete(agent.name);
+        this.proseSpeechChains.delete(agent.name);
+        this.openLogical.delete(agent.name);
         // The late stream finalizer intentionally refuses name-keyed cleanup once
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
@@ -4838,7 +5495,8 @@ export class AgentFramework {
       const parts = incoming.channelId.split(':');
       if (parts[0] !== 'discord') return;
       const channelId = parts[parts.length - 1];
-      const emoji = REFUSAL_REACTIONS[category] ?? REFUSAL_REACTION_FALLBACK;
+      // Own names only: an inherited one such as 'constructor' takes the fallback.
+      const emoji = Object.hasOwn(REFUSAL_REACTIONS, category) ? REFUSAL_REACTIONS[category] : REFUSAL_REACTION_FALLBACK;
       // Resolve the MCPL server that owns the locus channel and call
       // tools/call directly on its connection (bare tool name — no prefix
       // games), bypassing the agent event queue so no synthetic tool-result
@@ -5147,6 +5805,9 @@ export class AgentFramework {
     /** Discord addresses removed by message-granular undo. The durable outbox
      *  owns eventual delivery; this is also returned for immediate surfaces. */
     removedRefs?: Array<{ serverId: string; channelId: string; messageId: string }>;
+    /** For message-granular undo: whether awareness marks were scheduled
+     *  (not whether Discord has accepted them). */
+    markers?: SurgeryMarkerReceipt;
     hidden?: number;
     /** For `hide`: the Discord (channelId, messageId) of each removed message
      *  that carried one — so the surface can mark them with a reaction. */
@@ -5390,6 +6051,7 @@ export class AgentFramework {
           ok: true,
           messagesRemoved: r.messagesRemoved,
           removedRefs: r.removedRefs,
+          markers: r.markers,
           lastVisible: r.lastVisible,
         };
       } catch (error) {
@@ -5426,7 +6088,9 @@ export class AgentFramework {
       return { ok: true, undone: 0, requested, lastVisible: null };
     }
 
-    await this.syncDiscordAwarenessMarkers();
+    // The branch has moved: delivery of the marks it changes starts behind
+    // the data-plane gate, and the command doesn't wait for Discord.
+    this.startDiscordAwarenessDelivery('turn undo', agentName);
 
     return { ok: true, undone, requested, lastVisible: await this.lastVisiblePreview(agentName) };
   }
@@ -6021,6 +6685,12 @@ export class AgentFramework {
    * Discord messages that left the live context get awareness markers via the
    * durable outbox, exactly as message-granular `undo` does.
    *
+   * Returns once the switch has landed: the body is applied, with a
+   * marker-scheduling receipt (`markers`). It does not wait for Discord to
+   * accept the reactions: delivery is started, behind the MCPL data-plane
+   * gate, and continues without the caller or the store reservation waiting
+   * on it; its per-message outcomes stay in the outbox ledger.
+   *
    * Throws `OperatorActionError` (`agent-busy`, `unknown-message`, …) — the
    * agent must be idle; nothing is queued.
    */
@@ -6043,6 +6713,8 @@ export class AgentFramework {
      *  the group's last shard so the sharded message stays whole. */
     tailMessageId: string;
     removedRefs: Array<{ serverId: string; channelId: string; messageId: string }>;
+    /** Whether awareness marks were scheduled; never a delivery claim. */
+    markers: SurgeryMarkerReceipt;
     lastVisible: { participant?: string; role?: string; preview?: string } | null;
   }> {
     const logBase: OperatorLogInput = {
@@ -6080,9 +6752,12 @@ export class AgentFramework {
       }
 
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
-      // until the switch has landed or been rolled back.
+      // until the switch has landed and its marker scheduling has been
+      // recorded or reported, or the switch has been rolled back. Remote
+      // delivery is not waited on.
       const release = this.reserveStoreForSurgery('roll back', agentName);
       let branchName: string;
+      let markers: SurgeryMarkerReceipt;
       try {
         // Prepare the external side effect before switching Chronicle. If the
         // process dies after the switch but before activate(), startup
@@ -6113,8 +6788,14 @@ export class AgentFramework {
             { cause: error },
           );
         }
-        if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
-        await this.syncDiscordAwarenessMarkers();
+        // The body change has landed. Nothing after this point turns the
+        // rollback into a failure: marks are an outbox outcome, reported
+        // apart from the body (`markers`).
+        markers = this.activateSurgeryMarkers(markerBatch, 'rollback', agentName);
+        // Installs the MCPL data-plane gate synchronously, before the store is
+        // released, and starts delivery without awaiting it (the first
+        // reaction request may already be on the wire when this returns).
+        this.startDiscordAwarenessDelivery('rollback', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -6123,7 +6804,8 @@ export class AgentFramework {
       console.error(
         `[operator] rollback agent=${agentName} to=${tailMessageId}` +
           `${tailMessageId !== opts.messageId ? ` (requested ${opts.messageId}, snapped to end of body group)` : ''}` +
-          ` removed=${messagesRemoved} branch=${branchName} by=${describeRequester(opts.requester)}`,
+          ` removed=${messagesRemoved} branch=${branchName} marks=${describeMarkers(markers)}` +
+          ` by=${describeRequester(opts.requester)}`,
       );
       this.recordOperatorAction({
         ...logBase,
@@ -6133,6 +6815,7 @@ export class AgentFramework {
           tailMessageId,
           messagesRemoved,
           discordRefs: removedRefs.length,
+          markers,
         },
       });
       return {
@@ -6142,6 +6825,7 @@ export class AgentFramework {
         messagesRemoved,
         tailMessageId,
         removedRefs,
+        markers,
         lastVisible: await this.lastVisiblePreview(agentName),
       };
     } catch (error) {
@@ -6157,6 +6841,9 @@ export class AgentFramework {
    * removed together. Discord originals get awareness markers via the outbox;
    * the batch is `explicit`-activated only after every removal succeeded, and
    * a crash mid-way is finished at next boot (resumePreparedDiscordSuppressions).
+   * Like rollbackToMessage, it returns once the body change has landed, with
+   * a marker-scheduling receipt (`markers`); delivery continues without the
+   * caller waiting on it.
    *
    * Not retroactive over derived state: a message already folded into an
    * autobiographical summary stays in that summary — roll back to before it
@@ -6178,6 +6865,8 @@ export class AgentFramework {
     messagesRemoved: number;
     removedIds: string[];
     removedRefs: Array<{ serverId: string; channelId: string; messageId: string }>;
+    /** Whether awareness marks were scheduled; never a delivery claim. */
+    markers: SurgeryMarkerReceipt;
     lastVisible: { participant?: string; role?: string; preview?: string } | null;
   }> {
     const requestedIds = [...new Set(opts.messageIds.map(String))];
@@ -6230,9 +6919,12 @@ export class AgentFramework {
         throw new OperatorActionError('invalid', 'Suppression branch name must differ from the active branch');
       }
       // Gate + reserve the whole store (see reserveStoreForSurgery); held
-      // until the fork is fully redacted or the source is restored.
+      // until the fork is fully redacted and its marker scheduling has been
+      // recorded or reported, or the source is restored. Remote delivery is
+      // not waited on.
       const release = this.reserveStoreForSurgery('suppress', agentName);
       let createdBranch: string;
+      let markers: SurgeryMarkerReceipt;
       try {
         const markerBatch = this.discordAwarenessOutbox?.prepare({
           agentName,
@@ -6273,7 +6965,6 @@ export class AgentFramework {
             if (iv.group || iv.fromId !== iv.toId) cm.removeMessages(iv.fromId as MessageId, iv.toId as MessageId);
             else cm.removeMessage(iv.fromId as MessageId);
           }
-          if (markerBatch) this.discordAwarenessOutbox!.activate(markerBatch.id);
         } catch (error) {
           // A partially suppressed branch is not safe to serve from. Keep it
           // for diagnosis, put the agent back on the untouched source — and
@@ -6286,7 +6977,19 @@ export class AgentFramework {
             { cause: error },
           );
         }
-        await this.syncDiscordAwarenessMarkers();
+        // Every redaction committed: the body change has landed and the fork
+        // is safe to serve from. Activating the marker batch is bookkeeping
+        // about a world-side effect; if it fails, the suppression still
+        // stands, and the receipt says what became of the marks: not
+        // scheduled once the batch is retired, or unresolved if it can't be.
+        // (The batch's resume journal has nothing left to do, since every
+        // interval has committed, so retiring the batch gives up only the
+        // marks.)
+        markers = this.activateSurgeryMarkers(markerBatch, 'suppress', agentName);
+        // Installs the MCPL data-plane gate synchronously, before the store is
+        // released, and starts delivery without awaiting it (the first
+        // reaction request may already be on the wire when this returns).
+        this.startDiscordAwarenessDelivery('suppress', agentName);
         this.materializeConfigMountAfterBranchSwitch();
       } finally {
         release();
@@ -6294,7 +6997,7 @@ export class AgentFramework {
 
       console.error(
         `[operator] suppress agent=${agentName} removed=${messagesRemoved} branch=${createdBranch} ` +
-          `by=${describeRequester(opts.requester)}`,
+          `marks=${describeMarkers(markers)} by=${describeRequester(opts.requester)}`,
       );
       const loggedIds = capIds(removedIds);
       this.recordOperatorAction({
@@ -6306,6 +7009,7 @@ export class AgentFramework {
           removedIds: loggedIds.ids,
           ...(loggedIds.truncated ? { removedIdsTruncated: true } : {}),
           discordRefs: removedRefs.length,
+          markers,
         },
       });
       return {
@@ -6315,12 +7019,115 @@ export class AgentFramework {
         messagesRemoved,
         removedIds,
         removedRefs,
+        markers,
         lastVisible: await this.lastVisiblePreview(agentName),
       };
     } catch (error) {
       this.recordOperatorAction({ ...logBase, error: error instanceof Error ? error.message : String(error) });
       throw error;
     }
+  }
+
+  /**
+   * Record a surgery's prepared marker batch as active once its body change
+   * has landed, and say what happened. Never throws: the body is already
+   * applied, so a ledger failure here is reported in the receipt rather than
+   * as a failed surgery an operator might retry. A batch that could not be
+   * activated is retired, so no later reconciliation can deliver it behind a
+   * receipt saying it was not scheduled (`not-scheduled`). If retiring fails
+   * too, the receipt says only that the outcome is `unresolved`: the batch is
+   * retained, and it may still be delivered. A rollback's batch
+   * (activated by target branch) may be promoted by the very next
+   * reconciliation, the one the delivery it starts runs; a suppression's
+   * (activated explicitly) waits for the next start.
+   *
+   * A batch with no refs (a suppression journal with nothing addressable) is
+   * still activated, which closes its resume journal. It schedules no marks,
+   * so it reports `none` whatever the ledger does. If it can be neither
+   * activated nor retired, its journal is left prepared and closes at the
+   * next start: every interval it names has already committed, so the resume
+   * skips them all and activates it.
+   */
+  private activateSurgeryMarkers(
+    batch: DiscordAwarenessBatch | null,
+    verb: 'rollback' | 'suppress',
+    agentName: string,
+  ): SurgeryMarkerReceipt {
+    if (!batch) return { status: 'none', queued: 0 };
+    try {
+      this.discordAwarenessOutbox!.activate(batch.id);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      let retired = false;
+      let retireDetail = '';
+      try {
+        retired = this.discordAwarenessOutbox!.discard(batch.id);
+      } catch (discardError) {
+        retireDetail = discardError instanceof Error ? discardError.message : String(discardError);
+      }
+      console.error(
+        `[discord-awareness] ${verb} agent=${agentName}: body applied, but marker batch ${batch.id} ` +
+          `could not be activated (${detail}); ` +
+          (retired ? 'batch retired' : `batch retained${retireDetail ? ` (retire failed: ${retireDetail})` : ''}`),
+      );
+      if (batch.refs.length === 0) return { status: 'none', queued: 0 };
+      this.opsAlert(
+        retired ? 'discord-awareness-not-scheduled' : 'discord-awareness-unresolved',
+        agentName,
+        retired
+          ? `${verb} applied, but its ${batch.refs.length} awareness mark(s) were not scheduled ` +
+            `(batch ${batch.id} retired): ${detail}`
+          : `${verb} applied, but awareness batch ${batch.id} (${batch.refs.length} mark(s)) could be ` +
+            `neither activated nor retired; it may still be delivered: ${detail}`,
+        { data: { batchId: batch.id, retired } },
+      );
+      return retired
+        ? { status: 'not-scheduled', queued: 0, error: detail }
+        : { status: 'unresolved', queued: 0, batchId: batch.id, error: detail };
+    }
+    if (batch.refs.length === 0) return { status: 'none', queued: 0 };
+    return { status: 'queued', queued: batch.refs.length, batchId: batch.id };
+  }
+
+  /**
+   * Start awareness delivery after a branch move (a surgery, a switch, an
+   * undo or redo) without the caller awaiting it. No operator response waits
+   * for Discord to accept marks: the MCPL data-plane gate alone holds channel
+   * traffic that arrives after it until they are attempted.
+   * `syncDiscordAwarenessMarkers` installs that gate synchronously, before
+   * its first await, so calling this while a surgery still holds the store
+   * puts the gate up before the store is released. With no drain running, the
+   * drain starts in the same synchronous run (the first reaction request can
+   * be written before this returns); with one running, this generation's pass
+   * follows it (drainForGeneration). Either way delivery continues
+   * independently: the caller's response and any store reservation stop
+   * waiting on remote reactions. A turn may run during delivery when its wake
+   * carries no channel traffic (a scheduler timer, a provider admission), and
+   * also when its channel traffic was admitted before the gate went up
+   * (queued when a surgery began, or arriving during its switch or fork): the
+   * surgery's store reservation, which used to hold such a turn through the
+   * drain, now ends once the gate is up. A failure is accounted by the gate
+   * itself: the current generation's failure recycles the connections, and a
+   * superseded one leaves that to the newer generation, whose own pass meets
+   * the same ledger. Here it is logged and raised as an ops alert, and the
+   * next sync, reconnect or start delivers what is still pending.
+   *
+   * @param after What moved the branch, for the log and the alert
+   *   ("rollback", "branch switch", "undo" …).
+   * @param agentName The agent the move was for, or "framework" for a
+   *   branch switch that names none.
+   */
+  startDiscordAwarenessDelivery(after: string, agentName = 'framework'): void {
+    if (!this.discordAwarenessOutbox) return;
+    this.syncDiscordAwarenessMarkers().catch((error) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`[discord-awareness] delivery after ${after} agent=${agentName} failed: ${detail}`);
+      this.opsAlert(
+        'discord-awareness-delivery',
+        agentName,
+        `Awareness mark delivery after ${after} failed: ${detail}`,
+      );
+    });
   }
 
   /** Re-materialize config files from the (new) active branch — fire and
@@ -6511,7 +7318,7 @@ export class AgentFramework {
     });
 
     const agent = new Agent(config, contextManager, this.membrane);
-    this.restoreToolResultGuardSetting(agent);
+    this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent);
     const restoredSettings = this.readAgentRuntimeSettings(config.name);
@@ -6588,7 +7395,7 @@ export class AgentFramework {
       allowedTools: [...SUBCONSCIOUS_TOOL_NAMES, 'think', 'skip_reply', 'end_turn'],
     };
     const agent = new Agent(agentConfig, contextManager, this.membrane);
-    this.restoreToolResultGuardSetting(agent);
+    this.adoptToolResultGuard(agent);
     agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
     this.sharedSlotAgents.add(agent); // reads the shared slot through its merged view
     this.agents.set(name, agent);
@@ -6762,7 +7569,7 @@ export class AgentFramework {
           const membraneResults = currentState.toolResults.map(tc =>
             this.toMembraneToolResult(tc.id, tc.result, maxChars, spilled.get(tc.id))
           );
-          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata);
+          agent.toolResultGuard.storeResults(toolResultContent, membraneResults, currentState.toolResults, turnRowMetadata, maxChars);
 
           // Flush any messages that were deferred while this turn was in
           // flight. Route to the PRIMARY agent — deferred messages are
@@ -6958,7 +7765,7 @@ export class AgentFramework {
             // agent must be wakeable the moment it goes idle. (Idempotent;
             // driveStream's finally is the backstop.)
             this.eventGate?.onInferenceEnded(agent.name);
-            this.settleAgent(agent.name, { stopReason: 'turn_ended', speech: '' });
+            this.settleAgent(agent.name, { stopReason: 'turn_ended', speech: '' }, this.turnRouting.get(agent.name)?.logical);
             this.emitTrace({ type: 'inference:turn_ended', agentName: agent.name });
           } else if (overBudget || overPhysical) {
             // Context budget exceeded: break the stream, let compile() compress.
@@ -7017,7 +7824,8 @@ export class AgentFramework {
               ...(midTurnInjections.length > 0 ? { injectedMessages: midTurnInjections.length } : {}),
             });
           } else {
-            // Non-streaming fallback: schedule re-inference
+            // Non-streaming fallback: schedule re-inference, which continues
+            // this stream's logical turn (openLogical).
             this.pendingRequests.push({
               agentName: agent.name,
               reason: 'tool_results_ready',
@@ -7469,7 +8277,11 @@ export class AgentFramework {
       // seeding again would stack another template copy on top of it.
       const { messages: existing } = await contextManager.compile();
       if (existing.length === 0) {
-        const { messages: compiled } = await template.getContextManager().compile();
+        // The copy is the fork's own, and the template's annotation edits only
+        // the template's message: seed only once each of the template's
+        // annotations has finished.
+        const { messages: compiled } = await template.toolResultGuard.afterAnnotations(
+          () => template.getContextManager().compile());
         for (const msg of compiled) {
           const participant = msg.participant === template.name ? name : msg.participant;
           contextManager.addMessage(participant, msg.content);
@@ -7478,7 +8290,7 @@ export class AgentFramework {
 
       const config: AgentConfig = { ...templateConfig, name, strategy: undefined };
       const agent = new Agent(config, contextManager, this.membrane);
-      this.restoreToolResultGuardSetting(agent);
+      this.adoptToolResultGuard(agent);
       agent.markContextConsumed(); // RFC-006: nothing stored before now is replaceable
       this.agents.set(name, agent);
       this.agentConfigs.set(name, config);
@@ -7513,6 +8325,9 @@ export class AgentFramework {
     const channelId = this.conversationAgentHomes.get(agentName);
     const agent = this.agents.get(agentName);
     this.agents.delete(agentName);
+    this.turnRouting.delete(agentName);
+    this.proseSpeechChains.delete(agentName);
+    this.openLogical.delete(agentName);
     this.toolImageLedgers.delete(agentName);
     this.agentConfigs.delete(agentName);
     this.conversationAgentHomes.delete(agentName);
@@ -8622,24 +9437,19 @@ export class AgentFramework {
     return stamp ? { silentHeartbeat: stamp } : undefined;
   }
 
-  /** Record prose segments suppressed by explicit-send silencing. */
-  private recordProseSuppression(agentName: string, count: number): void {
+  /** Record plain-prose segments this turn suppressed. */
+  private recordProseSuppression(routing: TurnRouting, count: number): void {
     if (count <= 0) return;
-    this.turnProseSuppressed.set(agentName, (this.turnProseSuppressed.get(agentName) ?? 0) + count);
+    routing.logical.suppressed += count;
   }
 
   /** Record a successful plain-prose delivery for this turn's receipt. */
   private recordProseDelivery(
-    agentName: string,
+    routing: TurnRouting,
     outcome: { delivered: boolean; channelId: string } | null | undefined,
   ): void {
     if (!outcome?.delivered) return;
-    let list = this.turnProseDeliveries.get(agentName);
-    if (!list) {
-      list = [];
-      this.turnProseDeliveries.set(agentName, list);
-    }
-    list.push(outcome.channelId);
+    routing.logical.deliveries.push(outcome.channelId);
   }
 
   /**
@@ -8655,12 +9465,12 @@ export class AgentFramework {
    * delivered nothing. Failures are already marked separately
    * ([discord-send-failed]); this is the success half.
    */
-  private appendProseDeliveryReceipt(agent: Agent): void {
-    const list = this.turnProseDeliveries.get(agent.name);
-    const suppressed = this.turnProseSuppressed.get(agent.name) ?? 0;
-    if ((!list || list.length === 0) && suppressed === 0) return;
-    this.turnProseDeliveries.delete(agent.name);
-    this.turnProseSuppressed.delete(agent.name);
+  private appendProseDeliveryReceipt(agent: Agent, routing: TurnRouting): void {
+    const list = routing.logical.deliveries;
+    const suppressed = routing.logical.suppressed;
+    if (list.length === 0 && suppressed === 0) return;
+    routing.logical.deliveries = [];
+    routing.logical.suppressed = 0;
     const seen = new Set<string>();
     const shown: string[] = [];
     for (const id of list ?? []) {
@@ -8789,6 +9599,47 @@ export class AgentFramework {
   }
 
   /**
+   * A `!` continuation the turn asked for (`>>#x !`, `>>>#x !`): start another
+   * turn now instead of pausing until the next external event. It reads the
+   * logical turn of the stream that asked (shared with a retry or a
+   * re-inference that continues it), once its deliveries have run, when the
+   * turn completes or a tool ends it. A stream that ends in an error asks for
+   * none itself, but a framework retry that follows it carries the request;
+   * a turn abandoned by a quiesce asks for none.
+   */
+  private requestProseContinuation(agent: Agent, routing: TurnRouting): void {
+    // The flag may be shared with an earlier stream of the same logical
+    // turn (LogicalTurn); its deliveries are on the agent's chain ahead of
+    // this stream's, so by the time this check runs, they have run.
+    if (!routing.logical.continuation) return;
+    routing.logical.continuation = false;
+    // An explicit turn's check can run after its stream has returned. A
+    // stopped framework, or an agent no longer registered under its name (a
+    // disposed fork or ephemeral run), takes no new turn from it.
+    if (this.providerAdmissionClosed || this.agents.get(agent.name) !== agent) {
+      console.error(`[prose] ${agent.name}: '!' continuation dropped — ${this.providerAdmissionClosed ? 'the framework is stopping' : 'the agent is no longer registered'}`);
+      return;
+    }
+    console.error(`[prose] ${agent.name}: '!' continuation — requesting immediate next turn`);
+    this.pendingRequests.push({
+      agentName: agent.name,
+      reason: 'prose-continuation',
+      source: 'framework',
+      timestamp: Date.now(),
+    });
+  }
+
+  /** The agent's routing state for its current turn, made when it has none. */
+  private routingOf(agentName: string): TurnRouting {
+    let routing = this.turnRouting.get(agentName);
+    if (!routing) {
+      routing = freshTurnRouting();
+      this.turnRouting.set(agentName, routing);
+    }
+    return routing;
+  }
+
+  /**
    * Explicit-prose-routing delivery gateway (docs/explicit-prose-routing.md).
    * Every prose segment of an `explicit`-mode agent flows through here:
    * parse the `>>` prefix, resolve the target, deliver — or bounce to the
@@ -8796,32 +9647,58 @@ export class AgentFramework {
    * nothing is ever sent to a destination the model did not name (directly
    * or via the turn's sticky target).
    */
-  private async deliverProse(agent: Agent, rawText: string): Promise<void> {
-    // Multi-envelope: a single prose block may address SEVERAL destinations —
-    // every line beginning with `>>` opens a new envelope, routed
-    // independently (first live use: Tilde 2026-07-24, one block carrying a
-    // letter to #tilde-mythos AND a `>>#tilde` aside; the single-envelope
-    // parser delivered the aside literally into the first destination —
-    // exactly the leak class this mode exists to kill). Text before the
-    // first `>>` is its own unprefixed envelope (sticky/bounce as usual).
-    const lines = rawText.split('\n');
-    const envelopes: string[] = [];
-    let current: string[] = [];
-    for (const line of lines) {
-      // Only a REAL prefix line opens an envelope: `>>` immediately followed
-      // by a target token. A quoted `>> arrow` (space after) stays body text.
-      if (/^>>\S/.test(line.trimStart()) && current.length > 0) {
-        envelopes.push(current.join('\n'));
-        current = [];
-      }
-      current.push(line);
-    }
-    if (current.length > 0) envelopes.push(current.join('\n'));
+  private async deliverProse(agent: Agent, rawText: string, round?: { keepPrivate?: boolean }): Promise<void> {
+    // The direct entry delivers under the live turn's routing.
+    await this.deliverAdmittedProse(agent, this.admitProse(rawText), {
+      keepPrivate: round?.keepPrivate,
+      routing: this.routingOf(agent.name),
+    });
+  }
 
+  /**
+   * Explicit prose's envelopes, each `>>` target resolved now, once. A live
+   * round is admitted at its boundary: its turn's destination is decided from
+   * these resolutions (roundDestination), and its queued delivery posts to
+   * them, however the registry's names change before it runs.
+   */
+  private admitProse(rawText: string): AdmittedEnvelope[] {
+    return splitExplicitEnvelopes(rawText).map((text) => {
+      const parsed = parseProsePrefix(text);
+      if (parsed.kind !== 'target') return { text };
+      try {
+        return { text, resolved: this.channelRegistry!.resolveProseTarget(parsed.target!) };
+      } catch (err) {
+        // Admission runs in the stream's event loop, so a resolver that
+        // throws makes the envelope bounce rather than stop the round.
+        return { text, resolved: { error: `the destination couldn't be resolved: ${err instanceof Error ? err.message : String(err)}` } };
+      }
+    });
+  }
+
+  private async deliverAdmittedProse(
+    agent: Agent,
+    envelopes: AdmittedEnvelope[],
+    round: ProseRound,
+  ): Promise<void> {
+    // Multi-envelope: a single prose block may address SEVERAL destinations,
+    // each envelope routed independently (sticky/bounce as usual).
     for (const envelope of envelopes) {
-      if (!envelope.trim()) continue;
-      await this.deliverProseEnvelope(agent, envelope.replace(/^\s+(?=>>)/, ''));
+      await this.deliverProseEnvelope(agent, envelope, round);
     }
+  }
+
+  /**
+   * Where a delivered round leaves its turn's sticky destination, as the
+   * explicit gateway sets it once the round's envelopes run: each `>>`
+   * envelope whose target resolved becomes the destination. One that didn't
+   * resolve bounces and leaves it, as do `>>skip_reply` and unprefixed text.
+   */
+  private roundDestination(current: string | null, envelopes: AdmittedEnvelope[]): string | null {
+    let destination = current;
+    for (const envelope of envelopes) {
+      if (envelope.resolved && 'channelId' in envelope.resolved) destination = envelope.resolved.channelId;
+    }
+    return destination;
   }
 
   /** Locus-preserving explicit publication. Source remains byte-identical in Chronicle. */
@@ -8830,7 +9707,9 @@ export class AgentFramework {
     rawText: string,
     locus: string | null,
     allowLocus: boolean,
+    turnRouting: TurnRouting,
   ): Promise<void> {
+    const routing = turnRouting;
     const lines = rawText.split('\n');
     const envelopes: string[] = [];
     let current: string[] = [];
@@ -8848,77 +9727,85 @@ export class AgentFramework {
       const normalized = envelope.replace(/^\s+(?=>>>)/, '');
       const attempted = normalized.startsWith('>>>');
       const parsed = parseHybridProsePrefix(normalized);
-      if (parsed.continueTurn) this.proseContinuations.add(agent.name);
+      if (parsed.continueTurn) routing.logical.continuation = true;
       if (parsed.kind === 'private') {
-        this.proseTargetPins.delete(agent.name);
-        this.proseHybridSuppressed.add(agent.name);
+        delete routing.pin;
+        routing.hybridHold = true;
         console.error(`[prose] ${agent.name}: >>>skip_reply — ${parsed.body.length} chars kept in context (not sent)`);
         continue;
       }
       if (parsed.kind === 'target') {
         const resolved = this.channelRegistry!.resolveProseTarget(parsed.target!);
         if ('error' in resolved) {
-          this.proseTargetPins.delete(agent.name);
-          this.proseHybridSuppressed.add(agent.name);
+          delete routing.pin;
+          routing.hybridHold = true;
           this.bounceProse(agent, parsed.body, resolved.error, resolved.candidates, '>>>');
           continue;
         }
         let body = parsed.body;
         const usedClipboard = body.includes('{{unsent}}');
         if (usedClipboard) body = body.replaceAll('{{unsent}}', this.proseClipboards.get(agent.name) ?? '');
-        this.proseTargetPins.set(agent.name, resolved.channelId);
-        this.proseHybridSuppressed.delete(agent.name);
+        routing.pin = resolved.channelId;
+        routing.hybridHold = false;
         if (!body.trim()) {
           console.error(`[prose] ${agent.name}: >>>${parsed.target} established target; empty body — nothing sent yet`);
           continue;
         }
         try {
           const outcome = await this.channelRegistry!.routeSpeech(agent.name, body, resolved.channelId);
-          this.recordProseDelivery(agent.name, outcome);
+          this.recordProseDelivery(routing, outcome);
           if (outcome?.delivered) {
             this.proseBounceStreaks.delete(agent.name);
             if (usedClipboard) this.proseClipboards.delete(agent.name);
           } else {
-            this.proseTargetPins.delete(agent.name);
-            this.proseHybridSuppressed.add(agent.name);
+            delete routing.pin;
+            routing.hybridHold = true;
             this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} was not confirmed`, undefined, '>>>');
           }
         } catch (err) {
-          this.proseTargetPins.delete(agent.name);
-          this.proseHybridSuppressed.add(agent.name);
+          delete routing.pin;
+          routing.hybridHold = true;
           this.bounceProse(agent, parsed.body, `delivery to ${resolved.channelId} failed: ${err instanceof Error ? err.message : String(err)}`, undefined, '>>>');
         }
         continue;
       }
       if (attempted) {
-        this.proseTargetPins.delete(agent.name);
-        this.proseHybridSuppressed.add(agent.name);
+        delete routing.pin;
+        routing.hybridHold = true;
         this.bounceProse(agent, normalized, 'malformed >>> routing envelope: destination is missing', undefined, '>>>');
         continue;
       }
-      if (this.proseHybridSuppressed.has(agent.name)) {
-        this.recordProseSuppression(agent.name, 1);
+      if (routing.hybridHold) {
+        this.recordProseSuppression(routing, 1);
         continue;
       }
-      const sticky = this.proseTargetPins.get(agent.name);
+      const sticky = routing.pin;
       if (!allowLocus && !sticky) {
-        this.recordProseSuppression(agent.name, 1);
+        this.recordProseSuppression(routing, 1);
         continue;
       }
       const target = sticky ?? locus;
       try {
         const outcome = await this.channelRegistry!.routeSpeech(agent.name, envelope, target);
-        this.recordProseDelivery(agent.name, outcome);
+        this.recordProseDelivery(routing, outcome);
       } catch (err) {
         console.error('hybrid locus delivery failed:', err);
       }
     }
   }
 
-  private async deliverProseEnvelope(agent: Agent, rawText: string): Promise<void> {
+  private async deliverProseEnvelope(
+    agent: Agent,
+    envelope: AdmittedEnvelope,
+    round: ProseRound,
+  ): Promise<void> {
     const name = agent.name;
+    const routing = round.routing;
+    const rawText = envelope.text;
     const parsed = parseProsePrefix(rawText);
-    if (parsed.continueTurn) this.proseContinuations.add(name);
+    // A private round (one that called skip_reply) asks for no publication
+    // or continuation, even when delivery runs after that turn has ended.
+    if (parsed.continueTurn && !round.keepPrivate) routing.logical.continuation = true;
 
     if (parsed.kind === 'private') {
       // The text already lives in the assistant message (window/chronicle);
@@ -8929,20 +9816,35 @@ export class AgentFramework {
       return;
     }
 
+    if (round.keepPrivate) {
+      // skip_reply's promise: "Any plain text you wrote this turn stays
+      // private and is NOT posted". Every envelope of the round stays in the
+      // context, as a >>skip_reply envelope does: it isn't sent, doesn't
+      // bounce to the clipboard and doesn't move the destination.
+      console.error(
+        `[prose] ${name}: ${parsed.kind === 'target' ? `>>${parsed.target}` : 'unprefixed'} — ` +
+          `${parsed.body.length} chars kept in context (skip_reply round)`,
+      );
+      return;
+    }
+
     let targetChannel: string;
     let body: string;
     if (parsed.kind === 'target') {
-      const res = this.channelRegistry!.resolveProseTarget(parsed.target!);
+      // Resolved once, when the round was admitted (admitProse), never again
+      // here after the wait: a `>>` envelope without its resolution is a bug.
+      const res = envelope.resolved;
+      if (!res) throw new Error(`[prose] ${name}: a >> envelope reached delivery without the target admitted with it`);
       if ('error' in res) {
         this.bounceProse(agent, parsed.body, res.error, res.candidates);
         return;
       }
       targetChannel = res.channelId;
       // Sticky within the turn: later unprefixed segments follow this target.
-      this.proseTargetPins.set(name, targetChannel);
+      routing.pin = targetChannel;
       body = parsed.body;
     } else {
-      const sticky = this.proseTargetPins.get(name);
+      const sticky = routing.pin;
       if (!sticky) {
         this.bounceProse(agent, rawText, 'no destination prefix and no destination set yet this turn');
         return;
@@ -9121,7 +10023,7 @@ export class AgentFramework {
           await this.startAgentStream(agent, trigger, attempt, true);
         }).catch((error) => {
           this.releasePrimaryProviderGate(agent.name);
-          console.error(`[provider-cooldown] failed to resume primary for ${agent.name}:`, error);
+          console.error(`[provider-cooldown] failed to resume primary for ${agent.name}: ${describeFailureWithFrames(error)}`);
         });
         return;
       }
@@ -9173,8 +10075,8 @@ export class AgentFramework {
     turnToken: number,
     ownsProviderGate: boolean,
   ): Promise<boolean> {
-    const continuingTurn = trigger?.reason === 'context_budget_restart'
-      || trigger?.reason === 'tool_result_guard_retry';
+    const lifecycle = this.lifecycleGeneration;
+    const continuingTurn = resumesLogicalTurn(trigger?.reason);
     const turnProseRouting = trigger?.suppressProse ? 'disabled' : agent.proseRouting;
     // Flush messages deferred during the PREVIOUS turn — before the
     // checkpoint, the locus announcement, and the compile — so a turn started
@@ -9318,20 +10220,30 @@ export class AgentFramework {
         // A framework retry is a new physical stream in the same logical turn.
         this.logicalTurnToolCalls.set(agent, { turnToken, count: previousLogicalToolState?.count ?? 0 });
       }
-      // Fresh turn: forget the previous turn's explicit-send engagements and
-      // prose deliveries — both are strictly turn-scoped (a restart continues
-      // the same logical turn and keeps them).
+      // Fresh turn: forget the previous turn's explicit-send engagements.
+      // A restart continues the same logical turn and keeps them.
       this.turnEngagedChannels.delete(agent.name);
-      this.turnProseDeliveries.delete(agent.name);
-      this.turnProseSuppressed.delete(agent.name);
-      this.proseHybridSuppressed.delete(agent.name);
-      if (turnProseRouting === 'hybrid') this.proseTargetPins.delete(agent.name);
+      // A new routing state for the new turn, in every mode: the sticky
+      // destination, the turn's destination, hybrid's hold and the receipt
+      // tallies start empty. The previous turn's object isn't cleared: prose
+      // it left queued still reads and writes its own.
+      const fresh = freshTurnRouting();
+      // A start while the agent's logical turn is open continues it: it
+      // shares the earlier stream's ` !` and receipt tallies, which a
+      // delivery still queued there can write after this stream begins
+      // (openLogical). Otherwise this start opens one. A silent start does
+      // neither: it routes no prose, so it keeps a logical turn of its own,
+      // and an open turn waits for the next start that routes prose.
+      if (!trigger?.suppressProse) {
+        const open = this.openLogical.get(agent.name);
+        if (open) fresh.logical = open;
+        else this.openLogical.set(agent.name, fresh.logical);
+      }
+      this.turnRouting.set(agent.name, fresh);
       if (turnProseRouting === 'explicit' || turnProseRouting === 'disabled') {
         // Explicit and disabled prose routing have no inferred locus.
         // Explicit mode uses a turn-scoped `>>` target; disabled mode has no
         // prose target at all. Neither mode freezes or announces a locus.
-        this.proseTargetPins.delete(agent.name);
-        this.proseContinuations.delete(agent.name);
         this.midTurnInputSignals.delete(agent.name);
         this.turnLocusPins.delete(agent.name);
       } else {
@@ -9348,9 +10260,16 @@ export class AgentFramework {
     // opened/pinned a channel mid-turn.
     if (trigger?.suppressProse) {
       this.turnLocusPins.delete(agent.name);
-      this.proseTargetPins.delete(agent.name);
-      this.proseContinuations.delete(agent.name);
+      // Silent: no routing state. A continuing silent start keeps its turn's
+      // logical turn; a fresh one keeps the one of its own it was given.
+      const silent = freshTurnRouting();
+      const logical = this.turnRouting.get(agent.name)?.logical;
+      if (logical) silent.logical = logical;
+      this.turnRouting.set(agent.name, silent);
     }
+    // This start's own logical turn: a failure before its stream exists
+    // settles it, and no other start's.
+    const startLogical = this.turnRouting.get(agent.name)?.logical;
 
     this.touchEphemeralRun(agent.name, true);
     this.emitTrace({
@@ -9437,9 +10356,10 @@ export class AgentFramework {
         injections = injections ? [...injections, silentInjection] : [silentInjection];
       }
 
-      // An ephemeral watchdog may dispose this Agent while hooks/compile await.
-      // Do not create a provider stream after its generation lost ownership.
-      if (this.agents.get(agent.name) !== agent) {
+      // An ephemeral watchdog may dispose this Agent while hooks/compile await,
+      // and stop() may close provider admission. Do not create a provider
+      // stream after its generation lost ownership, or once admission closed.
+      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed) {
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
@@ -9464,9 +10384,25 @@ export class AgentFramework {
       } = await agent.startStreamWithInjections(tools, injections, undefined, compressionTools, {
         silentHeartbeat: trigger?.silentHeartbeat,
       });
-      if (this.agents.get(agent.name) !== agent) {
+      // The compile can wait for annotations (each batch has one spill
+      // deadline), so check ownership, admission, and the lifecycle again.
+      // A stop followed by start must not revive this earlier turn.
+      // Membrane's yielding stream starts its request when it is first
+      // iterated, so cancelling it here, before driveStream, sends nothing.
+      if (this.agents.get(agent.name) !== agent || this.providerAdmissionClosed || lifecycle !== this.lifecycleGeneration) {
+        console.error(`[turn] ${agent.name}: a turn compiled while ${
+          this.agents.get(agent.name) !== agent ? 'the agent was replaced or removed'
+            : this.providerAdmissionClosed ? 'the framework was stopping'
+              : 'the framework was stopped and started again'} is dropped before it sends anything`);
         stream.cancel();
         agent.cancelStream();
+        if (this.agents.get(agent.name) === agent) {
+          // The compile took the agent's stream id, so a frame that started
+          // this one (a guard or budget restart) no longer owns the entries
+          // it left, and its teardown leaves them to this frame.
+          this.activeStreams.delete(agent.name);
+          this.pendingAssistantBlocks.delete(agent.name);
+        }
         this.channelRegistry?.stopTyping();
         this.eventGate?.onInferenceEnded(agent.name);
         return false;
@@ -9529,7 +10465,7 @@ export class AgentFramework {
           stopReason: 'exhausted',
           speech: '',
           error: err.message,
-        });
+        }, startLogical);
         this.emitTrace({
           type: 'inference:exhausted',
           agentName: agent.name,
@@ -9593,6 +10529,9 @@ export class AgentFramework {
     // from the map here: the turn-alive busy check in processInferenceRequests
     // means no successor turn can have replaced it while we compiled.
     const myTurnToken = this.activeTurnTokens.get(agent.name);
+    // The turn-alive guard also keeps this turn's routing current at entry.
+    // Retain it for queued deliveries and receipts after a tool ends the turn.
+    const streamRouting = this.routingOf(agent.name);
     let hadToolCalls = false;
     let generationLost = false;
 
@@ -9614,14 +10553,26 @@ export class AgentFramework {
     // awaits the chain before routing trailing prose, so in-channel ordering
     // is preserved end-to-end. Each link catches its own error: one failed
     // post must not silence the rest of the turn.
-    let turnSpeechChain: Promise<void> = Promise.resolve();
+    //
+    // Every stream queues its deliveries behind the agent's latest link, so
+    // the agent's posts go out in the order they were written, across a
+    // turn's streams (a budget restart, a tool-result-guard retry) and across
+    // turns. A turn that a tool ends (skip_reply) settles before its queued
+    // prose has posted; that prose keeps its own turn's routing state
+    // (turnRouting), and the next turn's posts wait behind it.
+    const resumesTurn = resumesLogicalTurn(trigger?.reason);
+    let turnSpeechChain: Promise<void> = this.proseSpeechChains.get(agent.name) ?? Promise.resolve();
+    this.proseSpeechChains.set(agent.name, turnSpeechChain);
+    const chainSpeech = (link: () => Promise<void>, failure: string): void => {
+      turnSpeechChain = turnSpeechChain.then(link).catch((err) => console.error(failure, err));
+      // A stream another has replaced doesn't move the turn's latest link.
+      if (agent.streamId === myStreamId) this.proseSpeechChains.set(agent.name, turnSpeechChain);
+    };
     const enqueueSpeech = (text: string, locus: string | null): void => {
-      turnSpeechChain = turnSpeechChain
-        .then(async () => {
-          const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
-          this.recordProseDelivery(agent.name, outcome);
-        })
-        .catch((err) => console.error('mid-turn speech routing failed:', err));
+      chainSpeech(async () => {
+        const outcome = await this.channelRegistry!.routeSpeech(agent.name, text, locus);
+        this.recordProseDelivery(streamRouting, outcome);
+      }, 'mid-turn speech routing failed:');
     };
 
     // Sticky explicit-send suppression: prose after send_message stays quiet
@@ -9700,7 +10651,16 @@ export class AgentFramework {
       !agent.toolWrapperProseGuard
       ? new ProseStreamRouter({
           mode: turnProseRouting === 'explicit' ? 'explicit' : turnProseRouting === 'hybrid' ? 'hybrid' : 'locus',
-          initialTarget: typingChannel,
+          // Explicit text has no destination until a `>>` prefix names one,
+          // so a fresh turn's stream starts suppressed. One that resumes the
+          // turn (a tool-result-guard retry, a budget restart) starts at the
+          // destination the turn's delivered rounds have set: a private
+          // round's prefixes don't count, and the gateway's queued
+          // deliveries needn't have run. The trigger channel is only where
+          // explicit mode's typing indicator shows.
+          initialTarget: turnProseRouting === 'explicit'
+            ? (resumesTurn ? streamRouting.destination : null)
+            : typingChannel,
           resolve: (spec) => {
             const r = this.channelRegistry!.resolveProseTarget(spec);
             return 'channelId' in r ? r.channelId : null;
@@ -9722,6 +10682,8 @@ export class AgentFramework {
     // other trace consumers voice it). Hold both; release in order on a clean
     // round (tool-calls / non-guard completion), discard on a guard refusal.
     let guardHeld: Array<{ trace: Parameters<AgentFramework['emitTrace']>[0]; text?: string }> = [];
+    // The text block the stream's last text came from, within this round.
+    let lastTextBlock: number | undefined;
     const releaseGuardHeld = (): void => {
       const held = guardHeld;
       guardHeld = [];
@@ -9766,7 +10728,17 @@ export class AgentFramework {
               // turn's prose is bound for, without re-deriving routing.
               channelId: typingChannel ?? undefined,
             };
-            const text = event.meta.type === 'text' ? event.content : undefined;
+            // Delivery joins a round's text blocks with a newline
+            // (splitProseSegments), so a later block starts a new line for
+            // the stream too.
+            let text = event.meta.type === 'text' ? event.content : undefined;
+            if (text !== undefined) {
+              const block = event.meta.blockIndex;
+              if (block !== undefined) {
+                if (lastTextBlock !== undefined && block !== lastTextBlock) text = '\n' + text;
+                lastTextBlock = block;
+              }
+            }
             if (agent.toolResultGuard.hasSubmittedPending || agent.toolResultGuard.recovering) {
               guardHeld.push({ trace, text });
             } else {
@@ -9799,6 +10771,11 @@ export class AgentFramework {
             outgoingIndex = 0;
             discardGuardHeld();
             proseStream?.reset();
+            lastTextBlock = undefined;
+            // Explicit mode's retried attempt starts where the turn's
+            // delivered rounds have set the destination, not at the stream's
+            // seed: rounds this stream delivered before the refusal stand.
+            if (turnProseRouting === 'explicit') proseStream?.retarget(streamRouting.destination);
             this.emitTrace({
               type: 'inference:tokens',
               agentName: agent.name,
@@ -9828,6 +10805,10 @@ export class AgentFramework {
             // preceding results before storing/dispatching this new round.
             agent.toolResultGuard.accept();
             releaseGuardHeld();
+            // The round's text ends here: delivery parses each round's text
+            // on its own, so the next round's text starts a new line.
+            if (proseStream) emitOutgoing(proseStream.endSegment());
+            lastTextBlock = undefined;
             adoptInjectedRound();
             hadToolCalls = true;
             this.recordLogicalTurnToolCalls(agent, myTurnToken ?? -1, event.calls.length);
@@ -9936,39 +10917,58 @@ export class AgentFramework {
                     console.error(
                       `[routing] ${agent.name}: mid-turn prose NOT routed (proseRouting=disabled)`,
                     );
-                    this.recordProseSuppression(agent.name, roundSegments.length);
+                    this.recordProseSuppression(streamRouting, roundSegments.length);
                   } else if (turnProseRouting === 'hybrid') {
                     if (turnSilenced) {
-                      this.recordProseSuppression(agent.name, roundSegments.length);
+                      this.recordProseSuppression(streamRouting, roundSegments.length);
                     } else if (!hasSameRoundPrivateThink) {
                       const locus = resolveTurnLocus();
+                      // Queued under this turn's routing, whenever it posts.
+                      const routing = streamRouting;
                       for (const seg of roundSegments) {
-                        turnSpeechChain = turnSpeechChain
-                          .then(() => this.deliverHybridProse(agent, seg, locus, true))
-                          .catch((err) => console.error('mid-turn hybrid prose delivery failed:', err));
+                        chainSpeech(() => this.deliverHybridProse(agent, seg, locus, true, routing), 'mid-turn hybrid prose delivery failed:');
                       }
                     }
                   } else if (turnProseRouting === 'explicit') {
-                    // Explicit mode: every segment through the prose gateway.
-                    // Silencing does not apply — unprefixed prose bounces and
-                    // prefixed prose is deliberate; think-privacy still holds.
+                    // Explicit mode: the segments go through the prose
+                    // gateway, unless a private think in the round holds them
+                    // back. Send silencing does not apply: unprefixed prose
+                    // bounces, and prefixed prose is deliberate. skip_reply
+                    // does: its round's envelopes all stay in the context
+                    // (deliverProseEnvelope's keepPrivate), as the tool
+                    // promises, and skip_reply then ends the turn at this
+                    // round's tool results.
                     if (!hasSameRoundPrivateThink) {
+                      const keepPrivate = roundToolNames.some((n) => bareToolName(n) === 'skip_reply');
+                      // The round is admitted now: its targets are resolved
+                      // once, for the turn's destination and for its queued
+                      // delivery alike.
+                      const admitted = roundSegments.map((seg) => this.admitProse(seg));
+                      // Queued under this turn's routing, whenever it posts.
+                      const routing = streamRouting;
+                      if (!keepPrivate) {
+                        routing.destination = this.roundDestination(routing.destination, admitted.flat());
+                      }
                       console.error(
-                        `[prose] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway`,
+                        `[prose] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway${keepPrivate ? ', kept private (skip_reply)' : ''}`,
                       );
-                      for (const seg of roundSegments) {
-                        turnSpeechChain = turnSpeechChain
-                          .then(() => this.deliverProse(agent, seg))
-                          .catch((err) => console.error('mid-turn prose delivery failed:', err));
+                      for (const envelopes of admitted) {
+                        chainSpeech(() => this.deliverAdmittedProse(agent, envelopes, { keepPrivate, routing }), 'mid-turn prose delivery failed:');
                       }
                     }
+                    // The stream's next round starts where delivery sends
+                    // unprefixed text: the turn's destination. The stream
+                    // followed this round's prefixes as it was written, but a
+                    // private round's, a >>skip_reply envelope's or a target
+                    // that didn't resolve leave the destination as it was.
+                    proseStream?.retarget(streamRouting.destination);
                   } else if (turnSilenced) {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (turn silenced)`,
                     );
                     // Visible in the turn-end receipt — silencing must never
                     // be a silent black hole (n=8: the flying-scene reply).
-                    this.recordProseSuppression(agent.name, roundSegments.length);
+                    this.recordProseSuppression(streamRouting, roundSegments.length);
                   } else if (hasSameRoundPrivateThink) {
                     console.error(
                       `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
@@ -10010,6 +11010,7 @@ export class AgentFramework {
               // persisted as assistant speech, including a terminal refusal
               // after the single recovery retry.
               proseStream?.reset();
+              if (turnProseRouting === 'explicit') proseStream?.retarget(streamRouting.destination);
               if (withheld) {
                 const usage = response.details?.usage ?? response.usage;
                 const tokenUsage = usage ? {
@@ -10108,7 +11109,7 @@ export class AgentFramework {
                 );
                 agent.toolResultGuard.storeResults(toolResultContent, readyState.toolResults.map((tc) =>
                   this.toMembraneToolResult(tc.id, tc.result, cap, spilled.get(tc.id))), readyState.toolResults,
-                  this.silentTurnRowMetadata(agent.name));
+                  this.silentTurnRowMetadata(agent.name), cap);
                 // The response is already complete: this batch is never
                 // submitted in this turn, so it cannot be refused. Admit it.
                 agent.toolResultGuard.settleTurnEnded();
@@ -10190,6 +11191,20 @@ export class AgentFramework {
             const speechContent = hadToolCalls ? [] : allText;
             const thoughts = hadToolCalls ? allText : [];
 
+            // Explicit text is admitted as its round ends, before anything
+            // below waits (a module's speech callback, the turn's earlier
+            // deliveries): its targets resolve now, as a live round's do.
+            const finalSpeechText = speechContent.map((b) => b.text).join('\n').trim();
+            const finalSegments = hadToolCalls && allText.length > 0
+              ? splitProseSegments(liveProseRouting ? terminalContent : response.content)
+              : [];
+            const admitFinal = turnProseRouting === 'explicit' && !!this.channelRegistry;
+            // The final text is delivered under this turn's routing, as its
+            // queued rounds are.
+            const finalRouting = streamRouting;
+            const admittedSpeech = admitFinal && finalSpeechText ? this.admitProse(finalSpeechText) : null;
+            const admittedSegments = admitFinal ? finalSegments.map((seg) => this.admitProse(seg)) : [];
+
             const du = response.details?.usage;
             const tokenUsage = du
               ? {
@@ -10224,7 +11239,7 @@ export class AgentFramework {
                     .filter((block: ContentBlock): block is ContentBlock & { type: 'text' } => block.type === 'text')
                     .map((block) => block.text)
                     .join('\n'),
-            });
+            }, streamRouting.logical);
 
             this.emitTrace({
               type: 'inference:completed',
@@ -10356,7 +11371,7 @@ export class AgentFramework {
               // border is close, rather than noise on every near-threshold
               // flip. (It must not re-enter any agent's context — the emoji
               // is suppressed at the surface via
-              // DISCORD_SUPPRESS_REACTION_EMOJIS; without that, marking a
+              // DISCORD_SUPPRESSED_REACTIONS_BASELINE; without that, marking a
               // refusal feeds the next one.)
               if (!handledByRewind) {
                 void this.reactToRefusal(agent.name, category);
@@ -10402,33 +11417,35 @@ export class AgentFramework {
             // they are never routed here — which is precisely how the `think`
             // tool (and any explicit send tool) yields a silent turn.
             if (speechContent.length > 0 && this.channelRegistry) {
-              const speechText = speechContent
-                .map((b) => (b as ContentBlock & { type: 'text' }).text)
-                .join('\n')
-                .trim();
+              const speechText = finalSpeechText;
               if (speechText) {
+                // After the agent's earlier deliveries: every stream's chain
+                // starts from the agent's latest link, so this waits for the
+                // turn's earlier rounds and for an earlier turn's posts still
+                // queued.
+                await turnSpeechChain;
                 if (turnProseRouting === 'disabled') {
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (proseRouting=disabled)`);
-                  this.recordProseSuppression(agent.name, 1);
+                  this.recordProseSuppression(streamRouting, 1);
                 } else if (turnSilenced && turnProseRouting !== 'explicit') {
                   // Only reachable on a guard recovery that carried the
                   // same-turn send suppression, or a suppressProse trigger
                   // (a fresh text-only turn starts unsilenced). Explicit
                   // mode is exempt, as mid-turn.
                   console.error(`[routing] ${agent.name}: text-only prose NOT routed (turn silenced)`);
-                  this.recordProseSuppression(agent.name, 1);
+                  this.recordProseSuppression(streamRouting, 1);
                 } else if (turnProseRouting === 'hybrid') {
                   const locus = resolveTurnLocus();
                   console.error(`[prose] ${agent.name}: text-only turn -> hybrid prose gateway`);
                   try {
-                    await this.deliverHybridProse(agent, speechText, locus, true);
+                    await this.deliverHybridProse(agent, speechText, locus, true, finalRouting);
                   } catch (err) {
                     console.error('text-only hybrid prose delivery failed:', err);
                   }
                 } else if (turnProseRouting === 'explicit') {
                   console.error(`[prose] ${agent.name}: text-only turn -> prose gateway`);
                   try {
-                    await this.deliverProse(agent, speechText);
+                    await this.deliverAdmittedProse(agent, admittedSpeech!, { routing: finalRouting });
                   } catch (err) {
                     console.error('text-only prose delivery failed:', err);
                   }
@@ -10445,7 +11462,7 @@ export class AgentFramework {
                   );
                   try {
                     const outcome = await this.channelRegistry.routeSpeech(agent.name, speechText, locus);
-                    this.recordProseDelivery(agent.name, outcome);
+                    this.recordProseDelivery(streamRouting, outcome);
                   } catch (err) {
                     console.error('speech routing failed:', err);
                   }
@@ -10474,7 +11491,7 @@ export class AgentFramework {
                 ? turnSilenced
                 : turnSilenced || toolNames.some(isSilencingTool);
 
-              const segments = splitProseSegments(liveProseRouting ? terminalContent : response.content);
+              const segments = finalSegments;
 
               // Preserve in-channel ordering: everything enqueued live must
               // land before the trailing prose. Awaited even when silenced —
@@ -10486,16 +11503,16 @@ export class AgentFramework {
                   console.error(
                     `[routing] ${agent.name}: tool-call trailing prose NOT routed (proseRouting=disabled)`,
                   );
-                  this.recordProseSuppression(agent.name, segments.length);
+                  this.recordProseSuppression(streamRouting, segments.length);
                 }
               } else if (turnProseRouting === 'hybrid') {
                 if (silenced && segments.length > 0) {
-                  this.recordProseSuppression(agent.name, segments.length);
+                  this.recordProseSuppression(streamRouting, segments.length);
                 } else if (segments.length > 0) {
                   const locus = resolveTurnLocus();
                   for (const seg of segments) {
                     try {
-                      await this.deliverHybridProse(agent, seg, locus, true);
+                      await this.deliverHybridProse(agent, seg, locus, true, finalRouting);
                     } catch (err) {
                       console.error('trailing hybrid prose delivery failed:', err);
                     }
@@ -10506,9 +11523,9 @@ export class AgentFramework {
                   console.error(
                     `[prose] ${agent.name}: tool-call turn [${toolNames.join(', ')}] -> ${segments.length} trailing segment(s) via prose gateway`,
                   );
-                  for (const seg of segments) {
+                  for (const envelopes of admittedSegments) {
                     try {
-                      await this.deliverProse(agent, seg);
+                      await this.deliverAdmittedProse(agent, envelopes, { routing: finalRouting });
                     } catch (err) {
                       console.error('trailing prose delivery failed:', err);
                     }
@@ -10520,7 +11537,7 @@ export class AgentFramework {
                   `(${silenced ? 'silencing tool / explicit send' : 'no trailing prose'})`,
                 );
                 if (silenced && segments.length > 0) {
-                  this.recordProseSuppression(agent.name, segments.length);
+                  this.recordProseSuppression(streamRouting, segments.length);
                 }
               } else {
                 // Reuse the locus pinned at the turn's first live-routed
@@ -10538,7 +11555,7 @@ export class AgentFramework {
                 for (const seg of segments) {
                   try {
                     const outcome = await this.channelRegistry.routeSpeech(agent.name, seg, locus);
-                    this.recordProseDelivery(agent.name, outcome);
+                    this.recordProseDelivery(streamRouting, outcome);
                   } catch (err) {
                     console.error('speech routing failed:', err);
                   }
@@ -10550,28 +11567,21 @@ export class AgentFramework {
             // doesn't depend on the status field, so it correctly runs after.
 
             // Logical turn end (normal completion): drop the `[delivered]`
-            // receipt. All deliveries are settled — the live chain was
-            // awaited before trailing dispatch, and trailing/text-only
-            // segments were awaited in-loop. Locus mode only; explicit-mode
-            // envelopes acknowledge themselves through the prose gateway.
+            // receipt, once every delivery has settled. The text-only and
+            // trailing paths awaited the chain when there was final text; a
+            // turn whose last response is empty awaits it here, so the
+            // receipt and the continuation see its last rounds' deliveries.
+            // Locus and hybrid mode; explicit-mode envelopes acknowledge
+            // themselves through the prose gateway.
+            await turnSpeechChain;
             if (!trigger?.suppressProse && turnProseRouting !== 'explicit') {
-              this.appendProseDeliveryReceipt(agent);
+              this.appendProseDeliveryReceipt(agent, streamRouting);
             }
 
-            // Explicit-prose `!` continuation: a prose segment this turn asked
-            // to keep going (`>>#x !` / `>>private !`) — start another turn
-            // now instead of pausing until the next external event. This gives
-            // prose the same continuation ability tool rounds have (wanted for
+            // A `!` continuation this turn asked for. This gives prose the
+            // same continuation ability tool rounds have (wanted for
             // robotics-style loops where an end-of-turn pause is harmful).
-            if (this.proseContinuations.delete(agent.name)) {
-              console.error(`[prose] ${agent.name}: '!' continuation — requesting immediate next turn`);
-              this.pendingRequests.push({
-                agentName: agent.name,
-                reason: 'prose-continuation',
-                source: 'framework',
-                timestamp: Date.now(),
-              });
-            }
+            this.requestProseContinuation(agent, finalRouting);
 
             break;
           }
@@ -10623,7 +11633,7 @@ export class AgentFramework {
                   stopReason: 'exhausted',
                   speech: '',
                   error: 'Turn abandoned by operator quiesce',
-                });
+                }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting.logical : undefined);
                 this.emitTrace({
                   type: 'inference:aborted',
                   agentName: agent.name,
@@ -10652,7 +11662,7 @@ export class AgentFramework {
                 stopReason: 'exhausted',
                 speech: '',
                 error: err.message,
-              });
+              }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting.logical : undefined);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -10706,7 +11716,7 @@ export class AgentFramework {
                       stopReason: 'exhausted',
                       speech: '',
                       error: 'Turn abandoned by operator quiesce',
-                    });
+                    }, streamRouting.logical);
                   }
                   this.emitTrace({
                     type: 'inference:aborted',
@@ -10719,13 +11729,22 @@ export class AgentFramework {
                 // endTurn IS a logical turn end — earlier rounds may have
                 // live-routed prose (narrate → skip_reply is a real shape),
                 // so settle the delivery chain and drop the receipt. A
-                // budget restart continues the same logical turn: the
-                // deliveries map persists (cleared only at fresh turn
-                // start) and the continuation stream's end writes ONE
-                // receipt for the whole turn.
+                // budget restart keeps the same turn's routing and tallies;
+                // the continuation stream's end writes one receipt for it.
                 if (cancelKind === 'turn_ended' && !trigger?.suppressProse && turnProseRouting !== 'explicit') {
                   await turnSpeechChain;
-                  this.appendProseDeliveryReceipt(agent);
+                  this.appendProseDeliveryReceipt(agent, streamRouting);
+                }
+                // A `!` an earlier round asked for still starts its
+                // continuation when a tool ends the turn, once the turn's
+                // deliveries have run. Explicit mode doesn't hold the turn
+                // for them, so it checks at the end of its chain.
+                if (cancelKind === 'turn_ended') {
+                  if (turnProseRouting === 'explicit') {
+                    void turnSpeechChain.then(() => this.requestProseContinuation(agent, streamRouting));
+                  } else {
+                    this.requestProseContinuation(agent, streamRouting);
+                  }
                 }
                 return;
               }
@@ -10741,7 +11760,7 @@ export class AgentFramework {
                 stopReason: 'exhausted',
                 speech: '',
                 error: `Stream aborted: ${reason}`,
-              });
+              }, streamRouting.logical);
               this.emitTrace({
                 type: 'inference:exhausted',
                 agentName: agent.name,
@@ -10887,7 +11906,7 @@ export class AgentFramework {
         stopReason: 'exhausted',
         speech: '',
         error: err.message,
-      });
+      }, streamRouting.logical);
       this.emitTrace({
         type: 'inference:exhausted',
         agentName: agent.name,
@@ -11151,13 +12170,15 @@ export class AgentFramework {
     let ownedToEnd = false;
     try {
       const started = Date.now();
-      const result = await this.executeToolCall({
-        id: toolUseId,
-        name: toolName,
-        input,
-        callerAgentName: agentName,
-      });
+      const call = { id: toolUseId, name: toolName, input, callerAgentName: agentName };
+      const returned = await this.executeToolCall(call);
       const durationMs = Date.now() - started;
+      // The pair is stored as a model's call would be, so the result stored,
+      // traced and logged is its checked form. The caller gets the tool's
+      // own result back, as an in-process caller does, unless nothing
+      // usable could be stored: then it gets the error result stored.
+      const checked = checkedToolResult(call, returned);
+      const result = checked.result;
 
       // Store the pair through the same shapes the ordinary path uses. Build
       // the result blocks BEFORE storing the tool_use: the spill path awaits.
@@ -11205,7 +12226,7 @@ export class AgentFramework {
         `[puppet] ${agentName}: ${toolName} → ${result.isError ? 'ERROR' : 'ok'} ` +
         `in ${durationMs}ms (${toolUseId})${ownedToEnd ? '' : ' — deferred behind a live turn'}`,
       );
-      return { toolUseId, result };
+      return { toolUseId, result: checked.usable ? returned : result };
     } finally {
       if (this.activeTurnTokens.get(agentName) === turnToken) this.activeTurnTokens.delete(agentName);
       // Messages deferred while we held the token land now, after the pair
@@ -11268,10 +12289,11 @@ export class AgentFramework {
     // ephemerals, ModuleContext.callTool) reach utilities the same way the
     // model does.
     if (call.name === 'utils') {
-      return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call);
+      return this.handleUtilsToolCall(call.callerAgentName ?? '__ephemeral__', call, { inProcess: true });
     }
 
-    // Module tools
+    // Module tools. The caller uses the result in process, so it gets the
+    // module's own result, as the module returned it.
     return this.moduleRegistry.handleToolCall(call);
   }
 
@@ -11350,6 +12372,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'code_execution',
           result,
@@ -11773,7 +12796,7 @@ export class AgentFramework {
       // stays reachable by provenance after the bytes leave the wire.
       const raw = tc.result.isError
         ? tc.result.error ?? 'Unknown error'
-        : toolResultDataToHistoryString(tc.result.data, undefined, {
+        : nonErrorResultText(tc.result, undefined, {
           imageRef: (blockIndex, image) => ledger.retain({
             toolCallId: tc.id,
             toolName: tc.name,
@@ -11796,6 +12819,133 @@ export class AgentFramework {
     return { blocks, spilled };
   }
 
+  /** Where a tool result labelled `label` is written: `<first writable
+   *  mount>/tool-results/<label>.txt`, or null when there is no writable
+   *  workspace. */
+  private toolResultFilePlace(label: string): { workspace: WorkspaceModule; path: string; safeLabel: string } | null {
+    const workspace = this.getWorkspaceModule();
+    const mountName = workspace ? this.firstWritableMountName(workspace) : null;
+    if (!workspace || !mountName) return null;
+    const safeLabel = label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
+    return { workspace, path: `${mountName}/tool-results/${safeLabel}.txt`, safeLabel };
+  }
+
+  /**
+   * A withheld original uses the remaining time in its batch's deadline.
+   * A write still under way at that deadline is reported as unfinished and
+   * goes on; the guard stops waiting for it, though stop() still waits for
+   * the workspace's turn it holds (bounded only by a teardown timeout). From
+   * then until every
+   * overdue write settles, new withheld spills are workspace_unanswered.
+   * Writes from other batches can start before the first deadline fires.
+   * An exhausted batch starts no more writes even if none is overdue.
+   * The inline cap's spills use writeToolResultFile without this deadline.
+   */
+  private async spillWithheld(label: string, text: string, branch: string,
+    deadline = Date.now() + this.withheldSpillDeadlineMs): Promise<WithheldSpill> {
+    // A batch with no finite deadline (a host whose deadline() threw) gets
+    // this write's own, rather than a timer Node would cut to 1 ms.
+    if (!Number.isFinite(deadline)) deadline = Date.now() + this.withheldSpillDeadlineMs;
+    if (this.guardSpillsClosedFor === this.lifecycleGeneration) return null;
+    const place = this.toolResultFilePlace(label);
+    if (!place) return null;
+    if (this.stalledSpills.size > 0) {
+      // Said once per stall, with the count when it clears, so a stalled
+      // workspace doesn't write a line for every result it can't take.
+      if (this.stallSkips++ === 0) {
+        console.error(`[spill] withheld originals are skipped as workspace_unanswered while ${this.stalledSpills.size} write(s) past their deadline are under way (first: ${place.path})`);
+      }
+      return { skipped: 'workspace_unanswered' };
+    }
+    const remaining = deadline - Date.now();
+    // The guard says once per batch that it used its deadline.
+    if (remaining <= 0) return { skipped: 'batch_deadline' };
+    const write = this.writeToolResultFile(label, text, branch);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<'late'>((resolve) => {
+      timer = setTimeout(() => {
+        // Marked as the deadline passes, before anything else runs, so no
+        // spill that starts after it finds the workspace answering.
+        const stalled: Promise<void> = write.then(() => {}, () => {}).finally(() => {
+          this.stalledSpills.delete(stalled);
+          if (this.stalledSpills.size === 0 && this.stallSkips > 0) {
+            console.error(`[spill] the workspace answered again; ${this.stallSkips} withheld original(s) were skipped as workspace_unanswered meanwhile`);
+            this.stallSkips = 0;
+          }
+        });
+        this.stalledSpills.add(stalled);
+        console.error(`[spill] ${place.path} still being written at the withheld batch deadline`);
+        resolve('late');
+      }, remaining);
+      timer.unref?.();
+    });
+    try {
+      const written = await Promise.race([write, late]);
+      if (written !== 'late') {
+        if (!written) return null;
+        if (written.branchLeft) return { skipped: 'branch_changed' };
+        return { path: written.path, ...(written.error !== undefined ? { error: written.error } : {}) };
+      }
+      return { path: place.path, unfinished: true };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Write one tool result's text to its tool-results file (see
+   * toolResultFilePlace): the one place both the inline cap's spill and the
+   * guard's withheld originals go. null when there is no writable workspace.
+   * A failed write is reported, traced and logged here, never thrown. With a
+   * branch, the file lands on that branch or isn't written (see writeBinary).
+   */
+  private async writeToolResultFile(
+    label: string,
+    content: string,
+    branch?: string,
+  ): Promise<{ path: string; error?: string; branchLeft?: true } | null> {
+    const place = this.toolResultFilePlace(label);
+    if (!place) return null;
+    const { workspace, path, safeLabel } = place;
+    let failure: string;
+    try {
+      const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain', { branch });
+      if (result.success) return { path };
+      // The file is in the workspace's Chronicle tree, where its tools read
+      // it, and the rest of the write failed (its copy on disk, or something
+      // after the entry was set): it is written for every reader the stub or
+      // the truncation note sends there. The workspace emits
+      // workspace:materialize-failed only for a refused push, so the failure
+      // is traced here too.
+      if ((result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true) {
+        const error = (result.error ?? 'the rest of the write failed').slice(0, 200);
+        this.emitTrace({ type: 'tool:spill_failed', label: safeLabel, path, contentLength: content.length, error });
+        console.error(`[spill] ${path} is in the workspace's Chronicle tree, but the rest of its write failed: ${error}`);
+        return { path };
+      }
+      // Declined, not failed: the store left the branch the file is for, so
+      // it isn't written anywhere, as the caller asked.
+      if ((result.data as { branchLeft?: boolean } | undefined)?.branchLeft === true) {
+        return { path, error: result.error ?? 'the workspace had left the branch this file is for', branchLeft: true };
+      }
+      failure = result.error ?? 'write refused';
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
+    }
+    failure = failure.slice(0, 200);
+    this.emitTrace({
+      type: 'tool:spill_failed',
+      label: safeLabel,
+      path,
+      contentLength: content.length,
+      error: failure,
+    });
+    console.error(
+      `[spill] workspace write failed for ${path} (${content.length} chars): ${failure}`,
+    );
+    return { path, error: failure };
+  }
+
   private async spillOrTruncate(
     content: string,
     cap: number | undefined,
@@ -11810,52 +12960,32 @@ export class AgentFramework {
     const { head, tail } = splitPreservingImageSlots(content, cap);
     const kept = formatPreservedImageSlots(tail);
 
-    const workspace = this.getWorkspaceModule();
-    const mountName = workspace ? this.firstWritableMountName(workspace) : null;
-    if (workspace && mountName) {
-      const safeLabel = label.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 80);
-      const path = `${mountName}/tool-results/${safeLabel}.txt`;
-      let failure: string;
-      try {
-        const result = await workspace.writeBinary(path, Buffer.from(content, 'utf8'), 'text/plain');
-        if (result.success) {
-          // JSON serialization can expand each read-back code unit to six
-          // chars (\\u0000). Leave room for the page's metadata and a possible
-          // extra code unit at a surrogate-pair boundary.
-          const pageOverhead = JSON.stringify(path).length + 256;
-          const readLimit = Math.max(1, Math.min(2000, Math.floor((cap - pageOverhead) / 6) - 1));
-          return {
-            text: head
-              + `\n\n[truncated — showing ${head.length} of ${content.length} chars; full content: workspace file ${path}`
-              + `. Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
-              + 'use nextOffsetChars as offsetChars until null, keeping limitChars. Or raise the inline cap via '
-              + 'agent_settings update tool_result_inline_max_chars.]'
-              + kept,
-            filePath: path,
-          };
-        }
-        failure = result.error ?? 'write refused';
-      } catch (err) {
-        failure = err instanceof Error ? err.message : String(err);
-      }
+    const written = await this.writeToolResultFile(label, content);
+    if (written && written.error === undefined) {
+      const path = written.path;
+      // JSON serialization can expand each read-back code unit to six
+      // chars (\\u0000). Leave room for the page's metadata and a possible
+      // extra code unit at a surrogate-pair boundary.
+      const pageOverhead = JSON.stringify(path).length + 256;
+      const readLimit = Math.max(1, Math.min(2000, Math.floor((cap - pageOverhead) / 6) - 1));
+      return {
+        text: head
+          + `\n\n[truncated — showing ${head.length} of ${content.length} chars; full content: workspace file ${path}`
+          + `. Page with workspace--read ${JSON.stringify({ path, offsetChars: 0, limitChars: readLimit })}; `
+          + 'use nextOffsetChars as offsetChars until null, keeping limitChars. Or raise the inline cap via '
+          + 'agent_settings update tool_result_inline_max_chars.]'
+          + kept,
+        filePath: path,
+      };
+    }
+    if (written) {
       // A workspace was there and the write FAILED — say that, loudly and
       // distinctly. Telling the agent "no writable workspace" would teach
       // them their residence lacks a capability it actually has.
-      failure = failure.slice(0, 200);
-      this.emitTrace({
-        type: 'tool:spill_failed',
-        label: safeLabel,
-        path,
-        contentLength: content.length,
-        error: failure,
-      });
-      console.error(
-        `[spill] workspace write failed for ${path} (${content.length} chars): ${failure}`,
-      );
       return {
         text: head
-          + `\n\n[truncated — showing ${head.length} of ${content.length} chars; spill to workspace file ${path} FAILED`
-          + ` (${failure}); content over the cap was not retained]`
+          + `\n\n[truncated — showing ${head.length} of ${content.length} chars; spill to workspace file ${written.path} FAILED`
+          + ` (${written.error}); content over the cap was not retained]`
           + kept,
         filePath: null,
       };
@@ -11921,7 +13051,7 @@ export class AgentFramework {
     if (result.isError) {
       return `Error: ${result.error ?? 'tool call failed'}`;
     }
-    if (result.data === undefined) return '';
+    if (result.data === undefined || result.data === null) return nonErrorResultText(result, 5_000_000);
     // RFC-005 "eagerly lazy": a script receiving a result is the strongest
     // available signal that the bytes are wanted (scripts process, they do
     // not browse) — materialize every referenced payload now, so the stub
@@ -12207,6 +13337,9 @@ export class AgentFramework {
   private logInference(entry: InferenceLogEntry): void {
     // Store large request/response as blobs
     const entryToStore = { ...entry };
+    // The failure text is stored inline in every record; the request that
+    // produced it is already stored separately as a blob.
+    if (typeof entryToStore.error === 'string') entryToStore.error = boundFailureText(entryToStore.error);
 
     // Blob threshold: 10KB - typical context-heavy requests exceed this
     const BLOB_THRESHOLD = 10000;
@@ -12356,7 +13489,7 @@ export class AgentFramework {
     const enrichedCall: ToolCall = { ...call, callerAgentName: agentName };
     if (isPresentationTool(call.name)) {
       const result = this.editToolPresentation(agentName, enrichedCall);
-      this.pushEvent({type:'tool-result',callId:call.id,agentName,moduleName:'tool-presentation',result});
+      this.pushEvent({type:'tool-result',callId:call.id,toolName:call.name,agentName,moduleName:'tool-presentation',result});
       return;
     }
 
@@ -12418,10 +13551,16 @@ export class AgentFramework {
     ) {
       void this.tuneOutCoordinator
         .handleSubconsciousTool(enrichedCall.name, enrichedCall.input as Record<string, unknown>)
+        // A rejection is answered with a failed result, as a framework tool's
+        // dispatch failure is (dispatchUtilsToolCall), never left unhandled.
+        .catch((err): ToolResult => ({ success: false, error: thrownText(err), isError: true }))
         .then((result) => {
-          this.queue.push({
+          // Through pushEvent, like every other tool's result, so one that
+          // arrives after stop() is dropped rather than rejected unhandled.
+          this.pushEvent({
             type: 'tool-result',
             callId: enrichedCall.id,
+            toolName: enrichedCall.name,
             agentName,
             moduleName: 'tune-out',
             result,
@@ -12492,6 +13631,7 @@ export class AgentFramework {
       this.pushEvent({
         type: 'tool-result',
         callId: enrichedCall.id,
+        toolName: enrichedCall.name,
         agentName,
         moduleName: 'framework',
         result: { success: true, data: PROSE_ROUTING_HELP },
@@ -12527,7 +13667,7 @@ export class AgentFramework {
     const startTime = Date.now();
 
     this.moduleRegistry
-      .handleToolCall({ ...call, callerAgentName: agentName })
+      .storableToolCall({ ...call, callerAgentName: agentName })
       .then((result) => {
         const durationMs = Date.now() - startTime;
         this.emitTrace({
@@ -12541,6 +13681,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName,
           result,
@@ -12562,6 +13703,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName,
           result: {
@@ -12782,6 +13924,10 @@ export class AgentFramework {
         (event.error as string) ?? 'unknown error',
         event.retryable as boolean | undefined,
         event.errorType as string | undefined,
+        {
+          httpStatus: event.httpStatus as number | undefined,
+          providerErrorCode: event.providerErrorCode as string | undefined,
+        },
       );
     } else if (event.type === 'inference:completed') {
       // A successful response — even mid-turn between tool calls — proves the
@@ -12800,8 +13946,26 @@ export class AgentFramework {
       ...event,
       timestamp: Date.now(),
     } as TraceEvent;
+    // Listeners (web UI, subagent observers, host loggers) receive bounded
+    // failure text. An event's `error` and `stack` strings are whatever its
+    // source's Error carried, which for a provider failure can be an echo of
+    // the whole request.
+    const bounded = traceEvent as unknown as Record<string, unknown>;
+    if (typeof bounded.error === 'string') bounded.error = boundFailureText(bounded.error);
+    if (typeof bounded.stack === 'string') bounded.stack = boundFailureText(bounded.stack);
 
-    for (const listener of this.traceListeners) {
+    // An event goes to the subscriptions present when its delivery starts,
+    // each one only if it is still active when its turn comes, as the DOM's
+    // EventTarget delivers: a subscription made during delivery waits for the
+    // next event, and one removed during delivery is skipped if its turn
+    // hasn't come. Each onTrace call is a subscription of its own, so a
+    // function subscribed twice is called twice. Iterating the live array let
+    // an unsubscribe during delivery make the listener after the one being
+    // called miss the event, since splice shifts the rest under the iterator.
+    for (const registration of [...this.traceListeners]) {
+      if (!registration.active) continue;
+      // Called as a plain function, as before, so the registration isn't its `this`.
+      const { listener } = registration;
       try {
         listener(traceEvent);
       } catch (error) {
@@ -12877,10 +14041,14 @@ export class AgentFramework {
    *  and kind-specific fields (additive only — doctor parses by regex). */
   private logFailure(record: Record<string, unknown>): void {
     try {
+      // Every field is bounded: `reason` is conventionally free text, and any
+      // caller's field may carry an error message, or an Error whose own
+      // fields include the whole request.
+      const bounded = boundFailureFields(record);
       mkdirSync('logs', { recursive: true });
       appendFileSync(
         'logs/failures.log',
-        JSON.stringify({ at: new Date().toISOString(), ...record }) + '\n',
+        JSON.stringify({ at: new Date().toISOString(), ...bounded }) + '\n',
       );
     } catch { /* best-effort */ }
   }
@@ -12913,13 +14081,27 @@ export class AgentFramework {
   private opsAlert(
     kind: string,
     agentName: string,
-    message: string,
+    rawMessage: string,
     opts?: { data?: Record<string, unknown>; skipLog?: boolean },
   ): void {
+    // A JavaScript caller of notifyOps or notifyOpsAlert can pass a message
+    // that isn't a string; it's described as a thrown value is, rather than
+    // thrown on (a string is its own description).
+    const wholeMessage = failureDescription(rawMessage);
+    const message = boundFailureText(wholeMessage);
+    // The caller's data goes to failures.log and to trace listeners, bounded
+    // the same way for both. A JavaScript caller's null is no data, and data
+    // that isn't a plain object (a string, an array, a Buffer) is kept as one
+    // field, `data`, rather than spread into a field per character or element.
+    const rawData: unknown = opts?.data;
+    const plain = typeof rawData === 'object' && rawData !== null &&
+      [Object.prototype, null].includes(Object.getPrototypeOf(rawData));
+    const data = rawData == null ? undefined
+      : boundFailureFields(plain ? rawData as Record<string, unknown> : { data: rawData });
     if (!opts?.skipLog) {
-      this.logFailure({ agent: agentName, kind, reason: message, ...opts?.data });
+      this.logFailure({ agent: agentName, kind, reason: message, ...data });
     }
-    this.emitTrace({ type: 'ops:alert', kind, agentName, message, data: opts?.data });
+    this.emitTrace({ type: 'ops:alert', kind, agentName, message, data });
 
     const hook = process.env.CONNECTOME_OPS_WEBHOOK;
     if (!hook) return;
@@ -12932,7 +14114,7 @@ export class AgentFramework {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        content: `\u{1F6A8} **${agentName}** ${kind}: ${message.slice(0, 500)}`,
+        content: `\u{1F6A8} **${agentName}** ${kind}: ${boundFailureText(wholeMessage, OPS_WEBHOOK_MESSAGE_MAX_CHARS)}`,
       }),
     }).catch((err) => console.error(
       `[ops-alert] webhook post failed (${key}):`,
@@ -12998,9 +14180,23 @@ export class AgentFramework {
    * Deliberately NOT a message match: the message wording belongs to CM and
    * can be reworded without warning.
    */
-  private classifyInferenceError(err: Error): { retryable?: boolean; errorType?: string } {
-    if (err instanceof MembraneError) {
-      return { retryable: err.retryable, errorType: err.type };
+  private classifyInferenceError(err: Error): {
+    retryable?: boolean; errorType?: string; httpStatus?: number; providerErrorCode?: string;
+  } {
+    // From either copy of membrane (isMembraneError). The fields are read as
+    // data, and the type is bounded like describeFailure's, for every sink the
+    // classification reaches (the trace, the marker, the logs).
+    if (isMembraneError(err)) {
+      const fields = err as Error & {
+        retryable?: unknown; type?: unknown; httpStatus?: unknown; providerErrorCode?: unknown;
+      };
+      const providerErrorCode = boundProviderErrorCode(fields.providerErrorCode);
+      return {
+        ...(typeof fields.retryable === 'boolean' ? { retryable: fields.retryable } : {}),
+        ...(typeof fields.type === 'string' ? { errorType: boundFailureText(fields.type, PROVIDER_ERROR_CODE_MAX_CHARS) } : {}),
+        ...(typeof fields.httpStatus === 'number' ? { httpStatus: fields.httpStatus } : {}),
+        ...(providerErrorCode !== undefined ? { providerErrorCode } : {}),
+      };
     }
     if (err instanceof OverBudgetError || err.name === 'OverBudgetError') {
       return { errorType: 'over_budget' };
@@ -13028,25 +14224,70 @@ export class AgentFramework {
 
   private noteInferenceExhausted(
     agentName: string,
-    reason: string,
+    rawReason: string,
     retryable?: boolean,
-    errorType?: string,
+    rawErrorType?: string,
+    detail?: { httpStatus?: number; providerErrorCode?: string },
   ): void {
+    // The reason is the failure's own message, and a provider can echo the
+    // whole rejected request in it: one household's [inference-failed]
+    // marker carried ~1.7 MB of its own request back into its context. Every
+    // sink below gets an excerpt cut from the whole reason at its own bound
+    // (boundFailureText, so its marker states the whole length): the stderr
+    // line, failures.log and the hard-down alert FAILURE_TEXT_MAX_CHARS, the
+    // [inference-failed] marker FAILURE_MARKER_REASON_MAX_CHARS, the status's
+    // lastError and the compile-refused alert FAILURE_SUMMARY_MAX_CHARS, and
+    // the rewind marker REWIND_MARKER_REASON_MAX_CHARS. The classification
+    // travels as structured fields beside the text.
+    //
+    // A reason that isn't a string (the stream paths always pass a message)
+    // is described rather than allowed to throw before anything is recorded.
+    // Its whole description is the whole reason, cut once by each sink.
+    const wholeReason: string = typeof rawReason === 'string' ? rawReason : failureDescription(rawReason);
+    // The type is bounded wherever it's written, as classifyInferenceError
+    // bounds the types it reads, since a caller can pass one it didn't classify.
+    const errorType = typeof rawErrorType === 'string'
+      ? boundFailureText(rawErrorType, PROVIDER_ERROR_CODE_MAX_CHARS) : rawErrorType;
+    const reason = boundFailureText(wholeReason);
+    const markerReason = boundFailureText(wholeReason, FAILURE_MARKER_REASON_MAX_CHARS);
+    const httpStatus = typeof detail?.httpStatus === 'number' ? detail.httpStatus : undefined;
+    const providerErrorCode = boundProviderErrorCode(detail?.providerErrorCode);
+    const classification: Record<string, unknown> = {
+      ...(errorType !== undefined ? { errorType } : {}),
+      ...(retryable !== undefined ? { retryable } : {}),
+      ...(httpStatus !== undefined ? { httpStatus } : {}),
+      ...(providerErrorCode !== undefined ? { providerErrorCode } : {}),
+    };
+    // Each excerpt says how long the whole was when it was cut.
+    const cutAt = (excerpt: string): Record<string, unknown> =>
+      excerpt === wholeReason ? {} : { reasonChars: wholeReason.length };
     const streak = (this.consecutiveInferenceFailures.get(agentName) ?? 0) + 1;
     this.consecutiveInferenceFailures.set(agentName, streak);
-    this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: reason.slice(0, 300) });
+    this.lastInferenceAt.set(agentName, { ...this.lastInferenceAt.get(agentName), failedAt: Date.now(), lastError: boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS) });
 
     // (1) Durable stderr line — works in headless/daemon mode with no client.
-    console.error(`[inference-failed] agent=${agentName} consecutive=${streak}: ${reason}`);
+    const labels = [
+      errorType !== undefined ? `type=${errorType}` : undefined,
+      httpStatus !== undefined ? `status=${httpStatus}` : undefined,
+      providerErrorCode !== undefined ? `code=${providerErrorCode}` : undefined,
+    ].filter((label): label is string => label !== undefined);
+    console.error(
+      `[inference-failed] agent=${agentName} consecutive=${streak}` +
+      `${labels.length > 0 ? ` ${labels.join(' ')}` : ''}: ${reason}`,
+    );
 
     // (1b) Machine-greppable durable record, independent of journald/unit log
     // redirects: logs/failures.log under the host's working directory. This is
-    // what connectome-doctor reads. Legacy fields kept; `kind` is additive.
-    this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted' });
+    // what connectome-doctor reads. Legacy fields kept; `kind` and the
+    // classification fields are additive.
+    this.logFailure({ agent: agentName, consecutive: streak, reason, kind: 'inference-exhausted', ...classification, ...cutAt(reason) });
 
     // (2) Agent-facing chronicle marker (no inference triggered → no loop).
     const agent = this.agents.get(agentName);
     if (agent && process.env.SUPPRESS_INFERENCE_FAILED_MARKER !== '1') {
+      const cause = [errorType, httpStatus !== undefined ? `HTTP ${httpStatus}` : undefined]
+        .filter((part): part is string => part !== undefined)
+        .join(', ');
       try {
         agent.getContextManager().addMessage(
           'user',
@@ -13054,15 +14295,15 @@ export class AgentFramework {
             type: 'text',
             text:
               `[inference-failed] Your previous turn did not complete: the model ` +
-              `call failed and produced no response, so nothing was sent. Reason: ` +
-              `${reason}. If this recurs with the same cause, change approach ` +
+              `call failed${cause ? ` (${cause})` : ''} and produced no response, so nothing was sent. Reason: ` +
+              `${markerReason}. If this recurs with the same cause, change approach ` +
               `rather than retrying identically (e.g. drop an oversized attachment ` +
               `or an unsupported setting).`,
           }],
-          { system: true, kind: 'inference-failed', reason, consecutive: streak },
+          { system: true, kind: 'inference-failed', reason: markerReason, consecutive: streak, ...classification, ...cutAt(markerReason) },
         );
       } catch (err) {
-        console.error(`[inference-failed] could not record chronicle marker for ${agentName}:`, err);
+        console.error(`[inference-failed] could not record chronicle marker for ${agentName}: ${describeFailureWithFrames(err)}`);
       }
     }
 
@@ -13081,10 +14322,16 @@ export class AgentFramework {
     // (e.g. a reason string that crossed a serialization boundary). It matches
     // CM's current OverBudgetError wording and MAY rot if CM rewords it — the
     // errorType gate is the one that's load-bearing.
+    //
+    // The fallback applies only to an unclassified reason. A classified
+    // failure (a provider's 400, say) already says what it is, and its
+    // message is the provider's text, which can quote anything, including
+    // these phrases from the agent's own context.
     const overBudget =
       errorType === 'over_budget' ||
       errorType === 'context_refusal' ||
-      /exceed hard budget|no summary covers/i.test(reason);
+      // Decided on the whole reason: presentation bounds never change it.
+      (errorType === undefined && /exceed hard budget|no summary covers/i.test(wholeReason));
     // Observability: a refused compile means the agent cannot think AT ALL
     // this turn — surface it on the ops-alert pipeline (ops:alert trace +
     // webhook → fleet-watch) immediately, not only at the hard-down streak.
@@ -13094,7 +14341,7 @@ export class AgentFramework {
       this.opsAlert(
         'context-refusal',
         agentName,
-        `compile refused (${errorType ?? 'unclassified'}): ${reason.slice(0, 300)} — ` +
+        `compile refused (${errorType ?? 'unclassified'}): ${boundFailureText(wholeReason, FAILURE_SUMMARY_MAX_CHARS)} — ` +
         `drain breaker ${agent ? 'kicking' : 'unavailable (no agent handle)'}; ` +
         `if this persists, raise contextBudgetTokens or overBudgetGraceRatio.`,
         { skipLog: true },
@@ -13112,7 +14359,7 @@ export class AgentFramework {
           }
           console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks)`);
         } catch (err) {
-          console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks:`, err);
+          console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
         } finally {
           this.overBudgetDrainInFlight.delete(agentName);
         }
@@ -13129,10 +14376,13 @@ export class AgentFramework {
       // Ops alert (webhook + ops:alert trace), throttled per (agent, kind) —
       // a hard-down agent re-posts every ~15 min, not on every failed retry.
       // failures.log already got the per-exhaustion record above.
+      // The excerpt leaves room for the prefix, so the alert's own bound
+      // never cuts it a second time.
+      const hardDown = `${streak} consecutive inference failures. Last reason: `;
       this.opsAlert(
         'hard-down',
         agentName,
-        `${streak} consecutive inference failures. Last reason: ${reason}`,
+        hardDown + boundFailureText(wholeReason, FAILURE_TEXT_MAX_CHARS - hardDown.length),
         { skipLog: true },
       );
 
@@ -13146,7 +14396,7 @@ export class AgentFramework {
       // rejecting your history" marker. `retryable` is kept only for the trace.
       void retryable;
       if (errorType === 'invalid_request' && agent) {
-        this.quarantinePoisonedHistory(agent, reason);
+        this.quarantinePoisonedHistory(agent, wholeReason);
       }
     }
   }
@@ -13164,7 +14414,7 @@ export class AgentFramework {
    * At the cap (or with nothing left to shed) it stops — the agent stays up
    * and hard-down logging continues, but no further history is consumed.
    */
-  private quarantinePoisonedHistory(agent: Agent, reason: string): void {
+  private quarantinePoisonedHistory(agent: Agent, wholeReason: string): void {
     const cap = Math.max(1, Math.min(10, agent.refusalHandling?.maxRewinds ?? 3));
     const used = this.exhaustionRewinds.get(agent.name) ?? 0;
     if (used >= cap) {
@@ -13185,7 +14435,8 @@ export class AgentFramework {
     }
 
     this.exhaustionRewinds.set(agent.name, used + 1);
-    const count = this.updateRewindMarker(agent, truncateReason(reason), 'inference-failure');
+    const count = this.updateRewindMarker(
+      agent, boundFailureText(wholeReason, REWIND_MARKER_REASON_MAX_CHARS), 'inference-failure');
     console.error(
       `[inference-rewind] agent=${agent.name} auto-quarantined ${rec.descriptor} ` +
       `(${count} turn(s) shed this episode, cap ${cap}) after non-retryable ` +
@@ -13425,7 +14676,11 @@ export class AgentFramework {
     await this.refreshMcplTools();
   }
 
-  /** Reconcile the durable ledger with Chronicle, then deliver every server's work. */
+  /**
+   * Reconcile the durable ledger with Chronicle, then deliver every server's
+   * work. A drain still running is waited for and then followed by a fresh
+   * pass (drainForGeneration).
+   */
   async syncDiscordAwarenessMarkers(_onlyServerId?: string): Promise<void> {
     if (!this.discordAwarenessOutbox) return;
     // A targeted retry may discover pending work for other Discord servers
@@ -13640,46 +14895,70 @@ export class AgentFramework {
       throw new DiscordAwarenessAccountingError('branch reconciliation', error);
     }
     const pending = this.readDiscordAwarenessPending();
-    if (pending.length === 0) {
+    // A drain that is still running holds operations it read before this
+    // reconciliation, and it sends them whatever the ledger now says. A branch
+    // move can hide them from `pending`: restoring a rollback's source makes
+    // its marks undesired, and an add whose reply has not arrived is not yet
+    // present, so the ledger shows nothing to do while the drain goes on to
+    // send its saved adds and then the removals they need. So a generation
+    // accounts for every running drain as well as for every pending
+    // operation, and waits for those drains instead of releasing the data
+    // planes beside them (drainForGeneration).
+    const serverIds = [...new Set([
+      ...pending.map((operation) => operation.ref.serverId),
+      ...this.discordAwarenessDrains.keys(),
+    ])];
+    if (serverIds.length === 0) {
       return {
         requiresBarrier: false,
         promise: Promise.resolve({ status: 'delivered', delivered: 0, failed: 0 }),
       };
     }
-    const serverIds = [...new Set(pending.map((operation) => operation.ref.serverId))];
     const promise = Promise.all(
-      serverIds.map((serverId) => this.drainDiscordAwarenessOutbox(serverId)),
-    ).then((outcomes): DiscordAwarenessDrainOutcome => {
-      if (outcomes.every((outcome) => outcome.status === 'unavailable')) {
-        return {
-          status: 'unavailable',
-          accounted: outcomes.reduce(
-            (count, outcome) => count + (outcome.status === 'unavailable' ? outcome.accounted : 0),
-            0,
-          ),
-        };
-      }
-      return {
-        status: 'delivered',
-        delivered: outcomes.reduce(
-          (count, outcome) => count + (outcome.status === 'delivered' ? outcome.delivered : 0),
-          0,
-        ),
-        failed: outcomes.reduce(
-          (count, outcome) => count + (outcome.status === 'delivered' ? outcome.failed : 0),
-          0,
-        ),
-      };
-    });
+      serverIds.map((serverId) => this.drainForGeneration(serverId)),
+    ).then(combineDrainOutcomes);
     return { requiresBarrier: true, promise };
   }
 
   /**
+   * One server's drain for a new generation: a gate completes only after
+   * every operation pending when it was armed has been attempted. A drain
+   * already running can't promise that. It never re-sends a key it has
+   * attempted, so an operation re-pended while it runs (a rollback, its undo,
+   * then a redo, all mid-drain) stays pending, and it may already have made
+   * its last read of the ledger, missing a batch activated since. So a
+   * generation that finds a drain running waits for it, then drains again
+   * with a fresh pass that reads the ledger anew. Two generations waiting on
+   * the same drain share the fresh pass that follows it.
+   */
+  private drainForGeneration(serverId: string): Promise<DiscordAwarenessDrainOutcome> {
+    const running = this.discordAwarenessDrains.get(serverId);
+    if (!running) return this.drainDiscordAwarenessOutbox(serverId);
+    return running.then((first) => this.drainDiscordAwarenessOutbox(serverId)
+      .then((fresh) => combineDrainOutcomes([first, fresh])));
+  }
+
+  /**
+   * Wait out the awareness gate for an inbound event: the generation current
+   * now, and any generation installed while waiting, until none is current
+   * or the current one is one already waited for. A handler that waited only
+   * for the generation it first saw would go on behind a newer one armed
+   * meanwhile. Rejects as the generation it waited for rejects.
+   */
+  private async awaitDiscordAwarenessBarriers(): Promise<void> {
+    let waited: DiscordAwarenessBarrier | null = null;
+    for (let barrier = this.discordAwarenessBarrier; barrier && barrier !== waited; barrier = this.discordAwarenessBarrier) {
+      waited = barrier;
+      await barrier.promise;
+    }
+  }
+
+  /**
    * Install one framework-global Discord-awareness generation before releasing
-   * any inference-bearing event. With pending work, every MCPL data plane is
-   * paused while all control planes remain live. With no pending work, ready()
-   * runs synchronously so request responders preserve their historical
-   * same-stack behavior.
+   * any inference-bearing event. With pending work or a drain still running,
+   * every MCPL data plane is paused while all control planes remain live.
+   * With neither, ready() runs synchronously so request responders preserve
+   * their historical same-stack behavior.
    */
   private installMcplDataPlaneGate(): DiscordAwarenessBarrier {
     for (const connection of this.mcplServerRegistry?.getAllServers() ?? []) {
@@ -13782,6 +15061,14 @@ export class AgentFramework {
       throw new Error('MCPL subsystem is not initialized');
     }
 
+    // Every connect needs a readable awareness ledger: a runtime connect's
+    // awareness barrier reconciles it, and a stdio child taking the
+    // protective default derives that from it. Read it first, so an
+    // unreadable ledger refuses the connect before anything is registered
+    // under its id or spawned (a reconnecting server would otherwise be left
+    // registered as a closed stub). With no outbox configured nothing is read.
+    this.getPlacedReactionBaseline();
+
     // Register prefix + config for tool dispatch routing (idempotent with
     // the pre-registration pass in initializeMcpl).
     const prefix = config.toolPrefix ?? `mcpl--${config.id}`;
@@ -13797,7 +15084,33 @@ export class AgentFramework {
       );
     }
 
-    const connection = await this.mcplServerRegistry.addServer(config, this.mcplHostCapabilities);
+    // A stdio child's protective reaction default, DISCORD_SUPPRESSED_REACTIONS_BASELINE
+    // (WebSocket servers own their environment outside this process). The
+    // caller's config stays unchanged, so a runtime restart derives afresh.
+    // The default is derived at each spawn: the env below is a getter, which
+    // the transport reads at first connect, at every automatic reconnect and
+    // at a stub's retry, so retained markers added since the last spawn are
+    // covered.
+    let connectionConfig = config;
+    if (!isWebSocketTransport(config)) {
+      const declared = this.declaredReactionBaseline(config);
+      if (declared) {
+        console.error(
+          `[mcpl] ${config.id}: DISCORD_SUPPRESSED_REACTIONS_BASELINE ${declared.source === 'env' ? 'from its env' : 'inherited from the host'} ` +
+            `replaces the framework's protective default`,
+        );
+      }
+      connectionConfig = { ...config };
+      Object.defineProperty(connectionConfig, 'env', {
+        enumerable: true,
+        configurable: true,
+        get: () => ({
+          ...config.env,
+          DISCORD_SUPPRESSED_REACTIONS_BASELINE: declared?.value ?? this.getPlacedReactionBaseline().join(','),
+        }),
+      });
+    }
+    const connection = await this.mcplServerRegistry.addServer(connectionConfig, this.mcplHostCapabilities);
 
     // Wire listeners before either startup staging or the runtime global gate
     // releases control traffic needed for registration and marker service.
@@ -14164,6 +15477,92 @@ export class AgentFramework {
   // ==========================================================================
 
   /**
+   * Snapshot the protective Discord reaction default for this deployment, as
+   * suppression tokens: the forms the Discord adapter's suppression matcher
+   * reads, not marker payloads for an add, a remove or a replay. It covers
+   * the reactions the framework places: refusal markers, the adapter's own
+   * default awareness marker, the configured awareness marker, and retained
+   * outbox markers (including offline recovery choices and marks that can
+   * later be removed or replayed). A custom emoji appears as its bare ID,
+   * which suppression matches even after a rename; stored markers and the
+   * actual add/remove payloads stay unchanged. Explicit adapter or operator
+   * suppression settings still take precedence. Throws on an unreadable
+   * ledger rather than reporting a partial baseline.
+   */
+  getPlacedReactionBaseline(): readonly string[] {
+    let retained: string[];
+    try {
+      retained = this.discordAwarenessOutbox?.batches().map((batch) => batch.emoji) ?? [];
+    } catch (error) {
+      throw new DiscordAwarenessAccountingError('reaction-baseline ledger read', error);
+    }
+    // Discord events carry the custom emoji's name and ID separately. Full
+    // marker forms belong in add/remove calls, but suppression matches their
+    // stable ID (including after a rename), rather than the composite token.
+    const suppressionToken = (emoji: string): string => {
+      const custom = /^(?:<a?:\w+:(\d{17,20})>|(?:a:)?\w+:(\d{17,20}))$/.exec(emoji.trim());
+      return custom?.[1] ?? custom?.[2] ?? emoji;
+    };
+    return [...new Set([
+      ...REFUSAL_REACTION_BASELINE,
+      DEFAULT_DISCORD_AWARENESS_EMOJI,
+      this.discordAwarenessEmoji,
+      ...retained,
+    ].map(suppressionToken))].filter((emoji) => emoji.length > 0);
+  }
+
+  /**
+   * The reaction baseline an operator chose for a stdio server, if any: a
+   * value declared in its env, or one inherited from the host with
+   * `inheritEnv`, the declared one first. A value with no tokens, as
+   * discord-mcpl's parser reads them, counts as unset: the adapter splits on
+   * commas and keeps a token only when its normalizer leaves something of it
+   * (blank, `:`, `::` and a lone U+FE0F leave nothing), so such a value (an
+   * empty systemd `Environment=`, say, or `${A},${B}` or `:${NAME}:` with the
+   * variables empty) would otherwise turn the protective default off without
+   * anyone choosing that.
+   *
+   * Windows names are matched in both sources: Workers expose a case-
+   * sensitive `process.env` copy. Within one source, Node's spawn keeps the
+   * first spelling in sorted order, so each source is resolved that way.
+   *
+   * A value is read as the child will see it. A config loaded from JSON can
+   * carry a non-string there despite the type, and spawn writes every
+   * defined value as its string form, so a number is a declared value, not a
+   * failed connect. A null counts as unset, like a blank: written in JSON it
+   * means no value, and read as spawn's "null" it would replace the
+   * protective default with a list that suppresses nothing.
+   */
+  private declaredReactionBaseline(
+    config: import('./mcpl/types.js').McplServerConfig,
+  ): { value: string; source: 'env' | 'inherited' } | undefined {
+    // A token as discord-mcpl's parser keeps one: `parseSuppressionEnvTokens`
+    // trims each comma-separated token and keeps it when
+    // `normalizeReactionEmoji` (discord-mcpl `src/filters.ts`) leaves
+    // something, after it strips U+FE0F, trims, and strips one leading and one
+    // trailing colon. The same steps in the same order, so the two can be
+    // compared when either changes.
+    const isToken = (token: string): boolean =>
+      token.trim().replace(/\uFE0F/g, '').trim().replace(/^:|:$/g, '') !== '';
+    const valueIn = (env: NodeJS.ProcessEnv | undefined): string | undefined => {
+      let raw: unknown;
+      if (process.platform !== 'win32') raw = env?.DISCORD_SUPPRESSED_REACTIONS_BASELINE;
+      else {
+        const key = Object.keys(env ?? {}).sort()
+          .find((name) => name.toUpperCase() === 'DISCORD_SUPPRESSED_REACTIONS_BASELINE');
+        raw = key === undefined ? undefined : env?.[key];
+      }
+      if (raw === undefined || raw === null) return undefined;
+      const value = String(raw);
+      return value.split(',').some(isToken) ? value : undefined;
+    };
+    const declared = valueIn(config.env);
+    if (declared !== undefined) return { value: declared, source: 'env' };
+    const inherited = config.inheritEnv ? valueIn(process.env) : undefined;
+    return inherited !== undefined ? { value: inherited, source: 'inherited' } : undefined;
+  }
+
+  /**
    * Connect a new MCPL server at runtime. Refreshes the tool list and
    * notifies the agent of newly available tools. Throws if the MCPL
    * subsystem is not initialized, the id is already connected, or the
@@ -14245,6 +15644,12 @@ export class AgentFramework {
     if (!config) {
       throw new Error(`MCPL server "${id}" is not configured`);
     }
+    // Every connect reads the awareness ledger: its awareness barrier
+    // reconciles it, and a stdio child taking the protective default derives
+    // that from it. Read it before disconnecting, so an unreadable ledger
+    // refuses the restart and leaves the running child up, whatever the
+    // server's baseline or transport. (No outbox configured: nothing to read.)
+    this.getPlacedReactionBaseline();
     await this.disconnectMcplServer(id);
     await this.connectMcplServer(config);
   }
@@ -14372,9 +15777,22 @@ export class AgentFramework {
       params: PushEventParams,
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
-      const barrier = this.discordAwarenessBarrier;
-      if (barrier) await barrier.promise;
-      await this.pushHandler?.handlePushEvent(connection.id, params, responder as never);
+      const answer = answerOnce(responder, 'push/event', connection.id);
+      try {
+        // Only when a generation is current: with none, the event is handled in
+        // the turn it arrives, as it always was (the push coalescer's ordering of
+        // a push against its retraction depends on that).
+        if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
+        // Checked here, after the barrier and before anything records the
+        // push as accepted: a stopped host refuses it.
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('push/event', connection.id, answer, { kind: 'refused' });
+          return;
+        }
+        await this.pushHandler?.handlePushEvent(connection.id, params, answer.responder as never);
+      } catch (error) {
+        this.refuseServerItem('push/event', connection.id, answer, { kind: 'failed', error });
+      }
     });
 
     // Handle server-initiated inference requests (Step 6)
@@ -14384,26 +15802,49 @@ export class AgentFramework {
     ) => {
       // RFC-006 §5.3 / SPEC §10.7: no inference from inside a render.
       if (this.pushCoalescer?.isRendering(connection.id)) {
-        responder?.respondError(-32600, 'Cannot request inference while push/render is in progress');
+        try {
+          responder?.respondError(-32600, 'Cannot request inference while push/render is in progress');
+        } catch {
+          // The connection is going; there is no one left to tell.
+        }
         return;
       }
       if (this.inferenceRouter && responder) {
-        const barrier = this.discordAwarenessBarrier;
-        if (barrier) await barrier.promise;
-        await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
-          respond: responder.respond,
-          respondError: responder.respondError,
-          requestId: responder.id,
-        });
+        const answer = answerOnce(responder, 'inference/request', connection.id);
+        try {
+          if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
+          // A stopping host starts no inference for a server: refused, like a
+          // push, before the router runs.
+          if (this.queue?.isClosed) {
+            this.refuseServerItem('inference/request', connection.id, answer, { kind: 'refused' });
+            return;
+          }
+          await this.inferenceRouter.handleInferenceRequest(connection.id, params, {
+            respond: answer.responder!.respond,
+            respondError: answer.responder!.respondError,
+            requestId: responder.id,
+          });
+        } catch (error) {
+          this.refuseServerItem('inference/request', connection.id, answer, { kind: 'failed', error });
+        }
       }
     });
 
     // Handle channel registration (Step 7)
     connection.on('channels-register', async (
       params: ChannelsRegisterParams,
-      responder?: { respond: (result: unknown) => void },
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      await this.channelRegistry?.handleRegister(connection.id, params, responder as never);
+      const answer = answerOnce(responder, 'channels/register', connection.id);
+      try {
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('channels/register', connection.id, answer, { kind: 'refused' });
+          return;
+        }
+        await this.channelRegistry?.handleRegister(connection.id, params, answer.responder as never);
+      } catch (error) {
+        this.refuseServerItem('channels/register', connection.id, answer, { kind: 'failed', error });
+      }
     });
 
     // Handle channel changes (Step 7) — §14.5 dual-mode: the responder is
@@ -14412,9 +15853,18 @@ export class AgentFramework {
     // filtering plus a diagnostic trace.
     connection.on('channels-changed', async (
       params: ChannelsChangedParams,
-      responder?: { respond: (result: unknown) => void },
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      await this.channelRegistry?.handleChanged(connection.id, params, responder as never);
+      const answer = answerOnce(responder, 'channels/changed', connection.id);
+      try {
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'refused' });
+          return;
+        }
+        await this.channelRegistry?.handleChanged(connection.id, params, answer.responder as never);
+      } catch (error) {
+        this.refuseServerItem('channels/changed', connection.id, answer, { kind: 'failed', error });
+      }
     });
 
     // §6.6/§12: requests that previously had no handler and hung forever
@@ -14473,11 +15923,19 @@ export class AgentFramework {
     // Handle incoming channel messages (Step 7)
     connection.on('channels-incoming', async (
       params: ChannelsIncomingParams,
-      responder?: { respond: (result: unknown) => void },
+      responder?: { respond: (result: unknown) => void; respondError?: (code: number, message: string) => void },
     ) => {
-      const barrier = this.discordAwarenessBarrier;
-      if (barrier) await barrier.promise;
-      await this.channelRegistry?.handleIncoming(connection.id, params, responder as never);
+      const answer = answerOnce(responder, 'channels/incoming', connection.id);
+      try {
+        if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'refused' });
+          return;
+        }
+        await this.channelRegistry?.handleIncoming(connection.id, params, answer.responder as never);
+      } catch (error) {
+        this.refuseServerItem('channels/incoming', connection.id, answer, { kind: 'failed', error });
+      }
     });
 
     // Handle host-level admin commands from a surface (e.g. Discord /undo)
@@ -14486,14 +15944,19 @@ export class AgentFramework {
       responder?: { respond: (result: unknown) => void; respondError: (code: number, message: string) => void },
     ) => {
       if (!responder) return;
+      const answer = answerOnce(responder, 'host/command', connection.id);
       try {
-        const barrier = this.discordAwarenessBarrier;
-        if (barrier) await barrier.promise;
+        if (this.discordAwarenessBarrier) await this.awaitDiscordAwarenessBarriers();
+        // A stopping host runs no host command: refused like the requests
+        // above, before its handler runs.
+        if (this.queue?.isClosed) {
+          this.refuseServerItem('host/command', connection.id, answer, { kind: 'refused' });
+          return;
+        }
         const result = await this.handleHostCommand(connection.id, params ?? {});
-        responder.respond(result);
+        answer.responder!.respond(result);
       } catch (error) {
-        const err = error instanceof Error ? error : new Error(String(error));
-        responder.respondError(-32603, err.message);
+        this.refuseServerItem('host/command', connection.id, answer, { kind: 'failed', error });
       }
     });
 
@@ -14530,7 +15993,7 @@ export class AgentFramework {
       // grant) before the data-plane barrier releases — otherwise the first
       // post-reconnect events land while the grant is still empty and are
       // rejected fail-closed instead of delivered.
-      void (async () => {
+      const reregistered = (async () => {
         try {
           const config = this.mcplServerConfigs.get(connection.id);
           if (config) {
@@ -14545,7 +16008,11 @@ export class AgentFramework {
         this.releaseMcplDataPlaneGate(awarenessBarrier);
         this.handleToolsListChanged(connection.id);
       })();
-      void awarenessBarrier.promise.then(() => {
+      // The gate completes, and the data planes go ready, only once both the
+      // awareness drain and the re-registration have finished. A drain can
+      // settle first (one already running, or little to send), and the grant
+      // must exist before the first data-plane event flows.
+      void Promise.all([awarenessBarrier.promise, reregistered]).then(() => {
         if (
           awarenessBarrier.requiresBarrier
           && !this.completeMcplDataPlaneGate(awarenessBarrier)
@@ -14871,6 +16338,7 @@ export class AgentFramework {
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
+        toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
         result: { success: false, error: `MCPL server not found: ${serverId}`, isError: true },
@@ -14885,6 +16353,7 @@ export class AgentFramework {
       this.pushEvent({
         type: 'tool-result',
         callId: call.id,
+        toolName: call.name,
         agentName,
         moduleName: `mcpl:${serverId}`,
         result: {
@@ -15044,6 +16513,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: `mcpl:${serverId}`,
           result: {
@@ -15063,6 +16533,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: `mcpl:${serverId}`,
           result: { success: false, error: err.message, isError: true },
@@ -15094,6 +16565,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'channels',
           result: { success: false, error, isError: true },
@@ -15162,6 +16634,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'channels',
           result,
@@ -15174,6 +16647,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'channels',
           result: { success: false, error: err.message, isError: true },
@@ -15195,7 +16669,7 @@ export class AgentFramework {
         module: 'gate', tool: call.name, callId: call.id, durationMs: 0,
         ...(result.isError ? { error: result.error } : {}),
       });
-      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
     };
 
     try {
@@ -15365,9 +16839,10 @@ export class AgentFramework {
           }
         : { success: false, error: r.error, isError: false };
     }
-    this.queue.push({
+    this.pushEvent({
       type: 'tool-result',
       callId: call.id,
+      toolName: call.name,
       agentName,
       moduleName: 'tune-out',
       result,
@@ -15381,7 +16856,7 @@ export class AgentFramework {
 
     const finish = (result: ToolResult) => {
       this.emitTrace({ type: 'tool:completed', module: 'gate', tool: call.name, callId: call.id, durationMs: 0 });
-      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
     };
 
     if (call.name === 'wake') {
@@ -15415,7 +16890,7 @@ export class AgentFramework {
       } else if (agent?.proseRouting === 'explicit') {
         // Explicit mode: announce to the turn's sticky prose target if the
         // model has set one; otherwise stay quiet — never guess a channel.
-        const target = this.proseTargetPins.get(agentName);
+        const target = this.turnRouting.get(agentName)?.pin;
         if (target) {
           this.channelRegistry.routeSpeech(agentName, text, target).catch((err) => {
             console.error('[sleep] announce failed:', err instanceof Error ? err.message : err);
@@ -15484,7 +16959,7 @@ export class AgentFramework {
         ...(result.isError ? { error: result.error } : {}),
       });
       this.pushEvent({
-        type: 'tool-result', callId: call.id, agentName, moduleName: 'workspace',
+        type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace',
         result: { ...result, isError: result.isError ?? false },
       });
     })();
@@ -15501,7 +16976,7 @@ export class AgentFramework {
         durationMs: 0,
         ...(result.isError ? { error: result.error } : {}),
       });
-      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'workspace', result });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace', result });
     };
     void (async (): Promise<void> => {
       try {
@@ -15526,7 +17001,11 @@ export class AgentFramework {
           typeof workspace.getTools === 'function' &&
           workspace.getTools().some((tool) => tool.name === 'read_image')
         ) {
-          const result = await workspace.handleToolCall({ ...call, name: 'read_image' });
+          // The workspace module's own handler, called directly: its result
+          // gets the same check a module's result gets in the registry. The
+          // agent's name is for the check's log line, not the handler.
+          const moduleCall = { ...call, name: 'read_image' };
+          const result = storableToolResult({ ...moduleCall, callerAgentName: agentName }, await workspace.handleToolCall(moduleCall));
           if (result.success && Array.isArray(result.data)) {
             const image = result.data.find(
               (block): block is { type: 'image'; data: string; mimeType: string } =>
@@ -15571,11 +17050,7 @@ export class AgentFramework {
           ],
         });
       } catch (error) {
-        finish({
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-          isError: true,
-        });
+        finish(thrownResult(error));
       }
     })();
   }
@@ -15640,7 +17115,7 @@ export class AgentFramework {
         durationMs: 0,
         ...(result.isError ? { error: result.error } : {}),
       });
-      this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'workspace', result });
+      this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'workspace', result });
     };
     type Candidate =
       | { kind: 'attachment'; data: string | null; mediaType: string; messagesBack: number }
@@ -15657,6 +17132,7 @@ export class AgentFramework {
       | {
         kind: 'reference';
         refId: string;
+        /** The type as the stub shows it (a label), lowercased: `image/…`. */
         mediaType: string;
         toolCallId: string;
         toolName: string;
@@ -15710,10 +17186,22 @@ export class AgentFramework {
             };
           }
           if (candidate.kind === 'reference') {
+            // Point at fetch_reference only where it can deliver: not for a
+            // reference this process holds no record of (fetch_reference
+            // looks the id up in the same registry), nor, as the stub does,
+            // for an unfetched one the fetcher would refuse as expired.
+            const record = referenceRegistry.get(candidate.refId);
+            const expiry = record && !record.fetchedPath ? referenceExpiry(record.testimony) : null;
             throw new Error(
               `save_recent_image: image at index ${position} is a reference (${candidate.refId}, ${candidate.mediaType}, ` +
               `from ${describeTool(candidate)}) — its bytes are not held here. Nothing written. ` +
-              'Fetch it with fetch_reference and save the materialized file instead.',
+              (!record
+                ? 'This process holds no record of it (a restart or an eviction drops records, and a stub quoted ' +
+                  "from elsewhere never had one), so fetch_reference can't fetch it either. If its tool can produce " +
+                  'it again, re-run that tool for a fresh reference.'
+                : expiry
+                  ? `It can't be fetched either — ${EXPIRY_REASON[expiry]}.`
+                  : 'Fetch it with fetch_reference and save the materialized file instead.'),
             );
           }
           if (candidate.ref === null) {
@@ -15825,13 +17313,15 @@ export class AgentFramework {
               consider({ kind: 'tool', ref: ph.ref, toolCallId, toolName, mediaType: ph.mediaType, messagesBack });
               continue;
             }
-            // Reference stub: the registry's testimony (when this process
-            // still has the record) says whether it was an image; the
-            // sniffed stub text is the fallback. Non-image references
-            // are not slots.
-            const testimony = referenceRegistry.get(ph.refId)?.testimony.mimeType?.toLowerCase() ?? ph.mediaType;
-            if (!testimony || !testimony.startsWith('image/')) continue;
-            consider({ kind: 'reference', refId: ph.refId, mediaType: testimony, toolCallId, toolName, messagesBack });
+            // Reference stub: the registry's claimed type (when this process
+            // still has the record), else the first image/ token in the
+            // stub's text, which can come from its name, says whether it was
+            // an image. Either is read as the stub shows a type, sanitized
+            // and bounded. Non-image references are not slots.
+            const claimed = referenceRegistry.get(ph.refId)?.testimony.mimeType ?? ph.mediaType ?? undefined;
+            const mediaType = referenceTypeLabel(claimed).toLowerCase();
+            if (!mediaType.startsWith('image/')) continue;
+            consider({ kind: 'reference', refId: ph.refId, mediaType, toolCallId, toolName, messagesBack });
           }
         };
 
@@ -15884,10 +17374,14 @@ export class AgentFramework {
               };
               if (block?.type === 'image') {
                 const inline = block.source?.type === 'base64' && typeof block.source.data === 'string';
+                // The sender's word, shown in the receipt and stored with the
+                // file, so it's taken as a label; with nothing left of it, it
+                // counts as absent.
+                const claimed = block.source?.mediaType;
                 consider({
                   kind: 'attachment',
                   data: inline ? block.source!.data! : null,
-                  mediaType: block.source?.mediaType ?? 'image/png',
+                  mediaType: (typeof claimed === 'string' ? sanitizeLabel(claimed, REFERENCE_LIMITS.mimeType) : '') || 'image/png',
                   messagesBack,
                 });
               } else if (block?.type === 'tool_result' && typeof block.content === 'string') {
@@ -15936,21 +17430,35 @@ export class AgentFramework {
         for (const image of found) {
           const destination = pathFor(image.rangeOffset);
           const bytes = Buffer.from(image.data, 'base64');
-          const result = await workspace.writeBinary(destination, bytes, image.mediaType);
-          if (!result.success) {
-            finish({
-              success: false,
-              error:
-                `save_recent_image: failed writing "${destination}": ${result.error}` +
-                (savedFiles.length > 0
-                  ? ` (already saved: ${savedFiles.map((f) => f.path).join(', ')})`
-                  : ''),
-              isError: true,
-            });
+          const failed = (why: unknown): void => finish({
+            success: false,
+            error:
+              `save_recent_image: failed writing "${destination}": ${why instanceof Error ? why.message : String(why)}` +
+              (savedFiles.length > 0
+                ? ` (already saved: ${savedFiles.map((f) => f.path).join(', ')})`
+                : ''),
+            isError: true,
+          });
+          let result: Awaited<ReturnType<typeof workspace.writeBinary>>;
+          try {
+            result = await workspace.writeBinary(destination, bytes, image.mediaType);
+          } catch (error) {
+            // Thrown before its tree entry was set; the images before it
+            // are saved, and the failure says so, as a returned one does.
+            failed(error);
+            return;
+          }
+          const inChronicle = (result.data as { inChronicle?: boolean } | undefined)?.inChronicle === true;
+          if (!result.success && !inChronicle) {
+            failed(result.error);
             return;
           }
           savedFiles.push({
             ...(result.data as Record<string, unknown>),
+            path: destination,
+            size: bytes.byteLength,
+            mimeType: image.mediaType,
+            ...(!result.success ? { diskCopyError: result.error ?? 'disk copy failed' } : {}),
             imageIndex: index + image.rangeOffset,
             ...image.receipt,
           });
@@ -15978,7 +17486,7 @@ export class AgentFramework {
    *  (Module.getUtilities). Shared by the model-facing dispatcher and the
    *  programmatic path (executeToolCall), so code_execution scripts and
    *  ephemerals reach utilities too. */
-  private async handleUtilsToolCall(agentName: string, call: ToolCall): Promise<ToolResult> {
+  private async handleUtilsToolCall(agentName: string, call: ToolCall, options: { inProcess?: boolean } = {}): Promise<ToolResult> {
     const input = (call.input ?? {}) as { action?: unknown; name?: unknown; args?: unknown };
     const utilities = this.moduleRegistry.getAllUtilities();
     const available = (): string =>
@@ -16013,13 +17521,12 @@ export class AgentFramework {
           };
         }
         // Same dispatch as a first-class tool call — the module cannot tell
-        // which surface the call came through.
-        return this.moduleRegistry.handleToolCall({
-          id: call.id,
-          name: def.name,
-          input: args,
-          callerAgentName: agentName,
-        });
+        // which surface the call came through. An in-process caller gets the
+        // module's own result; the model's path takes its checked form.
+        const utilityCall = { id: call.id, name: def.name, input: args, callerAgentName: agentName };
+        return options.inProcess
+          ? this.moduleRegistry.handleToolCall(utilityCall)
+          : this.moduleRegistry.storableToolCall(utilityCall);
       }
       default:
         return { success: false, isError: true, error: 'action must be "list", "describe", or "run"' };
@@ -16044,6 +17551,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'framework',
           result,
@@ -16217,6 +17725,7 @@ export class AgentFramework {
     this.pushEvent({
       type: 'tool-result',
       callId: call.id,
+      toolName: call.name,
       agentName,
       moduleName: 'agent',
       result,
@@ -16257,7 +17766,7 @@ export class AgentFramework {
       this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
       result = { success: false, error: err.message, isError: true };
     }
-    this.pushEvent({ type: 'tool-result', callId: call.id, agentName, moduleName: 'gate', result });
+    this.pushEvent({ type: 'tool-result', callId: call.id, toolName: call.name, agentName, moduleName: 'gate', result });
   }
 
   private dispatchGateToolCall(agentName: string, call: ToolCall): void {
@@ -16271,6 +17780,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'gate',
           result,
@@ -16283,6 +17793,7 @@ export class AgentFramework {
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
+          toolName: call.name,
           agentName,
           moduleName: 'gate',
           result: { success: false, error: err.message, isError: true },

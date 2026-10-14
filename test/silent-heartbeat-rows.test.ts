@@ -411,7 +411,10 @@ describe('silent heartbeat stored rows', () => {
       const tickRows = stored(x.framework).slice(before);
       assert.deepEqual(tickRows.map((m) => m.participant), ['assistant', 'user', 'assistant']);
       for (const row of tickRows) assert.equal(row.metadata?.silentHeartbeat?.eventId, tick.eventId);
-      assert.equal((tickRows[1]!.content[0] as { content?: unknown }).content, TOOL_RESULT_GUARD_NOTICE);
+      // Written out, not computed by the code under test.
+      assert.equal((tickRows[1]!.content[0] as { content?: unknown }).content, 'Tool result withheld by the guard. ' +
+        "The tool has already executed. Its result is kept in the guard's audit record (framework/tool-result-guard), " +
+        'for an operator.');
       assert.doesNotMatch(JSON.stringify(tickRows), /discard-this-partial-output/);
 
       const opening = membrane.calls[1]!.messages;

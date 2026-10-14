@@ -111,7 +111,8 @@ test('refreshMcplTools: a live server that advertised no MCP tools does not hold
   for (const quietConnected of [true, false]) {
     const fw = Object.create(AgentFramework.prototype) as any;
     const traces: Traced[] = [];
-    fw.traceListeners = [(e: Traced) => traces.push(e)];
+    fw.traceListeners = [];
+    fw.onTrace((e: Traced) => traces.push(e));
     fw.mcplServerConfigs = new Map([
       ['prov', { id: 'prov', command: 'unused' }],
       ['quiet', { id: 'quiet', command: 'unused' }],
@@ -401,7 +402,8 @@ class ManifestFake extends EventEmitter {
 function manifestHarness(receipt: Record<string, unknown>) {
   const fw = Object.create(AgentFramework.prototype) as any;
   const traces: Traced[] = [];
-  fw.traceListeners = [(e: Traced) => traces.push(e)];
+  fw.traceListeners = [];
+  fw.onTrace((e: Traced) => traces.push(e));
   fw.featureSetManager = new FeatureSetManager((e) => fw.emitTrace(e));
   fw.mcplTools = [];
   fw.mcplToolRefreshInFlight = false;
@@ -463,7 +465,8 @@ test('policy-refused traces report the branch the host took, not raw receipt fie
 
   const fw = Object.create(AgentFramework.prototype) as any;
   const traces: Traced[] = [];
-  fw.traceListeners = [(e: Traced) => traces.push(e)];
+  fw.traceListeners = [];
+  fw.onTrace((e: Traced) => traces.push(e));
   fw.featureSetManager = new FeatureSetManager();
   const connection = {
     id: 'srv',

@@ -9,6 +9,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
 
 import { AgentFramework } from '../src/framework.js';
 import { McplServerConnection } from '../src/mcpl/server-connection.js';
@@ -533,6 +534,86 @@ test('reconnect pauses fresh inbound data but permits registration and awareness
   }
 });
 
+test('a reconnect gate opens only after re-registration, even when the awareness drain settles first', async () => {
+  // The gate is global: marks pending for one server keep every data plane
+  // paused. Here the reconnecting server's re-registration (its §5.3 policy
+  // reply) is held while another server's drain finishes. The reconnecting
+  // server's data must wait for its grant, not only for the drain.
+  mkdirSync(TEST_ROOT, { recursive: true });
+  const dir = mkdtempSync(join(TEST_ROOT, 'awareness-reconnect-grant-'));
+  const outboxPath = join(dir, 'awareness.json');
+  const statusPath = join(dir, 'status.jsonl');
+  const crashPath = join(dir, 'crash');
+  const policyHoldPath = join(dir, 'release-policy');
+  const server = (id: 'discord' | 'heartbeat', env: Record<string, string>, reconnect = false): McplServerConfig => ({
+    id,
+    command: process.execPath,
+    args: [FIXTURE],
+    requestTimeoutMs: 0,
+    env: { STATUS_PATH: statusPath, LEDGER_PATH: outboxPath, SERVER_ID: id, ...env },
+    enabledFeatureSets: ['chat'],
+    ...(reconnect ? { reconnect: true, reconnectIntervalMs: 20, reconnectMaxIntervalMs: 20 } : {}),
+  });
+  const outbox = new DiscordAwarenessOutbox(outboxPath);
+  let framework: AgentFramework | undefined;
+  try {
+    framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      discordAwarenessOutboxPath: outboxPath,
+      discordAwarenessDeadlineMs: 1_000,
+      membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'assistant', model: 'test', systemPrompt: 'test' }],
+      modules: [],
+      mcplServers: [
+        server('discord', {}),
+        server('heartbeat', {
+          CRASH_PATH: crashPath,
+          GENERATION_PATH: join(dir, 'heartbeat-generation'),
+          POLICY_HOLD_PATH: policyHoldPath,
+        }, true),
+      ],
+    });
+    await waitFor('both servers\' startup data answered', () => ['discord', 'heartbeat'].every((id) =>
+      records(statusPath).some((r) => r.serverId === id && r.generation === 1 && r.event === 'push-response')));
+
+    // A mark pending for discord, then the heartbeat server drops and comes back.
+    const batch = outbox.prepare({
+      agentName: 'assistant',
+      sourceBranch: 'source',
+      targetBranch: 'main',
+      activationPolicy: 'explicit',
+      refs: [{ serverId: 'discord', channelId: 'discord:guild:startup', messageId: 'message-3' }],
+    });
+    assert.ok(batch);
+    outbox.activate(batch.id);
+    writeFileSync(crashPath, 'crash');
+
+    await waitFor('the reconnect generation\'s policy held', () =>
+      records(statusPath).some((r) => r.serverId === 'heartbeat' && r.generation === 2 && r.event === 'policy-held'));
+    assert.ok(
+      records(statusPath).some((r) => r.serverId === 'heartbeat' && r.generation === 2 && r.event === 'data-request-sent'),
+      'the reconnected server has already sent the data its grant must hold',
+    );
+    await waitFor('discord\'s mark delivered while re-registration is held', () =>
+      outbox.batches()[0]?.refs[0]?.deliveryStatus === 'applied');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(
+      records(statusPath).some((r) => r.serverId === 'heartbeat' && r.generation === 2 && r.event === 'push-response'),
+      false,
+      'the reconnected server\'s data waits for its grant, though the drain has settled',
+    );
+
+    writeFileSync(policyHoldPath, 'release');
+    await waitFor('the reconnected server\'s data after its grant', () =>
+      records(statusPath).some((r) => r.serverId === 'heartbeat' && r.generation === 2 && r.event === 'push-response'));
+    const push = records(statusPath).find((r) => r.serverId === 'heartbeat' && r.generation === 2 && r.event === 'push-response');
+    assert.equal(push?.accepted, true, 'delivered under the re-established grant, not rejected fail-closed');
+  } finally {
+    await framework?.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('startup fails explicitly when awareness reconciliation throws', async () => {
   mkdirSync(TEST_ROOT, { recursive: true });
   const dir = mkdtempSync(join(TEST_ROOT, 'awareness-reconcile-failure-'));
@@ -770,6 +851,90 @@ test('overlapping reconnect/list-change generations release only the newest barr
   await listChangeBarrier.promise;
   framework.completeMcplDataPlaneGate(listChangeBarrier);
   assert.equal(readyCalls, 1);
+});
+
+test('inbound handlers wait out a generation installed while they wait', async () => {
+  const framework = Object.create(AgentFramework.prototype) as any;
+  const first = deferred<any>();
+  const second = deferred<any>();
+  framework.discordAwarenessBarrier = { generation: 1, requiresBarrier: true, promise: first.promise };
+  const handled: string[] = [];
+  framework.pushHandler = { handlePushEvent: async () => { handled.push('push-event'); } };
+  framework.inferenceRouter = { handleInferenceRequest: async () => { handled.push('inference-request'); } };
+  framework.channelRegistry = { handleIncoming: async () => { handled.push('channels-incoming'); } };
+  framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
+  const connection = new EventEmitter() as any;
+  connection.id = 'discord';
+  framework.wireMcplEvents(connection);
+  const responder = { id: 1, respond: () => {}, respondError: () => {} };
+  for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
+    connection.emit(event, {}, responder);
+  }
+
+  // A newer generation is armed while the handlers wait on the first.
+  framework.discordAwarenessBarrier = { generation: 2, requiresBarrier: true, promise: second.promise };
+  first.resolve({ status: 'delivered', delivered: 0, failed: 0 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(handled, [], 'no handler runs behind the newer generation');
+
+  framework.discordAwarenessBarrier = null;
+  second.resolve({ status: 'delivered', delivered: 0, failed: 0 });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(handled.sort(), ['channels-incoming', 'host-command', 'inference-request', 'push-event']);
+});
+
+test('an inbound handler waiting on a generation that fails refuses its request and never runs it', async () => {
+  // A generation fails when the awareness ledger can't be read or written, so
+  // its marks were not all attempted: nothing that waited behind it may run,
+  // and each request is answered with the failure rather than left waiting.
+  const framework = Object.create(AgentFramework.prototype) as any;
+  const failing = deferred<any>();
+  framework.discordAwarenessBarrier = { generation: 1, requiresBarrier: true, promise: failing.promise };
+  const handled: string[] = [];
+  framework.pushHandler = { handlePushEvent: async () => { handled.push('push-event'); } };
+  framework.inferenceRouter = { handleInferenceRequest: async () => { handled.push('inference-request'); } };
+  framework.channelRegistry = { handleIncoming: async () => { handled.push('channels-incoming'); } };
+  framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
+  const connection = new EventEmitter() as any;
+  connection.id = 'discord';
+  framework.wireMcplEvents(connection);
+  const answers: Array<{ event: string; code?: number; result?: unknown }> = [];
+  for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
+    connection.emit(event, {}, {
+      id: 1,
+      respond: (result: unknown) => { answers.push({ event, result }); },
+      respondError: (code: number) => { answers.push({ event, code }); },
+    });
+  }
+
+  failing.reject(new Error('injected accounting failure'));
+  await waitFor('every request to be answered', () => answers.length === 4);
+  assert.deepEqual(handled, [], 'nothing runs behind a failed generation');
+  assert.deepEqual(
+    answers.sort((a, b) => a.event.localeCompare(b.event)),
+    ['channels-incoming', 'host-command', 'inference-request', 'push-event'].map((event) => ({ event, code: -32603 })),
+    'each request is refused with the failure',
+  );
+});
+
+test('with no generation current, an inbound event is handled in the turn it arrives', () => {
+  // The push coalescer orders a push against its retraction by arrival, so a
+  // handler with no gate to wait out must not yield first.
+  const framework = Object.create(AgentFramework.prototype) as any;
+  framework.discordAwarenessBarrier = null;
+  const handled: string[] = [];
+  framework.pushHandler = { handlePushEvent: async () => { handled.push('push-event'); } };
+  framework.inferenceRouter = { handleInferenceRequest: async () => { handled.push('inference-request'); } };
+  framework.channelRegistry = { handleIncoming: async () => { handled.push('channels-incoming'); } };
+  framework.handleHostCommand = async () => { handled.push('host-command'); return { ok: true }; };
+  const connection = new EventEmitter() as any;
+  connection.id = 'discord';
+  framework.wireMcplEvents(connection);
+  const responder = { id: 1, respond: () => {}, respondError: () => {} };
+  for (const event of ['push-event', 'inference-request', 'channels-incoming', 'host-command']) {
+    connection.emit(event, {}, responder);
+  }
+  assert.deepEqual(handled.sort(), ['channels-incoming', 'host-command', 'inference-request', 'push-event']);
 });
 
 test('synchronous zero-pending flush rechecks the gate after a nested list change', () => {

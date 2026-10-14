@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { AddressInfo } from 'node:net';
-import { McplServerConnection } from '../src/mcpl/server-connection.js';
+import { McplServerConnection, type McplConnectionCloseInfo } from '../src/mcpl/server-connection.js';
 import { buildWebSocketUrl, isWebSocketTransport } from '../src/mcpl/transport.js';
 import type { McplHostCapabilities } from '../src/mcpl/types.js';
 
@@ -51,6 +51,15 @@ function startMockMcplWsServer(onSocket?: (ws: WebSocket) => void) {
 function wsUrl(wss: WebSocketServer): string {
   const port = (wss.address() as AddressInfo).port;
   return `ws://127.0.0.1:${port}/mcpl`;
+}
+
+/** Bound an event wait so a missing emission fails the test instead of hanging it. */
+function withDeadline<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms waiting for ${what}`)), ms);
+  });
+  return Promise.race([p, deadline]).finally(() => clearTimeout(timer)) as Promise<T>;
 }
 
 function waitListening(wss: WebSocketServer): Promise<void> {
@@ -190,6 +199,115 @@ test('reconnect: an unexpected socket drop triggers a background reconnect', asy
 
     await conn.close();
   } finally {
+    wss.close();
+  }
+});
+
+test("a server-side close with code 4001 surfaces on the connection 'close' event before the reconnect", async () => {
+  const sockets: WebSocket[] = [];
+  const wss = startMockMcplWsServer((ws) => sockets.push(ws));
+  await waitListening(wss);
+  let conn: McplServerConnection | undefined;
+  try {
+    // The provider hands out whatever the host currently holds. A host that
+    // caches its credential swaps it in the 4001 listener; the dial that the
+    // reconnect makes must then see the replacement — that ordering is the
+    // point of surfacing the close before scheduling the reconnect.
+    let token = 'token-1';
+    const dialed: string[] = [];
+    conn = await McplServerConnection.connect(
+      {
+        id: 'editor',
+        url: wsUrl(wss),
+        reconnect: true,
+        reconnectIntervalMs: 100,
+        accessProvider: async () => { dialed.push(token); return token; },
+      },
+      HOST_CAPS,
+    );
+    const closes: Array<{ code: number | null; signal: string | null; info: McplConnectionCloseInfo | undefined }> = [];
+    conn.on('close', (code?: number | null, signal?: string | null, info?: McplConnectionCloseInfo) => {
+      closes.push({ code: code ?? null, signal: signal ?? null, info });
+      if (info?.code === 4001) token = 'token-2';
+    });
+    const reconnected = new Promise<void>((resolve) => conn!.once('reconnect', () => resolve()));
+    conn.ready();
+    assert.deepEqual(dialed, ['token-1']);
+
+    // The server refuses/expires the credential: an application close code.
+    assert.equal(sockets.length, 1);
+    sockets[0].close(4001, 'token expired');
+
+    await withDeadline(reconnected, 5_000, "'reconnect' after a 4001 close");
+    // Positional (code, signal) unchanged for existing listeners; the third
+    // argument carries the full close info.
+    assert.equal(closes.length, 1);
+    assert.equal(closes[0].code, 4001);
+    assert.equal(closes[0].signal, null);
+    assert.deepEqual(closes[0].info, {
+      transport: 'websocket',
+      code: 4001,
+      signal: null,
+      reason: 'token expired',
+      byHost: false,
+    });
+    // The reconnect dialed with the credential the close listener installed.
+    assert.deepEqual(dialed, ['token-1', 'token-2']);
+    assert.equal(sockets.length, 2);
+    const result = await conn.sendToolsCall('echo', { text: 'after 4001' });
+    const block = (result.content as Array<{ type: string; text?: string }>)[0];
+    assert.equal(block.text, 'after 4001');
+
+    // A host-initiated close reports byHost with no transport code.
+    const hostClose = new Promise<McplConnectionCloseInfo | undefined>((resolve) =>
+      conn!.once('close', (_code?: number | null, _signal?: string | null, info?: McplConnectionCloseInfo) => resolve(info)));
+    await conn.close();
+    const info = await withDeadline(hostClose, 5_000, "'close' after conn.close()");
+    assert.equal(info?.byHost, true);
+    assert.equal(info?.code, null);
+    assert.equal(info?.transport, 'websocket');
+  } finally {
+    await conn?.close().catch(() => { /* already closed */ });
+    wss.close();
+  }
+});
+
+test("reconnectAfterFailure() on a live transport reports byHost: true and still reconnects", async () => {
+  const sockets: WebSocket[] = [];
+  const wss = startMockMcplWsServer((ws) => sockets.push(ws));
+  await waitListening(wss);
+  let conn: McplServerConnection | undefined;
+  try {
+    conn = await McplServerConnection.connect(
+      { id: 'editor', url: wsUrl(wss), reconnect: true, reconnectIntervalMs: 100 },
+      HOST_CAPS,
+    );
+    conn.ready();
+    const closed = new Promise<McplConnectionCloseInfo | undefined>((resolve) =>
+      conn!.once('close', (_code?: number | null, _signal?: string | null, info?: McplConnectionCloseInfo) => resolve(info)));
+    const reconnected = new Promise<void>((resolve) => conn!.once('reconnect', () => resolve()));
+
+    await conn.reconnectAfterFailure();
+
+    const info = await withDeadline(closed, 5_000, "'close' after reconnectAfterFailure()");
+    assert.equal(info?.byHost, true);
+    assert.equal(info?.transport, 'websocket');
+    await withDeadline(reconnected, 5_000, "'reconnect' after reconnectAfterFailure()");
+    assert.equal(sockets.length, 2);
+    const result = await conn.sendToolsCall('echo', { text: 'after recovery' });
+    assert.equal((result.content as Array<{ type: string; text?: string }>)[0].text, 'after recovery');
+
+    // The flag does not leak: a later remote drop is still reported as remote.
+    const remote = new Promise<McplConnectionCloseInfo | undefined>((resolve) =>
+      conn!.once('close', (_code?: number | null, _signal?: string | null, info?: McplConnectionCloseInfo) => resolve(info)));
+    const reconnectedAgain = new Promise<void>((resolve) => conn!.once('reconnect', () => resolve()));
+    sockets[1].close(4001, 'token expired');
+    const remoteInfo = await withDeadline(remote, 5_000, "'close' after a remote 4001");
+    assert.equal(remoteInfo?.byHost, false);
+    assert.equal(remoteInfo?.code, 4001);
+    await withDeadline(reconnectedAgain, 5_000, "'reconnect' after a remote 4001");
+  } finally {
+    await conn?.close().catch(() => { /* already closed */ });
     wss.close();
   }
 });

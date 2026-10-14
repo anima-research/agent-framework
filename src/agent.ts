@@ -2,7 +2,7 @@ import type { Membrane, NormalizedMessage, NormalizedRequest, ContentBlock, Yiel
 import { isAbortedResponse } from '@animalabs/membrane';
 import { createHash } from 'node:crypto';
 import type { CacheWireReceipt, KvUnifiedRequestHooks } from './kv-unified-wire.js';
-import { ToolResultGuard, TOOL_RESULT_GUARD_NOTICE } from './tool-result-guard.js';
+import { ToolResultGuard } from './tool-result-guard.js';
 import {
   indexSilentTickRows,
   separateSilentHeartbeatTicks,
@@ -12,7 +12,7 @@ import {
   type StoredRowLike,
 } from './silent-heartbeat.js';
 import {
-  toolResultDataToHistoryString,
+  nonErrorResultText,
   truncateForHistory,
   DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS,
 } from './tool-result-history.js';
@@ -667,31 +667,43 @@ export class Agent {
       const wireResults = content.flatMap((block) => block.type === 'tool_result'
         // buildToolResultMessages serializes every payload to a string.
         ? [{ toolUseId: block.toolUseId, content: block.content as string, isError: block.isError }] : []);
-      this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults);
+      // Stored under the house default cap (buildToolResultMessages), as what a
+      // stub keeps is too.
+      this.toolResultGuard.storeResults(content, wireResults, this._state.toolResults, undefined,
+        DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS);
     }
 
-    // Compile context (with optional injections)
-    const { messages, systemInjections } = await this.compileWithInjections(budget, injections);
-
-    // If we have pending tool results, add them
-    if (this._state.status === 'ready' && !guardedResults) {
-      const toolResultMessages = this.buildToolResultMessages(this._state.toolResults);
-      messages.push(...toolResultMessages);
-    }
-
-    const request: NormalizedRequest = {
-      messages: this.toolResultGuard.prepareRequest(messages, true),
-      system: this.buildSystemPrompt(systemInjections),
-      config: {
-        model: this.model,
-        maxTokens: this.maxTokens,
-        ...(this.temperature !== undefined && { temperature: this.temperature }),
-        ...(this.thinking !== undefined && { thinking: this.thinking }),
-      },
-      tools: tools.length > 0 ? tools : undefined,
-      ...(this.providerParams && { providerParams: this.providerParams }),
-      assistantParticipant: this.name,
+    // Compile the context (with optional injections) into a request. The
+    // guard's refusal retry is assembled the same way, afresh. It is compiled
+    // only once each withheld stub's annotation has finished, including one
+    // that began during the compile, and after a stub edit that failed has
+    // been retried; one whose store still fails is compiled as the bare
+    // notice.
+    let unguardedResults: ReturnType<Agent['buildToolResultMessages']> | undefined;
+    const assemble = async (): Promise<NormalizedRequest> => {
+      const { messages, systemInjections } = await this.toolResultGuard.afterAnnotations(
+        () => this.compileWithInjections(budget, injections));
+      // Read once, after the first compile, since results may have become
+      // ready while it ran; the refusal retry, assembled while the agent is
+      // inferring, sends the same ones.
+      unguardedResults ??= this._state.status === 'ready' && !guardedResults
+        ? this.buildToolResultMessages(this._state.toolResults) : [];
+      messages.push(...unguardedResults);
+      return {
+        messages: this.toolResultGuard.prepareRequest(messages, true),
+        system: this.buildSystemPrompt(systemInjections),
+        config: {
+          model: this.model,
+          maxTokens: this.maxTokens,
+          ...(this.temperature !== undefined && { temperature: this.temperature }),
+          ...(this.thinking !== undefined && { thinking: this.thinking }),
+        },
+        tools: tools.length > 0 ? tools : undefined,
+        ...(this.providerParams && { providerParams: this.providerParams }),
+        assistantParticipant: this.name,
+      };
     };
+    const request = await assemble();
 
     const abortController = new AbortController();
     if (options?.signal) {
@@ -704,7 +716,7 @@ export class Agent {
 
     // Set state to inferring
     this._inferenceStartedAt = Date.now();
-    const inferencePromise = this.doInference(request, abortController.signal);
+    const inferencePromise = this.doInference(request, abortController.signal, assemble);
     this._state = { status: 'inferring', promise: inferencePromise, abortController };
 
     try {
@@ -793,6 +805,10 @@ export class Agent {
    * it does not touch agent state and does not call the membrane, and
    * `ContextManager.compile` is itself side-effect-free (compression runs in
    * the background). Safe to call regardless of the agent's current status.
+   * It doesn't wait for the tool-result guard's annotations, so a preview
+   * never waits on a workspace write (rollback, undo and redo report one), and
+   * may show a withheld stub before its place is added; the activation waits
+   * for them around its call.
    */
   async buildActivationRequest(
     availableTools: ToolDefinition[],
@@ -961,7 +977,11 @@ export class Agent {
     this.lastStreamRealInputTokens = 0;
     this.lastStreamOutputTokens = 0;
 
-    const request = await this.buildActivationRequest(availableTools, injections, budget, compressionTools, options);
+    // Compiled only once each withheld stub's annotation has finished,
+    // including one that began during the compile, and after a stub edit that
+    // failed has been retried (see afterAnnotations).
+    const request = await this.toolResultGuard.afterAnnotations(
+      () => this.buildActivationRequest(availableTools, injections, budget, compressionTools, options));
     request.messages = this.toolResultGuard.prepareRequest(request.messages, true);
 
     const receiptAware = (this.contextManager as unknown as { getStrategy?: () => unknown })
@@ -1179,9 +1199,13 @@ export class Agent {
 
   private async doInference(
     request: NormalizedRequest,
-    signal?: AbortSignal
+    signal: AbortSignal | undefined,
+    /** Compiles the context into a request again, for the guard's retry. */
+    reassemble: () => Promise<NormalizedRequest>,
   ): Promise<InferenceResult> {
-    let response = await this.membrane.stream(request, { signal });
+    let response = signal?.aborted
+      ? { aborted: true as const, reason: 'user' as const }
+      : await this.membrane.stream(request, { signal });
     // Usage of a refused attempt abandoned by the guard; it was billed and
     // is added to the retry's usage below rather than overwritten.
     let abandonedUsage: { inputTokens: number; outputTokens: number } | undefined;
@@ -1191,12 +1215,14 @@ export class Agent {
       const ids = this.toolResultGuard.withhold('unknown');
       if (ids) {
         abandonedUsage = response.usage;
-        const withheld = new Set(ids);
-        request = { ...request, messages: request.messages.map((message) => ({
-          ...message, content: message.content.map((block) => block.type === 'tool_result' && withheld.has(block.toolUseId)
-            ? { type: 'tool_result', toolUseId: block.toolUseId, content: TOOL_RESULT_GUARD_NOTICE, isError: block.isError } : block),
-        })) };
-        response = await this.membrane.stream(request, { signal });
+        // The retry is compiled afresh, like every request: once each stub's
+        // annotation has finished (agent-framework #277), and against the
+        // budget without the batch's reservation, so a stub longer than its
+        // original can't carry the request past the budget.
+        const retry = await reassemble();
+        response = signal?.aborted
+          ? { aborted: true, reason: 'user', partialUsage: response.usage }
+          : await this.membrane.stream(retry, { signal });
       }
     }
 
@@ -1277,7 +1303,7 @@ export class Agent {
       toolUseId: r.id,
       content: r.result.isError
         ? truncateForHistory(r.result.error ?? 'Unknown error', DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS)
-        : toolResultDataToHistoryString(r.result.data, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
+        : nonErrorResultText(r.result, DEFAULT_TOOL_RESULT_INLINE_MAX_CHARS),
       isError: r.result.isError,
     }));
 

@@ -361,6 +361,11 @@ describe('Conversation routing', () => {
       framework.getAgent('conversation-slack-D3-g1'), null,
       'closed fork should be disposed once its closure turn finished',
     );
+    const internals = framework as unknown as {
+      turnRouting: Map<string, unknown>; proseSpeechChains: Map<string, unknown>;
+    };
+    assert.equal(internals.turnRouting.has('conversation-slack-D3-g1'), false, 'the closed fork leaves no routing');
+    assert.equal(internals.proseSpeechChains.has('conversation-slack-D3-g1'), false, 'the closed fork leaves no speech chain');
 
     // Next DM spawns a fresh generation.
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi again' }]));

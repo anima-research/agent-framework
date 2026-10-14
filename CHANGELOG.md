@@ -12,6 +12,508 @@ Releases up to and including 0.7.3 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.22.0 — 2026-10-13
+
+### Breaking
+
+- **Workspace tool-output consumers:** `glob` returns `matches` as objects,
+  `{ path, state, size?, mimeType?, conflict?, note? }`, instead of path strings. `sync` reports
+  `conflicts` as `{ path, kind, diskCopy }`. `sync` without a path no longer replaces a workspace
+  draft with a differing disk copy: the draft stays, and where disk changed too, the path is a
+  conflict until a `sync` of that path or a forced `materialize` resolves it, or the two converge.
+  For an `unknown-provenance` or `store-origin-collision` conflict, the forced `materialize` must
+  name the path: one without a path leaves it. `ls`, `grep` and `sync` otherwise only add fields
+  (each `ls` file entry's `state`; grep's `state`, `version`, `skipped` and `incomplete`; a path
+  sync's `discarded`).
+- **Hosts and module authors reading workspace internals:** `MountState` no longer has
+  `materializedHashes` or `refusedPaths`. Disk-agreement evidence lives in `workspace/disk-agreement`
+  chronicle records, and branch-local intent in each mount's `workspace/<mount>/intent` tree state.
+  The module's saved state carries neither field, so a build from #169's branch started on a
+  store this release wrote begins with no freshness baselines.
+- **Prompt cache:** the descriptions of the workspace's `ls`, `glob`, `grep`, `sync`,
+  `materialize` and `delete` tools change, and `sync` and `materialize` take new parameters, so
+  the first request after the upgrade that carries those tools' definitions misses the cache from
+  its tool block on.
+
+### Added
+
+- Tool-name patterns that match no tool are reported. This covers
+  `toolClassOverrides` keys and `toolLifecycle.observe.tools` /
+  `toolLifecycle.inputs.tools`. Each pattern is reported once, as a console
+  line and an `mcpl:tool-pattern-unmatched` trace. A pattern written against
+  the bare server id gets the `mcpl--<serverId>--…` form suggested, since
+  that is the default tool prefix. A pattern that could name a server's tools
+  waits until that server has listed them.
+- Two disablements that were only console lines are now also traces.
+  `mcpl:feature-set-disabled` covers a feature set that §6.4 derivation turns
+  off, for example one that declares no `uses` while `enabledFeatureSets`
+  lists it. `mcpl:policy-refused` covers a server refusing the host's policy,
+  with its `fallback`.
+- README documents MCPL tool naming (`<toolPrefix>--<tool>`, default prefix
+  `mcpl--<serverId>`) and how `enabledFeatureSets` behaves. The `toolPrefix`
+  doc comment now shows the real `--` separator.
+
+- **`Module.onToolBatchComplete(agentName)`**: called once an agent's tool batch completes,
+  when the round's last pending result arrives and before it is provided. It therefore runs
+  before anything that continues the turn: re-inference, stream resume or the end of the turn.
+  The framework awaits every module's hook in parallel, each bounded at 30 s and fail-open; a
+  hook that throws (before returning its promise or after) or times out is traced as
+  `module:batch_hook_failed` and the round goes on.
+  The agent's state is checked again afterwards, so a result whose turn was cancelled or
+  replaced during the hook is dropped (traced as `tool:result_dropped`). A hook still running
+  from an earlier batch, past its bound, is skipped rather than called again. The hook is
+  awaited in the framework's event loop, so a slow one holds every agent's event processing,
+  not only the batch's agent. Script-inner tool calls don't trigger it, nor does a batch whose
+  error results the framework fills in after its stream ended before its tools answered.
+- Workspace: `materialize` accepts `applyDeletions`, `WorkspaceConfig` accepts
+  `agentActionScanDeadlineMs` (default 20000, kept below the hook's 30 s bound), and
+  `workspace:deleted` events carry `conflicts` when a disk deletion met a newer workspace edit.
+
+- Add opt-in resident-editable tool descriptions and visibility, a source-grouped generated catalogue, and optional component description profiles. Hidden tools retain their existing execution permissions.
+- Keep hidden definitions available to compression, protect catalogue path aliases and discovery instructions, and preserve shared override-file permissions during resident edits.
+
+- Live requests capture advertised and compression definitions together before asynchronous context gathering, so mid-gather tool refreshes cannot split their snapshots. Settings edits preserve permissions through the open temporary-file descriptor and reject detected pathname replacement before committing.
+
+### Changed
+
+- **Per-channel conversation routing is deprecated** (`FrameworkConfig.conversations`,
+  `ConversationRouter`, `ConversationRouterConfig`). Its `'mention'` bind/trigger
+  rule, the default for channels, reads `metadata.mentioned`, which discord-mcpl
+  never sets, so on Discord channels an @-mention neither binds a fork nor
+  triggers a bound one (#235). Behavior is unchanged for now: routing still
+  works, and the framework logs one `[deprecated]` line when it is created with
+  `conversations` set. Removal is a follow-up. The `idleTtlMs` docs now note
+  that expiry is checked at most about once a minute, so the sweep usually
+  notices an expired binding up to ~60s after the TTL; that is not a deadline
+  for closing the fork, whose closure turn can be delayed further (e.g. while
+  the host is quiesced).
+
+- Depends on `@animalabs/membrane` `^0.5.87` (was `^0.5.78`), the version this
+  release is built and tested against. Membrane 0.5.87 classifies provider
+  errors at the HTTP boundary and honours `retry-after`, defaults to native
+  tool mode where the formatter supports it, and reports `pause_turn` as its
+  own stop reason; see its changelog for the full list.
+
+### Fixed
+
+- A module's tool result that JSON can't hold, such as a cyclic object, a
+  BigInt or a `toJSON` that throws, is now answered as an error result
+  naming the tool wherever the framework stores or sends it: a model's
+  call, a script's inner call, the `utils` meta-tool for a model,
+  `read_image`, and the pair `puppetToolCall` stores. So is a result that
+  isn't a result object (`undefined`, `null`, an array, a string, an `Error`
+  returned rather than thrown), a result whose getters or Proxy traps throw
+  while it's read, and a non-error result whose data is a function or a
+  symbol, which JSON leaves out whole. The error keeps the module's own
+  error text and its `endTurn` when they can be read. Before, the first
+  code to store, send or trace such a result threw, and the agent's turn
+  never settled (#309). Those paths now read a module's result once and use
+  its JSON form, so its getters and `toJSON` never run a second time. A
+  caller that uses the result in process (`ModuleContext.callTool`,
+  `executeToolCall`) still gets the module's own result, and
+  `puppetToolCall` still returns it, or the error result where it used to
+  reject.
+- A module's `error` is sent as text: an `Error`'s message, an object's own
+  `message`, any other value's JSON, or a BigInt's or symbol's `String()`.
+  One that says nothing (`null`, `false` or empty), and a throw with no
+  text, read as "Unknown error", as a missing one does. A result's
+  `success`, `isError` and `endTurn` are sent as booleans.
+- A tool result with no data is stored as empty text, as an empty content
+  array is. Before, storing it threw, and the turn never settled. A
+  failure the tool doesn't flag as an error for the model
+  (`{ success: false, error, isError: false }`) with no data reads as its
+  error text, for the model and for a script.
+
+- In explicit prose routing, when a round calls `skip_reply` itself (in
+  native tool mode, and not from a `code_execution` script), the prose
+  gateway no longer delivers or bounces that round's plain text.
+  `skip_reply` promises that "Any plain text you wrote this turn stays
+  private and is NOT posted". The round's segments used to go through the
+  gateway like any other round's. Unprefixed text with no destination
+  bounced: it went onto the clipboard for an `{{unsent}}` resend, got a
+  bounce notice and could wake the resident again. Unprefixed text after a
+  destination set earlier in the turn was published there. Now none of that
+  round's envelopes is delivered or bounced, and none moves the destination
+  or asks for a continuation. A `>>skip_reply {{unsent}}` in it still sets
+  the retained text aside. A valid destination prefix, or a destination set
+  earlier in the turn, can still send the round's text through the live
+  outgoing stream as it is written.
+- Explicit prose routing no longer streams unprefixed text to the trigger
+  channel. The MCPL outgoing stream (`channels/outgoing/chunk` and
+  `complete`) started with the trigger channel as its destination, so a
+  streaming-capable server there received text that delivery would bounce.
+  It now starts with no destination on a fresh turn, since explicit text has
+  none until a `>>` prefix names one. When a tool-result-guard retry or a
+  budget restart resumes the turn, it starts at the destination the turn's
+  delivered rounds have set, decided at each round's end, so a private
+  round's prefix doesn't count. The stream also reads a `>>` prefix after
+  any leading whitespace, and ends its target at any whitespace, as delivery
+  does, rather than streaming such a line as text or dropping it. The stream
+  parses each round's text from the start of a line, as delivery parses each
+  round on its own: a round that began with a `>>` prefix streamed it as
+  text to the previous round's destination. A round's later text block
+  starts a new line, as delivery joins a round's text blocks with a newline.
+  At each round's end, and when the membrane retries a refused attempt, the
+  stream returns to the turn's destination, so a private round's prefix, a
+  `>>skip_reply` envelope or a target that didn't resolve no longer moves
+  where later rounds stream.
+- A turn resumed by a tool-result-guard retry or a budget restart now queues
+  its prose deliveries behind the turn's earlier ones, in every mode, so the
+  turn delivers in the order it wrote. Before, a resumed reply could be
+  delivered ahead of an earlier round's queued envelope, to the destination
+  that envelope was about to change. In explicit mode, a round's `>>`
+  targets are resolved once, when the round ends, and its queued delivery
+  posts to those channels.
+
+- A debounced (batched) gate wake that contains an addressed message —
+  mention, reply, or DM — now routes the turn's plain speech to that
+  message's channel, the same rule the direct wake path already applies.
+  Previously a batched wake carried no channel and fell back to the
+  process-global most-recent-inbound channel, so ambient traffic elsewhere
+  in the debounce window (or before a DM, which never updates that
+  fallback) received the reply. Push events are mapped to their registered
+  composite channel id via a new `EventGate` option `resolveRouteChannel`
+  (the framework supplies it); batched-wake lines now show that id instead
+  of the adapter's raw one. Ambient-only batches keep the legacy fallback.
+- When a batch holds several addressed wakes, the newest addressed EVENT now
+  decides the turn's channel, not the most recently queued request. A gate
+  wake flushed after a busy turn no longer outranks a newer mention's direct
+  wake. A conversation fork takes a batched wake's route only for its home
+  channel, so a fork bound elsewhere shows no typing in the addressed
+  channel. An addressed wake with no author no longer borrows another
+  request's author for its turn telemetry.
+
+- `code_execution` time limits now stop blocking code (`time.sleep()`, a busy
+  loop, a blocking read) at the limit (#235). The deadline's cancel reached a
+  script only at an `await`, so blocking code ran on until it returned (and
+  read as a success) or was killed 10s later, losing its output and the
+  interpreter's variables. The host now also sends the interpreter SIGINT,
+  repeated until the script reports. In the script's own code the runtime
+  raises it as `KeyboardInterrupt`; a script waiting on an `await` is
+  cancelled straight away, without waiting for the cancel op. The result keeps the output so far, shows the line the
+  script was stopped at, and says it reached its time limit, and variables
+  survive. The kill remains for code that ignores the interrupt (a long call
+  inside C code, code that swallows `KeyboardInterrupt`, blocking code in a
+  task the script started), and its message now names the time limit and the
+  lost variables. `PyRunner` takes `cancelGraceMs` for the time between the
+  two. Windows keeps the previous behavior.
+
+- A `code_execution` script no longer receives another script's tool result.
+  Inner-call ids restart in every interpreter, and a result was delivered to
+  whichever interpreter was current when it arrived: after a script was
+  aborted, killed at its time limit, or crashed mid-call, the late result of
+  its call could resolve the first call of the next script, which then went
+  on with the wrong data. Results and wake acknowledgements now go only to
+  the interpreter that asked; one whose interpreter is gone is dropped and
+  logged.
+
+- A tool call that ends the turn, made by a `code_execution` script that was
+  stopped before the call finished, no longer ends the turn of the agent's
+  next script. The deferred end-turn request was kept per agent; it now marks
+  only the foreground script that made the call. Background scripts' requests
+  no longer reach a foreground script running alongside them.
+
+- A tool result the guard withholds now says where its original is. The
+  guard's notice ("Tool result withheld by the guard. The tool has already
+  executed.") is followed by the original's place: a workspace file under the
+  first writable mount's `tool-results/` (named
+  `<date>-withheld-<batch>-<index>-<toolUseId>`, one per result, with any
+  character outside `A-Za-z0-9._-` replaced and the name cut to 80
+  characters, so a long tool use id is cut), or, with no writable workspace
+  or a failed write, the guard's audit record (`framework/tool-result-guard`),
+  for an operator. The place holds the result as stored, which is its text:
+  for a result over the inline cap, its capped text, whose own note names the
+  file with the whole output. A failed write's own error stays in the audit
+  record and the logs; the audit record also says when no file was written or
+  a write threw. When saving the audit record itself
+  had failed as the result arrived, the stub says so rather than that the
+  original is kept there. This holds for every withheld settlement: a refusal,
+  an aborted stream, a batch that was never submitted, and one whose audit sync
+  failed. The notice still names no refusal and no category. Before this, a
+  withheld result left only the notice, so the agent couldn't tell what the
+  tool had done (agent-framework #277). The file is an ordinary workspace
+  file: the agent can read it back deliberately, and so can whoever else reads
+  the mount, such as another agent sharing it or a synced copy.
+- How the stub is written. Where each original went is queued first, as an
+  audit record of its own, and the stub's edit is then made at once. If it
+  fails, it is retried before the next activation, compile of a request that
+  is sent, maintenance pass or stop, including for an ephemeral run or a
+  closed fork that has left the agent map, and the batch stays held out of
+  summaries until it lands. Until then, or if the store keeps failing or the
+  process stops first, the stub is the bare notice, and the `annotated` audit
+  record describes the spill's outcome when the annotation finishes, with `unfinished` for a write still running. That record is not revised when the write later settles. A file whose copy on disk fails
+  is still in the workspace's tree, where its tools read it, so the stub names
+  it; for this, `WorkspaceModule.writeBinary`'s result for that case carries
+  `data: { inChronicle: true }`, including when a post-commit operation throws. Inline truncation notes also name that readable tree file, and the disk-copy failure is logged and traced. Each batch has one 30-second deadline for all its withheld writes. A write still under way then is named as unfinished, with the audit record as the fallback. The guard stops waiting for it there; the write goes on, and may finish or fail later. `stop()` still waits for the workspace's own turns, which such a write holds, bounded only by a teardown timeout passed to `stop()` (indefinitely without one, as since #248). Until it
+  settles, no other withheld original is written, for this batch or a later
+  one of any agent: their stubs name the audit record. Writes can start before the first deadline fires; those batches each use their own deadline. A write that never settles keeps new withheld spills disabled for the process lifetime. A deadline that fires names its file on stderr; a stall's skips are logged once, naming the first file, and counted when it clears; an exhausted batch's skips are logged once per batch. The inline cap's spills are outside this deadline. Requests sent by the framework and the direct Agent API are compiled only once each annotation started so far has finished,
+  including one that began while the compile waited or ran, and the refusal
+  retry; a conversation fork seeded from its template copies only stubs whose
+  annotation has finished. A request preview doesn't wait, so rollback,
+  undo and redo never wait on a workspace write, and a preview can show a stub
+  before its place is added, as can public `compileContext()`. Stop lets running annotations finish while the
+  workspace is up; one that starts after that writes no file and is saved
+  before the store closes. A crash before a stub is written leaves the notice
+  alone, and the staged audit record still holds the original. If the active
+  branch changes while the originals are being written, no more are written:
+  a write that has not set its tree entry is refused where it commits, and it and the rest are recorded as skipped for the branch change. A write whose tree entry was already set remains on that branch. While the store is away the
+  stub stays as it was; if the branch is back by the edit, those results'
+  stubs name the audit record. So no original's tree entry lands on another
+  branch. For this, `WorkspaceModule.writeBinary` takes an optional `branch`:
+  the file's tree entry lands on that branch or isn't written, and a refused
+  write's result carries `data: { branchLeft: true }` (it isn't traced as a
+  failed spill). A mount has one directory on disk for every branch, so with
+  `autoMaterialize` a file's copy there, made after its tree entry, is there
+  whichever branch is active, like any other write's. The audit records `annotated`
+  (where each original went) and `stub_updated` (the stub's edit) carry the
+  batch's `sourceBranch`. The direct Agent API's refusal retry is now
+  compiled afresh, as the framework's is, so its longer stubs fit the budget.
+
+- With `maintenanceIntervalMs: 0`, periodic retries of retained guards are disabled; stop still retries them. A failing audit record blocks later queued edits and their compression holds until its write succeeds. Shutdown reports an error if that retry still fails.
+- A framework-driven turn that compiled across stop is discarded before driving its stream, with a line saying why, even if the framework has restarted. A `start()` after a finished `stop()` starts a new lifecycle, with the spill gate open again; a `start()` made while a `stop()` is still draining isn't a supported order. Direct Agent calls remain governed by their caller's abort signal; a refusal retry checks that signal again after waiting for annotations. The direct API reads its unguarded tool results once, after the first compile, and sends the same ones with the refusal retry.
+- Concurrent starts on one Agent, a direct inference call beside a framework-driven turn, are not made safe by this change: an Agent compiles while its status still reads idle, as before, and the annotation wait lengthens that window by up to the batch's deadline. `abortInference()` returns false during a direct call's initial assembly.
+- `save_recent_image` reports a tree-only write as saved, including its path, size, MIME type, `inChronicle` and `diskCopyError` (the failure after the tree entry, whichever it was). A later failure in a multi-image save, returned or thrown, includes that file among the already-saved paths. An RFC-005 reference fetched to such a file names it.
+
+- MCPL tool lifecycle (RFC-007) now reports the tool calls a `code_execution`
+  script makes, not just the script's own `code_execution` call. Each is
+  reported like a model call, under the inner tool's own name and class, so
+  grants, narrowing, filters and the `comms`/unclassed input exclusions apply
+  to it as they would to the model calling that tool directly. It carries the
+  inference that issued the `code_execution` call and, in
+  `_meta["agent-framework/parentToolCallId"]`, that call's `toolCallId`. A
+  stream's end does not abort these calls: one still running when its script
+  is killed is reported `completed` or `failed` when it finishes.
+- Two `code_execution` calls in one model response no longer hang the turn.
+  The runner now claims itself before it waits for the interpreter, so the
+  second call is refused with "already running" and the first runs normally.
+  Before, both got through: the second was refused by the interpreter, the
+  first script's result was dropped, and its tool call never answered.
+
+- **`materialize` no longer silently overwrites disk files changed by another writer** (#109). A file disk changed since it last agreed with the workspace is refused and listed in the result (`skipped`, with the remedy) instead of silently reverted. So is a disk copy that exists but can't be read (e.g. a write-only file), with the filesystem error in the reason, rather than treated as absent. `force: true` remains the deliberate override. A refused workspace edit stays owed: every later materialize takes it up again, and it counts in `status.pendingChanges`. A file the workspace hasn't changed, whose disk copy changed, isn't owed: a materialize naming it refuses it, and one without a path leaves it, for a `sync` of the path (take disk) or a `materialize` naming it with `force` (take the workspace). What disk last agreed with is kept as evidence that survives restarts and branch switches (see the truthful-listings entry), and a `sync` that takes a disk copy records that agreement, so the agent's next edit to that file isn't refused. A first materialize that finds every file already in place still pins the branch, and a file whose disk copy already matches the target bytes is left untouched (mtime preserved). The post-undo/redo `_config` restore keeps its overwrite semantics.
+
+- Visibly-empty MCPL content no longer causes uncaused wakes (#235). Content with no non-text block and no non-whitespace text was stored and woke the agent, but the request sanitizer stripped it, so the model woke to `[Continue]` or to an older message re-presented as the newest. `push/event` now rejects such content with `-32602` (`data.field: "payload.content"`), and `channels/incoming` rejects the message with `reason: "empty_content"`; both log `reason=empty-content`. Exemptions: an RFC-006 retraction, which may be empty (an empty or blank-text notice appends nothing), and the exact silent-heartbeat marker (#216), now one shared predicate. Empty deferred fallbacks are rejected because a fallback must be self-contained. A blank-text render counts as "nothing happened", and a turn whose only causes were deferred batches that rendered nothing (empty, blank, cancelled or revoked) is not started. `PushCoalescer.assemble()` now reports which subjects settled and which materialized content. Rejections are typed `TraceEvent` members (`mcpl:push-event-rejected`, `mcpl:channel-incoming-rejected`). The store/wake site drops empty push and channel events from modules or the coalescer: no row, no wake, and an `mcpl:empty-content-dropped` trace.
+  **MCPL server authors:** to wake the agent, send content it can see. An empty push from any server other than the exact silent-heartbeat marker now gets an error.
+
+- Preserve unbounded module and MCPL shutdown by default and allow explicit wait budgets. Retain failed or pending cleanup for retry, run final storage repair and sync best-effort, and keep storage open until teardown succeeds. Reuse in-flight cleanup and make successful shutdown idempotent until a new borrowed-store lifecycle begins. Preserve final storage errors, including Chronicle close failures that consume the handle, and expose timeout diagnostics to hosts.
+
+- Silent heartbeat ticks no longer merge into the previous assistant message
+  on the wire. Every row a tick's turn stores (assistant responses,
+  tool_result rows) now carries
+  `metadata.silentHeartbeat: { eventId, serverId, agentName }`, and request
+  builds render a request-only `[heartbeat tick]` user turn immediately
+  before the first of the tick's rows that survives compilation (the agent's
+  own opening request for a tick ends on that same turn instead of
+  `[Continue]`). Nothing new is stored, and the separator's position follows
+  from the stamped rows alone, so it is identical on every compile and keeps
+  the cached prefix stable. Rows are recognised by tool_use ids and thinking
+  signatures only: an unsigned, tool-free tick reply still merges as before
+  (no signed thinking, so no provider rejection). Previously back-to-back
+  ticks, or a tick after a reply that left no delivery receipt, were sent as
+  one assistant message carrying signed thinking from two responses.
+
+- **Late tool results, and MCPL requests and notifications, at `stop()` no
+  longer end in an unhandled rejection.** `stop()` closes the process queue
+  before it closes MCPL connections, and nothing caught the "Queue is
+  closed" that this meant for late arrivals. Test files that stop a
+  framework while a tool still runs, such as `conversation-routing`, failed
+  at file level with it.
+  - A tool's result that arrives after `stop()` is logged and dropped: the
+    queue that would carry it to its stream is closed, and the tool has
+    already run. Before, its push threw, the throw was reported as the
+    tool's own failure, and that failure's push threw again, unhandled.
+  - tune-out's results now go through the same `pushEvent` as every other
+    tool's, so they also emit `process:received`, and a rejection of its
+    handler is answered with a failed result, as other tools' dispatch
+    failures are, instead of being left unhandled.
+  - The drop's log line names the tool and whether it succeeded, which is
+    what decides whether anything needs reconciling (the resident may run
+    the tool again). For this, the framework's tool results carry the tool's
+    name (`ToolResultEvent.toolName`, optional).
+  - A server's `push/event`, `channels/incoming`, `channels/register`,
+    `channels/changed`, `inference/request` or `host/command` that arrives
+    once the host is stopping is refused before its handler runs, with a
+    JSON-RPC error (`-32000`, "the host is stopping", the code the push
+    coalescer already gives a stopping host). It is never answered
+    "accepted", no inference starts, and no host command runs.
+  - A handler that throws is answered with an error too: while the host
+    stops, `-32000` with the handler's own message after "the host stopped
+    while handling this request"; on a live host, `-32603` with its message.
+    The message is bounded, and any thrown value is printed safely. Part of
+    the request may already have been admitted. A notification is logged.
+  - **For operators:** such a handler fault used to be an unhandled
+    rejection, which ends a Node process by default, so a supervisor would
+    have restarted the host. Now the host stays up and logs the failure.
+  - A request is answered at most once. A second answer, such as a
+    handler's late one after its failure was answered, is refused and
+    logged. An answer that throws, such as a result the connection can't
+    serialize, doesn't count, so the request still gets the error answer.
+  - Any other event pushed to a stopped framework still throws to its
+    caller.
+
+- In explicit mode, a turn that a tool ends, such as with `skip_reply`, no
+  longer leaves the prose it queued to run under the next turn's routing
+  state. Such a turn settles before its earlier rounds' queued deliveries
+  have posted, and in explicit mode the next turn can start at once. That
+  start cleared the sticky destination those deliveries read when they
+  post, so a queued unprefixed segment bounced into the next turn. Each
+  turn now has its own routing state (the sticky destination, the turn's
+  destination, hybrid's hold) and its logical turn's ` !` continuation and
+  receipt tallies (the destinations and suppressed segments its receipt
+  reports), and a queued delivery keeps the one of the turn that queued
+  it. In hybrid and
+  locus mode the ended turn already keeps the next one waiting until its
+  receipt is written, as before.
+- The agent's prose deliveries go out in the order they were written,
+  across turns: every stream queues its deliveries behind the agent's
+  earlier ones, a fresh turn's included (apart from a stream that a later
+  one replaced). A turn's reply, and its completion, can therefore wait for
+  an earlier turn's posts: up to their request timeouts, one after another,
+  or for good when `requestTimeoutMs` is 0 and a post is never answered.
+- In explicit and hybrid mode, a ` !` continuation that an earlier round
+  asked for now starts when a tool ends the turn, once that turn's
+  deliveries have run, unless the framework has stopped or the agent has
+  been disposed by then (a dropped one is logged). In explicit mode a turn
+  that another event started meanwhile runs first. Before, hybrid mode
+  started it only after the next turn, and explicit mode dropped it, or,
+  when its delivery ran late, started it after the next turn.
+- A logical turn now stays open from the start that opens it until the turn
+  settles (it completes, a tool ends it, or it fails or is abandoned), and
+  every start that routes prose while it is open continues it: a framework
+  retry, the start that consumes unstreamed tool results (whichever wake
+  the scheduler starts it with), the later start a provider-capacity hold
+  defers a turn to. Each begins the sticky destination and hybrid's hold
+  afresh, as before, but a ` !` asked for earlier in the turn still stands,
+  in explicit mode too, and in hybrid and locus mode the receipt at the
+  turn's end reports every stream's deliveries, including ones that land
+  after a new stream began. Before, explicit mode dropped that ` !`, and the
+  receipt counted only the deliveries that landed after the new start.
+- A turn that completes now waits for its queued deliveries before its
+  receipt and its continuation check, in every mode, whatever its last
+  response. Before, only a completion with final text waited, so in hybrid
+  and locus mode a stream whose last response was empty (a budget
+  restart's, say) wrote its receipt first: those deliveries were never
+  receipted, or were counted in the next turn's receipt. A ` !` they carried
+  was missed too.
+
+- **Workspace listings tell the truth about disk, and no scan discards a workspace edit.** `ls`,
+  `glob` and `grep` check their scope against disk before answering, under one rule over disk, the
+  workspace store and what disk last agreed with. Files created by a shell show up, including
+  binary and oversize ones, listed as `disk-only` with their size and, for images, their type.
+  A file deleted by a shell leaves the workspace on every scan path (a watcher event, `sync`, a
+  listing, the scan after a restart, and a watcher reattach) where the workspace held what disk
+  last agreed with; a workspace edit of it stays, as a `deleted-on-disk` conflict. Each file entry
+  carries a state:
+  `synced`, `workspace-draft`, `workspace-deleted`, `not-in-branch`, `disk-only`, `conflict` (with
+  its kind) or `disk-missing-provenance-unknown`. Where disk couldn't be checked, the state is
+  `unverified`, and `incomplete` names the unreadable, ignored or capped regions. A pending
+  workspace edit is never overwritten by a scan, a watcher event or a lazy read. When disk and
+  the workspace both changed, the path becomes a conflict that stays until a `sync` of that path
+  (take disk), a forced `materialize` (take the workspace) or convergence. A text disk version is
+  kept in the store; a binary or oversize one is referenced, and the listing says if it changed
+  since. `grep` labels a kept disk version `recorded-disk` once disk has changed since, and lists
+  a conflict's disk side it couldn't search as skipped. A `sync` of a path lists under
+  `discarded` each workspace change it gave up for disk's state.
+- **A mount root that isn't the directory disk last agreed with is unavailable, not empty.** The
+  workspace records the root's identity (its device and inode) with the first evidence it
+  gathers there. When the drive under a read-write mount is unmounted, the watcher recreates its
+  mountpoint as an empty directory; that root is listed as unavailable (`incomplete`, saying what
+  to do), so no scan reads its emptiness as every file deleted, and no `materialize`, forced or
+  not, writes into it. When the drive comes back at the same path, the mount is available again;
+  one that comes back elsewhere leaves it unavailable until it is back at that path. If the
+  directory was replaced on purpose, or a drive came back under a new device number, `sync` with
+  `acceptRoot: true` takes the root as it is now: what was recorded about the old one is set
+  aside, and every file is compared afresh.
+- **A workspace deletion stays deleted, and materialize never deletes from disk unasked.** Without
+  `autoMaterialize`, a deleted file's disk copy, unchanged since disk last agreed with the
+  workspace, is listed as `workspace-deleted`, and no scan or lazy read brings that copy back; a
+  copy changed on disk since is a conflict. `materialize` lists the deletions it left on disk;
+  `applyDeletions: true` removes those whose disk copy is still one the workspace held, and
+  `force` too removes those changed since. A `sync` of the path takes disk's copy back into the
+  workspace when it's one the workspace can hold (text within the size limit). Once the deletion
+  is confirmed on disk, a file that later appears at the path is a new file, adopted like any
+  other.
+  `autoMaterialize` writes and deletes follow materialize's freshness rule: a disk copy changed
+  by another writer since it last agreed is refused, not overwritten or unlinked.
+- **A `materialize` without a path takes up only what disk still owes:** workspace edits,
+  entries never checked against disk, conflicts and workspace deletions. It no longer depends on
+  the sequence the mount was last materialized at (`status.lastMaterializedSeq`), which is saved
+  only at a clean stop: after a restart that lost it, a bare `materialize` took up the whole tree.
+  A file the workspace hasn't changed is left as disk has it, with or without `force`, unless its
+  path is given. A path the evidence says nothing about is treated the same way. Where disk holds
+  a different copy (`unknown-provenance`, or `store-origin-collision` for a file the workspace
+  created), only a `materialize` that names the path with `force` overwrites it. Where an entry
+  from before the evidence has no disk copy, only one that names the path writes it, and a `sync`
+  of the path drops it from the workspace instead. A bare `materialize` trusts the evidence: if
+  disk was replaced behind the workspace, a `sync` takes disk's copies, and naming the paths with
+  `force` writes the workspace's. `status.pendingChanges` counts what disk owes by the evidence;
+  an entry never checked against disk isn't counted until a listing or a `materialize` checks it.
+- **Undo and branch switches are not mistaken for disk edits.** What disk last agreed with is kept
+  in global chronicle records rather than branch state, so selecting an earlier state keeps that
+  state as a draft over the later disk version, and a file present only in another branch's
+  history is listed `not-in-branch`, never ingested or unlinked. Each write or unlink a
+  materialize makes, and each adoption that ingests a disk change or removes a file, is recorded
+  as an intent ahead of it and completed once it is durable, so a crash or a torn record tail
+  never costs an edit. If an append of disk-agreement evidence fails inside Chronicle, the
+  workspace refuses operations that need that evidence and reports why. Those operations remain
+  unavailable until the host restarts and reloads the store's records. The append may have
+  reached the log without becoming readable in this process, so deciding a conflict from
+  possibly incomplete evidence would be unsafe. A binary or oversize disk version, for which the workspace drops its copy,
+  forgets the evidence first instead. After a crash, an interrupted write or unlink is decided by what disk shows (a copy
+  matching neither the one before nor the one intended is an `interrupted` conflict), and one
+  that shows on disk without proof it is durable is completed only by the next `materialize`,
+  which redoes it; an interrupted adoption is settled by its own branch's tree. This replaces
+  #109's stop-time baselines and refused paths,
+  which an abrupt exit or a branch switch could lose or rewind. A store that saved them doesn't
+  import them, since they name no root: its first pass records each file disk agrees with, and
+  lists any other as a conflict or of unknown provenance.
+- **`watch: 'on-agent-action'` works as documented:** after each completed tool batch, before
+  anything continues the agent's turn, the mount is scanned. A scan that outlasts
+  `agentActionScanDeadlineMs` stops holding the round and continues in the background; the miss
+  is reported on `status` (`lastAgentActionScan`) and as a `workspace:agent-action-scan-incomplete`
+  event, as are the regions a finished scan couldn't observe (`incomplete`). Batches that come
+  while a scan waits share it, and while a scan that outlasted its deadline still runs, a later
+  batch isn't held: its miss is recorded at once, and its scan comes after. The hold is in the
+  framework's event loop, so while it lasts every agent's events wait.
+- Disk text is stored as its raw bytes rather than through a UTF-8 round trip, so a file in
+  another encoding no longer differs from its own stored copy.
+- `status` with `mount` reports that mount alone, and refuses one that doesn't exist. A
+  `materialize` that names a read-only mount lists it under `skipped`, rather than answering as
+  if nothing was owed there.
+- `materialize` and `autoMaterialize` check each write and unlink where it happens, not only when
+  it is planned. A file is opened in its directory without truncating and located before any
+  byte changes: never through a symlink the mount doesn't follow, or a directory that resolves
+  outside the mount, and never into a file with other hard links, whose other names (a package
+  store's, say) a write in place would change too, even with `force`. Unless `force`, it must
+  also still hold what the materialize decided on, so a disk edit or a new file that appears
+  meanwhile is refused, not overwritten. Refused paths are listed as skipped with the reason.
+  Where the platform can sync a directory (not Windows, nor a filesystem that refuses it), every
+  directory from a written file up to the mount root is synced before the write counts as done,
+  directories it had to create included. Listings likewise accept a directory's contents only
+  while it is still the directory at its path, and a scan, write or unlink accepts what it found
+  only while the mount root is still the one it began under: a scan that finds the root replaced
+  when it looks again treats what it observed as unverified, and reports the root. Each check is made where the operation happens,
+  against what is there at that moment. Node has no `openat`, so a parent directory replaced
+  concurrently in the window between a check and a create, `mkdir`, unlink or listing can still
+  redirect that one operation: an empty file or directory can appear outside the mount, or a
+  same-named file there can be unlinked. Nor can a write or an unlink be bound to the moment of
+  its last check: an edit to the open file between the last look and the truncate can be
+  overwritten, and a file put at the path, or an edit made to it, between the last look and the
+  unlink can be removed. Content writes stay bound to the
+  descriptor verified, inside the mount and with no other hard links, before modification; a
+  hard link made to the file after that check shares the write.
+
+## 0.21.1 — 2026-10-13
+
+### Changed
+
+- Depends on `@animalabs/context-manager` `^0.14.0` (was `^0.13.0`). Under
+  `foldingStrategy: 'kv-unified'` the strategy no longer persists its
+  presentation receipt as one entry per message on every accepted call: the
+  receipt is stored run-length encoded, so a Chronicle `records.log` no longer
+  grows quadratically with session length (context-manager#148). Stores written
+  under 0.13.x still load. Patch release from the v0.21.0 tag with this
+  dependency bump only; the work on `main` since 0.21.0 is not included.
+
 ## 0.21.0 — 2026-10-03
 
 ### Breaking
