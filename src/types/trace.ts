@@ -96,9 +96,11 @@ export type TraceEvent =
   | (TraceEventBase & {
       /**
        * A turn whose compile was refused for budget is held while compression
-       * makes its context fit, instead of failing (#304). Its logical turn
-       * stays open; `inference:hold_ended` follows, and then the turn's fresh
-       * compile, or after a hold that ended without a fit, its exhaustion.
+       * makes its context fit, instead of failing (#304). It follows the
+       * refused attempt's `inference:failed`, as a provider hold does. Its
+       * logical turn stays open; `inference:hold_ended` follows, and then
+       * the turn's fresh compile, or after a hold that ended without a fit,
+       * its exhaustion.
        */
       type: 'inference:held';
       agentName: string;
@@ -109,7 +111,10 @@ export type TraceEvent =
       /** The refused compile's budget and size in tokens, when context-manager gave them. */
       budget?: number;
       actual?: number;
-      /** The hold's deadline (epoch ms), 30 minutes after the first refusal. */
+      /** When the hold started (epoch ms): this refusal, or for a released
+       *  turn refused again, the refusal that first held it. */
+      since: number;
+      /** The hold's deadline (epoch ms), 30 minutes after `since`. */
       until: number;
       /** Requests the hold has taken so far, the refused one included. */
       heldRequests: number;
@@ -119,14 +124,17 @@ export type TraceEvent =
       agentName: string;
       /**
        * 'fit': a dry-run compile fits, and the held requests are queued for
-       * one fresh compile. 'deadline': the 30 minutes passed. 'nothing_pending':
-       * compression has nothing left to do and the context still doesn't fit.
-       * After those two the requests are queued too, and the turn fails as a
-       * refused compile did before the hold. 'stopped': the framework stopped
-       * or the agent left, and the requests went with it.
+       * one fresh compile. 'check_failed': the dry run failed for a reason
+       * other than the budget, and the requests are queued for the turn's
+       * own compile to meet it. 'deadline': the 30 minutes passed.
+       * 'nothing_pending': compression has nothing left to do and the context
+       * still doesn't fit. After those two the requests are queued too, and
+       * the turn fails as a refused compile did before the hold. 'stopped':
+       * the framework stopped or the agent left, and the requests went with
+       * it.
        */
-      outcome: 'fit' | 'deadline' | 'nothing_pending' | 'stopped';
-      /** Since the first refusal. */
+      outcome: 'fit' | 'check_failed' | 'deadline' | 'nothing_pending' | 'stopped';
+      /** Since the hold started (`inference:held`'s `since`). */
       waitedMs: number;
       heldRequests: number;
     })
