@@ -2013,7 +2013,7 @@ export class ChannelRegistry {
         timestamp: new Date().toISOString(),
       });
     } catch (error) {
-      console.error(`[channel] answered mark for ${channelId} not recorded: ${(error as Error).message}`);
+      console.error(`[channel] answered mark for ${logValue(channelId)} not recorded: ${logDetail((error as Error).message)}`);
     }
   }
 
