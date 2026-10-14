@@ -405,13 +405,14 @@ test('resolveSendTarget names the channel a send went to and guesses nothing', a
   await registry.handleChanged('discord-a', { added: [added('discord:g:444', '444'), added('discord:g:555', '555')] } as never);
   await registry.handleChanged('discord-b', { added: [added('discord:h:555', '555')] } as never);
   const opensBefore = openCalls.length;
+  // Awaited, so main's openIfClosedForSend can stand in for it in a red-first run.
 
-  assert.equal(registry.resolveSendTarget('discord:g:444'), 'discord:g:444', 'a descriptor id');
-  assert.equal(registry.resolveSendTarget('444', 'discord-a'), 'discord:g:444', 'a raw id, on its server');
-  assert.equal(registry.resolveSendTarget('444', 'discord-b'), undefined, 'not on another server');
-  assert.equal(registry.resolveSendTarget('555'), undefined, 'a raw id two servers share');
-  assert.equal(registry.resolveSendTarget('555', 'discord-b'), 'discord:h:555', 'the server settles it');
-  assert.equal(registry.resolveSendTarget('999', 'discord-a'), undefined, 'an unknown id');
+  assert.equal(await registry.resolveSendTarget('discord:g:444'), 'discord:g:444', 'a descriptor id');
+  assert.equal(await registry.resolveSendTarget('444', 'discord-a'), 'discord:g:444', 'a raw id, on its server');
+  assert.equal(await registry.resolveSendTarget('444', 'discord-b'), undefined, 'not on another server');
+  assert.equal(await registry.resolveSendTarget('555'), undefined, 'a raw id two servers share');
+  assert.equal(await registry.resolveSendTarget('555', 'discord-b'), 'discord:h:555', 'the server settles it');
+  assert.equal(await registry.resolveSendTarget('999', 'discord-a'), undefined, 'an unknown id');
   assert.equal(openCalls.length, opensBefore, 'a lookup opens nothing');
 });
 
