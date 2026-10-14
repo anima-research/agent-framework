@@ -268,3 +268,333 @@ test('suppression rejects a range that splits a tool exchange', async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// A document posted twice stores two runs of shards under one bodyGroupId
+// (the chunker names a group by its text). Each run is a body of its own.
+type ShardAppender = {
+  messageStore: {
+    append: (
+      participant: string,
+      content: unknown[],
+      metadata?: unknown,
+      causedBy?: unknown,
+      extra?: { bodyGroupId: string; shardIndex: number },
+    ) => { id: unknown };
+  };
+};
+
+/** One body of `texts.length` shards, each stored with its own Discord message id. */
+function appendShards(cm: ContextManager, group: string, discordIds: string[]): string[] {
+  return discordIds.map((discordMessageId, shardIndex) => String(
+    (cm as unknown as ShardAppender).messageStore.append(
+      'user',
+      [{ type: 'text', text: `shard ${shardIndex}` }],
+      { serverId: 'discord', channelId: 'discord:g1:c1', messageId: discordMessageId },
+      undefined,
+      { bodyGroupId: group, shardIndex },
+    ).id,
+  ));
+}
+
+function appendDocumentCopy(cm: ContextManager, discordMessageId: string): string[] {
+  return ['part one', 'part two'].map((text, shardIndex) => String(
+    (cm as unknown as ShardAppender).messageStore.append(
+      'user',
+      [{ type: 'text', text }],
+      { serverId: 'discord', channelId: 'discord:g1:c1', messageId: discordMessageId },
+      undefined,
+      { bodyGroupId: 'doc-group', shardIndex },
+    ).id,
+  ));
+}
+
+test('an anchor at the end of one copy of a reposted document does not split it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-repost-anchor-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'before' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-before',
+    });
+    const first = appendDocumentCopy(cm, 'm-doc-1');
+    appendDocumentCopy(cm, 'm-doc-2');
+    cm.close();
+    store.close();
+
+    const result = await createOfflineRecoveryBranch({
+      storePath,
+      agentName: 'cairn',
+      contextId: first[1],
+      branchName: 'recovery/cairn/repost-anchor',
+    });
+
+    assert.equal(result.messagesRemoved, 2);
+    assert.deepEqual(result.refs.map((ref) => ref.messageId), ['m-doc-2']);
+    const recoveredStore = JsStore.openOrCreate({ path: storePath });
+    const recoveredCm = await ContextManager.open({ store: recoveredStore, namespace: 'agents/cairn' });
+    assert.deepEqual(
+      recoveredCm.getAllMessages().map((message) => message.metadata?.messageId),
+      ['m-before', 'm-doc-1', 'm-doc-1'],
+    );
+    recoveredCm.close();
+    recoveredStore.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an anchor inside one copy of a document still splits its body', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-split-anchor-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'before' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-before',
+    });
+    const first = appendDocumentCopy(cm, 'm-doc-1');
+    appendDocumentCopy(cm, 'm-doc-2');
+    cm.close();
+    store.close();
+
+    await assert.rejects(
+      createOfflineRecoveryBranch({
+        storePath,
+        agentName: 'cairn',
+        contextId: first[0],
+        branchName: 'recovery/cairn/split-anchor',
+      }),
+      /splits body group doc-group; choose its final shard/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('suppressing one copy of a reposted document keeps the other', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-repost-suppress-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'before' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-before',
+    });
+    appendDocumentCopy(cm, 'm-doc-1');
+    appendDocumentCopy(cm, 'm-doc-2');
+    cm.addMessage('user', [{ type: 'text', text: 'current' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current',
+    });
+    cm.close();
+    store.close();
+
+    const result = await createOfflineRecoveryBranch({
+      storePath,
+      agentName: 'cairn',
+      messageId: 'm-current',
+      suppressMessageIds: ['m-doc-2'],
+    });
+
+    assert.equal(result.messagesRemoved, 0);
+    assert.equal(result.messagesSuppressed, 2);
+    assert.deepEqual(result.refs.map((ref) => ref.messageId), ['m-doc-2']);
+    const recoveredStore = JsStore.openOrCreate({ path: storePath });
+    const recoveredCm = await ContextManager.open({ store: recoveredStore, namespace: 'agents/cairn' });
+    assert.deepEqual(
+      recoveredCm.getAllMessages().map((message) => message.metadata?.messageId),
+      ['m-before', 'm-doc-1', 'm-doc-1', 'm-current'],
+    );
+    recoveredCm.close();
+    recoveredStore.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a suppression that splits one copy of a document is refused', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-split-suppress-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'before' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-before',
+    });
+    appendShards(cm, 'doc-group', ['m-s0', 'm-s1']);
+    appendShards(cm, 'doc-group', ['m-t0', 'm-t1']);
+    cm.addMessage('user', [{ type: 'text', text: 'current' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current',
+    });
+    cm.close();
+    store.close();
+
+    await assert.rejects(
+      createOfflineRecoveryBranch({
+        storePath,
+        agentName: 'cairn',
+        messageId: 'm-current',
+        suppressMessageIds: ['m-s1'],
+      }),
+      /Recovery selection splits body group doc-group/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a split across a scan window is refused too', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-split-seam-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    // 999 plain messages put the body's shards at positions 999 and 1000,
+    // on either side of the validator's 1,000-message scan window.
+    for (let i = 0; i < 999; i++) cm.addMessage('user', [{ type: 'text', text: `filler ${i}` }]);
+    appendShards(cm, 'seam-group', ['m-s0', 'm-s1']);
+    cm.addMessage('user', [{ type: 'text', text: 'current' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current',
+    });
+    assert.equal(cm.getMessageCount(), 1002);
+    cm.close();
+    store.close();
+
+    await assert.rejects(
+      createOfflineRecoveryBranch({
+        storePath,
+        agentName: 'cairn',
+        messageId: 'm-current',
+        suppressMessageIds: ['m-s1'],
+      }),
+      /Recovery selection splits body group seam-group/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('suppressing a one-shard copy of a reposted document keeps the other', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-one-shard-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'before' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-before',
+    });
+    appendShards(cm, 'one-shard-group', ['m-doc-1']);
+    appendShards(cm, 'one-shard-group', ['m-doc-2']);
+    cm.addMessage('user', [{ type: 'text', text: 'current' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current',
+    });
+    cm.close();
+    store.close();
+
+    const result = await createOfflineRecoveryBranch({
+      storePath,
+      agentName: 'cairn',
+      messageId: 'm-current',
+      suppressMessageIds: ['m-doc-2'],
+    });
+
+    assert.equal(result.messagesSuppressed, 1);
+    const recoveredStore = JsStore.openOrCreate({ path: storePath });
+    const recoveredCm = await ContextManager.open({ store: recoveredStore, namespace: 'agents/cairn' });
+    assert.deepEqual(
+      recoveredCm.getAllMessages().map((message) => message.metadata?.messageId),
+      ['m-before', 'm-doc-1', 'm-current'],
+    );
+    recoveredCm.close();
+    recoveredStore.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a suppressed message outside any body is removed alone, and a one-shard copy as a range', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-removal-kind-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'before' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-before',
+    });
+    const plain = String(cm.addMessage('user', [{ type: 'text', text: 'plain' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-plain',
+    }));
+    appendShards(cm, 'one-shard-group', ['m-doc-1']);
+    const [copy] = appendShards(cm, 'one-shard-group', ['m-doc-2']);
+    cm.addMessage('user', [{ type: 'text', text: 'current' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-current',
+    });
+    cm.close();
+    store.close();
+
+    // removeMessage's remove event also drops the context-log entries copied
+    // from the message; context-manager refuses it for any shard.
+    const removeMessage = t.mock.method(ContextManager.prototype, 'removeMessage');
+    const removeMessages = t.mock.method(ContextManager.prototype, 'removeMessages');
+    const result = await createOfflineRecoveryBranch({
+      storePath,
+      agentName: 'cairn',
+      messageId: 'm-current',
+      suppressMessageIds: ['m-plain', 'm-doc-2'],
+    });
+
+    assert.equal(result.messagesSuppressed, 2);
+    assert.deepEqual(removeMessage.mock.calls.map((call) => String(call.arguments[0])), [plain]);
+    assert.deepEqual(removeMessages.mock.calls.map((call) => call.arguments.map(String)), [[copy, copy]]);
+    removeMessage.mock.restore();
+    removeMessages.mock.restore();
+    const recoveredStore = JsStore.openOrCreate({ path: storePath });
+    const recoveredCm = await ContextManager.open({ store: recoveredStore, namespace: 'agents/cairn' });
+    assert.deepEqual(
+      recoveredCm.getAllMessages().map((message) => message.metadata?.messageId),
+      ['m-before', 'm-doc-1', 'm-current'],
+    );
+    recoveredCm.close();
+    recoveredStore.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an anchor at the end of a write that was cut short keeps that partial body and leaves out its retry', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'offline-recovery-cut-short-'));
+  const storePath = join(dir, 'agent.chronicle');
+  try {
+    const store = JsStore.openOrCreate({ path: storePath });
+    const cm = await ContextManager.open({ store, namespace: 'agents/cairn' });
+    cm.addMessage('user', [{ type: 'text', text: 'before' }], {
+      serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm-before',
+    });
+    // Two of a body's shards, written before an interruption, then its retry
+    // from shard 0: the retry is a body of its own.
+    const partial = appendShards(cm, 'cut-group', ['m-cut-0', 'm-cut-1']);
+    appendShards(cm, 'cut-group', ['m-retry-0', 'm-retry-1', 'm-retry-2']);
+    cm.close();
+    store.close();
+
+    const result = await createOfflineRecoveryBranch({
+      storePath,
+      agentName: 'cairn',
+      contextId: partial[1],
+      branchName: 'recovery/cairn/cut-short',
+    });
+
+    assert.equal(result.messagesRemoved, 3);
+    assert.deepEqual(result.refs.map((ref) => ref.messageId), ['m-retry-0', 'm-retry-1', 'm-retry-2']);
+    const recoveredStore = JsStore.openOrCreate({ path: storePath });
+    const recoveredCm = await ContextManager.open({ store: recoveredStore, namespace: 'agents/cairn' });
+    assert.deepEqual(
+      recoveredCm.getAllMessages().map((message) => message.metadata?.messageId),
+      ['m-before', 'm-cut-0', 'm-cut-1'],
+    );
+    recoveredCm.close();
+    recoveredStore.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

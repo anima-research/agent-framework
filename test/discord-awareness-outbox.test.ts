@@ -143,6 +143,104 @@ test('framework resumes an interrupted suppression before activating its markers
   }
 });
 
+test('a resumed suppression removes a one-shard body as a range and a message outside any body alone', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'discord-awareness-resume-shard-'));
+  const path = join(dir, 'outbox.json');
+  try {
+    const outbox = new DiscordAwarenessOutbox(path);
+    const batch = outbox.prepare({
+      agentName: 'cairn',
+      sourceBranch: 'main',
+      targetBranch: 'recovery/cairn/suppressed',
+      activationPolicy: 'explicit',
+      suppressionIntervals: [
+        { fromId: 'plain', toId: 'plain' },
+        { fromId: 'shard', toId: 'shard' },
+      ],
+      refs: [
+        { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm1' },
+      ],
+    })!;
+    const present = new Set(['plain', 'shard']);
+    const removals: string[] = [];
+    // As context-manager 0.14 does, removeMessage refuses a shard, a
+    // one-shard body's included.
+    const cm = {
+      getMessage: (id: string) => present.has(id)
+        ? { id, ...(id === 'shard' ? { bodyGroupId: 'doc', shardIndex: 0 } : {}) }
+        : null,
+      removeMessage: (id: string) => {
+        if (id === 'shard') throw new Error(`Cannot remove shard ${id} in isolation: it is part of bodyGroup doc.`);
+        present.delete(id);
+        removals.push(id);
+      },
+      removeMessages: (from: string, to: string) => {
+        present.delete(from); present.delete(to); removals.push(`${from}..${to}`);
+      },
+    };
+    const framework = Object.create(AgentFramework.prototype) as any;
+    framework.discordAwarenessOutbox = outbox;
+    framework.store = {
+      currentBranch: () => ({ name: 'recovery/cairn/suppressed' }),
+      listBranches: () => [],
+    };
+    framework.agents = new Map([['cairn', { getContextManager: () => cm }]]);
+
+    await framework.resumePreparedDiscordSuppressions();
+
+    assert.deepEqual(removals, ['shard..shard', 'plain']);
+    assert.equal(outbox.batches().find((candidate) => candidate.id === batch.id)?.status, 'active');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a resumed suppression skips an interval that committed before the crash, and refuses one only partly present', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'discord-awareness-resume-states-'));
+  try {
+    const run = async (present: Set<string>) => {
+      const outbox = new DiscordAwarenessOutbox(join(dir, `outbox-${[...present].join('-') || 'none'}.json`));
+      const batch = outbox.prepare({
+        agentName: 'cairn',
+        sourceBranch: 'main',
+        targetBranch: 'recovery/cairn/suppressed',
+        activationPolicy: 'explicit',
+        suppressionIntervals: [
+          { fromId: 'a0', toId: 'a1' },
+          { fromId: 'b0', toId: 'b1' },
+        ],
+        refs: [{ serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'm1' }],
+      })!;
+      const removals: string[] = [];
+      const cm = {
+        getMessage: (id: string) => (present.has(id) ? { id } : null),
+        removeMessage: (id: string) => { present.delete(id); removals.push(id); },
+        removeMessages: (from: string, to: string) => { present.delete(from); present.delete(to); removals.push(`${from}..${to}`); },
+      };
+      const framework = Object.create(AgentFramework.prototype) as any;
+      framework.discordAwarenessOutbox = outbox;
+      framework.store = { currentBranch: () => ({ name: 'recovery/cairn/suppressed' }), listBranches: () => [] };
+      framework.agents = new Map([['cairn', { getContextManager: () => cm }]]);
+      const outcome = await framework.resumePreparedDiscordSuppressions().then(() => 'resumed', (error: Error) => error.message);
+      return { outcome, removals, status: outbox.batches().find((candidate) => candidate.id === batch.id)?.status };
+    };
+
+    // The later interval committed before the crash: only the earlier is removed.
+    const committed = await run(new Set(['a0', 'a1']));
+    assert.equal(committed.outcome, 'resumed');
+    assert.deepEqual(committed.removals, ['a0..a1']);
+    assert.equal(committed.status, 'active');
+
+    // An interval with one end gone isn't safe to finish.
+    const partial = await run(new Set(['a0', 'a1', 'b0']));
+    assert.match(partial.outcome, /interval b0\.\.b1 is only partially present/);
+    assert.deepEqual(partial.removals, []);
+    assert.equal(partial.status, 'prepared');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('framework drain records failures per ref and continues past permanent failures', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'discord-awareness-drain-'));
   const path = join(dir, 'outbox.json');
@@ -265,6 +363,9 @@ test('message-granular undo prepares markers before switching branches', async (
     framework.pendingAssistantBlocks = new Map();
     // A host/command and a store surgery are operations stop() waits for.
     framework.operatorOperations = new Set();
+    // A surgery waits for maintenance work that is running: here, none.
+    framework.maintenancePass = null;
+    framework.overBudgetDrains = new Set();
     framework.operatorLog = new OperatorLog(undefined);
 
     const result = await framework.handleHostCommand('discord', {
