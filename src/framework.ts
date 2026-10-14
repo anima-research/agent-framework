@@ -1900,6 +1900,15 @@ export class AgentFramework {
    * ephemeral agents have isolated slots and are their own only readers.
    */
   private readonly sharedSlotAgents = new Set<Agent>();
+  /**
+   * A fork's or an ephemeral run's failed-reply notices that reached its live
+   * stream at a tool boundary, by deferred-write id. Read, though stored above
+   * its consumed watermark, since no compile ran after them; a release
+   * (unreadFailedReplies) doesn't pass them on. Forgotten at release.
+   */
+  private readonly injectedFailureNotices = new Map<string, Set<string>>();
+  /** Releases asked for while the host was quiesced, by agent name; resume() runs them. */
+  private readonly releasesAfterResume = new Map<string, () => void>();
   /** Group commit: one fsync per event-loop turn, shared by every waiter. */
   private coalescingCommit: Promise<void> | null = null;
   private inferenceRouter: InferenceRouter | null = null;
@@ -4607,10 +4616,14 @@ export class AgentFramework {
     this.eventGate?.setQuiesced(false);
 
     try {
-      // Flush context writes deferred by the quiesce window (module events,
-      // api message.send) — with no turn alive there is no other flush
-      // point. Per-message try/catch and per-message durable ack (see
-      // flushDeferredWrites); nothing here may reach the plane reopen below.
+      // Releases asked for during the window run first, each landing its
+      // agent's queued writes and passing on its unread failed replies, as at
+      // any release. Then flush context writes deferred by the quiesce window
+      // (module events, api message.send) — with no turn alive there is no
+      // other flush point. Per-message try/catch and per-message durable ack
+      // (see flushDeferredWrites); nothing here may reach the plane reopen
+      // below.
+      this.runReleasesAfterResume();
       await this.flushDeferredWrites('resume');
       this.persistHostMode(null);
     } finally {
@@ -4682,7 +4695,20 @@ export class AgentFramework {
     this.deferredMessages = keep;
     this.handOffDeferredWrites(flush);
     let stored = 0;
+    let passed = 0;
     for (const msg of flush) {
+      // A target no longer registered (a fork or a run gone before a crash
+      // that left this write to boot recovery) has no window to land in. A
+      // failed reply it never read is passed to the primary, by name; any
+      // other write is dropped, logged, by addMessage.
+      if (
+        msg.forAgent && !this.agents.has(msg.forAgent) &&
+        (msg.metadata as { kind?: unknown } | undefined)?.kind === 'discord-send-failed'
+      ) {
+        this.passFailedReplyToPrimary(msg.forAgent, msg.metadata);
+        passed++;
+        continue;
+      }
       try {
         this.addMessage(msg.participant, msg.content, msg.metadata, {
           deferredWriteId: msg.id,
@@ -4702,6 +4728,7 @@ export class AgentFramework {
     this.ackDeferredWrites();
     console.error(
       `[host-mode] ${label}: flushed ${stored}/${flush.length} deferred context write(s)` +
+      (passed > 0 ? `, ${passed} failed repl${passed === 1 ? 'y' : 'ies'} of a released agent passed to the primary` : '') +
       (keep.length > 0 ? `, ${keep.length} kept for a still-alive turn` : ''),
     );
   }
@@ -5897,7 +5924,11 @@ export class AgentFramework {
         // The late stream finalizer intentionally refuses name-keyed cleanup once
         // deregistered, so disposal must release EventGate liveness itself.
         this.eventGate?.onInferenceEnded(agent.name);
-        this.agents.delete(agent.name);
+        this.releaseNowOrAfterResume(agent.name, () => {
+          if (this.agents.get(agent.name) !== agent) return;
+          this.releaseWindow(agent);
+          this.agents.delete(agent.name);
+        });
       }
       this.toolImageLedgers.delete(agent.name);
       // Spawn-and-dispose bookkeeping (main, d453165/fee96a7): without this,
@@ -8571,6 +8602,7 @@ export class AgentFramework {
                     content: msg.content,
                     ...(msg.metadata ? { metadata: msg.metadata } : {}),
                   });
+                  this.noteInjectedFailureNotice(agent, msg.id, msg.metadata);
                 }
               }
             }
@@ -9320,9 +9352,16 @@ export class AgentFramework {
    * forever. The fork's context stays in Chronicle for investigation.
    */
   private disposeConversationAgent(agentName: string): void {
+    if (this.quiesced) {
+      // Released by resume() (releaseNowOrAfterResume). It stays closing, so
+      // a sweep meanwhile reaches here again and waits too.
+      this.releasesAfterResume.set(agentName, () => this.disposeConversationAgent(agentName));
+      return;
+    }
     this.closingConversationAgents.delete(agentName);
     const channelId = this.conversationAgentHomes.get(agentName);
     const agent = this.agents.get(agentName);
+    if (agent) this.releaseWindow(agent);
     this.agents.delete(agentName);
     this.turnRouting.delete(agentName);
     this.proseSpeechChains.delete(agentName);
@@ -9423,9 +9462,12 @@ export class AgentFramework {
 
     // Fallback reaper: a closing fork whose closure inference never ran
     // (request dropped as stale, inference policy veto) would otherwise stay
-    // registered forever. No active stream + no pending request = done.
+    // registered forever. No turn, no active stream and no pending request =
+    // done. A turn holds its token from dequeue, through its hooks and
+    // compile, before its stream registers, so a fork mid-compile is busy.
     for (const agentName of [...this.closingConversationAgents]) {
       if (
+        !this.activeTurnTokens.has(agentName) &&
         !this.activeStreams.has(agentName) &&
         !this.pendingRequests.some((r) => r.agentName === agentName)
       ) {
@@ -10619,13 +10661,21 @@ export class AgentFramework {
       (plural ? 'these channels' : 'this channel') +
       ` will reach you. If you don't want ${plural ? 'one of them' : 'it'}, use channel_close — ` +
       'your choice sticks; neither policy nor a later send will silently reopen it.';
+    // An open caused by an agent's own send is that agent's to hear about, in
+    // the window it reads; a policy admission with no agent behind it goes to
+    // the primary.
+    let target: { forAgent: string } | undefined;
+    if (agentName) {
+      const addressed = this.noticeTargetFor(agentName, 'channel auto-open');
+      if (!addressed) return;
+      target = addressed;
+    }
     try {
       // Through framework.addMessage for mid-turn safety (deferral +
       // hear-while-acting injection) — a delivery-forced open happens inside
       // a live turn, and a direct context-manager append there would store
-      // the notice out of order. Targets the primary agent; connectome-host
-      // runs trunk-only, so this is the delivering agent in practice.
-      this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'channel-notice' });
+      // the notice out of order.
+      this.addMessage('user', [{ type: 'text', text }], { system: true, kind: 'channel-notice' }, target);
       console.error(`[channel] auto-open notice (${cause}) -> ${agentName ?? 'primary'}: ${shown}`);
     } catch (err) {
       console.error('recordChannelAutoOpenNotice failed:', err);
@@ -10922,30 +10972,34 @@ export class AgentFramework {
       `destination plus the token {{unsent}}, e.g. "${prefix}#channel {{unsent}}" or "${prefix}@person {{unsent}}". ` +
       `"${prefix}skip_reply {{unsent}}" keeps it in context only.` +
       (prefix === '>>' ? ' The prose_help tool shows the full syntax.' : '');
-    try {
-      // Through framework.addMessage, NOT the context manager directly: while
-      // the turn is still streaming this defers the notice to the next tool
-      // boundary, where it is BOTH stored in order and injected into the live
-      // stream (hear-while-acting) — the model sees the error and can correct
-      // the prefix within the same turn. A direct append here would land the
-      // notice before the turn's assistant blocks (cache bust, invisible
-      // until the next compile).
-      const id = this.addMessage(
-        'user',
-        [{ type: 'text', text: notice }],
-        { system: true, kind: 'prose-bounce' },
-      );
-      if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-bounce' });
-      else this.emitTrace({ type: 'message:added', messageId: 'deferred', source: 'prose-bounce' });
-    } catch (err) {
-      console.error('bounceProse: failed to record bounce notice:', err);
+    const target = this.noticeTargetFor(name, 'prose-bounce');
+    if (target) {
+      try {
+        // Through framework.addMessage, NOT the context manager directly: while
+        // the turn is still streaming this defers the notice to the next tool
+        // boundary, where it is BOTH stored in order and injected into the live
+        // stream (hear-while-acting) — the model sees the error and can correct
+        // the prefix within the same turn. A direct append here would land the
+        // notice before the turn's assistant blocks (cache bust, invisible
+        // until the next compile).
+        const id = this.addMessage(
+          'user',
+          [{ type: 'text', text: notice }],
+          { system: true, kind: 'prose-bounce' },
+          target,
+        );
+        if (id) this.emitTrace({ type: 'message:added', messageId: id, source: 'prose-bounce' });
+        else this.emitTrace({ type: 'message:added', messageId: 'deferred', source: 'prose-bounce' });
+      } catch (err) {
+        console.error('bounceProse: failed to record bounce notice:', err);
+      }
     }
     const capped = streak > AgentFramework.PROSE_BOUNCE_WAKE_CAP;
     console.error(
       `[prose] ${name}: BOUNCED ${text.length} chars — ${reason}` +
       (capped ? ' (bounce-wake cap reached; notice appended without wake)' : ''),
     );
-    if (!capped) {
+    if (!capped && target) {
       // Wake so the resend can happen immediately — an unsent DM reply must
       // not sit invisible until the next unrelated event.
       this.pendingRequests.push({
@@ -13884,12 +13938,14 @@ export class AgentFramework {
    * later if that ever needs revisiting.
    */
   private injectScriptWake(record: BackgroundScriptRecord, envelope: string): void {
+    const target = this.noticeTargetFor(record.agentName, `background-script ${record.id} wake`);
+    if (!target) return;
     try {
       const messageId = this.addMessage('user', [{ type: 'text', text: envelope }], {
         source: 'background-script',
         scriptId: record.id,
         tags: ['script:wake'],
-      });
+      }, target);
       this.pendingRequests.push({
         agentName: record.agentName,
         reason: 'script:wake',
@@ -13898,7 +13954,7 @@ export class AgentFramework {
       });
       this.emitTrace({
         type: 'message:added',
-        messageId,
+        messageId: messageId || 'deferred',
         source: `background-script:${record.id}`,
       });
     } catch (err) {
@@ -15001,6 +15057,187 @@ export class AgentFramework {
     return mine;
   }
 
+  /**
+   * Where a notice about an agent's own action belongs: its failed reply, its
+   * bounced prose (beside its `{{unsent}}` clipboard), its background script's
+   * wake, a channel its own send opened. Every registered agent's notice is
+   * addressed to that agent, so it lands in the window that agent reads and
+   * waits on that agent's own turn, stream and tool cycle: a conversation
+   * fork or an ephemeral run reads only its isolated slot, and a resident's
+   * notice would otherwise wait on the primary's turn rather than its own.
+   * Residents share one message slot, so a resident's notice can land there
+   * while another resident's turn is alive; agent-framework #291 covers that.
+   *
+   * null when the agent is no longer registered (a fork or a run already
+   * released): there is no window to write, so the caller writes nothing,
+   * traces nothing and requests no wake. The drop is logged here, once. A
+   * failed reply is passed on by name instead (passFailedReplyToPrimary).
+   */
+  private noticeTargetFor(agentName: string, notice: string): { forAgent: string } | null {
+    if (this.agents.has(agentName)) return { forAgent: agentName };
+    console.error(`[notice] ${agentName} is no longer registered, so its ${notice} notice is dropped`);
+    return null;
+  }
+
+  /**
+   * A conversation fork or an ephemeral run is about to be deregistered. A
+   * release never runs while the host is quiesced: it waits for resume()
+   * (releaseNowOrAfterResume), since a write could land mid-surgery.
+   *
+   * The agent never reads its window again, so every failed-reply notice it
+   * never read is passed to the primary, by name, once: each one stored in
+   * its window above its consumed watermark (flushed there at its turn's end,
+   * or stored while it was idle) and not heard at a tool boundary, and each
+   * one still queued for it. Writes still
+   * queued would wait for a boundary it never reaches, and the flush that
+   * finds it gone would drop them, so they land in its own window now, which
+   * Chronicle keeps for investigation; its stream is over or cancelled, so
+   * nothing it compiles can diverge from them.
+   */
+  private releaseWindow(agent: Agent): void {
+    for (const metadata of this.unreadFailedReplies(agent)) this.passFailedReplyToPrimary(agent.name, metadata);
+    const queued = this.drainDeferredFor(agent.name);
+    if (queued.length === 0) return;
+    const cm = agent.getContextManager();
+    for (const msg of queued) {
+      try {
+        cm.addMessage(msg.participant, msg.content, withDeferredWriteId(msg.metadata, msg.id));
+      } catch (err) {
+        console.error(
+          `[deferred-flush] ${agent.name}: failed to store a queued write before release ` +
+          `(participant=${msg.participant}):`,
+          err,
+        );
+      }
+      this.passFailedReplyToPrimary(agent.name, msg.metadata);
+    }
+    this.ackDeferredWrites();
+  }
+
+  /**
+   * The failed-reply notices stored in `agent`'s window that it never read:
+   * above its consumed watermark (or any, when it never compiled on this
+   * branch), and not injected into its live stream at a tool boundary.
+   */
+  private unreadFailedReplies(agent: Agent): MessageMetadata[] {
+    const injected = this.injectedFailureNotices.get(agent.name);
+    this.injectedFailureNotices.delete(agent.name);
+    try {
+      const cm = agent.getContextManager();
+      const watermark = agent.getConsumedWatermark();
+      const floor = watermark && watermark.branch === cm.currentBranch().name
+        ? watermark.sequence
+        : Number.NEGATIVE_INFINITY;
+      return cm.getAllMessages()
+        .filter((m) => {
+          const metadata = m.metadata as { kind?: unknown; deferredWriteId?: unknown } | undefined;
+          return m.sequence > floor && metadata?.kind === 'discord-send-failed' &&
+            !(typeof metadata.deferredWriteId === 'string' && injected?.has(metadata.deferredWriteId));
+        })
+        .map((m) => m.metadata as MessageMetadata);
+    } catch (err) {
+      // A release must complete whatever its window's read meets.
+      console.error(`[route-failure] ${agent.name}: could not read its window for unread failed replies:`, err);
+      return [];
+    }
+  }
+
+  /**
+   * Record a failed-reply notice injected into `agent`'s live stream at a
+   * tool boundary (injectedFailureNotices). Residents are never released, so
+   * only an isolated agent's are kept.
+   */
+  private noteInjectedFailureNotice(agent: Agent, id: string, metadata: MessageMetadata | undefined): void {
+    if (this.sharedSlotAgents.has(agent)) return;
+    if ((metadata as { kind?: unknown } | undefined)?.kind !== 'discord-send-failed') return;
+    let ids = this.injectedFailureNotices.get(agent.name);
+    if (!ids) this.injectedFailureNotices.set(agent.name, (ids = new Set()));
+    ids.add(id);
+  }
+
+  /**
+   * Run `release` now, or, while the host is quiesced, when it resumes. A
+   * release lands the agent's queued writes in its window, and while quiesced
+   * a write could land mid-surgery; dropping them instead would lose them
+   * from both the window and the recovery queue. The agent stays registered
+   * meanwhile, and can't start a turn while quiesced.
+   */
+  private releaseNowOrAfterResume(agentName: string, release: () => void): void {
+    if (this.quiesced) this.releasesAfterResume.set(agentName, release);
+    else release();
+  }
+
+  /** resume(): the releases asked for during the quiesce window, each on its own. */
+  private runReleasesAfterResume(): void {
+    const releases = [...this.releasesAfterResume.values()];
+    this.releasesAfterResume.clear();
+    for (const release of releases) {
+      try {
+        release();
+      } catch (err) {
+        console.error('[host-mode] resume: a release postponed by the quiesce window failed:', err);
+      }
+    }
+  }
+
+  /**
+   * A fork or an ephemeral run ended before reading that its reply never
+   * reached the human: it was released with the notice unread or still
+   * queued, its queued notice was restored at boot after it was gone, or its
+   * delivery failed after release. Tell the primary instead, naming the
+   * speaker, so an agent who can still act learns of it: to resend, or to
+   * tell the human. Only for a delivery to a channel; a reply that had no
+   * channel to go to (no locus) had no human waiting for it. Never throws:
+   * it runs inside a release, which must complete whatever this write meets.
+   */
+  private passFailedReplyToPrimary(speaker: string, metadata: MessageMetadata | undefined): void {
+    const failure = metadata as { kind?: unknown; channelId?: unknown; reason?: unknown; textLen?: unknown } | undefined;
+    if (failure?.kind !== 'discord-send-failed') return;
+    if (typeof failure.channelId !== 'string' || failure.channelId === '') {
+      console.error(`[route-failure] ${speaker} has ended, and its reply had no channel to reach: no one else is told`);
+      return;
+    }
+    // The default path falls back to the first registered agent when there
+    // is no primary, which could be the speaker being released.
+    if (!this.primaryAgentName || !this.agents.has(this.primaryAgentName)) {
+      console.error(`[route-failure] ${speaker} has ended, and there is no primary to tell that its reply to ${failure.channelId} failed`);
+      return;
+    }
+    // A notice queued by an earlier build may carry neither; say only what it has.
+    const textLen = typeof failure.textLen === 'number' ? failure.textLen : undefined;
+    const reason = typeof failure.reason === 'string' && failure.reason !== '' ? failure.reason : undefined;
+    try {
+      this.addMessage(
+        'user',
+        [{
+          type: 'text',
+          text: `[discord-send-failed] A reply by ${speaker}${textLen !== undefined ? ` (${textLen} chars)` : ''} could not be delivered to ` +
+            `${this.channelForNotice(failure.channelId)}${reason !== undefined ? ` (${reason})` : ''}. ${speaker} has ended, and the human did not receive it.`,
+        }],
+        {
+          system: true, kind: 'discord-send-failed', channelId: failure.channelId, speaker,
+          ...(reason !== undefined ? { reason } : {}),
+          ...(textLen !== undefined ? { textLen } : {}),
+        } as MessageMetadata,
+      );
+    } catch (err) {
+      console.error(`[route-failure] failed to tell the primary that ${speaker}'s reply to ${failure.channelId} failed:`, err);
+    }
+  }
+
+  /**
+   * A channel as a notice names it: the label when the registry has one, since
+   * a bare snowflake is unresolvable for the agent (the 2026-07-21 incident
+   * read as "a stale artifact", not a live failure).
+   */
+  private channelForNotice(channelId: string | null): string {
+    if (!channelId) return 'the channel';
+    const label = this.channelRegistry?.getDescriptor(channelId)?.label;
+    return label && label !== channelId
+      ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
+      : channelId;
+  }
+
   private editMessage(id: MessageId, content: ContentBlock[]): void {
     const agent = this.primaryAgentName
       ? this.agents.get(this.primaryAgentName)
@@ -15716,28 +15953,25 @@ export class AgentFramework {
         // addMessage() alone does not request inference, so this never wakes
         // her (matching the `discord-send-failed-skip` gate intent: context
         // yes, wake no).
-        onRouteFailure: ({ channelId, reason, textLen }) => {
+        onRouteFailure: ({ conversationId, channelId, reason, textLen }) => {
           try {
-            // Render a human-readable channel name when we can — a bare
-            // snowflake in the marker is unresolvable for the agent (the
-            // 2026-07-21 incident read as "a stale artifact", not a live
-            // failure). The marker is `system: true`, so it is never
-            // conversational and never influences routing.
-            const label = channelId
-              ? this.channelRegistry?.getDescriptor(channelId)?.label
-              : undefined;
-            const where = channelId
-              ? label && label !== channelId
-                ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
-                : channelId
-              : 'the channel';
+            // The marker is `system: true`, so it is never conversational and
+            // never influences routing.
+            const metadata: MessageMetadata = { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason, textLen };
+            if (!this.agents.has(conversationId)) {
+              // Released before its delivery failed: no window left to read it.
+              this.passFailedReplyToPrimary(conversationId, metadata);
+              return;
+            }
+            // A registered speaker's notice is addressed to it (noticeTargetFor).
             this.addMessage(
               'user',
               [{
                 type: 'text',
-                text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${where} (${reason}). It was saved to your archive but the human did not receive it.`,
+                text: `[discord-send-failed] Your previous reply (${textLen} chars) could not be delivered to ${this.channelForNotice(channelId)} (${reason}). It was saved to your archive but the human did not receive it.`,
               }],
-              { system: true, kind: 'discord-send-failed', channelId: channelId ?? '', reason },
+              metadata,
+              { forAgent: conversationId },
             );
           } catch (err) {
             console.error('onRouteFailure: failed to record send-failure marker:', err);
