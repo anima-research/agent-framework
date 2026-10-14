@@ -464,6 +464,27 @@ test('the next decision about an answered channel ends its answer', async () => 
   }
 });
 
+test("an answer still in flight when the agent decides about its channel marks nothing", async () => {
+  const origin = { kind: 'agent' as const, agentName: 'sol' };
+  // Once with no decision on record, and once over the agent's own earlier
+  // close, where closing again keeps the record as it was.
+  for (const closedBefore of [false, true]) {
+    let release!: () => void;
+    const held = new Promise<{ delivered: boolean }>((resolve) => { release = () => resolve({ delivered: true }); });
+    const { registry } = makeRegistry(held as unknown as { delivered: boolean });
+    seedRegistered(registry, 'discord', 'dm', 'lobby');
+    if (closedBefore) await registry.handleChannelToolCall('channel_close', { channelId: 'dm' }, origin);
+    const speaking = registry.routeSpeech('sol', 'answering', 'dm');
+    // The same round closes the channel while the publish is in flight.
+    assert.equal((await registry.handleChannelToolCall('channel_close', { channelId: 'dm' }, origin)).success, true);
+    release();
+    assert.ok(await speaking, 'the answer is still delivered');
+    registry.handleIncoming('discord', incoming('lobby', 'elsewhere'));
+    registry.notePushDelivered('discord', 'dm', 'm2', undefined, ['chat:dm', 'chat:addressed']);
+    assert.equal(registry.getDefaultPublishChannel(), 'lobby', `the close stands (closed before: ${closedBefore})`);
+  }
+});
+
 test('resolveSendTarget names the channel a send went to and guesses nothing', async () => {
   const { registry, openCalls } = makeRegistry({ delivered: true });
   const added = (id: string, raw: string) => ({

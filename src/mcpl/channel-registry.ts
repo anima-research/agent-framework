@@ -688,6 +688,12 @@ export class ChannelRegistry {
      *  and nothing has decided about it since. */
     answered?: true;
   }>();
+  /** Decisions about channels' desired state so far, and each channel's
+   *  latest, so an answer still in flight when a decision about its channel
+   *  is made marks nothing (noteAnswered's `decidedSince`). Every call that
+   *  decides counts, one that keeps the record as it was included. */
+  private decisionCount = 0;
+  private lastDecisionAt = new Map<string, number>();
 
   /** One-time migration inputs from the retired recipe auto-open policy. */
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
@@ -1957,6 +1963,7 @@ export class ChannelRegistry {
     source: string,
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
+    this.lastDecisionAt.set(key, ++this.decisionCount);
     const current = this.desiredStates.get(key);
     let recorded = source;
     if (current?.state === desired) {
@@ -1981,6 +1988,12 @@ export class ChannelRegistry {
     });
   }
 
+  /** How many decisions about channels' desired state the registry has
+   *  taken: read before a publish or a send, and passed to noteAnswered after. */
+  decisionSequence(): number {
+    return this.decisionCount;
+  }
+
   /**
    * The agent's speech, or a send tool's call, delivered into this channel
    * while it was closed. Speaking never opens a channel, but where the
@@ -1989,14 +2002,18 @@ export class ChannelRegistry {
    * moves the most recent inbound channel (notePushDelivered), as an open
    * channel's channels/incoming does. Kept on the desired-state record, so it
    * survives a restart, until the next decision about the channel: an open,
-   * a close, a decline or a tune-out. It runs after a delivered publish, so a
-   * store that fails to record it is logged, not thrown: the publish stands,
-   * and the mark holds until this process ends.
+   * a close, a decline or a tune-out. A decision made while the answer was
+   * in flight, after `decidedSince` (decisionSequence() taken before it was
+   * sent), stands too: the answer marks nothing, as when the agent closes a
+   * channel in the same round it answers there. It runs after a delivered
+   * publish, so a store that fails to record it is logged, not thrown: the
+   * publish stands, and the mark holds until this process ends.
    */
-  noteAnswered(channelId: string, serverId: string): void {
+  noteAnswered(channelId: string, serverId: string, decidedSince: number): void {
     const entry = this.channels.get(`${serverId}:${channelId}`);
     if (!entry || entry.open) return;
     const key = this.lifecycleKey(serverId, channelId);
+    if ((this.lastDecisionAt.get(key) ?? 0) > decidedSince) return;
     const current = this.desiredStates.get(key);
     if (current?.answered || current?.state === 'tuned-out') return;
     const state = current?.state ?? 'closed';
@@ -2059,6 +2076,7 @@ export class ChannelRegistry {
     source: string,
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
+    this.lastDecisionAt.set(key, ++this.decisionCount);
     this.desiredStates.set(key, {
       state: 'tuned-out',
       source,
@@ -2092,6 +2110,7 @@ export class ChannelRegistry {
     const current = this.desiredStates.get(key);
     if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
     const ended = { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
+    this.lastDecisionAt.set(key, ++this.decisionCount);
     this.desiredStates.set(key, { state: nextState, source });
     this.appendLifecycleEvent({
       kind: 'desired-state',
@@ -3189,6 +3208,7 @@ export class ChannelRegistry {
       channelId,
       content: [{ type: 'text', text }],
     };
+    const decidedSince = this.decisionCount;
     const result = await server.sendChannelsPublish(publishParams);
     const delivered = (result as { delivered?: boolean } | undefined)?.delivered ?? true;
     // Surface the posted message's id (ChannelsPublishResult.messageId) so
@@ -3205,7 +3225,7 @@ export class ChannelRegistry {
     }
     // Answering a closed channel leaves it closed, and where a turn with no
     // trigger speaks still follows the agent there (noteAnswered).
-    if (!entry.open) this.noteAnswered(channelId, entry.serverId);
+    if (!entry.open) this.noteAnswered(channelId, entry.serverId, decidedSince);
 
     console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${logValue(channelId)} (server=${entry.serverId}, delivered=${delivered})`);
     this.emitTraceFn({

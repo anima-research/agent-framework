@@ -19,9 +19,11 @@
     agent: a message pushed from a channel it answered while the channel was closed moves the
     most recent inbound channel, as an open channel's `channels/incoming` does. That holds across
     a restart, until the next decision about the channel (an open, a close, a decline or a
-    tune-out). For a DM, every message of which reaches the agent, that is as before. An answered
-    guild channel's messages that don't address the agent no longer arrive, so only those that do
-    move it. A push from a closed channel the agent never answered moves nothing, as before.
+    tune-out). A decision made while the answer is still in flight, such as a close in the same
+    round, stands too: the answer marks nothing. For a DM, every message of which reaches the
+    agent, that is as before. An answered guild channel's messages that don't address the agent no
+    longer arrive, so only those that do move it. A push from a closed channel the agent never
+    answered moves nothing, as before.
   - **What else changes:** the subscription-policy notice's last sentence and `channel_close`'s
     description now say that a channel the agent closes stays closed until it opens it with
     `channel_open`, and that neither speaking there nor policy reopens it. The closed-channel
@@ -41,12 +43,14 @@
     after a restart, and now stays closed until the agent opens it.
 - **Direct `ChannelRegistry` consumers:** `openIfClosedForSend()` is removed.
   `resolveSendTarget(channelId, serverId?)` returns the descriptor id of the channel a send went
-  to, from a composite or raw id, and opens nothing. `noteAnswered(channelId, serverId)` and
+  to, from a composite or raw id, and opens nothing. `decisionSequence()`,
+  `noteAnswered(channelId, serverId, decidedSince)` and
   `notePushDelivered(serverId, channelId, messageId?, threadId?, tags?)` are new: `routeSpeech`
-  and the framework's send path call the first when the agent answers a closed channel, and the
-  framework's push lane calls the second when it accepts a push. A module's `channel_close` with
-  an unknown machine source is now refused even when the channel is already closed. The
-  coalescer's host can observe each occurrence it admits afresh (`accepted`).
+  and the framework's send path read the first before they publish and call the second when the
+  agent answers a closed channel, and the framework's push lane calls the third when it accepts
+  a push. A module's `channel_close` with an unknown machine source is now refused even when the
+  channel is already closed. The coalescer's host can observe each occurrence it admits afresh
+  (`accepted`).
   `onChannelAutoOpened` reports only `source: 'subscription-policy'`, and its `conversationId` is
   gone. The `mcpl:channel-opened-by-send` and `mcpl:channel-open-failed` traces are no longer
   emitted. A `desired-state` record in the channel lifecycle log can carry `answered: true`;

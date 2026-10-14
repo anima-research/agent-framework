@@ -17646,6 +17646,9 @@ export class AgentFramework {
       }
     }
 
+    // Decisions about channels taken while the call is in flight, such as the
+    // agent's channel_close in the same round, outrank the answer it makes.
+    const decidedSince = this.channelRegistry?.decisionSequence() ?? 0;
     server.sendToolsCall(toolName, args, stateParams)
       .then(async (result) => {
         // RFC-005: register references and eagerly fetch the small ones
@@ -17695,7 +17698,7 @@ export class AgentFramework {
             engaged.add(engagedChannel);
             // A closed channel stays closed, and where a turn with no trigger
             // speaks still follows the agent there.
-            this.channelRegistry.noteAnswered(engagedChannel, serverId);
+            this.channelRegistry.noteAnswered(engagedChannel, serverId, decidedSince);
           }
         }
 

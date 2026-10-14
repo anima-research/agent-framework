@@ -26,10 +26,13 @@ async function harness() {
   // Every channels/open attempt, including one the server refuses.
   const opens: Array<{ channelId?: string }> = [];
   let refuseOpens = false;
+  // While set, the send's result waits for it.
+  let hold: Promise<void> | null = null;
   const server = {
     id: 'discord',
     grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
     async sendToolsCall() {
+      if (hold) await hold;
       // discord-mcpl's send tools answer with the posted message and the raw channel id.
       return { content: [{ type: 'text', text: JSON.stringify({ messageId: 'm9', channelId: '444555' }) }] };
     },
@@ -95,6 +98,7 @@ async function harness() {
   return {
     registry, opens, windowMessages, reply,
     setRefuseOpens: (v: boolean) => { refuseOpens = v; },
+    setHold: (p: Promise<void> | null) => { hold = p; },
   };
 }
 
@@ -154,4 +158,20 @@ test('a reply_message into a tuned-out channel leaves the tune-out in place', as
   assert.equal(registry.getDesiredState('discord', channelId), 'tuned-out', 'the tune-out stands');
   assert.equal(opens.length, opensBefore, 'the send sent no channels/open');
   assert.deepEqual(windowMessages, [], 'no notice says the channel opened');
+});
+
+test('a reply_message still in flight when the agent closes its channel marks nothing', async () => {
+  const { registry, reply, setHold } = await harness();
+  assert.equal((await registry.handleChannelToolCall('channel_open', { channelId }, origin)).success, true);
+  let release!: () => void;
+  setHold(new Promise<void>((resolve) => { release = resolve; }));
+  const replying = reply();
+  // The same round closes the channel while the reply is in flight.
+  assert.equal((await registry.handleChannelToolCall('channel_close', { channelId }, origin)).success, true);
+  release();
+  const { success } = await replying;
+  assert.equal(success, true);
+  assert.equal(registry.isChannelOpen(channelId), false, 'the channel stays closed');
+  registry.notePushDelivered('discord', channelId, 'm2', undefined, ['chat:mention']);
+  assert.equal(registry.getDefaultPublishChannel(), null, 'the close, made while the reply was in flight, stands');
 });
