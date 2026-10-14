@@ -160,6 +160,11 @@ interface WireRecord {
    *  which can fail the call before the transport's own 404 error reaches it. */
   sessionEnded?: boolean;
   /**
+   * The last `Last-Event-ID` a resume of this call's stream carried, kept
+   * for a later resume that lost it (see observedFetch).
+   */
+  lastEventId?: string;
+  /**
    * The call's own abort, given to the SDK, which cancels the call when it
    * fires: at the call's deadline, or as soon as the stream that would carry
    * the current leg's answer ends unanswered and can't be resumed (see
@@ -542,9 +547,10 @@ interface HttpObservations {
   firstOpenFailed: boolean;
   /**
    * The signal the standalone stream's GETs carry: the transport's own,
-   * taken from its first open. A request stream's resume carries another, its
-   * request's signal combined with the transport's, so this tells the two
-   * apart when both resume with `Last-Event-ID`.
+   * taken from its first open, the first GET without `Last-Event-ID`. A
+   * request stream's resume carries another, its request's signal combined
+   * with the transport's, so this tells the two apart, with `Last-Event-ID`
+   * or without it.
    */
   standaloneSignal?: AbortSignal | null;
 }
@@ -1066,9 +1072,9 @@ export class ModernMcpConnection extends EventEmitter {
    *   no longer serves this session a stream, as the SDK's 2026 handler
    *   answers a 2025 session it now serves statelessly, or refuses. The
    *   connection negotiates again. A first open's 405 says only that the
-   *   server offers no stream, so it changes nothing.
-   * Each of these three marks the session ended at once (`http.ended`), so
-   * it gets no DELETE: the server has let it go.
+   *   server offers no stream, so it changes nothing. Each of these three,
+   *   the 404, the -32022 and the 405, marks the session ended at once
+   *   (`http.ended`), so it gets no DELETE: the server has let it go.
    * - The standalone stream opening again, after it had opened, without
    *   `Last-Event-ID`: it couldn't ask for what it missed, whether because
    *   the server's events carry no ids or because the stream that dropped
@@ -1076,6 +1082,15 @@ export class ModernMcpConnection extends EventEmitter {
    *   stream). See {@link streamReopened}. A GET that carries one resumes a
    *   stream, the standalone one or a request's, and the server replays
    *   what that stream missed.
+   * - A request's stream resumed without `Last-Event-ID`. The SDK keeps a
+   *   stream's last event id only for that stream, so once a resumed
+   *   stream that carried no new id is cut too, it resumes without one
+   *   (modelcontextprotocol/typescript-sdk#2499), which the server would
+   *   take for a second standalone stream. The resume runs in its call's
+   *   wire scope, the request's own async chain, so the call's record keeps
+   *   the last id its resumes carried and supplies it then. An id the SDK
+   *   sends itself is left as it is. With no record in scope, the GET goes
+   *   as it is.
    * - A standalone resume the server refuses with 400, as one does for an
    *   event id it no longer holds: retrying the same id can't succeed, and
    *   the SDK would retry it for the session's life. The stream opens again
@@ -1092,10 +1107,22 @@ export class ModernMcpConnection extends EventEmitter {
       const session = sessionOf();
       const http = session.http!;
       const method = (init?.method ?? 'GET').toUpperCase();
-      const resuming = headers.has('last-event-id');
-      const firstOpen = method === 'GET' && !resuming && !http.streamOpened;
-      if (firstOpen && http.standaloneSignal === undefined) http.standaloneSignal = init?.signal ?? null;
-      const standalone = method === 'GET' && (!resuming || (http.standaloneSignal != null && init?.signal === http.standaloneSignal));
+      let resuming = headers.has('last-event-id');
+      if (method === 'GET' && !resuming && http.standaloneSignal === undefined) http.standaloneSignal = init?.signal ?? null;
+      const standalone = method === 'GET' && (init?.signal ?? null) === http.standaloneSignal;
+      if (method === 'GET' && !standalone) {
+        // A request's stream resumed, in its call's scope: keep the id it
+        // carries, or give back the last one when the SDK lost it (#2499).
+        const record = wireScope.getStore();
+        if (resuming) {
+          if (record) record.lastEventId = headers.get('last-event-id')!;
+        } else if (record?.lastEventId !== undefined) {
+          headers.set('last-event-id', record.lastEventId);
+          init = { ...init, headers };
+          resuming = true;
+        }
+      }
+      const firstOpen = standalone && !http.streamOpened;
       let response: Response;
       let retried = false;
       if (firstOpen) ({ response, retried } = await this.firstOpen(session, url, init));
