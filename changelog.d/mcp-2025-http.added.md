@@ -19,7 +19,9 @@
     reopen without one, or one whose id the server refused with 400, relists
     the tools of a server that announces list changes.
   - **A request's stream** that the server closes after a priming event is
-    resumed for as long as the request lives.
+    resumed for as long as the request lives. A call whose stream ends
+    unanswered with nothing to resume from fails then, as `no-response`,
+    not at its deadline.
   - **A session the server ends** (HTTP 404 to a request carrying its id):
     a call whose POST met the 404 fails as `error-response` with
     `data.httpStatus` 404, and isn't replayed; a call whose stream was cut is
@@ -30,24 +32,29 @@
     follows `reconnect`, and the backoff keeps growing until a session
     answers, with a session id or without one.
   - **A server upgraded in place** to `2026-07-28` is followed: a 400
-    carrying JSON-RPC `-32022` to any request, or a 405 to the standalone
-    stream's reopen after it had opened, ends the session as a 404 does, and
-    the new connect negotiates afresh. These are how the SDK's 2026 handler
-    answers 2025 traffic it refuses (`legacy: 'reject'`) or serves
-    statelessly (its default). A call refused with `-32022` fails as
+    carrying JSON-RPC `-32022` to any request, or a 405 to a GET for one of
+    the session's streams after the server had served it (the standalone
+    stream's reopen, or a request stream's resume), ends the session as a
+    404 does, and the new connect negotiates afresh. These are how the SDK's
+    2026 handler answers 2025 traffic it refuses (`legacy: 'reject'`) or
+    serves statelessly (its default). A call refused with `-32022` fails as
     `error-response` with the server's code and data, and isn't replayed. A
     connection that never had a standalone stream, to a server that serves
-    2025 statelessly, stays on 2025 until its next connect.
+    2025 statelessly, stays on 2025 until its next connect, unless the
+    upgrade cut a call's stream, whose resume then meets the 405.
   - **A `DELETE`** ends each session the server holds by its id when the
     connection lets it go, waiting at most 3 s: at `close()`, a connect in
     flight included, and when a connect fails after its `initialize` was
-    answered. A session the server ended with 404 gets none.
+    answered. A session the server let go, with a 404, a `-32022` or such a
+    405, gets none.
   - **Results** are final: a result that fails the tool's output schema is a
     plain error, as on `2026-07-28`, not an unknown outcome.
 - **On `2026-07-28` over HTTP**, a dropped stream's retries take the same
   timing as on a 2025 revision: the server's `retry` hint first, and the
-  connection's backoff after a failed try. They still stop after two, so a
-  listen stream that can't be resumed is reopened, with a relist.
+  connection's backoff after a failed try. They stop after two failed tries,
+  the SDK's default, on every stream: a listen stream that can't be resumed
+  is reopened, with a relist, and a call whose stream can't be resumed fails
+  then, as `no-response`, rather than at its deadline.
 - **`McplProtocolVersionError` over HTTP** names the revisions each side
   speaks, and `offered` is the list this client offered: `['2024-11-05']`
   from the legacy engine, `['2026-07-28']` from a modern stdio server, and
