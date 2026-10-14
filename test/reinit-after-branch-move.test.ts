@@ -454,6 +454,35 @@ describe('after a branch move, every agent on the store compiles without a resta
     await reinitDone();
   });
 
+  it("an undo's re-initialization waits for maintenance already running before any manager re-initializes", async () => {
+    checkpointTurn();
+    // A maintenance pass in flight: one the test settles.
+    let settle!: () => void;
+    const pass = new Promise<void>((resolve) => { settle = resolve; });
+    const fw = framework as unknown as { maintenancePass: Promise<void> | null };
+    fw.maintenancePass = pass;
+    const calls: string[] = [];
+    for (const name of ['a', 'b']) {
+      const cm = cmOf(name) as unknown as { setStrategy: (s: unknown) => Promise<void> };
+      const setStrategy = cm.setStrategy.bind(cm);
+      cm.setStrategy = (strategy: unknown) => { calls.push(name); return setStrategy(strategy); };
+    }
+    try {
+      framework.undoLastTurn('a');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(calls, [], 'no manager re-initializes while the pass runs');
+      settle();
+      fw.maintenancePass = null;
+      await reinitDone();
+      assert.deepEqual(calls.sort(), ['a', 'b']);
+    } finally {
+      settle();
+      fw.maintenancePass = null;
+    }
+    await works('a');
+    await works('b');
+  });
+
   it("a rollback whose restore fails too reports the named agent's manager", async () => {
     const a = cmOf('a') as unknown as { initializeStrategy: (...args: unknown[]) => Promise<void> };
     const initializeStrategy = a.initializeStrategy;
