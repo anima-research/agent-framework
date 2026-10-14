@@ -78,6 +78,9 @@ interface Fixture {
   getAnswers: number[];
   /** The same for GETs that resume a stream (with Last-Event-ID). */
   resumeAnswers: number[];
+  /** Hold every GET without Last-Event-ID unanswered, as a slow network
+   *  holds the stream's first open, until the returned function is called. */
+  holdGets(): () => void;
   /** Forget every session, as a restarted server has. With `cut`, also end
    *  their streams, as a restart's lost connections do. */
   forget(cut: boolean): Promise<void>;
@@ -173,6 +176,7 @@ async function start2025(opts: {
   const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
   const getAnswers: number[] = [];
   const resumeAnswers: number[] = [];
+  let held: Promise<void> | undefined;
   const eventStore = opts.resumable ? memoryEventStore() : undefined;
   const server = createHttpServer(async (req, res) => {
     const chunks: Buffer[] = [];
@@ -190,6 +194,7 @@ async function start2025(opts: {
     res.writeHead = ((status: number, ...rest: unknown[]) => { entry.status = status; return writeHead(status, ...rest); }) as never;
     if (req.method === 'POST' && message && opts.answer?.(message, res)) return;
     if (req.method === 'GET') {
+      if (!resumed && held) await held;
       const status = resumed ? resumeAnswers.shift() : getAnswers.shift() ?? opts.get;
       if (status === 0) {
         req.socket.destroy();
@@ -236,6 +241,14 @@ async function start2025(opts: {
     sessions,
     getAnswers,
     resumeAnswers,
+    holdGets() {
+      let release!: () => void;
+      held = new Promise<void>((resolve) => { release = resolve; });
+      return () => {
+        held = undefined;
+        release();
+      };
+    },
     async forget(cut: boolean) {
       const live = [...sessions.values()];
       sessions.clear();
@@ -415,6 +428,26 @@ test('a request stream resumed while the first open waits to try again leaves th
   // The open after its failed try relists; the call's resume doesn't.
   assert.equal(changes, 1);
   assert.deepEqual(fixture.seen.filter((s) => s.method === 'GET' && !s.resumed).map((s) => s.status), [503, 200]);
+});
+
+test('a request stream resumed before the first open is answered leaves that open a first one: it relists nothing', async () => {
+  const fixture = await start2025({ versions: ['2025-11-25'], resumable: { retryMs: 50 } });
+  const release = fixture.holdGets();
+  const connection = await connect(fixture);
+  let changes = 0;
+  connection.on('tools-list-changed', () => changes++);
+  await until(() => fixture.seen.some((s) => s.method === 'GET' && !s.resumed), 'the first open sent, and held');
+  const calling = connection.callTool('slow', { ms: 150 });
+  await until(() => fixture.events.includes('slow-start'), 'the call running');
+  const callId = fixture.seen.find((s) => s.rpc === 'tools/call')!.id;
+  fixture.sessions.get(sessionOf(connection)!)!.closeSSEStream(callId as never);
+  await calling; // its answer came on the resumed stream
+  assert.ok(fixture.seen.some((s) => s.method === 'GET' && s.resumed && s.status === 200), 'the call\'s stream resumed');
+  release();
+  await until(() => count(fixture, (s) => s.method === 'GET' && !s.resumed && s.status === 200) === 1, 'the standalone stream open');
+  await sleep(100);
+  // It opened at its first try, so it is no reopen, whatever the call's stream did meanwhile.
+  assert.equal(changes, 0);
 });
 
 for (const status of [408, 409, 500, 502, 504, 507, 522, 0]) {
