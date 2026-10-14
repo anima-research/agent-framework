@@ -21,6 +21,23 @@
   as before. A publish that fails, times out or isn't confirmed is never
   streamed. A `{{unsent}}` resend streams the retained text it sends,
   rather than the token.
+- A call made inside a foreground `code_execution` script now counts
+  toward its round's routing, as the same call made directly does (#306).
+  In explicit mode an inner `skip_reply` keeps the round's envelopes in the
+  context. In locus and hybrid mode an inner `skip_reply` suppresses the
+  round's prose, and an inner silencing send suppresses it and the turn's
+  later prose. An inner `think` under the private same-round policy holds
+  the round back in every mode. A round that calls `code_execution` is
+  routed once those calls have returned, so its prose goes out when the
+  script finishes rather than when it starts. The turn's locus and an
+  explicit round's `>>` targets are still taken when the round ends, at its
+  tool-calls event; hybrid's `>>>` targets apply as its delivery runs, as
+  for any queued hybrid delivery. A background script's call returns as
+  soon as the script has started, and its later calls aren't the round's. A
+  round whose turn ends or stops waiting on it, or that a newer round of
+  the same agent replaces, before its scripts return, as when the turn is
+  stopped, is withheld: a log line names it, and the turn's delivery
+  receipt counts it as suppressed.
 - Every stream now sends `channels/outgoing/complete` for each channel it
   streamed to, on every exit path, as MCPL Spec 14.3 asks: once its
   deliveries have run, or, when the host stops, at once, with what it has

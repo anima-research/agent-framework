@@ -640,6 +640,33 @@ interface ProseRound {
   onPublished?: SpeechPublished;
 }
 
+/**
+ * A round that called `code_execution`, waiting for those calls to return
+ * before its prose is routed: a foreground script's own calls count as the
+ * round's, so a `skip_reply` or a send inside the script silences the round
+ * as a direct call does (AgentFramework.scriptRounds).
+ */
+interface ScriptRound {
+  /** The agent and stream that dispatched the round. */
+  agent: Agent;
+  streamId: number;
+  /** Each of the round's code_execution calls, with the tools its foreground script has called so far, in order. */
+  scripts: Map<string, string[]>;
+  /** The round's code_execution calls whose results haven't arrived. */
+  pending: Set<string>;
+  /** Routes the round's prose; called once, when its last code_execution result arrives. */
+  route: () => void;
+  /**
+   * Withholds the round's prose when its routing can't be decided: before
+   * its scripts returned, its stream ended or no longer waits on it, or a
+   * newer round of the same agent name replaced it. Whether a script would
+   * have silenced the round is unknown. A log line names it, and the turn's
+   * delivery receipt counts its segments as suppressed: a turn that a later
+   * stream continues writes its receipt after the withhold.
+   */
+  withhold: (why: string) => void;
+}
+
 function isTurnContinuation(reason: string): boolean {
   return reason === 'context_budget_restart' || reason === 'tool_results_ready'
     || reason === 'tool_result_guard_retry';
@@ -1966,8 +1993,12 @@ export class AgentFramework {
    *  result marks the script that made the call, and is applied to that
    *  script's code_execution result instead of cancelling the stream
    *  mid-script (which would wedge the turn). A stopped script's late result
-   *  marks only that script, never the agent's next one. */
-  private scriptDeferredEndTurn: Map<string, { endTurn: boolean }> = new Map();
+   *  marks only that script, never the agent's next one. `calls` records
+   *  each tool the script calls, for its round's routing (ScriptRound). */
+  private scriptDeferredEndTurn: Map<string, { endTurn: boolean; calls: string[] }> = new Map();
+  /** Per agent, a round that called code_execution and waits for those calls'
+   *  results before its prose is routed (ScriptRound). */
+  private scriptRounds: Map<string, ScriptRound> = new Map();
   /** RFC-007: per agent, the origin of the foreground script its runner is
    *  executing, handed to that script's inner calls (scripts run one at a
    *  time per runner). Background runners capture theirs in the closure. */
@@ -8495,6 +8526,10 @@ export class AgentFramework {
       // itself is never sent, only whether it was an error.
       this.toolLifecycleEmitter?.onResult(event.agentName, event.callId, event.result);
 
+      // A code_execution result: once its round has them all, the round's
+      // prose is routed, before anything here can end or continue the turn.
+      this.settleScriptRound(event.agentName, event.callId);
+
       const agent = this.agents.get(event.agentName);
       if (agent) {
         this.touchEphemeralRun(event.agentName, true);
@@ -12169,17 +12204,6 @@ export class AgentFramework {
 
             agent.enterWaitingForTools(event.calls, stream);
 
-            for (const call of event.calls) {
-              // RFC-007: register at the one dispatch point for model-issued
-              // calls, keyed by (agent, call id) with this inference's id;
-              // `started` goes out once dispatch returns. Refusal sites inside
-              // dispatch run synchronously and call refuse() first, so a call
-              // the host refuses produces no events.
-              this.toolLifecycleEmitter?.register(agent.name, outgoingInferenceId, call);
-              this.dispatchToolCall(agent.name, call);
-              this.toolLifecycleEmitter?.open(agent.name, call.id);
-            }
-
             // Speak-while-acting: route THIS round's prose to the locus NOW
             // instead of batching every segment to the end of the turn. Long
             // tool-using turns (robot control, live sessions) otherwise dump
@@ -12191,80 +12215,140 @@ export class AgentFramework {
             // from the round it occurs (see SILENCING_TOOLS). Only rounds
             // with verbatim roundContent are live-routed (see liveProseRouting
             // note above — the fallback preamble is cumulative in XML mode).
-            if (this.channelRegistry) {
-              const roundToolNames = event.calls.map((c) => c.name);
+            //
+            // The round's tool names decide whether its prose goes out, so a
+            // round that calls code_execution is routed once those calls have
+            // returned: a foreground script's own calls count as the round's,
+            // and a skip_reply or a send inside the script silences the round
+            // as a direct call does (ScriptRound). Its prose then goes out
+            // when the script finishes. A background script's call returns as
+            // soon as the script has started. The turn's locus and an
+            // explicit round's admitted targets are taken now, at the round's
+            // tool-calls event, so a re-pin or a renamed label while a script
+            // runs doesn't move them. Hybrid's `>>>` targets, sticky pin and
+            // hold apply as its delivery runs, as for any queued hybrid
+            // delivery.
+            const roundToolNames = event.calls.map((c) => c.name);
+            const liveRound = !!this.channelRegistry && !!roundContent && roundContent.length > 0;
+            if (liveRound) liveProseRouting = true;
+            const roundSegments = liveRound ? splitProseSegments(assistantBlocks) : [];
+            const roundLocus = resolveTurnLocus();
+            // An explicit round is admitted as it ends: its targets are
+            // resolved once, for its queued delivery.
+            const roundAdmitted = turnProseRouting === 'explicit'
+              ? roundSegments.map((seg) => this.admitProse(seg))
+              : [];
+            const routeRound = (toolNames: string[]): void => {
+              if (!this.channelRegistry) return;
               const hasSameRoundPrivateThink =
-                roundToolNames.includes('think') &&
+                toolNames.includes('think') &&
                 requestSnapshot.sameRoundThinkTextPolicy === 'private';
-              if (roundToolNames.some(isSilencingTool)) {
+              if (toolNames.some(isSilencingTool)) {
                 turnSilenced = true;
               }
-              if (roundContent && roundContent.length > 0) {
-                liveProseRouting = true;
-                const roundSegments = splitProseSegments(assistantBlocks);
-                if (roundSegments.length > 0) {
-                  if (turnProseRouting === 'disabled') {
-                    console.error(
-                      `[routing] ${agent.name}: mid-turn prose NOT routed (proseRouting=disabled)`,
-                    );
-                    this.recordProseSuppression(streamRouting, roundSegments.length);
-                  } else if (turnProseRouting === 'hybrid') {
-                    if (turnSilenced) {
-                      this.recordProseSuppression(streamRouting, roundSegments.length);
-                    } else if (!hasSameRoundPrivateThink) {
-                      const locus = resolveTurnLocus();
-                      // Queued under this turn's routing, whenever it posts.
-                      const routing = streamRouting;
-                      for (const seg of roundSegments) {
-                        chainSpeech(() => this.deliverHybridProse(agent, seg, locus, true, routing, streamSpeech), 'mid-turn hybrid prose delivery failed:');
-                      }
-                    }
-                  } else if (turnProseRouting === 'explicit') {
-                    // Explicit mode: the segments go through the prose
-                    // gateway, unless a private think in the round holds them
-                    // back. Send silencing does not apply: unprefixed prose
-                    // bounces, and prefixed prose is deliberate. skip_reply
-                    // does: its round's envelopes all stay in the context
-                    // (deliverProseEnvelope's keepPrivate), as the tool
-                    // promises, and skip_reply then ends the turn at this
-                    // round's tool results.
-                    if (!hasSameRoundPrivateThink) {
-                      const keepPrivate = roundToolNames.some((n) => bareToolName(n) === 'skip_reply');
-                      // The round is admitted now: its targets are resolved
-                      // once, for its queued delivery.
-                      const admitted = roundSegments.map((seg) => this.admitProse(seg));
-                      // Queued under this turn's routing, whenever it posts.
-                      const routing = streamRouting;
-                      console.error(
-                        `[prose] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway${keepPrivate ? ', kept private (skip_reply)' : ''}`,
-                      );
-                      for (const envelopes of admitted) {
-                        chainSpeech(() => this.deliverAdmittedProse(agent, envelopes, { keepPrivate, routing, onPublished: streamSpeech }), 'mid-turn prose delivery failed:');
-                      }
-                    }
-                  } else if (turnSilenced) {
-                    console.error(
-                      `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (turn silenced)`,
-                    );
-                    // Visible in the turn-end receipt — silencing must never
-                    // be a silent black hole (n=8: the flying-scene reply).
-                    this.recordProseSuppression(streamRouting, roundSegments.length);
-                  } else if (hasSameRoundPrivateThink) {
-                    console.error(
-                      `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
-                    );
-                  } else {
-                    const locus = resolveTurnLocus();
-                    console.error(
-                      `[routing] ${agent.name}: mid-turn round [${roundToolNames.join(', ')}] -> routing ${roundSegments.length} prose segment(s) live -> ${locus ?? '(default)'}`,
-                    );
-                    for (const seg of roundSegments) {
-                      enqueueSpeech(seg, locus);
-                    }
+              if (roundSegments.length === 0) return;
+              if (turnProseRouting === 'disabled') {
+                console.error(
+                  `[routing] ${agent.name}: mid-turn prose NOT routed (proseRouting=disabled)`,
+                );
+                this.recordProseSuppression(streamRouting, roundSegments.length);
+              } else if (turnProseRouting === 'hybrid') {
+                if (turnSilenced) {
+                  this.recordProseSuppression(streamRouting, roundSegments.length);
+                } else if (!hasSameRoundPrivateThink) {
+                  // Queued under this turn's routing, whenever it posts.
+                  const routing = streamRouting;
+                  for (const seg of roundSegments) {
+                    chainSpeech(() => this.deliverHybridProse(agent, seg, roundLocus, true, routing, streamSpeech), 'mid-turn hybrid prose delivery failed:');
                   }
                 }
+              } else if (turnProseRouting === 'explicit') {
+                // Explicit mode: the segments go through the prose gateway,
+                // unless a private think in the round holds them back. Send
+                // silencing does not apply: unprefixed prose bounces, and
+                // prefixed prose is deliberate. skip_reply does: its round's
+                // envelopes all stay in the context (deliverProseEnvelope's
+                // keepPrivate), as the tool promises, and skip_reply then
+                // ends the turn at this round's tool results.
+                if (!hasSameRoundPrivateThink) {
+                  const keepPrivate = toolNames.some((n) => bareToolName(n) === 'skip_reply');
+                  // Queued under this turn's routing, whenever it posts.
+                  const routing = streamRouting;
+                  console.error(
+                    `[prose] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> ${roundSegments.length} segment(s) via prose gateway${keepPrivate ? ', kept private (skip_reply)' : ''}`,
+                  );
+                  for (const envelopes of roundAdmitted) {
+                    chainSpeech(() => this.deliverAdmittedProse(agent, envelopes, { keepPrivate, routing, onPublished: streamSpeech }), 'mid-turn prose delivery failed:');
+                  }
+                }
+              } else if (turnSilenced) {
+                console.error(
+                  `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (turn silenced)`,
+                );
+                // Visible in the turn-end receipt — silencing must never
+                // be a silent black hole (n=8: the flying-scene reply).
+                this.recordProseSuppression(streamRouting, roundSegments.length);
+              } else if (hasSameRoundPrivateThink) {
+                console.error(
+                  `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> prose NOT routed (same_round_think_text_policy=private)`,
+                );
+              } else {
+                console.error(
+                  `[routing] ${agent.name}: mid-turn round [${toolNames.join(', ')}] -> routing ${roundSegments.length} prose segment(s) live -> ${roundLocus ?? '(default)'}`,
+                );
+                for (const seg of roundSegments) {
+                  enqueueSpeech(seg, roundLocus);
+                }
               }
+            };
+            const scriptCallIds = event.calls
+              .filter((c) => c.name === CODE_EXECUTION_TOOL_NAME)
+              .map((c) => c.id);
+            if (scriptCallIds.length > 0) {
+              // In place before dispatch, so a foreground script records
+              // its calls here from its first one.
+              const round: ScriptRound = {
+                agent,
+                streamId: myStreamId,
+                scripts: new Map(scriptCallIds.map((id) => [id, []])),
+                pending: new Set(scriptCallIds),
+                route: () => {
+                  // Only while this stream still owns the agent and waits on
+                  // the round: a turn replaced, reset or cancelled meanwhile
+                  // can't finish deciding it.
+                  if (this.agents.get(agent.name) !== agent || agent.streamId !== myStreamId
+                    || agent.state.status !== 'waiting_for_tools') {
+                    round.withhold('its turn no longer waits on it (replaced, reset or stopped) while its scripts ran');
+                    return;
+                  }
+                  routeRound([...roundToolNames, ...[...round.scripts.values()].flat()]);
+                },
+                withhold: (why) => {
+                  if (roundSegments.length === 0) return;
+                  console.error(
+                    `[routing] ${agent.name}: round [${roundToolNames.join(', ')}] -> ${roundSegments.length} prose segment(s) withheld: ${why}`,
+                  );
+                  this.recordProseSuppression(streamRouting, roundSegments.length);
+                },
+              };
+              // A round still waiting under this name can't be decided now:
+              // a newer round displaces it.
+              this.scriptRounds.get(agent.name)?.withhold('a newer round replaced it before its scripts returned');
+              this.scriptRounds.set(agent.name, round);
             }
+
+            for (const call of event.calls) {
+              // RFC-007: register at the one dispatch point for model-issued
+              // calls, keyed by (agent, call id) with this inference's id;
+              // `started` goes out once dispatch returns. Refusal sites inside
+              // dispatch run synchronously and call refuse() first, so a call
+              // the host refuses produces no events.
+              this.toolLifecycleEmitter?.register(agent.name, outgoingInferenceId, call);
+              this.dispatchToolCall(agent.name, call);
+              this.toolLifecycleEmitter?.open(agent.name, call.id);
+            }
+
+            if (scriptCallIds.length === 0) routeRound(roundToolNames);
             // Stream's async iterator blocks on next() until provideToolResults() is called
             break;
           }
@@ -13336,6 +13420,16 @@ export class AgentFramework {
       // exhausted, abort) so it never sticks after the turn ends.
       if (frameReachedTerminal) this.channelRegistry?.stopTyping();
 
+      // A round of this stream still waiting for its code_execution calls
+      // can't be routed now: whether its scripts would have silenced it is
+      // unknown, so its prose is withheld, as text whose routing is
+      // undecided is.
+      const unsettled = this.scriptRounds.get(agent.name);
+      if (unsettled?.agent === agent && unsettled.streamId === myStreamId) {
+        this.scriptRounds.delete(agent.name);
+        unsettled.withhold('its stream ended before its scripts returned');
+      }
+
       // Spec 14.3: once the deliveries this stream queued have run, close
       // each channel it streamed to with everything it sent there, the
       // consumer's signal to finalize (end the TTS utterance, settle the
@@ -13735,6 +13829,18 @@ export class AgentFramework {
   }
 
   /**
+   * A model-issued tool's result has arrived. When it answers the last of
+   * the code_execution calls a round waits on (ScriptRound), the round's
+   * prose is routed now, its scripts' calls counted.
+   */
+  private settleScriptRound(agentName: string, callId: string): void {
+    const round = this.scriptRounds.get(agentName);
+    if (!round || !round.pending.delete(callId) || round.pending.size > 0) return;
+    this.scriptRounds.delete(agentName);
+    round.route();
+  }
+
+  /**
    * Run one code_execution script for an agent. Never rejects.
    *
    * The script runs in the agent's persistent python interpreter with every
@@ -13834,9 +13940,10 @@ export class AgentFramework {
 
     const runner = this.getOrCreateScriptRunner(agentName);
     // A busy runner refuses this exec; the running script keeps its mark and
-    // its origin.
+    // its origin. The script records the tools it calls where its round
+    // reads them (ScriptRound), when a round dispatched it.
     const ownsRunner = !runner.busy;
-    const script = { endTurn: false };
+    const script = { endTurn: false, calls: this.scriptRounds.get(agentName)?.scripts.get(call.id) ?? [] };
     if (ownsRunner) this.scriptDeferredEndTurn.set(agentName, script);
     const ownsOrigin = origin !== undefined && ownsRunner;
     if (ownsOrigin) this.foregroundScriptOrigins.set(agentName, origin);
@@ -14390,11 +14497,14 @@ export class AgentFramework {
     args: Record<string, unknown>,
     origin?: ScriptCallOrigin,
     /** The foreground script that made the call; none for a background script. */
-    script?: { endTurn: boolean },
+    script?: { endTurn: boolean; calls: string[] },
   ): Promise<string> {
     if (toolName === CODE_EXECUTION_TOOL_NAME) {
       return 'Error: code_execution cannot be called from within a script';
     }
+    // The call counts toward its round's routing however it turns out, as a
+    // direct call does.
+    script?.calls.push(toolName);
     const result = await this.dispatchScriptToolCall(agentName, toolName, args, origin);
     if (result.endTurn && script) {
       // Deferred: applied to the final code_execution result (see
