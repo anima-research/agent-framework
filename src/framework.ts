@@ -7977,6 +7977,9 @@ export class AgentFramework {
           state.again = false;
           failures = await this.reinitializeManagers();
         } while (state.again);
+        // No move joins once the last pass is done: an undo or redo made from
+        // a listener of the report below meets the hold alone and is refused.
+        if (this.syncMoveReinit === state) this.syncMoveReinit = null;
         this.reportReinitFailures(state.after, failures);
       } finally {
         if (this.syncMoveReinit === state) this.syncMoveReinit = null;

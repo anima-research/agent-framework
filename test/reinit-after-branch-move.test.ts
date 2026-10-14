@@ -499,4 +499,75 @@ describe('after a branch move, every agent on the store compiles without a resta
     assert.equal(alerts.length, 1, JSON.stringify(reinitAlerts()));
     assert.match(alerts[0]!.message, /The restore to main moved the store's branch/);
   });
+
+  it("a redo made from a listener of the last pass's alert is refused as busy, and every manager ends current", async () => {
+    checkpointTurn();
+    // b's next initialization fails, so the undo's pass reports an alert.
+    const strategy = cmOf('b').getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+    const initialize = strategy.initialize.bind(strategy);
+    let failNext = true;
+    strategy.initialize = async (...args: unknown[]) => {
+      if (failNext) { failNext = false; throw new Error('injected initialization failure'); }
+      return initialize(...args);
+    };
+    // A trace listener that redoes, synchronously, when it hears that alert.
+    let redo: unknown = 'not called';
+    framework.onTrace((event) => {
+      if (event.type === 'ops:alert' && event.kind === 'context-reinit-failed' && redo === 'not called') {
+        try { redo = framework.redo('a'); } catch (error) { redo = error; }
+      }
+    });
+    const undone = framework.undoLastTurn('a');
+    await reinitDone();
+    assert.ok(
+      redo instanceof OperatorActionError && redo.code === 'agent-busy' && /Cannot redo: the store is under live undo for a/.test(redo.message),
+      `the redo was refused: ${redo instanceof Error ? redo.message : JSON.stringify(redo)}`,
+    );
+    assert.equal(framework.getStore().currentBranch().name, undone.toBranch, 'the store stays where the undo left it');
+    assert.equal(internals().surgeryHold, null);
+    await works('a');
+  });
+});
+
+describe('conversation forks and an undo', () => {
+  type ForkInternals = Internals & {
+    createConversationAgent(name: string, channelId: string): Promise<{ getContextManager(): ContextManager }>;
+  };
+
+  it("a fork created while an undo's managers re-initialize waits for them, and compiles", async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'reinit-fork-'));
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'store'),
+      membrane: new MockMembrane().asMembrane(),
+      agents: [
+        { name: 'a', model: 'test-model', systemPrompt: 'You are a.', strategy: autobiographical() },
+        { name: 'b', model: 'test-model', systemPrompt: 'You are b.', strategy: autobiographical() },
+      ],
+      modules: [],
+      conversations: { templateAgent: 'a', bind: { channel: 'mention' }, strategyFactory: () => autobiographical() },
+    });
+    try {
+      const internals = framework as unknown as ForkInternals;
+      const cmA = framework.getAgent('a')!.getContextManager();
+      cmA.addMessage('user', [{ type: 'text', text: 'hello a' }]);
+      const sequenceBefore = framework.getStore().currentSequence();
+      cmA.addMessage('user', [{ type: 'text', text: 'a turn to undo' }]);
+      internals.saveTurnCheckpoints('a', [{ agentName: 'a', turnIndex: 1, sequenceBefore, branchName: 'main', timestamp: Date.now() }]);
+      // The template's re-initialization takes 300 ms, so a fork that didn't
+      // wait would be seeded from it mid-initialization.
+      const strategy = cmA.getStrategy() as unknown as { initialize: (...args: unknown[]) => Promise<void> };
+      const initialize = strategy.initialize.bind(strategy);
+      strategy.initialize = async (...args: unknown[]) => {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        return initialize(...args);
+      };
+      assert.equal(framework.undoLastTurn('a').undone, true);
+      assert.ok(internals.syncMoveReinit, 'the re-initialization is running');
+      const fork = await internals.createConversationAgent('a-chan-g1', 'world:chan');
+      await fork.getContextManager().compile({ maxTokens: 100_000, reserveForResponse: 1_000 }, undefined, { dryRun: true });
+    } finally {
+      await framework.stop();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });
