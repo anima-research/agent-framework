@@ -276,25 +276,40 @@ describe('durable wake intent recovery', () => {
     await framework.stop();
   });
 
-  it('failed Framework.create leaves a due intent in the journal', async () => {
+  it('failed Framework.create after restore leaves overdue and future intents durable and no timer live', async () => {
     const now = Date.now();
     const configPath = join(TMP_DIR, 'gate.json');
     const journalPath = join(TMP_DIR, 'gate.wake-intents.json');
     writeFileSync(journalPath, JSON.stringify({
       version: 1,
       sleep: { agentName: 'agent', armedAt: now - 10_000, wakeAt: now - 1_000, source: 'sleep' },
-      selfWakes: [],
+      selfWakes: [{ agentName: 'agent', armedAt: now, wakeAt: now + 60_000, source: 'skip_reply' }],
     }));
-    const membrane = new MockMembrane();
-    await assert.rejects(AgentFramework.create({
-      storePath: join(TMP_DIR, 'failed-store'),
-      membrane: membrane.asMembrane(),
-      agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }],
-      modules: [], gate: { configPath },
-      toolResultInlineMaxChars: 10, // validated after gate construction
-    }), /toolResultInlineMaxChars/);
+    let restoredGate: EventGate | undefined;
+    const originalRestore = EventGate.prototype.restoreWakeIntents;
+    EventGate.prototype.restoreWakeIntents = function () { restoredGate = this; return originalRestore.call(this); };
+    try {
+      await assert.rejects(AgentFramework.create({
+        storePath: join(TMP_DIR, 'failed-store'), membrane: new MockMembrane().asMembrane(),
+        agents: [{ name: 'agent', model: 'test-model', systemPrompt: 'test' }], modules: [],
+        gate: { configPath },
+        mcplServers: [
+          { id: 'one', command: 'unused', args: [], toolPrefix: 'dup' },
+          { id: 'two', command: 'unused', args: [], toolPrefix: 'dup' },
+        ],
+      }), /toolPrefix.*collides/);
+    } finally {
+      EventGate.prototype.restoreWakeIntents = originalRestore;
+    }
     const state = JSON.parse(readFileSync(journalPath, 'utf8'));
-    assert.ok(state.sleep, 'failed create must not consume the due wake');
+    assert.ok(state.sleep, 'failed create must not consume the overdue wake');
+    assert.strictEqual(state.selfWakes.length, 1, 'failed create must keep the future wake');
+    const internals = restoredGate as unknown as {
+      sleepTimer: ReturnType<typeof setTimeout> | null;
+      selfWakeTimers: Map<string, ReturnType<typeof setTimeout>>;
+    };
+    assert.strictEqual(internals.sleepTimer, null);
+    assert.strictEqual(internals.selfWakeTimers.size, 0, 'failed create disposes restored timers');
   });
 
   it('quarantines a corrupt journal instead of overwriting it', () => {
@@ -332,16 +347,32 @@ describe('durable wake intent recovery', () => {
     h.gate.dispose();
   });
 
-  it('autoRecover lets standalone embedders restore during construction', () => {
+  it('skips out-of-range and backwards journal timestamps', () => {
     writeFileSync(join(TMP_DIR, 'gate.wake-intents.json'), JSON.stringify({
-      version: 1, sleep: { agentName: 'agent', armedAt: 1, wakeAt: 60_000, source: 'sleep' }, selfWakes: [],
+      version: 1,
+      sleep: { agentName: 'agent', armedAt: 0, wakeAt: -1e20, source: 'sleep' },
+      selfWakes: [{ agentName: 'agent', armedAt: 10, wakeAt: 9, source: 'skip_reply' }],
+    }));
+    const h = harness(() => 100);
+    assert.strictEqual(h.gate.getSleepState(), null);
+    assert.strictEqual((h.gate as unknown as { selfWakeIntents: Map<string, unknown> }).selfWakeIntents.size, 0);
+    h.gate.dispose();
+  });
+
+  it('autoRecover plus explicit recovery arms one self-wake timer', () => {
+    writeFileSync(join(TMP_DIR, 'gate.wake-intents.json'), JSON.stringify({
+      version: 1,
+      selfWakes: [{ agentName: 'agent', armedAt: 1, wakeAt: 60_000, source: 'skip_reply' }],
     }));
     const gate = new EventGate({
       configPath: join(TMP_DIR, 'gate.json'), now: () => 1_000, autoRecover: true,
       emitTrace: () => {}, addMessage: () => '', requestInference: () => {}, getAgentNames: () => ['agent'],
     });
-    assert.strictEqual(gate.getSleepState()!.until, 60_000);
+    gate.recoverWakeIntents();
+    const timers = (gate as unknown as { selfWakeTimers: Map<string, unknown> }).selfWakeTimers;
+    assert.strictEqual(timers.size, 1);
     gate.dispose();
+    assert.strictEqual(timers.size, 0);
   });
 
   it('constructor with no journal performs no wake-journal write', () => {
@@ -396,13 +427,15 @@ describe('durable wake intent recovery', () => {
 describe('wake recovery startup ordering', () => {
   it('AgentFramework.create recovers wake intent before MCPL initialization', async () => {
     const order: string[] = [];
-    const gateProto = EventGate.prototype as unknown as { recoverWakeIntents(): void };
+    const gateProto = EventGate.prototype as unknown as { restoreWakeIntents(): void; admitOverdueWakeIntents(): void };
     const frameworkProto = AgentFramework.prototype as unknown as {
       initializeMcpl(configs: unknown[], routing?: unknown): Promise<void>;
     };
-    const originalRecover = gateProto.recoverWakeIntents;
+    const originalRestore = gateProto.restoreWakeIntents;
+    const originalAdmit = gateProto.admitOverdueWakeIntents;
     const originalMcpl = frameworkProto.initializeMcpl;
-    gateProto.recoverWakeIntents = function () { order.push('recover'); };
+    gateProto.restoreWakeIntents = function () { order.push('restore'); };
+    gateProto.admitOverdueWakeIntents = function () { order.push('admit'); };
     frameworkProto.initializeMcpl = async function () { order.push('mcpl'); };
     const dir = join(TMP_DIR, 'ordering');
     try {
@@ -412,10 +445,11 @@ describe('wake recovery startup ordering', () => {
         gate: { configPath: join(dir, 'gate.json') },
         mcplServers: [{ id: 'fixture', command: 'unused', args: [] }],
       });
-      assert.deepStrictEqual(order, ['recover', 'mcpl']);
+      assert.deepStrictEqual(order, ['restore', 'mcpl', 'admit']);
       await framework.stop();
     } finally {
-      gateProto.recoverWakeIntents = originalRecover;
+      gateProto.restoreWakeIntents = originalRestore;
+      gateProto.admitOverdueWakeIntents = originalAdmit;
       frameworkProto.initializeMcpl = originalMcpl;
     }
   });
@@ -440,5 +474,48 @@ describe('wake recovery startup ordering', () => {
     const state = JSON.parse(readFileSync(join(TMP_DIR, 'gate.wake-intents.json'), 'utf8'));
     assert.ok(state.sleep, 'durable due intent remains for next startup');
     gate.dispose();
+  });
+});
+
+describe('wake durability receipts', () => {
+  it('setSleep and armSelfWake report a failed journal write without dropping live timers', () => {
+    const gate = makeGate().gate;
+    (gate as unknown as { persistWakeState(): void }).persistWakeState = () => { throw new Error('disk full'); };
+    const sleepResult = gate.setSleep(60, undefined, 'agent');
+    const wakeResult = gate.armSelfWake('agent', 60);
+    assert.strictEqual(sleepResult.durable, false);
+    assert.strictEqual(wakeResult.durable, false);
+    const internals = gate as unknown as {
+      sleepTimer: ReturnType<typeof setTimeout> | null;
+      selfWakeTimers: Map<string, ReturnType<typeof setTimeout>>;
+    };
+    assert.ok(internals.sleepTimer);
+    assert.strictEqual(internals.selfWakeTimers.size, 1);
+    gate.dispose();
+  });
+
+  it('quiesced create restores overdue intent without admitting it', async () => {
+    const now = Date.now();
+    const dir = join(TMP_DIR, 'quiesced-create');
+    mkdirSync(join(dir, 'recovery'), { recursive: true });
+    const configPath = join(dir, 'gate.json');
+    const journalPath = join(dir, 'gate.wake-intents.json');
+    writeFileSync(journalPath, JSON.stringify({
+      version: 1,
+      sleep: { agentName: 'agent', armedAt: now - 10_000, wakeAt: now - 1_000, source: 'sleep' },
+      selfWakes: [],
+    }));
+    const storePath = join(dir, 'store');
+    const hostModePath = join(dir, 'host-mode.json');
+    writeFileSync(hostModePath, JSON.stringify({ version: 1, quiesced: true, since: now }));
+    const framework = await AgentFramework.create({
+      storePath, hostModePath, membrane: new MockMembrane().asMembrane(),
+      agents: [{ name: 'agent', model: 'test', systemPrompt: 'test' }], modules: [],
+      gate: { configPath },
+    });
+    const state = JSON.parse(readFileSync(journalPath, 'utf8'));
+    assert.ok(state.sleep, 'quiesced create leaves overdue wake durable');
+    assert.equal((framework as unknown as { pendingRequests: unknown[] }).pendingRequests.length, 0);
+    await framework.stop();
   });
 });
