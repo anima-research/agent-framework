@@ -2554,7 +2554,7 @@ export class AgentFramework {
     framework.toolPatternChecksArmed = true;
     framework.checkToolPatterns();
 
-    framework.eventGate?.admitOverdueWakeIntents();
+    if (!framework.quiesced) framework.eventGate?.admitOverdueWakeIntents();
     return framework;
     } catch (error) {
       framework.eventGate?.dispose();
@@ -4631,6 +4631,7 @@ export class AgentFramework {
       );
     }
 
+    this.eventGate?.admitOverdueWakeIntents();
     const releasedRequests = this.pendingRequests.length;
     // In-memory first: addMessage must stop deferring so the flush below can
     // land. The DURABLE flag is cleared only after the flush completes — a
