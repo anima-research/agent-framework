@@ -19,6 +19,14 @@ import type {
   StoredMessage,
   TokenBudget,
 } from '@animalabs/context-manager';
+import {
+  bodyGroupRun,
+  bodyRangeIn,
+  locateMessageIndex,
+  locateMessageIndices,
+  removeStoredMessage,
+  removeStoredMessages,
+} from './stored-removal.js';
 import type {
   FrameworkConfig,
   InferencePolicy,
@@ -769,6 +777,23 @@ function logSeedOmissions(
   );
 }
 
+/**
+ * A maintenance provider call withdrawn because a surgery holds the store. It
+ * sent nothing: it was refused at the provider gate, or woken there from its
+ * wait. context-manager counts no attempt for it. A merge keeps its queue
+ * entry, so the next tick after the hold does it again. A chunk's
+ * compression has already left the queue: it logs "Failed to compress chunk
+ * (hierarchical)" with this error and records the call, and the chunk, still
+ * uncompressed, is queued again at that manager's next rebuild (its next
+ * initialization, message, sent compile or released hold).
+ */
+class MaintenanceWithdrawnError extends Error {
+  constructor(hold: { verb: string; agentName: string }) {
+    super(`maintenance call withdrawn: a live ${hold.verb} for ${hold.agentName} holds the store`);
+    this.name = 'MaintenanceWithdrawnError';
+  }
+}
+
 class DiscordAwarenessAccountingError extends Error {
   constructor(operation: string, cause: unknown) {
     const detail = cause instanceof Error ? cause.message : String(cause);
@@ -877,6 +902,28 @@ export class ResumeBlockedError extends Error {
   }
 }
 
+/**
+ * How `runEphemeralToCompletion` rejects when a retryable provider failure
+ * states a wait the run won't sleep: one longer than an ephemeral run sleeps
+ * in its turn (600 s), an infinite one, or one that is `NaN`. The run ends at
+ * once, without retrying inside the wait, and every other ending of the run
+ * rejects with a plain `Error`. `retryAfterMs` is the wait as the provider
+ * stated it, in milliseconds, so `Infinity` or `NaN` in those two cases: a
+ * host that schedules a rerun from it handles a value that isn't finite, and
+ * one past the 2,147,483,647 ms a timer can hold. The message says the same
+ * in words. A host can test `instanceof` or the `name`, which also holds for
+ * an error from another copy of this package.
+ */
+export class ProviderWaitNotSleptError extends Error {
+  constructor(
+    message: string,
+    readonly retryAfterMs: number,
+  ) {
+    super(message);
+    this.name = 'ProviderWaitNotSleptError';
+  }
+}
+
 interface RedoEntry {
   branchName: string;
   checkpoint: TurnCheckpoint;
@@ -897,72 +944,6 @@ class DefaultInferencePolicy implements InferencePolicy {
   ): boolean {
     return requests.some((r) => r.agentName === agentName);
   }
-}
-
-/** Minimal read surface the live-surgery helpers need from a ContextManager. */
-interface SurgeryReadableCm {
-  getMessageCount(): number;
-  getMessageWindow(
-    offset: number,
-    limit: number,
-    opts?: { resolveBlobs?: boolean; alignToBodyGroups?: boolean },
-  ): { messages: Array<{ id: unknown; bodyGroupId?: string }>; startIndex: number };
-}
-
-const SURGERY_SCAN_WINDOW = 500;
-
-/**
- * Slot index of `messageId` on the active branch, or -1. Scans from the tail
- * in blob-free windows: operator targets are almost always recent, and a
- * full `getAllMessages()` re-inflates every attachment on the branch.
- */
-function locateMessageIndex(cm: SurgeryReadableCm, messageId: string): number {
-  const hit = locateMessageIndices(cm, new Set([messageId])).get(messageId);
-  return hit ? hit.index : -1;
-}
-
-/** Tail-first scan resolving many ids at once; stops as soon as all are found. */
-function locateMessageIndices(
-  cm: SurgeryReadableCm,
-  ids: Set<string>,
-): Map<string, { index: number; bodyGroupId?: string }> {
-  const found = new Map<string, { index: number; bodyGroupId?: string }>();
-  const total = cm.getMessageCount();
-  for (let end = total; end > 0 && found.size < ids.size; end -= SURGERY_SCAN_WINDOW) {
-    const start = Math.max(0, end - SURGERY_SCAN_WINDOW);
-    const { messages, startIndex } = cm.getMessageWindow(start, end - start, { resolveBlobs: false });
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const id = String(messages[i].id);
-      if (ids.has(id) && !found.has(id)) {
-        found.set(id, {
-          index: startIndex + i,
-          ...(messages[i].bodyGroupId ? { bodyGroupId: messages[i].bodyGroupId } : {}),
-        });
-      }
-    }
-  }
-  return found;
-}
-
-/**
- * Inclusive slot range of the body-group run containing `index` (the slot
- * itself when it is not sharded). Delegates to the store's own
- * `alignToBodyGroups` edge walk — one contiguity assumption, not two.
- */
-function bodyGroupRun(
-  cm: SurgeryReadableCm,
-  index: number,
-): { from: number; to: number; fromId: string; toId: string; group: boolean } {
-  const win = cm.getMessageWindow(index, 1, { alignToBodyGroups: true, resolveBlobs: false });
-  const from = win.startIndex;
-  const to = win.startIndex + win.messages.length - 1;
-  return {
-    from,
-    to,
-    fromId: String(win.messages[0].id),
-    toId: String(win.messages[win.messages.length - 1].id),
-    group: win.messages[0].bodyGroupId !== undefined,
-  };
 }
 
 function describeMarkers(m: SurgeryMarkerReceipt): string {
@@ -1534,18 +1515,19 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  *
  * 400 and 422 are how a provider answers a request that fails its
  * validation, as a history it can't accept does, but other refusals come
- * back the same way, such as Anthropic's 400 for a credit balance that's too
- * low. A 413 is the request's size. When the newest exchange made it too
- * large, as an oversized attachment does, shedding that exchange may bring
- * the request back under the limit, and nothing else in the framework
- * recovers a 413; when the history as a whole is too large, the shed doesn't
- * help, and the breaker stops at its rewind cap. The 413 arm takes both
- * labels a 413 arrives under, invalid_request and context_length, because
- * membrane's label for a 413 differs by version and adapter. Other statuses
- * keep the history, since shed history can't be got back and the status
- * gives no sign that a shed would help: a 404 is a model or an endpoint that
- * doesn't exist, and 405, 409, 410 and 415 are about the HTTP request or the
- * resource, as a rule, rather than the conversation.
+ * back the same way, such as a refusal of the account that membrane doesn't
+ * recognize by its text. A 413 is the request's size. When the newest
+ * exchange made it too large, as an oversized attachment does, shedding that
+ * exchange may bring the request back under the limit, and nothing else in
+ * the framework recovers a 413; when the history as a whole is too large,
+ * the shed doesn't help, and the breaker stops at its rewind cap. The 413 arm
+ * takes both labels membranes have given a 413, invalid_request and
+ * context_length (see the notes below). Other statuses keep the history,
+ * since a shed takes the exchange out of the agent's context, which only an
+ * operator's undo brings back, and the status gives no sign that a shed
+ * would help: a 404 is a model or an endpoint that doesn't exist, and 405,
+ * 409, 410 and 415 are about the HTTP request or the resource, as a rule,
+ * rather than the conversation.
  *
  * The table test in test/inference-exhaustion-rewind.test.ts is this
  * predicate's contract. The notes below on which membrane version gives which
@@ -1560,13 +1542,24 @@ function boundFailureFields(record: Record<string, unknown>): Record<string, unk
  *   adapter files every status it doesn't list (404, 405, 409, 410, 413,
  *   415, 422 …) as invalid_request, so it alone produces an invalid_request
  *   at 413 or 422, and no 0.5.86 adapter produces a context_length at 413.
- * - From membrane #56 (merged, not yet in a release), one table serves every
- *   adapter. Auth codes and context overflow are checked on a 400 or 422
- *   first, a 404 is invalid_request, a 413 is context_length, and other 4xx
- *   are invalid_request. So a 413 still sheds, an Anthropic one included,
- *   while a context_length at 400 or 422, a token overflow, keeps the
- *   history. The 422 arm then also covers an OpenAI-compatible server, such
- *   as a FastAPI one, that answers a validation failure with 422.
+ * - From membrane 0.5.87 (membrane #56 and #107), this package's floor, every
+ *   adapter sends an HTTP failure through one status table
+ *   (errorFromProviderStatus). On a 400 or 422, auth codes and reasons and
+ *   the two account refusals it recognizes by their text (a balance too low,
+ *   usage limits reached) are auth, and a context overflow, by its code or
+ *   text, is context_length. A 401, 402 or 403 is auth, a 408 timeout, a 429
+ *   rate_limit, a 404 invalid_request and a 413 context_length; other 4xx
+ *   are invalid_request. So a 413 the table types sheds, an Anthropic one
+ *   included, while a context_length at 400 or 422, a token overflow, keeps
+ *   the history, and so does an account refusal, which is auth. An adapter
+ *   can type a failure before the table does, as Anthropic's does for a
+ *   gateway's aggregate error (server). A failure with no HTTP status takes
+ *   the status its provider code implies when the table knows the code, as
+ *   for Anthropic's mid-stream errors, and is otherwise typed from its
+ *   message, with no status. The 422 arm also covers an
+ *   OpenAI-compatible server, such as a FastAPI one, that answers a
+ *   validation failure with 422. The test of provider answers through the
+ *   table, beside the table test, pins how the two meet at the floor.
  *
  * An error with no status, from a membrane that reports none, keeps the rule
  * the breaker had before: the type alone.
@@ -1703,6 +1696,10 @@ export class AgentFramework {
   private maintenanceRunId = 0;
   private currentMaintenanceRun: ContextMaintenanceRun | null = null;
   private maintenanceHistory: ContextMaintenanceRun[] = [];
+  /** Each agent's last reported maintenance failure, its whole text and when
+   *  it was alerted, until its maintenance goes without one
+   *  (reportMaintenanceFailure). */
+  private maintenanceFailureReported = new Map<string, { text: string; at: number }>();
   private providerGates: Map<string, LocalProviderGate> = new Map();
   private providerAccelerationCooldowns: Map<string, ProviderAccelerationCooldown> = new Map();
   private providerAccelerationRecoveries: Map<string, ProviderAccelerationRecovery> = new Map();
@@ -1852,6 +1849,8 @@ export class AgentFramework {
    *  tick counts in the success log stop meaning anything. One kick per agent
    *  at a time; cleared when the kick settles (success or failure). */
   private overBudgetDrainInFlight: Set<string> = new Set();
+  /** The over-budget drain kicks running, which a branch move waits for as it waits for a maintenance pass. */
+  private overBudgetDrains = new Set<Promise<void>>();
   /** Per-agent current rewind episode: the single consolidated marker's id and
    *  how many turns have been shed so far. One marker per episode, updated in
    *  place (see updateRewindMarker); cleared when the episode ends. */
@@ -2975,13 +2974,20 @@ export class AgentFramework {
   private async withAuxiliaryAdmission<T>(agentName: string, run: () => Promise<T>, model?: string): Promise<T> {
     const gate = this.providerGate(agentName);
     this.refuseHeldProviderModel(agentName, model);
-    if (this.providerGateBlocked(agentName)) {
+    this.withdrawMaintenanceUnderSurgery();
+    // A parked call is woken when the gate opens, when stop() closes
+    // admission, or when a surgery takes the store; one woken while the gate
+    // is still closed parks again.
+    while (this.providerGateBlocked(agentName)) {
       gate.deferredAuxiliary++;
       try {
         await new Promise<void>((resolve) => gate.auxiliaryWaiters.push(resolve));
       } finally {
         gate.deferredAuxiliary = Math.max(0, gate.deferredAuxiliary - 1);
       }
+      if (this.providerAdmissionClosed) break;
+      // A surgery that took the store while this call was parked withdraws it.
+      this.withdrawMaintenanceUnderSurgery();
     }
     if (this.providerAdmissionClosed) {
       throw new Error(`Provider admission closed while stopping (${agentName})`);
@@ -3006,6 +3012,16 @@ export class AgentFramework {
       gate.auxiliaryInFlight = Math.max(0, gate.auxiliaryInFlight - 1);
       if (gate.auxiliaryInFlight === 0) for (const resolve of gate.idleWaiters.splice(0)) resolve();
     }
+  }
+  /**
+   * Maintenance makes no provider call while a surgery holds the store. The
+   * surgery waits for the maintenance work that is running before it moves
+   * the branch, so a call that parked at the gate would make it wait on
+   * whatever reopens the gate: the end of a cooldown, or the retry turn a
+   * cooldown queues, which the hold itself keeps from starting.
+   */
+  private withdrawMaintenanceUnderSurgery(): void {
+    if (this.surgeryHold) throw new MaintenanceWithdrawnError(this.surgeryHold);
   }
   private auxiliaryMembraneFor(agentName: string): Membrane {
     return this.membraneAdmitting((run, model) => this.withAuxiliaryAdmission(agentName, run, model));
@@ -3182,17 +3198,26 @@ export class AgentFramework {
     return undefined;
   }
   /** Why an ephemeral run ended instead of sleeping a provider's stated wait,
-   *  for its caller. */
-  private statedWaitNotSlept(error: Error): string {
-    const stated = isMembraneError(error) ? error.retryAfterMs : undefined;
+   *  for its caller: the text, and the wait itself, which its rejection
+   *  carries (ProviderWaitNotSleptError). */
+  private statedWaitNotSlept(error: Error): { error: string; statedWaitMs: number } {
+    // Called only after nonOwningProviderWait answered 'fail', which takes a
+    // numeric stated wait.
+    const stated = isMembraneError(error) && typeof error.retryAfterMs === 'number' ? error.retryAfterMs : Number.NaN;
     const cap = `${PROVIDER_ACCELERATION_MAX_COOLDOWN_MS / 1000} s`;
-    if (typeof stated !== 'number' || Number.isNaN(stated)) {
-      return `${error.message} (the provider's stated wait is not a number, and an ephemeral run sleeps only a ` +
-        `stated wait of ${cap} or less, so it ends now)`;
+    if (Number.isNaN(stated)) {
+      return {
+        error: `${error.message} (the provider's stated wait is not a number, and an ephemeral run sleeps only a ` +
+          `stated wait of ${cap} or less, so it ends now)`,
+        statedWaitMs: Number.NaN,
+      };
     }
     const asked = Number.isFinite(stated) ? `${Math.ceil(stated / 1000)} s` : 'longer than can be represented';
-    return `${error.message} (the provider asked to wait ${asked}; an ephemeral run doesn't sleep a stated wait ` +
-      `longer than ${cap}, so it ends now)`;
+    return {
+      error: `${error.message} (the provider asked to wait ${asked}; an ephemeral run doesn't sleep a stated wait ` +
+        `longer than ${cap}, so it ends now)`,
+      statedWaitMs: stated,
+    };
   }
   /**
    * A compile refused for budget (#304): hold the turn while compression makes
@@ -3552,6 +3577,7 @@ export class AgentFramework {
    * `after` runs once the kick ends, the one already running if there is one.
    */
   private kickOverBudgetDrain(agentName: string, agent: Agent, after?: () => void): void {
+    if (this.surgeryHold) return;
     if (after) {
       const waiting = this.overBudgetDrainAfter.get(agentName);
       if (waiting) waiting.push(after);
@@ -3559,17 +3585,24 @@ export class AgentFramework {
     }
     if (this.overBudgetDrainInFlight.has(agentName)) return;
     this.overBudgetDrainInFlight.add(agentName);
-    void (async () => {
+    const drain = (async () => {
       let ticks = 0;
       try {
         const cm = agent.getContextManager();
-        while (ticks < 8) {
+        while (ticks < 8 && !this.surgeryHold) {
           await cm.tick();
           ticks++;
         }
-        console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks)`);
+        console.error(
+          `[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks` +
+            `${ticks < 8 ? ', stopped while a surgery holds the store' : ''})`,
+        );
       } catch (err) {
-        console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
+        if (err instanceof MaintenanceWithdrawnError) {
+          console.error(`[inference-failed] drain kicked for ${agentName} (OverBudget breaker, ${ticks} ticks, stopped: ${err.message})`);
+        } else {
+          console.error(`[inference-failed] drain kick failed for ${agentName} after ${ticks} ticks: ${describeFailureWithFrames(err)}`);
+        }
       } finally {
         this.overBudgetDrainInFlight.delete(agentName);
       }
@@ -3579,6 +3612,8 @@ export class AgentFramework {
         for (const run of waiting) run();
       }
     })();
+    this.overBudgetDrains.add(drain);
+    void drain.finally(() => { this.overBudgetDrains.delete(drain); });
   }
 
   /** When a hold's timer next fires: at its deadline, stepped past what one
@@ -3884,7 +3919,32 @@ export class AgentFramework {
     });
   }
 
+  /** resume()'s refusal while a surgery holds the store. */
+  private refuseResumeUnderSurgery(): void {
+    if (!this.surgeryHold) return;
+    throw new OperatorActionError(
+      'agent-busy',
+      `Cannot resume: a live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} holds the store — retry when it completes`,
+    );
+  }
+
+  /** Whether maintenance work is running: a pass, or an over-budget drain kick. */
+  private maintenanceRunning(): boolean {
+    return this.maintenancePass !== null || this.overBudgetDrains.size > 0;
+  }
+
+  /** Wait for the maintenance work that is running, whatever its outcome. */
+  private async settleMaintenancePass(): Promise<void> {
+    await Promise.allSettled([...(this.maintenancePass ? [this.maintenancePass] : []), ...this.overBudgetDrains]);
+  }
+
   private async runQueuedMaintenance(): Promise<void> {
+    // A surgery holds the store while it switches or forks a branch. No pass
+    // starts while it's held (the timer's next pass after it runs as usual),
+    // and a running pass starts no new tick. The surgery waits for that pass
+    // to finish before it moves the branch, so no maintenance work overlaps
+    // the move, and a failure a pass meets is never the surgery's doing.
+    if (this.surgeryHold) return;
     // A guard whose agent has left the map gets no activation to retry its
     // queue; retry it here. It leaves busyGuards once nothing of it is left.
     const live = new Set([...this.agents.values()].map((agent) => agent.toolResultGuard));
@@ -3896,32 +3956,66 @@ export class AgentFramework {
         console.error(`[tool-result-guard] agent=${name} storage retry failed during maintenance:`, error);
       }
     }
-    const queued = [...this.agents.values()].flatMap((agent) => {
+    for (const name of this.maintenanceFailureReported.keys()) {
+      if (!this.agents.has(name)) this.maintenanceFailureReported.delete(name);
+    }
+    type Queued = { agent: Agent; record: ContextMaintenanceAgentRun }
+      & ({ failed: true } | { failed: false; cm: ContextManager });
+    const queued = [...this.agents.values()].flatMap((agent): Queued[] => {
       try {
         agent.toolResultGuard.flushUnrecorded();
       } catch (error) {
         console.error(`[tool-result-guard] agent=${agent.name} storage retry failed during maintenance:`, error);
       }
-      const cm = agent.getContextManager();
-      const tools = this.compressionToolsForAgent(agent.name);
-      cm.setToolDefinitions(tools);
-      if (this.providerGateBlocked(agent.name)) return [];
-      if (cm.isReady()) return [];
-      const pending = cm.getPendingWork()?.description;
+      // Whatever throws while one agent's maintenance is prepared is that
+      // agent's failure, reported for it alone, while the others run.
+      const failedAgent = (error: unknown): Queued[] => {
+        const record: ContextMaintenanceAgentRun = {
+          agentName: agent.name,
+          startedAt: Date.now(),
+          ticks: 0,
+          readyBefore: false,
+        };
+        record.finishedAt = record.startedAt;
+        this.reportMaintenanceFailure(
+          agent.name,
+          record,
+          error instanceof Error ? String(error.message) : failureDescription(error),
+        );
+        return [{ agent, record, failed: true }];
+      };
+      let cm: ContextManager;
+      let state: ReturnType<AgentFramework['contextReadiness']>;
+      try {
+        cm = agent.getContextManager();
+        const tools = this.compressionToolsForAgent(agent.name);
+        cm.setToolDefinitions(tools);
+        if (this.providerGateBlocked(agent.name)) return [];
+        state = this.contextReadiness(cm);
+      } catch (error) {
+        return failedAgent(error);
+      }
+      if ('ready' in state && state.ready) {
+        this.maintenanceFailureReported.delete(agent.name);
+        return [];
+      }
       const progress = this.contextProgress(cm);
       const record: ContextMaintenanceAgentRun = {
         agentName: agent.name,
         startedAt: Date.now(),
         ticks: 0,
         readyBefore: false,
-        ...(pending ? { pendingBefore: pending } : {}),
+        ...('pending' in state && state.pending ? { pendingBefore: state.pending } : {}),
         ...(progress ? { progressBefore: progress } : {}),
       };
-      return [{
-        agent,
-        cm,
-        record,
-      }];
+      if ('error' in state) {
+        // Its readiness can't be read: that agent's failure, reported for it
+        // alone, while the others run.
+        record.finishedAt = Date.now();
+        this.reportMaintenanceFailure(agent.name, record, state.error);
+        return [{ agent, record, failed: true }];
+      }
+      return [{ agent, cm, record, failed: false }];
     });
     if (queued.length === 0) return;
 
@@ -3933,41 +4027,54 @@ export class AgentFramework {
     this.currentMaintenanceRun = run;
 
     try {
-      await Promise.all(queued.map(async ({ agent, cm, record }) => {
+      const running = queued.filter((item): item is Extract<Queued, { failed: false }> => !item.failed);
+      // Settled, not all: the pass ends only when every agent's work has.
+      const outcomes = await Promise.allSettled(running.map(async ({ agent, cm, record }) => {
+        // A tick whose provider call a surgery withdrew ends this agent's
+        // work for the pass, as the hold would have before its next tick: it
+        // is no failure, and what the failure reports remember stays as it is.
+        let withdrawn = false;
         try {
           for (
             let i = 0;
-            i < MAINTENANCE_TICKS_PER_PASS && this.running && !cm.isReady();
+            i < MAINTENANCE_TICKS_PER_PASS && this.running && !this.surgeryHold && !cm.isReady();
             i++
           ) {
             await cm.tick();
             record.ticks++;
           }
         } catch (error) {
-          const wholeError = error instanceof Error ? String(error.message) : failureDescription(error);
-          record.error = boundFailureText(wholeError);
-          console.error(`[context-maintenance] agent=${agent.name} failed:`, record.error);
-          this.opsAlert(
-            'context-maintenance-failed',
-            agent.name,
-            wholeError,
-            {
-              data: {
-                scope: 'agent',
-                ...(record.pendingBefore ? { pending: record.pendingBefore } : {}),
-                ...(record.progressBefore ? { progress: record.progressBefore } : {}),
-              },
-            },
-          );
+          if (error instanceof MaintenanceWithdrawnError) {
+            withdrawn = true;
+            console.error(`[context-maintenance] agent=${agent.name} stopped: ${error.message}`);
+          } else {
+            this.reportMaintenanceFailure(
+              agent.name,
+              record,
+              error instanceof Error ? String(error.message) : failureDescription(error),
+            );
+          }
         } finally {
-          const pending = cm.getPendingWork()?.description;
           record.finishedAt = Date.now();
-          record.readyAfter = cm.isReady();
-          if (pending) record.pendingAfter = pending;
+          const state = this.contextReadiness(cm);
+          if ('error' in state) {
+            // A run records an agent's first failure: a readiness refusal
+            // after a tick that failed is read again by the next pass.
+            if (record.error === undefined && !withdrawn) this.reportMaintenanceFailure(agent.name, record, state.error);
+          } else {
+            record.readyAfter = state.ready;
+            if (state.pending) record.pendingAfter = state.pending;
+            if (record.error === undefined && !withdrawn) this.maintenanceFailureReported.delete(agent.name);
+          }
           const progress = this.contextProgress(cm);
           if (progress) record.progressAfter = progress;
         }
       }));
+      for (const outcome of outcomes) {
+        if (outcome.status === 'rejected') {
+          console.error('[context-maintenance] reporting an agent\'s failure failed:', describeFailureWithFrames(outcome.reason));
+        }
+      }
     } finally {
       run.finishedAt = Date.now();
       run.agents.sort((a, b) => a.agentName.localeCompare(b.agentName));
@@ -3977,15 +4084,78 @@ export class AgentFramework {
     }
   }
 
+  /**
+   * One agent's maintenance failure: recorded on its run, bounded as every
+   * failure sink is (`record.error`), and logged and alerted for that agent
+   * with the whole text. A failure that lasts, such as a manager whose
+   * strategy failed to initialize, meets every pass, a few seconds apart:
+   * each run records it, and it is logged and alerted again only when its
+   * whole text changes, once opsAlert's cooldown for it has passed since the
+   * webhook last posted it (so the webhook, which posts a kind at most once
+   * per cooldown, hears a failure that lasts), or after a pass in which that
+   * agent's maintenance went without a failure (maintenanceFailureReported).
+   */
+  private reportMaintenanceFailure(agentName: string, record: ContextMaintenanceAgentRun, wholeError: string): void {
+    record.error = boundFailureText(wholeError);
+    const reported = this.maintenanceFailureReported.get(agentName);
+    const now = Date.now();
+    if (reported && reported.text === wholeError) {
+      // The same failure again is alerted once the webhook's cooldown for it
+      // has passed, counted from the webhook's last post of it: a report of
+      // changed text that the webhook didn't post doesn't push the reminder
+      // back. With no webhook, it's counted from this failure's last report.
+      const since = this.opsAlertLastSent.get(`${agentName}:context-maintenance-failed`) ?? reported.at;
+      if (now - since < this.opsAlertCooldownMs) return;
+    }
+    this.maintenanceFailureReported.set(agentName, { text: wholeError, at: now });
+    console.error(`[context-maintenance] agent=${agentName} failed:`, record.error);
+    this.opsAlert(
+      'context-maintenance-failed',
+      agentName,
+      wholeError,
+      {
+        data: {
+          scope: 'agent',
+          ...(record.pendingBefore ? { pending: record.pendingBefore } : {}),
+          ...(record.progressBefore ? { progress: record.progressBefore } : {}),
+        },
+      },
+    );
+  }
+
+  /**
+   * An agent's context readiness, or the error that reading it threw. The
+   * context manager refuses while its strategy's initialization is pending
+   * or has failed (context-manager 0.14), and a strategy can refuse on its
+   * own, as the autobiographical one does after a store-level branch switch
+   * it hasn't reloaded for. Every such throw is that agent's failure.
+   */
+  private contextReadiness(
+    cm: ContextManager,
+  ): { ready: boolean; pending?: string } | { error: string } {
+    try {
+      const ready = cm.isReady();
+      const pending = ready ? undefined : cm.getPendingWork()?.description;
+      return pending ? { ready, pending } : { ready };
+    } catch (error) {
+      return { error: error instanceof Error ? String(error.message) : failureDescription(error) };
+    }
+  }
+
+  /** The strategy's progress snapshot, for diagnostics: one it can't give reads as none. */
   private contextProgress(cm: ContextManager): Record<string, unknown> | undefined {
-    const strategy = cm.getStrategy() as {
-      getProgressSnapshot?: () => unknown;
-    };
-    if (typeof strategy.getProgressSnapshot !== 'function') return undefined;
-    const progress = strategy.getProgressSnapshot();
-    return progress && typeof progress === 'object'
-      ? progress as Record<string, unknown>
-      : undefined;
+    try {
+      const strategy = cm.getStrategy() as {
+        getProgressSnapshot?: () => unknown;
+      };
+      if (typeof strategy.getProgressSnapshot !== 'function') return undefined;
+      const progress = strategy.getProgressSnapshot();
+      return progress && typeof progress === 'object'
+        ? progress as Record<string, unknown>
+        : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -5036,22 +5206,41 @@ export class AgentFramework {
 
   private async runResume(opts?: { force?: boolean }): Promise<HostModeStatus> {
     if (!this.quiesced) return this.getHostModeStatus();
+    // A surgery switches or forks the branch while it holds the store, and a
+    // manager whose initialization that left pending refuses its settings
+    // read: resume once it's done, as the other operator calls do. Checked
+    // again after the waits below, since a surgery can take the store while
+    // resume waits for a pass or a preview.
+    this.refuseResumeUnderSurgery();
 
     // The canonical operator flow is `maintain; resume`, and a timer-driven
     // pass may still be mid-flight: previewContext refuses to overlap one
     // ("already running"), which used to degrade the gate to "no opinion".
     // Wait for the pass first, then retry a few times for the case where a
     // fresh pass started in between.
-    if (this.maintenancePass) {
-      await this.maintenancePass.catch(() => {});
-    }
+    if (this.maintenanceRunning()) await this.settleMaintenancePass();
     const failing: Array<{ agentName: string; preview: RuntimeSettingsPreview }> = [];
     for (const agentName of this.agents.keys()) {
-      let preview = this.previewAgentRuntimeSettings(agentName);
-      for (let attempt = 0; attempt < 8 && !preview.available && preview.reason === 'preview_in_flight'; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        if (this.maintenancePass) await this.maintenancePass.catch(() => {});
+      let preview: RuntimeSettingsPreview;
+      try {
         preview = this.previewAgentRuntimeSettings(agentName);
+        for (let attempt = 0; attempt < 8 && !preview.available && preview.reason === 'preview_in_flight'; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          if (this.maintenancePass) await this.maintenancePass.catch(() => {});
+          preview = this.previewAgentRuntimeSettings(agentName);
+        }
+      } catch (error) {
+        // The agent's settings can't be read, as when its context manager's
+        // strategy failed to initialize: that manager refuses its compiles and
+        // writes until a switchBranch or setStrategy succeeds, and maintenance
+        // reports it. The gate guards against an agent that would run over
+        // budget, and this one can't run, so it gets no verdict, as a preview
+        // that isn't available gets none, and resume goes on for the others.
+        console.warn(
+          `[host-mode] resume: ${agentName}'s settings can't be read ` +
+          `(${error instanceof Error ? error.message : String(error)}) — proceeding without a verdict for it`,
+        );
+        continue;
       }
       if (preview.available && preview.effective && !preview.effective.fits) {
         failing.push({ agentName, preview });
@@ -5062,6 +5251,7 @@ export class AgentFramework {
         );
       }
     }
+    this.refuseResumeUnderSurgery();
     // stop() closes the queue first. If it has begun, before this call or
     // during the waits above, leave the host quiesced, as it will boot,
     // rather than reopen what stop() is closing.
@@ -5447,6 +5637,13 @@ export class AgentFramework {
       console.warn('[host-mode] maintenanceTick: framework is not running — no pass executed');
       return { ...this.getContextMaintenanceSnapshot(), ran: false };
     }
+    if (this.surgeryHold) {
+      // No pass starts while a surgery holds the store (runQueuedMaintenance).
+      console.warn(
+        `[host-mode] maintenanceTick: a ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} holds the store — no pass executed`,
+      );
+      return { ...this.getContextMaintenanceSnapshot(), ran: false };
+    }
     this.startQueuedMaintenance();
     await this.maintenancePass;
     return { ...this.getContextMaintenanceSnapshot(), ran: true };
@@ -5456,12 +5653,13 @@ export class AgentFramework {
   getContextMaintenanceSnapshot(): ContextMaintenanceSnapshot {
     const agents = [...this.agents.values()].map((agent) => {
       const cm = agent.getContextManager();
-      const pending = cm.getPendingWork()?.description;
+      const state = this.contextReadiness(cm);
       const progress = this.contextProgress(cm);
       return {
         agentName: agent.name,
-        ready: cm.isReady(),
-        ...(pending ? { pending } : {}),
+        ...('error' in state
+          ? { ready: false, error: boundFailureText(state.error) }
+          : { ready: state.ready, ...(state.pending ? { pending: state.pending } : {}) }),
         ...(progress ? { progress } : {}),
       };
     });
@@ -6248,7 +6446,14 @@ export class AgentFramework {
    *  per-stream local survives budget restarts. */
   private settleAgent(
     agentName: string,
-    outcome: { stopReason: AgentSettleResult['stopReason']; speech: string; error?: string },
+    outcome: {
+      stopReason: AgentSettleResult['stopReason'];
+      speech: string;
+      error?: string;
+      /** An ephemeral run that ended rather than sleep the provider's stated
+       *  wait: that wait (statedWaitNotSlept). */
+      statedWaitMs?: number;
+    },
     /** The settling stream's logical turn (TurnRouting), when that stream
      *  still owns the agent: it ends here, so the agent's next fresh start
      *  opens a new one. A stream that no longer owns the agent passes none. */
@@ -6262,7 +6467,10 @@ export class AgentFramework {
     run.lastActivity = Date.now();
     if (outcome.stopReason === 'exhausted') {
       // The caller may log or relay the message, which can echo the whole request.
-      run.settle.reject(new Error(boundFailureText(outcome.error ?? 'Unknown error')));
+      const message = boundFailureText(outcome.error ?? 'Unknown error');
+      run.settle.reject(outcome.statedWaitMs === undefined
+        ? new Error(message)
+        : new ProviderWaitNotSleptError(message, outcome.statedWaitMs));
       return;
     }
     run.settle.resolve({
@@ -6278,6 +6486,9 @@ export class AgentFramework {
    * The agent is temporarily registered, inference is triggered, and the
    * framework drives the stream (emitting traces, logging, dispatching tools).
    * Returns the agent's speech output when it finishes (no more tool calls).
+   * Rejects with ProviderWaitNotSleptError when the run ends rather than sleep
+   * a retryable failure's stated wait, and with a plain Error for any other
+   * ending.
    *
    * The caller provides a pre-created agent + contextManager (from createEphemeralAgent).
    * The task message should already be in the context manager.
@@ -6896,27 +7107,41 @@ export class AgentFramework {
       idx = i; break;
     }
     if (idx < 0) return null;
+    // The newest message can be the last shard of a body (a document stored
+    // in shards). context-manager removes a shard only with the rest of its
+    // body, so the rewind takes the whole body.
+    const first = bodyRangeIn(all, idx).from;
+    const members = all.slice(first, idx + 1);
     const msg = all[idx];
     const md = (msg.metadata ?? {}) as {
       messageId?: unknown; channelId?: unknown; system?: unknown;
     };
 
-    const content = Array.isArray(msg.content) ? msg.content : [];
+    const content = members.flatMap((m) => (Array.isArray(m.content) ? m.content : []));
     const toolBlocks = content.filter((b) => typeOf(b) === 'tool_result');
     const images = content.filter((b) => typeOf(b) === 'image').length;
     const textLen = content
       .filter((b) => typeOf(b) === 'text')
       .reduce((n, b) => n + String((b as { text?: string }).text ?? '').length, 0);
 
-    // Determine the complete exchange to remove.
-    const removedIds: MessageId[] = [msg.id];
+    // Determine the complete exchange to remove, newest first.
+    const removedIds: MessageId[] = members.map((m) => m.id).reverse();
+    // Where the exchange starts: this body, or the tool_use turn paired with it.
+    let from = first;
     let kind: RewindRecord['kind'];
     let descriptor: string;
     if (toolBlocks.length > 0) {
       kind = 'tool';
-      // Pair the tool_result with the tool_use assistant turn right before it.
-      if (idx - 1 >= 0 && hasBlock(all[idx - 1], 'tool_use')) {
-        removedIds.push(all[idx - 1].id);
+      // Pair the tool_result with the tool_use assistant turn right before
+      // it, the whole of it: a turn stored as a body carries its tool_use on
+      // its first shard, not its last.
+      if (first - 1 >= 0) {
+        const turn = bodyRangeIn(all, first - 1);
+        const turnMembers = all.slice(turn.from, turn.to + 1);
+        if (turnMembers.some((m) => hasBlock(m, 'tool_use'))) {
+          from = turn.from;
+          removedIds.push(...turnMembers.map((m) => m.id).reverse());
+        }
       }
       const sz = toolBlocks.reduce(
         (n, b) => n + String((b as { content?: unknown }).content ?? '').length, 0);
@@ -6935,7 +7160,8 @@ export class AgentFramework {
       ? { channelId: String(md.channelId), messageId: String(md.messageId) }
       : undefined;
 
-    for (const id of removedIds) cm.removeMessage(id);
+    // One removal for the whole exchange, so it is never half applied.
+    removeStoredMessages(cm, all[from], msg);
     return { kind, descriptor, removedIds, discordRef };
   }
 
@@ -7310,27 +7536,56 @@ export class AgentFramework {
       if (agent.state.status !== 'idle') {
         return { ok: false, error: `Cannot hide while agent is ${agent.state.status}` };
       }
+      // A surgery switches or forks the branch while it holds the store, so
+      // a removal now would land on the branch it's leaving, or meet a
+      // manager mid-switch: refused as busy, as the other operator calls are.
+      if (this.surgeryHold) {
+        return {
+          ok: false,
+          error: `Cannot hide: a live ${this.surgeryHold.verb} for ${this.surgeryHold.agentName} holds the store — retry when it completes`,
+        };
+      }
       if (!params.fromMessageId) {
         return { ok: false, error: 'hide: fromMessageId is required' };
       }
       const cm = agent.getContextManager();
       const all = cm.getAllMessages();
-      const byDiscordId = (did: string) =>
-        all.findIndex((m) => String((m.metadata as { messageId?: unknown } | undefined)?.messageId) === String(did));
+      // Only a message that carries a Discord id matches: a missing one
+      // would otherwise read as the text "undefined".
+      const discordIdOf = (m: StoredMessage) => {
+        const id = (m.metadata as { messageId?: unknown } | undefined)?.messageId;
+        return id === undefined || id === null || id === '' ? undefined : String(id);
+      };
+      const byDiscordId = (did: string) => all.findIndex((m) => discordIdOf(m) === String(did));
 
       // Collect Discord refs of every message in [lo, hi] that carries one,
       // so the surface can mark them. channelId here is whatever the ingest
       // path stored (raw id or "discord:guild:channel"); the surface
       // normalizes it.
-      const refsIn = (lo: number, hi: number) => {
+      // Each Discord message once, though every shard of a body carries it.
+      const refsIn = (runs: Array<{ from: number; to: number }>) => {
         const refs: Array<{ channelId: string; messageId: string }> = [];
-        for (let i = lo; i <= hi; i++) {
-          const md = all[i].metadata as { messageId?: unknown; channelId?: unknown } | undefined;
-          if (md?.messageId && md?.channelId) {
+        const seen = new Set<string>();
+        for (const { from, to } of runs) {
+          for (let i = from; i <= to; i++) {
+            const md = all[i].metadata as { messageId?: unknown; channelId?: unknown } | undefined;
+            if (!md?.messageId || !md?.channelId) continue;
+            const key = `${String(md.channelId)}\u0000${String(md.messageId)}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
             refs.push({ channelId: String(md.channelId), messageId: String(md.messageId) });
           }
         }
         return refs;
+      };
+      // How many stored messages the runs hold, a body (a long message, in
+      // shards) counting once.
+      const messagesIn = (runs: Array<{ from: number; to: number }>) => {
+        let count = 0;
+        for (const { from, to } of runs) {
+          for (let i = from; i <= to; i = bodyRangeIn(all, i).to + 1) count++;
+        }
+        return count;
       };
 
       const fromIdx = byDiscordId(params.fromMessageId);
@@ -7347,12 +7602,16 @@ export class AgentFramework {
           if (toIdx < 0) {
             return { ok: false, error: `Message ${params.toMessageId} is not an addressable message in context.` };
           }
-          const [lo, hi] = fromIdx <= toIdx ? [fromIdx, toIdx] : [toIdx, fromIdx];
-          const refs = refsIn(lo, hi);
+          const [first, last] = fromIdx <= toIdx ? [fromIdx, toIdx] : [toIdx, fromIdx];
+          // A message stored as a body (a long one, in shards) is hidden whole.
+          const lo = bodyRangeIn(all, first).from;
+          const hi = bodyRangeIn(all, last).to;
+          const refs = refsIn([{ from: lo, to: hi }]);
+          const hidden = messagesIn([{ from: lo, to: hi }]);
           const rangeIds = all.slice(lo, hi + 1).map((m) => String(m.id));
-          cm.removeMessages(all[lo].id, all[hi].id);
+          removeStoredMessages(cm, all[lo], all[hi]);
           console.error(
-            `[host-command] hide agent=${agentName} range removed=${hi - lo + 1} ` +
+            `[host-command] hide agent=${agentName} range removed=${hidden} ` +
               `(${params.fromMessageId}..${params.toMessageId}) by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
           );
           const loggedRange = capIds(rangeIds);
@@ -7363,35 +7622,55 @@ export class AgentFramework {
             params: { fromMessageId: params.fromMessageId, toMessageId: params.toMessageId },
             result: {
               branch: this.store.currentBranch().name,
-              hidden: hi - lo + 1,
+              hidden,
               removedIds: loggedRange.ids,
               ...(loggedRange.truncated ? { removedIdsTruncated: true } : {}),
             },
           });
           return {
             ok: true,
-            hidden: hi - lo + 1,
+            hidden,
             hiddenRefs: refs,
             lastVisible: await this.lastVisiblePreview(agentName),
           };
         }
-        const refs = refsIn(fromIdx, fromIdx);
-        const hiddenId = String(all[fromIdx].id);
-        cm.removeMessage(all[fromIdx].id);
+        // A message stored as a body (a long one, in shards) is hidden whole,
+        // and so is every copy of it: a write cut short leaves a partial body
+        // before its retry, both carrying the Discord id.
+        const runs: Array<{ from: number; to: number }> = [];
+        all.forEach((m, i) => {
+          if (discordIdOf(m) !== String(params.fromMessageId)) return;
+          const { from, to } = bodyRangeIn(all, i);
+          const last = runs[runs.length - 1];
+          if (last && from <= last.to + 1) last.to = Math.max(last.to, to);
+          else runs.push({ from, to });
+        });
+        const refs = refsIn(runs);
+        const hidden = messagesIn(runs);
+        const hiddenIds = runs.flatMap(({ from, to }) => all.slice(from, to + 1).map((m) => String(m.id)));
+        for (const { from, to } of runs) removeStoredMessages(cm, all[from], all[to]);
         console.error(
-          `[host-command] hide agent=${agentName} removed=1 (${params.fromMessageId}) ` +
+          `[host-command] hide agent=${agentName} removed=${hidden} (${params.fromMessageId}) ` +
             `by=${params.requesterName ?? params.requesterId ?? 'unknown'} (server=${serverId})`,
         );
+        // Every shard of every copy goes, so the ids are bounded as the
+        // range form's are.
+        const loggedIds = capIds(hiddenIds);
         this.recordOperatorAction({
           kind: 'hide',
           agent: agentName,
           requester: hostCommandRequester(serverId, params),
           params: { fromMessageId: params.fromMessageId },
-          result: { branch: this.store.currentBranch().name, hidden: 1, removedIds: [hiddenId] },
+          result: {
+            branch: this.store.currentBranch().name,
+            hidden,
+            removedIds: loggedIds.ids,
+            ...(loggedIds.truncated ? { removedIdsTruncated: true } : {}),
+          },
         });
         return {
           ok: true,
-          hidden: 1,
+          hidden,
           hiddenRefs: refs,
           lastVisible: await this.lastVisiblePreview(agentName),
         };
@@ -7794,6 +8073,8 @@ export class AgentFramework {
     this.refuseOperatorAfterStop('switch branch');
     const release = this.reserveStoreForSurgery('switch branch', 'every agent');
     try {
+      // A maintenance tick already running finishes before the switch.
+      if (this.maintenanceRunning()) await this.settleMaintenancePass();
       this.store.switchBranch(name);
       // Reversible Discord awareness markers are part of the branch
       // projection. Their delivery starts behind the data-plane gate, which
@@ -8056,6 +8337,9 @@ export class AgentFramework {
     // arrivals during the awaited switch (see surgeryHold).
     const hold = { verb, agentName, since: Date.now() };
     this.surgeryHold = hold;
+    // Maintenance calls parked at a provider gate wake, find the hold and are
+    // withdrawn, so the wait for running maintenance can't wait on them.
+    for (const gate of this.providerGates.values()) for (const resolve of gate.auxiliaryWaiters.splice(0)) resolve();
     // stop() waits for the release (see stopOwned): a surgery admitted before
     // stop() began finishes, flush included, before the store closes.
     let settle!: () => void;
@@ -8199,6 +8483,8 @@ export class AgentFramework {
       let branchName: string;
       let markers: SurgeryMarkerReceipt;
       try {
+        // A maintenance tick already running finishes before the switch.
+        if (this.maintenanceRunning()) await this.settleMaintenancePass();
         // Prepare the external side effect before switching Chronicle. If the
         // process dies after the switch but before activate(), startup
         // promotes this batch by matching targetBranch to the active branch.
@@ -8367,6 +8653,8 @@ export class AgentFramework {
       let createdBranch: string;
       let markers: SurgeryMarkerReceipt;
       try {
+        // A maintenance tick already running finishes before the fork.
+        if (this.maintenanceRunning()) await this.settleMaintenancePass();
         const markerBatch = this.discordAwarenessOutbox?.prepare({
           agentName,
           sourceBranch,
@@ -10520,7 +10808,7 @@ export class AgentFramework {
     const agent = this.agents.get(p.agent);
     if (!agent) return false;
     try {
-      agent.getContextManager().removeMessage(p.messageId);
+      removeStoredMessage(agent.getContextManager(), p.messageId as MessageId);
       this.emitTrace({ type: 'message:removed', messageId: p.messageId, source: 'mcpl:coalescing' });
       return true;
     } catch (err) {
@@ -12333,7 +12621,7 @@ export class AgentFramework {
         this.settleAgent(agent.name, {
           stopReason: 'exhausted',
           speech: '',
-          error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
+          ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
         }, routing);
         // The turn has failed, after a hold or not: the next refusal is a new
         // turn's, holds afresh, and carries no note of this one's wait.
@@ -13544,7 +13832,7 @@ export class AgentFramework {
               this.settleAgent(agent.name, {
                 stopReason: 'exhausted',
                 speech: '',
-                error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
+                ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
               }, this.agents.get(agent.name) === agent && agent.streamId === myStreamId ? streamRouting : undefined);
               this.emitTrace({
                 type: 'inference:exhausted',
@@ -13826,7 +14114,7 @@ export class AgentFramework {
       this.settleAgent(agent.name, {
         stopReason: 'exhausted',
         speech: '',
-        error: statedWait === 'fail' ? this.statedWaitNotSlept(err) : err.message,
+        ...(statedWait === 'fail' ? this.statedWaitNotSlept(err) : { error: err.message }),
       }, streamRouting);
       this.emitTrace({
         type: 'inference:exhausted',
@@ -15808,7 +16096,7 @@ export class AgentFramework {
     if (!agent) {
       throw new Error('No agents configured');
     }
-    agent.getContextManager().removeMessage(id);
+    removeStoredMessage(agent.getContextManager(), id);
   }
 
   private getMessage(id: MessageId): StoredMessage | null {
@@ -16686,8 +16974,7 @@ export class AgentFramework {
               `${interval.fromId}..${interval.toId} is only partially present`,
           );
         }
-        if (interval.fromId === interval.toId) cm.removeMessage(from.id);
-        else cm.removeMessages(from.id, to.id);
+        removeStoredMessages(cm, from, to);
       }
       this.discordAwarenessOutbox.activate(batch.id);
       console.error(`[discord-awareness] resumed suppression batch ${batch.id}`);

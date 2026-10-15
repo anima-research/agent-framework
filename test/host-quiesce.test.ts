@@ -312,6 +312,40 @@ test('resume proceeds with a warn when the strategy cannot preview', async () =>
   });
 });
 
+test('resume proceeds without a verdict for an agent whose context manager refuses, and warns naming it', async (t) => {
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    await framework.quiesce();
+    // A failed strategy initialization fences the context manager: its
+    // settings queries throw until a successful switchBranch or setStrategy.
+    const cm = framework.getAgent('agent')!.getContextManager();
+    const failing = {
+      name: 'refusing-init-test',
+      async initialize() { throw new Error('strategy initialization failed for the test'); },
+      checkReadiness: () => ({ ready: true }),
+      async tick() {},
+      select: () => [],
+    } as unknown as ContextStrategy;
+    await assert.rejects(cm.setStrategy(failing), /strategy initialization failed for the test/);
+    assert.throws(() => cm.getHotContextSettings(), /requires successful strategy initialization/);
+
+    const warn = t.mock.method(console, 'warn', () => {});
+    let status: Awaited<ReturnType<typeof framework.resume>>;
+    try {
+      status = await framework.resume();
+    } finally {
+      warn.mock.restore();
+    }
+    assert.equal(status.quiesced, false);
+    assert.ok(warn.mock.calls.some((call) => {
+      const line = String(call.arguments[0]);
+      return line.includes("agent's settings can't be read")
+        && line.includes('requires successful strategy initialization')
+        && line.includes('proceeding without a verdict for it');
+    }), 'resume warns, naming the agent and the error');
+  });
+});
+
 test('maintenanceTick runs the real maintenance pass while quiesced', async () => {
   class QueuedStrategy implements ContextStrategy {
     readonly name = 'queued-test';
@@ -338,6 +372,47 @@ test('maintenanceTick runs the real maintenance pass while quiesced', async () =
     const snapshot = await framework.maintenanceTick();
     assert.ok(strategy.ticks >= 2, `maintenance ticked while quiesced (${strategy.ticks})`);
     assert.ok(snapshot.agents.some((a) => a.agentName === 'agent'));
+  }, { strategy });
+});
+
+test('maintenanceTick runs no pass while a surgery holds the store, and says so', async (t) => {
+  class QueuedStrategy implements ContextStrategy {
+    readonly name = 'queued-test';
+    ticks = 0;
+    checkReadiness(): ReadinessState {
+      return { ready: false, description: 'test maintenance queued' };
+    }
+    async tick(_ctx: StrategyContext): Promise<void> {
+      this.ticks++;
+    }
+    select(
+      _store: MessageStoreView,
+      _log: ContextLogView,
+      _budget: TokenBudget,
+    ): ContextEntry[] {
+      return [];
+    }
+  }
+  const strategy = new QueuedStrategy();
+  const membrane = new MockMembrane();
+  await withFramework(membrane, async (framework) => {
+    // Held before start(), whose first pass would otherwise tick at once.
+    const internals = framework as unknown as { surgeryHold: { verb: string; agentName: string; since: number } | null };
+    internals.surgeryHold = { verb: 'rollback', agentName: 'agent', since: Date.now() };
+    framework.start();
+    await framework.quiesce({ reason: 'compression window' });
+    const warn = t.mock.method(console, 'warn', () => {});
+    try {
+      const snapshot = await framework.maintenanceTick();
+      assert.equal(snapshot.ran, false);
+      assert.equal(strategy.ticks, 0);
+      assert.equal(snapshot.history.length, 0);
+      assert.ok(warn.mock.calls.some((call) =>
+        String(call.arguments[0]).includes('a rollback for agent holds the store — no pass executed')));
+    } finally {
+      internals.surgeryHold = null;
+      warn.mock.restore();
+    }
   }, { strategy });
 });
 
