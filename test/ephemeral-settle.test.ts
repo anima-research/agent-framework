@@ -144,6 +144,11 @@ describe('runEphemeralToCompletion settle signal', () => {
         toolCallsCount: 0,
       });
       assert.strictEqual(framework.getAgent(agent.name), null);
+      const internals = framework as unknown as {
+        turnRouting: Map<string, unknown>; proseSpeechChains: Map<string, unknown>;
+      };
+      assert.equal(internals.turnRouting.has(agent.name), false, 'disposal removes turn routing');
+      assert.equal(internals.proseSpeechChains.has(agent.name), false, 'disposal removes the speech chain');
     } finally {
       await stopAndRemove(framework, tempDir);
     }

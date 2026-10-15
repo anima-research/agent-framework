@@ -14,6 +14,10 @@ const dataMethod = process.env.DATA_METHOD ?? 'push/event';
 const serverId = process.env.SERVER_ID ?? 'discord';
 const arrivalPath = process.env.ARRIVAL_PATH;
 const waitForArrivalPath = process.env.WAIT_FOR_ARRIVAL_PATH;
+// After a reconnect (generation 2 on), the host's initial policy Request
+// (featureSets/update) is answered only once this file exists, so a test can
+// hold the server's re-registration open.
+const policyHoldPath = process.env.POLICY_HOLD_PATH;
 
 let generation = 1;
 if (generationPath) {
@@ -52,6 +56,7 @@ let reactionQueued = false;
 let pendingControl = false;
 let listChangeTriggered = false;
 let reactionOrdinal = 0;
+let heldPolicy = null;
 let buf = '';
 
 function ledgerDeliveryStatus() {
@@ -195,6 +200,11 @@ function handle(message) {
     // host times out (15s), the grant stays empty, and every push/channel
     // in these tests is rejected fail-closed.
     if (message.id !== undefined && message.id !== null) {
+      if (policyHoldPath && generation >= 2 && !existsSync(policyHoldPath)) {
+        heldPolicy = message;
+        log('policy-held');
+        return;
+      }
       reply(message.id, { accepted: true });
     }
     return;
@@ -257,6 +267,12 @@ process.stdin.on('data', (chunk) => {
 });
 
 const timer = setInterval(() => {
+  if (heldPolicy && policyHoldPath && existsSync(policyHoldPath)) {
+    const held = heldPolicy;
+    heldPolicy = null;
+    log('policy-response');
+    reply(held.id, { accepted: true });
+  }
   if (pendingToolRequest && !registered && waitForArrivalPath && existsSync(waitForArrivalPath)) {
     serviceReaction(pendingToolRequest);
     maybeFinishRegistration();

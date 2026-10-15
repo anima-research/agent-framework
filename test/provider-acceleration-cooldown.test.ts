@@ -238,7 +238,10 @@ test('shutdown aborts a primary waiting behind in-flight auxiliary work', async 
   }
 });
 
-test('ordinary 429 keeps the existing retry policy instead of entering acceleration cooldown', async () => {
+// An ordinary 429 is not organization acceleration. Its stated retry-after
+// (1 ms here) is a provider wait (provider-waits.test.ts): honoured, then one
+// fresh attempt; nothing is left parked.
+test('ordinary 429 does not enter acceleration cooldown: its stated wait passes, then one retry', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'af-provider-generic-'));
   const membrane = new GenericRateLimitThenSuccessMembrane();
   const framework = await AgentFramework.create({
@@ -252,6 +255,7 @@ test('ordinary 429 keeps the existing retry policy instead of entering accelerat
     assert.equal(membrane.calls.length, 2);
     const internal = framework as unknown as { providerAccelerationCooldowns: Map<string, unknown> };
     assert.equal(internal.providerAccelerationCooldowns.size, 0);
+    assert.deepEqual(framework.providerWaitSnapshot('resident'), [], 'the 1 ms wait has passed');
   } finally { await framework.stop(); rmSync(dir, { recursive: true, force: true }); }
 });
 

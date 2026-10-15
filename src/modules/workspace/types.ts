@@ -18,9 +18,13 @@ export interface MountConfig {
   mode: 'read-write' | 'read-only';
   /**
    * Watch mode for filesystem changes:
-   * - 'always': chokidar watches continuously, syncs on debounce
-   * - 'on-agent-action': sync from filesystem after each agent tool call
-   * - 'never': fully virtual, no automatic filesystem reads
+   * - 'always': chokidar watches continuously; each event re-observes its paths
+   * - 'on-agent-action': after each completed agent tool batch, the mount is
+   *   scanned, and the agent's next inference waits for that scan up to
+   *   `agentActionScanDeadlineMs`; a scan that takes longer finishes while
+   *   the round goes on
+   * - 'never': no background reads; listings and lazy reads still observe
+   *   the paths they show
    */
   watch?: 'always' | 'on-agent-action' | 'never';
   /** Debounce window in ms for watch: 'always' mode (default: 300) */
@@ -72,6 +76,19 @@ export interface WorkspaceConfig {
   deltaSnapshotEvery?: number;
   /** Full snapshot frequency for tree states (default: 10) */
   fullSnapshotEvery?: number;
+  /**
+   * How long the scan of `watch: 'on-agent-action'` mounts after a tool batch
+   * may hold the agent's next inference, in ms (default: 20000). A scan that
+   * takes longer finishes in the background; the miss is recorded on the
+   * mount's status and pushed as a `workspace:agent-action-scan-incomplete`
+   * event. So is a scan that finished without observing everything, with the
+   * regions it couldn't (`incomplete`). While a scan that outlasted its
+   * deadline still runs, later batches aren't held: their scan is queued
+   * after it, and the miss is recorded at once. The framework bounds every
+   * module's batch hook at 30 s, so a deadline above 29 s is lowered to 29 s,
+   * with a warning, for the workspace's own miss to come first.
+   */
+  agentActionScanDeadlineMs?: number;
 }
 
 // ============================================================================
@@ -79,23 +96,52 @@ export interface WorkspaceConfig {
 // ============================================================================
 
 /**
- * Per-mount runtime state (not persisted — rebuilt on start).
+ * Per-mount runtime state (not persisted — rebuilt on start). What disk last
+ * agreed with lives in the module's disk-agreement journal (global chronicle
+ * records), and branch-local intent in `intentTreeStateId`.
  */
 export interface MountState {
   /** The mount config */
   config: MountConfig;
   /** Tree state ID in Chronicle */
   treeStateId: string;
+  /** Branch-local intent (tombstones, store origin, conflicts) for this mount's paths */
+  intentTreeStateId: string;
   /** Sequence number of last materialization */
   lastMaterializedSeq: number;
   /** Paths currently suppressed from watcher (recently materialized) */
   suppressedPaths: Set<string>;
-  /** Whether initial lazy sync has been completed */
+  /** Whether a full scan of the mount has completed this session */
   initialSyncDone: boolean;
   /** Branch ID that was active when this mount last materialized */
   lastMaterializedBranchId: string | null;
-  /** Per-file hash at time of last materialization — baseline for conflict detection */
-  materializedHashes: Map<string, string>;
+  /**
+   * The last on-agent-action scan, as of `at`: `complete` when it has
+   * finished at all, `withinDeadline` when it finished before the deadline
+   * released the round, `reason` for a miss or a failure, and `incomplete`
+   * for the regions a finished scan couldn't observe (each also pushed as a
+   * `workspace:agent-action-scan-incomplete` event).
+   */
+  lastAgentActionScan?: {
+    at: number;
+    complete: boolean;
+    withinDeadline: boolean;
+    reason?: string;
+    incomplete?: Array<{ path: string; reason: string }>;
+  };
+  /**
+   * The after-batch scan queued behind the mount's running work, not yet
+   * started: later batches share it, since it starts after their tools ran.
+   */
+  agentActionScanWaiting?: AgentActionScan;
+  /**
+   * The mount's newest after-batch scan. Only its outcome is put on
+   * `lastAgentActionScan`: one queued behind an older scan describes a later
+   * batch, which the older scan's outcome mustn't speak for.
+   */
+  agentActionScanLatest?: AgentActionScan;
+  /** A scan that outlasted a batch's deadline, while it still runs. */
+  agentActionScanLate?: Promise<unknown>;
   /**
    * Wall-clock time chokidar emitted `ready` for this mount, or null if the
    * watcher hasn't finished its initial scan. null after session start =
@@ -195,6 +241,14 @@ export interface GrepInput {
   contextAfter?: number;
 }
 
+/** One after-batch scan of a mount, shared by the batches that wait for it. */
+export interface AgentActionScan {
+  /** Whether some batch stopped waiting for it (its deadline passed, or an earlier scan still ran late). */
+  late: boolean;
+  /** Settles, never rejects, once its outcome is recorded: on status if it is the newest, as events either way. */
+  settled: Promise<void>;
+}
+
 export interface StatusInput {
   /** Specific mount to check (optional — defaults to all) */
   mount?: string;
@@ -207,11 +261,18 @@ export interface MaterializeInput {
   mount?: string;
   /**
    * Materialize even when the current branch has genuinely diverged from the
-   * branch last materialized to disk (default: false). Not needed for linear
-   * continuations (child branches forked at or after the last materialized
-   * point) — those pass the guard automatically.
+   * branch last materialized to disk, and overwrite a disk copy in conflict
+   * (default: false). Not needed for linear continuations (child branches
+   * forked at or after the last materialized point) — those pass the guard
+   * automatically.
    */
   force?: boolean;
+  /**
+   * Also delete from disk the files deleted in the workspace whose disk copy
+   * is still one the workspace holds (default: false). With `force`, also
+   * those whose disk copy changed since.
+   */
+  applyDeletions?: boolean;
 }
 
 export interface SyncInput {
@@ -219,6 +280,8 @@ export interface SyncInput {
   path?: string;
   /** Specific mount (optional — defaults to all) */
   mount?: string;
+  /** Take each mount's root as it is now, when it isn't the directory disk last agreed with. */
+  acceptRoot?: boolean;
 }
 
 // ============================================================================
@@ -252,6 +315,8 @@ export interface WorkspaceDeletedEvent {
   type: 'workspace:deleted';
   paths: string[];
   mount: string;
+  /** Paths deleted on disk whose newer workspace version was kept as a conflict. */
+  conflicts?: string[];
   [key: string]: unknown;
 }
 

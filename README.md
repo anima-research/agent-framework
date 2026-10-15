@@ -224,6 +224,10 @@ it with `discordAwarenessDeadlineMs` (default 10000ms, clamped to 50..60000ms).
 Configure the online marker with `discordAwarenessEmoji`; the offline CLI
 accepts `--emoji`.
 
+For stdio MCPL children, the framework defaults `DISCORD_SUPPRESSED_REACTIONS_BASELINE` to the reactions it places: its refusal markers, the Discord adapter's default awareness marker, the configured awareness marker, and every retained outbox emoji. This covers later removals and replays after a configuration change. Suppression is by emoji, so members' own reactions with those emoji stop reaching the agent too. The default is derived at each spawn of a child (its first connect, each automatic reconnect, a restart), so the next child spawned gets the markers retained since the last spawn. When the awareness ledger exists but can't be read, a runtime connect reads it first and refuses before anything is registered or spawned (a startup connect, whose routing is staged beforehand, before anything spawns), and a restart refuses before it stops the running child. An automatic reconnect of a child that takes the default fails and retries rather than spawn it without the default. A value with tokens in the server's env (case-insensitive on Windows), or one intentionally inherited with `inheritEnv: true`, takes precedence, and the framework logs that it replaces the default. A value with no tokens, as discord-mcpl's parser reads them, counts as unset, since the adapter would read it as suppression off. The parser splits on commas and keeps a token only when its normalizer leaves something of it, after stripping U+FE0F, trimming, and stripping one leading and one trailing colon: so a blank value, commas alone, `:`, `::` or a lone U+FE0F (say from `${A},${B}` or `:${NAME}:` with the variables empty) has no tokens. The adapter's filters file and legacy operator env still take precedence over this variable, and they are where an operator turns suppression off.
+
+`framework.getPlacedReactionBaseline()` returns a fresh snapshot of that default for other embeddings, including separately managed WebSocket adapters. It returns suppression tokens, with a custom emoji as its bare ID, not marker payloads for adding, removing or replaying a reaction. An unreadable awareness ledger throws instead of producing a partial snapshot. Hosts that previously supplied a refusal-only default must stop supplying it to adopt this framework-derived default; an explicit operator choice should remain intact.
+
 ### MCPL (MCP Live)
 
 Optional host-side implementation of the MCP Live protocol. External servers (game engines, dev tools, etc.) can:
@@ -338,7 +342,7 @@ const server = new ApiServer(framework, { port: 8765 });
 await server.start();
 ```
 
-**Commands:** `message.send`, `message.list`, `inference.request`, `inference.abort`, `branch.*`, `agent.*`, `module.*`, `store.*`, `inference.tail/inspect/search`, `events.*`, `host.quiesce/resume/status/maintenanceTick`
+**Commands:** `message.send`, `message.list`, `inference.request`, `inference.abort`, `branch.*`, `agent.*`, `module.*`, `store.*`, `inference.tail/inspect/search`, `events.*`, `host.quiesce/resume/status/maintenanceTick`, `host.providerWaits/releaseProviderWait`
 
 Also available as an MCP server via the `agent-framework-mcp` binary.
 
@@ -359,9 +363,12 @@ await framework.resume();            // throws ResumeBlockedError if the layout 
 Also reachable over HTTP (`POST /quiesce`, `POST /resume`,
 `POST /maintenance/tick`, `GET /hostmode`; options via query string) and as
 `host/command` verbs (`quiesce`, `resume`, `maintain`, `host-status`) from MCPL
-servers granted `allowHostCommands`. The HTTP host verbs accept an optional
-shared secret (`ApiServerConfig.adminToken`, sent as `x-admin-token`) for
-deployments that front the port with a proxy.
+servers granted `allowHostCommands`. The same servers can lift a provider's
+stated wait with `release-provider-wait` (`agentName`, optional `model`), as
+`host.releaseProviderWait` does over the WebSocket API, and
+`host.providerWaits` lists the waits that bind. The HTTP host verbs accept an
+optional shared secret (`ApiServerConfig.adminToken`, sent as `x-admin-token`)
+for deployments that front the port with a proxy.
 
 ## Observability
 

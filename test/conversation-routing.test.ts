@@ -11,6 +11,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { AgentFramework } from '../src/index.js';
 import type { ProcessEvent, ConversationRouterConfig, TraceEvent } from '../src/index.js';
+import { Membrane, OpenAIResponsesAPIAdapter, OpenAIResponsesFormatter } from '@animalabs/membrane';
+import type { ContentBlock } from '@animalabs/membrane';
 import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 function incomingEvent(overrides: {
@@ -216,7 +218,29 @@ describe('Conversation routing', () => {
     await framework.stop();
   });
 
-  it('fork inherits the template context', async () => {
+  /** Spawn the fork for `slack:D3`, and return what its namespace was seeded
+   *  with and the `[conversation]` lines the spawn logged. */
+  async function seedOf(framework: AgentFramework) {
+    const log = mock.method(console, 'log', () => {});
+    let lines: string[];
+    try {
+      framework.pushEvent(incomingEvent({ channelId: 'slack:D3', text: 'hi', channelType: 'im' }));
+      await framework.runUntilIdle();
+      lines = log.mock.calls.map((c) => String(c.arguments[0])).filter((line) => line.startsWith('[conversation]'));
+    } finally {
+      log.mock.restore();
+    }
+    const seeded = framework.getAgent('conversation-slack-D3-g1')!.getContextManager().getAllMessages();
+    return { seeded, lines };
+  }
+
+  /** The line a spawn logs for a seed that left something out. */
+  function seedLine(thinking: number, calls: number, results: number): string {
+    return `[conversation] conversation-slack-D3-g1: seeded from trunk without ${thinking} thinking block(s), ` +
+      `${calls} unanswered tool call(s) and ${results} orphaned tool result(s)`;
+  }
+
+  it('fork inherits the template context, and a seed that leaves nothing out logs nothing', async () => {
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
     const framework = await makeFramework();
 
@@ -225,17 +249,246 @@ describe('Conversation routing', () => {
       { type: 'text', text: 'HANDBOOK: always check the logs first.' },
     ]);
 
-    framework.pushEvent(incomingEvent({ channelId: 'slack:D2', text: 'hi', channelType: 'im' }));
-    await framework.runUntilIdle();
-
-    const fork = framework.getAgent('conversation-slack-D2-g1')!;
-    const { messages } = await fork.getContextManager().compile();
+    const { seeded, lines } = await seedOf(framework);
     assert.ok(
-      messages.some((m) => JSON.stringify(m.content).includes('HANDBOOK')),
+      seeded.some((m) => JSON.stringify(m.content).includes('HANDBOOK')),
       'fork should inherit trunk context',
     );
+    assert.deepEqual(lines, [], 'a seed with nothing left out logs no line');
 
     await framework.stop();
+  });
+
+  it("a fork's seed is a dry run, and carries none of the template's thinking", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeFramework();
+    const trunk = framework.getAgent('trunk')!.getContextManager();
+    trunk.addMessage('user', [{ type: 'text', text: 'HANDBOOK: always check the logs first.' }]);
+    trunk.addMessage('trunk', [
+      { type: 'thinking', thinking: 'minted under the trunk\'s prefix', signature: 'sig-trunk' },
+      { type: 'text', text: 'Checked the logs.' },
+    ] as never);
+    trunk.addMessage('trunk', [{ type: 'redacted_thinking', data: 'opaque' }] as never);
+
+    // Every compile on any context manager during the spawn, by instance.
+    const proto = (trunk.constructor as { prototype: { compile: (...args: unknown[]) => unknown } }).prototype;
+    const original = proto.compile;
+    const compiles: Array<{ cm: unknown; dry: boolean }> = [];
+    proto.compile = function (this: unknown, ...args: unknown[]) {
+      compiles.push({ cm: this, dry: (args[2] as { dryRun?: boolean } | undefined)?.dryRun === true });
+      return original.apply(this, args);
+    };
+    let seed: Awaited<ReturnType<typeof seedOf>>;
+    try {
+      seed = await seedOf(framework);
+    } finally {
+      proto.compile = original;
+    }
+    const { seeded, lines } = seed;
+
+    const fork = framework.getAgent('conversation-slack-D3-g1')!.getContextManager();
+    const onTrunk = compiles.filter((c) => c.cm === trunk);
+    assert.ok(onTrunk.length >= 1, 'the seed compiled the template');
+    assert.ok(onTrunk.every((c) => c.dry), "the template's compiles during the spawn are dry runs");
+    assert.equal(compiles.find((c) => c.cm === fork)?.dry, true, "the new namespace's emptiness check is a dry run");
+
+    const types = seeded.flatMap((m) => m.content.map((b) => b.type));
+    assert.ok(!types.includes('thinking') && !types.includes('redacted_thinking'), `no thinking in the seed: ${types}`);
+    const texts = seeded.map((m) => JSON.stringify(m.content));
+    assert.ok(texts.some((t) => t.includes('HANDBOOK')) && texts.some((t) => t.includes('Checked the logs.')));
+    assert.ok(seeded.some((m) => m.participant === 'conversation-slack-D3-g1'
+      && JSON.stringify(m.content).includes('Checked the logs.')), "the reply keeps its text, under the fork's name");
+    assert.ok(seeded.every((m) => m.content.length > 0), 'the thinking-only message is left out, not stored empty');
+    assert.deepEqual(lines, [seedLine(2, 0, 0)], 'one line counts what the seed left out');
+
+    await framework.stop();
+  });
+
+  it("a seed that ends on a completed tool round keeps the round, without its thinking", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeFramework();
+    const trunk = framework.getAgent('trunk')!.getContextManager();
+    trunk.addMessage('user', [{ type: 'text', text: 'check the logs' }]);
+    trunk.addMessage('trunk', [
+      { type: 'thinking', thinking: 'the logs first', signature: 'sig-round' },
+      { type: 'tool_use', id: 'toolu_logs', name: 'read_logs', input: {} },
+    ] as never);
+    trunk.addMessage('user', [{ type: 'tool_result', toolUseId: 'toolu_logs', content: 'all quiet' }] as never);
+
+    const { seeded, lines } = await seedOf(framework);
+    const contents = seeded.map((m) => m.content);
+    const round = contents.findIndex((c) => c.some((b) => b.type === 'tool_use'));
+    assert.ok(round >= 0, 'the round is in the seed');
+    assert.deepEqual(contents[round]!.map((b) => b.type), ['tool_use'], 'its call stays, its thinking goes');
+    assert.equal(seeded[round]!.participant, 'conversation-slack-D3-g1');
+    assert.deepEqual(contents[round + 1]!.map((b) => b.type), ['tool_result'], 'its result follows it');
+    assert.deepEqual(lines, [seedLine(1, 0, 0)]);
+    await framework.stop();
+  });
+
+  it("a seed's unanswered call gives way to a placeholder, and the seed ends on neither it nor a thinking-only row", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeFramework();
+    const trunk = framework.getAgent('trunk')!.getContextManager();
+    trunk.addMessage('user', [{ type: 'text', text: 'check the logs' }]);
+    trunk.addMessage('trunk', [{ type: 'text', text: 'Looking.' }]);
+    // A tool round's assistant row, stored before its results (the spawn can
+    // land between the two when the coalescer spawns outside the event loop),
+    // and a thinking-only row after it.
+    trunk.addMessage('trunk', [
+      { type: 'thinking', thinking: 'mid-round', signature: 'sig-mid' },
+      { type: 'tool_use', id: 'toolu_pending', name: 'read_logs', input: {} },
+    ] as never);
+    trunk.addMessage('trunk', [{ type: 'thinking', thinking: 'still thinking', signature: 'sig-after' }] as never);
+
+    const { seeded, lines } = await seedOf(framework);
+    const types = seeded.flatMap((m) => m.content.map((b) => b.type));
+    assert.ok(!types.includes('tool_use') && !types.includes('thinking'), `no unanswered call or thinking in the seed: ${types}`);
+    // The seed is everything before the fork's own first message ('hi').
+    const firstOwn = seeded.findIndex((m) => JSON.stringify(m.content).includes('"hi"'));
+    assert.ok(firstOwn > 1, 'the incoming message follows the seed');
+    // The thinking goes first, so the round's row holds only its unanswered
+    // call, which the pairing pass replaces with its placeholder.
+    const last = seeded[firstOwn - 1]!;
+    assert.deepEqual(last.content.map((b) => b.type), ['text']);
+    assert.ok(JSON.stringify(last.content).includes('[tool call omitted]'), `the seed ends on the placeholder: ${JSON.stringify(last.content)}`);
+    assert.equal(last.participant, 'conversation-slack-D3-g1');
+    assert.ok(JSON.stringify(seeded[firstOwn - 2]!.content).includes('Looking.'), 'the exchange before the round stays');
+    assert.deepEqual(lines, [seedLine(2, 1, 0)]);
+    await framework.stop();
+  });
+
+  it("a seed keeps a partly answered round's answered call and drops the other, drops an orphaned result and a trailing unanswered call, and keeps the text beside each", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeFramework();
+    const trunk = framework.getAgent('trunk')!.getContextManager();
+    // A result whose call isn't in the history (as where a window starts
+    // after the call), beside the user's text.
+    trunk.addMessage('user', [
+      { type: 'tool_result', toolUseId: 'toolu_gone', content: 'stale' },
+      { type: 'text', text: 'check both' },
+    ] as never);
+    // A parallel round with one of its two calls answered.
+    trunk.addMessage('trunk', [
+      { type: 'text', text: 'Checking both.' },
+      { type: 'tool_use', id: 'toolu_a', name: 'read_logs', input: {} },
+      { type: 'tool_use', id: 'toolu_b', name: 'read_config', input: {} },
+    ] as never);
+    trunk.addMessage('user', [{ type: 'tool_result', toolUseId: 'toolu_a', content: 'all quiet' }] as never);
+    // The next round's row, stored before its result: thinking, text and a call.
+    trunk.addMessage('trunk', [
+      { type: 'thinking', thinking: 'the config next', signature: 'sig-next' },
+      { type: 'text', text: 'And the config.' },
+      { type: 'tool_use', id: 'toolu_c', name: 'read_config', input: {} },
+    ] as never);
+
+    const { seeded, lines } = await seedOf(framework);
+    const blocks = seeded.flatMap((m) => m.content) as Array<{ type: string; id?: string; toolUseId?: string }>;
+    assert.deepEqual(blocks.filter((b) => b.type === 'tool_use').map((b) => b.id), ['toolu_a'], 'the answered call stays, the unanswered ones go');
+    assert.deepEqual(blocks.filter((b) => b.type === 'tool_result').map((b) => b.toolUseId), ['toolu_a'], 'its result stays, the orphaned one goes');
+    const round = seeded.find((m) => m.content.some((b) => b.type === 'tool_use'))!;
+    assert.deepEqual(round.content.map((b) => b.type), ['text', 'tool_use'], "the round's text stays beside its answered call");
+    assert.ok(seeded.some((m) => JSON.stringify(m.content).includes('check both')), "the user's text stays beside the orphaned result");
+    const trailing = seeded.find((m) => JSON.stringify(m.content).includes('And the config.'))!;
+    assert.deepEqual(trailing.content.map((b) => b.type), ['text'], "the trailing row keeps its text, without its thinking or its unanswered call");
+    assert.deepEqual(lines, [seedLine(1, 2, 1)]);
+    await framework.stop();
+  });
+
+  /** A Responses reply as membrane stores it: `output` through membrane's own
+   *  Responses adapter and its conversion to content blocks, with the HTTP
+   *  call stubbed. */
+  async function storedResponsesReply(output: Array<Record<string, unknown>>): Promise<ContentBlock[]> {
+    const completed = {
+      type: 'response.completed',
+      response: { id: 'resp_seed', status: 'completed', output, usage: { input_tokens: 1, output_tokens: 1 } },
+    };
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(`data: ${JSON.stringify(completed)}\n\n`, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    })) as typeof fetch;
+    try {
+      const responses = new Membrane(new OpenAIResponsesAPIAdapter({ apiKey: 'test' }), {
+        formatter: new OpenAIResponsesFormatter(),
+      });
+      const response = await responses.stream({
+        messages: [{ participant: 'user', content: [{ type: 'text', text: 'what changed?' }] }],
+        config: { model: 'gpt-test', maxTokens: 100 },
+        tools: [{ name: 'read_config', description: 'Read the config.', inputSchema: { type: 'object', properties: {} } }],
+      } as never);
+      return (response as { content: ContentBlock[] }).content;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  it("a Responses seed replays no item paired with the reasoning it left out; opaque carriers stay whole", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'ok' }]));
+    const framework = await makeFramework();
+    const trunk = framework.getAgent('trunk')!.getContextManager();
+    trunk.addMessage('user', [{ type: 'text', text: 'what changed?' }]);
+    // A reply holding a compaction, a reasoning item, a hosted web search, a
+    // message and a function call, as membrane stores it.
+    trunk.addMessage('trunk', await storedResponsesReply([
+      { type: 'compaction', id: 'cmp_1', encrypted_content: 'earlier history' },
+      { type: 'reasoning', id: 'rs_1', encrypted_content: 'enc', summary: [] },
+      { type: 'web_search_call', id: 'ws_1', status: 'completed', action: { type: 'search', query: 'config' } },
+      { type: 'message', id: 'msg_1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'The config.' }] },
+      { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'read_config', arguments: '{}', status: 'completed' },
+    ]));
+    trunk.addMessage('user', [{ type: 'tool_result', toolUseId: 'call_1', content: 'ok' }] as never);
+    // A reply with no reasoning item: nothing it was paired with is left out,
+    // so it replays as it was.
+    trunk.addMessage('trunk', await storedResponsesReply([
+      { type: 'message', id: 'msg_2', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Read it.' }] },
+    ]));
+    // An Anthropic reply in the same history: its thinking carries no raw item.
+    trunk.addMessage('trunk', [
+      { type: 'thinking', thinking: 'plain', signature: 'sig-plain' },
+      { type: 'text', text: 'Done.' },
+    ] as never);
+
+    const { seeded } = await seedOf(framework);
+    const items = new OpenAIResponsesFormatter().buildMessages(
+      seeded.map((m) => ({ participant: m.participant, content: m.content })),
+      { participantMode: 'simple', assistantParticipant: 'conversation-slack-D3-g1', humanParticipant: 'user', systemPrompt: 'fork' } as never,
+    ).messages as unknown as Array<Record<string, unknown>>;
+    const ids = items.map((item) => item.id).filter((id) => id !== undefined);
+    assert.deepEqual(ids, ['cmp_1', 'ws_1', 'msg_2'], `only the opaque carriers and the unpaired reply replay by id: ${JSON.stringify(items)}`);
+    assert.ok(!items.some((item) => item.type === 'reasoning'), 'the reasoning item is left out');
+    assert.ok(items.some((item) => item.type === 'function_call' && item.call_id === 'call_1'), 'the call renders from its fields');
+    assert.ok(items.some((item) => item.type === 'message' && JSON.stringify(item.content).includes('The config.')), 'the text renders from its fields');
+    const plain = seeded.find((m) => JSON.stringify(m.content).includes('Done.'))!;
+    assert.deepEqual(plain.content.map((b) => b.type), ['text'], "an Anthropic reply loses only its thinking");
+    await framework.stop();
+  });
+
+  it("a fork whose namespace already holds history isn't seeded again", async () => {
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'noted' }]));
+    const fw1 = await makeFramework({}, 'reseed.chronicle');
+    fw1.getAgent('trunk')!.getContextManager().addMessage('user', [
+      { type: 'text', text: 'HANDBOOK-V1: always check the logs first.' },
+    ]);
+    fw1.pushEvent(incomingEvent({ channelId: 'slack:D8', text: 'case one', channelType: 'im' }));
+    await fw1.runUntilIdle();
+    assert.ok(fw1.getAgent('conversation-slack-D8-g1'), 'first engagement spawns g1');
+    await fw1.stop();
+
+    // Restart with the generation counters lost, so the next engagement
+    // proposes g1 again, and its namespace already holds g1's history.
+    membrane.pushResponse(createMockResponse([{ type: 'text', text: 'again' }]));
+    const fw2 = await makeFramework({}, 'reseed.chronicle');
+    (fw2.getConversationRouter() as unknown as { generations: Map<string, number> }).generations.clear();
+    fw2.pushEvent(incomingEvent({ channelId: 'slack:D8', text: 'case two', channelType: 'im' }));
+    await fw2.runUntilIdle();
+
+    const g1 = fw2.getAgent('conversation-slack-D8-g1');
+    assert.ok(g1, 'the lost counters propose g1 again');
+    const contents = g1!.getContextManager().getAllMessages().map((m) => JSON.stringify(m.content));
+    assert.equal(contents.filter((c) => c.includes('HANDBOOK-V1')).length, 1, 'no second template copy on its history');
+    assert.ok(contents.some((c) => c.includes('case one')), 'its own history stays');
+    await fw2.stop();
   });
 
   // Exercise the delivery boundary without scheduling inference. The same
@@ -361,6 +614,11 @@ describe('Conversation routing', () => {
       framework.getAgent('conversation-slack-D3-g1'), null,
       'closed fork should be disposed once its closure turn finished',
     );
+    const internals = framework as unknown as {
+      turnRouting: Map<string, unknown>; proseSpeechChains: Map<string, unknown>;
+    };
+    assert.equal(internals.turnRouting.has('conversation-slack-D3-g1'), false, 'the closed fork leaves no routing');
+    assert.equal(internals.proseSpeechChains.has('conversation-slack-D3-g1'), false, 'the closed fork leaves no speech chain');
 
     // Next DM spawns a fresh generation.
     membrane.pushResponse(createMockResponse([{ type: 'text', text: 'hi again' }]));

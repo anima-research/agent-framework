@@ -19,10 +19,15 @@
  * emits NOTHING — the delivery path will bounce/retain it; a stream consumer
  * must never see text that delivery would refuse to send.
  *
- * Two modes, mirroring proseRouting:
- *  - explicit: parse `>>` prefixes; initial target null (suppressed).
+ * Three modes, mirroring proseRouting:
+ *  - explicit: parse `>>` prefixes. A fresh turn's stream starts suppressed;
+ *              a later stream of the turn starts at the turn's destination,
+ *              and each round's end returns the stream to it (retarget).
+ *  - hybrid:   parse `>>>` envelopes, with the turn's locus as the
+ *              fallback. An envelope with no target, or `>>>skip_reply`,
+ *              holds back what follows until a later `>>>` names a target.
  *  - locus:    NO prefix parsing (locus mode's `>>` lines are plain text);
- *              everything streams to the frozen turn locus.
+ *              everything streams to the turn's locus.
  */
 
 export interface RoutedDelta {
@@ -30,7 +35,10 @@ export interface RoutedDelta {
   delta: string;
 }
 
-type State = 'line-start' | 'hybrid-indent' | 'maybe-prefix' | 'prefix-gap' | 'prefix-token' | 'after-token' | 'body';
+type State = 'line-start' | 'indent' | 'maybe-prefix' | 'prefix-gap' | 'prefix-token' | 'after-token' | 'body';
+
+/** Whitespace as the delivery path reads it (`trimStart()`, `\s`, `\S`). */
+const isSpace = (ch: string): boolean => /\s/.test(ch);
 
 export class ProseStreamRouter {
   private target: string | null;
@@ -44,7 +52,9 @@ export class ProseStreamRouter {
     private opts: {
       /** explicit parses `>>`; hybrid parses `>>>` while retaining locus fallback. */
       mode: 'explicit' | 'hybrid' | 'locus';
-      /** Initial destination: the frozen turn locus (locus mode) or null. */
+      /** Initial destination: the turn's locus (locus and hybrid mode); in
+       *  explicit mode, null on a fresh turn, or the turn's destination on a
+       *  later stream of the turn. */
       initialTarget: string | null;
       /** Resolve a `>>spec` to a channelId, or null (unresolved/ambiguous). */
       resolve: (spec: string) => string | null;
@@ -57,6 +67,17 @@ export class ProseStreamRouter {
   /** Per-channel full text emitted so far (for outgoing/complete). */
   byChannel(): ReadonlyMap<string, string> {
     return this.accumulated;
+  }
+
+  /**
+   * Point the stream at a destination decided outside it. Explicit mode does
+   * this at each round's end, with the turn's destination: a private round's
+   * prefixes, a `>>skip_reply` envelope and a target that didn't resolve all
+   * leave that destination as it was, though the stream followed them while
+   * the round was written.
+   */
+  retarget(target: string | null): void {
+    this.target = target;
   }
 
   /**
@@ -82,21 +103,36 @@ export class ProseStreamRouter {
     return coalesce(out);
   }
 
-  /** End of stream: flush any held line-start text (it can no longer become a
-   *  complete prefix; an unterminated `>>tok` at EOF is routing metadata with
-   *  no body — dropped, matching delivery which would deliver empty body). */
-  finish(): RoutedDelta[] {
+  /**
+   * The end of a segment: one round's text, which delivery parses on its
+   * own. The pending line's decision is made now. Held line-start text can
+   * no longer become a prefix, so it is body. A prefix whose target is
+   * written but has no body takes effect, as delivery reads `>>#chan` with
+   * nothing after it. The next segment starts a new line.
+   */
+  endSegment(): RoutedDelta[] {
     const out: RoutedDelta[] = [];
-    if (this.state === 'hybrid-indent') this.emit(this.held, out);
+    if (this.state === 'indent') this.emit(this.held, out);
     if (this.state === 'maybe-prefix') {
-      const full = this.opts.mode === 'hybrid' ? '>>>' : '>>';
-      const arrows = this.opts.mode === 'hybrid' ? this.held.trimStart() : this.held;
-      if (arrows !== full) this.emit(this.held, out);
+      // Hybrid's `>>>` with nothing after it is an envelope with no target:
+      // delivery bounces it and holds back what follows. Anything else held
+      // is text to delivery, explicit's bare `>>` included.
+      const arrows = this.held.trimStart();
+      if (this.opts.mode === 'hybrid' && arrows === '>>>') this.target = null;
+      else this.emit(this.held, out);
     }
-    // prefix-token / after-token at EOF: prefix without body — nothing to emit.
+    // Hybrid's `>>>` and a gap with nothing after it: no target either.
+    if (this.state === 'prefix-gap') this.target = null;
+    if (this.state === 'prefix-token') this.applyTarget();
     this.held = '';
-    this.state = 'line-start';
+    this.token = '';
+    if (this.opts.mode !== 'locus') this.state = 'line-start';
     return coalesce(out);
+  }
+
+  /** End of stream: the last segment ends. */
+  finish(): RoutedDelta[] {
+    return this.endSegment();
   }
 
   private step(ch: string, out: RoutedDelta[]): void {
@@ -111,8 +147,11 @@ export class ProseStreamRouter {
         return;
 
       case 'line-start':
-        if (this.opts.mode === 'hybrid' && (ch === ' ' || ch === '\t')) {
-          this.state = 'hybrid-indent';
+        // Indentation before a prefix is held until the line's decision: the
+        // delivery path reads an indented `>>` (explicit) or `>>>` (hybrid)
+        // line as a prefix too, after any leading whitespace.
+        if (ch !== '\n' && isSpace(ch)) {
+          this.state = 'indent';
           this.held = ch;
           return;
         }
@@ -121,8 +160,8 @@ export class ProseStreamRouter {
         this.step(ch, out);
         return;
 
-      case 'hybrid-indent':
-        if (ch === ' ' || ch === '\t') { this.held += ch; return; }
+      case 'indent':
+        if (ch !== '\n' && isSpace(ch)) { this.held += ch; return; }
         if (ch === '>') { this.held += ch; this.state = 'maybe-prefix'; return; }
         this.emit(this.held, out);
         this.held = '';
@@ -132,7 +171,7 @@ export class ProseStreamRouter {
 
       case 'maybe-prefix': {
         const prefix = this.opts.mode === 'hybrid' ? '>>>' : '>>';
-        const arrows = this.opts.mode === 'hybrid' ? this.held.trimStart() : this.held;
+        const arrows = this.held.trimStart();
         if (ch === '>' && arrows.length < prefix.length) {
           this.held += '>';
           return;
@@ -143,11 +182,22 @@ export class ProseStreamRouter {
             this.state = 'prefix-gap';
             return;
           }
-          if (ch === '\n' || ch === ' ' || ch === '\t') {
-            if (this.opts.mode === 'explicit') this.emit(this.held, out);
+          if (isSpace(ch)) {
+            if (this.opts.mode === 'explicit') {
+              // `>>` and then whitespace is a quoted arrow: body text, since
+              // delivery's prefix needs a target right after the arrows.
+              this.emit(this.held, out);
+            } else {
+              // `>>>` and then whitespace other than a space or tab (a
+              // newline included) is an envelope with no target. Delivery
+              // bounces it and holds back what follows until a later `>>>`
+              // names a target.
+              this.target = null;
+            }
+            // The whitespace itself is body, a newline included.
             this.held = '';
-            this.state = ch === '\n' ? 'line-start' : 'body';
-            if (ch !== '\n') this.step(ch, out);
+            this.state = 'body';
+            this.step(ch, out);
             return;
           }
           this.state = 'prefix-token';
@@ -165,6 +215,9 @@ export class ProseStreamRouter {
       case 'prefix-gap':
         if (ch === ' ' || ch === '\t') return;
         if (ch === '\n') { this.target = null; this.state = 'line-start'; return; }
+        // Other whitespace can't start hybrid's target (`[ \t]*\S+`): an
+        // envelope with no target, as above.
+        if (isSpace(ch)) { this.target = null; this.state = 'body'; return; }
         this.state = 'prefix-token';
         this.token = ch;
         return;
@@ -172,6 +225,9 @@ export class ProseStreamRouter {
       case 'prefix-token':
         if (ch === ' ' || ch === '\t') { this.applyTarget(); this.state = 'after-token'; this.sawBang = false; return; }
         if (ch === '\n') { this.applyTarget(); this.state = 'line-start'; return; }
+        // Any other whitespace ends the token too (`\S+`), and starts the
+        // body: the grammar's gap after a token is spaces and tabs only.
+        if (isSpace(ch)) { this.applyTarget(); this.state = 'body'; this.step(ch, out); return; }
         this.token += ch;
         return;
 

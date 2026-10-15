@@ -147,7 +147,15 @@ export interface BranchDeleteParams {
 export interface AgentContextParams {
   /** Agent name */
   agentName: string;
-  /** Maximum tokens to include (optional) */
+  /** A hypothetical budget to compile the context at (optional). Without it
+   *  the context compiles at context-manager's default budget (100,000, with
+   *  4,000 reserved for the response), not the agent's own window. The
+   *  compile is a dry run. Under the autobiographical strategy, a budget the
+   *  context can't fit still fails the command, with context-manager's
+   *  refusal, which names the tokens and the limit. Passthrough keeps the
+   *  newest messages that fit (none, if the newest alone is larger), and
+   *  windowed passthrough returns the newest message alone, larger than the
+   *  budget. */
   maxTokens?: number;
 }
 

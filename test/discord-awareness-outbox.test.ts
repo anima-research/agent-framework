@@ -263,6 +263,8 @@ test('message-granular undo prepares markers before switching branches', async (
     framework.nextTurnToken = 1;
     framework.deferredMessages = [];
     framework.pendingAssistantBlocks = new Map();
+    // A host/command and a store surgery are operations stop() waits for.
+    framework.operatorOperations = new Set();
     framework.operatorLog = new OperatorLog(undefined);
 
     const result = await framework.handleHostCommand('discord', {
@@ -270,6 +272,9 @@ test('message-granular undo prepares markers before switching branches', async (
     });
     assert.equal(result.ok, true);
     assert.deepEqual(result.removedRefs.map((ref: { messageId: string }) => ref.messageId), ['m1', 'm2']);
+    // The command's receipt says the two marks were scheduled, under the batch the ledger holds.
+    const [batch] = framework.discordAwarenessOutbox.batches();
+    assert.deepEqual(result.markers, { status: 'queued', queued: 2, batchId: batch.id });
     assert.deepEqual(calls.map((call) => call.split('/')[0]), ['branch:undo-msgs', 'switch:undo-msgs']);
     assert.deepEqual(
       framework.discordAwarenessOutbox.pending('discord').map((operation: { ref: { messageId: string } }) => operation.ref.messageId),

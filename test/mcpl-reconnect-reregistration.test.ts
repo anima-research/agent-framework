@@ -98,6 +98,8 @@ async function makeHarness() {
   const pushed: unknown[] = [];
 
   const fw = Object.create(AgentFramework.prototype) as any;
+  // Public lifecycle calls use the constructor's in-flight operation set.
+  fw.operatorOperations = new Set();
   fw.traceListeners = [];
   fw.consecutiveInferenceFailures = new Map();
   fw.exhaustionRewinds = new Map();

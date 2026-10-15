@@ -50,6 +50,7 @@ import {
   splitPreservingImageSlots,
 } from '../src/tool-image-ledger.js';
 import { toolResultDataToHistoryString, truncateForHistory } from '../src/tool-result-history.js';
+import { classifyBlock, referenceRegistry, type ReferenceTestimony } from '../src/mcpl/references.js';
 import { createMockResponse, MockMembrane } from './helpers/mock-membrane.js';
 
 const PNG = Buffer.from(
@@ -147,6 +148,7 @@ async function startTurn(opts: {
   seedHistory?: (framework: AgentFramework) => void;
   toolResultInlineMaxChars?: number;
   world?: (module: SnapModule) => void;
+  workspace?: (workspace: WorkspaceModule) => void;
 }): Promise<Harness> {
   const tempDir = mkdtempSync(join(tmpdir(), opts.prefix));
   const mountDir = join(tempDir, 'mount');
@@ -180,6 +182,7 @@ async function startTurn(opts: {
     { type: 'image', source: { type: 'base64', data: GIF.toString('base64'), mediaType: 'image/gif' } },
   ] as ContentBlock[]);
   opts.seedHistory?.(framework);
+  opts.workspace?.(workspace);
   framework.start();
   framework.pushEvent({
     type: 'external-message',
@@ -405,7 +408,142 @@ describe('save_recent_image provenance (issue #104)', () => {
     }
   });
 
-  it('an image-typed RFC-005 reference stub occupies a failing slot that points at fetch_reference', async () => {
+  it("a reference whose claimed type carries bidi controls is the image its stub shows, and its refusal shows the type without them", async () => {
+    // The stub shows `Image/PNG`, so after a restart the stub's text alone
+    // makes this a slot (matched without regard to case); the record must
+    // say the same, or the index slides.
+    const c = classifyBlock({ type: 'image', uri: 'https://example.invalid/sri-label.png', mimeType: '\u202EImage/PNG\u061C' });
+    assert.strictEqual(c.kind, 'reference');
+    const record = referenceRegistry.register((c as { testimony: ReferenceTestimony }).testimony);
+    const h = await startTurn({
+      prefix: 'sri-reference-label-',
+      responses: [[saveCall('call_save', { path: 'files/label.png', index: 0 })], done],
+      seedHistory: (framework) => {
+        framework.getAgent('prime')!.getContextManager().addMessage('user', [{
+          type: 'tool_result',
+          toolUseId: 'call_cam',
+          toolName: 'mcpl--vst--camera',
+          content: `[${record.refId}] label.png — Image/PNG, 1.2MB claimed — from tool result — fetch with fetch_reference`,
+          isError: false,
+        }] as ContentBlock[]);
+      },
+    });
+    try {
+      const result = await waitForToolResult(h.framework, 'call_save');
+      assert.strictEqual(result.isError, true, `index 0 is the reference, not the older GIF: ${result.content}`);
+      assert.match(result.content, new RegExp(`index 0 is a reference \\(${record.refId}, image/png, from`));
+      assert.ok(!/[\u061C\u202E]/.test(result.content), result.content);
+      assert.strictEqual(await fileBytes(h, 'files/label.png'), null);
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('an expired reference refuses with its reason; one with a saved copy still points at fetch_reference', async () => {
+    const register = (name: string) => {
+      const c = classifyBlock({ type: 'image', uri: `https://example.invalid/${name}`, mimeType: 'image/png', expiresAt: '2001-01-01T00:00:00Z' });
+      assert.strictEqual(c.kind, 'reference');
+      return referenceRegistry.register((c as { testimony: ReferenceTestimony }).testimony);
+    };
+    const kept = register('sri-expired-kept.png');
+    kept.fetchedPath = 'files/refs/kept.png'; // saved before its expiry passed: fetch_reference serves it
+    const expired = register('sri-expired.png');
+    const h = await startTurn({
+      prefix: 'sri-reference-expired-',
+      responses: [
+        [saveCall('call_save0', { path: 'files/expired.png', index: 0 })],
+        [saveCall('call_save1', { path: 'files/kept.png', index: 1 })],
+        done,
+      ],
+      seedHistory: (framework) => {
+        framework.getAgent('prime')!.getContextManager().addMessage('user', [{
+          type: 'tool_result',
+          toolUseId: 'call_cam',
+          toolName: 'mcpl--vst--camera',
+          content: `[${kept.refId}] kept.png — image/png — from tool result — saved: files/refs/kept.png\n`
+            + `[${expired.refId}] expired.png — image/png — from tool result — expired: its expiresAt has passed`,
+          isError: false,
+        }] as ContentBlock[]);
+      },
+    });
+    try {
+      const refused = await waitForToolResult(h.framework, 'call_save0');
+      assert.strictEqual(refused.isError, true);
+      assert.match(refused.content, new RegExp(`index 0 is a reference \\(${expired.refId}, image/png, from`));
+      assert.match(refused.content, /It can't be fetched either — expired: its expiresAt has passed\./);
+      assert.ok(!refused.content.includes('fetch_reference'), refused.content);
+      const keptRefusal = await waitForToolResult(h.framework, 'call_save1');
+      assert.strictEqual(keptRefusal.isError, true);
+      assert.match(keptRefusal.content, new RegExp(`index 1 is a reference \\(${kept.refId}, image/png, from`));
+      assert.match(keptRefusal.content, /Fetch it with fetch_reference and save the materialized file instead\./);
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("an attachment's media type is shown and stored as a label, and one with nothing left counts as absent", async () => {
+    // The store keeps a declared type only for bytes it can't sniff as a
+    // raster image, so these aren't images it knows. Oldest first: a type
+    // with controls in it, one that sanitizes to nothing, and a url-source
+    // image with no type at all (index 0: not inline, so not saveable).
+    const bytes = (tag: string): string => Buffer.from(`not a raster image ${tag}`).toString('base64');
+    const h = await startTurn({
+      prefix: 'sri-attachment-type-',
+      responses: [[saveCall('call_save', { path: 'files/sent.bmp', index: 1, count: 2 })], done],
+      seedHistory: (framework) => {
+        framework.getAgent('prime')!.getContextManager().addMessage('user', [
+          { type: 'image', source: { type: 'base64', data: bytes('a'), mediaType: 'image/\u202Ebmp\u0085' } },
+          { type: 'image', source: { type: 'base64', data: bytes('b'), mediaType: '\u202E\u061C' } },
+          { type: 'image', source: { type: 'url', url: 'https://example.invalid/sri-url.png' } },
+        ] as unknown as ContentBlock[]);
+      },
+    });
+    try {
+      const result = await waitForToolResult(h.framework, 'call_save');
+      assert.ok(!/[\u0085\u061C\u202E]/.test(result.content), result.content);
+      const receipts = saved(result);
+      assert.deepStrictEqual(receipts.map((r) => [r.imageIndex, r.mediaType, r.mimeType]), [
+        [1, 'image/png', 'image/png'],
+        [2, 'image/bmp', 'image/bmp'],
+      ]);
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a reference with no record shows its type bounded as a stub would, and says to re-run the tool', async () => {
+    // A stub line the registry has no record of (after a restart, or quoted
+    // text), whose type is far longer than a stub would show.
+    const longType = `image/${'x'.repeat(300)}`;
+    const h = await startTurn({
+      prefix: 'sri-reference-unknown-',
+      responses: [[saveCall('call_save', { path: 'files/long.png', index: 0 })], done],
+      seedHistory: (framework) => {
+        framework.getAgent('prime')!.getContextManager().addMessage('user', [{
+          type: 'tool_result',
+          toolUseId: 'call_cam',
+          toolName: 'mcpl--vst--camera',
+          content: `[ref_3_cc02] long.png — ${longType} — from tool result — fetch with fetch_reference`,
+          isError: false,
+        }] as ContentBlock[]);
+      },
+    });
+    try {
+      const result = await waitForToolResult(h.framework, 'call_save');
+      assert.strictEqual(result.isError, true);
+      assert.ok(result.content.includes(`(ref_3_cc02, image/${'x'.repeat(113)}…, from`), result.content);
+      assert.match(result.content, /holds no record of it .*If its tool can produce it again, re-run that tool for a fresh reference\./);
+      assert.ok(!result.content.includes('Fetch it with fetch_reference'), result.content);
+    } finally {
+      await h.framework.stop();
+      rmSync(h.tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('an image-typed RFC-005 reference stub with no record still occupies a failing slot', async () => {
     const h = await startTurn({
       prefix: 'sri-reference-',
       responses: [
@@ -428,7 +566,7 @@ describe('save_recent_image provenance (issue #104)', () => {
       const result = await waitForToolResult(h.framework, 'call_save');
       assert.strictEqual(result.isError, true);
       assert.match(result.content, /index 0 is a reference \(ref_1_ab3d, image\/png, from mcpl--vst--camera \(call call_cam\)\)/);
-      assert.match(result.content, /fetch_reference/);
+      assert.match(result.content, /holds no record of it/, 'no record here: fetch_reference could only call it unknown');
       assert.strictEqual(await fileBytes(h, 'files/cam.png'), null);
       // The text/plain reference is not an image slot: index 1 is the GIF.
       const gif = saved(await waitForToolResult(h.framework, 'call_save_gif'));
@@ -814,3 +952,92 @@ describe('ToolImageLedger', () => {
     );
   });
 });
+
+it('a write that throws before its tree entry names the images already saved', async () => {
+  const h = await startTurn({
+    prefix: 'sri-throw-',
+    responses: [
+      [snapCall('call_snap')],
+      [saveCall('call_save', { path: 'files/images.png', index: 0, count: 2 })],
+      done,
+    ],
+    workspace: (workspace) => {
+      const write = workspace.writeBinary.bind(workspace);
+      let writes = 0;
+      workspace.writeBinary = async (...args) => {
+        if (++writes === 2) throw new Error('injected tree exception');
+        return write(...args);
+      };
+    },
+  });
+  try {
+    const result = await waitForToolResult(h.framework, 'call_save');
+    assert.equal(result.isError, true);
+    assert.match(result.content, /injected tree exception/);
+    assert.match(result.content, /already saved: files\/images-0.png/);
+  } finally { await h.framework.stop(); rmSync(h.tempDir, { recursive: true, force: true }); }
+});
+
+it('a save whose write fails after its tree entry, through the workspace itself, is reported saved with its failure', async () => {
+  const h = await startTurn({
+    prefix: 'sri-tree-real-',
+    responses: [
+      [snapCall('call_snap')],
+      [saveCall('call_save', { path: 'files/images.png', index: 0, count: 1 })],
+      done,
+    ],
+    workspace: (workspace) => {
+      const ws = workspace as unknown as { intents: Map<string, { update: (...args: unknown[]) => unknown }> };
+      const intents = [...ws.intents.values()][0];
+      intents.update = () => { throw new Error('injected intent exception'); };
+    },
+  });
+  try {
+    const result = await waitForToolResult(h.framework, 'call_save');
+    const files = saved(result);
+    assert.equal(files.length, 1);
+    assert.equal(files[0].inChronicle, true);
+    assert.match(String(files[0].diskCopyError), /the rest of the write failed: injected intent exception/);
+    assert.ok((await fileBytes(h, String(files[0].path)))?.equals(PNG));
+  } finally { await h.framework.stop(); rmSync(h.tempDir, { recursive: true, force: true }); }
+});
+
+for (const secondFails of [false, true]) {
+  it(`a tree-only image save ${secondFails ? 'appears in a later failure receipt' : 'succeeds with a disk-copy warning'}`, async () => {
+    const h = await startTurn({
+      prefix: 'sri-tree-only-',
+      responses: [
+        [snapCall('call_snap')],
+        [saveCall('call_save', { path: 'files/images.png', index: 0, count: 2 })],
+        done,
+      ],
+      workspace: (workspace) => {
+        const write = workspace.writeBinary.bind(workspace);
+        let writes = 0;
+        workspace.writeBinary = async (...args) => {
+          if (++writes === 2 && secondFails) return { success: false, error: 'tree unavailable', isError: true };
+          const result = await write(...args);
+          assert.equal(result.success, true);
+          return { success: false, data: { inChronicle: true }, error: 'injected disk-copy failure', isError: true };
+        };
+      },
+    });
+    try {
+      const result = await waitForToolResult(h.framework, 'call_save');
+      if (secondFails) {
+        assert.equal(result.isError, true);
+        assert.match(result.content, /tree unavailable/);
+        assert.match(result.content, /already saved: files\/images-0.png/);
+      } else {
+        const files = saved(result);
+        assert.equal(files.length, 2);
+        assert.equal(files[0].path, 'files/images-0.png');
+        assert.equal(files[0].inChronicle, true);
+        assert.match(String(files[0].diskCopyError), /injected disk-copy failure/);
+        assert.equal(files[0].size, PNG.byteLength);
+        assert.equal(files[0].mimeType, 'image/png');
+      }
+      assert.ok((await fileBytes(h, 'files/images-0.png'))?.equals(PNG));
+    } finally { await h.framework.stop(); rmSync(h.tempDir, { recursive: true, force: true }); }
+  });
+}

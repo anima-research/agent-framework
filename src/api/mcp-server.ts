@@ -391,7 +391,12 @@ export class McpServer {
             },
             maxTokens: {
               type: 'number',
-              description: 'Maximum tokens to include (optional)',
+              description:
+                "A hypothetical budget to compile the context at (optional; without it, the context manager's " +
+                "default of 100000, not the agent's own window). Under the autobiographical strategy, a budget " +
+                "the context can't fit fails the call with the context manager's refusal, which names the tokens " +
+                'and the limit. Passthrough keeps the newest messages that fit (none, if the newest alone is ' +
+                'larger), and windowed passthrough returns the newest message alone, larger than the budget.',
             },
           },
           required: ['agentName'],

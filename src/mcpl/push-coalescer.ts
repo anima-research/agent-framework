@@ -18,6 +18,7 @@
  * bookkeeping and is unit-tested without a framework.
  */
 import type { McplContentBlock, PushEventResult } from './types.js';
+import { classifyBlock, isInlineContradiction } from './references.js';
 import { isVisiblyEmptyContent } from './visible-content.js';
 
 export const PUSH_COALESCING_SUPPORT = {
@@ -35,6 +36,18 @@ export class CoalesceError extends Error {
     super(message);
     this.name = 'CoalesceError';
   }
+}
+
+/**
+ * How the host names a coalesce rejection, from the code the wire answered
+ * with. `coalesce-failed` is the host's own failure: -32000 (coalescing
+ * unavailable, the host stopping, or an acceptance it couldn't make durable)
+ * and -32603 (an internal error). `coalesce-invalid` is every other answer,
+ * the sender's: -32602 for a malformed item, -32017 or -32023 for a channel
+ * that isn't permitted or isn't registered.
+ */
+export function coalesceRejectionReason(answered: number): 'coalesce-failed' | 'coalesce-invalid' {
+  return answered === -32000 || answered === -32603 ? 'coalesce-failed' : 'coalesce-invalid';
 }
 
 /** Content with nothing model-visible (see visible-content.ts): -32602. */
@@ -212,7 +225,6 @@ export interface CoalescerOptions {
   recoveryBackoffMs?: number;
   maxSubjects?: number;
   maxNotices?: number;
-  maxContentBytes?: number;
   maxDataBytes?: number;
 }
 
@@ -232,6 +244,32 @@ function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOc
 /**
  * Validate wire content before it is stored, rendered or converted.
  *
+ * Its shape and its visible emptiness, nothing else. An incoming coalesced
+ * occurrence reaches context through the converters an uncoalesced message
+ * goes through: a plain occurrence the moment it is admitted (the coalescer
+ * only remembers where it landed), a deferred one when its render settles or
+ * falls back to it. Its content must be an array of objects. A block the
+ * converters can't render (a video, an unknown type, an image with neither
+ * uri nor data) becomes a placeholder, as it does uncoalesced, and so does a
+ * malformed one, since the converters take any object without throwing: a
+ * type, text, data, mimeType or uri that isn't a string counts as absent, a
+ * text block's as no text. The uncoalesced lane doesn't check the array:
+ * there a member that isn't an object becomes the untyped placeholder, and a
+ * null member or content that isn't an array throws in conversion
+ * (agent-framework#297 brings that lane to this rule).
+ * Nor does the uncoalesced path set a byte budget on content:
+ * an inline image is admitted here as it is there (agent-framework#266: a
+ * 1 MiB serialized-content budget here dropped every coalesced message
+ * carrying a screenshot). A deferred occurrence's content is held, until then,
+ * in the coalescer's state and its persisted snapshot and receipts.
+ *
+ * A render result, which the host delivers in the occurrence's place, gets
+ * these checks, as RFC-006 §5.2 gives it every check a pushed payload gets,
+ * and one more (`checkBlockShapes`): each block must be one the converters
+ * show as itself or as a reference stub, not as a placeholder. A malformed
+ * render falls back to the occurrence's own content; a pushed payload has
+ * nothing to fall back to, and gets its placeholders.
+ *
  * Visibly-empty content is refused unless `allowEmpty`: an admitted
  * occurrence with nothing to show would wake the model with no visible cause.
  * Empty is legitimate only where the RFC gives it a meaning — a retraction
@@ -240,20 +278,36 @@ function mergeIdentity(prior: CoalescedOccurrence['identity'], next: CoalescedOc
  */
 export function validateCoalescedContent(
   content: unknown,
-  maxBytes = 1024 * 1024,
-  options: { allowEmpty?: boolean } = {},
+  options: { allowEmpty?: boolean; checkBlockShapes?: boolean } = {},
 ): asserts content is McplContentBlock[] {
   if (!Array.isArray(content)) throw new CoalesceError('payload.content', 'content must be an array');
   for (const b of content as Array<Record<string, unknown>>) {
     if (!b || typeof b !== 'object' || Array.isArray(b)) throw new CoalesceError('payload.content', 'invalid content block');
-    if (b.type === 'text' && typeof b.text === 'string') continue;
-    if (b.type === 'resource' && typeof b.uri === 'string') continue;
-    if ((b.type === 'image' || b.type === 'audio')
-      && (typeof b.uri === 'string' || (typeof b.data === 'string' && typeof b.mimeType === 'string'))) continue;
-    throw new CoalesceError('payload.content', 'invalid content block');
+    if (options.checkBlockShapes && !showsAsItself(b)) throw new CoalesceError('payload.content', 'invalid content block');
   }
-  if (Buffer.byteLength(JSON.stringify(content)) > maxBytes) throw new CoalesceError('payload.content', 'content exceeds host byte limit');
   if (!options.allowEmpty && isVisiblyEmptyContent(content)) throw new EmptyContentError();
+}
+
+/**
+ * Whether the converters (`convertBlock` in push-handler.ts and
+ * channel-registry.ts) show a block as itself, its text or its image or
+ * audio source, or as a reference stub, and not as a placeholder: an
+ * unrecognized block, a no-data or no-media-type one, or withheld inline
+ * data. A text block whose text isn't a string, which they show as no text,
+ * is refused too. This follows their branches in their order.
+ */
+function showsAsItself(b: Record<string, unknown>): boolean {
+  if (b.type === 'text') return typeof b.text === 'string';
+  if (b.type === 'resource') return classifyBlock(b).kind === 'reference';
+  if (b.type !== 'image' && b.type !== 'audio') return false;
+  if (isInlineContradiction(b)) return false;
+  if (isFilledString(b.uri) && b.disposition) return classifyBlock(b).kind === 'reference';
+  if (isFilledString(b.data) && isFilledString(b.mimeType)) return true;
+  return b.type === 'image' && isFilledString(b.uri);
+}
+
+function isFilledString(value: unknown): value is string {
+  return typeof value === 'string' && value !== '';
 }
 
 /** Validate the `coalesce` member of either lane (§13). */
@@ -700,14 +754,24 @@ export class PushCoalescer<E = unknown> {
       try {
         const result = await this.host.render(occurrence, params);
         if (rendering.cancelled) { this.host.audit({ kind: 'late-render', subject, eventId: occurrence.eventId, discarded: true }); }
-        // §5.2: an empty result is legitimate ("nothing happened").
-        else validateCoalescedContent(result?.content, this.options.maxContentBytes, { allowEmpty: true });
+        // §5.2: an empty result is legitimate ("nothing happened"); each
+        // block must be well formed.
+        else validateCoalescedContent(result?.content, { allowEmpty: true, checkBlockShapes: true });
         if (rendering.cancelled) throw new CancelledRender();
         content = result.content;
         timestamp = typeof result.timestamp === 'string' ? result.timestamp : new Date().toISOString();
         source = 'render';
       } catch (error) {
-        if (!(error instanceof CancelledRender)) this.host.audit({ kind: 'render-failed', subject, eventId: occurrence.eventId, error: String(error) });
+        if (!(error instanceof CancelledRender)) {
+          // The occurrence's own content is delivered instead; the host names
+          // the failure where operators look (a console line, not only this
+          // audit record).
+          this.host.audit({
+            kind: 'render-failed', subject, serverId: occurrence.serverId, eventId: occurrence.eventId,
+            ...(error instanceof CoalesceError ? { field: error.field } : {}),
+            error: String(error),
+          });
+        }
       } finally {
         const left = (this.rendersInFlight.get(occurrence.serverId) ?? 1) - 1;
         if (left > 0) this.rendersInFlight.set(occurrence.serverId, left); else this.rendersInFlight.delete(occurrence.serverId);

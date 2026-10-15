@@ -24,6 +24,13 @@ import type {
   TraceEventListener,
 } from './types/index.js';
 import type { Agent } from './agent.js';
+import { DEFAULT_SHUTDOWN_TIMEOUT_MS, validateShutdownTimeout, waitForShutdown } from './shutdown.js';
+
+/** How the registry queues a module's event: its push names the module. A
+ * `ProcessQueue` serves too, ignoring the name. */
+export interface ModuleQueue {
+  push(event: ProcessEvent, moduleName?: string): void;
+}
 
 const MODULE_STATE_PREFIX = 'modules/';
 
@@ -47,6 +54,15 @@ export function isStateExistsError(err: unknown): boolean {
 const MAX_CONTEXT_TIMEOUT_MS = 30_000;
 
 /**
+ * Bound on each module's onToolBatchComplete. The hook runs inside the
+ * framework's sequential event loop, so a wedged module would stall every
+ * agent's events, not just its own round; past this the round goes on without
+ * it. A module with its own semantic deadline (the workspace scan's) sets it
+ * below this one, so it can record the miss itself.
+ */
+export const TOOL_BATCH_HOOK_TIMEOUT_MS = 30_000;
+
+/**
  * Registered speech handler.
  */
 interface SpeechHandler {
@@ -60,11 +76,15 @@ interface SpeechHandler {
  * Registry for managing modules.
  */
 export class ModuleRegistry {
+  /** Each module's tool-batch hook still running, past its bound or not. */
+  private batchHooksRunning = new Map<string, Promise<unknown>>();
+
   private modules: Map<string, Module> = new Map();
+  private stopping = new Map<Module, Promise<void>>();
   private moduleContexts: Map<string, ModuleContextImpl> = new Map();
   private speechHandlers: SpeechHandler[] = [];
   private store: JsStore;
-  private queue: ProcessQueue;
+  private queue: ModuleQueue;
   private getAgents: () => Agent[];
   private addMessageFn: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
   private editMessageFn: (id: MessageId, content: ContentBlock[]) => void;
@@ -72,7 +92,7 @@ export class ModuleRegistry {
   private getMessageFn: (id: MessageId) => StoredMessage | null;
   private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
 
-  private pushEventFn: (event: ProcessEvent) => void;
+  private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
   /** Framework ops-alert channel, surfaced to modules via
@@ -87,7 +107,7 @@ export class ModuleRegistry {
 
   constructor(
     store: JsStore,
-    queue: ProcessQueue,
+    queue: ModuleQueue,
     options: {
       getAgents: () => Agent[];
       addMessage: (participant: string, content: ContentBlock[], metadata?: MessageMetadata) => MessageId;
@@ -95,7 +115,8 @@ export class ModuleRegistry {
       removeMessage: (id: MessageId) => void;
       getMessage: (id: MessageId) => StoredMessage | null;
       queryMessages: (filter: MessageQuery) => MessageQueryResult;
-      pushEvent: (event: ProcessEvent) => void;
+      /** Called with the pushing module's name. */
+      pushEvent: (event: ProcessEvent, moduleName?: string) => void;
       onTrace: (listener: TraceEventListener) => () => void;
       callTool: (call: ToolCall) => Promise<ToolResult>;
       notifyOps?: (kind: string, agentName: string, message: string, data?: Record<string, unknown>) => void;
@@ -173,9 +194,7 @@ export class ModuleRegistry {
       throw new Error(`Module not found: ${name}`);
     }
 
-    await module.stop();
-    this.modules.delete(name);
-    this.moduleContexts.delete(name);
+    await this.stopModule(module);
   }
 
   /**
@@ -261,7 +280,20 @@ export class ModuleRegistry {
   }
 
   /**
-   * Handle a tool call by routing to the appropriate module.
+   * A module tool's call for a path that stores or sends its result: the
+   * model's dispatch, a script's inner call, the `utils` meta-tool for a
+   * model. The result is checked and read once, in its JSON form
+   * ({@link storableToolResult}).
+   */
+  async storableToolCall(call: ToolCall): Promise<ToolResult> {
+    return storableToolResult(call, await this.handleToolCall(call));
+  }
+
+  /**
+   * Handle a tool call by routing to the appropriate module: the module's own
+   * result, unchecked, as it returned it, for a caller that uses the result
+   * in process (`ModuleContext.callTool`, `executeToolCall`, or a host
+   * calling the registry). A module's throw is answered as an error result.
    */
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     // Parse module--tool name
@@ -297,23 +329,37 @@ export class ModuleRegistry {
     try {
       return await module.handleToolCall(moduleCall);
     } catch (error) {
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : String(error),
-        isError: true,
-      };
+      return thrownResult(error);
     }
   }
 
   /**
-   * Stop all modules.
+   * Stop all modules. A caller may bound its wait without cancelling cleanup.
+   * The default waits for each module's own shutdown contract.
    */
-  async stopAll(): Promise<void> {
-    const stopPromises = Array.from(this.modules.values()).map((m) => m.stop());
-    await Promise.all(stopPromises);
-    this.modules.clear();
-    this.moduleContexts.clear();
-    this.speechHandlers = [];
+  async stopAll(timeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS): Promise<void> {
+    validateShutdownTimeout(timeoutMs);
+    await waitForShutdown(Array.from(this.modules.values(), module => ({
+      label: `module:${module.name}`, promise: this.stopModule(module),
+    })), timeoutMs);
+  }
+
+  private stopModule(module: Module): Promise<void> {
+    const existing = this.stopping.get(module);
+    if (existing) return existing;
+    const attempt = Promise.resolve().then(() => module.stop()).then(() => {
+      if (this.modules.get(module.name) === module) {
+        this.modules.delete(module.name);
+        this.moduleContexts.delete(module.name);
+        this.speechHandlers = this.speechHandlers.filter(handler => handler.moduleName !== module.name);
+      }
+      this.stopping.delete(module);
+    }, error => {
+      this.stopping.delete(module);
+      throw error;
+    });
+    this.stopping.set(module, attempt);
+    return attempt;
   }
 
   /**
@@ -398,6 +444,57 @@ export class ModuleRegistry {
   }
 
   /**
+   * Tell modules an agent's tool batch completed (see
+   * Module.onToolBatchComplete). Hooks run in parallel, each awaited up to
+   * `timeoutMs`; a hook that throws or times out is logged and skipped, so a
+   * wedged module can't hold the round. Returns the modules that didn't
+   * finish, for the caller's trace.
+   */
+  async notifyToolBatchComplete(
+    agentName: string,
+    timeoutMs = TOOL_BATCH_HOOK_TIMEOUT_MS,
+  ): Promise<Array<{ module: string; error: string }>> {
+    const failures: Array<{ module: string; error: string }> = [];
+    const promises: Promise<void>[] = [];
+    for (const module of this.modules.values()) {
+      if (!module.onToolBatchComplete) continue;
+      // A hook still running from an earlier batch (it outlasted its bound)
+      // isn't called again or waited for: a wedged module costs one bound,
+      // not one per batch.
+      if (this.batchHooksRunning.has(module.name)) {
+        failures.push({ module: module.name, error: 'still running from an earlier batch' });
+        continue;
+      }
+      // Called from a promise, so a hook that throws synchronously, before
+      // returning its promise, is caught below like any other failure
+      // instead of escaping the round (the result would never be provided).
+      const call = Promise.resolve().then(() => module.onToolBatchComplete!(agentName));
+      this.batchHooksRunning.set(module.name, call);
+      const settled = (): void => {
+        if (this.batchHooksRunning.get(module.name) === call) this.batchHooksRunning.delete(module.name);
+      };
+      call.then(settled, settled);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      promises.push(
+        Promise.race([
+          call,
+          new Promise<void>((_, rej) => {
+            timer = setTimeout(() => rej(new Error(`onToolBatchComplete timed out after ${timeoutMs}ms`)), timeoutMs);
+          }),
+        ])
+          .catch((err: unknown) => {
+            const error = err instanceof Error ? err.message : String(err);
+            failures.push({ module: module.name, error });
+            console.error(`[${module.name}] onToolBatchComplete:`, err);
+          })
+          .finally(() => clearTimeout(timer)),
+      );
+    }
+    await Promise.all(promises);
+    return failures;
+  }
+
+  /**
    * Dispatch speech to registered handlers.
    */
   async dispatchSpeech(
@@ -447,7 +544,7 @@ class ModuleContextImpl implements ModuleContext {
   private removeMessageFn: (id: MessageId) => void;
   private getMessageFn: (id: MessageId) => StoredMessage | null;
   private queryMessagesFn: (filter: MessageQuery) => MessageQueryResult;
-  private pushEventFn: (event: ProcessEvent) => void;
+  private pushEventFn: (event: ProcessEvent, moduleName?: string) => void;
   private onTraceFn: (listener: TraceEventListener) => () => void;
   private callToolFn: (call: ToolCall) => Promise<ToolResult>;
 
@@ -458,7 +555,7 @@ class ModuleContextImpl implements ModuleContext {
     moduleName: string,
     store: JsStore,
     stateId: string,
-    queue: ProcessQueue,
+    queue: ModuleQueue,
     registry: ModuleRegistry,
     isRestart: boolean,
     getAgents: () => Agent[],
@@ -467,14 +564,15 @@ class ModuleContextImpl implements ModuleContext {
     removeMessage: (id: MessageId) => void,
     getMessage: (id: MessageId) => StoredMessage | null,
     queryMessages: (filter: MessageQuery) => MessageQueryResult,
-    pushEvent: (event: ProcessEvent) => void,
+    pushEvent: (event: ProcessEvent, moduleName?: string) => void,
     onTrace: (listener: TraceEventListener) => () => void,
     callTool: (call: ToolCall) => Promise<ToolResult>
   ) {
     this.moduleName = moduleName;
     this.store = store;
     this.stateId = stateId;
-    this.queue = queue;
+    // The deprecated handle: a push names this module, as pushEvent() does.
+    this.queue = { push: (event) => queue.push(event, moduleName) };
     this.registry = registry;
     this.isRestart = isRestart;
     this.getAgentsFn = getAgents;
@@ -657,7 +755,7 @@ class ModuleContextImpl implements ModuleContext {
   }
 
   pushEvent(event: ProcessEvent): void {
-    this.pushEventFn(event);
+    this.pushEventFn(event, this.moduleName);
   }
 
   private persistExternalIdMap(): void {
@@ -709,5 +807,151 @@ class ProcessStateImpl implements ProcessState {
 
   pushEvent(event: ProcessEvent): void {
     this.ctx.pushEvent(event);
+  }
+}
+
+/** A result's flags, which consumers read for their truth: booleans here. */
+const RESULT_FLAGS = ['success', 'isError', 'endTurn'] as const;
+
+/**
+ * A module's tool result as the framework can store, send and trace it. A
+ * module runs in the host's process, so it can return what JSON can't hold,
+ * such as a cyclic object, a BigInt or a `toJSON` that throws, no result
+ * object at all, or one whose getters or Proxy traps throw, or answer
+ * differently each time they're read. Everything after this (the stored
+ * history, the request sent to the model, traces, the tool-result guard's
+ * audit record, a script's result) would throw on it, and the agent's turn
+ * would never settle.
+ *
+ * So the result is read once, here, and this never throws. Each field a
+ * consumer reads is read by name, so a result class's getters count, and any
+ * other own field is kept, except a `toJSON`: consumers read a result's
+ * fields, never a `toJSON` of the result. What's returned is the JSON form of
+ * those fields, parsed, so every consumer holds plain data and no module code
+ * runs again. It's taken where the framework stores or sends a result
+ * ({@link ModuleRegistry.storableToolCall}). A caller that uses the result
+ * in process (`ModuleContext.callTool`, `executeToolCall`) gets the module's
+ * own result, as the module returned it ({@link ModuleRegistry.handleToolCall}).
+ * The flags are booleans, read for their truth as consumers read them.
+ * `error` is its text form, which is all a consumer reads of it, so an error
+ * value JSON can't hold costs nothing. An error that says nothing (null,
+ * false or empty) is left out, so the result reads as having no error text.
+ *
+ * A result that can't be read or converted becomes an error result naming the
+ * tool, keeping the module's own error text and its `endTurn` when they could
+ * be read. So does data that is a function or a symbol, which JSON leaves out
+ * whole.
+ */
+export function storableToolResult(call: ToolCall, result: unknown): ToolResult {
+  return checkedToolResult(call, result).result;
+}
+
+/**
+ * {@link storableToolResult}, saying whether the module's result was usable:
+ * read and converted (`usable`), or replaced by the error result naming the
+ * tool. A caller that stores the result and hands the module's own result
+ * back, as `puppetToolCall` does, hands back the error result instead when
+ * there was nothing usable to store.
+ */
+export function checkedToolResult(call: ToolCall, result: unknown): { result: ToolResult; usable: boolean } {
+  // What's been read so far, kept by an error result if a later read throws.
+  let ownText: string | undefined;
+  let endTurn = false;
+  const unusable = (problem: string): { result: ToolResult; usable: boolean } => {
+    const own = ownText ? `, with this error: ${ownText}` : '.';
+    const error = `Tool '${call.name}' ${problem}. The call itself completed${own}`;
+    console.error(`[tools] ${call.callerAgentName ? `agent ${call.callerAgentName}: ` : ''}${error}`);
+    return { result: { success: false, isError: true, error, ...(endTurn ? { endTurn: true } : {}) }, usable: false };
+  };
+  const reasonOf = (error: unknown) => thrownText(error).split('\n')[0] || 'no reason given';
+  try {
+    if (!result || typeof result !== 'object' || Array.isArray(result) || result instanceof Error) {
+      const what = result === undefined || result === null ? String(result)
+        : Array.isArray(result) ? 'an array' : result instanceof Error ? 'an Error' : `a ${typeof result}`;
+      if (result instanceof Error) ownText = errorText(result);
+      return unusable(`returned ${what} instead of a result object, so there's nothing to store or send`);
+    }
+    const candidate = result as Record<string, unknown>;
+    // No prototype, so an own field named like an inherited one is a field.
+    const fields: Record<string, unknown> = Object.create(null);
+    const read = (key: string) => { if (key in candidate) fields[key] = candidate[key]; };
+    // endTurn first and the error's text next, so an error result keeps
+    // whichever of them could be read when a later read throws.
+    read('endTurn');
+    endTurn = Boolean(fields.endTurn);
+    read('error');
+    ownText = errorText(fields.error);
+    for (const key of ['success', 'isError', 'data']) read(key);
+    for (const key of Object.keys(candidate)) {
+      if (key !== 'toJSON' && !(key in fields)) fields[key] = candidate[key];
+    }
+    // The error is kept as its text, which consumers read; its value isn't.
+    delete fields.error;
+    // The flags are kept as their truth, which is all consumers read of them,
+    // before anything is serialized, so a flag's own value (a BigInt, a
+    // function, an object with a toJSON) neither breaks nor runs anything.
+    for (const flag of RESULT_FLAGS) {
+      if (fields[flag] !== undefined) fields[flag] = Boolean(fields[flag]);
+    }
+    // An error result reads as its error, so only a non-error result's data matters.
+    if (!fields.isError && (typeof fields.data === 'function' || typeof fields.data === 'symbol')) {
+      return unusable(`returned a ${typeof fields.data} as its data, which JSON leaves out, so there's nothing to store or send`);
+    }
+    let json: string;
+    try {
+      json = JSON.stringify(fields);
+    } catch (error) {
+      return unusable(`returned a result that can't be converted to JSON, so it can't be stored or sent (${reasonOf(error)})`);
+    }
+    const storable = JSON.parse(json) as Record<string, unknown>;
+    if (ownText !== undefined) storable.error = ownText;
+    return { result: storable as unknown as ToolResult, usable: true };
+  } catch (error) {
+    return unusable(`returned a result that can't be read, so it can't be stored or sent (${reasonOf(error)})`);
+  }
+}
+
+/** A result's `error` as text, always a string or none: a string as it is,
+ *  an `Error`'s message read the same way (a module's value, so not always a
+ *  string), an object's own `message`, any other value's JSON, and a
+ *  primitive JSON can't hold (a BigInt, a symbol) as its String(). None for a
+ *  value that says nothing: absent, null, false or empty, which consumers
+ *  then report as "Unknown error". */
+function errorText(error: unknown): string | undefined {
+  if (error === undefined || error === null || error === false || error === '') return undefined;
+  if (typeof error === 'string') return error;
+  if (error instanceof Error) return errorText(error.message);
+  const message = (error as { message?: unknown }).message;
+  if (typeof message === 'string' && message) return message;
+  try {
+    const json = JSON.stringify(error) as string | undefined;
+    if (json !== undefined) return json;
+  } catch {
+    // A cyclic or BigInt-holding value: nothing faithful to show as JSON.
+  }
+  if (typeof error !== 'object' && typeof error !== 'function') return thrownText(error);
+  return 'an error value with no text form';
+}
+
+/** A module's throw, answered as an error result: its text, or none when it
+ *  has none, so consumers say "Unknown error". */
+export function thrownResult(error: unknown): ToolResult {
+  const text = thrownText(error);
+  return { success: false, isError: true, ...(text ? { error: text } : {}) };
+}
+
+/** A thrown value's whole text, always a string, for a result's error, and
+ *  for a value that has none too. An `Error`'s message is a module's value,
+ *  so it may not be a string: one that isn't is given its String(), and an
+ *  absent one is empty. String() throws on an object without a prototype,
+ *  and such a value is named as having no text form. */
+function thrownText(value: unknown): string {
+  try {
+    if (!(value instanceof Error)) return String(value);
+    const message: unknown = value.message;
+    if (typeof message === 'string') return message;
+    return message === undefined || message === null ? '' : String(message);
+  } catch {
+    return 'a value with no text form';
   }
 }

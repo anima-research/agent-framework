@@ -17,7 +17,7 @@ import { MockMembrane, MockYieldingStream, createMockResponse } from './mock-mem
 export const TS = '2026-09-30T00:00:00Z';
 export const ok = () => createMockResponse([{ type: 'text', text: 'ok' }]);
 
-export async function fixture(options: { server?: Record<string, unknown>; framework?: Partial<FrameworkConfig>; agents?: unknown[]; dir?: string; port?: number } = {}) {
+export async function fixture(options: { server?: Record<string, unknown>; framework?: Partial<FrameworkConfig>; agents?: unknown[]; dir?: string; port?: number; featureSets?: Record<string, unknown>; mcpl?: Record<string, unknown> } = {}) {
   const wss = new WebSocketServer({ port: options.port ?? 0, host: '127.0.0.1' });
   await once(wss, 'listening');
   let online = true;
@@ -40,14 +40,21 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
         reply({ protocolVersion: '2024-11-05', capabilities: { tools: {}, experimental: { mcpl: {
           version: '0.5', pushEvents: true, inferenceRequest: true,
           channels: { incoming: true, register: true, lifecycle: true, publish: true },
-          featureSets: { doc: { description: 'doc', uses: ['pushEvents'] } },
+          featureSets: options.featureSets ?? { doc: { description: 'doc', uses: ['pushEvents'] } },
+          ...options.mcpl,
         } } }, serverInfo: { name: 'editor', version: '1' } });
       } else if (m.method === 'featureSets/update') reply({ accepted: true });
       else if (m.method === 'tools/list') reply({ tools: [] });
       else if (m.method === 'channels/publish') { published.push(m.params); if (m.id !== undefined) reply({ delivered: true }); }
       else if (m.method === 'channels/close') reply({ closed: true });
       else if (m.method === 'channels/open') reply({ channel: { id: m.params.channelId, type: 'discord', label: m.params.channelId } });
-      else if (m.method === 'push/render') { renders.push(m.params); reply(await renderer(m.params)); }
+      else if (m.method === 'push/render') {
+        renders.push(m.params);
+        const out = await renderer(m.params) as { error?: unknown } | undefined;
+        // A renderer may answer with a JSON-RPC error: { error: { code, message } }.
+        if (out && typeof out === 'object' && 'error' in out) ws.send(JSON.stringify({ jsonrpc: '2.0', id: m.id, error: out.error }));
+        else reply(out);
+      }
       else if (m.id !== undefined) reply({});
     });
   });
@@ -111,8 +118,9 @@ export async function fixture(options: { server?: Record<string, unknown>; frame
 }
 
 export async function eventually(predicate: () => boolean, what = 'condition'): Promise<void> {
-  const deadline = Date.now() + 3000;
-  while (!predicate()) { assert(Date.now() < deadline, `${what} did not settle`); await new Promise((r) => setTimeout(r, 10)); }
+  // The monotonic clock: a wall-clock step must not fail a wait that's on schedule.
+  const deadline = performance.now() + 3000;
+  while (!predicate()) { assert(performance.now() < deadline, `${what} did not settle`); await new Promise((r) => setTimeout(r, 10)); }
 }
 
 

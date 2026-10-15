@@ -67,6 +67,54 @@ test('unresolvable target suppresses that envelope only', () => {
   assert.equal(textFor(out, 'discord:g:100'), 'to somewhere');
 });
 
+test('explicit: an indented prefix routes, as delivery reads it', () => {
+  const out = run(explicit(), '  >>#general indented reply\n\t>>#ops tabbed aside\n  plain indented line');
+  assert.equal(textFor(out, 'discord:g:100'), 'indented reply\n');
+  assert.equal(textFor(out, 'discord:g:200'), 'tabbed aside\n  plain indented line');
+});
+
+test('explicit: indentation before a quoted arrow or a lone `>` stays body', () => {
+  const out = run(explicit(), '>>#general look:\n  >> quoted arrow\n  > quote');
+  assert.equal(textFor(out, 'discord:g:100'), 'look:\n  >> quoted arrow\n  > quote');
+});
+
+test('explicit: any leading whitespace before a prefix, as delivery trims it', () => {
+  const out = run(explicit(), '\u00a0>>#general nbsp\n\u2003>>#ops em space\n\r>>@sol after a CR');
+  assert.equal(textFor(out, 'discord:g:100'), 'nbsp\n');
+  assert.equal(textFor(out, 'discord:g:200'), 'em space\n');
+  assert.equal(textFor(out, 'discord:dm:300'), 'after a CR');
+});
+
+test('explicit: whitespace other than a space or tab ends the token and starts the body', () => {
+  const out = run(explicit(), '\t>>#ops\r\nhello');
+  assert.equal(textFor(out, 'discord:g:200'), '\r\nhello');
+});
+
+test('explicit: `>>` and then any whitespace is a quoted arrow', () => {
+  const out = run(explicit(), '>>#general look:\n>>\u00a0quoted');
+  assert.equal(textFor(out, 'discord:g:100'), 'look:\n>>\u00a0quoted');
+});
+
+test('explicit: a bare `>>` line is text, its newline included, as delivery sends it', () => {
+  const r = new ProseStreamRouter({ mode: 'explicit', initialTarget: 'discord:g:100', resolve: (spec) => RESOLVE[spec] ?? null });
+  const out = [...r.feed('>>\nhello'), ...r.finish()];
+  assert.equal(textFor(out, 'discord:g:100'), '>>\nhello');
+});
+
+test('explicit: each segment starts a new line, and a prefix with no body takes effect at its end', () => {
+  // Delivery parses each round's text on its own: a round may begin with a
+  // prefix, and a round that is only a prefix sets the sticky destination.
+  const r = explicit();
+  const out: RoutedDelta[] = [];
+  out.push(...r.feed('>>#general first'), ...r.endSegment());
+  out.push(...r.feed('>>#ops second'), ...r.endSegment());
+  out.push(...r.feed('>>@sol'), ...r.endSegment());
+  out.push(...r.feed('to sol'), ...r.finish());
+  assert.equal(textFor(out, 'discord:g:100'), 'first');
+  assert.equal(textFor(out, 'discord:g:200'), 'second');
+  assert.equal(textFor(out, 'discord:dm:300'), 'to sol');
+});
+
 test('` !` continuation modifier is swallowed; `!` as body survives', () => {
   const out = run(explicit(), '>>#general ! next turn continues\n>>#ops !bang body');
   assert.equal(textFor(out, 'discord:g:100'), 'next turn continues\n');

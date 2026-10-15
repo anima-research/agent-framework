@@ -140,6 +140,15 @@ never do.
   consumers run github-clone checkouts, so release notes must exist even
   when npm publish fails. Version bumps are a maintainer release-time
   action, not part of feature PRs.
+- **Release holds.** When releasing `main` as it stands would harm
+  someone running it, open an issue that says what has to happen first
+  and label it `release-hold`, or ask a maintainer to label it. Close it
+  once that's happened, or if it no longer applies. While one is open,
+  `npm version` stops before it bumps anything, `npm publish` refuses,
+  and the publish workflow refuses both its npm publish and its GitHub
+  release notes. The check also stops a release when it can't read the
+  holds from GitHub, and says why. npm's `--ignore-scripts` skips it, as
+  it skips every lifecycle script.
 
 ## Building and testing
 

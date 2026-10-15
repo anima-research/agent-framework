@@ -52,8 +52,32 @@ export function toolResultDataToHistoryString(
   options?: HistorySerializeOptions,
 ): string {
   const fromArray = tryHistoryStringFromContentArray(data, options);
-  const str = fromArray ?? JSON.stringify(data);
+  // JSON leaves out undefined, a function and a symbol: a result with no data
+  // is stored as no text, as an empty content array is.
+  const str = fromArray ?? (JSON.stringify(data) as string | undefined) ?? '';
   return maxChars ? truncateForHistory(str, maxChars) : str;
+}
+
+/**
+ * The text of a tool result that isn't an error result: its data, as history
+ * stores it, or, when it has no data, its error text. A tool can answer
+ * `{ success: false, error, isError: false }`, a failure it doesn't flag as
+ * an error for the model, and the model still reads what failed.
+ *
+ * Each field is read once: the direct Agent API passes its caller's own
+ * result here, unchecked, and a getter needn't answer the same way twice.
+ */
+export function nonErrorResultText(
+  result: { data?: unknown; error?: string },
+  maxChars?: number,
+  options?: HistorySerializeOptions,
+): string {
+  const data = result.data;
+  if (data === undefined || data === null) {
+    const error = result.error;
+    if (typeof error === 'string' && error) return maxChars ? truncateForHistory(error, maxChars) : error;
+  }
+  return toolResultDataToHistoryString(data, maxChars, options);
 }
 
 /** Bounded copy of an arbitrary string with the standard truncation notice.

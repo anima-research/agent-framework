@@ -41,11 +41,14 @@ export type TraceEvent =
       type: 'inference:started';
       agentName: string;
       /**
-       * The turn-frozen outbound locus (see turnLocusPins) — the channel this
-       * turn's plain prose will be routed to. Omitted for turns with no locus
-       * (heartbeats with no default channel). Observability only, like every
-       * trace field; lets external taps (e.g. a TTS relay) tag the whole
-       * activation with its channel without re-deriving routing.
+       * The turn's locus as this stream starts (locus and hybrid mode): where
+       * its unprefixed plain prose is published, unless a hybrid `>>>`
+       * destination takes it, or a re-pin or a `channel_open` moves the locus
+       * later in the turn. Omitted for a turn with no locus: explicit and
+       * disabled mode, a silent turn, and a heartbeat with no default
+       * channel. Observability only, like every trace field; lets external
+       * taps (e.g. a TTS relay) tag the whole activation with its channel
+       * without re-deriving routing.
        */
       channelId?: string;
       /** True for a control-plane wake that must not surface typing/prose. */
@@ -66,20 +69,29 @@ export type TraceEvent =
   | (TraceEventBase & {
       type: 'inference:failed';
       agentName: string;
+      /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
       error: string;
+      /** Bounded like `error`. */
       stack?: string;
     })
   | (TraceEventBase & {
       type: 'inference:exhausted';
       agentName: string;
+      /** The failure's message, bounded as every trace event's `error` is (2,000 characters). */
       error: string;
       /** Whether membrane classified the failure as retryable (observability). */
       retryable?: boolean;
       /**
-       * The membrane error type (e.g. 'invalid_request', 'auth', 'context_length').
-       * The poison-history breaker fires only on 'invalid_request'.
+       * The membrane error type (e.g. 'invalid_request', 'auth', 'context_length'),
+       * at most 128 characters. The poison-history breaker fires only on
+       * 'invalid_request' at HTTP 400, 413 or 422 or with no status, and on
+       * 'context_length' at 413 (shedMayHelp).
        */
       errorType?: string;
+      /** The provider's HTTP status, when the failure carried one. */
+      httpStatus?: number;
+      /** The provider's own error code, when it sent one (at most 128 characters). */
+      providerErrorCode?: string;
     })
 
   // Streaming inference lifecycle
@@ -95,7 +107,9 @@ export type TraceEvent =
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       /** 0-indexed block position in the current assistant turn. */
       blockIndex: number;
-      /** Turn-frozen outbound locus for this turn (see inference:started). */
+      /** The channel this stream shows typing in: the turn's locus as the
+       *  stream started (see inference:started), or in explicit mode the
+       *  channel the start's wake came from. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -110,7 +124,9 @@ export type TraceEvent =
       phase: 'block_start' | 'block_complete';
       blockType: 'text' | 'thinking' | 'tool_call' | 'tool_result';
       blockIndex: number;
-      /** Turn-frozen outbound locus for this turn (see inference:started). */
+      /** The channel this stream shows typing in: the turn's locus as the
+       *  stream started (see inference:started), or in explicit mode the
+       *  channel the start's wake came from. */
       channelId?: string;
     })
   | (TraceEventBase & {
@@ -173,6 +189,16 @@ export type TraceEvent =
     })
   | (TraceEventBase & {
       /**
+       * A module's onToolBatchComplete threw or outlasted its bound; the
+       * round went on without it.
+       */
+      type: 'module:batch_hook_failed';
+      agentName: string;
+      module: string;
+      error: string;
+    })
+  | (TraceEventBase & {
+      /**
        * A writable workspace existed but the oversized-result spill write
        * failed (size cap, storeBlob failure, …) — the over-cap tail was NOT
        * retained. Distinct from the no-workspace fallback, which is silent
@@ -217,22 +243,47 @@ export type TraceEvent =
       messageId: string;
       source: string;
     })
-  /** A push/event refused at the MCPL boundary (today: visibly-empty content). */
+  /** A push/event refused at the MCPL boundary: visibly-empty content
+   *  (`empty-content`, answered -32602, with no `field` or `detail`), or a
+   *  coalesced occurrence the host refused. A refused occurrence's reason
+   *  follows the code the producer was answered with: `coalesce-invalid` when
+   *  the occurrence was the producer's to fix (-32602 malformed; -32017 or
+   *  -32023 for a channel not permitted or not registered), `coalesce-failed`
+   *  when the host itself failed (-32000, -32603). Its trace carries the
+   *  error's message in `detail`, and the failing `field` when the error
+   *  names one, and `channelId` when the push is refused for its channel
+   *  (-32017, -32023), so each refusal names its channel even while repeats
+   *  of its line are held back. An `eventId` that is missing or isn't a
+   *  string is traced as `''`. A push refused for its feature set, or as a
+   *  duplicate, gets a `[push-event-rejected]` line and no trace. */
   | (TraceEventBase & {
       type: 'mcpl:push-event-rejected';
       serverId: string;
       eventId: string;
       featureSet: string;
       reason: string;
+      field?: string;
+      channelId?: string;
+      detail?: string;
     })
-  /** A channels/incoming message refused at the MCPL boundary: unregistered
-   *  channel (§14.5), or visibly-empty content (then `messageId` is set). */
+  /** A channels/incoming message refused at the MCPL boundary: an
+   *  unregistered channel (`unknown-channel`, §14.5), visibly-empty content
+   *  (`empty-content`), or a coalesced item the host refused
+   *  (`coalesce-invalid` / `coalesce-failed`, with `detail`, and `field` when
+   *  the error names one, as for a push). A coalesced item refused with
+   *  -32602 (malformed) is answered `coalesce_invalid`, and one refused
+   *  otherwise (-32000, or an internal error) with the error's own message.
+   *  `messageId` is set whenever the message carries one. An uncoalesced
+   *  message without a channelId or messageId is answered `invalid
+   *  channel/message identity`, with no line and no trace. */
   | (TraceEventBase & {
       type: 'mcpl:channel-incoming-rejected';
       serverId: string;
       channelId: string;
       messageId?: string;
       reason: string;
+      field?: string;
+      detail?: string;
     })
   /** MCPL content with nothing model-visible reached the store/wake site
    *  (module-emitted or coalescer-delivered) and was dropped: no row, no wake. */
@@ -524,8 +575,10 @@ export type TraceEvent =
       kind: string;
       /** Agent name, or a server/component id for non-agent alerts (e.g. mcpl-down). */
       agentName: string;
+      /** At most 2,000 characters. */
       message: string;
-      /** Kind-specific structured payload (mirrors the failures.log record). */
+      /** Kind-specific structured payload (mirrors the failures.log record),
+       *  bounded field by field as that record is. */
       data?: Record<string, unknown>;
     })
 

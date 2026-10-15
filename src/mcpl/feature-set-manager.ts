@@ -19,6 +19,7 @@ import {
   UNKNOWN_FEATURE_SET,
 } from './errors.js';
 import { isKnownCapabilityPath } from './capability-grant.js';
+import { logValue } from './log-value.js';
 
 // ============================================================================
 // Error Class
@@ -222,7 +223,7 @@ export class FeatureSetManager {
       ): void => {
         const selectedByConfig = state.enabled.delete(name);
         const note = explicitSelection && selectedByConfig ? ' — overrides enabledFeatureSets' : '';
-        console.error(`[mcpl] ${serverId}/${name} disabled: ${detail}${note}`);
+        console.error(`[mcpl] ${serverId}/${logValue(name)} disabled: ${detail}${note}`);
         this.emitTrace?.({
           type: 'mcpl:feature-set-disabled',
           serverId,
@@ -240,14 +241,14 @@ export class FeatureSetManager {
         }
         const unknown = uses.filter((u) => typeof u !== 'string' || !isKnownCapabilityPath(u));
         if (unknown.length > 0) {
-          disable(name, 'invalid_uses', `invalid_uses (§6.4 — unrecognized: ${unknown.join(', ')})`, {
+          disable(name, 'invalid_uses', `invalid_uses (§6.4 — unrecognized: ${unknown.map(logValue).join(', ')})`, {
             unrecognized: unknown.map((u) => (typeof u === 'string' ? u : JSON.stringify(u))),
           });
           continue;
         }
         const missing = (uses as string[]).filter((u) => !grant.has(u));
         if (missing.length > 0) {
-          disable(name, 'missing_capabilities', `missing capabilities ${missing.join(', ')} (§6.4)`, { missing });
+          disable(name, 'missing_capabilities', `missing capabilities ${missing.map(logValue).join(', ')} (§6.4)`, { missing });
         }
       }
     }

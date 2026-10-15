@@ -37,8 +37,10 @@ import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
-import { EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
+import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
 import { isVisiblyEmptyContent } from './visible-content.js';
+import { logDetail, logValue } from './log-value.js';
+import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
 
 // ============================================================================
@@ -249,7 +251,9 @@ interface McplChannelIncomingEvent {
 function convertBlock(block: McplContentBlock): ContentBlock {
   switch (block.type) {
     case 'text':
-      return { type: 'text', text: block.text };
+      // Text that isn't a string is no text, as the request sanitizer and
+      // the visible-content check already read it.
+      return { type: 'text', text: typeof block.text === 'string' ? block.text : '' };
 
     case 'image':
       if (isInlineContradiction(block)) {
@@ -257,24 +261,24 @@ function convertBlock(block: McplContentBlock): ContentBlock {
         // closed, withhold the data (checked BEFORE the data branch).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
-      if (block.uri && block.disposition) {
+      if (isFilledString(block.uri) && block.disposition) {
         // RFC-005 uri-form media with a disposition claim: stub, do not
         // hand the URI to the provider or inline it.
         return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
       }
-      if (block.data && block.mimeType) {
+      if (isFilledString(block.data) && isFilledString(block.mimeType)) {
         return {
           type: 'image',
           source: { type: 'base64', data: block.data, mediaType: block.mimeType },
         } as ContentBlock;
       }
-      if (block.uri) {
+      if (isFilledString(block.uri)) {
         return {
           type: 'image',
           source: { type: 'url', url: block.uri },
         } as ContentBlock;
       }
-      return { type: 'text', text: '[Image: no data]' };
+      return { type: 'text', text: isFilledString(block.data) ? '[Image: no media type]' : '[Image: no data]' };
 
     case 'audio':
       if (isInlineContradiction(block)) {
@@ -282,29 +286,41 @@ function convertBlock(block: McplContentBlock): ContentBlock {
         // closed, withhold the data (checked BEFORE the data branch).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
-      if (block.uri && block.disposition) {
+      if (isFilledString(block.uri) && block.disposition) {
         // RFC-005 uri-form media with a disposition claim: stub, do not
         // hand the URI to the provider or inline it.
         return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
       }
-      if (block.data && block.mimeType) {
+      if (isFilledString(block.data) && isFilledString(block.mimeType)) {
         return {
           type: 'audio',
           source: { type: 'base64', data: block.data, mediaType: block.mimeType },
         } as ContentBlock;
       }
-      return { type: 'text', text: '[Audio: no data]' };
+      return { type: 'text', text: isFilledString(block.data) ? '[Audio: no media type]' : '[Audio: no data]' };
 
     case 'resource':
       // RFC-005: reference blocks become bounded stubs — never raw URIs
       // (a signed URL is a bearer credential that looks like a location).
       return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
 
-    default:
+    default: {
       // Unknown wire block types previously fell off the exhaustive switch
-      // and propagated `undefined` into ContentBlock[]. Fail visibly.
-      return { type: 'text', text: `[unrecognized content block: ${(block as { type?: string }).type ?? 'untyped'}]` };
+      // and propagated `undefined` into ContentBlock[]. Fail visibly. A type
+      // that isn't a string is no type, and is never converted to one: an
+      // object can throw when it is.
+      const type: unknown = (block as { type?: unknown }).type;
+      return { type: 'text', text: `[unrecognized content block: ${typeof type === 'string' ? type : 'untyped'}]` };
+    }
   }
+}
+
+/** A string with something in it: the only data, mimeType or uri a block's
+ *  source is built from, and the only uri that makes it a reference. Anything
+ *  else a sender puts there leaves the block without it, so conversion never
+ *  throws and never copies a non-string. */
+function isFilledString(value: unknown): value is string {
+  return typeof value === 'string' && value !== '';
 }
 
 // ============================================================================
@@ -512,17 +528,19 @@ interface ChannelRegistryOptions {
    */
   homeChannelResolver?: (agentName: string) => string | undefined;
   /**
-   * Resolve the channel that triggered an agent's CURRENT inference turn, by
-   * agent name. This is the fix for single-TRUNK agents (the only mode
+   * Resolve an agent's channel for its CURRENT inference turn, by agent name:
+   * the turn's locus once it has one, else the channel that triggered the
+   * turn. This is the fix for single-TRUNK agents (the only mode
    * connectome-host runs — it never exposes conversation forks). A trunk agent
    * has no fork home, so without this its plain-text speech falls back to the
    * process-global `defaultPublishChannel`, which tracks the most-recent inbound
    * across ALL channels and misroutes a reply to whichever channel last spoke
-   * under concurrency (item-3 redux). The framework tracks the triggering
-   * channel of the live turn per-agent and exposes it here; resolves to
-   * undefined for a heartbeat / no-trigger turn, which correctly keeps the
-   * global fallback. Consulted AFTER `homeChannelResolver` (a fork's home always
-   * wins), BEFORE `defaultPublishChannel`.
+   * under concurrency (item-3 redux). The framework keeps both on the live
+   * turn's routing state and exposes them here. For a heartbeat / no-trigger
+   * turn it resolves to undefined until the turn's locus is resolved, so that
+   * resolution takes the global fallback, which the turn then keeps.
+   * Consulted AFTER `homeChannelResolver` (a fork's home always wins), BEFORE
+   * `defaultPublishChannel`.
    */
   activeChannelResolver?: (agentName: string) => string | undefined;
 }
@@ -576,6 +594,10 @@ export class ChannelRegistry {
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
+
+  /** Holds back repeats of the line for a message refused because its
+   *  channel isn't registered (RefusalLines). */
+  private unknownChannelLines = new RefusalLines();
 
   /**
    * Most-recently-known label per channelId, replayed from
@@ -849,6 +871,45 @@ export class ChannelRegistry {
   }
 
   /**
+   * A coalesced message the host refused. Until now the host said nothing, so
+   * a dropped message (agent-framework#266: every Discord message with a
+   * screenshot) left no trace where operators look. The sender gets the
+   * per-message result this lane gives: `coalesce_invalid` for a malformed
+   * item, or the thrown error's message for anything else. `answered` is the
+   * code that result stands for (-32602 for `coalesce_invalid`), and the
+   * reason follows it (coalesceRejectionReason): `coalesce-failed` when the
+   * host itself failed, `coalesce-invalid` when the sender's item was
+   * refused, with the failing `field` and the error's message as `detail`.
+   * The line prints the ids the sender sent, whatever their type; the trace
+   * carries them when they are strings.
+   */
+  private traceCoalesceRejection(
+    serverId: string,
+    message: { channelId?: unknown; messageId?: unknown } | null | undefined,
+    error: { field?: unknown; message: string },
+    answered: number,
+  ): void {
+    const reason = coalesceRejectionReason(answered);
+    const field = typeof error.field === 'string' && error.field ? error.field : undefined;
+    const channelId = typeof message?.channelId === 'string' ? message.channelId : '';
+    const messageId = typeof message?.messageId === 'string' && message.messageId ? message.messageId : undefined;
+    console.error(
+      `[channel-incoming-rejected] server=${serverId} channel=${logValue(message?.channelId ?? '')} ` +
+      `messageId=${logValue(message?.messageId ?? '')} ` +
+      `reason=${reason}${field ? ` field=${logValue(field)}` : ''}: ${logDetail(error.message)}`,
+    );
+    this.emitTraceFn({
+      type: 'mcpl:channel-incoming-rejected',
+      serverId,
+      channelId,
+      ...(messageId ? { messageId } : {}),
+      reason,
+      ...(field ? { field } : {}),
+      detail: error.message,
+    });
+  }
+
+  /**
    * Handle `channels/incoming` from a server.
    *
    * Converts each message's content, pushes McplChannelIncomingEvent to the
@@ -864,10 +925,20 @@ export class ChannelRegistry {
     for (const message of params.messages) {
       if (!message || typeof message.channelId !== 'string' || !message.channelId
         || typeof message.messageId !== 'string' || !message.messageId) {
+        // The same gate as admission below: with no coalescer wired, a
+        // message carrying `coalesce` is handled uncoalesced, and refused as
+        // any uncoalesced message without an identity is.
+        const coalescedItem = message?.coalesce !== undefined && !!this.handleCoalescedIncoming;
+        if (coalescedItem) {
+          this.traceCoalesceRejection(serverId, message, {
+            field: typeof message.channelId !== 'string' || !message.channelId ? 'channelId' : 'messageId',
+            message: 'a coalesced message needs a channelId and a messageId',
+          }, -32602);
+        }
         results.push({
           messageId: typeof message?.messageId === 'string' ? message.messageId : '',
           accepted: false,
-          reason: message?.coalesce !== undefined ? 'coalesce_invalid' : 'invalid channel/message identity',
+          reason: coalescedItem ? 'coalesce_invalid' : 'invalid channel/message identity',
         });
         continue;
       }
@@ -899,11 +970,24 @@ export class ChannelRegistry {
       // routable entry rather than an open self-attested one.
       const incomingKey = `${serverId}:${message.channelId}`;
       if (!this.channels.has(incomingKey)) {
+        // Loud, coalesced or not, like every other refusal of a message, but
+        // at most once a minute per channel (RefusalLines): a server that
+        // never registered a busy channel would otherwise print a line for
+        // every message in it. Every refusal is traced.
+        const held = this.unknownChannelLines.admit(serverId, message.channelId);
+        if (held !== null) {
+          console.error(
+            `[channel-incoming-rejected] server=${serverId} channel=${logValue(message.channelId)} ` +
+            `messageId=${logValue(message.messageId)} reason=unknown-channel ` +
+            `(not registered, §14.5${held ? `; ${held} more since the last line` : ''})`,
+          );
+        }
         this.emitTraceFn({
           type: 'mcpl:channel-incoming-rejected',
           serverId,
           channelId: message.channelId,
-          reason: 'unknown channel — not registered (§14.5)',
+          messageId: message.messageId,
+          reason: 'unknown-channel',
         });
         results.push({
           messageId: message.messageId,
@@ -921,7 +1005,7 @@ export class ChannelRegistry {
       // shows the model nothing would wake it with no visible cause.
       const emptyAllowed = coalesced && (message.coalesce as { retract?: unknown } | null)?.retract === true;
       const rejectEmpty = () => {
-        console.error(`[channel-incoming-rejected] server=${serverId} channel=${message.channelId} messageId=${message.messageId} reason=empty-content`);
+        console.error(`[channel-incoming-rejected] server=${serverId} channel=${logValue(message.channelId)} messageId=${logValue(message.messageId)} reason=empty-content`);
         this.emitTraceFn({
           type: 'mcpl:channel-incoming-rejected',
           serverId,
@@ -935,10 +1019,14 @@ export class ChannelRegistry {
         // RFC-006 §13: malformed content on a coalesced item is that item's
         // failure, not the batch's — check the shape before converting.
         try {
-          validateCoalescedContent(message.content, undefined, { allowEmpty: emptyAllowed });
+          validateCoalescedContent(message.content, { allowEmpty: emptyAllowed });
         } catch (error) {
           if (error instanceof EmptyContentError) rejectEmpty();
-          else results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+          else {
+            // Answered coalesce_invalid whatever the error's code: -32602.
+            this.traceCoalesceRejection(serverId, message, error as Error & { field?: string }, -32602);
+            results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+          }
           continue;
         }
       }
@@ -970,8 +1058,11 @@ export class ChannelRegistry {
       // Determine whether to trigger inference
       let triggerInference = true;
       if (this.shouldTriggerInference) {
-        const textContent = message.content
-          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+        // The text the agent's context gets, as the push lane's filter reads
+        // it: the converted text blocks, a placeholder or reference stub
+        // among them, and a text block's non-string text as empty text.
+        const textContent = convertedContent
+          .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
           .map((b) => b.text)
           .join('\n');
         triggerInference = this.shouldTriggerInference(
@@ -1014,7 +1105,10 @@ export class ChannelRegistry {
           if (result.accepted) markAccepted();
           results.push(result);
         } catch (error) {
-          const err = error as Error & { code?: number };
+          const err = error as Error & { code?: number; field?: string };
+          // -32602 is answered coalesce_invalid; anything else as its message,
+          // a plain Error standing for an internal error (-32603).
+          this.traceCoalesceRejection(serverId, message, err, typeof err.code === 'number' ? err.code : -32603);
           results.push({
             messageId: message.messageId,
             accepted: false,
@@ -1357,8 +1451,9 @@ export class ChannelRegistry {
 
     // Resolve the outbound locus the SAME way routeSpeech does, so the agent is
     // told the channel its speech will actually land in: a conversation fork's
-    // home channel, else this turn's triggering channel (single trunk agent —
-    // item-3 redux), else the global default (heartbeats). Without this, a fork
+    // home channel, else this turn's channel (single trunk agent — item-3
+    // redux: its locus, else its triggering channel), else the global default
+    // (heartbeats). Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
     // agent was told the wrong channel under concurrency.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
@@ -3027,7 +3122,7 @@ export class ChannelRegistry {
       try {
         await this.openChannelNow(entry, 'opened-by-delivery');
         console.error(
-          `[routeSpeech] ${conversationId}: locus ${channelId} was closed — opened by delivery (speech implies engagement)`,
+          `[routeSpeech] ${conversationId}: locus ${logValue(channelId)} was closed — opened by delivery (speech implies engagement)`,
         );
         this.emitTraceFn({
           type: 'mcpl:channel-opened-by-send',
@@ -3080,7 +3175,7 @@ export class ChannelRegistry {
       return fail(channelId, `server "${entry.serverId}" reported delivered:false for "${channelId}"`);
     }
 
-    console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${channelId} (server=${entry.serverId}, delivered=${delivered})`);
+    console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${logValue(channelId)} (server=${entry.serverId}, delivered=${delivered})`);
     this.emitTraceFn({
       type: 'mcpl:speech-routed',
       conversationId,

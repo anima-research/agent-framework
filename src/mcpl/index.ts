@@ -107,6 +107,8 @@ export {
 
 // Server connection and registry
 export { McplServerConnection } from './server-connection.js';
+export type { McplConnectionCloseInfo } from './server-connection.js';
+export type { TransportCloseInfo } from './transport.js';
 export { McplServerRegistry, type McplCapabilityQuery } from './server-registry.js';
 
 // Feature set management (permission layer)

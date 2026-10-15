@@ -974,33 +974,101 @@ test('R16b: a producer retry re-wakes a batch left asleep by a failed freeze', a
   assert(f.lastRequest().includes('asleep_fallback'));
 });
 
-test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the series resets on recovery', async (t) => {
-  const f = await fixture(); t.after(f.close);
+// The timeout bounds a drain that never returns, such as a backoff regressed
+// to a tight loop; npm test sets no timeout of its own.
+/**
+ * R17's harness: a coalescing fixture whose store fails while `failing` is
+ * set, its recovery backoff at `baseMs`, and every traced recovery wake with
+ * the monotonic time it was traced at.
+ */
+async function storageOutage(t: { after: (fn: () => Promise<void>) => void }, baseMs: number) {
+  const f = await fixture();
   const coalescer = (f.framework as unknown as { pushCoalescer: { options: { recoveryBackoffMs?: number }; pendingBatches(): number; recovery: Map<string, { attempt: number; timer?: unknown }> } }).pushCoalescer;
-  coalescer.options.recoveryBackoffMs = 40;
+  coalescer.options.recoveryBackoffMs = baseMs;
   const internals = f.framework as unknown as { pendingRequests: unknown[] };
   const store = (f.framework as unknown as { store: { sync: () => void } }).store;
   const orig = store.sync.bind(store);
-  let failing = false;
-  store.sync = () => { if (failing) throw new Error('EIO persistent'); orig(); };
-  const wakes: Array<{ attempt: number; delayMs: number }> = [];
-  f.framework.onTrace((e) => { if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'recovery-wake') wakes.push(e as never); });
-  await f.send('push/event', f.params('1', 'outage_fallback', { deferred: true, initial: true }));
-  failing = true;
+  const outage = { failing: false };
+  store.sync = () => { if (outage.failing) throw new Error('EIO persistent'); orig(); };
+  // One hook, in order: storage recovers before the fixture closes, so a
+  // failed assertion doesn't add the close's own EIO to its report.
+  t.after(async () => { outage.failing = false; await f.close(); });
+  const wakes: Array<{ attempt: number; delayMs: number; at: number }> = [];
+  f.framework.onTrace((e) => {
+    if (e.type === 'mcpl:coalescing' && (e as { kind?: string }).kind === 'recovery-wake') {
+      wakes.push({ ...(e as unknown as { attempt: number; delayMs: number }), at: performance.now() });
+    }
+  });
   f.alwaysRespond();
-  for (let i = 0; i < 3; i++) {
-    await f.framework.runUntilIdle(); // freeze fails → recovery scheduled
-    await eventually(() => internals.pendingRequests.length > 0, `recovery wake ${i + 1}`);
-  }
-  assert.deepEqual(wakes.map((w) => w.attempt), [1, 2, 3], 'consecutive failures count up');
-  assert.deepEqual(wakes.map((w) => w.delayMs), [40, 80, 160], 'and the delay doubles');
+  /**
+   * Drive until `count` recovery wakes have fired, ending with one still
+   * pending. Observe the recovery transitions themselves, not the drains:
+   * runUntilIdle drains until idle, so a recovery timer that fires while a
+   * drain is still running is consumed by that same drain, which freezes and
+   * fails again. One drain can therefore carry several attempts.
+   */
+  const driveTo = async (count: number) => {
+    while (wakes.length < count) {
+      const before = wakes.length;
+      await f.framework.runUntilIdle(); // each failed freeze schedules the next recovery
+      await eventually(() => internals.pendingRequests.length > 0, `recovery wake after ${wakes.length}`);
+      // Between attempts only the recovery timer re-wakes the batch, and it
+      // traces before it queues the request: every round adds a wake, so a
+      // lost trace fails here instead of looping forever.
+      assert(wakes.length > before, 'each re-wake is a traced recovery wake');
+    }
+  };
+  /** Each wake's timer was armed after the wake before it was traced, so their gap is at least its delay. */
+  const assertSpacing = (from = 0) => {
+    for (let i = from + 1; i < wakes.length; i++) {
+      // Less a millisecond: Node may fire a timer up to 1 ms early.
+      assert(wakes[i].at - wakes[i - 1].at >= wakes[i].delayMs - 1,
+        `wake ${i + 1} came ${(wakes[i].at - wakes[i - 1].at).toFixed(1)} ms after the one before, under its ${wakes[i].delayMs} ms delay`);
+    }
+  };
+  return { f, coalescer, outage, wakes, driveTo, assertSpacing };
+}
+
+test('R17: a persistent storage outage backs off (1×, 2×, 4× …) and the series resets on recovery', { timeout: 30_000 }, async (t) => {
+  const { f, coalescer, outage, wakes, driveTo, assertSpacing } = await storageOutage(t, 40);
+  await f.send('push/event', f.params('1', 'outage_fallback', { deferred: true, initial: true }));
+  outage.failing = true;
+  await driveTo(3);
+  // Every wake is one more consecutive failure, and its delay doubles from the
+  // base, however the attempts fell across drains. The timers are spaced at
+  // least that far apart, not only labelled so.
+  assert.deepEqual(wakes.map((w) => w.attempt), wakes.map((_, i) => i + 1), 'consecutive failures count up');
+  assert.deepEqual(wakes.map((w) => w.delayMs), wakes.map((_, i) => Math.min(40 * 2 ** i, 40 * 60)), 'and the delay doubles');
+  assertSpacing();
   assert.equal(coalescer.pendingBatches(), 1);
   assert(!f.context().includes('outage_fallback'));
-  failing = false; // storage recovers
+  outage.failing = false; // storage recovers
   await f.framework.runUntilIdle();
   assert(f.lastRequest().includes('outage_fallback'), 'delivered once storage recovered');
   assert.equal(coalescer.pendingBatches(), 0);
   assert.equal(coalescer.recovery.size, 0, 'the failure series is forgotten on success');
+
+  // A second outage starts a new series: its first wake is attempt 1 again,
+  // at the base delay.
+  const second = wakes.length;
+  await f.send('push/event', f.params('2', 'second_outage', { deferred: true }));
+  outage.failing = true;
+  await driveTo(second + 1);
+  assert.deepEqual(wakes.slice(second, second + 1).map(({ attempt, delayMs }) => ({ attempt, delayMs })), [{ attempt: 1, delayMs: 40 }]);
+  outage.failing = false;
+  await f.framework.runUntilIdle();
+  assert(f.lastRequest().includes('second_outage'), 'delivered once storage recovered again');
+});
+
+test('R17b: the backoff stops doubling at 60× its base', { timeout: 30_000 }, async (t) => {
+  // A small base reaches the cap within a second: attempt 7 is the first
+  // whose doubling (64×) passes it.
+  const { f, wakes, outage, driveTo, assertSpacing } = await storageOutage(t, 3);
+  await f.send('push/event', f.params('1', 'capped_fallback', { deferred: true, initial: true }));
+  outage.failing = true;
+  await driveTo(8);
+  assert.deepEqual(wakes.slice(0, 8).map((w) => w.delayMs), [3, 6, 12, 24, 48, 96, 180, 180]);
+  assertSpacing();
 });
 
 // ---------------------------------------------------------------------------

@@ -56,7 +56,8 @@ test('non-array data: JSON stringify', () => {
   assert.equal(toolResultDataToHistoryString({ ok: true }), '{"ok":true}');
   assert.equal(toolResultDataToHistoryString('hello'), '"hello"');
   assert.equal(toolResultDataToHistoryString(42), '42');
-  assert.equal(toolResultDataToHistoryString(undefined), undefined as any); // JSON.stringify(undefined) === undefined
+  // JSON leaves undefined out (JSON.stringify gives undefined): no data is no text.
+  assert.equal(toolResultDataToHistoryString(undefined), '');
 });
 
 test('maxChars truncates the resulting string with a marker', () => {
