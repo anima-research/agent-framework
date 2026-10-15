@@ -1907,9 +1907,14 @@ export class EventGate {
   private validWakeIntent(value: unknown, allowAnonymous: boolean): value is PersistedWakeIntent {
     if (!value || typeof value !== 'object') return false;
     const v = value as Record<string, unknown>;
+    const armedAt = v.armedAt;
+    const wakeAt = v.wakeAt;
+    const validDate = (value: unknown): value is number =>
+      typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= 8.64e15;
     return (allowAnonymous ? v.agentName === undefined || typeof v.agentName === 'string' : typeof v.agentName === 'string')
-      && typeof v.armedAt === 'number' && Number.isFinite(v.armedAt)
-      && typeof v.wakeAt === 'number' && Number.isFinite(v.wakeAt)
+      && validDate(armedAt)
+      && validDate(wakeAt)
+      && wakeAt >= armedAt
       && typeof v.source === 'string'
       && (v.note === undefined || typeof v.note === 'string')
       && (v.suppressed === undefined || (typeof v.suppressed === 'number' && Number.isFinite(v.suppressed)));
@@ -1933,11 +1938,12 @@ export class EventGate {
       return { version: 1, ...(sleep ? { sleep } : {}), selfWakes };
     } catch (error) {
       const quarantine = `${this.wakeStatePath}.corrupt-${this.now()}`;
-      try { renameSync(this.wakeStatePath, quarantine); }
-      catch (renameError) {
+      try {
+        renameSync(this.wakeStatePath, quarantine);
+        console.error(`[gate] wake journal unreadable; quarantined as ${quarantine}: ${error instanceof Error ? error.message : error}`);
+      } catch (renameError) {
         console.error(`[gate] wake journal unreadable and quarantine failed: ${renameError instanceof Error ? renameError.message : renameError}`);
       }
-      console.error(`[gate] wake journal unreadable; quarantined as ${quarantine}: ${error instanceof Error ? error.message : error}`);
       return null;
     }
   }
