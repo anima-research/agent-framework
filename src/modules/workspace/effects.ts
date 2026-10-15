@@ -53,6 +53,7 @@ import {
   errno,
   checkDir,
   checkRoot,
+  insideNested,
   nameOf,
   parentOf,
 } from './observe.js';
@@ -223,6 +224,8 @@ export async function writeContained(view: MountView, rootReal: string, rel: str
     const real = await realpath(target).catch(() => null);
     if (real === null) throw new EffectFailed(CHANGED, touched);
     if (!contained(rootReal, real)) throw new EffectFailed(view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT, touched);
+    const nested = insideNested(view, real);
+    if (nested) throw new EffectFailed(nested, touched);
     const named = await stat(real, { bigint: true }).catch(() => null);
     if (named === null || named.dev !== info.dev || named.ino !== info.ino) throw new EffectFailed(CHANGED, touched);
     if (!view.followSymlinks) {
@@ -289,6 +292,8 @@ export async function unlinkContained(view: MountView, rootReal: string, rel: st
     if (!view.followSymlinks) throw new EffectFailed(NOT_FOLLOWED, false);
     const real = await realpath(target).catch(() => null);
     if (real === null || !contained(rootReal, real)) throw new EffectFailed('a symlink that leaves the mount', false);
+    const nested = insideNested(view, real);
+    if (nested) throw new EffectFailed(nested, false);
     const through = await stat(real, { bigint: true }).catch(() => null);
     if (through === null) throw new EffectFailed(CHANGED, false);
     file = through;

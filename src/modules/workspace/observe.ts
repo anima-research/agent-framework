@@ -41,7 +41,7 @@ import { constants as fsConstants } from 'node:fs';
 import type { BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, readdir, realpath, stat, statfs } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
-import { dirname, join, sep } from 'node:path';
+import { dirname, join, parse, relative, sep } from 'node:path';
 import { sameRootIdentity, type Fingerprint, type RootIdentity } from './disk-agreement.js';
 
 export interface MountView {
@@ -56,6 +56,12 @@ export interface MountView {
   /** Text above this size is not ingested. */
   maxFileSize: number;
   ignore: string[];
+  /**
+   * Roots nested in this mount, preserving spelling and unmade-component
+   * metadata. Disk-content reads and effects check these boundaries, as
+   * they check containment in the outer mount (agent-framework #280).
+   */
+  nested?: ReadonlyArray<ResolvedPath & { name: string }>;
 }
 
 export type StatFingerprint = Omit<Fingerprint, 'hashedAt'>;
@@ -102,6 +108,51 @@ export const RACY_WINDOW_MS = 2000;
 
 export const OUTSIDE_PARENT = 'a parent directory resolves outside the mount';
 export const NOT_FOLLOWED = 'a symlink, which this mount does not follow';
+
+/**
+ * A resolved spelling, with the first component that was absent when it was
+ * read. Missing components keep their spelling; the marker is used only by
+ * the nesting comparison. Components are counted after the filesystem root.
+ */
+export interface ResolvedPath {
+  real: string;
+  missingFrom?: number;
+}
+
+/** The platform's path functions the nesting comparison uses; tests pass path.win32. */
+export type PathApi = Pick<typeof import('node:path'), 'parse' | 'relative' | 'sep'>;
+const PLATFORM_PATH: PathApi = { parse, relative, sep };
+
+export function pathComponents(p: string, path: PathApi = PLATFORM_PATH): string[] {
+  return p.slice(path.parse(p).root.length).split(path.sep).filter(Boolean);
+}
+
+/** Mount-relative suffix, preserving candidate spelling: '' for the root
+ * itself, null when the candidate isn't inside it (outside it, or on another
+ * Windows drive). It compares spellings, so both must be resolved
+ * (resolveWorkspacePath, realpath): an unresolved link or case variant of the
+ * same directory doesn't nest. Known components compare exactly. On
+ * darwin/win32, a comparison involving an unmade component uses the
+ * platform's default case folding, whatever the volume's own setting. */
+export function nestedSuffix(root: ResolvedPath, candidate: ResolvedPath, path: PathApi = PLATFORM_PATH): string | null {
+  if (path.relative(path.parse(root.real).root, path.parse(candidate.real).root) !== '') return null;
+  const a = pathComponents(root.real, path);
+  const b = pathComponents(candidate.real, path);
+  if (b.length < a.length) return null;
+  const fold = process.platform === 'darwin' || process.platform === 'win32';
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] === b[i]) continue;
+    const unmade = i >= (root.missingFrom ?? Infinity) || i >= (candidate.missingFrom ?? Infinity);
+    if (!fold || !unmade || a[i].toLowerCase() !== b[i].toLowerCase()) return null;
+  }
+  return b.slice(a.length).join('/');
+}
+
+/** Why a canonical path inside the mount is still not the mount's: it lies in a mount nested in it. */
+export function insideNested(view: MountView, real: string): string | null {
+  const inner = view.nested?.find((n) => nestedSuffix(n, { real }) !== null);
+  return inner ? `inside mount "${inner.name}", which is nested in this one` : null;
+}
 export const ROOT_UNAVAILABLE = 'the mount root is unavailable';
 export const ROOT_REPLACED =
   'the mount root is not the directory disk last agreed with (an unmounted drive, or a replaced directory): ' +
@@ -235,6 +286,9 @@ async function locateDir(view: MountView, rootReal: string, rel: string): Promis
     if (real !== rootReal) return { kind: 'unobserved', reason: ROOT_UNAVAILABLE };
   } else if (!contained(rootReal, real)) {
     return { kind: 'unobserved', reason: OUTSIDE_PARENT, outside: true };
+  } else {
+    const nested = insideNested(view, real);
+    if (nested) return { kind: 'unobserved', reason: nested };
   }
   const checked = await checkedAt(view, rel, real);
   if (checked) {
@@ -449,10 +503,12 @@ export async function filesystemTrustsCtime(root: string): Promise<boolean> {
  * (absence is then proven separately), or somewhere a no-follow open would
  * still reach through — O_NOFOLLOW guards only the final component.
  */
-async function parentPlacement(rootReal: string, lexical: string): Promise<'inside' | 'gone' | { reason: string }> {
+async function parentPlacement(view: MountView, rootReal: string, lexical: string): Promise<'inside' | 'gone' | { reason: string }> {
   try {
     const parent = await realpath(dirname(lexical));
-    return contained(rootReal, parent) ? 'inside' : { reason: OUTSIDE_PARENT };
+    if (!contained(rootReal, parent)) return { reason: OUTSIDE_PARENT };
+    const nested = insideNested(view, parent);
+    return nested ? { reason: nested } : 'inside';
   } catch (err) {
     const code = errno(err);
     if (code === 'ENOENT' || code === 'ENOTDIR') return 'gone';
@@ -468,7 +524,7 @@ async function parentPlacement(rootReal: string, lexical: string): Promise<'insi
  */
 export async function observePath(view: MountView, rootReal: string, relativePath: string): Promise<Observation> {
   const lexical = join(view.root, relativePath);
-  const placement = await parentPlacement(rootReal, lexical);
+  const placement = await parentPlacement(view, rootReal, lexical);
   if (placement === 'gone') return absence(view, rootReal, relativePath);
   if (placement !== 'inside') return { kind: 'unobserved', reason: placement.reason };
   let info;
@@ -494,6 +550,8 @@ export async function observePath(view: MountView, rootReal: string, relativePat
       return { kind: 'unobserved', reason: `a symlink that cannot be resolved (${errno(err) ?? String(err)})` };
     }
     if (!contained(rootReal, real)) return { kind: 'unobserved', reason: 'a symlink that leaves the mount' };
+    const nested = insideNested(view, real);
+    if (nested) return { kind: 'unobserved', reason: nested };
     if (!target.isFile()) {
       return { kind: 'unobserved', reason: target.isDirectory() ? 'a symlink to a directory, not walked' : 'not a regular file' };
     }
@@ -545,6 +603,8 @@ async function openContained(
     if (!contained(rootReal, real)) {
       return { kind: 'unobserved', reason: view.followSymlinks ? 'a symlink that leaves the mount' : OUTSIDE_PARENT };
     }
+    const nested = insideNested(view, real);
+    if (nested) return { kind: 'unobserved', reason: nested };
     const named = await stat(real, { bigint: true }).catch(() => null);
     if (named === null || named.dev !== info.dev || named.ino !== info.ino) {
       return { kind: 'unobserved', reason: 'the file changed while it was read' };
@@ -695,7 +755,8 @@ export interface Walk {
 /**
  * Whether a mount's ignore list covers a mount-relative path: the path itself
  * or any directory above it, as the walk's own test reads each entry by its
- * path and name.
+ * path and name on the way down. The watcher reads it the same way
+ * (agent-framework #280).
  */
 export function coveredByIgnore(relativePath: string, patterns: string[]): boolean {
   const segments = relativePath.split('/').filter(Boolean);
@@ -705,15 +766,26 @@ export function coveredByIgnore(relativePath: string, patterns: string[]): boole
   return false;
 }
 
-/** Simple ignore patterns, as the watcher and the old walk read them. */
+/**
+ * Simple ignore patterns, as the walk and the watcher read them (types.ts
+ * `MountConfig.ignore` lists the forms). A name matches an entry so named at
+ * any depth; a path (`a/b`, or `a/b/**`) matches that path from the mount
+ * root. A trailing slash is dropped, so `node_modules/` reads as
+ * `node_modules` (gitignore would match only a directory so named; here a
+ * file so named is passed over too). Before #282's round, a trailing-slash or
+ * bare slash-path pattern matched nothing.
+ */
 export function isIgnored(relativePath: string, name: string, patterns: string[]): boolean {
-  for (const pattern of patterns) {
+  for (const written of patterns) {
+    const pattern = written.length > 1 && written.endsWith('/') ? written.slice(0, -1) : written;
     if (pattern === name) return true;
     if (pattern.endsWith('/**')) {
       const prefix = pattern.slice(0, -3);
       if (relativePath === prefix || relativePath.startsWith(prefix + '/')) return true;
+    } else if (relativePath === pattern) {
+      // A name at the mount root, or a path, which is anchored there.
+      return true;
     }
-    if (!pattern.includes('/') && relativePath === pattern) return true;
     if (pattern.startsWith('*.') && name.endsWith(pattern.slice(1))) return true;
   }
   return false;
@@ -796,7 +868,11 @@ export async function walkScope(
     let reachedCap = false;
     for (const entry of entries) {
       const childRel = rel ? `${rel}/${entry.name}` : entry.name;
-      if (isIgnored(childRel, entry.name, ignore)) {
+      // A nested mount's directory is passed over as its generated rule passes
+      // it over, also where the rule doesn't name it: made under another case
+      // than configured, or nested only after the module was built. Walking it
+      // would list files the checks refuse one by one, counting toward the cap.
+      if (isIgnored(childRel, entry.name, ignore) || (entry.isDirectory() && insideNested(view, dir.at(entry.name)) !== null)) {
         others.push([childRel, 'ignored by the mount']);
         regions.push({ path: childRel, reason: 'ignored by the mount', kind: 'ignored' });
         continue;

@@ -1,0 +1,107 @@
+- Workspace tools check nested-mount boundaries before and inside each mount's turn, and disk operations check again before their effects. A mount's ignore patterns now apply to its watcher.
+  - A watched mount (`watch` defaults to `'always'`) now leaves changes
+    under its ignored paths, `node_modules` included, out of the workspace.
+    The watcher handed the patterns to chokidar as strings, which chokidar
+    takes as exact paths, so every such change was synced. The watcher now
+    applies the walk's own rule: a path is passed over when it or a
+    directory above it matches. Chokidar also no longer descends into
+    ignored directories.
+  - Files the old watcher already took in from under an ignored path stay
+    tracked, and the watcher and a sync without a path no longer update them.
+    A sync that names such a path still takes disk's copy, and says the
+    mount ignores it. A `read`, `edit` or `read_image` of one checks it
+    against disk first, by its own path. Where disk can't be checked, as
+    through a link the mount doesn't follow, or the check decides nothing,
+    it works from the workspace copy and says so (`diskCheck`; for
+    `read_image`, a "Disk check" line), as listings mark it unverified. The
+    `readBinary` API checks the same way, returns the same `diskCheck`, and
+    explains a copy the check drops as `read` does. A `delete` of one
+    doesn't take disk's copy first, so its unlink still refuses to remove a
+    change on disk the workspace hasn't seen.
+    Each sync without a path lists them under `skipped`
+    ("disk could not be checked: ignored by the mount"). It also lists, under
+    `incomplete`, the ignored entry that hides them: the file itself for a
+    pattern it matches, such as `app.log` under `*.log`, or the ignored
+    directory above it, such as `node_modules`. That lasts as long as disk
+    can't show them gone. For a file the pattern matches itself, that's until
+    the file is removed. For a file inside an ignored directory, it's until
+    that directory is removed, since the walk doesn't look inside it. On a
+    mount without `autoMaterialize`, deleting such a file from the workspace
+    doesn't end the listing either. On one with it, the delete removes the
+    disk copy, which ends it. There is no way yet to stop tracking a file and
+    keep it on disk, except for nested paths and outer links into nested mounts (below).
+  - A pattern with a trailing slash (`node_modules/`, `build/cache/`) or a
+    slash inside it (`build/cache`) matched nothing. Now a trailing slash is
+    dropped, so `node_modules/` reads as `node_modules` (gitignore would
+    match only a directory so named; here a file so named is passed over
+    too). A pattern with a slash is a path from the mount root, with
+    everything under it.
+  - The overlap guard said it was "auto-ignoring" the inner mount's
+    directory, but it added the bare relative path, which the walk reads only
+    as an entry name. A mount nested two or more levels deep (`a/b`) was
+    still synced by the outer mount, and a mount nested one level deep
+    (`sub`) also hid every other directory named `sub`. It now adds `a/b/**`,
+    which matches that path from the outer mount's root and what is under it,
+    and nothing else. A sync without a path counts the inner mount's
+    directory under `passedOver`, as it counts any ignored directory.
+    The walk passes over a nested mount's directory that the rule doesn't
+    name in the same way: one made in another case than configured, or one
+    that came to lie in the outer mount after startup. The watcher passes
+    over only what the rule names; a change it reports from such a
+    directory is refused like any path in a nested mount.
+  - Nesting is read from the mounts' canonical roots. A mount configured
+    through a symlink, or spelled in another case on a case-insensitive
+    filesystem, is still nested, and the rule is spelled as disk spells the
+    root, or as configured for a root not made yet.
+    An inner mount in a directory whose name starts with `..` (such as
+    `..cache`) is now recognized as nested.
+    A root that doesn't exist yet is its configured path, resolved as
+    `path.resolve` resolves it, then read as the filesystem will read it:
+    through the directories that exist, with a link on the way that leads
+    to nothing yet read as what it names. A `..` in such a link's target
+    counts after any link before it in that target, as the filesystem
+    counts it. So a mount configured at `via/child`, where `via` links into
+    another mount, or at a link to that mount's `child`, is nested there
+    before `child` is made. Each pass and each tool call also reads
+    nesting afresh, so a mount that comes to lie inside another after
+    startup (its root made later, or a symlinked parent created) is treated
+    like one found at startup: the outer mount's tools refuse its paths before anything
+    reaches the outer mount's workspace, and the checks below refuse it
+    however it is reached.
+  - The outer mount's tools refuse a path inside a nested mount, naming the
+    mount to use: `outer/a/b/x.txt` is "inside mount "inner", which is nested
+    in "outer" at a/b/: use "inner/x.txt"". That covers `read`, `write`,
+    `edit`, `ls`, `glob`, `grep`, and a `sync` or `materialize` that names the
+    path. Before, a named sync took the inner mount's files into the outer
+    one. `write`, `edit`, `writeBinary` and `delete` also read where the
+    path leads on disk at their checks, so existing case variants and links inside the mount, dangling or not, are checked too. A link changed after the store check can leave an outer draft at a now-nested path; materialize refuses the later disk write.
+    - `delete` can stop tracking an old outer copy at a nested path, or an outer link into a nested mount, on a read-only mount too, where it takes the exact key alone. It removes that key's copy, intent and agreement; the disk entry, if any, stays untouched. A read-only mount still refuses every other delete.
+    - A `materialize` without a path skips writes of such copies, with a note saying that disk was left untouched and the copy can be deleted here to stop tracking it. An already-pending deletion at a nested path is untracked once instead of receiving that advice again.
+  - Every check that a canonical path lies inside the mount, when reading,
+    walking or writing, also refuses one inside a nested mount. So a symlink
+    that a `followSymlinks` mount follows into a nested mount reaches nothing
+    there, and a write through it is refused.
+    `readFileFromDisk` and `read_image` refuse a file there, naming the
+    mount to use, and so does `readBinaryFromDisk`. That reader now keeps the
+    boundary the other readers keep, checked against the file it opens: it
+    still follows a symlink that stays within the mount, and it now refuses
+    one that leads outside the mount ("Symlink escape detected"), which it
+    used to read. Under a size limit, a file the boundary refuses is refused
+    as such, and its size isn't reported.
+  - Every workspace tool reads a path in one spelling: `a/./b`, `a//b` and
+    `a/b/` are `a/b`.
+  - A mount whose configured path has `.` or `..` segments is read the way
+    `path.resolve` reads it, by nesting and by every operation alike. Before,
+    its own sync did that, while its tools refused its files as path
+    traversal, and so did registering a generated file in it, such as an
+    agent's tool catalogue. Where a link came before a `..`, the disk readers
+    checked its files against a different root, the one reached by following
+    that link first, and refused them. Its watcher reported none of its
+    changes.
+  - Refusals name the innermost mount when several contain the path. A refusal of a path as written includes its directory, such as `"outer/a/b/x.txt" is inside mount "inner", which is nested in "outer" at a/b/: use "inner/x.txt"`, and the tool's answer prefixes it with `Error:`. One of a path reached by how disk spells it leaves the directory out: `"outer/via/x.txt" is inside mount "inner", which is nested in "outer": use "inner/x.txt"`.
+  - On macOS and Windows, a nesting comparison ignores case only where a directory isn't made yet; directories that exist compare exactly, and a generated rule keeps an unmade root's configured spelling. That's the platforms' default, not a probe of the volume. On a case-sensitive volume there, a directory of the outer mount's whose name differs only in case from a nested root not made yet is treated as that root's: refused, passed over by the walk, and untracked by delete. A case-insensitive filesystem on another platform isn't covered.
+  - A delete at a nested path removes only the exact key given, or the key disk names for the entry, never one chosen by ignoring case. So a path through a link back out of the nested mount can't make the outer mount forget its own file. On macOS and Windows, its refusal names a tracked key that differs only in case, when a delete by that key would stop tracking it as well.
+  - Deleting an outer link into a nested mount stops tracking the link, rather than recording a deletion on disk that the outer mount can't make; the result says the file or link on disk, if any, was left untouched. A `materialize` without a path clears older pending deletions at nested paths, or of such links, the same way, whatever `force` and `applyDeletions` say. It notes each once, also when branch divergence blocks the rest of the push.
+  - The disk readers refuse a path outside the mount, or inside a nested one, before saying what kind of entry it is, a directory reached through a link included.
+  - The nesting checks read disk synchronously, so a mount whose storage stops answering can block the process (#311).
+  - (agent-framework #280)
