@@ -15,7 +15,7 @@ import { JsStore } from '@animalabs/chronicle';
 import { MembraneError } from '@animalabs/membrane';
 import type { NormalizedRequest, NormalizedResponse, StreamEvent, YieldingStream } from '@animalabs/membrane';
 import type { EventResponse, Module, ModuleContext, ProcessEvent, ProcessState, ToolCall, ToolDefinition, ToolResult } from '../src/index.js';
-import { AgentFramework, ApiServer } from '../src/index.js';
+import { AgentFramework, ApiServer, ProviderWaitNotSleptError } from '../src/index.js';
 import { ProviderWaits, waitDeadline, PROVIDER_WAIT_RECORD_TYPE } from '../src/provider-waits.js';
 import { MockMembrane, MockYieldingStream, createMockResponse } from './helpers/mock-membrane.js';
 
@@ -1840,6 +1840,10 @@ for (const site of ['stream', 'setup', 'throw'] as const) {
         assert.ok('error' in outcome, 'the run ends with an error');
         assert.match(outcome.error.message, /zz rate limit reached/);
         assert.match(outcome.error.message, /the provider asked to wait 1200 s; an ephemeral run doesn't sleep a stated wait longer than 600 s, so it ends now/);
+        // Marked, so a host needn't read the words.
+        assert.ok(outcome.error instanceof ProviderWaitNotSleptError, 'the rejection is a ProviderWaitNotSleptError');
+        assert.equal(outcome.error.name, 'ProviderWaitNotSleptError');
+        assert.equal(outcome.error.retryAfterMs, 20 * 60_000, 'it carries the stated wait');
         await sleep(100);
         assert.equal(membrane.primary, 1, 'no retry before the provider\'s time');
         assert.deepEqual(fw.providerWaitSnapshot(`zz-ephemeral-long-${site}`), [], 'nothing recorded for a single-use name');
@@ -1848,9 +1852,11 @@ for (const site of ['stream', 'setup', 'throw'] as const) {
   });
 }
 
+// Each ending's words as published: a host may match them (connectome-host
+// 0.10.2 does, one pattern per ending), so they don't change.
 for (const [stated, says] of [
-  [Number.NaN, /the provider's stated wait is not a number/],
-  [Number.POSITIVE_INFINITY, /the provider asked to wait longer than can be represented/],
+  [Number.NaN, /the provider's stated wait is not a number, and an ephemeral run sleeps only a stated wait of 600 s or less, so it ends now\)$/],
+  [Number.POSITIVE_INFINITY, /the provider asked to wait longer than can be represented; an ephemeral run doesn't sleep a stated wait longer than 600 s, so it ends now\)$/],
 ] as const) {
   test(`an ephemeral run whose stated wait can't be represented (${stated}) ends at once too`, async () => {
     await withStoreDir(async (path) => {
@@ -1861,11 +1867,58 @@ for (const [stated, says] of [
         const outcome = await ephemeralRun(fw, `zz-ephemeral-${stated}`);
         assert.ok('error' in outcome, 'the run ends with an error');
         assert.match(outcome.error.message, says);
+        assert.ok(outcome.error instanceof ProviderWaitNotSleptError);
+        assert.equal(outcome.error.name, 'ProviderWaitNotSleptError');
+        assert.ok(Object.is(outcome.error.retryAfterMs, stated), `it carries ${stated}, not ${outcome.error.retryAfterMs}`);
         assert.equal(membrane.primary, 1);
       } finally { await fw.stop(); log.restore(); }
     });
   });
 }
+
+for (const [label, failure] of [
+  ['refused', () => new MembraneError({
+    type: 'invalid_request', retryable: false, httpStatus: 400,
+    message: 'zz the request was refused', rawError: { status: 400 },
+  })],
+  // Not retryable, so its stated wait is no reason to wait: it ends as any failure does.
+  ['not retryable, with a long stated wait', () => new MembraneError({
+    type: 'invalid_request', retryable: false, httpStatus: 400, retryAfterMs: 20 * 60_000,
+    message: 'zz the request was refused', rawError: { status: 400 },
+  })],
+] as const) {
+  for (const site of ['stream', 'setup', 'throw'] as const) {
+    test(`an ephemeral run that fails for another reason isn't marked as a stated wait (${label}, ${site})`, async () => {
+      await withStoreDir(async (path) => {
+        const log = silence();
+        const membrane = new FailingAt(1, site, failure);
+        const { fw } = await framework(path, membrane);
+        try {
+          const outcome = await ephemeralRun(fw, `zz-ephemeral-refused-${site}`);
+          assert.ok('error' in outcome, 'the run ends with an error');
+          assert.match(outcome.error.message, /zz the request was refused/);
+          assert.doesNotMatch(outcome.error.message, /stated wait/);
+          assert.ok(!(outcome.error instanceof ProviderWaitNotSleptError), 'a plain error');
+          assert.equal(outcome.error.name, 'Error');
+        } finally { await fw.stop(); log.restore(); }
+      });
+    });
+  }
+}
+
+test('a stated wait just past the cap is named in whole seconds rounded up, past the cap', async () => {
+  await withStoreDir(async (path) => {
+    const log = silence();
+    const membrane = new FailingAt(1, 'stream', () => rateLimited(600_001));
+    const { fw } = await framework(path, membrane);
+    try {
+      const outcome = await ephemeralRun(fw, 'zz-ephemeral-just-past');
+      assert.ok('error' in outcome, 'the run ends with an error');
+      assert.match(outcome.error.message, /the provider asked to wait 601 s; an ephemeral run doesn't sleep a stated wait longer than 600 s/);
+      assert.equal((outcome.error as ProviderWaitNotSleptError).retryAfterMs, 600_001);
+    } finally { await fw.stop(); log.restore(); }
+  });
+});
 
 test('an ephemeral run sleeps a stated wait within the framework cap and retries', async () => {
   await withStoreDir(async (path) => {
@@ -2014,7 +2067,8 @@ const foreignRateLimit = (retryAfterMs: unknown) => Object.assign(new Error('zz 
 });
 
 for (const who of ['resident', 'conversation agent', 'ephemeral run'] as const) {
-  test(`a 429 from another copy of membrane that states a wait is recorded, not slept in the turn (${who})`, async () => {
+  const outcome = who === 'ephemeral run' ? 'ends the run at once, marked' : 'is recorded, not slept in the turn';
+  test(`a 429 from another copy of membrane that states a wait ${outcome} (${who})`, async () => {
     await withStoreDir(async (path) => {
       const log = silence();
       // An ephemeral run doesn't record: a wait past its cap ends it at once.
@@ -2027,6 +2081,9 @@ for (const who of ['resident', 'conversation agent', 'ephemeral run'] as const) 
           const outcome = await ephemeralRun(fw, 'zz-ephemeral-foreign');
           assert.ok('error' in outcome, 'the run ends with an error');
           assert.match(outcome.error.message, /the provider asked to wait 1200 s/);
+          assert.ok(outcome.error instanceof ProviderWaitNotSleptError);
+          assert.equal(outcome.error.name, 'ProviderWaitNotSleptError');
+          assert.equal(outcome.error.retryAfterMs, 1_200_000);
           assert.equal(membrane.primary, 1, 'never retried inside the stated wait');
           return;
         }

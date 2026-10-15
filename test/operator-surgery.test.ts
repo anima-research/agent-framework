@@ -372,6 +372,189 @@ describe('live operator surgery', () => {
     void s0;
   });
 
+  it('hide removes a message stored as a body whole, a one-shard body and every copy included', async () => {
+    // Each shard of a long message carries its Discord message id.
+    const appendBody = (discordId: string, group: string, texts: string[], from = 0): string[] =>
+      texts.map((text, i) =>
+        (cm() as unknown as ShardStore).messageStore.append(
+          'user',
+          [{ type: 'text', text }],
+          { serverId: 'discord', channelId: 'discord:g1:c1', messageId: discordId },
+          undefined,
+          { bodyGroupId: group, shardIndex: from + i },
+        ).id,
+      );
+    const [lone] = appendBody('d-lone', 'g-lone', ['lone']);
+    const long = appendBody('d-long', 'g-long', ['l0', 'l1', 'l2']);
+    // A write cut short after two shards, then its retry from shard 0.
+    const partial = appendBody('d-cut', 'g-cut', ['c0', 'c1']);
+    const retry = appendBody('d-cut', 'g-cut', ['c0', 'c1', 'c2']);
+    const internals = framework as unknown as {
+      handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+    };
+    const hide = (fromMessageId: string) => internals.handleHostCommand('discord', {
+      command: 'hide',
+      agentName: 'scout',
+      fromMessageId,
+      requesterName: 'antra',
+    });
+    const refsOf = (result: Record<string, unknown>) =>
+      (result.hiddenRefs as Array<{ messageId: string }>).map((ref) => ref.messageId);
+
+    const one = await hide('d-lone');
+    assert.equal(one.ok, true, String(one.error));
+    assert.equal(one.hidden, 1);
+    assert.equal(cm().getMessage(lone as never), null);
+
+    const whole = await hide('d-long');
+    assert.equal(whole.ok, true, String(whole.error));
+    assert.equal(whole.hidden, 1, 'one message, though stored in three shards');
+    assert.deepEqual(refsOf(whole), ['d-long']);
+    for (const id of long) assert.equal(cm().getMessage(id as never), null);
+
+    const copies = await hide('d-cut');
+    assert.equal(copies.ok, true, String(copies.error));
+    assert.equal(copies.hidden, 2, 'the partial copy and its retry');
+    assert.deepEqual(refsOf(copies), ['d-cut']);
+    for (const id of [...partial, ...retry]) assert.equal(cm().getMessage(id as never), null);
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+
+    // A body of more shards than the operator log keeps ids for: its entry
+    // keeps the first 50 and says the list is cut.
+    const huge = appendBody('d-huge', 'g-huge', Array.from({ length: 60 }, (_, i) => `h${i}`));
+    const big = await hide('d-huge');
+    assert.equal(big.ok, true, String(big.error));
+    assert.equal(big.hidden, 1);
+    const entry = readLog(framework.getOperatorLogPath()!).filter((e) => e.kind === 'hide').at(-1)!;
+    assert.deepEqual(entry.result?.removedIds, huge.slice(0, 50));
+    assert.equal(entry.result?.removedIdsTruncated, true);
+    for (const id of huge) assert.equal(cm().getMessage(id as never), null);
+  });
+
+  it('hide refuses while a surgery holds the store, and a missing Discord id matches nothing', async () => {
+    cm().addMessage('user', [{ type: 'text', text: 'held' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'd-held' });
+    const internals = framework as unknown as {
+      handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+      reserveStoreForSurgery(verb: string, agentName: string): () => void;
+    };
+    const hide = (fromMessageId: string) => internals.handleHostCommand('discord', {
+      command: 'hide', agentName: 'scout', fromMessageId, requesterName: 'antra',
+    });
+    const release = internals.reserveStoreForSurgery('roll back', 'scout');
+    try {
+      const refused = await hide('d-held');
+      assert.equal(refused.ok, false);
+      assert.match(String(refused.error), /a live roll back for scout holds the store/);
+    } finally {
+      release();
+    }
+    // Two messages with no Discord id, such as the agent's replies: the
+    // text "undefined" names neither of them.
+    cm().addMessage('scout', [{ type: 'text', text: 'reply-1' }]);
+    cm().addMessage('scout', [{ type: 'text', text: 'reply-2' }]);
+    const none = await hide('undefined');
+    assert.equal(none.ok, false);
+    assert.match(String(none.error), /is not an addressable message in context/);
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5', 'held', 'reply-1', 'reply-2']);
+    const hidden = await hide('d-held');
+    assert.equal(hidden.ok, true, String(hidden.error));
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5', 'reply-1', 'reply-2']);
+  });
+
+  it('hide over a range widens both ends to whole bodies, and counts each message once', async () => {
+    const appendBody = (discordId: string, group: string, texts: string[]): string[] =>
+      texts.map((text, shardIndex) =>
+        (cm() as unknown as ShardStore).messageStore.append(
+          'user',
+          [{ type: 'text', text }],
+          { serverId: 'discord', channelId: 'discord:g1:c1', messageId: discordId },
+          undefined,
+          { bodyGroupId: group, shardIndex },
+        ).id,
+      );
+    appendBody('d-a', 'g-a', ['a0', 'a1']);
+    cm().addMessage('user', [{ type: 'text', text: 'between' }], { serverId: 'discord', channelId: 'discord:g1:c1', messageId: 'd-mid' });
+    appendBody('d-b', 'g-b', ['b0', 'b1', 'b2']);
+    const internals = framework as unknown as {
+      handleHostCommand(serverId: string, params: Record<string, unknown>): Promise<Record<string, unknown>>;
+    };
+    // From the second body's first shard back to the first body's: both
+    // widen to their whole bodies.
+    const result = await internals.handleHostCommand('discord', {
+      command: 'hide',
+      agentName: 'scout',
+      fromMessageId: 'd-b',
+      toMessageId: 'd-a',
+      requesterName: 'antra',
+    });
+    assert.equal(result.ok, true, String(result.error));
+    assert.equal(result.hidden, 3);
+    assert.deepEqual((result.hiddenRefs as Array<{ messageId: string }>).map((ref) => ref.messageId), ['d-a', 'd-mid', 'd-b']);
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+  });
+
+  it("a module's removal of a message in a body takes the whole body, and a plain message alone, with no full read of the branch", async () => {
+    const [b0, b1, b2] = appendShards('g-mod', ['b0', 'b1', 'b2']);
+    const plain = String(cm().addMessage('user', [{ type: 'text', text: 'plain' }]));
+    const internals = framework as unknown as { removeMessage(id: string): void };
+    // A full read inflates every attachment on the branch: the body is found
+    // in blob-free windows instead.
+    const reads = cm() as unknown as { getAllMessages(): unknown };
+    const getAllMessages = reads.getAllMessages;
+    reads.getAllMessages = () => { throw new Error('read the whole branch'); };
+    try {
+      internals.removeMessage(b1);
+      for (const id of [b0, b1, b2]) assert.equal(cm().getMessage(id as never), null);
+      internals.removeMessage(plain);
+      assert.equal(cm().getMessage(plain as never), null);
+    } finally {
+      reads.getAllMessages = getAllMessages;
+    }
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+  });
+
+  it('a rewind whose newest message is the last shard of a body takes the whole body', async () => {
+    const [s0, s1, s2] = appendShards('g-doc', ['d0', 'd1', 'd2']);
+    const internals = framework as unknown as {
+      shedNewestTurn(agent: unknown): { kind: string; removedIds: string[] } | null;
+    };
+    const record = internals.shedNewestTurn(framework.getAgent('scout'));
+    assert.ok(record);
+    assert.deepEqual(record.removedIds, [s2, s1, s0]);
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+  });
+
+  it('a rewind of a tool result takes its tool_use turn whole, a turn stored as a body, in one removal', async () => {
+    // As context-manager's chunker stores them: the tool_use block on the
+    // turn's first shard, text after it; then the result, also a body.
+    const store = (cm() as unknown as ShardStore).messageStore;
+    const turn = [
+      store.append('assistant', [{ type: 'tool_use', id: 't9', name: 'shell', input: {} }], {}, undefined, { bodyGroupId: 'g-turn', shardIndex: 0 }).id,
+      store.append('assistant', [{ type: 'text', text: 'narration' }], {}, undefined, { bodyGroupId: 'g-turn', shardIndex: 1 }).id,
+    ];
+    const result = [
+      store.append('user', [{ type: 'tool_result', toolUseId: 't9', content: 'r0' }], {}, undefined, { bodyGroupId: 'g-result', shardIndex: 0 }).id,
+      store.append('user', [{ type: 'text', text: 'r1' }], {}, undefined, { bodyGroupId: 'g-result', shardIndex: 1 }).id,
+    ];
+    const c = cm() as unknown as { removeMessages: (a: string, b: string) => void };
+    const ranges: Array<[string, string]> = [];
+    const original = c.removeMessages.bind(c);
+    c.removeMessages = (a: string, b: string) => { ranges.push([a, b]); original(a, b); };
+    try {
+      const internals = framework as unknown as {
+        shedNewestTurn(agent: unknown): { kind: string; removedIds: string[] } | null;
+      };
+      const record = internals.shedNewestTurn(framework.getAgent('scout'));
+      assert.ok(record);
+      assert.equal(record.kind, 'tool');
+      assert.deepEqual(record.removedIds, [result[1], result[0], turn[1], turn[0]]);
+      assert.deepEqual(ranges, [[turn[0], result[1]]], "one removal, from the turn's first shard to the result's last");
+    } finally {
+      c.removeMessages = original;
+    }
+    assert.deepEqual(remainingTexts(), ['m1', 'm2', 'm3', 'm4', 'm5']);
+  });
+
   // --- failure path ----------------------------------------------------------
 
   it('a failed suppression restores the source branch, retires its outbox batch, and leaves the store bootable', async () => {
