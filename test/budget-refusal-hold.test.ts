@@ -602,10 +602,12 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         kickOverBudgetDrain: (name: string, agent: unknown, after?: () => void) => void;
       };
       const proto = ContextManager.prototype as unknown as Patchable;
+      // Let go in the finally too, so a failed assertion fails the test
+      // rather than leaving the tick, and the stop that waits for it, hanging.
+      let letGo = () => {};
       try {
         assert.ok(await pollUntil(() => fw.maintenancePass === null, 3_000), 'the start pass is done');
         // From here a tick waits to be let go, as a compression call does.
-        let letGo!: () => void;
         const gate = new Promise<void>((resolve) => { letGo = resolve; });
         proto.tick = async function () { backlog.ticks++; await gate; };
         const before = backlog.ticks;
@@ -627,6 +629,7 @@ describe('a compile refused for budget holds its turn (#304)', () => {
         assert.equal(fw.overBudgetDrainAfter.has('prime'), false, 'the kick ran its callback when it ended');
         assert.ok(t.internal.budgetHolds.size === 1, 'the turn is still held');
       } finally {
+        letGo();
         await t.close();
       }
     });
