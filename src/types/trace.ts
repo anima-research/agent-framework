@@ -158,21 +158,25 @@ export type TraceEvent =
     })
   | (TraceEventBase & {
       /**
-       * Prose that delivery published, sent once the publish is confirmed:
-       * the outgoing stream's chunk (MCPL Spec 14.3
-       * `channels/outgoing/chunk`), emitted whether or not the channel's
-       * server takes the stream. It carries only what was published, so a
-       * consumer that speaks or shows it, such as a voice relay, never gets
-       * text that delivery withholds (a `skip_reply`, a silencing send, a
-       * private `think`, a hold, a bounce) or a publish that failed or
-       * wasn't confirmed. `inference:tokens` stays the model's text as it is
-       * written (held, as before, while a tool-result guard's batch is
-       * pending). A later publish to the same channel by the same stream
-       * opens with a paragraph break (`\n\n`), so a channel's chunks joined
-       * in `index` order are its text, its messages kept apart.
-       * `mcpl:speech-routed` also reports each speech publish, the `sleep`
-       * tool's announcement among them, with no stream id, index or end, so
-       * a relay that voices speech takes one of the two.
+       * Prose that delivery published, sent once the publish succeeds: the
+       * outgoing stream's chunk (MCPL Spec 14.3 `channels/outgoing/chunk`),
+       * emitted whether or not the channel's server takes the stream. It
+       * carries only what was published, so a consumer that speaks or shows
+       * it, such as a voice relay, never gets text that delivery withholds (a
+       * `skip_reply`, a silencing send, a private `think`, a hold, a bounce)
+       * or a publish that failed: one refused before sending, one that threw
+       * or timed out, or one the server reported undelivered
+       * (`delivered: false`). A reply that leaves `delivered` out counts as
+       * delivered, as delivery counts it. `inference:tokens` stays the
+       * model's text as it is written (held, as before, while a tool-result
+       * guard's batch is pending). A later publish to the same channel by the
+       * same stream opens with a paragraph break (`\n\n`), so a channel's
+       * chunks joined in `index` order are its text, its messages kept apart.
+       * `mcpl:speech-routed` also reports speech publishes, with no stream
+       * id, index or end: routeSpeech's once delivered, the `sleep` tool's
+       * announcement among them, and a subconscious's `speak_in_channel` as
+       * it is sent, before its outcome is known. A relay that voices speech
+       * takes one of the two, not both.
        */
       type: 'inference:published';
       agentName: string;

@@ -2996,7 +2996,7 @@ export class ChannelRegistry {
   /**
    * MCPL Spec 14.3 outgoing streaming: forward a text delta to the server
    * owning the channel. The framework sends each piece of prose once its
-   * publish is confirmed, so a stream carries only what was published.
+   * publish succeeds, so a stream carries only what was published.
    * Emitted only when that server's grant has `channels.streaming` —
    * servers that never opted in receive nothing. Fire-and-forget and never
    * throws: streaming is an observer surface; the authoritative delivery is

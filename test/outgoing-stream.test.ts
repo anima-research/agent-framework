@@ -1,12 +1,13 @@
 /**
  * The outgoing stream (MCPL Spec 14.3 `channels/outgoing/chunk` and
  * `complete`, mirrored as the `inference:published` traces) carries what
- * delivery published, sent once each publish is confirmed. Text that
+ * delivery published, sent once each publish succeeds. Text that
  * delivery withholds never reaches it: a round that a silencing tool,
  * `skip_reply` or a private `think` keeps back, text under a hybrid hold, a
- * bounce, or a round the stream never finished. Nor does a publish that fails
- * or isn't confirmed. A voice server speaks what it gets, and words already
- * spoken can't be taken back, so the stream can't run ahead of delivery.
+ * bounce, or a round the stream never finished. Nor does a publish that
+ * throws or that the server reports undelivered. A voice server speaks what
+ * it gets, and words already spoken can't be taken back, so the stream can't
+ * run ahead of delivery.
  */
 
 import { afterEach, test } from 'node:test';
@@ -96,14 +97,14 @@ type Logged =
 /**
  * The registry stub: #alpha, #cafe and @laria resolve, the turn's locus is
  * world:test, and every chunk, publish and complete lands in one ordered
- * log. A publish whose text is in `fails` returns unconfirmed.
+ * log. A publish whose text is in `fails` fails.
  */
 function registry(framework: AgentFramework, options: { streaming?: boolean } = {}) {
   const log: Logged[] = [];
   /** A publish whose text is held here doesn't return until the test lets it go. */
   const holds = new Map<string, Promise<void>>();
-  /** A publish of one of these texts isn't confirmed: `delivered: false`, or a throw. */
-  const fails = new Map<string, 'unconfirmed' | 'throw'>();
+  /** A publish of one of these texts fails: the server reports it undelivered (`delivered: false`), or it throws. */
+  const fails = new Map<string, 'undelivered' | 'throw'>();
   const known: Record<string, string> = { '#alpha': 'chan-alpha', '#cafe': 'chan-cafe', '@laria': 'discord:dm:99' };
   let stopped = false;
   const target: Record<string, unknown> = {
@@ -187,7 +188,7 @@ async function harness(scripts: NormalizedResponse[][], config: Partial<AgentCon
   return { framework, membrane, module, run, settled, traces, ...stub };
 }
 
-test('a delivered round streams its text once its publish is confirmed, and the published traces mirror the stream', async () => {
+test('a delivered round streams its text once its publish succeeds, and the published traces mirror the stream', async () => {
   const h = await harness([[round(text('first'), call('one', 'test--read')), final(text('second'))]]);
   try {
     await h.run();
@@ -198,7 +199,7 @@ test('a delivered round streams its text once its publish is confirmed, and the 
       { kind: 'publish', channelId: 'world:test', text: 'second' },
       { kind: 'chunk', channelId: 'world:test', text: '\n\nsecond', inferenceId: id, index: 1 },
       { kind: 'complete', channelId: 'world:test', text: 'first\n\nsecond', inferenceId: id },
-    ], 'each publish is streamed once it is confirmed, and a later one to the same channel opens with a paragraph break');
+    ], 'each publish is streamed once it succeeds, and a later one to the same channel opens with a paragraph break');
     assert.deepEqual(h.traces, [
       { type: 'inference:published', channelId: 'world:test', text: 'first', inferenceId: id, index: 0 },
       { type: 'inference:published', channelId: 'world:test', text: '\n\nsecond', inferenceId: id, index: 1 },
@@ -388,21 +389,21 @@ test("explicit: a stream's complete waits for the deliveries it queued, so no ch
       'mark:post released',
       'chunk:first',
       'complete:first',
-    ], 'the chunk follows the confirmed post, the complete follows the chunk, and the private round streams nothing');
+    ], 'the chunk follows the post once it succeeds, the complete follows the chunk, and the private round streams nothing');
   } finally {
     release();
     await h.framework.stop();
   }
 });
 
-for (const failure of ['unconfirmed', 'throw'] as const) {
-  test(`a publish that ${failure === 'throw' ? 'throws' : "isn't confirmed"} never streams, and the stream goes on with what is`, async () => {
+for (const failure of ['undelivered', 'throw'] as const) {
+  test(`a publish that ${failure === 'throw' ? 'throws' : 'the server reports undelivered'} never streams, and the stream goes on with what is`, async () => {
     const h = await harness([[round(text('lost'), call('one', 'test--read')), final(text('kept'))]]);
     h.fails.set('lost', failure);
     try {
       await h.run();
       assert.deepEqual(h.publishes().map((p) => p.text), ['lost', 'kept'], 'both publishes were tried');
-      assert.deepEqual(h.chunks().map((c) => c.text), ['kept'], 'only the confirmed one streams');
+      assert.deepEqual(h.chunks().map((c) => c.text), ['kept'], 'only the one that succeeded streams');
       assert.deepEqual(h.completes().map((c) => c.text), ['kept'], 'and the complete carries only it');
       assert.equal(h.traces.some((t) => t.text.includes('lost')), false, 'nor do the published traces');
     } finally { await h.framework.stop(); }
@@ -438,9 +439,9 @@ test('a stream stopped mid-turn still completes what it published', async () => 
 
 // A stop() that finds a publish still out ends the stream before its teardown
 // closes the connections the publish waits on, whatever becomes of the
-// publish then: the close rejects it, or confirms it too late to stream.
-for (const late of ['rejected', 'confirmed'] as const) {
-  test(`a stop() with a publish still out completes what the stream sent before teardown, and the publish ${late} then never streams`, async () => {
+// publish then: the close rejects it, or it succeeds too late to stream.
+for (const late of ['rejects', 'succeeds'] as const) {
+  test(`a stop() with a publish still out completes what the stream sent before teardown, and a publish that ${late === 'rejects' ? 'teardown rejects' : 'succeeds after teardown'} never streams`, async () => {
     const h = await harness([[
       round(text('first'), call('one', 'test--read')),
       round(text('second'), call('two', 'test--read')),
@@ -450,7 +451,7 @@ for (const late of ['rejected', 'confirmed'] as const) {
     // closing an MCPL connection settles a request it still holds.
     let settleSecond!: () => void;
     const secondHeld = new Promise<void>((resolve, reject) => {
-      settleSecond = () => (late === 'rejected' ? reject(new Error('connection closed')) : resolve());
+      settleSecond = () => (late === 'rejects' ? reject(new Error('connection closed')) : resolve());
     });
     secondHeld.catch(() => {});
     h.holds.set('second', secondHeld);
@@ -586,6 +587,20 @@ test("with the real channel registry, a stop() with a publish still out sends th
   }
 });
 
+test('disabled: nothing streams, from a mid-turn round, trailing text or a text-only turn', async () => {
+  for (const script of [
+    [round(text('mid-turn'), call('one', 'test--read')), final(text('trailing'))],
+    [final(text('text only'))],
+  ]) {
+    const h = await harness([script], { proseRouting: 'disabled' });
+    try {
+      await h.run();
+      assert.deepEqual(h.log, [], 'nothing is published, streamed or completed');
+      assert.deepEqual(h.traces, [], 'and no published trace is emitted');
+    } finally { await h.framework.stop(); }
+  }
+});
+
 test("the published traces are emitted when the channel's server takes no stream", async () => {
   const h = await harness([[round(text('first'), call('one', 'test--read')), final(text('second'))]], {}, { streaming: false });
   try {
@@ -599,8 +614,8 @@ test("the published traces are emitted when the channel's server takes no stream
   } finally { await h.framework.stop(); }
 });
 
-// A publish that isn't confirmed streams nothing, on every delivery path.
-const unconfirmedCases: Array<{ name: string; mode: 'locus' | 'hybrid' | 'explicit'; script: () => NormalizedResponse[]; lost: string; kept?: string }> = [
+// A publish that fails streams nothing, on every delivery path.
+const failedPublishCases: Array<{ name: string; mode: 'locus' | 'hybrid' | 'explicit'; script: () => NormalizedResponse[]; lost: string; kept?: string }> = [
   { name: 'locus text-only', mode: 'locus', script: () => [final(text('lost'))], lost: 'lost' },
   { name: 'locus trailing', mode: 'locus', script: () => [round(text('kept'), call('one', 'test--read')), final(text('lost'))], lost: 'lost', kept: 'kept' },
   { name: 'hybrid unprefixed', mode: 'hybrid', script: () => [round(text('lost'), call('one', 'test--read')), final(text('kept'))], lost: 'lost', kept: 'kept' },
@@ -608,9 +623,9 @@ const unconfirmedCases: Array<{ name: string; mode: 'locus' | 'hybrid' | 'explic
   { name: 'explicit mid-turn', mode: 'explicit', script: () => [round(text('>>#alpha lost'), call('one', 'test--read')), final(text('>>#cafe kept'))], lost: 'lost', kept: 'kept' },
   { name: 'explicit text-only', mode: 'explicit', script: () => [final(text('>>#alpha lost'))], lost: 'lost' },
 ];
-for (const c of unconfirmedCases) {
-  for (const failure of ['unconfirmed', 'throw'] as const) {
-    test(`${c.name}: a publish that ${failure === 'throw' ? 'throws' : "isn't confirmed"} streams nothing`, async () => {
+for (const c of failedPublishCases) {
+  for (const failure of ['undelivered', 'throw'] as const) {
+    test(`${c.name}: a publish that ${failure === 'throw' ? 'throws' : 'the server reports undelivered'} streams nothing`, async () => {
       const h = await harness([c.script()], { proseRouting: c.mode });
       h.fails.set(c.lost, failure);
       try {
@@ -620,7 +635,7 @@ for (const c of unconfirmedCases) {
         assert.equal(h.completes().some((co) => co.text.includes(c.lost)), false, 'nor does a complete');
         assert.equal(h.traces.some((t) => t.text.includes(c.lost)), false, 'nor a published trace');
         if (c.kept) {
-          assert.deepEqual(h.chunks().map((ch) => ch.text), [c.kept], 'the confirmed publish beside it still streams');
+          assert.deepEqual(h.chunks().map((ch) => ch.text), [c.kept], 'the publish beside it that succeeds still streams');
         }
       } finally { await h.framework.stop(); }
     });

@@ -72,6 +72,39 @@ describe('buildInjectedTools', () => {
 });
 
 describe('PyRunner (real python3)', () => {
+  it("no two runners' interpreters share a number, so a mark keyed by one can't match another's", async () => {
+    const first = new PyRunner({ onToolCall: async () => '' });
+    const second = new PyRunner({ onToolCall: async () => '' });
+    try {
+      assert.strictEqual(first.interpreter, null, 'no interpreter before the first script');
+      await first.exec('x = 1', []);
+      await second.exec('x = 1', []);
+      assert.notStrictEqual(first.interpreter, null);
+      assert.notStrictEqual(second.interpreter, null);
+      assert.notStrictEqual(first.interpreter, second.interpreter, 'each interpreter has its own number');
+    } finally {
+      first.dispose();
+      second.dispose();
+    }
+    assert.strictEqual(first.interpreter, null, 'and none once the runner is disposed');
+  });
+
+  it('an interpreter killed by a signal the runner didn\'t send has no number: it is gone', async () => {
+    const runner = new PyRunner({ onToolCall: async () => '' });
+    try {
+      await runner.exec('x = 1', []);
+      const child = (runner as unknown as { child: import('node:child_process').ChildProcess }).child;
+      assert.notStrictEqual(runner.interpreter, null, 'live while it runs');
+      const exited = new Promise((resolve) => child.once('exit', resolve));
+      process.kill(child.pid!, 'SIGKILL');
+      await exited;
+      assert.equal(child.killed, false, 'the runner sent no signal');
+      assert.strictEqual(runner.interpreter, null, 'and once the signal ended it, none is live');
+    } finally {
+      runner.dispose();
+    }
+  });
+
   it('runs a script and returns stdout', async () => {
     const runner = new PyRunner({ onToolCall: async () => '' });
     try {
@@ -687,8 +720,8 @@ describe("a round that runs code_execution is routed once its scripts return (re
     { name: 'channel_open', description: 'Open a channel.', inputSchema: { type: 'object' as const, properties: { channelId: { type: 'string' } } } },
   ];
 
-  async function scriptRound(mode: 'locus' | 'hybrid' | 'explicit', responses: ReturnType<typeof createMockResponse>[],
-    config: { sameRoundThinkTextPolicy?: 'private' } = {}) {
+  async function scriptRound(mode: 'locus' | 'hybrid' | 'explicit' | 'disabled', responses: ReturnType<typeof createMockResponse>[],
+    config: { sameRoundThinkTextPolicy?: 'private' } = {}, options: { codeExecution?: boolean } = {}) {
     const { tempDir, storePath } = tempStorePath('pytc-round-');
     const membrane = new MockMembrane();
     for (const response of responses) membrane.pushResponse(response);
@@ -700,7 +733,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
       agents: [{ name: 'assistant', model: 'test-model', systemPrompt: 'Act.', proseRouting: mode, ...config }],
       modules: [module],
       syncIntervalMs: 0,
-      codeExecution: { enabled: true },
+      ...(options.codeExecution === false ? {} : { codeExecution: { enabled: true } }),
     });
     // The registry stub: skip_reply and think are on the agent's surface, so
     // its scripts get them too, and skip_reply ends the turn as the real one
@@ -742,6 +775,10 @@ describe("a round that runs code_execution is routed once its scripts return (re
 
   const scriptCall = (input: Record<string, unknown>, id = 'ce1') =>
     ({ type: 'tool_use', id, name: 'code_execution', input }) as ContentBlock;
+  // A script holds its round only when it can change the round's routing:
+  // its code names such a tool (scriptMayRoute). A script given this suffix
+  // names skip_reply on a line that never runs, so its round waits for it.
+  const HOLDS = '\nif False: await skip_reply({})';
 
   for (const mode of ['locus', 'hybrid', 'explicit'] as const) {
     it(`${mode}: a skip_reply inside the script keeps its round's prose from delivery and the stream`, async () => {
@@ -761,8 +798,8 @@ describe("a round that runs code_execution is routed once its scripts return (re
     });
   }
 
-  it("locus: a send inside the script silences its round and the turn's later prose", async () => {
-    const h = await scriptRound('locus', [
+  for (const mode of ['locus', 'hybrid'] as const) it(`${mode}: a send inside the script silences its round and the turn's later prose`, async () => {
+    const h = await scriptRound(mode, [
       createMockResponse([
         { type: 'text', text: 'posting the summary' },
         scriptCall({ code: 'await test__send_message({})' }),
@@ -815,7 +852,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'on it' },
-        scriptCall({ code: 'print(await test__echo({}))' }),
+        scriptCall({ code: 'print(await test__echo({}))' + HOLDS }),
         { type: 'tool_use', id: 'slow1', name: 'test--slow', input: {} },
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
@@ -832,7 +869,395 @@ describe("a round that runs code_execution is routed once its scripts return (re
       assert.ok(at('publish:on it@world:test') >= 0, 'the prose was delivered');
       assert.ok(at('tool:echo') < at('publish:on it@world:test'), "it waited for the script's own call");
       assert.ok(at('publish:on it@world:test') < at('slow:returned'), 'and not for the slow tool beside it');
-      assert.ok(at('publish:on it@world:test') < at('chunk:on it@world:test'), 'and its chunk followed the confirmed publish');
+      assert.ok(at('publish:on it@world:test') < at('chunk:on it@world:test'), 'and its chunk followed its publish');
+    } finally {
+      clearInterval(watch);
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  it("a script whose code names no tool that changes routing doesn't hold its round: its prose goes out while the script runs", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'running the analysis' },
+        scriptCall({ code: 'await test__slow({})' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    // The script waits in its slow call until the round's prose has gone out,
+    // or until a bound, so a round that waited for the script still ends.
+    const watch = setInterval(() => { if (h.log.includes('publish:running the analysis@world:test')) h.module.releaseSlow(); }, 10);
+    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    try {
+      await h.run();
+      const at = (entry: string) => h.log.indexOf(entry);
+      assert.ok(at('publish:running the analysis@world:test') >= 0, 'the prose was delivered');
+      assert.ok(at('publish:running the analysis@world:test') < at('slow:returned'), 'while the script was still running');
+    } finally {
+      clearInterval(watch);
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  /** Runs a one-script round whose prose should go out while its script waits in a slow call. */
+  const publishedWhileScriptRuns = async (mode: 'locus' | 'explicit', code: string) => {
+    const prefix = mode === 'explicit' ? '>>#alpha ' : '';
+    const target = mode === 'explicit' ? 'chan-alpha' : 'world:test';
+    const h = await scriptRound(mode, [
+      createMockResponse([
+        { type: 'text', text: `${prefix}running the analysis` },
+        scriptCall({ code }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: `${prefix}done` }] as ContentBlock[]),
+    ]);
+    const published = `publish:running the analysis@${target}`;
+    const watch = setInterval(() => { if (h.log.includes(published)) h.module.releaseSlow(); }, 10);
+    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    try {
+      await h.run();
+      const at = (entry: string) => h.log.indexOf(entry);
+      assert.ok(at(published) >= 0, 'the prose was delivered');
+      assert.ok(at(published) < at('slow:returned'), 'while the script was still running');
+    } finally {
+      clearInterval(watch);
+      clearTimeout(bound);
+      await h.done();
+    }
+  };
+
+  it("a name inside a longer identifier, as say_hello or my_say, doesn't hold its round", async () => {
+    await publishedWhileScriptRuns('locus', 'say_hello = 1\nmy_say = 2\nsend_message_log = []\nawait test__slow({})');
+  });
+
+  it("a comment that names a routing tool doesn't hold its round, since Python never runs it", async () => {
+    await publishedWhileScriptRuns('locus', 'await test__slow({})  # then skip_reply, or say so');
+  });
+
+  it("explicit: a script that names only a send doesn't hold its round, since a send can't change an explicit round's routing", async () => {
+    await publishedWhileScriptRuns('explicit', 'await test__slow({})\nif False: await test__send_message({})');
+  });
+
+  it("disabled: a script that names skip_reply doesn't hold its round, since nothing is routed", async () => {
+    const h = await scriptRound('disabled', [
+      createMockResponse([
+        { type: 'text', text: 'never routed' },
+        scriptCall({ code: 'await test__slow({})' + HOLDS }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    const rounds = (h.framework as unknown as { scriptRounds: Map<string, unknown> }).scriptRounds;
+    let waitedOn: boolean | undefined;
+    const watch = setInterval(() => {
+      if (!h.log.includes('tool:slow')) return;
+      clearInterval(watch);
+      waitedOn = rounds.has('assistant');
+      h.module.releaseSlow();
+    }, 10);
+    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    try {
+      await h.run();
+      assert.equal(waitedOn, false, 'no round waited on the script');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), [], 'and nothing was published');
+    } finally {
+      clearInterval(watch);
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  it("a script whose code names a world utterance, as say, holds its round until it returns", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'about to speak' },
+        scriptCall({ code: 'await test__slow({})\nif False: await mcpl__world__say({})' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    // Once the script is in its slow call, a round routed at its tool-calls
+    // event has had its delivery queued long before; with the agent's queued
+    // deliveries run, the round must still be unpublished. Then the call goes.
+    let publishedWhileRunning: boolean | undefined;
+    let checking = false;
+    const watch = setInterval(() => {
+      if (checking || !h.log.includes('tool:slow')) return;
+      checking = true;
+      const queued = (h.framework as unknown as { proseSpeechChains: Map<string, Promise<void>> }).proseSpeechChains.get('assistant');
+      void Promise.resolve(queued).then(() => {}, () => {}).then(() => {
+        publishedWhileRunning = h.log.includes('publish:about to speak@world:test');
+        h.module.releaseSlow();
+      });
+    }, 10);
+    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    try {
+      await h.run();
+      const at = (entry: string) => h.log.indexOf(entry);
+      assert.equal(publishedWhileRunning, false, "the round wasn't published while its script ran");
+      assert.ok(at('slow:returned') < at('publish:about to speak@world:test'), 'it went out once the script had returned');
+    } finally {
+      clearInterval(watch);
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  it("a tool name a script builds at runtime goes unseen: its round is routed at its tool-calls event, as before scripts counted", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'not held' },
+        scriptCall({ code: 'name = "skip" + "_reply"\nawait tools[name]({})' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    try {
+      await h.run();
+      const at = (entry: string) => h.log.indexOf(entry);
+      assert.ok(at('tool:skip_reply') >= 0, 'the script called skip_reply by a name it built');
+      assert.ok(at('publish:not held@world:test') >= 0,
+        "the round was published anyway: its code names no tool that changes routing, so it didn't wait for the skip_reply that would have kept it back");
+    } finally { await h.done(); }
+  });
+
+  it("under the public same-round policy, a script that calls think doesn't hold its round", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'thinking it over' },
+        scriptCall({ code: 'await think({"content": "notes"})\nawait test__slow({})' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    const watch = setInterval(() => { if (h.log.includes('publish:thinking it over@world:test')) h.module.releaseSlow(); }, 10);
+    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    try {
+      await h.run();
+      const at = (entry: string) => h.log.indexOf(entry);
+      assert.ok(at('publish:thinking it over@world:test') >= 0, 'the prose was delivered');
+      assert.ok(at('publish:thinking it over@world:test') < at('slow:returned'), 'while the script was still running');
+    } finally {
+      clearInterval(watch);
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  it("without code execution, a code_execution call holds nothing: its round is routed at its tool-calls event", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'not a script after all' },
+        scriptCall({ code: 'await skip_reply({})' }),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ], {}, { codeExecution: false });
+    try {
+      await h.run();
+      assert.ok(h.log.includes('publish:not a script after all@world:test'),
+        "the call is answered as an unknown tool, whose result settles no round, so the round doesn't wait for it");
+    } finally { await h.done(); }
+  });
+
+  it("a helper an earlier script defined holds a later script's round: the interpreter ran a script that names a tool that changes routing", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'defining a helper' },
+        scriptCall({ code: 'async def post():\n    await test__send_message({})' }, 'ce1'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: 'posting the summary' },
+        scriptCall({ code: 'await post()' }, 'ce2'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    try {
+      await h.run();
+      assert.ok(h.log.includes('tool:send_message'), 'the helper sent');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:defining a helper@world:test'],
+        "the send through the helper silences its round and the turn's later prose, as a direct send does");
+    } finally { await h.done(); }
+  });
+
+  it("a script that only calls a routing tool directly, by name or by key, leaves no mark: a later script's round isn't held for it", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'thinking first' },
+        scriptCall({ code: 'await think({"content": "notes"})\nawait tools["think"]({"content": "more"})' }, 'ce1'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: 'running the analysis' },
+        scriptCall({ code: 'await test__slow({})' }, 'ce2'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ], { sameRoundThinkTextPolicy: 'private' });
+    const watch = setInterval(() => { if (h.log.includes('publish:running the analysis@world:test')) h.module.releaseSlow(); }, 10);
+    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    try {
+      await h.run();
+      const at = (entry: string) => h.log.indexOf(entry);
+      assert.ok(!h.log.includes('publish:thinking first@world:test'), 'the round whose script thought stays private');
+      assert.ok(at('publish:running the analysis@world:test') >= 0, "the later round's prose was delivered");
+      assert.ok(at('publish:running the analysis@world:test') < at('slow:returned'), 'while its script was still running');
+    } finally {
+      clearInterval(watch);
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  it("a key an earlier script kept holds a later script's round, as an alias does", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'keeping a key' },
+        scriptCall({ code: 'name = "test--send_message"' }, 'ce1'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: 'posting the summary' },
+        scriptCall({ code: 'await tools[name]({})' }, 'ce2'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    try {
+      await h.run();
+      assert.ok(h.log.includes('tool:send_message'), 'the kept key sent');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:keeping a key@world:test'],
+        "the send through the kept key silences its round and the turn's later prose, as a direct send does");
+    } finally { await h.done(); }
+  });
+
+  it("an alias an earlier script bound to a routing tool holds a later script's round, as a helper does", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'keeping a handle' },
+        scriptCall({ code: 'post = test__send_message' }, 'ce1'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: 'posting the summary' },
+        scriptCall({ code: 'await post({})' }, 'ce2'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    try {
+      await h.run();
+      assert.ok(h.log.includes('tool:send_message'), 'the alias sent');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')), ['publish:keeping a handle@world:test'],
+        "the send through the alias silences its round and the turn's later prose, as a direct send does");
+    } finally { await h.done(); }
+  });
+
+  it("a mark left in an earlier interpreter doesn't hold a round once a newer interpreter runs", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'defining a helper' },
+        scriptCall({ code: 'async def post():\n    await test__send_message({})' }, 'ce1'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: 'starting fresh' },
+        scriptCall({ code: 'x = 1' }, 'ce2'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: 'running the analysis' },
+        scriptCall({ code: 'await test__slow({})' }, 'ce3'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    // The helper's interpreter is reclaimed once its script returns; the next
+    // script starts a newer one, which is live when the third round is decided.
+    h.framework.onTrace((event) => {
+      if (event.type === 'tool:completed' && event.callId === 'ce1') {
+        const runner = (h.framework as unknown as { codeExecutionRunners: Map<string, { reclaim(why: string): void }> })
+          .codeExecutionRunners.get('assistant')!;
+        runner.reclaim('test');
+      }
+    });
+    const watch = setInterval(() => { if (h.log.includes('publish:running the analysis@world:test')) h.module.releaseSlow(); }, 10);
+    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    try {
+      await h.run();
+      const at = (entry: string) => h.log.indexOf(entry);
+      assert.ok(at('publish:running the analysis@world:test') >= 0, 'the third round was delivered');
+      assert.ok(at('publish:running the analysis@world:test') < at('slow:returned'), 'while its script was still running');
+    } finally {
+      clearInterval(watch);
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  it("under the public same-round policy, a helper that calls think doesn't hold a later script's round", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'defining a helper' },
+        scriptCall({ code: 'async def note():\n    await think({"content": "notes"})' }, 'ce1'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: 'running the analysis' },
+        scriptCall({ code: 'await note()\nawait test__slow({})' }, 'ce2'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    const watch = setInterval(() => { if (h.log.includes('publish:running the analysis@world:test')) h.module.releaseSlow(); }, 10);
+    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    try {
+      await h.run();
+      const at = (entry: string) => h.log.indexOf(entry);
+      assert.ok(h.log.includes('tool:think'), 'the helper thought');
+      assert.ok(at('publish:running the analysis@world:test') >= 0, 'the prose was delivered');
+      assert.ok(at('publish:running the analysis@world:test') < at('slow:returned'), 'while the script was still running');
+    } finally {
+      clearInterval(watch);
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  it("under the private same-round policy, a helper that calls think holds a later script's round back", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'defining a helper' },
+        scriptCall({ code: 'async def note():\n    await think({"content": "notes"})' }, 'ce1'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: 'working it through' },
+        scriptCall({ code: 'await note()' }, 'ce2'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'the answer' }] as ContentBlock[]),
+    ], { sameRoundThinkTextPolicy: 'private' });
+    try {
+      await h.run();
+      assert.ok(h.log.includes('tool:think'), 'the helper thought');
+      assert.deepStrictEqual(h.log.filter((e) => e.startsWith('publish:')),
+        ['publish:defining a helper@world:test', 'publish:the answer@world:test'],
+        'the round whose helper thought stays private, as with a direct think, and the rounds around it are delivered');
+    } finally { await h.done(); }
+  });
+
+  it("once the interpreter is reclaimed, a script that names no such tool doesn't hold its round, since the helpers went with it", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'defining a helper' },
+        scriptCall({ code: 'async def post():\n    await test__send_message({})' }, 'ce1'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([
+        { type: 'text', text: 'running the analysis' },
+        scriptCall({ code: 'await test__slow({})' }, 'ce2'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    // The interpreter that ran the helper's script is reclaimed once that
+    // script returns, as an idle reclaim or a restart would.
+    h.framework.onTrace((event) => {
+      if (event.type === 'tool:completed' && event.callId === 'ce1') {
+        const runner = (h.framework as unknown as { codeExecutionRunners: Map<string, { reclaim(why: string): void }> })
+          .codeExecutionRunners.get('assistant')!;
+        runner.reclaim('test');
+      }
+    });
+    const watch = setInterval(() => { if (h.log.includes('publish:running the analysis@world:test')) h.module.releaseSlow(); }, 10);
+    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    try {
+      await h.run();
+      const at = (entry: string) => h.log.indexOf(entry);
+      assert.ok(at('publish:running the analysis@world:test') >= 0, 'the prose was delivered');
+      assert.ok(at('publish:running the analysis@world:test') < at('slow:returned'), 'while the script was still running');
     } finally {
       clearInterval(watch);
       clearTimeout(bound);
@@ -868,7 +1293,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
       createMockResponse([
         { type: 'text', text: 'two scripts at once' },
         scriptCall({ code: 'await test__slow({})\nawait skip_reply({})' }, 'ce1'),
-        scriptCall({ code: 'print("second")' }, 'ce2'),
+        scriptCall({ code: 'print("second")' + HOLDS }, 'ce2'),
       ] as ContentBlock[], 'tool_use'),
     ]);
     // Let the first script go once the second's refusal has come back.
@@ -897,7 +1322,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
       createMockResponse([
         { type: 'text', text: 'still mine to say' },
         scriptCall({ code: 'await test__send_message({})', background: true }, 'bg'),
-        scriptCall({ code: 'await test__slow({})' }, 'fg'),
+        scriptCall({ code: 'await test__slow({})' + HOLDS }, 'fg'),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
@@ -921,7 +1346,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'for the room I was in' },
-        scriptCall({ code: 'await channel_open({"channelId": "chan-other"})' }),
+        scriptCall({ code: 'await channel_open({"channelId": "chan-other"})' + HOLDS }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'now over here' }] as ContentBlock[]),
     ]);
@@ -939,7 +1364,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     const membrane = (h.framework as unknown as { membrane: MockMembrane }).membrane;
     membrane.pushResponse(createMockResponse([
       { type: 'text', text: 'never decided' },
-      scriptCall({ code: 'await test__slow({})' }),
+      scriptCall({ code: 'await test__slow({})' + HOLDS }),
     ] as ContentBlock[], 'tool_use'));
     const lines: string[] = [];
     const error = console.error;
@@ -986,7 +1411,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'never decided' },
-        scriptCall({ code: 'await test__slow({})' }),
+        scriptCall({ code: 'await test__slow({})' + HOLDS }),
       ] as ContentBlock[], 'tool_use'),
     ]);
     const lines: string[] = [];
@@ -1065,23 +1490,77 @@ describe("a round that runs code_execution is routed once its scripts return (re
   });
 
   /** A pending round of another stream, as scriptRounds holds one: it records what it was asked to do. */
-  const pendingRound = (agent: unknown) => {
+  const pendingRound = (agent: unknown, pending: string[] = ['elsewhere']) => {
     const asked: string[] = [];
     return {
       asked,
       round: {
-        agent, streamId: -1, scripts: new Map<string, string[]>(), pending: new Set(['elsewhere']),
+        agent, streamId: -1, scripts: new Map<string, string[]>(), pending: new Set(pending),
         route: () => { asked.push('route'); },
         withhold: (why: string) => { asked.push(`withhold: ${why}`); },
       },
     };
   };
 
+  it("a script's result settles only the round that dispatched it, though a newer round waits on the same call id", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'the first round' },
+        scriptCall({ code: 'await test__slow({})' + HOLDS }, 'ce1'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    const rounds = (h.framework as unknown as { scriptRounds: Map<string, unknown> }).scriptRounds;
+    // While the script runs, a newer round comes to wait under the name on a
+    // call with the same id, as a provider that reuses ids could make one.
+    const newer = pendingRound(h.framework.getAgent('assistant'), ['ce1']);
+    let swapped = false;
+    const watch = setInterval(() => {
+      if (!h.log.includes('tool:slow')) return;
+      clearInterval(watch);
+      rounds.set('assistant', newer.round);
+      swapped = true;
+      h.module.releaseSlow();
+    }, 10);
+    // A script that never reaches its slow call still ends, and fails below.
+    const bound = setTimeout(() => h.module.releaseSlow(), 15000);
+    try {
+      await h.run();
+      assert.ok(swapped, 'the newer round came to wait while the script ran');
+      assert.deepStrictEqual(newer.asked, [], "the first round's result doesn't settle the newer round");
+      assert.equal(rounds.get('assistant'), newer.round, 'which still waits');
+    } finally {
+      clearInterval(watch);
+      clearTimeout(bound);
+      await h.done();
+    }
+  });
+
+  it("a newer round that doesn't wait displaces an older waiting round, so a call of its own with the same id can't settle it", async () => {
+    const h = await scriptRound('locus', [
+      createMockResponse([
+        { type: 'text', text: 'the newer round' },
+        scriptCall({ code: 'print("quick")' }, 'ce1'),
+      ] as ContentBlock[], 'tool_use'),
+      createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
+    ]);
+    // An older round of another stream still waits on a call with the same
+    // id, as a provider that reuses ids could leave one.
+    const older = pendingRound({}, ['ce1']);
+    (h.framework as unknown as { scriptRounds: Map<string, unknown> }).scriptRounds.set('assistant', older.round);
+    try {
+      await h.run();
+      assert.deepStrictEqual(older.asked, ['withhold: a newer round replaced it before its scripts returned'],
+        "the older round is withheld, and the newer round's result settles nothing of it");
+      assert.ok(h.log.includes('publish:the newer round@world:test'), 'and the newer round is routed at once');
+    } finally { await h.done(); }
+  });
+
   it('a round registered while another waits under the same agent name withholds the older one', async () => {
     const h = await scriptRound('locus', [
       createMockResponse([
         { type: 'text', text: 'the newer round' },
-        scriptCall({ code: 'print("quick")' }),
+        scriptCall({ code: 'print("quick")' + HOLDS }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: 'done' }] as ContentBlock[]),
     ]);
@@ -1126,7 +1605,7 @@ describe("a round that runs code_execution is routed once its scripts return (re
     const h = await scriptRound('explicit', [
       createMockResponse([
         { type: 'text', text: '>>#alpha written for alpha' },
-        scriptCall({ code: 'await test__slow({})' }),
+        scriptCall({ code: 'await test__slow({})' + HOLDS }),
       ] as ContentBlock[], 'tool_use'),
       createMockResponse([{ type: 'text', text: '>>skip_reply done' }] as ContentBlock[]),
     ]);

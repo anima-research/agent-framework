@@ -411,7 +411,7 @@ test('explicit mode: after a budget restart, the resumed reply streams where del
   ], { proseRouting: 'explicit', maxStreamTokens: 1000 });
   const routed: Array<{ text: string; channelId: string }> = [];
   const streamed: Array<{ channelId: string; delta: string }> = [];
-  // Each confirmed publish and each chunk, in the order they happened.
+  // Each publish that succeeds and each chunk, in the order they happened.
   const order: string[] = [];
   // What delivery had started to publish when the restarted stream wrote.
   let atRestart: string[] | undefined;
@@ -487,7 +487,7 @@ test('explicit mode: after a budget restart, the resumed reply streams where del
       'the resumed stream follows the destination the turn last addressed');
     assert.ok(order.indexOf('chunk:continued') > order.indexOf('published:continued')
       && order.indexOf('published:continued') > order.indexOf('published:first'),
-      `the resumed reply streams once its own publish is confirmed, after the earlier posts: ${order.join(', ')}`);
+      `the resumed reply streams once its own publish succeeds, after the earlier posts: ${order.join(', ')}`);
   } finally {
     releaseFirst();
     secondDelivered();

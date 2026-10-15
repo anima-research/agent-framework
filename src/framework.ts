@@ -108,6 +108,7 @@ import {
 } from './tool-image-ledger.js';
 import { randomUUID, createHash } from 'node:crypto';
 import { PyRunner, buildInjectedTools, formatLimit } from './code-execution/py-runner.js';
+import { scriptToolNames } from './code-execution/script-tool-names.js';
 import {
   buildCodeExecutionToolDefinition,
   CODE_EXECUTION_TOOL_NAME,
@@ -180,6 +181,28 @@ const isSilencingTool = (name: string): boolean => {
   const bare = bareToolName(name);
   return SILENCING_TOOLS.has(bare) || WORLD_PUBLICATION_TOOLS.has(bare);
 };
+
+/**
+ * Whether a call of one of these tools can change a round's routing
+ * (routeRound): in locus and hybrid mode a silencing or world-publication
+ * tool; in explicit mode, where sends don't silence, only `skip_reply`, which
+ * keeps the round private; in either, `think` under the private same-round
+ * policy, which holds the round back. Disabled mode routes nothing.
+ */
+const changesRouting = (
+  named: ReadonlySet<string>,
+  mode: NonNullable<AgentConfig['proseRouting']>,
+  privateThink: boolean,
+): boolean => {
+  if (mode === 'disabled') return false;
+  for (const name of named) {
+    if (name === 'think' ? privateThink : mode !== 'explicit' || name === 'skip_reply') return true;
+  }
+  return false;
+};
+
+/** The tools whose call can change a round's routing in some mode or policy (changesRouting). */
+const ROUTING_TOOLS = [...SILENCING_TOOLS, ...WORLD_PUBLICATION_TOOLS, 'think'];
 
 /**
  * True when an injected message is real conversational input — something the
@@ -623,11 +646,16 @@ function freshTurnRouting(): TurnRouting {
 }
 
 /**
- * What a prose delivery tells its stream once a publish is confirmed: the
+ * What a prose delivery tells its stream once a publish succeeds: the
  * channel and the text it published. The stream that queued the delivery
  * sends them on as its outgoing stream (MCPL Spec 14.3), so the stream
  * carries only what delivery published: nothing it withholds, and nothing
- * whose publish failed or wasn't confirmed.
+ * whose publish failed. A publish succeeds when routeSpeech returns an
+ * outcome that says delivered; a reply that leaves `delivered` out counts
+ * as delivered, as routeSpeech counts it. It fails when routeSpeech refuses
+ * it before sending (such as for no channel, a closed channel that won't
+ * open, or a server without `channels.publish`), when it throws or times
+ * out, or when the server reports it undelivered (`delivered: false`).
  */
 type SpeechPublished = (channelId: string, text: string) => void;
 
@@ -641,18 +669,19 @@ interface ProseRound {
 }
 
 /**
- * A round that called `code_execution`, waiting for those calls to return
- * before its prose is routed: a foreground script's own calls count as the
- * round's, so a `skip_reply` or a send inside the script silences the round
- * as a direct call does (AgentFramework.scriptRounds).
+ * A round whose `code_execution` scripts can change its routing
+ * (AgentFramework.scriptMayRoute), waiting for those calls to return before
+ * its prose is routed: a foreground script's own calls count as the round's,
+ * so a `skip_reply` or a send inside the script silences the round as a
+ * direct call does (AgentFramework.scriptRounds).
  */
 interface ScriptRound {
   /** The agent and stream that dispatched the round. */
   agent: Agent;
   streamId: number;
-  /** Each of the round's code_execution calls, with the tools its foreground script has called so far, in order. */
+  /** Each code_execution call the round waits on, with the tools its foreground script has called so far, in order. */
   scripts: Map<string, string[]>;
-  /** The round's code_execution calls whose results haven't arrived. */
+  /** Those calls whose results haven't arrived. */
   pending: Set<string>;
   /** Routes the round's prose; called once, when its last code_execution result arrives. */
   route: () => void;
@@ -2002,6 +2031,15 @@ export class AgentFramework {
   /** Per agent, a round that called code_execution and waits for those calls'
    *  results before its prose is routed (ScriptRound). */
   private scriptRounds: Map<string, ScriptRound> = new Map();
+  /** Each code_execution result, by the round that dispatched its call: it
+   *  settles only that round, even if a newer round reuses its call id. */
+  private scriptRoundOfResult: WeakMap<ToolResult, ScriptRound> = new WeakMap();
+  /** Per agent, the foreground interpreter (PyRunner.interpreter) that ran a
+   *  script leaving a tool that can change routing reachable, and the tools
+   *  its scripts named: a later script there can call them, so the agent's
+   *  script rounds wait while that interpreter lives, when one of them can
+   *  change that round's routing (scriptMayRoute). */
+  private scriptRoutingInterpreters: Map<string, { interpreter: number; names: Set<string> }> = new Map();
   /** RFC-007: per agent, the origin of the foreground script its runner is
    *  executing, handed to that script's inner calls (scripts run one at a
    *  time per runner). Background runners capture theirs in the closure. */
@@ -2751,6 +2789,7 @@ export class AgentFramework {
       runner.dispose();
     }
     this.codeExecutionRunners.clear();
+    this.scriptRoutingInterpreters.clear();
     // Background daemons die with the process (documented limitation) —
     // mark cancelled FIRST so their settle path stays silent (no crash-wake
     // into a framework that is shutting down).
@@ -8532,7 +8571,7 @@ export class AgentFramework {
 
       // A code_execution result: once its round has them all, the round's
       // prose is routed, before anything here can end or continue the turn.
-      this.settleScriptRound(event.agentName, event.callId);
+      this.settleScriptRound(event.agentName, event.callId, event.result);
 
       const agent = this.agents.get(event.agentName);
       if (agent) {
@@ -11943,15 +11982,15 @@ export class AgentFramework {
     };
 
     // MCPL Spec 14.3 outgoing streaming: the prose this stream's deliveries
-    // publish, sent to the channel's server once each publish is confirmed
-    // (voice synthesis), and to in-process consumers as an `inference:published`
-    // trace. Delivery feeds it, never the text as the model writes it, so it
-    // carries only what delivery published, where it published it. A
-    // round's text reaches it once the round's routing is decided and its
-    // publish is confirmed. Text that delivery withholds never does: a round
-    // a silencing tool, `skip_reply` or a private `think` keeps back, a hold,
-    // a bounce, or a round its stream never finished. Nor does a publish that
-    // fails or isn't confirmed. Emission to a server is gated in the registry
+    // publish, sent to the channel's server once each publish succeeds
+    // (SpeechPublished; voice synthesis), and to in-process consumers as an
+    // `inference:published` trace. Delivery feeds it, never the text as the
+    // model writes it, so it carries only what delivery published, where it
+    // published it. A round's text reaches it once the round's routing is
+    // decided and its publish succeeds. Text that delivery withholds never
+    // does: a round a silencing tool, `skip_reply` or a private `think` keeps
+    // back, a hold, a bounce, or a round its stream never finished. Nor does
+    // a publish that fails. Emission to a server is gated in the registry
     // (`channels.streaming`), and `channels/publish` stays the authoritative
     // send.
     const outgoingInferenceId = `inf_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -12246,18 +12285,19 @@ export class AgentFramework {
             // with verbatim roundContent are live-routed (see liveProseRouting
             // note above — the fallback preamble is cumulative in XML mode).
             //
-            // The round's tool names decide whether its prose goes out, so a
-            // round that calls code_execution is routed once those calls have
-            // returned: a foreground script's own calls count as the round's,
-            // and a skip_reply or a send inside the script silences the round
-            // as a direct call does (ScriptRound). Its prose then goes out
-            // when the script finishes. A background script's call returns as
-            // soon as the script has started. The turn's locus and an
-            // explicit round's admitted targets are taken now, at the round's
-            // tool-calls event, so a re-pin or a renamed label while a script
-            // runs doesn't move them. Hybrid's `>>>` targets, sticky pin and
-            // hold apply as its delivery runs, as for any queued hybrid
-            // delivery.
+            // The round's tool names decide whether its prose goes out, and a
+            // foreground script's own calls count as the round's: a skip_reply
+            // or a send inside the script silences the round as a direct call
+            // does. So a round whose script can call such a tool is routed
+            // once its scripts have returned (ScriptRound, scriptMayRoute),
+            // and its prose goes out when they finish. Any other round is
+            // routed now, a round with a script that can't call one included,
+            // so narration beside a script isn't held for the script's
+            // runtime. The turn's locus and an explicit round's admitted
+            // targets are taken now, at the round's tool-calls event, so a
+            // re-pin or a renamed label while a script runs doesn't move them.
+            // Hybrid's `>>>` targets, sticky pin and hold apply as its delivery
+            // runs, as for any queued hybrid delivery.
             const roundToolNames = event.calls.map((c) => c.name);
             const liveRound = !!this.channelRegistry && !!roundContent && roundContent.length > 0;
             if (liveRound) liveProseRouting = true;
@@ -12331,8 +12371,17 @@ export class AgentFramework {
                 }
               }
             };
+            // A round still waiting under this name can't be decided now: a
+            // newer round displaces it, whether or not this one waits, so no
+            // call of this round can settle it.
+            const displaced = this.scriptRounds.get(agent.name);
+            if (displaced) {
+              this.scriptRounds.delete(agent.name);
+              displaced.withhold('a newer round replaced it before its scripts returned');
+            }
             const scriptCallIds = event.calls
-              .filter((c) => c.name === CODE_EXECUTION_TOOL_NAME)
+              .filter((c) => c.name === CODE_EXECUTION_TOOL_NAME
+                && this.scriptMayRoute(agent.name, c, turnProseRouting, requestSnapshot.sameRoundThinkTextPolicy === 'private'))
               .map((c) => c.id);
             if (scriptCallIds.length > 0) {
               // In place before dispatch, so a foreground script records
@@ -12361,9 +12410,6 @@ export class AgentFramework {
                   this.recordProseSuppression(streamRouting, roundSegments.length);
                 },
               };
-              // A round still waiting under this name can't be decided now:
-              // a newer round displaces it.
-              this.scriptRounds.get(agent.name)?.withhold('a newer round replaced it before its scripts returned');
               this.scriptRounds.set(agent.name, round);
             }
 
@@ -13803,6 +13849,9 @@ export class AgentFramework {
       input: call.input,
     });
     const startTime = Date.now();
+    // The round that waits on this call, registered just before dispatch.
+    const waitingRound = this.scriptRounds.get(agentName);
+    const round = waitingRound?.pending.has(call.id) ? waitingRound : undefined;
     this.runCodeExecution(agentName, call)
       .catch((error): ToolResult => {
         this.toolLifecycleEmitter?.markDispatchFailure(agentName, call.id);
@@ -13829,6 +13878,7 @@ export class AgentFramework {
             durationMs: Date.now() - startTime,
           });
         }
+        if (round) this.scriptRoundOfResult.set(result, round);
         this.pushEvent({
           type: 'tool-result',
           callId: call.id,
@@ -13845,11 +13895,40 @@ export class AgentFramework {
    * the code_execution calls a round waits on (ScriptRound), the round's
    * prose is routed now, its scripts' calls counted.
    */
-  private settleScriptRound(agentName: string, callId: string): void {
+  private settleScriptRound(agentName: string, callId: string, result: ToolResult): void {
     const round = this.scriptRounds.get(agentName);
-    if (!round || !round.pending.delete(callId) || round.pending.size > 0) return;
+    if (!round || this.scriptRoundOfResult.get(result) !== round) return;
+    if (!round.pending.delete(callId) || round.pending.size > 0) return;
     this.scriptRounds.delete(agentName);
     round.route();
+  }
+
+  /**
+   * Whether a code_execution call's script can change its round's routing,
+   * so the round waits for it (ScriptRound). Its code must name a tool whose
+   * call can change the round's routing in the turn's mode, under its
+   * same-round policy (scriptToolNames, changesRouting), or the interpreter
+   * it will run in must have run a script that left such a tool reachable
+   * (scriptRoutingInterpreters), until that interpreter is reclaimed or
+   * restarted. What neither sees is routed at once, as a round was before
+   * scripts counted (scriptToolNames says what goes unseen). A background
+   * script, or a list or cancel action, returns at once, and its calls
+   * aren't the round's. Without code execution no script runs: the call is
+   * answered as an unknown tool, a result that settles no round.
+   */
+  private scriptMayRoute(
+    agentName: string,
+    call: ToolCall,
+    mode: NonNullable<AgentConfig['proseRouting']>,
+    privateThink: boolean,
+  ): boolean {
+    if (!this.codeExecutionConfig) return false;
+    const input = (call.input ?? {}) as { code?: unknown; background?: unknown; action?: unknown };
+    if (input.background === true || (input.action !== undefined && input.action !== 'run')) return false;
+    if (typeof input.code === 'string' && changesRouting(scriptToolNames(input.code, ROUTING_TOOLS).names, mode, privateThink)) return true;
+    const interpreter = this.codeExecutionRunners.get(agentName)?.interpreter ?? null;
+    const mark = this.scriptRoutingInterpreters.get(agentName);
+    return interpreter !== null && mark?.interpreter === interpreter && changesRouting(mark.names, mode, privateThink);
   }
 
   /**
@@ -13969,6 +14048,17 @@ export class AgentFramework {
       }
     }
     const endTurn = script.endTurn;
+    // A script that left a tool reachable, such as a helper it defined, may
+    // call it from a later script in the same interpreter (scriptMayRoute).
+    // Whether that changes the later round's routing is its mode's and
+    // policy's to say, so the mark keeps the names.
+    const interpreter = runner.interpreter;
+    const { reachable } = scriptToolNames(input.code, ROUTING_TOOLS);
+    if (ownsRunner && interpreter !== null && reachable.size > 0) {
+      const mark = this.scriptRoutingInterpreters.get(agentName);
+      const earlier = mark?.interpreter === interpreter ? mark.names : [];
+      this.scriptRoutingInterpreters.set(agentName, { interpreter, names: new Set([...earlier, ...reachable]) });
+    }
 
     return {
       success: true,
