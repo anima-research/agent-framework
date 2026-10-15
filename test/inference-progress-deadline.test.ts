@@ -175,6 +175,8 @@ test('each agent turn carries the progress deadline: 30 minutes unless inference
   assert.equal(DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS, 30 * 60_000);
   assert.equal((await turnOptions({}))?.progressTimeoutMs, DEFAULT_INFERENCE_PROGRESS_TIMEOUT_MS);
   assert.equal((await turnOptions({ inferenceProgressTimeoutMs: 1234 }))?.progressTimeoutMs, 1234);
+  // Infinity is the way to run with no bound: it passes, and membrane never fires it.
+  assert.equal((await turnOptions({ inferenceProgressTimeoutMs: Infinity }))?.progressTimeoutMs, Infinity);
   // Membrane reads these as no deadline, which would leave the hang in place.
   for (const value of [0, -1, Number.NaN]) {
     assert.equal(
