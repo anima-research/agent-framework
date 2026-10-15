@@ -11655,7 +11655,7 @@ export class AgentFramework {
       // MCPL beforeInference hooks (fail-open)
       if (this.hookOrchestrator) {
         try {
-          const hookParams = this.buildBeforeInferenceParams(agent, trigger);
+          const hookParams = this.buildBeforeInferenceParams(agent, trigger, true);
           const hookInjections = this.scopeInjectionsForAgent(
             agent.name,
             await this.hookOrchestrator.beforeInference(hookParams),
@@ -19312,7 +19312,7 @@ export class AgentFramework {
       });
   }
 
-  private buildBeforeInferenceParams(agent: Agent, trigger?: InferenceRequest): BeforeInferenceParams {
+  private buildBeforeInferenceParams(agent: Agent, trigger?: InferenceRequest, inTurn = false): BeforeInferenceParams {
     const inferenceId = `${agent.name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     return {
       inferenceId,
@@ -19331,10 +19331,10 @@ export class AgentFramework {
       // are omitted rather than fabricated — the hardcoded 200000 was false
       // for residents configured at 300k/600k.
       model: { id: agent.model },
-      channels: this.channelRegistry?.buildChannelContext(agent.name, {
+      channels: this.channelRegistry?.buildChannelContext(agent.name, inTurn ? {
         frozenLocus: this.turnRouting.get(agent.name)?.locus ?? null,
         privateTurn: this.turnRouting.get(agent.name)?.nonChannelOrigin === true,
-      }),
+      } : undefined),
     };
   }
 }

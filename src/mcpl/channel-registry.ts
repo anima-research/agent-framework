@@ -1456,15 +1456,10 @@ export class ChannelRegistry {
   ): ChannelContext | undefined {
     const openChannels = this.getOpenChannels();
 
-    // During a turn, report the same frozen locus routeSpeech consumes. A
-    // private non-channel turn freezes null and has no truthful incoming
-    // channel either. Outside a turn, retain the legacy live resolution.
-    // told the channel its speech will actually land in: a conversation fork's
-    // home channel, else this turn's channel (single trunk agent — item-3
-    // redux: its locus, else its triggering channel), else the global default
-    // (heartbeats). Without this, a fork
-    // was advertised the global locus but published somewhere else; and a trunk
-    // agent was told the wrong channel under concurrency.
+    // During a real turn, report the same frozen locus routeSpeech consumes.
+    // A private non-channel turn freezes null and has no truthful incoming
+    // channel either. Outside a turn (including preview), retain live resolution:
+    // a fork's home, else the trunk's active channel, else the global default.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
     const active = agentName ? this.activeChannelResolver?.(agentName) : undefined;
     const outgoing = turn ? turn.frozenLocus : home ?? active ?? this.defaultPublishChannel;
