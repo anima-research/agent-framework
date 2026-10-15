@@ -1505,6 +1505,8 @@ describe('present while acting', () => {
       decisionSequence: () => 0,
       resolveSendTarget: (target: string) => target,
       noteAnswered: () => {},
+      // An open channel, so the send's answer carries no closed-channel note.
+      isChannelOpen: () => true,
     };
     framework.turnRouting = new Map([['assistant', sending]]);
     const results: unknown[] = [];

@@ -1369,6 +1369,12 @@ export class ChannelRegistry {
     return this.findChannelEntry(channelId)?.open === true;
   }
 
+  /** Whether a channel is a DM by what the registry knows of it: its
+   *  metadata, or the id and label shapes DMs take (isDmChannelId). */
+  isDirectMessageChannel(channelId: string): boolean {
+    return this.isDmChannelId(channelId);
+  }
+
   getDesiredState(serverId: string, channelId: string): DesiredChannelState | undefined {
     return this.desiredStates.get(this.lifecycleKey(serverId, channelId))?.state;
   }

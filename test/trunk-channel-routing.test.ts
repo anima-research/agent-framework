@@ -47,6 +47,7 @@ function internals(framework: AgentFramework) {
     channelRegistry: unknown;
     handleMcplPushEvent(event: unknown): void;
     handleMcplChannelIncoming(event: unknown): Promise<unknown>;
+    directMessageChannels: Set<string>;
   };
 }
 
@@ -351,6 +352,8 @@ describe('Trunk channel routing (item-3 redux)', () => {
       .join('\n') ?? '';
     assert.match(text, /you there\?/);
     assert.doesNotMatch(text, /Channel invitation/);
+    // And the closed-channel note on the agent's words there is left out too.
+    assert.ok(i.directMessageChannels.has('discord:dm:1555'), 'known as a DM by its chat:dm message');
     await framework.stop();
   });
 
@@ -389,6 +392,8 @@ describe('Trunk channel routing (item-3 redux)', () => {
     await incomingOn('discord:dm:1555', 'antra: and one in private', ['chat:dm', 'chat:addressed', 'chat:private']);
     assert.match(lastText(), /one in private/);
     assert.doesNotMatch(lastText(), /Channel invitation/);
+    // Only the DM is known as one, for the closed-channel note.
+    assert.deepEqual([...i.directMessageChannels], ['discord:dm:1555']);
     await framework.stop();
   });
 

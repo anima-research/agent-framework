@@ -3892,6 +3892,11 @@ export class AgentFramework {
       ext.keys.forEach((key) => taken.add(key));
       result.set('_toolResultGuard', ext);
     }
+    {
+      const ext = this.closedChannelNoteSettingsExtension();
+      ext.keys.forEach((key) => taken.add(key));
+      result.set('_closedChannelNote', ext);
+    }
     for (const module of this.moduleRegistry.getAllModules()) {
       const ext = module.getAgentSettingsExtension?.();
       if (!ext) continue;
@@ -4000,6 +4005,92 @@ export class AgentFramework {
       },
       reset: (name) => set(name, undefined),
     };
+  }
+
+  /** Whether the agent wants the note on words that land in a closed channel:
+   *  on unless they've turned it off with agent_settings. */
+  private closedChannelNoteOn(agentName: string): boolean {
+    const state = this.store.getStateJson(FRAMEWORK_STATE_ID) as {
+      closedChannelNotes?: Record<string, unknown>;
+    } | null;
+    return state?.closedChannelNotes?.[agentName] !== false;
+  }
+
+  private closedChannelNoteSettingsExtension(): AgentSettingsExtension {
+    const get = (name: string): Record<string, unknown> => ({ closed_channel_note: this.closedChannelNoteOn(name) });
+    const set = (name: string, on: boolean | undefined): Record<string, unknown> => {
+      if (!this.agents.has(name)) throw new Error(`Unknown agent: ${name}`);
+      const data = this.store.getStateJson(FRAMEWORK_STATE_ID);
+      const state = (data && typeof data === 'object' ? data : {}) as Record<string, unknown>;
+      const values = { ...((state.closedChannelNotes as Record<string, boolean> | undefined) ?? {}) };
+      if (on === undefined) delete values[name];
+      else values[name] = on;
+      state.closedChannelNotes = values;
+      this.store.setStateJson(FRAMEWORK_STATE_ID, state);
+      return get(name);
+    };
+    return {
+      properties: {
+        closed_channel_note: {
+          type: 'boolean',
+          description: 'Add a note when your words go to a closed channel, saying that it stays closed, what still ' +
+            'reaches you from it, and how to open it. On by default. Persists across turns and restarts until changed.',
+        },
+      },
+      keys: ['closed_channel_note'],
+      get,
+      update: (name, patch) => {
+        if (typeof patch.closed_channel_note !== 'boolean') throw new Error('closed_channel_note must be a boolean');
+        return set(name, patch.closed_channel_note);
+      },
+      reset: (name) => set(name, undefined),
+    };
+  }
+
+  /** Channels that have delivered a message tagged chat:dm in this process:
+   *  every message of a DM reaches the agent, open or not, so the closed-channel
+   *  note is left off there. */
+  private readonly directMessageChannels = new Set<string>();
+
+  private noteDirectMessageTags(channelId: string, tags: string[] | undefined): void {
+    if (tags?.includes('chat:dm')) this.directMessageChannels.add(channelId);
+  }
+
+  /** What an agent is told when their words go to a channel that stays closed,
+   *  or undefined where nothing needs saying: an open channel, or a DM, known by
+   *  a chat:dm message it delivered or by what the registry knows of it. */
+  private closedChannelNoteFor(channelId: string, serverId: string | null): string | undefined {
+    const registry = this.channelRegistry;
+    if (!registry || registry.isChannelOpen(channelId)) return undefined;
+    if (this.directMessageChannels.has(channelId) || registry.isDirectMessageChannel(channelId)) return undefined;
+    const label = registry.getDescriptor(channelId)?.label;
+    const place = label && label !== channelId
+      ? `${label.startsWith('#') ? label : `#${label}`} (${channelId})`
+      : channelId;
+    const open = serverId
+      ? `call channel_open with channelId "${channelId}" and serverId "${serverId}"`
+      : `call channel_open with channelId "${channelId}"`;
+    return `${place} stays closed: speaking into a closed channel doesn't open it. Messages there that address you, ` +
+      `such as an @-mention, still reach you; to hear the rest of its traffic, ${open}.`;
+  }
+
+  /** How to stop the closed-channel note, said once wherever it appears. */
+  private static readonly CLOSED_CHANNEL_NOTE_OFF = 'To stop this note, set closed_channel_note to false with agent_settings.';
+
+  /** The closed-channel notes for an agent's words that landed in these
+   *  channels, or none when they've turned the note off. The note is advice:
+   *  if working it out fails, the words were still delivered, so that's
+   *  logged and nothing is added. */
+  private closedChannelNotes(agentName: string, channelIds: Iterable<string>, serverId?: string): string[] {
+    try {
+      const notes = [...channelIds].flatMap((id) =>
+        this.closedChannelNoteFor(id, serverId ?? this.channelRegistry?.getChannelServerId(id) ?? null) ?? []);
+      // The setting is read only when there's a note to give.
+      return notes.length > 0 && this.closedChannelNoteOn(agentName) ? notes : [];
+    } catch (err) {
+      console.error(`[closed-channel-note] for ${agentName} failed: ${(err as Error).message}`);
+      return [];
+    }
   }
 
   /** Every guard's annotation still running, for stop() (agent-framework #277). */
@@ -9101,6 +9192,7 @@ export class AgentFramework {
 
     // Addressed-while-closed invitation — parity with the push-event path
     // (channels.publish surfaces like portal-mcpl deliver mentions here).
+    this.noteDirectMessageTags(event.channelId, event.tags);
     const incomingContent = [...event.content];
     {
       const invitation = this.buildClosedChannelInvitation({
@@ -10160,6 +10252,7 @@ export class AgentFramework {
 
     const content = [...event.content];
     if (triggerChannel) {
+      this.noteDirectMessageTags(triggerChannel.channelId, event.tags);
       const origin = (event.origin ?? {}) as Record<string, unknown>;
       const invitation = this.buildClosedChannelInvitation({
         serverId: event.serverId,
@@ -10643,9 +10736,15 @@ export class AgentFramework {
           ? `${suppressed} plain-speech segment(s) suppressed (proseRouting=disabled — publish only with an explicit send tool)`
           : `${suppressed} plain-speech segment(s) suppressed (explicit send in the same round — resend with a send tool if it was meant to be heard)`
         : '';
+    // Words that stayed in a closed channel that isn't a DM say so, unless
+    // the agent has turned the note off.
+    const closedNotes = this.closedChannelNotes(agent.name, seen);
+    const closedNote = closedNotes.length > 0
+      ? ` · ${closedNotes.join(' ')} ${AgentFramework.CLOSED_CHANNEL_NOTE_OFF}`
+      : '';
     const text =
       shown.length > 0
-        ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}`
+        ? `[delivered] plain speech → ${shown.join(' · ')}${suppressedNote ? ` · ${suppressedNote}` : ''}${closedNote}`
         : `[delivered] nothing — ${suppressedNote}`;
     try {
       const mid = agent.getContextManager().addMessage(
@@ -17987,6 +18086,15 @@ export class AgentFramework {
             // A closed channel stays closed, and where a turn with no trigger
             // speaks still follows the agent there.
             this.channelRegistry.noteAnswered(engagedChannel, serverId, decidedSince);
+            // The send's answer says so, where the agent's words stayed in a
+            // closed channel that isn't a DM.
+            const [note] = toolName === 'send_dm' ? [] : this.closedChannelNotes(agentName, [engagedChannel], serverId);
+            if (note) {
+              result.content = [
+                ...(result.content ?? []),
+                { type: 'text', text: `[closed channel] ${note} ${AgentFramework.CLOSED_CHANNEL_NOTE_OFF}` },
+              ];
+            }
           }
         }
 

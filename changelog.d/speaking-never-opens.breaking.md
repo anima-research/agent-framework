@@ -7,6 +7,12 @@
   - **Who needs to act:** an agent that wants a channel's ongoing traffic after speaking there
     opens it with `channel_open`; speaking no longer does. Messages that address the agent still
     arrive while a channel is closed.
+  - **What residents read:** where an agent's words land in a closed channel that isn't a DM, the
+    send tool's answer, or for routed speech the turn's `[delivered]` line, says that the channel
+    stays closed, that messages addressing the agent still reach it, and how to open it with
+    `channel_open`. The agent turns that note off for good with `agent_settings`' new
+    `closed_channel_note`, which is on by default. A channel counts as a DM when the send was
+    `send_dm`, when it has delivered a `chat:dm` message, or when the registry knows it as one.
   - **What residents notice:** on discord-mcpl, opening a channel also turns on its reaction
     forwarding, and closing it turns that off. A reply in a closed guild channel used to open
     it, and so turn its reactions on. Now reactions to the reply arrive only where the agent
@@ -54,6 +60,8 @@
   `onChannelAutoOpened` reports only `source: 'subscription-policy'`, and its `conversationId` is
   gone. The `mcpl:channel-opened-by-send` and `mcpl:channel-open-failed` traces are no longer
   emitted. A `desired-state` record in the channel lifecycle log can carry `answered: true`;
-  earlier versions ignore the field.
-- **Prompt cache:** `channel_close`'s description changes, so the first request after the
-  upgrade that carries the channel tools misses the cache from its tool block on.
+  earlier versions ignore the field. `isDirectMessageChannel(channelId)` is new, and says whether
+  the registry knows a channel as a DM.
+- **Prompt cache:** `channel_close`'s description and `agent_settings`' input schema change, so
+  the first request after the upgrade that carries those tools misses the cache from its tool
+  block on.
