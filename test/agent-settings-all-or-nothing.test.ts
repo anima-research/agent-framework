@@ -1,7 +1,10 @@
 /**
- * agent_settings changes all of a call's settings or none of them: every
- * setting, the core ones and each extension's, is checked before any is
- * applied, so a refusal leaves everything as it was, and says so.
+ * agent_settings checks every setting a call names before it applies any, as
+ * far as a check can tell: the names, the core settings' own checks and each
+ * extension's validate. What a check can't foresee (an extension without
+ * validate, a strategy's own refusal, a store write that fails) can still
+ * refuse after something applied, so what can refuse goes first, and every
+ * refusal says exactly what the call changed: nothing, or which settings.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -55,7 +58,7 @@ class SettingModule implements Module {
 }
 
 async function withFramework(
-  options: { strategy?: boolean; modules?: Module[]; contextBudgetTokens?: number },
+  options: { strategy?: false | AutobiographicalStrategy; modules?: Module[]; contextBudgetTokens?: number },
   fn: (framework: AgentFramework, call: (input: Record<string, unknown>) => ToolResult) => Promise<void> | void,
 ): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'agent-settings-atomic-'));
@@ -66,7 +69,7 @@ async function withFramework(
       name: 'agent',
       model: 'test-model',
       systemPrompt: 'test',
-      ...(options.strategy === false ? {} : { strategy: strategy() }),
+      ...(options.strategy === false ? {} : { strategy: options.strategy ?? strategy() }),
       contextBudgetTokens: options.contextBudgetTokens ?? 100_000,
       maxTokens: 10_000,
     }],
@@ -100,12 +103,12 @@ async function withFramework(
 const settings = (call: (input: Record<string, unknown>) => ToolResult) =>
   call({ action: 'get' }).data as Record<string, unknown>;
 
-describe('agent_settings changes all of a call\'s settings or none', () => {
+describe('agent_settings checks a call\'s settings before it applies any, and says what a refusal changed', () => {
   it('a refused core setting leaves the extensions\' settings in the call unapplied', async () => {
     await withFramework({}, (_framework, call) => {
       const refused = call({ action: 'update', tool_result_inline_max_chars: 5_000, tool_result_guard: true, tail_tokens: -1 });
       assert.equal(refused.isError, true);
-      assert.equal(refused.error, 'tailTokens must be a non-negative safe integer Nothing in this call was changed.');
+      assert.equal(refused.error, 'tailTokens must be a non-negative safe integer. Nothing in this call was changed.');
       const now = settings(call);
       assert.equal(now.tool_result_inline_max_chars, null, 'the inline cap was not set');
       assert.equal(now.tool_result_guard, false, 'the guard was not enabled');
@@ -117,7 +120,7 @@ describe('agent_settings changes all of a call\'s settings or none', () => {
     await withFramework({}, (_framework, call) => {
       const refused = call({ action: 'update', tail_tokens: 20_000, tool_result_inline_max_chars: 5_000, tool_result_guard: 'yes' });
       assert.equal(refused.isError, true);
-      assert.equal(refused.error, 'tool_result_guard must be a boolean Nothing in this call was changed.');
+      assert.equal(refused.error, 'tool_result_guard must be a boolean. Nothing in this call was changed.');
       const now = settings(call);
       assert.equal(now.tailTokens, 30_000, 'the tail was not changed');
       assert.equal(now.tool_result_inline_max_chars, null, 'the inline cap, checked before it, was not set either');
@@ -128,7 +131,7 @@ describe('agent_settings changes all of a call\'s settings or none', () => {
     await withFramework({ strategy: false }, (_framework, call) => {
       const refused = call({ action: 'update', context_budget_tokens: 60_000, tool_result_guard: true });
       assert.equal(refused.isError, true);
-      assert.equal(refused.error, 'The active context strategy cannot prepare a smaller window live Nothing in this call was changed.');
+      assert.equal(refused.error, 'The active context strategy cannot prepare a smaller window live. Nothing in this call was changed.');
       assert.equal(settings(call).tool_result_guard, false);
     });
   });
@@ -157,7 +160,7 @@ describe('agent_settings changes all of a call\'s settings or none', () => {
     const module = new SettingModule('zz-ahead', 'zz_ahead', true);
     await withFramework({ modules: [module] }, (_framework, call) => {
       const refused = call({ action: 'update', tail_tokens: 20_000, zz_ahead: 'zz-bad' });
-      assert.equal(refused.error, 'zz_ahead refused zz-bad Nothing in this call was changed.');
+      assert.equal(refused.error, 'zz_ahead refused zz-bad. Nothing in this call was changed.');
       assert.equal(settings(call).tailTokens, 30_000);
       assert.equal(module.value, 'zz-initial');
     });
@@ -167,7 +170,7 @@ describe('agent_settings changes all of a call\'s settings or none', () => {
     const module = new SettingModule('zz-late', 'zz_late', false);
     await withFramework({ modules: [module] }, (_framework, call) => {
       const refused = call({ action: 'update', tail_tokens: 20_000, tool_result_guard: true, zz_late: 'zz-bad' });
-      assert.equal(refused.error, 'zz_late refused zz-bad Nothing in this call was changed.');
+      assert.equal(refused.error, 'zz_late refused zz-bad. Nothing in this call was changed.');
       const now = settings(call);
       assert.equal(now.tailTokens, 30_000);
       assert.equal(now.tool_result_guard, false);
@@ -179,7 +182,7 @@ describe('agent_settings changes all of a call\'s settings or none', () => {
     const second = new SettingModule('zz-second', 'zz_second', false);
     await withFramework({ modules: [first, second] }, (_framework, call) => {
       const refused = call({ action: 'update', tail_tokens: 20_000, zz_first: 'zz-good', zz_second: 'zz-bad' });
-      assert.equal(refused.error, 'zz_second refused zz-bad Changed before the refusal: zz_first; nothing else in this call was.');
+      assert.equal(refused.error, 'zz_second refused zz-bad. Changed before the refusal: zz_first; nothing else in this call was.');
       assert.equal(first.value, 'zz-good');
       assert.equal(second.value, 'zz-initial');
       assert.equal(settings(call).tailTokens, 30_000);
@@ -189,10 +192,10 @@ describe('agent_settings changes all of a call\'s settings or none', () => {
   it('a name that is no setting is refused, with nothing applied', async () => {
     await withFramework({}, (_framework, call) => {
       const refused = call({ action: 'update', tail_tokens: 20_000, tail_token: 5_000 });
-      assert.equal(refused.error, 'Unknown setting: tail_token Nothing in this call was changed.');
+      assert.equal(refused.error, 'Unknown setting: tail_token. Nothing in this call was changed.');
       assert.equal(settings(call).tailTokens, 30_000);
       const two = call({ action: 'update', zz_one: 1, zz_two: 2 });
-      assert.equal(two.error, 'Unknown settings: zz_one, zz_two Nothing in this call was changed.');
+      assert.equal(two.error, 'Unknown settings: zz_one, zz_two. Nothing in this call was changed.');
     });
   });
 
@@ -203,7 +206,7 @@ describe('agent_settings changes all of a call\'s settings or none', () => {
       framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 150_000 });
       const refused = call({ action: 'reset' });
       assert.equal(refused.isError, true);
-      assert.equal(refused.error, 'The active context strategy cannot prepare a smaller window live Nothing in this call was changed.');
+      assert.equal(refused.error, 'The active context strategy cannot prepare a smaller window live. Nothing in this call was changed.');
       const now = settings(call);
       assert.equal(now.tool_result_inline_max_chars, 5_000, 'the inline cap was not reset');
       assert.equal(now.contextBudgetTokens, 150_000);
@@ -220,6 +223,139 @@ describe('agent_settings changes all of a call\'s settings or none', () => {
       assert.equal(data.tool_result_guard, true);
       assert.equal(data.zz_ahead, 'zz-good');
       assert.equal(module.value, 'zz-good');
+    });
+  });
+  it('the strategy\'s own refusal comes before the extensions that checked ahead apply', async () => {
+    // An autobiographical strategy without kv-stable folding has live
+    // settings, but refuses a gradual transition when the update applies.
+    const unpaced = new AutobiographicalStrategy({ recentWindowTokens: 30_000 });
+    await withFramework({ strategy: unpaced }, (_framework, call) => {
+      const refused = call({ action: 'update', context_budget_tokens: 60_000, tool_result_inline_max_chars: 5_000 });
+      assert.equal(refused.isError, true);
+      assert.match(refused.error!, /^Gradual context-window transitions require adaptiveResolution with foldingStrategy "kv-stable"\. Nothing in this call was changed\.$/);
+      const now = settings(call);
+      assert.equal(now.tool_result_inline_max_chars, null, 'the inline cap was not set');
+      assert.equal(now.contextBudgetTokens, 100_000);
+    });
+  });
+
+  it('a tail for a strategy without live settings is refused before anything applies', async () => {
+    const module = new SettingModule('zz-late', 'zz_late', false);
+    await withFramework({ strategy: false, modules: [module] }, (_framework, call) => {
+      const refused = call({ action: 'update', tail_tokens: 20_000, zz_late: 'zz-good', tool_result_inline_max_chars: 5_000 });
+      assert.equal(refused.error, 'The active context strategy does not support live tail/transition settings. Nothing in this call was changed.');
+      assert.equal(module.value, 'zz-initial', 'the extension without validate, applied first otherwise, was not');
+      assert.equal(settings(call).tool_result_inline_max_chars, null);
+    });
+  });
+
+  it('a context manager that can\'t give the strategy\'s live settings refuses before anything applies', async () => {
+    const module = new SettingModule('zz-late', 'zz_late', false);
+    await withFramework({ modules: [module] }, (framework, call) => {
+      const cm = framework.getAgent('agent')!.getContextManager() as unknown as { getHotContextSettings: () => unknown };
+      cm.getHotContextSettings = () => { throw new Error('zz-branch not loaded'); };
+      const refused = call({ action: 'update', zz_late: 'zz-good', context_budget_tokens: 150_000 });
+      assert.equal(refused.error, 'zz-branch not loaded. Nothing in this call was changed.');
+      assert.equal(module.value, 'zz-initial');
+    });
+  });
+
+  it('an update that names `settings` is refused, since only a reset reads it', async () => {
+    await withFramework({}, (_framework, call) => {
+      const refused = call({ action: 'update', settings: ['tail_tokens'], tail_tokens: 20_000 });
+      assert.equal(refused.error, '`settings` lists names for a reset; to change a setting, give its name and new value. Nothing in this call was changed.');
+      assert.equal(settings(call).tailTokens, 30_000);
+    });
+  });
+
+  it('an extension\'s validate refuses before an extension without one applies', async () => {
+    const module = new SettingModule('zz-late', 'zz_late', false);
+    await withFramework({ modules: [module] }, (_framework, call) => {
+      const cap = call({ action: 'update', zz_late: 'zz-good', tool_result_inline_max_chars: 500 });
+      assert.equal(cap.error, 'tool_result_inline_max_chars must be a number >= 1000. Nothing in this call was changed.');
+      const guard = call({ action: 'update', zz_late: 'zz-good', tool_result_guard: 'yes' });
+      assert.equal(guard.error, 'tool_result_guard must be a boolean. Nothing in this call was changed.');
+      assert.equal(module.value, 'zz-initial');
+    });
+  });
+
+  it('a store write that fails after a setting changed names that setting', async () => {
+    await withFramework({}, (framework, call) => {
+      const internal = framework as unknown as {
+        persistToolResultInlineCap: (...args: unknown[]) => void;
+        persistAgentRuntimeSettings: (...args: unknown[]) => void;
+      };
+      const persistCap = internal.persistToolResultInlineCap;
+      internal.persistToolResultInlineCap = () => { throw new Error('zz-disk full'); };
+      const cap = call({ action: 'update', tool_result_inline_max_chars: 5_000 });
+      assert.equal(cap.error, 'zz-disk full. Changed before the refusal: tool_result_inline_max_chars; nothing else in this call was.');
+      internal.persistToolResultInlineCap = persistCap;
+      internal.persistAgentRuntimeSettings = () => { throw new Error('zz-disk full'); };
+      const tail = call({ action: 'update', tail_tokens: 20_000 });
+      assert.equal(tail.error, 'zz-disk full. Changed before the refusal: tail_tokens; nothing else in this call was.');
+      assert.equal(settings(call).tailTokens, 20_000, 'in memory, as the refusal says');
+    });
+  });
+
+  it('the budget preflight\'s notes are logged only once the budget has applied', async () => {
+    await withFramework({ strategy: false }, (framework, call) => {
+      const warned: string[] = [];
+      const warn = console.warn;
+      console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(' ')); };
+      try {
+        const internal = framework as unknown as { persistAgentRuntimeSettings: (...args: unknown[]) => void };
+        const persist = internal.persistAgentRuntimeSettings;
+        internal.persistAgentRuntimeSettings = () => { throw new Error('zz-disk full'); };
+        const failed = call({ action: 'update', context_budget_tokens: 150_000 });
+        assert.equal(failed.error, 'zz-disk full. Changed before the refusal: context_budget_tokens; nothing else in this call was.');
+        assert.deepEqual(warned.filter((w) => w.startsWith('[budget-preflight]')), [], 'nothing claims an apply that failed');
+        internal.persistAgentRuntimeSettings = persist;
+        assert.equal(call({ action: 'update', context_budget_tokens: 160_000 }).success, true);
+        assert.equal(warned.filter((w) => w.startsWith('[budget-preflight]')).length, 1);
+      } finally {
+        console.warn = warn;
+      }
+    });
+  });
+
+  it('a reset refuses a name beside `settings`, and a name that is no setting', async () => {
+    await withFramework({}, (_framework, call) => {
+      assert.equal(call({ action: 'update', tool_result_inline_max_chars: 5_000 }).isError, undefined);
+      const stray = call({ action: 'reset', tail_tokens: 20_000 });
+      assert.equal(stray.error, 'A reset takes only `settings`, a list of setting names; it has no tail_tokens. Nothing in this call was changed.');
+      const inherited = call({ action: 'reset', settings: ['constructor'] });
+      assert.equal(inherited.error, 'Unknown reset setting: constructor. Nothing in this call was changed.');
+      assert.equal(settings(call).tool_result_inline_max_chars, 5_000, 'nothing was reset');
+    });
+  });
+
+  it('a reset of a setting that isn\'t the budget passes while a raised budget sits above the configured one', async () => {
+    await withFramework({ strategy: false }, (framework, call) => {
+      framework.updateAgentRuntimeSettings('agent', { contextBudgetTokens: 150_000 });
+      const reset = call({ action: 'reset', settings: ['same_round_think_text_policy'] });
+      assert.equal(reset.success, true, reset.error);
+      assert.equal(settings(call).contextBudgetTokens, 150_000);
+    });
+  });
+
+  it('an immediate lower budget passes on an agent whose strategy has no live settings', async () => {
+    await withFramework({ strategy: false }, (_framework, call) => {
+      const lower = call({ action: 'update', context_budget_tokens: 60_000, immediate: true });
+      assert.equal(lower.success, true, lower.error);
+      assert.equal(settings(call).contextBudgetTokens, 60_000);
+    });
+  });
+
+  it('a reset of everything resets the extensions\' settings and answers with them', async () => {
+    const module = new SettingModule('zz-late', 'zz_late', false);
+    await withFramework({ modules: [module] }, (_framework, call) => {
+      assert.equal(call({ action: 'update', zz_late: 'zz-good', tool_result_inline_max_chars: 5_000 }).success, true);
+      const reset = call({ action: 'reset' });
+      assert.equal(reset.success, true, reset.error);
+      const data = reset.data as Record<string, unknown>;
+      assert.equal(data.zz_late, 'zz-initial');
+      assert.equal(data.tool_result_inline_max_chars, null);
+      assert.equal(module.value, 'zz-initial');
     });
   });
 });

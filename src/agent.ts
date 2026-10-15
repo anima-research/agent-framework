@@ -613,8 +613,11 @@ export class Agent {
   /**
    * The checks updateRuntimeSettings makes before it changes anything, run
    * alone, so a caller can refuse a patch before applying anything else: a
-   * value out of range, or a change this agent's context strategy can't make
-   * live.
+   * value out of range, a tail or pace for a strategy without live settings,
+   * or a lower budget it can't reach gradually. The strategy can still refuse
+   * what only it can judge, such as a gradual transition its configuration
+   * doesn't allow, when the update applies; that refusal also comes before
+   * anything changes.
    */
   checkRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
     this.validateRuntimeSettingsPatch(patch);

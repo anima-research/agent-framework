@@ -354,6 +354,26 @@ const UTILS_TOOL: import('./types/index.js').ToolDefinition = {
 };
 
 /** First sentence (or line) of a description — what `utils list` shows. */
+/**
+ * An agent's settings as an agent_settings update or reset could change them,
+ * each as text to compare: the core settings, and the given extensions' own
+ * keys.
+ */
+type SettingsReading = {
+  core: Record<string, string>;
+  exts: Map<AgentSettingsExtension, Record<string, string>>;
+};
+
+/** An extension's own keys as its get reads them, each as text to compare. */
+const readExtensionSettings = (ext: AgentSettingsExtension, agentName: string): Record<string, string> => {
+  const values = ext.get(agentName);
+  return Object.fromEntries(ext.keys.map((key) => [key, JSON.stringify(values[key] ?? null)]));
+};
+
+/** The keys whose text differs between two readings of the same settings. */
+const changedSettings = (before: Record<string, string>, now: Record<string, string>): string[] =>
+  Object.keys(before).filter((key) => before[key] !== now[key]);
+
 const utilityOneLiner = (description: string): string => {
   const line = description.split('\n')[0]!;
   const dot = line.indexOf('. ');
@@ -4234,24 +4254,27 @@ export class AgentFramework {
     patch: AgentRuntimeSettingsPatch,
     opts?: { persist?: boolean; allowInfeasible?: boolean; requester?: OperatorRequester; note?: string },
   ): AgentRuntimeSettingsSnapshot {
-    this.checkAgentRuntimeSettingsUpdate(agentName, patch, opts);
-    return this.applyAgentRuntimeSettingsUpdate(agentName, patch, opts);
-  }
-
-  /**
-   * Everything updateAgentRuntimeSettings refuses a patch for, checked
-   * before it changes anything: the agent's own checks
-   * (Agent.checkRuntimeSettingsPatch) and the budget preflight. The
-   * agent_settings tool runs it before it applies any of a call's settings.
-   */
-  private checkAgentRuntimeSettingsUpdate(
-    agentName: string,
-    patch: AgentRuntimeSettingsPatch,
-    opts?: { allowInfeasible?: boolean },
-  ): void {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
     agent.checkRuntimeSettingsPatch(patch);
+    const notes = this.preflightAgentRuntimeSettingsUpdate(agentName, patch, opts);
+    const result = this.applyAgentRuntimeSettingsUpdate(agentName, patch, opts);
+    for (const note of notes) console.warn(note);
+    return result;
+  }
+
+  /**
+   * The budget preflight updateAgentRuntimeSettings runs after the agent's
+   * own checks and before it applies: it refuses a lowering that would wedge
+   * the agent, and returns its notes for the caller to log once the patch
+   * has applied, since they say it is applying.
+   */
+  private preflightAgentRuntimeSettingsUpdate(
+    agentName: string,
+    patch: AgentRuntimeSettingsPatch,
+    opts?: { allowInfeasible?: boolean },
+  ): string[] {
+    const notes: string[] = [];
     // Feasibility preflight — only a budget-bearing patch can wedge, and only
     // on the immediate path (a paced descent leaves the compile budget alone
     // and converges only as far as the folded floor allows). Boot restore
@@ -4276,15 +4299,15 @@ export class AgentFramework {
             `OverBudget-wedge the agent. Lower the floor first (drain compression quarantine / ` +
             `advance the merge ladder), use a paced descent (no \`immediate\`), or pass allowInfeasible.`;
           if (!opts?.allowInfeasible) throw new BudgetPreflightError(msg, preview);
-          console.warn(`${msg} — applying anyway (allowInfeasible).`);
+          notes.push(`${msg} — applying anyway (allowInfeasible).`);
         } else if (preview.path === 'immediate' && !e.fits) {
-          console.warn(
+          notes.push(
             `[budget-preflight] ${agentName} remains over the folded floor at ` +
             `${patch.contextBudgetTokens} (floor renders ${e.finalTokens}); this patch does ` +
             `not lower the budget, so applying — drain quarantine / advance merges to clear it.`,
           );
         } else if (preview.path === 'paced' && preview.advisory && !preview.advisory.fits) {
-          console.warn(
+          notes.push(
             `[budget-preflight] paced descent for ${agentName} targets ` +
             `${preview.advisory.targetTokens} tokens, below the current folded floor — the ` +
             `transition will converge only as far as the floor allows (drain quarantine / ` +
@@ -4292,12 +4315,13 @@ export class AgentFramework {
           );
         }
       } else if (preview.reason) {
-        console.warn(
+        notes.push(
           `[budget-preflight] preview unavailable for ${agentName} (${preview.reason}); ` +
           `applying without preflight`,
         );
       }
     }
+    return notes;
   }
 
   /** updateAgentRuntimeSettings' changes, for a patch its check has passed. */
@@ -19059,6 +19083,44 @@ export class AgentFramework {
       });
   }
 
+  /** An agent's settings now, the core ones and the given extensions'. */
+  private readAgentSettings(agentName: string, exts: AgentSettingsExtension[]): SettingsReading {
+    const s = this.getAgentRuntimeSettings(agentName);
+    return {
+      core: {
+        // The budget it's set to, the one compiles plan at, and its transition
+        // all change with a budget update.
+        context_budget_tokens: JSON.stringify([s.contextBudgetTokens, s.effectiveContextBudgetTokens, s.transition]),
+        tail_tokens: JSON.stringify(s.tailTokens ?? null),
+        transition_pace_tokens: JSON.stringify(s.transitionPaceTokens ?? null),
+        same_round_think_text_policy: JSON.stringify([s.sameRoundThinkTextPolicy, s.sameRoundThinkTextPolicySource]),
+      },
+      exts: new Map(exts.map((ext) => [ext, readExtensionSettings(ext, agentName)])),
+    };
+  }
+
+  /**
+   * The sentence an agent_settings refusal ends with: what the call changed
+   * before it refused, read against how its settings stood before it applied
+   * anything. A refusal before then changed nothing.
+   */
+  private settingsChangedSince(agentName: string, before: SettingsReading | undefined): string {
+    if (!before) return 'Nothing in this call was changed.';
+    let changed: string[];
+    try {
+      const now = this.readAgentSettings(agentName, [...before.exts.keys()]);
+      changed = [
+        ...changedSettings(before.core, now.core),
+        ...[...before.exts].flatMap(([ext, values]) => changedSettings(values, now.exts.get(ext)!)),
+      ];
+    } catch {
+      return 'Whether anything in this call was changed couldn\'t be read back; action "get" shows the settings as they stand.';
+    }
+    return changed.length === 0
+      ? 'Nothing in this call was changed.'
+      : `Changed before the refusal: ${changed.join(', ')}; nothing else in this call was.`;
+  }
+
   private dispatchAgentSettingsToolCall(agentName: string, call: ToolCall): void {
     this.emitTrace({
       type: 'tool:started',
@@ -19068,11 +19130,13 @@ export class AgentFramework {
       input: call.input,
     });
     let result: ToolResult;
-    // What this call has changed so far, for a refusal to name: settings are
-    // checked before any is applied, so it stays empty unless an extension
-    // that can't check ahead refused after another had applied.
-    const changed: string[] = [];
     const action = (call.input as { action?: unknown } | undefined)?.action;
+    // The settings an update or reset could change, as they stood before it
+    // applied anything, so a refusal can say exactly what it changed: what a
+    // check can't foresee (an extension without validate, a strategy's own
+    // refusal, a store write that fails) can still refuse after something
+    // applied.
+    let before: SettingsReading | undefined;
     try {
       const input = (call.input ?? {}) as {
         action?: unknown;
@@ -19115,8 +19179,11 @@ export class AgentFramework {
           // Immediate budget decrease: skip the paced descent; the next
           // compile plans straight at the new budget (one-shot fold-down).
           if (input.immediate !== undefined) patch.immediate = Boolean(input.immediate);
+          if (input.settings !== undefined) {
+            throw new Error('`settings` lists names for a reset; to change a setting, give its name and new value');
+          }
           // A name that is no setting would otherwise be dropped unseen.
-          const known = new Set<string>(['action', 'immediate', 'settings', ...AgentFramework.AGENT_SETTINGS_CORE_KEYS]);
+          const known = new Set<string>(['action', 'immediate', ...AgentFramework.AGENT_SETTINGS_CORE_KEYS]);
           for (const ext of extensions.values()) ext.keys.forEach((key) => known.add(key));
           const unknown = Object.keys(input).filter((key) => !known.has(key));
           if (unknown.length > 0) {
@@ -19134,20 +19201,38 @@ export class AgentFramework {
             if (Object.keys(slice).length > 0) slices.push({ ext, slice });
           }
           const coreTouched = Object.keys(patch).length > 0;
-          // Every setting is checked before any is applied, so a refused call
-          // changes nothing.
-          if (coreTouched) this.checkAgentRuntimeSettingsUpdate(agentName, patch);
-          for (const { ext, slice } of slices) ext.validate?.(agentName, slice);
-          // An extension that can't check ahead is checked only by its own
-          // update, so it goes first, before anything that checked ahead.
-          const extResults: Record<string, unknown> = {};
-          for (const { ext, slice } of [...slices.filter((s) => !s.ext.validate), ...slices.filter((s) => s.ext.validate)]) {
-            Object.assign(extResults, ext.update(agentName, slice));
-            changed.push(...Object.keys(slice));
+          // Everything that can be checked ahead is checked before anything
+          // applies: the names, the core settings' own checks and each
+          // extension's validate.
+          if (coreTouched) {
+            const agent = this.agents.get(agentName);
+            if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+            agent.checkRuntimeSettingsPatch(patch);
           }
-          const core = coreTouched
-            ? this.applyAgentRuntimeSettingsUpdate(agentName, patch)
-            : this.getAgentRuntimeSettings(agentName);
+          for (const { ext, slice } of slices) ext.validate?.(agentName, slice);
+          // Reading them asks the context manager for the strategy's live
+          // settings too, so one that can't give them refuses here.
+          before = this.readAgentSettings(agentName, slices.map((s) => s.ext));
+          // Then what can refuse goes first. An extension without validate is
+          // checked only by its own update. The core settings come next: the
+          // budget preflight judges the agent as those updates left it, and
+          // the strategy can still refuse what only it can judge. Extensions
+          // that checked ahead come last.
+          const extResults: Record<string, unknown> = {};
+          for (const { ext, slice } of slices.filter((s) => !s.ext.validate)) {
+            Object.assign(extResults, ext.update(agentName, slice));
+          }
+          let core: AgentRuntimeSettingsSnapshot;
+          if (coreTouched) {
+            const notes = this.preflightAgentRuntimeSettingsUpdate(agentName, patch);
+            core = this.applyAgentRuntimeSettingsUpdate(agentName, patch);
+            for (const note of notes) console.warn(note);
+          } else {
+            core = this.getAgentRuntimeSettings(agentName);
+          }
+          for (const { ext, slice } of slices.filter((s) => s.ext.validate)) {
+            Object.assign(extResults, ext.update(agentName, slice));
+          }
           result = {
             success: true,
             data: {
@@ -19165,21 +19250,30 @@ export class AgentFramework {
           break;
         }
         case 'reset': {
+          // A reset takes its names in `settings`; anything else beside it
+          // would otherwise be dropped while everything is reset.
+          const extra = Object.keys(input).filter((key) => key !== 'action' && key !== 'settings');
+          if (extra.length > 0) {
+            throw new Error(
+              `A reset takes only \`settings\`, a list of setting names; it has no ${extra.join(', ')}`,
+            );
+          }
           let keys: Array<keyof AgentRuntimeSettingsPatch> | undefined;
           const extResetKeys = new Map<AgentSettingsExtension, string[]>();
           const resetsAllSettings = input.settings === undefined;
           if (input.settings !== undefined) {
             if (!Array.isArray(input.settings)) throw new Error('reset `settings` must be an array');
-            const names: Record<string, keyof AgentRuntimeSettingsPatch> = {
-              context_budget_tokens: 'contextBudgetTokens',
-              tail_tokens: 'tailTokens',
-              transition_pace_tokens: 'transitionPaceTokens',
-              same_round_think_text_policy: 'sameRoundThinkTextPolicy',
-            };
+            const names = new Map<string, keyof AgentRuntimeSettingsPatch>([
+              ['context_budget_tokens', 'contextBudgetTokens'],
+              ['tail_tokens', 'tailTokens'],
+              ['transition_pace_tokens', 'transitionPaceTokens'],
+              ['same_round_think_text_policy', 'sameRoundThinkTextPolicy'],
+            ]);
             keys = [];
             for (const name of input.settings) {
-              if (typeof name === 'string' && names[name]) {
-                keys.push(names[name]);
+              const coreKey = typeof name === 'string' ? names.get(name) : undefined;
+              if (coreKey) {
+                keys.push(coreKey);
                 continue;
               }
               const owner = [...extensions.values()].find(
@@ -19195,31 +19289,20 @@ export class AgentFramework {
           const touchedSameRoundThinkTextPolicy =
             resetsAllSettings || keys?.includes('sameRoundThinkTextPolicy') === true;
           const coreTouched = input.settings === undefined || keys !== undefined;
-          // The core reset's own check runs before any extension resets, so a
-          // refused reset changes nothing.
-          if (coreTouched) {
-            const agent = this.agents.get(agentName);
-            if (!agent) throw new Error(`Unknown agent: ${agentName}`);
-            agent.checkRuntimeSettingsReset(keys);
-          }
-          const extResults: Record<string, unknown> = {};
-          if (input.settings === undefined) {
-            // Reset-all covers extensions too.
-            for (const ext of extensions.values()) {
-              if (!ext.reset) continue;
-              Object.assign(extResults, ext.reset(agentName));
-              changed.push(...ext.keys);
-            }
-          } else {
-            for (const [ext, list] of extResetKeys) {
-              if (!ext.reset) continue;
-              Object.assign(extResults, ext.reset(agentName, list));
-              changed.push(...list);
-            }
-          }
+          // Reset-all covers extensions too.
+          const extResets: Array<[AgentSettingsExtension, string[] | undefined]> = resetsAllSettings
+            ? [...extensions.values()].map((ext) => [ext, undefined])
+            : [...extResetKeys];
+          before = this.readAgentSettings(agentName, extResets.map(([ext]) => ext));
+          // The core reset goes first: it is what refuses, at its check or
+          // where its strategy refuses, and it changes nothing when it does.
           const core = coreTouched
             ? this.resetAgentRuntimeSettings(agentName, keys)
             : this.getAgentRuntimeSettings(agentName);
+          const extResults: Record<string, unknown> = {};
+          for (const [ext, list] of extResets) {
+            if (ext.reset) Object.assign(extResults, ext.reset(agentName, list));
+          }
           result = {
             success: true,
             data: {
@@ -19241,12 +19324,11 @@ export class AgentFramework {
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      const outcome = changed.length === 0
-        ? 'Nothing in this call was changed.'
-        : `Changed before the refusal: ${changed.join(', ')}; nothing else in this call was.`;
       result = {
         success: false,
-        error: action === 'update' || action === 'reset' ? `${reason} ${outcome}` : reason,
+        error: action === 'update' || action === 'reset'
+          ? `${/[.!?]$/.test(reason.trim()) ? reason.trim() : `${reason.trim()}.`} ${this.settingsChangedSince(agentName, before)}`
+          : reason,
         isError: true,
       };
     }
