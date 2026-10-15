@@ -150,6 +150,16 @@ export interface AgentSettingsExtension {
   keys: string[];
   /** Current values for the extension's keys. */
   get(agentName: string): Record<string, unknown>;
+  /** Refuse a partial update before anything in the call is applied: throw
+   *  with the reason, and change nothing. agent_settings runs every
+   *  extension's check and the core settings' own before it applies any of
+   *  them, so a refused call applies nothing. Optional: without it, the
+   *  extension's update is its check, and agent_settings applies such
+   *  extensions before the ones that check ahead and before the core
+   *  settings. One of them refusing then leaves applied only what another
+   *  such extension applied before it in the same call, which the refusal
+   *  names. */
+  validate?(agentName: string, patch: Record<string, unknown>): void;
   /** Apply a partial update (only this extension's keys present) and return
    *  the new values. Throw to surface a validation error to the agent. */
   update(agentName: string, patch: Record<string, unknown>): Record<string, unknown>;

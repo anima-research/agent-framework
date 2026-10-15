@@ -610,8 +610,37 @@ export class Agent {
     return 'compatibility_default';
   }
 
-  updateRuntimeSettings(patch: AgentRuntimeSettingsPatch): AgentRuntimeSettingsSnapshot {
+  /**
+   * The checks updateRuntimeSettings makes before it changes anything, run
+   * alone, so a caller can refuse a patch before applying anything else: a
+   * value out of range, or a change this agent's context strategy can't make
+   * live.
+   */
+  checkRuntimeSettingsPatch(patch: AgentRuntimeSettingsPatch): void {
     this.validateRuntimeSettingsPatch(patch);
+    if (patch.contextBudgetTokens !== undefined && !patch.immediate
+        && patch.contextBudgetTokens < (this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS)
+        && !this.getHotContextSettings()) {
+      throw new Error('The active context strategy cannot prepare a smaller window live');
+    }
+  }
+
+  /**
+   * The check resetRuntimeSettings makes before it changes anything, run
+   * alone: returning to a configured budget below the live one needs a
+   * strategy that can lower the budget gradually.
+   */
+  checkRuntimeSettingsReset(keys?: Array<keyof AgentRuntimeSettingsPatch>): void {
+    if (keys !== undefined && !keys.includes('contextBudgetTokens')) return;
+    const configured = this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+    if (configured < live && !this.getHotContextSettings()) {
+      throw new Error('The active context strategy cannot prepare a smaller window live');
+    }
+  }
+
+  updateRuntimeSettings(patch: AgentRuntimeSettingsPatch): AgentRuntimeSettingsSnapshot {
+    this.checkRuntimeSettingsPatch(patch);
     let nextContextBudget = this.contextBudgetTokens;
     let nextContextTarget = this.contextBudgetTargetTokens;
     let appliedDefaultPace = false;
@@ -638,10 +667,8 @@ export class Agent {
         nextContextTarget = undefined;
         if (this.getHotContextSettings()) hotPatch.preparedWindowTokens = null;
       } else {
-        const hot = this.getHotContextSettings();
-        if (!hot) {
-          throw new Error('The active context strategy cannot prepare a smaller window live');
-        }
+        // checkRuntimeSettingsPatch refused a paced decrease without one.
+        const hot = this.getHotContextSettings()!;
         if (patch.transitionPaceTokens === undefined && hot.transitionPaceTokens === undefined) {
           hotPatch.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;
           appliedDefaultPace = true;
@@ -674,6 +701,7 @@ export class Agent {
   }
 
   resetRuntimeSettings(keys?: Array<keyof AgentRuntimeSettingsPatch>): AgentRuntimeSettingsSnapshot {
+    this.checkRuntimeSettingsReset(keys);
     const reset = new Set(keys ?? ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens', 'sameRoundThinkTextPolicy']);
     let nextContextBudget = this.contextBudgetTokens;
     let nextContextTarget = this.contextBudgetTargetTokens;
@@ -689,8 +717,8 @@ export class Agent {
       const configured = this.configuredContextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
       const live = this.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
       if (configured < live) {
-        const hot = this.getHotContextSettings();
-        if (!hot) throw new Error('The active context strategy cannot prepare a smaller window live');
+        // checkRuntimeSettingsReset refused this without one.
+        const hot = this.getHotContextSettings()!;
         hotPatch.preparedWindowTokens = configured - this.maxTokens;
         if (hot.transitionPaceTokens === undefined) {
           hotPatch.transitionPaceTokens = DEFAULT_TRANSITION_PACE_TOKENS;

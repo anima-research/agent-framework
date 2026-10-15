@@ -3878,6 +3878,13 @@ export class AgentFramework {
 
   /** agent_settings extension for the spill gate (see spillOrTruncate). */
   private spillSettingsExtension(): AgentSettingsExtension {
+    const inlineCapOf = (patch: Record<string, unknown>): number => {
+      const n = Number(patch.tool_result_inline_max_chars);
+      if (!Number.isFinite(n) || n < 1000) {
+        throw new Error('tool_result_inline_max_chars must be a number >= 1000');
+      }
+      return Math.floor(n);
+    };
     return {
       properties: {
         tool_result_inline_max_chars: {
@@ -3905,14 +3912,14 @@ export class AgentFramework {
           tool_result_inline_max_chars_clamped_by: resolved?.clampedBy ?? null,
         };
       },
+      validate: (_agentName: string, patch: Record<string, unknown>) => {
+        inlineCapOf(patch);
+      },
       update: (agentName: string, patch: Record<string, unknown>) => {
-        const n = Number(patch.tool_result_inline_max_chars);
-        if (!Number.isFinite(n) || n < 1000) {
-          throw new Error('tool_result_inline_max_chars must be a number >= 1000');
-        }
-        this.toolResultInlineMaxCharsOverride.set(agentName, Math.floor(n));
-        this.persistToolResultInlineCap(agentName, Math.floor(n));
-        return { tool_result_inline_max_chars: Math.floor(n) };
+        const cap = inlineCapOf(patch);
+        this.toolResultInlineMaxCharsOverride.set(agentName, cap);
+        this.persistToolResultInlineCap(agentName, cap);
+        return { tool_result_inline_max_chars: cap };
       },
       reset: (agentName: string, keys?: string[]) => {
         if (!keys || keys.includes('tool_result_inline_max_chars')) {
@@ -3931,6 +3938,10 @@ export class AgentFramework {
   }
 
   private toolResultGuardSettingsExtension(): AgentSettingsExtension {
+    const enabledOf = (patch: Record<string, unknown>): boolean => {
+      if (typeof patch.tool_result_guard !== 'boolean') throw new Error('tool_result_guard must be a boolean');
+      return patch.tool_result_guard;
+    };
     const get = (name: string): Record<string, unknown> => {
       const guard = this.agents.get(name)?.toolResultGuard;
       return {
@@ -3962,10 +3973,10 @@ export class AgentFramework {
       },
       keys: ['tool_result_guard'],
       get,
-      update: (name, patch) => {
-        if (typeof patch.tool_result_guard !== 'boolean') throw new Error('tool_result_guard must be a boolean');
-        return set(name, patch.tool_result_guard);
+      validate: (_name, patch) => {
+        enabledOf(patch);
       },
+      update: (name, patch) => set(name, enabledOf(patch)),
       reset: (name) => set(name, undefined),
     };
   }
@@ -4223,8 +4234,24 @@ export class AgentFramework {
     patch: AgentRuntimeSettingsPatch,
     opts?: { persist?: boolean; allowInfeasible?: boolean; requester?: OperatorRequester; note?: string },
   ): AgentRuntimeSettingsSnapshot {
+    this.checkAgentRuntimeSettingsUpdate(agentName, patch, opts);
+    return this.applyAgentRuntimeSettingsUpdate(agentName, patch, opts);
+  }
+
+  /**
+   * Everything updateAgentRuntimeSettings refuses a patch for, checked
+   * before it changes anything: the agent's own checks
+   * (Agent.checkRuntimeSettingsPatch) and the budget preflight. The
+   * agent_settings tool runs it before it applies any of a call's settings.
+   */
+  private checkAgentRuntimeSettingsUpdate(
+    agentName: string,
+    patch: AgentRuntimeSettingsPatch,
+    opts?: { allowInfeasible?: boolean },
+  ): void {
     const agent = this.agents.get(agentName);
     if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+    agent.checkRuntimeSettingsPatch(patch);
     // Feasibility preflight — only a budget-bearing patch can wedge, and only
     // on the immediate path (a paced descent leaves the compile budget alone
     // and converges only as far as the folded floor allows). Boot restore
@@ -4271,6 +4298,16 @@ export class AgentFramework {
         );
       }
     }
+  }
+
+  /** updateAgentRuntimeSettings' changes, for a patch its check has passed. */
+  private applyAgentRuntimeSettingsUpdate(
+    agentName: string,
+    patch: AgentRuntimeSettingsPatch,
+    opts?: { persist?: boolean; requester?: OperatorRequester; note?: string },
+  ): AgentRuntimeSettingsSnapshot {
+    const agent = this.agents.get(agentName);
+    if (!agent) throw new Error(`Unknown agent: ${agentName}`);
     const result = agent.updateRuntimeSettings(patch);
     if (opts?.persist !== false) {
       this.persistAgentRuntimeSettings(agentName, this.persistedRuntimeSettingsOf(agent));
@@ -19031,6 +19068,11 @@ export class AgentFramework {
       input: call.input,
     });
     let result: ToolResult;
+    // What this call has changed so far, for a refusal to name: settings are
+    // checked before any is applied, so it stays empty unless an extension
+    // that can't check ahead refused after another had applied.
+    const changed: string[] = [];
+    const action = (call.input as { action?: unknown } | undefined)?.action;
     try {
       const input = (call.input ?? {}) as {
         action?: unknown;
@@ -19073,22 +19115,38 @@ export class AgentFramework {
           // Immediate budget decrease: skip the paced descent; the next
           // compile plans straight at the new budget (one-shot fold-down).
           if (input.immediate !== undefined) patch.immediate = Boolean(input.immediate);
+          // A name that is no setting would otherwise be dropped unseen.
+          const known = new Set<string>(['action', 'immediate', 'settings', ...AgentFramework.AGENT_SETTINGS_CORE_KEYS]);
+          for (const ext of extensions.values()) ext.keys.forEach((key) => known.add(key));
+          const unknown = Object.keys(input).filter((key) => !known.has(key));
+          if (unknown.length > 0) {
+            throw new Error(`Unknown setting${unknown.length > 1 ? 's' : ''}: ${unknown.join(', ')}`);
+          }
           // Route extension-owned keys to their modules; apply the core patch
           // only when it touches core keys (an extension-only update must not
           // disturb a converging budget transition).
-          const extResults: Record<string, unknown> = {};
+          const slices: Array<{ ext: AgentSettingsExtension; slice: Record<string, unknown> }> = [];
           for (const ext of extensions.values()) {
             const slice: Record<string, unknown> = {};
             for (const key of ext.keys) {
               if (input[key] !== undefined) slice[key] = input[key];
             }
-            if (Object.keys(slice).length > 0) {
-              Object.assign(extResults, ext.update(agentName, slice));
-            }
+            if (Object.keys(slice).length > 0) slices.push({ ext, slice });
           }
           const coreTouched = Object.keys(patch).length > 0;
+          // Every setting is checked before any is applied, so a refused call
+          // changes nothing.
+          if (coreTouched) this.checkAgentRuntimeSettingsUpdate(agentName, patch);
+          for (const { ext, slice } of slices) ext.validate?.(agentName, slice);
+          // An extension that can't check ahead is checked only by its own
+          // update, so it goes first, before anything that checked ahead.
+          const extResults: Record<string, unknown> = {};
+          for (const { ext, slice } of [...slices.filter((s) => !s.ext.validate), ...slices.filter((s) => s.ext.validate)]) {
+            Object.assign(extResults, ext.update(agentName, slice));
+            changed.push(...Object.keys(slice));
+          }
           const core = coreTouched
-            ? this.updateAgentRuntimeSettings(agentName, patch)
+            ? this.applyAgentRuntimeSettingsUpdate(agentName, patch)
             : this.getAgentRuntimeSettings(agentName);
           result = {
             success: true,
@@ -19136,18 +19194,29 @@ export class AgentFramework {
           }
           const touchedSameRoundThinkTextPolicy =
             resetsAllSettings || keys?.includes('sameRoundThinkTextPolicy') === true;
+          const coreTouched = input.settings === undefined || keys !== undefined;
+          // The core reset's own check runs before any extension resets, so a
+          // refused reset changes nothing.
+          if (coreTouched) {
+            const agent = this.agents.get(agentName);
+            if (!agent) throw new Error(`Unknown agent: ${agentName}`);
+            agent.checkRuntimeSettingsReset(keys);
+          }
           const extResults: Record<string, unknown> = {};
           if (input.settings === undefined) {
             // Reset-all covers extensions too.
             for (const ext of extensions.values()) {
-              if (ext.reset) Object.assign(extResults, ext.reset(agentName));
+              if (!ext.reset) continue;
+              Object.assign(extResults, ext.reset(agentName));
+              changed.push(...ext.keys);
             }
           } else {
             for (const [ext, list] of extResetKeys) {
-              if (ext.reset) Object.assign(extResults, ext.reset(agentName, list));
+              if (!ext.reset) continue;
+              Object.assign(extResults, ext.reset(agentName, list));
+              changed.push(...list);
             }
           }
-          const coreTouched = input.settings === undefined || keys !== undefined;
           const core = coreTouched
             ? this.resetAgentRuntimeSettings(agentName, keys)
             : this.getAgentRuntimeSettings(agentName);
@@ -19171,9 +19240,13 @@ export class AgentFramework {
           throw new Error('agent_settings: action must be get, update, reset, or cancel');
       }
     } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const outcome = changed.length === 0
+        ? 'Nothing in this call was changed.'
+        : `Changed before the refusal: ${changed.join(', ')}; nothing else in this call was.`;
       result = {
         success: false,
-        error: error instanceof Error ? error.message : String(error),
+        error: action === 'update' || action === 'reset' ? `${reason} ${outcome}` : reason,
         isError: true,
       };
     }
